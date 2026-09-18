@@ -222,7 +222,7 @@ fn flush_exit(events: &mpsc::SyncSender<Message>, code: Option<i32>, output_comp
         },
         Some(ack),
     );
-    let deadline = Instant::now() + Duration::from_millis(200);
+    let deadline = Instant::now() + Duration::from_secs(2);
     loop {
         match events.try_send(message) {
             Ok(()) => {
@@ -251,6 +251,42 @@ mod tests {
             }
             Err(std::io::ErrorKind::Other.into())
         }
+    }
+
+    #[test]
+    fn supervisor_exit_waits_for_saturated_output_queue() {
+        let (events, receiver) = mpsc::sync_channel::<Message>(1);
+        events
+            .send((
+                Event::Output {
+                    bytes: vec![b'x'],
+                    stderr: false,
+                },
+                None,
+            ))
+            .unwrap();
+        let drained = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(350));
+            assert!(matches!(
+                receiver.recv_timeout(Duration::from_secs(1)),
+                Ok((Event::Output { .. }, None))
+            ));
+            let (event, ack) = receiver
+                .recv_timeout(Duration::from_secs(1))
+                .expect("exit status must wait for output queue capacity");
+            assert!(matches!(
+                event,
+                Event::Exit {
+                    code: Some(0),
+                    output_complete: true
+                }
+            ));
+            ack.expect("exit event carries delivery acknowledgement")
+                .send(())
+                .unwrap();
+        });
+        flush_exit(&events, Some(0), true);
+        drained.join().unwrap();
     }
 
     #[test]

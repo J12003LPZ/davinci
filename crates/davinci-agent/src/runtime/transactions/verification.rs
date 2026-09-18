@@ -24,6 +24,34 @@ impl VerificationObservation {
     }
 }
 
+/// An opaque, host-created observation for binding external evidence to source.
+/// It cannot be deserialized or used to mark a transaction verified.
+#[derive(Debug)]
+pub struct SourceObservation(VerificationObservation);
+
+impl SourceObservation {
+    pub fn transaction_id(&self) -> &str {
+        &self.0.id
+    }
+
+    pub fn sequence(&self) -> u64 {
+        self.0.sequence
+    }
+
+    pub fn workspace_identity(&self) -> &str {
+        &self.0.workspace_identity
+    }
+
+    /// Fingerprint of affected files only, not every repository dependency.
+    pub fn source_digest(&self) -> &str {
+        &self.0.source_digest
+    }
+
+    pub fn affected_files(&self) -> &[String] {
+        &self.0.affected_files
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct TransactionVerification {
@@ -34,6 +62,66 @@ pub struct TransactionVerification {
 }
 
 impl TransactionCoordinator {
+    /// Observe applied source without changing journal state or older verification.
+    /// The host must supply current read authority, never authority from a record.
+    pub fn observe_source(
+        &self,
+        id: &str,
+        authority: Authority<'_>,
+    ) -> Result<SourceObservation, String> {
+        self.locked(|store| {
+            let record = store.load(id, &self.root, &self.owner, self.allow_session_recovery)?;
+            if !matches!(
+                record.summary.state,
+                TransactionState::Applied | TransactionState::Verified
+            ) {
+                return Err("transaction state does not allow source observation".into());
+            }
+            self.check_verification_images(&record, authority)?;
+            Ok(SourceObservation(VerificationObservation {
+                id: id.into(),
+                sequence: record.summary.sequence,
+                workspace_identity: record.summary.workspace_identity.clone(),
+                owner: self.owner.clone(),
+                source_digest: source_digest(&record),
+                observed_at_ms: now(),
+                affected_files: record.summary.affected_files.clone(),
+            }))
+        })
+    }
+
+    /// Recheck immediately before and after external evidence collection. A match
+    /// binds evidence to source; it does not prove assertions or coverage passed.
+    pub fn check_source_observation(
+        &self,
+        observation: &SourceObservation,
+        authority: Authority<'_>,
+    ) -> Result<(), String> {
+        let observation = &observation.0;
+        if observation.owner != self.owner {
+            return Err("source observation belongs to another owner".into());
+        }
+        self.locked(|store| {
+            let record = store.load(
+                &observation.id,
+                &self.root,
+                &self.owner,
+                self.allow_session_recovery,
+            )?;
+            if record.summary.sequence != observation.sequence
+                || record.summary.workspace_identity != observation.workspace_identity
+                || source_digest(&record) != observation.source_digest
+                || !matches!(
+                    record.summary.state,
+                    TransactionState::Applied | TransactionState::Verified
+                )
+            {
+                return Err("transaction changed since source observation".into());
+            }
+            self.check_verification_images(&record, authority)
+        })
+    }
+
     /// Trusted host API: call immediately before an authorized verification command
     /// whose coverage includes this transaction. Never accept observations from model JSON.
     pub fn begin_verification(

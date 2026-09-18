@@ -524,6 +524,34 @@ fn browser_dev_server_requires_active_owned_declared_port_and_current_authority(
 }
 
 #[test]
+fn browser_source_read_requires_current_read_authority() {
+    let directory = tempfile::tempdir().unwrap();
+    std::fs::write(directory.path().join("a.txt"), b"source").unwrap();
+    let agent = agent(directory.path(), PermissionMode::AlwaysApprove);
+    let manager = agent.tool_context.processes.as_ref().unwrap();
+    manager
+        .check_current_source_read(
+            directory.path(),
+            &directory.path().join("a.txt"),
+            &agent.tool_context.active_contract,
+        )
+        .unwrap();
+    agent
+        .permissions
+        .lock()
+        .unwrap()
+        .deny
+        .push(PermissionRule::bare("read"));
+    assert!(manager
+        .check_current_source_read(
+            directory.path(),
+            &directory.path().join("a.txt"),
+            &agent.tool_context.active_contract,
+        )
+        .is_err());
+}
+
+#[test]
 fn browser_dev_server_refuses_revocation_and_cancellation_before_callback() {
     let directory = tempfile::tempdir().unwrap();
     let agent = agent(directory.path(), PermissionMode::AlwaysApprove);

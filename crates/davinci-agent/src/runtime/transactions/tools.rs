@@ -136,6 +136,15 @@ impl MutationAuthority {
     }
 }
 
+/// Host-only coordinator construction using the same trusted owner/session/task
+/// derivation as mutation tools. Model JSON never supplies these identity fields.
+pub fn coordinator_for_context(
+    cwd: &Path,
+    context: &ToolContext,
+) -> Result<TransactionCoordinator, ToolError> {
+    ToolTransaction::new(cwd, context).map(|transaction| transaction.coordinator())
+}
+
 pub(crate) struct ToolTransaction<'a> {
     root: PathBuf,
     requested_root: PathBuf,

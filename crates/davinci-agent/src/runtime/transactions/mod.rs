@@ -8,7 +8,7 @@ mod model;
 mod store;
 mod unix_xattrs;
 mod verification;
-pub use verification::{TransactionVerification, VerificationObservation};
+pub use verification::{SourceObservation, TransactionVerification, VerificationObservation};
 pub(crate) mod tools;
 #[cfg(windows)]
 mod windows_acl;
@@ -25,7 +25,7 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use store::Store;
-pub use tools::MutationAuthority;
+pub use tools::{coordinator_for_context, MutationAuthority};
 
 type Authority<'a> = &'a dyn Fn(&Path) -> Result<(), String>;
 

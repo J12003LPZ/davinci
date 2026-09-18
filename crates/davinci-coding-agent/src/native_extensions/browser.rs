@@ -2,9 +2,11 @@
 use crate::interaction_testing::{
     artifacts::{ArtifactBudgetTracker, MAX_RUN_BYTES},
     browser_process::{BrowserProcess, BrowserProcessConfig},
+    validate_receipt_provenance, BackendKind, InteractionReceipt,
 };
 use davinci_agent::{
-    process_manager::{BrowserDevServerLease, BrowserRequest},
+    process_manager::{BrowserDevServerLease, BrowserRequest, ProcessManager},
+    runtime::transactions::{coordinator_for_context, SourceObservation, TransactionCoordinator},
     ToolContext, ToolError, ToolResult,
 };
 use serde::{Deserialize, Serialize};
@@ -86,12 +88,76 @@ impl Startup {
         self.ready.notify_all();
     }
 }
+struct SourceBinding {
+    coordinator: TransactionCoordinator,
+    observation: SourceObservation,
+    workspace: PathBuf,
+    contract: Arc<Mutex<Option<davinci_agent::runtime::TaskContract>>>,
+}
+impl SourceBinding {
+    fn transaction_id(&self) -> &str {
+        self.observation.transaction_id()
+    }
+    fn sequence(&self) -> u64 {
+        self.observation.sequence()
+    }
+    fn workspace_identity(&self) -> &str {
+        self.observation.workspace_identity()
+    }
+    fn source_digest(&self) -> &str {
+        self.observation.source_digest()
+    }
+    fn affected_files(&self) -> &[String] {
+        self.observation.affected_files()
+    }
+    fn check(&self, manager: &ProcessManager, context: &ToolContext) -> Result<(), String> {
+        if context.is_aborted() {
+            return Err("browser source observation cancelled".into());
+        }
+        self.coordinator
+            .check_source_observation(&self.observation, &|path| {
+                manager.check_current_source_read(&self.workspace, path, &self.contract)
+            })
+    }
+    fn metadata(&self) -> Value {
+        json!({
+            "transaction_id": self.transaction_id(),
+            "transaction_sequence": self.sequence(),
+            "workspace_identity": self.workspace_identity(),
+            "source_digest": self.source_digest(),
+            "affected_paths": self.affected_files(),
+        })
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BrowserAssertionSpec {
+    pub dom_contains: String,
+    pub accessibility_contains: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct BrowserVerificationReceipt {
+    pub transaction_id: String,
+    pub transaction_sequence: u64,
+    pub workspace_identity: String,
+    pub source_digest: String,
+    pub affected_paths: Vec<String>,
+    pub action_sequences: Vec<u64>,
+    pub screenshot_artifact: Option<String>,
+    pub incomplete_coverage: Vec<String>,
+    pub interaction: InteractionReceipt,
+}
+
 struct Resource {
     backend: u64,
     process_id: u32,
     port: u16,
     lease: BrowserDevServerLease,
     engine: Arc<BrowserProcess>,
+    browser_version: String,
+    source: Option<Arc<SourceBinding>>,
 }
 #[derive(Clone)]
 struct RetainedArtifact {
@@ -99,6 +165,7 @@ struct RetainedArtifact {
     action_sequence: u64,
     lease: BrowserDevServerLease,
     workspace: PathBuf,
+    source: Option<Arc<SourceBinding>>,
 }
 #[derive(Clone)]
 pub struct BrowserController {
@@ -141,6 +208,8 @@ impl BrowserWorkerHost {
         workspace: &Path,
         processes: davinci_agent::process_manager::ProcessManager,
         abort: Arc<std::sync::atomic::AtomicBool>,
+        transaction_owner: davinci_agent::runtime::transactions::TransactionOwner,
+        task_contract: Option<davinci_agent::runtime::TaskContract>,
     ) -> Result<BrowserWorker, String> {
         let workspace = workspace
             .canonicalize()
@@ -170,6 +239,8 @@ impl BrowserWorkerHost {
                 processes: Some(processes),
                 foreground_supervisor: Some(self.supervisor.clone()),
                 abort: Some(abort),
+                transaction_owner,
+                active_contract: Arc::new(Mutex::new(task_contract)),
                 ..Default::default()
             },
             owned: Mutex::new(Default::default()),
@@ -257,6 +328,7 @@ struct Open {
     #[serde(default = "root_path")]
     path: String,
     viewport: Option<Viewport>,
+    transaction_id: Option<String>,
 }
 fn root_path() -> String {
     "/".into()
@@ -300,6 +372,10 @@ fn parse(name: &str, args: &Value) -> Result<Request, String> {
             || request.viewport.as_ref().is_some_and(|v| {
                 !(128..=1920).contains(&v.width) || !(128..=1080).contains(&v.height)
             })
+            || request
+                .transaction_id
+                .as_deref()
+                .is_some_and(|id| Uuid::parse_str(id).is_err())
         {
             return Err("invalid browser open bounds".into());
         }
@@ -422,17 +498,26 @@ impl BrowserController {
             abort: context.abort.as_deref(), permit: context.dispatch_permit.as_deref(),
             process_id: retained.lease.process_id(), port: retained.lease.port(), lease: Some(&retained.lease),
         }, || {
+            if let Some(source) = &retained.source {
+                source.check(manager, context)?;
+            }
             let artifacts = self.artifacts.lock().map_err(|_| "browser artifacts unavailable")?;
             let bytes = artifacts.items.get(&request.artifact).ok_or("browser artifact unavailable")?;
             if request.offset > bytes.len() { return Err("browser artifact offset exceeds size".into()); }
             let end = request.offset.saturating_add(request.limit).min(bytes.len());
-            Ok(json!({"artifact":request.artifact,"mediaType":"image/png",
+            let mut result = json!({"artifact":request.artifact,"mediaType":"image/png",
                 "browser_id":retained.browser_id,"action_sequence":retained.action_sequence,
                 "verification":"observations_only",
                 "sha256":crate::interaction_testing::artifacts::compute_sha256(bytes),
                 "size":bytes.len(),"offset":request.offset,"nextOffset":end,
                 "eof":end == bytes.len(),
-                "base64":base64::engine::general_purpose::STANDARD.encode(&bytes[request.offset..end])}))
+                "base64":base64::engine::general_purpose::STANDARD.encode(&bytes[request.offset..end])});
+            drop(artifacts);
+            if let Some(source) = &retained.source {
+                source.check(manager, context)?;
+                result["source_binding"] = source.metadata();
+            }
+            Ok(result)
         })
     }
 
@@ -467,6 +552,205 @@ impl BrowserController {
             artifacts: Arc::new(Mutex::new(ArtifactBudgetTracker::new(MAX_RUN_BYTES))),
         }
     }
+    fn bind_source(
+        &self,
+        transaction_id: &str,
+        manager: &ProcessManager,
+        context: &ToolContext,
+    ) -> Result<Arc<SourceBinding>, String> {
+        let coordinator =
+            coordinator_for_context(&self.workspace, context).map_err(|error| error.to_string())?;
+        let contract = context.active_contract.clone();
+        let observation = coordinator.observe_source(transaction_id, &|path| {
+            manager.check_current_source_read(&self.workspace, path, &contract)
+        })?;
+        Ok(Arc::new(SourceBinding {
+            coordinator,
+            observation,
+            workspace: self.workspace.clone(),
+            contract,
+        }))
+    }
+
+    /// Host-only deterministic browser verification. This composes the existing
+    /// authorized native actions and returns RealBrowser evidence without changing
+    /// transaction verification state.
+    pub fn verify_host(
+        &self,
+        cwd: &Path,
+        id: Uuid,
+        spec: BrowserAssertionSpec,
+        context: &ToolContext,
+    ) -> Result<BrowserVerificationReceipt, String> {
+        if spec.dom_contains.is_empty()
+            || spec.dom_contains.len() > 4096
+            || spec
+                .accessibility_contains
+                .as_ref()
+                .is_some_and(|value| value.is_empty() || value.len() > 4096)
+        {
+            return Err("browser assertion bounds are invalid".into());
+        }
+        let resource = self
+            .store
+            .lock()
+            .map_err(|_| "browser state unavailable")?
+            .resources
+            .get(&id)
+            .cloned()
+            .ok_or("browser resource unavailable")?;
+        let source = resource
+            .source
+            .clone()
+            .ok_or("browser verification requires a transaction source binding")?;
+        let manager = context
+            .processes
+            .as_ref()
+            .ok_or("browser process manager unavailable")?;
+        source.check(manager, context)?;
+
+        let mut action_sequences = Vec::new();
+        let mut observe = |name: &str| -> Result<Value, String> {
+            let result = self
+                .execute(cwd, name, &json!({"browser_id":id}), context)
+                .map_err(|error| error.to_string())?;
+            if result.is_error {
+                return Err(format!("{name} failed during browser verification"));
+            }
+            let details = result
+                .details
+                .ok_or("browser verification details unavailable")?;
+            let sequence = details["result"]["action_sequence"]
+                .as_u64()
+                .filter(|value| *value > 0)
+                .ok_or("browser verification action sequence unavailable")?;
+            action_sequences.push(sequence);
+            Ok(details)
+        };
+
+        let snapshot = observe("browser_snapshot")?;
+        let accessibility = observe("browser_accessibility")?;
+        let console = observe("browser_console")?;
+        let network = observe("browser_network")?;
+        let screenshot = observe("browser_screenshot")?;
+        source.check(manager, context)?;
+
+        let html = snapshot["result"]["html"]
+            .as_str()
+            .ok_or("browser snapshot missing HTML")?;
+        let dom_passed = html.contains(&spec.dom_contains);
+        let mut assertions = vec![format!(
+            "{}: DOM contains {:?}",
+            if dom_passed { "PASS" } else { "FAIL" },
+            spec.dom_contains
+        )];
+
+        let tree = accessibility["result"]["tree"]
+            .as_str()
+            .ok_or("browser accessibility snapshot unavailable")?;
+        let accessibility_passed = spec
+            .accessibility_contains
+            .as_ref()
+            .map(|expected| {
+                let passed = tree.contains(expected);
+                assertions.push(format!(
+                    "{}: accessibility contains {:?}",
+                    if passed { "PASS" } else { "FAIL" },
+                    expected
+                ));
+                passed
+            })
+            .unwrap_or(true);
+
+        let console_events = console["result"]["events"]
+            .as_array()
+            .ok_or("browser console evidence unavailable")?;
+        let console_clear = console_events.is_empty();
+        assertions.push(format!(
+            "{}: no console errors",
+            if console_clear { "PASS" } else { "FAIL" }
+        ));
+        let console_errors = console_events
+            .iter()
+            .map(|event| {
+                event["message"]
+                    .as_str()
+                    .unwrap_or("browser console error")
+                    .chars()
+                    .take(1024)
+                    .collect()
+            })
+            .collect();
+
+        let network_events = network["result"]["events"]
+            .as_array()
+            .ok_or("browser network evidence unavailable")?;
+        let network_clear = network_events.is_empty();
+        assertions.push(format!(
+            "{}: no failed network requests",
+            if network_clear { "PASS" } else { "FAIL" }
+        ));
+        let network_failures = network_events
+            .iter()
+            .map(|event| {
+                format!(
+                    "{} (status {})",
+                    event["url"].as_str().unwrap_or("[unknown URL]"),
+                    event["status"].as_u64().unwrap_or(0)
+                )
+            })
+            .collect();
+
+        let mut incomplete_coverage = Vec::new();
+        if console["result"]["omitted"].as_bool() == Some(true) {
+            incomplete_coverage.push("console evidence was truncated".into());
+        }
+        if network["result"]["omitted"].as_bool() == Some(true) {
+            incomplete_coverage.push("network evidence was truncated".into());
+        }
+        let screenshot_artifact = screenshot["result"]["artifact"]
+            .as_str()
+            .map(str::to_owned)
+            .ok_or("browser screenshot artifact unavailable")?;
+        let passed = dom_passed
+            && accessibility_passed
+            && console_clear
+            && network_clear
+            && incomplete_coverage.is_empty();
+        let interaction = InteractionReceipt {
+            scenario_id: format!("browser-transaction-{}", source.transaction_id()),
+            backend_kind: BackendKind::RealBrowser,
+            backend_identity: format!("chromium-{}", resource.browser_version),
+            source_manifest: Some(source.source_digest().to_owned()),
+            assertions_passed: passed,
+            assertions,
+            frames_count: 3,
+            event_log: vec![
+                "host browser actions completed".into(),
+                "accessibility snapshot captured".into(),
+                "screenshot retained as artifact".into(),
+                "transaction source remained unchanged".into(),
+            ],
+            console_errors,
+            network_failures,
+            trace_refs: vec![screenshot_artifact.clone()],
+            exit_outcome: Some(if passed { 0 } else { 1 }),
+        };
+        validate_receipt_provenance(&interaction)?;
+
+        Ok(BrowserVerificationReceipt {
+            transaction_id: source.transaction_id().to_owned(),
+            transaction_sequence: source.sequence(),
+            workspace_identity: source.workspace_identity().to_owned(),
+            source_digest: source.source_digest().to_owned(),
+            affected_paths: source.affected_files().to_vec(),
+            action_sequences,
+            screenshot_artifact: Some(screenshot_artifact),
+            incomplete_coverage,
+            interaction,
+        })
+    }
+
     fn reconcile_backend(&self) -> Result<(), String> {
         let stale = {
             let mut store = self.store.lock().map_err(|_| "browser state unavailable")?;
@@ -645,19 +929,43 @@ impl BrowserController {
                             cwd, name, args, abort: context.abort.as_deref(), permit: context.dispatch_permit.as_deref(),
                             process_id, port, lease: Some(lease),
                         }, |_| Ok(()))?;
+                        let source = open
+                            .transaction_id
+                            .as_deref()
+                            .map(|id| self.bind_source(id, manager, context))
+                            .transpose()?;
                         let origin = lease.origin();
                         let mut options = json!({"origins":[origin]});
                         if let Some(viewport) = open.viewport { options["viewport"] = json!(viewport); }
                         let opened = engine.request_with_abort(json!({"op":"open","options":options}), Duration::from_secs(30), context.abort.as_deref())?;
                         let backend = opened["resource"].as_u64().filter(|id| *id > 0).ok_or("invalid browser resource")?;
                         let id = Uuid::new_v4();
-                        let resource = Arc::new(Resource { backend, process_id, port, lease: lease.clone(), engine: engine.clone() });
+                        let browser_version = opened["browserVersion"]
+                            .as_str()
+                            .ok_or("invalid browser version")?
+                            .to_owned();
+                        let resource = Arc::new(Resource {
+                            backend,
+                            process_id,
+                            port,
+                            lease: lease.clone(),
+                            engine: engine.clone(),
+                            browser_version: browser_version.clone(),
+                            source: source.clone(),
+                        });
                         self.store.lock().map_err(|_| "browser state unavailable")?.resources.insert(id, resource);
                         created = Some(id);
                         let navigation = engine.request_with_abort(json!({"op":"execute","resource":backend,
                             "command":{"action":"navigate","url":format!("{origin}{}",open.path)}}), Duration::from_secs(10), context.abort.as_deref())?;
-                        Ok(json!({"status":"opened","browser_id":id,"origin":origin,
-                            "browser_version":opened["browserVersion"],"navigation":navigation}))
+                        if let Some(source) = &source {
+                            source.check(manager, context)?;
+                        }
+                        let mut result = json!({"status":"opened","browser_id":id,"origin":origin,
+                            "browser_version":opened["browserVersion"],"navigation":navigation});
+                        if let Some(source) = &source {
+                            result["source_binding"] = source.metadata();
+                        }
+                        Ok(result)
                     })();
                     self.store.lock().map_err(|_| "browser state unavailable")?.opening -= 1;
                     result
@@ -669,7 +977,13 @@ impl BrowserController {
                         self.store.lock().map_err(|_| "browser state unavailable")?.resources.remove(&id);
                         Ok(result)
                     } else {
+                        if let Some(source) = &resource.source {
+                            source.check(manager, context)?;
+                        }
                         let mut result = resource.engine.request_with_abort(json!({"op":"execute","resource":resource.backend,"command":command}), Duration::from_secs(10), context.abort.as_deref())?;
+                        if let Some(source) = &resource.source {
+                            source.check(manager, context)?;
+                        }
                         if name == "browser_screenshot" {
                             let mut artifacts = self.artifacts.lock().map_err(|_| "browser artifacts unavailable")?;
                             result = resource.engine.retain_screenshot(&result, &mut artifacts)?;
@@ -677,7 +991,16 @@ impl BrowserController {
                             let action_sequence = result["action_sequence"].as_u64().filter(|id| *id > 0).ok_or("invalid screenshot action sequence")?;
                             drop(artifacts);
                             self.store.lock().map_err(|_| "browser state unavailable")?.retained.insert(label,
-                                RetainedArtifact { browser_id: id, action_sequence, lease: resource.lease.clone(), workspace: self.workspace.clone() });
+                                RetainedArtifact {
+                                    browser_id: id,
+                                    action_sequence,
+                                    lease: resource.lease.clone(),
+                                    workspace: self.workspace.clone(),
+                                    source: resource.source.clone(),
+                                });
+                        }
+                        if let Some(source) = &resource.source {
+                            result["source_binding"] = source.metadata();
                         }
                         Ok(json!({"status":"observed","browser_id":id,"result":result}))
                     }
@@ -712,7 +1035,7 @@ pub fn tool_spec(name: &str) -> Option<davinci_ai::ToolSpec> {
         {"type":"object","properties":{"kind":{"enum":["label","test_id"]},"value":{"type":"string","minLength":1,"maxLength":1024}},"required":["kind","value"],"additionalProperties":false}]});
     let mut parameters = json!({"type":"object","properties":{"browser_id":{"type":"string","format":"uuid"}},"required":["browser_id"],"additionalProperties":false});
     if name == "browser_open" {
-        parameters = json!({"type":"object","properties":{"process_id":{"type":"integer","minimum":1},"port":{"type":"integer","minimum":1,"maximum":65535},"host":{"type":"string","enum":["127.0.0.1","::1"],"description":"Managed loopback address; defaults to 127.0.0.1."},"path":{"type":"string","maxLength":8192,"description":"Local path beginning with /; defaults to /."},"viewport":{"type":"object","properties":{"width":{"type":"integer","minimum":128,"maximum":1920},"height":{"type":"integer","minimum":128,"maximum":1080}},"required":["width","height"],"additionalProperties":false}},"required":["process_id","port"],"additionalProperties":false});
+        parameters = json!({"type":"object","properties":{"process_id":{"type":"integer","minimum":1},"port":{"type":"integer","minimum":1,"maximum":65535},"host":{"type":"string","enum":["127.0.0.1","::1"],"description":"Managed loopback address; defaults to 127.0.0.1."},"path":{"type":"string","maxLength":8192,"description":"Local path beginning with /; defaults to /."},"viewport":{"type":"object","properties":{"width":{"type":"integer","minimum":128,"maximum":1920},"height":{"type":"integer","minimum":128,"maximum":1080}},"required":["width","height"],"additionalProperties":false},"transaction_id":{"type":"string","format":"uuid","description":"Opaque transaction identifier supplied by a prior edit. Ownership and source binding come from trusted host state."}},"required":["process_id","port"],"additionalProperties":false});
     } else if matches!(name, "browser_click" | "browser_type" | "browser_select") {
         parameters["properties"]["selector"] = selector;
         parameters["required"]
@@ -735,6 +1058,120 @@ pub fn tool_spec(name: &str) -> Option<davinci_ai::ToolSpec> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn browser_open_accepts_only_an_opaque_transaction_id() {
+        let transaction_id = Uuid::new_v4().to_string();
+        let request = parse(
+            "browser_open",
+            &json!({"process_id":1,"port":3000,"transaction_id":transaction_id}),
+        )
+        .expect("opaque transaction ID is accepted");
+        let Request::Open(open) = request else {
+            panic!("expected browser open request");
+        };
+        assert_eq!(
+            open.transaction_id.as_deref(),
+            Some(transaction_id.as_str())
+        );
+        assert!(parse(
+            "browser_snapshot",
+            &json!({"browser_id":Uuid::new_v4(),"transaction_id":transaction_id})
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn browser_source_binding_rechecks_live_transaction_source() {
+        let root = tempfile::tempdir().unwrap();
+        let permissions = Arc::new(davinci_agent::PermissionState::new(
+            davinci_agent::PermissionPolicy::new(davinci_agent::PermissionMode::AlwaysApprove),
+        ));
+        let manager = davinci_agent::process_manager::ProcessManager::new(
+            root.path(),
+            Arc::new(Mutex::new(davinci_agent::JobBook::default())),
+            permissions,
+            davinci_agent::jobs::supervisor::SupervisorCommand {
+                executable: std::env::current_exe().unwrap(),
+                argv: Vec::new(),
+            },
+        )
+        .unwrap();
+        let context = ToolContext {
+            processes: Some(manager.clone()),
+            ..Default::default()
+        };
+        let coordinator = davinci_agent::runtime::transactions::TransactionCoordinator::new(
+            root.path(),
+            context.transaction_owner.clone(),
+        )
+        .unwrap();
+        let preview = coordinator
+            .preview(vec![
+                davinci_agent::runtime::transactions::ProposedChange::write(
+                    "a.txt",
+                    b"after".to_vec(),
+                ),
+            ])
+            .unwrap();
+        let applied = coordinator.apply(&preview.id, &|_| Ok(()), None).unwrap();
+
+        let controller = BrowserController::new(root.path(), BrowserConfig::default());
+        let binding = controller
+            .bind_source(&preview.id, &manager, &context)
+            .expect("current transaction source is observable");
+        assert_eq!(binding.transaction_id(), preview.id);
+        assert_eq!(binding.sequence(), applied.sequence);
+        assert_eq!(binding.affected_files(), &["a.txt"]);
+        binding
+            .check(&manager, &context)
+            .expect("unchanged source remains bound");
+
+        std::fs::write(root.path().join("a.txt"), b"changed").unwrap();
+        assert!(binding.check(&manager, &context).is_err());
+    }
+
+    #[test]
+    fn graph_browser_worker_preserves_host_transaction_owner() {
+        let root = tempfile::tempdir().unwrap();
+        let permissions = Arc::new(davinci_agent::PermissionState::new(
+            davinci_agent::PermissionPolicy::new(davinci_agent::PermissionMode::AlwaysApprove),
+        ));
+        let manager = davinci_agent::process_manager::ProcessManager::new(
+            root.path(),
+            Arc::new(Mutex::new(davinci_agent::JobBook::default())),
+            permissions,
+            davinci_agent::jobs::supervisor::SupervisorCommand {
+                executable: std::env::current_exe().unwrap(),
+                argv: Vec::new(),
+            },
+        )
+        .unwrap();
+        let owner = davinci_agent::runtime::transactions::TransactionOwner {
+            agent_id: davinci_agent::AgentId::new(),
+            parent_agent_id: Some(davinci_agent::AgentId::new()),
+            session_id: Some("graph-session".into()),
+            task_id: None,
+            graph_node: Some("writer-1".into()),
+        };
+        let host = BrowserWorkerHost {
+            controller: BrowserController::default(),
+            supervisor: davinci_agent::jobs::supervisor::SupervisorCommand {
+                executable: std::env::current_exe().unwrap(),
+                argv: Vec::new(),
+            },
+        };
+        let worker = host
+            .for_worker(
+                root.path(),
+                manager,
+                Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                owner.clone(),
+                None,
+            )
+            .unwrap();
+        assert_eq!(worker.context.transaction_owner, owner);
+    }
 
     #[test]
     fn browser_startup_waiter_cancellation_preserves_shared_attempt() {

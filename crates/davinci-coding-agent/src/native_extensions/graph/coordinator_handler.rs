@@ -58,8 +58,23 @@ pub(super) fn for_worker(
         .as_ref()
         .zip(processes.as_ref())
         .and_then(|(host, manager)| {
-            host.for_worker(&spec.cwd, manager.clone(), abort.clone())
-                .ok()
+            let parent = deps.runtime.as_ref()?;
+            let agent_id = spec.runtime_agent_id?;
+            let owner = davinci_agent::runtime::transactions::TransactionOwner {
+                agent_id,
+                parent_agent_id: Some(parent.agent_id),
+                session_id: parent.session_id.clone(),
+                task_id: spec.task_contract.as_ref().map(|contract| contract.task_id),
+                graph_node: Some(spec.task_id.clone()),
+            };
+            host.for_worker(
+                &spec.cwd,
+                manager.clone(),
+                abort.clone(),
+                owner,
+                spec.task_contract.clone(),
+            )
+            .ok()
         });
     (language.is_some() || processes.is_some() || browser.is_some()).then(|| {
         Arc::new(ParentTools {
@@ -228,7 +243,14 @@ mod tests {
             );
         }
         let browser = browser.map(|host| {
-            host.for_worker(cwd, processes.clone(), abort.clone())
+            let owner = davinci_agent::runtime::transactions::TransactionOwner {
+                agent_id: child,
+                parent_agent_id: Some(parent.agent_id),
+                session_id: parent.session_id.clone(),
+                task_id: None,
+                graph_node: Some("graph-browser-fixture".into()),
+            };
+            host.for_worker(cwd, processes.clone(), abort.clone(), owner, None)
                 .unwrap()
         });
         TaskCoordinatorTransport::bind_with_handler(

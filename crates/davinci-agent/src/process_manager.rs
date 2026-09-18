@@ -130,6 +130,43 @@ impl BrowserDevServerLease {
 }
 
 impl ProcessManager {
+    /// Host-only source read check for source-bound browser evidence.
+    /// Cached observations never grant authority; callers re-run this before
+    /// and after browser evidence collection.
+    pub fn check_current_source_read(
+        &self,
+        cwd: &Path,
+        path: &Path,
+        contract: &Arc<Mutex<Option<crate::runtime::contracts::TaskContract>>>,
+    ) -> Result<(), String> {
+        self.owner.ensure_open()?;
+        let cwd = cwd
+            .canonicalize()
+            .map_err(|_| "browser source workspace unavailable")?;
+        if cwd != self.workspace {
+            return Err("browser source workspace changed".into());
+        }
+        let args = json!({"path":path});
+        if let Some(contract) = contract
+            .lock()
+            .map_err(|_| "task contract lock poisoned")?
+            .as_ref()
+        {
+            contract
+                .check_call(&cwd, "read", &args)
+                .map_err(|error| error.to_string())?;
+        }
+        match self
+            .permissions
+            .lock()
+            .map_err(|_| "permission policy lock poisoned")?
+            .decide("browser-source-observation", "read", &args, &cwd)
+        {
+            PermissionVerdict::Allow => Ok(()),
+            _ => Err("browser source observation requires current read authority".into()),
+        }
+    }
+
     /// Browser I/O entry point: require current OS listener ownership both
     /// before the operation and before accepting its result, in addition to
     /// this request's live permission and managed-lifetime checks.

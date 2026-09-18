@@ -3097,6 +3097,59 @@ fn run_rpc_with_host(
             continue;
         }
         let mut command: RpcCommand = serde_json::from_str(&line).map_err(|err| err.to_string())?;
+        if command.kind == "verify_browser" {
+            #[derive(serde::Deserialize)]
+            #[serde(deny_unknown_fields)]
+            struct BrowserVerificationRequest {
+                browser_id: uuid::Uuid,
+                dom_contains: String,
+                accessibility_contains: Option<String>,
+            }
+            let result = (|| {
+                if command
+                    .value
+                    .as_ref()
+                    .is_some_and(|value| value.len() > 12 * 1024)
+                {
+                    return Err("browser verification request exceeds limit".into());
+                }
+                let request: BrowserVerificationRequest = serde_json::from_str(
+                    command
+                        .value
+                        .as_deref()
+                        .ok_or("browser verification request required")?,
+                )
+                .map_err(|_| "invalid browser verification request")?;
+                let controller = host
+                    .lock()
+                    .unwrap_or_else(|err| err.into_inner())
+                    .native
+                    .lock()
+                    .map_err(|_| "native host unavailable")?
+                    .browser
+                    .clone();
+                let receipt = controller.verify_host(
+                    &runtime.cwd,
+                    request.browser_id,
+                    crate::native_extensions::browser::BrowserAssertionSpec {
+                        dom_contains: request.dom_contains,
+                        accessibility_contains: request.accessibility_contains,
+                    },
+                    &runtime.agent.tool_context,
+                )?;
+                serde_json::to_value(receipt)
+                    .map_err(|_| "browser verification receipt unavailable".into())
+            })();
+            let response = match result {
+                Ok(data) => rpc::ok_response(command.id.clone(), &command.kind, Some(data)),
+                Err(error) => rpc::fail_response(command.id.clone(), &command.kind, error),
+            };
+            output::write_raw_stdout_line(
+                &serde_json::to_string(&response).map_err(|err| err.to_string())?,
+            )
+            .map_err(|err| err.to_string())?;
+            continue;
+        }
         if command.kind == "get_browser_artifact" {
             let result = (|| {
                 if command

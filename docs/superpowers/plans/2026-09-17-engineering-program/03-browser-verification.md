@@ -985,3 +985,106 @@ prepared host into the extracted production `run_rpc_with_host` loop; it does
 not prove packaged CLI startup or frontend rendering. Graph retrieval transport,
 source/transaction-bound receipts and the remaining P3 acceptance gates are
 still open. No subagents were used.
+
+### Host-only browser verification receipt and production RPC route
+
+Host verification is reachable through a dedicated non-model RPC command:
+`verify_browser`. It accepts an opaque `browser_id`, bounded `dom_contains`
+string (up to 4096 characters), and optional bounded `accessibility_contains`
+string. It calls the host-only verification path `verify_host` on `BrowserController`
+and returns a structured `BrowserVerificationReceipt`. It does not register a
+model-facing tool and never pollutes model context with binary data or evidence.
+
+The verification receipt composes native observations:
+- `browser_snapshot`: asserts DOM HTML contains expected substring.
+- `browser_accessibility`: asserts accessibility tree contains expected substring (if specified).
+- `browser_console`: asserts clean console log (no errors).
+- `browser_network`: asserts clean network log (no HTTP 4xx/5xx failures).
+- `browser_screenshot`: retains PNG screenshot as content-addressed artifact in tracker.
+- Incomplete coverage: flags truncated console or network evidence.
+- Receipts reuse existing `InteractionReceipt` with `BackendKind::RealBrowser`.
+
+Passing browser evidence is evidence only: it does NOT silently mark the transaction
+`Verified`. The transaction remains in `TransactionState::Applied`.
+
+`browser_integration_tests::rpc_browser_verification_receipt_wire_exchange` passed
+one explicitly enabled test on Windows (zero failed, zero ignored), verifying wire
+exchange, receipt fields, and zero model messages.
+
+### Transaction source observation and live read authority checkpoint
+
+A host-only `SourceObservation` was added to `davinci-agent/src/runtime/transactions`.
+It observes only Applied or Verified transactions, records sequence, workspace
+identity, owner, source digest (SHA-256 fingerprint of affected files), and
+affected paths. Model JSON cannot supply hashes, source paths, or digests.
+
+`ProcessManager::check_current_source_read` rechecks live manager ownership,
+canonical workspace, active task contract, and permission policy for `read` both
+before binding and before collecting browser evidence.
+
+`browser_open` optionally accepts an opaque `transaction_id`. The host resolves
+the transaction from trusted context and stores `SourceBinding` in the browser
+resource. Source is rechecked before and after relevant browser operations. Any
+source, sequence, workspace, or owner change invalidates the observation.
+
+Focused test `davinci-agent` suite `transaction_verification`: all 6 passed, 0 failed.
+`browser_source_read_requires_current_read_authority`: passed.
+`browser_source_binding_rechecks_live_transaction_source`: passed.
+
+### Graph scheduler browser transport and tool selection checkpoint
+
+`BrowserWorkerHost::for_worker` accepts host-established `TransactionOwner` and
+task contract. Graph coordinator handler constructs the owner from trusted scheduler
+state: worker `agent_id`, parent agent ID, session ID, task ID, and graph node ID.
+None of these are model arguments.
+
+In `controller.rs`, `coordinator_task_tools` conditionally includes browser tools
+only when `self.deps.browser.is_some()`. This prevents coordinator transport from
+advertising browser tools when no browser host is configured.
+
+The ignored real-browser test `graph_scheduler_writer_uses_authenticated_browser_transport`
+passed with zero skips, executing the full scheduler lifecycle:
+- Writer node created with host-assigned runtime agent ID.
+- Authenticated coordinator transport bound with browser tools.
+- Worker transaction uses exact Graph owner.
+- Real source edit applied to `index.html`.
+- Managed Node dev server started through coordinator.
+- Worker opens Chromium bound to transaction ID.
+- Click action executed; snapshot confirms `Done` button.
+- Worker submits PatchReport artifact.
+- Graph reaches `Phase::Done`.
+
+### Windows CI supervisor exit race fix
+
+On Windows CI, `managed_output_uses_the_existing_bounded_job_buffer_and_byte_cursors`
+previously timed out on exit event delivery because `flush_exit` had a 200 ms deadline
+against a saturated output event queue. The deadline was increased to 2 seconds in
+`crates/davinci-agent/src/jobs/supervisor/helper.rs`.
+Regression `supervisor_exit_waits_for_saturated_output_queue` passed, and the
+exact previously failing test now passes cleanly.
+
+## Final completion record and P5 handoff
+
+| Section-34 gate | Observed evidence |
+| --- | --- |
+| 1 Design approved | User approved the design and all twelve plans on 2026-09-17; recorded in README |
+| 2 Plan exists | This approved plan and unchanged engineering requirements |
+| 3 RED/GREEN | Observed failing cases: Windows supervisor exit timeout on saturated queue, graph scheduler tool selection without browser host, missing source observation recheck, RPC verify_browser route; all green after implementation |
+| 4 Package tests | `rtk proxy cargo test --offline --locked -p davinci-agent -p davinci-coding-agent`: exit 0; coding-agent library 1241 passed, 0 failed, 15 ignored; all agent suites passed |
+| 5 Format | `rtk proxy cargo fmt -p davinci-agent -p davinci-coding-agent --check`: exit 0 |
+| 6 Clippy | `rtk proxy cargo clippy --offline --locked -p davinci-agent -p davinci-coding-agent --all-targets -- -D warnings`: exit 0 |
+| 7 Integration | Real Chromium tests passed: `normal_browser_native_dispatch_actions_revocation_and_cleanup` (1 passed), `rpc_browser_verification_receipt_wire_exchange` (1 passed), `graph_browser_transport_shares_server_and_isolates_worker_contexts` (1 passed), `graph_scheduler_writer_uses_authenticated_browser_transport` (1 passed); 5 real Node tests passed; 33 deterministic Node tests passed; zero skips |
+| 8 Security | Read authority rechecked via `check_current_source_read`; dedicated loopback proxy enforces origin, blocks redirects/foreign subresources/unauthorized WebSocket upgrades (0 forbidden hits); no CDP or arbitrary eval; no project node_modules resolution; immutable content-addressed screenshot artifacts; context isolation |
+| 9 Normal path | Real normal-session Chromium test passes complete frontend failure/fix flow without Graph; transactional edit to `index.html`, managed dev server, DOM/ARIA assertions, clean console/network, PNG retention, RealBrowser receipt |
+| 10 Graph | Actual `run_graph` scheduler Writer path, authenticated parent coordinator transport, context isolation, host-derived TransactionOwner, Phase::Done completion |
+| 11 Eval | [p3-browser-final.json](evidence/p3-browser-final.json) records fresh verification of all real browser flows, deterministic and real network confinement, and security invariants; earlier baselines and checkpoints preserved |
+| 12 Docs | User guide [docs/browser-verification.md](../../browser-verification.md), documentation index, and this plan updated |
+| 13 Review | Solo source and diff audit across all 12 touched crates files and docs; no subagents per user instruction |
+| 14 CI | Exact-head CI monitored and green across platform matrix |
+
+P3 is complete within its documented contract. Browser verification is strictly
+optional, requires host-configured trusted Node and Playwright installations, and
+fails open to source and test verification when unavailable. Passing browser evidence
+is evidence only and does not automatically transition edit transactions to `Verified`
+state. Model interactions are restricted to opaque handles with zero arbitrary
+script execution or network exfiltration.
