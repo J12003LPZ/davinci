@@ -6,7 +6,7 @@ Dependencies: P2 and P4 green; existing interaction_testing protocol/evidence/ar
 Requirements authority: project section 8 and cross-cutting sections 18-40;
 project numbers are kept stable while execution order follows the program design.
 
-### HTTP network boundary implementation checkpoint
+### Initial HTTP network boundary implementation checkpoint
 
 Implemented `interaction_testing/browser_network.js` using Node built-in HTTP.
 It validates canonical trusted origins before listening, checks every absolute
@@ -41,6 +41,83 @@ network helper and does not close P3. The production bridge, request-time native
 authorization, HTTPS/WebSocket enforcement, artifacts, cancellation and reuse,
 normal/Graph dispatch, planted login failure/fix evaluation, and milestone
 package/platform checks remain required.
+
+### HTTPS/WebSocket and actual frontend backend checkpoint
+
+Extended the per-context proxy with bounded HTTPS CONNECT and WebSocket support.
+CONNECT validates an exact host:port authority before any outbound connection;
+userinfo, paths, schemes, malformed ports, foreign ports and nested tunnels fail
+closed. HTTPS tunnels are opaque TLS streams restricted to approved destinations.
+For an HTTP-origin CONNECT (Chromium's ws:// path), the proxy sends CONNECT success
+and reuses Node's HTTP parser, then requires a matching authorized WebSocket
+upgrade before outbound I/O. Ordinary tunneled HTTP and foreign Host headers are
+denied. WebSocket upgrades replace Host and strip proxy credentials. Requests
+and tunnels share the 32-active/4096-total admission budget; each tunnel has a
+15-second lifetime and 16 MiB aggregate byte limit. Close waits for actual owned
+socket close events, including upgrades not awaited by server.close itself.
+
+Observed RED: two authorized tunnel tests returned 403 before implementation.
+First GREEN attempt exposed a close-event ordering failure; close was fixed and
+the focused suite passed. Actual Chromium then exposed that ws:// uses CONNECT,
+which the direct HTTP-upgrade fixture had not covered. The restricted HTTP-origin
+CONNECT path fixed it. A test-helper defect was also fixed: parser-level closure
+before a handshake now rejects the helper promise instead of waiting forever;
+one held local test process was interrupted, then the corrected test rerun passed.
+Malformed HTTP syntax may close the transport before the application sends 403;
+the adversarial acceptance requires that closure or 403, and zero outbound hits.
+
+Added `interaction_testing/browser_backend.js`, a host-only backend resource
+adapter. It does not add a permission or capability registry. Setup is lazy;
+simultaneous opens reserve one Chromium startup and get separate contexts.
+The trusted package loader requires an explicit absolute real path outside the
+workspace, checks package name and pinned version, and never auto-installs or
+resolves project node_modules. Contexts block service workers and downloads;
+origin routes and WebSocket routes precede navigation. Actions are serialized
+within each context and use role/name, label or test-id selectors. Unknown
+fields and arbitrary scripts/CDP are rejected. Viewports, input text, snapshots,
+accessibility, screenshots and aggregate telemetry are bounded. Telemetry
+omission prevents healthy evidence. Backend screenshot bytes are internal:
+native immutable artifact references through the existing Rust tracker are
+still required and not implemented by this checkpoint.
+
+Validation actually performed:
+
+- 20 deterministic tests passed, zero skipped: `node --test` on
+  browser_backend.test.cjs and browser_network.test.cjs. This includes shutdown
+  during shared startup. Initial backend test file RED was MODULE_NOT_FOUND
+  before individual cases executed. All six backend cases now pass, including
+  aggregate multibyte telemetry overflow that cannot produce healthy evidence.
+- Three actual Chromium network cases passed, zero skipped: HTTP redirect/image,
+  ws:// owned/foreign upgrades, and HTTPS/WSS plus a forbidden redirect. The TLS
+  fixture generates and removes a one-day self-signed certificate in its own
+  temporary directory; ignoreHTTPSErrors is explicitly fixture-only. This does
+  not establish production certificate-validation or general network confinement.
+- One actual backend frontend evaluation passed, zero skipped: planted login
+  failure yielded missing successful UI, console error and HTTP 500; corrected
+  page exercised type/select/click, successful DOM, ARIA, PNG and healthy telemetry.
+  Two further contexts shared the engine while cookie state stayed isolated.
+- Node syntax check and git diff whitespace check passed.
+
+Final combined real-test run passed all four cases, zero skipped. The scoped
+results and remaining gaps are recorded in
+`evidence/p3-browser-backend-checkpoint.json`.
+
+Trusted local real-test inputs were the explicit Playwright package/version in
+`evidence/p3-browser-baseline.json`, and Git's existing OpenSSL executable for
+the generated TLS fixture. Real tests skip if these explicit test inputs are
+missing; that skip is never acceptance. The three-platform native CI matrix now
+runs the deterministic browser tests. Actual browser/native normal/Graph CI
+acceptance is still required at the P3 milestone. CI run 35288750675 for the prior
+HTTP commit fbe3d9c was observed live, with package tests successful and native
+platform/quality jobs still running; this is not CI for this checkpoint.
+
+Next required work: supervised typed JSONL host bridge; P2 process-owner/port
+lease integration; current permission/role checks and cancellation at dispatch;
+source/transaction-bound immutable artifacts and RealBrowser receipts; optional
+host settings; normal and Graph tool registration; concurrency/security/lifecycle
+probes (including non-proxied protocols and TLS connection reuse); affected
+package tests, final diff review and exact-head green CI. The old fixture-only
+browser_bridge.js remains unchanged and must not be used as the production path.
 
 ## Outcome
 

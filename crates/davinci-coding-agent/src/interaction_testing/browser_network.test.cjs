@@ -65,12 +65,12 @@ test('proxy does not automatically follow a redirect outside policy', async t =>
   assert.equal(forbiddenHits, 0);
 });
 
-test('unsupported CONNECT and upgrades fail closed without opening a tunnel', async t => {
+test('unauthorized CONNECT and upgrades fail closed without opening a tunnel', async t => {
   const proxy = await createOriginProxy(['http://127.0.0.1:1']);
   t.after(() => proxy.close());
   for (const requestLine of [
-    'CONNECT 127.0.0.1:1 HTTP/1.1\r\nHost: 127.0.0.1:1\r\n\r\n',
-    'GET http://127.0.0.1:1/ HTTP/1.1\r\nHost: 127.0.0.1:1\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n',
+    'CONNECT 127.0.0.1:2 HTTP/1.1\r\nHost: 127.0.0.1:2\r\n\r\n',
+    'GET http://127.0.0.1:2/ HTTP/1.1\r\nHost: 127.0.0.1:2\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n',
   ]) {
     const response = await new Promise((resolve, reject) => {
       const socket = net.connect(new URL(proxy.serverUrl).port, '127.0.0.1');
@@ -83,6 +83,121 @@ test('unsupported CONNECT and upgrades fail closed without opening a tunnel', as
     });
     assert.match(response, /^HTTP\/1.1 403/);
   }
+});
+
+test('HTTP CONNECT refuses ordinary requests and a foreign WebSocket Host before I/O', async t => {
+  let hits = 0;
+  const server = http.createServer((_req, res) => {hits++; res.end();});
+  server.on('upgrade', (_req, socket) => {hits++; socket.destroy();});
+  const origin = await listen(server);
+  t.after(() => new Promise(resolve => server.close(resolve)));
+  const proxy = await createOriginProxy([origin]);
+  t.after(() => proxy.close());
+  for (const inner of [
+    `GET ${origin}/private HTTP/1.1\r\nHost: ${new URL(origin).host}\r\n\r\n`,
+    'GET /socket HTTP/1.1\r\nHost: foreign.example\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n',
+  ]) {
+    const authority = new URL(origin).host;
+    const {socket, header} = await tunnel(proxy.serverUrl,
+      `CONNECT ${authority} HTTP/1.1\r\nHost: ${authority}\r\n\r\n`);
+    t.after(() => socket.destroy());
+    assert.match(header, /^HTTP\/1.1 200/);
+    const reply = new Promise(resolve => socket.once('data', bytes => resolve(bytes.toString())));
+    socket.write(inner);
+    assert.match(await reply, /^HTTP\/1.1 403/);
+  }
+  assert.equal(hits, 0);
+});
+
+test('CONNECT rejects crafted authorities before any outbound connection', async t => {
+  let hits = 0;
+  const peers = new Set();
+  const server = net.createServer(socket => {hits++; peers.add(socket); socket.on('error', () => {});});
+  const origin = (await listen(server)).replace('http:', 'https:');
+  t.after(() => {for (const socket of peers) socket.destroy(); return new Promise(resolve => server.close(resolve));});
+  const proxy = await createOriginProxy([origin]);
+  t.after(() => proxy.close());
+  const authority = new URL(origin).host;
+  for (const target of [`user:fixture@${authority}`, `${authority}/private`, `${authority}?q=fixture`,
+    `${authority}#private`, `https://${authority}`, `${authority}:443`]) {
+    const result = await tunnel(proxy.serverUrl, `CONNECT ${target} HTTP/1.1\r\nHost: ${authority}\r\n\r\n`)
+      .catch(error => {
+        // Node's HTTP parser can reject malformed CONNECT syntax before the
+        // application handler. A closed transport is also a fail-closed result.
+        assert.equal(error.message, 'Tunnel closed before handshake');
+        return null;
+      });
+    if (result) {result.socket.destroy(); assert.match(result.header, /^HTTP\/1.1 403/);}
+  }
+  assert.equal(hits, 0);
+});
+
+function tunnel(proxy, line) {
+  return new Promise((resolve, reject) => {
+    const socket = net.connect(new URL(proxy).port, '127.0.0.1');
+    let header = Buffer.alloc(0);
+    socket.setTimeout(3000, () => socket.destroy(new Error('Tunnel deadline')));
+    function read(bytes) {
+      header = Buffer.concat([header, bytes]);
+      const end = header.indexOf('\r\n\r\n');
+      if (end !== -1) {
+        socket.removeListener('data', read);
+        resolve({socket, header: header.subarray(0, end).toString(), head: header.subarray(end + 4)});
+      }
+    }
+    socket.on('data', read);
+    socket.on('error', reject);
+    socket.once('end', () => reject(new Error('Tunnel closed before handshake')));
+    socket.on('connect', () => socket.write(line));
+  });
+}
+
+test('authorized HTTPS CONNECT forwards bytes and shutdown destroys the tunnel', async t => {
+  const peers = new Set();
+  const server = net.createServer(socket => {
+    peers.add(socket); socket.once('close', () => peers.delete(socket));
+    socket.on('error', () => {}); socket.on('data', bytes => socket.write(bytes));
+  });
+  const origin = (await listen(server)).replace('http:', 'https:');
+  t.after(() => {for (const peer of peers) peer.destroy(); return new Promise(resolve => server.close(resolve));});
+  const proxy = await createOriginProxy([origin]);
+  t.after(() => proxy.close());
+  const authority = new URL(origin).host;
+  const {socket, header} = await tunnel(proxy.serverUrl, `CONNECT ${authority} HTTP/1.1\r\nHost: ${authority}\r\n\r\n`);
+  t.after(() => socket.destroy());
+  assert.match(header, /^HTTP\/1.1 200/);
+  const received = new Promise(resolve => socket.once('data', bytes => resolve(bytes.toString())));
+  socket.write('owned tunnel');
+  assert.equal(await received, 'owned tunnel');
+  const closed = new Promise(resolve => socket.once('close', resolve));
+  await proxy.close(); await closed;
+  assert.equal(proxy.metrics().activeTunnels, 0);
+});
+
+test('authorized WebSocket upgrade preserves handshake and filters proxy credentials', async t => {
+  let receivedHeaders;
+  const peers = new Set();
+  const server = http.createServer();
+  server.on('upgrade', (req, socket, head) => {
+    receivedHeaders = req.headers;
+    peers.add(socket); socket.once('close', () => peers.delete(socket)); socket.on('error', () => {});
+    socket.write('HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n');
+    if (head.length) socket.write(head);
+    socket.on('data', bytes => socket.write(bytes));
+  });
+  const origin = await listen(server);
+  t.after(() => {for (const peer of peers) peer.destroy(); return new Promise(resolve => server.close(resolve));});
+  const proxy = await createOriginProxy([origin]);
+  t.after(() => proxy.close());
+  const {socket, header} = await tunnel(proxy.serverUrl,
+    `GET ${origin}/socket HTTP/1.1\r\nHost: wrong.example\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nProxy-Authorization: fixture-only\r\n\r\n`);
+  t.after(() => socket.destroy());
+  assert.match(header, /^HTTP\/1.1 101/);
+  assert.equal(receivedHeaders.host, new URL(origin).host);
+  assert.equal(receivedHeaders['proxy-authorization'], undefined);
+  const received = new Promise(resolve => socket.once('data', bytes => resolve(bytes.toString())));
+  socket.write('owned websocket fixture');
+  assert.equal(await received, 'owned websocket fixture');
 });
 
 test('proxy close is idempotent and destroys held inbound connections', async () => {
