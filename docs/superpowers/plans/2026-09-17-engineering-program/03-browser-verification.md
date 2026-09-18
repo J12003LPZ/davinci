@@ -152,6 +152,29 @@ lifetime leases, native settings/discovery, normal and Graph dispatch, source/
 transaction/action-bound evidence, lifecycle/security probes and milestone gates.
 The transport is host infrastructure only; no production caller is wired yet.
 
+### Engine dispatch context prerequisite
+
+Added backward-compatible `CustomToolExecutor::new_with_context` and
+`execute_with_context`. The engine forwards the current ToolContext to native
+callbacks after its existing contract/effect/ledger gates. Legacy constructor and
+execution behavior remain available. A context-dependent callback fails closed
+when called without engine context; this API alone grants no authorization.
+
+Observed RED: the new regression tests first failed to compile because the
+context-aware constructor was absent. After adding it, a stronger actual approved
+dispatch exposed that one-time consent was retained only for process/mutation/
+transaction boundaries. The engine now also retains consent for context-aware
+custom callbacks outside the builtin tool set. The regression verifies the actual
+runtime cancellation signal, session JobBook identity, consumption of the exact
+approved request once, rejection of a second consumption, and no session allow
+rule. Existing callback compatibility also passes.
+
+Validation: all 943 davinci-agent library tests passed; affected package Clippy
+with all targets and warnings denied passed. Coding-agent all-target compilation
+passed. This prepares current consent and
+resource forwarding but does not yet wire the coding-agent extension callbacks
+or implement browser authorization/process leases. P3 remains incomplete.
+
 ## Outcome
 
 An ordinary session verifies a real local frontend flow and returns bounded DOM/accessibility, console/network and screenshot evidence.

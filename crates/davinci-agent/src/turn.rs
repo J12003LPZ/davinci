@@ -1393,7 +1393,7 @@ impl Agent {
                 Ok(result) => result,
                 Err(crate::tools::ToolError::Unknown(_)) => {
                     if let Some(executor) = &self.custom_tool_executor {
-                        match executor.execute(cwd, name, args) {
+                        match executor.execute_with_context(cwd, name, args, &context) {
                             Ok(result) => result,
                             Err(err) => crate::ToolResult {
                                 content: err.to_string(),
@@ -1978,6 +1978,8 @@ impl Agent {
                                 if crate::tools::is_managed_process_tool(name)
                                     || crate::tools::is_coordinated_mutation(name)
                                     || crate::runtime::transactions::is_tool(name)
+                                    || (!crate::tools::BUILTIN_TOOLS.contains(&name)
+                                        && self.custom_tool_executor.as_ref().is_some_and(|executor| executor.requires_context))
                                 {
                                     self.approval_registry.retain_dispatch(&request, cwd, &self.permissions, revision)
                                         .err().map(|reason| format!("Permission denied: {reason}."))

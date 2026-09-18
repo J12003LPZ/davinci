@@ -150,7 +150,9 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use uuid::Uuid;
 
-type CustomToolFn = dyn Fn(&Path, &str, &Value) -> Result<ToolResult, ToolError> + Send + Sync;
+type CustomToolFn = dyn Fn(&Path, &str, &Value, Option<&ToolContext>) -> Result<ToolResult, ToolError>
+    + Send
+    + Sync;
 type PreToolFn = dyn Fn(&str, &Value) -> Option<String> + Send + Sync;
 type PostToolFn = dyn Fn(&str, &Path, &str, &Value, ToolResult) -> ToolResult + Send + Sync;
 
@@ -190,6 +192,7 @@ impl std::fmt::Debug for EventSink {
 #[derive(Clone)]
 pub struct CustomToolExecutor {
     inner: Arc<CustomToolFn>,
+    requires_context: bool,
 }
 
 impl std::fmt::Debug for CustomToolExecutor {
@@ -203,11 +206,45 @@ impl CustomToolExecutor {
     where
         F: Fn(&Path, &str, &Value) -> Result<ToolResult, ToolError> + Send + Sync + 'static,
     {
-        Self { inner: Arc::new(f) }
+        Self {
+            inner: Arc::new(move |cwd, name, args, _| f(cwd, name, args)),
+            requires_context: false,
+        }
+    }
+
+    /// Host adapter receiving this dispatch's engine context, including consent,
+    /// cancellation and session resources. This is not an authorization grant:
+    /// resource adapters must still recheck current policy at their boundaries.
+    pub fn new_with_context<F>(f: F) -> Self
+    where
+        F: Fn(&Path, &str, &Value, &ToolContext) -> Result<ToolResult, ToolError>
+            + Send
+            + Sync
+            + 'static,
+    {
+        Self {
+            inner: Arc::new(move |cwd, name, args, context| {
+                let context = context.ok_or_else(|| {
+                    ToolError::Failed("tool requires engine dispatch context".into())
+                })?;
+                f(cwd, name, args, context)
+            }),
+            requires_context: true,
+        }
     }
 
     pub fn execute(&self, cwd: &Path, name: &str, args: &Value) -> Result<ToolResult, ToolError> {
-        (self.inner)(cwd, name, args)
+        (self.inner)(cwd, name, args, None)
+    }
+
+    pub fn execute_with_context(
+        &self,
+        cwd: &Path,
+        name: &str,
+        args: &Value,
+        context: &ToolContext,
+    ) -> Result<ToolResult, ToolError> {
+        (self.inner)(cwd, name, args, Some(context))
     }
 }
 
@@ -4120,6 +4157,90 @@ mod tests {
                 .unwrap_err(),
             "Cannot continue from message role: assistant"
         );
+    }
+
+    #[test]
+    fn custom_tool_executor_context_requires_engine_context() {
+        let executor = CustomToolExecutor::new_with_context(|_, _, _, _| {
+            panic!("context-dependent callback must not run without engine context")
+        });
+        assert!(executor
+            .execute(Path::new("."), "browser_open", &serde_json::json!({}))
+            .is_err());
+    }
+
+    #[test]
+    fn custom_tool_executor_context_receives_dispatch_cancellation_and_jobs() {
+        let mut agent = Agent::new("context fixture");
+        agent.permissions = Arc::new(PermissionState::new(PermissionPolicy::new(
+            PermissionMode::Ask,
+        )));
+        agent.tools.push("context_fixture".into());
+        agent.set_runtime(RuntimeHandle::new(
+            RunId::new(),
+            AgentId::new(),
+            runtime::RuntimeBus::new(),
+        ));
+        agent.approval_responder = Some(approval::ApprovalResponder(Arc::new(|_, challenge| {
+            approval::ApprovalReply {
+                challenge_id: challenge.id,
+                choice_id: "once".into(),
+                instructions: None,
+            }
+        })));
+        let abort = agent
+            .runtime
+            .as_ref()
+            .unwrap()
+            .cancellation_token
+            .as_atomic_bool();
+        let jobs = agent.tool_context.jobs.clone();
+        let permissions = agent.permissions.clone();
+        let observed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let captured = observed.clone();
+        agent.custom_tool_executor = Some(CustomToolExecutor::new_with_context(
+            move |cwd, name, args, context| {
+                assert_eq!(name, "context_fixture");
+                assert!(context.dispatch_permit.is_some());
+                let revision = permissions.lock().unwrap().revision();
+                let permit = context.dispatch_permit.as_ref().unwrap();
+                permit
+                    .consume(&permissions, revision, cwd, name, args)
+                    .unwrap();
+                assert!(permit
+                    .consume(&permissions, revision, cwd, name, args)
+                    .is_err());
+                assert!(Arc::ptr_eq(context.abort.as_ref().unwrap(), &abort));
+                assert!(Arc::ptr_eq(&context.jobs, &jobs));
+                captured.store(true, std::sync::atomic::Ordering::SeqCst);
+                Ok(ToolResult {
+                    content: "context observed".into(),
+                    is_error: false,
+                    details: None,
+                })
+            },
+        ));
+        let cwd = agent.cwd.clone();
+        assert!(matches!(
+            agent.prepare_tool_call(
+                &cwd,
+                "context-call",
+                "context_fixture",
+                &serde_json::json!({}),
+                0
+            ),
+            turn::Preparation::Ready { .. }
+        ));
+        let result = agent.run_prepared_call(
+            &cwd,
+            "context-call",
+            "context_fixture",
+            &serde_json::json!({}),
+            0,
+        );
+        assert!(!result.is_error, "{}", result.content);
+        assert!(observed.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(agent.permissions.lock().unwrap().session_allow.is_empty());
     }
 
     #[test]
