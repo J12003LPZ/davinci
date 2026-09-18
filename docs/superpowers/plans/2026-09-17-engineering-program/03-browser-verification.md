@@ -1,6 +1,6 @@
 # P3: Browser / Playwright Verification
 
-Status: design approved by the user on 2026-09-17; implementation in progress.
+Status: completed at cdbfe00afdbd8c2839066ea63782f211e698be26; design approved 2026-09-17.
 Execution sequence: 4 of 12.
 Dependencies: P2 and P4 green; existing interaction_testing protocol/evidence/artifact contracts.
 Requirements authority: project section 8 and cross-cutting sections 18-40;
@@ -1080,7 +1080,7 @@ exact previously failing test now passes cleanly.
 | 11 Eval | [p3-browser-final.json](evidence/p3-browser-final.json) records fresh verification of all real browser flows, deterministic and real network confinement, and security invariants; earlier baselines and checkpoints preserved |
 | 12 Docs | User guide [docs/browser-verification.md](../../browser-verification.md), documentation index, and this plan updated |
 | 13 Review | Solo source and diff audit across all 12 touched crates files and docs; no subagents per user instruction |
-| 14 CI | Exact-head CI monitored and green across platform matrix |
+| 14 CI | Exact-head CI passed at `cdbfe00afdbd8c2839066ea63782f211e698be26`: PR CI [35310203206](https://github.com/J12003LPZ/davinci/actions/runs/35310203206), workflow lint [35310203230](https://github.com/J12003LPZ/davinci/actions/runs/35310203230), Security SARIF [35310203220](https://github.com/J12003LPZ/davinci/actions/runs/35310203220), push CI [35310198092](https://github.com/J12003LPZ/davinci/actions/runs/35310198092) and SARIF [35310198050](https://github.com/J12003LPZ/davinci/actions/runs/35310198050) all green |
 
 P3 is complete within its documented contract. Browser verification is strictly
 optional, requires host-configured trusted Node and Playwright installations, and
