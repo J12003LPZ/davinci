@@ -96,6 +96,7 @@ struct Resource {
 #[derive(Clone)]
 struct RetainedArtifact {
     browser_id: Uuid,
+    action_sequence: u64,
     lease: BrowserDevServerLease,
     workspace: PathBuf,
 }
@@ -426,6 +427,7 @@ impl BrowserController {
             if request.offset > bytes.len() { return Err("browser artifact offset exceeds size".into()); }
             let end = request.offset.saturating_add(request.limit).min(bytes.len());
             Ok(json!({"artifact":request.artifact,"mediaType":"image/png",
+                "browser_id":retained.browser_id,"action_sequence":retained.action_sequence,
                 "verification":"observations_only",
                 "sha256":crate::interaction_testing::artifacts::compute_sha256(bytes),
                 "size":bytes.len(),"offset":request.offset,"nextOffset":end,
@@ -672,9 +674,10 @@ impl BrowserController {
                             let mut artifacts = self.artifacts.lock().map_err(|_| "browser artifacts unavailable")?;
                             result = resource.engine.retain_screenshot(&result, &mut artifacts)?;
                             let label = result["artifact"].as_str().ok_or("invalid retained artifact")?.to_owned();
+                            let action_sequence = result["action_sequence"].as_u64().filter(|id| *id > 0).ok_or("invalid screenshot action sequence")?;
                             drop(artifacts);
                             self.store.lock().map_err(|_| "browser state unavailable")?.retained.insert(label,
-                                RetainedArtifact { browser_id: id, lease: resource.lease.clone(), workspace: self.workspace.clone() });
+                                RetainedArtifact { browser_id: id, action_sequence, lease: resource.lease.clone(), workspace: self.workspace.clone() });
                         }
                         Ok(json!({"status":"observed","browser_id":id,"result":result}))
                     }

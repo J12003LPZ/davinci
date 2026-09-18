@@ -261,6 +261,12 @@ fn rpc_retained_browser_artifact_wire_exchange_for(child_owner: bool) {
     assert_eq!(bytes.len(), 64);
     assert_eq!(&bytes[..8], b"\x89PNG\r\n\x1a\n");
     assert_eq!(response["data"]["sha256"], ready["artifact"]["sha256"]);
+    assert!(ready["artifact"]["action_sequence"].as_u64().unwrap() > 0);
+    assert_eq!(
+        response["data"]["action_sequence"],
+        ready["artifact"]["action_sequence"]
+    );
+    assert_eq!(response["data"]["browser_id"], ready["browser_id"]);
     assert_eq!(response["data"]["verification"], "observations_only");
     writeln!(
         stdin,
@@ -534,6 +540,12 @@ fn normal_browser_native_dispatch_actions_revocation_and_cleanup() {
                     .unwrap();
                 assert_eq!(&bytes[..8], b"\x89PNG\r\n\x1a\n");
                 assert_eq!(retrieved["sha256"], details["result"]["sha256"]);
+                assert!(details["result"]["action_sequence"].as_u64().unwrap() > 0);
+                assert_eq!(
+                    retrieved["action_sequence"],
+                    details["result"]["action_sequence"]
+                );
+                assert_eq!(retrieved["browser_id"], id);
                 assert_eq!(bytes.len(), 64);
                 let mut tail = request.clone();
                 tail["offset"] = details["result"]["size"].clone();

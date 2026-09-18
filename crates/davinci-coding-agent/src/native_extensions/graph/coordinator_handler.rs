@@ -570,6 +570,9 @@ mod tests {
         };
         let bytes = read_artifact().unwrap();
         assert_eq!(bytes["sha256"], screenshot["sha256"]);
+        assert!(screenshot["action_sequence"].as_u64().unwrap() > 0);
+        assert_eq!(bytes["action_sequence"], screenshot["action_sequence"]);
+        assert_eq!(bytes["browser_id"], artifact_request["browser_id"]);
         assert_eq!(bytes["verification"], "observations_only");
         use base64::Engine;
         let png = base64::engine::general_purpose::STANDARD

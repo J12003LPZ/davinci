@@ -67,7 +67,15 @@ impl State {
                 .filter(|slot| slot.is_none())
                 .ok_or("unknown or repeated browser response")?;
             *slot = Some(match (response.ok, response.result, response.error) {
-                (true, Some(result), None) => Ok(result),
+                (true, Some(mut result), None) => {
+                    // Bind provenance to the correlated request, never to a field
+                    // supplied by the backend or the page being inspected.
+                    result
+                        .as_object_mut()
+                        .ok_or("invalid browser result")?
+                        .insert("action_sequence".into(), json!(response.id));
+                    Ok(result)
+                }
                 (false, None, Some(_)) => Err("browser request failed".into()),
                 _ => return Err("inconsistent browser response".into()),
             });
@@ -402,6 +410,10 @@ impl BrowserProcess {
         result: &Value,
         tracker: &mut ArtifactBudgetTracker,
     ) -> Result<Value, String> {
+        let sequence = result["action_sequence"]
+            .as_u64()
+            .filter(|id| *id > 0)
+            .ok_or("missing screenshot action sequence")?;
         let reference = result["artifact"]
             .as_str()
             .ok_or("missing screenshot transfer")?;
@@ -458,7 +470,10 @@ impl BrowserProcess {
             return Err("screenshot retention budget exceeded".into());
         }
         fs::remove_file(file).map_err(|_| "screenshot transfer cleanup failed")?;
-        Ok(json!({"artifact":label,"sha256":hash,"size":size,"mediaType":"image/png"}))
+        Ok(
+            json!({"artifact":label,"sha256":hash,"size":size,"mediaType":"image/png",
+            "action_sequence":sequence}),
+        )
     }
 }
 
@@ -612,6 +627,7 @@ mod tests {
         let bytes = &tracker.items[retained["artifact"].as_str().unwrap()];
         assert_eq!(&bytes[..8], b"\x89PNG\r\n\x1a\n");
         assert_eq!(compute_sha256(bytes), retained["sha256"]);
+        assert_eq!(retained["action_sequence"], screenshot["action_sequence"]);
         assert!(bridge.retain_screenshot(&screenshot, &mut tracker).is_err());
         let other = request(json!({"op":"open","options":{"origins":[origin]}}))["resource"]
             .as_u64()
@@ -676,7 +692,7 @@ mod tests {
         state
             .receive(b"{}}\n{\"id\":1,\"ok\":false,\"error\":\"secret\"}\n")
             .unwrap();
-        assert_eq!(state.pending[&2], Some(Ok(json!({}))));
+        assert_eq!(state.pending[&2], Some(Ok(json!({"action_sequence":2}))));
         assert_eq!(
             state.pending[&1],
             Some(Err("browser request failed".into()))
@@ -690,8 +706,19 @@ mod tests {
     }
 
     #[test]
+    fn response_sequence_is_host_owned_and_tracks_out_of_order_completion() {
+        let mut state = State::default();
+        state.pending.insert(1, None);
+        state.pending.insert(2, None);
+        state.receive(b"{\"id\":2,\"ok\":true,\"result\":{\"action_sequence\":999}}\n{\"id\":1,\"ok\":true,\"result\":{}}\n").unwrap();
+        assert_eq!(state.pending[&2], Some(Ok(json!({"action_sequence":2}))));
+        assert_eq!(state.pending[&1], Some(Ok(json!({"action_sequence":1}))));
+    }
+
+    #[test]
     fn malformed_response_cannot_complete_a_request() {
         for bytes in [
+            b"{\"id\":1,\"ok\":true,\"result\":null}\n".as_slice(),
             b"{\"id\":1,\"ok\":true,\"result\":{},\"extra\":1}\n".as_slice(),
             b"{\"id\":1,\"ok\":true,\"result\":{},\"error\":\"wrong\"}\n",
             b"{\"id\":1,\"ok\":false}\n",

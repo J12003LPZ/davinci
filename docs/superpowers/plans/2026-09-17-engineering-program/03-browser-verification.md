@@ -6,6 +6,24 @@ Dependencies: P2 and P4 green; existing interaction_testing protocol/evidence/ar
 Requirements authority: project section 8 and cross-cutting sections 18-40;
 project numbers are kept stable while execution order follows the program design.
 
+### Browser action provenance checkpoint
+
+The Rust bridge now attaches its host-assigned request correlation as
+`action_sequence` to successful observations, overriding any backend-supplied
+value. Screenshot retention preserves it, and authorized artifact retrieval
+returns the original sequence together with the opaque browser context ID and
+content hash. The sequence is scoped to one bridge lifetime, can have gaps for
+other contexts, and is not a claim that an assertion passed or source was current.
+
+The injected-sequence/out-of-order regression failed before implementation, then
+passed. Four focused transport checks passed; the real-backend case was separately
+enabled and passed with zero skips. Actual normal dispatch, authenticated Graph
+transport (shared/detached workspaces and IPv4/IPv6), and RPC artifact exchange
+(session/direct-child ownership) each passed with zero skips, proving sequence and
+context preservation alongside PNG bytes. Source/transaction binding, real
+assertion receipts and the complete frontend evaluations remain open. No new
+dependency, installation, model-facing tool or verification-success claim was added.
+
 ### Shared Graph browser transport checkpoint
 
 Writer and TestAnalyzer browser tools remain deferred and require the existing
