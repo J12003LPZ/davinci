@@ -818,3 +818,31 @@ steps remained running at observation. This does not establish exact-head CI
 for the new workspace changes. Contracted sandbox execution, transaction-bound
 receipts, public artifact retrieval and full scheduler/frontend evaluation
 remain open; P3 and the full program remain in progress.
+
+### Shared evidence artifact boundary checkpoint
+
+Before public browser artifact retrieval can reuse the runtime verification
+evidence store, its existing retrieval boundary needs to reject paths not issued
+by the store. A fixture with matching bytes, size and hash reproduced an absolute
+path escape: the old implementation rejected parent components but accepted an
+absolute path outside its configured directory. This is a demonstrated storage
+integration defect, not a replacement evidence or retention system.
+
+Retrieval now accepts only a lowercase SHA-256 content-addressed flat `.bin`
+filename. It rejects absolute/nested paths, nonregular blobs and unexpected size;
+the opened handle also needs a regular file with the expected size. Unix opens
+use `O_NOFOLLOW`; Windows opens the reparse point itself and rejects its reparse
+attribute. Reads stop at the expected size plus one byte, and size/hash checks
+remain required after reading. The configured store directory remains trusted
+host configuration. This low-level operation does not establish session authority
+or authorize a model-facing retrieval request.
+
+RED: the new absolute/nested-path fixture failed on Windows before the fix.
+GREEN: all 13 focused runtime evidence-store tests passed on Windows without
+ignores, including valid retrieval and changed-content/size rejection. Agent
+all-target Clippy with warnings denied and whitespace checks passed. Native CI
+now runs this selector on Windows, Linux and macOS, including the Unix symlink
+regression; those new-head native results are still required. Actionlint is not
+installed locally; the existing workflow-lint lane must validate the YAML change.
+Public browser artifact retrieval and contracted execution remain unfinished.
+No subagents were used. P3 and the full program remain in progress.
