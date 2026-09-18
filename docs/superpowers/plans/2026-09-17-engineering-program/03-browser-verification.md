@@ -846,3 +846,20 @@ regression; those new-head native results are still required. Actionlint is not
 installed locally; the existing workflow-lint lane must validate the YAML change.
 Public browser artifact retrieval and contracted execution remain unfinished.
 No subagents were used. P3 and the full program remain in progress.
+
+### Immutable retained artifact labels checkpoint
+
+The existing interaction artifact tracker accepted a second payload under an
+already retained label, replacing the original evidence and charging its bytes
+again. A regression fixture reproduced that replacement before the fix. The
+tracker now rejects duplicate labels, including identical payload retries,
+without replacing content or consuming additional run/task budget. Rejected
+writes retain omission metadata through the existing retention interface.
+Browser screenshot labels already use fresh UUIDs; no new storage or registry
+was introduced.
+
+All 13 targeted interaction artifact tests passed locally after the fix,
+including duplicate content rejection and filling the remaining byte budget.
+This protects storage immutability; it does not establish current request
+authorization or source/transaction receipt authority. Public artifact retrieval,
+transaction-bound receipts and the other P3 acceptance gates remain open.
