@@ -1226,6 +1226,9 @@ pub fn loaded_models<'a>(
 mod tests {
     use super::*;
 
+    // Fixture overrides are process-wide, including those read by watch threads.
+    static FIXTURE_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[test]
     fn normalizes_management_and_inference_urls() {
         assert_eq!(
@@ -1342,6 +1345,7 @@ mod tests {
 
     #[test]
     fn lists_models_from_fixture_reply() {
+        let _lock = FIXTURE_ENV_LOCK.lock().unwrap();
         std::env::set_var(
             "PI_LLAMA_MODELS_REPLY",
             r#"{"data":[{"id":"local","status":{"value":"loaded"},"meta":{"n_ctx":32768}}]}"#,
@@ -1354,6 +1358,7 @@ mod tests {
 
     #[test]
     fn load_unload_download_use_action_fixture() {
+        let _lock = FIXTURE_ENV_LOCK.lock().unwrap();
         std::env::set_var("PI_LLAMA_ACTION_REPLY", r#"{"ok":true}"#);
         load_model("http://127.0.0.1:8080", "local").unwrap();
         unload_model("http://127.0.0.1:8080", "local").unwrap();
@@ -1366,6 +1371,7 @@ mod tests {
 
     #[test]
     fn sse_watch_and_wait_loops_match_ts() {
+        let _lock = FIXTURE_ENV_LOCK.lock().unwrap();
         let events = parse_sse_events(
             "data: {\"model\":\"local\",\"event\":\"model_status\",\"data\":{\"status\":\"loaded\",\"progress\":{\"current\":\"loading_weights\",\"stages\":[\"prepare\",\"loading_weights\"],\"value\":1}}}\n\n\
              data: not-json\n\n\
@@ -1411,6 +1417,7 @@ mod tests {
 
     #[test]
     fn connection_retry_and_progress_bar_match_ts() {
+        let _lock = FIXTURE_ENV_LOCK.lock().unwrap();
         assert!(is_connection_error("TypeError fetch failed"));
         assert!(is_connection_error("TimeoutError: timeout"));
         assert_eq!(
@@ -1441,6 +1448,7 @@ mod tests {
 
     #[test]
     fn live_sse_watch_streams_frames_incrementally() {
+        let _lock = FIXTURE_ENV_LOCK.lock().unwrap();
         use std::io::{Read, Write};
         use std::net::TcpListener;
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -1463,6 +1471,7 @@ mod tests {
         let url = format!("http://127.0.0.1:{}", addr.port());
         let mut got = Vec::new();
         watch_live(&url, |event| got.push(event), None).unwrap();
+        assert_eq!(got.len(), 1, "expected one event from the local SSE server");
         assert_eq!(got[0].model, "local");
         assert_eq!(got[0].event, "model_status");
         let progress = parse_load_progress(got[0].data.as_ref().unwrap()).unwrap();

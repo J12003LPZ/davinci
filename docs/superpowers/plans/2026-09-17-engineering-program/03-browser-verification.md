@@ -664,3 +664,18 @@ Managed-lifetime prerequisite `77a9d4b` CI run `35296495119` was inspected while
 active: no failed jobs, with affected coding-agent/native/quality jobs still
 running. Workflow lint passed; a pending run is not a completion gate. This
 startup checkpoint requires its own exact-head CI after pushing.
+
+### CI fixture isolation checkpoint
+
+Exact startup-head CI run `35296825175`, coding-agent job `105450990735`,
+failed in `llama::tests::live_sse_watch_streams_frames_incrementally`: the event
+vector was empty before indexing. The live test and neighboring fixture tests
+shared process-wide `PI_LLAMA_SSE_REPLY` and `PI_LLAMA_DRY_RUN` overrides without
+synchronization. A test-only mutex now serializes all llama management fixture
+tests, including the live server test, for the full lifetime of their watch
+threads. The live test asserts the event count before accessing the event.
+
+All nine llama tests passed locally with eight test threads and no ignores.
+Coding-agent formatting passed. This repairs a CI prerequisite; it does not
+complete P3's macOS ownership, sandbox, artifact, receipt or evaluation gates.
+The repaired head still requires exact-head remote CI.
