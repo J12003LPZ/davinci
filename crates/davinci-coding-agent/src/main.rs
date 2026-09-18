@@ -7588,9 +7588,11 @@ fn bind_test_impact_context(agent: &Agent, host: &ExtensionHost) {
 fn attach_tool_executor(agent: &mut Agent, host: &ExtensionHost) {
     bind_test_impact_context(agent, host);
     let host = host.clone();
-    agent.custom_tool_executor = Some(CustomToolExecutor::new(move |cwd, name, args| {
-        host.execute_js_or_manifest_tool(cwd, name, args)
-    }));
+    agent.custom_tool_executor = Some(CustomToolExecutor::new_with_context(
+        move |cwd, name, args, context| {
+            host.execute_js_or_manifest_tool_with_context(cwd, name, args, context)
+        },
+    ));
 }
 
 fn attach_shared_tool_executor(agent: &mut Agent, host: Arc<Mutex<ExtensionHost>>) {
@@ -7598,13 +7600,15 @@ fn attach_shared_tool_executor(agent: &mut Agent, host: Arc<Mutex<ExtensionHost>
         agent,
         &host.lock().unwrap_or_else(|error| error.into_inner()),
     );
-    agent.custom_tool_executor = Some(CustomToolExecutor::new(move |cwd, name, args| {
-        let host = host
-            .lock()
-            .map_err(|error| davinci_agent::ToolError::Failed(error.to_string()))?
-            .clone();
-        host.execute_js_or_manifest_tool(cwd, name, args)
-    }));
+    agent.custom_tool_executor = Some(CustomToolExecutor::new_with_context(
+        move |cwd, name, args, context| {
+            let host = host
+                .lock()
+                .map_err(|error| davinci_agent::ToolError::Failed(error.to_string()))?
+                .clone();
+            host.execute_js_or_manifest_tool_with_context(cwd, name, args, context)
+        },
+    ));
 }
 
 /// Hand the graph controller the session's model, thinking level, and trust
@@ -10170,6 +10174,44 @@ fn store_api_key(provider: &str, key: &str) -> Result<(), String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn contextual_dispatch_attachments_require_context_and_live_cancellation() {
+        for shared in [false, true] {
+            let mut agent = davinci_agent::Agent::new_builtin(davinci_agent::PromptProfile::Stable);
+            let host = super::ExtensionHost::default();
+            if shared {
+                super::attach_shared_tool_executor(
+                    &mut agent,
+                    std::sync::Arc::new(std::sync::Mutex::new(host)),
+                );
+            } else {
+                super::attach_tool_executor(&mut agent, &host);
+            }
+            let executor = agent.custom_tool_executor.as_ref().unwrap();
+            let cwd = std::path::Path::new(".");
+            let args = serde_json::json!({});
+            assert!(
+                matches!(executor.execute(cwd, "unregistered_extension", &args),
+                Err(davinci_agent::ToolError::Failed(message))
+                if message == "tool requires engine dispatch context")
+            );
+            let abort = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+            let context = davinci_agent::ToolContext {
+                abort: Some(abort.clone()),
+                ..Default::default()
+            };
+            assert!(
+                matches!(executor.execute_with_context(cwd, "unregistered_extension", &args, &context),
+                Err(davinci_agent::ToolError::Failed(message))
+                if message == "tool request cancelled")
+            );
+            abort.store(false, std::sync::atomic::Ordering::SeqCst);
+            assert!(matches!(
+                executor.execute_with_context(cwd, "unregistered_extension", &args, &context),
+                Err(davinci_agent::ToolError::Unknown(_))
+            ));
+        }
+    }
     use super::*;
 
     static OFFLINE_TOOL_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());

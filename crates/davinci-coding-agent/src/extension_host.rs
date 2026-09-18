@@ -1096,6 +1096,24 @@ impl ExtensionHost {
         None
     }
 
+    /// Engine dispatch entry point shared by foreground and worker attachments.
+    /// Context supplies live request state, not permission to use resources;
+    /// resource adapters must additionally authorize at their own boundaries.
+    pub fn execute_js_or_manifest_tool_with_context(
+        &self,
+        cwd: &Path,
+        name: &str,
+        args: &Value,
+        context: &davinci_agent::ToolContext,
+    ) -> Result<davinci_agent::ToolResult, davinci_agent::ToolError> {
+        if context.is_aborted() {
+            return Err(davinci_agent::ToolError::Failed(
+                "tool request cancelled".into(),
+            ));
+        }
+        self.execute_js_or_manifest_tool(cwd, name, args)
+    }
+
     pub fn execute_js_or_manifest_tool(
         &self,
         cwd: &Path,
@@ -1468,6 +1486,39 @@ fn resolve_extension_shortcuts(
 mod tests {
     use super::*;
     use crate::js_host::JsRegisteredProvider;
+
+    #[test]
+    fn contextual_dispatch_rejects_cancelled_native_and_extension_requests() {
+        let host = ExtensionHost::default();
+        let abort = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let context = davinci_agent::ToolContext {
+            abort: Some(abort.clone()),
+            ..Default::default()
+        };
+        for name in ["memory_search", "unregistered_extension"] {
+            let result = host.execute_js_or_manifest_tool_with_context(
+                Path::new("."),
+                name,
+                &serde_json::json!({}),
+                &context,
+            );
+            assert!(
+                matches!(result, Err(davinci_agent::ToolError::Failed(message))
+                if message == "tool request cancelled")
+            );
+        }
+        // Read the live signal on every call, rather than snapshotting it when attached.
+        abort.store(false, std::sync::atomic::Ordering::SeqCst);
+        assert!(matches!(
+            host.execute_js_or_manifest_tool_with_context(
+                Path::new("."),
+                "unregistered_extension",
+                &serde_json::json!({}),
+                &context,
+            ),
+            Err(davinci_agent::ToolError::Unknown(_))
+        ));
+    }
 
     #[test]
     fn native_tools_register_runtime_capabilities() {

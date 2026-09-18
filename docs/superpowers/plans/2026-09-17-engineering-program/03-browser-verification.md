@@ -348,6 +348,27 @@ and formatting passed. Solo diff review was used as requested. Native normal/Gra
 browser dispatch, current-source/transaction binding and completion receipts remain
 unfinished; P3 is not complete.
 
+### Engine attachment context checkpoint
+
+Both foreground and shared extension executor attachments now use the existing
+context-aware custom executor. Calls without engine context fail closed. The
+extension-host entry point reads the live cancellation signal before dispatching
+native, JavaScript or manifest tools. The shared host is cloned before dispatch,
+preserving release of its mutex before external I/O. Legacy host entry points are
+retained for compatibility. This is a dispatch prerequisite, not browser tool
+registration or an authorization grant; the browser adapter still must consume
+the current process manager, exact dispatch permit and bound managed-server lease.
+It does not cancel already-running legacy extension I/O.
+
+Validation: the initial executable regression failed to compile because the
+contextual host method was absent. After implementation, both contextual dispatch
+regressions passed, all 11 extension-host cases passed, and the real normal-agent
+edit/replan/test integration passed. Coding-agent executable/tests Clippy with
+warnings denied and package formatting passed. An initial library-only selector
+ran zero tests; it is not counted as validation. Diff reviewed solo, as requested.
+P3 remains incomplete: native browser dispatch, Graph consumption and real
+source/transaction-bound receipts still require implementation and validation.
+
 ### Managed dev-server attachment checkpoint
 
 The host-only `ProcessManager::with_browser_dev_server` boundary now checks the
