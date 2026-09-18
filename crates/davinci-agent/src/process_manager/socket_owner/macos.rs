@@ -390,11 +390,14 @@ mod native {
 
     #[cfg(test)]
     #[test]
-    fn layouts_match_the_installed_darwin_sdk() {
+    fn public_layouts_match_the_installed_darwin_sdk() {
+        // The public SDK exposes libproc's descriptor ABI and xinpgen, but
+        // omits the private xinpcb_n/xsocket_n wire records. Their compatibility
+        // is exercised against real kernel snapshots by the ownership tests;
+        // defining PRIVATE cannot make missing SDK declarations available.
         let directory = tempfile::tempdir().unwrap();
         let source = directory.path().join("socket-layout.c");
         std::fs::write(&source, format!(r#"
-#define PRIVATE 1
 #include <stddef.h>
 #include <sys/socket.h>
 #include <sys/socketvar.h>
@@ -402,20 +405,11 @@ mod native {
 #include <netinet/in_pcb.h>
 #include <sys/proc_info.h>
 _Static_assert(sizeof(struct xinpgen) == {generation_size}, "generation size");
-_Static_assert(offsetof(struct xinpcb_n, inp_lport) == {port}, "port offset");
-_Static_assert(offsetof(struct xinpcb_n, inp_gencnt) == {generation}, "generation offset");
-_Static_assert(offsetof(struct xinpcb_n, inp_vflag) == {version}, "version offset");
-_Static_assert(offsetof(struct xinpcb_n, inp_dependladdr) == {address}, "address offset");
-_Static_assert(offsetof(struct xsocket_n, xso_so) == {handle}, "socket handle offset");
-_Static_assert(offsetof(struct xsocket_n, so_type) == {socket_type}, "socket type offset");
-_Static_assert(offsetof(struct xsocket_n, so_options) == {options}, "options offset");
-_Static_assert(offsetof(struct xsocket_n, xso_protocol) == {protocol}, "protocol offset");
-_Static_assert(offsetof(struct xsocket_n, xso_family) == {family}, "family offset");
 _Static_assert(offsetof(struct socket_fdinfo, psi) + offsetof(struct socket_info, soi_so) == {descriptor}, "descriptor handle offset");
 _Static_assert(AF_INET == 2 && SOCK_STREAM == 1 && IPPROTO_TCP == 6 && SO_ACCEPTCONN == 2, "listener constants");
 _Static_assert(PROC_PIDFDSOCKETINFO == 3 && sizeof(struct socket_fdinfo) <= 4096, "descriptor ABI cap");
 int main(void) {{ return 0; }}
-"#, generation_size=size_of::<Generation>(), port=offset_of!(Inpcb,local_port), generation=offset_of!(Inpcb,generation), version=offset_of!(Inpcb,version), address=offset_of!(Inpcb,local_address), handle=offset_of!(Socket,handle), socket_type=offset_of!(Socket,socket_type), options=offset_of!(Socket,options), protocol=offset_of!(Socket,protocol), family=offset_of!(Socket,family), descriptor=SOCKET_HANDLE)).unwrap();
+"#, generation_size=size_of::<Generation>(), descriptor=SOCKET_HANDLE)).unwrap();
         let result = std::process::Command::new("/usr/bin/cc")
             .args(["-std=c11", "-fsyntax-only"])
             .arg(&source)

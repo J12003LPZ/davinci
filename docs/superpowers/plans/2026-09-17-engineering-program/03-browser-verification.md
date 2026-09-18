@@ -730,3 +730,19 @@ pass on this checkpoint's exact pushed head before platform completion is claime
 The earlier `c192282` macOS job passed while ownership was excluded; it is not
 evidence for this new implementation. No subagents were used. P3 and the full
 engineering program remain in progress.
+
+### Darwin SDK validation correction
+
+CI run `35298203925`, macOS job `105455037534`, compiled the native Rust
+implementation and passed six ownership tests, including actual listener
+ownership and the simultaneous foreign reuse-port listener regression. Its C
+SDK check failed because the installed public SDK omits private `xinpcb_n` and
+`xsocket_n` declarations, even when `PRIVATE` is defined. The corrected check
+validates the public `xinpgen` and libproc descriptor ABI and constants against
+the installed SDK. Private wire-record compatibility remains a real-kernel
+runtime gate; it is not claimed to be validated by the public SDK. This
+correction needs its own native CI result before the SDK gate is closed.
+
+For this correction, all four portable/Windows socket tests passed without
+ignores; agent formatting, all-target Clippy with warnings denied and diff
+whitespace checks passed. Production ownership code is unchanged.
