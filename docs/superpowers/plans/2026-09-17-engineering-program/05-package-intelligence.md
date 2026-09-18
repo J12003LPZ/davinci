@@ -1,6 +1,6 @@
 # P5: Package / Dependency Intelligence
 
-Status: design approved by the user on 2026-09-17; implementation pending.
+Status: completed at 9a3fdf9b47216bcfc2ca58bef5d380d1a10c863a; design approved 2026-09-17.
 Execution sequence: 5 of 12.
 Dependencies: P1 workspace metadata and CacheRuntime; P3 complete in sequential delivery.
 Requirements authority: project section 10 and cross-cutting sections 18-40;
@@ -108,5 +108,5 @@ Implementation is completed on `codex/package-intelligence-01a0ad48` in the isol
 | 11. Evaluation | [p5-package-final.json](evidence/p5-package-final.json) captures full verification evidence, supported formats, security invariants, and test results. |
 | 12. Docs | Updated `05-package-intelligence.md` and `README.md` program ledger. |
 | 13. Review | Solo source and diff audit across touched crates, fixtures, tests, and documentation. No subagents used per instruction. |
-| 14. CI | Pending push to `codex/package-intelligence-01a0ad48` and exact-head CI run monitoring. |
+| 14. CI | Exact-head CI passed at `9a3fdf9b47216bcfc2ca58bef5d380d1a10c863a`: Push CI [35367111447](https://github.com/J12003LPZ/davinci/actions/runs/35367111447), Push SARIF [35367111099](https://github.com/J12003LPZ/davinci/actions/runs/35367111099), PR #13 CI [35367117486](https://github.com/J12003LPZ/davinci/actions/runs/35367117486), PR #13 SARIF [35367117517](https://github.com/J12003LPZ/davinci/actions/runs/35367117517) all 100% green across platform matrix. |
 

@@ -1,7 +1,7 @@
 # Engineering program ledger
 
-Status: design package approved; P1, P2, P3 and P4 validated; P5 next.
-P3 head `cdbfe00` passed CI, including Windows/Linux/macOS native matrix,
+Status: design package approved; P1, P2, P3, P4 and P5 validated; P7 next.
+P5 head `9a3fdf9` passed CI, including Windows/Linux/macOS native matrix,
 normal-agent and Graph paths. Its evidence and limitations remain in its plan.
 Goal scope: all twelve projects and the global acceptance/performance/report gates.
 Reference: [program design](../../specs/2026-09-17-engineering-program.md) and
@@ -32,7 +32,7 @@ Reference: [program design](../../specs/2026-09-17-engineering-program.md) and
 | 2 | [P2 Persistent Process Manager](02-process-manager.md) | Complete; PR #10 open | Approved | Package tests, fmt, Clippy, integration, security and eval passed | Green at `bfc60e3` |
 | 3 | [P4 Transactional Edit Engine](04-transactional-edits.md) | Complete; PR #11 open | Approved | Package, integration, security, concurrency, normal/Graph and eval gates passed | Green at `a2054d3` |
 | 4 | [P3 Browser / Playwright Verification](03-browser-verification.md) | Complete; PR #12 updated | Approved | Package tests, fmt, Clippy, real Chromium normal/Graph paths, network confinement, RPC verification and eval passed | Green at `cdbfe00` |
-| 5 | [P5 Package / Dependency Intelligence](05-package-intelligence.md) | Planned | Approved | Not run | Not pushed |
+| 5 | [P5 Package / Dependency Intelligence](05-package-intelligence.md) | Complete; PR #13 open | Approved | Package tests, fmt, Clippy, integration, security and eval passed | Green at `9a3fdf9` |
 | 6 | [P7 Build Intelligence](07-build-intelligence.md) | Planned | Approved | Not run | Not pushed |
 | 7 | [P6 Git Intelligence](06-git-intelligence.md) | Planned | Approved | Not run | Not pushed |
 | 8 | [P9 Change Impact Engine](09-change-impact.md) | Planned | Approved | Not run | Not pushed |
@@ -498,5 +498,5 @@ Implementation is completed on `codex/package-intelligence-01a0ad48` in the isol
 | 11. Evaluation | [p5-package-final.json](evidence/p5-package-final.json) captures full verification evidence, supported formats, security invariants, and test results. |
 | 12. Docs | Updated `05-package-intelligence.md` and `README.md` program ledger. |
 | 13. Review | Solo source and diff audit across touched crates, fixtures, tests, and documentation. No subagents used per instruction. |
-| 14. CI | Pending push to `codex/package-intelligence-01a0ad48` and exact-head CI run monitoring. |
+| 14. CI | Exact-head CI passed at `9a3fdf9b47216bcfc2ca58bef5d380d1a10c863a`: Push CI [35367111447](https://github.com/J12003LPZ/davinci/actions/runs/35367111447), Push SARIF [35367111099](https://github.com/J12003LPZ/davinci/actions/runs/35367111099), PR #13 CI [35367117486](https://github.com/J12003LPZ/davinci/actions/runs/35367117486), PR #13 SARIF [35367117517](https://github.com/J12003LPZ/davinci/actions/runs/35367117517) all 100% green across platform matrix. |
 

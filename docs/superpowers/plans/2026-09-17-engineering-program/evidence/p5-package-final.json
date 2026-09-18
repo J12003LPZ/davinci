@@ -60,5 +60,19 @@
   "lint_checks": {
     "fmt": "rtk proxy cargo fmt -p davinci-agent -p davinci-coding-agent --check (exit 0)",
     "clippy": "rtk proxy cargo clippy --offline --locked -p davinci-agent -p davinci-coding-agent --all-targets -- -D warnings (exit 0)"
+  },
+  "pull_request": {
+    "number": 13,
+    "url": "https://github.com/J12003LPZ/davinci/pull/13",
+    "base": "codex/browser-verification-01a0ad48",
+    "head": "codex/package-intelligence-01a0ad48"
+  },
+  "ci_verification": {
+    "head_sha": "9a3fdf9b47216bcfc2ca58bef5d380d1a10c863a",
+    "push_ci_run": "https://github.com/J12003LPZ/davinci/actions/runs/35367111447",
+    "push_sarif_run": "https://github.com/J12003LPZ/davinci/actions/runs/35367111099",
+    "pr_ci_run": "https://github.com/J12003LPZ/davinci/actions/runs/35367117486",
+    "pr_sarif_run": "https://github.com/J12003LPZ/davinci/actions/runs/35367117517",
+    "status": "all green"
   }
 }
