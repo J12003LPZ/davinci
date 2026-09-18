@@ -35,6 +35,13 @@ fn parse_process_manager<'de, D: serde::Deserializer<'de>>(
     }))
 }
 
+fn parse_browser_verification<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<crate::native_extensions::browser::BrowserConfig>, D::Error> {
+    let value = Option::<serde_json::Value>::deserialize(deserializer)?;
+    Ok(value.map(|value| serde_json::from_value(value).unwrap_or_default()))
+}
+
 fn parse_test_impact<'de, D: serde::Deserializer<'de>>(
     deserializer: D,
 ) -> Result<Option<crate::native_extensions::test_impact::TestImpactConfig>, D::Error> {
@@ -65,6 +72,12 @@ fn parse_language_intelligence<'de, D: serde::Deserializer<'de>>(
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct Settings {
+    #[serde(
+        default,
+        rename = "browserVerification",
+        deserialize_with = "parse_browser_verification"
+    )]
+    pub browser_verification: Option<crate::native_extensions::browser::BrowserConfig>,
     #[serde(
         default,
         rename = "editingTransactions",
@@ -1344,6 +1357,24 @@ pub fn is_trusted(settings: &Settings, cwd: &Path, override_trust: Option<bool>)
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn browser_settings_fail_closed_and_preserve_unrelated_settings() {
+        assert!(Settings::default().browser_verification.is_none());
+        for value in [
+            serde_json::json!({"enabled":false}),
+            serde_json::json!({"enabled":"invalid"}),
+            serde_json::json!({"enabled":true,"unknown":1}),
+            serde_json::json!(false),
+        ] {
+            let settings: Settings = serde_json::from_value(serde_json::json!({
+                "theme":"fixture", "browserVerification":value
+            }))
+            .unwrap();
+            assert_eq!(settings.theme.as_deref(), Some("fixture"));
+            assert!(!settings.browser_verification.unwrap().enabled);
+        }
+    }
 
     #[test]
     fn editing_transaction_settings_fail_closed_without_dropping_unrelated_settings() {

@@ -6,6 +6,72 @@ Dependencies: P2 and P4 green; existing interaction_testing protocol/evidence/ar
 Requirements authority: project section 8 and cross-cutting sections 18-40;
 project numbers are kept stable while execution order follows the program design.
 
+### Native normal-session dispatch checkpoint
+
+All ten browser tools now use the existing native registry and context-aware CLI
+executor attachments. The shared controller reserves startup without holding the
+native-host lock over process I/O. Each action consumes the current P2 request
+authority and rechecks its opaque owner/session/lifetime binding and OS listener
+ownership before accepting the result. Navigation accepts only a bounded local
+path under that server's origin; actions accept role/name, label or test-id
+selectors. Arbitrary scripts, protocols, origins and unknown fields are rejected.
+Tools declare both process and network effects while keeping their conservative
+permission class. Outputs explicitly identify themselves as observations, not
+transaction verification or completion proof.
+
+`browserVerification` is optional global host configuration (`enabled`, absolute
+`node`, absolute external Playwright `package`, pinned `version`). Project settings
+can disable it; they cannot enable a disabled host or replace host executable,
+package or version pins. Malformed feature settings disable the feature without
+dropping unrelated settings. No package installation or browser launch occurs at
+ordinary startup. Disabled calls return structured source/test fallback.
+
+Executed checks for this checkpoint:
+
+- Actual installed Chromium test
+  `normal_browser_native_dispatch_actions_revocation_and_cleanup`, explicitly
+  enabled with the trusted Node/Playwright paths from the baseline. One test
+  passed with both normal and shared executor attachments, zero skips. It starts
+  a real P2-owned Node HTTP listener, observes a planted button failure, edits
+  `index.html` through the engine, opens a fresh context on the same server,
+  exercises all ten native tools, observes corrected DOM/ARIA, retains a PNG
+  artifact without binary tool output, denies a revoked snapshot permission, and
+  closes the context and server. Foreign-owner and cancelled context requests
+  are rejected without destroying the authorized caller's browser. The initial
+  teardown assertion incorrectly expected `stopped`; P2 transitions through
+  `stopping` asynchronously to `exited`. The fixture now polls the same server
+  record with a five-second deadline to prove terminal cleanup. This fixture is
+  deterministic provider dispatch; it is not
+  a live LLM evaluation or the whole-program login acceptance.
+- Four offline native/settings cases passed: bounded parser and schema, project
+  pin protection and disable-only behavior, disabled/cancelled no-start behavior,
+  and malformed settings preserving unrelated values. The actual Chromium case
+  remains explicitly ignored in the ordinary offline test invocation.
+- Capability-effect regression was RED with `Other("other")` for `browser_open`,
+  then GREEN after all ten tools declared process and network authority. All
+  949 agent library tests passed, zero skips or failures.
+- Coding-agent library browser checks: 15 passed, one explicitly ignored actual
+  browser case. CLI extension-host checks: 11 passed. CLI settings checks: 20
+  passed. No failures. Commands used `cargo test --offline --locked`, the affected
+  package, target and module selectors, prefixed by `rtk proxy`.
+- Final `rtk proxy cargo fmt -p davinci-agent -p davinci-coding-agent --check`
+  and `rtk proxy cargo clippy --offline --locked -p davinci-agent
+  -p davinci-coding-agent --all-targets -- -D warnings` passed. Diff whitespace
+  and the changed registration, configuration, dispatch and adapter paths were
+  reviewed solo. Incomplete lifecycle/evidence gates listed below remain open.
+
+Socket-proof prerequisite `645e2eb` has green CI run `35292905555`, workflow lint
+`35292905598`, and SARIF interoperability `35292905478`. Those runs prove the
+prerequisite commit, not the native adapter's unpushed changes.
+
+Remaining P3 work includes shared parent Graph transport/role integration,
+in-flight request cancellation, stale-resource reconciliation, macOS listener
+ownership and IPv6-only listeners, source/action/transaction-bound receipts,
+public retained-artifact retrieval, the required normal/Graph frontend evaluation,
+full affected-package/eval gates, final diff review and exact-head CI. P3 remains
+in progress; the later nine projects and all global acceptance/performance/report
+requirements remain in the program scope.
+
 ### Initial HTTP network boundary implementation checkpoint
 
 Implemented `interaction_testing/browser_network.js` using Node built-in HTTP.

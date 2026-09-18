@@ -31,7 +31,7 @@ Reference: [program design](../../specs/2026-09-17-engineering-program.md) and
 | 1 | [P1 Test Impact Intelligence](01-test-impact.md) | Complete; PR #9 open | Approved | Package tests, fmt, Clippy, integration, security and eval passed | Green at `6b3aad9` |
 | 2 | [P2 Persistent Process Manager](02-process-manager.md) | Complete; PR #10 open | Approved | Package tests, fmt, Clippy, integration, security and eval passed | Green at `bfc60e3` |
 | 3 | [P4 Transactional Edit Engine](04-transactional-edits.md) | Complete; PR #11 open | Approved | Package, integration, security, concurrency, normal/Graph and eval gates passed | Green at `a2054d3` |
-| 4 | [P3 Browser / Playwright Verification](03-browser-verification.md) | In progress; baseline inspection | Approved | Not run | Not pushed |
+| 4 | [P3 Browser / Playwright Verification](03-browser-verification.md) | In progress; supervised backend and native normal-session dispatch; draft PR #12 | Approved | Socket ownership, backend/network, native actions, permission revocation and normal UI failure/fix checks passed; remaining P3 gates open | Prerequisite CI green at `645e2eb`; adapter CI pending |
 | 5 | [P5 Package / Dependency Intelligence](05-package-intelligence.md) | Planned | Approved | Not run | Not pushed |
 | 6 | [P7 Build Intelligence](07-build-intelligence.md) | Planned | Approved | Not run | Not pushed |
 | 7 | [P6 Git Intelligence](06-git-intelligence.md) | Planned | Approved | Not run | Not pushed |

@@ -1111,6 +1111,15 @@ impl ExtensionHost {
                 "tool request cancelled".into(),
             ));
         }
+        if crate::native_extensions::browser::TOOL_NAMES.contains(&name) {
+            let browser = self
+                .native
+                .lock()
+                .map_err(|_| davinci_agent::ToolError::Failed("native host unavailable".into()))?
+                .browser
+                .clone();
+            return browser.execute(cwd, name, args, context);
+        }
         self.execute_js_or_manifest_tool(cwd, name, args)
     }
 

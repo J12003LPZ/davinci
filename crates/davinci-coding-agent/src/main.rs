@@ -1,6 +1,8 @@
 mod agent_profiles;
 mod args;
 mod auth_cmd;
+#[cfg(test)]
+mod browser_integration_tests;
 mod cache_stats;
 mod catalog_refresh;
 mod changelog;
@@ -83,6 +85,7 @@ mod experimental {
 
 mod export;
 mod extension_host;
+use davinci_coding_agent::interaction_testing;
 mod extensions;
 mod external_editor;
 mod file_processor;

@@ -1,5 +1,6 @@
 //! Native Rust ports of the bundled pi extensions.
 
+pub mod browser;
 pub mod content_router;
 pub mod ecosystem;
 pub mod graph;
@@ -37,6 +38,16 @@ use std::path::Path;
 use std::sync::Arc;
 
 pub const NATIVE_TOOLS: &[&str] = &[
+    "browser_open",
+    "browser_snapshot",
+    "browser_click",
+    "browser_type",
+    "browser_select",
+    "browser_console",
+    "browser_network",
+    "browser_accessibility",
+    "browser_screenshot",
+    "browser_close",
     "test_related",
     "test_impacted",
     "test_plan",
@@ -229,6 +240,7 @@ pub fn graph_worker_context() -> Option<GraphWorkerContext> {
 
 #[derive(Debug, Clone, Default)]
 pub struct NativeExtensionHost {
+    pub browser: browser::BrowserController,
     pub test_impact: test_impact::TestImpact,
     pub repo_intelligence: repo_intelligence::RepoIntelligence,
     pub cache: davinci_agent::runtime::cache::CacheRuntime,
@@ -303,6 +315,24 @@ impl NativeExtensionHost {
         language_intelligence.set_governor(governor.clone());
         graph.language_intelligence = Some(language_intelligence.clone());
         Self {
+            browser: browser::BrowserController::new(
+                cwd,
+                agent_dir
+                    .map(|dir| {
+                        let mut config = crate::settings::load_settings(dir)
+                            .browser_verification
+                            .unwrap_or_default();
+                        // Project settings may disable the feature, never select executable/package pins.
+                        if crate::settings::load_merged_settings(dir, cwd)
+                            .browser_verification
+                            .is_some_and(|settings| !settings.enabled)
+                        {
+                            config.enabled = false;
+                        }
+                        config
+                    })
+                    .unwrap_or_default(),
+            ),
             test_impact,
             repo_intelligence,
             cache,
@@ -502,6 +532,9 @@ impl NativeExtensionHost {
         args: &Value,
     ) -> Result<ToolResult, ToolError> {
         match name {
+            name if browser::TOOL_NAMES.contains(&name) => Err(ToolError::Failed(
+                "browser tool requires engine dispatch context".into(),
+            )),
             name if test_impact::TOOL_NAMES.contains(&name) => self.test_impact.execute(name, args),
             name if repo_intelligence::is_repo_tool(name) => {
                 self.repo_intelligence.execute_tool(name, args)
@@ -587,6 +620,9 @@ impl NativeExtensionHost {
     }
 
     pub fn describe_tool(name: &str) -> Option<davinci_ai::ToolSpec> {
+        if browser::TOOL_NAMES.contains(&name) {
+            return browser::tool_spec(name);
+        }
         if repo_intelligence::is_repo_tool(name) {
             return repo_intelligence::tool_spec(name);
         }
