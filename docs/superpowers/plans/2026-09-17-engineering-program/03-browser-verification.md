@@ -348,6 +348,31 @@ and formatting passed. Solo diff review was used as requested. Native normal/Gra
 browser dispatch, current-source/transaction binding and completion receipts remain
 unfinished; P3 is not complete.
 
+### Managed listening-socket ownership checkpoint
+
+`ProcessManager::with_verified_browser_dev_server` adds request-time OS listener
+proof before browser I/O and before accepting its result, alongside the existing
+current permission, cancellation and managed-lifetime checks. Bindings pin the
+managed PID's OS creation identity. Windows uses the native TCP owner table and
+process snapshot, comparing creation times along descendant ancestry. Linux uses
+bounded procfs TCP inode, descriptor and process-identity reads. No shell commands
+or new resource/permission registry are introduced. All candidate IPv4 loopback
+listeners must belong to the managed child or a verifiable current descendant.
+The metadata-only API remains available for compatibility; native browser I/O
+must use the verified entry point. This is a point-in-time check and does not
+reserve a port against concurrent rebinding between observations.
+
+Executed local Windows validation: the real listening-socket test failed red
+before implementation, then passed. The actual managed Node regression passed
+for direct and child listeners, denied a foreign listener without invoking the
+callback, and rejected callback evidence after port takeover while the managed
+process remained running. All 16 affected process-manager tests passed; agent
+formatting and all-target Clippy with warnings denied passed. Linux execution
+remains to be proven by CI. macOS currently reports ownership unavailable and
+fails closed; macOS and IPv6-only listener support still require implementation.
+Native browser dispatch, Graph consumption and source-bound receipts remain
+unfinished. This checkpoint does not complete P3.
+
 ### Engine attachment context checkpoint
 
 Both foreground and shared extension executor attachments now use the existing

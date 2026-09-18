@@ -45,6 +45,156 @@ fn server() -> Value {
     json!({"executable":"node", "argv":["-e", "process.stdout.write('READY\\n');process.stdin.on('data',b=>process.stdout.write(b));setTimeout(()=>process.exit(0),20000)"]})
 }
 
+#[cfg(any(windows, target_os = "linux"))]
+#[test]
+fn browser_socket_proof_rejects_foreign_listener_and_port_takeover() {
+    let directory = tempfile::tempdir().unwrap();
+    let session = agent(directory.path(), PermissionMode::AlwaysApprove);
+    let manager = session.tool_context.processes.as_ref().unwrap();
+    let foreign = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = foreign.local_addr().unwrap().port();
+    let mut start = server();
+    start["ports"] = json!([port]);
+    let started = manager
+        .execute(directory.path(), "process_start", &start, None, None)
+        .unwrap();
+    let id = started.details.unwrap()["process"]["id"].as_u64().unwrap() as u32;
+    let args = json!({"process_id":id,"port":port});
+    let lease = manager
+        .with_browser_dev_server(
+            BrowserRequest {
+                cwd: directory.path(),
+                name: "browser_open",
+                args: &args,
+                abort: None,
+                permit: None,
+                process_id: id,
+                port,
+                lease: None,
+            },
+            |lease| Ok(lease.clone()),
+        )
+        .unwrap();
+    // Metadata alone admits a binding but must never admit browser network I/O.
+    assert!(lease.verify_listening_socket().is_err());
+    assert!(manager
+        .with_verified_browser_dev_server(
+            BrowserRequest {
+                cwd: directory.path(),
+                name: "browser_open",
+                args: &args,
+                abort: None,
+                permit: None,
+                process_id: id,
+                port,
+                lease: Some(&lease),
+            },
+            |_| -> Result<(), String> { panic!("foreign listener must not enter browser I/O") }
+        )
+        .is_err());
+
+    for descendant in [false, true] {
+        let reserved = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = reserved.local_addr().unwrap().port();
+        drop(reserved);
+        let script = format!("const s=require('net').createServer();s.listen({port},'127.0.0.1',()=>console.log('LISTENING'));process.stdin.on('data',()=>s.close(()=>console.log('CLOSED')));setTimeout(()=>process.exit(),20000)");
+        let script = if descendant {
+            format!("const c=require('child_process').spawn(process.execPath,['-e',{}],{{stdio:['pipe','pipe','pipe']}});c.stdout.pipe(process.stdout);c.stderr.pipe(process.stderr);process.stdin.pipe(c.stdin);setTimeout(()=>process.exit(),20000)", serde_json::to_string(&script).unwrap())
+        } else {
+            script
+        };
+        let started = manager
+            .execute(
+                directory.path(),
+                "process_start",
+                &json!({
+                    "executable":"node", "argv":["-e",script], "ports":[port]
+                }),
+                None,
+                None,
+            )
+            .unwrap();
+        let id = started.details.unwrap()["process"]["id"].as_u64().unwrap() as u32;
+        wait_for(|| {
+            manager
+                .owner
+                .output(id, None, 8192)
+                .unwrap()
+                .text
+                .contains("LISTENING")
+        });
+        let args = json!({"process_id":id,"port":port});
+        let lease = manager
+            .with_browser_dev_server(
+                BrowserRequest {
+                    cwd: directory.path(),
+                    name: "browser_open",
+                    args: &args,
+                    abort: None,
+                    permit: None,
+                    process_id: id,
+                    port,
+                    lease: None,
+                },
+                |lease| Ok(lease.clone()),
+            )
+            .unwrap();
+        assert!(
+            lease.verify_listening_socket().is_ok(),
+            "descendant={descendant}"
+        );
+        let request = BrowserRequest {
+            cwd: directory.path(),
+            name: "browser_snapshot",
+            args: &args,
+            abort: None,
+            permit: None,
+            process_id: id,
+            port,
+            lease: Some(&lease),
+        };
+        assert!(manager
+            .with_verified_browser_dev_server(request, |_| Ok(()))
+            .is_ok());
+        let mut takeover = None;
+        let result = manager.with_verified_browser_dev_server(request, |_| {
+            manager
+                .execute(
+                    directory.path(),
+                    "process_write",
+                    &json!({"id":id,"text":"CLOSE\n"}),
+                    None,
+                    None,
+                )
+                .unwrap();
+            wait_for(|| {
+                manager
+                    .owner
+                    .output(id, None, 8192)
+                    .unwrap()
+                    .text
+                    .contains("CLOSED")
+            });
+            takeover =
+                Some(std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, port)).unwrap());
+            Ok("untrusted browser result")
+        });
+        assert!(result.is_err());
+        assert!(lease.verify_listening_socket().is_err());
+        assert_eq!(manager.owner.active_snapshot(id).unwrap().state, "running");
+        drop(takeover);
+        manager
+            .execute(
+                directory.path(),
+                "process_stop",
+                &json!({"id":id}),
+                None,
+                None,
+            )
+            .unwrap();
+    }
+}
+
 #[test]
 fn browser_dev_server_requires_active_owned_declared_port_and_current_authority() {
     let directory = tempfile::tempdir().unwrap();

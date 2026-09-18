@@ -2,6 +2,7 @@
 mod command;
 pub(crate) use command::direct as resolve_native_executable;
 mod schemas;
+mod socket_owner;
 pub use schemas::tool_specs;
 
 #[cfg(test)]
@@ -84,15 +85,49 @@ pub struct BrowserDevServerLease {
     session: uuid::Uuid,
     lifetime: uuid::Uuid,
     port: u16,
+    pid: u32,
+    pid_birth: Option<u64>,
 }
 
 impl BrowserDevServerLease {
     pub fn origin(&self) -> String {
         format!("http://127.0.0.1:{}", self.port)
     }
+
+    /// Requires OS evidence that the local listener belongs to the managed
+    /// child or a currently verifiable descendant. Declared ports are insufficient.
+    pub fn verify_listening_socket(&self) -> Result<(), String> {
+        let birth = self
+            .pid_birth
+            .ok_or("managed process identity unavailable")?;
+        if socket_owner::identity(self.pid)? != birth {
+            return Err("managed process identity changed".into());
+        }
+        socket_owner::verify(self.pid, self.port)?;
+        if socket_owner::identity(self.pid)? != birth {
+            return Err("managed process identity changed".into());
+        }
+        Ok(())
+    }
 }
 
 impl ProcessManager {
+    /// Browser I/O entry point: require current OS listener ownership both
+    /// before the operation and before accepting its result, in addition to
+    /// this request's live permission and managed-lifetime checks.
+    pub fn with_verified_browser_dev_server<T>(
+        &self,
+        request: BrowserRequest<'_>,
+        operation: impl FnOnce(&BrowserDevServerLease) -> Result<T, String>,
+    ) -> Result<T, String> {
+        self.with_browser_dev_server(request, |lease| {
+            lease.verify_listening_socket()?;
+            let result = operation(lease)?;
+            lease.verify_listening_socket()?;
+            Ok(result)
+        })
+    }
+
     /// Authorize the exact browser request and check its active process binding
     /// before and after host I/O. Cached bindings confer no permission.
     pub fn with_browser_dev_server<T>(
@@ -180,6 +215,8 @@ impl ProcessManager {
             session: process.session,
             lifetime: process.lifetime,
             port,
+            pid: process.pid,
+            pid_birth: socket_owner::identity(process.pid).ok(),
         })
     }
 
