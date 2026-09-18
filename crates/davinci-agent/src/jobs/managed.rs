@@ -101,6 +101,7 @@ struct Scope {
 
 struct Owner {
     id: Uuid,
+    parent: Option<Uuid>,
     scope: Arc<Scope>,
 }
 
@@ -215,6 +216,7 @@ impl ManagedOwner {
             .insert(scope.workspace.clone(), Arc::downgrade(&scope));
         Ok(Self(Arc::new(Owner {
             id: Uuid::new_v4(),
+            parent: None,
             scope,
         })))
     }
@@ -224,6 +226,7 @@ impl ManagedOwner {
     pub fn child_lease(&self) -> Self {
         Self(Arc::new(Owner {
             id: Uuid::new_v4(),
+            parent: Some(self.id()),
             scope: self.0.scope.clone(),
         }))
     }
@@ -262,12 +265,17 @@ impl ManagedOwner {
         };
         Ok(Self(Arc::new(Owner {
             id: Uuid::new_v4(),
+            parent: Some(self.id()),
             scope,
         })))
     }
 
     pub fn id(&self) -> Uuid {
         self.0.id
+    }
+
+    pub(crate) fn artifact_parent(&self) -> Option<Uuid> {
+        self.0.parent
     }
 
     /// End the parent session, including child leases still held by workers.

@@ -44,6 +44,18 @@ fn rpc_artifact_helper_entry() {
     )
     .unwrap();
     agent.tool_context.processes = Some(manager.clone());
+    let fixture_manager = if std::env::var_os("DAVINCI_TEST_RPC_CHILD_ARTIFACT").is_some() {
+        manager.child_lease(
+            agent.permissions.clone(),
+            davinci_agent::shell_policy::ShellPolicyProfile::Permissive,
+        )
+    } else {
+        manager.clone()
+    };
+    let fixture_context = davinci_agent::ToolContext {
+        processes: Some(fixture_manager.clone()),
+        ..agent.tool_context.clone()
+    };
     let controller = BrowserController::new(
         root.path(),
         BrowserConfig {
@@ -65,7 +77,7 @@ fn rpc_artifact_helper_entry() {
         .unwrap()
         .port();
     let script = format!("require('node:http').createServer((q,r)=>r.end('<html><button>Login</button></html>')).listen({port},'127.0.0.1',()=>console.log('READY'));setTimeout(()=>process.exit(0),60000);");
-    let started = manager
+    let started = fixture_manager
         .execute(
             root.path(),
             "process_start",
@@ -76,7 +88,7 @@ fn rpc_artifact_helper_entry() {
         .unwrap();
     let process_id = started.details.unwrap()["process"]["id"].as_u64().unwrap();
     let deadline = Instant::now() + Duration::from_secs(5);
-    while !manager
+    while !fixture_manager
         .execute(
             root.path(),
             "process_output",
@@ -99,7 +111,7 @@ fn rpc_artifact_helper_entry() {
             root.path(),
             "browser_open",
             &json!({"process_id":process_id,"port":port}),
-            &agent.tool_context,
+            &fixture_context,
         )
         .unwrap()
         .details
@@ -110,7 +122,7 @@ fn rpc_artifact_helper_entry() {
             root.path(),
             "browser_screenshot",
             &json!({"browser_id":browser_id}),
-            &agent.tool_context,
+            &fixture_context,
         )
         .unwrap()
         .details
@@ -120,10 +132,10 @@ fn rpc_artifact_helper_entry() {
             root.path(),
             "browser_close",
             &json!({"browser_id":browser_id}),
-            &agent.tool_context,
+            &fixture_context,
         )
         .unwrap();
-    manager
+    fixture_manager
         .execute(
             root.path(),
             "process_stop",
@@ -132,6 +144,8 @@ fn rpc_artifact_helper_entry() {
             None,
         )
         .unwrap();
+    drop(fixture_context);
+    drop(fixture_manager);
     println!(
         "\n{}",
         json!({"type":"artifact_fixture_ready","browser_id":browser_id,"artifact":screenshot["result"]})
@@ -145,6 +159,12 @@ fn rpc_artifact_helper_entry() {
 #[test]
 #[ignore = "requires explicitly configured trusted Node and Playwright installation"]
 fn rpc_retained_browser_artifact_wire_exchange() {
+    for child_owner in [false, true] {
+        rpc_retained_browser_artifact_wire_exchange_for(child_owner);
+    }
+}
+
+fn rpc_retained_browser_artifact_wire_exchange_for(child_owner: bool) {
     use base64::Engine;
     use std::{
         io::{BufRead, BufReader, Write},
@@ -161,6 +181,9 @@ fn rpc_retained_browser_artifact_wire_exchange() {
     let stderr = std::fs::File::create(state.path().join("stderr.txt")).unwrap();
     let mut command = Command::new(std::env::current_exe().unwrap());
     command.env_clear();
+    if child_owner {
+        command.env("DAVINCI_TEST_RPC_CHILD_ARTIFACT", "1");
+    }
     for key in [
         "PATH",
         "SystemRoot",

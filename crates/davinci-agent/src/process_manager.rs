@@ -82,6 +82,8 @@ pub struct BrowserRequest<'a> {
 pub struct BrowserDevServerLease {
     process_id: u32,
     owner: uuid::Uuid,
+    parent_owner: Option<uuid::Uuid>,
+    workspace: PathBuf,
     session: uuid::Uuid,
     lifetime: uuid::Uuid,
     port: u16,
@@ -230,6 +232,8 @@ impl ProcessManager {
     /// Retained bytes keep their immutable host-issued owner binding, but do not
     /// require the original dev server to remain alive. Current policy still gates
     /// every read, including approval, cancellation and parent-session shutdown.
+    /// The issuing parent may read its direct child's retained evidence, using
+    /// the lease's canonical workspace. This grants no live process/browser action.
     pub fn with_retained_browser_artifact<T>(
         &self,
         request: BrowserRequest<'_>,
@@ -239,7 +243,7 @@ impl ProcessManager {
             .lease
             .ok_or("browser artifact requires its original lease")?;
         if request.name != "browser_screenshot"
-            || lease.owner != self.owner.id()
+            || (lease.owner != self.owner.id() && lease.parent_owner != Some(self.owner.id()))
             || lease.process_id != request.process_id
             || lease.port != request.port
         {
@@ -261,12 +265,11 @@ impl ProcessManager {
         {
             return Err("browser artifact arguments exceed limit".into());
         }
-        if !request
+        let cwd = request
             .cwd
             .canonicalize()
-            .map_err(|_| "browser cwd unavailable")?
-            .starts_with(&self.workspace)
-        {
+            .map_err(|_| "browser cwd unavailable")?;
+        if cwd != lease.workspace {
             return Err("browser artifact request is outside its workspace".into());
         }
         let authority = self.authorize(request.cwd, request.name, request.args, request.permit)?;
@@ -302,6 +305,8 @@ impl ProcessManager {
         Ok(BrowserDevServerLease {
             process_id,
             owner: process.owner,
+            parent_owner: self.owner.artifact_parent(),
+            workspace: self.workspace.clone(),
             session: process.session,
             lifetime: process.lifetime,
             port,

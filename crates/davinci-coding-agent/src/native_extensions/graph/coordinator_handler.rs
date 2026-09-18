@@ -544,14 +544,39 @@ mod tests {
                 .content
                 .contains(">Done</button>")
         );
+        let mut screenshot = None;
         for tool in [
             "browser_console",
             "browser_network",
             "browser_accessibility",
             "browser_screenshot",
         ] {
-            assert!(!call(&second, tool, json!({"browser_id":two_id})).is_error);
+            let result = call(&second, tool, json!({"browser_id":two_id}));
+            assert!(!result.is_error);
+            if tool == "browser_screenshot" {
+                screenshot = Some(result.details.unwrap()["result"].clone());
+            }
         }
+        let screenshot = screenshot.unwrap();
+        let artifact_request =
+            json!({"browser_id":two_id,"artifact":screenshot["artifact"],"offset":0,"limit":64});
+        let parent_context = davinci_agent::ToolContext {
+            processes: Some(manager.clone()),
+            ..Default::default()
+        };
+        let read_artifact = || {
+            host.controller
+                .retrieve_artifact(parent_dir.path(), &artifact_request, &parent_context)
+        };
+        let bytes = read_artifact().unwrap();
+        assert_eq!(bytes["sha256"], screenshot["sha256"]);
+        assert_eq!(bytes["verification"], "observations_only");
+        use base64::Engine;
+        let png = base64::engine::general_purpose::STANDARD
+            .decode(bytes["base64"].as_str().unwrap())
+            .unwrap();
+        assert_eq!(png.len(), 64);
+        assert_eq!(&png[..8], b"\x89PNG\r\n\x1a\n");
         let abort = Arc::new(AtomicBool::new(false));
         let cancelled = transport_with_browser_abort(
             &parent,
@@ -619,11 +644,28 @@ mod tests {
         assert!(!call(&second, "browser_close", json!({"browser_id":two_id})).is_error);
         drop(second);
         assert_eq!(host.controller.context_count(), 0);
+        assert_eq!(read_artifact().unwrap()["sha256"], screenshot["sha256"]);
+        permissions
+            .lock()
+            .unwrap()
+            .deny
+            .push(PermissionRule::bare("browser_screenshot"));
+        assert!(
+            read_artifact().is_err(),
+            "parent retrieval must recheck current permission"
+        );
+        permissions.lock().unwrap().deny.clear();
         let until = Instant::now() + Duration::from_secs(5);
         while jobs.lock().unwrap().get(id as u32).unwrap().status() == JobStatus::Running {
             assert!(Instant::now() < until, "worker process not released");
             std::thread::sleep(Duration::from_millis(10));
         }
+        assert_eq!(read_artifact().unwrap()["sha256"], screenshot["sha256"]);
+        manager.shutdown();
+        assert!(
+            read_artifact().is_err(),
+            "session shutdown must invalidate parent retrieval"
+        );
     }
 
     #[test]

@@ -407,6 +407,35 @@ fn browser_dev_server_requires_active_owned_declared_port_and_current_authority(
     let child_lease = child
         .with_browser_dev_server(request, |lease| Ok(lease.clone()))
         .unwrap();
+    let child_artifact = BrowserRequest {
+        name: "browser_screenshot",
+        lease: Some(&child_lease),
+        ..request
+    };
+    assert_eq!(
+        manager
+            .with_retained_browser_artifact(child_artifact, || Ok("worker evidence"))
+            .unwrap(),
+        "worker evidence"
+    );
+    let sibling = manager.child_lease(
+        session.permissions.clone(),
+        crate::shell_policy::ShellPolicyProfile::Permissive,
+    );
+    assert!(sibling
+        .with_retained_browser_artifact::<()>(child_artifact, || panic!(
+            "sibling must not read worker evidence"
+        ))
+        .is_err());
+    assert!(foreign
+        .tool_context
+        .processes
+        .as_ref()
+        .unwrap()
+        .with_retained_browser_artifact::<()>(child_artifact, || panic!(
+            "another session must not read worker evidence"
+        ))
+        .is_err());
     manager.owner.release(id).unwrap();
     assert!(!lease.is_live());
     assert!(child_lease.is_live());
@@ -461,6 +490,22 @@ fn browser_dev_server_requires_active_owned_declared_port_and_current_authority(
         )
         .is_err());
     drop(child);
+    assert_eq!(
+        manager
+            .with_retained_browser_artifact(child_artifact, || Ok("released worker evidence"))
+            .unwrap(),
+        "released worker evidence"
+    );
+    let outside = tempfile::tempdir().unwrap();
+    assert!(manager
+        .with_retained_browser_artifact::<()>(
+            BrowserRequest {
+                cwd: outside.path(),
+                ..child_artifact
+            },
+            || panic!("artifact must stay bound to its issued workspace")
+        )
+        .is_err());
     assert!(manager
         .with_retained_browser_artifact(retained_request, || {
             manager.shutdown();

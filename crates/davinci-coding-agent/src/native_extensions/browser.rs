@@ -97,6 +97,7 @@ struct Resource {
 struct RetainedArtifact {
     browser_id: Uuid,
     lease: BrowserDevServerLease,
+    workspace: PathBuf,
 }
 #[derive(Clone)]
 pub struct BrowserController {
@@ -416,7 +417,7 @@ impl BrowserController {
             .filter(|retained| retained.browser_id == request.browser_id)
             .ok_or("browser artifact unavailable for this context")?;
         manager.with_retained_browser_artifact(BrowserRequest {
-            cwd, name: "browser_screenshot", args,
+            cwd: &retained.workspace, name: "browser_screenshot", args,
             abort: context.abort.as_deref(), permit: context.dispatch_permit.as_deref(),
             process_id: retained.lease.process_id(), port: retained.lease.port(), lease: Some(&retained.lease),
         }, || {
@@ -673,7 +674,7 @@ impl BrowserController {
                             let label = result["artifact"].as_str().ok_or("invalid retained artifact")?.to_owned();
                             drop(artifacts);
                             self.store.lock().map_err(|_| "browser state unavailable")?.retained.insert(label,
-                                RetainedArtifact { browser_id: id, lease: resource.lease.clone() });
+                                RetainedArtifact { browser_id: id, lease: resource.lease.clone(), workspace: self.workspace.clone() });
                         }
                         Ok(json!({"status":"observed","browser_id":id,"result":result}))
                     }

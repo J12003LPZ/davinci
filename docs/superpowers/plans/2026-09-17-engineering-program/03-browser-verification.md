@@ -660,6 +660,37 @@ startup and preserve the existing normal/Graph transport behavior; full Graph
 scheduler evaluation and the remaining P3 evidence/sandbox/platform gates are
 still open. No subagents were used.
 
+### Parent-authorized Graph artifact retrieval checkpoint
+
+The ownership regression reproduced rejection of a parent's read of evidence
+created under its issued child lease. Managed owners now record their immediate
+issuing parent. The immutable browser lease captures that parent and its canonical
+workspace. Retained-byte retrieval accepts the original owner or that direct
+parent, requires the recorded workspace, and retains current permission,
+cancellation and session-shutdown checks before and after reading. This grants
+no live browser/process authority and introduces no model-facing binary tool.
+The browser's existing retained metadata supplies the workspace; callers cannot
+select another workspace through retrieval JSON.
+
+After the fix, four targeted process/browser boundary tests passed, including
+sibling and unrelated-session denial, parent retrieval after child teardown,
+wrong-workspace rejection and current authorization. The explicitly enabled real
+Graph browser fixture passed one test covering IPv4/IPv6 and shared/detached Git
+worktrees. It captured artifacts through the authenticated worker channel and
+retrieved bounded PNG bytes through the parent controller after contexts,
+workers and servers stopped; revoked permission and session shutdown deny reads.
+The external stdin/stdout RPC test passed one test containing both session-owned
+and released-child-owned screenshot cases. Both retain the matching hash and
+leave model messages empty. These wire cases use a prepared test host; packaged
+CLI startup and frontend rendering remain unproven.
+
+Formatting, affected agent/coding-agent all-target Clippy with warnings denied,
+and diff whitespace checks passed. A missing test-only `ToolContext` qualification
+initially failed compilation and was corrected before the successful RPC and
+Clippy reruns. Source/transaction-bound receipts, the complete edit/verify
+evaluation and the remaining P3 package/platform gates remain open. No subagents
+were used; P3 and the full program remain in progress.
+
 Managed-lifetime prerequisite `77a9d4b` CI run `35296495119` was inspected while
 active: no failed jobs, with affected coding-agent/native/quality jobs still
 running. Workflow lint passed; a pending run is not a completion gate. This
