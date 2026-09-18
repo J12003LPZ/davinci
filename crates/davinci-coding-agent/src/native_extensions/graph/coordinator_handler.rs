@@ -14,6 +14,7 @@ use std::{
 struct ParentTools {
     language: Option<LanguageIntelligence>,
     processes: Option<ProcessManager>,
+    browser: Option<crate::native_extensions::browser::BrowserWorker>,
     cwd: PathBuf,
     contracted: bool,
     abort: Arc<AtomicBool>,
@@ -48,10 +49,16 @@ pub(super) fn for_worker(
                         graph_node: Some(spec.task_id.clone()),
                     })
             });
-    (language.is_some() || processes.is_some()).then(|| {
+    let browser = deps
+        .browser
+        .as_ref()
+        .zip(processes.as_ref())
+        .map(|(host, manager)| host.for_worker(manager.clone(), abort.clone()));
+    (language.is_some() || processes.is_some() || browser.is_some()).then(|| {
         Arc::new(ParentTools {
             language,
             processes,
+            browser,
             cwd: spec.cwd.clone(),
             contracted: spec.task_contract.is_some(),
             abort,
@@ -61,7 +68,8 @@ pub(super) fn for_worker(
 
 impl CoordinatorToolHandler for ParentTools {
     fn handles(&self, tool: &str) -> bool {
-        self.processes.is_some() && davinci_agent::tools::is_managed_process_tool(tool)
+        self.browser.is_some() && crate::native_extensions::browser::TOOL_NAMES.contains(&tool)
+            || self.processes.is_some() && davinci_agent::tools::is_managed_process_tool(tool)
             || self
                 .language
                 .as_ref()
@@ -69,6 +77,18 @@ impl CoordinatorToolHandler for ParentTools {
     }
 
     fn execute(&self, tool: &str, args: &Value) -> Result<ToolResult, ToolError> {
+        if crate::native_extensions::browser::TOOL_NAMES.contains(&tool) {
+            if self.contracted {
+                return Err(ToolError::Failed(
+                    "execution_contract_unenforceable: browser has no contracted sandbox".into(),
+                ));
+            }
+            return self
+                .browser
+                .as_ref()
+                .ok_or_else(|| ToolError::Failed("worker browser unavailable".into()))?
+                .execute(&self.cwd, tool, args);
+        }
         if davinci_agent::tools::is_managed_process_tool(tool) {
             if self.contracted && matches!(tool, "process_start" | "process_write") {
                 return Err(ToolError::Failed("execution_contract_unenforceable: managed processes have no contracted sandbox".into()));
@@ -127,6 +147,17 @@ mod tests {
         cwd: &Path,
         contracted: bool,
     ) -> TaskCoordinatorTransport {
+        transport_with_browser(parent, manager, permissions, cwd, contracted, None)
+    }
+
+    fn transport_with_browser(
+        parent: &RuntimeHandle,
+        manager: &ProcessManager,
+        permissions: &Arc<PermissionState>,
+        cwd: &Path,
+        contracted: bool,
+        browser: Option<&crate::native_extensions::browser::BrowserWorkerHost>,
+    ) -> TaskCoordinatorTransport {
         let child = AgentId::new();
         parent
             .registry
@@ -148,24 +179,37 @@ mod tests {
             })
             .unwrap();
         let abort = Arc::new(AtomicBool::new(false));
+        let processes = manager.child_lease(
+            permissions.clone(),
+            roles::shell_profile(roles::role_bash_policy(Role::Writer)),
+        );
+        let mut tools: Vec<String> = [
+            "process_start",
+            "process_status",
+            "process_output",
+            "process_write",
+        ]
+        .map(str::to_string)
+        .into();
+        if browser.is_some() {
+            tools.extend(
+                crate::native_extensions::browser::TOOL_NAMES
+                    .iter()
+                    .map(|v| (*v).to_string()),
+            );
+        }
+        let browser = browser.map(|host| host.for_worker(processes.clone(), abort.clone()));
         TaskCoordinatorTransport::bind_with_handler(
             parent,
             child,
             permissions.clone(),
-            vec![
-                "process_start".into(),
-                "process_status".into(),
-                "process_output".into(),
-                "process_write".into(),
-            ],
+            tools,
             cwd.into(),
             abort.clone(),
             Some(Arc::new(ParentTools {
                 language: None,
-                processes: Some(manager.child_lease(
-                    permissions.clone(),
-                    roles::shell_profile(roles::role_bash_policy(Role::Writer)),
-                )),
+                browser,
+                processes: Some(processes),
                 cwd: cwd.into(),
                 contracted,
                 abort,
@@ -193,6 +237,270 @@ mod tests {
             },
         )
         .unwrap()
+    }
+
+    #[test]
+    fn graph_worker_node_resolves_relative_script_from_canonical_workspace() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("relative.cjs"),
+            "console.log('RELATIVE_SCRIPT_OK')",
+        )
+        .unwrap();
+        let jobs = Arc::new(Mutex::new(JobBook::default()));
+        let permissions = Arc::new(PermissionState::new(PermissionPolicy::new(
+            PermissionMode::AlwaysApprove,
+        )));
+        let manager = manager(dir.path(), jobs, permissions.clone());
+        let parent = parent();
+        let worker = transport(&parent, &manager, &permissions, dir.path(), false);
+        let started = worker
+            .client()
+            .call(
+                "process_start",
+                &json!({"executable":"node","argv":["relative.cjs"]}),
+            )
+            .unwrap()
+            .details
+            .unwrap();
+        let id = &started["process"]["id"];
+        let until = Instant::now() + Duration::from_secs(5);
+        loop {
+            let output = worker
+                .client()
+                .call("process_output", &json!({"id":id}))
+                .unwrap();
+            if output.content.contains("RELATIVE_SCRIPT_OK") {
+                break;
+            }
+            assert!(
+                Instant::now() < until,
+                "relative script failed: {}",
+                output.content
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    #[test]
+    fn graph_browser_parent_rejects_unenforceable_contract() {
+        use crate::native_extensions::browser::{BrowserController, BrowserWorkerHost};
+        let dir = tempfile::tempdir().unwrap();
+        let permissions = Arc::new(PermissionState::new(PermissionPolicy::new(
+            PermissionMode::AlwaysApprove,
+        )));
+        let manager = manager(
+            dir.path(),
+            Arc::new(Mutex::new(JobBook::default())),
+            permissions.clone(),
+        );
+        let host = BrowserWorkerHost {
+            controller: BrowserController::default(),
+            supervisor: SupervisorCommand {
+                executable: std::env::current_exe().unwrap(),
+                argv: vec![],
+            },
+        };
+        let parent = parent();
+        let worker = transport_with_browser(
+            &parent,
+            &manager,
+            &permissions,
+            dir.path(),
+            true,
+            Some(&host),
+        );
+        let result = worker
+            .client()
+            .call("browser_open", &json!({"process_id":1,"port":1234}));
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("execution_contract_unenforceable"));
+    }
+
+    #[test]
+    #[ignore = "requires explicitly configured trusted Node and Playwright installation"]
+    fn graph_browser_transport_shares_server_and_isolates_worker_contexts() {
+        use crate::native_extensions::browser::{
+            BrowserConfig, BrowserController, BrowserWorkerHost,
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let jobs = Arc::new(Mutex::new(JobBook::default()));
+        let permissions = Arc::new(PermissionState::new(PermissionPolicy::new(
+            PermissionMode::AlwaysApprove,
+        )));
+        let manager = manager(dir.path(), jobs.clone(), permissions.clone());
+        let parent = parent();
+        let host = BrowserWorkerHost {
+            controller: BrowserController::new(
+                dir.path(),
+                BrowserConfig {
+                    enabled: true,
+                    node: std::env::var("DAVINCI_TRUSTED_NODE_TEST_PATH")
+                        .unwrap()
+                        .into(),
+                    package: std::env::var("DAVINCI_TRUSTED_PLAYWRIGHT_TEST_PATH")
+                        .unwrap()
+                        .into(),
+                    version: "1.62.0".into(),
+                },
+            ),
+            supervisor: SupervisorCommand {
+                executable: std::env::current_exe().unwrap(),
+                argv: vec![
+                    "--exact".into(),
+                    "native_extensions::graph::coordinator_handler::tests::helper_entry".into(),
+                    "--nocapture".into(),
+                ],
+            },
+        };
+        let first = transport_with_browser(
+            &parent,
+            &manager,
+            &permissions,
+            dir.path(),
+            false,
+            Some(&host),
+        );
+        let second = transport_with_browser(
+            &parent,
+            &manager,
+            &permissions,
+            dir.path(),
+            false,
+            Some(&host),
+        );
+        let port = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        let script = format!(
+            r#"const http=require('node:http');const s=http.createServer((q,r)=>{{r.setHeader('content-type','text/html');if(q.url==='/set')r.setHeader('set-cookie','owner=first; Path=/');r.end(`<label>Name<input aria-label=Name></label><select aria-label=Choice><option value=a>A</option><option value=b>B</option></select><button onclick="this.textContent='Done'">Start</button><p>`+ (q.headers.cookie||'NO_COOKIE')+'</p>');}});s.listen({port},'127.0.0.1',()=>console.log('READY'));setTimeout(()=>s.close(),60000)"#
+        );
+        std::fs::write(dir.path().join("server.cjs"), script).unwrap();
+        let args = json!({"executable":"node","argv":["server.cjs"],"ports":[port]});
+        let started = first
+            .client()
+            .call("process_start", &args)
+            .unwrap()
+            .details
+            .unwrap();
+        let id = started["process"]["id"].as_u64().unwrap();
+        let reused = second
+            .client()
+            .call("process_start", &args)
+            .unwrap()
+            .details
+            .unwrap();
+        assert_eq!(reused["process"]["id"], id);
+        assert_eq!(reused["reused"], true);
+        let until = Instant::now() + Duration::from_secs(5);
+        loop {
+            let output = first
+                .client()
+                .call("process_output", &json!({"id":id}))
+                .unwrap();
+            if output.content.contains("READY") {
+                break;
+            }
+            assert!(
+                Instant::now() < until,
+                "server not ready: {}",
+                output.content
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let call = |worker: &TaskCoordinatorTransport, tool: &str, args: Value| {
+            worker
+                .client()
+                .call_with_timeout(tool, &args, None, Duration::from_secs(35))
+                .unwrap()
+        };
+        let one = call(
+            &first,
+            "browser_open",
+            json!({"process_id":id,"port":port,"path":"/set"}),
+        )
+        .details
+        .unwrap();
+        let two = call(
+            &second,
+            "browser_open",
+            json!({"process_id":id,"port":port}),
+        )
+        .details
+        .unwrap();
+        let one_id = one["browser_id"].as_str().unwrap();
+        let two_id = two["browser_id"].as_str().unwrap();
+        assert_ne!(one_id, two_id);
+        assert_eq!(host.controller.context_count(), 2);
+        assert!(second
+            .client()
+            .call("browser_snapshot", &json!({"browser_id":one_id}))
+            .is_err());
+        let snapshot = call(&second, "browser_snapshot", json!({"browser_id":two_id}));
+        assert!(snapshot.content.contains("NO_COOKIE"));
+        assert!(!snapshot.content.contains("owner=first"));
+        for (tool, args) in [
+            (
+                "browser_type",
+                json!({"browser_id":two_id,"selector":{"kind":"label","value":"Name"},"text":"Ada"}),
+            ),
+            (
+                "browser_select",
+                json!({"browser_id":two_id,"selector":{"kind":"label","value":"Choice"},"value":"b"}),
+            ),
+            (
+                "browser_click",
+                json!({"browser_id":two_id,"selector":{"kind":"role","role":"button","name":"Start"}}),
+            ),
+        ] {
+            assert!(!call(&second, tool, args).is_error);
+        }
+        assert!(
+            call(&second, "browser_snapshot", json!({"browser_id":two_id}))
+                .content
+                .contains(">Done</button>")
+        );
+        for tool in [
+            "browser_console",
+            "browser_network",
+            "browser_accessibility",
+            "browser_screenshot",
+        ] {
+            assert!(!call(&second, tool, json!({"browser_id":two_id})).is_error);
+        }
+        permissions
+            .lock()
+            .unwrap()
+            .deny
+            .push(PermissionRule::bare("browser_snapshot"));
+        assert!(second
+            .client()
+            .call("browser_snapshot", &json!({"browser_id":two_id}))
+            .is_err());
+        drop(first);
+        assert_eq!(
+            host.controller.context_count(),
+            1,
+            "worker teardown must close its context even with revoked permission"
+        );
+        permissions.lock().unwrap().deny.clear();
+        assert!(
+            call(&second, "browser_snapshot", json!({"browser_id":two_id}))
+                .content
+                .contains(">Done</button>")
+        );
+        assert!(!call(&second, "browser_close", json!({"browser_id":two_id})).is_error);
+        drop(second);
+        assert_eq!(host.controller.context_count(), 0);
+        let until = Instant::now() + Duration::from_secs(5);
+        while jobs.lock().unwrap().get(id as u32).unwrap().status() == JobStatus::Running {
+            assert!(Instant::now() < until, "worker process not released");
+            std::thread::sleep(Duration::from_millis(10));
+        }
     }
 
     #[test]
@@ -345,6 +653,7 @@ mod tests {
         let handler = ParentTools {
             language: Some(language),
             processes: None,
+            browser: None,
             cwd: dir.path().into(),
             contracted: false,
             abort: Arc::new(AtomicBool::new(false)),
@@ -422,6 +731,7 @@ mod tests {
             governor: None,
             language_intelligence: None,
             processes: Some(manager),
+            browser: None,
             runtime: Some(parent()),
             permissions: Some(permissions),
             task_contract: None,

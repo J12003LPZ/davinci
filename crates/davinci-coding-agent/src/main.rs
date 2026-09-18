@@ -7728,6 +7728,14 @@ fn apply_graph_session_context(parsed: &Args, agent: &Agent, host: &ExtensionHos
             .set_permissions(Some(agent.permissions.clone()));
         native.graph.set_task_contract(agent.active_contract());
         native.graph.processes = agent.tool_context.processes.clone();
+        native.graph.browser = agent
+            .tool_context
+            .foreground_supervisor
+            .clone()
+            .map(|supervisor| native_extensions::browser::BrowserWorkerHost {
+                controller: native.browser.clone(),
+                supervisor,
+            });
     }
     let settings = load_merged_settings_with_override(
         &default_agent_dir(),

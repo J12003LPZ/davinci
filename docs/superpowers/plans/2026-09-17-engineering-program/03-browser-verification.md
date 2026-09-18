@@ -6,6 +6,55 @@ Dependencies: P2 and P4 green; existing interaction_testing protocol/evidence/ar
 Requirements authority: project section 8 and cross-cutting sections 18-40;
 project numbers are kept stable while execution order follows the program design.
 
+### Shared Graph browser transport checkpoint
+
+Writer and TestAnalyzer browser tools remain deferred and require the existing
+authenticated parent task-coordinator channel. Contextual worker dispatch forwards
+all ten tools with its live cancellation signal and bounded 35-second transport
+deadline. Transport failure has no local-engine fallback. The parent carries the
+normal session's controller and trusted supervisor, creates a worker process lease,
+and uses the same native browser implementation. Each worker tracks only its own
+opaque contexts. Teardown closes those contexts even after tool permission is
+revoked; the shared engine and artifact budget survive other workers' teardown.
+Unenforceable hard execution contracts fail closed rather than silently executing
+the browser outside a contracted sandbox.
+
+Executed evidence:
+
+- Worker dispatch was RED: an unavailable parent returned the disabled local
+  browser fallback. It is GREEN after forwarding through the parent channel.
+- Role/transport/deferred-tool regression passed after the original RED
+  `browser_open` transport requirement failure.
+- Explicitly enabled real Chromium test
+  `graph_browser_transport_shares_server_and_isolates_worker_contexts`: one passed,
+  zero skips. Two authenticated worker transports reuse the same real managed
+  HTTP server; browser cookie state is isolated, foreign context IDs are denied,
+  all ten actions are exercised, revoked snapshot permission is denied, and
+  teardown removes exactly the departing worker's context. This is a transport
+  fixture, not yet the full Graph scheduler/worker frontend evaluation.
+- The real fixture exposed Node failing to resolve a relative script from a
+  Windows verbatim current directory (`EISDIR`, `lstat 'C:'`). Supervisor startup
+  now simplifies that spelling only if both paths canonicalize to the same
+  authorized directory. The non-ignored
+  `graph_worker_node_resolves_relative_script_from_canonical_workspace` regression
+  passes, retaining the Writer role's prohibition on inline Node evaluation.
+- Focused library browser checks: 17 passed, two real-backend cases explicitly
+  ignored in that offline invocation. Parent coordinator checks: eight passed,
+  one actual-browser case explicitly ignored. The actual Graph case was then
+  run explicitly and passed. Agent process-manager checks: 16 passed. CLI
+  extension-host checks: 12 passed. The actual normal-session browser test also
+  passed with both executor attachments, zero skips.
+- Affected-package formatting check and all-target Clippy with `-D warnings`
+  passed for agent and coding-agent. Diff whitespace and production dispatch,
+  authority, ownership, teardown and Windows path changes were reviewed solo.
+
+Native-adapter prerequisite `707674f` has green CI `35294015238`, workflow lint
+`35294015248`, and SARIF interoperability `35294015230`. This checkpoint still
+requires its own exact-head CI. Distinct Graph worktree binding, contracted browser
+execution, scheduler/worker end-to-end evaluation, in-flight cancellation, recovery,
+cross-platform listener proof and transaction-bound evidence remain open. The full
+program and remaining P3 gates are unchanged.
+
 ### Native normal-session dispatch checkpoint
 
 All ten browser tools now use the existing native registry and context-aware CLI

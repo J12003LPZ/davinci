@@ -74,6 +74,109 @@ impl Default for BrowserController {
     }
 }
 
+/// Parent-owned engine and trusted executable authority, never supplied by a worker.
+#[derive(Debug, Clone)]
+pub struct BrowserWorkerHost {
+    pub controller: BrowserController,
+    pub supervisor: davinci_agent::jobs::supervisor::SupervisorCommand,
+}
+
+/// One worker's contexts; physical engine and artifact budget remain shared.
+pub(super) struct BrowserWorker {
+    host: BrowserWorkerHost,
+    context: ToolContext,
+    owned: Mutex<std::collections::HashSet<Uuid>>,
+}
+
+impl BrowserWorkerHost {
+    pub(super) fn for_worker(
+        &self,
+        processes: davinci_agent::process_manager::ProcessManager,
+        abort: Arc<std::sync::atomic::AtomicBool>,
+    ) -> BrowserWorker {
+        BrowserWorker {
+            host: self.clone(),
+            context: ToolContext {
+                processes: Some(processes),
+                foreground_supervisor: Some(self.supervisor.clone()),
+                abort: Some(abort),
+                ..Default::default()
+            },
+            owned: Mutex::new(Default::default()),
+        }
+    }
+}
+
+impl BrowserWorker {
+    pub(super) fn execute(
+        &self,
+        cwd: &Path,
+        name: &str,
+        args: &Value,
+    ) -> Result<ToolResult, ToolError> {
+        let request = parse(name, args).map_err(ToolError::Failed)?;
+        if let Request::Action { id, .. } = &request {
+            if !self
+                .owned
+                .lock()
+                .map_err(|_| ToolError::Failed("worker browser state unavailable".into()))?
+                .contains(id)
+            {
+                return Err(ToolError::Failed(
+                    "worker browser resource unavailable".into(),
+                ));
+            }
+        }
+        let result = self.host.controller.execute(cwd, name, args, &self.context);
+        // Backend failures can close contexts. Do not retain stale owner IDs.
+        {
+            let store = self
+                .host
+                .controller
+                .store
+                .lock()
+                .map_err(|_| ToolError::Failed("browser state unavailable".into()))?;
+            self.owned
+                .lock()
+                .map_err(|_| ToolError::Failed("worker browser state unavailable".into()))?
+                .retain(|id| store.resources.contains_key(id));
+        }
+        let result = result?;
+        if !result.is_error {
+            let mut owned = self
+                .owned
+                .lock()
+                .map_err(|_| ToolError::Failed("worker browser state unavailable".into()))?;
+            if name == "browser_open" {
+                if let Some(id) = result
+                    .details
+                    .as_ref()
+                    .and_then(|v| v["browser_id"].as_str())
+                    .and_then(|v| Uuid::parse_str(v).ok())
+                {
+                    owned.insert(id);
+                }
+            } else if name == "browser_close" {
+                if let Request::Action { id, .. } = request {
+                    owned.remove(&id);
+                }
+            }
+        }
+        Ok(result)
+    }
+}
+
+impl Drop for BrowserWorker {
+    fn drop(&mut self) {
+        // Teardown is host cleanup, independent of revoked tool permission.
+        if let Ok(owned) = self.owned.get_mut() {
+            for id in owned.drain() {
+                self.host.controller.close(id);
+            }
+        }
+    }
+}
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Open {
@@ -193,6 +296,10 @@ fn parse(name: &str, args: &Value) -> Result<Request, String> {
 }
 
 impl BrowserController {
+    #[cfg(test)]
+    pub(crate) fn context_count(&self) -> usize {
+        self.store.lock().unwrap().resources.len()
+    }
     pub fn new(workspace: &Path, config: BrowserConfig) -> Self {
         Self {
             config,

@@ -182,10 +182,24 @@ fn readers_complete(readers: Vec<thread::JoinHandle<std::io::Result<()>>>) -> bo
 }
 
 fn spawn(config: ProcessConfig) -> std::io::Result<std::process::Child> {
+    #[cfg(windows)]
+    let cwd = {
+        // Node and other runtimes cannot resolve relative files from a verbatim
+        // current directory. Preserve the authorized location: simplify only
+        // when both spellings resolve to the same canonical directory.
+        let ordinary = crate::permission::strip_verbatim_prefix(&config.cwd);
+        if ordinary.canonicalize()? == config.cwd.canonicalize()? {
+            ordinary
+        } else {
+            config.cwd
+        }
+    };
+    #[cfg(not(windows))]
+    let cwd = config.cwd;
     let mut command = Command::new(config.executable);
     command
         .args(config.argv)
-        .current_dir(config.cwd)
+        .current_dir(cwd)
         .env_clear()
         .envs(config.environment)
         .stdin(Stdio::piped())

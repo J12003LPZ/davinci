@@ -1112,6 +1112,14 @@ impl ExtensionHost {
             ));
         }
         if crate::native_extensions::browser::TOOL_NAMES.contains(&name) {
+            if let Some(parent) = &context.task_coordinator {
+                return parent.call_with_timeout(
+                    name,
+                    args,
+                    context.abort.as_deref(),
+                    std::time::Duration::from_secs(35),
+                );
+            }
             let browser = self
                 .native
                 .lock()
@@ -1495,6 +1503,33 @@ fn resolve_extension_shortcuts(
 mod tests {
     use super::*;
     use crate::js_host::JsRegisteredProvider;
+
+    #[test]
+    fn browser_worker_dispatch_does_not_fall_back_when_parent_transport_is_unavailable() {
+        let host = ExtensionHost::default();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        drop(listener);
+        let context = davinci_agent::ToolContext {
+            task_coordinator: Some(
+                davinci_agent::runtime::task_transport::TaskCoordinatorClient::new(
+                    address,
+                    "unavailable-test-parent".into(),
+                ),
+            ),
+            ..Default::default()
+        };
+        let result = host.execute_js_or_manifest_tool_with_context(
+            Path::new("."),
+            "browser_open",
+            &serde_json::json!({"process_id":1,"port":1234}),
+            &context,
+        );
+        assert!(
+            result.is_err(),
+            "worker must not use its disabled local browser as fallback"
+        );
+    }
 
     #[test]
     fn contextual_dispatch_rejects_cancelled_native_and_extension_requests() {
