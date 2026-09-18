@@ -158,6 +158,26 @@ mod tests {
         contracted: bool,
         browser: Option<&crate::native_extensions::browser::BrowserWorkerHost>,
     ) -> TaskCoordinatorTransport {
+        transport_with_browser_abort(
+            parent,
+            manager,
+            permissions,
+            cwd,
+            contracted,
+            browser,
+            Arc::new(AtomicBool::new(false)),
+        )
+    }
+
+    fn transport_with_browser_abort(
+        parent: &RuntimeHandle,
+        manager: &ProcessManager,
+        permissions: &Arc<PermissionState>,
+        cwd: &Path,
+        contracted: bool,
+        browser: Option<&crate::native_extensions::browser::BrowserWorkerHost>,
+        abort: Arc<AtomicBool>,
+    ) -> TaskCoordinatorTransport {
         let child = AgentId::new();
         parent
             .registry
@@ -178,7 +198,6 @@ mod tests {
                 failure_reason: None,
             })
             .unwrap();
-        let abort = Arc::new(AtomicBool::new(false));
         let processes = manager.child_lease(
             permissions.clone(),
             roles::shell_profile(roles::role_bash_policy(Role::Writer)),
@@ -472,6 +491,49 @@ mod tests {
         ] {
             assert!(!call(&second, tool, json!({"browser_id":two_id})).is_error);
         }
+        let abort = Arc::new(AtomicBool::new(false));
+        let cancelled = transport_with_browser_abort(
+            &parent,
+            &manager,
+            &permissions,
+            dir.path(),
+            false,
+            Some(&host),
+            abort.clone(),
+        );
+        let reused = call(&cancelled, "process_start", args.clone());
+        assert_eq!(reused.details.unwrap()["process"]["id"], id);
+        let opened = call(
+            &cancelled,
+            "browser_open",
+            json!({"process_id":id,"port":port}),
+        );
+        let cancelled_id = opened.details.unwrap()["browser_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert_eq!(host.controller.context_count(), 3);
+        let started = Instant::now();
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                std::thread::sleep(Duration::from_millis(100));
+                abort.store(true, std::sync::atomic::Ordering::SeqCst);
+            });
+            // Await the parent response so early client-side abort cannot mask
+            // a handler that continues running the browser action.
+            let result = cancelled.client().call_with_timeout("browser_click",
+                &json!({"browser_id":cancelled_id,"selector":{"kind":"role","role":"button","name":"Missing"}}),
+                None, Duration::from_secs(35));
+            assert!(result.is_err(), "cancelled parent action must not succeed");
+        });
+        drop(cancelled);
+        assert!(started.elapsed() < Duration::from_secs(2));
+        assert_eq!(host.controller.context_count(), 2);
+        assert!(
+            call(&second, "browser_snapshot", json!({"browser_id":two_id}))
+                .content
+                .contains(">Done</button>")
+        );
         permissions
             .lock()
             .unwrap()

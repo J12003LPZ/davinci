@@ -581,7 +581,15 @@ seconds, remove that context and preserve another context. The explicitly enable
 executable fixture passed without skips. Checkpoint `487b6f6` was pushed; CI
 `35295532393` was queued when inspected, so exact-head CI is not yet established.
 
-P3 remains incomplete. Graph in-flight cancellation integration,
+The authenticated Graph transport Chromium fixture now also admits a third
+worker, reuses the same managed server, opens its isolated context and cancels a
+missing-selector action. It waits for the parent handler response with client
+early-abort disabled, joins worker teardown within two seconds, checks the other
+two contexts survive and verifies another worker's DOM. The explicit fixture
+passed without skips; all eight offline coordinator-handler tests passed (the
+real fixture is ignored in that offline selector).
+
+P3 remains incomplete. Full Graph scheduler evaluation,
 stale-resource reconciliation, dead-engine recovery, remaining platform ownership
 proofs, transaction-bound receipts, artifact retrieval and final evaluations still
 require implementation or direct evidence. This checkpoint is not its completion
