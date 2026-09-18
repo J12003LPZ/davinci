@@ -5,6 +5,8 @@
 .idea/
 .vscode/
 node_modules/
+!crates/davinci-coding-agent/tests/fixtures/**/node_modules/
+!crates/davinci-coding-agent/tests/fixtures/**/node_modules/**
 .pi/
 .davinci/
 .serena/
