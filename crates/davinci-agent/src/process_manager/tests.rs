@@ -413,6 +413,43 @@ fn browser_dev_server_requires_active_owned_declared_port_and_current_authority(
     assert_eq!(child.owner.active_snapshot(id).unwrap().state, "running");
     // Historical status is still useful; it is not authority to attach a browser.
     assert!(manager.owner.snapshot(id).is_ok());
+    let retained_request = BrowserRequest {
+        name: "browser_screenshot",
+        lease: Some(&lease),
+        ..request
+    };
+    assert_eq!(
+        manager
+            .with_retained_browser_artifact(retained_request, || Ok("retained bytes"))
+            .unwrap(),
+        "retained bytes"
+    );
+    assert!(child
+        .with_retained_browser_artifact::<()>(retained_request, || panic!(
+            "foreign lease must not run retrieval"
+        ))
+        .is_err());
+    let revoked = manager.with_retained_browser_artifact(retained_request, || {
+        session
+            .permissions
+            .lock()
+            .unwrap()
+            .deny
+            .push(PermissionRule::bare("browser_screenshot"));
+        Ok("bytes must not escape after revocation")
+    });
+    assert!(revoked.is_err());
+    session.permissions.lock().unwrap().deny.pop();
+    let cancelled = AtomicBool::new(true);
+    assert!(manager
+        .with_retained_browser_artifact::<()>(
+            BrowserRequest {
+                abort: Some(&cancelled),
+                ..retained_request
+            },
+            || panic!("cancelled retrieval must not run")
+        )
+        .is_err());
     assert!(manager
         .with_browser_dev_server(
             BrowserRequest {
@@ -424,6 +461,17 @@ fn browser_dev_server_requires_active_owned_declared_port_and_current_authority(
         )
         .is_err());
     drop(child);
+    assert!(manager
+        .with_retained_browser_artifact(retained_request, || {
+            manager.shutdown();
+            Ok("ended session must not return retained bytes")
+        })
+        .is_err());
+    assert!(manager
+        .with_retained_browser_artifact::<()>(retained_request, || panic!(
+            "ended session must not read retained artifacts"
+        ))
+        .is_err());
     assert!(
         !child_lease.is_live(),
         "observation must not retain its owner"

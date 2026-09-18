@@ -207,6 +207,7 @@ fn normal_browser_native_dispatch_actions_revocation_and_cleanup() {
             assert!(!error, "{name}: {output}");
             assert_eq!(details["verification"], "observations_only");
         }
+        let mut retained_request = None;
         for name in [
             "browser_snapshot",
             "browser_accessibility",
@@ -228,6 +229,7 @@ fn normal_browser_native_dispatch_actions_revocation_and_cleanup() {
                 assert!(details["result"]["artifact"].is_string(), "{details}");
                 assert!(details["result"].get("bytes").is_none());
                 let request = json!({"browser_id":id,"artifact":details["result"]["artifact"],"offset":0,"limit":64});
+                retained_request = Some(request.clone());
                 let retrieved = controller
                     .retrieve_artifact(root.path(), &request, &agent.tool_context)
                     .unwrap();
@@ -376,6 +378,16 @@ fn normal_browser_native_dispatch_actions_revocation_and_cleanup() {
             json!({"process_id":process_id,"port":port,"host":loopback_host}),
         );
         assert!(!error, "{output}");
+        assert!(
+            controller
+                .retrieve_artifact(
+                    root.path(),
+                    retained_request.as_ref().unwrap(),
+                    &agent.tool_context
+                )
+                .is_ok(),
+            "closing the browser context must not discard retained artifact authority"
+        );
         let expired_id = expired["browser_id"].as_str().unwrap();
         let (_, output, error) = super::test_impact_integration_tests::call(
             &mut agent,
@@ -383,6 +395,16 @@ fn normal_browser_native_dispatch_actions_revocation_and_cleanup() {
             json!({"id":process_id}),
         );
         assert!(!error, "{output}");
+        assert!(
+            controller
+                .retrieve_artifact(
+                    root.path(),
+                    retained_request.as_ref().unwrap(),
+                    &agent.tool_context
+                )
+                .is_ok(),
+            "stopping the dev server must not discard retained evidence"
+        );
         let (_, _, error) = super::test_impact_integration_tests::call(
             &mut agent,
             "browser_console",

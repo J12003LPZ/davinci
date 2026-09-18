@@ -892,4 +892,29 @@ has been compiled; a complete external RPC frontend exchange is not yet proven.
 Five offline browser tests passed (two backend-dependent cases ignored in that
 selector); formatting, affected-crate all-target Clippy with warnings denied and
 diff whitespace checks passed.
+
+### Retained artifact lifecycle checkpoint
+
+The live-context-only lookup reproduced a lifecycle defect: the retained PNG
+became inaccessible once its context closed. Retention now records its immutable
+browser context ID and host-issued process owner lease in the existing browser
+store, separately from the live resource. This metadata holds no browser engine
+reference. Closing contexts, replacing a crashed browser backend or stopping
+the dev server does not discard retained bytes or their ownership identity.
+
+The process adapter's retained-artifact boundary requires that original lease
+to belong to its current managed owner, checks canonical workspace and current
+`browser_screenshot` permission, and checks cancellation/session shutdown both
+before and after reading. It deliberately does not attach to a listening server:
+stored evidence is not a live browser action. Sibling worker leases and new
+sessions cannot borrow the original artifact owner identity.
+
+RED: the expanded real Chromium fixture failed after context closure before the
+fix. GREEN: its explicitly enabled normal-session case passed across IPv4/IPv6
+and both executor attachments, including retrieval after context and server
+shutdown. The focused process boundary regression passed, covering sibling
+lease rejection, permission revocation during retrieval, cancellation and parent
+session shutdown. External RPC frontend exchange, Graph retrieval transport,
+transaction-bound receipts and remaining P3 gates are still open. No subagents
+were used; P3 and the full program remain in progress.
 No subagents were used. P3 and the full program remain in progress.

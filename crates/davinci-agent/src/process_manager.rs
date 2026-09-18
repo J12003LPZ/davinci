@@ -92,6 +92,14 @@ pub struct BrowserDevServerLease {
 }
 
 impl BrowserDevServerLease {
+    pub fn process_id(&self) -> u32 {
+        self.process_id
+    }
+
+    pub fn port(&self) -> u16 {
+        self.port
+    }
+
     /// Cleanup observation only; permission must still be checked per request.
     pub fn is_live(&self) -> bool {
         self.liveness.is_live()
@@ -215,6 +223,63 @@ impl ProcessManager {
         }
         if self.browser_binding(process_id, port, ipv6)? != current {
             return Err("browser dev-server lifetime changed during the request".into());
+        }
+        Ok(result)
+    }
+
+    /// Retained bytes keep their immutable host-issued owner binding, but do not
+    /// require the original dev server to remain alive. Current policy still gates
+    /// every read, including approval, cancellation and parent-session shutdown.
+    pub fn with_retained_browser_artifact<T>(
+        &self,
+        request: BrowserRequest<'_>,
+        operation: impl FnOnce() -> Result<T, String>,
+    ) -> Result<T, String> {
+        let lease = request
+            .lease
+            .ok_or("browser artifact requires its original lease")?;
+        if request.name != "browser_screenshot"
+            || lease.owner != self.owner.id()
+            || lease.process_id != request.process_id
+            || lease.port != request.port
+        {
+            return Err("browser artifact ownership mismatch".into());
+        }
+        self.owner.ensure_open()?;
+        let cancelled = || {
+            request
+                .abort
+                .is_some_and(|value| value.load(Ordering::SeqCst))
+        };
+        if cancelled() {
+            return Err("browser artifact request cancelled".into());
+        }
+        if serde_json::to_vec(request.args)
+            .map_err(|_| "invalid browser artifact arguments")?
+            .len()
+            > 64 * 1024
+        {
+            return Err("browser artifact arguments exceed limit".into());
+        }
+        if !request
+            .cwd
+            .canonicalize()
+            .map_err(|_| "browser cwd unavailable")?
+            .starts_with(&self.workspace)
+        {
+            return Err("browser artifact request is outside its workspace".into());
+        }
+        let authority = self.authorize(request.cwd, request.name, request.args, request.permit)?;
+        self.recheck(request.cwd, request.name, request.args, &authority)?;
+        self.owner.ensure_open()?;
+        if cancelled() {
+            return Err("browser artifact request cancelled".into());
+        }
+        let result = operation()?;
+        self.recheck(request.cwd, request.name, request.args, &authority)?;
+        self.owner.ensure_open()?;
+        if cancelled() {
+            return Err("browser artifact request cancelled".into());
         }
         Ok(result)
     }

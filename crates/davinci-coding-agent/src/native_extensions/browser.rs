@@ -46,6 +46,7 @@ struct Store {
     starting: Option<Arc<Startup>>,
     opening: usize,
     resources: HashMap<Uuid, Arc<Resource>>,
+    retained: HashMap<String, RetainedArtifact>,
 }
 #[derive(Default)]
 struct Startup {
@@ -91,7 +92,11 @@ struct Resource {
     port: u16,
     lease: BrowserDevServerLease,
     engine: Arc<BrowserProcess>,
-    artifacts: Mutex<std::collections::HashSet<String>>,
+}
+#[derive(Clone)]
+struct RetainedArtifact {
+    browser_id: Uuid,
+    lease: BrowserDevServerLease,
 }
 #[derive(Clone)]
 pub struct BrowserController {
@@ -401,23 +406,20 @@ impl BrowserController {
             .processes
             .as_ref()
             .ok_or("browser process manager unavailable")?;
-        let resource = self
+        let retained = self
             .store
             .lock()
             .map_err(|_| "browser state unavailable")?
-            .resources
-            .get(&request.browser_id)
+            .retained
+            .get(&request.artifact)
             .cloned()
-            .ok_or("browser resource unavailable")?;
-        manager.with_verified_browser_dev_server(BrowserRequest {
+            .filter(|retained| retained.browser_id == request.browser_id)
+            .ok_or("browser artifact unavailable for this context")?;
+        manager.with_retained_browser_artifact(BrowserRequest {
             cwd, name: "browser_screenshot", args,
             abort: context.abort.as_deref(), permit: context.dispatch_permit.as_deref(),
-            process_id: resource.process_id, port: resource.port, lease: Some(&resource.lease),
-        }, |_| {
-            if !resource.artifacts.lock().map_err(|_| "browser artifact ownership unavailable")?
-                .contains(&request.artifact) {
-                return Err("browser artifact unavailable for this context".into());
-            }
+            process_id: retained.lease.process_id(), port: retained.lease.port(), lease: Some(&retained.lease),
+        }, || {
             let artifacts = self.artifacts.lock().map_err(|_| "browser artifacts unavailable")?;
             let bytes = artifacts.items.get(&request.artifact).ok_or("browser artifact unavailable")?;
             if request.offset > bytes.len() { return Err("browser artifact offset exceeds size".into()); }
@@ -646,7 +648,7 @@ impl BrowserController {
                         let opened = engine.request_with_abort(json!({"op":"open","options":options}), Duration::from_secs(30), context.abort.as_deref())?;
                         let backend = opened["resource"].as_u64().filter(|id| *id > 0).ok_or("invalid browser resource")?;
                         let id = Uuid::new_v4();
-                        let resource = Arc::new(Resource { backend, process_id, port, lease: lease.clone(), engine: engine.clone(), artifacts: Mutex::new(Default::default()) });
+                        let resource = Arc::new(Resource { backend, process_id, port, lease: lease.clone(), engine: engine.clone() });
                         self.store.lock().map_err(|_| "browser state unavailable")?.resources.insert(id, resource);
                         created = Some(id);
                         let navigation = engine.request_with_abort(json!({"op":"execute","resource":backend,
@@ -668,8 +670,10 @@ impl BrowserController {
                         if name == "browser_screenshot" {
                             let mut artifacts = self.artifacts.lock().map_err(|_| "browser artifacts unavailable")?;
                             result = resource.engine.retain_screenshot(&result, &mut artifacts)?;
-                            resource.artifacts.lock().map_err(|_| "browser artifact ownership unavailable")?
-                                .insert(result["artifact"].as_str().ok_or("invalid retained artifact")?.to_owned());
+                            let label = result["artifact"].as_str().ok_or("invalid retained artifact")?.to_owned();
+                            drop(artifacts);
+                            self.store.lock().map_err(|_| "browser state unavailable")?.retained.insert(label,
+                                RetainedArtifact { browser_id: id, lease: resource.lease.clone() });
                         }
                         Ok(json!({"status":"observed","browser_id":id,"result":result}))
                     }
