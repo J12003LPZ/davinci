@@ -227,6 +227,65 @@ fn normal_browser_native_dispatch_actions_revocation_and_cleanup() {
             if name == "browser_screenshot" {
                 assert!(details["result"]["artifact"].is_string(), "{details}");
                 assert!(details["result"].get("bytes").is_none());
+                let request = json!({"browser_id":id,"artifact":details["result"]["artifact"],"offset":0,"limit":64});
+                let retrieved = controller
+                    .retrieve_artifact(root.path(), &request, &agent.tool_context)
+                    .unwrap();
+                use base64::Engine;
+                let bytes = base64::engine::general_purpose::STANDARD
+                    .decode(retrieved["base64"].as_str().unwrap())
+                    .unwrap();
+                assert_eq!(&bytes[..8], b"\x89PNG\r\n\x1a\n");
+                assert_eq!(retrieved["sha256"], details["result"]["sha256"]);
+                assert_eq!(bytes.len(), 64);
+                let mut tail = request.clone();
+                tail["offset"] = details["result"]["size"].clone();
+                let eof = controller
+                    .retrieve_artifact(root.path(), &tail, &agent.tool_context)
+                    .unwrap();
+                assert_eq!(eof["eof"], true);
+                assert_eq!(eof["base64"], "");
+                tail["offset"] = json!(details["result"]["size"].as_u64().unwrap() + 1);
+                assert!(controller
+                    .retrieve_artifact(root.path(), &tail, &agent.tool_context)
+                    .is_err());
+                let (other, output, error) = super::test_impact_integration_tests::call(
+                    &mut agent,
+                    "browser_open",
+                    json!({"process_id":process_id,"port":port,"host":loopback_host}),
+                );
+                assert!(!error, "{output}");
+                let mut foreign = request.clone();
+                foreign["browser_id"] = other["browser_id"].clone();
+                assert!(controller
+                    .retrieve_artifact(root.path(), &foreign, &agent.tool_context)
+                    .is_err());
+                let (_, output, error) = super::test_impact_integration_tests::call(
+                    &mut agent,
+                    "browser_close",
+                    json!({"browser_id":other["browser_id"]}),
+                );
+                assert!(!error, "{output}");
+                let mut invalid = request.clone();
+                invalid["limit"] = json!(65537);
+                assert!(controller
+                    .retrieve_artifact(root.path(), &invalid, &agent.tool_context)
+                    .is_err());
+                invalid = request.clone();
+                invalid["artifact"] = json!("../outside.png");
+                assert!(controller
+                    .retrieve_artifact(root.path(), &invalid, &agent.tool_context)
+                    .is_err());
+                agent
+                    .permissions
+                    .lock()
+                    .unwrap()
+                    .deny
+                    .push(PermissionRule::bare("browser_screenshot"));
+                assert!(controller
+                    .retrieve_artifact(root.path(), &request, &agent.tool_context)
+                    .is_err());
+                agent.permissions.lock().unwrap().deny.pop();
             }
         }
         let (interrupted, output, error) = super::test_impact_integration_tests::call(

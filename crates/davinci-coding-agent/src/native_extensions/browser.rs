@@ -91,6 +91,7 @@ struct Resource {
     port: u16,
     lease: BrowserDevServerLease,
     engine: Arc<BrowserProcess>,
+    artifacts: Mutex<std::collections::HashSet<String>>,
 }
 #[derive(Clone)]
 pub struct BrowserController {
@@ -364,6 +365,72 @@ fn parse(name: &str, args: &Value) -> Result<Request, String> {
 }
 
 impl BrowserController {
+    /// Frontend-only bounded binary retrieval; never added to model tool output.
+    pub fn retrieve_artifact(
+        &self,
+        cwd: &Path,
+        args: &Value,
+        context: &ToolContext,
+    ) -> Result<Value, String> {
+        use base64::Engine;
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Retrieval {
+            browser_id: Uuid,
+            artifact: String,
+            offset: usize,
+            limit: usize,
+        }
+        if serde_json::to_vec(args)
+            .map_err(|_| "invalid browser artifact request")?
+            .len()
+            > 12 * 1024
+        {
+            return Err("browser artifact request exceeds limit".into());
+        }
+        let request: Retrieval =
+            serde_json::from_value(args.clone()).map_err(|_| "invalid browser artifact request")?;
+        if !self.config.enabled
+            || request.artifact.len() > 128
+            || !(1..=65536).contains(&request.limit)
+            || cwd.canonicalize().map_err(|_| "browser cwd unavailable")? != self.workspace
+        {
+            return Err("invalid browser artifact bounds or workspace".into());
+        }
+        let manager = context
+            .processes
+            .as_ref()
+            .ok_or("browser process manager unavailable")?;
+        let resource = self
+            .store
+            .lock()
+            .map_err(|_| "browser state unavailable")?
+            .resources
+            .get(&request.browser_id)
+            .cloned()
+            .ok_or("browser resource unavailable")?;
+        manager.with_verified_browser_dev_server(BrowserRequest {
+            cwd, name: "browser_screenshot", args,
+            abort: context.abort.as_deref(), permit: context.dispatch_permit.as_deref(),
+            process_id: resource.process_id, port: resource.port, lease: Some(&resource.lease),
+        }, |_| {
+            if !resource.artifacts.lock().map_err(|_| "browser artifact ownership unavailable")?
+                .contains(&request.artifact) {
+                return Err("browser artifact unavailable for this context".into());
+            }
+            let artifacts = self.artifacts.lock().map_err(|_| "browser artifacts unavailable")?;
+            let bytes = artifacts.items.get(&request.artifact).ok_or("browser artifact unavailable")?;
+            if request.offset > bytes.len() { return Err("browser artifact offset exceeds size".into()); }
+            let end = request.offset.saturating_add(request.limit).min(bytes.len());
+            Ok(json!({"artifact":request.artifact,"mediaType":"image/png",
+                "verification":"observations_only",
+                "sha256":crate::interaction_testing::artifacts::compute_sha256(bytes),
+                "size":bytes.len(),"offset":request.offset,"nextOffset":end,
+                "eof":end == bytes.len(),
+                "base64":base64::engine::general_purpose::STANDARD.encode(&bytes[request.offset..end])}))
+        })
+    }
+
     #[cfg(test)]
     pub(crate) fn shutdown_backend_for_test(&self) {
         let engine = self.store.lock().unwrap().engine.clone().unwrap();
@@ -579,7 +646,7 @@ impl BrowserController {
                         let opened = engine.request_with_abort(json!({"op":"open","options":options}), Duration::from_secs(30), context.abort.as_deref())?;
                         let backend = opened["resource"].as_u64().filter(|id| *id > 0).ok_or("invalid browser resource")?;
                         let id = Uuid::new_v4();
-                        let resource = Arc::new(Resource { backend, process_id, port, lease: lease.clone(), engine: engine.clone() });
+                        let resource = Arc::new(Resource { backend, process_id, port, lease: lease.clone(), engine: engine.clone(), artifacts: Mutex::new(Default::default()) });
                         self.store.lock().map_err(|_| "browser state unavailable")?.resources.insert(id, resource);
                         created = Some(id);
                         let navigation = engine.request_with_abort(json!({"op":"execute","resource":backend,
@@ -601,6 +668,8 @@ impl BrowserController {
                         if name == "browser_screenshot" {
                             let mut artifacts = self.artifacts.lock().map_err(|_| "browser artifacts unavailable")?;
                             result = resource.engine.retain_screenshot(&result, &mut artifacts)?;
+                            resource.artifacts.lock().map_err(|_| "browser artifact ownership unavailable")?
+                                .insert(result["artifact"].as_str().ok_or("invalid retained artifact")?.to_owned());
                         }
                         Ok(json!({"status":"observed","browser_id":id,"result":result}))
                     }

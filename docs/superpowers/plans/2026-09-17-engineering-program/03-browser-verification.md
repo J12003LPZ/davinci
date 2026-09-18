@@ -863,3 +863,33 @@ including duplicate content rejection and filling the remaining byte budget.
 This protects storage immutability; it does not establish current request
 authorization or source/transaction receipt authority. Public artifact retrieval,
 transaction-bound receipts and the other P3 acceptance gates remain open.
+
+### Authorized frontend artifact retrieval checkpoint
+
+The normal RPC loop now accepts `get_browser_artifact`. Its existing string
+`value` field carries a JSON request with `browser_id`, `artifact`, `offset`
+and `limit`; unknown inner fields are rejected. Requests are limited to 12 KiB
+and chunks to 64 KiB of decoded bytes. Responses include PNG media type, the
+full retained content hash and size, chunk offset, next offset, EOF and bounded
+base64 for frontend transport. This command is not registered as a model tool
+and never inserts binary data into the model conversation.
+
+Each context records its own retained screenshot labels through the existing
+artifact tracker. Lookup requires that context's label and canonical workspace,
+then the existing managed-server boundary checks process ownership, listener
+identity, original lifetime, cancellation and current `browser_screenshot`
+permission before and after retrieval. A retained artifact cannot provide
+authorization. Responses remain observations, not successful verification
+receipts. Browser context and server must currently remain live; retrieval after
+context closure and Graph transport coverage are still open acceptance work.
+
+RED: the real normal-browser fixture failed at retrieval before implementation.
+GREEN: its expanded explicitly enabled Chromium case passed without ignores
+across IPv4/IPv6 and both normal executor attachments. It checks bounded PNG
+bytes, hash equality, EOF, oversized chunks, invalid offsets and paths,
+cross-context denial and live permission revocation. The production RPC branch
+has been compiled; a complete external RPC frontend exchange is not yet proven.
+Five offline browser tests passed (two backend-dependent cases ignored in that
+selector); formatting, affected-crate all-target Clippy with warnings denied and
+diff whitespace checks passed.
+No subagents were used. P3 and the full program remain in progress.

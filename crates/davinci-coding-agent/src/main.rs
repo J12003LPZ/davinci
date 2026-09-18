@@ -3086,6 +3086,42 @@ fn run_rpc(parsed: &Args, agent: &mut Agent) -> Result<i32, String> {
             continue;
         }
         let mut command: RpcCommand = serde_json::from_str(&line).map_err(|err| err.to_string())?;
+        if command.kind == "get_browser_artifact" {
+            let result = (|| {
+                if command
+                    .value
+                    .as_ref()
+                    .is_some_and(|value| value.len() > 12 * 1024)
+                {
+                    return Err("browser artifact request exceeds limit".into());
+                }
+                let args: serde_json::Value = serde_json::from_str(
+                    command
+                        .value
+                        .as_deref()
+                        .ok_or("browser artifact request required")?,
+                )
+                .map_err(|_| "invalid browser artifact request")?;
+                let controller = host
+                    .lock()
+                    .unwrap_or_else(|err| err.into_inner())
+                    .native
+                    .lock()
+                    .map_err(|_| "native host unavailable")?
+                    .browser
+                    .clone();
+                controller.retrieve_artifact(&runtime.cwd, &args, &runtime.agent.tool_context)
+            })();
+            let response = match result {
+                Ok(data) => rpc::ok_response(command.id.clone(), &command.kind, Some(data)),
+                Err(error) => rpc::fail_response(command.id.clone(), &command.kind, error),
+            };
+            output::write_raw_stdout_line(
+                &serde_json::to_string(&response).map_err(|err| err.to_string())?,
+            )
+            .map_err(|err| err.to_string())?;
+            continue;
+        }
         let is_prompt = command.kind == "prompt";
         if is_prompt {
             let message = command.message.as_deref().unwrap_or("");
