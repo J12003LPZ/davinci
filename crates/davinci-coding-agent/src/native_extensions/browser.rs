@@ -297,6 +297,21 @@ fn parse(name: &str, args: &Value) -> Result<Request, String> {
 
 impl BrowserController {
     #[cfg(test)]
+    pub(crate) fn shutdown_backend_for_test(&self) {
+        let engine = self.store.lock().unwrap().engine.clone().unwrap();
+        engine
+            .request(json!({"op":"shutdown"}), Duration::from_secs(5))
+            .unwrap();
+        // Confirm the transport has stopped accepting requests before returning.
+        assert!(engine
+            .request(
+                json!({"op":"open","options":{"origins":["http://127.0.0.1:3000"]}}),
+                Duration::from_secs(1)
+            )
+            .is_err());
+    }
+
+    #[cfg(test)]
     pub(crate) fn context_count(&self) -> usize {
         self.store.lock().unwrap().resources.len()
     }
@@ -310,7 +325,26 @@ impl BrowserController {
             artifacts: Arc::new(Mutex::new(ArtifactBudgetTracker::new(MAX_RUN_BYTES))),
         }
     }
+    fn reconcile_backend(&self) -> Result<(), String> {
+        let stale = {
+            let mut store = self.store.lock().map_err(|_| "browser state unavailable")?;
+            if store
+                .engine
+                .as_ref()
+                .is_some_and(|engine| !engine.is_healthy())
+            {
+                Some((store.engine.take(), std::mem::take(&mut store.resources)))
+            } else {
+                None
+            }
+        };
+        // Dropping the last backend reference may stop/wait for its process.
+        // Never perform that cleanup while holding the controller's store lock.
+        drop(stale);
+        Ok(())
+    }
     fn engine(&self, context: &ToolContext) -> Result<Arc<BrowserProcess>, String> {
+        self.reconcile_backend()?;
         {
             let mut store = self.store.lock().map_err(|_| "browser state unavailable")?;
             if let Some(engine) = &store.engine {
@@ -388,6 +422,7 @@ impl BrowserController {
             .processes
             .as_ref()
             .ok_or_else(|| ToolError::Failed("managed process context required".into()))?;
+        self.reconcile_backend().map_err(ToolError::Failed)?;
         let (process_id, port, expected, existing) = match &request {
             Request::Open(open) => (open.process_id, open.port, None, None),
             Request::Action { id, .. } => {
@@ -508,6 +543,59 @@ pub fn tool_spec(name: &str) -> Option<davinci_ai::ToolSpec> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[ignore = "requires explicitly configured trusted Node and Playwright installation"]
+    fn browser_dead_backend_is_replaced_without_replaying_actions() {
+        let root = tempfile::tempdir().unwrap();
+        let controller = BrowserController::new(
+            root.path(),
+            BrowserConfig {
+                enabled: true,
+                node: std::env::var("DAVINCI_TRUSTED_NODE_TEST_PATH")
+                    .unwrap()
+                    .into(),
+                package: std::env::var("DAVINCI_TRUSTED_PLAYWRIGHT_TEST_PATH")
+                    .unwrap()
+                    .into(),
+                version: "1.62.0".into(),
+            },
+        );
+        let context = ToolContext {
+            foreground_supervisor: Some(davinci_agent::jobs::supervisor::SupervisorCommand {
+                executable: std::env::current_exe().unwrap(),
+                argv: vec![
+                    "--exact".into(),
+                    "native_extensions::graph::coordinator_handler::tests::helper_entry".into(),
+                    "--nocapture".into(),
+                ],
+            }),
+            ..Default::default()
+        };
+        let first = controller.engine(&context).unwrap();
+        first
+            .request(
+                json!({"op":"open","options":{"origins":["http://127.0.0.1:3000"]}}),
+                Duration::from_secs(30),
+            )
+            .unwrap();
+        controller.shutdown_backend_for_test();
+        let replacement = controller.engine(&context).unwrap();
+        assert!(
+            !Arc::ptr_eq(&first, &replacement),
+            "dead backend must not remain cached"
+        );
+        let opened = replacement
+            .request(
+                json!({"op":"open","options":{"origins":["http://127.0.0.1:3000"]}}),
+                Duration::from_secs(30),
+            )
+            .unwrap();
+        assert!(opened["resource"].is_u64());
+        replacement
+            .request(json!({"op":"shutdown"}), Duration::from_secs(5))
+            .unwrap();
+    }
 
     #[test]
     fn browser_project_settings_cannot_enable_or_replace_host_pins() {

@@ -93,6 +93,12 @@ pub struct BrowserProcess {
 }
 
 impl BrowserProcess {
+    /// A failed or exited transport cannot own reusable live page state.
+    pub fn is_healthy(&self) -> bool {
+        let state = self.state.0.lock().unwrap_or_else(|e| e.into_inner());
+        state.failure.is_none() && !state.closed
+    }
+
     /// Launches only after the caller's current browser request is authorized.
     pub fn start(
         host: &SupervisorCommand,

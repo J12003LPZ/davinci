@@ -262,6 +262,31 @@ fn normal_browser_native_dispatch_actions_revocation_and_cleanup() {
             !error,
             "another context must survive cancellation: {output}"
         );
+        controller.shutdown_backend_for_test();
+        let (_, _, error) = super::test_impact_integration_tests::call(
+            &mut agent,
+            "browser_snapshot",
+            json!({"browser_id":id}),
+        );
+        assert!(error, "dead backend page state must not be reused");
+        let (reopened, output, error) = super::test_impact_integration_tests::call(
+            &mut agent,
+            "browser_open",
+            json!({"process_id":process_id,"port":port}),
+        );
+        assert!(!error, "fresh request must recover the backend: {output}");
+        let recovered_id = reopened["browser_id"].as_str().unwrap();
+        assert_ne!(recovered_id, id);
+        let id = recovered_id;
+        let (_, output, error) = super::test_impact_integration_tests::call(
+            &mut agent,
+            "browser_click",
+            json!({"browser_id":id,"selector":{"kind":"role","role":"button","name":"Start"}}),
+        );
+        assert!(
+            !error,
+            "recovered browser must perform new actions: {output}"
+        );
         agent
             .permissions
             .lock()

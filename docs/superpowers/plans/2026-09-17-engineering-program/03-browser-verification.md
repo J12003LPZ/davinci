@@ -589,8 +589,25 @@ two contexts survive and verifies another worker's DOM. The explicit fixture
 passed without skips; all eight offline coordinator-handler tests passed (the
 real fixture is ignored in that offline selector).
 
+### Dead backend recovery checkpoint
+
+A new supervised Chromium regression reproduced cached dead-backend reuse (RED),
+then passed after adding transport health and controller reconciliation (GREEN).
+Exited or invalidated transports lose their context references before request
+admission, so stale contexts cannot exhaust the eight-context quota or be revived.
+References are dropped outside the store lock. A fresh authorized open lazily
+starts a replacement backend; interrupted actions are never replayed.
+
+Executed checks: 17 focused offline Rust browser tests passed with three real
+fixtures ignored in that lane. All three explicitly enabled library browser
+fixtures passed without skips. The extended normal-session fixture also passed
+without skips across both attachment variants: after backend shutdown, an old ID
+fails, a new open attaches to the same managed process with a new ID, and a new
+click succeeds. This establishes exited-transport recovery; it does not establish
+managed-server crash reconciliation or every browser-engine crash behavior.
+
 P3 remains incomplete. Full Graph scheduler evaluation,
-stale-resource reconciliation, dead-engine recovery, remaining platform ownership
+managed-server stale-resource reconciliation, remaining platform ownership
 proofs, transaction-bound receipts, artifact retrieval and final evaluations still
 require implementation or direct evidence. This checkpoint is not its completion
 gate, and existing-head CI does not validate these uncommitted changes.
