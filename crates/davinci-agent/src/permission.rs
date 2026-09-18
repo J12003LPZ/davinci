@@ -134,6 +134,13 @@ pub fn tool_class(tool: &str) -> ToolClass {
         | "package_why" => ToolClass::Read,
         "workspace_packages" | "build_targets" | "build_dependencies" | "build_affected"
         | "build_command" => ToolClass::Read,
+        "git_symbol_history"
+        | "git_related_commits"
+        | "git_changed_symbols"
+        | "git_branch_diff"
+        | "git_blame_symbol"
+        | "git_commit_context"
+        | "git_conflict_explain" => ToolClass::Read,
         "repo_map"
         | "symbol_search"
         | "file_symbols"

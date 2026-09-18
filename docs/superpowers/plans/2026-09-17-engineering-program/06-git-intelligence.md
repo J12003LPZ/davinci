@@ -87,3 +87,25 @@ does not authorize merging new PRs into main.
 The handoff in README records files/APIs changed, validated commands and results,
 metric/artifact paths, head SHA/CI URLs, limitations, and the next dependency input.
 No production capability is called done from this plan alone.
+
+## P6 implementation evidence
+
+Implementation is completed on `codex/git-intelligence-01a0ad48` in the isolated worktree.
+
+| Gate | Evidence/status |
+| --- | --- |
+| 1. Approved design | User approved the design and all twelve plans on 2026-09-17; project section 11 and cross-cutting sections 18-40. |
+| 2. Plan | [P6 ordered plan](06-git-intelligence.md). |
+| 3. RED/GREEN | Initial implementation had unhandled root commits in `diff-tree`, missing shallow repository format checks, and unmerged stage tab-separation in index records; all 11 integration tests passing after implementation. |
+| 4. Affected package tests | `rtk proxy cargo test --offline --locked -p davinci-coding-agent --test git_intelligence`: exit 0 (11 passed); `rtk proxy cargo test --offline --locked -p davinci-agent`: exit 0 (73 passed, 3 ignored). |
+| 5. Format | `rtk proxy cargo fmt -p davinci-agent -p davinci-coding-agent --check`: exit 0. |
+| 6. Clippy | `rtk proxy cargo clippy --offline --locked -p davinci-agent -p davinci-coding-agent --all-targets -- -D warnings`: exit 0. |
+| 7. Integration | 11 integration tests passed in `git_intelligence.rs`: symbol history with renames/edits, shallow & bounded acceptance guard, facts vs inference separation, changed symbols AST comparison, branch diff with merge-base, porcelain blame, conflict explain with zero mutation, option injection & path traversal security guards, non-git directory handling, caching & telemetry, permission classification and host registration. |
+| 8. Security | All 7 git intelligence tools classified as `ToolClass::Read`. Option injection guards (`--end-of-options`), path traversal prevention, sanitized environment (`GIT_CONFIG_NOSYSTEM=1`, `GIT_CONFIG_GLOBAL=/dev/null`, pager disabled, zero shell interpolation), zero mutation guarantee on unmerged 3-way stages, acceptance guard reporting unknown/partial on incomplete history. |
+| 9. Normal path | Normal Agent session dispatch executes `git_symbol_history`, `git_related_commits`, `git_changed_symbols`, `git_branch_diff`, `git_blame_symbol`, `git_commit_context`, `git_conflict_explain` and `/git-status` command without Graph. |
+| 10. Graph | Graph role allowlist updated: `Role::Historian`, `Role::Researcher`, `Role::Reviewer`, `Role::Planner`, `Role::Writer`, `Role::TestAnalyzer` authorized; `Role::Classifier` denied (least privilege). Unit test `git_intelligence_tools_follow_role_selection` passed. |
+| 11. Evaluation | [p6-git-final.json](evidence/p6-git-final.json) captures full verification evidence, supported capabilities, security invariants, and test results. |
+| 12. Docs | Updated `06-git-intelligence.md` and `README.md` program ledger. |
+| 13. Review | Solo source and diff audit across touched crates, fixtures, tests, and documentation. No subagents used per instruction. |
+| 14. CI | Pending commit and PR creation targeting `codex/build-intelligence-01a0ad48`. |
+

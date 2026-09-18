@@ -500,3 +500,46 @@ Implementation is completed on `codex/package-intelligence-01a0ad48` in the isol
 | 13. Review | Solo source and diff audit across touched crates, fixtures, tests, and documentation. No subagents used per instruction. |
 | 14. CI | Exact-head CI passed at `9a3fdf9b47216bcfc2ca58bef5d380d1a10c863a`: Push CI [35367111447](https://github.com/J12003LPZ/davinci/actions/runs/35367111447), Push SARIF [35367111099](https://github.com/J12003LPZ/davinci/actions/runs/35367111099), PR #13 CI [35367117486](https://github.com/J12003LPZ/davinci/actions/runs/35367117486), PR #13 SARIF [35367117517](https://github.com/J12003LPZ/davinci/actions/runs/35367117517) all 100% green across platform matrix. |
 
+## P7 implementation evidence
+
+Implementation is completed on `codex/build-intelligence-01a0ad48` in the isolated worktree.
+
+| Gate | Evidence/status |
+| --- | --- |
+| 1. Approved design | User approved the design and all twelve plans on 2026-09-17; project section 12 and cross-cutting sections 18-40. |
+| 2. Plan | [P7 ordered plan](07-build-intelligence.md). |
+| 3. RED/GREEN | Initial compilation and fixture tests failed; all 12 integration tests passing after implementation. |
+| 4. Affected package tests | `rtk proxy cargo test --offline --locked -p davinci-coding-agent --test build_intelligence`: exit 0 (12 passed); `rtk proxy cargo test --offline --locked -p davinci-agent`: exit 0 (73 passed, 3 ignored). |
+| 5. Format | `rtk proxy cargo fmt -p davinci-agent -p davinci-coding-agent --check`: exit 0. |
+| 6. Clippy | `rtk proxy cargo clippy --offline --locked -p davinci-agent -p davinci-coding-agent --all-targets -- -D warnings`: exit 0. |
+| 7. Integration | 12 integration tests passed in `build_intelligence.rs`: workspace package discovery, Turborepo target pipeline, Nx target defaults & dependsOn, TypeScript composite project references, non-omission downstream reverse dependency traversal, deterministic build command synthesis for Turbo/Nx/pnpm, cyclic dependencies, custom tasks, Vite/Next framework detection, path traversal rejection, CacheRuntime caching & telemetry, NativeExtensionHost registration and permission classification. |
+| 8. Security | All 5 build intelligence tools classified as `ToolClass::Read`. Traversal attempts in package, scope, or file paths rejected. Zero discovery execution: manifests and config files inspected declaratively with no compiler or package code execution. Project-native caches preserved without modification or clearing. |
+| 9. Normal path | Normal Agent session dispatch executes `workspace_packages`, `build_targets`, `build_dependencies`, `build_affected`, `build_command` and `/build-status` command without Graph. |
+| 10. Graph | Graph role allowlist updated: `Role::Researcher`, `Role::Planner`, `Role::Writer`, `Role::Reviewer`, and `Role::TestAnalyzer` authorized for all 5 tools; `Role::Classifier` denied (least privilege). Unit test `build_intelligence_tools_follow_role_selection` passed. |
+| 11. Evaluation | [p7-build-final.json](evidence/p7-build-final.json) captures full verification evidence, supported runners, security invariants, and test results. |
+| 12. Docs | Updated `07-build-intelligence.md` and `README.md` program ledger. |
+| 13. Review | Solo source and diff audit across touched crates, fixtures, tests, and documentation. No subagents used per instruction. |
+| 14. CI | Green on head `950ab505d87c3569b693ca21085d2e269080551b` and PR #14 ([PR #14](https://github.com/J12003LPZ/davinci/pull/14)). Push CI: [run 35370012630](https://github.com/J12003LPZ/davinci/actions/runs/35370012630) (22/22 jobs success); Push SARIF: [run 35370012618](https://github.com/J12003LPZ/davinci/actions/runs/35370012618); PR CI: [run 35370058879](https://github.com/J12003LPZ/davinci/actions/runs/35370058879) (22/22 jobs success); PR SARIF: [run 35370058953](https://github.com/J12003LPZ/davinci/actions/runs/35370058953). |
+
+## P6 implementation evidence
+
+Implementation is completed on `codex/git-intelligence-01a0ad48` in the isolated worktree.
+
+| Gate | Evidence/status |
+| --- | --- |
+| 1. Approved design | User approved the design and all twelve plans on 2026-09-17; project section 11 and cross-cutting sections 18-40. |
+| 2. Plan | [P6 ordered plan](06-git-intelligence.md). |
+| 3. RED/GREEN | Initial implementation had unhandled root commits in `diff-tree`, missing shallow repository format checks, and unmerged stage tab-separation in index records; all 11 integration tests passing after implementation. |
+| 4. Affected package tests | `rtk proxy cargo test --offline --locked -p davinci-coding-agent --test git_intelligence`: exit 0 (11 passed); `rtk proxy cargo test --offline --locked -p davinci-agent`: exit 0 (73 passed, 3 ignored). |
+| 5. Format | `rtk proxy cargo fmt -p davinci-agent -p davinci-coding-agent --check`: exit 0. |
+| 6. Clippy | `rtk proxy cargo clippy --offline --locked -p davinci-agent -p davinci-coding-agent --all-targets -- -D warnings`: exit 0. |
+| 7. Integration | 11 integration tests passed in `git_intelligence.rs`: symbol history with renames/edits, shallow & bounded acceptance guard, facts vs inference separation, changed symbols AST comparison, branch diff with merge-base, porcelain blame, conflict explain with zero mutation, option injection & path traversal security guards, non-git directory handling, caching & telemetry, permission classification and host registration. |
+| 8. Security | All 7 git intelligence tools classified as `ToolClass::Read`. Option injection guards (`--end-of-options`), path traversal prevention, sanitized environment (`GIT_CONFIG_NOSYSTEM=1`, `GIT_CONFIG_GLOBAL=/dev/null`, pager disabled, zero shell interpolation), zero mutation guarantee on unmerged 3-way stages, acceptance guard reporting unknown/partial on incomplete history. |
+| 9. Normal path | Normal Agent session dispatch executes `git_symbol_history`, `git_related_commits`, `git_changed_symbols`, `git_branch_diff`, `git_blame_symbol`, `git_commit_context`, `git_conflict_explain` and `/git-status` command without Graph. |
+| 10. Graph | Graph role allowlist updated: `Role::Historian`, `Role::Researcher`, `Role::Reviewer`, `Role::Planner`, `Role::Writer`, `Role::TestAnalyzer` authorized; `Role::Classifier` denied (least privilege). Unit test `git_intelligence_tools_follow_role_selection` passed. |
+| 11. Evaluation | [p6-git-final.json](evidence/p6-git-final.json) captures full verification evidence, supported capabilities, security invariants, and test results. |
+| 12. Docs | Updated `06-git-intelligence.md` and `README.md` program ledger. |
+| 13. Review | Solo source and diff audit across touched crates, fixtures, tests, and documentation. No subagents used per instruction. |
+| 14. CI | Pending commit and PR creation targeting `codex/build-intelligence-01a0ad48`. |
+
+
