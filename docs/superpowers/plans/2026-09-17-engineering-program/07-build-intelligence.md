@@ -107,5 +107,5 @@ Implementation is completed on `codex/build-intelligence-01a0ad48` in the isolat
 | 11. Evaluation | [p7-build-final.json](evidence/p7-build-final.json) captures full verification evidence, supported runners, security invariants, and test results. |
 | 12. Docs | Updated `07-build-intelligence.md` and `README.md` program ledger. |
 | 13. Review | Solo source and diff audit across touched crates, fixtures, tests, and documentation. No subagents used per instruction. |
-| 14. CI | Exact-head CI run pending commit push and PR creation. |
+| 14. CI | Green on head `950ab505d87c3569b693ca21085d2e269080551b` and PR #14 ([PR #14](https://github.com/J12003LPZ/davinci/pull/14)). Push CI: [run 35370012630](https://github.com/J12003LPZ/davinci/actions/runs/35370012630) (22/22 jobs success); Push SARIF: [run 35370012618](https://github.com/J12003LPZ/davinci/actions/runs/35370012618); PR CI: [run 35370058879](https://github.com/J12003LPZ/davinci/actions/runs/35370058879) (22/22 jobs success); PR SARIF: [run 35370058953](https://github.com/J12003LPZ/davinci/actions/runs/35370058953). |
 

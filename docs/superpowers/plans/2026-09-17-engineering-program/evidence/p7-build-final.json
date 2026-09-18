@@ -68,17 +68,17 @@
     "clippy": "rtk proxy cargo clippy --offline --locked -p davinci-agent -p davinci-coding-agent --all-targets -- -D warnings (exit 0)"
   },
   "pull_request": {
-    "number": null,
-    "url": null,
+    "number": 14,
+    "url": "https://github.com/J12003LPZ/davinci/pull/14",
     "base": "codex/package-intelligence-01a0ad48",
     "head": "codex/build-intelligence-01a0ad48"
   },
   "ci_verification": {
-    "head_sha": null,
-    "push_ci_run": null,
-    "push_sarif_run": null,
-    "pr_ci_run": null,
-    "pr_sarif_run": null,
-    "status": "pending CI run"
+    "head_sha": "950ab505d87c3569b693ca21085d2e269080551b",
+    "push_ci_run": "https://github.com/J12003LPZ/davinci/actions/runs/35370012630",
+    "push_sarif_run": "https://github.com/J12003LPZ/davinci/actions/runs/35370012618",
+    "pr_ci_run": "https://github.com/J12003LPZ/davinci/actions/runs/35370058879",
+    "pr_sarif_run": "https://github.com/J12003LPZ/davinci/actions/runs/35370058953",
+    "status": "all green (22/22 jobs on push CI, 22/22 jobs on PR CI, push & PR SARIF success)"
   }
 }
