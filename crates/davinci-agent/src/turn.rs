@@ -119,12 +119,56 @@ impl Agent {
             self.inject_queued(&mut events, &mut new_messages, true);
             self.inject_job_notices(&mut events, &mut new_messages);
 
-            // Old tool output leaves the provider's view first; compaction
-            // is the expensive fallback when that is not enough.
-            self.prune_context();
-            let tokens = self.estimated_context_tokens();
+            let active_context_vm = self.context_vm_mode() == crate::runtime::ContextVmMode::Active;
+            // The legacy path prunes tool output before deciding whether to
+            // summarize. Active Context VM keeps Agent.messages untouched and
+            // folds its derived state instead.
+            let tokens = if active_context_vm {
+                let events = self.context_vm_events_for_runtime();
+                if let Some(runtime) = &self.runtime {
+                    let _ = runtime.context_vm.append_delta(&events);
+                }
+                self.context_vm_image()
+                    .map(|image| self.context_vm_estimated_provider_tokens(&image))
+                    .unwrap_or_else(|_| self.estimated_context_tokens())
+            } else {
+                self.prune_context();
+                self.estimated_context_tokens()
+            };
             self.stats.note_context(tokens);
-            if self.auto_compaction {
+            if self.auto_compaction && active_context_vm {
+                let decision = self.runtime.as_ref().and_then(|runtime| {
+                    let root = runtime.context_vm.root();
+                    let delta_tokens = root
+                        .deltas
+                        .iter()
+                        .map(|page| page.estimated_tokens)
+                        .sum::<u64>();
+                    let config = runtime.context_vm.config();
+                    Some(
+                        crate::runtime::context_vm::ContextFoldPolicy {
+                            max_delta_pages: config.max_delta_pages,
+                            max_delta_tokens: config.max_delta_tokens,
+                            window_pressure_percent: config.window_pressure_percent,
+                        }
+                        .decide(
+                            &root,
+                            delta_tokens,
+                            tokens,
+                            self.context_window,
+                            false,
+                            false,
+                        ),
+                    )
+                });
+                if decision.is_some_and(|decision| decision.should_fold) {
+                    if let Some(reason) = decision.and_then(|decision| decision.reason) {
+                        if self.fold_context(reason, None).is_ok() {
+                            self.stats.compactions += 1;
+                        }
+                    }
+                }
+            } else if self.auto_compaction {
                 let mut settings = self.compaction;
                 settings.enabled = true;
                 if crate::should_compact(tokens, self.context_window, &settings)
@@ -2359,6 +2403,11 @@ fn tool_result_message(
     result: crate::ToolResult,
     auto_resize_images: bool,
 ) -> ChatMessage {
+    let governor_details = result
+        .details
+        .as_ref()
+        .and_then(|details| details.get("tokenGovernor"))
+        .cloned();
     let mut content = vec![MessageContent::Text {
         text: result.content,
     }];
@@ -2382,12 +2431,17 @@ fn tool_result_message(
         }
     }
     content = crate::normalize_tool_result_images(&content, auto_resize_images);
+    let mut extra = serde_json::Map::new();
+    if let Some(governor_details) = governor_details {
+        extra.insert("tokenGovernor".into(), governor_details);
+    }
     ChatMessage {
         role: "toolResult".into(),
         content,
         tool_call_id: Some(id.to_string()),
         tool_name: Some(name.to_string()),
         is_error: Some(result.is_error),
+        extra,
         ..ChatMessage::default()
     }
 }

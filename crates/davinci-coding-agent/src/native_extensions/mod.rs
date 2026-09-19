@@ -43,6 +43,16 @@ use serde_json::{json, Value};
 use std::path::Path;
 use std::sync::Arc;
 
+/// Shared adapter for Context VM artifact retrieval. Keeping this at the
+/// native-extension boundary lets callers use the governor's existing
+/// retrieve_output store rather than duplicating tool-result bytes.
+pub fn retrieve_context_artifact(
+    governor: &mut TokenGovernor,
+    uri: &str,
+) -> Result<String, ToolError> {
+    governor.retrieve_artifact(uri)
+}
+
 pub const NATIVE_TOOLS: &[&str] = &[
     "browser_open",
     "browser_snapshot",
@@ -1229,6 +1239,25 @@ mod tests {
         assert_eq!(
             search_res[0].record.kind,
             vector_memory::MemoryKind::Constraint
+        );
+    }
+
+    #[test]
+    fn context_vm_artifact_adapter_delegates_to_governor_store() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = OutputStore::new(dir.path());
+        let original = "exact governor bytes\nwith evidence";
+        let reference = store.save(original).unwrap();
+        let mut governor =
+            TokenGovernor::with_store("context-vm-test", TokenGovernorConfig::default(), store);
+
+        assert_eq!(
+            retrieve_context_artifact(
+                &mut governor,
+                &format!("governor://output/{}", reference.id),
+            )
+            .unwrap(),
+            original
         );
     }
 }

@@ -2,6 +2,7 @@
 
 pub mod artifacts;
 pub mod compare;
+pub mod context_vm;
 pub mod executor;
 pub mod gate;
 pub mod json_events;
@@ -20,6 +21,7 @@ pub use compare::{
     format_repeated_comparison_markdown, EvalVariant, PairedComparison, Regression,
     RepeatedPairedComparison,
 };
+pub use context_vm::{context_vm_fixture_names, run_context_vm_evals, ContextVmEvalResult};
 pub use executor::{
     execute_multiturn_synthetic_scenario, execute_scenario, MultiTurnSoakResult, ScenarioRunResult,
     WorkspaceDiff,

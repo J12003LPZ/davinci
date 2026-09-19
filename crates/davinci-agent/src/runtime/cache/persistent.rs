@@ -43,6 +43,7 @@ fn name(id: &str, namespace: CacheNamespace) -> String {
 fn namespace_name(namespace: CacheNamespace) -> &'static str {
     match namespace {
         CacheNamespace::Prompt => "prompt",
+        CacheNamespace::Context => "context",
         CacheNamespace::File => "file",
         CacheNamespace::Ast => "ast",
         CacheNamespace::Repo => "repo",
@@ -61,6 +62,7 @@ fn object_namespace(name: &str) -> Option<CacheNamespace> {
     }
     [
         CacheNamespace::Prompt,
+        CacheNamespace::Context,
         CacheNamespace::File,
         CacheNamespace::Ast,
         CacheNamespace::Repo,

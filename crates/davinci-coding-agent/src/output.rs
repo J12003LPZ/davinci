@@ -136,6 +136,10 @@ pub struct ContextManifestSummary {
     pub overlay_revision: u64,
     pub manifest_digest: String,
     pub total_estimated_tokens: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_root_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_epoch: Option<u64>,
     pub items: Vec<ContextManifestItemSummary>,
 }
 
@@ -182,7 +186,72 @@ impl ContextManifestSummary {
             overlay_revision: manifest.overlay_revision,
             manifest_digest: manifest.manifest_digest.clone(),
             total_estimated_tokens: manifest.estimated_total_tokens,
+            context_root_id: manifest.context_root_id.clone(),
+            context_epoch: manifest.context_epoch,
             items,
+        }
+    }
+
+    pub fn to_json_string(&self) -> Result<String, serde_json::Error> {
+        serde_json::to_string_pretty(self)
+    }
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ContextVmStatusSummary {
+    pub mode: String,
+    pub epoch: u64,
+    pub checkpoint_id: Option<String>,
+    pub delta_count: usize,
+    pub episode_count: usize,
+    pub hot_event_count: usize,
+    pub last_fold_reason: Option<String>,
+    pub page_fault_hits: u64,
+    pub page_fault_misses: u64,
+    pub prefix_digest: Option<String>,
+}
+
+#[allow(dead_code)]
+impl ContextVmStatusSummary {
+    pub fn from_agent(agent: &davinci_agent::Agent) -> Self {
+        let mode = match agent.context_vm_mode() {
+            davinci_agent::runtime::ContextVmMode::Off => "off",
+            davinci_agent::runtime::ContextVmMode::Shadow => "shadow",
+            davinci_agent::runtime::ContextVmMode::Active => "active",
+        }
+        .to_string();
+        let Some(runtime) = agent.runtime.as_ref() else {
+            return Self {
+                mode,
+                epoch: 0,
+                checkpoint_id: None,
+                delta_count: 0,
+                episode_count: 0,
+                hot_event_count: 0,
+                last_fold_reason: None,
+                page_fault_hits: 0,
+                page_fault_misses: 0,
+                prefix_digest: None,
+            };
+        };
+        let root = runtime.context_vm.root();
+        let metrics = runtime.context_vm.metrics();
+        Self {
+            mode,
+            epoch: root.epoch,
+            checkpoint_id: root.checkpoint.map(|page| page.id),
+            delta_count: root.deltas.len(),
+            episode_count: root.episodes.len(),
+            hot_event_count: root.hot_event_refs.len(),
+            last_fold_reason: runtime.context_vm.last_fold_reason(),
+            page_fault_hits: metrics.page_fault_hits,
+            page_fault_misses: metrics.page_fault_misses,
+            prefix_digest: runtime
+                .context_vm
+                .prefix_digest()
+                .map(|digest| digest.chars().take(12).collect()),
         }
     }
 

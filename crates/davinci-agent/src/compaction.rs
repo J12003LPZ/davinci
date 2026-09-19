@@ -16,6 +16,11 @@ pub const UPDATE_SUMMARIZATION_PROMPT: &str = "The messages above are NEW conver
 
 pub const TURN_PREFIX_SUMMARIZATION_PROMPT: &str = "This is the PREFIX of a turn that was too large to keep. The SUFFIX (recent work) is retained.\n\nSummarize the prefix to provide context for the retained suffix:\n\n## Original Request\n[What did the user ask for in this turn?]\n\n## Early Progress\n- [Key decisions and work done in the prefix]\n\n## Context for Suffix\n- [Information needed to understand the retained recent work]\n\nBe concise. Focus on what's needed to understand the kept suffix.";
 
+pub const CONTEXT_VM_FOLD_SYSTEM_PROMPT: &str =
+    "Produce JSON only. Derive a structured continuation state from the supplied authoritative events. Every field must cite one or more supplied source_ref values. Do not invent repository facts, test results, user constraints, or decisions.";
+pub const CONTEXT_VM_FOLD_PROMPT: &str =
+    "Return a JSON object matching CheckpointProposal. Preserve still-active parent fields unless authoritative new events supersede them. Narrative is optional and must remain AgentInference.";
+
 pub const COMPACTION_SUMMARY_PREFIX: &str =
     "The conversation history before this point was compacted into the following summary:\n\n<summary>\n";
 pub const COMPACTION_SUMMARY_SUFFIX: &str = "\n</summary>";
@@ -857,7 +862,7 @@ pub fn serialize_conversation(messages: &[ChatMessage]) -> String {
                 if !content.is_empty() {
                     parts.push(format!(
                         "[Tool result]: {}",
-                        truncate_for_summary(&content, TOOL_RESULT_MAX_CHARS)
+                        truncate_tool_result_for_summary(&content, TOOL_RESULT_MAX_CHARS)
                     ));
                 }
             }
@@ -871,12 +876,41 @@ fn truncate_for_summary(text: &str, max_chars: usize) -> String {
     if text.len() <= max_chars {
         text.to_string()
     } else {
-        let truncated = text.len() - max_chars;
-        format!(
-            "{}\n\n[... {truncated} more characters truncated]",
-            &text[..max_chars]
-        )
+        let prefix = safe_prefix(text, max_chars);
+        let truncated = text.len().saturating_sub(prefix.len());
+        format!("{}\n\n[... {truncated} more characters truncated]", prefix)
     }
+}
+
+fn truncate_tool_result_for_summary(text: &str, max_chars: usize) -> String {
+    if text.len() <= max_chars {
+        return text.to_string();
+    }
+    let marker = "Call retrieve_output with id \"";
+    if let Some(marker_start) = text.rfind(marker) {
+        let trailer_start = text[..marker_start].rfind("\n[").unwrap_or(marker_start);
+        let trailer = &text[trailer_start..];
+        if trailer.len() + 2 < max_chars {
+            let prefix = safe_prefix(text, max_chars - trailer.len() - 2);
+            return format!("{prefix}\n\n{trailer}");
+        }
+    }
+    truncate_for_summary(text, max_chars)
+}
+
+fn safe_prefix(text: &str, max_bytes: usize) -> &str {
+    if text.len() <= max_bytes {
+        return text;
+    }
+    let mut boundary = 0;
+    for (index, character) in text.char_indices() {
+        let end = index + character.len_utf8();
+        if end > max_bytes {
+            break;
+        }
+        boundary = end;
+    }
+    &text[..boundary]
 }
 
 #[cfg(test)]
@@ -1037,6 +1071,18 @@ mod tests {
         ]);
         assert!(!both.contains("truncated"));
         assert!(both.contains(&long_text));
+    }
+
+    #[test]
+    fn serialized_tool_result_preserves_retrieve_output_trailer() {
+        let content = format!(
+            "{}\n[... full exact output is saved as out-123. Call retrieve_output with id \"out-123\" to inspect omitted data.]",
+            "x".repeat(5_000)
+        );
+        let message = ChatMessage::tool_result("c1", "bash", content, false);
+        let serialized = serialize_conversation(&[message]);
+        assert!(serialized.contains("retrieve_output"));
+        assert!(serialized.contains("out-123"));
     }
 
     #[test]

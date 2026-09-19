@@ -2240,7 +2240,10 @@ fn complete_prompt_with_host(
                                     system_prompt_hash: davinci_agent::hash_system_prompt_with_manifest(&system, current.prompt_manifest.as_ref()),
                                     tool_schema_hash: current.provider_tool_schema_identity(),
                                     permission_surface_hash: davinci_agent::hash_tool_names(&current.visible_tool_names().iter().map(String::as_str).collect::<Vec<_>>()),
-                                    context_item_hashes: Vec::new(),
+                                    context_item_hashes: current
+                                        .context_vm_cache_affinity()
+                                        .into_iter()
+                                        .collect(),
                                     agent_profile_hash: None,
                                     contract_hash: None,
                                     role: Some("root".into()),

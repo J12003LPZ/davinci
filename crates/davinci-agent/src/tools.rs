@@ -73,6 +73,7 @@ impl DecisionResponder {
 
 pub const BUILTIN_TOOLS: &[&str] = &[
     "read",
+    "retrieve_context",
     "write",
     "edit",
     "bash",
@@ -268,6 +269,21 @@ pub fn tool_specs() -> Vec<AgentTool> {
             name: "read".into(),
             description: "Read the contents of a file. Supports text files and images (jpg, png, gif, webp, bmp). Images are sent as attachments. For text files, output is truncated to 2000 lines or 50KB (whichever is hit first). Use offset/limit for large files.".into(),
             parameters: serde_json::json!({"type":"object","properties":{"path":{"type":"string"},"offset":{"type":"number"},"limit":{"type":"number"}},"required":["path"]}),
+        },
+        AgentTool {
+            name: "retrieve_context".into(),
+            description: "Retrieve an exact Context VM page or authoritative source by reference. Use query and offset/limit to page large evidence without exposing hidden reasoning.".into(),
+            parameters: serde_json::json!({
+                "type":"object",
+                "properties":{
+                    "page":{"type":"string"},
+                    "sourceRef":{"type":"string"},
+                    "query":{"type":"string"},
+                    "offset":{"type":"integer","minimum":0},
+                    "limit":{"type":"integer","minimum":0,"maximum":400}
+                },
+                "oneOf":[{"required":["page"]},{"required":["sourceRef"]}]
+            }),
         },
         AgentTool {
             name: "write".into(),
@@ -603,6 +619,7 @@ pub fn execute_tool_with(
                 .map_err(ToolError::Failed)
         }
         "read" => read_tool_cached(cwd, input, context),
+        "retrieve_context" => crate::runtime::context_vm::retrieve_context_tool(input, context),
         "write" => write_tool(cwd, input, context),
         "edit" => edit_tool(cwd, input, context),
         "apply_patch" => apply_patch_tool(cwd, input, context),

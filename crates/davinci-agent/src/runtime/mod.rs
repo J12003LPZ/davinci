@@ -14,6 +14,7 @@ pub mod completion;
 pub mod context;
 pub mod context_manifest;
 pub mod context_overlay;
+pub mod context_vm;
 pub mod contract_executor;
 pub mod contracts;
 pub mod control;
@@ -64,6 +65,11 @@ pub use context_manifest::{
     overlay_application, ContextManifestEntry, PreparedContextManifest, ProvenanceKind,
 };
 pub use context_overlay::{overlay_change_allowed, ContextOverlay};
+pub use context_vm::{
+    CheckpointState, ContextImage, ContextImageEntry, ContextPageKind, ContextPageRef, ContextRoot,
+    ContextVmConfig, ContextVmMode, ContextVmRuntime, ContextVmState, Episode, ProvenanceRef,
+    StateDelta, StateValue,
+};
 pub use contract_executor::{
     effect_profile_allows, ContractExecutor, ExecutionError, ExecutorCapabilities,
 };
@@ -115,6 +121,7 @@ pub use worktree::{has_uncommitted_changes, WorktreeError, WorktreeLease, Worktr
 #[derive(Clone)]
 pub struct RuntimeHandle {
     pub cache: cache::CacheRuntime,
+    pub context_vm: context_vm::ContextVmRuntime,
     pub run_id: RunId,
     pub agent_id: AgentId,
     pub parent_agent_id: Option<AgentId>,
@@ -154,8 +161,14 @@ impl RuntimeHandle {
         let registry = RuntimeRegistry::with_bus(bus.clone());
         let task_registry = TaskRegistry::with_bus(bus.clone());
         let mailbox = AgentMailbox::with_registry_and_bus(registry.clone(), bus.clone());
+        let cache = cache::CacheRuntime::default();
+        let mut context_vm_config = context_vm::ContextVmConfig::default();
+        context_vm_config.mode = context_vm::ContextVmMode::from_env_value(
+            std::env::var("DAVINCI_CONTEXT_VM").ok().as_deref(),
+        );
         Self {
-            cache: cache::CacheRuntime::default(),
+            context_vm: context_vm::ContextVmRuntime::new(context_vm_config, cache.clone()),
+            cache,
             run_id,
             agent_id,
             parent_agent_id: None,
@@ -183,7 +196,9 @@ impl RuntimeHandle {
         self
     }
     pub fn with_cache(mut self, cache: cache::CacheRuntime) -> Self {
-        self.cache = cache;
+        let config = self.context_vm.config().clone();
+        self.cache = cache.clone();
+        self.context_vm = context_vm::ContextVmRuntime::new(config, cache);
         self
     }
 
@@ -216,6 +231,7 @@ impl RuntimeHandle {
     /// Retain live identities, coordination state, writer lease and event counters.
     pub fn with_session_state_from(mut self, previous: &Self) -> Self {
         self.cache = previous.cache.clone();
+        self.context_vm = previous.context_vm.clone();
         self.run_id = previous.run_id;
         self.agent_id = previous.agent_id;
         self.parent_agent_id = previous.parent_agent_id;
@@ -241,6 +257,7 @@ impl RuntimeHandle {
     /// Preserve a host-bound worker's coordinator without replacing parent observers.
     pub fn with_worker_state_from(mut self, worker: &Self) -> Self {
         self.cache = worker.cache.clone();
+        self.context_vm = worker.context_vm.clone();
         self.run_id = worker.run_id;
         self.agent_id = worker.agent_id;
         self.parent_agent_id = worker.parent_agent_id;

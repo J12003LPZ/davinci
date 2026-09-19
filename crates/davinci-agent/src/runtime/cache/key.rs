@@ -5,6 +5,7 @@ use sha2::{Digest, Sha256};
 #[serde(rename_all = "snake_case")]
 pub enum CacheNamespace {
     Prompt,
+    Context,
     File,
     Ast,
     Repo,

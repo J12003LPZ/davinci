@@ -219,6 +219,19 @@ pub enum RuntimeEvent {
         estimated_tokens: u64,
         cache_key: Option<String>,
     },
+    ContextVmShadowCompared {
+        legacy_tokens: u64,
+        vm_tokens: u64,
+        missing_user_refs: u64,
+        missing_tool_refs: u64,
+    },
+    ContextVmFolded {
+        epoch: u64,
+        reason: String,
+        checkpoint_id: String,
+        before_tokens: u64,
+        after_tokens: u64,
+    },
     CacheAffinity {
         key: String,
         reason: String,

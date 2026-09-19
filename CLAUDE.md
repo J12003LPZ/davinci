@@ -43,6 +43,50 @@ Toolchain is pinned to Rust 1.83.0 (`rust-toolchain.toml`). Every workspace depe
 
 On Windows, build and launch the local executable with `rtk cargo build -p davinci-coding-agent --offline` and `.\target\debug\davinci.exe`. A build does not replace the installed `%USERPROFILE%\.cargo\bin\davinci.exe` resolved by bare `davinci`. Use RTK for shell commands and Headroom for large outputs; honor explicit user restrictions on subagents and test execution.
 
+### Context VM / state folding
+
+The Context VM is derived state, not a replacement for the session history:
+
+```text
+session JSONL/events = authoritative WAL
+typed pages           = immutable derived state
+artifacts             = exact evidence
+ContextImage          = bounded provider working set
+provider cache        = backend optimization only
+```
+
+Set `DAVINCI_CONTEXT_VM=off|shadow|active` (default `off`). `off` preserves
+legacy pruning and compaction. `shadow` compiles and measures the VM while
+returning the exact legacy provider projection. `active` uses the VM image and
+derived folds while retaining every authoritative `Agent::messages` entry and
+session event. Hidden thinking is never projected into pages or retrieval.
+
+Active-mode failures rebuild from the authoritative session branch; a missing
+mandatory policy blocks the request. `retrieve_context` is a bounded,
+read-only exact-recovery path for Context VM pages and sources. The existing
+`retrieve_output` contract and Token Governor output store remain unchanged.
+Context VM cache affinity is only an optimization: disabling provider caching
+must not change the logical ContextImage.
+
+For debugging, use `shadow`, inspect the prepared context manifest and Context
+VM status (`mode`, `epoch`, checkpoint, delta/episode/hot counts, fold reason,
+page-fault hits/misses, and prefix digest), compare missing user/tool refs, use
+`retrieve_context`, then replay the session branch and compare legacy versus VM
+provider messages. Normal non-fold turns perform no extra model call for
+context maintenance.
+
+Focused offline release-gate commands are:
+
+```powershell
+rtk cargo test -p davinci-agent --test context_vm_types --offline --locked
+rtk cargo test -p davinci-agent --test context_vm_cache --offline --locked
+rtk cargo test -p davinci-agent --test context_vm_replay --offline --locked
+rtk cargo test -p davinci-agent --test context_vm_shadow --offline --locked
+rtk cargo test -p davinci-agent --test context_vm_retrieval --offline --locked
+rtk cargo test -p davinci-agent --test context_vm_active --offline --locked
+rtk cargo test -p davinci-evals context_vm_ --offline --locked
+```
+
 ### Deliver changes to the executable the user actually runs
 
 For user-facing executable changes, complete the local build and installed update as part of delivery unless the user explicitly requests source-only work. Do not stop at changing source or rebuilding `target/debug`.

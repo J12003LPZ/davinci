@@ -43,7 +43,8 @@ fn repo_intelligence_native_host_registration_and_execution() {
 #[test]
 fn repo_intelligence_native_output_retention_and_disabled_settings() {
     use davinci_coding_agent::native_extensions::{
-        NativeExtensionHost, OutputStore, TokenGovernor, TokenGovernorConfig,
+        retrieve_context_artifact, NativeExtensionHost, OutputStore, TokenGovernor,
+        TokenGovernorConfig,
     };
     use serde_json::json;
     let repo = tempfile::tempdir().unwrap();
@@ -74,9 +75,19 @@ fn repo_intelligence_native_output_retention_and_disabled_settings() {
     let processed = host.after_tool("file_symbols", &args, original);
     let id = processed.details.as_ref().unwrap()["tokenGovernor"]["outputId"]
         .as_str()
-        .unwrap();
+        .unwrap()
+        .to_string();
     assert!(processed.content.contains("retrieve_output"));
-    assert_eq!(store.load(id).unwrap(), content);
+    assert_eq!(store.load(&id).unwrap(), content);
+    let artifact = host
+        .governor
+        .artifact_ref(&id, "tool:file_symbols")
+        .unwrap();
+    assert_eq!(artifact.content_hash.len(), 64);
+    assert_eq!(
+        retrieve_context_artifact(&mut host.governor, &artifact.uri).unwrap(),
+        content
+    );
     fs::write(
         cache.path().join("settings.json"),
         r#"{"repoIntelligence":{"enabled":false}}"#,
