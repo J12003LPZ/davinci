@@ -108,23 +108,18 @@ pub struct GraphCacheIdentity<'a> {
 /// The key is derived purely from (repo_id, graph_version, role, model, toolset, system_contract)
 /// and specifically excludes run IDs or timestamps so compatible runs and retries reuse cache slots.
 pub fn graph_worker_cache_key(input: &GraphCacheIdentity<'_>) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(b"graph_worker_cache_v1\n");
-    hasher.update(input.repo_id.as_bytes());
-    hasher.update(b"\n");
-    hasher.update(input.graph_version.to_string().as_bytes());
-    hasher.update(b"\n");
-    hasher.update(input.role.as_str().as_bytes());
-    hasher.update(b"\n");
-    hasher.update(input.model.as_bytes());
-    hasher.update(b"\n");
-    hasher.update(input.toolset_hash.as_bytes());
-    hasher.update(b"\n");
-    hasher.update(input.system_contract_hash.as_bytes());
-
-    let hash_hex = format!("{:x}", hasher.finalize());
-    let short_hash = &hash_hex[..16];
-    let candidate = format!("gw-{}-{}", input.role.as_str(), short_hash);
+    let candidate = davinci_agent::runtime::cache::legacy_prompt_cache_key(
+        "graph_worker_cache_v1",
+        &[
+            input.repo_id,
+            &input.graph_version.to_string(),
+            input.role.as_str(),
+            input.model,
+            input.toolset_hash,
+            input.system_contract_hash,
+        ],
+        &format!("gw-{}-", input.role.as_str()),
+    );
     davinci_ai::cache::clamp_openai_prompt_cache_key(&candidate)
 }
 

@@ -604,7 +604,7 @@ impl Snapshot {
 // Validate the opened object before reading, rather than trusting a path check
 // that an attacker can invalidate between canonicalization and open.
 #[cfg(windows)]
-pub(super) fn open_confined(root: &Path, relative: &Path) -> std::io::Result<File> {
+pub(crate) fn open_confined(root: &Path, relative: &Path) -> std::io::Result<File> {
     use std::os::windows::ffi::OsStringExt;
     use std::os::windows::fs::OpenOptionsExt;
     use std::os::windows::io::AsRawHandle;
@@ -651,7 +651,7 @@ pub(super) fn open_confined(root: &Path, relative: &Path) -> std::io::Result<Fil
 }
 
 #[cfg(unix)]
-pub(super) fn open_confined(root: &Path, relative: &Path) -> std::io::Result<File> {
+pub(crate) fn open_confined(root: &Path, relative: &Path) -> std::io::Result<File> {
     use std::os::fd::{AsRawFd, FromRawFd};
     use std::os::unix::ffi::OsStrExt;
     use std::os::unix::fs::OpenOptionsExt;
@@ -691,7 +691,7 @@ pub(super) fn open_confined(root: &Path, relative: &Path) -> std::io::Result<Fil
 }
 
 #[cfg(not(any(windows, unix)))]
-pub(super) fn open_confined(_: &Path, _: &Path) -> std::io::Result<File> {
+pub(crate) fn open_confined(_: &Path, _: &Path) -> std::io::Result<File> {
     Err(std::io::Error::other(
         "confined source access unavailable on this platform",
     ))

@@ -219,6 +219,19 @@ pub enum RuntimeEvent {
         estimated_tokens: u64,
         cache_key: Option<String>,
     },
+    ContextVmShadowCompared {
+        legacy_tokens: u64,
+        vm_tokens: u64,
+        missing_user_refs: u64,
+        missing_tool_refs: u64,
+    },
+    ContextVmFolded {
+        epoch: u64,
+        reason: String,
+        checkpoint_id: String,
+        before_tokens: u64,
+        after_tokens: u64,
+    },
     CacheAffinity {
         key: String,
         reason: String,
@@ -236,6 +249,48 @@ pub enum RuntimeEvent {
         status: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         reason: Option<String>,
+    },
+    BeforeWrite {
+        path: PathBuf,
+        bytes: usize,
+    },
+    AfterWrite {
+        path: PathBuf,
+        bytes: usize,
+        is_error: bool,
+    },
+    BeforeProcessStart {
+        executable: String,
+        argv: Vec<String>,
+        cwd: PathBuf,
+    },
+    AfterProcessExit {
+        executable: String,
+        argv: Vec<String>,
+        exit_code: Option<i32>,
+        is_error: bool,
+    },
+    BeforeTest {
+        framework: String,
+        targets: Vec<String>,
+    },
+    AfterTest {
+        framework: String,
+        targets: Vec<String>,
+        passed: bool,
+        failures: usize,
+    },
+    BeforeCommit {
+        message: String,
+        files: Vec<String>,
+    },
+    AfterCommit {
+        commit_id: Option<String>,
+        message: String,
+        is_error: bool,
+    },
+    BeforeCompletion {
+        task_id: Option<TaskId>,
     },
 }
 

@@ -5,7 +5,6 @@
 //! Licensed under the MIT License.
 
 use std::fs;
-use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -368,234 +367,76 @@ pub fn apply_hunks_to_content(original: &str, hunks: &[Hunk]) -> Result<String, 
 /// Explicit recovery only: the caller must authorize every journal target.
 /// Repository journals are untrusted and must never be replayed by an ordinary patch.
 pub fn recover_incomplete_journal_if_any(workspace_root: &Path) -> Result<(), String> {
-    let davinci_journal = workspace_root.join(JOURNAL_FILE_NAME);
-    let legacy_journal = workspace_root.join(LEGACY_JOURNAL_FILE_NAME);
-    let journal_path = if davinci_journal.exists() {
-        davinci_journal
-    } else if legacy_journal.exists() {
-        legacy_journal
-    } else {
-        return Ok(());
-    };
-    match fs::symlink_metadata(&journal_path) {
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(error) => return Err(format!("Failed inspecting journal: {error}")),
-        Ok(metadata) if !metadata.file_type().is_file() => {
-            return Err("Journal must be a regular file".into())
+    for name in [JOURNAL_FILE_NAME, LEGACY_JOURNAL_FILE_NAME] {
+        match fs::symlink_metadata(workspace_root.join(name)) {
+            Ok(_) => return Err("Legacy journal lacks owned postimage identity; automatic recovery is unsafe. Preserve the journal and reconcile its targets explicitly.".into()),
+            Err(error) if error.kind()==std::io::ErrorKind::NotFound => (),
+            Err(error) => return Err(format!("Failed inspecting journal: {error}")),
         }
-        Ok(_) => {}
     }
-
-    let raw =
-        fs::read_to_string(&journal_path).map_err(|e| format!("Failed reading journal: {e}"))?;
-    let journal: PatchJournal =
-        serde_json::from_str(&raw).map_err(|e| format!("Corrupt journal file: {e}"))?;
-
-    let targets = journal
-        .entries
-        .iter()
-        .map(|entry| sanitize_relative_path(workspace_root, &entry.relative_path))
-        .collect::<Result<Vec<_>, _>>()?;
-    for (entry, target) in journal.entries.iter().zip(targets) {
-        restore_entry(&target, entry).map_err(|error| {
-            format!(
-                "Recovery failed for {}: {error}; journal retained",
-                entry.relative_path
-            )
-        })?;
-    }
-    fs::remove_file(journal_path)
-        .map_err(|error| format!("Recovery applied but journal cleanup failed: {error}"))
+    Ok(())
 }
 
-fn restore_entry(target: &Path, entry: &JournalEntry) -> std::io::Result<()> {
-    match &entry.original_content {
-        Some(original) => {
-            if let Some(parent) = target.parent() {
-                let _ = fs::create_dir_all(parent);
-            }
-            fs::write(target, original)
-        }
-        None => match fs::remove_file(target) {
-            Err(error)
-                if error.kind() == std::io::ErrorKind::NotFound
-                    || error.kind() == std::io::ErrorKind::NotADirectory
-                    || error.raw_os_error() == Some(20) =>
-            {
-                Ok(())
-            }
-            result => result,
-        },
-    }
-}
-
-/// Executes a patch with rollback. Existing journals require explicit recovery.
+/// Existing grammar and hunk application, backed by the shared transaction lifecycle.
 pub fn execute_apply_patch(workspace_root: &Path, input: &str) -> Result<String, String> {
+    use crate::runtime::transactions::{TransactionCoordinator, TransactionOwner};
+    let coordinator = TransactionCoordinator::new(workspace_root, TransactionOwner::default())?;
+    let (changes, message) = prepare_patch(workspace_root, input, |path| {
+        let relative = path
+            .strip_prefix(workspace_root)
+            .map_err(|e| e.to_string())?;
+        coordinator.snapshot(relative.to_str().ok_or("patch path is not UTF-8")?)
+    })?;
+    let preview = coordinator.preview(changes)?;
+    let applied = coordinator
+        .apply(&preview.id, &|_| Ok(()), None)
+        .map_err(|e| format!("{e}; transaction {}", preview.id))?;
+    Ok(format!("{message} Transaction: {}.", applied.id))
+}
+
+/// Compute all changes against opaque source snapshots; no mutation or unconfined reads.
+pub(crate) fn prepare_patch(
+    workspace_root: &Path,
+    input: &str,
+    snapshot: impl Fn(&Path) -> Result<crate::runtime::transactions::SourceSnapshot, String>,
+) -> Result<(Vec<crate::runtime::transactions::ProposedChange>, String), String> {
     let parsed = parse_codex_patch(input)?;
-    let journal_path = workspace_root.join(JOURNAL_FILE_NAME);
-    let legacy_journal = workspace_root.join(LEGACY_JOURNAL_FILE_NAME);
-    let rewind_journal = workspace_root.join(REWIND_JOURNAL_FILE_NAME);
-    let legacy_rewind = workspace_root.join(LEGACY_REWIND_JOURNAL_FILE_NAME);
-    if journal_path.exists()
-        || legacy_journal.exists()
-        || rewind_journal.exists()
-        || legacy_rewind.exists()
-    {
-        return Err(
-            "An existing patch journal requires explicit, authorized recovery; no files changed"
-                .into(),
-        );
-    }
-    match fs::symlink_metadata(&journal_path) {
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-        Err(error) => return Err(format!("Failed inspecting journal: {error}")),
-        Ok(_) => return Err(
-            "An existing patch journal requires explicit, authorized recovery; no files changed"
-                .into(),
-        ),
-    }
-
-    // Step 1: Pre-flight validation and prepare journal
-    let mut journal_entries = Vec::new();
-    let mut planned_mutations: Vec<(PathBuf, Option<String>)> = Vec::new();
-
-    let mut modified_count = 0;
-    let mut added_count = 0;
-    let mut deleted_count = 0;
-
+    let mut changes = Vec::new();
+    let (mut modified, mut added, mut deleted) = (0, 0, 0);
     for action in &parsed.actions {
-        match action {
-            FileAction::Add { path, content } => {
-                let target = sanitize_relative_path(workspace_root, path)?;
-                let original = if target.exists() {
-                    Some(fs::read_to_string(&target).map_err(|e| e.to_string())?)
-                } else {
-                    None
-                };
-                journal_entries.push(JournalEntry {
-                    relative_path: path.clone(),
-                    original_content: original,
-                });
-                planned_mutations.push((target, Some(content.clone())));
-                added_count += 1;
+        let path = match action {
+            FileAction::Add { path, .. }
+            | FileAction::Delete { path }
+            | FileAction::Update { path, .. } => path,
+        };
+        let target = sanitize_relative_path(workspace_root, path)?;
+        let source = snapshot(&target)?;
+        let bytes = match action {
+            FileAction::Add { content, .. } => {
+                added += 1;
+                Some(content.as_bytes().to_vec())
             }
-            FileAction::Delete { path } => {
-                let target = sanitize_relative_path(workspace_root, path)?;
-                if !target.exists() {
+            FileAction::Delete { .. } => {
+                if source.bytes().is_none() {
                     return Err(format!("File to delete does not exist: {path}"));
                 }
-                let original = fs::read_to_string(&target).map_err(|e| e.to_string())?;
-                journal_entries.push(JournalEntry {
-                    relative_path: path.clone(),
-                    original_content: Some(original),
-                });
-                planned_mutations.push((target, None));
-                deleted_count += 1;
+                deleted += 1;
+                None
             }
-            FileAction::Update { path, hunks } => {
-                let target = sanitize_relative_path(workspace_root, path)?;
-                if !target.exists() {
-                    return Err(format!("File to update does not exist: {path}"));
-                }
-                let original = fs::read_to_string(&target).map_err(|e| e.to_string())?;
-                let updated = apply_hunks_to_content(&original, hunks)?;
-                journal_entries.push(JournalEntry {
-                    relative_path: path.clone(),
-                    original_content: Some(original),
-                });
-                planned_mutations.push((target, Some(updated)));
-                modified_count += 1;
+            FileAction::Update { hunks, .. } => {
+                let updated = apply_hunks_to_content(source.text()?, hunks)?;
+                modified += 1;
+                Some(updated.into_bytes())
             }
-        }
-    }
-
-    // Step 2: Write journal
-    let journal = PatchJournal {
-        timestamp: std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis() as u64,
-        entries: journal_entries,
-    };
-    let journal_bytes = serde_json::to_string(&journal).map_err(|e| e.to_string())?;
-    let mut journal_file = fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&journal_path)
-        .map_err(|e| format!("Failed to create exclusive journal; no files changed: {e}"))?;
-    journal_file
-        .write_all(journal_bytes.as_bytes())
-        .and_then(|_| journal_file.sync_all())
-        .map_err(|e| {
-            format!("Failed to persist journal; no files changed, journal retained: {e}")
-        })?;
-    drop(journal_file);
-
-    // Step 3: Apply mutations transactionally
-    let mut applied_so_far: Vec<&JournalEntry> = Vec::new();
-    for (target, new_content) in planned_mutations {
-        let entry = journal.entries.iter().find(|e| {
-            match sanitize_relative_path(workspace_root, &e.relative_path) {
-                Ok(p) => p == target,
-                Err(_) => false,
-            }
-        });
-
-        let mutation_result = match new_content {
-            Some(content) => {
-                if let Some(parent) = target.parent() {
-                    let _ = fs::create_dir_all(parent);
-                }
-                fs::write(&target, content)
-            }
-            None => fs::remove_file(&target),
         };
-
-        if let Err(err) = mutation_result {
-            // Rollback everything from journal including the failed target
-            if let Some(e) = entry {
-                applied_so_far.push(e);
-            }
-            let mut rollback_errors = Vec::new();
-            for entry in applied_so_far.into_iter().rev() {
-                let restored = sanitize_relative_path(workspace_root, &entry.relative_path)
-                    .and_then(|path| {
-                        restore_entry(&path, entry).map_err(|error| error.to_string())
-                    });
-                if let Err(error) = restored {
-                    rollback_errors.push(format!("{}: {error}", entry.relative_path));
-                }
-            }
-            if !rollback_errors.is_empty() {
-                return Err(format!(
-                    "Mutation failed: {err}; rollback incomplete, journal retained: {}",
-                    rollback_errors.join("; ")
-                ));
-            }
-            fs::remove_file(&journal_path).map_err(|error| {
-                format!(
-                    "Mutation failed: {err}; rollback applied but journal cleanup failed: {error}"
-                )
-            })?;
-            return Err(format!("Mutation failed, rolled back changes: {err}"));
-        }
-
-        if let Some(e) = entry {
-            applied_so_far.push(e);
-        }
+        changes.push(source.change(bytes));
     }
-
-    // Step 4: Commit complete, remove journal
-    fs::remove_file(journal_path).map_err(|error| {
-        format!("Patch applied but journal cleanup failed; inspect state before retrying: {error}")
-    })?;
-
-    Ok(format!(
-        "Applied patch (digest: {}): {} modified, {} added, {} deleted.",
-        &parsed.raw_digest[..8],
-        modified_count,
-        added_count,
-        deleted_count
+    Ok((
+        changes,
+        format!(
+            "Applied patch (digest: {}): {modified} modified, {added} added, {deleted} deleted.",
+            &parsed.raw_digest[..8]
+        ),
     ))
 }
 
@@ -642,89 +483,24 @@ pub fn apply_transactional_replacements(
     workspace_root: &Path,
     file_replacements: &[FileByteReplacements],
 ) -> Result<String, String> {
-    let journal_path = workspace_root.join(JOURNAL_FILE_NAME);
-    let legacy_journal = workspace_root.join(LEGACY_JOURNAL_FILE_NAME);
-    let rewind_journal = workspace_root.join(REWIND_JOURNAL_FILE_NAME);
-    let legacy_rewind = workspace_root.join(LEGACY_REWIND_JOURNAL_FILE_NAME);
-    if journal_path.exists()
-        || legacy_journal.exists()
-        || rewind_journal.exists()
-        || legacy_rewind.exists()
-    {
-        return Err(
-            "An existing patch journal requires explicit, authorized recovery; no files changed"
-                .into(),
-        );
-    }
-
-    let mut journal_entries = Vec::new();
-    let mut modified_files = Vec::new();
-
+    use crate::runtime::transactions::{TransactionCoordinator, TransactionOwner};
+    let coordinator = TransactionCoordinator::new(workspace_root, TransactionOwner::default())?;
+    let mut changes = Vec::new();
     for (target, replacements) in file_replacements {
-        if !target.exists() {
-            return Err(format!("Target file does not exist: {}", target.display()));
-        }
-        let original_content = fs::read_to_string(target)
-            .map_err(|e| format!("Failed reading {}: {e}", target.display()))?;
-
-        let rel_path = target
-            .strip_prefix(workspace_root)
-            .unwrap_or(target)
-            .to_string_lossy()
-            .replace('\\', "/");
-
-        let updated_content = apply_byte_replacements(&original_content, replacements)?;
-
-        journal_entries.push(JournalEntry {
-            relative_path: rel_path,
-            original_content: Some(original_content),
-        });
-        modified_files.push((target.clone(), updated_content));
+        let relative = target.strip_prefix(workspace_root).unwrap_or(target);
+        let relative = relative.to_str().ok_or("replacement path is not UTF-8")?;
+        let snapshot = coordinator.snapshot(relative)?;
+        let updated = apply_byte_replacements(snapshot.text()?, replacements)?;
+        changes.push(snapshot.change(Some(updated.into_bytes())));
     }
-
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-    let journal = PatchJournal {
-        timestamp: now,
-        entries: journal_entries,
-    };
-    let journal_raw = serde_json::to_string_pretty(&journal)
-        .map_err(|e| format!("Failed serializing journal: {e}"))?;
-
-    let mut file = fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&journal_path)
-        .map_err(|e| {
-            format!("Failed to persist journal; no files changed, journal retained: {e}")
-        })?;
-    file.write_all(journal_raw.as_bytes()).map_err(|e| {
-        format!("Failed to persist journal; no files changed, journal retained: {e}")
-    })?;
-    file.sync_all().map_err(|e| {
-        format!("Failed to persist journal; no files changed, journal retained: {e}")
-    })?;
-    drop(file);
-
-    let count = modified_files.len();
-    for (path, content) in modified_files {
-        if let Err(err) = fs::write(&path, content) {
-            let _ = recover_incomplete_journal_if_any(workspace_root);
-            return Err(format!(
-                "Failed applying replacement to {}: {err}",
-                path.display()
-            ));
-        }
-    }
-
-    fs::remove_file(&journal_path)
-        .map_err(|error| format!("Replacements applied but journal cleanup failed: {error}"))?;
-
+    let count = changes.len();
+    let preview = coordinator.preview(changes)?;
+    let applied = coordinator
+        .apply(&preview.id, &|_| Ok(()), None)
+        .map_err(|e| format!("{e}; transaction {}", preview.id))?;
     Ok(format!(
-        "Applied replacements across {} files successfully",
-        count
+        "Applied replacements across {count} files successfully. Transaction: {}.",
+        applied.id
     ))
 }
 
@@ -822,7 +598,7 @@ mod tests {
     }
 
     #[test]
-    fn explicit_recovery_restores_and_removes_journal() {
+    fn legacy_recovery_refuses_to_overwrite_unowned_changes() {
         let dir = tempdir().unwrap();
         fs::write(dir.path().join("changed.txt"), "changed").unwrap();
         let journal = write_journal(
@@ -832,12 +608,14 @@ mod tests {
                 original_content: Some("original".into()),
             }],
         );
-        recover_incomplete_journal_if_any(dir.path()).unwrap();
+        assert!(recover_incomplete_journal_if_any(dir.path())
+            .unwrap_err()
+            .contains("owned postimage"));
         assert_eq!(
             fs::read_to_string(dir.path().join("changed.txt")).unwrap(),
-            "original"
+            "changed"
         );
-        assert!(!journal.exists());
+        assert!(journal.exists());
     }
 
     #[test]
@@ -846,7 +624,7 @@ mod tests {
         fs::write(dir.path().join("blocker"), "not a directory").unwrap();
         let patch = "*** Begin Patch\n*** Add File: first.txt\n+new\n*** Add File: blocker/child.txt\n+cannot create\n*** End Patch";
         let error = execute_apply_patch(dir.path(), patch).unwrap_err();
-        assert!(error.contains("rolled back"), "{error}");
+        assert!(!error.is_empty());
         assert!(!dir.path().join("first.txt").exists());
         assert_eq!(
             fs::read_to_string(dir.path().join("blocker")).unwrap(),

@@ -1,0 +1,10 @@
+{
+  "name": "my-vite-app",
+  "scripts": {
+    "build": "vite build",
+    "typecheck": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "vite": "^5.0.0"
+  }
+}

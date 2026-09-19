@@ -4,9 +4,11 @@ pub mod apply_patch;
 pub mod approval;
 pub mod decisions;
 mod permission_state;
+pub mod process_manager;
 pub use permission_state::PermissionState;
 mod batch;
 mod branch;
+pub mod command_receipt;
 mod compaction;
 mod context;
 mod edit_diff;
@@ -32,6 +34,7 @@ mod templates;
 pub mod todo;
 pub mod tool_ledger;
 pub mod tools;
+mod transaction_verification;
 mod turn;
 pub mod web;
 
@@ -50,9 +53,10 @@ pub use compaction::{
     serialize_conversation, should_compact, CompactionDetails, CompactionResult,
     CompactionSettings, CompactionThreshold, CutPointResult, FileOperations, SummarizeRequest,
     SummarizeResponse, Summarizer, BRANCH_SUMMARY_PREFIX, BRANCH_SUMMARY_SUFFIX,
-    COMPACTION_SUMMARY_PREFIX, COMPACTION_SUMMARY_SUFFIX, DEFAULT_KEEP_RECENT_TOKENS,
-    DEFAULT_RESERVE_TOKENS, SUMMARIZATION_PROMPT, SUMMARIZATION_SYSTEM_PROMPT,
-    TURN_PREFIX_SUMMARIZATION_PROMPT, UPDATE_SUMMARIZATION_PROMPT,
+    COMPACTION_SUMMARY_PREFIX, COMPACTION_SUMMARY_SUFFIX, CONTEXT_VM_FOLD_PROMPT,
+    CONTEXT_VM_FOLD_SYSTEM_PROMPT, DEFAULT_KEEP_RECENT_TOKENS, DEFAULT_RESERVE_TOKENS,
+    SUMMARIZATION_PROMPT, SUMMARIZATION_SYSTEM_PROMPT, TURN_PREFIX_SUMMARIZATION_PROMPT,
+    UPDATE_SUMMARIZATION_PROMPT,
 };
 pub use context::{
     load_context_files, load_context_files_for_targets, ContextBudgetReport, ContextContribution,
@@ -70,10 +74,10 @@ pub use mcp::{McpRegistry, McpServerRow};
 pub(crate) use permission::read_only_capability_allows;
 pub use permission::{
     check_path_boundary, glob_matches, is_git_metadata_path, is_outside_or_symlink_escape,
-    is_symlink_escape, project_relative, session_rule_for, subject_of, summary_of, tool_class,
-    FilesystemBoundaryPolicy, PermissionMode, PermissionPolicy, PermissionRule, PermissionVerdict,
-    ReadOutsideRootPolicy, RuleParseError, RuleSpecifier, ToolApprovalDecision,
-    ToolApprovalRequest, ToolApprover, ToolClass,
+    is_sensitive_file_path, is_symlink_escape, project_relative, session_rule_for, subject_of,
+    summary_of, tool_class, FilesystemBoundaryPolicy, PermissionMode, PermissionPolicy,
+    PermissionRule, PermissionVerdict, ReadOutsideRootPolicy, RuleParseError, RuleSpecifier,
+    ToolApprovalDecision, ToolApprovalRequest, ToolApprover, ToolClass,
 };
 pub use prompt::{
     CapabilityGateOutcome, CapabilityRunState, DebuggingState, FrontendDesignState,
@@ -126,7 +130,7 @@ pub use runtime::{
     normalize_relative_path, path_scope_allows, save_workflow_to_project, wrap_untrusted_data,
     AgentId, AgentKind, AgentRecord, AgentState, CacheIdentity, CacheMissReason, CancellationToken,
     CapabilitySource, ConcurrencyPolicy, ContextBroker, ContextItem, ContextPacket, ContextRequest,
-    ContextSource, ContractError, ContractExecutor, DeclaredEffect, ExecutionError,
+    ContextSource, ContextVmMode, ContractError, ContractExecutor, DeclaredEffect, ExecutionError,
     ExecutorCapabilities, OutputPolicy, PhaseStatus, PreparedAction, RegistryError, ReplayPolicy,
     RunId, RuntimeBus, RuntimeCapability, RuntimeCapabilityRegistry, RuntimeDecision, RuntimeEvent,
     RuntimeEventEnvelope, RuntimeHandle, RuntimeRegistry, RuntimeSubscriber, ScopeViolation,
@@ -147,7 +151,9 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use uuid::Uuid;
 
-type CustomToolFn = dyn Fn(&Path, &str, &Value) -> Result<ToolResult, ToolError> + Send + Sync;
+type CustomToolFn = dyn Fn(&Path, &str, &Value, Option<&ToolContext>) -> Result<ToolResult, ToolError>
+    + Send
+    + Sync;
 type PreToolFn = dyn Fn(&str, &Value) -> Option<String> + Send + Sync;
 type PostToolFn = dyn Fn(&str, &Path, &str, &Value, ToolResult) -> ToolResult + Send + Sync;
 
@@ -187,6 +193,7 @@ impl std::fmt::Debug for EventSink {
 #[derive(Clone)]
 pub struct CustomToolExecutor {
     inner: Arc<CustomToolFn>,
+    requires_context: bool,
 }
 
 impl std::fmt::Debug for CustomToolExecutor {
@@ -200,11 +207,45 @@ impl CustomToolExecutor {
     where
         F: Fn(&Path, &str, &Value) -> Result<ToolResult, ToolError> + Send + Sync + 'static,
     {
-        Self { inner: Arc::new(f) }
+        Self {
+            inner: Arc::new(move |cwd, name, args, _| f(cwd, name, args)),
+            requires_context: false,
+        }
+    }
+
+    /// Host adapter receiving this dispatch's engine context, including consent,
+    /// cancellation and session resources. This is not an authorization grant:
+    /// resource adapters must still recheck current policy at their boundaries.
+    pub fn new_with_context<F>(f: F) -> Self
+    where
+        F: Fn(&Path, &str, &Value, &ToolContext) -> Result<ToolResult, ToolError>
+            + Send
+            + Sync
+            + 'static,
+    {
+        Self {
+            inner: Arc::new(move |cwd, name, args, context| {
+                let context = context.ok_or_else(|| {
+                    ToolError::Failed("tool requires engine dispatch context".into())
+                })?;
+                f(cwd, name, args, context)
+            }),
+            requires_context: true,
+        }
     }
 
     pub fn execute(&self, cwd: &Path, name: &str, args: &Value) -> Result<ToolResult, ToolError> {
-        (self.inner)(cwd, name, args)
+        (self.inner)(cwd, name, args, None)
+    }
+
+    pub fn execute_with_context(
+        &self,
+        cwd: &Path,
+        name: &str,
+        args: &Value,
+        context: &ToolContext,
+    ) -> Result<ToolResult, ToolError> {
+        (self.inner)(cwd, name, args, Some(context))
     }
 }
 
@@ -273,6 +314,7 @@ pub struct Agent {
     pub provider_max_retry_delay_ms: u64,
     pub thinking_budgets: Option<ThinkingBudgets>,
     pub context_window: u64,
+    pub context_vm_mode: ContextVmMode,
     pub queues: SteerFollowUpQueues,
     pub tools: Vec<String>,
     pub tool_registry: Vec<String>,
@@ -343,6 +385,11 @@ pub struct Agent {
     capability_run_state: Arc<Mutex<prompt::CapabilityRunState>>,
     /// Mutation generations and verification evidence for the current run.
     mutation_verification: Arc<Mutex<MutationVerificationState>>,
+    pending_transaction_verification:
+        Arc<Mutex<std::collections::BTreeMap<String, Vec<transaction_verification::Pending>>>>,
+    /// Bounded actual command evidence, populated only by built-in execution.
+    command_receipts:
+        Arc<Mutex<std::collections::VecDeque<runtime::evidence_store::ExecutionReceipt>>>,
     plan_storage_error: Option<String>,
     pending_bash_messages: Vec<ChatMessage>,
     pending_prompt_messages: Vec<ChatMessage>,
@@ -399,6 +446,9 @@ impl Agent {
             provider_max_retry_delay_ms: 60_000,
             thinking_budgets: None,
             context_window: 200_000,
+            context_vm_mode: ContextVmMode::from_env_value(
+                std::env::var("DAVINCI_CONTEXT_VM").ok().as_deref(),
+            ),
             queues: SteerFollowUpQueues::default(),
             tools: BUILTIN_TOOLS.iter().map(|t| t.to_string()).collect(),
             tool_registry: BUILTIN_TOOLS.iter().map(|t| t.to_string()).collect(),
@@ -445,6 +495,10 @@ impl Agent {
             visual_verification_available: false,
             capability_run_state: Arc::new(Mutex::new(prompt::CapabilityRunState::default())),
             mutation_verification: Arc::new(Mutex::new(MutationVerificationState::default())),
+            pending_transaction_verification: Arc::new(Mutex::new(
+                std::collections::BTreeMap::new(),
+            )),
+            command_receipts: Arc::new(Mutex::new(std::collections::VecDeque::new())),
             plan_storage_error: None,
             pending_bash_messages: Vec::new(),
             pending_prompt_messages: Vec::new(),
@@ -505,12 +559,21 @@ impl Agent {
         if self.abort_signal.is_none() || owns_abort_signal {
             self.abort_signal = Some(runtime.cancellation_token.as_atomic_bool());
         }
+        self.tool_context.cache = runtime.cache.clone();
         self.tool_context.runtime = Some(runtime.clone());
         self.runtime_session = self.session.as_ref().and_then(|session| {
             let source = std::fs::canonicalize(&session.path).ok()?;
             (runtime.session_id.as_deref() == Some(session.header.id.as_str()))
                 .then(|| (source, session.header.id.clone(), runtime.run_id))
         });
+        if let Some(session) = &self.session {
+            if let Some((root, through_seq)) = runtime::context_vm::latest_persisted_root(
+                &session.entries,
+                session.leaf_id.as_deref(),
+            ) {
+                runtime.context_vm.install_root(root, through_seq);
+            }
+        }
         self.runtime = Some(runtime);
     }
 
@@ -1027,7 +1090,18 @@ impl Agent {
         message
     }
 
-    pub fn messages_for_provider(&self) -> Vec<ChatMessage> {
+    pub fn context_vm_mode(&self) -> ContextVmMode {
+        self.context_vm_mode
+    }
+
+    pub fn set_context_vm_mode(&mut self, mode: ContextVmMode) {
+        self.context_vm_mode = mode;
+        if let Some(runtime) = &mut self.runtime {
+            runtime.context_vm.set_mode(mode);
+        }
+    }
+
+    fn legacy_messages_for_provider(&self) -> Vec<ChatMessage> {
         let plan_context = self
             .plan_provider_context()
             .map(|text| ChatMessage::text("custom", text));
@@ -1054,6 +1128,136 @@ impl Agent {
         convert_to_llm_for_provider(&messages, self.block_images)
     }
 
+    #[doc(hidden)]
+    pub fn legacy_messages_for_provider_for_test(&self) -> Vec<ChatMessage> {
+        self.legacy_messages_for_provider()
+    }
+
+    pub fn context_vm_image(&self) -> Result<runtime::ContextImage, String> {
+        let Some(runtime) = &self.runtime else {
+            return Err("context VM runtime is unavailable".into());
+        };
+        let events = self.context_vm_events_for_runtime();
+        let selected = self.select_root_context(self.context_window);
+        let mut items = Vec::new();
+        for file in selected.repository_files {
+            items.push(runtime::ContextItem {
+                source: format!("file::{}", file.path.display()),
+                content: file.body.clone(),
+                estimated_tokens: (file.body.len() as u64).div_ceil(4),
+                priority: 100,
+                stable_for_cache: true,
+                provenance: serde_json::json!({"provenance_kind":"repository_fact"}),
+            });
+        }
+        for (index, message) in selected.ephemeral_messages.iter().enumerate() {
+            let content = davinci_ai::content_text(&message.content);
+            items.push(runtime::ContextItem {
+                source: format!("ephemeral_context::{index}"),
+                estimated_tokens: (content.len() as u64).div_ceil(4),
+                content,
+                priority: 200,
+                stable_for_cache: false,
+                provenance: serde_json::json!({"provenance_kind":"tool_evidence"}),
+            });
+        }
+        if let Some(plan) = self.plan_provider_context() {
+            items.push(runtime::ContextItem {
+                source: "agent::living_plan".into(),
+                estimated_tokens: (plan.len() as u64).div_ceil(4),
+                content: plan,
+                priority: 500,
+                stable_for_cache: true,
+                provenance: serde_json::json!({"provenance_kind":"user_decision"}),
+            });
+        }
+        let max_tokens = self
+            .context_window
+            .saturating_sub(self.provider_context_overhead_tokens.unwrap_or(0))
+            .max(1);
+        let direct_tokens = items.iter().map(|item| item.estimated_tokens).sum::<u64>();
+        let goal = self
+            .last_real_user_request
+            .clone()
+            .or_else(|| {
+                events
+                    .iter()
+                    .rev()
+                    .find(|event| event.kind == runtime::context_vm::ContextEventKind::User)
+                    .map(|event| event.visible_text.clone())
+            })
+            .unwrap_or_else(|| "continue the current task".into());
+        let request = runtime::ContextRequest::new(
+            runtime.run_id,
+            runtime.agent_id,
+            goal,
+            self.provider.clone(),
+            self.model_id.clone(),
+            self.tools.clone(),
+            max_tokens.saturating_sub(direct_tokens),
+            runtime::AgentKind::Main,
+        );
+        let broker_packet = runtime.context_broker.build_context(&request);
+        let mut all_items = items;
+        all_items.extend(broker_packet.items);
+        let broker_tokens = all_items.iter().map(|item| item.estimated_tokens).sum();
+        let broker_packet = runtime::ContextPacket {
+            items: all_items,
+            estimated_tokens: broker_tokens,
+            cache_key: format!("agent-context:{}", broker_packet.cache_key),
+        };
+        runtime
+            .context_vm
+            .compile(&events, &broker_packet, max_tokens)
+    }
+
+    pub(crate) fn context_vm_events_for_runtime(&self) -> Vec<runtime::context_vm::ContextEvent> {
+        if let Some(session) = &self.session {
+            runtime::context_vm::events_from_session_branch(
+                &session.entries,
+                session.leaf_id.as_deref(),
+            )
+        } else {
+            runtime::context_vm::events_from_messages(&self.messages)
+        }
+    }
+
+    fn record_context_vm_shadow(&self, legacy: &[ChatMessage]) {
+        let Ok(image) = self.context_vm_image() else {
+            return;
+        };
+        let events = self
+            .runtime
+            .as_ref()
+            .map(|runtime| runtime.context_vm.events())
+            .unwrap_or_default();
+        let comparison = runtime::context_vm::compare_shadow_views(legacy, &image, &events);
+        if let Some(runtime) = &self.runtime {
+            runtime.context_vm.record_shadow_comparison(&comparison);
+            runtime.emit_observe(crate::RuntimeEvent::ContextVmShadowCompared {
+                legacy_tokens: comparison.legacy_estimated_tokens,
+                vm_tokens: comparison.vm_estimated_tokens,
+                missing_user_refs: comparison.missing_user_refs.len() as u64,
+                missing_tool_refs: comparison.missing_tool_refs.len() as u64,
+            });
+        }
+    }
+
+    pub fn messages_for_provider(&self) -> Vec<ChatMessage> {
+        match self.context_vm_mode() {
+            ContextVmMode::Off => self.legacy_messages_for_provider(),
+            ContextVmMode::Shadow => {
+                let legacy = self.legacy_messages_for_provider();
+                self.record_context_vm_shadow(&legacy);
+                legacy
+            }
+            ContextVmMode::Active => self
+                .context_vm_image()
+                .map(|image| image.messages)
+                .unwrap_or_else(|_| self.legacy_messages_for_provider()),
+        }
+    }
+
     /// The run's counters, complete.
     pub fn run_stats(&self) -> RunStats {
         let mut stats = self.stats;
@@ -1066,6 +1270,11 @@ impl Agent {
     /// ephemeral context counts although it is not in `messages`. System and
     /// tool schemas count too. This is a byte heuristic, not a tokenizer or upper bound.
     pub fn estimated_context_tokens(&self) -> u64 {
+        if self.context_vm_mode() == ContextVmMode::Active {
+            if let Ok(image) = self.context_vm_image() {
+                return self.context_vm_estimated_provider_tokens(&image);
+            }
+        }
         self.messages
             .iter()
             .map(|message| {
@@ -1091,6 +1300,21 @@ impl Agent {
                     .len() as u64)
                     .div_ceil(4)
             })
+    }
+
+    fn context_vm_estimated_provider_tokens(&self, image: &runtime::ContextImage) -> u64 {
+        let system_tokens = (self.provider_system_prompt().len() as u64).div_ceil(4);
+        let overhead = self.provider_context_overhead_tokens.unwrap_or_else(|| {
+            let specs = self.provider_tool_specs();
+            (serde_json::to_vec(&specs)
+                .expect("tool schemas are JSON")
+                .len() as u64)
+                .div_ceil(4)
+        });
+        image
+            .estimated_tokens
+            .saturating_add(system_tokens)
+            .saturating_add(overhead)
     }
 
     /// Set once per request configuration using the actual tool catalog.
@@ -1168,60 +1392,74 @@ impl Agent {
             None,
         ));
 
-        // 3. Living plan if present
-        if let Some(plan_text) = self.plan_provider_context() {
-            let plan_tokens = (plan_text.len() as u64).div_ceil(4);
-            entries.push(ContextManifestEntry::new(
-                "living_plan",
-                "plan",
-                ProvenanceKind::UserDecision,
-                "agent::living_plan",
-                ContextManifestEntry::hash_content(&plan_text),
-                plan_tokens,
-                true,
-                Some("active_plan".into()),
-                false,
-                "fresh",
-                None,
-            ));
+        let active_image = if self.context_vm_mode() == ContextVmMode::Active {
+            self.context_vm_image().ok()
+        } else {
+            None
+        };
+
+        // 3. Living plan if present. Active Context VM images already include
+        // broker-selected plan and ephemeral items, so adding the legacy
+        // projection here would duplicate provider context.
+        if active_image.is_none() {
+            if let Some(plan_text) = self.plan_provider_context() {
+                let plan_tokens = (plan_text.len() as u64).div_ceil(4);
+                entries.push(ContextManifestEntry::new(
+                    "living_plan",
+                    "plan",
+                    ProvenanceKind::UserDecision,
+                    "agent::living_plan",
+                    ContextManifestEntry::hash_content(&plan_text),
+                    plan_tokens,
+                    true,
+                    Some("active_plan".into()),
+                    false,
+                    "fresh",
+                    None,
+                ));
+            }
         }
 
         // 4. Ephemeral context
-        for (i, msg) in self.ephemeral_context.iter().enumerate() {
-            let tokens = compaction::estimate_tokens(msg);
-            let content_str = serde_json::to_string(&msg.content).unwrap_or_default();
-            entries.push(ContextManifestEntry::new(
-                format!("ephemeral_{i}"),
-                "ephemeral",
-                ProvenanceKind::ToolEvidence,
-                "agent::ephemeral_context",
-                ContextManifestEntry::hash_content(&content_str),
-                tokens,
-                true,
-                Some("ephemeral_injection".into()),
-                false,
-                "fresh",
-                None,
-            ));
+        if active_image.is_none() {
+            for (i, msg) in self.ephemeral_context.iter().enumerate() {
+                let tokens = compaction::estimate_tokens(msg);
+                let content_str = serde_json::to_string(&msg.content).unwrap_or_default();
+                entries.push(ContextManifestEntry::new(
+                    format!("ephemeral_{i}"),
+                    "ephemeral",
+                    ProvenanceKind::ToolEvidence,
+                    "agent::ephemeral_context",
+                    ContextManifestEntry::hash_content(&content_str),
+                    tokens,
+                    true,
+                    Some("ephemeral_injection".into()),
+                    false,
+                    "fresh",
+                    None,
+                ));
+            }
         }
 
         // 5. Conversation messages
-        for (i, msg) in self.messages_for_provider().iter().enumerate() {
-            let tokens = compaction::estimate_tokens(msg);
-            let content_str = serde_json::to_string(&msg.content).unwrap_or_default();
-            entries.push(ContextManifestEntry::new(
-                format!("message_{i}"),
-                "history",
-                ProvenanceKind::ToolEvidence,
-                format!("message::{}", msg.role),
-                ContextManifestEntry::hash_content(&content_str),
-                tokens,
-                true,
-                Some("conversation_history".into()),
-                false,
-                "fresh",
-                None,
-            ));
+        if active_image.is_none() {
+            for (i, msg) in self.messages_for_provider().iter().enumerate() {
+                let tokens = compaction::estimate_tokens(msg);
+                let content_str = serde_json::to_string(&msg.content).unwrap_or_default();
+                entries.push(ContextManifestEntry::new(
+                    format!("message_{i}"),
+                    "history",
+                    ProvenanceKind::ToolEvidence,
+                    format!("message::{}", msg.role),
+                    ContextManifestEntry::hash_content(&content_str),
+                    tokens,
+                    true,
+                    Some("conversation_history".into()),
+                    false,
+                    "fresh",
+                    None,
+                ));
+            }
         }
 
         let manifest = PreparedContextManifest::new(
@@ -1232,6 +1470,22 @@ impl Agent {
             entries,
             0,
         );
+        let manifest = if let Some(image) = active_image {
+            let root_id = image
+                .root
+                .checkpoint
+                .as_ref()
+                .map(|page| page.id.clone())
+                .unwrap_or_else(|| format!("ctxvm:epoch:{}", image.root.epoch));
+            let vm_entries = self
+                .runtime
+                .as_ref()
+                .map(|runtime| runtime.context_vm.manifest_entries(&image))
+                .unwrap_or_default();
+            manifest.with_context_vm_entries(vm_entries, root_id, image.root.epoch)
+        } else {
+            manifest
+        };
 
         self.last_prepared_manifest = Some(manifest.clone());
         manifest
@@ -1895,7 +2149,106 @@ impl Agent {
         self.expose_active_tools();
     }
 
+    pub fn fold_context(
+        &mut self,
+        reason: runtime::context_vm::FoldReason,
+        _custom_instructions: Option<&str>,
+    ) -> Result<runtime::ContextRoot, String> {
+        let Some(runtime) = &self.runtime else {
+            return Err("context VM runtime is unavailable".into());
+        };
+        let events = self.context_vm_events_for_runtime();
+        let runtime = runtime;
+        let root = runtime.context_vm.fold(reason, &events)?;
+        let prefix_digest = self
+            .context_vm_image()
+            .map(|image| image.prefix_digest)
+            .unwrap_or_default();
+        let (before_tokens, after_tokens) = runtime.context_vm.last_fold_tokens().unwrap_or((0, 0));
+        if let Some(session) = &mut self.session {
+            let seq = session
+                .entries
+                .iter()
+                .map(|entry| entry.seq)
+                .max()
+                .unwrap_or(0)
+                .saturating_add(1);
+            let entry = runtime::context_vm::context_checkpoint_entry(
+                &root,
+                events.iter().map(|event| event.seq).max().unwrap_or(0),
+                &prefix_digest,
+                session.leaf_id.clone(),
+                seq,
+            );
+            session
+                .append_entry(entry)
+                .map_err(|error| format!("context checkpoint persistence failed: {error}"))?;
+        }
+        runtime.emit_observe(crate::RuntimeEvent::ContextVmFolded {
+            epoch: root.epoch,
+            reason: reason.as_str().into(),
+            checkpoint_id: root
+                .checkpoint
+                .as_ref()
+                .map(|page| page.id.clone())
+                .unwrap_or_default(),
+            before_tokens,
+            after_tokens,
+        });
+        Ok(root)
+    }
+
+    pub fn context_vm_cache_affinity(&self) -> Option<String> {
+        if self.context_vm_mode() != ContextVmMode::Active {
+            return None;
+        }
+        self.runtime
+            .as_ref()
+            .map(|runtime| runtime.context_vm.cache_affinity())
+    }
+
     pub fn compact(&mut self, custom_instructions: Option<&str>) -> CompactionResult {
+        if self.context_vm_mode() == ContextVmMode::Active {
+            self.is_compacting = true;
+            let estimated_before = self.estimated_context_tokens();
+            if let Some(runtime) = &self.runtime {
+                runtime.emit_observe(crate::RuntimeEvent::PreCompact {
+                    estimated_tokens: estimated_before,
+                });
+            }
+            let fold =
+                self.fold_context(runtime::context_vm::FoldReason::Manual, custom_instructions);
+            let estimated_after = self.estimated_context_tokens();
+            if let Some(runtime) = &self.runtime {
+                runtime.emit_observe(crate::RuntimeEvent::PostCompact {
+                    before_tokens: estimated_before,
+                    after_tokens: estimated_after,
+                });
+            }
+            self.is_compacting = false;
+            return match fold {
+                Ok(root) => CompactionResult {
+                    summary: format!("Context VM epoch {} checkpointed", root.epoch),
+                    messages: self.messages.clone(),
+                    compacted: true,
+                    details: CompactionDetails::default(),
+                    first_kept_entry_id: String::new(),
+                    tokens_before: estimated_before,
+                    tokens_after: estimated_after,
+                    usage: None,
+                },
+                Err(error) => CompactionResult {
+                    summary: error,
+                    messages: self.messages.clone(),
+                    compacted: false,
+                    details: CompactionDetails::default(),
+                    first_kept_entry_id: String::new(),
+                    tokens_before: estimated_before,
+                    tokens_after: estimated_before,
+                    usage: None,
+                },
+            };
+        }
         self.is_compacting = true;
         let estimated_before = self.estimated_context_tokens();
         if let Some(runtime) = &self.runtime {
@@ -2023,6 +2376,7 @@ impl Agent {
                 .is_some_and(|(path, id, _)| *path == source && *id == session.header.id)
                 && runtime.task_registry.is_durable()
         });
+        let session_changed = current.is_none();
         let candidate = match current {
             Some(runtime) => runtime.clone(),
             None => runtime::session::restore_session_runtime(
@@ -2035,6 +2389,11 @@ impl Agent {
         let candidate_ledger = ToolCallLedger::load_bound(&ledger_path, &session.header.id)
             .map_err(|error| format!("Runtime recovery required: {error}"))?;
         let messages = messages_from_session(&session);
+        if session_changed {
+            if let Some(processes) = &self.tool_context.processes {
+                self.tool_context.processes = Some(processes.new_session()?);
+            }
+        }
         self.last_real_user_request = last_real_user_request_from_messages(&messages);
         self.reset_session_approvals();
         self.messages = messages;
@@ -4101,6 +4460,90 @@ mod tests {
                 .unwrap_err(),
             "Cannot continue from message role: assistant"
         );
+    }
+
+    #[test]
+    fn custom_tool_executor_context_requires_engine_context() {
+        let executor = CustomToolExecutor::new_with_context(|_, _, _, _| {
+            panic!("context-dependent callback must not run without engine context")
+        });
+        assert!(executor
+            .execute(Path::new("."), "browser_open", &serde_json::json!({}))
+            .is_err());
+    }
+
+    #[test]
+    fn custom_tool_executor_context_receives_dispatch_cancellation_and_jobs() {
+        let mut agent = Agent::new("context fixture");
+        agent.permissions = Arc::new(PermissionState::new(PermissionPolicy::new(
+            PermissionMode::Ask,
+        )));
+        agent.tools.push("context_fixture".into());
+        agent.set_runtime(RuntimeHandle::new(
+            RunId::new(),
+            AgentId::new(),
+            runtime::RuntimeBus::new(),
+        ));
+        agent.approval_responder = Some(approval::ApprovalResponder(Arc::new(|_, challenge| {
+            approval::ApprovalReply {
+                challenge_id: challenge.id,
+                choice_id: "once".into(),
+                instructions: None,
+            }
+        })));
+        let abort = agent
+            .runtime
+            .as_ref()
+            .unwrap()
+            .cancellation_token
+            .as_atomic_bool();
+        let jobs = agent.tool_context.jobs.clone();
+        let permissions = agent.permissions.clone();
+        let observed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let captured = observed.clone();
+        agent.custom_tool_executor = Some(CustomToolExecutor::new_with_context(
+            move |cwd, name, args, context| {
+                assert_eq!(name, "context_fixture");
+                assert!(context.dispatch_permit.is_some());
+                let revision = permissions.lock().unwrap().revision();
+                let permit = context.dispatch_permit.as_ref().unwrap();
+                permit
+                    .consume(&permissions, revision, cwd, name, args)
+                    .unwrap();
+                assert!(permit
+                    .consume(&permissions, revision, cwd, name, args)
+                    .is_err());
+                assert!(Arc::ptr_eq(context.abort.as_ref().unwrap(), &abort));
+                assert!(Arc::ptr_eq(&context.jobs, &jobs));
+                captured.store(true, std::sync::atomic::Ordering::SeqCst);
+                Ok(ToolResult {
+                    content: "context observed".into(),
+                    is_error: false,
+                    details: None,
+                })
+            },
+        ));
+        let cwd = agent.cwd.clone();
+        assert!(matches!(
+            agent.prepare_tool_call(
+                &cwd,
+                "context-call",
+                "context_fixture",
+                &serde_json::json!({}),
+                0
+            ),
+            turn::Preparation::Ready { .. }
+        ));
+        let result = agent.run_prepared_call(
+            &cwd,
+            "context-call",
+            "context_fixture",
+            &serde_json::json!({}),
+            0,
+        );
+        assert!(!result.is_error, "{}", result.content);
+        assert!(observed.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(agent.permissions.lock().unwrap().session_allow.is_empty());
     }
 
     #[test]

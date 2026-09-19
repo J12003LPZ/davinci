@@ -29,6 +29,44 @@ Every subsystem boundary in the Davinci ecosystem operates under explicit, bound
 - **Token Governor** owns tool-output compression and recovery.
 - **Verification** remains the deterministic authority for outcomes and promotion.
 
+### Context VM / state folding
+
+Context VM is a derived provider-working-set layer shared by normal interactive
+turns and graph consumers. Its ownership boundaries are:
+
+```text
+session JSONL/events = authoritative WAL
+typed Context VM pages = derived, immutable application state
+stored artifacts = exact evidence and recovery source
+ContextImage = bounded provider working set
+provider/KV cache = optional backend optimization
+```
+
+`DAVINCI_CONTEXT_VM` controls rollout and defaults to `off`:
+
+- `off` keeps the existing pruning and legacy compaction behavior.
+- `shadow` compiles and compares a ContextImage but sends the unchanged legacy
+  provider projection.
+- `active` sends the ContextImage and folds derived state without replacing
+  `Agent::messages` or the authoritative session branch.
+
+Context VM pages use the existing `CacheRuntime` under the `context` namespace
+with persistent immutable, content-addressed IDs. Missing or corrupt pages in
+active mode are replayed from the session branch; missing mandatory policy is a
+request-blocking error. `retrieve_context` returns bounded, exact page/source
+content and never exposes hidden reasoning. Token Governor `retrieve_output`
+remains backward compatible; Context VM artifact references use the existing
+output store rather than a second retention database.
+
+The read-only status projection reports mode, epoch, checkpoint/delta/episode
+counts, hot events, last fold reason, page-fault hits/misses, and a short prefix
+digest. To debug a discrepancy, switch to `shadow`, inspect the prepared
+manifest and missing user/tool references, inspect the ContextRoot/page refs,
+retrieve the exact source with `retrieve_context`, replay the session branch,
+and compare the legacy and VM provider views. Normal turns add no model call
+for context maintenance; a fold may use the fold path only when its explicit
+manual, phase-boundary, delta, or window-pressure trigger fires.
+
 ---
 
 ## 2. Invariants

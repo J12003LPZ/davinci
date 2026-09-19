@@ -27,6 +27,9 @@ pub struct SharedCounters {
     pub files_changed_count: AtomicU64,
     pub verification_commands_run: AtomicU64,
     pub verification_failures: AtomicU64,
+    pub process_startups: AtomicU64,
+    pub process_reuses: AtomicU64,
+    pub process_restarts: AtomicU64,
 }
 
 impl SharedCounters {
@@ -47,12 +50,21 @@ impl SharedCounters {
         stats.files_changed_count += self.files_changed_count.load(Ordering::Relaxed);
         stats.verification_commands_run += self.verification_commands_run.load(Ordering::Relaxed);
         stats.verification_failures += self.verification_failures.load(Ordering::Relaxed);
+        stats.process_startups += self.process_startups.load(Ordering::Relaxed);
+        stats.process_reuses += self.process_reuses.load(Ordering::Relaxed);
+        stats.process_restarts += self.process_restarts.load(Ordering::Relaxed);
     }
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RunStats {
+    #[serde(default)]
+    pub process_startups: u64,
+    #[serde(default)]
+    pub process_reuses: u64,
+    #[serde(default)]
+    pub process_restarts: u64,
     /// Provider completions requested (one per model turn, retries excluded).
     pub model_turns: u64,
     /// Additional provider attempts actually started, excluding cancelled backoffs.

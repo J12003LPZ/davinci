@@ -1182,6 +1182,7 @@ impl TokenGovernor {
             _ => (generic.content, "generic"),
         };
         let view_bytes = chosen_content.len();
+        let content_hash = file_content_hash(&result.content);
         self.remember_stored(name, args, &reference, kind.as_str(), strategy);
         self.bytes_withheld += result.content.len().saturating_sub(view_bytes);
         result.content = chosen_content;
@@ -1197,6 +1198,7 @@ impl TokenGovernor {
                     "viewBytes": view_bytes,
                     "outputId": reference.id,
                     "reference": format!("governor://{}", reference.id),
+                    "contentHash": content_hash,
                 }
             }),
         );
@@ -1225,6 +1227,18 @@ impl TokenGovernor {
             strategy: strategy.to_string(),
         });
         self.stored.truncate(STORED_MANIFEST_ENTRIES);
+    }
+
+    /// Retain a native tool's normalized full result before applying its semantic cap.
+    pub(crate) fn retain_native_output(
+        &mut self,
+        name: &str,
+        args: &Value,
+        content: &str,
+    ) -> Result<String, ToolError> {
+        let reference = self.store.save(content)?;
+        self.remember_stored(name, args, &reference, "json", "semantic-cap");
+        Ok(reference.id)
     }
 
     pub fn retrieve(&mut self, args: &Value) -> Result<ToolResult, ToolError> {
@@ -1343,6 +1357,34 @@ impl TokenGovernor {
             is_error: false,
             details: Some(json!({"tokenGovernor": governor_details})),
         })
+    }
+
+    /// Convert a stored governor output into the Context VM's lossless
+    /// artifact reference without copying the output into context state.
+    pub fn artifact_ref(
+        &self,
+        id: &str,
+        source_ref: impl Into<String>,
+    ) -> Result<davinci_agent::runtime::context_vm::ArtifactRef, ToolError> {
+        let content = self.store.load(id)?;
+        Ok(davinci_agent::runtime::context_vm::ArtifactRef {
+            uri: format!("governor://output/{id}"),
+            content_hash: file_content_hash(&content),
+            source_ref: source_ref.into(),
+        })
+    }
+
+    /// Resolve a `governor://output/out-...` artifact through the existing output
+    /// store. This is the exact retrieval path used by retrieve_output, with
+    /// no second in-memory copy or alternate storage format.
+    pub fn retrieve_artifact(&mut self, uri: &str) -> Result<String, ToolError> {
+        let id = uri
+            .strip_prefix("governor://output/")
+            .or_else(|| uri.strip_prefix("governor://"))
+            .ok_or_else(|| ToolError::Failed("invalid governor artifact URI".into()))?;
+        let content = self.store.load(id)?;
+        self.retrievals.fetch_add(1, Ordering::Relaxed);
+        Ok(content)
     }
 
     pub fn status(&self) -> Value {
@@ -1482,6 +1524,27 @@ mod tests {
         assert_eq!(
             governor.retrieve(&json!({"id": id})).unwrap().content,
             "1: head\n2: warning: keep this\n3: noise\n4: tail"
+        );
+    }
+
+    #[test]
+    fn context_artifact_ref_reuses_the_existing_output_store() {
+        let dir = tempdir().unwrap();
+        let store = OutputStore::new(dir.path());
+        let original = "exact governor bytes\nwith evidence";
+        let reference = store.save(original).unwrap();
+        let mut governor = TokenGovernor::with_store("test", TokenGovernorConfig::default(), store);
+
+        let artifact = governor
+            .artifact_ref(&reference.id, "session:tool-result")
+            .unwrap();
+        assert_eq!(artifact.uri, format!("governor://output/{}", reference.id));
+        assert_eq!(governor.retrieve_artifact(&artifact.uri).unwrap(), original);
+        assert_eq!(
+            governor
+                .retrieve_artifact(&format!("governor://{}", reference.id))
+                .unwrap(),
+            original
         );
     }
 

@@ -1,0 +1,217 @@
+{
+  "cold": {
+    "latency_ms": 15.8271,
+    "reparsed": 46,
+    "source_bytes_read": 6173,
+    "source_files": 46
+  },
+  "correct_full_suite": {
+    "argv": [
+      "--test",
+      "--test-reporter=tap"
+    ],
+    "exit_code": 0,
+    "failed": 0,
+    "failure_paths": [],
+    "passed": 23,
+    "paths": [
+      "packages/auth/test/session.test.mjs",
+      "packages/auth/test/token.test.mjs",
+      "packages/other/test/unrelated0.test.mjs",
+      "packages/other/test/unrelated1.test.mjs",
+      "packages/other/test/unrelated10.test.mjs",
+      "packages/other/test/unrelated11.test.mjs",
+      "packages/other/test/unrelated12.test.mjs",
+      "packages/other/test/unrelated13.test.mjs",
+      "packages/other/test/unrelated14.test.mjs",
+      "packages/other/test/unrelated15.test.mjs",
+      "packages/other/test/unrelated16.test.mjs",
+      "packages/other/test/unrelated17.test.mjs",
+      "packages/other/test/unrelated18.test.mjs",
+      "packages/other/test/unrelated19.test.mjs",
+      "packages/other/test/unrelated2.test.mjs",
+      "packages/other/test/unrelated3.test.mjs",
+      "packages/other/test/unrelated4.test.mjs",
+      "packages/other/test/unrelated5.test.mjs",
+      "packages/other/test/unrelated6.test.mjs",
+      "packages/other/test/unrelated7.test.mjs",
+      "packages/other/test/unrelated8.test.mjs",
+      "packages/other/test/unrelated9.test.mjs",
+      "packages/web/test/login.test.mjs"
+    ],
+    "program": "node",
+    "runtime_ms": 223.725,
+    "stderr": "",
+    "stdout_bytes": 3497,
+    "test_count": 23
+  },
+  "fixture": "test-impact-monorepo-v1",
+  "missed_failure_paths": [
+    "packages/web/test/login.test.mjs"
+  ],
+  "mutated_full_suite": {
+    "argv": [
+      "--test",
+      "--test-reporter=tap"
+    ],
+    "exit_code": 1,
+    "failed": 3,
+    "failure_paths": [
+      "packages/auth/test/session.test.mjs",
+      "packages/auth/test/token.test.mjs",
+      "packages/web/test/login.test.mjs"
+    ],
+    "passed": 20,
+    "paths": [
+      "packages/auth/test/session.test.mjs",
+      "packages/auth/test/token.test.mjs",
+      "packages/other/test/unrelated0.test.mjs",
+      "packages/other/test/unrelated1.test.mjs",
+      "packages/other/test/unrelated10.test.mjs",
+      "packages/other/test/unrelated11.test.mjs",
+      "packages/other/test/unrelated12.test.mjs",
+      "packages/other/test/unrelated13.test.mjs",
+      "packages/other/test/unrelated14.test.mjs",
+      "packages/other/test/unrelated15.test.mjs",
+      "packages/other/test/unrelated16.test.mjs",
+      "packages/other/test/unrelated17.test.mjs",
+      "packages/other/test/unrelated18.test.mjs",
+      "packages/other/test/unrelated19.test.mjs",
+      "packages/other/test/unrelated2.test.mjs",
+      "packages/other/test/unrelated3.test.mjs",
+      "packages/other/test/unrelated4.test.mjs",
+      "packages/other/test/unrelated5.test.mjs",
+      "packages/other/test/unrelated6.test.mjs",
+      "packages/other/test/unrelated7.test.mjs",
+      "packages/other/test/unrelated8.test.mjs",
+      "packages/other/test/unrelated9.test.mjs",
+      "packages/web/test/login.test.mjs"
+    ],
+    "program": "node",
+    "runtime_ms": 232.0035,
+    "stderr": "",
+    "stdout_bytes": 5735,
+    "test_count": 23
+  },
+  "mutated_heuristic_selection": {
+    "argv": [
+      "--test",
+      "--test-reporter=tap"
+    ],
+    "exit_code": 1,
+    "failed": 2,
+    "failure_paths": [
+      "packages/auth/test/session.test.mjs",
+      "packages/auth/test/token.test.mjs"
+    ],
+    "passed": 0,
+    "paths": [
+      "packages/auth/test/session.test.mjs",
+      "packages/auth/test/token.test.mjs"
+    ],
+    "program": "node",
+    "runtime_ms": 86.69409999999999,
+    "stderr": "",
+    "stdout_bytes": 1926,
+    "test_count": 2
+  },
+  "notes": [
+    "Single debug-profile sample; timing is descriptive, not a performance threshold.",
+    "A heuristic subset is not sufficient final verification. Full suite establishes all planted failures.",
+    "No provider token counts, LSP, browser, or new test-impact implementation are measured."
+  ],
+  "one_file_edit": {
+    "latency_ms": 10.9511,
+    "reparsed": 1,
+    "source_bytes_read": 6173
+  },
+  "related_query": {
+    "latency_ms": 13.216500000000002,
+    "results": {
+      "index_updated_ms": 1789625009168,
+      "parse_failures": [],
+      "parse_status": "ok",
+      "results": [
+        {
+          "confidence": "heuristic",
+          "path": "packages/auth/test/token.test.mjs",
+          "reasons": [
+            "direct importer",
+            "likely test pair"
+          ],
+          "score": 180,
+          "source": "ast"
+        },
+        {
+          "confidence": "heuristic",
+          "path": "packages/auth/src/session.mjs",
+          "reasons": [
+            "direct importer",
+            "same module directory"
+          ],
+          "score": 110,
+          "source": "ast"
+        },
+        {
+          "confidence": "heuristic",
+          "path": "packages/auth/test/session.test.mjs",
+          "reasons": [
+            "dependency distance 2"
+          ],
+          "score": 35,
+          "source": "ast"
+        },
+        {
+          "confidence": "heuristic",
+          "path": "packages/web/src/login.mjs",
+          "reasons": [
+            "dependency distance 2"
+          ],
+          "score": 35,
+          "source": "ast"
+        },
+        {
+          "confidence": "heuristic",
+          "path": "package.json",
+          "reasons": [
+            "project configuration"
+          ],
+          "score": 15,
+          "source": "config"
+        },
+        {
+          "confidence": "heuristic",
+          "path": "packages/auth/package.json",
+          "reasons": [
+            "project configuration"
+          ],
+          "score": 15,
+          "source": "config"
+        }
+      ],
+      "total": 6,
+      "truncated": false,
+      "unresolved": [],
+      "warnings": []
+    },
+    "returned_bytes": 938
+  },
+  "schema": 1,
+  "scope": "three JS packages; 23 Node tests; one planted cross-package regression",
+  "selection": "existing related_files results intersected with fixture test paths",
+  "warm": {
+    "latency_ms": 15.938600000000001,
+    "reparsed": 0,
+    "source_bytes_read": 6173
+  },
+  "validation": {
+    "command": "rtk proxy cargo test -p davinci-coding-agent --test test_impact_baseline --offline --locked -- --ignored --nocapture",
+    "exit_code": 0,
+    "source_baseline": "ca9fe69cd0da21bf161af25b2bed681748fb0d58",
+    "fixture_changes": "uncommitted baseline fixture only; production source unchanged",
+    "platform": "win32",
+    "node_version": "v24.19.0",
+    "captured_utc": "2026-09-17T06:03:29.513Z",
+    "purpose": "Before implementation; a second sample was captured because the first console result was truncated."
+  }
+}

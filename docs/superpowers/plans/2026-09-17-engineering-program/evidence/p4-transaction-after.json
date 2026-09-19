@@ -1,0 +1,18 @@
+{
+  "affected_files": 2,
+  "later_user_bytes_preserved": true,
+  "measurement": "P4 after: public write/edit/apply_patch, owned rollback and stale recovery refusal in temporary files",
+  "mutation_ms": 74.17609999999999,
+  "notes": [
+    "Single debug-profile sample; timings are not a statistical speed claim.",
+    "Before used a constructed legacy journal; after uses genuine completed transaction records.",
+    "This evaluates rollback correctness, not power-loss durability or host-crash latency."
+  ],
+  "operation_count": 3,
+  "operations_with_transaction_id": 3,
+  "owned_rollback_restored_files": 2,
+  "platform": "windows",
+  "rollback_ms": 20.3552,
+  "schema": 1,
+  "stale_rollback_state": "conflicted"
+}

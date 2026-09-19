@@ -15,17 +15,268 @@ use std::fs::OpenOptions;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 
-/// The longest a hook may run before it is killed and reported. A hung
-/// `preTool` hook would otherwise wedge the turn; a hung `stop` hook, the
-/// exit.
+/// Maximum allowed hook payload size for stdin and captured stdout/stderr streams.
+pub const MAX_HOOK_STREAM_BYTES: usize = 64 * 1024;
+
+/// Default hook timeout when not overridden by rule or settings.
+#[allow(dead_code)]
+pub const DEFAULT_HOOK_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Legacy fallback timeout.
 const HOOK_TIMEOUT: Duration = Duration::from_secs(60);
 
-#[derive(Debug, Clone, Default, Deserialize)]
+/// Explicit failure policy for hook rules.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum HookFailurePolicy {
+    #[default]
+    Block,
+    Warn,
+    Ignore,
+}
+
+/// Structured deterministic hook rule supporting typed event, tool, and path glob filters.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct HookPolicyRule {
+    pub event: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool: Option<String>,
+    #[serde(default, rename = "path", skip_serializing_if = "Option::is_none")]
+    pub path_pattern: Option<String>,
+    #[serde(default)]
+    pub action: Vec<String>,
+    #[serde(default, rename = "timeoutMs", skip_serializing_if = "Option::is_none")]
+    pub timeout_ms: Option<u64>,
+    #[serde(default, rename = "onFailure")]
+    pub on_failure: HookFailurePolicy,
+}
+
+impl HookPolicyRule {
+    pub fn matches(&self, event: &str, tool: &str, path: Option<&Path>) -> bool {
+        let normalized_rule_event = normalize_event_name(&self.event);
+        let normalized_target_event = normalize_event_name(event);
+        if normalized_rule_event != normalized_target_event {
+            return false;
+        }
+        if let Some(rule_tool) = &self.tool {
+            if !rule_tool.is_empty() && !rule_tool.eq_ignore_ascii_case(tool) {
+                return false;
+            }
+        }
+        if let Some(pattern) = &self.path_pattern {
+            let Some(p) = path else {
+                return false;
+            };
+            if !matches_path(pattern, p) {
+                return false;
+            }
+        }
+        true
+    }
+}
+
+/// Settings configuration for Hook Policy Engine.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct HookPolicyConfig {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    #[serde(default = "default_max_depth")]
+    pub max_depth: usize,
+    #[serde(default = "default_timeout_ms")]
+    pub default_timeout_ms: u64,
+    #[serde(default)]
+    pub default_failure_policy: HookFailurePolicy,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+fn default_max_depth() -> usize {
+    3
+}
+
+fn default_timeout_ms() -> u64 {
+    10_000
+}
+
+impl Default for HookPolicyConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            max_depth: 3,
+            default_timeout_ms: 10_000,
+            default_failure_policy: HookFailurePolicy::Block,
+        }
+    }
+}
+
+/// Global telemetry recording hook executions and outcomes.
+#[derive(Default)]
+pub struct HookTelemetry {
+    pub executed: AtomicUsize,
+    pub blocked: AtomicUsize,
+    pub warned: AtomicUsize,
+    pub ignored: AtomicUsize,
+    pub timed_out: AtomicUsize,
+    pub recursion_stopped: AtomicUsize,
+}
+
+pub static GLOBAL_HOOK_TELEMETRY: HookTelemetry = HookTelemetry {
+    executed: AtomicUsize::new(0),
+    blocked: AtomicUsize::new(0),
+    warned: AtomicUsize::new(0),
+    ignored: AtomicUsize::new(0),
+    timed_out: AtomicUsize::new(0),
+    recursion_stopped: AtomicUsize::new(0),
+};
+
+std::thread_local! {
+    static HOOK_DEPTH: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// RAII guard bounding self-trigger recursion across hook invocations.
+#[derive(Debug)]
+pub struct HookDepthGuard;
+
+impl HookDepthGuard {
+    pub fn enter(max_depth: usize) -> Result<Self, String> {
+        let env_depth = std::env::var("DAVINCI_HOOK_DEPTH")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(0);
+        let current_depth = HOOK_DEPTH.with(|d| d.get()).max(env_depth);
+        if current_depth >= max_depth {
+            GLOBAL_HOOK_TELEMETRY
+                .recursion_stopped
+                .fetch_add(1, Ordering::Relaxed);
+            return Err(format!(
+                "hook recursion depth limit exceeded (depth: {current_depth} >= max: {max_depth})"
+            ));
+        }
+        HOOK_DEPTH.with(|d| d.set(current_depth + 1));
+        Ok(Self)
+    }
+}
+
+impl Drop for HookDepthGuard {
+    fn drop(&mut self) {
+        HOOK_DEPTH.with(|d| {
+            let depth = d.get();
+            if depth > 0 {
+                d.set(depth - 1);
+            }
+        });
+    }
+}
+
+pub fn compute_sha256(data: &[u8]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(data);
+    format!("{:x}", hasher.finalize())
+}
+
+pub fn matches_path(pattern: &str, candidate: &Path) -> bool {
+    let path_str = candidate.to_string_lossy().replace('\\', "/");
+    let pattern_str = pattern.replace('\\', "/");
+
+    if pattern_str.starts_with("*.") {
+        let ext = &pattern_str[1..];
+        if path_str.ends_with(ext) {
+            return true;
+        }
+    }
+
+    if let Ok(glob) = globset::Glob::new(&pattern_str) {
+        if glob.compile_matcher().is_match(Path::new(&path_str)) {
+            return true;
+        }
+    }
+
+    if let Some(file_name) = candidate.file_name().and_then(|n| n.to_str()) {
+        if let Ok(glob) = globset::Glob::new(&pattern_str) {
+            if glob.compile_matcher().is_match(Path::new(file_name)) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+pub fn normalize_event_name(raw: &str) -> &'static str {
+    let cleaned: String = raw.chars().filter(|c| c.is_alphanumeric()).collect();
+    let lower = cleaned.to_lowercase();
+    match lower.as_str() {
+        "beforewrite" => "beforeWrite",
+        "afterwrite" => "afterWrite",
+        "beforeprocessstart" => "beforeProcessStart",
+        "afterprocessexit" => "afterProcessExit",
+        "beforetest" => "beforeTest",
+        "aftertest" => "afterTest",
+        "beforecommit" => "beforeCommit",
+        "aftercommit" => "afterCommit",
+        "beforecompletion" => "beforeCompletion",
+        "beforetool" | "pretool" => "beforeTool",
+        "aftertool" | "posttool" => "afterTool",
+        "posttoolfailure" => "postToolFailure",
+        "posttoolbatch" => "postToolBatch",
+        "sessionstart" => "sessionStart",
+        "sessionend" => "sessionEnd",
+        "stop" => "stop",
+        "userpromptsubmit" => "userPromptSubmit",
+        "permissionrequest" => "permissionRequest",
+        "subagentstart" => "subagentStart",
+        "subagentstop" => "subagentStop",
+        "taskcreated" => "taskCreated",
+        "taskcompleted" => "taskCompleted",
+        "precompact" => "preCompact",
+        "postcompact" => "postCompact",
+        "premodelswitch" => "preModelSwitch",
+        "postmodelswitch" => "postModelSwitch",
+        _ => "unknown",
+    }
+}
+
+pub fn rule_event_for(event: &davinci_agent::RuntimeEvent) -> Option<&'static str> {
+    match event {
+        davinci_agent::RuntimeEvent::SessionStarted { .. } => Some("sessionStart"),
+        davinci_agent::RuntimeEvent::SessionEnded { .. } => Some("sessionEnd"),
+        davinci_agent::RuntimeEvent::UserPromptSubmitted => Some("userPromptSubmit"),
+        davinci_agent::RuntimeEvent::PreToolUse { .. } => Some("beforeTool"),
+        davinci_agent::RuntimeEvent::PostToolUse {
+            is_error: false, ..
+        } => Some("afterTool"),
+        davinci_agent::RuntimeEvent::PostToolUse { is_error: true, .. } => Some("postToolFailure"),
+        davinci_agent::RuntimeEvent::PostToolBatch { .. } => Some("postToolBatch"),
+        davinci_agent::RuntimeEvent::BeforeWrite { .. } => Some("beforeWrite"),
+        davinci_agent::RuntimeEvent::AfterWrite { .. } => Some("afterWrite"),
+        davinci_agent::RuntimeEvent::BeforeProcessStart { .. } => Some("beforeProcessStart"),
+        davinci_agent::RuntimeEvent::AfterProcessExit { .. } => Some("afterProcessExit"),
+        davinci_agent::RuntimeEvent::BeforeTest { .. } => Some("beforeTest"),
+        davinci_agent::RuntimeEvent::AfterTest { .. } => Some("afterTest"),
+        davinci_agent::RuntimeEvent::BeforeCommit { .. } => Some("beforeCommit"),
+        davinci_agent::RuntimeEvent::AfterCommit { .. } => Some("afterCommit"),
+        davinci_agent::RuntimeEvent::BeforeCompletion { .. } => Some("beforeCompletion"),
+        davinci_agent::RuntimeEvent::TaskCompletionRequested { .. } => Some("beforeCompletion"),
+        davinci_agent::RuntimeEvent::TaskCompleted { .. } => Some("taskCompleted"),
+        davinci_agent::RuntimeEvent::PreCompact { .. } => Some("preCompact"),
+        davinci_agent::RuntimeEvent::PostCompact { .. } => Some("postCompact"),
+        davinci_agent::RuntimeEvent::PreModelSwitch { .. } => Some("preModelSwitch"),
+        davinci_agent::RuntimeEvent::PostModelSwitch { .. } => Some("postModelSwitch"),
+        _ => None,
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct HooksFile {
     #[serde(default)]
@@ -62,32 +313,129 @@ pub struct HooksFile {
     pub session_end: Vec<Vec<String>>,
     #[serde(default)]
     pub stop: Vec<Vec<String>>,
+
+    #[serde(default, alias = "policies")]
+    pub rules: Vec<HookPolicyRule>,
+
+    #[serde(skip)]
+    pub project_path: Option<PathBuf>,
+    #[serde(skip)]
+    pub content_hash: Option<String>,
+    #[serde(skip)]
+    pub project_trusted: bool,
+}
+
+impl HooksFile {
+    pub fn validate_trust_and_integrity(&self, cwd: &Path, agent_dir: &Path) -> Result<(), String> {
+        let Some(project_path) = &self.project_path else {
+            return Ok(());
+        };
+
+        if !self.project_trusted {
+            return Err(format!(
+                "untrusted project hook execution blocked for {}",
+                project_path.display()
+            ));
+        }
+
+        let store = crate::trust::ProjectTrustStore::open(agent_dir);
+        if let Some(decision) = store.get(cwd) {
+            if !decision {
+                return Err(format!(
+                    "project trust has been revoked for {}",
+                    project_path.display()
+                ));
+            }
+        }
+
+        let Ok(current_bytes) = std::fs::read(project_path) else {
+            return Err(format!(
+                "project hooks file missing or unreadable: {}",
+                project_path.display()
+            ));
+        };
+        let current_hash = compute_sha256(&current_bytes);
+        if let Some(expected_hash) = &self.content_hash {
+            if &current_hash != expected_hash {
+                return Err(format!(
+                    "project hooks file was modified on disk; revalidation required for {}",
+                    project_path.display()
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    pub fn get_legacy_commands(&self, kind: &str) -> Vec<&Vec<String>> {
+        match kind {
+            "sessionStart" => self.session_start.iter().collect(),
+            "userPromptSubmit" => self.user_prompt_submit.iter().collect(),
+            "preTool" => self.pre_tool.iter().collect(),
+            "permissionRequest" => self.permission_request.iter().collect(),
+            "postTool" => self.post_tool.iter().collect(),
+            "postToolFailure" => self
+                .post_tool_failure
+                .iter()
+                .chain(self.post_tool.iter())
+                .collect(),
+            "postToolBatch" => self.post_tool_batch.iter().collect(),
+            "subagentStart" => self.subagent_start.iter().collect(),
+            "subagentStop" => self.subagent_stop.iter().collect(),
+            "taskCreated" => self.task_created.iter().collect(),
+            "taskCompleted" => self.task_completed.iter().collect(),
+            "preCompact" => self.pre_compact.iter().collect(),
+            "postCompact" => self.post_compact.iter().collect(),
+            "preModelSwitch" => self.pre_model_switch.iter().collect(),
+            "postModelSwitch" => self.post_model_switch.iter().collect(),
+            "sessionEnd" => self.session_end.iter().chain(self.stop.iter()).collect(),
+            _ => Vec::new(),
+        }
+    }
 }
 
 pub fn load(agent_dir: &Path, cwd: &Path, trusted: bool) -> HooksFile {
     if let Ok(path) = std::env::var("PI_HOOKS_CONFIG") {
-        return load_path(Path::new(&path));
+        let mut file = load_path(Path::new(&path));
+        file.project_trusted = true;
+        return file;
     }
     let mut file = load_path(&agent_dir.join("hooks.json"));
+    file.project_trusted = trusted;
     if trusted {
-        let project = load_path(&cwd.join(".pi").join("hooks.json"));
-        file.session_start.extend(project.session_start);
-        file.user_prompt_submit.extend(project.user_prompt_submit);
-        file.pre_tool.extend(project.pre_tool);
-        file.permission_request.extend(project.permission_request);
-        file.post_tool.extend(project.post_tool);
-        file.post_tool_failure.extend(project.post_tool_failure);
-        file.post_tool_batch.extend(project.post_tool_batch);
-        file.subagent_start.extend(project.subagent_start);
-        file.subagent_stop.extend(project.subagent_stop);
-        file.task_created.extend(project.task_created);
-        file.task_completed.extend(project.task_completed);
-        file.pre_compact.extend(project.pre_compact);
-        file.post_compact.extend(project.post_compact);
-        file.pre_model_switch.extend(project.pre_model_switch);
-        file.post_model_switch.extend(project.post_model_switch);
-        file.session_end.extend(project.session_end);
-        file.stop.extend(project.stop);
+        let davinci_path = cwd.join(".davinci").join("hooks.json");
+        let pi_path = cwd.join(".pi").join("hooks.json");
+        let project_path = if davinci_path.exists() {
+            Some(davinci_path)
+        } else if pi_path.exists() {
+            Some(pi_path)
+        } else {
+            None
+        };
+        if let Some(p) = project_path {
+            if let Ok(bytes) = std::fs::read(&p) {
+                file.content_hash = Some(compute_sha256(&bytes));
+                file.project_path = Some(p.clone());
+                let project = load_path(&p);
+                file.session_start.extend(project.session_start);
+                file.user_prompt_submit.extend(project.user_prompt_submit);
+                file.pre_tool.extend(project.pre_tool);
+                file.permission_request.extend(project.permission_request);
+                file.post_tool.extend(project.post_tool);
+                file.post_tool_failure.extend(project.post_tool_failure);
+                file.post_tool_batch.extend(project.post_tool_batch);
+                file.subagent_start.extend(project.subagent_start);
+                file.subagent_stop.extend(project.subagent_stop);
+                file.task_created.extend(project.task_created);
+                file.task_completed.extend(project.task_completed);
+                file.pre_compact.extend(project.pre_compact);
+                file.post_compact.extend(project.post_compact);
+                file.pre_model_switch.extend(project.pre_model_switch);
+                file.post_model_switch.extend(project.post_model_switch);
+                file.session_end.extend(project.session_end);
+                file.stop.extend(project.stop);
+                file.rules.extend(project.rules);
+            }
+        }
     }
     file
 }
@@ -218,13 +566,72 @@ pub fn run_one_envelope(
     result: Option<&str>,
     envelope: Option<&davinci_agent::RuntimeEventEnvelope>,
 ) -> Option<String> {
-    let program = argv.first()?;
-    if std::env::var("PI_HOOKS_DRY_RUN").is_ok() {
-        return None;
+    match run_supervised_hook(
+        argv, kind, tool, None, args, result, envelope, None, None, 3,
+    ) {
+        Ok(()) => None,
+        Err(err) => Some(err),
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn run_rule(
+    rule: &HookPolicyRule,
+    kind: &str,
+    tool: &str,
+    path: Option<&Path>,
+    args: &Value,
+    result: Option<&str>,
+    envelope: Option<&davinci_agent::RuntimeEventEnvelope>,
+    timeout_ms: Option<u64>,
+    cwd: Option<&Path>,
+    max_depth: usize,
+) -> Result<(), String> {
+    run_supervised_hook(
+        &rule.action,
+        kind,
+        tool,
+        path,
+        args,
+        result,
+        envelope,
+        timeout_ms,
+        cwd,
+        max_depth,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn run_supervised_hook(
+    argv: &[String],
+    kind: &str,
+    tool: &str,
+    path: Option<&Path>,
+    args: &Value,
+    result: Option<&str>,
+    envelope: Option<&davinci_agent::RuntimeEventEnvelope>,
+    timeout_ms: Option<u64>,
+    cwd: Option<&Path>,
+    max_depth: usize,
+) -> Result<(), String> {
+    let program = argv
+        .first()
+        .ok_or_else(|| "empty hook command".to_string())?;
+
+    if std::env::var("PI_HOOKS_DRY_RUN").is_ok() {
+        return Ok(());
+    }
+
+    let _depth_guard = HookDepthGuard::enter(max_depth)?;
+
+    GLOBAL_HOOK_TELEMETRY
+        .executed
+        .fetch_add(1, Ordering::Relaxed);
+
     let mut payload = serde_json::json!({
         "kind": kind,
         "tool": tool,
+        "path": path.map(|p| p.to_string_lossy()),
         "args": args,
         "result": result,
     });
@@ -238,9 +645,6 @@ pub fn run_one_envelope(
             payload["sessionId"] = serde_json::json!(session_id);
         }
         payload["event"] = serde_json::to_value(&env.payload).unwrap_or(Value::Null);
-        // Shell hooks retain their existing pre-completion input contract.
-        // Only this compatibility adapter uses the old name: runtime observers
-        // and persistence receive TaskCompletionRequested, never a false fact.
         if matches!(
             env.payload,
             davinci_agent::RuntimeEvent::TaskCompletionRequested { .. }
@@ -250,65 +654,202 @@ pub fn run_one_envelope(
             payload["event"]["phase"] = serde_json::json!("proposal");
         }
     }
+
     let payload_str = payload.to_string();
+
     let mut cmd = Command::new(program);
-    cmd.args(&argv[1..])
-        .env("PI_HOOK_KIND", kind)
-        .env("PI_HOOK_TOOL", tool)
-        .stdin(Stdio::piped())
+    if argv.len() > 1 {
+        cmd.args(&argv[1..]);
+    }
+
+    cmd.env_clear();
+    for var in [
+        "PATH",
+        "PATHEXT",
+        "SystemRoot",
+        "WINDIR",
+        "COMSPEC",
+        "TEMP",
+        "TMP",
+        "TMPDIR",
+        "LANG",
+        "LC_ALL",
+        "LC_CTYPE",
+    ] {
+        if let Ok(val) = std::env::var(var) {
+            cmd.env(var, val);
+        }
+    }
+    cmd.env("PI_HOOK_KIND", kind);
+    cmd.env("PI_HOOK_TOOL", tool);
+    cmd.env("PI_HOOK_EVENT", kind);
+    let current_depth = HOOK_DEPTH.with(|d| d.get());
+    cmd.env("DAVINCI_HOOK_DEPTH", current_depth.to_string());
+
+    if let Some(c) = cwd {
+        cmd.current_dir(c);
+    }
+
+    cmd.stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(0x08000000);
+    }
+
     let mut child = match cmd.spawn() {
         Ok(child) => child,
-        Err(err) => return Some(format!("hook `{program}` failed: {err}")),
+        Err(err) => {
+            GLOBAL_HOOK_TELEMETRY
+                .blocked
+                .fetch_add(1, Ordering::Relaxed);
+            return Err(format!("hook `{program}` failed: {err}"));
+        }
     };
+
+    let child_pid = child.id();
+
     if let Some(mut stdin) = child.stdin.take() {
         let _ = stdin.write_all(payload_str.as_bytes());
+        let _ = stdin.flush();
+        drop(stdin);
     }
+
     let stdout = child.stdout.take().map(|mut pipe| {
         std::thread::spawn(move || {
             let mut buf = Vec::new();
-            let _ = std::io::Read::read_to_end(&mut pipe, &mut buf);
+            let mut chunk = [0u8; 8192];
+            while let Ok(n) = std::io::Read::read(&mut pipe, &mut chunk) {
+                if n == 0 {
+                    break;
+                }
+                let remaining = MAX_HOOK_STREAM_BYTES.saturating_sub(buf.len());
+                let take = n.min(remaining);
+                buf.extend_from_slice(&chunk[..take]);
+                if buf.len() >= MAX_HOOK_STREAM_BYTES {
+                    break;
+                }
+            }
             buf
         })
     });
+
     let stderr = child.stderr.take().map(|mut pipe| {
         std::thread::spawn(move || {
             let mut buf = Vec::new();
-            let _ = std::io::Read::read_to_end(&mut pipe, &mut buf);
+            let mut chunk = [0u8; 8192];
+            while let Ok(n) = std::io::Read::read(&mut pipe, &mut chunk) {
+                if n == 0 {
+                    break;
+                }
+                let remaining = MAX_HOOK_STREAM_BYTES.saturating_sub(buf.len());
+                let take = n.min(remaining);
+                buf.extend_from_slice(&chunk[..take]);
+                if buf.len() >= MAX_HOOK_STREAM_BYTES {
+                    break;
+                }
+            }
             buf
         })
     });
+
+    let timeout = timeout_ms
+        .map(Duration::from_millis)
+        .unwrap_or(HOOK_TIMEOUT);
     let started = Instant::now();
+
     let status = loop {
         match child.try_wait() {
             Ok(Some(status)) => break status,
-            Ok(None) if started.elapsed() >= HOOK_TIMEOUT => {
+            Ok(None) if started.elapsed() >= timeout => {
+                kill_process_tree(child_pid);
                 let _ = child.kill();
                 let _ = child.wait();
-                return Some(format!(
+                GLOBAL_HOOK_TELEMETRY
+                    .timed_out
+                    .fetch_add(1, Ordering::Relaxed);
+                GLOBAL_HOOK_TELEMETRY
+                    .blocked
+                    .fetch_add(1, Ordering::Relaxed);
+                return Err(format!(
                     "hook `{program}` timed out after {}s",
-                    HOOK_TIMEOUT.as_secs()
+                    timeout.as_secs()
                 ));
             }
             Ok(None) => std::thread::sleep(Duration::from_millis(10)),
-            Err(err) => return Some(format!("hook `{program}` failed: {err}")),
+            Err(err) => {
+                GLOBAL_HOOK_TELEMETRY
+                    .blocked
+                    .fetch_add(1, Ordering::Relaxed);
+                return Err(format!("hook `{program}` failed: {err}"));
+            }
         }
     };
-    let stdout = stdout
+
+    let stdout_bytes = stdout
         .map(|handle| handle.join().unwrap_or_default())
         .unwrap_or_default();
-    let stderr = stderr
+    let stderr_bytes = stderr
         .map(|handle| handle.join().unwrap_or_default())
         .unwrap_or_default();
+
     if status.success() {
-        return None;
+        return Ok(());
     }
-    let mut text = String::from_utf8_lossy(&stderr).into_owned();
+
+    GLOBAL_HOOK_TELEMETRY
+        .blocked
+        .fetch_add(1, Ordering::Relaxed);
+
+    let mut text = String::from_utf8_lossy(&stderr_bytes).into_owned();
     if text.trim().is_empty() {
-        text = String::from_utf8_lossy(&stdout).into_owned();
+        text = String::from_utf8_lossy(&stdout_bytes).into_owned();
     }
-    Some(format!("hook `{program}` blocked {tool}: {}", text.trim()))
+    Err(format!("hook `{program}` blocked {tool}: {}", text.trim()))
+}
+
+fn kill_process_tree(pid: u32) {
+    if cfg!(windows) {
+        let _ = Command::new("taskkill")
+            .args(["/F", "/T", "/PID", &pid.to_string()])
+            .output();
+    } else {
+        #[cfg(unix)]
+        {
+            unsafe {
+                libc::kill(-(pid as i32), libc::SIGKILL);
+                libc::kill(pid as i32, libc::SIGKILL);
+            }
+        }
+    }
+}
+
+pub fn status_report(cwd: &Path) -> Value {
+    let hooks = load(&davinci_session::default_agent_dir(), cwd, true);
+    serde_json::json!({
+        "trusted": hooks.project_trusted,
+        "projectPath": hooks.project_path.as_ref().map(|p| p.to_string_lossy()),
+        "contentHash": hooks.content_hash,
+        "rulesCount": hooks.rules.len(),
+        "legacyHooksCount": {
+            "preTool": hooks.pre_tool.len(),
+            "postTool": hooks.post_tool.len(),
+            "sessionStart": hooks.session_start.len(),
+            "sessionEnd": hooks.session_end.len(),
+            "stop": hooks.stop.len(),
+        },
+        "telemetry": {
+            "executed": GLOBAL_HOOK_TELEMETRY.executed.load(Ordering::Relaxed),
+            "blocked": GLOBAL_HOOK_TELEMETRY.blocked.load(Ordering::Relaxed),
+            "warned": GLOBAL_HOOK_TELEMETRY.warned.load(Ordering::Relaxed),
+            "ignored": GLOBAL_HOOK_TELEMETRY.ignored.load(Ordering::Relaxed),
+            "timedOut": GLOBAL_HOOK_TELEMETRY.timed_out.load(Ordering::Relaxed),
+            "recursionStopped": GLOBAL_HOOK_TELEMETRY.recursion_stopped.load(Ordering::Relaxed),
+        }
+    })
 }
 
 #[cfg(test)]

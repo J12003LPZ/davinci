@@ -151,7 +151,86 @@ pub(super) fn file_targets(
     cwd: &Path,
     boundary: &FilesystemBoundaryPolicy,
 ) -> Result<Vec<FileTarget>, String> {
-    if tool == "apply_patch" {
+    if matches!(tool, "test_related" | "test_impacted" | "test_plan") {
+        let mut paths = Vec::new();
+        if let Some(values) = args.get("paths") {
+            for value in values.as_array().ok_or("paths must be an array")? {
+                paths.push(value.as_str().ok_or("paths must contain strings")?);
+            }
+        }
+        if let Some(path) = args.get("path") {
+            paths.push(path.as_str().ok_or("path must be a string")?);
+        }
+        let symbols = args
+            .get("symbolIds")
+            .map(|value| {
+                let values = value.as_array().ok_or("symbolIds must be an array")?;
+                if values
+                    .iter()
+                    .any(|v| v.as_str().is_none_or(|s| s.is_empty() || s.len() > 4096))
+                {
+                    return Err("invalid symbolIds");
+                }
+                Ok(values.len())
+            })
+            .transpose()?
+            .unwrap_or(0);
+        if paths.len() + symbols == 0 || paths.len() + symbols > 64 {
+            return Err("expected 1..64 paths or symbolIds".into());
+        }
+        paths
+            .into_iter()
+            .map(|path| {
+                if path.is_empty()
+                    || path.len() > 4096
+                    || path.contains([':', '\\', '\0'])
+                    || Path::new(path).components().any(|part| {
+                        !matches!(
+                            part,
+                            std::path::Component::Normal(_) | std::path::Component::CurDir
+                        )
+                    })
+                {
+                    return Err("impact paths must be relative workspace paths".into());
+                }
+                let item = target(cwd, path, boundary, false);
+                if item.secret || item.outside || item.symlink_escape {
+                    return Err("impact path is outside the permitted source boundary".into());
+                }
+                Ok(item)
+            })
+            .collect()
+    } else {
+        ordinary_file_targets(tool, args, cwd, boundary)
+    }
+}
+
+fn ordinary_file_targets(
+    tool: &str,
+    args: &Value,
+    cwd: &Path,
+    boundary: &FilesystemBoundaryPolicy,
+) -> Result<Vec<FileTarget>, String> {
+    if matches!(tool, "patch_apply" | "patch_status" | "patch_rollback") {
+        let paths = args
+            .get("paths")
+            .and_then(Value::as_array)
+            .ok_or("transaction requires paths")?;
+        if paths.is_empty() || paths.len() > 64 {
+            return Err("transaction requires 1..64 paths".into());
+        }
+        return paths
+            .iter()
+            .map(|value| {
+                let path = value
+                    .as_str()
+                    .filter(|p| !p.is_empty())
+                    .ok_or("invalid transaction path")?;
+                Ok(target(cwd, path, boundary, tool == "patch_rollback"))
+            })
+            .collect();
+    }
+    if matches!(tool, "apply_patch" | "patch_preview") {
         let input = args
             .get("input")
             .and_then(Value::as_str)
@@ -175,7 +254,28 @@ pub(super) fn file_targets(
     }
     if matches!(
         tool,
-        "read" | "grep" | "find" | "ls" | "write" | "edit" | "notebook_edit"
+        "read"
+            | "grep"
+            | "find"
+            | "ls"
+            | "write"
+            | "edit"
+            | "notebook_edit"
+            | "repo_map"
+            | "symbol_search"
+            | "file_symbols"
+            | "file_dependencies"
+            | "symbol_relationships"
+            | "related_files"
+            | "code_query"
+            | "lsp_definition"
+            | "lsp_references"
+            | "lsp_hover"
+            | "lsp_document_symbols"
+            | "lsp_workspace_symbols"
+            | "lsp_implementations"
+            | "lsp_type_definition"
+            | "lsp_diagnostics"
     ) {
         if matches!(tool, "write" | "edit" | "notebook_edit")
             && args
@@ -201,7 +301,7 @@ pub(super) fn routine_local_shell(
     cwd: &Path,
     boundary: &FilesystemBoundaryPolicy,
 ) -> bool {
-    if tool == "write_stdin"
+    if matches!(tool, "write_stdin" | "process_start" | "process_write")
         || args.get("run_in_background").and_then(Value::as_bool) == Some(true)
         || args.get("background").and_then(Value::as_bool) == Some(true)
     {
@@ -320,6 +420,42 @@ pub(super) fn routine_local_shell(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn repository_and_language_tools_keep_sensitive_path_checks() {
+        let root = tempfile::tempdir().unwrap();
+        for tool in [
+            "repo_map",
+            "symbol_search",
+            "file_symbols",
+            "file_dependencies",
+            "symbol_relationships",
+            "related_files",
+            "code_query",
+            "lsp_definition",
+            "lsp_references",
+            "lsp_hover",
+            "lsp_document_symbols",
+            "lsp_workspace_symbols",
+            "lsp_implementations",
+            "lsp_type_definition",
+            "lsp_diagnostics",
+        ] {
+            assert_eq!(
+                super::super::tool_class(tool),
+                super::super::ToolClass::Read
+            );
+            let targets = file_targets(
+                tool,
+                &serde_json::json!({"path": ".env"}),
+                root.path(),
+                &FilesystemBoundaryPolicy::default(),
+            )
+            .unwrap();
+            assert_eq!(targets.len(), 1, "{tool}");
+            assert!(targets[0].secret, "{tool}");
+        }
+    }
 
     #[test]
     fn protected_names_cover_case_streams_and_nested_credentials() {

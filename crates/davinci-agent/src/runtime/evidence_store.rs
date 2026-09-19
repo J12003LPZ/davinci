@@ -4,6 +4,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::fs;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
@@ -32,6 +33,10 @@ pub struct ExecutionReceipt {
     pub tool_name: String,
     #[serde(default)]
     pub argv: Vec<String>,
+    /// Workspace-relative target roots reported by an actual compiler invocation.
+    /// Does not imply coverage of transitive modules or arbitrary sibling files.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub compiler_source_roots: Vec<String>,
     #[serde(default)]
     pub cwd: String,
     pub started: bool,
@@ -69,6 +74,7 @@ impl Default for ExecutionReceipt {
             requirement_id: None,
             tool_name: String::new(),
             argv: Vec::new(),
+            compiler_source_roots: Vec::new(),
             cwd: ".".into(),
             started: false,
             exit_code: None,
@@ -157,20 +163,55 @@ impl VerificationEvidenceStore {
 
     /// Retrieve an artifact verifying bounds, non-escape, existence, size, and SHA-256.
     pub fn get_artifact(&self, artifact_ref: &ArtifactRef) -> Result<Vec<u8>, String> {
-        // Prevent directory traversal escape
-        let rel_path = Path::new(&artifact_ref.relative_store_path);
-        for component in rel_path.components() {
-            if matches!(component, std::path::Component::ParentDir) {
-                return Err("directory traversal attempt in artifact retrieval".into());
+        // Only the flat content-addressed filename issued by this store is valid.
+        // A matching hash does not authorize reading an absolute or nested path.
+        if artifact_ref.sha256.len() != 64
+            || !artifact_ref
+                .sha256
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+            || artifact_ref.relative_store_path != format!("{}.bin", artifact_ref.sha256)
+        {
+            return Err("invalid content-addressed artifact path".into());
+        }
+        let full_path = self.dir.join(&artifact_ref.relative_store_path);
+        let metadata = fs::symlink_metadata(&full_path).map_err(|e| e.to_string())?;
+        if !metadata.is_file() || metadata.len() != artifact_ref.size {
+            return Err("artifact blob is not a regular file of the expected size".into());
+        }
+        let mut options = fs::OpenOptions::new();
+        options.read(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.custom_flags(libc::O_NOFOLLOW);
+        }
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::OpenOptionsExt;
+            options.custom_flags(0x00200000); // FILE_FLAG_OPEN_REPARSE_POINT
+        }
+        let opened = options.open(&full_path).map_err(|e| e.to_string())?;
+        let metadata = opened.metadata().map_err(|e| e.to_string())?;
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::MetadataExt;
+            if metadata.file_attributes() & 0x00000400 != 0 {
+                return Err("artifact blob is a reparse point".into());
             }
         }
-
-        let full_path = self.dir.join(rel_path);
-        if !full_path.exists() {
-            return Err(format!("artifact blob missing: {}", artifact_ref.id));
+        if !metadata.is_file() || metadata.len() != artifact_ref.size {
+            return Err("artifact blob changed before retrieval".into());
         }
-
-        let bytes = fs::read(&full_path).map_err(|e| e.to_string())?;
+        let limit = artifact_ref
+            .size
+            .checked_add(1)
+            .ok_or("artifact size overflow")?;
+        let mut bytes = Vec::new();
+        opened
+            .take(limit)
+            .read_to_end(&mut bytes)
+            .map_err(|e| e.to_string())?;
         if bytes.len() as u64 != artifact_ref.size {
             return Err(format!(
                 "artifact size mismatch: expected {}, got {}",
@@ -375,6 +416,71 @@ mod tests {
         };
 
         assert!(store.get_artifact(&escape_ref).is_err());
+    }
+
+    #[test]
+    fn artifact_retrieval_rejects_absolute_and_nested_paths() {
+        let dir = tempdir().unwrap();
+        let outside = tempdir().unwrap();
+        let store = VerificationEvidenceStore::new(dir.path());
+        let other = VerificationEvidenceStore::new(outside.path());
+        let bytes = b"artifact boundary fixture";
+        let reference = store.store_artifact("text/plain", bytes).unwrap();
+        assert_eq!(store.get_artifact(&reference).unwrap(), bytes);
+        let external = other.store_artifact("text/plain", bytes).unwrap();
+        let mut escaped = external.clone();
+        escaped.relative_store_path = outside
+            .path()
+            .join(&external.relative_store_path)
+            .to_str()
+            .unwrap()
+            .to_string();
+        assert!(store.get_artifact(&escaped).is_err());
+
+        std::fs::create_dir(dir.path().join("nested")).unwrap();
+        std::fs::write(
+            dir.path()
+                .join("nested")
+                .join(&reference.relative_store_path),
+            bytes,
+        )
+        .unwrap();
+        let mut nested = reference;
+        nested.relative_store_path = format!("nested/{}", nested.relative_store_path);
+        assert!(store.get_artifact(&nested).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn artifact_retrieval_rejects_symlink_blobs() {
+        let dir = tempdir().unwrap();
+        let outside = tempdir().unwrap();
+        let other = VerificationEvidenceStore::new(outside.path());
+        let reference = other
+            .store_artifact("text/plain", b"symlink fixture")
+            .unwrap();
+        std::os::unix::fs::symlink(
+            outside.path().join(&reference.relative_store_path),
+            dir.path().join(&reference.relative_store_path),
+        )
+        .unwrap();
+        let store = VerificationEvidenceStore::new(dir.path());
+        assert!(store.get_artifact(&reference).is_err());
+    }
+
+    #[test]
+    fn artifact_retrieval_rejects_changed_size_and_content() {
+        let dir = tempdir().unwrap();
+        let store = VerificationEvidenceStore::new(dir.path());
+        let reference = store.store_artifact("text/plain", b"original").unwrap();
+        let path = dir.path().join(&reference.relative_store_path);
+        std::fs::write(&path, b"modified").unwrap();
+        assert!(store
+            .get_artifact(&reference)
+            .unwrap_err()
+            .contains("hash mismatch"));
+        std::fs::write(&path, b"grew beyond original size").unwrap();
+        assert!(store.get_artifact(&reference).is_err());
     }
 
     #[test]

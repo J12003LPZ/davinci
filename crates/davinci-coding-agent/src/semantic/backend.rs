@@ -8,6 +8,10 @@ use super::manager::{
 use super::tools::{is_path_in_root, path_to_uri, uri_to_path};
 use super::transport::{is_unsolicited_effect, lsp_frame, LspFrameParser, RequestTable};
 use super::{SemanticBackend, SemanticSessionKey};
+use davinci_agent::runtime::cache::{
+    CacheDependency, CacheError, CacheKey, CacheNamespace, CachePolicy, CacheRequest, CacheRuntime,
+    SingleFlight,
+};
 use davinci_agent::semantic::{
     Diagnostic, DiagnosticSeverity, Location, Position, Range, RenamePreview, SemanticCapabilities,
     SemanticResult, SymbolItem,
@@ -42,16 +46,23 @@ impl LocalBackendSessions {
         }
     }
 
-    fn insert(&mut self, key: SemanticSessionKey, session: Arc<LocalLspSession>) {
+    fn insert(
+        &mut self,
+        key: SemanticSessionKey,
+        session: Arc<LocalLspSession>,
+    ) -> Vec<Arc<LocalLspSession>> {
+        let mut retired: Vec<_> = self.sessions.remove(&key).into_iter().collect();
+        self.insertion_order.retain(|entry| entry != &key);
         while self.sessions.len() >= self.max_sessions {
             let Some(oldest) = self.insertion_order.first().cloned() else {
                 break;
             };
             self.insertion_order.remove(0);
-            self.sessions.remove(&oldest);
+            retired.extend(self.sessions.remove(&oldest));
         }
         self.insertion_order.push(key.clone());
         self.sessions.insert(key, session);
+        retired
     }
 }
 
@@ -59,6 +70,8 @@ impl LocalBackendSessions {
 /// request has passed the trust and permission gate.
 pub struct LocalSemanticBackend {
     sessions: Mutex<LocalBackendSessions>,
+    launches: SingleFlight,
+    cache: CacheRuntime,
 }
 
 impl fmt::Debug for LocalSemanticBackend {
@@ -79,9 +92,81 @@ impl Default for LocalSemanticBackend {
 }
 
 impl LocalSemanticBackend {
+    pub fn shared(cache: CacheRuntime) -> Arc<Self> {
+        type Registry = Mutex<BTreeMap<usize, std::sync::Weak<LocalSemanticBackend>>>;
+        static REGISTRY: std::sync::OnceLock<Registry> = std::sync::OnceLock::new();
+        let mut registry = REGISTRY
+            .get_or_init(Mutex::default)
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        registry.retain(|_, value| value.strong_count() > 0);
+        let key = cache.resource_scope();
+        if let Some(backend) = registry.get(&key).and_then(std::sync::Weak::upgrade) {
+            return backend;
+        }
+        let backend = Arc::new(Self::with_cache(cache));
+        if registry.len() < 64 {
+            registry.insert(key, Arc::downgrade(&backend));
+        }
+        backend
+    }
+
+    pub(super) fn discover(
+        &self,
+        language: &str,
+        root: &Path,
+    ) -> Option<super::LanguageServerSpec> {
+        let root = root.canonicalize().ok()?;
+        let environment = format!(
+            "{:?}",
+            (
+                &root,
+                std::env::var_os("PATH"),
+                std::env::var_os("PATHEXT"),
+                std::env::var_os("DAVINCI_RUST_ANALYZER"),
+                std::env::var_os("DAVINCI_TYPESCRIPT_LANGUAGE_SERVER")
+            )
+        );
+        let key = CacheKey::new(
+            CacheNamespace::Lsp,
+            format!("server-discovery:{}", super::normalize_language(language)),
+            1,
+            "local-server-discovery-v1",
+            vec![CacheDependency::ConfigHash(
+                davinci_agent::runtime::cache::digest(environment.as_bytes()),
+            )],
+        );
+        let positive = CacheRequest::new(key.clone(), CachePolicy::TtlBound { ttl_ms: 250 });
+        if let Ok(Some(spec)) = self
+            .cache
+            .get::<super::LanguageServerSpec>(&positive, || Ok(()))
+        {
+            if Path::new(&spec.program).is_file() {
+                return Some((*spec).clone());
+            }
+        }
+        let negative = CacheRequest::new(key, CachePolicy::Negative { ttl_ms: 250 });
+        if matches!(self.cache.get::<bool>(&negative, || Ok(())), Ok(Some(_))) {
+            return None;
+        }
+        let spec = super::resolve_language_server(language, &root);
+        if let Some(spec) = &spec {
+            let _ = self.cache.put(&positive, spec.clone(), || Ok(()));
+        } else {
+            let _ = self.cache.put(&negative, true, || Ok(()));
+        }
+        spec
+    }
+
     pub fn new() -> Self {
+        Self::with_cache(CacheRuntime::default())
+    }
+
+    pub fn with_cache(cache: CacheRuntime) -> Self {
         Self {
             sessions: Mutex::new(LocalBackendSessions::new(MAX_LOCAL_SESSIONS)),
+            launches: SingleFlight::default(),
+            cache,
         }
     }
 
@@ -93,18 +178,47 @@ impl LocalSemanticBackend {
         root: &Path,
         request_timeout: Duration,
     ) -> Result<SemanticCapabilities, String> {
-        let mut sessions = self
-            .sessions
-            .lock()
-            .map_err(|_| "Semantic backend session registry is unavailable".to_string())?;
-        if let Some(session) = sessions.sessions.get(&key) {
-            return Ok(session.capabilities.clone());
+        let identity = format!("{key:?}:{spec:?}");
+        let (session, leader) = self
+            .launches
+            .run(&identity, request_timeout, None, || {
+                let existing = self
+                    .sessions
+                    .lock()
+                    .map_err(|_| {
+                        CacheError::Compute("Semantic session registry unavailable".into())
+                    })?
+                    .sessions
+                    .get(&key)
+                    .cloned();
+                if let Some(session) = existing.filter(|session| {
+                    session.program == spec.program
+                        && session.args == spec.args
+                        && session.is_alive()
+                }) {
+                    self.cache.record_resource(false, self.session_count());
+                    return Ok(session);
+                }
+                // Process startup and initialization must not hold the registry lock.
+                let session = Arc::new(
+                    LocalLspSession::launch(spec, root, request_timeout, self.cache.clone())
+                        .map_err(CacheError::Compute)?,
+                );
+                let mut sessions = self.sessions.lock().map_err(|_| {
+                    CacheError::Compute("Semantic session registry unavailable".into())
+                })?;
+                let retired = sessions.insert(key, session.clone());
+                self.cache.record_resource(true, sessions.sessions.len());
+                drop(sessions);
+                // Shutdown can perform I/O; never run it under the registry lock.
+                drop(retired);
+                Ok(session)
+            })
+            .map_err(|error| error.to_string())?;
+        if !leader {
+            self.cache.record_resource(false, self.session_count());
         }
-
-        let session = Arc::new(LocalLspSession::launch(spec, root, request_timeout)?);
-        let capabilities = session.capabilities.clone();
-        sessions.insert(key, session);
-        Ok(capabilities)
+        Ok(session.capabilities.clone())
     }
 
     pub fn session_count(&self) -> usize {
@@ -286,10 +400,13 @@ impl SemanticBackend for LocalSemanticBackend {
 struct LocalLspSession {
     root: PathBuf,
     program: String,
+    args: Vec<String>,
     capabilities: SemanticCapabilities,
     request_timeout: Duration,
     connection: Mutex<LspConnection>,
     documents: Mutex<DocumentTracker>,
+    cache: CacheRuntime,
+    generation: String,
 }
 
 impl fmt::Debug for LocalLspSession {
@@ -303,10 +420,18 @@ impl fmt::Debug for LocalLspSession {
 }
 
 impl LocalLspSession {
+    fn is_alive(&self) -> bool {
+        self.connection
+            .lock()
+            .ok()
+            .is_some_and(|mut connection| matches!(connection.child.try_wait(), Ok(None)))
+    }
+
     fn launch(
         spec: &super::LanguageServerSpec,
         root: &Path,
         request_timeout: Duration,
+        cache: CacheRuntime,
     ) -> Result<Self, String> {
         let request_timeout = request_timeout.max(Duration::from_millis(1));
         let config = LspServerConfig {
@@ -352,10 +477,13 @@ impl LocalLspSession {
                 .canonicalize()
                 .map_err(|error| format!("Could not canonicalize semantic root: {error}"))?,
             program: spec.program.clone(),
+            args: spec.args.clone(),
             capabilities,
             request_timeout: request_timeout.max(Duration::from_millis(1)),
             connection: Mutex::new(connection),
             documents: Mutex::new(DocumentTracker::new()),
+            cache,
+            generation: uuid::Uuid::new_v4().to_string(),
         })
     }
 
@@ -375,6 +503,57 @@ impl LocalLspSession {
             .lock()
             .map_err(|_| "Local language-server connection is unavailable".to_string())?;
         self.sync_document(&target, &mut connection)?;
+        if !matches!(connection.child.try_wait(), Ok(None)) {
+            return Err("Local language server is no longer running".into());
+        }
+        // Document symbols are short-lived, document-local derived data. Broader
+        // workspace queries and diagnostics deliberately bypass this cache.
+        if method == "textDocument/documentSymbol" {
+            let documents = self
+                .documents
+                .lock()
+                .map_err(|_| "Semantic document tracker unavailable".to_string())?;
+            let document = documents
+                .get_document(&target)
+                .ok_or_else(|| "Semantic document is not synchronized".to_string())?;
+            let workspace = self.root.to_string_lossy().into_owned();
+            let request = CacheRequest::new(
+                CacheKey::new(
+                    CacheNamespace::Lsp,
+                    serde_json::to_string(&(method, &params)).map_err(|e| e.to_string())?,
+                    1,
+                    "document-symbols-v1",
+                    vec![
+                        CacheDependency::ServerGeneration {
+                            workspace: workspace.clone(),
+                            generation: self.generation.clone(),
+                        },
+                        CacheDependency::DocumentVersion {
+                            workspace,
+                            uri: path_to_uri(&target),
+                            version: i64::from(document.version),
+                        },
+                        CacheDependency::ContentHash(document.content_hash.clone()),
+                    ],
+                ),
+                CachePolicy::TtlBound { ttl_ms: 250 },
+            );
+            drop(documents);
+            let result = self
+                .cache
+                .get_or_compute(
+                    &request,
+                    || Ok(()),
+                    None,
+                    || {
+                        connection
+                            .request(method, params, self.request_timeout)
+                            .map_err(CacheError::Compute)
+                    },
+                )
+                .map_err(|e| e.to_string())?;
+            return Ok((*result).clone());
+        }
         connection.request(method, params, self.request_timeout)
     }
 
@@ -386,16 +565,15 @@ impl LocalLspSession {
                 self.root.display()
             ));
         }
-        let metadata = std::fs::metadata(path)
-            .map_err(|error| format!("Could not inspect semantic document: {error}"))?;
-        if metadata.len() > MAX_DOCUMENT_BYTES {
-            return Err(format!(
-                "Semantic document exceeds the {} byte limit",
-                MAX_DOCUMENT_BYTES
-            ));
-        }
-        let content = std::fs::read_to_string(path)
+        let relative = path
+            .strip_prefix(&self.root)
+            .map_err(|_| "Semantic document outside root".to_string())?;
+        let snapshot = self
+            .cache
+            .read_current_file(&self.root, relative, MAX_DOCUMENT_BYTES as usize, || Ok(()))
             .map_err(|error| format!("Could not read semantic document: {error}"))?;
+        let content = String::from_utf8(snapshot.bytes)
+            .map_err(|error| format!("Semantic document is not UTF-8: {error}"))?;
         let uri = path_to_uri(&normalize_verbatim_path(path.to_path_buf()));
         let update = {
             let mut documents = self
@@ -414,7 +592,7 @@ impl LocalLspSession {
                     "textDocument/didOpen",
                     documents.did_open(uri.clone(), path.to_path_buf(), content.clone()),
                 )),
-                Some((true, hash)) if hash != super::documents::sha256_digest(&content) => Some((
+                Some((true, hash)) if hash != snapshot.content_hash => Some((
                     "textDocument/didChange",
                     documents.did_change(path, content.clone())?,
                 )),
@@ -883,6 +1061,143 @@ fn format_server_error(error: &Value) -> String {
 mod tests {
     use super::*;
     use tempfile::tempdir;
+
+    #[test]
+    #[ignore = "subprocess fixture; invoked by cache_session_reuse_edit_and_restart"]
+    fn cache_fixture_lsp() {
+        if !Path::new("cache-lsp-fixture-enabled").is_file() {
+            return;
+        }
+        let mut input = std::io::stdin().lock();
+        let mut output = std::io::stdout().lock();
+        // Separate the test harness preamble from the first framed header.
+        output.write_all(b"\r\n").unwrap();
+        output.flush().unwrap();
+        let mut text = String::new();
+        let mut calls = 0;
+        for _ in 0..100 {
+            let mut length = 0;
+            loop {
+                let mut line = String::new();
+                if input.read_line(&mut line).unwrap() == 0 {
+                    return;
+                }
+                if line == "\r\n" {
+                    break;
+                }
+                if let Some(value) = line.strip_prefix("Content-Length:") {
+                    length = value.trim().parse().unwrap();
+                }
+            }
+            let mut body = vec![0; length];
+            input.read_exact(&mut body).unwrap();
+            let request: Value = serde_json::from_slice(&body).unwrap();
+            let result = match request["method"].as_str().unwrap_or("") {
+                "initialize" => json!({"capabilities":{"documentSymbolProvider":true}}),
+                "textDocument/didOpen" => {
+                    text = request["params"]["textDocument"]["text"]
+                        .as_str()
+                        .unwrap()
+                        .into();
+                    continue;
+                }
+                "textDocument/didChange" => {
+                    text = request["params"]["contentChanges"][0]["text"]
+                        .as_str()
+                        .unwrap()
+                        .into();
+                    continue;
+                }
+                "textDocument/documentSymbol" => {
+                    calls += 1;
+                    json!({"calls":calls,"text":text})
+                }
+                "shutdown" => Value::Null,
+                "exit" => return,
+                _ => continue,
+            };
+            output
+                .write_all(&lsp_frame(
+                    &json!({"jsonrpc":"2.0","id":request["id"],"result":result}).to_string(),
+                ))
+                .unwrap();
+            output.flush().unwrap();
+        }
+    }
+
+    #[test]
+    fn cache_session_reuse_edit_and_restart() {
+        let root = tempdir().unwrap();
+        std::fs::write(root.path().join("cache-lsp-fixture-enabled"), "fixture").unwrap();
+        std::fs::write(root.path().join("file.rs"), "before").unwrap();
+        let spec = super::super::LanguageServerSpec {
+            program: std::env::current_exe()
+                .unwrap()
+                .to_string_lossy()
+                .into_owned(),
+            args: vec![
+                "--exact".into(),
+                "semantic::backend::tests::cache_fixture_lsp".into(),
+                "--ignored".into(),
+                "--nocapture".into(),
+            ],
+            language: "rust".into(),
+        };
+        let key = super::super::LazySemanticSessionRegistry::key(root.path(), "rust", "fixture");
+        let cache = CacheRuntime::default();
+        let backend = Arc::new(LocalSemanticBackend::with_cache(cache.clone()));
+        let barrier = Arc::new(std::sync::Barrier::new(10));
+        let workers: Vec<_> = (0..10)
+            .map(|_| {
+                let (backend, barrier, key, spec, root) = (
+                    backend.clone(),
+                    barrier.clone(),
+                    key.clone(),
+                    spec.clone(),
+                    root.path().to_path_buf(),
+                );
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    backend
+                        .start_session(key, &spec, &root, Duration::from_secs(5))
+                        .unwrap();
+                })
+            })
+            .collect();
+        for worker in workers {
+            worker.join().unwrap();
+        }
+        assert_eq!(cache.stats().resource_cold_starts, 1);
+        assert_eq!(cache.stats().resource_reuses, 9);
+        let session = backend.sessions.lock().unwrap().sessions[&key].clone();
+        let query = || {
+            session
+                .request_for_document("textDocument/documentSymbol", "file.rs", json!({}))
+                .unwrap()
+        };
+        assert_eq!(query()["calls"], 1);
+        assert_eq!(query()["calls"], 1);
+        std::fs::write(root.path().join("file.rs"), "edited").unwrap();
+        assert_eq!(query()["text"], "edited");
+        assert_eq!(query()["calls"], 2);
+        session.connection.lock().unwrap().child.kill().unwrap();
+        session.connection.lock().unwrap().child.wait().unwrap();
+        assert!(session
+            .request_for_document("textDocument/documentSymbol", "file.rs", json!({}))
+            .is_err());
+        backend
+            .start_session(key.clone(), &spec, root.path(), Duration::from_secs(5))
+            .unwrap();
+        let restarted = backend.sessions.lock().unwrap().sessions[&key].clone();
+        assert_ne!(session.generation, restarted.generation);
+        assert_eq!(
+            restarted
+                .request_for_document("textDocument/documentSymbol", "file.rs", json!({}))
+                .unwrap()["calls"],
+            1
+        );
+        assert_eq!(cache.stats().resource_cold_starts, 2);
+    }
 
     #[test]
     fn semantic_definition_converts_canned_lsp_response() {

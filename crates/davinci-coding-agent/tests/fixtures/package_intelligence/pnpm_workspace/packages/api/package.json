@@ -1,0 +1,8 @@
+{
+  "name": "@monorepo/api",
+  "version": "1.0.0",
+  "dependencies": {
+    "zod": "^3.22.0",
+    "@monorepo/shared-utils": "workspace:*"
+  }
+}

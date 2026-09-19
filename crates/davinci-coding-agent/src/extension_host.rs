@@ -583,6 +583,42 @@ impl ExtensionHost {
         if !is_worker_submit && !is_registered {
             return None;
         }
+        if crate::native_extensions::test_impact::TOOL_NAMES.contains(&name) {
+            let impact = self
+                .native
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .test_impact
+                .clone();
+            return Some(impact.execute(name, args));
+        }
+        if crate::native_extensions::package_intelligence::TOOL_NAMES.contains(&name) {
+            let package = self
+                .native
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .package_intelligence
+                .clone();
+            return Some(package.execute_tool(name, args));
+        }
+        if crate::native_extensions::build_intelligence::TOOL_NAMES.contains(&name) {
+            let build = self
+                .native
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .build_intelligence
+                .clone();
+            return Some(build.execute_tool(name, args));
+        }
+        if crate::native_extensions::repo_intelligence::is_repo_tool(name) {
+            let repo = self
+                .native
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .repo_intelligence
+                .clone();
+            return Some(repo.execute_tool(name, args));
+        }
         // `graph_run` blocks for the whole run. It must not do so while
         // holding the native host: every other tool call's pre-hook, the
         // status commands and session shutdown (`abort_all_runs`) take the
@@ -1078,6 +1114,59 @@ impl ExtensionHost {
         None
     }
 
+    /// Engine dispatch entry point shared by foreground and worker attachments.
+    /// Context supplies live request state, not permission to use resources;
+    /// resource adapters must additionally authorize at their own boundaries.
+    pub fn execute_js_or_manifest_tool_with_context(
+        &self,
+        cwd: &Path,
+        name: &str,
+        args: &Value,
+        context: &davinci_agent::ToolContext,
+    ) -> Result<davinci_agent::ToolResult, davinci_agent::ToolError> {
+        if context.is_aborted() {
+            return Err(davinci_agent::ToolError::Failed(
+                "tool request cancelled".into(),
+            ));
+        }
+        if crate::native_extensions::browser::TOOL_NAMES.contains(&name) {
+            if let Some(parent) = &context.task_coordinator {
+                return parent.call_with_timeout(
+                    name,
+                    args,
+                    context.abort.as_deref(),
+                    std::time::Duration::from_secs(35),
+                );
+            }
+            let browser = self
+                .native
+                .lock()
+                .map_err(|_| davinci_agent::ToolError::Failed("native host unavailable".into()))?
+                .browser
+                .clone();
+            return browser.execute(cwd, name, args, context);
+        }
+        if crate::native_extensions::verification_planner::TOOL_NAMES.contains(&name) {
+            let planner = self
+                .native
+                .lock()
+                .map_err(|_| davinci_agent::ToolError::Failed("native host unavailable".into()))?
+                .verification_planner
+                .clone();
+            return planner.execute_with_context(cwd, name, args, Some(context));
+        }
+        if crate::native_extensions::workspace_snapshot::TOOL_NAMES.contains(&name) {
+            let snapshots = self
+                .native
+                .lock()
+                .map_err(|_| davinci_agent::ToolError::Failed("native host unavailable".into()))?
+                .workspace_snapshot
+                .clone();
+            return snapshots.execute_with_context(cwd, name, args, Some(context));
+        }
+        self.execute_js_or_manifest_tool(cwd, name, args)
+    }
+
     pub fn execute_js_or_manifest_tool(
         &self,
         cwd: &Path,
@@ -1452,6 +1541,66 @@ mod tests {
     use crate::js_host::JsRegisteredProvider;
 
     #[test]
+    fn browser_worker_dispatch_does_not_fall_back_when_parent_transport_is_unavailable() {
+        let host = ExtensionHost::default();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        drop(listener);
+        let context = davinci_agent::ToolContext {
+            task_coordinator: Some(
+                davinci_agent::runtime::task_transport::TaskCoordinatorClient::new(
+                    address,
+                    "unavailable-test-parent".into(),
+                ),
+            ),
+            ..Default::default()
+        };
+        let result = host.execute_js_or_manifest_tool_with_context(
+            Path::new("."),
+            "browser_open",
+            &serde_json::json!({"process_id":1,"port":1234}),
+            &context,
+        );
+        assert!(
+            result.is_err(),
+            "worker must not use its disabled local browser as fallback"
+        );
+    }
+
+    #[test]
+    fn contextual_dispatch_rejects_cancelled_native_and_extension_requests() {
+        let host = ExtensionHost::default();
+        let abort = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let context = davinci_agent::ToolContext {
+            abort: Some(abort.clone()),
+            ..Default::default()
+        };
+        for name in ["memory_search", "unregistered_extension"] {
+            let result = host.execute_js_or_manifest_tool_with_context(
+                Path::new("."),
+                name,
+                &serde_json::json!({}),
+                &context,
+            );
+            assert!(
+                matches!(result, Err(davinci_agent::ToolError::Failed(message))
+                if message == "tool request cancelled")
+            );
+        }
+        // Read the live signal on every call, rather than snapshotting it when attached.
+        abort.store(false, std::sync::atomic::Ordering::SeqCst);
+        assert!(matches!(
+            host.execute_js_or_manifest_tool_with_context(
+                Path::new("."),
+                "unregistered_extension",
+                &serde_json::json!({}),
+                &context,
+            ),
+            Err(davinci_agent::ToolError::Unknown(_))
+        ));
+    }
+
+    #[test]
     fn native_tools_register_runtime_capabilities() {
         let host = ExtensionHost::default();
         let registry = RuntimeCapabilityRegistry::new();
@@ -1459,6 +1608,20 @@ mod tests {
         let memory = registry.get("memory_search").expect("native capability");
         assert_eq!(memory.source, CapabilitySource::NativeExtension);
         assert!(memory.read_only);
+        for name in [
+            "repo_map",
+            "symbol_search",
+            "file_symbols",
+            "file_dependencies",
+            "symbol_relationships",
+            "related_files",
+            "code_query",
+        ] {
+            let capability = registry.get(name).expect("repository native capability");
+            assert_eq!(capability.source, CapabilitySource::NativeExtension);
+            assert!(capability.read_only);
+            assert!(!registry.is_mutating(name));
+        }
         assert!(registry.is_mutating("graph_run"));
     }
 

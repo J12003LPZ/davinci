@@ -738,6 +738,13 @@ pub fn context_inspector_sheet_from_manifest(
     }
 }
 
+/// Read-only status projection for the Context VM inspector and RPC output.
+/// It reports the derived root and metrics without compiling, folding, or
+/// retrieving any page.
+pub fn context_vm_status(agent: &davinci_agent::Agent) -> crate::output::ContextVmStatusSummary {
+    crate::output::ContextVmStatusSummary::from_agent(agent)
+}
+
 /// Formatted report of interaction test coverage and named capability gaps.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct InteractionCoverageReport {
@@ -1866,6 +1873,37 @@ mod tests {
             .flat_map(|l| l.spans.iter().map(|s| s.content.as_ref()))
             .collect();
         assert!(text.contains("No context manifest available"));
+    }
+
+    #[test]
+    fn context_vm_status_is_read_only_and_exposes_runtime_state() {
+        let mut agent = davinci_agent::Agent::new("system");
+        agent.set_runtime(davinci_agent::RuntimeHandle::new(
+            davinci_agent::RunId::new(),
+            davinci_agent::AgentId::new(),
+            davinci_agent::RuntimeBus::new(),
+        ));
+        agent.set_context_vm_mode(davinci_agent::runtime::ContextVmMode::Active);
+        let root_before = agent.runtime.as_ref().unwrap().context_vm.root();
+        let metrics_before = agent.runtime.as_ref().unwrap().context_vm.metrics();
+
+        let summary = context_vm_status(&agent);
+
+        assert_eq!(summary.mode, "active");
+        assert_eq!(summary.epoch, root_before.epoch);
+        assert_eq!(summary.checkpoint_id, None);
+        assert_eq!(summary.delta_count, 0);
+        assert_eq!(summary.episode_count, 0);
+        assert_eq!(summary.page_fault_hits, 0);
+        assert_eq!(summary.page_fault_misses, 0);
+        assert_eq!(
+            agent.runtime.as_ref().unwrap().context_vm.root(),
+            root_before
+        );
+        assert_eq!(
+            agent.runtime.as_ref().unwrap().context_vm.metrics(),
+            metrics_before
+        );
     }
 
     #[test]

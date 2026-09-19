@@ -9,6 +9,208 @@ env:
   PI_OFFLINE: "1"
 
 jobs:
+  test-impact-native:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+      - name: Bounded browser backend and network policy
+        run: node --test crates/davinci-coding-agent/src/interaction_testing/browser_backend.test.cjs crates/davinci-coding-agent/src/interaction_testing/browser_network.test.cjs crates/davinci-coding-agent/src/interaction_testing/browser_transport.test.cjs crates/davinci-coding-agent/src/interaction_testing/browser_host.test.cjs
+      - name: Use repository-pinned Rust
+        run: rustup show
+      - name: Native listener ownership proof
+        run: |
+          cargo test -p davinci-agent --locked --lib process_manager::socket_owner
+          cargo clippy -p davinci-agent --locked --lib --tests -- -D warnings
+      - name: Test planning and filesystem observation
+        run: cargo test -p davinci-coding-agent --locked --test test_impact --test test_impact_observation
+      - name: Normal agent edit and verification path
+        run: cargo test -p davinci-coding-agent --locked --bin davinci test_impact_integration_tests
+      - name: Offline test selection evaluation
+        run: cargo test -p davinci-coding-agent --locked --test test_impact_eval -- --ignored --nocapture
+      - name: Managed process authorization and lifecycle
+        run: cargo test -p davinci-agent --locked --lib process_manager::tests
+      - name: Native supervisor ownership and public process contracts
+        run: cargo test -p davinci-agent --locked --test process_supervisor --test process_manager
+      - name: Evidence artifact retrieval boundaries
+        run: cargo test -p davinci-agent --locked --lib runtime::evidence_store
+      - name: Graph process leases
+        run: cargo test -p davinci-coding-agent --locked --lib graph_managed_process
+      - name: Normal agent process path
+        run: cargo test -p davinci-coding-agent --locked --bin davinci process_manager_integration_tests
+      - name: Packaged supervisor entry point
+        run: cargo test -p davinci-coding-agent --locked --test process_manager
+      - name: Offline process reuse and cleanup evaluation
+        env:
+          DAVINCI_PROCESS_EVAL_ARTIFACT: ${{ runner.temp }}/process-evaluation.json
+        run: cargo test -p davinci-coding-agent --locked --test process_manager -- --ignored --nocapture
+      - name: Preserve native process measurements
+        uses: actions/upload-artifact@v4
+        with:
+          name: process-evaluation-${{ runner.os }}
+          path: ${{ runner.temp }}/process-evaluation.json
+          if-no-files-found: error
+      - name: Native transaction metadata and authorization
+        run: cargo test -p davinci-agent --locked --lib transaction
+      - name: Native directory lease lifetime
+        run: cargo test -p davinci-agent --locked --lib directory_lease
+      - name: Supervisor output capture integrity
+        run: cargo test -p davinci-agent --locked --lib supervisor_capture
+      - name: Foreground supervised command lifecycle
+        run: cargo test -p davinci-agent --locked --lib foreground_supervisor_capture_and_cancellation
+      - name: Transaction recovery, commit evidence and verification
+        run: cargo test -p davinci-agent --locked --test transactions --test transaction_commit --test transaction_verification
+      - name: Transaction CLI and intelligence integration
+        run: cargo test -p davinci-coding-agent --locked --test transaction_cli --test transaction_intelligence
+      - name: Build transaction worker fixture
+        run: cargo build -p davinci-coding-agent --locked --bin davinci
+      - name: Transaction worker submit and recovery
+        env:
+          PI_GRAPH_WORKER_EXECUTABLE: ${{ github.workspace }}/target/debug/davinci${{ runner.os == 'Windows' && '.exe' || '' }}
+          PI_OFFLINE_TOOL_CALL: '[{"name":"write","arguments":{"path":"a.txt","content":"worker edit"}},{"name":"graph_submit","arguments":{"artifact":{"changedFiles":["a.txt"],"summary":"Updated a.txt transactionally","deviations":[],"planInvalidated":false}}}]'
+        run: cargo test -p davinci-coding-agent --locked --lib transaction_parent_launch_accepts_submitted_edit_and_preserves_recovery -- --ignored
+      - name: Offline transaction recovery evaluation
+        env:
+          DAVINCI_TRANSACTION_EVAL_ARTIFACT: ${{ runner.temp }}/transaction-evaluation.json
+        run: cargo test -p davinci-agent --locked --test transaction_eval
+      - name: Preserve native transaction measurements
+        uses: actions/upload-artifact@v4
+        with:
+          name: transaction-evaluation-${{ runner.os }}
+          path: ${{ runner.temp }}/transaction-evaluation.json
+          if-no-files-found: error
+
+  p12-live-browser-native:
+    name: p12-live-browser (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.x'
+      - name: Install pinned Playwright Chromium fixture
+        shell: bash
+        run: |
+          set -euo pipefail
+          fixture_dir="$RUNNER_TEMP/davinci-playwright"
+          if [[ "$RUNNER_OS" == "Windows" ]]; then
+            fixture_dir="${RUNNER_TEMP//\\//}/davinci-playwright"
+          fi
+          npm install --prefix "$fixture_dir" --no-save --no-package-lock playwright@1.62.0
+          if [[ "$RUNNER_OS" == "Linux" ]]; then
+            "$fixture_dir/node_modules/.bin/playwright" install --with-deps chromium
+          else
+            "$fixture_dir/node_modules/.bin/playwright" install chromium
+          fi
+          {
+            echo "DAVINCI_TRUSTED_NODE_TEST_PATH=$(node -p 'process.execPath')"
+            echo "DAVINCI_TRUSTED_PLAYWRIGHT_TEST_PATH=$fixture_dir/node_modules/playwright"
+            echo "DAVINCI_BROWSER_DIAGNOSTICS=1"
+          } >> "$GITHUB_ENV"
+      - name: Run the P12 feature-off baseline on the shared fixture
+        shell: bash
+        run: |
+          set -euo pipefail
+          for run in 1 2; do
+            DAVINCI_P12_FEATURES=off \
+            DAVINCI_P12_EVAL_ARTIFACT="$RUNNER_TEMP/p12-feature-off-${run}.json" \
+              cargo test -p davinci-coding-agent --locked --bin davinci -- --ignored --nocapture login_button_seventeen_step_normal_dispatch_and_graph_deny
+          done
+      - name: Run the real P12 feature-on normal and Graph 17-step browser path
+        shell: bash
+        run: |
+          set -euo pipefail
+          for run in 1 2; do
+            DAVINCI_P12_FEATURES=on \
+            DAVINCI_P12_EVAL_ARTIFACT="$RUNNER_TEMP/p12-live-login-${run}.json" \
+              cargo test -p davinci-coding-agent --locked --bin davinci -- --ignored --nocapture login_button_seventeen_step_normal_dispatch_and_graph_deny
+          done
+      - name: Compare paired P12 feature receipts
+        env:
+          COMPARISON: ${{ runner.temp }}/p12-feature-comparison.json
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - "$RUNNER_TEMP/p12-feature-off-1.json" "$RUNNER_TEMP/p12-feature-off-2.json" "$RUNNER_TEMP/p12-live-login-1.json" "$RUNNER_TEMP/p12-live-login-2.json" "$COMPARISON" <<'PY'
+          import json
+          import pathlib
+          import statistics
+          import sys
+
+          off_paths = list(map(pathlib.Path, sys.argv[1:3]))
+          on_paths = list(map(pathlib.Path, sys.argv[3:5]))
+          comparison_path = pathlib.Path(sys.argv[5])
+          off_runs = [json.loads(path.read_text()) for path in off_paths]
+          on_runs = [json.loads(path.read_text()) for path in on_paths]
+          assert len(off_runs) == len(on_runs) == 2
+          for off in off_runs:
+              assert off["feature_enabled"] is False
+              assert off["fixture_id"] == "login-button-seventeen-step"
+              assert off["memory_bytes"] > 0
+          for on in on_runs:
+              assert on["feature_enabled"] is True
+              assert on["fixture_id"] == "login-button-seventeen-step"
+              assert on["normal"]["metrics"]["memory_bytes"] > 0
+              assert on["normal"]["metrics"]["cache_hits"] > 0
+              assert on["graph_writer"]["metrics"]["cache_hits"] > 0
+              assert on["normal"]["metrics"]["browser_success"] is True
+              assert on["graph_writer"]["metrics"]["browser_success"] is True
+          assert {run["fixture_id"] for run in off_runs + on_runs} == {"login-button-seventeen-step"}
+
+          def distribution(values):
+              return {
+                  "samples": values,
+                  "median": statistics.median(values),
+                  "min": min(values),
+                  "max": max(values),
+              }
+
+          comparison = {
+              "schema_version": 1,
+              "runs_per_mode": 2,
+              "fixture_id": on_runs[0]["fixture_id"],
+              "same_fixture": True,
+              "feature_off": {
+                  "startup_ms": distribution([run["startup_ms"] for run in off_runs]),
+                  "memory_bytes": distribution([run["memory_bytes"] for run in off_runs]),
+                  "disabled_tools": sorted({run["disabled_tool"] for run in off_runs}),
+              },
+              "feature_on": {
+                  "startup_ms": distribution([run["normal"]["metrics"]["startup_ms"] for run in on_runs]),
+                  "memory_bytes": distribution([run["normal"]["metrics"]["memory_bytes"] for run in on_runs]),
+                  "cache_hits": distribution([run["normal"]["metrics"]["cache_hits"] for run in on_runs]),
+                  "graph_cache_hits": distribution([run["graph_writer"]["metrics"]["cache_hits"] for run in on_runs]),
+                  "browser_success": all(run["normal"]["metrics"]["browser_success"] for run in on_runs),
+              },
+          }
+          comparison_path.write_text(json.dumps(comparison, indent=2) + "\n")
+          print(json.dumps(comparison, sort_keys=True))
+          PY
+      - name: Preserve P12 live evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: p12-live-login-${{ runner.os }}
+          path: |
+            ${{ runner.temp }}/p12-feature-off-1.json
+            ${{ runner.temp }}/p12-feature-off-2.json
+            ${{ runner.temp }}/p12-live-login-1.json
+            ${{ runner.temp }}/p12-live-login-2.json
+            ${{ runner.temp }}/p12-feature-comparison.json
+          if-no-files-found: error
+
   voice-native:
     strategy:
       fail-fast: false

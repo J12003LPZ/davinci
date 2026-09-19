@@ -4,6 +4,7 @@ pub mod artifacts;
 pub mod behavior;
 pub mod codex_eval;
 pub mod competitor;
+pub mod engineering;
 pub mod harness_eval;
 pub mod harness_table;
 pub mod optimization;

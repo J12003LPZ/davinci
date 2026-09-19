@@ -156,6 +156,11 @@ pub fn is_decision_event(event: &RuntimeEvent) -> bool {
             | RuntimeEvent::PermissionRequested { .. }
             | RuntimeEvent::PreModelSwitch { .. }
             | RuntimeEvent::TaskCompletionRequested { .. }
+            | RuntimeEvent::BeforeWrite { .. }
+            | RuntimeEvent::BeforeProcessStart { .. }
+            | RuntimeEvent::BeforeTest { .. }
+            | RuntimeEvent::BeforeCommit { .. }
+            | RuntimeEvent::BeforeCompletion { .. }
     )
 }
 

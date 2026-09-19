@@ -5,8 +5,233 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProcessManagerSettings {
+    pub enabled: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EditingTransactionsSettings {
+    pub enabled: bool,
+}
+
+fn parse_editing_transactions<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<EditingTransactionsSettings>, D::Error> {
+    let value = Option::<serde_json::Value>::deserialize(deserializer)?;
+    Ok(value.map(|value| {
+        serde_json::from_value(value).unwrap_or(EditingTransactionsSettings { enabled: false })
+    }))
+}
+
+fn parse_process_manager<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<ProcessManagerSettings>, D::Error> {
+    let value = Option::<serde_json::Value>::deserialize(deserializer)?;
+    Ok(value.map(|value| {
+        serde_json::from_value(value).unwrap_or(ProcessManagerSettings { enabled: false })
+    }))
+}
+
+fn parse_browser_verification<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<crate::native_extensions::browser::BrowserConfig>, D::Error> {
+    let value = Option::<serde_json::Value>::deserialize(deserializer)?;
+    Ok(value.map(|value| serde_json::from_value(value).unwrap_or_default()))
+}
+
+fn parse_test_impact<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<crate::native_extensions::test_impact::TestImpactConfig>, D::Error> {
+    use crate::native_extensions::test_impact::TestImpactConfig;
+    let value = Option::<serde_json::Value>::deserialize(deserializer)?;
+    Ok(value
+        .map(|value| serde_json::from_value(value).unwrap_or(TestImpactConfig { enabled: false })))
+}
+
+fn parse_package_intelligence<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<
+    Option<crate::native_extensions::package_intelligence::PackageIntelligenceConfig>,
+    D::Error,
+> {
+    use crate::native_extensions::package_intelligence::PackageIntelligenceConfig;
+    let value = Option::<serde_json::Value>::deserialize(deserializer)?;
+    Ok(value.map(|value| {
+        serde_json::from_value(value).unwrap_or(PackageIntelligenceConfig { enabled: false })
+    }))
+}
+
+fn parse_build_intelligence<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<crate::native_extensions::build_intelligence::BuildIntelligenceConfig>, D::Error>
+{
+    use crate::native_extensions::build_intelligence::BuildIntelligenceConfig;
+    let value = Option::<serde_json::Value>::deserialize(deserializer)?;
+    Ok(value.map(|value| {
+        serde_json::from_value(value).unwrap_or(BuildIntelligenceConfig { enabled: false })
+    }))
+}
+
+fn parse_git_intelligence<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<crate::native_extensions::git_intelligence::GitIntelligenceConfig>, D::Error> {
+    use crate::native_extensions::git_intelligence::GitIntelligenceConfig;
+    let value = Option::<serde_json::Value>::deserialize(deserializer)?;
+    Ok(value.map(|value| {
+        serde_json::from_value(value).unwrap_or_else(|_| GitIntelligenceConfig {
+            enabled: false,
+            ..Default::default()
+        })
+    }))
+}
+
+fn parse_change_impact<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<crate::native_extensions::change_impact::ChangeImpactConfig>, D::Error> {
+    use crate::native_extensions::change_impact::ChangeImpactConfig;
+    let value = Option::<serde_json::Value>::deserialize(deserializer)?;
+    Ok(value.map(|value| {
+        serde_json::from_value(value).unwrap_or_else(|_| ChangeImpactConfig {
+            enabled: false,
+            ..Default::default()
+        })
+    }))
+}
+
+fn parse_verification_planner<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<
+    Option<crate::native_extensions::verification_planner::VerificationPlannerConfig>,
+    D::Error,
+> {
+    use crate::native_extensions::verification_planner::VerificationPlannerConfig;
+    let value = Option::<serde_json::Value>::deserialize(deserializer)?;
+    Ok(value.map(|value| {
+        serde_json::from_value(value).unwrap_or_else(|_| VerificationPlannerConfig {
+            enabled: false,
+            ..Default::default()
+        })
+    }))
+}
+
+fn parse_workspace_snapshots<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<crate::native_extensions::workspace_snapshot::WorkspaceSnapshotConfig>, D::Error>
+{
+    use crate::native_extensions::workspace_snapshot::WorkspaceSnapshotConfig;
+    let value = Option::<serde_json::Value>::deserialize(deserializer)?;
+    Ok(value.map(|value| {
+        serde_json::from_value(value).unwrap_or_else(|_| WorkspaceSnapshotConfig {
+            enabled: false,
+            ..Default::default()
+        })
+    }))
+}
+
+fn parse_hook_policy<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<crate::hooks::HookPolicyConfig>, D::Error> {
+    use crate::hooks::HookPolicyConfig;
+    let value = Option::<serde_json::Value>::deserialize(deserializer)?;
+    Ok(value.map(|value| {
+        serde_json::from_value(value).unwrap_or_else(|_| HookPolicyConfig {
+            enabled: false,
+            ..Default::default()
+        })
+    }))
+}
+
+fn parse_language_intelligence<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<
+    Option<crate::native_extensions::language_intelligence::LanguageIntelligenceConfig>,
+    D::Error,
+> {
+    use crate::native_extensions::language_intelligence::LanguageIntelligenceConfig;
+    let value = Option::<serde_json::Value>::deserialize(deserializer)?;
+    Ok(value.map(|value| {
+        serde_json::from_value(value).unwrap_or_else(|_| LanguageIntelligenceConfig {
+            enabled: false,
+            configuration_error: Some(
+                "Invalid languageIntelligence settings; check backend and value types".into(),
+            ),
+            ..Default::default()
+        })
+    }))
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct Settings {
+    #[serde(
+        default,
+        rename = "browserVerification",
+        deserialize_with = "parse_browser_verification"
+    )]
+    pub browser_verification: Option<crate::native_extensions::browser::BrowserConfig>,
+    #[serde(
+        default,
+        rename = "editingTransactions",
+        deserialize_with = "parse_editing_transactions"
+    )]
+    pub editing_transactions: Option<EditingTransactionsSettings>,
+    #[serde(
+        default,
+        rename = "processManager",
+        deserialize_with = "parse_process_manager"
+    )]
+    pub process_manager: Option<ProcessManagerSettings>,
+    #[serde(default, rename = "testImpact", deserialize_with = "parse_test_impact")]
+    pub test_impact: Option<crate::native_extensions::test_impact::TestImpactConfig>,
+    #[serde(
+        default,
+        rename = "packageIntelligence",
+        deserialize_with = "parse_package_intelligence"
+    )]
+    pub package_intelligence:
+        Option<crate::native_extensions::package_intelligence::PackageIntelligenceConfig>,
+    #[serde(
+        default,
+        rename = "buildIntelligence",
+        deserialize_with = "parse_build_intelligence"
+    )]
+    pub build_intelligence:
+        Option<crate::native_extensions::build_intelligence::BuildIntelligenceConfig>,
+    #[serde(
+        default,
+        rename = "gitIntelligence",
+        deserialize_with = "parse_git_intelligence"
+    )]
+    pub git_intelligence: Option<crate::native_extensions::git_intelligence::GitIntelligenceConfig>,
+    #[serde(
+        default,
+        rename = "changeImpact",
+        deserialize_with = "parse_change_impact"
+    )]
+    pub change_impact: Option<crate::native_extensions::change_impact::ChangeImpactConfig>,
+    #[serde(
+        default,
+        rename = "verificationPlanner",
+        deserialize_with = "parse_verification_planner"
+    )]
+    pub verification_planner:
+        Option<crate::native_extensions::verification_planner::VerificationPlannerConfig>,
+    #[serde(
+        default,
+        rename = "workspaceSnapshots",
+        deserialize_with = "parse_workspace_snapshots"
+    )]
+    pub workspace_snapshots:
+        Option<crate::native_extensions::workspace_snapshot::WorkspaceSnapshotConfig>,
+    #[serde(default, rename = "hookPolicy", deserialize_with = "parse_hook_policy")]
+    pub hook_policy: Option<crate::hooks::HookPolicyConfig>,
+    #[serde(default, rename = "repoIntelligence")]
+    pub repo_intelligence:
+        Option<crate::native_extensions::repo_intelligence::RepoIntelligenceConfig>,
+    #[serde(default)]
+    pub cache: Option<davinci_agent::runtime::cache::CacheConfig>,
     #[serde(default)]
     pub extensions: Vec<String>,
     #[serde(default)]
@@ -143,6 +368,13 @@ pub struct Settings {
     pub permissions: Option<PermissionSettings>,
     #[serde(default)]
     pub learning: Option<crate::native_extensions::learning::LearningConfig>,
+    #[serde(
+        default,
+        rename = "languageIntelligence",
+        deserialize_with = "parse_language_intelligence"
+    )]
+    pub language_intelligence:
+        Option<crate::native_extensions::language_intelligence::LanguageIntelligenceConfig>,
     #[serde(default, rename = "languageServers")]
     pub language_servers: Option<HashMap<String, LspServerConfigSetting>>,
     /// Settings keys this struct does not model (for example `subagents`,
@@ -1262,6 +1494,75 @@ mod tests {
     use super::*;
 
     #[test]
+    fn browser_settings_fail_closed_and_preserve_unrelated_settings() {
+        assert!(Settings::default().browser_verification.is_none());
+        for value in [
+            serde_json::json!({"enabled":false}),
+            serde_json::json!({"enabled":"invalid"}),
+            serde_json::json!({"enabled":true,"unknown":1}),
+            serde_json::json!(false),
+        ] {
+            let settings: Settings = serde_json::from_value(serde_json::json!({
+                "theme":"fixture", "browserVerification":value
+            }))
+            .unwrap();
+            assert_eq!(settings.theme.as_deref(), Some("fixture"));
+            assert!(!settings.browser_verification.unwrap().enabled);
+        }
+    }
+
+    #[test]
+    fn editing_transaction_settings_fail_closed_without_dropping_unrelated_settings() {
+        assert!(Settings::default().editing_transactions.is_none());
+        for value in [
+            serde_json::json!({"enabled":false}),
+            serde_json::json!({"enabled":"invalid"}),
+            serde_json::json!({"enabled":true,"extra":1}),
+        ] {
+            let settings: Settings = serde_json::from_value(
+                serde_json::json!({"theme":"fixture","editingTransactions":value}),
+            )
+            .unwrap();
+            assert_eq!(settings.theme.as_deref(), Some("fixture"));
+            assert!(!settings.editing_transactions.unwrap().enabled);
+        }
+        let enabled: Settings =
+            serde_json::from_value(serde_json::json!({"editingTransactions":{"enabled":true}}))
+                .unwrap();
+        assert!(enabled.editing_transactions.unwrap().enabled);
+    }
+
+    #[test]
+    fn process_manager_settings_disable_cleanly_and_preserve_unrelated_settings() {
+        assert!(Settings::default().process_manager.is_none());
+        for value in [
+            serde_json::json!({"enabled":false}),
+            serde_json::json!({"enabled":"invalid"}),
+            serde_json::json!({"enabled":true,"unrecognized":1}),
+        ] {
+            let settings: Settings = serde_json::from_value(serde_json::json!({
+                "theme":"fixture", "processManager":value
+            }))
+            .unwrap();
+            assert_eq!(settings.theme.as_deref(), Some("fixture"));
+            assert!(!settings.process_manager.unwrap().enabled);
+        }
+        let settings: Settings =
+            serde_json::from_value(serde_json::json!({"processManager":{"enabled":true}})).unwrap();
+        assert!(settings.process_manager.unwrap().enabled);
+    }
+
+    #[test]
+    fn invalid_language_settings_preserve_unrelated_settings() {
+        let settings: Settings = serde_json::from_value(serde_json::json!({
+            "theme":"fixture", "languageIntelligence":{"typescript":{"backend":"typo"}}
+        }))
+        .unwrap();
+        assert_eq!(settings.theme.as_deref(), Some("fixture"));
+        assert!(!settings.language_intelligence.unwrap().enabled);
+    }
+
+    #[test]
     fn rewriting_settings_keeps_unknown_keys_and_writes_no_nulls() {
         let dir = tempfile::tempdir().unwrap();
         let path = settings_path(dir.path());
@@ -1718,5 +2019,26 @@ mod tests {
             .expect_err("an invalid selected setting must be reported");
         assert!(error.contains("experimental"));
         assert!(error.contains("stable, preview, legacy-v1"));
+    }
+
+    #[test]
+    fn test_hook_policy_settings() {
+        let json = r#"{
+            "hookPolicy": {
+                "enabled": true,
+                "maxDepth": 5,
+                "defaultTimeoutMs": 5000,
+                "defaultFailurePolicy": "warn"
+            }
+        }"#;
+        let settings: Settings = serde_json::from_str(json).unwrap();
+        let hook_policy = settings.hook_policy.unwrap();
+        assert!(hook_policy.enabled);
+        assert_eq!(hook_policy.max_depth, 5);
+        assert_eq!(hook_policy.default_timeout_ms, 5000);
+        assert_eq!(
+            hook_policy.default_failure_policy,
+            crate::hooks::HookFailurePolicy::Warn
+        );
     }
 }

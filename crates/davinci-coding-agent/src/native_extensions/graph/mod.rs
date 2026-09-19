@@ -18,6 +18,7 @@ pub(crate) mod briefings;
 pub(crate) mod config;
 pub(crate) mod control;
 pub(crate) mod controller;
+mod coordinator_handler;
 pub(crate) mod definitions;
 pub(crate) mod export;
 pub(crate) mod history;
@@ -305,6 +306,10 @@ pub struct GraphController {
     pub memory: Option<crate::native_extensions::VectorMemory>,
     pub learning: Option<crate::native_extensions::LearningController>,
     pub governor: Option<crate::native_extensions::TokenGovernor>,
+    pub language_intelligence:
+        Option<crate::native_extensions::language_intelligence::LanguageIntelligence>,
+    pub processes: Option<davinci_agent::process_manager::ProcessManager>,
+    pub browser: Option<crate::native_extensions::browser::BrowserWorkerHost>,
     pub runtime: Option<davinci_agent::RuntimeHandle>,
     pub permissions: Option<Arc<davinci_agent::PermissionState>>,
     pub task_contract: Option<davinci_agent::runtime::TaskContract>,
@@ -326,6 +331,9 @@ impl GraphController {
             memory: None,
             learning: None,
             governor: None,
+            language_intelligence: None,
+            processes: None,
+            browser: None,
             runtime: None,
             permissions: None,
             task_contract: None,
@@ -351,6 +359,9 @@ impl GraphController {
 
     #[allow(dead_code)]
     pub fn set_permissions(&mut self, permissions: Option<Arc<davinci_agent::PermissionState>>) {
+        if let Some(language) = &self.language_intelligence {
+            language.set_permissions(permissions.clone());
+        }
         self.permissions = permissions;
     }
 
@@ -410,6 +421,9 @@ impl GraphController {
             memory: self.memory.clone(),
             learning: self.learning.clone(),
             governor: self.governor.clone(),
+            language_intelligence: self.language_intelligence.clone(),
+            processes: self.processes.clone(),
+            browser: self.browser.clone(),
             runtime: self.runtime.clone(),
             permissions: self.permissions.clone(),
             task_contract: self.task_contract.clone(),

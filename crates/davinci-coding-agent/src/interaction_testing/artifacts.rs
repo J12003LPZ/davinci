@@ -84,8 +84,15 @@ impl ArtifactBudgetTracker {
     }
 
     /// Stores an artifact if under both the run and aggregate task budgets.
+    /// Labels are immutable: duplicate writes are rejected without charging bytes.
     /// If over budget, retains omission metadata and never drops assertion records.
     pub fn store_artifact(&mut self, label: &str, data: Vec<u8>) -> bool {
+        if self.items.contains_key(label) {
+            self.omitted_labels.push(format!(
+                "omitted: {label} (artifact label already retained)"
+            ));
+            return false;
+        }
         let size = data.len();
         let Some(run_after) = self.total_bytes.checked_add(size) else {
             self.omitted_labels
@@ -281,6 +288,20 @@ mod tests {
         .unwrap_err();
 
         assert!(err.contains("zero assertions"));
+    }
+
+    #[test]
+    fn retained_artifact_labels_are_immutable() {
+        let mut tracker = ArtifactBudgetTracker::new(8);
+        assert!(tracker.store_artifact("frame.png", vec![1, 2, 3]));
+        assert!(!tracker.store_artifact("frame.png", vec![4, 5]));
+        assert_eq!(tracker.items["frame.png"], vec![1, 2, 3]);
+        assert_eq!(tracker.total_bytes, 3);
+        assert!(!tracker.store_artifact("frame.png", vec![1, 2, 3]));
+        assert_eq!(tracker.total_bytes, 3);
+        assert!(tracker.store_artifact("second.png", vec![0; 5]));
+        assert_eq!(tracker.total_bytes, 8);
+        assert_eq!(tracker.omitted_labels.len(), 2);
     }
 
     #[test]

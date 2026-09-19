@@ -93,6 +93,10 @@ pub struct PreparedContextManifest {
     pub estimated_total_tokens: u64,
     pub estimated_overhead_tokens: u64,
     pub manifest_digest: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_root_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_epoch: Option<u64>,
 }
 
 impl PreparedContextManifest {
@@ -130,7 +134,40 @@ impl PreparedContextManifest {
             estimated_total_tokens,
             estimated_overhead_tokens,
             manifest_digest: digest,
+            context_root_id: None,
+            context_epoch: None,
         }
+    }
+
+    pub fn with_context_vm(mut self, root_id: impl Into<String>, epoch: u64) -> Self {
+        self.context_root_id = Some(root_id.into());
+        self.context_epoch = Some(epoch);
+        self
+    }
+
+    pub fn with_context_vm_entries(
+        mut self,
+        entries: impl IntoIterator<Item = ContextManifestEntry>,
+        root_id: impl Into<String>,
+        epoch: u64,
+    ) -> Self {
+        self.entries.extend(entries);
+        self.estimated_total_tokens = self
+            .entries
+            .iter()
+            .filter(|entry| entry.selected)
+            .map(|entry| entry.token_estimate)
+            .sum::<u64>()
+            + self.estimated_overhead_tokens;
+        self.manifest_digest = Self::compute_digest(
+            &self.request_id,
+            self.root_run_id,
+            self.source_revision,
+            self.overlay_revision,
+            &self.entries,
+            self.estimated_overhead_tokens,
+        );
+        self.with_context_vm(root_id, epoch)
     }
 
     pub fn compute_digest(

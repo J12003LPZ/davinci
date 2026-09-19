@@ -1,0 +1,3 @@
+# Preserve the supplied program requirements byte-for-byte. Its seven-equals
+# heading underline is intentional prose, not a Git conflict marker.
+docs/superpowers/specs/2026-09-17-engineering-program-requirements.md -text conflict-marker-size=80
