@@ -5,7 +5,7 @@ use crate::native_extensions::browser::{
 };
 use davinci_agent::{
     jobs::supervisor::SupervisorCommand, process_manager::ProcessManager, PermissionMode,
-    PermissionRule,
+    PermissionRule, PreToolHook,
 };
 use serde_json::json;
 use std::{
@@ -1036,6 +1036,54 @@ fn normal_browser_native_dispatch_actions_revocation_and_cleanup() {
     }
 }
 
+fn snapshot_checkpoint_id(details: &serde_json::Value) -> String {
+    details
+        .pointer("/checkpoint/id")
+        .and_then(|value| value.as_str())
+        .filter(|value| !value.is_empty())
+        .expect("workspace_checkpoint must return nested checkpoint.id")
+        .to_string()
+}
+
+struct GraphEnvGuard {
+    previous: Vec<(&'static str, Option<String>)>,
+}
+
+impl GraphEnvGuard {
+    fn apply(pairs: &[(&str, String)]) -> Self {
+        const KEYS: &[&str] = &[
+            "PI_GRAPH_ROLE",
+            "PI_GRAPH_EXPECT",
+            "PI_GRAPH_ARTIFACT_PATH",
+            "PI_GRAPH_AUTHORIZED_TOOLS",
+            "PI_GRAPH_NODE_ID",
+            "DAVINCI_TASK_COORDINATOR_ADDR",
+        ];
+        let previous = KEYS
+            .iter()
+            .map(|key| (*key, std::env::var(key).ok()))
+            .collect();
+        for key in KEYS {
+            std::env::remove_var(key);
+        }
+        for (key, value) in pairs {
+            std::env::set_var(key, value);
+        }
+        Self { previous }
+    }
+}
+
+impl Drop for GraphEnvGuard {
+    fn drop(&mut self) {
+        for (key, value) in &self.previous {
+            match value {
+                Some(value) => std::env::set_var(key, value),
+                None => std::env::remove_var(key),
+            }
+        }
+    }
+}
+
 #[test]
 #[ignore = "requires explicitly configured trusted Node and Playwright installation"]
 fn login_button_seventeen_step_normal_dispatch_and_graph_deny() {
@@ -1167,6 +1215,10 @@ fn login_button_seventeen_step_normal_dispatch_and_graph_deny() {
     .collect();
     host.register_with(&agent.runtime_for_session().unwrap().capability_registry);
     attach_tool_executor(&mut agent, &host);
+    let hook_host = host.clone();
+    agent.pre_tool = Some(PreToolHook(Arc::new(move |name, args| {
+        hook_host.native_before_tool(name, args, String::new)
+    })));
 
     let port = TcpListener::bind(("127.0.0.1", 0))
         .unwrap()
@@ -1296,11 +1348,7 @@ fn login_button_seventeen_step_normal_dispatch_and_graph_deny() {
     );
     record("workspace_checkpoint", error, checkpoint.elapsed());
     assert!(!error, "{output}");
-    let checkpoint_id = checkpointed["checkpointId"]
-        .as_str()
-        .or_else(|| checkpointed["id"].as_str())
-        .unwrap_or("login")
-        .to_string();
+    let checkpoint_id = snapshot_checkpoint_id(&checkpointed);
 
     let (_, output, error) = super::test_impact_integration_tests::call(
         &mut agent,
@@ -1365,12 +1413,16 @@ fn login_button_seventeen_step_normal_dispatch_and_graph_deny() {
     record("browser_network", error, Duration::from_millis(0));
     assert!(!error, "{output}");
 
-    let (_, _output, error) = super::test_impact_integration_tests::call(
+    let (_, output, error) = super::test_impact_integration_tests::call(
         &mut agent,
         "workspace_diff",
         json!({"checkpointId":checkpoint_id}),
     );
     record("workspace_diff", error, Duration::from_millis(0));
+    assert!(
+        !error,
+        "workspace_diff must succeed with checkpoint.id {checkpoint_id}: {output}"
+    );
     let (_, output, error) = super::test_impact_integration_tests::call(
         &mut agent,
         "verification_plan",
@@ -1404,56 +1456,201 @@ fn login_button_seventeen_step_normal_dispatch_and_graph_deny() {
             "missing live step {name} in {dispatched:?}"
         );
     }
+    eprintln!(
+        "P12_NORMAL_RECEIPT {}",
+        json!({
+            "mode": "normal",
+            "dispatched": dispatched.iter().map(|(name, error, elapsed)| json!({
+                "tool": name,
+                "error": error,
+                "ms": elapsed.as_secs_f64() * 1000.0
+            })).collect::<Vec<_>>(),
+            "checkpoint_id": checkpoint_id,
+            "metrics": serde_json::Value::Object(timings.clone())
+        })
+    );
     eprintln!("P12_LOGIN_METRICS {}", serde_json::Value::Object(timings));
 
+    let required_csv = required.join(",");
     let artifact = root.path().join("graph-artifact.json");
-    let previous = [
-        ("PI_GRAPH_ROLE", std::env::var("PI_GRAPH_ROLE").ok()),
-        ("PI_GRAPH_EXPECT", std::env::var("PI_GRAPH_EXPECT").ok()),
+    let writer_guard = GraphEnvGuard::apply(&[
+        ("PI_GRAPH_ROLE", "writer".into()),
+        ("PI_GRAPH_EXPECT", "patch-report".into()),
         (
             "PI_GRAPH_ARTIFACT_PATH",
-            std::env::var("PI_GRAPH_ARTIFACT_PATH").ok(),
+            artifact.to_string_lossy().into_owned(),
         ),
+        ("PI_GRAPH_NODE_ID", "writer-login".into()),
+        ("PI_GRAPH_AUTHORIZED_TOOLS", required_csv.clone()),
+        ("DAVINCI_TASK_COORDINATOR_ADDR", "127.0.0.1:9".into()),
+    ]);
+    let mut graph_dispatched = Vec::new();
+    let mut graph_timings = serde_json::Map::new();
+    let mut graph_record = |name: &str, error: bool, elapsed: Duration| {
+        graph_dispatched.push((name.to_string(), error, elapsed));
+        graph_timings.insert(
+            name.to_string(),
+            json!({"error": error, "ms": elapsed.as_secs_f64() * 1000.0}),
+        );
+    };
+
+    let graph_started = Instant::now();
+    let (_, output, error) = super::test_impact_integration_tests::call(
+        &mut agent,
+        "process_start",
+        json!({"executable":"node","argv":["--version"]}),
+    );
+    graph_record("process_start", error, graph_started.elapsed());
+    assert!(!error, "graph writer process_start: {output}");
+
+    for (name, args) in [
+        ("repo_map", json!({})),
+        ("lsp_document_symbols", json!({"path":"src/login.ts"})),
+        ("package_info", json!({"package":"login-app"})),
         (
-            "PI_GRAPH_AUTHORIZED_TOOLS",
-            std::env::var("PI_GRAPH_AUTHORIZED_TOOLS").ok(),
+            "git_blame_symbol",
+            json!({"symbol":"loginButtonLabel","path":"src/login.ts"}),
         ),
-    ];
-    std::env::set_var("PI_GRAPH_ROLE", "classifier");
-    std::env::set_var("PI_GRAPH_EXPECT", "patch-report");
-    std::env::set_var("PI_GRAPH_ARTIFACT_PATH", &artifact);
-    std::env::set_var("PI_GRAPH_AUTHORIZED_TOOLS", "repo_map");
-    let denied_plan = host
-        .native
-        .lock()
-        .unwrap()
-        .before_tool(
-            "verification_plan",
-            &json!({"files":["src/login.ts"]}),
-            String::new,
-        )
-        .is_some();
-    let denied_restore = host
-        .native
-        .lock()
-        .unwrap()
-        .before_tool(
-            "workspace_restore",
-            &json!({"checkpointId":checkpoint_id}),
-            String::new,
-        )
-        .is_some();
-    for (key, value) in previous {
-        match value {
-            Some(value) => std::env::set_var(key, value),
-            None => std::env::remove_var(key),
+        ("impact_analyze", json!({"files":["src/login.ts"]})),
+        ("test_plan", json!({"path":"src/login.ts"})),
+        ("build_command", json!({"files":["src/login.ts"]})),
+        ("bash", json!({"command":"node --test src/login.test.ts"})),
+        ("lsp_diagnostics", json!({"path":"src/login.ts"})),
+        ("verification_plan", json!({"files":["src/login.ts"]})),
+    ] {
+        let started = Instant::now();
+        let (_, output, error) = super::test_impact_integration_tests::call(&mut agent, name, args);
+        graph_record(name, error, started.elapsed());
+        if matches!(
+            name,
+            "repo_map"
+                | "package_info"
+                | "impact_analyze"
+                | "test_plan"
+                | "build_command"
+                | "verification_plan"
+        ) {
+            assert!(!error, "graph writer {name}: {output}");
         }
     }
-    assert!(denied_plan, "classifier must be denied verification_plan");
-    assert!(
-        denied_restore,
-        "classifier must be denied workspace_restore"
+
+    let graph_checkpoint = Instant::now();
+    let (graph_checkpointed, output, error) = super::test_impact_integration_tests::call(
+        &mut agent,
+        "workspace_checkpoint",
+        json!({"path":"src/login.ts","label":"graph-login"}),
     );
+    graph_record("workspace_checkpoint", error, graph_checkpoint.elapsed());
+    assert!(!error, "graph writer workspace_checkpoint: {output}");
+    let graph_checkpoint_id = snapshot_checkpoint_id(&graph_checkpointed);
+
+    let (_, output, error) = super::test_impact_integration_tests::call(
+        &mut agent,
+        "edit",
+        json!({
+            "path":"src/login.ts",
+            "oldText":"return ok ? 'Login' : 'Broken';",
+            "newText":"return ok ? 'Login' : 'Denied';"
+        }),
+    );
+    graph_record("edit", error, Duration::from_millis(0));
+    assert!(!error, "graph writer edit: {output}");
+
+    let graph_browser = Instant::now();
+    let (graph_opened, output, error) = super::test_impact_integration_tests::call(
+        &mut agent,
+        "browser_open",
+        json!({"process_id":process_id,"port":port,"host":"127.0.0.1"}),
+    );
+    graph_record("browser_open", error, graph_browser.elapsed());
+    assert!(!error, "graph writer browser_open: {output}");
+    let graph_browser_id = graph_opened["browser_id"].as_str().unwrap().to_string();
+    let (_, output, error) = super::test_impact_integration_tests::call(
+        &mut agent,
+        "browser_snapshot",
+        json!({"browser_id":graph_browser_id}),
+    );
+    graph_record("browser_snapshot", error, Duration::from_millis(0));
+    assert!(!error, "graph writer browser_snapshot: {output}");
+    let (_, output, error) = super::test_impact_integration_tests::call(
+        &mut agent,
+        "browser_console",
+        json!({"browser_id":graph_browser_id}),
+    );
+    graph_record("browser_console", error, Duration::from_millis(0));
+    assert!(!error, "graph writer browser_console: {output}");
+
+    let (_, output, error) = super::test_impact_integration_tests::call(
+        &mut agent,
+        "workspace_diff",
+        json!({"checkpointId":graph_checkpoint_id}),
+    );
+    graph_record("workspace_diff", error, Duration::from_millis(0));
+    assert!(
+        !error,
+        "graph writer workspace_diff must succeed with {graph_checkpoint_id}: {output}"
+    );
+
+    for name in required {
+        assert!(
+            graph_dispatched.iter().any(|(tool, _, _)| tool == name),
+            "missing graph writer step {name} in {graph_dispatched:?}"
+        );
+    }
+    eprintln!(
+        "P12_GRAPH_WRITER_RECEIPT {}",
+        json!({
+            "mode": "graph-writer",
+            "dispatched": graph_dispatched.iter().map(|(name, error, elapsed)| json!({
+                "tool": name,
+                "error": error,
+                "ms": elapsed.as_secs_f64() * 1000.0
+            })).collect::<Vec<_>>(),
+            "checkpoint_id": graph_checkpoint_id,
+            "metrics": serde_json::Value::Object(graph_timings)
+        })
+    );
+    drop(writer_guard);
+
+    let _classifier_guard = GraphEnvGuard::apply(&[
+        ("PI_GRAPH_ROLE", "classifier".into()),
+        ("PI_GRAPH_EXPECT", "patch-report".into()),
+        (
+            "PI_GRAPH_ARTIFACT_PATH",
+            artifact.to_string_lossy().into_owned(),
+        ),
+        ("PI_GRAPH_NODE_ID", "classifier-login".into()),
+        ("PI_GRAPH_AUTHORIZED_TOOLS", "repo_map".into()),
+    ]);
+    let (_, plan_output, plan_error) = super::test_impact_integration_tests::call(
+        &mut agent,
+        "verification_plan",
+        json!({"files":["src/login.ts"]}),
+    );
+    let (_, restore_output, restore_error) = super::test_impact_integration_tests::call(
+        &mut agent,
+        "workspace_restore",
+        json!({"checkpointId":graph_checkpoint_id}),
+    );
+    eprintln!(
+        "P12_GRAPH_DENY_RECEIPT {}",
+        json!({
+            "mode": "graph-classifier",
+            "verification_plan_error": plan_error,
+            "verification_plan_output": plan_output,
+            "workspace_restore_error": restore_error,
+            "workspace_restore_output": restore_output
+        })
+    );
+    assert!(
+        plan_error,
+        "classifier must be denied verification_plan: {plan_output}"
+    );
+    assert!(
+        restore_error,
+        "classifier must be denied workspace_restore: {restore_output}"
+    );
+    drop(_classifier_guard);
 
     let (_, output, error) = super::test_impact_integration_tests::call(
         &mut agent,
