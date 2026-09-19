@@ -6,6 +6,7 @@ Native capability guides: [repository intelligence](repo-intelligence.md),
 [language intelligence](language-intelligence.md), [test impact](test-impact.md),
 [managed processes](process-manager.md), [transactional edits](transactional-edits.md),
 and [browser verification](browser-verification.md).
+Program closeout: [engineering program verification](engineering-program-verification.md).
 
 ---
 

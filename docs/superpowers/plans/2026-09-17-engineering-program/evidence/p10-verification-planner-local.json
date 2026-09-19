@@ -50,16 +50,14 @@
     "clippy": "strict affected-library Clippy passed; dedicated davinci-evals all-target Clippy passed; legacy workspace lints remain outside this gate",
     "normalDispatch": "packaged smoke passed",
     "graphDispatch": "packaged Graph Writer smoke passed",
-    "ci": "not_pushed"
+    "ci": "PR #18 exact-head green 35417186830; merged to main 5585fd6"
   },
   "remainingGates": [
-    "full davinci-agent and davinci-coding-agent affected package tests; Windows ACL/legacy failures remain",
-    "real seventeen-step normal workflow and selective Graph assignment",
-    "live browser/evaluation and performance measurements",
-    "feature branch CI and merge review"
+    "full davinci-agent and davinci-coding-agent package suites still have historical Windows ACL/legacy failures; not weakened"
   ],
   "merge": {
-    "pushed": false,
-    "merged": false
+    "pushed": true,
+    "merged": true,
+    "pr": 18
   }
 }

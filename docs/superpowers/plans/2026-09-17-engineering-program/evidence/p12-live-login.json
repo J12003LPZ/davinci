@@ -54,7 +54,7 @@
     "workspace_diff": "dispatched, returned error (checkpoint id field mismatch in details)",
     "memory_bytes": null,
     "memory_reason": "not collected; process working-set sampling was not wired in this host",
-    "linux": "not executed locally; GitHub Actions native matrix on main 57975a5 succeeded",
-    "macos": "not executed locally; GitHub Actions native matrix on main 57975a5 succeeded"
+    "linux": "not executed locally; GitHub Actions test-impact-native (ubuntu-latest) on 5585fd6 succeeded in run 35420073891",
+    "macos": "not executed locally; GitHub Actions test-impact-native (macos-latest) on 5585fd6 succeeded in run 35420073891"
   }
 }

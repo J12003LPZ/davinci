@@ -1,6 +1,6 @@
 # P12: Continuous Agent Evaluation Framework
 
-Status: design approved by the user on 2026-09-17; implementation pending.
+Status: completed; live 17-step merged in PR #19 onto `origin/main` `5585fd6`. Design approved 2026-09-17.
 Execution sequence: 12 of 12.
 Dependencies: All previous milestones green; existing davinci-evals behavior/trace/scorer/gate/artifacts.
 Requirements authority: project section 17 and cross-cutting sections 18-40;
