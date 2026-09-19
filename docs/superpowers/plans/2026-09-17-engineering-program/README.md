@@ -1,6 +1,6 @@
 # Engineering program ledger
 
-Status: design package approved; P1 implementation in progress.
+Status: design package approved; P1 validated; P2 local gates passed, CI pending.
 Goal scope: all twelve projects and the global acceptance/performance/report gates.
 Reference: [program design](../../specs/2026-09-17-engineering-program.md) and
 [unchanged supplied requirements](../../specs/2026-09-17-engineering-program-requirements.md).
@@ -26,8 +26,8 @@ Reference: [program design](../../specs/2026-09-17-engineering-program.md) and
 
 | Order | Project/plan | Implementation | Design approval | Local gates/eval | CI |
 | --- | --- | --- | --- | --- | --- |
-| 1 | [P1 Test Impact Intelligence](01-test-impact.md) | Local implementation validated | Approved | Package tests, fmt, Clippy, integration, security and eval passed | PR #9; ignore-change fix awaiting CI |
-| 2 | [P2 Persistent Process Manager](02-process-manager.md) | Planned | Approved | Not run | Not pushed |
+| 1 | [P1 Test Impact Intelligence](01-test-impact.md) | Complete; PR #9 open | Approved | Package tests, fmt, Clippy, integration, security and eval passed | Green at `6b3aad9` |
+| 2 | [P2 Persistent Process Manager](02-process-manager.md) | Implemented; awaiting platform CI | Approved | Package tests, fmt, Clippy, integration, security and eval passed on Windows | Pending exact-head run |
 | 3 | [P4 Transactional Edit Engine](04-transactional-edits.md) | Planned | Approved | Not run | Not pushed |
 | 4 | [P3 Browser / Playwright Verification](03-browser-verification.md) | Planned | Approved | Not run | Not pushed |
 | 5 | [P5 Package / Dependency Intelligence](05-package-intelligence.md) | Planned | Approved | Not run | Not pushed |
@@ -161,7 +161,9 @@ The prior merged PR test counts are not evidence for this new program.
 
 ## Next action
 
-Verify P1's exact-head CI in PR #9 before starting P2.
+P1 passed exact-head CI in PR #9. Publish and monitor P2 on the stacked
+`codex/process-manager-01a0ad48` branch in the same isolated worktree. P4 begins
+only after P2's required exact-head platform CI is green.
 Approval is recorded above; routine implementation decisions need no new approval.
 Keep the full program goal active until all global acceptance is verified.
 
@@ -172,7 +174,8 @@ saved (`router:noop`). No compression savings are claimed for that call.
 
 ## P1 implementation evidence
 
-Implementation is locally validated; the exact-head CI gate remains pending.
+Implementation and exact-head CI are validated at
+`6b3aad9fd28b96f85c8115fe4099bea6e4557b17`; PR #9 remains open for review.
 User-facing behavior and limits are documented in [test impact](../../../test-impact.md).
 
 | Gate | Evidence/status |
@@ -190,7 +193,7 @@ User-facing behavior and limits are documented in [test impact](../../../test-im
 | 11. Evaluation | [After artifact](evidence/p1-monorepo-after.json): explicit ignored evaluation passed with real Node tests, 3/23 selected, all 3 planted failures caught, no false-positive paths in this fixture, warm 59/6,173 source bytes, force/fallback/zero-test cases. [Baseline](evidence/p1-monorepo-baseline.json) remains frozen. |
 | 12. Docs | User guide, repository freshness guide, documentation index, and this ledger updated. |
 | 13. Diff review | Reviewed shared index refresh/observer lifecycle, bounded traversal, command argv, current permissions/cache delivery, host lock release, settings, and normal/Graph dispatch. No subagents, per user instruction. |
-| 14. CI | [PR #9](https://github.com/J12003LPZ/davinci/pull/9) is published. Initial CI found the retry reparse defect below. Exact-head success remains pending; the native matrix covers Windows, Linux, and macOS. |
+| 14. CI | [PR #9](https://github.com/J12003LPZ/davinci/pull/9): [CI run 35235736772](https://github.com/J12003LPZ/davinci/actions/runs/35235736772), workflow lint, and security interoperability passed at `6b3aad9fd28b96f85c8115fe4099bea6e4557b17`. The Windows/Linux/macOS native jobs each passed 14 impact, 6 observer, 1 normal-agent, and 1 explicit evaluation test. [Platform evidence](evidence/p1-ci-platforms.json) contains the actual evaluation objects parsed from those job logs. |
 
 Executed explicit after evaluation:
 
@@ -262,5 +265,105 @@ changed, added, or removed ignore rules force full content reconciliation withou
 depending on event timing. The regression retains its `full` assertion and now
 also verifies that an unaffected source is reread without being reparsed.
 
-After this correction, 14 impact, 6 observer, and 7 repository tests passed locally,
-along with the explicit after evaluation. The new commit must pass CI before P2.
+After this correction, 14 impact, 6 observer, 7 repository, and 1 overflow/backend
+tests passed locally, along with the explicit after evaluation, formatting, and
+affected all-target Clippy. CI subsequently passed on all three platforms at
+`6b3aad9fd28b96f85c8115fe4099bea6e4557b17`, completing the P1 gate before P2 began.
+
+## P2 baseline and implementation checkpoint
+
+P2 starts from P1's verified head, on `codex/process-manager-01a0ad48` in the same
+isolated worktree. Remote `main` was fetched and remains
+`ca9fe69cd0da21bf161af25b2bed681748fb0d58`.
+
+The [frozen Windows baseline](evidence/p2-process-baseline.json) uses the existing
+`JobBook::register`, stdin, bounded output, and cancellation APIs with real
+loopback Node servers. Two identical executable/argv requests created two jobs
+and six processes including children/grandchildren. Readiness took 129.4012 ms
+and 118.254 ms. Stdin round trip succeeded. A 5 MiB single-line burst was bounded
+and marked dropped; line-boundary trimming retained only the final 36 bytes.
+Cancellation closed all six fixture listeners in 783.5255 ms. In a separate host
+process that exited without destructors, three fixture listeners remained alive
+after 200 ms. Explicit fixture cleanup then closed all three. This is an observed
+short-lived orphan window, not a claim about indefinite survival.
+
+Executed: `rtk proxy cargo test -p davinci-agent --test process_manager_baseline --offline --locked -- --ignored --nocapture`
+passed one explicit evaluation, with the artifact environment variable set to an
+absolute output path. Formatting and baseline-target Clippy passed. An initial
+fixture probe needed a socket-disconnect error handler; a relative artifact path
+also failed because Cargo runs this test in the crate directory. Both harness
+issues were corrected before recording the successful artifact.
+
+The existing JobBook now has supervised records and explicit owner leases.
+A private helper owns the OS process lifetime before spawning the requested
+child: Windows Job Object, Unix session/group. Host pipe loss and final lease
+release trigger cleanup; output stays in the existing bounded JobBook buffer.
+Observed RED/GREEN includes the missing supervisor, immediate reuse of a stopped
+lifetime, approval transfer, and an existing shell deny missed by process_start.
+
+### P2 local completion gates
+
+| Gate | Evidence |
+| --- | --- |
+| 1. Design | Approved by the user on 2026-09-17. |
+| 2. Plan | Approved [P2 plan](02-process-manager.md), section-7 requirements and shared invariants. |
+| 3. RED/GREEN | Observed failures before supervisor implementation, stopped-lifetime reuse correction, one-call approval transfer, existing shell-deny enforcement, logical wait across restart backoff, and the Windows npm verbatim-path correction. The corresponding regressions now pass. |
+| 4. Affected package tests | `cargo test -p davinci-agent -p davinci-coding-agent --offline --locked -- --quiet`: exit 0, 3,194 passed, 16 ignored across 27 targets. Includes 877 agent unit tests, 1,014 coding-agent library tests and 1,221 binary tests. Ignored optional evaluations are not counted as executed. |
+| 5. Format | `cargo fmt --check`: passed after formatting. |
+| 6. Clippy | `cargo clippy --workspace --all-targets --offline --locked -- -D warnings`: passed. |
+| 7. Integration | 15 supervisor test entries (12 substantive cases, 3 helper entries), 2 public process contract tests, and 2 packaged-binary entries passed. Covers descendant cleanup, held pipes, startup concurrency/cancellation, owner isolation, literal stdin, output bounds and private CLI entry before normal initialization. |
+| 8. Security | Current policy on all six tools, cross-shell denies, exact one-call consent, changed/expired/revoked consent, hard contracts, role ceilings, cwd escape, environment injection, restart revocation and no one-call replay all passed locally. Unix symlink behavior awaits native CI. |
+| 9. Normal path | `process_manager_integration_tests`: 2 entries passed, including the normal `Agent::run_loop` fixture in both shared and nonshared executor modes. Covers enabled/disabled settings, deferred discovery, reuse, token-governor output plus `retrieve_output`, and shutdown. |
+| 10. Graph | `graph_managed_process`: 5 tests passed. Includes authenticated multi-worker lease reuse/final release, role/mode/contract denial, composed native output retrieval, and an actual saved Graph controller dispatch with host provenance and worker-exit cleanup. |
+| 11. Evaluation | One explicit ignored packaged lifecycle evaluation passed; [Windows after artifact](evidence/p2-process-after-windows.json) is compared with the unchanged [baseline](evidence/p2-process-baseline.json). Two requests reuse one server, stdin succeeds, 5 MiB output is bounded, and ordinary descendants disappear after shutdown/host loss. |
+| 12. Docs | [Managed process guide](../../../process-manager.md), documentation index, plan and ledger updated. Lists limits, approval/restart behavior, port provenance and Unix group escape limitation. |
+| 13. Diff review | Reviewed ownership/lock order, reservation cleanup, current authority, private helper protocol, environment, restart reconciliation, PID lifetime, session/Graph shutdown, bounded I/O, and test fixtures. Existing background shell APIs remain available; their model-facing endpoints reject managed IDs. Solo review per user instruction. |
+| 14. CI | Pending exact feature head. The existing Windows/Linux/macOS native matrix now also runs process authorization, supervisor/public contracts, Graph, normal Agent, packaged executable and explicit lifecycle evaluation. Evaluation JSON is uploaded per platform. P2 is not complete until this gate passes. |
+
+All shell commands were invoked through RTK. Package logs were summarized by
+deterministically parsing Cargo's result lines; zero-test/doc targets are not
+counted as test cases. Existing unrelated optional evaluations remained ignored.
+The explicit after command was:
+
+```text
+rtk proxy cargo test -p davinci-coding-agent --test process_manager --offline --locked -- --ignored --nocapture
+```
+
+`DAVINCI_PROCESS_EVAL_ARTIFACT` was an absolute path to the linked JSON. A first
+attempt used the default output cursor and therefore did not ask about discarded
+bytes; the fixture now requests cursor zero. A later relative artifact path
+failed after the behavior assertions; the recorded absolute-path run passed.
+The frozen before measurement was not overwritten.
+
+The after sample reports first readiness 190.1967 ms and reuse 1.4052 ms, one root
+startup, three fixture processes, shutdown cleanup 351.9869 ms, and zero listener
+survivors at the 200 ms host-loss observation. Cold startup is slower than the
+old 129.4012 ms sample; repeated startup and ownership improve. Measurements are
+single Windows debug runs with real Node processes, not provider-token results.
+
+The Windows npm regression initially exited 1 because Node's module resolver
+rejected the canonical verbatim script path. The adapter now removes that prefix
+only after verifying the ordinary path resolves to the same canonical entry.
+The installed npm `--version` invocation and full affected package tests passed
+after the correction. No shell-string fallback or dependency install was added.
+
+### P2 handoff surface
+
+- `jobs/managed.rs` extends JobBook with scope/owner leases, bounded single-flight,
+  cursor pages and logical lifetime metadata; `managed/restarts.rs` reconciles
+  bounded restarts with continuing authority.
+- `jobs/supervisor/{mod,wire,platform,helper,client}.rs` owns the private bounded
+  protocol and OS lifetime. Windows uses a private Job Object; Unix uses a session
+  group. These are lifecycle primitives, not a hostile-process sandbox.
+- `process_manager/{command,schemas,tests}.rs` and `process_manager.rs` own the
+  authorized adapter, direct argv/environment resolution and all six tools.
+- `approval/dispatch.rs`, permission/risk, argv shell policy, tool dispatch and
+  runtime capability metadata preserve approval and contract enforcement.
+- CLI/settings/native shutdown and Graph's composed coordinator handler bind the
+  same service. Worker lease identity comes from the host, never model arguments.
+- Existing `SharedCounters`/`RunStats` expose actual startups/reuses/restarts.
+  Live resources and output rings are not serialized into CacheRuntime.
+- Tests include the reusable Node server fixture, frozen old-host baseline,
+  packaged-binary evaluation, normal-session and Graph dispatch integrations.
+- Remaining required evidence: exact-head CI and native Unix behavior. Next
+  project is P4, after CI passes; its process dependency is this shared adapter.

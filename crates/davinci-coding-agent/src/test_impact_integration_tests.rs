@@ -11,7 +11,7 @@ use std::sync::{Arc, Mutex};
 #[allow(dead_code)]
 mod fixture;
 
-fn call(agent: &mut Agent, name: &str, args: Value) -> (Value, Value, bool) {
+pub(super) fn call(agent: &mut Agent, name: &str, args: Value) -> (Value, Value, bool) {
     agent.prompt("Execute the fixture's next authorized step.");
     let call_id = format!("fixture-{}-{name}", agent.messages.len());
     let mut sent = false;

@@ -4,6 +4,7 @@ pub mod apply_patch;
 pub mod approval;
 pub mod decisions;
 mod permission_state;
+pub mod process_manager;
 pub use permission_state::PermissionState;
 mod batch;
 mod branch;
@@ -2024,6 +2025,7 @@ impl Agent {
                 .is_some_and(|(path, id, _)| *path == source && *id == session.header.id)
                 && runtime.task_registry.is_durable()
         });
+        let session_changed = current.is_none();
         let candidate = match current {
             Some(runtime) => runtime.clone(),
             None => runtime::session::restore_session_runtime(
@@ -2036,6 +2038,11 @@ impl Agent {
         let candidate_ledger = ToolCallLedger::load_bound(&ledger_path, &session.header.id)
             .map_err(|error| format!("Runtime recovery required: {error}"))?;
         let messages = messages_from_session(&session);
+        if session_changed {
+            if let Some(processes) = &self.tool_context.processes {
+                self.tool_context.processes = Some(processes.new_session()?);
+            }
+        }
         self.last_real_user_request = last_real_user_request_from_messages(&messages);
         self.reset_session_approvals();
         self.messages = messages;

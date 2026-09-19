@@ -247,12 +247,40 @@ impl GraphWorkerContext {
                     return Some(violation.to_string());
                 }
             }
-            if matches!(tool_name, "bash" | "powershell" | "exec_command") {
+            if matches!(
+                tool_name,
+                "bash" | "powershell" | "exec_command" | "process_start" | "process_write"
+            ) {
                 return Some(
                     "execution_contract_unenforceable: graph worker shell execution has no contracted process sandbox"
                         .into(),
                 );
             }
+        }
+        if tool_name == "process_write" {
+            return Some("Graph roles cannot write arbitrary stdin to managed processes".into());
+        }
+        if tool_name == "process_start" {
+            let Some(executable) = args.get("executable").and_then(Value::as_str) else {
+                return Some("Invalid process executable".into());
+            };
+            let argv: Vec<String> = match serde_json::from_value(
+                args.get("argv").cloned().unwrap_or_else(|| json!([])),
+            ) {
+                Ok(argv) => argv,
+                Err(_) => return Some("Invalid process argv".into()),
+            };
+            return match davinci_agent::shell_policy::evaluate_argv(
+                super::roles::shell_profile(self.bash_policy),
+                executable,
+                &argv,
+            ) {
+                davinci_agent::shell_policy::ShellCommandDecision::Allowed => None,
+                davinci_agent::shell_policy::ShellCommandDecision::Denied { reason }
+                | davinci_agent::shell_policy::ShellCommandDecision::NeedsApproval { reason } => {
+                    Some(reason)
+                }
+            };
         }
         if !matches!(tool_name, "bash" | "powershell" | "exec_command") {
             return None;

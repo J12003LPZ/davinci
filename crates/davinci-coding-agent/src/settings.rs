@@ -5,6 +5,21 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProcessManagerSettings {
+    pub enabled: bool,
+}
+
+fn parse_process_manager<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<ProcessManagerSettings>, D::Error> {
+    let value = Option::<serde_json::Value>::deserialize(deserializer)?;
+    Ok(value.map(|value| {
+        serde_json::from_value(value).unwrap_or(ProcessManagerSettings { enabled: false })
+    }))
+}
+
 fn parse_test_impact<'de, D: serde::Deserializer<'de>>(
     deserializer: D,
 ) -> Result<Option<crate::native_extensions::test_impact::TestImpactConfig>, D::Error> {
@@ -35,6 +50,12 @@ fn parse_language_intelligence<'de, D: serde::Deserializer<'de>>(
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct Settings {
+    #[serde(
+        default,
+        rename = "processManager",
+        deserialize_with = "parse_process_manager"
+    )]
+    pub process_manager: Option<ProcessManagerSettings>,
     #[serde(default, rename = "testImpact", deserialize_with = "parse_test_impact")]
     pub test_impact: Option<crate::native_extensions::test_impact::TestImpactConfig>,
     #[serde(default, rename = "repoIntelligence")]
@@ -1302,6 +1323,26 @@ pub fn is_trusted(settings: &Settings, cwd: &Path, override_trust: Option<bool>)
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn process_manager_settings_disable_cleanly_and_preserve_unrelated_settings() {
+        assert!(Settings::default().process_manager.is_none());
+        for value in [
+            serde_json::json!({"enabled":false}),
+            serde_json::json!({"enabled":"invalid"}),
+            serde_json::json!({"enabled":true,"unrecognized":1}),
+        ] {
+            let settings: Settings = serde_json::from_value(serde_json::json!({
+                "theme":"fixture", "processManager":value
+            }))
+            .unwrap();
+            assert_eq!(settings.theme.as_deref(), Some("fixture"));
+            assert!(!settings.process_manager.unwrap().enabled);
+        }
+        let settings: Settings =
+            serde_json::from_value(serde_json::json!({"processManager":{"enabled":true}})).unwrap();
+        assert!(settings.process_manager.unwrap().enabled);
+    }
 
     #[test]
     fn invalid_language_settings_preserve_unrelated_settings() {

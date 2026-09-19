@@ -127,6 +127,11 @@ pub fn default_execution_policies(
         )
     } else if name == "tool_search" {
         (ConcurrencyPolicy::ParallelSafe, ReplayPolicy::SafeToReplay)
+    } else if matches!(name, "process_status" | "process_output" | "process_list") {
+        (
+            ConcurrencyPolicy::ParallelSafe,
+            ReplayPolicy::ReconcileBeforeReplay,
+        )
     } else if matches!(
         name,
         "bash"
@@ -221,7 +226,8 @@ pub fn default_declared_effects(name: &str, class: ToolClass) -> Vec<DeclaredEff
         "write" | "edit" | "notebook_edit" | "apply_patch" => {
             vec![DeclaredEffect::FileSystemWrite]
         }
-        "bash" | "powershell" | "exec_command" | "write_stdin" => {
+        "bash" | "powershell" | "exec_command" | "write_stdin" | "process_start"
+        | "process_write" | "process_stop" => {
             vec![DeclaredEffect::ProcessExecution]
         }
         "web_fetch" | "web_search" => vec![DeclaredEffect::NetworkAccess],

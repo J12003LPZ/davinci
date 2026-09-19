@@ -83,6 +83,12 @@ pub const BUILTIN_TOOLS: &[&str] = &[
     "todo",
     "job_output",
     "job_kill",
+    "process_start",
+    "process_status",
+    "process_output",
+    "process_write",
+    "process_stop",
+    "process_list",
     "notebook_edit",
     "mcp_read",
     "agent",
@@ -121,6 +127,10 @@ pub const CODEX_HOT_TOOLS: &[&str] = &[
 /// tool thread and the davinci shell all read them.
 #[derive(Debug, Clone, Default)]
 pub struct ToolContext {
+    /// Session-owned process service installed by a trusted host, lazily starts children.
+    pub processes: Option<crate::process_manager::ProcessManager>,
+    /// Engine-issued consent for this exact dispatch; never model input.
+    pub dispatch_permit: Option<Arc<crate::approval::DispatchPermit>>,
     pub cache: crate::runtime::cache::CacheRuntime,
     pub jobs: Arc<Mutex<JobBook>>,
     pub todos: Arc<Mutex<TodoList>>,
@@ -147,6 +157,18 @@ pub struct ToolContext {
     /// Host-question deadline. `None` uses the production default; tests and
     /// embedders may choose a shorter explicit bound.
     pub decision_timeout: Option<std::time::Duration>,
+}
+
+pub fn is_managed_process_tool(name: &str) -> bool {
+    matches!(
+        name,
+        "process_start"
+            | "process_status"
+            | "process_output"
+            | "process_write"
+            | "process_stop"
+            | "process_list"
+    )
 }
 
 pub fn team_tools_enabled() -> bool {
@@ -483,6 +505,7 @@ pub fn tool_specs() -> Vec<AgentTool> {
     if workflow_tools_enabled() {
         specs.extend(crate::runtime::workflow_tool_specs());
     }
+    specs.extend(crate::process_manager::tool_specs());
     specs
 }
 
@@ -532,6 +555,23 @@ pub fn execute_tool_with(
     context: &ToolContext,
 ) -> Result<ToolResult, ToolError> {
     match name {
+        process if is_managed_process_tool(process) => {
+            if let Some(coordinator) = &context.task_coordinator {
+                return coordinator.call_with_timeout(process, input, context.abort.as_deref(), std::time::Duration::from_secs(15));
+            }
+            let manager = context.processes.as_ref().ok_or_else(|| ToolError::Failed("Managed processes are disabled or unavailable in this host".into()))?;
+            let contract = context.active_contract.lock().unwrap_or_else(|e| e.into_inner());
+            let provenance = crate::jobs::managed::Provenance {
+                session_id: context.runtime.as_ref().and_then(|runtime| runtime.session_id.clone()),
+                agent_id: context.runtime.as_ref().map(|runtime| runtime.agent_id),
+                task_id: contract.as_ref().map(|contract| contract.task_id),
+                graph_node: None,
+            };
+            drop(contract);
+            manager.clone().with_provenance(provenance)
+                .execute(cwd, process, input, context.abort.as_deref(), context.dispatch_permit.as_deref())
+                .map_err(ToolError::Failed)
+        }
         "read" => read_tool_cached(cwd, input, context),
         "write" => write_tool(cwd, input),
         "edit" => edit_tool(cwd, input),

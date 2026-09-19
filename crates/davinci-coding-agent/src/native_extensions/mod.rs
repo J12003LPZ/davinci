@@ -397,6 +397,9 @@ impl NativeExtensionHost {
 
     /// A background graph run must not outlive the session that started it.
     pub fn session_shutdown(&mut self) {
+        if let Some(processes) = &self.graph.processes {
+            processes.shutdown();
+        }
         self.language_intelligence.shutdown();
         graph::abort_all_runs();
         self.learning.cancel_active_review();

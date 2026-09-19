@@ -15,6 +15,9 @@ use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
 
+pub mod managed;
+pub mod supervisor;
+
 /// Bytes of output kept per job; above it the head is dropped.
 const OUTPUT_CAP: usize = 4 * 1024 * 1024;
 /// How much is kept once the cap is passed.
@@ -54,10 +57,12 @@ impl JobStatus {
 struct OutputBuffer {
     bytes: Vec<u8>,
     dropped: bool,
+    total_bytes: u64,
 }
 
 impl OutputBuffer {
     fn append(&mut self, chunk: &[u8]) {
+        self.total_bytes = self.total_bytes.saturating_add(chunk.len() as u64);
         self.bytes.extend_from_slice(chunk);
         if self.bytes.len() > OUTPUT_CAP {
             let cut = self.bytes.len() - OUTPUT_KEEP;
@@ -89,6 +94,7 @@ struct Shared {
     stdin: Mutex<Option<ChildStdin>>,
     finished_at: Mutex<Option<Instant>>,
     supports_stdin: bool,
+    supervisor: Mutex<Option<Arc<supervisor::Supervisor>>>,
 }
 
 pub struct Job {
@@ -100,6 +106,7 @@ pub struct Job {
     pub agent_id: Option<crate::runtime::ids::AgentId>,
     pub generation: Option<u64>,
     shared: Arc<Shared>,
+    managed: Option<Arc<managed::Record>>,
     /// The model has been told this job finished.
     announced: bool,
     /// The user has seen this job finish.
@@ -149,6 +156,15 @@ impl Job {
         if !self.status().is_running() {
             return Err(format!("Job {} has already exited.", self.id));
         }
+        let supervised = self
+            .shared
+            .supervisor
+            .lock()
+            .unwrap_or_else(|err| err.into_inner())
+            .clone();
+        if let Some(supervised) = supervised {
+            return supervised.write(text.as_bytes());
+        }
         if !self.shared.supports_stdin {
             return Err(format!(
                 "Job {} does not support stdin: stdin is null or closed.",
@@ -174,6 +190,19 @@ impl Job {
     }
 
     fn kill(&self) -> bool {
+        if let Some(record) = &self.managed {
+            record.stop();
+        }
+        if let Some(supervised) = self
+            .shared
+            .supervisor
+            .lock()
+            .unwrap_or_else(|err| err.into_inner())
+            .as_ref()
+        {
+            supervised.stop();
+            return true;
+        }
         let mut child = self
             .shared
             .child
@@ -333,6 +362,15 @@ pub fn kill_every_job() {
         let Some(shared) = weak.upgrade() else {
             continue;
         };
+        if let Some(supervised) = shared
+            .supervisor
+            .lock()
+            .unwrap_or_else(|err| err.into_inner())
+            .as_ref()
+        {
+            supervised.stop();
+            continue;
+        }
         if !shared
             .status
             .lock()
@@ -353,6 +391,7 @@ pub fn kill_every_job() {
 pub struct JobBook {
     jobs: Vec<Job>,
     next_id: u32,
+    managed_starts: std::collections::BTreeMap<String, Arc<managed::Flight>>,
     /// The host's active runtime; updated and checked under the book mutex.
     pub(crate) cancellation_owner: Option<std::sync::Weak<std::sync::atomic::AtomicBool>>,
 }
@@ -385,6 +424,7 @@ impl JobBook {
             stdin: Mutex::new(stdin),
             finished_at: Mutex::new(None),
             supports_stdin,
+            supervisor: Mutex::new(None),
         });
         {
             let mut live = LIVE_JOBS.lock().unwrap_or_else(|err| err.into_inner());
@@ -465,6 +505,7 @@ impl JobBook {
             agent_id,
             generation,
             shared,
+            managed: None,
             announced: false,
             seen: false,
         });
@@ -713,6 +754,9 @@ pub fn output_tool(
     let shared = {
         let book = book.lock().unwrap_or_else(|err| err.into_inner());
         let job = book.get(id).ok_or_else(|| unknown_job(&book, id))?;
+        if job.managed.is_some() {
+            return Err("Use process_output with the managed process owner".into());
+        }
         Arc::clone(&job.shared)
     };
     if let Some(limit) = wait {
@@ -757,6 +801,9 @@ pub fn output_tool(
 pub fn kill_tool(book: &Arc<Mutex<JobBook>>, input: &Value) -> Result<crate::ToolResult, String> {
     let id = job_id(input)?;
     let mut book = book.lock().unwrap_or_else(|err| err.into_inner());
+    if book.get(id).is_some_and(|job| job.managed.is_some()) {
+        return Err("Use process_stop with the managed process owner".into());
+    }
     let before = book
         .get(id)
         .map(|job| job.status())
@@ -813,6 +860,9 @@ pub fn stdin_tool(book: &Arc<Mutex<JobBook>>, input: &Value) -> Result<crate::To
         .and_then(Value::as_str)
         .ok_or_else(|| "Missing required parameter: input".to_string())?;
     let book = book.lock().unwrap_or_else(|err| err.into_inner());
+    if book.get(id).is_some_and(|job| job.managed.is_some()) {
+        return Err("Use process_write with the managed process owner".into());
+    }
     let bytes = book.write_stdin(id, text)?;
     Ok(crate::ToolResult {
         content: format!("Sent {bytes} bytes to stdin"),

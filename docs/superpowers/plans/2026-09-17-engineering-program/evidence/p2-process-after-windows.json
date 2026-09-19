@@ -1,0 +1,29 @@
+{
+  "descendants_after_host_loss": 0,
+  "descendants_after_shutdown": 0,
+  "earliest_cursor": 5243145,
+  "equivalent_requests": 2,
+  "first_ready_ms": 190.1967,
+  "fixture_processes": 3,
+  "host_loss_observation_ms": 844.3375,
+  "job_ids": [
+    1,
+    1
+  ],
+  "measurement": "P2 packaged supervisor; real loopback Node server with child and grandchild",
+  "notes": [
+    "The cold start includes descendants becoming ready; the warm request reuses the same live server.",
+    "Output is a bounded page with byte cursors, not an unbounded saved log.",
+    "Timing is machine-specific; no provider usage is measured."
+  ],
+  "output_emitted_bytes": 5242880,
+  "output_truncated": true,
+  "platform": "windows",
+  "retained_page_bytes": 11,
+  "root_startups": 1,
+  "schema": 1,
+  "second_ready_ms": 1.4052,
+  "shutdown_cleanup_ms": 351.9869,
+  "stdin_roundtrip": true,
+  "survivors_200ms_after_abrupt_host_exit": 0
+}

@@ -1,0 +1,26 @@
+{
+  "cancellation_cleanup_ms": 783.5255,
+  "descendants_after_cancellation": 0,
+  "equivalent_requests": 2,
+  "first_ready_ms": 129.4012,
+  "fixture_processes": 6,
+  "fixture_processes_after_explicit_cleanup": 0,
+  "job_ids": [
+    1,
+    2
+  ],
+  "measurement": "pre-P2 JobBook; real loopback Node server with child and grandchild",
+  "notes": [
+    "Startup timing includes both descendants becoming ready.",
+    "The 200ms host-exit observation is a bounded sample, not an indefinite-lifetime claim."
+  ],
+  "output_dropped_marker": true,
+  "output_emitted_bytes": 5242880,
+  "platform": "windows",
+  "retained_output_bytes": 36,
+  "root_startups": 2,
+  "schema": 1,
+  "second_ready_ms": 118.254,
+  "stdin_roundtrip": true,
+  "survivors_200ms_after_abrupt_host_exit": 3
+}
