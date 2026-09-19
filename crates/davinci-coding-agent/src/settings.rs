@@ -163,6 +163,25 @@ fn parse_language_intelligence<'de, D: serde::Deserializer<'de>>(
     }))
 }
 
+fn parse_decision_intelligence<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<DecisionIntelligenceSettings>, D::Error> {
+    let value = Option::<serde_json::Value>::deserialize(deserializer)?;
+    Ok(value.map(|value| serde_json::from_value(value).unwrap_or_default()))
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default, rename_all = "camelCase", deny_unknown_fields)]
+pub struct DecisionIntelligenceSettings {
+    pub enabled: bool,
+}
+
+impl Default for DecisionIntelligenceSettings {
+    fn default() -> Self {
+        Self { enabled: false }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct Settings {
     #[serde(
@@ -183,6 +202,12 @@ pub struct Settings {
         deserialize_with = "parse_process_manager"
     )]
     pub process_manager: Option<ProcessManagerSettings>,
+    #[serde(
+        default,
+        rename = "decisionIntelligence",
+        deserialize_with = "parse_decision_intelligence"
+    )]
+    pub decision_intelligence: Option<DecisionIntelligenceSettings>,
     #[serde(default, rename = "testImpact", deserialize_with = "parse_test_impact")]
     pub test_impact: Option<crate::native_extensions::test_impact::TestImpactConfig>,
     #[serde(
@@ -987,8 +1012,31 @@ pub fn load_merged_settings_with_override(
         cwd.join(LEGACY_CONFIG_DIR_NAME).join("settings.json")
     };
     let project = load_settings_value(&project_path);
-    let merged = deep_merge_json(global_value, project);
+    let merged = enforce_decision_intelligence_user_boundary(
+        &global_value,
+        deep_merge_json(global_value.clone(), project),
+    );
     serde_json::from_value(migrate_settings(merged)).unwrap_or_default()
+}
+
+fn enforce_decision_intelligence_user_boundary(
+    global: &serde_json::Value,
+    mut merged: serde_json::Value,
+) -> serde_json::Value {
+    let user_enabled = global
+        .get("decisionIntelligence")
+        .and_then(|value| value.get("enabled"))
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    if !user_enabled {
+        if let Some(object) = merged.as_object_mut() {
+            object.insert(
+                "decisionIntelligence".to_owned(),
+                serde_json::json!({"enabled": false}),
+            );
+        }
+    }
+    merged
 }
 
 fn load_settings_value(path: &Path) -> serde_json::Value {
@@ -1096,6 +1144,12 @@ pub fn apply_http_proxy_settings(http_proxy: Option<&str>) {
 }
 
 impl Settings {
+    pub fn decision_intelligence_enabled(&self) -> bool {
+        self.decision_intelligence
+            .as_ref()
+            .is_some_and(|settings| settings.enabled)
+    }
+
     pub fn compaction_enabled(&self) -> bool {
         self.compaction
             .as_ref()
@@ -1436,6 +1490,7 @@ pub fn to_interactive_config(
             .follow_up_mode
             .clone()
             .unwrap_or_else(|| "one-at-a-time".into()),
+        decision_intelligence: settings.decision_intelligence_enabled(),
         transport: settings.transport.clone().unwrap_or_else(|| "auto".into()),
         http_idle_timeout: davinci_tui::format_http_idle_timeout(
             settings.http_idle_timeout_ms.unwrap_or(300_000),

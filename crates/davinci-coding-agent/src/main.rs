@@ -676,6 +676,26 @@ fn build_agent(parsed: &Args, session_dir: &Path, cwd: &Path) -> Result<Agent, S
         .tools
         .retain(|tool| !parsed.exclude_tools.contains(tool));
     agent.cwd = cwd.to_path_buf();
+    if settings.decision_intelligence_enabled() {
+        match AuthStorage::create()
+            .map_err(|error| error.to_string())
+            .and_then(|auth| {
+                davinci_coding_agent::decision_providers::typesafe::TypeSafeProvider::from_auth(
+                    &auth,
+                )
+                .map_err(|error| error.to_string())
+            }) {
+            Ok(Some(provider)) => {
+                let runtime = Arc::new(davinci_agent::decision::DecisionRuntime::new(provider));
+                runtime.enable();
+                agent.set_decision_runtime(runtime);
+            }
+            Ok(None) => eprintln!(
+                "TypeSafe decision intelligence is enabled but has no credential; remaining off"
+            ),
+            Err(error) => eprintln!("TypeSafe decision intelligence unavailable: {error}"),
+        }
+    }
     // The product default is `ask`; the library default (every tool runs)
     // is only for embedders. Who answers an ask is the mode's business:
     // davinci, RPC and the legacy chrome each install an approver, and a
@@ -6380,6 +6400,11 @@ fn persist_interactive_setting(spec: &str) -> Result<(), String> {
         }
         "steering-mode" => stored.steering_mode = Some(value.to_string()),
         "follow-up-mode" => stored.follow_up_mode = Some(value.to_string()),
+        "decision-intelligence" => {
+            stored.decision_intelligence = Some(crate::settings::DecisionIntelligenceSettings {
+                enabled: value == "on",
+            });
+        }
         "transport" => stored.transport = Some(value.to_string()),
         "http-idle-timeout" => stored.http_idle_timeout_ms = parse_http_idle_timeout(value),
         "hide-thinking" => stored.hide_thinking_block = Some(value == "true"),
@@ -6411,7 +6436,7 @@ fn persist_interactive_setting(spec: &str) -> Result<(), String> {
 }
 
 fn sync_agent_from_settings(agent: &mut Agent) {
-    let stored = load_settings(&default_agent_dir());
+    let stored = load_merged_settings(&default_agent_dir(), &agent.cwd);
     agent.auto_compaction = stored.compaction_enabled();
     agent.compaction = stored.compaction_settings();
     agent.block_images = stored.block_images();
@@ -6419,6 +6444,9 @@ fn sync_agent_from_settings(agent: &mut Agent) {
     agent.transport = stored.transport.clone();
     agent.install_telemetry = stored.install_telemetry_enabled();
     agent.auto_retry = stored.retry_enabled();
+    if !stored.decision_intelligence_enabled() {
+        agent.disable_decision_runtime();
+    }
 }
 
 fn looks_like_oauth_input(value: &str) -> bool {

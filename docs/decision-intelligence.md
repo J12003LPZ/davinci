@@ -1,0 +1,185 @@
+# TypeSafe / Jev decision intelligence
+
+TypeSafe / Jev is an optional, provider-neutral decision layer for fast,
+structured routing observations. It is not a coding completion model and it is
+not an authority for permissions, security, transactions, required
+verification, or workspace boundaries.
+
+The v1 implementation is Phase 1 shadow mode: enabled requests are sent,
+strictly validated, audited with metadata, and measured, but their answers do
+not change the deterministic coding path. The feature is disabled by default.
+
+## Settings and activation
+
+The user-owned setting is shown under `AGENT BEHAVIOR` as:
+
+`TypeSafe / Jev decision intelligence off`
+
+Its values are `off` and `on`. A missing or malformed setting is treated as
+disabled. The project settings merge may disable the feature, but it can never
+enable it when the user setting is absent or off:
+
+```text
+effective_enabled = user_enabled && !project_disabled
+```
+
+Turning the setting off immediately stops new decision requests. It does not
+delete the stored TypeSafe credential. The existing deterministic routing,
+verification, and prompt behavior remain the baseline in either setting.
+
+## Credential lifecycle
+
+Credential resolution is deliberately separate from ordinary model selection:
+
+1. `TYPESAFE_API_KEY` is preferred when present.
+2. Otherwise the `typesafe` entry in `auth.json` is used.
+3. An empty or invalid environment override is an explicit failure; it does
+   not silently fall back to the stored key.
+
+The settings flow accepts paste, masks the candidate, rejects voice input while
+the secret overlay has focus, and caps input at 8192 UTF-8 bytes. Enter first
+performs a real credential validation request. The key is persisted and the
+setting is enabled only after validation succeeds. If settings persistence
+fails after a new key was stored, the previous credential is restored (or the
+new entry is removed) and the feature remains off. Esc and Ctrl+C cancel.
+
+The validation request is a bounded probe to:
+
+```text
+POST https://api.typesafe.ai/v1/systemone
+Authorization: Bearer <candidate>
+Content-Type: application/json
+```
+
+It uses model `jev-latest` and requires the `answers.probe` answer to be a
+finite `noul` value in `[0, 1]`. No `/model` discovery request is used.
+
+## Request privacy contract
+
+The request state is schema version 1 and contains only:
+
+- a redacted, Unicode-capped current task;
+- derived task signals;
+- language and framework signals;
+- recent file-kind categories;
+- whether the workspace has uncommitted changes; and
+- boolean availability flags for supported capabilities.
+
+The serialized request is capped at 12 KiB and the task is capped at 4096
+Unicode scalar values. Source bodies, absolute or raw paths, file names,
+`.env` contents, environment values, credentials, authorization headers, raw
+diffs, raw tool/test/build/browser output, cookies, network details, memory or
+skill bodies, system prompts, hidden reasoning, and prior transcript content
+are excluded.
+
+The current task passes through the agent secret-redaction contract before it
+is placed in the state. Provider responses are capped at 32 KiB and are
+accepted only when their answer set exactly matches the requested questions.
+
+## Provider and failure behavior
+
+Normal decision requests have a soft budget of 800 ms and a hard budget of
+1500 ms. Validation uses a 5-second timeout. At most one bounded retry is
+allowed for 429, 529, or a transport reset when the hard budget permits it.
+
+The provider maps failures to these health states:
+
+- `Disabled`
+- `Ready`
+- `CredentialInvalid`
+- `RateLimited`
+- `Overloaded`
+- `Unavailable`
+- `SchemaMismatch`
+
+Failure never fails the coding turn; the deterministic path continues. A 401
+marks the current runtime generation credential-invalid and prevents repeated
+calls until an explicit enable or credential replacement resets that
+generation. 429, 529, and network failures use bounded cooldowns. User-facing
+notices are emitted only on health transitions and never include credentials,
+provider payloads, or raw errors containing secret material.
+
+The runtime uses request generations. Disabling, enabling, or replacing a
+provider increments the generation, and a response from an older generation is
+discarded as stale.
+
+## Response and routing policy
+
+The response validator accepts only the requested answer types:
+
+- Noul: a finite probability value;
+- Choice: a declared choice, a finite probability distribution, and confidence;
+- Score: a finite score, a finite probability distribution, and confidence.
+
+Unknown fields, missing answers, unknown choices, non-finite values,
+out-of-range probabilities, malformed distributions, and oversized responses
+are rejected.
+
+Deterministic requirements remain authoritative:
+
+```text
+FinalRequirements = DeterministicMinimum UNION AcceptedJevExtras
+```
+
+Jev answers can only add an approved optional capability when the provider is
+available, the action is authorized, no deterministic veto applies, and the
+configured confidence threshold is met. Jev cannot remove or weaken a
+deterministic requirement. Verification, test, change, security, transaction,
+permission, and workspace-boundary decisions remain deterministic. Choice and
+score answers are telemetry-only in Phase 1.
+
+The requested questions are bounded to the supported routing set:
+
+`browser_relevant`, `git_history_relevant`,
+`package_intelligence_relevant`, `test_impact_relevant`,
+`change_impact_relevant`, `verification_planner_relevant`,
+`verification_scope`, and `regression_risk`.
+
+Confidence bands are high at `>= .85`, medium at `>= .60`, and abstain below
+`.60`. Noul answers use the separate bands: strong yes `>= .90`, actionable
+yes `>= .85`, uncertain `>= .70`, abstain `>= .30`, possible no `>= .10`, and
+strong no below `.10`. Negative answers never remove deterministic work.
+
+## Audit and telemetry
+
+The bounded audit record contains only request ID, provider, model, decision
+class, question IDs, a hash of the redacted state, state byte size, latency,
+outcome, applied actions, and disagreement metadata. It never stores the task,
+full request, full response, credential, authorization material, or raw tool
+output.
+
+Telemetry records request/success/failure counts, timeouts, explicit HTTP
+401/422/429/529 counts, schema failures, fallbacks, additions, disagreements,
+reported provider token usage, and latency. It also keeps a small bounded
+rolling set of per-answer metadata:
+answer type, value or choice, confidence, probability margin, and whether the
+answer was shadow-only or behavior-affecting. It contains no task text or
+credential material.
+
+There is no durable decision cache. Only bounded in-process state is retained
+for health, audit, and telemetry.
+
+## Rollout gate
+
+Phase 1 is shadow-only and records no behavior changes. A future guarded
+additive phase requires the offline decision-intelligence evaluation and a
+review showing:
+
+- no deterministic regressions;
+- zero removal of deterministic requirements;
+- complete fallback coverage for provider failure fixtures;
+- no credential or private-input leakage;
+- measured latency and usage within budget; and
+- measured useful-addition, false-addition, missed-addition, and disagreement
+  rates.
+
+Until that gate is explicitly met, the runtime must not silently switch to
+guarded behavior.
+
+The repository evaluation fixture covers the ten required scenario classes,
+including off/default behavior, privacy, deterministic fallback, provider
+failures, stale results, shadow invariance, mandatory verification, and the
+measurement fields needed for a guarded decision.
+
+Live TypeSafe API validation is intentionally not part of the offline test
+pass; it requires a user-provided credential and external service access.

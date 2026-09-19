@@ -134,6 +134,7 @@ pub struct InteractiveSettingsConfig {
     pub auto_compact_threshold: String,
     pub steering_mode: String,
     pub follow_up_mode: String,
+    pub decision_intelligence: bool,
     pub transport: String,
     pub http_idle_timeout: String,
     pub hide_thinking: bool,
@@ -175,6 +176,7 @@ impl Default for InteractiveSettingsConfig {
             auto_compact_threshold: "default".into(),
             steering_mode: "one-at-a-time".into(),
             follow_up_mode: "one-at-a-time".into(),
+            decision_intelligence: false,
             transport: "auto".into(),
             http_idle_timeout: "5 min".into(),
             hide_thinking: false,
@@ -358,6 +360,19 @@ pub fn interactive_settings_list(config: &InteractiveSettingsConfig) -> Settings
                 ),
                 current_value: config.follow_up_mode.clone(),
                 values: vec!["one-at-a-time".into(), "all".into()],
+            },
+            SettingItem {
+                id: "decision-intelligence".into(),
+                label: "TypeSafe / Jev decision intelligence".into(),
+                description: Some(
+                    "Use TypeSafe Jev for fast structured routing judgments. Sends only a redacted current task and bounded derived metadata; source bodies, credentials, hidden reasoning, and raw tool outputs are never sent.".into(),
+                ),
+                current_value: if config.decision_intelligence {
+                    "on".into()
+                } else {
+                    "off".into()
+                },
+                values: vec!["off".into(), "on".into()],
             },
             SettingItem {
                 id: "transport".into(),

@@ -39,6 +39,7 @@ image.workspace = true
 libc.workspace = true
 signal-hook.workspace = true
 sha2.workspace = true
+zeroize.workspace = true
 walkdir.workspace = true
 regex.workspace = true
 tree-sitter.workspace = true

@@ -2,6 +2,7 @@
 
 pub mod apply_patch;
 pub mod approval;
+pub mod decision;
 pub mod decisions;
 mod permission_state;
 pub mod process_manager;
@@ -404,6 +405,9 @@ pub struct Agent {
     pub last_prepared_manifest: Option<runtime::context_manifest::PreparedContextManifest>,
     /// Optional shared runtime handle for versioned lifecycle events and coordination.
     pub runtime: Option<RuntimeHandle>,
+    /// Optional additive decision-intelligence runtime. It is deliberately
+    /// separate from deterministic routing and remains disabled by default.
+    pub decision_runtime: Option<Arc<decision::DecisionRuntime>>,
     /// Active prompt manifest identifying modules, hashes, and token budgets.
     pub prompt_manifest: Option<PromptManifest>,
     /// Active prompt session state distinguishing built-in profiles from custom replacement prompts.
@@ -507,6 +511,7 @@ impl Agent {
             provider_system_prompt_suffix: None,
             last_prepared_manifest: None,
             runtime: None,
+            decision_runtime: None,
             runtime_session: None,
         };
         *agent
@@ -580,6 +585,36 @@ impl Agent {
     pub fn with_runtime(mut self, runtime: RuntimeHandle) -> Self {
         self.set_runtime(runtime);
         self
+    }
+
+    pub fn set_decision_runtime(&mut self, runtime: Arc<decision::DecisionRuntime>) {
+        self.decision_runtime = Some(runtime);
+    }
+
+    pub fn decision_runtime(&self) -> Option<Arc<decision::DecisionRuntime>> {
+        self.decision_runtime.clone()
+    }
+
+    pub fn enable_decision_runtime(&mut self) {
+        if let Some(runtime) = &self.decision_runtime {
+            runtime.enable();
+        }
+    }
+
+    pub fn disable_decision_runtime(&mut self) {
+        if let Some(runtime) = &self.decision_runtime {
+            runtime.disable();
+        }
+    }
+
+    pub fn evaluate_decision_shadow(
+        &self,
+        request: &decision::request::DecisionRequest,
+    ) -> Result<decision::response::DecisionResponse, decision::provider::DecisionError> {
+        let Some(runtime) = &self.decision_runtime else {
+            return Err(decision::provider::DecisionError::Disabled);
+        };
+        runtime.evaluate(request)
     }
 
     /// Return the runtime bound to the current session, when reusable by the host.

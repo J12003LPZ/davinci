@@ -9,6 +9,7 @@
 
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use ratatui::text::Line;
+use zeroize::Zeroizing;
 
 use crate::interaction::{apply_editor_key, input_owner, key_event_bytes, InputOwner};
 
@@ -19,9 +20,32 @@ use super::views::sheet::{self, Composer};
 use super::views::{
     agents, ask, codex, cogitator, compact, context_inspector, decision_modal, diff, disegno,
     export, governor, grafo, graph_run, instrumenta, keys, login, mcp, memoria, mensura, officina,
-    opera, permissions, recovery, resume, rewind, securitas, settings, startup, task_board,
-    transcript, tree, trust, vectors, workflows,
+    opera, permissions, recovery, resume, rewind, secret_input, securitas, settings, startup,
+    task_board, transcript, tree, trust, vectors, workflows,
 };
+
+/// Secret value carried from the masked input overlay to the host.
+#[derive(Clone, PartialEq, Eq)]
+pub struct SecretInputValue(Zeroizing<String>);
+
+impl SecretInputValue {
+    pub(crate) fn new(value: String) -> Self {
+        Self(Zeroizing::new(value))
+    }
+
+    pub fn into_inner(self) -> String {
+        let mut value = self.0;
+        std::mem::take(&mut *value)
+    }
+}
+
+impl std::fmt::Debug for SecretInputValue {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("SecretInputValue")
+            .finish_non_exhaustive()
+    }
+}
 
 /// What the runtime should do after a key.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -39,6 +63,9 @@ pub enum Flow {
     /// Request the next permission mode. Only the runtime may apply it and
     /// synchronize `Model::permission_mode`; the draft and UI state stay put.
     CyclePermissionMode,
+    /// A secret was submitted from the dedicated masked input. The host must
+    /// validate it immediately and must not put it in the transcript.
+    SecretInputSubmitted(SecretInputValue),
 }
 
 /// Computes the next 0-indexed permission mode in the 5-mode cycle.
@@ -459,6 +486,7 @@ fn overlay_rows(model: &Model, overlay: Overlay) -> Vec<Line<'static>> {
         Overlay::Instrumenta => instrumenta::all_lines(model),
         Overlay::Sessions => memoria::session_lines(model),
         Overlay::Cogitator => cogitator::lines(model, &model.config_path),
+        Overlay::SecretInput => secret_input::lines(model),
         Overlay::Ask => {
             if let Some(rewind) = &model.rewind_modal {
                 rewind::lines(rewind, model.width, &model.theme)
@@ -498,6 +526,10 @@ fn overlay_body(model: &Model, overlay: Overlay, height: usize) -> Vec<Line<'sta
 /// Route one key. `esc` closes the instrument in hand, `ctrl+c` interrupts the
 /// run and never the app (design.md §6).
 pub fn handle_key(model: &mut Model, key: KeyEvent) -> Flow {
+    if model.overlay == Some(Overlay::SecretInput) {
+        let data = key_event_bytes(&key);
+        return handle_overlay_key(model, Overlay::SecretInput, key, data.as_deref());
+    }
     if model.voice.blocks_send && voice_send_key(model, &key) {
         model.voice.notice = "Finish or cancel voice before sending".into();
         return Flow::Continue;
@@ -1237,6 +1269,39 @@ fn handle_overlay_key(
     key: KeyEvent,
     data: Option<&str>,
 ) -> Flow {
+    if overlay == Overlay::SecretInput {
+        let Some(secret) = model.secret_input.as_mut() else {
+            model.overlay = None;
+            return Flow::Continue;
+        };
+        if key.code == KeyCode::Esc
+            || (key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL))
+        {
+            secret.cancel();
+            model.secret_input = None;
+            model.overlay = None;
+            return Flow::Continue;
+        }
+        if key.code == KeyCode::Enter && key.modifiers.is_empty() && key.kind == KeyEventKind::Press
+        {
+            let Some(candidate) = secret.begin_validation() else {
+                return Flow::Continue;
+            };
+            model.secret_input = None;
+            model.overlay = None;
+            return Flow::SecretInputSubmitted(SecretInputValue::new(candidate));
+        }
+        if key.code == KeyCode::Backspace {
+            secret.backspace();
+            return Flow::Continue;
+        }
+        if key.modifiers.is_empty() {
+            if let KeyCode::Char(character) = key.code {
+                secret.insert_text(&character.to_string());
+            }
+        }
+        return Flow::Continue;
+    }
     if overlay == Overlay::Ask && model.rewind_modal.is_some() {
         let rewind = model.rewind_modal.as_mut().unwrap();
         if key.code == KeyCode::Esc {
@@ -1353,6 +1418,7 @@ fn handle_overlay_key(
         Overlay::Instrumenta => Some("davinci.instrumenta.toggle"),
         Overlay::Sessions => Some("davinci.sessions.toggle"),
         Overlay::Cogitator => Some("davinci.cogitator.toggle"),
+        Overlay::SecretInput => None,
         Overlay::Ask => None,
     };
     if toggle_action.is_some_and(|action| action_matches(model, data, action))
@@ -2856,6 +2922,33 @@ mod section_input_regressions {
     }
     fn press_mods(m: &mut Model, key: KeyCode, mods: KeyModifiers) -> Flow {
         handle_key(m, KeyEvent::new(key, mods))
+    }
+
+    #[test]
+    fn secret_input_owns_ctrl_c_instead_of_interrupting_the_session() {
+        let mut m = model("1a");
+        m.secret_input = Some(crate::davinci::views::secret_input::SecretInputState::new());
+        m.overlay = Some(Overlay::SecretInput);
+
+        let flow = press_mods(&mut m, KeyCode::Char('c'), KeyModifiers::CONTROL);
+
+        assert_eq!(flow, Flow::Continue);
+        assert!(m.secret_input.is_none());
+        assert!(m.overlay.is_none());
+    }
+
+    #[test]
+    fn secret_input_accepts_paste_without_putting_it_in_the_composer() {
+        let mut m = model("1a");
+        m.secret_input = Some(crate::davinci::views::secret_input::SecretInputState::new());
+        m.overlay = Some(Overlay::SecretInput);
+        m.paste("candidate");
+
+        let flow = press(&mut m, KeyCode::Enter);
+
+        assert!(matches!(&flow, Flow::SecretInputSubmitted(_)));
+        assert!(!format!("{flow:?}").contains("candidate"));
+        assert_eq!(&*m.composer, "");
     }
 
     #[test]

@@ -2,6 +2,8 @@
 
 pub mod agent_profiles;
 pub mod completion_delivery;
+pub mod decision_providers;
+pub mod decision_state;
 pub mod hooks;
 pub mod interaction_testing;
 pub mod interactive_tui;

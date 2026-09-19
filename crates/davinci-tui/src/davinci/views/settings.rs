@@ -33,6 +33,7 @@ pub fn group_rank(key: &str) -> usize {
         "skill-commands" | "autocomplete-max-visible" => 2,
         "steering-mode"
         | "follow-up-mode"
+        | "decision-intelligence"
         | "default-project-trust"
         | "double-escape-action"
         | "tree-filter-mode"

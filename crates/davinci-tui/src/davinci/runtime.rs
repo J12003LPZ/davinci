@@ -631,6 +631,7 @@ pub fn run(model: &mut Model, mut on_submit: impl FnMut(&mut Model, String)) -> 
                         // change or choice. Never advance UI permission state
                         // without the live host's authoritative policy update.
                         Flow::CyclePermissionMode
+                        | Flow::SecretInputSubmitted(_)
                         | Flow::Choose(_)
                         | Flow::Continue
                         | Flow::Interrupt => {}
