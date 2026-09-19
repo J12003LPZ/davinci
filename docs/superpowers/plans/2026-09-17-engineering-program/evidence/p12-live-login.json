@@ -4,26 +4,30 @@
   "runs": [
     {
       "pass": true,
-      "duration_s": 4.72,
+      "duration_s": 6.47,
+      "checkpoint_id": "ws-036fef7745b6687f8da15a39",
+      "workspace_diff_error": false,
       "metrics": {
-        "process_start_ms": 112.002,
-        "browser_open_ms": 382.8736,
-        "impact_analyze_cold_ms": 58.0794,
-        "impact_analyze_warm_ms": 32.4437,
-        "repo_map_ms": 66.1456,
-        "workspace_checkpoint_ms": 51.0313
+        "process_start_ms": 122.1111,
+        "browser_open_ms": 418.2212,
+        "impact_analyze_cold_ms": 68.7418,
+        "impact_analyze_warm_ms": 38.2895,
+        "repo_map_ms": 72.4989,
+        "workspace_checkpoint_ms": 49.8195
       }
     },
     {
       "pass": true,
-      "duration_s": 4.84,
+      "duration_s": 6.57,
+      "checkpoint_id": "ws-8e014735e6883802aefdc8f9",
+      "workspace_diff_error": false,
       "metrics": {
-        "process_start_ms": 102.6251,
-        "browser_open_ms": 425.4502,
-        "impact_analyze_cold_ms": 59.6101,
-        "impact_analyze_warm_ms": 34.6795,
-        "repo_map_ms": 40.5597,
-        "workspace_checkpoint_ms": 55.0815
+        "process_start_ms": 143.748,
+        "browser_open_ms": 405.9771,
+        "impact_analyze_cold_ms": 66.2633,
+        "impact_analyze_warm_ms": 35.1222,
+        "repo_map_ms": 41.8084,
+        "workspace_checkpoint_ms": 42.7217
       }
     }
   ],
@@ -46,15 +50,18 @@
     "workspace_diff",
     "verification_plan"
   ],
+  "graph_writer_ran_seventeen_steps": true,
+  "graph_writer_workspace_diff_error": false,
   "graph_classifier_denied_verification_plan": true,
   "graph_classifier_denied_workspace_restore": true,
+  "graph_classifier_deny_via": "agent.call pre_tool NativeExtensionHost::before_tool",
   "limitations": {
     "lsp_diagnostics": "dispatched, returned error (language server unavailable in fixture)",
     "lsp_document_symbols": "dispatched, returned error (language server unavailable in fixture)",
-    "workspace_diff": "dispatched, returned error (checkpoint id field mismatch in details)",
+    "workspace_diff": "succeeds after reading nested checkpoint.id",
     "memory_bytes": null,
     "memory_reason": "not collected; process working-set sampling was not wired in this host",
-    "linux": "not executed locally; GitHub Actions test-impact-native (ubuntu-latest) on 5585fd6 succeeded in run 35420073891",
-    "macos": "not executed locally; GitHub Actions test-impact-native (macos-latest) on 5585fd6 succeeded in run 35420073891"
+    "linux": "not executed locally; GitHub Actions native matrix on main succeeded",
+    "macos": "not executed locally; GitHub Actions native matrix on main succeeded"
   }
 }

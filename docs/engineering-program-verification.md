@@ -27,17 +27,21 @@ cargo test --offline --locked -p davinci-coding-agent --bin davinci -- --ignored
 
 | Run | Duration | process_start_ms | browser_open_ms | impact cold/warm ms | repo_map_ms | workspace_checkpoint_ms |
 | --- | --- | --- | --- | --- | --- | --- |
-| 1 | 4.72s | 112.002 | 382.8736 | 58.0794 / 32.4437 | 66.1456 | 51.0313 |
-| 2 | 4.84s | 102.6251 | 425.4502 | 59.6101 / 34.6795 | 40.5597 | 55.0815 |
+| 1 | 6.47s | 122.1111 | 418.2212 | 68.7418 / 38.2895 | 72.4989 | 49.8195 |
+| 2 | 6.57s | 143.748 | 405.9771 | 66.2633 / 35.1222 | 41.8084 | 42.7217 |
 
 Dispatched required tools: `repo_map`, `lsp_document_symbols`, `package_info`, `git_blame_symbol`, `impact_analyze`, `process_start`, `workspace_checkpoint`, `edit`, `lsp_diagnostics`, `test_plan`, `bash`, `build_command`, `browser_open`, `browser_snapshot`, `browser_console`, `workspace_diff`, `verification_plan`.
 
-Graph: Classifier denied `verification_plan` and `workspace_restore`.
+`workspace_diff` succeeds using nested `checkpoint.id` (run 1 `ws-036fef7745b6687f8da15a39`, run 2 `ws-8e014735e6883802aefdc8f9`).
+
+Graph Writer executed the same 17 tools through `agent.call` with `pre_tool` -> `NativeExtensionHost::before_tool` and Writer allowlist (`workspace_diff` success). Classifier deny of `verification_plan` and `workspace_restore` was returned as tool errors: `tool "..." is not available to the classifier role`.
+
+Raw `--nocapture` transcripts were captured in the session scratch `p12-normal/` and `p12-graph/` directories (not committed).
 
 ## Limitations (not relabeled success)
 
 - `lsp_diagnostics` / `lsp_document_symbols`: dispatched, returned error (language server unavailable in fixture).
-- `workspace_diff`: dispatched, returned error (checkpoint id field mismatch in details).
+- `workspace_diff`: succeeds after the nested `checkpoint.id` fix.
 - `startup_ms` / `memory_bytes`: null; working-set sampling was not wired.
 - `cache_hit_rate`: null; warm impact was faster than cold but hit/miss counters were not exported.
 - Linux/macOS live Chromium 17-step: not executed locally. GitHub native ubuntu/macos `test-impact-native` jobs on this SHA succeeded; they do not re-run the ignored Playwright 17-step.
