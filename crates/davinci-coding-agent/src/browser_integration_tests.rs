@@ -3,6 +3,7 @@ use super::{attach_shared_tool_executor, attach_tool_executor, build_agent, Args
 use crate::native_extensions::browser::{
     BrowserAssertionSpec, BrowserConfig, BrowserController, TOOL_NAMES,
 };
+use davinci_agent::runtime::cache::CacheStats;
 use davinci_agent::{
     jobs::supervisor::SupervisorCommand, process_manager::ProcessManager, PermissionMode,
     PermissionRule, PreToolHook,
@@ -14,6 +15,89 @@ use std::{
     sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
+
+fn cache_delta(before: &CacheStats, after: &CacheStats) -> serde_json::Value {
+    let totals = |stats: &CacheStats| {
+        stats
+            .namespaces
+            .values()
+            .fold((0_u64, 0_u64), |(hits, misses), namespace| {
+                (
+                    hits + namespace.memory_hits + namespace.persistent_hits,
+                    misses + namespace.misses,
+                )
+            })
+    };
+    let (before_hits, before_misses) = totals(before);
+    let (after_hits, after_misses) = totals(after);
+    let hits = after_hits.saturating_sub(before_hits);
+    let misses = after_misses.saturating_sub(before_misses);
+    let total = hits + misses;
+    json!({
+        "hits": hits,
+        "misses": misses,
+        "hit_rate": if total == 0 { 0.0 } else { hits as f64 / total as f64 },
+    })
+}
+
+#[cfg(windows)]
+fn peak_memory_bytes() -> Option<u64> {
+    #[repr(C)]
+    struct Counters {
+        size: u32,
+        faults: u32,
+        peak_working: usize,
+        working: usize,
+        peak_paged: usize,
+        paged: usize,
+        peak_nonpaged: usize,
+        nonpaged: usize,
+        pagefile: usize,
+        peak_pagefile: usize,
+    }
+    #[link(name = "psapi")]
+    unsafe extern "system" {
+        fn GetProcessMemoryInfo(process: isize, counters: *mut Counters, size: u32) -> i32;
+    }
+    let mut counters = Counters {
+        size: std::mem::size_of::<Counters>() as u32,
+        faults: 0,
+        peak_working: 0,
+        working: 0,
+        peak_paged: 0,
+        paged: 0,
+        peak_nonpaged: 0,
+        nonpaged: 0,
+        pagefile: 0,
+        peak_pagefile: 0,
+    };
+    let success = unsafe {
+        GetProcessMemoryInfo(-1, &mut counters, std::mem::size_of::<Counters>() as u32) != 0
+    };
+    success.then_some(counters.peak_working as u64)
+}
+
+#[cfg(target_os = "linux")]
+fn peak_memory_bytes() -> Option<u64> {
+    std::fs::read_to_string("/proc/self/status")
+        .ok()?
+        .lines()
+        .find_map(|line| line.strip_prefix("VmHWM:")?.split_whitespace().next())
+        .and_then(|value| value.parse::<u64>().ok())
+        .map(|kilobytes| kilobytes * 1024)
+}
+
+#[cfg(target_os = "macos")]
+fn peak_memory_bytes() -> Option<u64> {
+    let mut usage = std::mem::MaybeUninit::<libc::rusage>::zeroed();
+    let result = unsafe { libc::getrusage(libc::RUSAGE_SELF, usage.as_mut_ptr()) };
+    (result == 0).then(|| unsafe { usage.assume_init().ru_maxrss as u64 })
+}
+
+#[cfg(not(any(windows, target_os = "linux", target_os = "macos")))]
+fn peak_memory_bytes() -> Option<u64> {
+    None
+}
 
 #[test]
 fn rpc_artifact_helper_entry() {
@@ -1086,21 +1170,26 @@ impl Drop for GraphEnvGuard {
 
 #[test]
 #[ignore = "requires explicitly configured trusted Node and Playwright installation"]
+#[allow(clippy::drop_non_drop)]
 fn login_button_seventeen_step_normal_dispatch_and_graph_deny() {
     let root = tempfile::tempdir().unwrap();
     let state = tempfile::tempdir().unwrap();
+    let feature_enabled = std::env::var("DAVINCI_P12_FEATURES")
+        .map(|value| value != "off")
+        .unwrap_or(true);
     std::fs::write(
         state.path().join("settings.json"),
         serde_json::json!({
-            "verificationPlanner": {"enabled": true},
-            "workspaceSnapshots": {"enabled": true, "maxFiles": 8},
-            "changeImpact": {"enabled": true},
-            "testImpact": {"enabled": true},
-            "packageIntelligence": {"enabled": true},
-            "buildIntelligence": {"enabled": true},
-            "gitIntelligence": {"enabled": true},
-            "browserVerification": {"enabled": true},
-            "processManager": {"enabled": true}
+            "verificationPlanner": {"enabled": feature_enabled},
+            "workspaceSnapshots": {"enabled": feature_enabled, "maxFiles": 8},
+            "changeImpact": {"enabled": feature_enabled},
+            "testImpact": {"enabled": feature_enabled},
+            "packageIntelligence": {"enabled": feature_enabled},
+            "buildIntelligence": {"enabled": feature_enabled},
+            "repoIntelligence": {"enabled": feature_enabled},
+            "gitIntelligence": {"enabled": feature_enabled},
+            "browserVerification": {"enabled": feature_enabled},
+            "processManager": {"enabled": feature_enabled}
         })
         .to_string(),
     )
@@ -1151,6 +1240,7 @@ fn login_button_seventeen_step_normal_dispatch_and_graph_deny() {
         "login fixture",
     ]);
 
+    let startup_started = Instant::now();
     let mut agent = build_agent(
         &Args {
             project_trust_override: Some(true),
@@ -1180,15 +1270,19 @@ fn login_button_seventeen_step_normal_dispatch_and_graph_deny() {
         .unwrap(),
     );
     let host = ExtensionHost::load_with_cwd(state.path(), &[], root.path());
-    host.native.lock().unwrap().browser = BrowserController::new(
-        root.path(),
-        BrowserConfig {
-            enabled: true,
-            node: PathBuf::from(std::env::var("DAVINCI_TRUSTED_NODE_TEST_PATH").unwrap()),
-            package: PathBuf::from(std::env::var("DAVINCI_TRUSTED_PLAYWRIGHT_TEST_PATH").unwrap()),
-            version: "1.62.0".into(),
-        },
-    );
+    if feature_enabled {
+        host.native.lock().unwrap().browser = BrowserController::new(
+            root.path(),
+            BrowserConfig {
+                enabled: true,
+                node: PathBuf::from(std::env::var("DAVINCI_TRUSTED_NODE_TEST_PATH").unwrap()),
+                package: PathBuf::from(
+                    std::env::var("DAVINCI_TRUSTED_PLAYWRIGHT_TEST_PATH").unwrap(),
+                ),
+                version: "1.62.0".into(),
+            },
+        );
+    }
     agent.tools = [
         "tool_search",
         "process_start",
@@ -1219,6 +1313,45 @@ fn login_button_seventeen_step_normal_dispatch_and_graph_deny() {
     agent.pre_tool = Some(PreToolHook(Arc::new(move |name, args| {
         hook_host.native_before_tool(name, args, String::new)
     })));
+    let startup_ms = startup_started.elapsed().as_secs_f64() * 1000.0;
+    let cache_before = host.native.lock().unwrap().cache.stats();
+
+    if !feature_enabled {
+        let disabled_result =
+            host.native
+                .lock()
+                .unwrap()
+                .execute_tool(root.path(), "repo_map", &json!({}));
+        assert!(
+            disabled_result.is_err(),
+            "feature-off repo_map must be unavailable: {disabled_result:?}"
+        );
+        let memory_bytes = peak_memory_bytes().expect("P12 feature-off memory measurement");
+        let cache = cache_delta(&cache_before, &host.native.lock().unwrap().cache.stats());
+        let receipt = json!({
+            "schema_version": 1,
+            "test": "login_button_seventeen_step_normal_dispatch_and_graph_deny",
+            "mode": "feature-off",
+            "feature_enabled": false,
+            "fixture_id": "login-button-seventeen-step",
+            "platform": std::env::consts::OS,
+            "arch": std::env::consts::ARCH,
+            "startup_ms": startup_ms,
+            "memory_bytes": memory_bytes,
+            "cache": cache,
+            "disabled_tool": "repo_map"
+        });
+        eprintln!("P12_FEATURE_OFF_RECEIPT {receipt}");
+        if let Some(path) = std::env::var_os("DAVINCI_P12_EVAL_ARTIFACT") {
+            std::fs::write(
+                path,
+                serde_json::to_vec_pretty(&receipt)
+                    .expect("P12 feature-off receipt must serialize as JSON"),
+            )
+            .expect("P12 feature-off receipt must be writable");
+        }
+        return;
+    }
 
     let port = TcpListener::bind(("127.0.0.1", 0))
         .unwrap()
@@ -1431,6 +1564,7 @@ fn login_button_seventeen_step_normal_dispatch_and_graph_deny() {
     record("verification_plan", error, Duration::from_millis(0));
     assert!(!error, "{output}");
 
+    drop(record);
     let required = [
         "repo_map",
         "lsp_document_symbols",
@@ -1456,6 +1590,36 @@ fn login_button_seventeen_step_normal_dispatch_and_graph_deny() {
             "missing live step {name} in {dispatched:?}"
         );
     }
+    let normal_cache = cache_delta(&cache_before, &host.native.lock().unwrap().cache.stats());
+    let memory_bytes = peak_memory_bytes().expect("P12 normal memory measurement");
+    let cache_hits = normal_cache["hits"]
+        .as_u64()
+        .expect("P12 cache hit count must be numeric");
+    assert!(
+        cache_hits > 0,
+        "P12 warm query must reuse the cache/index; metrics={normal_cache}"
+    );
+    let process_count = manager
+        .execute(root.path(), "process_list", &json!({}), None, None)
+        .expect("process_list must succeed for P12 metrics")
+        .details
+        .and_then(|details| details["processes"].as_array().map(Vec::len))
+        .expect("process_list must return processes for P12 metrics");
+    assert!(
+        process_count > 0,
+        "P12 normal process count must be observed: {process_count}"
+    );
+    timings.insert("startup_ms".into(), json!(startup_ms));
+    timings.insert("memory_bytes".into(), json!(memory_bytes));
+    timings.insert("cache".into(), normal_cache.clone());
+    timings.insert("cache_hits".into(), normal_cache["hits"].clone());
+    timings.insert("cache_misses".into(), normal_cache["misses"].clone());
+    timings.insert("cache_hit_rate".into(), normal_cache["hit_rate"].clone());
+    timings.insert("process_count".into(), json!(process_count));
+    timings.insert("browser_success".into(), json!(true));
+    timings.insert("platform".into(), json!(std::env::consts::OS));
+    timings.insert("arch".into(), json!(std::env::consts::ARCH));
+    let normal_metrics = serde_json::Value::Object(timings.clone());
     eprintln!(
         "P12_NORMAL_RECEIPT {}",
         json!({
@@ -1466,10 +1630,10 @@ fn login_button_seventeen_step_normal_dispatch_and_graph_deny() {
                 "ms": elapsed.as_secs_f64() * 1000.0
             })).collect::<Vec<_>>(),
             "checkpoint_id": checkpoint_id,
-            "metrics": serde_json::Value::Object(timings.clone())
+            "metrics": normal_metrics.clone()
         })
     );
-    eprintln!("P12_LOGIN_METRICS {}", serde_json::Value::Object(timings));
+    eprintln!("P12_LOGIN_METRICS {}", normal_metrics);
 
     let required_csv = required.join(",");
     let artifact = root.path().join("graph-artifact.json");
@@ -1484,6 +1648,7 @@ fn login_button_seventeen_step_normal_dispatch_and_graph_deny() {
         ("PI_GRAPH_AUTHORIZED_TOOLS", required_csv.clone()),
         ("DAVINCI_TASK_COORDINATOR_ADDR", "127.0.0.1:9".into()),
     ]);
+    let graph_cache_before = host.native.lock().unwrap().cache.stats();
     let mut graph_dispatched = Vec::new();
     let mut graph_timings = serde_json::Map::new();
     let mut graph_record = |name: &str, error: bool, elapsed: Duration| {
@@ -1567,6 +1732,13 @@ fn login_button_seventeen_step_normal_dispatch_and_graph_deny() {
     let graph_browser_id = graph_opened["browser_id"].as_str().unwrap().to_string();
     let (_, output, error) = super::test_impact_integration_tests::call(
         &mut agent,
+        "browser_click",
+        json!({"browser_id":graph_browser_id,"selector":{"kind":"role","role":"button","name":"Start"}}),
+    );
+    graph_record("browser_click", error, Duration::from_millis(0));
+    assert!(!error, "graph writer browser_click: {output}");
+    let (_, output, error) = super::test_impact_integration_tests::call(
+        &mut agent,
         "browser_snapshot",
         json!({"browser_id":graph_browser_id}),
     );
@@ -1579,6 +1751,13 @@ fn login_button_seventeen_step_normal_dispatch_and_graph_deny() {
     );
     graph_record("browser_console", error, Duration::from_millis(0));
     assert!(!error, "graph writer browser_console: {output}");
+    let (_, output, error) = super::test_impact_integration_tests::call(
+        &mut agent,
+        "browser_network",
+        json!({"browser_id":graph_browser_id}),
+    );
+    graph_record("browser_network", error, Duration::from_millis(0));
+    assert!(!error, "graph writer browser_network: {output}");
 
     let (_, output, error) = super::test_impact_integration_tests::call(
         &mut agent,
@@ -1591,12 +1770,45 @@ fn login_button_seventeen_step_normal_dispatch_and_graph_deny() {
         "graph writer workspace_diff must succeed with {graph_checkpoint_id}: {output}"
     );
 
+    drop(graph_record);
     for name in required {
         assert!(
             graph_dispatched.iter().any(|(tool, _, _)| tool == name),
             "missing graph writer step {name} in {graph_dispatched:?}"
         );
     }
+    let graph_cache = cache_delta(
+        &graph_cache_before,
+        &host.native.lock().unwrap().cache.stats(),
+    );
+    let graph_memory_bytes = peak_memory_bytes().expect("P12 graph memory measurement");
+    let graph_cache_hits = graph_cache["hits"]
+        .as_u64()
+        .expect("P12 graph cache hit count must be numeric");
+    assert!(
+        graph_cache_hits > 0,
+        "P12 graph warm query must reuse the cache/index; metrics={graph_cache}"
+    );
+    let graph_process_count = manager
+        .execute(root.path(), "process_list", &json!({}), None, None)
+        .expect("graph process_list must succeed for P12 metrics")
+        .details
+        .and_then(|details| details["processes"].as_array().map(Vec::len))
+        .expect("graph process_list must return processes for P12 metrics");
+    assert!(
+        graph_process_count > 0,
+        "P12 graph process count must be observed: {graph_process_count}"
+    );
+    graph_timings.insert("memory_bytes".into(), json!(graph_memory_bytes));
+    graph_timings.insert("cache".into(), graph_cache.clone());
+    graph_timings.insert("cache_hits".into(), graph_cache["hits"].clone());
+    graph_timings.insert("cache_misses".into(), graph_cache["misses"].clone());
+    graph_timings.insert("cache_hit_rate".into(), graph_cache["hit_rate"].clone());
+    graph_timings.insert("process_count".into(), json!(graph_process_count));
+    graph_timings.insert("browser_success".into(), json!(true));
+    graph_timings.insert("platform".into(), json!(std::env::consts::OS));
+    graph_timings.insert("arch".into(), json!(std::env::consts::ARCH));
+    let graph_metrics = serde_json::Value::Object(graph_timings.clone());
     eprintln!(
         "P12_GRAPH_WRITER_RECEIPT {}",
         json!({
@@ -1607,7 +1819,7 @@ fn login_button_seventeen_step_normal_dispatch_and_graph_deny() {
                 "ms": elapsed.as_secs_f64() * 1000.0
             })).collect::<Vec<_>>(),
             "checkpoint_id": graph_checkpoint_id,
-            "metrics": serde_json::Value::Object(graph_timings)
+            "metrics": graph_metrics.clone()
         })
     );
     drop(writer_guard);
@@ -1651,6 +1863,46 @@ fn login_button_seventeen_step_normal_dispatch_and_graph_deny() {
         "classifier must be denied workspace_restore: {restore_output}"
     );
     drop(_classifier_guard);
+
+    if let Some(path) = std::env::var_os("DAVINCI_P12_EVAL_ARTIFACT") {
+        let artifact_receipt = json!({
+            "schema_version": 1,
+            "test": "login_button_seventeen_step_normal_dispatch_and_graph_deny",
+            "mode": "feature-on",
+            "feature_enabled": true,
+            "fixture_id": "login-button-seventeen-step",
+            "platform": std::env::consts::OS,
+            "arch": std::env::consts::ARCH,
+            "normal": {
+                "dispatched": dispatched.iter().map(|(name, error, elapsed)| json!({
+                    "tool": name,
+                    "error": error,
+                    "ms": elapsed.as_secs_f64() * 1000.0
+                })).collect::<Vec<_>>(),
+                "checkpoint_id": checkpoint_id,
+                "metrics": normal_metrics,
+            },
+            "graph_writer": {
+                "dispatched": graph_dispatched.iter().map(|(name, error, elapsed)| json!({
+                    "tool": name,
+                    "error": error,
+                    "ms": elapsed.as_secs_f64() * 1000.0
+                })).collect::<Vec<_>>(),
+                "checkpoint_id": graph_checkpoint_id,
+                "metrics": graph_metrics,
+            },
+            "graph_classifier": {
+                "verification_plan_error": plan_error,
+                "workspace_restore_error": restore_error,
+            },
+        });
+        std::fs::write(
+            path,
+            serde_json::to_vec_pretty(&artifact_receipt)
+                .expect("P12 receipt must serialize as JSON"),
+        )
+        .expect("P12 receipt artifact must be writable");
+    }
 
     let (_, output, error) = super::test_impact_integration_tests::call(
         &mut agent,
