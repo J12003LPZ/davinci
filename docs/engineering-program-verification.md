@@ -1,25 +1,26 @@
 # DaVinci engineering program — final verification report
 
 Date: 2026-09-19.
-Write tree: `C:\Users\sergi\.claude-worktrees\pi-rust-9416e5cee6\01a0ad48`.
+Write tree: `C:\Users\sergi\Desktop\pi-rust\final-worktree`.
 Shared checkout `C:\Users\sergi\Desktop\pi-rust` was not modified.
 
 ## Delivery
 
-- `origin/main`: `5585fd6612aa48a0ce0d48536953ea1697c60836` (`Merge pull request #19 from J12003LPZ/codex/p12-live-eval-01a0ad48`).
-- Merged PRs: #9 P1, #10 P2, #11 P4, #12 P3, #13 P5, #14 P7, #15 P6, #16 P9, #17 P8, #18 P10–P12, #19 P12 live 17-step.
-- Isolated worktree on `codex/program-report-01a0ad48` from that SHA; twelve feature SHAs are ancestors of `origin/main`.
+- `origin/main`: `9fe1e1062a6d265e7f282ab4556a478ed3bf3f7e` (merged PR #22, the final acceptance and macOS host-path fix).
+- Merged PRs: #9 P1, #10 P2, #11 P4, #12 P3, #13 P5, #14 P7, #15 P6, #16 P9, #17 P8, #18 P10–P12, #19 P12 live 17-step, #20 program report, #21 Graph/checkpoint acceptance fix, and #22 final acceptance/macOS host fix.
+- Isolated final-evidence branch `codex/program-evidence-20260919` is based on that SHA; all twelve feature SHAs and the live acceptance fixes are ancestors of `origin/main`.
 
-## Main CI on `5585fd6`
+## Main CI on `9fe1e106`
 
-- Security SARIF: https://github.com/J12003LPZ/davinci/actions/runs/35420073914 success.
-- CI: https://github.com/J12003LPZ/davinci/actions/runs/35420073891 success on attempt 2. Attempt 1 was cancelled after Windows `Test planning and filesystem observation` stayed in_progress from 04:02:32Z past 28 minutes (prior green Windows job finished that step in 3.3 minutes). `rerun-failed-jobs` started attempt 2 at 04:31:39Z; Windows native completed success.
+- Security SARIF: https://github.com/J12003LPZ/davinci/actions/runs/35460353623 success.
+- CI: https://github.com/J12003LPZ/davinci/actions/runs/35460353612 success across the full matrix, including Linux/macOS/Windows native P12 and test-impact jobs.
+- Workflow lint: https://github.com/J12003LPZ/davinci/actions/runs/35460353647 success.
 
 Prior assembled main (P1–P12 without the live 17-step follow-up): `57975a5` CI https://github.com/J12003LPZ/davinci/actions/runs/35418243472 success.
 
 ## P12 live 17-step
 
-Command (twice, both pass):
+The focused command passed twice locally. The merged `main` SHA also passed the real Chromium workflow twice per platform (macOS, Linux, and Windows):
 
 ```text
 cargo test --offline --locked -p davinci-coding-agent --bin davinci -- --ignored --nocapture login_button_seventeen_step
@@ -38,14 +39,15 @@ Graph Writer executed the same 17 tools through `agent.call` with `pre_tool` -> 
 
 Raw `--nocapture` transcripts were captured in the session scratch `p12-normal/` and `p12-graph/` directories (not committed).
 
+Hosted P12 evidence is attached to CI run [35460353612](https://github.com/J12003LPZ/davinci/actions/runs/35460353612) and preserved in the `p12-live-login-macOS`, `p12-live-login-Linux`, and `p12-live-login-Windows` artifacts. Every platform ran the feature-off and feature-on fixture twice; all six feature-on browser runs succeeded, recorded startup and working-set memory, and reported 3 normal cache hits plus 4 Graph Writer cache hits. Median feature-on startup/memory was 162.475 ms / 50,642,944 bytes on macOS, 337.726 ms / 62,803,968 bytes on Linux, and 364.064 ms / 39,739,392 bytes on Windows. The Graph Writer completed all 17 steps, `workspace_diff` succeeded, and the Classifier denied both `verification_plan` and `workspace_restore` through `NativeExtensionHost::before_tool`.
+
 ## Limitations (not relabeled success)
 
 - `lsp_diagnostics` / `lsp_document_symbols`: dispatched, returned error (language server unavailable in fixture).
-- `workspace_diff`: succeeds after the nested `checkpoint.id` fix.
-- `startup_ms` / `memory_bytes`: null; working-set sampling was not wired.
-- `cache_hit_rate`: null; warm impact was faster than cold but hit/miss counters were not exported.
-- Linux/macOS live Chromium 17-step: not executed locally. GitHub native ubuntu/macos `test-impact-native` jobs on this SHA succeeded; they do not re-run the ignored Playwright 17-step.
-- Full `davinci-agent` / `davinci-coding-agent` package suites previously exposed Windows ACL, browser timeout, no-HEAD fixture, and process-lifecycle failures. Those were not weakened. Native CI shards and focused tests are the Section 34 evidence.
+- `workspace_diff`: succeeds on every hosted run after the nested `checkpoint.id` fix.
+- Linux/macOS live Chromium 17-step: not executed locally; the hosted native P12 jobs passed the real browser path on all three platforms.
+- Full `davinci-agent` / `davinci-coding-agent` package suites retain historical Windows ACL, browser timeout, no-HEAD fixture, and process-lifecycle failures. Those paths were not weakened; the required native CI shards passed.
+- Fresh local Windows Cargo validation is unavailable in this environment because rustc reports `Access is denied` and the offline registry lacks `cpal`; hosted CI is the release gate.
 
 ## Architecture (owners on main)
 
@@ -64,4 +66,4 @@ Raw `--nocapture` transcripts were captured in the session scratch `p12-normal/`
 
 ## Restart
 
-No production service restart. Agents pick up `origin/main` `5585fd6` on next checkout/rebuild.
+No production service restart. Agents pick up `origin/main` `9fe1e106` on next checkout/rebuild.

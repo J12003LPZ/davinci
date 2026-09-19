@@ -1,7 +1,7 @@
 {
   "project": "P12",
   "name": "continuous-evals",
-  "status": "implementation_present_focused_validation_passed",
+  "status": "implementation_present_focused_and_hosted_validation_passed",
   "source_copy": "program-worktree",
   "changed_surfaces": [
     "crates/davinci-evals/src/engineering.rs",
@@ -46,18 +46,39 @@
     "normal_login_scenario": "passed twice locally via login_button_seventeen_step_normal_dispatch_and_graph_deny",
     "graph_assignment": "classifier deny of verification_plan and workspace_restore passed in the same live test",
     "real_browser": "passed; Chromium via DAVINCI_TRUSTED_NODE_TEST_PATH and DAVINCI_TRUSTED_PLAYWRIGHT_TEST_PATH",
-    "ci": "PR #19 exact-head green; main 5585fd6 CI 35420073891 success attempt 2"
+    "ci": "PR #22 exact-head green; merged main 9fe1e1062a6d265e7f282ab4556a478ed3bf3f7e CI 35460353612, SARIF 35460353623, and workflow lint 35460353647 all succeeded"
   },
   "focused_command": {
     "command": "cargo +1.98.1 test --offline --locked -p davinci-evals --test engineering -- --nocapture",
     "exit": 0,
     "result": "10 passed, 0 failed, 0 ignored"
   },
+  "hosted_acceptance": {
+    "sha": "9fe1e1062a6d265e7f282ab4556a478ed3bf3f7e",
+    "ci_run": "https://github.com/J12003LPZ/davinci/actions/runs/35460353612",
+    "sarif_run": "https://github.com/J12003LPZ/davinci/actions/runs/35460353623",
+    "workflow_lint_run": "https://github.com/J12003LPZ/davinci/actions/runs/35460353647",
+    "p12_jobs": {
+      "macos": "https://github.com/J12003LPZ/davinci/actions/runs/35460353612/job/105942980220",
+      "linux": "https://github.com/J12003LPZ/davinci/actions/runs/35460353612/job/105942980322",
+      "windows": "https://github.com/J12003LPZ/davinci/actions/runs/35460353612/job/105942980285"
+    },
+    "runs_per_platform": 2,
+    "feature_off_and_on_comparisons": "captured for macOS, Linux, and Windows in the p12-live-login-* artifacts",
+    "startup_and_memory": "captured for every hosted feature-on run",
+    "cache_telemetry": "normal path recorded 3 hits/8 misses; Graph Writer recorded 4 hits/2 misses on every hosted platform",
+    "browser_success": "true on all six hosted feature-on runs",
+    "graph_writer_seventeen_steps": true,
+    "classifier_denied_verification_plan": true,
+    "classifier_denied_workspace_restore": true,
+    "workspace_diff_success": true
+  },
   "pending_gates": [
-    "full davinci-agent and davinci-coding-agent package suites still have historical Windows ACL, browser-timeout, no-HEAD, and process-lifecycle failures; not weakened; native CI shards are the gate",
-    "startup_ms and memory_bytes remain null with reason",
-    "Linux/macOS live Chromium 17-step not executed locally",
-    "main CI 35420073891 succeeded on attempt 2 after cancelling a hung Windows native step"
+    "full davinci-agent and davinci-coding-agent package suites retain historical Windows ACL, browser-timeout, no-HEAD, and process-lifecycle failures; those paths were not weakened and the required native CI shards passed",
+    "lsp_document_symbols and lsp_diagnostics return fixture errors because no language server is installed",
+    "Linux/macOS live Chromium 17-step was not run locally; both hosted native jobs passed it",
+    "fresh local Windows Cargo validation remains unavailable because rustc reports Access is denied and the offline registry lacks cpal"
   ],
-  "merge_ready": true
+  "merge_ready": true,
+  "release_verified": true
 }
