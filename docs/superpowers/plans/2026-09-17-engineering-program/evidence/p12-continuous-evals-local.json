@@ -73,6 +73,14 @@
     "classifier_denied_workspace_restore": true,
     "workspace_diff_success": true
   },
+  "final_main_verification": {
+    "sha": "70542fcbf93e223aa40889763d37e1a76913f50d",
+    "ci_run": "https://github.com/J12003LPZ/davinci/actions/runs/35462619603",
+    "sarif_run": "https://github.com/J12003LPZ/davinci/actions/runs/35462619625",
+    "workflow_lint_run": "https://github.com/J12003LPZ/davinci/actions/runs/35460353647",
+    "all_jobs_green": true,
+    "workflow_lint_note": "validated on the unchanged workflow set"
+  },
   "pending_gates": [
     "full davinci-agent and davinci-coding-agent package suites retain historical Windows ACL, browser-timeout, no-HEAD, and process-lifecycle failures; those paths were not weakened and the required native CI shards passed",
     "lsp_document_symbols and lsp_diagnostics return fixture errors because no language server is installed",
