@@ -1,0 +1,718 @@
+{
+  "cold": {
+    "broader_verification": [
+      {
+        "argv": [
+          "run",
+          "test"
+        ],
+        "cwd": "packages/auth",
+        "framework": "package",
+        "manager_evidence": "npm convention; no explicit package manager",
+        "program": "npm",
+        "reason": "required package verification",
+        "requires_authorization": true
+      },
+      {
+        "argv": [
+          "run",
+          "test"
+        ],
+        "cwd": "packages/web",
+        "framework": "package",
+        "manager_evidence": "npm convention; no explicit package manager",
+        "program": "npm",
+        "reason": "required package verification",
+        "requires_authorization": true
+      }
+    ],
+    "changed": [
+      "packages/auth/src/token.mjs"
+    ],
+    "first_tier": [
+      {
+        "argv": [
+          "--test",
+          "test/session.test.mjs",
+          "test/token.test.mjs"
+        ],
+        "cwd": "packages/auth",
+        "framework": "node:test",
+        "manager_evidence": "npm convention; no explicit package manager",
+        "program": "node",
+        "reason": "explicit selected test paths; package lifecycle remains in broader tier",
+        "requires_authorization": true
+      },
+      {
+        "argv": [
+          "--test",
+          "test/login.test.mjs"
+        ],
+        "cwd": "packages/web",
+        "framework": "node:test",
+        "manager_evidence": "npm convention; no explicit package manager",
+        "program": "node",
+        "reason": "explicit selected test paths; package lifecycle remains in broader tier",
+        "requires_authorization": true
+      }
+    ],
+    "freshness": {
+      "full_refresh_required_before_completion": true,
+      "mode": "full"
+    },
+    "history": "not available",
+    "measured_latency_ms": 83.2957,
+    "partial": false,
+    "remaining": 0,
+    "results": [
+      {
+        "package": "packages/auth",
+        "path": "packages/auth/test/session.test.mjs",
+        "reasons": [
+          {
+            "chain": [
+              "packages/auth/src/token.mjs",
+              "packages/auth/src/session.mjs",
+              "packages/auth/test/session.test.mjs"
+            ],
+            "kind": "dependency",
+            "source": "ast"
+          }
+        ]
+      },
+      {
+        "package": "packages/auth",
+        "path": "packages/auth/test/token.test.mjs",
+        "reasons": [
+          {
+            "chain": [
+              "packages/auth/src/token.mjs",
+              "packages/auth/test/token.test.mjs"
+            ],
+            "kind": "dependency",
+            "source": "ast"
+          },
+          {
+            "chain": [
+              "packages/auth/src/token.mjs",
+              "packages/auth/test/token.test.mjs"
+            ],
+            "kind": "paired_test",
+            "source": "test-map"
+          }
+        ]
+      },
+      {
+        "package": "packages/web",
+        "path": "packages/web/test/login.test.mjs",
+        "reasons": [
+          {
+            "chain": [
+              "packages/auth/src/token.mjs",
+              "packages/auth/src/session.mjs",
+              "packages/web/src/login.mjs",
+              "packages/web/test/login.test.mjs"
+            ],
+            "kind": "dependency",
+            "source": "ast"
+          }
+        ]
+      }
+    ],
+    "returned_bytes": 2487,
+    "source_identity": "6508690bd42b932f40f13d76a8e4850f413c1d528356dd835d927db80fc828d7",
+    "summary": "3 related tests; targeted checks precede required broader verification",
+    "telemetry": {
+      "indexed_tests_not_selected": 20,
+      "latency_ms": 83.2218,
+      "mapping_cache_hit": false,
+      "metadata_bytes_read": 344,
+      "refresh_mode": "full",
+      "reparsed": 46,
+      "source_bytes_read": 6173,
+      "source_files_read": 46,
+      "tests_selected": 3
+    },
+    "total": 3,
+    "truncated": false,
+    "warnings": []
+  },
+  "construction_ms": 39.1477,
+  "correct_full_suite": {
+    "argv": [
+      "--test",
+      "--test-reporter=tap"
+    ],
+    "exit_code": 0,
+    "failed": 0,
+    "failure_paths": [],
+    "passed": 23,
+    "paths": [
+      "packages/auth/test/session.test.mjs",
+      "packages/auth/test/token.test.mjs",
+      "packages/other/test/unrelated0.test.mjs",
+      "packages/other/test/unrelated1.test.mjs",
+      "packages/other/test/unrelated10.test.mjs",
+      "packages/other/test/unrelated11.test.mjs",
+      "packages/other/test/unrelated12.test.mjs",
+      "packages/other/test/unrelated13.test.mjs",
+      "packages/other/test/unrelated14.test.mjs",
+      "packages/other/test/unrelated15.test.mjs",
+      "packages/other/test/unrelated16.test.mjs",
+      "packages/other/test/unrelated17.test.mjs",
+      "packages/other/test/unrelated18.test.mjs",
+      "packages/other/test/unrelated19.test.mjs",
+      "packages/other/test/unrelated2.test.mjs",
+      "packages/other/test/unrelated3.test.mjs",
+      "packages/other/test/unrelated4.test.mjs",
+      "packages/other/test/unrelated5.test.mjs",
+      "packages/other/test/unrelated6.test.mjs",
+      "packages/other/test/unrelated7.test.mjs",
+      "packages/other/test/unrelated8.test.mjs",
+      "packages/other/test/unrelated9.test.mjs",
+      "packages/web/test/login.test.mjs"
+    ],
+    "program": "node",
+    "runtime_ms": 244.8066,
+    "stderr": "",
+    "stdout_bytes": 3500,
+    "test_count": 23
+  },
+  "correct_selected_suite": {
+    "argv": [
+      "--test",
+      "--test-reporter=tap"
+    ],
+    "exit_code": 0,
+    "failed": 0,
+    "failure_paths": [],
+    "passed": 3,
+    "paths": [
+      "packages/auth/test/session.test.mjs",
+      "packages/auth/test/token.test.mjs",
+      "packages/web/test/login.test.mjs"
+    ],
+    "program": "node",
+    "runtime_ms": 98.5842,
+    "stderr": "",
+    "stdout_bytes": 523,
+    "test_count": 3
+  },
+  "fallback_warm": {
+    "latency_ms": 6.5991,
+    "mode": "full",
+    "source_bytes_read": 6173,
+    "source_files_read": 46
+  },
+  "false_positive_paths": [],
+  "fixture": "test-impact-monorepo-v1",
+  "forced": {
+    "broader_verification": [
+      {
+        "argv": [
+          "run",
+          "test"
+        ],
+        "cwd": "packages/auth",
+        "framework": "package",
+        "manager_evidence": "npm convention; no explicit package manager",
+        "program": "npm",
+        "reason": "required package verification",
+        "requires_authorization": true
+      },
+      {
+        "argv": [
+          "run",
+          "test"
+        ],
+        "cwd": "packages/web",
+        "framework": "package",
+        "manager_evidence": "npm convention; no explicit package manager",
+        "program": "npm",
+        "reason": "required package verification",
+        "requires_authorization": true
+      }
+    ],
+    "changed": [
+      "packages/auth/src/token.mjs"
+    ],
+    "first_tier": [
+      {
+        "argv": [
+          "--test",
+          "test/session.test.mjs",
+          "test/token.test.mjs"
+        ],
+        "cwd": "packages/auth",
+        "framework": "node:test",
+        "manager_evidence": "npm convention; no explicit package manager",
+        "program": "node",
+        "reason": "explicit selected test paths; package lifecycle remains in broader tier",
+        "requires_authorization": true
+      },
+      {
+        "argv": [
+          "--test",
+          "test/login.test.mjs"
+        ],
+        "cwd": "packages/web",
+        "framework": "node:test",
+        "manager_evidence": "npm convention; no explicit package manager",
+        "program": "node",
+        "reason": "explicit selected test paths; package lifecycle remains in broader tier",
+        "requires_authorization": true
+      }
+    ],
+    "freshness": {
+      "full_refresh_required_before_completion": true,
+      "mode": "full"
+    },
+    "history": "not available",
+    "measured_latency_ms": 42.6705,
+    "partial": false,
+    "remaining": 0,
+    "results": [
+      {
+        "package": "packages/auth",
+        "path": "packages/auth/test/session.test.mjs",
+        "reasons": [
+          {
+            "chain": [
+              "packages/auth/src/token.mjs",
+              "packages/auth/src/session.mjs",
+              "packages/auth/test/session.test.mjs"
+            ],
+            "kind": "dependency",
+            "source": "ast"
+          }
+        ]
+      },
+      {
+        "package": "packages/auth",
+        "path": "packages/auth/test/token.test.mjs",
+        "reasons": [
+          {
+            "chain": [
+              "packages/auth/src/token.mjs",
+              "packages/auth/test/token.test.mjs"
+            ],
+            "kind": "dependency",
+            "source": "ast"
+          },
+          {
+            "chain": [
+              "packages/auth/src/token.mjs",
+              "packages/auth/test/token.test.mjs"
+            ],
+            "kind": "paired_test",
+            "source": "test-map"
+          }
+        ]
+      },
+      {
+        "package": "packages/web",
+        "path": "packages/web/test/login.test.mjs",
+        "reasons": [
+          {
+            "chain": [
+              "packages/auth/src/token.mjs",
+              "packages/auth/src/session.mjs",
+              "packages/web/src/login.mjs",
+              "packages/web/test/login.test.mjs"
+            ],
+            "kind": "dependency",
+            "source": "ast"
+          }
+        ]
+      }
+    ],
+    "returned_bytes": 2496,
+    "source_identity": "344347dbe507fbe06c23ba22ff83d2bf4c57dabc9b07b0c28fa4b4b38df1f799",
+    "summary": "3 related tests; targeted checks precede required broader verification",
+    "telemetry": {
+      "indexed_tests_not_selected": 20,
+      "latency_ms": 42.615100000000005,
+      "mapping_cache_hit": true,
+      "metadata_bytes_read": 344,
+      "refresh_mode": "full",
+      "reparsed": 0,
+      "source_bytes_read": 6173,
+      "source_files_read": 46,
+      "tests_selected": 3
+    },
+    "total": 3,
+    "truncated": false,
+    "warnings": []
+  },
+  "measurement": "single debug-profile sample; fixture-only accuracy, not a general miss-rate guarantee",
+  "missed_failure_paths": [],
+  "mutated_full_suite": {
+    "argv": [
+      "--test",
+      "--test-reporter=tap"
+    ],
+    "exit_code": 1,
+    "failed": 3,
+    "failure_paths": [
+      "packages/auth/test/session.test.mjs",
+      "packages/auth/test/token.test.mjs",
+      "packages/web/test/login.test.mjs"
+    ],
+    "passed": 20,
+    "paths": [
+      "packages/auth/test/session.test.mjs",
+      "packages/auth/test/token.test.mjs",
+      "packages/other/test/unrelated0.test.mjs",
+      "packages/other/test/unrelated1.test.mjs",
+      "packages/other/test/unrelated10.test.mjs",
+      "packages/other/test/unrelated11.test.mjs",
+      "packages/other/test/unrelated12.test.mjs",
+      "packages/other/test/unrelated13.test.mjs",
+      "packages/other/test/unrelated14.test.mjs",
+      "packages/other/test/unrelated15.test.mjs",
+      "packages/other/test/unrelated16.test.mjs",
+      "packages/other/test/unrelated17.test.mjs",
+      "packages/other/test/unrelated18.test.mjs",
+      "packages/other/test/unrelated19.test.mjs",
+      "packages/other/test/unrelated2.test.mjs",
+      "packages/other/test/unrelated3.test.mjs",
+      "packages/other/test/unrelated4.test.mjs",
+      "packages/other/test/unrelated5.test.mjs",
+      "packages/other/test/unrelated6.test.mjs",
+      "packages/other/test/unrelated7.test.mjs",
+      "packages/other/test/unrelated8.test.mjs",
+      "packages/other/test/unrelated9.test.mjs",
+      "packages/web/test/login.test.mjs"
+    ],
+    "program": "node",
+    "runtime_ms": 233.1745,
+    "stderr": "",
+    "stdout_bytes": 5738,
+    "test_count": 23
+  },
+  "mutated_selected_suite": {
+    "argv": [
+      "--test",
+      "--test-reporter=tap"
+    ],
+    "exit_code": 1,
+    "failed": 3,
+    "failure_paths": [
+      "packages/auth/test/session.test.mjs",
+      "packages/auth/test/token.test.mjs",
+      "packages/web/test/login.test.mjs"
+    ],
+    "passed": 0,
+    "paths": [
+      "packages/auth/test/session.test.mjs",
+      "packages/auth/test/token.test.mjs",
+      "packages/web/test/login.test.mjs"
+    ],
+    "program": "node",
+    "runtime_ms": 96.8832,
+    "stderr": "",
+    "stdout_bytes": 2761,
+    "test_count": 3
+  },
+  "no_test_case": {
+    "broader_verification": [
+      {
+        "argv": [
+          "run",
+          "test"
+        ],
+        "cwd": "packages/auth",
+        "framework": "package",
+        "manager_evidence": "npm convention; no explicit package manager",
+        "program": "npm",
+        "reason": "required package verification",
+        "requires_authorization": true
+      }
+    ],
+    "execution": "not run; zero tests are not verification",
+    "selected": 0
+  },
+  "notes": [
+    "Node commands execute real generated fixtures, without package downloads or LLM calls.",
+    "Counts of files not selected are planning facts, not proof those tests may be omitted at completion.",
+    "Warm source I/O excludes metadata and directory enumeration; total test_plan latency includes authorization and cache lookup."
+  ],
+  "one_file_edit": {
+    "broader_verification": [
+      {
+        "argv": [
+          "run",
+          "test"
+        ],
+        "cwd": "packages/auth",
+        "framework": "package",
+        "manager_evidence": "npm convention; no explicit package manager",
+        "program": "npm",
+        "reason": "required package verification",
+        "requires_authorization": true
+      },
+      {
+        "argv": [
+          "run",
+          "test"
+        ],
+        "cwd": "packages/web",
+        "framework": "package",
+        "manager_evidence": "npm convention; no explicit package manager",
+        "program": "npm",
+        "reason": "required package verification",
+        "requires_authorization": true
+      }
+    ],
+    "changed": [
+      "packages/auth/src/token.mjs"
+    ],
+    "first_tier": [
+      {
+        "argv": [
+          "--test",
+          "test/session.test.mjs",
+          "test/token.test.mjs"
+        ],
+        "cwd": "packages/auth",
+        "framework": "node:test",
+        "manager_evidence": "npm convention; no explicit package manager",
+        "program": "node",
+        "reason": "explicit selected test paths; package lifecycle remains in broader tier",
+        "requires_authorization": true
+      },
+      {
+        "argv": [
+          "--test",
+          "test/login.test.mjs"
+        ],
+        "cwd": "packages/web",
+        "framework": "node:test",
+        "manager_evidence": "npm convention; no explicit package manager",
+        "program": "node",
+        "reason": "explicit selected test paths; package lifecycle remains in broader tier",
+        "requires_authorization": true
+      }
+    ],
+    "freshness": {
+      "full_refresh_required_before_completion": true,
+      "mode": "observed"
+    },
+    "history": "not available",
+    "measured_latency_ms": 40.8377,
+    "partial": false,
+    "remaining": 0,
+    "results": [
+      {
+        "package": "packages/auth",
+        "path": "packages/auth/test/session.test.mjs",
+        "reasons": [
+          {
+            "chain": [
+              "packages/auth/src/token.mjs",
+              "packages/auth/src/session.mjs",
+              "packages/auth/test/session.test.mjs"
+            ],
+            "kind": "dependency",
+            "source": "ast"
+          }
+        ]
+      },
+      {
+        "package": "packages/auth",
+        "path": "packages/auth/test/token.test.mjs",
+        "reasons": [
+          {
+            "chain": [
+              "packages/auth/src/token.mjs",
+              "packages/auth/test/token.test.mjs"
+            ],
+            "kind": "dependency",
+            "source": "ast"
+          },
+          {
+            "chain": [
+              "packages/auth/src/token.mjs",
+              "packages/auth/test/token.test.mjs"
+            ],
+            "kind": "paired_test",
+            "source": "test-map"
+          }
+        ]
+      },
+      {
+        "package": "packages/web",
+        "path": "packages/web/test/login.test.mjs",
+        "reasons": [
+          {
+            "chain": [
+              "packages/auth/src/token.mjs",
+              "packages/auth/src/session.mjs",
+              "packages/web/src/login.mjs",
+              "packages/web/test/login.test.mjs"
+            ],
+            "kind": "dependency",
+            "source": "ast"
+          }
+        ]
+      }
+    ],
+    "returned_bytes": 2502,
+    "source_identity": "344347dbe507fbe06c23ba22ff83d2bf4c57dabc9b07b0c28fa4b4b38df1f799",
+    "summary": "3 related tests; targeted checks precede required broader verification",
+    "telemetry": {
+      "indexed_tests_not_selected": 20,
+      "latency_ms": 40.783899999999996,
+      "mapping_cache_hit": false,
+      "metadata_bytes_read": 344,
+      "refresh_mode": "observed",
+      "reparsed": 1,
+      "source_bytes_read": 59,
+      "source_files_read": 1,
+      "tests_selected": 3
+    },
+    "total": 3,
+    "truncated": false,
+    "warnings": []
+  },
+  "platform": "windows",
+  "schema": 1,
+  "warm": {
+    "broader_verification": [
+      {
+        "argv": [
+          "run",
+          "test"
+        ],
+        "cwd": "packages/auth",
+        "framework": "package",
+        "manager_evidence": "npm convention; no explicit package manager",
+        "program": "npm",
+        "reason": "required package verification",
+        "requires_authorization": true
+      },
+      {
+        "argv": [
+          "run",
+          "test"
+        ],
+        "cwd": "packages/web",
+        "framework": "package",
+        "manager_evidence": "npm convention; no explicit package manager",
+        "program": "npm",
+        "reason": "required package verification",
+        "requires_authorization": true
+      }
+    ],
+    "changed": [
+      "packages/auth/src/token.mjs"
+    ],
+    "first_tier": [
+      {
+        "argv": [
+          "--test",
+          "test/session.test.mjs",
+          "test/token.test.mjs"
+        ],
+        "cwd": "packages/auth",
+        "framework": "node:test",
+        "manager_evidence": "npm convention; no explicit package manager",
+        "program": "node",
+        "reason": "explicit selected test paths; package lifecycle remains in broader tier",
+        "requires_authorization": true
+      },
+      {
+        "argv": [
+          "--test",
+          "test/login.test.mjs"
+        ],
+        "cwd": "packages/web",
+        "framework": "node:test",
+        "manager_evidence": "npm convention; no explicit package manager",
+        "program": "node",
+        "reason": "explicit selected test paths; package lifecycle remains in broader tier",
+        "requires_authorization": true
+      }
+    ],
+    "freshness": {
+      "full_refresh_required_before_completion": true,
+      "mode": "observed"
+    },
+    "history": "not available",
+    "measured_latency_ms": 37.1114,
+    "partial": false,
+    "remaining": 0,
+    "results": [
+      {
+        "package": "packages/auth",
+        "path": "packages/auth/test/session.test.mjs",
+        "reasons": [
+          {
+            "chain": [
+              "packages/auth/src/token.mjs",
+              "packages/auth/src/session.mjs",
+              "packages/auth/test/session.test.mjs"
+            ],
+            "kind": "dependency",
+            "source": "ast"
+          }
+        ]
+      },
+      {
+        "package": "packages/auth",
+        "path": "packages/auth/test/token.test.mjs",
+        "reasons": [
+          {
+            "chain": [
+              "packages/auth/src/token.mjs",
+              "packages/auth/test/token.test.mjs"
+            ],
+            "kind": "dependency",
+            "source": "ast"
+          },
+          {
+            "chain": [
+              "packages/auth/src/token.mjs",
+              "packages/auth/test/token.test.mjs"
+            ],
+            "kind": "paired_test",
+            "source": "test-map"
+          }
+        ]
+      },
+      {
+        "package": "packages/web",
+        "path": "packages/web/test/login.test.mjs",
+        "reasons": [
+          {
+            "chain": [
+              "packages/auth/src/token.mjs",
+              "packages/auth/src/session.mjs",
+              "packages/web/src/login.mjs",
+              "packages/web/test/login.test.mjs"
+            ],
+            "kind": "dependency",
+            "source": "ast"
+          }
+        ]
+      }
+    ],
+    "returned_bytes": 2490,
+    "source_identity": "6508690bd42b932f40f13d76a8e4850f413c1d528356dd835d927db80fc828d7",
+    "summary": "3 related tests; targeted checks precede required broader verification",
+    "telemetry": {
+      "indexed_tests_not_selected": 20,
+      "latency_ms": 37.0587,
+      "mapping_cache_hit": true,
+      "metadata_bytes_read": 344,
+      "refresh_mode": "observed",
+      "reparsed": 0,
+      "source_bytes_read": 59,
+      "source_files_read": 1,
+      "tests_selected": 3
+    },
+    "total": 3,
+    "truncated": false,
+    "warnings": []
+  }
+}

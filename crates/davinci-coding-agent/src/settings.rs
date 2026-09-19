@@ -5,6 +5,15 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+fn parse_test_impact<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<crate::native_extensions::test_impact::TestImpactConfig>, D::Error> {
+    use crate::native_extensions::test_impact::TestImpactConfig;
+    let value = Option::<serde_json::Value>::deserialize(deserializer)?;
+    Ok(value
+        .map(|value| serde_json::from_value(value).unwrap_or(TestImpactConfig { enabled: false })))
+}
+
 fn parse_language_intelligence<'de, D: serde::Deserializer<'de>>(
     deserializer: D,
 ) -> Result<
@@ -26,6 +35,8 @@ fn parse_language_intelligence<'de, D: serde::Deserializer<'de>>(
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct Settings {
+    #[serde(default, rename = "testImpact", deserialize_with = "parse_test_impact")]
+    pub test_impact: Option<crate::native_extensions::test_impact::TestImpactConfig>,
     #[serde(default, rename = "repoIntelligence")]
     pub repo_intelligence:
         Option<crate::native_extensions::repo_intelligence::RepoIntelligenceConfig>,

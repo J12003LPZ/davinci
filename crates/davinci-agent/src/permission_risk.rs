@@ -151,6 +151,66 @@ pub(super) fn file_targets(
     cwd: &Path,
     boundary: &FilesystemBoundaryPolicy,
 ) -> Result<Vec<FileTarget>, String> {
+    if matches!(tool, "test_related" | "test_impacted" | "test_plan") {
+        let mut paths = Vec::new();
+        if let Some(values) = args.get("paths") {
+            for value in values.as_array().ok_or("paths must be an array")? {
+                paths.push(value.as_str().ok_or("paths must contain strings")?);
+            }
+        }
+        if let Some(path) = args.get("path") {
+            paths.push(path.as_str().ok_or("path must be a string")?);
+        }
+        let symbols = args
+            .get("symbolIds")
+            .map(|value| {
+                let values = value.as_array().ok_or("symbolIds must be an array")?;
+                if values
+                    .iter()
+                    .any(|v| v.as_str().is_none_or(|s| s.is_empty() || s.len() > 4096))
+                {
+                    return Err("invalid symbolIds");
+                }
+                Ok(values.len())
+            })
+            .transpose()?
+            .unwrap_or(0);
+        if paths.len() + symbols == 0 || paths.len() + symbols > 64 {
+            return Err("expected 1..64 paths or symbolIds".into());
+        }
+        paths
+            .into_iter()
+            .map(|path| {
+                if path.is_empty()
+                    || path.len() > 4096
+                    || path.contains([':', '\\', '\0'])
+                    || Path::new(path).components().any(|part| {
+                        !matches!(
+                            part,
+                            std::path::Component::Normal(_) | std::path::Component::CurDir
+                        )
+                    })
+                {
+                    return Err("impact paths must be relative workspace paths".into());
+                }
+                let item = target(cwd, path, boundary, false);
+                if item.secret || item.outside || item.symlink_escape {
+                    return Err("impact path is outside the permitted source boundary".into());
+                }
+                Ok(item)
+            })
+            .collect()
+    } else {
+        ordinary_file_targets(tool, args, cwd, boundary)
+    }
+}
+
+fn ordinary_file_targets(
+    tool: &str,
+    args: &Value,
+    cwd: &Path,
+    boundary: &FilesystemBoundaryPolicy,
+) -> Result<Vec<FileTarget>, String> {
     if tool == "apply_patch" {
         let input = args
             .get("input")

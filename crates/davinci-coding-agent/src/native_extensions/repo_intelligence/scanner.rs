@@ -1,6 +1,7 @@
 use super::LanguageAdapter;
 use crate::native_extensions::security_scan::snapshot::open_confined;
 use ignore::gitignore::{Gitignore, GitignoreBuilder};
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io::Read;
 use std::path::{Component, Path, PathBuf};
@@ -14,6 +15,32 @@ pub(super) struct Scan {
     pub metadata: Vec<String>,
     pub text_files: Vec<String>,
     pub warnings: Vec<String>,
+    pub stamps: BTreeMap<String, FileStamp>,
+    pub directories: BTreeSet<PathBuf>,
+    pub ignore_hashes: BTreeMap<String, String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct FileStamp {
+    pub len: u64,
+    modified: Option<std::time::SystemTime>,
+    created: Option<std::time::SystemTime>,
+    #[cfg(unix)]
+    changed: (i64, i64, u64),
+}
+
+impl FileStamp {
+    fn new(metadata: &fs::Metadata) -> Self {
+        #[cfg(unix)]
+        use std::os::unix::fs::MetadataExt;
+        Self {
+            len: metadata.len(),
+            modified: metadata.modified().ok(),
+            created: metadata.created().ok(),
+            #[cfg(unix)]
+            changed: (metadata.ctime(), metadata.ctime_nsec(), metadata.ino()),
+        }
+    }
 }
 
 pub(super) fn linked(metadata: &fs::Metadata) -> bool {
@@ -44,7 +71,7 @@ pub(super) fn validate_relative(raw: &str) -> Result<PathBuf, String> {
     Ok(path.to_path_buf())
 }
 
-fn excluded(path: &Path) -> bool {
+pub(super) fn excluded(path: &Path) -> bool {
     davinci_agent::is_sensitive_file_path(&path.to_string_lossy())
         || path.components().any(|c| {
             matches!(
@@ -80,17 +107,29 @@ pub(super) fn read_bounded(root: &Path, relative: &Path, limit: usize) -> Result
     String::from_utf8(bytes).map_err(|_| "parse_failed: non UTF-8 file".into())
 }
 
-pub(super) fn config_file(path: &str) -> bool {
+pub(crate) fn config_file(path: &str) -> bool {
     let name = path.rsplit('/').next().unwrap_or(path);
     matches!(
         name,
-        "package.json" | "tsconfig.json" | "jsconfig.json" | "turbo.json" | "nx.json"
+        "package.json"
+            | "tsconfig.json"
+            | "jsconfig.json"
+            | "turbo.json"
+            | "nx.json"
+            | "pnpm-workspace.yaml"
+            | "pnpm-lock.yaml"
+            | "package-lock.json"
+            | "npm-shrinkwrap.json"
+            | "yarn.lock"
+            | "bun.lock"
+            | "bun.lockb"
     ) || [
         "vite.config.",
         "next.config.",
         "eslint.config.",
         "vitest.config.",
         "jest.config.",
+        "playwright.config.",
         ".eslintrc",
         "tsconfig.",
     ]
@@ -98,7 +137,11 @@ pub(super) fn config_file(path: &str) -> bool {
     .any(|prefix| name.starts_with(prefix))
 }
 
-pub(super) fn scan(root: &Path) -> Result<Scan, String> {
+pub(super) fn scan(
+    root: &Path,
+    authorize: &impl Fn(&str) -> Result<(), String>,
+    mut observe: impl FnMut(&Path),
+) -> Result<Scan, String> {
     let mut scan = Scan::default();
     let mut stack = vec![(PathBuf::new(), Vec::<Gitignore>::new())];
     let mut visited = 0;
@@ -119,9 +162,16 @@ pub(super) fn scan(root: &Path) -> Result<Scan, String> {
             continue;
         }
         let ignore_path = relative.join(".gitignore");
+        observe(&directory);
+        scan.directories.insert(directory.clone());
         if root.join(&ignore_path).exists() {
+            authorize(&ignore_path.to_string_lossy().replace('\\', "/"))?;
             match read_bounded(root, &ignore_path, 64 * 1024) {
                 Ok(body) => {
+                    scan.ignore_hashes.insert(
+                        ignore_path.to_string_lossy().replace('\\', "/"),
+                        super::symbols::digest(body.as_bytes()),
+                    );
                     let mut builder = GitignoreBuilder::new(&directory);
                     for line in body.lines() {
                         if builder
@@ -187,6 +237,7 @@ pub(super) fn scan(root: &Path) -> Result<Scan, String> {
             let supported = LanguageAdapter::for_path(&name).is_some();
             let config = config_file(&name);
             if supported {
+                scan.stamps.insert(name.clone(), FileStamp::new(&meta));
                 scan.sources.push(name.clone());
             }
             if config {

@@ -1,0 +1,92 @@
+# P3: Browser / Playwright Verification
+
+Status: design approved by the user on 2026-09-17; implementation pending.
+Execution sequence: 4 of 12.
+Dependencies: P2 and P4 green; existing interaction_testing protocol/evidence/artifact contracts.
+Requirements authority: project section 8 and cross-cutting sections 18-40;
+project numbers are kept stable while execution order follows the program design.
+
+## Outcome
+
+An ordinary session verifies a real local frontend flow and returns bounded DOM/accessibility, console/network and screenshot evidence.
+
+## Scope and ownership
+
+Proposed files/modules (not claims of completed edits):
+
+- crates/davinci-coding-agent/src/interaction_testing/{browser,artifacts,mod}.rs
+- crates/davinci-coding-agent/src/native_extensions/browser_verification/ (new host adapter)
+- Host-owned optional Playwright bridge under existing scripts/ layout (new, exact package location settled after installed-backend inspection)
+- crates/davinci-coding-agent/src/{settings,extension_host,main,shutdown}.rs and native_extensions/mod.rs
+- crates/davinci-agent/src/{permission,permission_risk}.rs; Graph role adapter; new browser integration/eval fixtures
+
+The main session is the only writer. No subagents, parallel writers or unrelated cleanup.
+Reinspect these paths and callers at implementation time because main may advance.
+
+## Baseline before implementation
+
+Run current fixture browser adapter and demonstrate its FixtureOnly receipt classification. Inspect installed Node/Playwright/browser versions separately; measure real backend cold startup before adding reuse.
+
+## Ordered implementation and RED/GREEN work
+
+1. RED: native browser discovery/dispatch absent, real bridge launch/cleanup, selectors, blocked cross-origin/subresource/redirect/WebSocket traffic, missing executable and artifact overflow.
+
+2. Verify maintained installed Playwright APIs/version and choose a pinned optional host-owned bridge. Follow official network/context/ARIA docs linked from the program design. Do not import project node_modules code into the trusted bridge or auto-download at runtime.
+
+3. Extend existing typed JSONL commands with open, snapshot, click, type, select, console, network, accessibility, screenshot and close. Validate message sizes/request IDs/selector lengths and reject arbitrary evaluate, CDP, downloads/uploads and persistent user profiles.
+
+4. Attach browser_open to a current authorized P2 dev-server lease; validate origin and resource ownership. Establish context-wide HTTP(S), redirects/popups/subresources and WebSocket enforcement before navigation; block service workers. Permit additional origins only through trusted project/network policy.
+
+5. Collect console errors, request failures and HTTP error statuses with bounded queues. Provide deterministic role/name/test-id selectors, accessibility tree snapshots, viewport bounds and explicit action timeout.
+
+6. Store screenshots/traces with existing artifact budgets and immutable references; no model-facing base64 or page/cookie persistence in disk cache. Bind evidence to current source/transaction, browser identity and action sequence.
+
+7. Share browser engine resources safely while separating per-owner contexts and mutable page state. Reserve startup to avoid duplicate launches; serialize per-context operations, not unrelated sessions. Cancel/close/shutdown cleans bridge and descendants.
+
+8. Wire native tools through normal dispatch, current permissions, output governor and relevant frontend discovery; Graph uses the same implementations with role restrictions.
+
+9. GREEN: deterministic fake bridge/offline security tests, actual real-browser local login fixture and cleanup/console/network assertions, related crate gates and platform CI. Missing optional backend returns unavailable but does not satisfy real-browser acceptance.
+
+## Required targeted validation
+
+- No backend startup in ordinary text edit/status; absent Node/Playwright allows source/test fallback without reporting browser success.
+- Local page with planted click bug, console error and failed network request must yield failing source-bound verification; corrected page passes actual interaction.
+- Unauthorized navigation, crafted origins/userinfo, file/data schemes, popup/redirect, WebSocket and cross-owner session IDs fail.
+- Screenshot artifact bounds, cancellation during launch/action, permission revocation between calls, simultaneous startup and final context cleanup.
+
+## Settings and fallback
+
+browserVerification.enabled is independently configurable; backend path/version is trusted host configuration. Default enabled capability availability remains lazy and reports missing backend without install.
+
+## Specific acceptance guard
+
+FixtureOnly receipts and source inspection cannot prove RealBrowser completion. Accessibility snapshots are evidence, not an unsupported full accessibility compliance claim.
+
+## Completion gate and handoff
+
+The approved [program design](../../specs/2026-09-17-engineering-program.md)
+and original [requirements](../../specs/2026-09-17-engineering-program-requirements.md)
+are the reference. Shared authorization, bounded-output, cache, lifecycle, telemetry,
+settings and security invariants apply in addition to the project-specific steps.
+
+Record all fourteen section-34 gates in this project's ledger row: design approval,
+plan, observed RED/GREEN, affected package tests, fmt, Clippy, integration, security,
+normal path, applicable Graph path, benchmark/eval, docs, diff review, and exact-head
+CI. Planned fixtures/test names above are not claims of existing or executed tests.
+
+Validation sequence: focused failing acceptance test; focused passing checks after
+implementation; affected crate tests with `--offline --locked`; `cargo fmt --check`;
+affected Clippy during development and required workspace Clippy at the milestone;
+matching integration/security/eval cases; feature-branch push and actual CI monitoring.
+Run broader suites only for affected shared contracts or final acceptance. Record
+exact executed selectors, exits and test counts; zero-case runs do not count.
+
+Use a separate coherent commit/PR for the subsystem. With earlier PRs unmerged,
+stack on the preceding verified branch and target that branch for review. Preserve
+dependency commits without force pushes. Do not begin the next subsystem with
+known failures or incomplete required gates. Approval to implement this program
+does not authorize merging new PRs into main.
+
+The handoff in README records files/APIs changed, validated commands and results,
+metric/artifact paths, head SHA/CI URLs, limitations, and the next dependency input.
+No production capability is called done from this plan alone.

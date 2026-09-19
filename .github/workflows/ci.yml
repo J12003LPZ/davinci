@@ -9,6 +9,26 @@ env:
   PI_OFFLINE: "1"
 
 jobs:
+  test-impact-native:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+      - name: Use repository-pinned Rust
+        run: rustup show
+      - name: Test planning and filesystem observation
+        run: cargo test -p davinci-coding-agent --locked --test test_impact --test test_impact_observation
+      - name: Normal agent edit and verification path
+        run: cargo test -p davinci-coding-agent --locked --bin davinci test_impact_integration_tests
+      - name: Offline test selection evaluation
+        run: cargo test -p davinci-coding-agent --locked --test test_impact_eval -- --ignored --nocapture
+
   voice-native:
     strategy:
       fail-fast: false

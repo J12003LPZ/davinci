@@ -88,8 +88,13 @@ you protect other local agent state.
 Construction performs no scan, parse, or cache creation. Each query walks bounded
 workspace paths, hashes supported source contents, and reparses only changed files.
 Deleted/renamed/ignored files are removed. Config hints are reread during refresh.
-Hashing intentionally catches same-size edits with preserved timestamps; warm
-queries still perform source I/O and reload/publish normalized JSON.
+Hashing intentionally catches same-size edits with preserved timestamps. Existing
+repository tools retain full content reconciliation. The shared index also exposes
+an observed refresh for [test-impact planning](test-impact.md): fresh inventory,
+bounded native change events, file stamps, and explicit changed-path reads allow
+unchanged source records to be reused between full reconciliations.
+Ignore-file contents are fingerprinted during inventory; a changed set of ignore
+rules forces full content reconciliation even if its watcher event is delayed.
 
 Controllers share immutable snapshots within a process. Graph worker processes
 coordinate through the same workspace cache and an OS-owned exclusive lease.
@@ -97,7 +102,9 @@ The lease releases on process exit and times out after bounded retries; a busy
 lease returns an explicit error rather than duplicating a cold parse. Corrupt,
 incompatible, or missing cache data rebuilds. Unavailable persistence uses memory
 with a warning. Atomic temporary-file publication prevents partial JSON reads.
-No background watcher or service is introduced.
+A bounded native watcher starts lazily with the index and ends with its last
+in-process owner. Overflow, unavailable observation, and periodic/explicit full
+refreshes use content hashing. Watcher hints are not an atomic filesystem snapshot.
 
 Traversal respects nested `.gitignore` rules, generated directories, and the
 existing sensitive-path policy. Symlinks and Windows reparse points are rejected,
@@ -107,7 +114,7 @@ include 1 MB/source file, 20,000 source files, 100,000 directory entries, depth 
 call, and 4 MB/text-search content. Limits can yield partial coverage with warnings.
 
 The merged settings object accepts `repoIntelligence` with `enabled` (default true),
-`persistIndex` (true), `maxFileBytes` (1,000,000 maximum), and `maxResults` (25,
+`persistIndex` (true), `observeChanges` (true), `maxFileBytes` (1,000,000 maximum), and `maxResults` (25,
 maximum 100). Setting `enabled` false keeps schemas discoverable but rejects queries
 without indexing. No MCP registration is needed. Runtime capability selection and
 Graph role allowlists continue to govern tool availability.
@@ -128,4 +135,5 @@ The normalized Rust contracts keep tool semantics language-neutral. A future Rus
 Python, or Go adapter can add grammar/extraction while preserving those tools;
 rust-analyzer can implement the semantic provider boundary. Test Impact Analysis,
 Git co-change/history, and Package Intelligence can add separately labeled evidence.
-Those features are not implemented in V1.
+[Test impact](test-impact.md) now consumes the existing index; the other adapters
+remain separate projects.

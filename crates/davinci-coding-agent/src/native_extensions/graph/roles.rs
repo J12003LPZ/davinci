@@ -73,6 +73,16 @@ pub fn role_tools(role: Role) -> Vec<String> {
         Role::Classifier | Role::Historian => &[],
     };
     tools.extend(semantic.iter().map(|name| (*name).to_string()));
+    if matches!(
+        role,
+        Role::Planner | Role::TestAnalyzer | Role::Writer | Role::Reviewer
+    ) {
+        tools.extend(
+            crate::native_extensions::test_impact::TOOL_NAMES
+                .iter()
+                .map(|name| (*name).to_string()),
+        );
+    }
     ensure_governor_recovery_tool(&mut tools);
     tools
 }
@@ -236,6 +246,29 @@ mod tests {
         }
 
         assert!(!role_tools(Role::Classifier).contains(&"tool_search".to_string()));
+    }
+
+    #[test]
+    fn test_impact_role_projection_keeps_discovery_and_output_recovery() {
+        for role in [
+            Role::Planner,
+            Role::TestAnalyzer,
+            Role::Writer,
+            Role::Reviewer,
+        ] {
+            let authorized = role_tools(role);
+            let initial = initial_worker_tools(role, &authorized);
+            for name in ["test_related", "test_impacted", "test_plan"] {
+                assert!(authorized.contains(&name.into()));
+                assert!(!initial.contains(&name.into()));
+            }
+            assert!(authorized.contains(&"retrieve_output".into()));
+            assert!(initial.contains(&"tool_search".into()));
+            assert!(!authorized.iter().any(|name| name.starts_with("graph_test")));
+            let restricted = initial_worker_tools(role, &["tool_search".into()]);
+            assert_eq!(restricted, ["tool_search"]);
+        }
+        assert!(!role_tools(Role::Classifier).contains(&"test_plan".into()));
     }
 
     #[test]

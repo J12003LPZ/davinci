@@ -2,8 +2,8 @@ use super::{RepoIndex, Symbol};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::path::Path;
 
-#[derive(Debug, Clone)]
-pub(super) struct Dependency {
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct Dependency {
     pub from: String,
     pub to: Option<String>,
     pub specifier: String,
@@ -22,10 +22,13 @@ pub(super) fn resolve(index: &RepoIndex, from: &str, specifier: &str) -> Option<
 }
 
 fn resolve_base(index: &RepoIndex, base: String) -> Option<String> {
-    if index.files.contains_key(&base) {
-        return Some(base);
-    }
-    let mut candidates = Vec::new();
+    path_candidates(base)
+        .into_iter()
+        .find(|path| index.files.contains_key(path))
+}
+
+fn path_candidates(base: String) -> Vec<String> {
+    let mut candidates = vec![base.clone()];
     if let Some(stem) = base
         .strip_suffix(".js")
         .or_else(|| base.strip_suffix(".jsx"))
@@ -43,8 +46,19 @@ fn resolve_base(index: &RepoIndex, base: String) -> Option<String> {
         candidates.push(format!("{base}/index.{extension}"));
     }
     candidates
-        .into_iter()
-        .find(|candidate| index.files.contains_key(candidate))
+}
+
+/// Candidate paths are hypotheses for missing imports, never resolved edges.
+pub(super) fn missing_candidates(index: &RepoIndex, from: &str, specifier: &str) -> Vec<String> {
+    let bases = if specifier.starts_with('.') {
+        let parent = Path::new(from).parent().unwrap_or(Path::new(""));
+        super::modules::normalize(&parent.join(specifier))
+            .into_iter()
+            .collect()
+    } else {
+        super::modules::candidates(&index.aliases, from, specifier)
+    };
+    bases.into_iter().flat_map(path_candidates).collect()
 }
 
 pub(super) fn dependencies(index: &RepoIndex) -> Vec<Dependency> {
