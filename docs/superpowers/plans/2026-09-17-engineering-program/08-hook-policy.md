@@ -1,6 +1,6 @@
 # P8: Deterministic Hook / Policy Engine
 
-Status: Complete; PR #17 open.
+Status: Complete; PR #17 open and verified green across CI matrix.
 Execution sequence: 9 of 12.
 Dependencies: P2 supervised execution, P4 transaction events, existing RuntimeBus and trust; P9 green.
 Requirements authority: project section 13 and cross-cutting sections 18-40;
@@ -109,5 +109,4 @@ Implementation is completed on `codex/hook-policy-01a0ad48` in the isolated work
 | 11. Evaluation | [p8-hook-final.json](evidence/p8-hook-final.json) captures full verification evidence, decision/observer events, security invariants, and test results. |
 | 12. Docs | Updated `08-hook-policy.md` and `README.md` program ledger. |
 | 13. Review | Solo source and diff audit across touched crates, models, tools, and tests. No subagents used per instruction. |
-| 14. CI | PR #17 targeting `codex/change-impact-01a0ad48`. |
-
+| 14. CI | Green on head `cbef3fa4d1dc7fc52b210f2c4161a067a99653dc` and PR #17 ([PR #17](https://github.com/J12003LPZ/davinci/pull/17)). Push CI: [run 35414060812](https://github.com/J12003LPZ/davinci/actions/runs/35414060812) (22/22 jobs success); Push SARIF: [run 35414060714](https://github.com/J12003LPZ/davinci/actions/runs/35414060714); PR CI: [run 35414088579](https://github.com/J12003LPZ/davinci/actions/runs/35414088579) (22/22 jobs success); PR SARIF: [run 35414088573](https://github.com/J12003LPZ/davinci/actions/runs/35414088573). |

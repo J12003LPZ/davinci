@@ -36,7 +36,7 @@ Reference: [program design](../../specs/2026-09-17-engineering-program.md) and
 | 6 | [P7 Build Intelligence](07-build-intelligence.md) | Complete; PR #14 open | Approved | Package tests, fmt, Clippy, integration, security and eval passed | Green at `950ab50` |
 | 7 | [P6 Git Intelligence](06-git-intelligence.md) | Complete; PR #15 open | Approved | Package tests, fmt, Clippy, integration, security and eval passed | Green at `dcaf02b` |
 | 8 | [P9 Change Impact Engine](09-change-impact.md) | Complete; PR #16 open | Approved | Package tests, fmt, Clippy, integration, security and eval passed | Green at `726431e` |
-| 9 | [P8 Deterministic Hook / Policy Engine](08-hook-policy.md) | Complete; PR #17 open | Approved | Package tests, fmt, Clippy, integration, security and eval passed | Pending PR #17 |
+| 9 | [P8 Deterministic Hook / Policy Engine](08-hook-policy.md) | Complete; PR #17 open | Approved | Package tests, fmt, Clippy, integration, security and eval passed | Green at `cbef3fa` |
 | 10 | [P10 Verification Planner](10-verification-planner.md) | Planned | Approved | Not run | Not pushed |
 | 11 | [P11 Workspace Snapshot / Safe Sandbox Layer](11-workspace-snapshot.md) | Planned | Approved | Not run | Not pushed |
 | 12 | [P12 Continuous Agent Evaluation Framework](12-continuous-evals.md) | Planned | Approved | Not run | Not pushed |
@@ -561,4 +561,4 @@ Implementation is completed on `codex/hook-policy-01a0ad48` in the isolated work
 | 11. Evaluation | [p8-hook-final.json](evidence/p8-hook-final.json) captures full verification evidence, decision/observer events, security invariants, and test results. |
 | 12. Docs | Updated `08-hook-policy.md` and `README.md` program ledger. |
 | 13. Review | Solo source and diff audit across touched crates, models, tools, and tests. No subagents used per instruction. |
-| 14. CI | PR #17 targeting `codex/change-impact-01a0ad48`. |
+| 14 | CI | Green on head `cbef3fa4d1dc7fc52b210f2c4161a067a99653dc` and PR #17 ([PR #17](https://github.com/J12003LPZ/davinci/pull/17)). Push CI: [run 35414060812](https://github.com/J12003LPZ/davinci/actions/runs/35414060812) (22/22 jobs success); Push SARIF: [run 35414060714](https://github.com/J12003LPZ/davinci/actions/runs/35414060714); PR CI: [run 35414088579](https://github.com/J12003LPZ/davinci/actions/runs/35414088579) (22/22 jobs success); PR SARIF: [run 35414088573](https://github.com/J12003LPZ/davinci/actions/runs/35414088573). |
