@@ -1185,6 +1185,7 @@ fn login_button_seventeen_step_normal_dispatch_and_graph_deny() {
             "testImpact": {"enabled": feature_enabled},
             "packageIntelligence": {"enabled": feature_enabled},
             "buildIntelligence": {"enabled": feature_enabled},
+            "repoIntelligence": {"enabled": feature_enabled},
             "gitIntelligence": {"enabled": feature_enabled},
             "browserVerification": {"enabled": feature_enabled},
             "processManager": {"enabled": feature_enabled}
