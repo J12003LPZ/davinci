@@ -1,11 +1,8 @@
 # Engineering program ledger
 
-Status: design package approved; P1 and P2 validated; P4 implementation in progress.
-Latest P4 follow-up distinguishes redundant DOS spellings from distinct Windows
-short aliases. Head `055b938` passed affected package tests but failed the native
-Windows normal-agent edit case; the follow-up passes 50 focused transaction tests
-locally. Full P4 gates remain open pending the corrected head's native CI; see
-its plan for evidence and limitations.
+Status: design package approved; P1, P2, P3 and P4 validated; P5 next.
+P3 head `cdbfe00` passed CI, including Windows/Linux/macOS native matrix,
+normal-agent and Graph paths. Its evidence and limitations remain in its plan.
 Goal scope: all twelve projects and the global acceptance/performance/report gates.
 Reference: [program design](../../specs/2026-09-17-engineering-program.md) and
 [unchanged supplied requirements](../../specs/2026-09-17-engineering-program-requirements.md).
@@ -14,7 +11,7 @@ Reference: [program design](../../specs/2026-09-17-engineering-program.md) and
 
 - Date: 2026-09-17.
 - Fetched remote main: `ca9fe69cd0da21bf161af25b2bed681748fb0d58`.
-- Current branch: `codex/transactional-edits-01a0ad48`.
+- Current branch: `codex/browser-verification-01a0ad48`, stacked on validated P4.
 - Worktree: `C:/Users/sergi/.claude-worktrees/pi-rust-9416e5cee6/01a0ad48`.
 - Git worktree admin path differs from common Git directory; isolation verified.
 - Shared checkout has pre-existing changes and divergent local main. Preserved.
@@ -33,8 +30,8 @@ Reference: [program design](../../specs/2026-09-17-engineering-program.md) and
 | --- | --- | --- | --- | --- | --- |
 | 1 | [P1 Test Impact Intelligence](01-test-impact.md) | Complete; PR #9 open | Approved | Package tests, fmt, Clippy, integration, security and eval passed | Green at `6b3aad9` |
 | 2 | [P2 Persistent Process Manager](02-process-manager.md) | Complete; PR #10 open | Approved | Package tests, fmt, Clippy, integration, security and eval passed | Green at `bfc60e3` |
-| 3 | [P4 Transactional Edit Engine](04-transactional-edits.md) | In progress; draft PR #11 | Approved | Targeted checks passed; full gates open | Windows failure at `055b938`; correction awaits native CI |
-| 4 | [P3 Browser / Playwright Verification](03-browser-verification.md) | Planned | Approved | Not run | Not pushed |
+| 3 | [P4 Transactional Edit Engine](04-transactional-edits.md) | Complete; PR #11 open | Approved | Package, integration, security, concurrency, normal/Graph and eval gates passed | Green at `a2054d3` |
+| 4 | [P3 Browser / Playwright Verification](03-browser-verification.md) | Complete; PR #12 updated | Approved | Package tests, fmt, Clippy, real Chromium normal/Graph paths, network confinement, RPC verification and eval passed | Green at `cdbfe00` |
 | 5 | [P5 Package / Dependency Intelligence](05-package-intelligence.md) | Planned | Approved | Not run | Not pushed |
 | 6 | [P7 Build Intelligence](07-build-intelligence.md) | Planned | Approved | Not run | Not pushed |
 | 7 | [P6 Git Intelligence](06-git-intelligence.md) | Planned | Approved | Not run | Not pushed |
@@ -458,3 +455,26 @@ resumed sessions and agents without a runtime ledger. Actual Cargo verification
 passes the eight-case success/failure/authorization matrix; two discovery tests
 cover owner boundaries and bounded reads. P4 still requires native platform
 validation, descendant-pipe lifecycle completion, final checks, review and CI.
+
+## P3 implementation evidence
+
+Implementation and exact-head CI are validated at `cdbfe00afdbd8c2839066ea63782f211e698be26`;
+PR #12 updated for review. User-facing behavior and limits are documented in
+[browser verification](../../browser-verification.md) and [P3 plan](03-browser-verification.md).
+
+| Gate | Evidence/status |
+| --- | --- |
+| 1. Approved design | User approved the design and all twelve plans on 2026-09-17. |
+| 2. Plan | [P3 ordered plan](03-browser-verification.md). |
+| 3. RED/GREEN | Observed failing cases: Windows supervisor output queue exit race, graph coordinator tool selection without host, missing source observation recheck, RPC verify_browser route; all passing after implementation. |
+| 4. Affected package tests | `rtk proxy cargo test --offline --locked -p davinci-agent -p davinci-coding-agent`: exit 0; 1241 passed in coding-agent lib, 0 failed, 15 ignored; all agent suites passed. |
+| 5. Format | `rtk proxy cargo fmt -p davinci-agent -p davinci-coding-agent --check`: exit 0. |
+| 6. Clippy | `rtk proxy cargo clippy --offline --locked -p davinci-agent -p davinci-coding-agent --all-targets -- -D warnings`: exit 0. |
+| 7. Integration | Real Chromium tests passed with zero skips: `normal_browser_native_dispatch_actions_revocation_and_cleanup` (1 passed), `rpc_browser_verification_receipt_wire_exchange` (1 passed), `graph_browser_transport_shares_server_and_isolates_worker_contexts` (1 passed), `graph_scheduler_writer_uses_authenticated_browser_transport` (1 passed). 5 real Node tests passed; 33 deterministic Node tests passed. |
+| 8. Security | Read authority verified via `check_current_source_read`; dedicated loopback proxy enforces origin, blocks redirects/foreign subresources/unauthorized WebSocket upgrades (0 forbidden hits); no CDP or arbitrary eval; no project node_modules resolution; immutable content-addressed screenshot artifacts; context isolation. |
+| 9. Normal path | Real normal-session Chromium test passes complete frontend failure/fix flow without Graph; transactional edit to `index.html`, managed dev server, DOM/ARIA assertions, clean console/network, PNG retention, RealBrowser receipt. |
+| 10. Graph | Actual `run_graph` scheduler Writer path, authenticated parent coordinator transport, context isolation, host-derived TransactionOwner, Phase::Done completion. |
+| 11. Evaluation | [p3-browser-final.json](evidence/p3-browser-final.json) records fresh verification of all real browser flows, deterministic and real network confinement, and security invariants; earlier baselines and checkpoints preserved. |
+| 12. Docs | User guide [docs/browser-verification.md](../../browser-verification.md), documentation index, and this plan updated. |
+| 13. Review | Solo source and diff audit across all 12 touched crates files and docs; no subagents per user instruction. |
+| 14. CI | Exact-head CI passed at `cdbfe00afdbd8c2839066ea63782f211e698be26`: PR CI [35310203206](https://github.com/J12003LPZ/davinci/actions/runs/35310203206), workflow lint [35310203230](https://github.com/J12003LPZ/davinci/actions/runs/35310203230), Security SARIF [35310203220](https://github.com/J12003LPZ/davinci/actions/runs/35310203220), push CI [35310198092](https://github.com/J12003LPZ/davinci/actions/runs/35310198092) and SARIF [35310198050](https://github.com/J12003LPZ/davinci/actions/runs/35310198050) all green. |

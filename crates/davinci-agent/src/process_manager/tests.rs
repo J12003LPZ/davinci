@@ -45,6 +45,603 @@ fn server() -> Value {
     json!({"executable":"node", "argv":["-e", "process.stdout.write('READY\\n');process.stdin.on('data',b=>process.stdout.write(b));setTimeout(()=>process.exit(0),20000)"]})
 }
 
+#[test]
+fn process_worker_workspace_isolation_preserves_parent_shutdown_and_reuse() {
+    let parent_dir = tempfile::tempdir().unwrap();
+    let worker_dir = tempfile::tempdir().unwrap();
+    let other_dir = tempfile::tempdir().unwrap();
+    let session = agent(parent_dir.path(), PermissionMode::AlwaysApprove);
+    let parent = session.tool_context.processes.as_ref().unwrap();
+    let child = |cwd: &Path| {
+        parent
+            .child_lease_for_workspace(
+                cwd,
+                session.permissions.clone(),
+                crate::shell_policy::ShellPolicyProfile::Permissive,
+            )
+            .unwrap()
+    };
+    let first = child(worker_dir.path());
+    let second = child(worker_dir.path());
+    let other = child(other_dir.path());
+    let args = server();
+    let started = first
+        .execute(worker_dir.path(), "process_start", &args, None, None)
+        .unwrap();
+    let details = started.details.unwrap();
+    let id = details["process"]["id"].as_u64().unwrap() as u32;
+    assert_eq!(
+        details["process"]["workspace"],
+        json!(worker_dir.path().canonicalize().unwrap())
+    );
+    let reused = second
+        .execute(worker_dir.path(), "process_start", &args, None, None)
+        .unwrap()
+        .details
+        .unwrap();
+    assert_eq!(reused["process"]["id"], id);
+    assert_eq!(reused["reused"], true);
+    assert!(first
+        .execute(
+            parent_dir.path(),
+            "process_status",
+            &json!({"id":id}),
+            None,
+            None
+        )
+        .is_err());
+    assert!(other
+        .execute(
+            other_dir.path(),
+            "process_status",
+            &json!({"id":id}),
+            None,
+            None
+        )
+        .is_err());
+    let separate = other
+        .execute(other_dir.path(), "process_start", &args, None, None)
+        .unwrap()
+        .details
+        .unwrap();
+    assert_ne!(separate["process"]["id"], id);
+    // Equal command cwd does not make distinct workspace roots equivalent.
+    let nested_dir = worker_dir.path().join("nested");
+    std::fs::create_dir(&nested_dir).unwrap();
+    let nested = child(&nested_dir);
+    let mut nested_args = server();
+    nested_args["cwd"] = json!(nested_dir);
+    let from_outer = first
+        .execute(worker_dir.path(), "process_start", &nested_args, None, None)
+        .unwrap()
+        .details
+        .unwrap();
+    let from_nested = nested
+        .execute(&nested_dir, "process_start", &nested_args, None, None)
+        .unwrap()
+        .details
+        .unwrap();
+    assert_ne!(from_outer["process"]["id"], from_nested["process"]["id"]);
+    drop(first);
+    assert!(second
+        .execute(
+            worker_dir.path(),
+            "process_status",
+            &json!({"id":id}),
+            None,
+            None
+        )
+        .is_ok());
+    parent.shutdown();
+    assert!(second
+        .execute(
+            worker_dir.path(),
+            "process_status",
+            &json!({"id":id}),
+            None,
+            None
+        )
+        .is_err());
+    assert!(other
+        .execute(other_dir.path(), "process_list", &json!({}), None, None)
+        .is_err());
+    let until = Instant::now() + Duration::from_secs(5);
+    while session
+        .tool_context
+        .jobs
+        .lock()
+        .unwrap()
+        .get(id)
+        .unwrap()
+        .status()
+        == crate::jobs::JobStatus::Running
+    {
+        assert!(
+            Instant::now() < until,
+            "worktree server survived parent shutdown"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+#[cfg(any(windows, target_os = "linux", target_os = "macos"))]
+#[test]
+fn browser_socket_proof_rejects_foreign_listener_and_port_takeover() {
+    for host in ["127.0.0.1", "::1"] {
+        browser_socket_proof_for(host);
+    }
+}
+
+#[cfg(any(windows, target_os = "linux", target_os = "macos"))]
+fn browser_socket_proof_for(host: &str) {
+    let address: std::net::IpAddr = host.parse().unwrap();
+    let directory = tempfile::tempdir().unwrap();
+    let session = agent(directory.path(), PermissionMode::AlwaysApprove);
+    let manager = session.tool_context.processes.as_ref().unwrap();
+    let foreign = std::net::TcpListener::bind((address, 0)).unwrap();
+    let port = foreign.local_addr().unwrap().port();
+    let mut start = server();
+    start["ports"] = json!([port]);
+    let started = manager
+        .execute(directory.path(), "process_start", &start, None, None)
+        .unwrap();
+    let id = started.details.unwrap()["process"]["id"].as_u64().unwrap() as u32;
+    let args = json!({"process_id":id,"port":port,"host":host});
+    let lease = manager
+        .with_browser_dev_server(
+            BrowserRequest {
+                cwd: directory.path(),
+                name: "browser_open",
+                args: &args,
+                abort: None,
+                permit: None,
+                process_id: id,
+                port,
+                lease: None,
+            },
+            |lease| Ok(lease.clone()),
+        )
+        .unwrap();
+    // Metadata alone admits a binding but must never admit browser network I/O.
+    assert!(lease.verify_listening_socket().is_err());
+    assert!(manager
+        .with_verified_browser_dev_server(
+            BrowserRequest {
+                cwd: directory.path(),
+                name: "browser_open",
+                args: &args,
+                abort: None,
+                permit: None,
+                process_id: id,
+                port,
+                lease: Some(&lease),
+            },
+            |_| -> Result<(), String> { panic!("foreign listener must not enter browser I/O") }
+        )
+        .is_err());
+
+    for descendant in [false, true] {
+        let reserved = std::net::TcpListener::bind((address, 0)).unwrap();
+        let port = reserved.local_addr().unwrap().port();
+        drop(reserved);
+        let script = format!("const s=require('net').createServer();s.listen({port},'{host}',()=>console.log('LISTENING'));process.stdin.on('data',()=>s.close(()=>console.log('CLOSED')));setTimeout(()=>process.exit(),20000)");
+        let script = if descendant {
+            format!("const c=require('child_process').spawn(process.execPath,['-e',{}],{{stdio:['pipe','pipe','pipe']}});c.stdout.pipe(process.stdout);c.stderr.pipe(process.stderr);process.stdin.pipe(c.stdin);setTimeout(()=>process.exit(),20000)", serde_json::to_string(&script).unwrap())
+        } else {
+            script
+        };
+        let started = manager
+            .execute(
+                directory.path(),
+                "process_start",
+                &json!({
+                    "executable":"node", "argv":["-e",script], "ports":[port]
+                }),
+                None,
+                None,
+            )
+            .unwrap();
+        let id = started.details.unwrap()["process"]["id"].as_u64().unwrap() as u32;
+        wait_for(|| {
+            manager
+                .owner
+                .output(id, None, 8192)
+                .unwrap()
+                .text
+                .contains("LISTENING")
+        });
+        let args = json!({"process_id":id,"port":port,"host":host});
+        let lease = manager
+            .with_browser_dev_server(
+                BrowserRequest {
+                    cwd: directory.path(),
+                    name: "browser_open",
+                    args: &args,
+                    abort: None,
+                    permit: None,
+                    process_id: id,
+                    port,
+                    lease: None,
+                },
+                |lease| Ok(lease.clone()),
+            )
+            .unwrap();
+        assert!(
+            lease.verify_listening_socket().is_ok(),
+            "descendant={descendant}"
+        );
+        let request = BrowserRequest {
+            cwd: directory.path(),
+            name: "browser_snapshot",
+            args: &args,
+            abort: None,
+            permit: None,
+            process_id: id,
+            port,
+            lease: Some(&lease),
+        };
+        assert!(manager
+            .with_verified_browser_dev_server(request, |_| Ok(()))
+            .is_ok());
+        let mut takeover = None;
+        let result = manager.with_verified_browser_dev_server(request, |_| {
+            manager
+                .execute(
+                    directory.path(),
+                    "process_write",
+                    &json!({"id":id,"text":"CLOSE\n"}),
+                    None,
+                    None,
+                )
+                .unwrap();
+            wait_for(|| {
+                manager
+                    .owner
+                    .output(id, None, 8192)
+                    .unwrap()
+                    .text
+                    .contains("CLOSED")
+            });
+            takeover = Some(std::net::TcpListener::bind((address, port)).unwrap());
+            Ok("untrusted browser result")
+        });
+        assert!(result.is_err());
+        assert!(lease.verify_listening_socket().is_err());
+        assert_eq!(manager.owner.active_snapshot(id).unwrap().state, "running");
+        drop(takeover);
+        manager
+            .execute(
+                directory.path(),
+                "process_stop",
+                &json!({"id":id}),
+                None,
+                None,
+            )
+            .unwrap();
+    }
+}
+
+#[test]
+fn browser_dev_server_requires_active_owned_declared_port_and_current_authority() {
+    let directory = tempfile::tempdir().unwrap();
+    let session = agent(directory.path(), PermissionMode::AlwaysApprove);
+    let manager = session.tool_context.processes.as_ref().unwrap();
+    let mut start = server();
+    start["ports"] = json!([3000]);
+    let result = manager
+        .execute(directory.path(), "process_start", &start, None, None)
+        .unwrap();
+    let id = result.details.unwrap()["process"]["id"].as_u64().unwrap() as u32;
+    let args = json!({"process_id":id,"port":3000});
+    let request = BrowserRequest {
+        cwd: directory.path(),
+        name: "browser_open",
+        args: &args,
+        abort: None,
+        permit: None,
+        process_id: id,
+        port: 3000,
+        lease: None,
+    };
+    let lease = manager
+        .with_browser_dev_server(request, |lease| Ok(lease.clone()))
+        .unwrap();
+    assert_eq!(lease.origin(), "http://127.0.0.1:3000");
+    let ipv6_args = json!({"process_id":id,"port":3000,"host":"::1"});
+    let ipv6_request = BrowserRequest {
+        args: &ipv6_args,
+        ..request
+    };
+    let ipv6_lease = manager
+        .with_browser_dev_server(ipv6_request, |lease| Ok(lease.clone()))
+        .unwrap();
+    assert_eq!(ipv6_lease.origin(), "http://[::1]:3000");
+    assert_ne!(ipv6_lease, lease);
+    assert!(manager
+        .with_browser_dev_server(
+            BrowserRequest {
+                lease: Some(&lease),
+                ..ipv6_request
+            },
+            |_| Ok(())
+        )
+        .is_err());
+    let invalid_args = json!({"process_id":id,"port":3000,"host":"external.example"});
+    assert!(manager
+        .with_browser_dev_server(
+            BrowserRequest {
+                args: &invalid_args,
+                ..request
+            },
+            |_| Ok(())
+        )
+        .is_err());
+    assert!(lease.is_live());
+    assert!(manager
+        .with_browser_dev_server(
+            BrowserRequest {
+                port: 3001,
+                ..request
+            },
+            |_| Ok(())
+        )
+        .is_err());
+    let foreign = agent(directory.path(), PermissionMode::AlwaysApprove);
+    assert!(foreign
+        .tool_context
+        .processes
+        .as_ref()
+        .unwrap()
+        .with_browser_dev_server(request, |_| Ok(()))
+        .is_err());
+    let child = manager.child_lease(
+        session.permissions.clone(),
+        crate::shell_policy::ShellPolicyProfile::Permissive,
+    );
+    let reused = child
+        .execute(directory.path(), "process_start", &start, None, None)
+        .unwrap();
+    let reused = reused.details.unwrap();
+    assert_eq!(reused["process"]["id"], id);
+    assert_eq!(reused["reused"], true);
+    let child_lease = child
+        .with_browser_dev_server(request, |lease| Ok(lease.clone()))
+        .unwrap();
+    let child_artifact = BrowserRequest {
+        name: "browser_screenshot",
+        lease: Some(&child_lease),
+        ..request
+    };
+    assert_eq!(
+        manager
+            .with_retained_browser_artifact(child_artifact, || Ok("worker evidence"))
+            .unwrap(),
+        "worker evidence"
+    );
+    let sibling = manager.child_lease(
+        session.permissions.clone(),
+        crate::shell_policy::ShellPolicyProfile::Permissive,
+    );
+    assert!(sibling
+        .with_retained_browser_artifact::<()>(child_artifact, || panic!(
+            "sibling must not read worker evidence"
+        ))
+        .is_err());
+    assert!(foreign
+        .tool_context
+        .processes
+        .as_ref()
+        .unwrap()
+        .with_retained_browser_artifact::<()>(child_artifact, || panic!(
+            "another session must not read worker evidence"
+        ))
+        .is_err());
+    manager.owner.release(id).unwrap();
+    assert!(!lease.is_live());
+    assert!(child_lease.is_live());
+    assert_eq!(child.owner.active_snapshot(id).unwrap().state, "running");
+    // Historical status is still useful; it is not authority to attach a browser.
+    assert!(manager.owner.snapshot(id).is_ok());
+    let retained_request = BrowserRequest {
+        name: "browser_screenshot",
+        lease: Some(&lease),
+        ..request
+    };
+    assert_eq!(
+        manager
+            .with_retained_browser_artifact(retained_request, || Ok("retained bytes"))
+            .unwrap(),
+        "retained bytes"
+    );
+    assert!(child
+        .with_retained_browser_artifact::<()>(retained_request, || panic!(
+            "foreign lease must not run retrieval"
+        ))
+        .is_err());
+    let revoked = manager.with_retained_browser_artifact(retained_request, || {
+        session
+            .permissions
+            .lock()
+            .unwrap()
+            .deny
+            .push(PermissionRule::bare("browser_screenshot"));
+        Ok("bytes must not escape after revocation")
+    });
+    assert!(revoked.is_err());
+    session.permissions.lock().unwrap().deny.pop();
+    let cancelled = AtomicBool::new(true);
+    assert!(manager
+        .with_retained_browser_artifact::<()>(
+            BrowserRequest {
+                abort: Some(&cancelled),
+                ..retained_request
+            },
+            || panic!("cancelled retrieval must not run")
+        )
+        .is_err());
+    assert!(manager
+        .with_browser_dev_server(
+            BrowserRequest {
+                name: "browser_snapshot",
+                lease: Some(&lease),
+                ..request
+            },
+            |_| Ok(())
+        )
+        .is_err());
+    drop(child);
+    assert_eq!(
+        manager
+            .with_retained_browser_artifact(child_artifact, || Ok("released worker evidence"))
+            .unwrap(),
+        "released worker evidence"
+    );
+    let outside = tempfile::tempdir().unwrap();
+    assert!(manager
+        .with_retained_browser_artifact::<()>(
+            BrowserRequest {
+                cwd: outside.path(),
+                ..child_artifact
+            },
+            || panic!("artifact must stay bound to its issued workspace")
+        )
+        .is_err());
+    assert!(manager
+        .with_retained_browser_artifact(retained_request, || {
+            manager.shutdown();
+            Ok("ended session must not return retained bytes")
+        })
+        .is_err());
+    assert!(manager
+        .with_retained_browser_artifact::<()>(retained_request, || panic!(
+            "ended session must not read retained artifacts"
+        ))
+        .is_err());
+    assert!(
+        !child_lease.is_live(),
+        "observation must not retain its owner"
+    );
+}
+
+#[test]
+fn browser_source_read_requires_current_read_authority() {
+    let directory = tempfile::tempdir().unwrap();
+    std::fs::write(directory.path().join("a.txt"), b"source").unwrap();
+    let agent = agent(directory.path(), PermissionMode::AlwaysApprove);
+    let manager = agent.tool_context.processes.as_ref().unwrap();
+    manager
+        .check_current_source_read(
+            directory.path(),
+            &directory.path().join("a.txt"),
+            &agent.tool_context.active_contract,
+        )
+        .unwrap();
+    agent
+        .permissions
+        .lock()
+        .unwrap()
+        .deny
+        .push(PermissionRule::bare("read"));
+    assert!(manager
+        .check_current_source_read(
+            directory.path(),
+            &directory.path().join("a.txt"),
+            &agent.tool_context.active_contract,
+        )
+        .is_err());
+}
+
+#[test]
+fn browser_dev_server_refuses_revocation_and_cancellation_before_callback() {
+    let directory = tempfile::tempdir().unwrap();
+    let agent = agent(directory.path(), PermissionMode::AlwaysApprove);
+    let manager = agent.tool_context.processes.as_ref().unwrap();
+    let mut start = server();
+    start["ports"] = json!([3000]);
+    let result = manager
+        .execute(directory.path(), "process_start", &start, None, None)
+        .unwrap();
+    let id = result.details.unwrap()["process"]["id"].as_u64().unwrap() as u32;
+    let args = json!({"process_id":id,"port":3000});
+    let request = BrowserRequest {
+        cwd: directory.path(),
+        name: "browser_open",
+        args: &args,
+        abort: None,
+        permit: None,
+        process_id: id,
+        port: 3000,
+        lease: None,
+    };
+    let lease = manager
+        .with_browser_dev_server(request, |lease| Ok(lease.clone()))
+        .unwrap();
+    let abort = AtomicBool::new(true);
+    assert!(manager
+        .with_browser_dev_server(
+            BrowserRequest {
+                name: "browser_snapshot",
+                abort: Some(&abort),
+                lease: Some(&lease),
+                ..request
+            },
+            |_| -> Result<(), String> { panic!("cancelled callback") }
+        )
+        .is_err());
+    agent.permissions.lock().unwrap().mode = PermissionMode::ReadOnly;
+    assert!(manager
+        .with_browser_dev_server(
+            BrowserRequest {
+                name: "browser_click",
+                lease: Some(&lease),
+                ..request
+            },
+            |_| -> Result<(), String> { panic!("revoked callback") }
+        )
+        .is_err());
+}
+
+#[test]
+fn browser_dev_server_rejects_evidence_after_authority_changes_during_callback() {
+    for change in ["permission", "cancel", "release"] {
+        let directory = tempfile::tempdir().unwrap();
+        let session = agent(directory.path(), PermissionMode::AlwaysApprove);
+        let manager = session.tool_context.processes.as_ref().unwrap();
+        let mut start = server();
+        start["ports"] = json!([3000]);
+        let result = manager
+            .execute(directory.path(), "process_start", &start, None, None)
+            .unwrap();
+        let id = result.details.unwrap()["process"]["id"].as_u64().unwrap() as u32;
+        let args = json!({"process_id":id,"port":3000});
+        let abort = AtomicBool::new(false);
+        let result = manager.with_browser_dev_server(
+            BrowserRequest {
+                cwd: directory.path(),
+                name: "browser_click",
+                args: &args,
+                abort: Some(&abort),
+                permit: None,
+                process_id: id,
+                port: 3000,
+                lease: None,
+            },
+            |_| {
+                match change {
+                    "permission" => {
+                        session.permissions.lock().unwrap().mode = PermissionMode::ReadOnly
+                    }
+                    "cancel" => abort.store(true, Ordering::SeqCst),
+                    "release" => manager.owner.release(id).unwrap(),
+                    _ => unreachable!(),
+                }
+                Ok("stale browser evidence")
+            },
+        );
+        assert!(result.is_err(), "accepted stale evidence after {change}");
+    }
+}
+
 fn wait_for(mut condition: impl FnMut() -> bool) {
     let until = Instant::now() + Duration::from_secs(5);
     while !condition() {

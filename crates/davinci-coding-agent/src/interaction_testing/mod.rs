@@ -3,6 +3,7 @@
 pub mod artifacts;
 pub mod browser;
 pub mod browser_fixtures;
+pub mod browser_process;
 pub mod runner;
 pub mod scenarios;
 pub mod screen;

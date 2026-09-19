@@ -37,6 +37,7 @@ pub(super) fn requires_task_coordinator(tool: &str) -> bool {
         "task_create" | "task_update" | "task_list" | "task_get"
     ) || crate::native_extensions::language_intelligence::TOOL_NAMES.contains(&tool)
         || davinci_agent::tools::is_managed_process_tool(tool)
+        || crate::native_extensions::browser::TOOL_NAMES.contains(&tool)
 }
 
 pub use crate::native_extensions::token_governor::ensure_governor_recovery_tool;
@@ -91,6 +92,11 @@ pub fn role_tools(role: Role) -> Vec<String> {
         );
     }
     if matches!(role, Role::Writer | Role::TestAnalyzer) {
+        tools.extend(
+            crate::native_extensions::browser::TOOL_NAMES
+                .iter()
+                .map(|name| (*name).to_string()),
+        );
         tools.extend(
             [
                 "process_start",
@@ -209,6 +215,30 @@ pub(super) fn shell_profile(policy: BashPolicy) -> davinci_agent::shell_policy::
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn browser_tools_require_parent_transport_and_remain_role_scoped_and_deferred() {
+        for tool in crate::native_extensions::browser::TOOL_NAMES {
+            assert!(requires_task_coordinator(tool), "{tool}");
+            for role in [Role::Writer, Role::TestAnalyzer] {
+                let authorized = role_tools(role);
+                assert!(authorized.contains(&tool.to_string()), "{role:?}: {tool}");
+                assert!(!initial_worker_tools(role, &authorized).contains(&tool.to_string()));
+            }
+            for role in [
+                Role::Classifier,
+                Role::Researcher,
+                Role::Planner,
+                Role::Historian,
+                Role::Reviewer,
+            ] {
+                assert!(
+                    !role_tools(role).contains(&tool.to_string()),
+                    "{role:?}: {tool}"
+                );
+            }
+        }
+    }
 
     #[test]
     fn semantic_tools_require_parent_authority_and_follow_role_selection() {

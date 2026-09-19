@@ -166,3 +166,85 @@ fn persisted_verification_rejects_a_different_workspace() {
         "foreign workspace receipt must not remain verified"
     );
 }
+
+#[test]
+fn source_observation_preserves_verification_and_rechecks_live_reads() {
+    let root = tempfile::tempdir().unwrap();
+    let owner = TransactionOwner::default();
+    let coordinator = TransactionCoordinator::new(root.path(), owner.clone()).unwrap();
+    let preview = coordinator
+        .preview(vec![ProposedChange::write("a.txt", b"after".to_vec())])
+        .unwrap();
+    coordinator.apply(&preview.id, &|_| Ok(()), None).unwrap();
+    let pending = coordinator
+        .begin_verification(&preview.id, &|_| Ok(()))
+        .unwrap();
+    let verified = coordinator
+        .finish_verification(pending, receipt(root.path()), &|_| Ok(()))
+        .unwrap();
+    let observation = coordinator
+        .observe_source(&preview.id, &|_| Ok(()))
+        .unwrap();
+    assert_eq!(observation.transaction_id(), preview.id);
+    assert_eq!(observation.sequence(), verified.sequence);
+    assert_eq!(
+        observation.workspace_identity(),
+        verified.workspace_identity
+    );
+    assert_eq!(
+        observation.source_digest(),
+        verified.verification.as_ref().unwrap().source_digest
+    );
+    assert_eq!(observation.affected_files(), &["a.txt"]);
+    coordinator
+        .check_source_observation(&observation, &|_| Ok(()))
+        .unwrap();
+    assert_eq!(
+        serde_json::to_value(coordinator.status(&preview.id).unwrap()).unwrap(),
+        serde_json::to_value(&verified).unwrap(),
+        "observation must not mutate verification"
+    );
+    assert!(coordinator
+        .observe_source(&preview.id, &|_| Err("revoked".into()))
+        .is_err());
+    assert!(coordinator
+        .check_source_observation(&observation, &|_| Err("revoked".into()))
+        .is_err());
+    let foreign = TransactionCoordinator::new(root.path(), TransactionOwner::default()).unwrap();
+    assert!(foreign
+        .check_source_observation(&observation, &|_| Ok(()))
+        .is_err());
+    let other = tempfile::tempdir().unwrap();
+    let foreign_workspace = TransactionCoordinator::new(other.path(), owner).unwrap();
+    assert!(foreign_workspace
+        .check_source_observation(&observation, &|_| Ok(()))
+        .is_err());
+    fs::write(root.path().join("a.txt"), b"other").unwrap();
+    assert!(coordinator
+        .check_source_observation(&observation, &|_| Ok(()))
+        .is_err());
+    assert_eq!(fs::read(root.path().join("a.txt")).unwrap(), b"other");
+}
+
+#[test]
+fn source_observation_rejects_drafts_and_superseded_sequences() {
+    let root = tempfile::tempdir().unwrap();
+    let coordinator =
+        TransactionCoordinator::new(root.path(), TransactionOwner::default()).unwrap();
+    let preview = coordinator
+        .preview(vec![ProposedChange::write("a.txt", b"after".to_vec())])
+        .unwrap();
+    assert!(coordinator
+        .observe_source(&preview.id, &|_| Ok(()))
+        .is_err());
+    coordinator.apply(&preview.id, &|_| Ok(()), None).unwrap();
+    let observation = coordinator
+        .observe_source(&preview.id, &|_| Ok(()))
+        .unwrap();
+    coordinator
+        .begin_verification(&preview.id, &|_| Ok(()))
+        .unwrap();
+    assert!(coordinator
+        .check_source_observation(&observation, &|_| Ok(()))
+        .is_err());
+}

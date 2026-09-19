@@ -1,6 +1,8 @@
 mod agent_profiles;
 mod args;
 mod auth_cmd;
+#[cfg(test)]
+mod browser_integration_tests;
 mod cache_stats;
 mod catalog_refresh;
 mod changelog;
@@ -83,6 +85,7 @@ mod experimental {
 
 mod export;
 mod extension_host;
+use davinci_coding_agent::interaction_testing;
 mod extensions;
 mod external_editor;
 mod file_processor;
@@ -2969,6 +2972,18 @@ fn run_rpc(parsed: &Args, agent: &mut Agent) -> Result<i32, String> {
         return Ok(code);
     }
     install_mode_shutdown_watchers(parsed);
+    run_rpc_with_host(
+        parsed,
+        agent,
+        Arc::new(Mutex::new(loaded_extension_host(parsed))),
+    )
+}
+
+fn run_rpc_with_host(
+    parsed: &Args,
+    agent: &mut Agent,
+    host: Arc<Mutex<ExtensionHost>>,
+) -> Result<i32, String> {
     let session_dir = agent
         .session
         .as_ref()
@@ -2985,7 +3000,6 @@ fn run_rpc(parsed: &Args, agent: &mut Agent) -> Result<i32, String> {
         cwd,
         available_models(parsed),
     );
-    let host = Arc::new(Mutex::new(loaded_extension_host(parsed)));
     host.lock()
         .unwrap_or_else(|err| err.into_inner())
         .emit(ExtensionEvent::SessionStart);
@@ -3083,6 +3097,95 @@ fn run_rpc(parsed: &Args, agent: &mut Agent) -> Result<i32, String> {
             continue;
         }
         let mut command: RpcCommand = serde_json::from_str(&line).map_err(|err| err.to_string())?;
+        if command.kind == "verify_browser" {
+            #[derive(serde::Deserialize)]
+            #[serde(deny_unknown_fields)]
+            struct BrowserVerificationRequest {
+                browser_id: uuid::Uuid,
+                dom_contains: String,
+                accessibility_contains: Option<String>,
+            }
+            let result = (|| {
+                if command
+                    .value
+                    .as_ref()
+                    .is_some_and(|value| value.len() > 12 * 1024)
+                {
+                    return Err("browser verification request exceeds limit".into());
+                }
+                let request: BrowserVerificationRequest = serde_json::from_str(
+                    command
+                        .value
+                        .as_deref()
+                        .ok_or("browser verification request required")?,
+                )
+                .map_err(|_| "invalid browser verification request")?;
+                let controller = host
+                    .lock()
+                    .unwrap_or_else(|err| err.into_inner())
+                    .native
+                    .lock()
+                    .map_err(|_| "native host unavailable")?
+                    .browser
+                    .clone();
+                let receipt = controller.verify_host(
+                    &runtime.cwd,
+                    request.browser_id,
+                    crate::native_extensions::browser::BrowserAssertionSpec {
+                        dom_contains: request.dom_contains,
+                        accessibility_contains: request.accessibility_contains,
+                    },
+                    &runtime.agent.tool_context,
+                )?;
+                serde_json::to_value(receipt)
+                    .map_err(|_| "browser verification receipt unavailable".into())
+            })();
+            let response = match result {
+                Ok(data) => rpc::ok_response(command.id.clone(), &command.kind, Some(data)),
+                Err(error) => rpc::fail_response(command.id.clone(), &command.kind, error),
+            };
+            output::write_raw_stdout_line(
+                &serde_json::to_string(&response).map_err(|err| err.to_string())?,
+            )
+            .map_err(|err| err.to_string())?;
+            continue;
+        }
+        if command.kind == "get_browser_artifact" {
+            let result = (|| {
+                if command
+                    .value
+                    .as_ref()
+                    .is_some_and(|value| value.len() > 12 * 1024)
+                {
+                    return Err("browser artifact request exceeds limit".into());
+                }
+                let args: serde_json::Value = serde_json::from_str(
+                    command
+                        .value
+                        .as_deref()
+                        .ok_or("browser artifact request required")?,
+                )
+                .map_err(|_| "invalid browser artifact request")?;
+                let controller = host
+                    .lock()
+                    .unwrap_or_else(|err| err.into_inner())
+                    .native
+                    .lock()
+                    .map_err(|_| "native host unavailable")?
+                    .browser
+                    .clone();
+                controller.retrieve_artifact(&runtime.cwd, &args, &runtime.agent.tool_context)
+            })();
+            let response = match result {
+                Ok(data) => rpc::ok_response(command.id.clone(), &command.kind, Some(data)),
+                Err(error) => rpc::fail_response(command.id.clone(), &command.kind, error),
+            };
+            output::write_raw_stdout_line(
+                &serde_json::to_string(&response).map_err(|err| err.to_string())?,
+            )
+            .map_err(|err| err.to_string())?;
+            continue;
+        }
         let is_prompt = command.kind == "prompt";
         if is_prompt {
             let message = command.message.as_deref().unwrap_or("");
@@ -7588,9 +7691,11 @@ fn bind_test_impact_context(agent: &Agent, host: &ExtensionHost) {
 fn attach_tool_executor(agent: &mut Agent, host: &ExtensionHost) {
     bind_test_impact_context(agent, host);
     let host = host.clone();
-    agent.custom_tool_executor = Some(CustomToolExecutor::new(move |cwd, name, args| {
-        host.execute_js_or_manifest_tool(cwd, name, args)
-    }));
+    agent.custom_tool_executor = Some(CustomToolExecutor::new_with_context(
+        move |cwd, name, args, context| {
+            host.execute_js_or_manifest_tool_with_context(cwd, name, args, context)
+        },
+    ));
 }
 
 fn attach_shared_tool_executor(agent: &mut Agent, host: Arc<Mutex<ExtensionHost>>) {
@@ -7598,13 +7703,15 @@ fn attach_shared_tool_executor(agent: &mut Agent, host: Arc<Mutex<ExtensionHost>
         agent,
         &host.lock().unwrap_or_else(|error| error.into_inner()),
     );
-    agent.custom_tool_executor = Some(CustomToolExecutor::new(move |cwd, name, args| {
-        let host = host
-            .lock()
-            .map_err(|error| davinci_agent::ToolError::Failed(error.to_string()))?
-            .clone();
-        host.execute_js_or_manifest_tool(cwd, name, args)
-    }));
+    agent.custom_tool_executor = Some(CustomToolExecutor::new_with_context(
+        move |cwd, name, args, context| {
+            let host = host
+                .lock()
+                .map_err(|error| davinci_agent::ToolError::Failed(error.to_string()))?
+                .clone();
+            host.execute_js_or_manifest_tool_with_context(cwd, name, args, context)
+        },
+    ));
 }
 
 /// Hand the graph controller the session's model, thinking level, and trust
@@ -7721,6 +7828,14 @@ fn apply_graph_session_context(parsed: &Args, agent: &Agent, host: &ExtensionHos
             .set_permissions(Some(agent.permissions.clone()));
         native.graph.set_task_contract(agent.active_contract());
         native.graph.processes = agent.tool_context.processes.clone();
+        native.graph.browser = agent
+            .tool_context
+            .foreground_supervisor
+            .clone()
+            .map(|supervisor| native_extensions::browser::BrowserWorkerHost {
+                controller: native.browser.clone(),
+                supervisor,
+            });
     }
     let settings = load_merged_settings_with_override(
         &default_agent_dir(),
@@ -10170,6 +10285,44 @@ fn store_api_key(provider: &str, key: &str) -> Result<(), String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn contextual_dispatch_attachments_require_context_and_live_cancellation() {
+        for shared in [false, true] {
+            let mut agent = davinci_agent::Agent::new_builtin(davinci_agent::PromptProfile::Stable);
+            let host = super::ExtensionHost::default();
+            if shared {
+                super::attach_shared_tool_executor(
+                    &mut agent,
+                    std::sync::Arc::new(std::sync::Mutex::new(host)),
+                );
+            } else {
+                super::attach_tool_executor(&mut agent, &host);
+            }
+            let executor = agent.custom_tool_executor.as_ref().unwrap();
+            let cwd = std::path::Path::new(".");
+            let args = serde_json::json!({});
+            assert!(
+                matches!(executor.execute(cwd, "unregistered_extension", &args),
+                Err(davinci_agent::ToolError::Failed(message))
+                if message == "tool requires engine dispatch context")
+            );
+            let abort = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+            let context = davinci_agent::ToolContext {
+                abort: Some(abort.clone()),
+                ..Default::default()
+            };
+            assert!(
+                matches!(executor.execute_with_context(cwd, "unregistered_extension", &args, &context),
+                Err(davinci_agent::ToolError::Failed(message))
+                if message == "tool request cancelled")
+            );
+            abort.store(false, std::sync::atomic::Ordering::SeqCst);
+            assert!(matches!(
+                executor.execute_with_context(cwd, "unregistered_extension", &args, &context),
+                Err(davinci_agent::ToolError::Unknown(_))
+            ));
+        }
+    }
     use super::*;
 
     static OFFLINE_TOOL_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());

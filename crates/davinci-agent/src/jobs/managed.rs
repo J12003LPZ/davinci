@@ -10,11 +10,11 @@ pub use restarts::{Provenance, RestartCheck, RestartPolicy, StartOptions};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeSet, HashMap},
     path::{Path, PathBuf},
     sync::{
         atomic::{AtomicBool, AtomicUsize, Ordering},
-        Arc, Condvar, Mutex,
+        Arc, Condvar, Mutex, Weak,
     },
     time::{Duration, Instant},
 };
@@ -92,7 +92,8 @@ impl Drop for Waiter<'_> {
 
 struct Scope {
     id: Uuid,
-    closed: AtomicBool,
+    closed: Arc<AtomicBool>,
+    workspaces: Arc<Mutex<HashMap<PathBuf, Weak<Scope>>>>,
     workspace: PathBuf,
     jobs: Arc<Mutex<JobBook>>,
     host: SupervisorCommand,
@@ -100,12 +101,50 @@ struct Scope {
 
 struct Owner {
     id: Uuid,
+    parent: Option<Uuid>,
     scope: Arc<Scope>,
 }
 
 /// A session owner or a child lease explicitly issued by that owner.
 #[derive(Clone)]
 pub struct ManagedOwner(Arc<Owner>);
+
+/// Host-only lifetime observation. It neither grants execution authority nor
+/// keeps the owner (and its processes) alive after session/worker teardown.
+#[derive(Clone)]
+pub struct ManagedProcessLease {
+    owner: Weak<Owner>,
+    process_id: u32,
+    lifetime: Uuid,
+}
+
+impl std::fmt::Debug for ManagedProcessLease {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ManagedProcessLease")
+            .field("process_id", &self.process_id)
+            .field("lifetime", &self.lifetime)
+            .finish_non_exhaustive()
+    }
+}
+
+impl PartialEq for ManagedProcessLease {
+    fn eq(&self, other: &Self) -> bool {
+        self.owner.ptr_eq(&other.owner)
+            && self.process_id == other.process_id
+            && self.lifetime == other.lifetime
+    }
+}
+impl Eq for ManagedProcessLease {}
+
+impl ManagedProcessLease {
+    pub fn is_live(&self) -> bool {
+        self.owner.upgrade().is_some_and(|owner| {
+            ManagedOwner(owner)
+                .active_snapshot(self.process_id)
+                .is_ok_and(|snapshot| snapshot.lifetime == self.lifetime)
+        })
+    }
+}
 
 impl std::fmt::Debug for ManagedOwner {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -162,15 +201,23 @@ impl ManagedOwner {
         if !workspace.is_dir() {
             return Err("process workspace is not a directory".into());
         }
+        let scope = Arc::new(Scope {
+            id: Uuid::new_v4(),
+            closed: Arc::new(AtomicBool::new(false)),
+            workspaces: Arc::new(Mutex::new(HashMap::new())),
+            workspace,
+            jobs,
+            host,
+        });
+        scope
+            .workspaces
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(scope.workspace.clone(), Arc::downgrade(&scope));
         Ok(Self(Arc::new(Owner {
             id: Uuid::new_v4(),
-            scope: Arc::new(Scope {
-                id: Uuid::new_v4(),
-                closed: AtomicBool::new(false),
-                workspace,
-                jobs,
-                host,
-            }),
+            parent: None,
+            scope,
         })))
     }
 
@@ -179,12 +226,56 @@ impl ManagedOwner {
     pub fn child_lease(&self) -> Self {
         Self(Arc::new(Owner {
             id: Uuid::new_v4(),
+            parent: Some(self.id()),
             scope: self.0.scope.clone(),
         }))
     }
 
+    /// Host-selected workspace view in the same session and job book.
+    /// Weak views keep same-workspace restart supervision shared without
+    /// retaining departed workers or granting access to another owner's jobs.
+    pub fn child_lease_for_workspace(&self, workspace: &Path) -> Result<Self, String> {
+        self.ensure_open()?;
+        let workspace = workspace
+            .canonicalize()
+            .map_err(|_| "process workspace unavailable")?;
+        if !workspace.is_dir() {
+            return Err("process workspace is not a directory".into());
+        }
+        let parent = &self.0.scope;
+        let mut views = parent.workspaces.lock().unwrap_or_else(|e| e.into_inner());
+        views.retain(|_, scope| scope.strong_count() > 0);
+        let scope = match views.get(&workspace).and_then(Weak::upgrade) {
+            Some(scope) => scope,
+            None => {
+                if views.len() >= MAX_LEASES {
+                    return Err("process workspace limit reached".into());
+                }
+                let scope = Arc::new(Scope {
+                    id: parent.id,
+                    closed: parent.closed.clone(),
+                    workspaces: parent.workspaces.clone(),
+                    workspace: workspace.clone(),
+                    jobs: parent.jobs.clone(),
+                    host: parent.host.clone(),
+                });
+                views.insert(workspace, Arc::downgrade(&scope));
+                scope
+            }
+        };
+        Ok(Self(Arc::new(Owner {
+            id: Uuid::new_v4(),
+            parent: Some(self.id()),
+            scope,
+        })))
+    }
+
     pub fn id(&self) -> Uuid {
         self.0.id
+    }
+
+    pub(crate) fn artifact_parent(&self) -> Option<Uuid> {
+        self.0.parent
     }
 
     /// End the parent session, including child leases still held by workers.
@@ -280,8 +371,14 @@ impl ManagedOwner {
         if !config.cwd.starts_with(&self.0.scope.workspace) {
             return Err("process cwd is outside its workspace".into());
         }
-        let identity = serde_json::to_vec(&(&config, revision, self.0.scope.id, &options))
-            .map_err(|_| "invalid command identity")?;
+        let identity = serde_json::to_vec(&(
+            &config,
+            revision,
+            self.0.scope.id,
+            &self.0.scope.workspace,
+            &options,
+        ))
+        .map_err(|_| "invalid command identity")?;
         let key = format!("{:x}", Sha256::digest(identity));
         let (flight, leader) = {
             let mut book = self.0.scope.jobs.lock().unwrap_or_else(|e| e.into_inner());
@@ -541,6 +638,36 @@ impl ManagedOwner {
                 .map(|port| serde_json::json!({"port":port,"source":"request","verified":false}))
                 .collect(),
         })
+    }
+
+    /// Host resource attachment requires this caller's active lease. Historical
+    /// status access remains available after release through `snapshot`.
+    pub fn active_snapshot(&self, id: u32) -> Result<ProcessSnapshot, String> {
+        let (_, record) = self.owned(id)?;
+        if !record
+            .owners
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .active
+            .contains(&self.0.id)
+        {
+            return Err("managed process lease has been released".into());
+        }
+        let snapshot = self.snapshot(id)?;
+        if snapshot.state != "running" {
+            return Err("managed process is not running".into());
+        }
+        Ok(snapshot)
+    }
+
+    pub fn active_lease(&self, id: u32) -> Result<(ProcessSnapshot, ManagedProcessLease), String> {
+        let snapshot = self.active_snapshot(id)?;
+        let lease = ManagedProcessLease {
+            owner: Arc::downgrade(&self.0),
+            process_id: id,
+            lifetime: snapshot.lifetime,
+        };
+        Ok((snapshot, lease))
     }
 
     pub fn ids(&self) -> Vec<u32> {

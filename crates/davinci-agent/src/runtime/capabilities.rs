@@ -231,6 +231,23 @@ pub fn default_declared_effects(name: &str, class: ToolClass) -> Vec<DeclaredEff
             vec![DeclaredEffect::ProcessExecution]
         }
         "web_fetch" | "web_search" => vec![DeclaredEffect::NetworkAccess],
+        // Even observation tools drive an active browser on a managed server.
+        // Keep their permission class conservative while declaring both effects.
+        "browser_open"
+        | "browser_snapshot"
+        | "browser_click"
+        | "browser_type"
+        | "browser_select"
+        | "browser_console"
+        | "browser_network"
+        | "browser_accessibility"
+        | "browser_screenshot"
+        | "browser_close" => {
+            vec![
+                DeclaredEffect::ProcessExecution,
+                DeclaredEffect::NetworkAccess,
+            ]
+        }
         "mcp_read" => vec![DeclaredEffect::McpRead],
         "ask_user_question" => vec![DeclaredEffect::HostInteraction],
         _ => match class {
@@ -588,6 +605,36 @@ impl RuntimeCapabilityRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn browser_tools_declare_process_and_network_authority() {
+        for name in [
+            "browser_open",
+            "browser_snapshot",
+            "browser_click",
+            "browser_type",
+            "browser_select",
+            "browser_console",
+            "browser_network",
+            "browser_accessibility",
+            "browser_screenshot",
+            "browser_close",
+        ] {
+            assert_eq!(crate::permission::tool_class(name), ToolClass::Other);
+            assert_eq!(
+                default_declared_effects(name, ToolClass::Other),
+                vec![
+                    DeclaredEffect::ProcessExecution,
+                    DeclaredEffect::NetworkAccess
+                ],
+                "{name}"
+            );
+        }
+        assert_eq!(
+            default_declared_effects("browser_evaluate", ToolClass::Other),
+            vec![DeclaredEffect::Other("other".into())]
+        );
+    }
     use serde_json::json;
 
     #[test]

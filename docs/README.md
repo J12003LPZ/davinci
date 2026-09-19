@@ -4,7 +4,8 @@ Welcome to the **Davinci** technical documentation hub. This directory contains 
 
 Native capability guides: [repository intelligence](repo-intelligence.md),
 [language intelligence](language-intelligence.md), [test impact](test-impact.md),
-[managed processes](process-manager.md), and [transactional edits](transactional-edits.md).
+[managed processes](process-manager.md), [transactional edits](transactional-edits.md),
+and [browser verification](browser-verification.md).
 
 ---
 

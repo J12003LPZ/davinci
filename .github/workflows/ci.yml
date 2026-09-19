@@ -20,8 +20,14 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: '24'
+      - name: Bounded browser backend and network policy
+        run: node --test crates/davinci-coding-agent/src/interaction_testing/browser_backend.test.cjs crates/davinci-coding-agent/src/interaction_testing/browser_network.test.cjs crates/davinci-coding-agent/src/interaction_testing/browser_transport.test.cjs crates/davinci-coding-agent/src/interaction_testing/browser_host.test.cjs
       - name: Use repository-pinned Rust
         run: rustup show
+      - name: Native listener ownership proof
+        run: |
+          cargo test -p davinci-agent --locked --lib process_manager::socket_owner
+          cargo clippy -p davinci-agent --locked --lib --tests -- -D warnings
       - name: Test planning and filesystem observation
         run: cargo test -p davinci-coding-agent --locked --test test_impact --test test_impact_observation
       - name: Normal agent edit and verification path
@@ -32,6 +38,8 @@ jobs:
         run: cargo test -p davinci-agent --locked --lib process_manager::tests
       - name: Native supervisor ownership and public process contracts
         run: cargo test -p davinci-agent --locked --test process_supervisor --test process_manager
+      - name: Evidence artifact retrieval boundaries
+        run: cargo test -p davinci-agent --locked --lib runtime::evidence_store
       - name: Graph process leases
         run: cargo test -p davinci-coding-agent --locked --lib graph_managed_process
       - name: Normal agent process path
