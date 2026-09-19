@@ -1,0 +1,77 @@
+{
+  "milestone": "P9 Change Impact Engine Final Evidence",
+  "base_branch": "codex/git-intelligence-01a0ad48",
+  "branch": "codex/change-impact-01a0ad48",
+  "tools": [
+    "impact_analyze"
+  ],
+  "commands": [
+    "impact-status"
+  ],
+  "capabilities": [
+    "AST structural dependency and import analysis across TS/JS/Rust",
+    "Semantic reference lookup via LanguageIntelligence LSP integration",
+    "TestImpact mapping integration with command recommendation and broaderVerificationRequired",
+    "Workspace monorepo package discovery and downstream dependent cascade via PackageIntelligence",
+    "BuildIntelligence affected target detection",
+    "Public API risk evaluation for entry points and root exports",
+    "Configuration file modification detection (package.json, tsconfig, vite, cargo, etc.)",
+    "Potential browser UI flow mapping for frontend files and components",
+    "Acceptance Guard: Honest completeness reporting (Complete | Partial | Incomplete) and confidence (HIGH | MEDIUM | LOW), never confusing absence of evidence with absence of blast radius",
+    "Transaction ID resolution inspecting affected files and proposed content from .davinci-transactions",
+    "CacheRuntime integration with CacheNamespace::Test and CacheDependency::ContentHash",
+    "NativeExtensionHost integration and ToolClass::Read security classification"
+  ],
+  "security_invariants": {
+    "zero_mutation_guarantee": true,
+    "path_traversal_guards": true,
+    "read_only_tool_class": true,
+    "acceptance_guard_honest_completeness": true,
+    "no_false_semantic_claims": true,
+    "graph_role_enforcement": true
+  },
+  "package_tests": {
+    "command": "rtk proxy cargo test --offline --locked -p davinci-coding-agent --test change_impact",
+    "exit_code": 0,
+    "passed": 11,
+    "failed": 0,
+    "ignored": 0,
+    "cases": [
+      "test_language_intelligence_adapter_provider",
+      "test_security_guards_path_traversal_and_read_only_class",
+      "test_analysis_from_transaction_id",
+      "test_honest_completeness_and_no_false_semantic_confidence",
+      "test_potential_browser_flows_for_ui_changes",
+      "test_cache_runtime_caching_and_telemetry",
+      "test_native_extension_host_dispatch",
+      "test_direct_semantic_and_structural_impact",
+      "test_configuration_impact_detection",
+      "test_public_api_risk_detection",
+      "test_workspace_packages_and_downstream_dependents"
+    ]
+  },
+  "graph_role_tests": {
+    "command": "rtk proxy cargo test --offline --locked -p davinci-coding-agent change_impact_tools_follow_role_selection",
+    "exit_code": 0,
+    "passed": 1,
+    "failed": 0
+  },
+  "lint_checks": {
+    "fmt": "rtk proxy cargo fmt -p davinci-agent -p davinci-coding-agent --check (exit 0)",
+    "clippy": "rtk proxy cargo clippy --offline --locked -p davinci-agent -p davinci-coding-agent --all-targets -- -D warnings (exit 0)"
+  },
+  "pull_request": {
+    "number": 16,
+    "url": "https://github.com/J12003LPZ/davinci/pull/16",
+    "base": "codex/git-intelligence-01a0ad48",
+    "head": "codex/change-impact-01a0ad48"
+  },
+  "ci_verification": {
+    "head_sha": "726431e327b9f3f9201f4079fb63a73a6497cb1f",
+    "push_ci_run": "https://github.com/J12003LPZ/davinci/actions/runs/35411130997",
+    "push_sarif_run": "https://github.com/J12003LPZ/davinci/actions/runs/35411130839",
+    "pr_ci_run": "https://github.com/J12003LPZ/davinci/actions/runs/35411143442",
+    "pr_sarif_run": "https://github.com/J12003LPZ/davinci/actions/runs/35411143563",
+    "status": "all green (22/22 jobs on push CI, 22/22 jobs on PR CI, push & PR SARIF success)"
+  }
+}
