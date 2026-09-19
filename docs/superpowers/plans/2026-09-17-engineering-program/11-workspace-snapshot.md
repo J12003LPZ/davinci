@@ -1,6 +1,6 @@
 # P11: Workspace Snapshot / Safe Sandbox Layer
 
-Status: completed; merged in PR #18 onto `origin/main` `5585fd6`. Design approved 2026-09-17.
+Status: completed; merged in PR #18; final assembled tree is on `origin/main` `9fe1e106`. Design approved 2026-09-17.
 Execution sequence: 11 of 12.
 Dependencies: P4 transactions, existing worktree/checkpoint/rewind/source-manifest contracts; P10 green.
 Requirements authority: project section 16 and cross-cutting sections 18-40;
