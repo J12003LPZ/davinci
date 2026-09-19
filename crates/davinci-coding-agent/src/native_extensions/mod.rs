@@ -2,6 +2,7 @@
 
 pub mod browser;
 pub mod build_intelligence;
+pub mod change_impact;
 pub mod content_router;
 pub mod ecosystem;
 pub mod git_intelligence;
@@ -71,6 +72,7 @@ pub const NATIVE_TOOLS: &[&str] = &[
     "git_blame_symbol",
     "git_commit_context",
     "git_conflict_explain",
+    "impact_analyze",
     "repo_map",
     "symbol_search",
     "file_symbols",
@@ -116,6 +118,7 @@ pub const NATIVE_COMMANDS: &[&str] = &[
     "package-status",
     "build-status",
     "git-status",
+    "impact-status",
     "lsp-status",
     "memory-status",
     "memory-search",
@@ -278,6 +281,7 @@ pub struct NativeExtensionHost {
     pub package_intelligence: package_intelligence::PackageIntelligence,
     pub build_intelligence: build_intelligence::BuildIntelligence,
     pub git_intelligence: git_intelligence::GitIntelligence,
+    pub change_impact: change_impact::ChangeImpact,
     pub repo_intelligence: repo_intelligence::RepoIntelligence,
     pub cache: davinci_agent::runtime::cache::CacheRuntime,
     pub language_intelligence: language_intelligence::LanguageIntelligence,
@@ -365,6 +369,23 @@ impl NativeExtensionHost {
             language_intelligence::LanguageIntelligence::new(cwd, language_config);
         language_intelligence.set_governor(governor.clone());
         graph.language_intelligence = Some(language_intelligence.clone());
+        let change_config = crate::settings::load_merged_settings(&repo_agent_dir, cwd)
+            .change_impact
+            .unwrap_or_default();
+        let change_impact = change_impact::ChangeImpact::new(
+            cwd,
+            cache.clone(),
+            change_config,
+            repo_intelligence.clone(),
+            test_impact.clone(),
+            package_intelligence.clone(),
+            build_intelligence.clone(),
+            git_intelligence.clone(),
+            language_intelligence.clone(),
+        );
+        let repo_intelligence = repo_intelligence.with_semantic_provider(Arc::new(
+            change_impact::LanguageIntelligenceAdapter::new(language_intelligence.clone()),
+        ));
         Self {
             browser: browser::BrowserController::new(
                 cwd,
@@ -388,6 +409,7 @@ impl NativeExtensionHost {
             package_intelligence,
             build_intelligence,
             git_intelligence,
+            change_impact,
             repo_intelligence,
             cache,
             language_intelligence,
@@ -599,6 +621,9 @@ impl NativeExtensionHost {
             name if git_intelligence::TOOL_NAMES.contains(&name) => {
                 self.git_intelligence.execute_tool(name, args)
             }
+            name if change_impact::TOOL_NAMES.contains(&name) => {
+                self.change_impact.execute_tool(name, args)
+            }
             name if repo_intelligence::is_repo_tool(name) => {
                 self.repo_intelligence.execute_tool(name, args)
             }
@@ -652,6 +677,7 @@ impl NativeExtensionHost {
             "package-status" => Ok(Some(self.package_intelligence.status())),
             "build-status" => Ok(Some(self.build_intelligence.status())),
             "git-status" => Ok(Some(self.git_intelligence.status())),
+            "impact-status" => Ok(Some(self.change_impact.status())),
             "memory-status" => Ok(Some(self.memory.status())),
             "memory-search" => Ok(Some(self.memory.search_text(args))),
             "memory-reindex" => Ok(Some(self.memory.reindex().map_err(|err| err.to_string())?)),
@@ -703,6 +729,9 @@ impl NativeExtensionHost {
         }
         if git_intelligence::TOOL_NAMES.contains(&name) {
             return git_intelligence::tool_spec(name);
+        }
+        if change_impact::TOOL_NAMES.contains(&name) {
+            return change_impact::tool_spec(name);
         }
         if language_intelligence::TOOL_NAMES.contains(&name) {
             return language_intelligence::tool_spec(name);

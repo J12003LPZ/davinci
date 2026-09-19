@@ -88,6 +88,19 @@ fn parse_git_intelligence<'de, D: serde::Deserializer<'de>>(
     }))
 }
 
+fn parse_change_impact<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<crate::native_extensions::change_impact::ChangeImpactConfig>, D::Error> {
+    use crate::native_extensions::change_impact::ChangeImpactConfig;
+    let value = Option::<serde_json::Value>::deserialize(deserializer)?;
+    Ok(value.map(|value| {
+        serde_json::from_value(value).unwrap_or_else(|_| ChangeImpactConfig {
+            enabled: false,
+            ..Default::default()
+        })
+    }))
+}
+
 fn parse_language_intelligence<'de, D: serde::Deserializer<'de>>(
     deserializer: D,
 ) -> Result<
@@ -149,6 +162,12 @@ pub struct Settings {
         deserialize_with = "parse_git_intelligence"
     )]
     pub git_intelligence: Option<crate::native_extensions::git_intelligence::GitIntelligenceConfig>,
+    #[serde(
+        default,
+        rename = "changeImpact",
+        deserialize_with = "parse_change_impact"
+    )]
+    pub change_impact: Option<crate::native_extensions::change_impact::ChangeImpactConfig>,
     #[serde(default, rename = "repoIntelligence")]
     pub repo_intelligence:
         Option<crate::native_extensions::repo_intelligence::RepoIntelligenceConfig>,

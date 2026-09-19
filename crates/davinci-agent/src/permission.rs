@@ -141,6 +141,7 @@ pub fn tool_class(tool: &str) -> ToolClass {
         | "git_blame_symbol"
         | "git_commit_context"
         | "git_conflict_explain" => ToolClass::Read,
+        "impact_analyze" => ToolClass::Read,
         "repo_map"
         | "symbol_search"
         | "file_symbols"
