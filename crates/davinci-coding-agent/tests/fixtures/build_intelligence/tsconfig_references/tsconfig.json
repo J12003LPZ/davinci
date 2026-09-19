@@ -1,0 +1,12 @@
+{
+  // Monorepo root composite configuration
+  "compilerOptions": {
+    "composite": true,
+    "declaration": true
+  },
+  /* Reference each subproject cleanly */
+  "references": [
+    { "path": "packages/core" },
+    { "path": "packages/app" }
+  ]
+}

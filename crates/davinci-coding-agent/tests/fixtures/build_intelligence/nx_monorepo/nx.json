@@ -1,0 +1,13 @@
+{
+  "targetDefaults": {
+    "build": {
+      "dependsOn": ["^build"],
+      "outputs": ["{projectRoot}/dist"],
+      "cache": true
+    },
+    "lint": {
+      "inputs": ["default"],
+      "cache": true
+    }
+  }
+}

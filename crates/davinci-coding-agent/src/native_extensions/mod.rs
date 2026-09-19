@@ -1,6 +1,7 @@
 //! Native Rust ports of the bundled pi extensions.
 
 pub mod browser;
+pub mod build_intelligence;
 pub mod content_router;
 pub mod ecosystem;
 pub mod graph;
@@ -57,6 +58,11 @@ pub const NATIVE_TOOLS: &[&str] = &[
     "package_symbol",
     "package_dependents",
     "package_why",
+    "workspace_packages",
+    "build_targets",
+    "build_dependencies",
+    "build_affected",
+    "build_command",
     "repo_map",
     "symbol_search",
     "file_symbols",
@@ -100,6 +106,7 @@ pub const NATIVE_COMMANDS: &[&str] = &[
     "cache-status",
     "test-impact-status",
     "package-status",
+    "build-status",
     "lsp-status",
     "memory-status",
     "memory-search",
@@ -150,6 +157,11 @@ pub fn command_specs() -> Vec<(&'static str, &'static str, Option<&'static str>)
         (
             "package-status",
             "Show installed dependency resolution status, lockfile kinds, and cache telemetry.",
+            None,
+        ),
+        (
+            "build-status",
+            "Show repository build intelligence status, detected task runners, and cache telemetry.",
             None,
         ),
         (
@@ -255,6 +267,7 @@ pub struct NativeExtensionHost {
     pub browser: browser::BrowserController,
     pub test_impact: test_impact::TestImpact,
     pub package_intelligence: package_intelligence::PackageIntelligence,
+    pub build_intelligence: build_intelligence::BuildIntelligence,
     pub repo_intelligence: repo_intelligence::RepoIntelligence,
     pub cache: davinci_agent::runtime::cache::CacheRuntime,
     pub language_intelligence: language_intelligence::LanguageIntelligence,
@@ -325,6 +338,11 @@ impl NativeExtensionHost {
             .unwrap_or_default();
         let package_intelligence =
             package_intelligence::PackageIntelligence::new(cwd, cache.clone(), package_config);
+        let build_config = crate::settings::load_merged_settings(&repo_agent_dir, cwd)
+            .build_intelligence
+            .unwrap_or_default();
+        let build_intelligence =
+            build_intelligence::BuildIntelligence::new(cwd, cache.clone(), build_config);
         let language_config = agent_dir
             .and_then(|dir| crate::settings::load_merged_settings(dir, cwd).language_intelligence)
             .unwrap_or_default();
@@ -353,6 +371,7 @@ impl NativeExtensionHost {
             ),
             test_impact,
             package_intelligence,
+            build_intelligence,
             repo_intelligence,
             cache,
             language_intelligence,
@@ -558,6 +577,9 @@ impl NativeExtensionHost {
             name if package_intelligence::TOOL_NAMES.contains(&name) => {
                 self.package_intelligence.execute_tool(name, args)
             }
+            name if build_intelligence::TOOL_NAMES.contains(&name) => {
+                self.build_intelligence.execute_tool(name, args)
+            }
             name if repo_intelligence::is_repo_tool(name) => {
                 self.repo_intelligence.execute_tool(name, args)
             }
@@ -609,6 +631,7 @@ impl NativeExtensionHost {
             "lsp-status" => Ok(Some(self.language_intelligence.status())),
             "test-impact-status" => Ok(Some(self.test_impact.status())),
             "package-status" => Ok(Some(self.package_intelligence.status())),
+            "build-status" => Ok(Some(self.build_intelligence.status())),
             "memory-status" => Ok(Some(self.memory.status())),
             "memory-search" => Ok(Some(self.memory.search_text(args))),
             "memory-reindex" => Ok(Some(self.memory.reindex().map_err(|err| err.to_string())?)),
@@ -654,6 +677,9 @@ impl NativeExtensionHost {
         }
         if package_intelligence::TOOL_NAMES.contains(&name) {
             return package_intelligence::tool_spec(name);
+        }
+        if build_intelligence::TOOL_NAMES.contains(&name) {
+            return build_intelligence::tool_spec(name);
         }
         if language_intelligence::TOOL_NAMES.contains(&name) {
             return language_intelligence::tool_spec(name);
