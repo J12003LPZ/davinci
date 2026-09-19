@@ -1,6 +1,8 @@
 # Engineering program ledger
 
-Status: design package approved; P1 implementation in progress.
+Status: design package approved; P1–P9 on stacked PRs with exact-head CI; P3/P4 marked ready; P10–P12 implemented on `codex/p10-p12-01a0ad48`.
+P7 head `950ab50`, P6 head `dcaf02b` and P9 head `726431e` passed CI, including Windows/Linux/macOS native matrix,
+normal-agent and Graph paths. Its evidence and limitations remain in its plan.
 Goal scope: all twelve projects and the global acceptance/performance/report gates.
 Reference: [program design](../../specs/2026-09-17-engineering-program.md) and
 [unchanged supplied requirements](../../specs/2026-09-17-engineering-program-requirements.md).
@@ -9,7 +11,7 @@ Reference: [program design](../../specs/2026-09-17-engineering-program.md) and
 
 - Date: 2026-09-17.
 - Fetched remote main: `ca9fe69cd0da21bf161af25b2bed681748fb0d58`.
-- Branch: `codex/engineering-program-01a0ad48`.
+- Current branch: `codex/browser-verification-01a0ad48`, stacked on validated P4.
 - Worktree: `C:/Users/sergi/.claude-worktrees/pi-rust-9416e5cee6/01a0ad48`.
 - Git worktree admin path differs from common Git directory; isolation verified.
 - Shared checkout has pre-existing changes and divergent local main. Preserved.
@@ -26,18 +28,18 @@ Reference: [program design](../../specs/2026-09-17-engineering-program.md) and
 
 | Order | Project/plan | Implementation | Design approval | Local gates/eval | CI |
 | --- | --- | --- | --- | --- | --- |
-| 1 | [P1 Test Impact Intelligence](01-test-impact.md) | Local implementation validated | Approved | Package tests, fmt, Clippy, integration, security and eval passed | PR #9; ignore-change fix awaiting CI |
-| 2 | [P2 Persistent Process Manager](02-process-manager.md) | Planned | Approved | Not run | Not pushed |
-| 3 | [P4 Transactional Edit Engine](04-transactional-edits.md) | Planned | Approved | Not run | Not pushed |
-| 4 | [P3 Browser / Playwright Verification](03-browser-verification.md) | Planned | Approved | Not run | Not pushed |
-| 5 | [P5 Package / Dependency Intelligence](05-package-intelligence.md) | Planned | Approved | Not run | Not pushed |
-| 6 | [P7 Build Intelligence](07-build-intelligence.md) | Planned | Approved | Not run | Not pushed |
-| 7 | [P6 Git Intelligence](06-git-intelligence.md) | Planned | Approved | Not run | Not pushed |
-| 8 | [P9 Change Impact Engine](09-change-impact.md) | Planned | Approved | Not run | Not pushed |
-| 9 | [P8 Deterministic Hook / Policy Engine](08-hook-policy.md) | Planned | Approved | Not run | Not pushed |
-| 10 | [P10 Verification Planner](10-verification-planner.md) | Planned | Approved | Not run | Not pushed |
-| 11 | [P11 Workspace Snapshot / Safe Sandbox Layer](11-workspace-snapshot.md) | Planned | Approved | Not run | Not pushed |
-| 12 | [P12 Continuous Agent Evaluation Framework](12-continuous-evals.md) | Planned | Approved | Not run | Not pushed |
+| 1 | [P1 Test Impact Intelligence](01-test-impact.md) | Complete; PR #9 open | Approved | Package tests, fmt, Clippy, integration, security and eval passed | Green at `6b3aad9` |
+| 2 | [P2 Persistent Process Manager](02-process-manager.md) | Complete; PR #10 open | Approved | Package tests, fmt, Clippy, integration, security and eval passed | Green at `bfc60e3` |
+| 3 | [P4 Transactional Edit Engine](04-transactional-edits.md) | Complete; PR #11 ready | Approved | Package, integration, security, concurrency, normal/Graph and eval gates passed | Green at `a2054d3` |
+| 4 | [P3 Browser / Playwright Verification](03-browser-verification.md) | Complete; PR #12 ready | Approved | Package tests, fmt, Clippy, real Chromium normal/Graph paths, network confinement, RPC verification and eval passed | Green at `9f1adb3` |
+| 5 | [P5 Package / Dependency Intelligence](05-package-intelligence.md) | Complete; PR #13 open | Approved | Package tests, fmt, Clippy, integration, security and eval passed | Green at `9a3fdf9` |
+| 6 | [P7 Build Intelligence](07-build-intelligence.md) | Complete; PR #14 open | Approved | Package tests, fmt, Clippy, integration, security and eval passed | Green at `950ab50` |
+| 7 | [P6 Git Intelligence](06-git-intelligence.md) | Complete; PR #15 open | Approved | Package tests, fmt, Clippy, integration, security and eval passed | Green at `dcaf02b` |
+| 8 | [P9 Change Impact Engine](09-change-impact.md) | Complete; PR #16 open | Approved | Package tests, fmt, Clippy, integration, security and eval passed | Green at `726431e` |
+| 9 | [P8 Deterministic Hook / Policy Engine](08-hook-policy.md) | Complete; PR #17 open | Approved | Package tests, fmt, Clippy, integration, security and eval passed | Green at `cbef3fa` |
+| 10 | [P10 Verification Planner](10-verification-planner.md) | Implemented on stacked P10–P12 branch | Approved | Focused 5 planner + 1 eval tests passed; Graph role allow/deny passed; fmt and affected Clippy `-D warnings` passed | Not yet exact-head CI |
+| 11 | [P11 Workspace Snapshot / Safe Sandbox Layer](11-workspace-snapshot.md) | Implemented on stacked P10–P12 branch | Approved | Focused 6 snapshot + 1 eval tests passed; Writer-only restore Graph deny passed | Not yet exact-head CI |
+| 12 | [P12 Continuous Agent Evaluation Framework](12-continuous-evals.md) | Implemented on stacked P10–P12 branch | Approved | Engineering 10/10; packaged CLI normal + Graph writer + classifier deny; live Chromium 17-step still host-gated | Not yet exact-head CI |
 
 P4 precedes P3 as in the supplied Phase A order. P5 precedes P7 because build
 intelligence must reuse package/workspace metadata and graph rather than create
@@ -161,7 +163,9 @@ The prior merged PR test counts are not evidence for this new program.
 
 ## Next action
 
-Verify P1's exact-head CI in PR #9 before starting P2.
+P1 passed exact-head CI in PR #9. Publish and monitor P2 on the stacked
+`codex/process-manager-01a0ad48` branch in the same isolated worktree. P4 begins
+only after P2's required exact-head platform CI is green.
 Approval is recorded above; routine implementation decisions need no new approval.
 Keep the full program goal active until all global acceptance is verified.
 
@@ -172,7 +176,8 @@ saved (`router:noop`). No compression savings are claimed for that call.
 
 ## P1 implementation evidence
 
-Implementation is locally validated; the exact-head CI gate remains pending.
+Implementation and exact-head CI are validated at
+`6b3aad9fd28b96f85c8115fe4099bea6e4557b17`; PR #9 remains open for review.
 User-facing behavior and limits are documented in [test impact](../../../test-impact.md).
 
 | Gate | Evidence/status |
@@ -190,7 +195,7 @@ User-facing behavior and limits are documented in [test impact](../../../test-im
 | 11. Evaluation | [After artifact](evidence/p1-monorepo-after.json): explicit ignored evaluation passed with real Node tests, 3/23 selected, all 3 planted failures caught, no false-positive paths in this fixture, warm 59/6,173 source bytes, force/fallback/zero-test cases. [Baseline](evidence/p1-monorepo-baseline.json) remains frozen. |
 | 12. Docs | User guide, repository freshness guide, documentation index, and this ledger updated. |
 | 13. Diff review | Reviewed shared index refresh/observer lifecycle, bounded traversal, command argv, current permissions/cache delivery, host lock release, settings, and normal/Graph dispatch. No subagents, per user instruction. |
-| 14. CI | [PR #9](https://github.com/J12003LPZ/davinci/pull/9) is published. Initial CI found the retry reparse defect below. Exact-head success remains pending; the native matrix covers Windows, Linux, and macOS. |
+| 14. CI | [PR #9](https://github.com/J12003LPZ/davinci/pull/9): [CI run 35235736772](https://github.com/J12003LPZ/davinci/actions/runs/35235736772), workflow lint, and security interoperability passed at `6b3aad9fd28b96f85c8115fe4099bea6e4557b17`. The Windows/Linux/macOS native jobs each passed 14 impact, 6 observer, 1 normal-agent, and 1 explicit evaluation test. [Platform evidence](evidence/p1-ci-platforms.json) contains the actual evaluation objects parsed from those job logs. |
 
 Executed explicit after evaluation:
 
@@ -262,5 +267,298 @@ changed, added, or removed ignore rules force full content reconciliation withou
 depending on event timing. The regression retains its `full` assertion and now
 also verifies that an unaffected source is reread without being reparsed.
 
-After this correction, 14 impact, 6 observer, and 7 repository tests passed locally,
-along with the explicit after evaluation. The new commit must pass CI before P2.
+After this correction, 14 impact, 6 observer, 7 repository, and 1 overflow/backend
+tests passed locally, along with the explicit after evaluation, formatting, and
+affected all-target Clippy. CI subsequently passed on all three platforms at
+`6b3aad9fd28b96f85c8115fe4099bea6e4557b17`, completing the P1 gate before P2 began.
+
+## P2 baseline and implementation checkpoint
+
+P2 starts from P1's verified head, on `codex/process-manager-01a0ad48` in the same
+isolated worktree. Remote `main` was fetched and remains
+`ca9fe69cd0da21bf161af25b2bed681748fb0d58`.
+
+The [frozen Windows baseline](evidence/p2-process-baseline.json) uses the existing
+`JobBook::register`, stdin, bounded output, and cancellation APIs with real
+loopback Node servers. Two identical executable/argv requests created two jobs
+and six processes including children/grandchildren. Readiness took 129.4012 ms
+and 118.254 ms. Stdin round trip succeeded. A 5 MiB single-line burst was bounded
+and marked dropped; line-boundary trimming retained only the final 36 bytes.
+Cancellation closed all six fixture listeners in 783.5255 ms. In a separate host
+process that exited without destructors, three fixture listeners remained alive
+after 200 ms. Explicit fixture cleanup then closed all three. This is an observed
+short-lived orphan window, not a claim about indefinite survival.
+
+Executed: `rtk proxy cargo test -p davinci-agent --test process_manager_baseline --offline --locked -- --ignored --nocapture`
+passed one explicit evaluation, with the artifact environment variable set to an
+absolute output path. Formatting and baseline-target Clippy passed. An initial
+fixture probe needed a socket-disconnect error handler; a relative artifact path
+also failed because Cargo runs this test in the crate directory. Both harness
+issues were corrected before recording the successful artifact.
+
+The existing JobBook now has supervised records and explicit owner leases.
+A private helper owns the OS process lifetime before spawning the requested
+child: Windows Job Object, Unix session/group. Host pipe loss and final lease
+release trigger cleanup; output stays in the existing bounded JobBook buffer.
+Observed RED/GREEN includes the missing supervisor, immediate reuse of a stopped
+lifetime, approval transfer, and an existing shell deny missed by process_start.
+
+### P2 local completion gates
+
+| Gate | Evidence |
+| --- | --- |
+| 1. Design | Approved by the user on 2026-09-17. |
+| 2. Plan | Approved [P2 plan](02-process-manager.md), section-7 requirements and shared invariants. |
+| 3. RED/GREEN | Observed failures before supervisor implementation, stopped-lifetime reuse correction, one-call approval transfer, existing shell-deny enforcement, logical wait across restart backoff, and the Windows npm verbatim-path correction. The corresponding regressions now pass. |
+| 4. Affected package tests | `cargo test -p davinci-agent -p davinci-coding-agent --offline --locked -- --quiet`: exit 0, 3,194 passed, 16 ignored across 27 targets. Includes 877 agent unit tests, 1,014 coding-agent library tests and 1,221 binary tests. Ignored optional evaluations are not counted as executed. |
+| 5. Format | `cargo fmt --check`: passed after formatting. |
+| 6. Clippy | `cargo clippy --workspace --all-targets --offline --locked -- -D warnings`: passed. |
+| 7. Integration | 15 supervisor test entries (12 substantive cases, 3 helper entries), 2 public process contract tests, and 2 packaged-binary entries passed. Covers descendant cleanup, held pipes, startup concurrency/cancellation, owner isolation, literal stdin, output bounds and private CLI entry before normal initialization. |
+| 8. Security | Current policy on all six tools, cross-shell denies, exact one-call consent, changed/expired/revoked consent, hard contracts, role ceilings, cwd escape, environment injection, restart revocation and no one-call replay passed. Native Linux and macOS CI also passed the cwd symlink regression. |
+| 9. Normal path | `process_manager_integration_tests`: 2 entries passed, including the normal `Agent::run_loop` fixture in both shared and nonshared executor modes. Covers enabled/disabled settings, deferred discovery, reuse, token-governor output plus `retrieve_output`, and shutdown. |
+| 10. Graph | `graph_managed_process`: 5 tests passed. Includes authenticated multi-worker lease reuse/final release, role/mode/contract denial, composed native output retrieval, and an actual saved Graph controller dispatch with host provenance and worker-exit cleanup. |
+| 11. Evaluation | One explicit ignored packaged lifecycle evaluation passed; [Windows after artifact](evidence/p2-process-after-windows.json) is compared with the unchanged [baseline](evidence/p2-process-baseline.json). Two requests reuse one server, stdin succeeds, 5 MiB output is bounded, and ordinary descendants disappear after shutdown/host loss. |
+| 12. Docs | [Managed process guide](../../../process-manager.md), documentation index, plan and ledger updated. Lists limits, approval/restart behavior, port provenance and Unix group escape limitation. |
+| 13. Diff review | Reviewed ownership/lock order, reservation cleanup, current authority, private helper protocol, environment, restart reconciliation, PID lifetime, session/Graph shutdown, bounded I/O, and test fixtures. Existing background shell APIs remain available; their model-facing endpoints reject managed IDs. Solo review per user instruction. |
+| 14. CI | [PR #10](https://github.com/J12003LPZ/davinci/pull/10), head `bfc60e3f698ac30f9fb7500fc24490d028da2439`: [CI run 35247901869](https://github.com/J12003LPZ/davinci/actions/runs/35247901869) passed all 22 jobs; workflow lint 35247901761 and security interoperability 35247901735 passed. Windows/Linux/macOS each passed 11 process unit, 2 public contract, 15 supervisor, 5 Graph, 2 normal Agent, 2 packaged entry and 1 explicit lifecycle evaluation entries. [Platform evidence](evidence/p2-ci-platforms.json) preserves actual evaluation objects and test-result lines from each successful job. |
+
+All shell commands were invoked through RTK. Package logs were summarized by
+deterministically parsing Cargo's result lines; zero-test/doc targets are not
+counted as test cases. Existing unrelated optional evaluations remained ignored.
+The explicit after command was:
+
+```text
+rtk proxy cargo test -p davinci-coding-agent --test process_manager --offline --locked -- --ignored --nocapture
+```
+
+`DAVINCI_PROCESS_EVAL_ARTIFACT` was an absolute path to the linked JSON. A first
+attempt used the default output cursor and therefore did not ask about discarded
+bytes; the fixture now requests cursor zero. A later relative artifact path
+failed after the behavior assertions; the recorded absolute-path run passed.
+The frozen before measurement was not overwritten.
+
+The after sample reports first readiness 190.1967 ms and reuse 1.4052 ms, one root
+startup, three fixture processes, shutdown cleanup 351.9869 ms, and zero listener
+survivors at the 200 ms host-loss observation. Cold startup is slower than the
+old 129.4012 ms sample; repeated startup and ownership improve. Measurements are
+single Windows debug runs with real Node processes, not provider-token results.
+
+The Windows npm regression initially exited 1 because Node's module resolver
+rejected the canonical verbatim script path. The adapter now removes that prefix
+only after verifying the ordinary path resolves to the same canonical entry.
+The installed npm `--version` invocation and full affected package tests passed
+after the correction. No shell-string fallback or dependency install was added.
+
+### P2 handoff surface
+
+- `jobs/managed.rs` extends JobBook with scope/owner leases, bounded single-flight,
+  cursor pages and logical lifetime metadata; `managed/restarts.rs` reconciles
+  bounded restarts with continuing authority.
+- `jobs/supervisor/{mod,wire,platform,helper,client}.rs` owns the private bounded
+  protocol and OS lifetime. Windows uses a private Job Object; Unix uses a session
+  group. These are lifecycle primitives, not a hostile-process sandbox.
+- `process_manager/{command,schemas,tests}.rs` and `process_manager.rs` own the
+  authorized adapter, direct argv/environment resolution and all six tools.
+- `approval/dispatch.rs`, permission/risk, argv shell policy, tool dispatch and
+  runtime capability metadata preserve approval and contract enforcement.
+- CLI/settings/native shutdown and Graph's composed coordinator handler bind the
+  same service. Worker lease identity comes from the host, never model arguments.
+- Existing `SharedCounters`/`RunStats` expose actual startups/reuses/restarts.
+  Live resources and output rings are not serialized into CacheRuntime.
+- Tests include the reusable Node server fixture, frozen old-host baseline,
+  packaged-binary evaluation, normal-session and Graph dispatch integrations.
+- All fourteen P2 gates passed before P4 began. PR #10 remains open and unmerged.
+  Next project is P4, using the approved transactional-edit plan. Platform
+  evidence is recorded in the next branch to preserve the tested P2 head.
+
+## P4 current checkpoint
+
+The Windows short-name follow-up preserves aliases through edit/delete/recovery
+and journals interrupted alias publication. Its 49 focused unit tests, 30
+transaction integration/evaluation cases and the formerly failing normal-agent
+CI test pass locally. Native exact-head CI remains required; P4 is still open.
+
+Implementation is in draft [PR #11](https://github.com/J12003LPZ/davinci/pull/11)
+on `codex/transactional-edits-01a0ad48` in the isolated worktree. The latest
+checkpoint in the [P4 plan](04-transactional-edits.md) supersedes the historical
+notes below. P4 remains incomplete; P3 has not started. The plan records executed
+RED/GREEN checks and limitations. Ordinary mutations and explicit transaction
+tools share durable provenance, current authority and conflict-safe recovery.
+Source-bound command receipts and conservative Cargo target-root coverage are
+connected to normal dispatch. Git commit observation is available through
+`patch_status` with `observe_commit: true`, with current metadata authority and
+exact committed-image checks. Normal previews capture an observed base revision
+when current metadata policy allows it; otherwise the revision remains unknown.
+Policies with read-deny rules conservatively prevent Git observation until its
+internal metadata reads can be authorized individually.
+
+The latest changes passed three Git observation integration tests, 56 permission
+tests, 23 approval-focused tests, and all 35 turn tests. The latter include real
+command verification and one-time transaction read approval. Agent library
+Clippy with warnings denied passed. These targeted results do not close the
+affected-package, Graph end-to-end, fault-injection, metadata, eval, or platform
+CI gates. P3 has not started. The paragraphs below retain earlier checkpoint
+evidence; the current status and latest P4 plan entry supersede their pending items.
+
+The recovery follow-up adds atomic no-clobber active-marker publication and
+cleanup after failed rollback preparation. Four storage fault-injection tests
+passed across marker, apply and rollback journal failures. The 18-case transaction
+integration suite passed after fixing cancellation during the final authority
+check; an additional interrupted-rollback recovery test passed separately.
+Agent-library Clippy passed. These results advance recovery coverage without
+closing the remaining P4 platform, metadata, integration or evaluation gates.
+
+Graph provenance follow-up: the real parent launcher exposed a child agent-ID
+mismatch. The child now validates and retains the parent-assigned ID. The launcher
+recovery fixture passed, as did the two-prompt write/rollback regression and all
+four CLI transaction tests. The launcher fixture deliberately has no submitted
+Graph artifact and is correctly rejected as incomplete; full successful Graph
+lifecycle coverage remains open. See the P4 plan for the exact evidence scope.
+
+The subsequent real-launcher test now covers successful edit plus `graph_submit`
+using a bounded offline call sequence. Parent acceptance, exact artifact content,
+transaction provenance, effect recording and authorized recovery passed. This
+closes the missing successful worker lifecycle case; it does not claim a full
+multi-node Graph run or completion of P4's metadata/package/CI gates.
+
+Windows metadata follow-up now records/restores owner and primary group alongside
+the DACL. Two metadata regressions and 29 transaction/commit/verification tests
+passed, including non-default group recovery and refusal after group-only external
+changes. Unix metadata behavior and the final package/review/CI gates remain open.
+
+Unix owner/group and full permission-mode preservation are now implemented with
+journal validation. Serialization and validation tests passed on Windows; two
+Unix-only filesystem regressions await Linux/macOS execution. Unix extended
+attributes/ACLs are still outstanding, so this is not a completed metadata gate.
+
+Bounded Linux/macOS extended-attribute capture and restoration now feed the same
+transaction images and stale-state checks. Local parsing/bounds tests and Clippy
+passed; native attribute tests are added but unexecuted. macOS ACL handling and
+native platform validation remain open before P4 can pass its metadata gate.
+
+P4 foreground shell capture now rejects incomplete evidence on reader errors,
+panics and stream overflow. Output retention is bounded at 16 MiB per stream;
+overflow is drained and reported as failure before receipt creation. Four focused
+capture tests, two receipt tests and four transaction-verification integration
+tests passed locally, as did affected Clippy. Descendant-held pipe lifecycle,
+macOS ACLs, native platform tests and the final P4 completion gates remain open.
+
+The macOS ACL adapter is now implemented with bounded portable serialization,
+descriptor-based restoration, journal validation and metadata-only conflict
+detection. The format test and 29 existing transaction integration cases passed
+on Windows, as did affected Clippy. Native macOS recovery/conflict tests are
+added but unexecuted; native compilation/runtime evidence remains required.
+
+The affected agent/coding-agent package gate passed 3,265 tests (21 ignored) on
+Windows. A subsequent red/green fix now discovers durable transactions for
+resumed sessions and agents without a runtime ledger. Actual Cargo verification
+passes the eight-case success/failure/authorization matrix; two discovery tests
+cover owner boundaries and bounded reads. P4 still requires native platform
+validation, descendant-pipe lifecycle completion, final checks, review and CI.
+
+## P3 implementation evidence
+
+Implementation and exact-head CI are validated at `cdbfe00afdbd8c2839066ea63782f211e698be26`;
+PR #12 updated for review. User-facing behavior and limits are documented in
+[browser verification](../../browser-verification.md) and [P3 plan](03-browser-verification.md).
+
+| Gate | Evidence/status |
+| --- | --- |
+| 1. Approved design | User approved the design and all twelve plans on 2026-09-17. |
+| 2. Plan | [P3 ordered plan](03-browser-verification.md). |
+| 3. RED/GREEN | Observed failing cases: Windows supervisor output queue exit race, graph coordinator tool selection without host, missing source observation recheck, RPC verify_browser route; all passing after implementation. |
+| 4. Affected package tests | `rtk proxy cargo test --offline --locked -p davinci-agent -p davinci-coding-agent`: exit 0; 1241 passed in coding-agent lib, 0 failed, 15 ignored; all agent suites passed. |
+| 5. Format | `rtk proxy cargo fmt -p davinci-agent -p davinci-coding-agent --check`: exit 0. |
+| 6. Clippy | `rtk proxy cargo clippy --offline --locked -p davinci-agent -p davinci-coding-agent --all-targets -- -D warnings`: exit 0. |
+| 7. Integration | Real Chromium tests passed with zero skips: `normal_browser_native_dispatch_actions_revocation_and_cleanup` (1 passed), `rpc_browser_verification_receipt_wire_exchange` (1 passed), `graph_browser_transport_shares_server_and_isolates_worker_contexts` (1 passed), `graph_scheduler_writer_uses_authenticated_browser_transport` (1 passed). 5 real Node tests passed; 33 deterministic Node tests passed. |
+| 8. Security | Read authority verified via `check_current_source_read`; dedicated loopback proxy enforces origin, blocks redirects/foreign subresources/unauthorized WebSocket upgrades (0 forbidden hits); no CDP or arbitrary eval; no project node_modules resolution; immutable content-addressed screenshot artifacts; context isolation. |
+| 9. Normal path | Real normal-session Chromium test passes complete frontend failure/fix flow without Graph; transactional edit to `index.html`, managed dev server, DOM/ARIA assertions, clean console/network, PNG retention, RealBrowser receipt. |
+| 10. Graph | Actual `run_graph` scheduler Writer path, authenticated parent coordinator transport, context isolation, host-derived TransactionOwner, Phase::Done completion. |
+| 11. Evaluation | [p3-browser-final.json](evidence/p3-browser-final.json) records fresh verification of all real browser flows, deterministic and real network confinement, and security invariants; earlier baselines and checkpoints preserved. |
+| 12. Docs | User guide [docs/browser-verification.md](../../browser-verification.md), documentation index, and this plan updated. |
+| 13. Review | Solo source and diff audit across all 12 touched crates files and docs; no subagents per user instruction. |
+| 14. CI | Exact-head CI passed at `cdbfe00afdbd8c2839066ea63782f211e698be26`: PR CI [35310203206](https://github.com/J12003LPZ/davinci/actions/runs/35310203206), workflow lint [35310203230](https://github.com/J12003LPZ/davinci/actions/runs/35310203230), Security SARIF [35310203220](https://github.com/J12003LPZ/davinci/actions/runs/35310203220), push CI [35310198092](https://github.com/J12003LPZ/davinci/actions/runs/35310198092) and SARIF [35310198050](https://github.com/J12003LPZ/davinci/actions/runs/35310198050) all green. |
+
+## P5 implementation evidence
+
+Implementation is completed on `codex/package-intelligence-01a0ad48` in the isolated worktree.
+
+| Gate | Evidence/status |
+| --- | --- |
+| 1. Approved design | User approved the design and all twelve plans on 2026-09-17; project section 10 and cross-cutting sections 18-40. |
+| 2. Plan | [P5 ordered plan](05-package-intelligence.md). |
+| 3. RED/GREEN | Observed failing test suite on initial implementation due to fixture expectations, missing kebab-case lock parsing, and unvalidated package traversal; all 10 integration tests passing after implementation. |
+| 4. Affected package tests | `rtk proxy cargo test --offline --locked -p davinci-coding-agent --test package_intelligence`: exit 0 (10 passed); `rtk proxy cargo test --offline --locked -p davinci-agent`: exit 0 (73 passed, 3 ignored). |
+| 5. Format | `rtk proxy cargo fmt -p davinci-agent -p davinci-coding-agent --check`: exit 0. |
+| 6. Clippy | `rtk proxy cargo clippy --offline --locked -p davinci-agent -p davinci-coding-agent --all-targets -- -D warnings`: exit 0. |
+| 7. Integration | 10 integration tests passed in `package_intelligence.rs`: npm v1, npm v3 with selective symbol resolution, version mismatch detection, pnpm workspace virtual store, yarn classic, yarn berry, conditional exports, path traversal & script non-execution, cache hit/miss telemetry, host registration. |
+| 8. Security | All 5 package intelligence tools classified as `ToolClass::Read`. Traversal attempts in package name or workspace parameter rejected. Workspace isolation verified. Zero package lifecycle scripts executed. No recursive indexing of node_modules into RepoIntelligence. |
+| 9. Normal path | Normal Agent session dispatch executes `package_info`, `package_exports`, `package_symbol`, `package_dependents`, `package_why` and `/package-status` command without Graph. |
+| 10. Graph | Graph role allowlist updated: `Role::Researcher`, `Role::Planner`, `Role::Writer`, `Role::Reviewer`, and `Role::TestAnalyzer` authorized for all 5 tools; `Role::Classifier` denied (least privilege). Unit test `package_intelligence_tools_follow_role_selection` passed. |
+| 11. Evaluation | [p5-package-final.json](evidence/p5-package-final.json) captures full verification evidence, supported formats, security invariants, and test results. |
+| 12. Docs | Updated `05-package-intelligence.md` and `README.md` program ledger. |
+| 13. Review | Solo source and diff audit across touched crates, fixtures, tests, and documentation. No subagents used per instruction. |
+| 14. CI | Exact-head CI passed at `9a3fdf9b47216bcfc2ca58bef5d380d1a10c863a`: Push CI [35367111447](https://github.com/J12003LPZ/davinci/actions/runs/35367111447), Push SARIF [35367111099](https://github.com/J12003LPZ/davinci/actions/runs/35367111099), PR #13 CI [35367117486](https://github.com/J12003LPZ/davinci/actions/runs/35367117486), PR #13 SARIF [35367117517](https://github.com/J12003LPZ/davinci/actions/runs/35367117517) all 100% green across platform matrix. |
+
+## P7 implementation evidence
+
+Implementation is completed on `codex/build-intelligence-01a0ad48` in the isolated worktree.
+
+| Gate | Evidence/status |
+| --- | --- |
+| 1. Approved design | User approved the design and all twelve plans on 2026-09-17; project section 12 and cross-cutting sections 18-40. |
+| 2. Plan | [P7 ordered plan](07-build-intelligence.md). |
+| 3. RED/GREEN | Initial compilation and fixture tests failed; all 12 integration tests passing after implementation. |
+| 4. Affected package tests | `rtk proxy cargo test --offline --locked -p davinci-coding-agent --test build_intelligence`: exit 0 (12 passed); `rtk proxy cargo test --offline --locked -p davinci-agent`: exit 0 (73 passed, 3 ignored). |
+| 5. Format | `rtk proxy cargo fmt -p davinci-agent -p davinci-coding-agent --check`: exit 0. |
+| 6. Clippy | `rtk proxy cargo clippy --offline --locked -p davinci-agent -p davinci-coding-agent --all-targets -- -D warnings`: exit 0. |
+| 7. Integration | 12 integration tests passed in `build_intelligence.rs`: workspace package discovery, Turborepo target pipeline, Nx target defaults & dependsOn, TypeScript composite project references, non-omission downstream reverse dependency traversal, deterministic build command synthesis for Turbo/Nx/pnpm, cyclic dependencies, custom tasks, Vite/Next framework detection, path traversal rejection, CacheRuntime caching & telemetry, NativeExtensionHost registration and permission classification. |
+| 8. Security | All 5 build intelligence tools classified as `ToolClass::Read`. Traversal attempts in package, scope, or file paths rejected. Zero discovery execution: manifests and config files inspected declaratively with no compiler or package code execution. Project-native caches preserved without modification or clearing. |
+| 9. Normal path | Normal Agent session dispatch executes `workspace_packages`, `build_targets`, `build_dependencies`, `build_affected`, `build_command` and `/build-status` command without Graph. |
+| 10. Graph | Graph role allowlist updated: `Role::Researcher`, `Role::Planner`, `Role::Writer`, `Role::Reviewer`, and `Role::TestAnalyzer` authorized for all 5 tools; `Role::Classifier` denied (least privilege). Unit test `build_intelligence_tools_follow_role_selection` passed. |
+| 11. Evaluation | [p7-build-final.json](evidence/p7-build-final.json) captures full verification evidence, supported runners, security invariants, and test results. |
+| 12. Docs | Updated `07-build-intelligence.md` and `README.md` program ledger. |
+| 13. Review | Solo source and diff audit across touched crates, fixtures, tests, and documentation. No subagents used per instruction. |
+| 14. CI | Green on head `950ab505d87c3569b693ca21085d2e269080551b` and PR #14 ([PR #14](https://github.com/J12003LPZ/davinci/pull/14)). Push CI: [run 35370012630](https://github.com/J12003LPZ/davinci/actions/runs/35370012630) (22/22 jobs success); Push SARIF: [run 35370012618](https://github.com/J12003LPZ/davinci/actions/runs/35370012618); PR CI: [run 35370058879](https://github.com/J12003LPZ/davinci/actions/runs/35370058879) (22/22 jobs success); PR SARIF: [run 35370058953](https://github.com/J12003LPZ/davinci/actions/runs/35370058953). |
+
+## P6 implementation evidence
+
+Implementation is completed on `codex/git-intelligence-01a0ad48` in the isolated worktree.
+
+| Gate | Evidence/status |
+| --- | --- |
+| 1. Approved design | User approved the design and all twelve plans on 2026-09-17; project section 11 and cross-cutting sections 18-40. |
+| 2. Plan | [P6 ordered plan](06-git-intelligence.md). |
+| 3. RED/GREEN | Initial implementation had unhandled root commits in `diff-tree`, missing shallow repository format checks, and unmerged stage tab-separation in index records; all 11 integration tests passing after implementation. |
+| 4. Affected package tests | `rtk proxy cargo test --offline --locked -p davinci-coding-agent --test git_intelligence`: exit 0 (11 passed); `rtk proxy cargo test --offline --locked -p davinci-agent`: exit 0 (73 passed, 3 ignored). |
+| 5. Format | `rtk proxy cargo fmt -p davinci-agent -p davinci-coding-agent --check`: exit 0. |
+| 6. Clippy | `rtk proxy cargo clippy --offline --locked -p davinci-agent -p davinci-coding-agent --all-targets -- -D warnings`: exit 0. |
+| 7. Integration | 11 integration tests passed in `git_intelligence.rs`: symbol history with renames/edits, shallow & bounded acceptance guard, facts vs inference separation, changed symbols AST comparison, branch diff with merge-base, porcelain blame, conflict explain with zero mutation, option injection & path traversal security guards, non-git directory handling, caching & telemetry, permission classification and host registration. |
+| 8. Security | All 7 git intelligence tools classified as `ToolClass::Read`. Option injection guards (`--end-of-options`), path traversal prevention, sanitized environment (`GIT_CONFIG_NOSYSTEM=1`, `GIT_CONFIG_GLOBAL=/dev/null`, pager disabled, zero shell interpolation), zero mutation guarantee on unmerged 3-way stages, acceptance guard reporting unknown/partial on incomplete history. |
+| 9. Normal path | Normal Agent session dispatch executes `git_symbol_history`, `git_related_commits`, `git_changed_symbols`, `git_branch_diff`, `git_blame_symbol`, `git_commit_context`, `git_conflict_explain` and `/git-status` command without Graph. |
+| 10. Graph | Graph role allowlist updated: `Role::Historian`, `Role::Researcher`, `Role::Reviewer`, `Role::Planner`, `Role::Writer`, `Role::TestAnalyzer` authorized; `Role::Classifier` denied (least privilege). Unit test `git_intelligence_tools_follow_role_selection` passed. |
+| 11. Evaluation | [p6-git-final.json](evidence/p6-git-final.json) captures full verification evidence, supported capabilities, security invariants, and test results. |
+| 12. Docs | Updated `06-git-intelligence.md` and `README.md` program ledger. |
+| 13. Review | Solo source and diff audit across touched crates, fixtures, tests, and documentation. No subagents used per instruction. |
+| 14. CI | Green on head `dcaf02b5ad366ef0c48ac0017684bb83f2ec2c9d` and PR #15 ([PR #15](https://github.com/J12003LPZ/davinci/pull/15)). Push CI: [run 35372343120](https://github.com/J12003LPZ/davinci/actions/runs/35372343120) (22/22 jobs success); Push SARIF: [run 35372343125](https://github.com/J12003LPZ/davinci/actions/runs/35372343125); PR CI: [run 35372351676](https://github.com/J12003LPZ/davinci/actions/runs/35372351676) (22/22 jobs success); PR SARIF: [run 35372351664](https://github.com/J12003LPZ/davinci/actions/runs/35372351664). |
+
+## P8 implementation evidence
+
+Implementation is completed on `codex/hook-policy-01a0ad48` in the isolated worktree.
+
+| Gate | Evidence/status |
+| --- | --- |
+| 1. Approved design | User approved the design and all twelve plans on 2026-09-17; project section 13 and cross-cutting sections 18-40. |
+| 2. Plan | [P8 ordered plan](08-hook-policy.md). |
+| 3. RED/GREEN | Initial implementation uncovered stdin truncation causing json parse errors on payloads, missing depth guard debug trait, and argument lifetime constraints in `HooksRuntimeSubscriber`; all 11 integration tests passing after implementation. |
+| 4. Affected package tests | `rtk proxy cargo test --offline --locked -p davinci-coding-agent --test hook_policy`: exit 0 (11 passed); `rtk proxy cargo test --offline --locked -p davinci-agent`: exit 0 (73 passed, 3 ignored); `rtk proxy cargo test --offline --locked -p davinci-coding-agent --lib`: exit 0 (1045 passed, 15 ignored). |
+| 5. Format | `rtk proxy cargo fmt -p davinci-agent -p davinci-coding-agent --check`: exit 0. |
+| 6. Clippy | `rtk proxy cargo clippy --offline --locked -p davinci-agent -p davinci-coding-agent --all-targets -- -D warnings`: exit 0. |
+| 7. Integration | 11 integration tests passed in `hook_policy.rs`: legacy hook backward compatibility, policy rule filtering by event/tool/path globs, failure policies (warn, block, ignore), untrusted project hook rejection, post-load file modification invalidation, BeforeWrite decision blocking file mutation, AfterWrite observer failure tracking unmet completion requirements without retroactive file reversal, BeforeProcessStart blocking tool execution, recursion depth guard limiting depth, bounded JSON streams and timeout process termination, aggregate diagnostics via `/hook-status`. |
+| 8. Security | Binding trust to resolved path and SHA-256 content identity. Revalidated upon execution; disk changes invalidate trust immediately (fail closed). Native/model tools prohibited from granting trust or injecting hook definitions. Supervised process execution with bounded streams (64 KiB) and descendant process tree kill. Recursion depth capped at 3. |
+| 9. Normal path | Normal Agent session dispatch executes hooks subscribed via `HooksRuntimeSubscriber` on runtime bus events (decision and observer), enforces failure policies, and runs `/hook-status` diagnostics command without Graph. |
+| 10. Graph | Graph workers operate under host-bound policy constraints; workers cannot expand or inject hook policies. |
+| 11. Evaluation | [p8-hook-final.json](evidence/p8-hook-final.json) captures full verification evidence, decision/observer events, security invariants, and test results. |
+| 12. Docs | Updated `08-hook-policy.md` and `README.md` program ledger. |
+| 13. Review | Solo source and diff audit across touched crates, models, tools, and tests. No subagents used per instruction. |
+| 14 | CI | Green on head `cbef3fa4d1dc7fc52b210f2c4161a067a99653dc` and PR #17 ([PR #17](https://github.com/J12003LPZ/davinci/pull/17)). Push CI: [run 35414060812](https://github.com/J12003LPZ/davinci/actions/runs/35414060812) (22/22 jobs success); Push SARIF: [run 35414060714](https://github.com/J12003LPZ/davinci/actions/runs/35414060714); PR CI: [run 35414088579](https://github.com/J12003LPZ/davinci/actions/runs/35414088579) (22/22 jobs success); PR SARIF: [run 35414088573](https://github.com/J12003LPZ/davinci/actions/runs/35414088573). |

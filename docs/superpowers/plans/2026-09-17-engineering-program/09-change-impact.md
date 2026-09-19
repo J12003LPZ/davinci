@@ -1,6 +1,6 @@
 # P9: Change Impact Engine
 
-Status: design approved by the user on 2026-09-17; implementation pending.
+Status: Complete; PR #16 open and verified green across CI matrix.
 Execution sequence: 8 of 12.
 Dependencies: P1 tests, P4 transactions, P5 packages, P6 Git, P7 builds, Repo AST/LSP.
 Requirements authority: project section 14 and cross-cutting sections 18-40;
@@ -87,3 +87,25 @@ does not authorize merging new PRs into main.
 The handoff in README records files/APIs changed, validated commands and results,
 metric/artifact paths, head SHA/CI URLs, limitations, and the next dependency input.
 No production capability is called done from this plan alone.
+
+## P9 implementation evidence
+
+Implementation is completed on `codex/change-impact-01a0ad48` in the isolated worktree.
+
+| Gate | Evidence/status |
+| --- | --- |
+| 1. Approved design | User approved the design and all twelve plans on 2026-09-17; project section 14 and cross-cutting sections 18-40. |
+| 2. Plan | [P9 ordered plan](09-change-impact.md). |
+| 3. RED/GREEN | Initial compilation identified missing `LanguageIntelligenceAdapter` seam, `Import.specifier` vs `source` field differences, and relative path matching in TypeScript imports without extension; all 11 integration tests passing after implementation. |
+| 4. Affected package tests | `rtk proxy cargo test --offline --locked -p davinci-coding-agent --test change_impact`: exit 0 (11 passed); `rtk proxy cargo test --offline --locked -p davinci-agent`: exit 0 (73 passed, 3 ignored). |
+| 5. Format | `rtk proxy cargo fmt -p davinci-agent -p davinci-coding-agent --check`: exit 0. |
+| 6. Clippy | `rtk proxy cargo clippy --offline --locked -p davinci-agent -p davinci-coding-agent --all-targets -- -D warnings`: exit 0. |
+| 7. Integration | 11 integration tests passed in `change_impact.rs`: direct semantic references and structural AST imports, transaction ID resolution from `.davinci-transactions`, honest completeness without false confidence, public API risk and entry point detection, configuration blast radius, potential browser flows, workspace package downstream cascades, security guards (traversal rejection, ToolClass::Read), CacheRuntime telemetry, NativeExtensionHost dispatch and command execution, and LanguageIntelligenceAdapter as SemanticLanguageProvider. |
+| 8. Security | Tool classified as `ToolClass::Read`. Path traversal rejection on null bytes and `..` components, zero working tree mutation guarantee, honest completeness bounds, least privilege graph roles. |
+| 9. Normal path | Normal Agent session dispatch executes `impact_analyze` tool and `/impact-status` command without Graph. |
+| 10. Graph | Graph role allowlist updated: `Role::Planner`, `Role::Reviewer`, `Role::Researcher`, `Role::Writer`, `Role::TestAnalyzer` authorized; `Role::Classifier` denied (least privilege). Unit test `change_impact_tools_follow_role_selection` passed. |
+| 11. Evaluation | [p9-impact-final.json](evidence/p9-impact-final.json) captures full verification evidence, supported capabilities, security invariants, and test results. |
+| 12. Docs | Updated `09-change-impact.md` and `README.md` program ledger. |
+| 13. Review | Solo source and diff audit across touched crates, models, tools, and tests. No subagents used per instruction. |
+| 14. CI | Green on head `726431e327b9f3f9201f4079fb63a73a6497cb1f` and PR #16 ([PR #16](https://github.com/J12003LPZ/davinci/pull/16)). Push CI: [run 35411130997](https://github.com/J12003LPZ/davinci/actions/runs/35411130997) (22/22 jobs success); Push SARIF: [run 35411130839](https://github.com/J12003LPZ/davinci/actions/runs/35411130839); PR CI: [run 35411143442](https://github.com/J12003LPZ/davinci/actions/runs/35411143442) (22/22 jobs success); PR SARIF: [run 35411143563](https://github.com/J12003LPZ/davinci/actions/runs/35411143563). |
+

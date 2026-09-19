@@ -47,7 +47,7 @@ process.stdin.on('data', chunk => {
         uri: doc.uri, version: doc.version - 1, diagnostics: [{ range, severity: 1, message: 'stale error' }]
       } });
       if (mode.startsWith('push-')) setTimeout(() => send({ method: 'textDocument/publishDiagnostics', params: {
-        uri: doc.uri, version: doc.version, diagnostics: texts[doc.uri] === 'bad' ? [{ range, severity: 1, message: 'bad type' }] : []
+        uri: doc.uri, version: doc.version, diagnostics: texts[doc.uri].trim() === 'bad' ? [{ range, severity: 1, message: 'bad type' }] : []
       } }), 20);
       continue;
     }
@@ -56,7 +56,7 @@ process.stdin.on('data', chunk => {
       send({ id: message.id, result: initialized ? { contents: 'fixture hover', fixture: { opens, changes, texts } } : null }); continue;
     }
     if (message.method === 'textDocument/diagnostic') {
-      send({ id: message.id, result: { kind: 'full', items: texts[message.params.textDocument.uri] === 'bad' ? [{ range, severity: 1, message: 'bad type' }] : [] } }); continue;
+      send({ id: message.id, result: { kind: 'full', items: texts[message.params.textDocument.uri].trim() === 'bad' ? [{ range, severity: 1, message: 'bad type' }] : [] } }); continue;
     }
     if (message.method === 'workspace/symbol') { send({ id: message.id, result: [] }); continue; }
     if (message.method === 'textDocument/references') {

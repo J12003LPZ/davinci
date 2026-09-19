@@ -81,6 +81,26 @@ impl GraphWorkerLimit {
     }
 }
 
+fn coordinator_task_tools(
+    tools: &[String],
+    language_available: bool,
+    browser_available: bool,
+) -> Vec<String> {
+    tools
+        .iter()
+        .filter(|tool| {
+            davinci_agent::runtime::task_transport::is_task_tool(tool)
+                || davinci_agent::tools::is_managed_process_tool(tool)
+                || browser_available
+                    && crate::native_extensions::browser::TOOL_NAMES.contains(&tool.as_str())
+                || tool.as_str() == "retrieve_output" && language_available
+                || crate::native_extensions::language_intelligence::TOOL_NAMES
+                    .contains(&tool.as_str())
+        })
+        .cloned()
+        .collect()
+}
+
 pub struct ControllerDeps {
     pub runner: Arc<WorkerRunner>,
     pub verify_exec: Arc<VerifyExec>,
@@ -94,6 +114,8 @@ pub struct ControllerDeps {
     pub governor: Option<crate::native_extensions::TokenGovernor>,
     pub language_intelligence:
         Option<crate::native_extensions::language_intelligence::LanguageIntelligence>,
+    pub processes: Option<davinci_agent::process_manager::ProcessManager>,
+    pub browser: Option<crate::native_extensions::browser::BrowserWorkerHost>,
     pub runtime: Option<davinci_agent::RuntimeHandle>,
     pub permissions: Option<Arc<davinci_agent::PermissionState>>,
     pub task_contract: Option<davinci_agent::runtime::TaskContract>,
@@ -420,6 +442,9 @@ impl GraphExecution {
                 !crate::native_extensions::language_intelligence::TOOL_NAMES
                     .contains(&name.as_str())
             });
+        }
+        if !has_coordinator_authority || self.deps.processes.is_none() {
+            tools.retain(|name| !davinci_agent::tools::is_managed_process_tool(name));
         }
         ensure_governor_recovery_tool(&mut tools);
         tools
@@ -827,18 +852,11 @@ impl GraphExecution {
                     .transition(worker_agent_id, davinci_agent::AgentState::Running);
             }
 
-            let task_tools: Vec<String> = spec
-                .tools
-                .iter()
-                .filter(|tool| {
-                    davinci_agent::runtime::task_transport::is_task_tool(tool)
-                        || tool.as_str() == "retrieve_output"
-                            && self.deps.language_intelligence.is_some()
-                        || crate::native_extensions::language_intelligence::TOOL_NAMES
-                            .contains(&tool.as_str())
-                })
-                .cloned()
-                .collect();
+            let task_tools = coordinator_task_tools(
+                &spec.tools,
+                self.deps.language_intelligence.is_some(),
+                self.deps.browser.is_some(),
+            );
             let _coordinator_transport = if !task_tools.is_empty() {
                 if let (Some(runtime), Some(permissions)) =
                     (&self.deps.runtime, &self.deps.permissions)
@@ -850,7 +868,7 @@ impl GraphExecution {
                         task_tools,
                         spec.cwd.clone(),
                         self.exec_abort.clone(),
-                        self.deps.language_intelligence.as_ref().map(|manager| Arc::new(manager.for_workspace(&spec.cwd)) as Arc<dyn davinci_agent::runtime::task_transport::CoordinatorToolHandler>),
+                        super::coordinator_handler::for_worker(&self.deps, &spec, self.exec_abort.clone()),
                     ) {
                         Ok(transport) => {
                             spec.coordinator_client = Some(transport.client());
@@ -2531,6 +2549,290 @@ mod tests {
     use tempfile::tempdir;
 
     #[test]
+    fn coordinator_transport_includes_authorized_browser_tools() {
+        let tools = vec![
+            "browser_open".to_string(),
+            "browser_snapshot".to_string(),
+            "process_start".to_string(),
+            "read".to_string(),
+        ];
+        let selected = coordinator_task_tools(&tools, false, true);
+        assert!(selected.contains(&"browser_open".to_string()));
+        assert!(selected.contains(&"browser_snapshot".to_string()));
+        assert!(selected.contains(&"process_start".to_string()));
+        assert!(!selected.contains(&"read".to_string()));
+        let without_browser = coordinator_task_tools(&tools, false, false);
+        assert!(!without_browser.contains(&"browser_open".to_string()));
+        assert!(!without_browser.contains(&"browser_snapshot".to_string()));
+        assert!(without_browser.contains(&"process_start".to_string()));
+    }
+
+    #[test]
+    #[ignore = "requires explicitly configured trusted Node and Playwright installation"]
+    fn graph_scheduler_writer_uses_authenticated_browser_transport() {
+        use davinci_agent::{
+            jobs::{supervisor::SupervisorCommand, JobBook},
+            process_manager::ProcessManager,
+            runtime::{
+                transactions::{ProposedChange, TransactionCoordinator, TransactionOwner},
+                AgentId, RunId, RuntimeBus, RuntimeHandle,
+            },
+            PermissionMode, PermissionPolicy, PermissionState,
+        };
+
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("index.html"),
+            "<button onclick=\"this.textContent='Broken'\">Start</button>",
+        )
+        .unwrap();
+        let port = std::net::TcpListener::bind(("127.0.0.1", 0))
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        std::fs::write(
+            dir.path().join("server.cjs"),
+            format!(
+                "const http=require('node:http'),fs=require('node:fs');const s=http.createServer((q,r)=>{{r.setHeader('content-type','text/html');r.end(fs.readFileSync('index.html'));}});s.listen({port},'127.0.0.1',()=>console.log('READY'));setTimeout(()=>s.close(),60000);"
+            ),
+        )
+        .unwrap();
+        let git = |args: &[&str]| {
+            let output = std::process::Command::new("git")
+                .current_dir(dir.path())
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        };
+        git(&["init", "--quiet"]);
+        git(&["add", "."]);
+        git(&[
+            "-c",
+            "user.name=fixture",
+            "-c",
+            "user.email=fixture@example.invalid",
+            "commit",
+            "--quiet",
+            "-m",
+            "fixture",
+        ]);
+
+        let permissions = Arc::new(PermissionState::new(PermissionPolicy::new(
+            PermissionMode::AlwaysApprove,
+        )));
+        let supervisor = SupervisorCommand {
+            executable: std::env::current_exe().unwrap(),
+            argv: vec![
+                "--exact".into(),
+                "native_extensions::graph::coordinator_handler::tests::helper_entry".into(),
+                "--nocapture".into(),
+            ],
+        };
+        let jobs = Arc::new(Mutex::new(JobBook::default()));
+        let processes =
+            ProcessManager::new(dir.path(), jobs, permissions.clone(), supervisor.clone()).unwrap();
+        let runtime = RuntimeHandle::new(RunId::new(), AgentId::new(), RuntimeBus::new());
+        let browser = crate::native_extensions::browser::BrowserWorkerHost {
+            controller: crate::native_extensions::browser::BrowserController::new(
+                dir.path(),
+                crate::native_extensions::browser::BrowserConfig {
+                    enabled: true,
+                    node: std::env::var("DAVINCI_TRUSTED_NODE_TEST_PATH")
+                        .unwrap()
+                        .into(),
+                    package: std::env::var("DAVINCI_TRUSTED_PLAYWRIGHT_TEST_PATH")
+                        .unwrap()
+                        .into(),
+                    version: "1.62.0".into(),
+                },
+            ),
+            supervisor,
+        };
+        let parent_runtime = runtime.clone();
+        let writer_cwd = dir.path().to_path_buf();
+        let runner: Arc<WorkerRunner> = Arc::new(move |spec, _, _| {
+            let artifact = match spec.expect {
+                ArtifactKind::Classification => Artifact::Classification(Classification {
+                    task_class: TaskClass::Bug,
+                    complexity: Complexity::Standard,
+                    rationale: "browser fixture".into(),
+                    research_tasks: vec![],
+                    milestones: None,
+                }),
+                ArtifactKind::Plan => Artifact::Plan(Box::new(ImplementationPlan {
+                    steps: vec![PlanStep {
+                        description: "fix and verify browser".into(),
+                        files: vec!["index.html".into()],
+                    }],
+                    tests_to_add: vec![],
+                    tests_to_run: vec!["fixture-test".into()],
+                    completion_criteria: vec!["browser interaction passes".into()],
+                    invariants: vec![],
+                    out_of_scope: vec![],
+                })),
+                ArtifactKind::PatchReport => {
+                    assert_eq!(spec.cwd, writer_cwd);
+                    assert!(spec.tools.iter().any(|tool| tool == "browser_open"));
+                    let client = spec
+                        .coordinator_client
+                        .as_ref()
+                        .expect("scheduler must bind authenticated browser transport");
+                    let owner = TransactionOwner {
+                        agent_id: spec.runtime_agent_id.expect("host worker identity"),
+                        parent_agent_id: Some(parent_runtime.agent_id),
+                        session_id: parent_runtime.session_id.clone(),
+                        task_id: spec.task_contract.as_ref().map(|contract| contract.task_id),
+                        graph_node: Some(spec.task_id.clone()),
+                    };
+                    let coordinator = TransactionCoordinator::new(&spec.cwd, owner).unwrap();
+                    let preview = coordinator
+                        .preview(vec![ProposedChange::write(
+                            "index.html",
+                            b"<button onclick=\"this.textContent='Done'\">Start</button>".to_vec(),
+                        )])
+                        .unwrap();
+                    coordinator.apply(&preview.id, &|_| Ok(()), None).unwrap();
+
+                    let started = client
+                        .call(
+                            "process_start",
+                            &serde_json::json!({
+                                "executable":"node",
+                                "argv":["server.cjs"],
+                                "ports":[port]
+                            }),
+                        )
+                        .unwrap()
+                        .details
+                        .unwrap();
+                    let process_id = started["process"]["id"].as_u64().unwrap();
+                    let deadline = Instant::now() + Duration::from_secs(5);
+                    loop {
+                        let output = client
+                            .call("process_output", &serde_json::json!({"id":process_id}))
+                            .unwrap();
+                        if output.content.contains("READY") {
+                            break;
+                        }
+                        assert!(Instant::now() < deadline, "{output:?}");
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                    let opened = client
+                        .call(
+                            "browser_open",
+                            &serde_json::json!({
+                                "process_id":process_id,
+                                "port":port,
+                                "transaction_id":preview.id
+                            }),
+                        )
+                        .unwrap()
+                        .details
+                        .unwrap();
+                    assert_eq!(
+                        opened["source_binding"]["transaction_id"],
+                        serde_json::json!(preview.id)
+                    );
+                    let browser_id = opened["browser_id"].clone();
+                    client
+                        .call(
+                            "browser_click",
+                            &serde_json::json!({
+                                "browser_id":browser_id,
+                                "selector":{"kind":"role","role":"button","name":"Start"}
+                            }),
+                        )
+                        .unwrap();
+                    let snapshot = client
+                        .call(
+                            "browser_snapshot",
+                            &serde_json::json!({"browser_id":browser_id}),
+                        )
+                        .unwrap()
+                        .details
+                        .unwrap();
+                    assert!(snapshot["result"]["html"]
+                        .as_str()
+                        .unwrap()
+                        .contains(">Done</button>"));
+                    client
+                        .call(
+                            "browser_close",
+                            &serde_json::json!({"browser_id":browser_id}),
+                        )
+                        .unwrap();
+                    client
+                        .call("process_stop", &serde_json::json!({"id":process_id}))
+                        .unwrap();
+                    Artifact::PatchReport(Box::new(PatchReport {
+                        changed_files: vec!["index.html".into()],
+                        summary: "source-bound browser flow passed".into(),
+                        deviations: vec![],
+                        plan_invalidated: false,
+                        invalidation_reason: None,
+                    }))
+                }
+                ArtifactKind::Review => Artifact::Review(Box::new(ReviewDecision {
+                    verdict: Verdict::Approve,
+                    issues: vec![],
+                    notes: "browser evidence observed".into(),
+                    reviewed_chunk_ids: vec![],
+                })),
+                ArtifactKind::Evidence => unreachable!("fixture has no research tasks"),
+            };
+            WorkerResult {
+                ok: true,
+                artifact: Some(artifact),
+                ..WorkerResult::default()
+            }
+        });
+
+        let run = run_graph(
+            RunOptions {
+                goal: "fix browser fixture".into(),
+                cwd: dir.path().to_path_buf(),
+                forced: None,
+                dry_run: false,
+                abort: Arc::new(AtomicBool::new(false)),
+                resume_artifacts: HashMap::new(),
+                resume_run: None,
+            },
+            ControllerDeps {
+                runner,
+                verify_exec: Arc::new(|_, _, _, _| (0, "ok".into(), 1)),
+                config: GraphConfig {
+                    verify_commands: vec![VerifyCommandSpec {
+                        name: "fixture-test".into(),
+                        command: "fixture-test".into(),
+                        from_plan: false,
+                    }],
+                    ..Default::default()
+                },
+                session_model: None,
+                session_thinking: None,
+                project_trusted: true,
+                on_update: Arc::new(|_, _| {}),
+                memory: None,
+                learning: None,
+                governor: None,
+                language_intelligence: None,
+                processes: Some(processes),
+                browser: Some(browser),
+                runtime: Some(runtime),
+                permissions: Some(permissions),
+                task_contract: None,
+            },
+        );
+        assert_eq!(run.phase, Phase::Done, "{:?}", run.blocked_reason);
+    }
+
+    #[test]
     fn plan_invalidation_replans_before_dispatching_another_writer() {
         let dir = tempfile::tempdir().unwrap();
         let planner_calls = Arc::new(AtomicUsize::new(0));
@@ -2619,6 +2921,8 @@ mod tests {
                 learning: None,
                 governor: None,
                 language_intelligence: None,
+                processes: None,
+                browser: None,
                 runtime: None,
                 permissions: None,
                 task_contract: None,
@@ -2695,6 +2999,8 @@ mod tests {
                 learning: None,
                 governor: None,
                 language_intelligence: None,
+                processes: None,
+                browser: None,
                 runtime: None,
                 permissions: None,
                 task_contract: None,
@@ -2830,6 +3136,8 @@ mod tests {
             learning: None,
             governor: None,
             language_intelligence: None,
+            processes: None,
+            browser: None,
             runtime: Some(parent_runtime.clone()),
             permissions: Some(permissions),
             task_contract: None,
@@ -2890,6 +3198,8 @@ mod tests {
             learning: None,
             governor: None,
             language_intelligence: None,
+            processes: None,
+            browser: None,
             runtime: None,
             permissions: None,
             task_contract: None,
@@ -2958,6 +3268,8 @@ mod tests {
             learning: None,
             governor: None,
             language_intelligence: None,
+            processes: None,
+            browser: None,
             runtime: None,
             permissions: None,
             task_contract: None,
@@ -3083,6 +3395,8 @@ mod tests {
             learning: None,
             governor: None,
             language_intelligence: None,
+            processes: None,
+            browser: None,
             runtime: None,
             permissions: None,
             task_contract: None,
@@ -3206,6 +3520,8 @@ mod tests {
             learning: Some(learning),
             governor: None,
             language_intelligence: None,
+            processes: None,
+            browser: None,
             runtime: None,
             permissions: None,
             task_contract: None,
@@ -3414,6 +3730,8 @@ mod tests {
             learning: None,
             governor: None,
             language_intelligence: None,
+            processes: None,
+            browser: None,
             runtime: None,
             permissions: None,
             task_contract: None,
@@ -3545,6 +3863,8 @@ mod tests {
             learning: None,
             governor: None,
             language_intelligence: None,
+            processes: None,
+            browser: None,
             runtime: None,
             permissions: None,
             task_contract: None,
@@ -3672,6 +3992,8 @@ mod tests {
             learning: None,
             governor: None,
             language_intelligence: None,
+            processes: None,
+            browser: None,
             runtime: None,
             permissions: None,
             task_contract: None,
@@ -3808,6 +4130,8 @@ mod tests {
             learning: Some(learning.clone()),
             governor: None,
             language_intelligence: None,
+            processes: None,
+            browser: None,
             runtime: None,
             permissions: None,
             task_contract: None,
@@ -3916,6 +4240,8 @@ mod tests {
             learning: Some(learning.clone()),
             governor: None,
             language_intelligence: None,
+            processes: None,
+            browser: None,
             runtime: None,
             permissions: None,
             task_contract: None,
@@ -4144,6 +4470,8 @@ mod tests {
             learning: None,
             governor: None,
             language_intelligence: None,
+            processes: None,
+            browser: None,
             runtime: None,
             permissions: None,
             task_contract: None,
@@ -4257,6 +4585,8 @@ mod tests {
             learning: None,
             governor: None,
             language_intelligence: None,
+            processes: None,
+            browser: None,
             runtime: None,
             permissions: None,
             task_contract: None,
@@ -4359,6 +4689,8 @@ mod tests {
             learning: None,
             governor: None,
             language_intelligence: None,
+            processes: None,
+            browser: None,
             runtime: None,
             permissions: None,
             task_contract: None,
@@ -4452,6 +4784,8 @@ mod tests {
             learning: None,
             governor: None,
             language_intelligence: None,
+            processes: None,
+            browser: None,
             runtime: None,
             permissions: None,
             task_contract: None,
@@ -4525,6 +4859,8 @@ mod tests {
                 learning: None,
                 governor: None,
                 language_intelligence: None,
+                processes: None,
+                browser: None,
                 runtime: None,
                 permissions: None,
                 task_contract: None,
@@ -4633,6 +4969,8 @@ mod tests {
                 learning: None,
                 governor: None,
                 language_intelligence: None,
+                processes: None,
+                browser: None,
                 runtime: None,
                 permissions: None,
                 task_contract: None,
@@ -4720,6 +5058,8 @@ mod tests {
                 learning: None,
                 governor: None,
                 language_intelligence: None,
+                processes: None,
+                browser: None,
                 runtime: None,
                 permissions: None,
                 task_contract: None,
@@ -4826,6 +5166,8 @@ mod tests {
                 learning: None,
                 governor: None,
                 language_intelligence: None,
+                processes: None,
+                browser: None,
                 runtime: None,
                 permissions: None,
                 task_contract: None,

@@ -1,5 +1,5 @@
 //! General cache mechanics. Consumers validate current dependencies and authority.
-mod directory;
+pub(crate) mod directory;
 mod file;
 mod identity;
 mod key;

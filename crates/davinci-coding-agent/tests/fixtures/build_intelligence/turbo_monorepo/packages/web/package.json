@@ -1,0 +1,11 @@
+{
+  "name": "@repo/web",
+  "version": "1.0.0",
+  "dependencies": {
+    "@repo/ui": "workspace:*"
+  },
+  "scripts": {
+    "build": "next build",
+    "check": "tsc --noEmit"
+  }
+}

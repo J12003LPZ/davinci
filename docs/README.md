@@ -3,7 +3,9 @@
 Welcome to the **Davinci** technical documentation hub. This directory contains architectural specifications, implementation plans, design systems, security reviews, and historical archives for the Davinci coding agent.
 
 Native capability guides: [repository intelligence](repo-intelligence.md),
-[language intelligence](language-intelligence.md), and [test impact](test-impact.md).
+[language intelligence](language-intelligence.md), [test impact](test-impact.md),
+[managed processes](process-manager.md), [transactional edits](transactional-edits.md),
+and [browser verification](browser-verification.md).
 
 ---
 

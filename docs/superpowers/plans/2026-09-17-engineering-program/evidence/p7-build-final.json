@@ -1,0 +1,84 @@
+{
+  "milestone": "P7 Build Intelligence Final Evidence",
+  "base_branch": "codex/package-intelligence-01a0ad48",
+  "branch": "codex/build-intelligence-01a0ad48",
+  "tools": [
+    "workspace_packages",
+    "build_targets",
+    "build_dependencies",
+    "build_affected",
+    "build_command"
+  ],
+  "commands": [
+    "build-status"
+  ],
+  "supported_runners_and_tools": [
+    "Turborepo (turbo.json tasks, pipeline, dependsOn, inputs, outputs, cache)",
+    "Nx (nx.json, project.json targetDefaults, dependsOn, outputs, inputs, cache)",
+    "TypeScript Project References (composite tsconfig.json, references, tsbuildinfo)",
+    "Framework detection (Vite vite.config, Next.js next.config)",
+    "Package Managers (pnpm workspace, npm, yarn, bun)"
+  ],
+  "security_invariants": {
+    "zero_discovery_execution": true,
+    "no_compiler_execution": true,
+    "no_lifecycle_scripts": true,
+    "path_traversal_guards": true,
+    "workspace_escape_guards": true,
+    "read_only_tool_class": true,
+    "non_omission_guard_downstream_dependents": true,
+    "no_cache_clearing": true
+  },
+  "package_tests": {
+    "command": "rtk proxy cargo test --offline --locked -p davinci-coding-agent --test build_intelligence",
+    "exit_code": 0,
+    "passed": 12,
+    "failed": 0,
+    "ignored": 0,
+    "cases": [
+      "test_settings_parsing_build_intelligence",
+      "test_vite_and_next_framework_detection",
+      "test_nx_targets_and_depends_on",
+      "test_workspace_packages_discovery_turbo",
+      "test_security_guards_and_path_traversal",
+      "test_cyclic_and_unknown_scripts",
+      "test_turbo_targets_and_pipeline",
+      "test_build_command_generation_turbo_and_nx",
+      "test_cache_runtime_caching_and_telemetry",
+      "test_tsconfig_references_graph",
+      "test_build_affected_with_downstream_dependents",
+      "test_permission_classification_and_host_integration"
+    ]
+  },
+  "graph_role_tests": {
+    "command": "rtk proxy cargo test --offline --locked -p davinci-coding-agent build_intelligence_tools_follow_role_selection",
+    "exit_code": 0,
+    "passed": 1,
+    "failed": 0
+  },
+  "agent_tests": {
+    "command": "rtk proxy cargo test --offline --locked -p davinci-agent",
+    "exit_code": 0,
+    "passed": 73,
+    "failed": 0,
+    "ignored": 3
+  },
+  "lint_checks": {
+    "fmt": "rtk proxy cargo fmt -p davinci-agent -p davinci-coding-agent --check (exit 0)",
+    "clippy": "rtk proxy cargo clippy --offline --locked -p davinci-agent -p davinci-coding-agent --all-targets -- -D warnings (exit 0)"
+  },
+  "pull_request": {
+    "number": 14,
+    "url": "https://github.com/J12003LPZ/davinci/pull/14",
+    "base": "codex/package-intelligence-01a0ad48",
+    "head": "codex/build-intelligence-01a0ad48"
+  },
+  "ci_verification": {
+    "head_sha": "950ab505d87c3569b693ca21085d2e269080551b",
+    "push_ci_run": "https://github.com/J12003LPZ/davinci/actions/runs/35370012630",
+    "push_sarif_run": "https://github.com/J12003LPZ/davinci/actions/runs/35370012618",
+    "pr_ci_run": "https://github.com/J12003LPZ/davinci/actions/runs/35370058879",
+    "pr_sarif_run": "https://github.com/J12003LPZ/davinci/actions/runs/35370058953",
+    "status": "all green (22/22 jobs on push CI, 22/22 jobs on PR CI, push & PR SARIF success)"
+  }
+}

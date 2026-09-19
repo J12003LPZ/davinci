@@ -1,16 +1,23 @@
 //! Native Rust ports of the bundled pi extensions.
 
+pub mod browser;
+pub mod build_intelligence;
+pub mod change_impact;
 pub mod content_router;
 pub mod ecosystem;
+pub mod git_intelligence;
 pub mod graph;
 pub mod language_intelligence;
 pub mod learning;
+pub mod package_intelligence;
 pub mod repo_intelligence;
 pub mod security_scan;
 pub mod test_impact;
 pub mod token_governor;
 pub mod vector_memory;
+pub mod verification_planner;
 pub mod workspace_metadata;
+pub mod workspace_snapshot;
 
 #[allow(unused_imports)]
 pub use content_router::*;
@@ -37,9 +44,41 @@ use std::path::Path;
 use std::sync::Arc;
 
 pub const NATIVE_TOOLS: &[&str] = &[
+    "browser_open",
+    "browser_snapshot",
+    "browser_click",
+    "browser_type",
+    "browser_select",
+    "browser_console",
+    "browser_network",
+    "browser_accessibility",
+    "browser_screenshot",
+    "browser_close",
     "test_related",
     "test_impacted",
     "test_plan",
+    "package_info",
+    "package_exports",
+    "package_symbol",
+    "package_dependents",
+    "package_why",
+    "workspace_packages",
+    "build_targets",
+    "build_dependencies",
+    "build_affected",
+    "build_command",
+    "git_symbol_history",
+    "git_related_commits",
+    "git_changed_symbols",
+    "git_branch_diff",
+    "git_blame_symbol",
+    "git_commit_context",
+    "git_conflict_explain",
+    "impact_analyze",
+    "verification_plan",
+    "workspace_checkpoint",
+    "workspace_diff",
+    "workspace_restore",
     "repo_map",
     "symbol_search",
     "file_symbols",
@@ -82,6 +121,12 @@ pub const NATIVE_COMMANDS: &[&str] = &[
     "repo-index-status",
     "cache-status",
     "test-impact-status",
+    "package-status",
+    "build-status",
+    "git-status",
+    "impact-status",
+    "verification-status",
+    "workspace-status",
     "lsp-status",
     "memory-status",
     "memory-search",
@@ -107,6 +152,7 @@ pub const NATIVE_COMMANDS: &[&str] = &[
     "learning-reject",
     "skill-list",
     "skill-view",
+    "hook-status",
 ];
 
 /// Metadata shared by the interactive and RPC command discovery surfaces.
@@ -127,6 +173,26 @@ pub fn command_specs() -> Vec<(&'static str, &'static str, Option<&'static str>)
         (
             "test-impact-status",
             "Show test-impact availability and repository observation state.",
+            None,
+        ),
+        (
+            "verification-status",
+            "Show bounded verification-planner limits and planning telemetry.",
+            None,
+        ),
+        (
+            "workspace-status",
+            "Show bounded workspace checkpoint limits and restore telemetry.",
+            None,
+        ),
+        (
+            "package-status",
+            "Show installed dependency resolution status, lockfile kinds, and cache telemetry.",
+            None,
+        ),
+        (
+            "build-status",
+            "Show repository build intelligence status, detected task runners, and cache telemetry.",
             None,
         ),
         (
@@ -200,6 +266,11 @@ pub fn command_specs() -> Vec<(&'static str, &'static str, Option<&'static str>)
             "Read the full content of a skill.",
             Some("<name> [file]"),
         ),
+        (
+            "hook-status",
+            "Show deterministic hook and policy engine diagnostics, trust state, and telemetry.",
+            None,
+        ),
     ]
 }
 
@@ -229,7 +300,14 @@ pub fn graph_worker_context() -> Option<GraphWorkerContext> {
 
 #[derive(Debug, Clone, Default)]
 pub struct NativeExtensionHost {
+    pub browser: browser::BrowserController,
     pub test_impact: test_impact::TestImpact,
+    pub package_intelligence: package_intelligence::PackageIntelligence,
+    pub build_intelligence: build_intelligence::BuildIntelligence,
+    pub git_intelligence: git_intelligence::GitIntelligence,
+    pub change_impact: change_impact::ChangeImpact,
+    pub verification_planner: verification_planner::VerificationPlanner,
+    pub workspace_snapshot: workspace_snapshot::WorkspaceSnapshot,
     pub repo_intelligence: repo_intelligence::RepoIntelligence,
     pub cache: davinci_agent::runtime::cache::CacheRuntime,
     pub language_intelligence: language_intelligence::LanguageIntelligence,
@@ -241,6 +319,7 @@ pub struct NativeExtensionHost {
     pub visual_snapshot: VisualSnapshotHost,
     /// Set by the native visual backend registration path when one exists.
     pub visual_verification_available: bool,
+    pub cwd: std::path::PathBuf,
 }
 
 impl NativeExtensionHost {
@@ -295,6 +374,21 @@ impl NativeExtensionHost {
                 .test_impact
                 .unwrap_or_default(),
         );
+        let package_config = crate::settings::load_merged_settings(&repo_agent_dir, cwd)
+            .package_intelligence
+            .unwrap_or_default();
+        let package_intelligence =
+            package_intelligence::PackageIntelligence::new(cwd, cache.clone(), package_config);
+        let build_config = crate::settings::load_merged_settings(&repo_agent_dir, cwd)
+            .build_intelligence
+            .unwrap_or_default();
+        let build_intelligence =
+            build_intelligence::BuildIntelligence::new(cwd, cache.clone(), build_config);
+        let git_config = crate::settings::load_merged_settings(&repo_agent_dir, cwd)
+            .git_intelligence
+            .unwrap_or_default();
+        let git_intelligence =
+            git_intelligence::GitIntelligence::new(cwd, cache.clone(), git_config);
         let language_config = agent_dir
             .and_then(|dir| crate::settings::load_merged_settings(dir, cwd).language_intelligence)
             .unwrap_or_default();
@@ -302,8 +396,60 @@ impl NativeExtensionHost {
             language_intelligence::LanguageIntelligence::new(cwd, language_config);
         language_intelligence.set_governor(governor.clone());
         graph.language_intelligence = Some(language_intelligence.clone());
+        let change_config = crate::settings::load_merged_settings(&repo_agent_dir, cwd)
+            .change_impact
+            .unwrap_or_default();
+        let change_impact = change_impact::ChangeImpact::new(
+            cwd,
+            cache.clone(),
+            change_config,
+            repo_intelligence.clone(),
+            test_impact.clone(),
+            package_intelligence.clone(),
+            build_intelligence.clone(),
+            git_intelligence.clone(),
+            language_intelligence.clone(),
+        );
+        let repo_intelligence = repo_intelligence.with_semantic_provider(Arc::new(
+            change_impact::LanguageIntelligenceAdapter::new(language_intelligence.clone()),
+        ));
+        let verification_planner_config =
+            crate::settings::load_merged_settings(&repo_agent_dir, cwd)
+                .verification_planner
+                .unwrap_or_default();
+        let verification_planner =
+            verification_planner::VerificationPlanner::new(cwd, verification_planner_config);
+        let workspace_snapshot_config = crate::settings::load_merged_settings(&repo_agent_dir, cwd)
+            .workspace_snapshots
+            .unwrap_or_default();
+        let workspace_snapshot =
+            workspace_snapshot::WorkspaceSnapshot::new(cwd, workspace_snapshot_config);
         Self {
+            browser: browser::BrowserController::new(
+                cwd,
+                agent_dir
+                    .map(|dir| {
+                        let mut config = crate::settings::load_settings(dir)
+                            .browser_verification
+                            .unwrap_or_default();
+                        // Project settings may disable the feature, never select executable/package pins.
+                        if crate::settings::load_merged_settings(dir, cwd)
+                            .browser_verification
+                            .is_some_and(|settings| !settings.enabled)
+                        {
+                            config.enabled = false;
+                        }
+                        config
+                    })
+                    .unwrap_or_default(),
+            ),
             test_impact,
+            package_intelligence,
+            build_intelligence,
+            git_intelligence,
+            change_impact,
+            verification_planner,
+            workspace_snapshot,
             repo_intelligence,
             cache,
             language_intelligence,
@@ -314,6 +460,7 @@ impl NativeExtensionHost {
             learning,
             visual_verification_available: visual_snapshot.is_available(),
             visual_snapshot,
+            cwd: cwd.to_path_buf(),
         }
     }
 
@@ -397,6 +544,9 @@ impl NativeExtensionHost {
 
     /// A background graph run must not outlive the session that started it.
     pub fn session_shutdown(&mut self) {
+        if let Some(processes) = &self.graph.processes {
+            processes.shutdown();
+        }
         self.language_intelligence.shutdown();
         graph::abort_all_runs();
         self.learning.cancel_active_review();
@@ -499,7 +649,28 @@ impl NativeExtensionHost {
         args: &Value,
     ) -> Result<ToolResult, ToolError> {
         match name {
+            name if browser::TOOL_NAMES.contains(&name) => Err(ToolError::Failed(
+                "browser tool requires engine dispatch context".into(),
+            )),
             name if test_impact::TOOL_NAMES.contains(&name) => self.test_impact.execute(name, args),
+            name if package_intelligence::TOOL_NAMES.contains(&name) => {
+                self.package_intelligence.execute_tool(name, args)
+            }
+            name if build_intelligence::TOOL_NAMES.contains(&name) => {
+                self.build_intelligence.execute_tool(name, args)
+            }
+            name if git_intelligence::TOOL_NAMES.contains(&name) => {
+                self.git_intelligence.execute_tool(name, args)
+            }
+            name if change_impact::TOOL_NAMES.contains(&name) => {
+                self.change_impact.execute_tool(name, args)
+            }
+            name if verification_planner::TOOL_NAMES.contains(&name) => {
+                self.verification_planner.execute_tool(name, args)
+            }
+            name if workspace_snapshot::TOOL_NAMES.contains(&name) => {
+                self.workspace_snapshot.execute_tool(name, args)
+            }
             name if repo_intelligence::is_repo_tool(name) => {
                 self.repo_intelligence.execute_tool(name, args)
             }
@@ -550,6 +721,12 @@ impl NativeExtensionHost {
             "repo-index-status" => Ok(Some(self.repo_intelligence.status())),
             "lsp-status" => Ok(Some(self.language_intelligence.status())),
             "test-impact-status" => Ok(Some(self.test_impact.status())),
+            "package-status" => Ok(Some(self.package_intelligence.status())),
+            "build-status" => Ok(Some(self.build_intelligence.status())),
+            "git-status" => Ok(Some(self.git_intelligence.status())),
+            "impact-status" => Ok(Some(self.change_impact.status())),
+            "verification-status" => Ok(Some(self.verification_planner.status())),
+            "workspace-status" => Ok(Some(self.workspace_snapshot.status())),
             "memory-status" => Ok(Some(self.memory.status())),
             "memory-search" => Ok(Some(self.memory.search_text(args))),
             "memory-reindex" => Ok(Some(self.memory.reindex().map_err(|err| err.to_string())?)),
@@ -575,6 +752,14 @@ impl NativeExtensionHost {
             "learning-reject" => self.learning.reject_command(args).map(Some),
             "skill-list" => self.learning.skill_list_command(args).map(Some),
             "skill-view" => self.learning.skill_view_command(args).map(Some),
+            "hook-status" => {
+                let cwd = if self.cwd.as_os_str().is_empty() {
+                    std::env::current_dir().unwrap_or_default()
+                } else {
+                    self.cwd.clone()
+                };
+                Ok(Some(crate::hooks::status_report(&cwd)))
+            }
             name if name.starts_with("graph") => self.graph.command(name, args),
             name if name == "security-scan" || name.starts_with("sec-") => {
                 self.security.command(name, args)
@@ -584,11 +769,32 @@ impl NativeExtensionHost {
     }
 
     pub fn describe_tool(name: &str) -> Option<davinci_ai::ToolSpec> {
+        if browser::TOOL_NAMES.contains(&name) {
+            return browser::tool_spec(name);
+        }
         if repo_intelligence::is_repo_tool(name) {
             return repo_intelligence::tool_spec(name);
         }
         if test_impact::TOOL_NAMES.contains(&name) {
             return test_impact::tool_spec(name);
+        }
+        if package_intelligence::TOOL_NAMES.contains(&name) {
+            return package_intelligence::tool_spec(name);
+        }
+        if build_intelligence::TOOL_NAMES.contains(&name) {
+            return build_intelligence::tool_spec(name);
+        }
+        if git_intelligence::TOOL_NAMES.contains(&name) {
+            return git_intelligence::tool_spec(name);
+        }
+        if change_impact::TOOL_NAMES.contains(&name) {
+            return change_impact::tool_spec(name);
+        }
+        if verification_planner::TOOL_NAMES.contains(&name) {
+            return verification_planner::tool_spec(name);
+        }
+        if workspace_snapshot::TOOL_NAMES.contains(&name) {
+            return workspace_snapshot::tool_spec(name);
         }
         if language_intelligence::TOOL_NAMES.contains(&name) {
             return language_intelligence::tool_spec(name);

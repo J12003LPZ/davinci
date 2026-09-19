@@ -36,6 +36,8 @@ pub(super) fn requires_task_coordinator(tool: &str) -> bool {
         tool,
         "task_create" | "task_update" | "task_list" | "task_get"
     ) || crate::native_extensions::language_intelligence::TOOL_NAMES.contains(&tool)
+        || davinci_agent::tools::is_managed_process_tool(tool)
+        || crate::native_extensions::browser::TOOL_NAMES.contains(&tool)
 }
 
 pub use crate::native_extensions::token_governor::ensure_governor_recovery_tool;
@@ -60,6 +62,12 @@ pub fn role_tools(role: Role) -> Vec<String> {
         Role::Writer => {
             let mut tools = READ_TOOLS.to_vec();
             tools.extend_from_slice(&["bash", "edit", "write", GRAPH_SUBMIT_TOOL, "tool_search"]);
+            tools.extend_from_slice(&[
+                "patch_preview",
+                "patch_apply",
+                "patch_status",
+                "patch_rollback",
+            ]);
             tools
         }
     };
@@ -75,12 +83,88 @@ pub fn role_tools(role: Role) -> Vec<String> {
     tools.extend(semantic.iter().map(|name| (*name).to_string()));
     if matches!(
         role,
+        Role::Researcher | Role::Planner | Role::TestAnalyzer | Role::Writer | Role::Reviewer
+    ) {
+        tools.extend(
+            crate::native_extensions::package_intelligence::TOOL_NAMES
+                .iter()
+                .map(|name| (*name).to_string()),
+        );
+        tools.extend(
+            crate::native_extensions::build_intelligence::TOOL_NAMES
+                .iter()
+                .map(|name| (*name).to_string()),
+        );
+    }
+    if matches!(
+        role,
+        Role::Historian
+            | Role::Researcher
+            | Role::Planner
+            | Role::TestAnalyzer
+            | Role::Writer
+            | Role::Reviewer
+    ) {
+        tools.extend(
+            crate::native_extensions::git_intelligence::TOOL_NAMES
+                .iter()
+                .map(|name| (*name).to_string()),
+        );
+    }
+    if matches!(
+        role,
+        Role::Planner | Role::Reviewer | Role::Researcher | Role::Writer | Role::TestAnalyzer
+    ) {
+        tools.extend(
+            crate::native_extensions::change_impact::TOOL_NAMES
+                .iter()
+                .map(|name| (*name).to_string()),
+        );
+    }
+    if matches!(
+        role,
         Role::Planner | Role::TestAnalyzer | Role::Writer | Role::Reviewer
     ) {
         tools.extend(
             crate::native_extensions::test_impact::TOOL_NAMES
                 .iter()
                 .map(|name| (*name).to_string()),
+        );
+        tools.extend(
+            crate::native_extensions::verification_planner::TOOL_NAMES
+                .iter()
+                .map(|name| (*name).to_string()),
+        );
+    }
+    if matches!(
+        role,
+        Role::Historian
+            | Role::Researcher
+            | Role::Planner
+            | Role::TestAnalyzer
+            | Role::Writer
+            | Role::Reviewer
+    ) {
+        tools.push("workspace_diff".to_string());
+    }
+    if matches!(role, Role::Writer) {
+        tools.extend(["workspace_checkpoint", "workspace_restore"].map(str::to_string));
+    }
+    if matches!(role, Role::Writer | Role::TestAnalyzer) {
+        tools.extend(
+            crate::native_extensions::browser::TOOL_NAMES
+                .iter()
+                .map(|name| (*name).to_string()),
+        );
+        tools.extend(
+            [
+                "process_start",
+                "process_status",
+                "process_output",
+                "process_stop",
+                "process_list",
+            ]
+            .map(str::to_string),
         );
     }
     ensure_governor_recovery_tool(&mut tools);
@@ -167,15 +251,7 @@ pub fn is_bash_command_allowed(policy: BashPolicy, command: &str) -> BashDecisio
     if command.trim().is_empty() {
         return BashDecision::Blocked("empty command".into());
     }
-    let profile = match policy {
-        BashPolicy::None => davinci_agent::shell_policy::ShellPolicyProfile::None,
-        BashPolicy::ReadOnly => davinci_agent::shell_policy::ShellPolicyProfile::ReadOnly,
-        BashPolicy::ReadAndTest => davinci_agent::shell_policy::ShellPolicyProfile::ReadAndTest,
-        BashPolicy::WriteNoGitMutation => {
-            davinci_agent::shell_policy::ShellPolicyProfile::WriteNoGitMutation
-        }
-    };
-    match davinci_agent::shell_policy::evaluate(profile, command) {
+    match davinci_agent::shell_policy::evaluate(shell_profile(policy), command) {
         davinci_agent::shell_policy::ShellCommandDecision::Allowed => BashDecision::Allowed,
         davinci_agent::shell_policy::ShellCommandDecision::Denied { reason }
         | davinci_agent::shell_policy::ShellCommandDecision::NeedsApproval { reason } => {
@@ -184,9 +260,44 @@ pub fn is_bash_command_allowed(policy: BashPolicy, command: &str) -> BashDecisio
     }
 }
 
+pub(super) fn shell_profile(policy: BashPolicy) -> davinci_agent::shell_policy::ShellPolicyProfile {
+    match policy {
+        BashPolicy::None => davinci_agent::shell_policy::ShellPolicyProfile::None,
+        BashPolicy::ReadOnly => davinci_agent::shell_policy::ShellPolicyProfile::ReadOnly,
+        BashPolicy::ReadAndTest => davinci_agent::shell_policy::ShellPolicyProfile::ReadAndTest,
+        BashPolicy::WriteNoGitMutation => {
+            davinci_agent::shell_policy::ShellPolicyProfile::WriteNoGitMutation
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn browser_tools_require_parent_transport_and_remain_role_scoped_and_deferred() {
+        for tool in crate::native_extensions::browser::TOOL_NAMES {
+            assert!(requires_task_coordinator(tool), "{tool}");
+            for role in [Role::Writer, Role::TestAnalyzer] {
+                let authorized = role_tools(role);
+                assert!(authorized.contains(&tool.to_string()), "{role:?}: {tool}");
+                assert!(!initial_worker_tools(role, &authorized).contains(&tool.to_string()));
+            }
+            for role in [
+                Role::Classifier,
+                Role::Researcher,
+                Role::Planner,
+                Role::Historian,
+                Role::Reviewer,
+            ] {
+                assert!(
+                    !role_tools(role).contains(&tool.to_string()),
+                    "{role:?}: {tool}"
+                );
+            }
+        }
+    }
 
     #[test]
     fn semantic_tools_require_parent_authority_and_follow_role_selection() {
@@ -200,6 +311,111 @@ mod tests {
         assert!(!requires_task_coordinator("read"));
     }
 
+    #[test]
+    fn package_intelligence_tools_follow_role_selection() {
+        for name in crate::native_extensions::package_intelligence::TOOL_NAMES {
+            assert!(!requires_task_coordinator(name));
+            assert!(role_tools(Role::Researcher).contains(&name.to_string()));
+            assert!(role_tools(Role::Planner).contains(&name.to_string()));
+            assert!(role_tools(Role::Writer).contains(&name.to_string()));
+            assert!(role_tools(Role::Reviewer).contains(&name.to_string()));
+            assert!(role_tools(Role::TestAnalyzer).contains(&name.to_string()));
+            assert!(!role_tools(Role::Classifier).contains(&name.to_string()));
+        }
+    }
+
+    #[test]
+    fn build_intelligence_tools_follow_role_selection() {
+        for name in crate::native_extensions::build_intelligence::TOOL_NAMES {
+            assert!(!requires_task_coordinator(name));
+            assert!(role_tools(Role::Researcher).contains(&name.to_string()));
+            assert!(role_tools(Role::Planner).contains(&name.to_string()));
+            assert!(role_tools(Role::Writer).contains(&name.to_string()));
+            assert!(role_tools(Role::Reviewer).contains(&name.to_string()));
+            assert!(role_tools(Role::TestAnalyzer).contains(&name.to_string()));
+            assert!(!role_tools(Role::Classifier).contains(&name.to_string()));
+        }
+    }
+
+    #[test]
+    fn git_intelligence_tools_follow_role_selection() {
+        for name in crate::native_extensions::git_intelligence::TOOL_NAMES {
+            assert!(!requires_task_coordinator(name));
+            assert!(role_tools(Role::Historian).contains(&name.to_string()));
+            assert!(role_tools(Role::Researcher).contains(&name.to_string()));
+            assert!(role_tools(Role::Planner).contains(&name.to_string()));
+            assert!(role_tools(Role::Writer).contains(&name.to_string()));
+            assert!(role_tools(Role::Reviewer).contains(&name.to_string()));
+            assert!(role_tools(Role::TestAnalyzer).contains(&name.to_string()));
+            assert!(!role_tools(Role::Classifier).contains(&name.to_string()));
+        }
+    }
+
+    #[test]
+    fn change_impact_tools_follow_role_selection() {
+        for name in crate::native_extensions::change_impact::TOOL_NAMES {
+            assert!(!requires_task_coordinator(name));
+            assert!(role_tools(Role::Planner).contains(&name.to_string()));
+            assert!(role_tools(Role::Reviewer).contains(&name.to_string()));
+            assert!(role_tools(Role::Researcher).contains(&name.to_string()));
+            assert!(role_tools(Role::Writer).contains(&name.to_string()));
+            assert!(role_tools(Role::TestAnalyzer).contains(&name.to_string()));
+            assert!(!role_tools(Role::Classifier).contains(&name.to_string()));
+        }
+    }
+
+    #[test]
+    fn verification_planner_is_read_only_and_denied_to_classifier() {
+        for name in crate::native_extensions::verification_planner::TOOL_NAMES {
+            assert!(!requires_task_coordinator(name));
+            for role in [
+                Role::Planner,
+                Role::TestAnalyzer,
+                Role::Writer,
+                Role::Reviewer,
+            ] {
+                assert!(role_tools(role).contains(&name.to_string()));
+            }
+            assert!(!role_tools(Role::Classifier).contains(&name.to_string()));
+            assert!(!role_tools(Role::Historian).contains(&name.to_string()));
+            assert_eq!(
+                davinci_agent::tool_class(name),
+                davinci_agent::ToolClass::Read
+            );
+        }
+    }
+
+    #[test]
+    fn workspace_snapshots_keep_restore_authority_with_writer() {
+        for role in [
+            Role::Historian,
+            Role::Researcher,
+            Role::Planner,
+            Role::TestAnalyzer,
+            Role::Reviewer,
+        ] {
+            assert!(role_tools(role).contains(&"workspace_diff".to_string()));
+            assert!(!role_tools(role).contains(&"workspace_checkpoint".to_string()));
+            assert!(!role_tools(role).contains(&"workspace_restore".to_string()));
+        }
+        assert!(role_tools(Role::Writer).contains(&"workspace_diff".to_string()));
+        assert!(role_tools(Role::Writer).contains(&"workspace_checkpoint".to_string()));
+        assert!(role_tools(Role::Writer).contains(&"workspace_restore".to_string()));
+        assert!(!role_tools(Role::Classifier).iter().any(|name| {
+            name == "workspace_diff"
+                || name == "workspace_checkpoint"
+                || name == "workspace_restore"
+        }));
+        assert_eq!(
+            davinci_agent::tool_class("workspace_checkpoint"),
+            davinci_agent::ToolClass::Read
+        );
+        assert_eq!(
+            davinci_agent::tool_class("workspace_restore"),
+            davinci_agent::ToolClass::Edit
+        );
+    }
+
     fn allowed(policy: BashPolicy, command: &str) -> bool {
         is_bash_command_allowed(policy, command) == BashDecision::Allowed
     }
@@ -207,6 +423,17 @@ mod tests {
     #[test]
     fn only_the_writer_may_mutate_files() {
         assert!(role_tools(Role::Writer).iter().any(|tool| tool == "write"));
+        for name in [
+            "patch_preview",
+            "patch_apply",
+            "patch_status",
+            "patch_rollback",
+        ] {
+            assert!(role_tools(Role::Writer).contains(&name.to_string()));
+            for role in Role::ALL.iter().filter(|role| **role != Role::Writer) {
+                assert!(!role_tools(*role).contains(&name.to_string()));
+            }
+        }
         for role in Role::ALL.iter().filter(|role| **role != Role::Writer) {
             let tools = role_tools(*role);
             assert!(!tools.iter().any(|tool| tool == "write" || tool == "edit"));

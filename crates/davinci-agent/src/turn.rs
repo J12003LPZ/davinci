@@ -1186,6 +1186,7 @@ impl Agent {
         args: &Value,
         depth: usize,
     ) -> crate::ToolResult {
+        let dispatch_permit = self.approval_registry.take_dispatch(id);
         if let Err(violation) = self.check_contract_gate(cwd, id, name, args) {
             if let Ok(mut ledger) = self.tool_ledger.lock() {
                 ledger.cancel_reservation(id);
@@ -1334,34 +1335,65 @@ impl Agent {
                 .map(|c| c.task_id)
                 .unwrap_or_default();
 
-            let preimages: Vec<crate::runtime::checkpoints::FileCapture> = if mutating {
-                if let Some(runtime) = &self.runtime {
-                    targets
-                        .iter()
-                        .filter_map(|target| {
-                            runtime.blob_store.capture_file(task_id, cwd, target).ok()
-                        })
-                        .collect()
+            let coordinated = crate::tools::is_coordinated_mutation(name);
+            let preimages: Vec<crate::runtime::checkpoints::FileCapture> =
+                if mutating && !coordinated {
+                    if let Some(runtime) = &self.runtime {
+                        targets
+                            .iter()
+                            .filter_map(|target| {
+                                runtime.blob_store.capture_file(task_id, cwd, target).ok()
+                            })
+                            .collect()
+                    } else {
+                        Vec::new()
+                    }
                 } else {
                     Vec::new()
-                }
-            } else {
-                Vec::new()
-            };
+                };
 
             // The tool sees the turn's abort flag so a long shell command
             // or a `job_output` wait ends when the user interrupts.
             let mut context = self.tool_context.clone();
+            context.command_receipt =
+                matches!(name, "bash" | "powershell" | "exec_command").then(|| {
+                    crate::command_receipt::CommandReceiptCapture::new(
+                        id,
+                        name,
+                        self.active_contract().map(|contract| contract.task_id),
+                    )
+                });
+            context.dispatch_permit = dispatch_permit;
+            context.mutation_attempted =
+                std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            if coordinated || crate::runtime::transactions::is_tool(name) {
+                context.mutation_authority = Some(
+                    crate::runtime::transactions::MutationAuthority::for_dispatch(
+                        cwd,
+                        name,
+                        args,
+                        self.permissions.clone(),
+                        context.active_contract.clone(),
+                        context.dispatch_permit.clone(),
+                    ),
+                );
+            }
             context.abort = self
                 .runtime
                 .as_ref()
                 .map(|rt| rt.cancellation_token.as_atomic_bool())
                 .or_else(|| self.abort_signal.clone());
+            self.begin_transaction_verification(cwd, id, name, args, &context);
+            if context.command_receipt.is_some() {
+                if let Ok(mut receipts) = self.command_receipts.lock() {
+                    receipts.retain(|receipt| receipt.operation_id != id);
+                }
+            }
             let executed = match execute_tool_with(cwd, name, args, &context) {
                 Ok(result) => result,
                 Err(crate::tools::ToolError::Unknown(_)) => {
                     if let Some(executor) = &self.custom_tool_executor {
-                        match executor.execute(cwd, name, args) {
+                        match executor.execute_with_context(cwd, name, args, &context) {
                             Ok(result) => result,
                             Err(err) => crate::ToolResult {
                                 content: err.to_string(),
@@ -1384,6 +1416,28 @@ impl Agent {
                 },
             };
 
+            if let Some(receipt) = context
+                .command_receipt
+                .as_ref()
+                .and_then(|capture| capture.take())
+            {
+                if let Ok(mut receipts) = self.command_receipts.lock() {
+                    receipts.retain(|previous| previous.operation_id != id);
+                    if receipts.len() >= 128 {
+                        receipts.pop_front();
+                    }
+                    receipts.push_back(receipt);
+                }
+            }
+            if coordinated
+                && executed.is_error
+                && context
+                    .mutation_attempted
+                    .load(std::sync::atomic::Ordering::Acquire)
+            {
+                // A failed or conflicted recovery may still have changed a subset of files.
+                self.record_successful_mutation_paths(mutation_paths_from_tool(name, args));
+            }
             if mutating && !executed.is_error {
                 if let Some(runtime) = &self.runtime {
                     for pre in preimages {
@@ -1445,7 +1499,7 @@ impl Agent {
                 ledger.record_completion(id, &outcome.content, false);
             }
         }
-        if matches!(name, "write" | "edit" | "apply_patch" | "notebook_edit") && !outcome.is_error {
+        if crate::tools::is_coordinated_mutation(name) && !outcome.is_error {
             crate::stats::SharedCounters::add(&self.counters.files_changed_count, 1);
         }
         if matches!(name, "bash" | "powershell" | "exec_command") {
@@ -1515,10 +1569,7 @@ impl Agent {
             }
         }
         if !replayed {
-            if matches!(name, "write" | "edit" | "apply_patch" | "notebook_edit")
-                && !pre_hook_error
-                && !result.is_error
-            {
+            if crate::tools::is_coordinated_mutation(name) && !pre_hook_error && !result.is_error {
                 self.record_successful_mutation_paths(mutation_paths_from_tool(name, args));
             }
             if matches!(name, "bash" | "powershell" | "exec_command") {
@@ -1532,7 +1583,30 @@ impl Agent {
             }
         }
         let hook_vetoed = !pre_hook_error && result.is_error;
+        if !replayed {
+            if let Ok(mut receipts) = self.command_receipts.lock() {
+                if let Some(receipt) = receipts
+                    .iter_mut()
+                    .find(|receipt| receipt.operation_id == id)
+                {
+                    receipt.hook_vetoed |= hook_vetoed;
+                }
+            }
+        }
         self.record_receipt(cwd, id, name, args, &pre_hook_result, &result, hook_vetoed);
+        if !replayed {
+            let verification =
+                self.finish_transaction_verification(id, !pre_hook_error && !result.is_error);
+            if !verification.is_empty() {
+                let details = result.details.get_or_insert_with(|| serde_json::json!({}));
+                if let Some(details) = details.as_object_mut() {
+                    details.insert(
+                        "transaction_verification".into(),
+                        serde_json::json!(verification),
+                    );
+                }
+            }
+        }
         self.emit_tool_result(id, name, args, result)
     }
 
@@ -1766,6 +1840,8 @@ impl Agent {
     /// block there wins) and after the unknown-tool check (nobody is asked
     /// about a tool that does not exist).
     fn permission_denial(&self, cwd: &Path, id: &str, name: &str, args: &Value) -> Option<String> {
+        // A new preparation supersedes any abandoned consent for this call ID.
+        self.approval_registry.take_dispatch(id);
         // Asking for user intent is a host interaction, not a repository or
         // global-permission grant. The operations selected later still pass
         // the normal permission and task-contract gates.
@@ -1898,7 +1974,17 @@ impl Agent {
                     PermissionVerdict::Ask(current) if current == request => {
                         let current_digest = self.approval_registry.digest(&current, cwd, self.runtime.as_ref());
                         match pending.resolve(&reply, &current_digest, policy.revision(), davinci_session::now_ms()) {
-                            Ok(crate::approval::GrantScope::Once) => None,
+                            Ok(crate::approval::GrantScope::Once) => {
+                                if crate::tools::is_managed_process_tool(name)
+                                    || crate::tools::is_coordinated_mutation(name)
+                                    || crate::runtime::transactions::is_tool(name)
+                                    || (!crate::tools::BUILTIN_TOOLS.contains(&name)
+                                        && self.custom_tool_executor.as_ref().is_some_and(|executor| executor.requires_context))
+                                {
+                                    self.approval_registry.retain_dispatch(&request, cwd, &self.permissions, revision)
+                                        .err().map(|reason| format!("Permission denied: {reason}."))
+                                } else { None }
+                            },
                             Ok(crate::approval::GrantScope::Session | crate::approval::GrantScope::Project) => {
                                 policy.remember(&request.session_rule);
                                 None
@@ -2326,6 +2412,13 @@ fn sleep_retry_delay(delay_ms: u64, cancelled: impl Fn() -> bool) {
 
 pub(crate) fn mutation_paths_from_tool(name: &str, args: &Value) -> Vec<PathBuf> {
     let mut paths = Vec::new();
+    if matches!(name, "patch_apply" | "patch_rollback") {
+        paths.extend(
+            crate::runtime::contracts::extract_tool_targets(name, args)
+                .into_iter()
+                .map(PathBuf::from),
+        );
+    }
     for key in ["path", "file_path", "notebook_path"] {
         if let Some(value) = args.get(key).and_then(Value::as_str) {
             let path = PathBuf::from(value);
@@ -2715,6 +2808,58 @@ mod tests {
                 !agent.permissions.lock().unwrap().session_allow.is_empty(),
                 case == "unchanged_session"
             );
+        }
+    }
+
+    #[test]
+    fn transaction_preimage_approval_is_bound_to_normal_dispatch() {
+        for case in ["deny", "once", "revoke"] {
+            let dir = tempdir().unwrap();
+            std::fs::write(dir.path().join(".env"), "fixture-before").unwrap();
+            let mut agent = Agent::new("offline transaction approval fixture");
+            agent.tools = vec!["write".into()];
+            let mut policy = crate::PermissionPolicy::new(crate::PermissionMode::Edits);
+            policy.allow.push(crate::PermissionRule::bare("write"));
+            agent.permissions = Arc::new(crate::PermissionState::new(policy));
+            let policy = agent.permissions.clone();
+            let approvals = Arc::new(AtomicUsize::new(0));
+            let observed = approvals.clone();
+            agent.approver = Some(crate::ToolApprover(Arc::new(move |request| {
+                observed.fetch_add(1, Ordering::SeqCst);
+                assert_eq!(request.tool, "write");
+                if case == "revoke" {
+                    policy
+                        .lock()
+                        .unwrap()
+                        .deny
+                        .push(crate::PermissionRule::bare("read"));
+                }
+                if case == "deny" {
+                    crate::ToolApprovalDecision::Deny
+                } else {
+                    crate::ToolApprovalDecision::AllowOnce
+                }
+            })));
+            let args = json!({"path":".env", "content":"fixture-after"});
+            match agent.prepare_tool_call(dir.path(), "preimage-call", "write", &args, 0) {
+                Preparation::Ready { .. } if case == "once" => {
+                    let result =
+                        agent.run_prepared_call(dir.path(), "preimage-call", "write", &args, 0);
+                    assert!(!result.is_error, "{}", result.content);
+                }
+                Preparation::Immediate(result) if case != "once" => assert!(result.is_error),
+                _ => panic!("unexpected compound approval result for {case}"),
+            }
+            assert_eq!(approvals.load(Ordering::SeqCst), 1);
+            assert_eq!(
+                std::fs::read_to_string(dir.path().join(".env")).unwrap(),
+                if case == "once" {
+                    "fixture-after"
+                } else {
+                    "fixture-before"
+                }
+            );
+            assert!(agent.permissions.lock().unwrap().session_allow.is_empty());
         }
     }
 
@@ -3520,6 +3665,466 @@ mod tests {
         assert!(dispatch.is_error);
         assert!(dispatch.content.contains("review-only"));
         assert!(!dir.path().join("dispatch.rs").exists());
+    }
+
+    #[test]
+    fn normal_command_verifies_transaction_only_after_unchanged_source_and_hooks() {
+        for outcome in [
+            "pass",
+            "resumed",
+            "no-runtime",
+            "no-supervisor",
+            "stale",
+            "veto",
+            "uncompiled",
+            "denied",
+            "revoked",
+        ] {
+            let root = tempfile::tempdir().unwrap();
+            std::fs::create_dir(root.path().join("src")).unwrap();
+            std::fs::write(root.path().join("Cargo.toml"), "[package]\nname='transaction_fixture'\nversion='0.1.0'\nedition='2021'\n[workspace]\n").unwrap();
+            let runtime = crate::RuntimeHandle::new(
+                crate::RunId::new(),
+                crate::AgentId::new(),
+                crate::RuntimeBus::new(),
+            )
+            .with_session("verified-normal");
+            let mut agent = Agent::new("normal transaction verification").with_runtime(runtime);
+            if outcome == "no-runtime" {
+                agent = Agent::new("normal transaction verification");
+            }
+            agent.permissions = std::sync::Arc::new(crate::PermissionState::new(
+                crate::PermissionPolicy::new(crate::PermissionMode::AlwaysApprove),
+            ));
+            let path = if outcome == "uncompiled" {
+                std::fs::write(root.path().join("src/lib.rs"), "pub fn untouched() {}\n").unwrap();
+                "src/uncompiled.rs"
+            } else {
+                "src/lib.rs"
+            };
+            let args = serde_json::json!({"path":path, "content":"pub fn value() -> u8 { 1 }\n"});
+            assert!(matches!(
+                agent.prepare_tool_call(root.path(), "edit", "write", &args, 0),
+                Preparation::Ready { .. }
+            ));
+            let edited = agent.run_prepared_call(root.path(), "edit", "write", &args, 0);
+            assert!(!edited.is_error, "{}", edited.content);
+            let id = edited.details.as_ref().unwrap()["transaction"]["id"].clone();
+            agent.finalize_tool_call(root.path(), "edit", "write", &args, edited);
+            if outcome == "resumed" {
+                let permissions = agent.permissions.clone();
+                agent = Agent::new("resumed transaction verification").with_runtime(
+                    crate::RuntimeHandle::new(
+                        crate::RunId::new(),
+                        crate::AgentId::new(),
+                        crate::RuntimeBus::new(),
+                    )
+                    .with_session("verified-normal"),
+                );
+                agent.permissions = permissions;
+            }
+            if outcome == "denied" {
+                agent
+                    .permissions
+                    .lock()
+                    .unwrap()
+                    .deny
+                    .push(crate::PermissionRule::bare("read"));
+            }
+            if outcome != "no-supervisor" {
+                agent.tool_context.foreground_supervisor =
+                    Some(crate::command_receipt::test_supervisor());
+            }
+            let command = serde_json::json!({"command":"cargo check --workspace --offline --quiet --message-format=json"});
+            assert!(matches!(
+                agent.prepare_tool_call(root.path(), "check", "exec_command", &command, 0),
+                Preparation::Ready { .. }
+            ));
+            let checked =
+                agent.run_prepared_call(root.path(), "check", "exec_command", &command, 0);
+            assert!(!checked.is_error, "{}", checked.content);
+            if outcome == "revoked" {
+                agent
+                    .permissions
+                    .lock()
+                    .unwrap()
+                    .deny
+                    .push(crate::PermissionRule::bare("read"));
+            }
+            if outcome == "stale" {
+                std::fs::write(
+                    root.path().join("src/lib.rs"),
+                    "pub fn value() -> u8 { 2 }\n",
+                )
+                .unwrap();
+            }
+            if outcome == "veto" {
+                agent.post_tool = Some(crate::PostToolHook(std::sync::Arc::new(
+                    |_, _, _, _, mut result| {
+                        result.is_error = true;
+                        result
+                    },
+                )));
+            }
+            agent.finalize_tool_call(root.path(), "check", "exec_command", &command, checked);
+            agent.post_tool = None;
+            agent.permissions.lock().unwrap().deny.clear();
+            let status = agent.run_prepared_call(
+                root.path(),
+                "status",
+                "patch_status",
+                &serde_json::json!({"id":id, "paths":[path]}),
+                0,
+            );
+            assert!(!status.is_error, "{}", status.content);
+            assert_eq!(
+                status.details.unwrap()["transaction"]["state"],
+                if matches!(outcome, "pass" | "resumed" | "no-runtime") {
+                    "verified"
+                } else {
+                    "applied"
+                },
+                "{outcome}"
+            );
+        }
+    }
+
+    #[test]
+    fn actual_command_receipt_survives_decoration_with_hook_veto() {
+        let root = tempfile::tempdir().unwrap();
+        let mut agent = Agent::new("receipt fixture");
+        agent.tool_context.foreground_supervisor = Some(crate::command_receipt::test_supervisor());
+        agent.permissions = std::sync::Arc::new(crate::PermissionState::new(
+            crate::PermissionPolicy::new(crate::PermissionMode::AlwaysApprove),
+        ));
+        let args = serde_json::json!({"command":"exit 0"});
+        assert!(matches!(
+            agent.prepare_tool_call(root.path(), "actual", "exec_command", &args, 0),
+            Preparation::Ready { .. }
+        ));
+        let result = agent.run_prepared_call(root.path(), "actual", "exec_command", &args, 0);
+        assert!(!result.is_error, "{}", result.content);
+        assert!(agent.command_receipts.lock().unwrap()[0].is_passed());
+        agent.post_tool = Some(crate::PostToolHook(std::sync::Arc::new(|_, _, _, _, _| {
+            crate::ToolResult {
+                content: "hook veto".into(),
+                is_error: true,
+                details: None,
+            }
+        })));
+        agent.finalize_tool_call(root.path(), "actual", "exec_command", &args, result);
+        let receipts = agent.command_receipts.lock().unwrap();
+        assert_eq!(receipts[0].exit_code, Some(0));
+        assert!(receipts[0].hook_vetoed);
+        assert!(!receipts[0].is_passed());
+        drop(receipts);
+        agent.finalize_tool_call(
+            root.path(),
+            "fabricated",
+            "exec_command",
+            &args,
+            crate::ToolResult {
+                content: "passed".into(),
+                is_error: false,
+                details: Some(serde_json::json!({"exitCode":0, "started":true})),
+            },
+        );
+        assert_eq!(agent.command_receipts.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn transactional_normal_dispatch_publishes_exact_effects_and_invalidates_evidence() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("a.txt"), b"before").unwrap();
+        let runtime = crate::RuntimeHandle::new(
+            crate::RunId::new(),
+            crate::AgentId::new(),
+            crate::RuntimeBus::new(),
+        )
+        .with_session("transaction-normal");
+        let mut agent = Agent::new("transaction fixture").with_runtime(runtime.clone());
+        agent.permissions = std::sync::Arc::new(crate::PermissionState::new(
+            crate::PermissionPolicy::new(crate::PermissionMode::Edits),
+        ));
+        let args = serde_json::json!({"path":"a.txt","content":"after"});
+        assert!(matches!(
+            agent.prepare_tool_call(root.path(), "txn-normal", "write", &args, 0),
+            Preparation::Ready { .. }
+        ));
+        let result = agent.run_prepared_call(root.path(), "txn-normal", "write", &args, 0);
+        assert!(!result.is_error, "{}", result.content);
+        let summary = &result.details.as_ref().unwrap()["transaction"];
+        let id = summary["id"].as_str().unwrap();
+        assert_eq!(summary["owner"]["session_id"], "transaction-normal");
+        let effects = runtime.effect_ledger.read().unwrap();
+        assert_eq!(effects.len(), 1);
+        assert_eq!(effects[0].operation_id, id);
+        assert_eq!(effects[0].actor, runtime.agent_id);
+        assert_eq!(
+            runtime
+                .blob_store
+                .get_blob(effects[0].before_blob.as_deref().unwrap())
+                .unwrap(),
+            b"before"
+        );
+        assert_eq!(
+            runtime
+                .blob_store
+                .get_blob(effects[0].after_blob.as_deref().unwrap())
+                .unwrap(),
+            b"after"
+        );
+        drop(effects);
+        let before = agent.mutation_verification_state().mutation_generation;
+        agent.finalize_tool_call(root.path(), "txn-normal", "write", &args, result);
+        assert!(agent.mutation_verification_state().mutation_generation > before);
+    }
+
+    #[test]
+    fn transactional_normal_patch_authorizes_every_parsed_target() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("a.txt"), "before\n").unwrap();
+        let mut agent = Agent::new("transaction patch fixture");
+        agent.permissions = std::sync::Arc::new(crate::PermissionState::new(
+            crate::PermissionPolicy::new(crate::PermissionMode::Edits),
+        ));
+        let args = serde_json::json!({"input":"*** Begin Patch\n*** Update File: a.txt\n@@\n-before\n+after\n*** Add File: b.txt\n+new\n*** End Patch"});
+        assert!(matches!(
+            agent.prepare_tool_call(root.path(), "txn-patch", "apply_patch", &args, 0),
+            Preparation::Ready { .. }
+        ));
+        let result = agent.run_prepared_call(root.path(), "txn-patch", "apply_patch", &args, 0);
+        assert!(!result.is_error, "{}", result.content);
+        assert_eq!(
+            std::fs::read(root.path().join("a.txt")).unwrap(),
+            b"after\n"
+        );
+        assert_eq!(std::fs::read(root.path().join("b.txt")).unwrap(), b"new\n");
+        assert_eq!(
+            result.details.unwrap()["transaction"]["affected_files"],
+            serde_json::json!(["a.txt", "b.txt"])
+        );
+    }
+
+    #[test]
+    fn transactional_explicit_dispatch_checks_paths_policy_and_rollback_effects() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("a.txt"), "before\n").unwrap();
+        let runtime = crate::RuntimeHandle::new(
+            crate::RunId::new(),
+            crate::AgentId::new(),
+            crate::RuntimeBus::new(),
+        );
+        let mut agent = Agent::new("explicit transaction fixture").with_runtime(runtime.clone());
+        agent.permissions = std::sync::Arc::new(crate::PermissionState::new(
+            crate::PermissionPolicy::new(crate::PermissionMode::Edits),
+        ));
+        let preview_args = serde_json::json!({"input":"*** Begin Patch\n*** Update File: a.txt\n@@\n-before\n+after\n*** End Patch"});
+        assert!(matches!(
+            agent.prepare_tool_call(root.path(), "preview", "patch_preview", &preview_args, 0),
+            Preparation::Ready { .. }
+        ));
+        let preview =
+            agent.run_prepared_call(root.path(), "preview", "patch_preview", &preview_args, 0);
+        assert!(!preview.is_error, "{}", preview.content);
+        let id = preview.details.unwrap()["transaction"]["id"].clone();
+        let args = serde_json::json!({"id":id, "paths":["a.txt"]});
+        let other = serde_json::json!({"id":id, "paths":["other.txt"]});
+        assert!(matches!(
+            agent.prepare_tool_call(root.path(), "wrong", "patch_apply", &other, 0),
+            Preparation::Ready { .. }
+        ));
+        assert!(
+            agent
+                .run_prepared_call(root.path(), "wrong", "patch_apply", &other, 0)
+                .is_error
+        );
+        assert!(matches!(
+            agent.prepare_tool_call(root.path(), "revoked", "patch_apply", &args, 0),
+            Preparation::Ready { .. }
+        ));
+        agent.set_permission_mode(crate::PermissionMode::ReadOnly);
+        assert!(
+            agent
+                .run_prepared_call(root.path(), "revoked", "patch_apply", &args, 0)
+                .is_error
+        );
+        assert_eq!(
+            std::fs::read(root.path().join("a.txt")).unwrap(),
+            b"before\n"
+        );
+        agent.set_permission_mode(crate::PermissionMode::Edits);
+        for (call, name) in [("apply", "patch_apply"), ("rollback", "patch_rollback")] {
+            // Rollback is destructive and asks even in Edits mode. The fixture
+            // exercises the host's explicit AlwaysApprove mode for that action.
+            if name == "patch_rollback" {
+                agent.set_permission_mode(crate::PermissionMode::AlwaysApprove);
+            }
+            assert!(matches!(
+                agent.prepare_tool_call(root.path(), call, name, &args, 0),
+                Preparation::Ready { .. }
+            ));
+            let result = agent.run_prepared_call(root.path(), call, name, &args, 0);
+            assert!(!result.is_error, "{}", result.content);
+            agent.finalize_tool_call(root.path(), call, name, &args, result);
+        }
+        assert_eq!(
+            std::fs::read(root.path().join("a.txt")).unwrap(),
+            b"before\n"
+        );
+        let effects = runtime.effect_ledger.read().unwrap();
+        assert_eq!(effects.len(), 2);
+        assert_eq!(effects[0].after_blob, effects[1].before_blob);
+        assert_eq!(effects[0].before_blob, effects[1].after_blob);
+        assert_eq!(agent.mutation_verification_state().mutation_generation, 2);
+    }
+
+    #[test]
+    fn normal_transaction_status_observes_commits_with_current_git_authority() {
+        for case in ["committed", "uncommitted", "denied", "revoked"] {
+            let root = tempfile::tempdir().unwrap();
+            let git = |args: &[&str]| {
+                let output = std::process::Command::new("git")
+                    .current_dir(root.path())
+                    .env("GIT_CONFIG_NOSYSTEM", "1")
+                    .env(
+                        "GIT_CONFIG_GLOBAL",
+                        if cfg!(windows) { "NUL" } else { "/dev/null" },
+                    )
+                    .args([
+                        "-c",
+                        "user.name=Fixture",
+                        "-c",
+                        "user.email=fixture@example.invalid",
+                        "-c",
+                        "commit.gpgsign=false",
+                    ])
+                    .args(args)
+                    .output()
+                    .unwrap();
+                assert!(
+                    output.status.success(),
+                    "{}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+                String::from_utf8(output.stdout).unwrap().trim().to_owned()
+            };
+            git(&["init", "--quiet"]);
+            std::fs::write(root.path().join("a.txt"), "before").unwrap();
+            git(&["add", "--", "a.txt"]);
+            git(&["commit", "--quiet", "-m", "baseline"]);
+            let mut agent = Agent::new("normal commit observation fixture");
+            agent.set_permission_mode(crate::PermissionMode::Edits);
+            let base = git(&["rev-parse", "HEAD"]);
+            if case == "denied" {
+                agent
+                    .permissions
+                    .lock()
+                    .unwrap()
+                    .deny
+                    .push(crate::PermissionRule::parse("read(.git)").unwrap());
+            }
+            let edit = json!({"path":"a.txt", "content":"after"});
+            assert!(matches!(
+                agent.prepare_tool_call(root.path(), "edit", "write", &edit, 0),
+                Preparation::Ready { .. }
+            ));
+            let applied = agent.run_prepared_call(root.path(), "edit", "write", &edit, 0);
+            assert!(!applied.is_error, "{}", applied.content);
+            assert_eq!(
+                applied.details.as_ref().unwrap()["transaction"]["base_revision"],
+                if case == "denied" {
+                    serde_json::Value::Null
+                } else {
+                    json!(base)
+                }
+            );
+            let id = applied.details.unwrap()["transaction"]["id"].clone();
+            if case != "uncommitted" {
+                git(&["add", "--", "a.txt"]);
+                git(&["commit", "--quiet", "-m", "transaction"]);
+            }
+            let args = json!({"id":id, "paths":["a.txt"], "observe_commit":true});
+            let deny_git = || {
+                agent
+                    .permissions
+                    .lock()
+                    .unwrap()
+                    .deny
+                    .push(crate::PermissionRule::parse("read(.git)").unwrap())
+            };
+            if case == "denied" {
+                deny_git();
+            }
+            match agent.prepare_tool_call(root.path(), "observe", "patch_status", &args, 0) {
+                Preparation::Immediate(result) if case == "denied" => assert!(result.is_error),
+                Preparation::Ready { .. } if case != "denied" => {
+                    if case == "revoked" {
+                        deny_git();
+                    }
+                    let result =
+                        agent.run_prepared_call(root.path(), "observe", "patch_status", &args, 0);
+                    assert_eq!(
+                        result.is_error,
+                        case != "committed",
+                        "{case}: {}",
+                        result.content
+                    );
+                    if case == "committed" {
+                        let summary = &result.details.unwrap()["transaction"];
+                        assert_eq!(summary["state"], "committed");
+                        assert_eq!(summary["commit_revision"], git(&["rev-parse", "HEAD"]));
+                    }
+                }
+                _ => panic!("unexpected Git observation preparation: {case}"),
+            }
+            let plain = json!({"id":id, "paths":["a.txt"]});
+            let result = agent.run_prepared_call(root.path(), "plain", "patch_status", &plain, 0);
+            assert!(!result.is_error, "{}", result.content);
+            assert_eq!(
+                result.details.unwrap()["transaction"]["state"],
+                if case == "committed" {
+                    "committed"
+                } else {
+                    "applied"
+                }
+            );
+            assert_eq!(
+                std::fs::read_to_string(root.path().join("a.txt")).unwrap(),
+                "after"
+            );
+        }
+    }
+
+    #[test]
+    fn transactional_dispatch_refuses_revoked_policy_and_checkpoint_failure() {
+        for fault in ["permission", "checkpoint"] {
+            let root = tempfile::tempdir().unwrap();
+            std::fs::write(root.path().join("a.txt"), b"before").unwrap();
+            let runtime = crate::RuntimeHandle::new(
+                crate::RunId::new(),
+                crate::AgentId::new(),
+                crate::RuntimeBus::new(),
+            );
+            let mut agent = Agent::new("transaction fixture").with_runtime(runtime.clone());
+            agent.permissions = std::sync::Arc::new(crate::PermissionState::new(
+                crate::PermissionPolicy::new(crate::PermissionMode::Edits),
+            ));
+            let args = serde_json::json!({"path":"a.txt","content":"after"});
+            assert!(matches!(
+                agent.prepare_tool_call(root.path(), "txn-denied", "write", &args, 0),
+                Preparation::Ready { .. }
+            ));
+            if fault == "permission" {
+                agent.set_permission_mode(crate::PermissionMode::ReadOnly);
+            } else {
+                runtime.blob_store.set_disk_full(true);
+            }
+            let result = agent.run_prepared_call(root.path(), "txn-denied", "write", &args, 0);
+            assert!(result.is_error, "{fault}");
+            assert_eq!(std::fs::read(root.path().join("a.txt")).unwrap(), b"before");
+            assert!(runtime.effect_ledger.read().unwrap().is_empty());
+        }
     }
 
     #[test]

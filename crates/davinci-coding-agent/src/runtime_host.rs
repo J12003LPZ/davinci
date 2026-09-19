@@ -7,6 +7,8 @@ use davinci_agent::runtime::bus::is_decision_event;
 use davinci_agent::{RuntimeDecision, RuntimeEvent, RuntimeEventEnvelope, RuntimeSubscriber};
 
 use crate::hooks::{self, HooksFile};
+use davinci_session::default_agent_dir;
+use serde_json::Value;
 
 /// Bind the session projections and workflow executor used by the product host.
 /// `previous` must come from `Agent::runtime_for_session`, which validates its source.
@@ -139,91 +141,240 @@ impl HostOverheadProvenance {
 /// RuntimeSubscriber that executes configured lifecycle hooks.
 pub struct HooksRuntimeSubscriber {
     hooks: HooksFile,
+    config: crate::hooks::HookPolicyConfig,
+    cwd: std::path::PathBuf,
+    agent_dir: std::path::PathBuf,
+    unmet_requirements: Mutex<Vec<String>>,
 }
 
 impl HooksRuntimeSubscriber {
+    #[allow(dead_code)]
     pub fn new(hooks: HooksFile) -> Self {
-        Self { hooks }
+        Self::new_with_config(
+            hooks,
+            crate::hooks::HookPolicyConfig::default(),
+            std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from(".")),
+            default_agent_dir(),
+        )
+    }
+
+    pub fn new_with_config(
+        hooks: HooksFile,
+        config: crate::hooks::HookPolicyConfig,
+        cwd: std::path::PathBuf,
+        agent_dir: std::path::PathBuf,
+    ) -> Self {
+        Self {
+            hooks,
+            config,
+            cwd,
+            agent_dir,
+            unmet_requirements: Mutex::new(Vec::new()),
+        }
     }
 }
 
 impl RuntimeSubscriber for HooksRuntimeSubscriber {
     fn on_event(&self, event: &RuntimeEventEnvelope) -> RuntimeDecision {
+        use std::sync::atomic::Ordering;
+
         if std::env::var("DAVINCI_RUNTIME_HOOKS_V2").as_deref() == Ok("0") {
             return RuntimeDecision::Continue;
         }
 
-        let kind = match hooks::hook_kind_for(&event.payload) {
-            Some(k) => k,
-            None => return RuntimeDecision::Continue,
-        };
-
-        let tool_name = match &event.payload {
-            RuntimeEvent::PreToolUse { tool, .. } => tool.as_str(),
-            RuntimeEvent::PostToolUse { tool, .. } => tool.as_str(),
-            RuntimeEvent::PermissionRequested { tool, .. } => tool.as_str(),
-            _ => "",
-        };
-
-        let args = match &event.payload {
-            RuntimeEvent::PreToolUse { args, .. } => args,
-            _ => &serde_json::Value::Null,
-        };
-
-        let result_str = match &event.payload {
-            RuntimeEvent::PostToolUse { is_error, .. } => {
-                if *is_error {
-                    Some("error")
-                } else {
-                    Some("ok")
-                }
-            }
-            _ => None,
-        };
-
-        let commands: Vec<&Vec<String>> = match kind {
-            "sessionStart" => self.hooks.session_start.iter().collect(),
-            "userPromptSubmit" => self.hooks.user_prompt_submit.iter().collect(),
-            "preTool" => self.hooks.pre_tool.iter().collect(),
-            "permissionRequest" => self.hooks.permission_request.iter().collect(),
-            "postTool" => self.hooks.post_tool.iter().collect(),
-            "postToolFailure" => self
-                .hooks
-                .post_tool_failure
-                .iter()
-                .chain(self.hooks.post_tool.iter())
-                .collect(),
-            "postToolBatch" => self.hooks.post_tool_batch.iter().collect(),
-            "subagentStart" => self.hooks.subagent_start.iter().collect(),
-            "subagentStop" => self.hooks.subagent_stop.iter().collect(),
-            "taskCreated" => self.hooks.task_created.iter().collect(),
-            "taskCompleted" => self.hooks.task_completed.iter().collect(),
-            "preCompact" => self.hooks.pre_compact.iter().collect(),
-            "postCompact" => self.hooks.post_compact.iter().collect(),
-            "preModelSwitch" => self.hooks.pre_model_switch.iter().collect(),
-            "postModelSwitch" => self.hooks.post_model_switch.iter().collect(),
-            "sessionEnd" => self
-                .hooks
-                .session_end
-                .iter()
-                .chain(self.hooks.stop.iter())
-                .collect(),
-            _ => Vec::new(),
-        };
-
         let is_decision = is_decision_event(&event.payload);
 
-        for argv in commands {
-            if let Some(reason) =
-                hooks::run_one_envelope(argv, kind, tool_name, args, result_str, Some(event))
-            {
-                if is_decision {
-                    return RuntimeDecision::Deny { reason };
-                } else {
-                    eprintln!(
-                        "[davinci-hooks] Observe-only hook `{}` recorded non-zero status: {reason}",
-                        argv.first().map(|s| s.as_str()).unwrap_or("")
-                    );
+        // 1. Check trust and content integrity before running any hooks
+        if let Err(err) = self
+            .hooks
+            .validate_trust_and_integrity(&self.cwd, &self.agent_dir)
+        {
+            eprintln!("[davinci-hooks] Hook trust or integrity check failed: {err}");
+            if is_decision {
+                return RuntimeDecision::Deny {
+                    reason: format!("hook policy trust or integrity invalidated: {err}"),
+                };
+            } else {
+                return RuntimeDecision::Continue;
+            }
+        }
+
+        // 2. Check unmet completion requirements on completion proposals
+        if matches!(
+            &event.payload,
+            RuntimeEvent::BeforeCompletion { .. } | RuntimeEvent::TaskCompletionRequested { .. }
+        ) {
+            let unmet = self
+                .unmet_requirements
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            if !unmet.is_empty() {
+                return RuntimeDecision::Deny {
+                    reason: format!("unmet completion requirements: {}", unmet.join("; ")),
+                };
+            }
+        }
+
+        let (tool_name, target_path, args, result_str) = match &event.payload {
+            RuntimeEvent::PreToolUse { tool, args, .. } => {
+                let path = args
+                    .get("path")
+                    .and_then(Value::as_str)
+                    .map(std::path::Path::new);
+                (tool.as_str(), path, args.clone(), None)
+            }
+            RuntimeEvent::PostToolUse { tool, is_error, .. } => {
+                let res = if *is_error { Some("error") } else { Some("ok") };
+                (tool.as_str(), None, serde_json::Value::Null, res)
+            }
+            RuntimeEvent::PermissionRequested { tool, .. } => {
+                (tool.as_str(), None, serde_json::Value::Null, None)
+            }
+            RuntimeEvent::BeforeWrite { path, bytes } => {
+                let args_json = serde_json::json!({ "path": path, "bytes": bytes });
+                ("write", Some(path.as_path()), args_json, None)
+            }
+            RuntimeEvent::AfterWrite {
+                path,
+                bytes,
+                is_error,
+            } => {
+                let res = if *is_error { Some("error") } else { Some("ok") };
+                let args_json = serde_json::json!({ "path": path, "bytes": bytes });
+                ("write", Some(path.as_path()), args_json, res)
+            }
+            RuntimeEvent::BeforeProcessStart {
+                executable,
+                argv,
+                cwd,
+            } => {
+                let args_json =
+                    serde_json::json!({ "executable": executable, "argv": argv, "cwd": cwd });
+                ("process_start", Some(cwd.as_path()), args_json, None)
+            }
+            RuntimeEvent::AfterProcessExit {
+                executable,
+                argv,
+                exit_code,
+                is_error,
+            } => {
+                let res = if *is_error { Some("error") } else { Some("ok") };
+                let args_json = serde_json::json!({ "executable": executable, "argv": argv, "exit_code": exit_code });
+                ("process_start", None, args_json, res)
+            }
+            RuntimeEvent::BeforeTest { framework, targets } => {
+                let args_json = serde_json::json!({ "framework": framework, "targets": targets });
+                ("test", None, args_json, None)
+            }
+            RuntimeEvent::AfterTest {
+                framework,
+                targets,
+                passed,
+                failures,
+            } => {
+                let res = if *passed { Some("ok") } else { Some("error") };
+                let args_json = serde_json::json!({ "framework": framework, "targets": targets, "failures": failures });
+                ("test", None, args_json, res)
+            }
+            RuntimeEvent::BeforeCommit { message, files } => {
+                let args_json = serde_json::json!({ "message": message, "files": files });
+                ("commit", None, args_json, None)
+            }
+            RuntimeEvent::AfterCommit {
+                commit_id,
+                message,
+                is_error,
+            } => {
+                let res = if *is_error { Some("error") } else { Some("ok") };
+                let args_json = serde_json::json!({ "commit_id": commit_id, "message": message });
+                ("commit", None, args_json, res)
+            }
+            _ => ("", None, serde_json::Value::Null, None),
+        };
+
+        // 3. Dispatch structured rules if hookPolicy is enabled
+        if self.config.enabled {
+            if let Some(norm_evt) = hooks::rule_event_for(&event.payload) {
+                for rule in &self.hooks.rules {
+                    if rule.matches(norm_evt, tool_name, target_path) {
+                        let timeout = rule.timeout_ms.or(Some(self.config.default_timeout_ms));
+                        let max_depth = self.config.max_depth;
+                        match hooks::run_rule(
+                            rule,
+                            norm_evt,
+                            tool_name,
+                            target_path,
+                            &args,
+                            result_str,
+                            Some(event),
+                            timeout,
+                            Some(&self.cwd),
+                            max_depth,
+                        ) {
+                            Ok(()) => {}
+                            Err(err) => match rule.on_failure {
+                                hooks::HookFailurePolicy::Block => {
+                                    if is_decision {
+                                        return RuntimeDecision::Deny {
+                                            reason: format!(
+                                                "hook `{}` blocked {norm_evt}: {err}",
+                                                rule.action
+                                                    .first()
+                                                    .map(|s| s.as_str())
+                                                    .unwrap_or("")
+                                            ),
+                                        };
+                                    } else {
+                                        eprintln!(
+                                                "[davinci-hooks] Observe-only hook `{}` with block policy failed: {err}",
+                                                rule.action.first().map(|s| s.as_str()).unwrap_or("")
+                                            );
+                                        let mut unmet = self
+                                            .unmet_requirements
+                                            .lock()
+                                            .unwrap_or_else(|e| e.into_inner());
+                                        unmet.push(format!(
+                                            "hook `{}` failed: {err}",
+                                            rule.action.first().map(|s| s.as_str()).unwrap_or("")
+                                        ));
+                                    }
+                                }
+                                hooks::HookFailurePolicy::Warn => {
+                                    eprintln!(
+                                        "[davinci-hooks] Hook `{}` failed (warn): {err}",
+                                        rule.action.first().map(|s| s.as_str()).unwrap_or("")
+                                    );
+                                    hooks::GLOBAL_HOOK_TELEMETRY
+                                        .warned
+                                        .fetch_add(1, Ordering::Relaxed);
+                                }
+                                hooks::HookFailurePolicy::Ignore => {
+                                    hooks::GLOBAL_HOOK_TELEMETRY
+                                        .ignored
+                                        .fetch_add(1, Ordering::Relaxed);
+                                }
+                            },
+                        }
+                    }
+                }
+            }
+        }
+
+        // 4. Dispatch legacy vectors
+        if let Some(kind) = hooks::hook_kind_for(&event.payload) {
+            let commands = self.hooks.get_legacy_commands(kind);
+            for argv in commands {
+                if let Some(reason) =
+                    hooks::run_one_envelope(argv, kind, tool_name, &args, result_str, Some(event))
+                {
+                    if is_decision {
+                        return RuntimeDecision::Deny { reason };
+                    } else {
+                        eprintln!(
+                            "[davinci-hooks] Observe-only hook `{}` recorded non-zero status: {reason}",
+                            argv.first().map(|s| s.as_str()).unwrap_or("")
+                        );
+                    }
                 }
             }
         }

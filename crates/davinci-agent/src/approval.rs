@@ -8,6 +8,9 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use uuid::Uuid;
 
+mod dispatch;
+pub use dispatch::DispatchPermit;
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ApprovalChallenge {
@@ -60,6 +63,7 @@ struct Pending {
 pub(crate) struct ApprovalRegistry {
     owner: Uuid,
     pending: Mutex<HashMap<Uuid, Pending>>,
+    dispatch: dispatch::DispatchState,
 }
 
 impl Default for ApprovalRegistry {
@@ -67,12 +71,14 @@ impl Default for ApprovalRegistry {
         Self {
             owner: Uuid::new_v4(),
             pending: Mutex::new(HashMap::new()),
+            dispatch: dispatch::DispatchState::default(),
         }
     }
 }
 
 impl ApprovalRegistry {
     pub(crate) fn revoke_all(&self) {
+        self.dispatch.revoke_all();
         self.pending
             .lock()
             .unwrap_or_else(|err| err.into_inner())

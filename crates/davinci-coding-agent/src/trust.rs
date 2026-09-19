@@ -16,6 +16,7 @@ const TRUST_REQUIRING_PROJECT_CONFIG_RESOURCES: &[&str] = &[
     "themes",
     "SYSTEM.md",
     "APPEND_SYSTEM.md",
+    "hooks.json",
 ];
 
 #[derive(Debug, Clone, PartialEq, Eq)]

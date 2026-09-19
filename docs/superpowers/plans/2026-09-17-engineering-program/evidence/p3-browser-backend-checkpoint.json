@@ -1,0 +1,47 @@
+{
+  "scope": "P3 Node backend and per-context network foundation; not P3 completion",
+  "base_commit": "fbe3d9cab4627dc37745e7d40c91f17c47fe235e",
+  "trusted_playwright_version": "1.62.0",
+  "trusted_package_source": "explicit host-installed Python Playwright driver package recorded in p3-browser-baseline.json",
+  "deterministic_tests": {
+    "command": "rtk proxy node --test crates/davinci-coding-agent/src/interaction_testing/browser_backend.test.cjs crates/davinci-coding-agent/src/interaction_testing/browser_network.test.cjs",
+    "exit_code": 0,
+    "passed": 20,
+    "failed": 0,
+    "skipped": 0
+  },
+  "actual_browser_tests": {
+    "command": "node --test crates/davinci-coding-agent/src/interaction_testing/browser_network.real.test.cjs crates/davinci-coding-agent/src/interaction_testing/browser_backend.real.test.cjs through rtk proxy powershell with explicit trusted package and OpenSSL test paths",
+    "exit_code": 0,
+    "passed": 4,
+    "failed": 0,
+    "skipped": 0,
+    "observed": [
+      "foreign HTTP redirect and image subresource: zero forbidden server hits",
+      "owned HTTP redirect preserved final URL and expected DOM",
+      "owned ws:// message delivered; foreign WebSocket upgrade: zero forbidden server hits",
+      "owned HTTPS and WSS delivered; foreign redirect: zero forbidden server hits",
+      "planted login bug: failing UI, planted console error, HTTP 500 evidence, unhealthy backend evidence",
+      "corrected login: type/select/click, successful DOM, ARIA snapshot, bounded internal PNG bytes, healthy backend telemetry",
+      "three actual contexts shared one browser launch and kept login cookie state isolated"
+    ],
+    "tls_fixture": "temporary generated self-signed certificate; certificate bypass only in this test",
+    "cleanup": "test teardown closes contexts, browsers, proxies, fixture servers and owned temporary certificate directory"
+  },
+  "red_observations": [
+    "authorized HTTPS CONNECT and direct WebSocket upgrade returned 403 before implementation: two failures",
+    "first close check failed because server.close resolved before upgraded socket close event",
+    "actual Chromium ws:// failed until HTTP-origin CONNECT was parsed and constrained before outbound I/O",
+    "initial backend acceptance file failed MODULE_NOT_FOUND before individual tests executed"
+  ],
+  "remaining_required": [
+    "supervised typed JSONL Rust host bridge and current request authorization",
+    "P2 owner and dev-server port lease integration",
+    "native normal and Graph tool discovery, dispatch and role restrictions",
+    "source/transaction-bound RealBrowser receipts and immutable artifact references through existing Rust tracker",
+    "host settings and optional unavailable fallback",
+    "permission revocation, cross-owner resource and cancellation lifecycle integration",
+    "general network confinement probes including non-proxied protocols and TLS reuse",
+    "affected package, security, integration and exact-head platform CI milestone gates"
+  ]
+}

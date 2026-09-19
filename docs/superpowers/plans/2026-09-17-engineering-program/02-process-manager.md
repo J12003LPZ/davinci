@@ -1,6 +1,6 @@
 # P2: Persistent Process Manager
 
-Status: design approved by the user on 2026-09-17; implementation pending.
+Status: all fourteen gates passed at `bfc60e3f698ac30f9fb7500fc24490d028da2439`; PR #10 open and unmerged. See the ledger and platform evidence.
 Execution sequence: 2 of 12.
 Dependencies: P1 green; existing JobBook, process leases, command policy and RuntimeBus.
 Requirements authority: project section 7 and cross-cutting sections 18-40;

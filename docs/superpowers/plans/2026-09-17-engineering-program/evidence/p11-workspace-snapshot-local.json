@@ -1,0 +1,57 @@
+{
+  "project": "P11",
+  "name": "workspace-snapshot",
+  "status": "implementation_present_focused_validation_passed",
+  "source_copy": "program-worktree",
+  "contextScopedStore": true,
+  "changed_surfaces": [
+    "crates/davinci-coding-agent/src/native_extensions/workspace_snapshot",
+    "crates/davinci-coding-agent/src/native_extensions/mod.rs",
+    "crates/davinci-coding-agent/src/native_extensions/graph/roles.rs",
+    "crates/davinci-coding-agent/src/settings.rs",
+    "crates/davinci-coding-agent/src/extension_host.rs",
+    "crates/davinci-coding-agent/src/main.rs",
+    "crates/davinci-agent/src/permission.rs",
+    "crates/davinci-coding-agent/tests/workspace_snapshot.rs",
+    "crates/davinci-coding-agent/tests/workspace_snapshot_eval.rs"
+  ],
+  "implemented_contract": {
+    "tools": [
+      "workspace_checkpoint",
+      "workspace_diff",
+      "workspace_restore"
+    ],
+    "bounded_capture": true,
+    "sensitive_path_rejection": true,
+    "transaction_owner_validation": true,
+    "conflict_first_restore": true,
+    "restore_journal_and_verification": true,
+    "checkpoint_workspace_binding": true,
+    "git_identity_fingerprint": true,
+    "symlink_target_containment": true,
+    "mode_aware_diff": true,
+    "normal_and_graph_context_binding": true,
+    "classifier_denied": true
+  },
+  "validation": {
+    "rustfmt": {
+      "status": "passed",
+      "scope": "P11 Rust sources and fixtures"
+    },
+    "cargo_metadata": {
+      "status": "passed",
+      "mode": "offline locked no-deps"
+    },
+    "cargo_check": {
+      "status": "not_used_for_current_gate",
+      "error": "The focused test and packaged smoke commands were used instead of a duplicate check."
+    },
+    "integration_tests": "passed: 6 workspace_snapshot tests",
+    "eval_tests": "passed: 1 workspace_snapshot evaluation test",
+    "clippy": "strict affected-library Clippy passed; legacy workspace lints remain outside this gate",
+    "normal_execution": "packaged smoke passed",
+    "graph_execution": "packaged Graph Writer smoke passed",
+    "ci": "not_run"
+  },
+  "merge_ready": false
+}

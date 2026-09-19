@@ -1,0 +1,78 @@
+{
+  "milestone": "P5 Package / Dependency Intelligence Final Evidence",
+  "base_branch": "codex/browser-verification-01a0ad48",
+  "branch": "codex/package-intelligence-01a0ad48",
+  "tools": [
+    "package_info",
+    "package_exports",
+    "package_symbol",
+    "package_dependents",
+    "package_why"
+  ],
+  "commands": [
+    "package-status"
+  ],
+  "supported_lockfiles": [
+    "package-lock.json (npm v1, v2, v3)",
+    "pnpm-lock.yaml (v5, v6, v9)",
+    "yarn.lock (Classic v1, Berry v2+)"
+  ],
+  "security_invariants": {
+    "no_node_modules_recursive_index": true,
+    "no_code_execution": true,
+    "no_lifecycle_scripts": true,
+    "path_traversal_guards": true,
+    "workspace_escape_guards": true,
+    "read_only_tool_class": true
+  },
+  "package_tests": {
+    "command": "rtk proxy cargo test --offline --locked -p davinci-coding-agent --test package_intelligence",
+    "exit_code": 0,
+    "passed": 10,
+    "failed": 0,
+    "ignored": 0,
+    "cases": [
+      "test_settings_parsing_package_intelligence",
+      "test_security_guards_and_path_traversal",
+      "test_conditional_exports",
+      "test_version_mismatch_warning",
+      "test_cache_runtime_caching_and_telemetry",
+      "test_pnpm_workspace_resolution",
+      "test_yarn_classic_and_berry",
+      "test_npm_v1_resolution_and_tools",
+      "test_npm_v3_symbols_and_types",
+      "test_permission_classification_and_host_integration"
+    ]
+  },
+  "graph_role_tests": {
+    "command": "rtk proxy cargo test --offline --locked -p davinci-coding-agent package_intelligence_tools_follow_role_selection",
+    "exit_code": 0,
+    "passed": 1,
+    "failed": 0
+  },
+  "agent_tests": {
+    "command": "rtk proxy cargo test --offline --locked -p davinci-agent",
+    "exit_code": 0,
+    "passed": 73,
+    "failed": 0,
+    "ignored": 3
+  },
+  "lint_checks": {
+    "fmt": "rtk proxy cargo fmt -p davinci-agent -p davinci-coding-agent --check (exit 0)",
+    "clippy": "rtk proxy cargo clippy --offline --locked -p davinci-agent -p davinci-coding-agent --all-targets -- -D warnings (exit 0)"
+  },
+  "pull_request": {
+    "number": 13,
+    "url": "https://github.com/J12003LPZ/davinci/pull/13",
+    "base": "codex/browser-verification-01a0ad48",
+    "head": "codex/package-intelligence-01a0ad48"
+  },
+  "ci_verification": {
+    "head_sha": "9a3fdf9b47216bcfc2ca58bef5d380d1a10c863a",
+    "push_ci_run": "https://github.com/J12003LPZ/davinci/actions/runs/35367111447",
+    "push_sarif_run": "https://github.com/J12003LPZ/davinci/actions/runs/35367111099",
+    "pr_ci_run": "https://github.com/J12003LPZ/davinci/actions/runs/35367117486",
+    "pr_sarif_run": "https://github.com/J12003LPZ/davinci/actions/runs/35367117517",
+    "status": "all green"
+  }
+}
