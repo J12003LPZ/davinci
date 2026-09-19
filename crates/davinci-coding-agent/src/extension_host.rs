@@ -1146,6 +1146,24 @@ impl ExtensionHost {
                 .clone();
             return browser.execute(cwd, name, args, context);
         }
+        if crate::native_extensions::verification_planner::TOOL_NAMES.contains(&name) {
+            let planner = self
+                .native
+                .lock()
+                .map_err(|_| davinci_agent::ToolError::Failed("native host unavailable".into()))?
+                .verification_planner
+                .clone();
+            return planner.execute_with_context(cwd, name, args, Some(context));
+        }
+        if crate::native_extensions::workspace_snapshot::TOOL_NAMES.contains(&name) {
+            let snapshots = self
+                .native
+                .lock()
+                .map_err(|_| davinci_agent::ToolError::Failed("native host unavailable".into()))?
+                .workspace_snapshot
+                .clone();
+            return snapshots.execute_with_context(cwd, name, args, Some(context));
+        }
         self.execute_js_or_manifest_tool(cwd, name, args)
     }
 

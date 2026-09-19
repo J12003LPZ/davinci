@@ -1,0 +1,30 @@
+{
+  "scope": "P8-P12 packaged dispatcher smoke",
+  "status": "passed_local_smoke_with_external_gates_open",
+  "toolchain": "Rust 1.98.1",
+  "command": "cargo test --offline --locked -p davinci-coding-agent --test program_runtime -- --nocapture",
+  "exit": 0,
+  "result": {
+    "normal_mode": "passed",
+    "graph_writer_mode": "passed",
+    "tests": 2,
+    "failures": 0,
+    "tools": [
+      "impact_analyze",
+      "verification_plan",
+      "workspace_checkpoint"
+    ]
+  },
+  "assertions": [
+    "The packaged CLI started with offline and network-disabled settings.",
+    "Each mode dispatched three registered program tools through the executable path.",
+    "All three tool events reported success and the expected bounded result fields.",
+    "Graph Writer mode used the existing role/allowlist path."
+  ],
+  "not_proven": [
+    "The seventeen-step real normal login workflow.",
+    "Selective Graph assignment of the real workflow.",
+    "Real browser/provider/live-evaluation measurements.",
+    "Cross-platform CI and feature-branch delivery."
+  ]
+}

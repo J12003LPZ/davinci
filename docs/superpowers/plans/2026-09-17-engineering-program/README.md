@@ -1,6 +1,6 @@
 # Engineering program ledger
 
-Status: design package approved; P1, P2, P3, P4, P5, P7, P6 and P9 validated; P8 Complete (PR #17); P10 next.
+Status: design package approved; P1–P9 on stacked PRs with exact-head CI; P3/P4 marked ready; P10–P12 implemented on `codex/p10-p12-01a0ad48`.
 P7 head `950ab50`, P6 head `dcaf02b` and P9 head `726431e` passed CI, including Windows/Linux/macOS native matrix,
 normal-agent and Graph paths. Its evidence and limitations remain in its plan.
 Goal scope: all twelve projects and the global acceptance/performance/report gates.
@@ -30,16 +30,16 @@ Reference: [program design](../../specs/2026-09-17-engineering-program.md) and
 | --- | --- | --- | --- | --- | --- |
 | 1 | [P1 Test Impact Intelligence](01-test-impact.md) | Complete; PR #9 open | Approved | Package tests, fmt, Clippy, integration, security and eval passed | Green at `6b3aad9` |
 | 2 | [P2 Persistent Process Manager](02-process-manager.md) | Complete; PR #10 open | Approved | Package tests, fmt, Clippy, integration, security and eval passed | Green at `bfc60e3` |
-| 3 | [P4 Transactional Edit Engine](04-transactional-edits.md) | Complete; PR #11 open | Approved | Package, integration, security, concurrency, normal/Graph and eval gates passed | Green at `a2054d3` |
-| 4 | [P3 Browser / Playwright Verification](03-browser-verification.md) | Complete; PR #12 updated | Approved | Package tests, fmt, Clippy, real Chromium normal/Graph paths, network confinement, RPC verification and eval passed | Green at `cdbfe00` |
+| 3 | [P4 Transactional Edit Engine](04-transactional-edits.md) | Complete; PR #11 ready | Approved | Package, integration, security, concurrency, normal/Graph and eval gates passed | Green at `a2054d3` |
+| 4 | [P3 Browser / Playwright Verification](03-browser-verification.md) | Complete; PR #12 ready | Approved | Package tests, fmt, Clippy, real Chromium normal/Graph paths, network confinement, RPC verification and eval passed | Green at `9f1adb3` |
 | 5 | [P5 Package / Dependency Intelligence](05-package-intelligence.md) | Complete; PR #13 open | Approved | Package tests, fmt, Clippy, integration, security and eval passed | Green at `9a3fdf9` |
 | 6 | [P7 Build Intelligence](07-build-intelligence.md) | Complete; PR #14 open | Approved | Package tests, fmt, Clippy, integration, security and eval passed | Green at `950ab50` |
 | 7 | [P6 Git Intelligence](06-git-intelligence.md) | Complete; PR #15 open | Approved | Package tests, fmt, Clippy, integration, security and eval passed | Green at `dcaf02b` |
 | 8 | [P9 Change Impact Engine](09-change-impact.md) | Complete; PR #16 open | Approved | Package tests, fmt, Clippy, integration, security and eval passed | Green at `726431e` |
 | 9 | [P8 Deterministic Hook / Policy Engine](08-hook-policy.md) | Complete; PR #17 open | Approved | Package tests, fmt, Clippy, integration, security and eval passed | Green at `cbef3fa` |
-| 10 | [P10 Verification Planner](10-verification-planner.md) | Planned | Approved | Not run | Not pushed |
-| 11 | [P11 Workspace Snapshot / Safe Sandbox Layer](11-workspace-snapshot.md) | Planned | Approved | Not run | Not pushed |
-| 12 | [P12 Continuous Agent Evaluation Framework](12-continuous-evals.md) | Planned | Approved | Not run | Not pushed |
+| 10 | [P10 Verification Planner](10-verification-planner.md) | Implemented on stacked P10–P12 branch | Approved | Focused 5 planner + 1 eval tests passed; Graph role allow/deny passed; fmt and affected Clippy `-D warnings` passed | Not yet exact-head CI |
+| 11 | [P11 Workspace Snapshot / Safe Sandbox Layer](11-workspace-snapshot.md) | Implemented on stacked P10–P12 branch | Approved | Focused 6 snapshot + 1 eval tests passed; Writer-only restore Graph deny passed | Not yet exact-head CI |
+| 12 | [P12 Continuous Agent Evaluation Framework](12-continuous-evals.md) | Implemented on stacked P10–P12 branch | Approved | Engineering 10/10; packaged CLI normal + Graph writer + classifier deny; live Chromium 17-step still host-gated | Not yet exact-head CI |
 
 P4 precedes P3 as in the supplied Phase A order. P5 precedes P7 because build
 intelligence must reuse package/workspace metadata and graph rather than create

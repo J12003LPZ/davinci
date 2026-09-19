@@ -130,6 +130,25 @@ pub fn role_tools(role: Role) -> Vec<String> {
                 .iter()
                 .map(|name| (*name).to_string()),
         );
+        tools.extend(
+            crate::native_extensions::verification_planner::TOOL_NAMES
+                .iter()
+                .map(|name| (*name).to_string()),
+        );
+    }
+    if matches!(
+        role,
+        Role::Historian
+            | Role::Researcher
+            | Role::Planner
+            | Role::TestAnalyzer
+            | Role::Writer
+            | Role::Reviewer
+    ) {
+        tools.push("workspace_diff".to_string());
+    }
+    if matches!(role, Role::Writer) {
+        tools.extend(["workspace_checkpoint", "workspace_restore"].map(str::to_string));
     }
     if matches!(role, Role::Writer | Role::TestAnalyzer) {
         tools.extend(
@@ -343,6 +362,58 @@ mod tests {
             assert!(role_tools(Role::TestAnalyzer).contains(&name.to_string()));
             assert!(!role_tools(Role::Classifier).contains(&name.to_string()));
         }
+    }
+
+    #[test]
+    fn verification_planner_is_read_only_and_denied_to_classifier() {
+        for name in crate::native_extensions::verification_planner::TOOL_NAMES {
+            assert!(!requires_task_coordinator(name));
+            for role in [
+                Role::Planner,
+                Role::TestAnalyzer,
+                Role::Writer,
+                Role::Reviewer,
+            ] {
+                assert!(role_tools(role).contains(&name.to_string()));
+            }
+            assert!(!role_tools(Role::Classifier).contains(&name.to_string()));
+            assert!(!role_tools(Role::Historian).contains(&name.to_string()));
+            assert_eq!(
+                davinci_agent::tool_class(name),
+                davinci_agent::ToolClass::Read
+            );
+        }
+    }
+
+    #[test]
+    fn workspace_snapshots_keep_restore_authority_with_writer() {
+        for role in [
+            Role::Historian,
+            Role::Researcher,
+            Role::Planner,
+            Role::TestAnalyzer,
+            Role::Reviewer,
+        ] {
+            assert!(role_tools(role).contains(&"workspace_diff".to_string()));
+            assert!(!role_tools(role).contains(&"workspace_checkpoint".to_string()));
+            assert!(!role_tools(role).contains(&"workspace_restore".to_string()));
+        }
+        assert!(role_tools(Role::Writer).contains(&"workspace_diff".to_string()));
+        assert!(role_tools(Role::Writer).contains(&"workspace_checkpoint".to_string()));
+        assert!(role_tools(Role::Writer).contains(&"workspace_restore".to_string()));
+        assert!(!role_tools(Role::Classifier).iter().any(|name| {
+            name == "workspace_diff"
+                || name == "workspace_checkpoint"
+                || name == "workspace_restore"
+        }));
+        assert_eq!(
+            davinci_agent::tool_class("workspace_checkpoint"),
+            davinci_agent::ToolClass::Read
+        );
+        assert_eq!(
+            davinci_agent::tool_class("workspace_restore"),
+            davinci_agent::ToolClass::Edit
+        );
     }
 
     fn allowed(policy: BashPolicy, command: &str) -> bool {

@@ -15,7 +15,9 @@ pub mod security_scan;
 pub mod test_impact;
 pub mod token_governor;
 pub mod vector_memory;
+pub mod verification_planner;
 pub mod workspace_metadata;
+pub mod workspace_snapshot;
 
 #[allow(unused_imports)]
 pub use content_router::*;
@@ -73,6 +75,10 @@ pub const NATIVE_TOOLS: &[&str] = &[
     "git_commit_context",
     "git_conflict_explain",
     "impact_analyze",
+    "verification_plan",
+    "workspace_checkpoint",
+    "workspace_diff",
+    "workspace_restore",
     "repo_map",
     "symbol_search",
     "file_symbols",
@@ -119,6 +125,8 @@ pub const NATIVE_COMMANDS: &[&str] = &[
     "build-status",
     "git-status",
     "impact-status",
+    "verification-status",
+    "workspace-status",
     "lsp-status",
     "memory-status",
     "memory-search",
@@ -165,6 +173,16 @@ pub fn command_specs() -> Vec<(&'static str, &'static str, Option<&'static str>)
         (
             "test-impact-status",
             "Show test-impact availability and repository observation state.",
+            None,
+        ),
+        (
+            "verification-status",
+            "Show bounded verification-planner limits and planning telemetry.",
+            None,
+        ),
+        (
+            "workspace-status",
+            "Show bounded workspace checkpoint limits and restore telemetry.",
             None,
         ),
         (
@@ -288,6 +306,8 @@ pub struct NativeExtensionHost {
     pub build_intelligence: build_intelligence::BuildIntelligence,
     pub git_intelligence: git_intelligence::GitIntelligence,
     pub change_impact: change_impact::ChangeImpact,
+    pub verification_planner: verification_planner::VerificationPlanner,
+    pub workspace_snapshot: workspace_snapshot::WorkspaceSnapshot,
     pub repo_intelligence: repo_intelligence::RepoIntelligence,
     pub cache: davinci_agent::runtime::cache::CacheRuntime,
     pub language_intelligence: language_intelligence::LanguageIntelligence,
@@ -393,6 +413,17 @@ impl NativeExtensionHost {
         let repo_intelligence = repo_intelligence.with_semantic_provider(Arc::new(
             change_impact::LanguageIntelligenceAdapter::new(language_intelligence.clone()),
         ));
+        let verification_planner_config =
+            crate::settings::load_merged_settings(&repo_agent_dir, cwd)
+                .verification_planner
+                .unwrap_or_default();
+        let verification_planner =
+            verification_planner::VerificationPlanner::new(cwd, verification_planner_config);
+        let workspace_snapshot_config = crate::settings::load_merged_settings(&repo_agent_dir, cwd)
+            .workspace_snapshots
+            .unwrap_or_default();
+        let workspace_snapshot =
+            workspace_snapshot::WorkspaceSnapshot::new(cwd, workspace_snapshot_config);
         Self {
             browser: browser::BrowserController::new(
                 cwd,
@@ -417,6 +448,8 @@ impl NativeExtensionHost {
             build_intelligence,
             git_intelligence,
             change_impact,
+            verification_planner,
+            workspace_snapshot,
             repo_intelligence,
             cache,
             language_intelligence,
@@ -632,6 +665,12 @@ impl NativeExtensionHost {
             name if change_impact::TOOL_NAMES.contains(&name) => {
                 self.change_impact.execute_tool(name, args)
             }
+            name if verification_planner::TOOL_NAMES.contains(&name) => {
+                self.verification_planner.execute_tool(name, args)
+            }
+            name if workspace_snapshot::TOOL_NAMES.contains(&name) => {
+                self.workspace_snapshot.execute_tool(name, args)
+            }
             name if repo_intelligence::is_repo_tool(name) => {
                 self.repo_intelligence.execute_tool(name, args)
             }
@@ -686,6 +725,8 @@ impl NativeExtensionHost {
             "build-status" => Ok(Some(self.build_intelligence.status())),
             "git-status" => Ok(Some(self.git_intelligence.status())),
             "impact-status" => Ok(Some(self.change_impact.status())),
+            "verification-status" => Ok(Some(self.verification_planner.status())),
+            "workspace-status" => Ok(Some(self.workspace_snapshot.status())),
             "memory-status" => Ok(Some(self.memory.status())),
             "memory-search" => Ok(Some(self.memory.search_text(args))),
             "memory-reindex" => Ok(Some(self.memory.reindex().map_err(|err| err.to_string())?)),
@@ -748,6 +789,12 @@ impl NativeExtensionHost {
         }
         if change_impact::TOOL_NAMES.contains(&name) {
             return change_impact::tool_spec(name);
+        }
+        if verification_planner::TOOL_NAMES.contains(&name) {
+            return verification_planner::tool_spec(name);
+        }
+        if workspace_snapshot::TOOL_NAMES.contains(&name) {
+            return workspace_snapshot::tool_spec(name);
         }
         if language_intelligence::TOOL_NAMES.contains(&name) {
             return language_intelligence::tool_spec(name);

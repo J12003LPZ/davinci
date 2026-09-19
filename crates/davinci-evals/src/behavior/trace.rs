@@ -92,7 +92,16 @@ pub fn classify_shell_command(command: &str) -> &'static str {
     let lower = trimmed.to_lowercase();
     let first_word = lower.split_whitespace().next().unwrap_or("");
 
-    if lower.contains("test")
+    if lower.starts_with("npm run dev")
+        || lower.starts_with("npm start")
+        || lower.starts_with("pnpm dev")
+        || lower.starts_with("yarn dev")
+        || lower.starts_with("vite")
+        || lower.starts_with("next dev")
+        || lower.starts_with("cargo run")
+    {
+        "dev_server"
+    } else if lower.contains("test")
         || lower.starts_with("pytest")
         || lower.starts_with("cargo test")
         || lower.starts_with("npm test")
@@ -194,6 +203,14 @@ impl BehaviorTrace {
                     args,
                 } => {
                     trace.stats.tool_calls += 1;
+                    if let Some((capability, operation)) = native_capability(tool_name) {
+                        trace.events.push(BehaviorEvent::CapabilityIdentity {
+                            capability: capability.to_string(),
+                        });
+                        trace.events.push(BehaviorEvent::CapabilityIdentity {
+                            capability: operation.to_string(),
+                        });
+                    }
                     match tool_name.as_str() {
                         "read" | "read_file" | "mcp_read" => {
                             let path = args
@@ -446,6 +463,54 @@ fn is_edit_tool(tool_name: &str) -> bool {
         tool_name,
         "edit" | "write" | "apply_patch" | "notebook_edit"
     )
+}
+
+fn native_capability(tool_name: &str) -> Option<(&'static str, &str)> {
+    let capability = if matches!(
+        tool_name,
+        "repo_map"
+            | "symbol_search"
+            | "file_symbols"
+            | "file_dependencies"
+            | "symbol_relationships"
+            | "related_files"
+            | "code_query"
+    ) {
+        "repo_intelligence"
+    } else if tool_name.starts_with("lsp_") {
+        "language_intelligence"
+    } else if tool_name.starts_with("package_") {
+        "package_intelligence"
+    } else if matches!(
+        tool_name,
+        "workspace_packages"
+            | "build_targets"
+            | "build_dependencies"
+            | "build_affected"
+            | "build_command"
+    ) {
+        "build_intelligence"
+    } else if tool_name.starts_with("git_") {
+        "git_intelligence"
+    } else if tool_name.starts_with("test_") {
+        "test_impact"
+    } else if tool_name == "impact_analyze" {
+        "change_impact"
+    } else if tool_name == "verification_plan" {
+        "verification_planner"
+    } else if matches!(
+        tool_name,
+        "workspace_checkpoint" | "workspace_diff" | "workspace_restore"
+    ) {
+        "workspace_snapshots"
+    } else if tool_name.starts_with("browser_") {
+        "browser_verification"
+    } else if matches!(tool_name, "process_start" | "process_write") {
+        "process_manager"
+    } else {
+        return None;
+    };
+    Some((capability, tool_name))
 }
 
 #[cfg(test)]

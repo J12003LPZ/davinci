@@ -7692,6 +7692,18 @@ fn bind_test_impact_context(agent: &Agent, host: &ExtensionHost) {
     native
         .test_impact
         .set_cancellation(agent.abort_signal.clone());
+    native
+        .verification_planner
+        .set_permissions(agent.permissions.clone());
+    native
+        .verification_planner
+        .set_cancellation(agent.abort_signal.clone());
+    native
+        .workspace_snapshot
+        .set_permissions(agent.permissions.clone());
+    native
+        .workspace_snapshot
+        .set_cancellation(agent.abort_signal.clone());
 }
 
 fn attach_tool_executor(agent: &mut Agent, host: &ExtensionHost) {
@@ -7825,6 +7837,18 @@ fn apply_graph_session_context(parsed: &Args, agent: &Agent, host: &ExtensionHos
         native
             .language_intelligence
             .set_permissions(Some(agent.permissions.clone()));
+        native
+            .verification_planner
+            .set_permissions(agent.permissions.clone());
+        native
+            .verification_planner
+            .set_cancellation(agent.abort_signal.clone());
+        native
+            .workspace_snapshot
+            .set_permissions(agent.permissions.clone());
+        native
+            .workspace_snapshot
+            .set_cancellation(agent.abort_signal.clone());
         native.security.set_review_storage(default_agent_dir());
         native
             .graph

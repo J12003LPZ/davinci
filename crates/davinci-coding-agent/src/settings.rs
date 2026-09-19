@@ -101,6 +101,36 @@ fn parse_change_impact<'de, D: serde::Deserializer<'de>>(
     }))
 }
 
+fn parse_verification_planner<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<
+    Option<crate::native_extensions::verification_planner::VerificationPlannerConfig>,
+    D::Error,
+> {
+    use crate::native_extensions::verification_planner::VerificationPlannerConfig;
+    let value = Option::<serde_json::Value>::deserialize(deserializer)?;
+    Ok(value.map(|value| {
+        serde_json::from_value(value).unwrap_or_else(|_| VerificationPlannerConfig {
+            enabled: false,
+            ..Default::default()
+        })
+    }))
+}
+
+fn parse_workspace_snapshots<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<crate::native_extensions::workspace_snapshot::WorkspaceSnapshotConfig>, D::Error>
+{
+    use crate::native_extensions::workspace_snapshot::WorkspaceSnapshotConfig;
+    let value = Option::<serde_json::Value>::deserialize(deserializer)?;
+    Ok(value.map(|value| {
+        serde_json::from_value(value).unwrap_or_else(|_| WorkspaceSnapshotConfig {
+            enabled: false,
+            ..Default::default()
+        })
+    }))
+}
+
 fn parse_hook_policy<'de, D: serde::Deserializer<'de>>(
     deserializer: D,
 ) -> Result<Option<crate::hooks::HookPolicyConfig>, D::Error> {
@@ -181,6 +211,20 @@ pub struct Settings {
         deserialize_with = "parse_change_impact"
     )]
     pub change_impact: Option<crate::native_extensions::change_impact::ChangeImpactConfig>,
+    #[serde(
+        default,
+        rename = "verificationPlanner",
+        deserialize_with = "parse_verification_planner"
+    )]
+    pub verification_planner:
+        Option<crate::native_extensions::verification_planner::VerificationPlannerConfig>,
+    #[serde(
+        default,
+        rename = "workspaceSnapshots",
+        deserialize_with = "parse_workspace_snapshots"
+    )]
+    pub workspace_snapshots:
+        Option<crate::native_extensions::workspace_snapshot::WorkspaceSnapshotConfig>,
     #[serde(default, rename = "hookPolicy", deserialize_with = "parse_hook_policy")]
     pub hook_policy: Option<crate::hooks::HookPolicyConfig>,
     #[serde(default, rename = "repoIntelligence")]

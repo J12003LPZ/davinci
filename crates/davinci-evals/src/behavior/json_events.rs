@@ -68,6 +68,18 @@ pub fn trace_from_json_lines(scenario_id: &str, lines: &[String]) -> Result<Beha
                         .unwrap_or_else(|| event_type.to_string()),
                 });
             }
+            "workflow_step" | "engineering_step" => {
+                let step = string_field(&value, &["step", "workflowStep", "workflow_step"])
+                    .ok_or_else(|| {
+                        format!(
+                            "recognized workflow-step event on line {} has no step",
+                            index + 1
+                        )
+                    })?;
+                supplemental_events.push(BehaviorEvent::PlanEvent {
+                    kind: format!("workflow:{step}"),
+                });
+            }
             "capability" | "capability_identity" | "capability_activated" => {
                 let capability =
                     string_field(&value, &["capability", "id", "name"]).ok_or_else(|| {
@@ -380,6 +392,23 @@ mod tests {
         assert!(trace.events.iter().any(|event| matches!(
             event,
             BehaviorEvent::CapabilityIdentity { capability } if capability == "frontend-design"
+        )));
+    }
+
+    #[test]
+    fn workflow_step_events_are_normalized_for_engineering_receipts() {
+        let trace = trace_from_json_lines(
+            "workflow",
+            &[serde_json::json!({
+                "type": "workflow_step",
+                "step": "transaction_verify"
+            })
+            .to_string()],
+        )
+        .unwrap();
+        assert!(trace.events.iter().any(|event| matches!(
+            event,
+            BehaviorEvent::PlanEvent { kind } if kind == "workflow:transaction_verify"
         )));
     }
 }
