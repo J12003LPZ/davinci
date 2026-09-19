@@ -75,6 +75,19 @@ fn parse_build_intelligence<'de, D: serde::Deserializer<'de>>(
     }))
 }
 
+fn parse_git_intelligence<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<crate::native_extensions::git_intelligence::GitIntelligenceConfig>, D::Error> {
+    use crate::native_extensions::git_intelligence::GitIntelligenceConfig;
+    let value = Option::<serde_json::Value>::deserialize(deserializer)?;
+    Ok(value.map(|value| {
+        serde_json::from_value(value).unwrap_or_else(|_| GitIntelligenceConfig {
+            enabled: false,
+            ..Default::default()
+        })
+    }))
+}
+
 fn parse_language_intelligence<'de, D: serde::Deserializer<'de>>(
     deserializer: D,
 ) -> Result<
@@ -130,6 +143,12 @@ pub struct Settings {
     )]
     pub build_intelligence:
         Option<crate::native_extensions::build_intelligence::BuildIntelligenceConfig>,
+    #[serde(
+        default,
+        rename = "gitIntelligence",
+        deserialize_with = "parse_git_intelligence"
+    )]
+    pub git_intelligence: Option<crate::native_extensions::git_intelligence::GitIntelligenceConfig>,
     #[serde(default, rename = "repoIntelligence")]
     pub repo_intelligence:
         Option<crate::native_extensions::repo_intelligence::RepoIntelligenceConfig>,

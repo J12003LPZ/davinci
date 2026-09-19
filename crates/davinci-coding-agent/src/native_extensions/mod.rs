@@ -4,6 +4,7 @@ pub mod browser;
 pub mod build_intelligence;
 pub mod content_router;
 pub mod ecosystem;
+pub mod git_intelligence;
 pub mod graph;
 pub mod language_intelligence;
 pub mod learning;
@@ -63,6 +64,13 @@ pub const NATIVE_TOOLS: &[&str] = &[
     "build_dependencies",
     "build_affected",
     "build_command",
+    "git_symbol_history",
+    "git_related_commits",
+    "git_changed_symbols",
+    "git_branch_diff",
+    "git_blame_symbol",
+    "git_commit_context",
+    "git_conflict_explain",
     "repo_map",
     "symbol_search",
     "file_symbols",
@@ -107,6 +115,7 @@ pub const NATIVE_COMMANDS: &[&str] = &[
     "test-impact-status",
     "package-status",
     "build-status",
+    "git-status",
     "lsp-status",
     "memory-status",
     "memory-search",
@@ -268,6 +277,7 @@ pub struct NativeExtensionHost {
     pub test_impact: test_impact::TestImpact,
     pub package_intelligence: package_intelligence::PackageIntelligence,
     pub build_intelligence: build_intelligence::BuildIntelligence,
+    pub git_intelligence: git_intelligence::GitIntelligence,
     pub repo_intelligence: repo_intelligence::RepoIntelligence,
     pub cache: davinci_agent::runtime::cache::CacheRuntime,
     pub language_intelligence: language_intelligence::LanguageIntelligence,
@@ -343,6 +353,11 @@ impl NativeExtensionHost {
             .unwrap_or_default();
         let build_intelligence =
             build_intelligence::BuildIntelligence::new(cwd, cache.clone(), build_config);
+        let git_config = crate::settings::load_merged_settings(&repo_agent_dir, cwd)
+            .git_intelligence
+            .unwrap_or_default();
+        let git_intelligence =
+            git_intelligence::GitIntelligence::new(cwd, cache.clone(), git_config);
         let language_config = agent_dir
             .and_then(|dir| crate::settings::load_merged_settings(dir, cwd).language_intelligence)
             .unwrap_or_default();
@@ -372,6 +387,7 @@ impl NativeExtensionHost {
             test_impact,
             package_intelligence,
             build_intelligence,
+            git_intelligence,
             repo_intelligence,
             cache,
             language_intelligence,
@@ -580,6 +596,9 @@ impl NativeExtensionHost {
             name if build_intelligence::TOOL_NAMES.contains(&name) => {
                 self.build_intelligence.execute_tool(name, args)
             }
+            name if git_intelligence::TOOL_NAMES.contains(&name) => {
+                self.git_intelligence.execute_tool(name, args)
+            }
             name if repo_intelligence::is_repo_tool(name) => {
                 self.repo_intelligence.execute_tool(name, args)
             }
@@ -632,6 +651,7 @@ impl NativeExtensionHost {
             "test-impact-status" => Ok(Some(self.test_impact.status())),
             "package-status" => Ok(Some(self.package_intelligence.status())),
             "build-status" => Ok(Some(self.build_intelligence.status())),
+            "git-status" => Ok(Some(self.git_intelligence.status())),
             "memory-status" => Ok(Some(self.memory.status())),
             "memory-search" => Ok(Some(self.memory.search_text(args))),
             "memory-reindex" => Ok(Some(self.memory.reindex().map_err(|err| err.to_string())?)),
@@ -680,6 +700,9 @@ impl NativeExtensionHost {
         }
         if build_intelligence::TOOL_NAMES.contains(&name) {
             return build_intelligence::tool_spec(name);
+        }
+        if git_intelligence::TOOL_NAMES.contains(&name) {
+            return git_intelligence::tool_spec(name);
         }
         if language_intelligence::TOOL_NAMES.contains(&name) {
             return language_intelligence::tool_spec(name);
