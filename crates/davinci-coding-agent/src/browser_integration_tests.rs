@@ -1170,6 +1170,7 @@ impl Drop for GraphEnvGuard {
 
 #[test]
 #[ignore = "requires explicitly configured trusted Node and Playwright installation"]
+#[allow(clippy::drop_non_drop)]
 fn login_button_seventeen_step_normal_dispatch_and_graph_deny() {
     let root = tempfile::tempdir().unwrap();
     let state = tempfile::tempdir().unwrap();
