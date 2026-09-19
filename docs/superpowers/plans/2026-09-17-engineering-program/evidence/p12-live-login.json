@@ -1,7 +1,8 @@
 {
+  "schema_version": 2,
   "test": "browser_integration_tests::login_button_seventeen_step_normal_dispatch_and_graph_deny",
   "command": "cargo test --offline --locked -p davinci-coding-agent --bin davinci -- --ignored --nocapture login_button_seventeen_step",
-  "runs": [
+  "local_runs": [
     {
       "pass": true,
       "duration_s": 6.47,
@@ -31,6 +32,131 @@
       }
     }
   ],
+  "hosted_acceptance": {
+    "sha": "9fe1e1062a6d265e7f282ab4556a478ed3bf3f7e",
+    "ci_run": "https://github.com/J12003LPZ/davinci/actions/runs/35460353612",
+    "sarif_run": "https://github.com/J12003LPZ/davinci/actions/runs/35460353623",
+    "workflow_lint_run": "https://github.com/J12003LPZ/davinci/actions/runs/35460353647",
+    "all_jobs_green": true,
+    "jobs": {
+      "macos": "https://github.com/J12003LPZ/davinci/actions/runs/35460353612/job/105942980220",
+      "linux": "https://github.com/J12003LPZ/davinci/actions/runs/35460353612/job/105942980322",
+      "windows": "https://github.com/J12003LPZ/davinci/actions/runs/35460353612/job/105942980285"
+    },
+    "artifacts": [
+      "p12-live-login-macOS",
+      "p12-live-login-Linux",
+      "p12-live-login-Windows"
+    ],
+    "fixture_id": "login-button-seventeen-step",
+    "runs_per_mode": 2,
+    "platforms": {
+      "macos": {
+        "feature_off": {
+          "startup_ms_median": 225.9491875,
+          "memory_bytes_median": 37027840
+        },
+        "feature_on": {
+          "startup_ms_median": 162.4749375,
+          "memory_bytes_median": 50642944,
+          "cache_hits": 3,
+          "graph_cache_hits": 4,
+          "browser_success": true,
+          "runs": [
+            {
+              "startup_ms": 173.054875,
+              "memory_bytes": 50724864,
+              "process_start_ms": 83.315917,
+              "browser_open_ms": 1787.022,
+              "impact_analyze_cold_ms": 35.65975,
+              "impact_analyze_warm_ms": 21.197958,
+              "graph_checkpoint_id": "ws-7db1bcc9bfad331fc412ab8e"
+            },
+            {
+              "startup_ms": 151.895,
+              "memory_bytes": 50561024,
+              "process_start_ms": 75.532667,
+              "browser_open_ms": 526.732958,
+              "impact_analyze_cold_ms": 33.8685,
+              "impact_analyze_warm_ms": 21.668375,
+              "graph_checkpoint_id": "ws-2ecfee1ad7933bbaf335d799"
+            }
+          ]
+        }
+      },
+      "linux": {
+        "feature_off": {
+          "startup_ms_median": 280.666362,
+          "memory_bytes_median": 50587648
+        },
+        "feature_on": {
+          "startup_ms_median": 337.7264305,
+          "memory_bytes_median": 62803968,
+          "cache_hits": 3,
+          "graph_cache_hits": 4,
+          "browser_success": true,
+          "runs": [
+            {
+              "startup_ms": 278.504085,
+              "memory_bytes": 62853120,
+              "process_start_ms": 86.689757,
+              "browser_open_ms": 670.612288,
+              "impact_analyze_cold_ms": 31.345932,
+              "impact_analyze_warm_ms": 14.866446,
+              "graph_checkpoint_id": "ws-01437f35a7fb646d2b580196"
+            },
+            {
+              "startup_ms": 396.948776,
+              "memory_bytes": 62754816,
+              "process_start_ms": 87.253885,
+              "browser_open_ms": 623.135357,
+              "impact_analyze_cold_ms": 22.862319,
+              "impact_analyze_warm_ms": 14.697905,
+              "graph_checkpoint_id": "ws-b538e341af6ef74e0d6bab8c"
+            }
+          ]
+        }
+      },
+      "windows": {
+        "feature_off": {
+          "startup_ms_median": 617.2215,
+          "memory_bytes_median": 25702400
+        },
+        "feature_on": {
+          "startup_ms_median": 364.06425,
+          "memory_bytes_median": 39739392,
+          "cache_hits": 3,
+          "graph_cache_hits": 4,
+          "browser_success": true,
+          "runs": [
+            {
+              "startup_ms": 356.8615,
+              "memory_bytes": 39768064,
+              "process_start_ms": 165.4176,
+              "browser_open_ms": 843.8915,
+              "impact_analyze_cold_ms": 251.0187,
+              "impact_analyze_warm_ms": 66.1674,
+              "graph_checkpoint_id": "ws-7eb3cdbed0a31e1bb0f001cf"
+            },
+            {
+              "startup_ms": 371.267,
+              "memory_bytes": 39710720,
+              "process_start_ms": 198.568,
+              "browser_open_ms": 724.4478,
+              "impact_analyze_cold_ms": 108.8899,
+              "impact_analyze_warm_ms": 51.7975,
+              "graph_checkpoint_id": "ws-cc94ca4715b4ee2d4a2bf760"
+            }
+          ]
+        }
+      }
+    },
+    "graph_writer_ran_seventeen_steps": true,
+    "graph_writer_workspace_diff_error": false,
+    "graph_classifier_denied_verification_plan": true,
+    "graph_classifier_denied_workspace_restore": true,
+    "graph_classifier_deny_via": "agent.call pre_tool NativeExtensionHost::before_tool"
+  },
   "dispatched_required_tools": [
     "repo_map",
     "lsp_document_symbols",
@@ -50,18 +176,11 @@
     "workspace_diff",
     "verification_plan"
   ],
-  "graph_writer_ran_seventeen_steps": true,
-  "graph_writer_workspace_diff_error": false,
-  "graph_classifier_denied_verification_plan": true,
-  "graph_classifier_denied_workspace_restore": true,
-  "graph_classifier_deny_via": "agent.call pre_tool NativeExtensionHost::before_tool",
   "limitations": {
-    "lsp_diagnostics": "dispatched, returned error (language server unavailable in fixture)",
-    "lsp_document_symbols": "dispatched, returned error (language server unavailable in fixture)",
-    "workspace_diff": "succeeds after reading nested checkpoint.id",
-    "memory_bytes": null,
-    "memory_reason": "not collected; process working-set sampling was not wired in this host",
-    "linux": "not executed locally; GitHub Actions native matrix on main succeeded",
-    "macos": "not executed locally; GitHub Actions native matrix on main succeeded"
+    "lsp_diagnostics": "dispatched, returned an error because no language server is present in the fixture",
+    "lsp_document_symbols": "dispatched, returned an error because no language server is present in the fixture",
+    "workspace_diff": "succeeded on every hosted run",
+    "local_linux_macos": "not executed locally; the hosted Linux and macOS jobs passed the real Chromium path",
+    "local_windows_cargo": "fresh local Cargo validation remains unavailable in this environment because rustc reports Access is denied and the offline registry lacks cpal; hosted CI is the release gate"
   }
 }

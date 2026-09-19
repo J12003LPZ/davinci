@@ -1,7 +1,7 @@
 # Engineering program ledger
 
-Status: P1–P12 and the P12 live 17-step follow-up are merged to `origin/main` `5585fd6` (PR #19).
-Main CI on that SHA: https://github.com/J12003LPZ/davinci/actions/runs/35420073891 success (attempt 2 after cancelling a hung Windows step); SARIF https://github.com/J12003LPZ/davinci/actions/runs/35420073914 success.
+Status: P1–P12, the P12 live 17-step follow-up, and final acceptance fixes are merged to `origin/main` `9fe1e106` (PR #22).
+Main CI on that SHA: https://github.com/J12003LPZ/davinci/actions/runs/35460353612 success; SARIF https://github.com/J12003LPZ/davinci/actions/runs/35460353623 success; workflow lint https://github.com/J12003LPZ/davinci/actions/runs/35460353647 success.
 P7 head `950ab50`, P6 head `dcaf02b` and P9 head `726431e` passed CI, including Windows/Linux/macOS native matrix,
 normal-agent and Graph paths. Its evidence and limitations remain in its plan.
 Goal scope: all twelve projects and the global acceptance/performance/report gates.
@@ -10,10 +10,10 @@ Reference: [program design](../../specs/2026-09-17-engineering-program.md) and
 
 ## Authoritative workspace checkpoint
 
-- Date: 2026-09-17.
-- Fetched remote main: `ca9fe69cd0da21bf161af25b2bed681748fb0d58`.
-- Current branch: `codex/browser-verification-01a0ad48`, stacked on validated P4.
-- Worktree: `C:/Users/sergi/.claude-worktrees/pi-rust-9416e5cee6/01a0ad48`.
+- Date: 2026-09-19.
+- Fetched remote main: `9fe1e1062a6d265e7f282ab4556a478ed3bf3f7e`.
+- Current branch: `codex/program-evidence-20260919`, based on final `origin/main`.
+- Worktree: `C:/Users/sergi/Desktop/pi-rust/final-worktree`.
 - Git worktree admin path differs from common Git directory; isolation verified.
 - Shared checkout has pre-existing changes and divergent local main. Preserved.
 - Prior PRs 6/7/8 provide LSP, Repo AST and CacheRuntime; source inspected.
@@ -29,18 +29,18 @@ Reference: [program design](../../specs/2026-09-17-engineering-program.md) and
 
 | Order | Project/plan | Implementation | Design approval | Local gates/eval | CI |
 | --- | --- | --- | --- | --- | --- |
-| 1 | [P1 Test Impact Intelligence](01-test-impact.md) | Complete; PR #9 merged | Approved | Package tests, fmt, Clippy, integration, security and eval passed | Green at `6b3aad9`; on main `5585fd6` |
-| 2 | [P2 Persistent Process Manager](02-process-manager.md) | Complete; PR #10 merged | Approved | Package tests, fmt, Clippy, integration, security and eval passed | Green at `bfc60e3`; on main `5585fd6` |
-| 3 | [P4 Transactional Edit Engine](04-transactional-edits.md) | Complete; PR #11 merged | Approved | Package, integration, security, concurrency, normal/Graph and eval gates passed | Green at `a2054d3`; on main `5585fd6` |
-| 4 | [P3 Browser / Playwright Verification](03-browser-verification.md) | Complete; PR #12 merged | Approved | Package tests, fmt, Clippy, real Chromium normal/Graph paths, network confinement, RPC verification and eval passed | Green at `9f1adb3`; on main `5585fd6` |
-| 5 | [P5 Package / Dependency Intelligence](05-package-intelligence.md) | Complete; PR #13 merged | Approved | Package tests, fmt, Clippy, integration, security and eval passed | Green at `9a3fdf9`; on main `5585fd6` |
-| 6 | [P7 Build Intelligence](07-build-intelligence.md) | Complete; PR #14 merged | Approved | Package tests, fmt, Clippy, integration, security and eval passed | Green at `950ab50`; on main `5585fd6` |
-| 7 | [P6 Git Intelligence](06-git-intelligence.md) | Complete; PR #15 merged | Approved | Package tests, fmt, Clippy, integration, security and eval passed | Green at `dcaf02b`; on main `5585fd6` |
-| 8 | [P9 Change Impact Engine](09-change-impact.md) | Complete; PR #16 merged | Approved | Package tests, fmt, Clippy, integration, security and eval passed | Green at `d34e2c4`; on main `5585fd6` |
-| 9 | [P8 Deterministic Hook / Policy Engine](08-hook-policy.md) | Complete; PR #17 merged | Approved | Package tests, fmt, Clippy, integration, security and eval passed | Green at `d0f8c49`; on main `5585fd6` |
-| 10 | [P10 Verification Planner](10-verification-planner.md) | Complete; PR #18 merged | Approved | Focused 5 planner + 1 eval tests passed; Graph role allow/deny passed | Green exact-head `109c78c`; on main `5585fd6` |
-| 11 | [P11 Workspace Snapshot / Safe Sandbox Layer](11-workspace-snapshot.md) | Complete; PR #18 merged | Approved | Focused 6 snapshot + 1 eval tests passed; Writer-only restore Graph deny passed | Green exact-head `109c78c`; on main `5585fd6` |
-| 12 | [P12 Continuous Agent Evaluation Framework](12-continuous-evals.md) | Complete; PR #19 merged | Approved | Engineering 11/11; two Chromium 17-step runs passed; classifier deny passed | Green exact-head `9c27b49`; on main `5585fd6` |
+| 1 | [P1 Test Impact Intelligence](01-test-impact.md) | Complete; PR #9 merged | Approved | Package tests, fmt, Clippy, integration, security and eval passed | Green at `6b3aad9`; final main `9fe1e106` |
+| 2 | [P2 Persistent Process Manager](02-process-manager.md) | Complete; PR #10 merged | Approved | Package tests, fmt, Clippy, integration, security and eval passed | Green at `bfc60e3`; final main `9fe1e106` |
+| 3 | [P4 Transactional Edit Engine](04-transactional-edits.md) | Complete; PR #11 merged | Approved | Package, integration, security, concurrency, normal/Graph and eval gates passed | Green at `a2054d3`; final main `9fe1e106` |
+| 4 | [P3 Browser / Playwright Verification](03-browser-verification.md) | Complete; PR #12 merged | Approved | Package tests, fmt, Clippy, real Chromium normal/Graph paths, network confinement, RPC verification and eval passed | Green at `9f1adb3`; final main `9fe1e106` |
+| 5 | [P5 Package / Dependency Intelligence](05-package-intelligence.md) | Complete; PR #13 merged | Approved | Package tests, fmt, Clippy, integration, security and eval passed | Green at `9a3fdf9`; final main `9fe1e106` |
+| 6 | [P7 Build Intelligence](07-build-intelligence.md) | Complete; PR #14 merged | Approved | Package tests, fmt, Clippy, integration, security and eval passed | Green at `950ab50`; final main `9fe1e106` |
+| 7 | [P6 Git Intelligence](06-git-intelligence.md) | Complete; PR #15 merged | Approved | Package tests, fmt, Clippy, integration, security and eval passed | Green at `dcaf02b`; final main `9fe1e106` |
+| 8 | [P9 Change Impact Engine](09-change-impact.md) | Complete; PR #16 merged | Approved | Package tests, fmt, Clippy, integration, security and eval passed | Green at `d34e2c4`; final main `9fe1e106` |
+| 9 | [P8 Deterministic Hook / Policy Engine](08-hook-policy.md) | Complete; PR #17 merged | Approved | Package tests, fmt, Clippy, integration, security and eval passed | Green at `d0f8c49`; final main `9fe1e106` |
+| 10 | [P10 Verification Planner](10-verification-planner.md) | Complete; PR #18 merged | Approved | Focused 5 planner + 1 eval tests passed; Graph role allow/deny passed | Green exact-head `109c78c`; final main `9fe1e106` |
+| 11 | [P11 Workspace Snapshot / Safe Sandbox Layer](11-workspace-snapshot.md) | Complete; PR #18 merged | Approved | Focused 6 snapshot + 1 eval tests passed; Writer-only restore Graph deny passed | Green exact-head `109c78c`; final main `9fe1e106` |
+| 12 | [P12 Continuous Agent Evaluation Framework](12-continuous-evals.md) | Complete; PR #19 merged; acceptance fixes in PRs #20–#22 | Approved | Engineering tests, local and hosted Chromium 17-step runs, feature on/off metrics, cache telemetry, and classifier deny passed | Final main `9fe1e106` |
 
 P4 precedes P3 as in the supplied Phase A order. P5 precedes P7 because build
 intelligence must reuse package/workspace metadata and graph rather than create
@@ -164,8 +164,8 @@ The prior merged PR test counts are not evidence for this new program.
 
 ## Next action
 
-P1–P12 are merged. Final program report: [engineering-program-verification.md](../../../engineering-program-verification.md).
-Main CI on `5585fd6` is green: https://github.com/J12003LPZ/davinci/actions/runs/35420073891. No production restart.
+P1–P12 are merged, the final acceptance fixes are merged, and the program report is current: [engineering-program-verification.md](../../../engineering-program-verification.md).
+Main CI on `9fe1e106` is green: https://github.com/J12003LPZ/davinci/actions/runs/35460353612; SARIF and workflow lint are green as well. No production restart.
 
 Targeted validation of the baseline fixture passed: `rtk cargo fmt --check` and
 `rtk proxy cargo clippy -p davinci-coding-agent --test test_impact_baseline --offline --locked -- -D warnings`.
@@ -175,7 +175,7 @@ saved (`router:noop`). No compression savings are claimed for that call.
 ## P1 implementation evidence
 
 Implementation and exact-head CI are validated at
-`6b3aad9fd28b96f85c8115fe4099bea6e4557b17`; PR #9 remains open for review.
+`6b3aad9fd28b96f85c8115fe4099bea6e4557b17`; PR #9 is merged.
 User-facing behavior and limits are documented in [test impact](../../../test-impact.md).
 
 | Gate | Evidence/status |
@@ -365,7 +365,7 @@ after the correction. No shell-string fallback or dependency install was added.
   Live resources and output rings are not serialized into CacheRuntime.
 - Tests include the reusable Node server fixture, frozen old-host baseline,
   packaged-binary evaluation, normal-session and Graph dispatch integrations.
-- All fourteen P2 gates passed before P4 began. PR #10 remains open and unmerged.
+- All fourteen P2 gates passed before P4 began. PR #10 is merged.
   Next project is P4, using the approved transactional-edit plan. Platform
   evidence is recorded in the next branch to preserve the tested P2 head.
 
@@ -626,21 +626,21 @@ Implementation is completed on `codex/p10-p12-01a0ad48` and merged via PR #18.
 
 ## P12 implementation evidence
 
-Live 17-step follow-up is `9c27b4929b7700ce7d1ecbff976a832b78423e7b`, merged by PR #19 into `5585fd6`.
+Live 17-step follow-up is `9c27b4929b7700ce7d1ecbff976a832b78423e7b`, with final acceptance and macOS host-path fixes merged through PRs #20–#22 into `9fe1e106`.
 
 | Gate | Evidence/status |
 | --- | --- |
 | 1. Approved design | User approved the design and all twelve plans on 2026-09-17. |
 | 2. Plan | [P12 ordered plan](12-continuous-evals.md). |
-| 3. RED/GREEN | Engineering eval mapping missed edit/browser_snapshot/verification_plan; then 11/11 passed. Live test failed compile on unused output and double mut borrow; then two ignored Chromium runs passed. |
-| 4. Affected package tests | `cargo test --offline --locked -p davinci-evals --test engineering`: 11 passed. davinci-evals and davinci-coding-agent workspace-test jobs on `5585fd6` succeeded. |
-| 5. Format | `cargo fmt --check -p davinci-evals -p davinci-coding-agent`: exit 0. |
-| 6. Clippy | `cargo clippy --offline --locked -p davinci-evals -p davinci-coding-agent --all-targets -- -D warnings`: exit 0. |
-| 7. Integration | Live test `login_button_seventeen_step_normal_dispatch_and_graph_deny` dispatched all 17 required tools with real `process_start` and Chromium `browser_open`/`click`/`snapshot`/`console`/`network`. |
-| 8. Security | Classifier deny of `verification_plan` and `workspace_restore`. ACLs/permissions were not weakened. |
-| 9. Normal path | Two consecutive local Chromium runs, 4.72s and 4.84s. |
-| 10. Graph | Selective Graph deny recorded in the same test. |
-| 11. Evaluation | [p12-live-login.json](evidence/p12-live-login.json). Metrics: process_start 102–112 ms, browser_open 383–425 ms, impact cold 58–60 ms / warm 32–35 ms. `startup_ms` and `memory_bytes` are null with reason. |
-| 12. Docs | This ledger and [final report](../../../engineering-program-verification.md). |
-| 13. Review | Solo diff review. |
-| 14. CI | PR #19 CI [35419563201](https://github.com/J12003LPZ/davinci/actions/runs/35419563201) success; push CI [35419553200](https://github.com/J12003LPZ/davinci/actions/runs/35419553200) success; SARIF [35419563181](https://github.com/J12003LPZ/davinci/actions/runs/35419563181) and [35419553243](https://github.com/J12003LPZ/davinci/actions/runs/35419553243) success. Main CI on `5585fd6`: [35420073891](https://github.com/J12003LPZ/davinci/actions/runs/35420073891) success (attempt 2); SARIF [35420073914](https://github.com/J12003LPZ/davinci/actions/runs/35420073914) success. |
+| 3. RED/GREEN | Engineering eval mapping missed edit/browser_snapshot/verification_plan; then the focused suite passed. Live acceptance found the Graph path, nested checkpoint, and macOS temporary-path gaps; the regression tests and hosted matrix passed after the fixes. |
+| 4. Affected package tests | `cargo test --offline --locked -p davinci-evals --test engineering`: 10/10 focused tests passed in the final evidence. The final `main` CI also passed the davinci-evals and davinci-coding-agent workspace shards. |
+| 5. Format | Rust formatting checks passed for the affected sources and fixtures. |
+| 6. Clippy | Dedicated affected-package Clippy checks passed with `-D warnings`; the hosted quality job also passed. |
+| 7. Integration | The normal and Graph Writer paths dispatched all 17 required tools with real `process_start` and Chromium browser operations. Hosted macOS, Linux, and Windows jobs each ran the feature-on scenario twice. |
+| 8. Security | Classifier denied `verification_plan` and `workspace_restore` through `NativeExtensionHost::before_tool`; ACLs and permissions were not weakened. |
+| 9. Normal path | Local normal Chromium runs passed twice, and all six hosted feature-on runs passed. `workspace_diff` succeeded on every hosted run. |
+| 10. Graph | Graph Writer completed all 17 steps; Graph classifier deny receipts were observed on every hosted platform. |
+| 11. Evaluation | [p12-live-login.json](evidence/p12-live-login.json) and [p12-continuous-evals-local.json](evidence/p12-continuous-evals-local.json). Hosted feature-on median startup/memory: macOS 162.475 ms / 50,642,944 bytes, Linux 337.726 ms / 62,803,968 bytes, Windows 364.064 ms / 39,739,392 bytes. Normal cache telemetry was 3 hits/8 misses; Graph Writer was 4 hits/2 misses. |
+| 12. Docs | This ledger, the evidence JSON files, and [final report](../../../engineering-program-verification.md). |
+| 13. Review | Final diff reviewed for stale SHA/run references, JSON validity, and scope. |
+| 14. CI | Merged `main` SHA `9fe1e1062a6d265e7f282ab4556a478ed3bf3f7e`: CI [35460353612](https://github.com/J12003LPZ/davinci/actions/runs/35460353612), SARIF [35460353623](https://github.com/J12003LPZ/davinci/actions/runs/35460353623), and workflow lint [35460353647](https://github.com/J12003LPZ/davinci/actions/runs/35460353647) all succeeded. |
