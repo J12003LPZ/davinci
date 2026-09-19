@@ -6,15 +6,15 @@ Shared checkout `C:\Users\sergi\Desktop\pi-rust` was not modified.
 
 ## Delivery
 
-- `origin/main`: `9fe1e1062a6d265e7f282ab4556a478ed3bf3f7e` (merged PR #22, the final acceptance and macOS host-path fix).
-- Merged PRs: #9 P1, #10 P2, #11 P4, #12 P3, #13 P5, #14 P7, #15 P6, #16 P9, #17 P8, #18 P10–P12, #19 P12 live 17-step, #20 program report, #21 Graph/checkpoint acceptance fix, and #22 final acceptance/macOS host fix.
-- Isolated final-evidence branch `codex/program-evidence-20260919` is based on that SHA; all twelve feature SHAs and the live acceptance fixes are ancestors of `origin/main`.
+- `origin/main`: `70542fcbf93e223aa40889763d37e1a76913f50d` (merged PR #23, final evidence closeout; code acceptance remains `9fe1e106`).
+- Merged PRs: #9 P1, #10 P2, #11 P4, #12 P3, #13 P5, #14 P7, #15 P6, #16 P9, #17 P8, #18 P10–P12, #19 P12 live 17-step, #20 program report, #21 Graph/checkpoint acceptance fix; #22 final acceptance/macOS host fix, and #23 final evidence closeout.
+- The final evidence closeout is merged to `origin/main` at this SHA; all twelve feature SHAs and the live acceptance fixes are ancestors of it.
 
-## Main CI on `9fe1e106`
+## Final main verification on `70542fcb`
 
-- Security SARIF: https://github.com/J12003LPZ/davinci/actions/runs/35460353623 success.
-- CI: https://github.com/J12003LPZ/davinci/actions/runs/35460353612 success across the full matrix, including Linux/macOS/Windows native P12 and test-impact jobs.
-- Workflow lint: https://github.com/J12003LPZ/davinci/actions/runs/35460353647 success.
+- Security SARIF: https://github.com/J12003LPZ/davinci/actions/runs/35462619625 success.
+- CI: https://github.com/J12003LPZ/davinci/actions/runs/35462619603 success across the full matrix, including Linux/macOS/Windows native P12 and test-impact jobs.
+- Workflow lint: https://github.com/J12003LPZ/davinci/actions/runs/35460353647 success on the unchanged workflow set.
 
 Prior assembled main (P1–P12 without the live 17-step follow-up): `57975a5` CI https://github.com/J12003LPZ/davinci/actions/runs/35418243472 success.
 
@@ -39,7 +39,7 @@ Graph Writer executed the same 17 tools through `agent.call` with `pre_tool` -> 
 
 Raw `--nocapture` transcripts were captured in the session scratch `p12-normal/` and `p12-graph/` directories (not committed).
 
-Hosted P12 evidence is attached to CI run [35460353612](https://github.com/J12003LPZ/davinci/actions/runs/35460353612) and preserved in the `p12-live-login-macOS`, `p12-live-login-Linux`, and `p12-live-login-Windows` artifacts. Every platform ran the feature-off and feature-on fixture twice; all six feature-on browser runs succeeded, recorded startup and working-set memory, and reported 3 normal cache hits plus 4 Graph Writer cache hits. Median feature-on startup/memory was 162.475 ms / 50,642,944 bytes on macOS, 337.726 ms / 62,803,968 bytes on Linux, and 364.064 ms / 39,739,392 bytes on Windows. The Graph Writer completed all 17 steps, `workspace_diff` succeeded, and the Classifier denied both `verification_plan` and `workspace_restore` through `NativeExtensionHost::before_tool`.
+Artifact-level P12 evidence was captured on the code acceptance SHA `9fe1e106` in CI run [35460353612](https://github.com/J12003LPZ/davinci/actions/runs/35460353612) and preserved in the `p12-live-login-macOS`, `p12-live-login-Linux`, and `p12-live-login-Windows` artifacts. Every platform ran the feature-off and feature-on fixture twice; all six feature-on browser runs succeeded, recorded startup and working-set memory, and reported 3 normal cache hits plus 4 Graph Writer cache hits. Median feature-on startup/memory was 162.475 ms / 50,642,944 bytes on macOS, 337.726 ms / 62,803,968 bytes on Linux, and 364.064 ms / 39,739,392 bytes on Windows. The Graph Writer completed all 17 steps, `workspace_diff` succeeded, and the Classifier denied both `verification_plan` and `workspace_restore` through `NativeExtensionHost::before_tool`. Final main `70542fcb` reran all three hosted platforms successfully in CI [35462619603](https://github.com/J12003LPZ/davinci/actions/runs/35462619603).
 
 ## Limitations (not relabeled success)
 
@@ -66,4 +66,4 @@ Hosted P12 evidence is attached to CI run [35460353612](https://github.com/J1200
 
 ## Restart
 
-No production service restart. Agents pick up `origin/main` `9fe1e106` on next checkout/rebuild.
+No production service restart. Agents pick up `origin/main` `70542fcb` on next checkout/rebuild.

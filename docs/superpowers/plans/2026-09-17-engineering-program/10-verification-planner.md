@@ -1,6 +1,6 @@
 # P10: Verification Planner
 
-Status: completed; merged in PR #18; final assembled tree is on `origin/main` `9fe1e106`. Design approved 2026-09-17.
+Status: completed; merged in PR #18; final assembled tree is on `origin/main` `70542fcb`. Design approved 2026-09-17.
 Execution sequence: 10 of 12.
 Dependencies: P1, P3, P7, P8, P9 and existing source-bound evidence/completion.
 Requirements authority: project section 15 and cross-cutting sections 18-40;
