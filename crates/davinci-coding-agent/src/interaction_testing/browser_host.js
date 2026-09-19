@@ -49,9 +49,15 @@ async function main() {
   process.exitCode = outcome.failed ? 1 : 0;
 }
 
-if (require.main === module) main().catch(() => {
-  // Dependency errors can contain sensitive paths. No diagnostic joins JSONL.
-  process.stderr.write('Browser host unavailable\n');
+if (require.main === module) main().catch(error => {
+  // Dependency errors can contain sensitive paths. Keep the normal transport
+  // message generic; the opt-in diagnostic is limited to the native CI probe.
+  if (process.env.DAVINCI_BROWSER_DIAGNOSTICS === '1') {
+    const detail = error && typeof error.message === 'string' ? error.message.slice(0, 512) : 'unknown error';
+    process.stderr.write(`Browser host unavailable: ${detail}\n`);
+  } else {
+    process.stderr.write('Browser host unavailable\n');
+  }
   process.exitCode = 1;
 });
 module.exports = {createArtifactSink};

@@ -117,6 +117,7 @@ jobs:
           fi
           echo "DAVINCI_TRUSTED_NODE_TEST_PATH=$(node -p 'process.execPath')" >> "$GITHUB_ENV"
           echo "DAVINCI_TRUSTED_PLAYWRIGHT_TEST_PATH=$fixture_dir/node_modules/playwright" >> "$GITHUB_ENV"
+          echo "DAVINCI_BROWSER_DIAGNOSTICS=1" >> "$GITHUB_ENV"
       - name: Run the P12 feature-off baseline on the shared fixture
         shell: bash
         run: |

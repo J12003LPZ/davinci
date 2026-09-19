@@ -143,6 +143,7 @@ impl BrowserProcess {
         #[cfg(not(unix))]
         fs::create_dir(&directory).map_err(|_| "browser private directory unavailable")?;
         let launch = (|| {
+            let diagnostics = std::env::var_os("DAVINCI_BROWSER_DIAGNOSTICS").is_some();
             if directory
                 .canonicalize()
                 .map_err(|_| "browser private directory unavailable")?
@@ -160,6 +161,7 @@ impl BrowserProcess {
                         | "TMP"
                         | "TMPDIR"
                         | "PLAYWRIGHT_BROWSERS_PATH"
+                        | "DAVINCI_BROWSER_DIAGNOSTICS"
                 )
             }) {
                 return Err("unsupported browser host environment variable".into());
@@ -176,6 +178,9 @@ impl BrowserProcess {
                 }
             }
             let mut environment = config.environment;
+            if diagnostics {
+                environment.insert("DAVINCI_BROWSER_DIAGNOSTICS".into(), "1".into());
+            }
             // Windows Node crypto initialization needs SystemRoot. Preserve the
             // supervisor's platform-path allowlist, never loader/credential env.
             for name in ["PATH", "SystemRoot", "WINDIR", "TEMP", "TMP", "TMPDIR"] {
@@ -247,7 +252,15 @@ impl BrowserProcess {
                         }
                     }
                 }),
-                Arc::new(|_| {}),
+                Arc::new(move |bytes| {
+                    if diagnostics {
+                        let detail = String::from_utf8_lossy(&bytes);
+                        eprint!(
+                            "browser host stderr: {}",
+                            detail.chars().take(1024).collect::<String>()
+                        );
+                    }
+                }),
             )?);
             *owner.lock().unwrap_or_else(|e| e.into_inner()) = Some(Arc::downgrade(&supervisor));
             if state
