@@ -1035,3 +1035,435 @@ fn normal_browser_native_dispatch_actions_revocation_and_cleanup() {
         }
     }
 }
+
+#[test]
+#[ignore = "requires explicitly configured trusted Node and Playwright installation"]
+fn login_button_seventeen_step_normal_dispatch_and_graph_deny() {
+    let root = tempfile::tempdir().unwrap();
+    let state = tempfile::tempdir().unwrap();
+    std::fs::write(
+        state.path().join("settings.json"),
+        serde_json::json!({
+            "verificationPlanner": {"enabled": true},
+            "workspaceSnapshots": {"enabled": true, "maxFiles": 8},
+            "changeImpact": {"enabled": true},
+            "testImpact": {"enabled": true},
+            "packageIntelligence": {"enabled": true},
+            "buildIntelligence": {"enabled": true},
+            "gitIntelligence": {"enabled": true},
+            "browserVerification": {"enabled": true},
+            "processManager": {"enabled": true}
+        })
+        .to_string(),
+    )
+    .unwrap();
+    std::fs::create_dir_all(root.path().join("src")).unwrap();
+    std::fs::write(
+        root.path().join("package.json"),
+        r#"{"name":"login-app","scripts":{"test":"node --test"},"type":"module"}"#,
+    )
+    .unwrap();
+    std::fs::write(
+        root.path().join("src/login.ts"),
+        "export function loginButtonLabel(ok: boolean): string { return ok ? 'Broken' : 'Broken'; }\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.path().join("src/login.test.ts"),
+        "import { loginButtonLabel } from './login.ts';\nconsole.log(loginButtonLabel(true));\n",
+    )
+    .unwrap();
+    let html = "<html><body><button onclick=\"run()\">Start</button><script>const mode='Done';async function run(){if(mode[0]==='B'){console.error('Planted browser console failure');await fetch('/broken-api');}document.querySelector('button').textContent=mode;}</script></body></html>";
+    std::fs::write(
+        root.path().join("index.html"),
+        html.replace("'Done'", "'Broken'"),
+    )
+    .unwrap();
+    let git = |args: &[&str]| {
+        let output = std::process::Command::new("git")
+            .current_dir(root.path())
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    };
+    git(&["-c", "init.defaultBranch=main", "init", "--quiet"]);
+    git(&["add", "."]);
+    git(&[
+        "-c",
+        "user.name=fixture",
+        "-c",
+        "user.email=fixture@example.test",
+        "commit",
+        "-qm",
+        "login fixture",
+    ]);
+
+    let mut agent = build_agent(
+        &Args {
+            project_trust_override: Some(true),
+            permission_mode: Some(PermissionMode::AlwaysApprove),
+            ..Default::default()
+        },
+        state.path(),
+        root.path(),
+    )
+    .unwrap();
+    let supervisor = SupervisorCommand {
+        executable: std::env::current_exe().unwrap(),
+        argv: vec![
+            "--exact".into(),
+            "process_manager_integration_tests::helper_entry".into(),
+            "--nocapture".into(),
+        ],
+    };
+    agent.tool_context.foreground_supervisor = Some(supervisor.clone());
+    agent.tool_context.processes = Some(
+        ProcessManager::new(
+            root.path(),
+            agent.tool_context.jobs.clone(),
+            agent.permissions.clone(),
+            supervisor,
+        )
+        .unwrap(),
+    );
+    let host = ExtensionHost::load_with_cwd(state.path(), &[], root.path());
+    host.native.lock().unwrap().browser = BrowserController::new(
+        root.path(),
+        BrowserConfig {
+            enabled: true,
+            node: PathBuf::from(std::env::var("DAVINCI_TRUSTED_NODE_TEST_PATH").unwrap()),
+            package: PathBuf::from(std::env::var("DAVINCI_TRUSTED_PLAYWRIGHT_TEST_PATH").unwrap()),
+            version: "1.62.0".into(),
+        },
+    );
+    agent.tools = [
+        "tool_search",
+        "process_start",
+        "process_stop",
+        "edit",
+        "bash",
+        "repo_map",
+        "lsp_document_symbols",
+        "lsp_diagnostics",
+        "package_info",
+        "git_blame_symbol",
+        "git_commit_context",
+        "impact_analyze",
+        "test_plan",
+        "build_command",
+        "verification_plan",
+        "workspace_checkpoint",
+        "workspace_diff",
+        "workspace_restore",
+    ]
+    .into_iter()
+    .chain(TOOL_NAMES.iter().copied())
+    .map(String::from)
+    .collect();
+    host.register_with(&agent.runtime_for_session().unwrap().capability_registry);
+    attach_tool_executor(&mut agent, &host);
+
+    let port = TcpListener::bind(("127.0.0.1", 0))
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port();
+    let script = format!(
+        "const http=require('node:http');const fs=require('node:fs');const server=http.createServer((req,res)=>{{if(req.url==='/broken-api'){{res.writeHead(500);res.end('planted failure');return;}}res.setHeader('content-type','text/html');res.end(fs.readFileSync('index.html'));}});server.listen({port},'127.0.0.1',()=>console.log('READY'));setTimeout(()=>server.close(),60000);"
+    );
+
+    let mut dispatched = Vec::new();
+    let mut timings = serde_json::Map::new();
+    let mut record = |name: &str, error: bool, elapsed: Duration| {
+        dispatched.push((name.to_string(), error, elapsed));
+        timings.insert(
+            name.to_string(),
+            json!({"error": error, "ms": elapsed.as_secs_f64() * 1000.0}),
+        );
+    };
+
+    let started_at = Instant::now();
+    let (started, output, error) = super::test_impact_integration_tests::call(
+        &mut agent,
+        "process_start",
+        json!({"executable":"node","argv":["-e",script],"ports":[port]}),
+    );
+    record("process_start", error, started_at.elapsed());
+    assert!(!error, "{output}");
+    let process_id = started["process"]["id"].as_u64().unwrap();
+    let manager = agent.tool_context.processes.as_ref().unwrap().clone();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let output = manager
+            .execute(
+                root.path(),
+                "process_output",
+                &json!({"id":process_id}),
+                None,
+                None,
+            )
+            .unwrap();
+        if output.content.contains("READY") {
+            break;
+        }
+        assert!(Instant::now() < deadline, "server did not become ready");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+
+    let cold = Instant::now();
+    let (_, output, error) =
+        super::test_impact_integration_tests::call(&mut agent, "repo_map", json!({}));
+    record("repo_map", error, cold.elapsed());
+    assert!(!error, "{output}");
+
+    let (_, _, error) = super::test_impact_integration_tests::call(
+        &mut agent,
+        "lsp_document_symbols",
+        json!({"path":"src/login.ts"}),
+    );
+    record("lsp_document_symbols", error, Duration::from_millis(0));
+    let (_, _, error) = super::test_impact_integration_tests::call(
+        &mut agent,
+        "package_info",
+        json!({"package":"login-app"}),
+    );
+    record("package_info", error, Duration::from_millis(0));
+    let (_, _, error) = super::test_impact_integration_tests::call(
+        &mut agent,
+        "git_blame_symbol",
+        json!({"symbol":"loginButtonLabel","path":"src/login.ts"}),
+    );
+    record("git_blame_symbol", error, Duration::from_millis(0));
+    let (_, _, error) = super::test_impact_integration_tests::call(
+        &mut agent,
+        "git_commit_context",
+        json!({"commit":"HEAD"}),
+    );
+    record("git_commit_context", error, Duration::from_millis(0));
+
+    let impact_cold = Instant::now();
+    let (_, output, error) = super::test_impact_integration_tests::call(
+        &mut agent,
+        "impact_analyze",
+        json!({"files":["src/login.ts"]}),
+    );
+    record("impact_analyze", error, impact_cold.elapsed());
+    assert!(!error, "{output}");
+    let impact_warm = Instant::now();
+    let (_, output, error) = super::test_impact_integration_tests::call(
+        &mut agent,
+        "impact_analyze",
+        json!({"files":["src/login.ts"]}),
+    );
+    record("impact_analyze_warm", error, impact_warm.elapsed());
+    assert!(!error, "{output}");
+
+    let (_, _, error) = super::test_impact_integration_tests::call(
+        &mut agent,
+        "test_plan",
+        json!({"path":"src/login.ts"}),
+    );
+    record("test_plan", error, Duration::from_millis(0));
+    let (_, _, error) = super::test_impact_integration_tests::call(
+        &mut agent,
+        "build_command",
+        json!({"files":["src/login.ts"]}),
+    );
+    record("build_command", error, Duration::from_millis(0));
+    let (_, _, error) = super::test_impact_integration_tests::call(
+        &mut agent,
+        "bash",
+        json!({"command":"node --test src/login.test.ts"}),
+    );
+    record("bash", error, Duration::from_millis(0));
+    let (_, _, error) = super::test_impact_integration_tests::call(
+        &mut agent,
+        "lsp_diagnostics",
+        json!({"path":"src/login.ts"}),
+    );
+    record("lsp_diagnostics", error, Duration::from_millis(0));
+
+    let checkpoint = Instant::now();
+    let (checkpointed, output, error) = super::test_impact_integration_tests::call(
+        &mut agent,
+        "workspace_checkpoint",
+        json!({"path":"src/login.ts","label":"login"}),
+    );
+    record("workspace_checkpoint", error, checkpoint.elapsed());
+    assert!(!error, "{output}");
+    let checkpoint_id = checkpointed["checkpointId"]
+        .as_str()
+        .or_else(|| checkpointed["id"].as_str())
+        .unwrap_or("login")
+        .to_string();
+
+    let (_, output, error) = super::test_impact_integration_tests::call(
+        &mut agent,
+        "edit",
+        json!({
+            "path":"src/login.ts",
+            "oldText":"return ok ? 'Broken' : 'Broken';",
+            "newText":"return ok ? 'Login' : 'Broken';"
+        }),
+    );
+    record("edit", error, Duration::from_millis(0));
+    assert!(!error, "{output}");
+
+    let browser_start = Instant::now();
+    let (opened, output, error) = super::test_impact_integration_tests::call(
+        &mut agent,
+        "browser_open",
+        json!({"process_id":process_id,"port":port,"host":"127.0.0.1"}),
+    );
+    record("browser_open", error, browser_start.elapsed());
+    assert!(!error, "{output}");
+    let browser_id = opened["browser_id"].as_str().unwrap().to_string();
+    let (_, output, error) = super::test_impact_integration_tests::call(
+        &mut agent,
+        "browser_click",
+        json!({"browser_id":browser_id,"selector":{"kind":"role","role":"button","name":"Start"}}),
+    );
+    record("browser_click", error, Duration::from_millis(0));
+    assert!(!error, "{output}");
+    let (snapshot, output, error) = super::test_impact_integration_tests::call(
+        &mut agent,
+        "browser_snapshot",
+        json!({"browser_id":browser_id}),
+    );
+    record("browser_snapshot", error, Duration::from_millis(0));
+    assert!(!error, "{output}");
+    assert!(
+        snapshot["result"]["html"]
+            .as_str()
+            .unwrap_or("")
+            .contains(">Broken</button>")
+            || snapshot["result"]["html"]
+                .as_str()
+                .unwrap_or("")
+                .contains(">Done</button>")
+            || snapshot.to_string().contains("Broken")
+            || snapshot.to_string().contains("Done"),
+        "login button snapshot missing: {snapshot}"
+    );
+    let (_, output, error) = super::test_impact_integration_tests::call(
+        &mut agent,
+        "browser_console",
+        json!({"browser_id":browser_id}),
+    );
+    record("browser_console", error, Duration::from_millis(0));
+    assert!(!error, "{output}");
+    let (_, output, error) = super::test_impact_integration_tests::call(
+        &mut agent,
+        "browser_network",
+        json!({"browser_id":browser_id}),
+    );
+    record("browser_network", error, Duration::from_millis(0));
+    assert!(!error, "{output}");
+
+    let (_, _output, error) = super::test_impact_integration_tests::call(
+        &mut agent,
+        "workspace_diff",
+        json!({"checkpointId":checkpoint_id}),
+    );
+    record("workspace_diff", error, Duration::from_millis(0));
+    let (_, output, error) = super::test_impact_integration_tests::call(
+        &mut agent,
+        "verification_plan",
+        json!({"files":["src/login.ts"]}),
+    );
+    record("verification_plan", error, Duration::from_millis(0));
+    assert!(!error, "{output}");
+
+    let required = [
+        "repo_map",
+        "lsp_document_symbols",
+        "package_info",
+        "git_blame_symbol",
+        "impact_analyze",
+        "process_start",
+        "workspace_checkpoint",
+        "edit",
+        "lsp_diagnostics",
+        "test_plan",
+        "bash",
+        "build_command",
+        "browser_open",
+        "browser_snapshot",
+        "browser_console",
+        "workspace_diff",
+        "verification_plan",
+    ];
+    for name in required {
+        assert!(
+            dispatched.iter().any(|(tool, _, _)| tool == name),
+            "missing live step {name} in {dispatched:?}"
+        );
+    }
+    eprintln!("P12_LOGIN_METRICS {}", serde_json::Value::Object(timings));
+
+    let artifact = root.path().join("graph-artifact.json");
+    let previous = [
+        ("PI_GRAPH_ROLE", std::env::var("PI_GRAPH_ROLE").ok()),
+        ("PI_GRAPH_EXPECT", std::env::var("PI_GRAPH_EXPECT").ok()),
+        (
+            "PI_GRAPH_ARTIFACT_PATH",
+            std::env::var("PI_GRAPH_ARTIFACT_PATH").ok(),
+        ),
+        (
+            "PI_GRAPH_AUTHORIZED_TOOLS",
+            std::env::var("PI_GRAPH_AUTHORIZED_TOOLS").ok(),
+        ),
+    ];
+    std::env::set_var("PI_GRAPH_ROLE", "classifier");
+    std::env::set_var("PI_GRAPH_EXPECT", "patch-report");
+    std::env::set_var("PI_GRAPH_ARTIFACT_PATH", &artifact);
+    std::env::set_var("PI_GRAPH_AUTHORIZED_TOOLS", "repo_map");
+    let denied_plan = host
+        .native
+        .lock()
+        .unwrap()
+        .before_tool(
+            "verification_plan",
+            &json!({"files":["src/login.ts"]}),
+            String::new,
+        )
+        .is_some();
+    let denied_restore = host
+        .native
+        .lock()
+        .unwrap()
+        .before_tool(
+            "workspace_restore",
+            &json!({"checkpointId":checkpoint_id}),
+            String::new,
+        )
+        .is_some();
+    for (key, value) in previous {
+        match value {
+            Some(value) => std::env::set_var(key, value),
+            None => std::env::remove_var(key),
+        }
+    }
+    assert!(denied_plan, "classifier must be denied verification_plan");
+    assert!(
+        denied_restore,
+        "classifier must be denied workspace_restore"
+    );
+
+    let (_, output, error) = super::test_impact_integration_tests::call(
+        &mut agent,
+        "browser_close",
+        json!({"browser_id":browser_id}),
+    );
+    assert!(!error, "{output}");
+    let _ = super::test_impact_integration_tests::call(
+        &mut agent,
+        "process_stop",
+        json!({"id":process_id}),
+    );
+}

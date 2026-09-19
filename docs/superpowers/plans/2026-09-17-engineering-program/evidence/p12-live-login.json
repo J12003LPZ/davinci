@@ -1,0 +1,60 @@
+{
+  "test": "browser_integration_tests::login_button_seventeen_step_normal_dispatch_and_graph_deny",
+  "command": "cargo test --offline --locked -p davinci-coding-agent --bin davinci -- --ignored --nocapture login_button_seventeen_step",
+  "runs": [
+    {
+      "pass": true,
+      "duration_s": 4.72,
+      "metrics": {
+        "process_start_ms": 112.002,
+        "browser_open_ms": 382.8736,
+        "impact_analyze_cold_ms": 58.0794,
+        "impact_analyze_warm_ms": 32.4437,
+        "repo_map_ms": 66.1456,
+        "workspace_checkpoint_ms": 51.0313
+      }
+    },
+    {
+      "pass": true,
+      "duration_s": 4.84,
+      "metrics": {
+        "process_start_ms": 102.6251,
+        "browser_open_ms": 425.4502,
+        "impact_analyze_cold_ms": 59.6101,
+        "impact_analyze_warm_ms": 34.6795,
+        "repo_map_ms": 40.5597,
+        "workspace_checkpoint_ms": 55.0815
+      }
+    }
+  ],
+  "dispatched_required_tools": [
+    "repo_map",
+    "lsp_document_symbols",
+    "package_info",
+    "git_blame_symbol",
+    "impact_analyze",
+    "process_start",
+    "workspace_checkpoint",
+    "edit",
+    "lsp_diagnostics",
+    "test_plan",
+    "bash",
+    "build_command",
+    "browser_open",
+    "browser_snapshot",
+    "browser_console",
+    "workspace_diff",
+    "verification_plan"
+  ],
+  "graph_classifier_denied_verification_plan": true,
+  "graph_classifier_denied_workspace_restore": true,
+  "limitations": {
+    "lsp_diagnostics": "dispatched, returned error (language server unavailable in fixture)",
+    "lsp_document_symbols": "dispatched, returned error (language server unavailable in fixture)",
+    "workspace_diff": "dispatched, returned error (checkpoint id field mismatch in details)",
+    "memory_bytes": null,
+    "memory_reason": "not collected; process working-set sampling was not wired in this host",
+    "linux": "not executed locally; GitHub Actions native matrix on main 57975a5 succeeded",
+    "macos": "not executed locally; GitHub Actions native matrix on main 57975a5 succeeded"
+  }
+}
