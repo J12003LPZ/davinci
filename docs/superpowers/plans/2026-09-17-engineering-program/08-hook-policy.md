@@ -1,6 +1,6 @@
 # P8: Deterministic Hook / Policy Engine
 
-Status: design approved by the user on 2026-09-17; implementation pending.
+Status: Complete; PR #17 open and verified green across CI matrix.
 Execution sequence: 9 of 12.
 Dependencies: P2 supervised execution, P4 transaction events, existing RuntimeBus and trust; P9 green.
 Requirements authority: project section 13 and cross-cutting sections 18-40;
@@ -89,3 +89,24 @@ does not authorize merging new PRs into main.
 The handoff in README records files/APIs changed, validated commands and results,
 metric/artifact paths, head SHA/CI URLs, limitations, and the next dependency input.
 No production capability is called done from this plan alone.
+
+## P8 implementation evidence
+
+Implementation is completed on `codex/hook-policy-01a0ad48` in the isolated worktree.
+
+| Gate | Evidence/status |
+| --- | --- |
+| 1. Approved design | User approved the design and all twelve plans on 2026-09-17; project section 13 and cross-cutting sections 18-40. |
+| 2. Plan | [P8 ordered plan](08-hook-policy.md). |
+| 3. RED/GREEN | Initial implementation uncovered stdin truncation causing json parse errors on payloads, missing depth guard debug trait, and argument lifetime constraints in `HooksRuntimeSubscriber`; all 11 integration tests passing after implementation. |
+| 4. Affected package tests | `rtk proxy cargo test --offline --locked -p davinci-coding-agent --test hook_policy`: exit 0 (11 passed); `rtk proxy cargo test --offline --locked -p davinci-agent`: exit 0 (73 passed, 3 ignored); `rtk proxy cargo test --offline --locked -p davinci-coding-agent --lib`: exit 0 (1045 passed, 15 ignored). |
+| 5. Format | `rtk proxy cargo fmt -p davinci-agent -p davinci-coding-agent --check`: exit 0. |
+| 6. Clippy | `rtk proxy cargo clippy --offline --locked -p davinci-agent -p davinci-coding-agent --all-targets -- -D warnings`: exit 0. |
+| 7. Integration | 11 integration tests passed in `hook_policy.rs`: legacy hook backward compatibility, policy rule filtering by event/tool/path globs, failure policies (warn, block, ignore), untrusted project hook rejection, post-load file modification invalidation, BeforeWrite decision blocking file mutation, AfterWrite observer failure tracking unmet completion requirements without retroactive file reversal, BeforeProcessStart blocking tool execution, recursion depth guard limiting depth, bounded JSON streams and timeout process termination, aggregate diagnostics via `/hook-status`. |
+| 8. Security | Binding trust to resolved path and SHA-256 content identity. Revalidated upon execution; disk changes invalidate trust immediately (fail closed). Native/model tools prohibited from granting trust or injecting hook definitions. Supervised process execution with bounded streams (64 KiB) and descendant process tree kill. Recursion depth capped at 3. |
+| 9. Normal path | Normal Agent session dispatch executes hooks subscribed via `HooksRuntimeSubscriber` on runtime bus events (decision and observer), enforces failure policies, and runs `/hook-status` diagnostics command without Graph. |
+| 10. Graph | Graph workers operate under host-bound policy constraints; workers cannot expand or inject hook policies. |
+| 11. Evaluation | [p8-hook-final.json](evidence/p8-hook-final.json) captures full verification evidence, decision/observer events, security invariants, and test results. |
+| 12. Docs | Updated `08-hook-policy.md` and `README.md` program ledger. |
+| 13. Review | Solo source and diff audit across touched crates, models, tools, and tests. No subagents used per instruction. |
+| 14. CI | Green on head `cbef3fa4d1dc7fc52b210f2c4161a067a99653dc` and PR #17 ([PR #17](https://github.com/J12003LPZ/davinci/pull/17)). Push CI: [run 35414060812](https://github.com/J12003LPZ/davinci/actions/runs/35414060812) (22/22 jobs success); Push SARIF: [run 35414060714](https://github.com/J12003LPZ/davinci/actions/runs/35414060714); PR CI: [run 35414088579](https://github.com/J12003LPZ/davinci/actions/runs/35414088579) (22/22 jobs success); PR SARIF: [run 35414088573](https://github.com/J12003LPZ/davinci/actions/runs/35414088573). |

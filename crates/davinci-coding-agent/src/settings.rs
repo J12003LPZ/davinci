@@ -101,6 +101,19 @@ fn parse_change_impact<'de, D: serde::Deserializer<'de>>(
     }))
 }
 
+fn parse_hook_policy<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<crate::hooks::HookPolicyConfig>, D::Error> {
+    use crate::hooks::HookPolicyConfig;
+    let value = Option::<serde_json::Value>::deserialize(deserializer)?;
+    Ok(value.map(|value| {
+        serde_json::from_value(value).unwrap_or_else(|_| HookPolicyConfig {
+            enabled: false,
+            ..Default::default()
+        })
+    }))
+}
+
 fn parse_language_intelligence<'de, D: serde::Deserializer<'de>>(
     deserializer: D,
 ) -> Result<
@@ -168,6 +181,8 @@ pub struct Settings {
         deserialize_with = "parse_change_impact"
     )]
     pub change_impact: Option<crate::native_extensions::change_impact::ChangeImpactConfig>,
+    #[serde(default, rename = "hookPolicy", deserialize_with = "parse_hook_policy")]
+    pub hook_policy: Option<crate::hooks::HookPolicyConfig>,
     #[serde(default, rename = "repoIntelligence")]
     pub repo_intelligence:
         Option<crate::native_extensions::repo_intelligence::RepoIntelligenceConfig>,
@@ -1960,5 +1975,26 @@ mod tests {
             .expect_err("an invalid selected setting must be reported");
         assert!(error.contains("experimental"));
         assert!(error.contains("stable, preview, legacy-v1"));
+    }
+
+    #[test]
+    fn test_hook_policy_settings() {
+        let json = r#"{
+            "hookPolicy": {
+                "enabled": true,
+                "maxDepth": 5,
+                "defaultTimeoutMs": 5000,
+                "defaultFailurePolicy": "warn"
+            }
+        }"#;
+        let settings: Settings = serde_json::from_str(json).unwrap();
+        let hook_policy = settings.hook_policy.unwrap();
+        assert!(hook_policy.enabled);
+        assert_eq!(hook_policy.max_depth, 5);
+        assert_eq!(hook_policy.default_timeout_ms, 5000);
+        assert_eq!(
+            hook_policy.default_failure_policy,
+            crate::hooks::HookFailurePolicy::Warn
+        );
     }
 }
