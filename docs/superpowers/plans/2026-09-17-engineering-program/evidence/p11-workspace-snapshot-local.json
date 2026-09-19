@@ -51,7 +51,7 @@
     "clippy": "strict affected-library Clippy passed; legacy workspace lints remain outside this gate",
     "normal_execution": "packaged smoke passed",
     "graph_execution": "packaged Graph Writer smoke passed",
-    "ci": "not_run"
+    "ci": "PR #18 exact-head green 35417186830; merged to main 5585fd6"
   },
-  "merge_ready": false
+  "merge_ready": true
 }

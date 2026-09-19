@@ -1,6 +1,6 @@
 # P10: Verification Planner
 
-Status: design approved by the user on 2026-09-17; implementation pending.
+Status: completed; merged in PR #18 onto `origin/main` `5585fd6`. Design approved 2026-09-17.
 Execution sequence: 10 of 12.
 Dependencies: P1, P3, P7, P8, P9 and existing source-bound evidence/completion.
 Requirements authority: project section 15 and cross-cutting sections 18-40;
