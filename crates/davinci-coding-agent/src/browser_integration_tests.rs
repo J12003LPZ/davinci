@@ -1562,6 +1562,7 @@ fn login_button_seventeen_step_normal_dispatch_and_graph_deny() {
     record("verification_plan", error, Duration::from_millis(0));
     assert!(!error, "{output}");
 
+    drop(record);
     let required = [
         "repo_map",
         "lsp_document_symbols",
@@ -1587,7 +1588,6 @@ fn login_button_seventeen_step_normal_dispatch_and_graph_deny() {
             "missing live step {name} in {dispatched:?}"
         );
     }
-    drop(record);
     let normal_cache = cache_delta(&cache_before, &host.native.lock().unwrap().cache.stats());
     let memory_bytes = peak_memory_bytes().expect("P12 normal memory measurement");
     let cache_hits = normal_cache["hits"]
@@ -1768,13 +1768,13 @@ fn login_button_seventeen_step_normal_dispatch_and_graph_deny() {
         "graph writer workspace_diff must succeed with {graph_checkpoint_id}: {output}"
     );
 
+    drop(graph_record);
     for name in required {
         assert!(
             graph_dispatched.iter().any(|(tool, _, _)| tool == name),
             "missing graph writer step {name} in {graph_dispatched:?}"
         );
     }
-    drop(graph_record);
     let graph_cache = cache_delta(
         &graph_cache_before,
         &host.native.lock().unwrap().cache.stats(),
