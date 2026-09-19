@@ -385,7 +385,7 @@ fn add_workflow_label(label: &str, steps: &mut BTreeSet<EngineeringWorkflowStep>
         "process_start" | "dev_server" | "start_dev_server" => {
             steps.insert(EngineeringWorkflowStep::StartDevServer);
         }
-        "edit_code" => {
+        "edit" | "write" | "apply_patch" | "edit_code" => {
             steps.insert(EngineeringWorkflowStep::EditCode);
         }
         "transaction_create" | "workspace_checkpoint" => {
@@ -404,7 +404,7 @@ fn add_workflow_label(label: &str, steps: &mut BTreeSet<EngineeringWorkflowStep>
         "browser_open" | "open_browser" => {
             steps.insert(EngineeringWorkflowStep::OpenBrowser);
         }
-        "browser_login" | "verify_login" | "login_verified" => {
+        "browser_snapshot" | "browser_login" | "verify_login" | "login_verified" => {
             steps.insert(EngineeringWorkflowStep::VerifyLogin);
         }
         "browser_console" | "browser_network" | "console_network" => {
@@ -413,7 +413,7 @@ fn add_workflow_label(label: &str, steps: &mut BTreeSet<EngineeringWorkflowStep>
         "workspace_diff" | "workspace_restore" | "transaction_verify" => {
             steps.insert(EngineeringWorkflowStep::TransactionVerify);
         }
-        "evidence_completion" | "evidence_complete" => {
+        "verification_plan" | "evidence_completion" | "evidence_complete" => {
             steps.insert(EngineeringWorkflowStep::EvidenceCompletion);
         }
         _ => {}

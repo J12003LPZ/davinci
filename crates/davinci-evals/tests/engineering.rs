@@ -312,3 +312,64 @@ fn process_start_metric_counts_observed_native_starts() {
         Some(2.0)
     );
 }
+
+#[test]
+fn login_button_native_tool_events_cover_all_seventeen_steps() {
+    let tools = [
+        ("repo_map", json!({})),
+        ("lsp_document_symbols", json!({"path": "src/login.ts"})),
+        ("package_info", json!({"package": "login-app"})),
+        (
+            "git_blame_symbol",
+            json!({"symbol": "loginButtonLabel", "path": "src/login.ts"}),
+        ),
+        ("impact_analyze", json!({"files": ["src/login.ts"]})),
+        (
+            "process_start",
+            json!({"executable": "node", "argv": ["-e", "console.log('READY')"]}),
+        ),
+        (
+            "workspace_checkpoint",
+            json!({"path": "src/login.ts", "label": "login"}),
+        ),
+        (
+            "edit",
+            json!({"path": "src/login.ts", "oldText": "Broken", "newText": "Login"}),
+        ),
+        ("lsp_diagnostics", json!({"path": "src/login.ts"})),
+        ("test_plan", json!({"path": "src/login.ts"})),
+        ("bash", json!({"command": "node --test src/login.test.ts"})),
+        ("build_command", json!({"files": ["src/login.ts"]})),
+        ("browser_open", json!({"port": 1})),
+        ("browser_snapshot", json!({"browser_id": "ctx"})),
+        ("browser_console", json!({"browser_id": "ctx"})),
+        ("workspace_diff", json!({"checkpointId": "cp"})),
+        ("verification_plan", json!({"files": ["src/login.ts"]})),
+    ];
+    let mut events = Vec::new();
+    for (index, (name, args)) in tools.iter().enumerate() {
+        events.push(AgentEvent::ToolExecutionStart {
+            tool_call_id: format!("s{index}"),
+            tool_name: (*name).into(),
+            args: args.clone(),
+        });
+        events.push(AgentEvent::ToolExecutionEnd {
+            tool_call_id: format!("s{index}"),
+            tool_name: (*name).into(),
+            result: json!({"ok": true}),
+            is_error: false,
+            details: None,
+        });
+    }
+    let trace = BehaviorTrace::from_agent_events("login-button", None, &events, None);
+    let observation = observe_behavior_trace(&trace);
+    let missing: Vec<_> = EngineeringWorkflowStep::ALL
+        .into_iter()
+        .filter(|step| !observation.workflow_steps.contains(step))
+        .collect();
+    assert!(
+        missing.is_empty(),
+        "missing workflow steps {missing:?} observed={:?}",
+        observation.workflow_steps
+    );
+}
