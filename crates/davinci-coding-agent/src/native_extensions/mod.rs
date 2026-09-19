@@ -144,6 +144,7 @@ pub const NATIVE_COMMANDS: &[&str] = &[
     "learning-reject",
     "skill-list",
     "skill-view",
+    "hook-status",
 ];
 
 /// Metadata shared by the interactive and RPC command discovery surfaces.
@@ -247,6 +248,11 @@ pub fn command_specs() -> Vec<(&'static str, &'static str, Option<&'static str>)
             "Read the full content of a skill.",
             Some("<name> [file]"),
         ),
+        (
+            "hook-status",
+            "Show deterministic hook and policy engine diagnostics, trust state, and telemetry.",
+            None,
+        ),
     ]
 }
 
@@ -293,6 +299,7 @@ pub struct NativeExtensionHost {
     pub visual_snapshot: VisualSnapshotHost,
     /// Set by the native visual backend registration path when one exists.
     pub visual_verification_available: bool,
+    pub cwd: std::path::PathBuf,
 }
 
 impl NativeExtensionHost {
@@ -420,6 +427,7 @@ impl NativeExtensionHost {
             learning,
             visual_verification_available: visual_snapshot.is_available(),
             visual_snapshot,
+            cwd: cwd.to_path_buf(),
         }
     }
 
@@ -703,6 +711,14 @@ impl NativeExtensionHost {
             "learning-reject" => self.learning.reject_command(args).map(Some),
             "skill-list" => self.learning.skill_list_command(args).map(Some),
             "skill-view" => self.learning.skill_view_command(args).map(Some),
+            "hook-status" => {
+                let cwd = if self.cwd.as_os_str().is_empty() {
+                    std::env::current_dir().unwrap_or_default()
+                } else {
+                    self.cwd.clone()
+                };
+                Ok(Some(crate::hooks::status_report(&cwd)))
+            }
             name if name.starts_with("graph") => self.graph.command(name, args),
             name if name == "security-scan" || name.starts_with("sec-") => {
                 self.security.command(name, args)

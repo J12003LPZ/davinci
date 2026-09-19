@@ -1,7 +1,7 @@
 # Engineering program ledger
 
-Status: design package approved; P1, P2, P3, P4, P5, P7 and P6 validated; P9 next.
-P7 head `950ab50` and P6 head `dcaf02b` passed CI, including Windows/Linux/macOS native matrix,
+Status: design package approved; P1, P2, P3, P4, P5, P7, P6 and P9 validated; P8 Complete (PR #17); P10 next.
+P7 head `950ab50`, P6 head `dcaf02b` and P9 head `726431e` passed CI, including Windows/Linux/macOS native matrix,
 normal-agent and Graph paths. Its evidence and limitations remain in its plan.
 Goal scope: all twelve projects and the global acceptance/performance/report gates.
 Reference: [program design](../../specs/2026-09-17-engineering-program.md) and
@@ -36,7 +36,7 @@ Reference: [program design](../../specs/2026-09-17-engineering-program.md) and
 | 6 | [P7 Build Intelligence](07-build-intelligence.md) | Complete; PR #14 open | Approved | Package tests, fmt, Clippy, integration, security and eval passed | Green at `950ab50` |
 | 7 | [P6 Git Intelligence](06-git-intelligence.md) | Complete; PR #15 open | Approved | Package tests, fmt, Clippy, integration, security and eval passed | Green at `dcaf02b` |
 | 8 | [P9 Change Impact Engine](09-change-impact.md) | Complete; PR #16 open | Approved | Package tests, fmt, Clippy, integration, security and eval passed | Green at `726431e` |
-| 9 | [P8 Deterministic Hook / Policy Engine](08-hook-policy.md) | Planned | Approved | Not run | Not pushed |
+| 9 | [P8 Deterministic Hook / Policy Engine](08-hook-policy.md) | Complete; PR #17 open | Approved | Package tests, fmt, Clippy, integration, security and eval passed | Pending PR #17 |
 | 10 | [P10 Verification Planner](10-verification-planner.md) | Planned | Approved | Not run | Not pushed |
 | 11 | [P11 Workspace Snapshot / Safe Sandbox Layer](11-workspace-snapshot.md) | Planned | Approved | Not run | Not pushed |
 | 12 | [P12 Continuous Agent Evaluation Framework](12-continuous-evals.md) | Planned | Approved | Not run | Not pushed |
@@ -542,4 +542,23 @@ Implementation is completed on `codex/git-intelligence-01a0ad48` in the isolated
 | 13. Review | Solo source and diff audit across touched crates, fixtures, tests, and documentation. No subagents used per instruction. |
 | 14. CI | Green on head `dcaf02b5ad366ef0c48ac0017684bb83f2ec2c9d` and PR #15 ([PR #15](https://github.com/J12003LPZ/davinci/pull/15)). Push CI: [run 35372343120](https://github.com/J12003LPZ/davinci/actions/runs/35372343120) (22/22 jobs success); Push SARIF: [run 35372343125](https://github.com/J12003LPZ/davinci/actions/runs/35372343125); PR CI: [run 35372351676](https://github.com/J12003LPZ/davinci/actions/runs/35372351676) (22/22 jobs success); PR SARIF: [run 35372351664](https://github.com/J12003LPZ/davinci/actions/runs/35372351664). |
 
+## P8 implementation evidence
 
+Implementation is completed on `codex/hook-policy-01a0ad48` in the isolated worktree.
+
+| Gate | Evidence/status |
+| --- | --- |
+| 1. Approved design | User approved the design and all twelve plans on 2026-09-17; project section 13 and cross-cutting sections 18-40. |
+| 2. Plan | [P8 ordered plan](08-hook-policy.md). |
+| 3. RED/GREEN | Initial implementation uncovered stdin truncation causing json parse errors on payloads, missing depth guard debug trait, and argument lifetime constraints in `HooksRuntimeSubscriber`; all 11 integration tests passing after implementation. |
+| 4. Affected package tests | `rtk proxy cargo test --offline --locked -p davinci-coding-agent --test hook_policy`: exit 0 (11 passed); `rtk proxy cargo test --offline --locked -p davinci-agent`: exit 0 (73 passed, 3 ignored); `rtk proxy cargo test --offline --locked -p davinci-coding-agent --lib`: exit 0 (1045 passed, 15 ignored). |
+| 5. Format | `rtk proxy cargo fmt -p davinci-agent -p davinci-coding-agent --check`: exit 0. |
+| 6. Clippy | `rtk proxy cargo clippy --offline --locked -p davinci-agent -p davinci-coding-agent --all-targets -- -D warnings`: exit 0. |
+| 7. Integration | 11 integration tests passed in `hook_policy.rs`: legacy hook backward compatibility, policy rule filtering by event/tool/path globs, failure policies (warn, block, ignore), untrusted project hook rejection, post-load file modification invalidation, BeforeWrite decision blocking file mutation, AfterWrite observer failure tracking unmet completion requirements without retroactive file reversal, BeforeProcessStart blocking tool execution, recursion depth guard limiting depth, bounded JSON streams and timeout process termination, aggregate diagnostics via `/hook-status`. |
+| 8. Security | Binding trust to resolved path and SHA-256 content identity. Revalidated upon execution; disk changes invalidate trust immediately (fail closed). Native/model tools prohibited from granting trust or injecting hook definitions. Supervised process execution with bounded streams (64 KiB) and descendant process tree kill. Recursion depth capped at 3. |
+| 9. Normal path | Normal Agent session dispatch executes hooks subscribed via `HooksRuntimeSubscriber` on runtime bus events (decision and observer), enforces failure policies, and runs `/hook-status` diagnostics command without Graph. |
+| 10. Graph | Graph workers operate under host-bound policy constraints; workers cannot expand or inject hook policies. |
+| 11. Evaluation | [p8-hook-final.json](evidence/p8-hook-final.json) captures full verification evidence, decision/observer events, security invariants, and test results. |
+| 12. Docs | Updated `08-hook-policy.md` and `README.md` program ledger. |
+| 13. Review | Solo source and diff audit across touched crates, models, tools, and tests. No subagents used per instruction. |
+| 14. CI | PR #17 targeting `codex/change-impact-01a0ad48`. |

@@ -1,0 +1,86 @@
+{
+  "milestone": "P8 Deterministic Hook / Policy Engine Final Evidence",
+  "base_branch": "codex/change-impact-01a0ad48",
+  "branch": "codex/hook-policy-01a0ad48",
+  "commands": [
+    "hook-status"
+  ],
+  "decision_events": [
+    "BeforeWrite",
+    "BeforeProcessStart",
+    "BeforeTest",
+    "BeforeCommit",
+    "BeforeCompletion"
+  ],
+  "observer_events": [
+    "AfterWrite",
+    "AfterProcessExit",
+    "AfterTest",
+    "AfterCommit",
+    "SessionStart",
+    "SessionEnd",
+    "BeforeTool",
+    "AfterTool"
+  ],
+  "capabilities": [
+    "Extended hooks.json schema supporting typed event/tool/path filters (HookPolicyRule) and argv action",
+    "Explicit failure policies: warn, block, ignore with configurable default fallback",
+    "Preserved 100% backward compatibility for legacy hooks (preTool, postTool, stop, user_prompt_submit)",
+    "Content identity binding (SHA-256) and resolved path verification in trust store",
+    "Fails closed on disk modification or revoked trust without restarting process",
+    "Native and model tools prohibited from granting trust or injecting executable hooks",
+    "Supervised process execution with bounded JSON stdin/stdout/stderr (64 KiB)",
+    "Process tree termination on timeout or cancellation (taskkill /F /T /PID on Windows, process group on Unix)",
+    "Host-owned recursion prevention with depth counter (max_depth: 3)",
+    "Observer events record unmet completion requirements without claiming retroactive file reversal",
+    "Aggregate diagnostics via /hook-status command with trust, rule, and unmet requirement reporting"
+  ],
+  "security_invariants": {
+    "untrusted_hooks_rejected": true,
+    "file_modification_invalidates_trust": true,
+    "no_model_auto_trust": true,
+    "before_write_blocking_prevents_mutation": true,
+    "observer_failure_cannot_reverse_writes": true,
+    "recursion_depth_bounded": true,
+    "bounded_streams_and_timeout": true,
+    "descendant_process_cleanup": true
+  },
+  "package_tests": {
+    "command": "rtk proxy cargo test --offline --locked -p davinci-coding-agent --test hook_policy",
+    "exit_code": 0,
+    "passed": 11,
+    "failed": 0,
+    "ignored": 0,
+    "cases": [
+      "test_legacy_hooks_backward_compatibility",
+      "test_hook_policy_rules_matching",
+      "test_hook_failure_policies",
+      "test_untrusted_project_hooks_rejected",
+      "test_post_load_file_modification_invalidation",
+      "test_before_write_blocking_prevents_file_mutation",
+      "test_after_write_observer_failure_records_unmet_requirement",
+      "test_before_process_start_blocking_prevents_spawn",
+      "test_recursion_guard_limits_depth",
+      "test_bounded_streams_and_timeout",
+      "test_hook_status_diagnostics"
+    ]
+  },
+  "agent_tests": {
+    "command": "rtk proxy cargo test --offline --locked -p davinci-agent",
+    "exit_code": 0,
+    "passed": 73,
+    "failed": 0,
+    "ignored": 3
+  },
+  "coding_agent_lib_tests": {
+    "command": "rtk proxy cargo test --offline --locked -p davinci-coding-agent --lib",
+    "exit_code": 0,
+    "passed": 1045,
+    "failed": 0,
+    "ignored": 15
+  },
+  "lint_checks": {
+    "fmt": "rtk proxy cargo fmt -p davinci-agent -p davinci-coding-agent --check (exit 0)",
+    "clippy": "rtk proxy cargo clippy --offline --locked -p davinci-agent -p davinci-coding-agent --all-targets -- -D warnings (exit 0)"
+  }
+}

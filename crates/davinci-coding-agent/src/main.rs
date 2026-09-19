@@ -1977,10 +1977,16 @@ fn complete_prompt_with_host(
     let trusted = is_trusted(&settings, &agent.cwd, parsed.project_trust_override);
     let user_hooks = hooks::load(&default_agent_dir(), &agent.cwd, trusted);
 
+    let hook_policy = settings.hook_policy.clone().unwrap_or_default();
     let runtime_bus = davinci_agent::RuntimeBus::new();
-    runtime_bus.subscribe(Arc::new(runtime_host::HooksRuntimeSubscriber::new(
-        user_hooks.clone(),
-    )));
+    runtime_bus.subscribe(Arc::new(
+        runtime_host::HooksRuntimeSubscriber::new_with_config(
+            user_hooks.clone(),
+            hook_policy,
+            agent.cwd.clone(),
+            default_agent_dir(),
+        ),
+    ));
     runtime_bus.subscribe(Arc::new(runtime_host::CompactionRuntimeSubscriber::new(
         hook_host
             .lock()

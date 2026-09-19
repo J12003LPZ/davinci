@@ -261,8 +261,50 @@ impl<'a> ToolTransaction<'a> {
         self.coordinator.status(id).map_err(ToolError::Failed)
     }
     pub fn apply(&self, changes: Vec<ProposedChange>) -> Result<TransactionSummary, ToolError> {
-        let preview = self.preview(changes)?;
-        self.mutate(&preview.id, false)
+        if let Some(runtime) = &self.context.runtime {
+            for change in &changes {
+                let target_path = self.root.join(&change.path);
+                let bytes = change.bytes.as_ref().map(|b| b.len()).unwrap_or(0);
+                let event = crate::runtime::RuntimeEvent::BeforeWrite {
+                    path: target_path,
+                    bytes,
+                };
+                if let Err(reason) = runtime.emit_decision(event) {
+                    return Err(ToolError::Failed(format!(
+                        "before-write hook blocked: {reason}"
+                    )));
+                }
+            }
+        }
+        let changes_clone = changes.clone();
+        let preview_res = self.preview(changes);
+        let preview = match preview_res {
+            Ok(p) => p,
+            Err(e) => {
+                if let Some(runtime) = &self.context.runtime {
+                    for change in &changes_clone {
+                        runtime.emit_observe(crate::runtime::RuntimeEvent::AfterWrite {
+                            path: self.root.join(&change.path),
+                            bytes: change.bytes.as_ref().map(|b| b.len()).unwrap_or(0),
+                            is_error: true,
+                        });
+                    }
+                }
+                return Err(e);
+            }
+        };
+        let mutate_res = self.mutate(&preview.id, false);
+        if let Some(runtime) = &self.context.runtime {
+            let is_error = mutate_res.is_err();
+            for change in &changes_clone {
+                runtime.emit_observe(crate::runtime::RuntimeEvent::AfterWrite {
+                    path: self.root.join(&change.path),
+                    bytes: change.bytes.as_ref().map(|b| b.len()).unwrap_or(0),
+                    is_error,
+                });
+            }
+        }
+        mutate_res
     }
     pub fn observe_commit(&self, id: &str) -> Result<TransactionSummary, ToolError> {
         self.coordinator

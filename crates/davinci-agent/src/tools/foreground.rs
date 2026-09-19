@@ -79,12 +79,24 @@ pub(super) fn run(
     if let Some(error) = interrupted() {
         return Err(ToolError::Failed(error));
     }
+    if let Some(runtime) = &context.runtime {
+        let event = crate::runtime::RuntimeEvent::BeforeProcessStart {
+            executable: config.executable.to_string_lossy().into_owned(),
+            argv: config.argv.clone(),
+            cwd: config.cwd.clone(),
+        };
+        if let Err(reason) = runtime.emit_decision(event) {
+            return Err(ToolError::Failed(format!(
+                "before-process-start hook blocked: {reason}"
+            )));
+        }
+    }
     let capture = Arc::new(Mutex::new(Capture::default()));
     let stdout = capture.clone();
     let stderr = capture.clone();
     let process = Supervisor::spawn_with_stderr(
         host,
-        config,
+        config.clone(),
         Arc::new(move |event| {
             if let ProcessEvent::Output(bytes) = event {
                 stdout
@@ -138,6 +150,17 @@ pub(super) fn run(
             break exit;
         }
     };
+    if let Some(runtime) = &context.runtime {
+        runtime.emit_observe(crate::runtime::RuntimeEvent::AfterProcessExit {
+            executable: config.executable.to_string_lossy().into_owned(),
+            argv: config.argv.clone(),
+            exit_code: exit.code,
+            is_error: !exit.output_complete
+                || exit.error.is_some()
+                || exit.stopped
+                || exit.code != Some(0),
+        });
+    }
     if exit.stopped || exit.error.is_some() || !exit.output_complete {
         return Err(ToolError::Failed(exit.error.unwrap_or_else(|| {
             "command output capture incomplete or process stopped".into()

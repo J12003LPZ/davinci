@@ -237,6 +237,48 @@ pub enum RuntimeEvent {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         reason: Option<String>,
     },
+    BeforeWrite {
+        path: PathBuf,
+        bytes: usize,
+    },
+    AfterWrite {
+        path: PathBuf,
+        bytes: usize,
+        is_error: bool,
+    },
+    BeforeProcessStart {
+        executable: String,
+        argv: Vec<String>,
+        cwd: PathBuf,
+    },
+    AfterProcessExit {
+        executable: String,
+        argv: Vec<String>,
+        exit_code: Option<i32>,
+        is_error: bool,
+    },
+    BeforeTest {
+        framework: String,
+        targets: Vec<String>,
+    },
+    AfterTest {
+        framework: String,
+        targets: Vec<String>,
+        passed: bool,
+        failures: usize,
+    },
+    BeforeCommit {
+        message: String,
+        files: Vec<String>,
+    },
+    AfterCommit {
+        commit_id: Option<String>,
+        message: String,
+        is_error: bool,
+    },
+    BeforeCompletion {
+        task_id: Option<TaskId>,
+    },
 }
 
 impl RuntimeEvent {
