@@ -592,6 +592,15 @@ impl ExtensionHost {
                 .clone();
             return Some(impact.execute(name, args));
         }
+        if crate::native_extensions::package_intelligence::TOOL_NAMES.contains(&name) {
+            let package = self
+                .native
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .package_intelligence
+                .clone();
+            return Some(package.execute_tool(name, args));
+        }
         if crate::native_extensions::repo_intelligence::is_repo_tool(name) {
             let repo = self
                 .native

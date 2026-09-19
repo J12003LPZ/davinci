@@ -51,6 +51,19 @@ fn parse_test_impact<'de, D: serde::Deserializer<'de>>(
         .map(|value| serde_json::from_value(value).unwrap_or(TestImpactConfig { enabled: false })))
 }
 
+fn parse_package_intelligence<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<
+    Option<crate::native_extensions::package_intelligence::PackageIntelligenceConfig>,
+    D::Error,
+> {
+    use crate::native_extensions::package_intelligence::PackageIntelligenceConfig;
+    let value = Option::<serde_json::Value>::deserialize(deserializer)?;
+    Ok(value.map(|value| {
+        serde_json::from_value(value).unwrap_or(PackageIntelligenceConfig { enabled: false })
+    }))
+}
+
 fn parse_language_intelligence<'de, D: serde::Deserializer<'de>>(
     deserializer: D,
 ) -> Result<
@@ -92,6 +105,13 @@ pub struct Settings {
     pub process_manager: Option<ProcessManagerSettings>,
     #[serde(default, rename = "testImpact", deserialize_with = "parse_test_impact")]
     pub test_impact: Option<crate::native_extensions::test_impact::TestImpactConfig>,
+    #[serde(
+        default,
+        rename = "packageIntelligence",
+        deserialize_with = "parse_package_intelligence"
+    )]
+    pub package_intelligence:
+        Option<crate::native_extensions::package_intelligence::PackageIntelligenceConfig>,
     #[serde(default, rename = "repoIntelligence")]
     pub repo_intelligence:
         Option<crate::native_extensions::repo_intelligence::RepoIntelligenceConfig>,
