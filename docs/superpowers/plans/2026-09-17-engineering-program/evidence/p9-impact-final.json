@@ -59,5 +59,19 @@
   "lint_checks": {
     "fmt": "rtk proxy cargo fmt -p davinci-agent -p davinci-coding-agent --check (exit 0)",
     "clippy": "rtk proxy cargo clippy --offline --locked -p davinci-agent -p davinci-coding-agent --all-targets -- -D warnings (exit 0)"
+  },
+  "pull_request": {
+    "number": 16,
+    "url": "https://github.com/J12003LPZ/davinci/pull/16",
+    "base": "codex/git-intelligence-01a0ad48",
+    "head": "codex/change-impact-01a0ad48"
+  },
+  "ci_verification": {
+    "head_sha": "726431e327b9f3f9201f4079fb63a73a6497cb1f",
+    "push_ci_run": "https://github.com/J12003LPZ/davinci/actions/runs/35411130997",
+    "push_sarif_run": "https://github.com/J12003LPZ/davinci/actions/runs/35411130839",
+    "pr_ci_run": "https://github.com/J12003LPZ/davinci/actions/runs/35411143442",
+    "pr_sarif_run": "https://github.com/J12003LPZ/davinci/actions/runs/35411143563",
+    "status": "all green (22/22 jobs on push CI, 22/22 jobs on PR CI, push & PR SARIF success)"
   }
 }

@@ -35,7 +35,7 @@ Reference: [program design](../../specs/2026-09-17-engineering-program.md) and
 | 5 | [P5 Package / Dependency Intelligence](05-package-intelligence.md) | Complete; PR #13 open | Approved | Package tests, fmt, Clippy, integration, security and eval passed | Green at `9a3fdf9` |
 | 6 | [P7 Build Intelligence](07-build-intelligence.md) | Complete; PR #14 open | Approved | Package tests, fmt, Clippy, integration, security and eval passed | Green at `950ab50` |
 | 7 | [P6 Git Intelligence](06-git-intelligence.md) | Complete; PR #15 open | Approved | Package tests, fmt, Clippy, integration, security and eval passed | Green at `dcaf02b` |
-| 8 | [P9 Change Impact Engine](09-change-impact.md) | Planned | Approved | Not run | Not pushed |
+| 8 | [P9 Change Impact Engine](09-change-impact.md) | Complete; PR #16 open | Approved | Package tests, fmt, Clippy, integration, security and eval passed | Green at `726431e` |
 | 9 | [P8 Deterministic Hook / Policy Engine](08-hook-policy.md) | Planned | Approved | Not run | Not pushed |
 | 10 | [P10 Verification Planner](10-verification-planner.md) | Planned | Approved | Not run | Not pushed |
 | 11 | [P11 Workspace Snapshot / Safe Sandbox Layer](11-workspace-snapshot.md) | Planned | Approved | Not run | Not pushed |
