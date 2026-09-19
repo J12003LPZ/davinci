@@ -11,6 +11,21 @@ pub struct ProcessManagerSettings {
     pub enabled: bool,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EditingTransactionsSettings {
+    pub enabled: bool,
+}
+
+fn parse_editing_transactions<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<EditingTransactionsSettings>, D::Error> {
+    let value = Option::<serde_json::Value>::deserialize(deserializer)?;
+    Ok(value.map(|value| {
+        serde_json::from_value(value).unwrap_or(EditingTransactionsSettings { enabled: false })
+    }))
+}
+
 fn parse_process_manager<'de, D: serde::Deserializer<'de>>(
     deserializer: D,
 ) -> Result<Option<ProcessManagerSettings>, D::Error> {
@@ -50,6 +65,12 @@ fn parse_language_intelligence<'de, D: serde::Deserializer<'de>>(
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct Settings {
+    #[serde(
+        default,
+        rename = "editingTransactions",
+        deserialize_with = "parse_editing_transactions"
+    )]
+    pub editing_transactions: Option<EditingTransactionsSettings>,
     #[serde(
         default,
         rename = "processManager",
@@ -1323,6 +1344,27 @@ pub fn is_trusted(settings: &Settings, cwd: &Path, override_trust: Option<bool>)
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn editing_transaction_settings_fail_closed_without_dropping_unrelated_settings() {
+        assert!(Settings::default().editing_transactions.is_none());
+        for value in [
+            serde_json::json!({"enabled":false}),
+            serde_json::json!({"enabled":"invalid"}),
+            serde_json::json!({"enabled":true,"extra":1}),
+        ] {
+            let settings: Settings = serde_json::from_value(
+                serde_json::json!({"theme":"fixture","editingTransactions":value}),
+            )
+            .unwrap();
+            assert_eq!(settings.theme.as_deref(), Some("fixture"));
+            assert!(!settings.editing_transactions.unwrap().enabled);
+        }
+        let enabled: Settings =
+            serde_json::from_value(serde_json::json!({"editingTransactions":{"enabled":true}}))
+                .unwrap();
+        assert!(enabled.editing_transactions.unwrap().enabled);
+    }
 
     #[test]
     fn process_manager_settings_disable_cleanly_and_preserve_unrelated_settings() {

@@ -13,6 +13,8 @@ use thiserror::Error;
 use crate::jobs::JobBook;
 use crate::todo::TodoList;
 
+mod foreground;
+
 #[allow(dead_code)]
 pub fn decision_wait(interactive: bool, deferred: bool, cancelled: bool) -> &'static str {
     if cancelled {
@@ -94,6 +96,10 @@ pub const BUILTIN_TOOLS: &[&str] = &[
     "agent",
     "batch",
     "apply_patch",
+    "patch_preview",
+    "patch_apply",
+    "patch_status",
+    "patch_rollback",
     "exec_command",
     "write_stdin",
     "update_plan",
@@ -127,6 +133,19 @@ pub const CODEX_HOT_TOOLS: &[&str] = &[
 /// tool thread and the davinci shell all read them.
 #[derive(Debug, Clone, Default)]
 pub struct ToolContext {
+    /// Trusted host entry point for foreground process ownership. Without this,
+    /// legacy commands remain available but cannot emit verification receipts.
+    pub foreground_supervisor: Option<crate::jobs::supervisor::SupervisorCommand>,
+    /// Per-dispatch host capture; never reconstructed from tool result JSON.
+    pub command_receipt: Option<crate::command_receipt::CommandReceiptCapture>,
+    /// Trusted host setting; ordinary mutation safety cannot be disabled.
+    pub transactions_disabled: bool,
+    /// Stable provenance for trusted library calls without a RuntimeHandle.
+    pub transaction_owner: crate::runtime::transactions::TransactionOwner,
+    /// Live, engine-installed permission and contract checks for file mutations.
+    pub mutation_authority: Option<crate::runtime::transactions::MutationAuthority>,
+    /// Per-dispatch signal used to invalidate verification even after a failed recovery.
+    pub mutation_attempted: Arc<std::sync::atomic::AtomicBool>,
     /// Session-owned process service installed by a trusted host, lazily starts children.
     pub processes: Option<crate::process_manager::ProcessManager>,
     /// Engine-issued consent for this exact dispatch; never model input.
@@ -168,6 +187,13 @@ pub fn is_managed_process_tool(name: &str) -> bool {
             | "process_write"
             | "process_stop"
             | "process_list"
+    )
+}
+
+pub(crate) fn is_coordinated_mutation(name: &str) -> bool {
+    matches!(
+        name,
+        "write" | "edit" | "notebook_edit" | "apply_patch" | "patch_apply" | "patch_rollback"
     )
 }
 
@@ -506,6 +532,7 @@ pub fn tool_specs() -> Vec<AgentTool> {
         specs.extend(crate::runtime::workflow_tool_specs());
     }
     specs.extend(crate::process_manager::tool_specs());
+    specs.extend(crate::runtime::transactions::tool_specs());
     specs
 }
 
@@ -555,6 +582,9 @@ pub fn execute_tool_with(
     context: &ToolContext,
 ) -> Result<ToolResult, ToolError> {
     match name {
+        transaction if crate::runtime::transactions::is_tool(transaction) => {
+            crate::runtime::transactions::execute(cwd, transaction, input, context)
+        }
         process if is_managed_process_tool(process) => {
             if let Some(coordinator) = &context.task_coordinator {
                 return coordinator.call_with_timeout(process, input, context.abort.as_deref(), std::time::Duration::from_secs(15));
@@ -573,9 +603,9 @@ pub fn execute_tool_with(
                 .map_err(ToolError::Failed)
         }
         "read" => read_tool_cached(cwd, input, context),
-        "write" => write_tool(cwd, input),
-        "edit" => edit_tool(cwd, input),
-        "apply_patch" => apply_patch_tool(cwd, input),
+        "write" => write_tool(cwd, input, context),
+        "edit" => edit_tool(cwd, input, context),
+        "apply_patch" => apply_patch_tool(cwd, input, context),
         "exec_command" => exec_command_tool(cwd, input, context),
         "write_stdin" => write_stdin_tool(input, context),
         "bash" => shell_tool(cwd, input, context),
@@ -607,7 +637,7 @@ pub fn execute_tool_with(
         "job_output" => crate::jobs::output_tool(&context.jobs, input, context.abort.as_deref())
             .map_err(ToolError::Failed),
         "job_kill" => crate::jobs::kill_tool(&context.jobs, input).map_err(ToolError::Failed),
-        "notebook_edit" => notebook_edit_tool(cwd, input),
+        "notebook_edit" => notebook_edit_tool(cwd, input, context),
         "mcp_read" => mcp_read_tool(input, context),
         "agent_status" | "agent_message" | "agent_stop"
             if !team_tools_enabled() =>
@@ -650,16 +680,28 @@ pub fn execute_tool_with(
     }
 }
 
-fn apply_patch_tool(cwd: &Path, input: &serde_json::Value) -> Result<ToolResult, ToolError> {
+fn apply_patch_tool(
+    cwd: &Path,
+    input: &serde_json::Value,
+    context: &ToolContext,
+) -> Result<ToolResult, ToolError> {
     let patch = input
         .get("input")
         .and_then(Value::as_str)
         .ok_or_else(|| ToolError::Failed("Missing `input` argument for apply_patch".into()))?;
-    match crate::apply_patch::execute_apply_patch(cwd, patch) {
-        Ok(msg) => Ok(ToolResult {
+    let transaction = crate::runtime::transactions::tools::ToolTransaction::new(cwd, context)?;
+    let result = (|| {
+        let (changes, message) = crate::apply_patch::prepare_patch(cwd, patch, |path| {
+            transaction.snapshot(path).map_err(|e| e.to_string())
+        })?;
+        let summary = transaction.apply(changes).map_err(|e| e.to_string())?;
+        Ok::<_, String>((message, summary))
+    })();
+    match result {
+        Ok((msg, transaction)) => Ok(ToolResult {
             content: msg,
             is_error: false,
-            details: None,
+            details: Some(serde_json::json!({"transaction":transaction})),
         }),
         Err(err) => Ok(ToolResult {
             content: err,
@@ -1449,17 +1491,22 @@ fn detect_image_mime(path: &Path, bytes: &[u8]) -> Option<&'static str> {
     }
 }
 
-fn write_tool(cwd: &Path, input: &serde_json::Value) -> Result<ToolResult, ToolError> {
+fn write_tool(
+    cwd: &Path,
+    input: &serde_json::Value,
+    context: &ToolContext,
+) -> Result<ToolResult, ToolError> {
     let path = resolve_for_mutation(cwd, required_str(input, "path")?)?;
     crate::file_mutation_queue::with_file_mutation_queue(&path, || {
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent).map_err(|err| ToolError::Failed(err.to_string()))?;
-        }
+        let manager = crate::runtime::transactions::tools::ToolTransaction::new(cwd, context)?;
+        let snapshot = manager.snapshot(&path)?;
+        let created = snapshot.bytes().is_none();
         let content = required_str(input, "content")?;
         // The change is what the transcript shows, so the previous content
         // is read before it is gone; a fresh file diffs against nothing.
-        let previous = fs::read_to_string(&path).unwrap_or_default();
-        fs::write(&path, content).map_err(|err| ToolError::Failed(err.to_string()))?;
+        let previous = snapshot.text().unwrap_or_default().to_owned();
+        let transaction =
+            manager.apply(vec![snapshot.change(Some(content.as_bytes().to_vec()))])?;
         let (diff, first_changed_line) = crate::edit_diff::generate_diff_string(
             &crate::edit_diff::normalize_to_lf(&previous),
             &crate::edit_diff::normalize_to_lf(content),
@@ -1472,23 +1519,29 @@ fn write_tool(cwd: &Path, input: &serde_json::Value) -> Result<ToolResult, ToolE
                 "path": path,
                 "diff": diff,
                 "firstChangedLine": first_changed_line,
-                "created": previous.is_empty(),
+                "created": created,
+                "transaction":transaction,
             })),
         })
     })
 }
 
-fn edit_tool(cwd: &Path, input: &serde_json::Value) -> Result<ToolResult, ToolError> {
+fn edit_tool(
+    cwd: &Path,
+    input: &serde_json::Value,
+    context: &ToolContext,
+) -> Result<ToolResult, ToolError> {
     let (display_path, edits) =
         crate::edit_diff::prepare_edit_arguments(input).map_err(ToolError::Failed)?;
     let path = resolve_for_mutation(cwd, &display_path)?;
+    let manager = crate::runtime::transactions::tools::ToolTransaction::new(cwd, context)?;
     crate::file_mutation_queue::with_file_mutation_queue(&path, || {
         if crate::notebook::is_notebook_path(&path) {
-            if let Some(result) = notebook_edit_locked(&path, &display_path, &edits)? {
+            if let Some(result) = notebook_edit_locked(&path, &display_path, &edits, &manager)? {
                 return Ok(result);
             }
         }
-        edit_tool_locked(&path, &display_path, &edits)
+        edit_tool_locked(&path, &display_path, &edits, &manager)
     })
 }
 
@@ -1498,22 +1551,17 @@ fn notebook_edit_locked(
     path: &Path,
     display_path: &str,
     edits: &[crate::edit_diff::Edit],
+    manager: &crate::runtime::transactions::tools::ToolTransaction<'_>,
 ) -> Result<Option<ToolResult>, ToolError> {
-    let raw = fs::read_to_string(path).map_err(|err| {
-        ToolError::Failed(format!(
-            "Could not edit file: {display_path}. Error code: {}.",
-            err.raw_os_error()
-                .map(|code| code.to_string())
-                .unwrap_or_else(|| err.to_string())
-        ))
-    })?;
-    let Some(mut notebook) = crate::notebook::parse(&raw) else {
+    let snapshot = manager.snapshot(path)?;
+    let raw = snapshot.text().map_err(ToolError::Failed)?;
+    let Some(mut notebook) = crate::notebook::parse(raw) else {
         return Ok(None);
     };
     let changes = crate::notebook::edit_in_cells(&mut notebook, edits, display_path)
         .map_err(ToolError::Failed)?;
-    let text = crate::notebook::serialize(&notebook, crate::notebook::detect_indent(&raw));
-    fs::write(path, text).map_err(|err| ToolError::Failed(err.to_string()))?;
+    let text = crate::notebook::serialize(&notebook, crate::notebook::detect_indent(raw));
+    let transaction = manager.apply(vec![snapshot.change(Some(text.into_bytes()))])?;
     let (diff, first_changed_line) = crate::notebook::changes_diff(&changes);
     let cells: Vec<usize> = changes.iter().map(|change| change.index + 1).collect();
     Ok(Some(ToolResult {
@@ -1532,12 +1580,17 @@ fn notebook_edit_locked(
             "cells": cells,
             "diff": diff,
             "firstChangedLine": first_changed_line,
+            "transaction":transaction,
         })),
     }))
 }
 
 /// `notebook_edit { path, cell, mode, source?, cellType? }`.
-fn notebook_edit_tool(cwd: &Path, input: &serde_json::Value) -> Result<ToolResult, ToolError> {
+fn notebook_edit_tool(
+    cwd: &Path,
+    input: &serde_json::Value,
+    context: &ToolContext,
+) -> Result<ToolResult, ToolError> {
     use crate::notebook::{self, EditMode};
     let display_path = required_str(input, "path")?.to_string();
     let path = resolve_for_mutation(cwd, &display_path)?;
@@ -1555,16 +1608,17 @@ fn notebook_edit_tool(cwd: &Path, input: &serde_json::Value) -> Result<ToolResul
     let cell_type = notebook::apply_kind(input.get("cellType").and_then(Value::as_str))
         .map_err(ToolError::Failed)?;
     crate::file_mutation_queue::with_file_mutation_queue(&path, || {
-        let raw = fs::read_to_string(&path)
-            .map_err(|err| ToolError::Failed(format!("Could not read {display_path}: {err}")))?;
-        let mut parsed = notebook::parse(&raw).ok_or_else(|| {
+        let manager = crate::runtime::transactions::tools::ToolTransaction::new(cwd, context)?;
+        let snapshot = manager.snapshot(&path)?;
+        let raw = snapshot.text().map_err(ToolError::Failed)?;
+        let mut parsed = notebook::parse(raw).ok_or_else(|| {
             ToolError::Failed(format!("{display_path} is not a Jupyter notebook"))
         })?;
         let outcome =
             notebook::structural_edit(&mut parsed, &display_path, cell, mode, source, cell_type)
                 .map_err(ToolError::Failed)?;
-        let text = notebook::serialize(&parsed, notebook::detect_indent(&raw));
-        fs::write(&path, text).map_err(|err| ToolError::Failed(err.to_string()))?;
+        let text = notebook::serialize(&parsed, notebook::detect_indent(raw));
+        let transaction = manager.apply(vec![snapshot.change(Some(text.into_bytes()))])?;
         Ok(ToolResult {
             content: outcome.summary,
             is_error: false,
@@ -1574,6 +1628,7 @@ fn notebook_edit_tool(cwd: &Path, input: &serde_json::Value) -> Result<ToolResul
                 "mode": input.get("mode").and_then(Value::as_str).unwrap_or("replace").to_ascii_lowercase(),
                 "cells": outcome.cells,
                 "diff": outcome.diff,
+                "transaction":transaction,
             })),
         })
     })
@@ -1583,19 +1638,11 @@ fn edit_tool_locked(
     path: &Path,
     display_path: &str,
     edits: &[crate::edit_diff::Edit],
+    manager: &crate::runtime::transactions::tools::ToolTransaction<'_>,
 ) -> Result<ToolResult, ToolError> {
-    let raw = match fs::read_to_string(path) {
-        Ok(content) => content,
-        Err(err) => {
-            return Err(ToolError::Failed(format!(
-                "Could not edit file: {display_path}. Error code: {}.",
-                err.raw_os_error()
-                    .map(|code| code.to_string())
-                    .unwrap_or_else(|| err.to_string())
-            )));
-        }
-    };
-    let (bom, content) = crate::edit_diff::split_bom(&raw);
+    let snapshot = manager.snapshot(path)?;
+    let raw = snapshot.text().map_err(ToolError::Failed)?;
+    let (bom, content) = crate::edit_diff::split_bom(raw);
     let ending = crate::edit_diff::detect_line_ending(content);
     let normalized = crate::edit_diff::normalize_to_lf(content);
     let applied =
@@ -1605,7 +1652,7 @@ fn edit_tool_locked(
         "{bom}{}",
         crate::edit_diff::restore_line_endings(&applied.new_content, ending)
     );
-    fs::write(path, final_content).map_err(|err| ToolError::Failed(err.to_string()))?;
+    let transaction = manager.apply(vec![snapshot.change(Some(final_content.into_bytes()))])?;
     let (diff, first_changed_line) =
         crate::edit_diff::generate_diff_string(&applied.base_content, &applied.new_content, 4);
     Ok(ToolResult {
@@ -1617,6 +1664,7 @@ fn edit_tool_locked(
             "tokensBefore": applied.base_content.len(),
             "diff": diff,
             "firstChangedLine": first_changed_line,
+            "transaction":transaction,
         })),
     })
 }
@@ -1719,8 +1767,9 @@ fn shell_tool(
         _ => command.to_string(),
     };
     let background = wants_background(input);
-    let child = spawn_shell(cwd, &command, background)?;
+    let started_at_ms = crate::command_receipt::now();
     if background {
+        let child = spawn_shell(cwd, &command, true)?;
         let shown = required_str(input, "command")?;
         let pid = child.id();
         let id = context
@@ -1734,7 +1783,40 @@ fn shell_tool(
         serde_json::Value::Number(number) => number.to_string(),
         other => other.to_string(),
     });
-    let output = wait_shell_output(child, timeout_ms, timeout_label.as_deref(), context)?;
+    let output = if let Some(host) = &context.foreground_supervisor {
+        let custom = std::env::var("PI_SHELL")
+            .ok()
+            .filter(|value| !value.is_empty());
+        let shell =
+            davinci_ai::resolve_shell_config(custom.as_deref()).map_err(ToolError::Failed)?;
+        let mut argv = shell.args;
+        let stdin = match shell.command_transport {
+            davinci_ai::CommandTransport::Argv => {
+                argv.push(command.clone());
+                &[][..]
+            }
+            davinci_ai::CommandTransport::Stdin => command.as_bytes(),
+        };
+        let output = foreground::run(
+            host,
+            foreground::config(cwd, shell.shell.into(), argv)?,
+            stdin,
+            timeout_ms,
+            timeout_label.as_deref(),
+            context,
+        )?;
+        if let Some(capture) = &context.command_receipt {
+            capture.completed(cwd, &command, started_at_ms, &output);
+        }
+        output
+    } else {
+        wait_shell_output(
+            spawn_shell(cwd, &command, false)?,
+            timeout_ms,
+            timeout_label.as_deref(),
+            context,
+        )?
+    };
     let mut content = String::from_utf8_lossy(&output.stdout).into_owned();
     if !output.stderr.is_empty() {
         if !content.is_empty() {
@@ -1749,29 +1831,57 @@ fn shell_tool(
     })
 }
 
+const MAX_SHELL_STREAM_BYTES: usize = 16 * 1024 * 1024;
+
+fn read_shell_stream(mut pipe: impl std::io::Read, limit: usize) -> std::io::Result<Vec<u8>> {
+    let mut bytes = Vec::new();
+    let mut buffer = [0u8; 8192];
+    let mut overflow = false;
+    loop {
+        let count = match pipe.read(&mut buffer) {
+            Ok(0) => break,
+            Ok(count) => count,
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(error),
+        };
+        let retained = count.min(limit.saturating_sub(bytes.len()));
+        bytes.extend_from_slice(&buffer[..retained]);
+        overflow |= retained != count;
+        // Keep draining after the cap: stopping here could block the child on
+        // a full pipe. Incomplete output must never become verification evidence.
+    }
+    if overflow {
+        return Err(std::io::Error::other(
+            "command output exceeded stream byte limit",
+        ));
+    }
+    Ok(bytes)
+}
+
+fn join_shell_stream(
+    handle: Option<std::thread::JoinHandle<std::io::Result<Vec<u8>>>>,
+) -> Result<Vec<u8>, ToolError> {
+    match handle {
+        None => Ok(Vec::new()),
+        Some(handle) => handle
+            .join()
+            .map_err(|_| ToolError::Failed("command output reader panicked".into()))?
+            .map_err(|error| ToolError::Failed(format!("command output capture failed: {error}"))),
+    }
+}
+
 fn wait_shell_output(
     mut child: std::process::Child,
     timeout_ms: Option<u64>,
     timeout_label: Option<&str>,
     context: &ToolContext,
 ) -> Result<std::process::Output, ToolError> {
-    use std::io::Read;
     let stdout = child.stdout.take();
     let stderr = child.stderr.take();
-    let stdout_handle = stdout.map(|mut pipe| {
-        std::thread::spawn(move || {
-            let mut buf = Vec::new();
-            let _ = pipe.read_to_end(&mut buf);
-            buf
-        })
-    });
-    let stderr_handle = stderr.map(|mut pipe| {
-        std::thread::spawn(move || {
-            let mut buf = Vec::new();
-            let _ = pipe.read_to_end(&mut buf);
-            buf
-        })
-    });
+    let stdout_handle = stdout
+        .map(|pipe| std::thread::spawn(move || read_shell_stream(pipe, MAX_SHELL_STREAM_BYTES)));
+    let stderr_handle = stderr
+        .map(|pipe| std::thread::spawn(move || read_shell_stream(pipe, MAX_SHELL_STREAM_BYTES)));
     // Poll rather than block in `wait`: the turn's abort flag has to be able
     // to end the command, timeout or not.
     let start = std::time::Instant::now();
@@ -1788,12 +1898,10 @@ fn wait_shell_output(
                 }
                 let _ = child.kill();
                 let _ = child.wait();
-                let stdout = stdout_handle
-                    .map(|handle| handle.join().unwrap_or_default())
-                    .unwrap_or_default();
-                let stderr = stderr_handle
-                    .map(|handle| handle.join().unwrap_or_default())
-                    .unwrap_or_default();
+                let stdout = join_shell_stream(stdout_handle);
+                let stderr = join_shell_stream(stderr_handle);
+                let stdout = stdout?;
+                let stderr = stderr?;
                 let mut content = String::from_utf8_lossy(&stdout).into_owned();
                 if !stderr.is_empty() {
                     if !content.is_empty() {
@@ -1816,16 +1924,13 @@ fn wait_shell_output(
             Err(err) => return Err(ToolError::Failed(err.to_string())),
         }
     };
-    let stdout = stdout_handle
-        .map(|handle| handle.join().unwrap_or_default())
-        .unwrap_or_default();
-    let stderr = stderr_handle
-        .map(|handle| handle.join().unwrap_or_default())
-        .unwrap_or_default();
+    // Join both even when one failed, so no reader is detached on this path.
+    let stdout = join_shell_stream(stdout_handle);
+    let stderr = join_shell_stream(stderr_handle);
     Ok(std::process::Output {
         status,
-        stdout,
-        stderr,
+        stdout: stdout?,
+        stderr: stderr?,
     })
 }
 
@@ -1835,6 +1940,8 @@ fn powershell_tool(
     context: &ToolContext,
 ) -> Result<ToolResult, ToolError> {
     let command = required_str(input, "command")?;
+    let timeout_ms = resolve_bash_timeout_ms(input)?;
+    let timeout_label = input.get("timeout").map(ToString::to_string);
     if let Ok(reply) = std::env::var("PI_POWERSHELL_REPLY") {
         return Ok(ToolResult {
             content: reply,
@@ -1844,6 +1951,54 @@ fn powershell_tool(
     }
     let wrapped = format!("{POWERSHELL_UTF8_PREFIX}{command}");
     let background = wants_background(input);
+    if !background {
+        if let Some(host) = &context.foreground_supervisor {
+            let executable = ["pwsh", "powershell"]
+                .into_iter()
+                .find_map(|program| {
+                    crate::process_manager::resolve_native_executable(program, cwd).ok()
+                })
+                .ok_or_else(|| {
+                    ToolError::Failed(
+                        "PowerShell is not available and could not be launched".into(),
+                    )
+                })?;
+            let started_at_ms = crate::command_receipt::now();
+            let config = foreground::config(
+                cwd,
+                executable,
+                vec![
+                    "-NoProfile".into(),
+                    "-NonInteractive".into(),
+                    "-Command".into(),
+                    wrapped,
+                ],
+            )?;
+            let output = foreground::run(
+                host,
+                config,
+                &[],
+                timeout_ms,
+                timeout_label.as_deref(),
+                context,
+            )?;
+            if let Some(capture) = &context.command_receipt {
+                capture.completed(cwd, command, started_at_ms, &output);
+            }
+            let mut content = String::from_utf8_lossy(&output.stdout).into_owned();
+            if !output.stderr.is_empty() {
+                if !content.is_empty() {
+                    content.push('\n');
+                }
+                content.push_str(&String::from_utf8_lossy(&output.stderr));
+            }
+            return Ok(ToolResult {
+                content,
+                is_error: !output.status.success(),
+                details: Some(serde_json::json!({"exitCode": output.status.code()})),
+            });
+        }
+    }
     for program in ["pwsh", "powershell"] {
         let stdin = if background {
             std::process::Stdio::piped()
@@ -1870,7 +2025,7 @@ fn powershell_tool(
                 .register(command, child);
             return Ok(crate::jobs::started_result(id, pid, command));
         }
-        let output = wait_shell_output(child, None, None, context)?;
+        let output = wait_shell_output(child, timeout_ms, timeout_label.as_deref(), context)?;
         let mut content = String::from_utf8_lossy(&output.stdout).into_owned();
         if !output.stderr.is_empty() {
             if !content.is_empty() {
@@ -3262,6 +3417,81 @@ mod tests {
     use tempfile::tempdir;
 
     #[test]
+    fn shell_capture_rejects_partial_reads_and_drains_overflow() {
+        use std::io::{self, Read};
+        struct Broken;
+        impl Read for Broken {
+            fn read(&mut self, _: &mut [u8]) -> io::Result<usize> {
+                Err(io::Error::other("injected read failure"))
+            }
+        }
+        assert!(read_shell_stream(io::Cursor::new(b"prefix").chain(Broken), 16).is_err());
+        let mut oversized = io::Cursor::new(b"123456789");
+        assert!(read_shell_stream(&mut oversized, 8).is_err());
+        assert_eq!(
+            oversized.position(),
+            9,
+            "overflow must still drain the pipe"
+        );
+        assert_eq!(
+            read_shell_stream(io::Cursor::new(b"12345678"), 8).unwrap(),
+            b"12345678"
+        );
+        assert!(read_shell_stream(io::empty(), 0).unwrap().is_empty());
+    }
+
+    #[test]
+    fn shell_capture_reader_failures_are_not_empty_success() {
+        let panic =
+            std::thread::spawn(|| -> std::io::Result<Vec<u8>> { panic!("injected reader panic") });
+        assert!(join_shell_stream(Some(panic)).is_err());
+        let error = std::thread::spawn(|| Err(std::io::Error::other("injected pipe error")));
+        assert!(join_shell_stream(Some(error)).is_err());
+        assert!(join_shell_stream(None).unwrap().is_empty());
+    }
+
+    #[test]
+    fn shell_capture_output_fixture() {
+        use std::io::Write;
+        let Ok(stream) = std::env::var("DAVINCI_TEST_SHELL_CAPTURE_STREAM") else {
+            return;
+        };
+        let mut pipe: Box<dyn Write> = match stream.as_str() {
+            "stdout" => Box::new(std::io::stdout()),
+            "stderr" => Box::new(std::io::stderr()),
+            _ => panic!("invalid fixture stream"),
+        };
+        let bytes = [b'x'; 8192];
+        for _ in 0..=MAX_SHELL_STREAM_BYTES / bytes.len() {
+            pipe.write_all(&bytes).unwrap();
+        }
+    }
+
+    #[test]
+    fn shell_capture_real_child_overflow_is_an_error() {
+        for stream in ["stdout", "stderr"] {
+            let child = Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "tools::tests::shell_capture_output_fixture",
+                    "--nocapture",
+                ])
+                .env("DAVINCI_TEST_SHELL_CAPTURE_STREAM", stream)
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .spawn()
+                .unwrap();
+            let error = wait_shell_output(child, Some(10_000), Some("10"), &ToolContext::default())
+                .unwrap_err();
+            assert!(
+                error.to_string().contains("stream byte limit"),
+                "{stream}: {error}"
+            );
+        }
+    }
+
+    #[test]
     fn read_large_text_file_returns_requested_window() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("large.txt");
@@ -3669,6 +3899,40 @@ mod tests {
             .contains("Command timed out after 0.2 seconds"));
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn legacy_powershell_honors_and_validates_timeout() {
+        let dir = tempdir().unwrap();
+        let capture =
+            crate::command_receipt::CommandReceiptCapture::new("timeout", "powershell", None);
+        let context = ToolContext {
+            command_receipt: Some(capture.clone()),
+            ..Default::default()
+        };
+        let started = std::time::Instant::now();
+        let error = execute_tool_with(
+            dir.path(),
+            "powershell",
+            &serde_json::json!({"command":"Start-Sleep -Seconds 2", "timeout":0.2}),
+            &context,
+        )
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("Command timed out after 0.2 seconds"),
+            "{error}"
+        );
+        assert!(started.elapsed() < std::time::Duration::from_secs(2));
+        assert!(capture.take().is_none());
+        let invalid = execute_tool_with(dir.path(), "powershell", &serde_json::json!({"command":"Set-Content -Path should-not-exist.txt -Value ran", "timeout":0}), &context).unwrap_err();
+        assert_eq!(
+            invalid.to_string(),
+            "Invalid timeout: must be a finite number of seconds"
+        );
+        assert!(!dir.path().join("should-not-exist.txt").exists());
+    }
+
     #[test]
     fn grep_find_ls_match_ts_strings() {
         let dir = tempdir().unwrap();
@@ -3827,16 +4091,49 @@ mod tests {
 
     #[test]
     fn powershell_and_image_read() {
+        // Keep the reply override out of other concurrently running command tests.
+        if std::env::var_os("DAVINCI_POWERSHELL_REPLY_FIXTURE").is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "tools::tests::powershell_and_image_read",
+                    "--nocapture",
+                ])
+                .env("DAVINCI_POWERSHELL_REPLY_FIXTURE", "1")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stdout)
+            );
+            assert!(
+                String::from_utf8_lossy(&output.stdout).contains("1 passed"),
+                "fixture must execute its child test"
+            );
+            return;
+        }
         std::env::set_var("PI_POWERSHELL_REPLY", "ps-ok");
         let dir = tempdir().unwrap();
-        let ps = execute_tool(
+        let capture =
+            crate::command_receipt::CommandReceiptCapture::new("simulated", "powershell", None);
+        let context = ToolContext {
+            command_receipt: Some(capture.clone()),
+            ..Default::default()
+        };
+        let ps = execute_tool_with(
             dir.path(),
             "powershell",
             &serde_json::json!({"command":"Get-Date"}),
+            &context,
         )
         .unwrap();
         std::env::remove_var("PI_POWERSHELL_REPLY");
         assert_eq!(ps.content, "ps-ok");
+        assert!(
+            capture.take().is_none(),
+            "simulated output must not produce execution evidence"
+        );
         assert!(tool_specs().iter().any(|tool| tool.name == "powershell"));
         let png = image::RgbaImage::from_pixel(1, 1, image::Rgba([255, 0, 0, 255]));
         let mut bytes = Vec::new();

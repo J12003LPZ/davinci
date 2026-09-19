@@ -67,38 +67,31 @@ fn run_owned() -> std::io::Result<()> {
             .map(|p| Box::new(p) as Box<dyn Read + Send>),
     ]
     .into_iter()
-    .flatten()
-    .map(|mut pipe| {
+    .enumerate()
+    .filter_map(|(index, pipe)| pipe.map(|pipe| (index == 1, pipe)))
+    .map(|(stderr, pipe)| {
         let events = events.clone();
-        thread::spawn(move || {
-            let mut bytes = [0; 8192];
-            loop {
-                let count = match pipe.read(&mut bytes) {
-                    Ok(0) | Err(_) => break,
-                    Ok(n) => n,
-                };
-                if events
-                    .send((
-                        Event::Output {
-                            bytes: bytes[..count].to_vec(),
-                        },
-                        None,
-                    ))
-                    .is_err()
-                {
-                    break;
-                }
-            }
-        })
+        thread::spawn(move || forward_output(pipe, &events, stderr))
     })
     .collect();
-    let (writes, write_rx) = mpsc::sync_channel::<(u64, Vec<u8>)>(1);
+    let (writes, write_rx) = mpsc::sync_channel::<(u64, Option<Vec<u8>>)>(1);
     let write_events = events.clone();
-    let mut stdin = child.stdin.take().expect("piped stdin");
+    let mut stdin = child.stdin.take();
     thread::spawn(move || {
         while let Ok((id, bytes)) = write_rx.recv() {
-            let failed = stdin.write_all(&bytes).and_then(|_| stdin.flush()).is_err();
-            let count = if failed { 0 } else { bytes.len() };
+            let result = match bytes {
+                Some(bytes) => stdin
+                    .as_mut()
+                    .ok_or_else(|| std::io::Error::from(std::io::ErrorKind::BrokenPipe))
+                    .and_then(|stdin| stdin.write_all(&bytes).and_then(|_| stdin.flush()))
+                    .map(|_| bytes.len()),
+                None => {
+                    drop(stdin.take());
+                    Ok(0)
+                }
+            };
+            let failed = result.is_err();
+            let count = result.unwrap_or(0);
             if write_events
                 .send((Event::Written { id, count, failed }, None))
                 .is_err()
@@ -110,10 +103,12 @@ fn run_owned() -> std::io::Result<()> {
     let input_stop = stopped.clone();
     let input_events = events.clone();
     thread::spawn(move || {
-        while let Ok(Request::Write { id, bytes }) = wire::read(&mut input) {
-            if bytes.len() > MAX_INPUT {
-                break;
-            }
+        while let Ok(request) = wire::read(&mut input) {
+            let (id, bytes) = match request {
+                Request::Write { id, bytes } if bytes.len() <= MAX_INPUT => (id, Some(bytes)),
+                Request::CloseStdin { id } => (id, None),
+                _ => break,
+            };
             if writes.try_send((id, bytes)).is_err()
                 && input_events
                     .send((
@@ -141,16 +136,49 @@ fn run_owned() -> std::io::Result<()> {
             while readers.iter().any(|reader| !reader.is_finished()) && Instant::now() < deadline {
                 thread::sleep(POLL);
             }
-            flush_exit(
-                &events,
-                status.code(),
-                readers.iter().all(|reader| reader.is_finished()),
-            );
+            flush_exit(&events, status.code(), readers_complete(readers));
             return Ok(());
         }
         thread::sleep(POLL);
     }
     Ok(())
+}
+
+fn forward_output(
+    mut pipe: impl Read,
+    events: &mpsc::SyncSender<Message>,
+    stderr: bool,
+) -> std::io::Result<()> {
+    let mut bytes = [0; 8192];
+    loop {
+        let count = match pipe.read(&mut bytes) {
+            Ok(0) => return Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(error),
+            Ok(n) => n,
+        };
+        if events
+            .send((
+                Event::Output {
+                    bytes: bytes[..count].to_vec(),
+                    stderr,
+                },
+                None,
+            ))
+            .is_err()
+        {
+            return Err(std::io::ErrorKind::BrokenPipe.into());
+        }
+    }
+}
+
+fn readers_complete(readers: Vec<thread::JoinHandle<std::io::Result<()>>>) -> bool {
+    let mut complete = true;
+    for reader in readers {
+        // Never join a descendant-held pipe that exceeded the drain deadline.
+        complete &= reader.is_finished() && matches!(reader.join(), Ok(Ok(())));
+    }
+    complete
 }
 
 fn spawn(config: ProcessConfig) -> std::io::Result<std::process::Child> {
@@ -193,5 +221,64 @@ fn flush_exit(events: &mpsc::SyncSender<Message>, code: Option<i32>, output_comp
             }
             Err(_) => break,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct InterruptedThenData(bool);
+    impl Read for InterruptedThenData {
+        fn read(&mut self, _bytes: &mut [u8]) -> std::io::Result<usize> {
+            if !self.0 {
+                self.0 = true;
+                return Err(std::io::ErrorKind::Interrupted.into());
+            }
+            Err(std::io::ErrorKind::Other.into())
+        }
+    }
+
+    #[test]
+    fn supervisor_capture_does_not_report_read_failure_as_eof() {
+        let (events, _receiver) = mpsc::sync_channel(2);
+        let result = forward_output(InterruptedThenData(false), &events, false);
+        assert_eq!(result.unwrap_err().kind(), std::io::ErrorKind::Other);
+    }
+
+    #[test]
+    fn supervisor_capture_requires_output_delivery() {
+        let (events, receiver) = mpsc::sync_channel(2);
+        drop(receiver);
+        assert!(forward_output(&b"output"[..], &events, false).is_err());
+    }
+
+    #[test]
+    fn supervisor_capture_completion_requires_successful_readers() {
+        for failed in [false, true] {
+            let reader = thread::spawn(move || {
+                if failed {
+                    Err(std::io::ErrorKind::Other.into())
+                } else {
+                    Ok(())
+                }
+            });
+            while !reader.is_finished() {
+                thread::yield_now();
+            }
+            assert_eq!(readers_complete(vec![reader]), !failed);
+        }
+        let reader = thread::spawn(|| -> std::io::Result<()> { panic!("reader fixture") });
+        while !reader.is_finished() {
+            thread::yield_now();
+        }
+        assert!(!readers_complete(vec![reader]));
+        let (release, wait) = mpsc::sync_channel::<()>(1);
+        let reader = thread::spawn(move || {
+            let _ = wait.recv();
+            Ok(())
+        });
+        assert!(!readers_complete(vec![reader]));
+        drop(release);
     }
 }

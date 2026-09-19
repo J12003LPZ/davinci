@@ -12,6 +12,7 @@ pub(super) const POLL: std::time::Duration = std::time::Duration::from_millis(20
 pub(super) enum Request {
     Configure(ProcessConfig),
     Write { id: u64, bytes: Vec<u8> },
+    CloseStdin { id: u64 },
 }
 
 #[derive(Serialize, Deserialize)]
@@ -25,6 +26,7 @@ pub(super) enum Event {
     },
     Output {
         bytes: Vec<u8>,
+        stderr: bool,
     },
     Written {
         id: u64,

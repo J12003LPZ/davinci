@@ -543,6 +543,69 @@ fn supervised_commands_preserve_literal_argv_and_only_explicit_environment() {
 }
 
 #[test]
+fn supervisor_capture_preserves_streams_and_legacy_merge() {
+    let directory = tempfile::tempdir().unwrap();
+    for split in [true, false] {
+        let stdout = Arc::new(Mutex::new(Vec::new()));
+        let stderr = Arc::new(Mutex::new(Vec::new()));
+        let output = stdout.clone();
+        let errors = stderr.clone();
+        let command = config(
+            directory.path(),
+            vec![
+                "-e".into(),
+                "process.stdout.write('out');process.stderr.write('err')".into(),
+            ],
+        );
+        let event = Arc::new(move |event| {
+            if let ProcessEvent::Output(bytes) = event {
+                output.lock().unwrap().extend(bytes);
+            }
+        });
+        let process = if split {
+            Supervisor::spawn_with_stderr(
+                &host(),
+                command,
+                event,
+                Arc::new(move |bytes| errors.lock().unwrap().extend(bytes)),
+            )
+        } else {
+            Supervisor::spawn(&host(), command, event)
+        }
+        .unwrap();
+        let exit = process.wait(Duration::from_secs(5)).unwrap();
+        assert_eq!(exit.code, Some(0));
+        assert!(exit.output_complete);
+        if split {
+            assert_eq!(*stdout.lock().unwrap(), b"out");
+            assert_eq!(*stderr.lock().unwrap(), b"err");
+        } else {
+            let output = stdout.lock().unwrap();
+            assert!(output.as_slice() == b"outerr" || output.as_slice() == b"errout");
+            assert!(stderr.lock().unwrap().is_empty());
+        }
+    }
+}
+
+#[test]
+fn supervisor_closes_stdin_after_acknowledged_input() {
+    let directory = tempfile::tempdir().unwrap();
+    let output = Arc::new(Mutex::new(Vec::new()));
+    let captured = output.clone();
+    let process = Supervisor::spawn(&host(), config(directory.path(), vec!["-e".into(),
+        "let text='';process.stdin.on('data',b=>text+=b);process.stdin.on('end',()=>{process.stdout.write(text);setTimeout(()=>process.exit(0),200)})".into()]),
+        Arc::new(move |event| { if let ProcessEvent::Output(bytes) = event { captured.lock().unwrap().extend(bytes); } })).unwrap();
+    assert_eq!(process.write(b"first").unwrap(), 5);
+    assert_eq!(process.write(b"second").unwrap(), 6);
+    process.close_stdin().unwrap();
+    assert!(process.write(b"too late").is_err());
+    let exit = process.wait(Duration::from_secs(5)).unwrap();
+    assert_eq!(exit.code, Some(0));
+    assert!(exit.output_complete);
+    assert_eq!(*output.lock().unwrap(), b"firstsecond");
+}
+
+#[test]
 fn stopping_one_owned_lifetime_preserves_an_unrelated_process_tree() {
     let first_directory = tempfile::tempdir().unwrap();
     let second_directory = tempfile::tempdir().unwrap();

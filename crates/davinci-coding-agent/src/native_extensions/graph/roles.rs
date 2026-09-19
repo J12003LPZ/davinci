@@ -61,6 +61,12 @@ pub fn role_tools(role: Role) -> Vec<String> {
         Role::Writer => {
             let mut tools = READ_TOOLS.to_vec();
             tools.extend_from_slice(&["bash", "edit", "write", GRAPH_SUBMIT_TOOL, "tool_search"]);
+            tools.extend_from_slice(&[
+                "patch_preview",
+                "patch_apply",
+                "patch_status",
+                "patch_rollback",
+            ]);
             tools
         }
     };
@@ -223,6 +229,17 @@ mod tests {
     #[test]
     fn only_the_writer_may_mutate_files() {
         assert!(role_tools(Role::Writer).iter().any(|tool| tool == "write"));
+        for name in [
+            "patch_preview",
+            "patch_apply",
+            "patch_status",
+            "patch_rollback",
+        ] {
+            assert!(role_tools(Role::Writer).contains(&name.to_string()));
+            for role in Role::ALL.iter().filter(|role| **role != Role::Writer) {
+                assert!(!role_tools(*role).contains(&name.to_string()));
+            }
+        }
         for role in Role::ALL.iter().filter(|role| **role != Role::Writer) {
             let tools = role_tools(*role);
             assert!(!tools.iter().any(|tool| tool == "write" || tool == "edit"));

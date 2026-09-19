@@ -124,6 +124,8 @@ pub fn is_sensitive_file_path(path: &str) -> bool {
 
 pub fn tool_class(tool: &str) -> ToolClass {
     match tool {
+        "patch_preview" | "patch_status" => ToolClass::Read,
+        "patch_apply" | "patch_rollback" => ToolClass::Edit,
         "process_status" | "process_output" | "process_list" => ToolClass::Read,
         "process_start" | "process_write" => ToolClass::Shell,
         "process_stop" => ToolClass::Other,
@@ -945,6 +947,54 @@ impl PermissionPolicy {
                 }
             }
         }
+        // Transaction previews and recovery capture source bytes even when the
+        // outer tool is an edit. Approval is for the complete original call,
+        // so its one-shot permit also binds these compound reads.
+        if matches!(
+            tool,
+            "write"
+                | "edit"
+                | "notebook_edit"
+                | "apply_patch"
+                | "patch_preview"
+                | "patch_apply"
+                | "patch_status"
+                | "patch_rollback"
+        ) {
+            let mut source_paths = crate::runtime::contracts::extract_tool_targets(tool, args);
+            if tool == "patch_status"
+                && args.get("observe_commit").and_then(Value::as_bool) == Some(true)
+            {
+                // Git may resolve packed objects, linked-worktree metadata and
+                // config includes. A directory-level grant cannot prove that
+                // none of those internal reads intersects a scoped read deny.
+                if self.deny.iter().any(|rule| rule.tool_matches("read")) {
+                    return PermissionVerdict::Deny {
+                        reason: "Git commit observation requires unrestricted metadata reads; a read deny prevents proving its internal Git reads are authorized".into(),
+                    };
+                }
+                source_paths.push(".git".into());
+            }
+            for path in source_paths {
+                match self.decide(tool_call_id, "read", &serde_json::json!({"path":path}), cwd) {
+                    PermissionVerdict::Deny { reason } => {
+                        return PermissionVerdict::Deny { reason }
+                    }
+                    PermissionVerdict::Ask(mut request) => {
+                        request.tool = tool.to_owned();
+                        request.args = args.clone();
+                        request.summary = crate::approval::display_text(&format!(
+                            "Read transaction source for {tool}: {}",
+                            request.subject
+                        ));
+                        request.session_rule.clear();
+                        request.legal_choices = crate::approval::offer_scopes(true, false, false);
+                        evidence_approval = Some(request);
+                    }
+                    PermissionVerdict::Allow => {}
+                }
+            }
+        }
         let targets =
             match permission_risk::file_targets(tool, args, cwd, &self.filesystem_boundary) {
                 Ok(targets) => targets,
@@ -1266,7 +1316,7 @@ pub fn subject_of_with_boundary(
             false,
         ),
         ToolClass::Read | ToolClass::Edit => {
-            if tool == "apply_patch" {
+            if matches!(tool, "apply_patch" | "patch_preview") {
                 if let Some(input) = args.get("input").and_then(Value::as_str) {
                     if let Ok(parsed) = crate::apply_patch::parse_codex_patch(input) {
                         let mut outside = false;
@@ -1286,6 +1336,21 @@ pub fn subject_of_with_boundary(
                         return (paths.join(", "), outside);
                     }
                 }
+            }
+            if matches!(tool, "patch_apply" | "patch_status" | "patch_rollback") {
+                let targets = crate::runtime::contracts::extract_tool_targets(tool, args);
+                let subjects: Vec<_> = targets
+                    .iter()
+                    .map(|p| project_relative_with_boundary(cwd, p, boundary))
+                    .collect();
+                return (
+                    subjects
+                        .iter()
+                        .map(|(p, _)| p.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", "),
+                    subjects.iter().any(|(_, outside)| *outside),
+                );
             }
             let raw = args.get("path").and_then(Value::as_str).unwrap_or(".");
             project_relative_with_boundary(cwd, raw, boundary)
@@ -1693,6 +1758,64 @@ mod tests {
                 )),
                 "{mode:?}"
             );
+        }
+    }
+
+    #[test]
+    fn transaction_preimages_require_read_authority_even_with_edit_allow() {
+        for (tool, args) in [
+            ("write", json!({"path":".env", "content":"fixture"})),
+            ("edit", json!({"path":".env", "oldText":"a", "newText":"b"})),
+            ("notebook_edit", json!({"path":".env"})),
+            (
+                "apply_patch",
+                json!({"input":"*** Begin Patch\n*** Delete File: .env\n*** End Patch"}),
+            ),
+            (
+                "patch_preview",
+                json!({"input":"*** Begin Patch\n*** Delete File: .env\n*** End Patch"}),
+            ),
+            ("patch_apply", json!({"id":"fixture", "paths":[".env"]})),
+            ("patch_status", json!({"id":"fixture", "paths":[".env"]})),
+            ("patch_rollback", json!({"id":"fixture", "paths":[".env"]})),
+        ] {
+            let mut p = policy(PermissionMode::Edits);
+            p.allow.push(PermissionRule::bare(tool));
+            let PermissionVerdict::Ask(request) = verdict(&p, tool, args.clone()) else {
+                panic!("{tool} bypassed the preimage read approval");
+            };
+            assert_eq!(request.tool, tool);
+            assert_eq!(request.args, args);
+            assert!(request.session_rule.is_empty());
+            p.allow.push(PermissionRule::bare("read"));
+            assert!(
+                matches!(verdict(&p, tool, args.clone()), PermissionVerdict::Allow),
+                "{tool}"
+            );
+            p.deny.push(PermissionRule::bare("read"));
+            assert!(is_deny(&verdict(&p, tool, args)), "{tool}");
+        }
+    }
+
+    #[test]
+    fn transaction_git_observation_respects_nested_metadata_read_denies() {
+        for rule in [
+            "read(.git/config)",
+            "read(.git/objects/**)",
+            "read(private/**)",
+        ] {
+            let mut p = policy(PermissionMode::AlwaysApprove);
+            p.deny.push(PermissionRule::parse(rule).unwrap());
+            let args = json!({"id":"fixture", "paths":["a.txt"], "observe_commit":true});
+            assert!(is_deny(&verdict(&p, "patch_status", args)), "{rule}");
+            assert!(matches!(
+                verdict(
+                    &p,
+                    "patch_status",
+                    json!({"id":"fixture", "paths":["a.txt"]})
+                ),
+                PermissionVerdict::Allow
+            ));
         }
     }
 

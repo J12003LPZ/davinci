@@ -1,6 +1,11 @@
 # Engineering program ledger
 
-Status: design package approved; P1 validated; P2 local gates passed, CI pending.
+Status: design package approved; P1 and P2 validated; P4 implementation in progress.
+Latest P4 follow-up distinguishes redundant DOS spellings from distinct Windows
+short aliases. Head `055b938` passed affected package tests but failed the native
+Windows normal-agent edit case; the follow-up passes 50 focused transaction tests
+locally. Full P4 gates remain open pending the corrected head's native CI; see
+its plan for evidence and limitations.
 Goal scope: all twelve projects and the global acceptance/performance/report gates.
 Reference: [program design](../../specs/2026-09-17-engineering-program.md) and
 [unchanged supplied requirements](../../specs/2026-09-17-engineering-program-requirements.md).
@@ -9,7 +14,7 @@ Reference: [program design](../../specs/2026-09-17-engineering-program.md) and
 
 - Date: 2026-09-17.
 - Fetched remote main: `ca9fe69cd0da21bf161af25b2bed681748fb0d58`.
-- Branch: `codex/engineering-program-01a0ad48`.
+- Current branch: `codex/transactional-edits-01a0ad48`.
 - Worktree: `C:/Users/sergi/.claude-worktrees/pi-rust-9416e5cee6/01a0ad48`.
 - Git worktree admin path differs from common Git directory; isolation verified.
 - Shared checkout has pre-existing changes and divergent local main. Preserved.
@@ -27,8 +32,8 @@ Reference: [program design](../../specs/2026-09-17-engineering-program.md) and
 | Order | Project/plan | Implementation | Design approval | Local gates/eval | CI |
 | --- | --- | --- | --- | --- | --- |
 | 1 | [P1 Test Impact Intelligence](01-test-impact.md) | Complete; PR #9 open | Approved | Package tests, fmt, Clippy, integration, security and eval passed | Green at `6b3aad9` |
-| 2 | [P2 Persistent Process Manager](02-process-manager.md) | Implemented; awaiting platform CI | Approved | Package tests, fmt, Clippy, integration, security and eval passed on Windows | Pending exact-head run |
-| 3 | [P4 Transactional Edit Engine](04-transactional-edits.md) | Planned | Approved | Not run | Not pushed |
+| 2 | [P2 Persistent Process Manager](02-process-manager.md) | Complete; PR #10 open | Approved | Package tests, fmt, Clippy, integration, security and eval passed | Green at `bfc60e3` |
+| 3 | [P4 Transactional Edit Engine](04-transactional-edits.md) | In progress; draft PR #11 | Approved | Targeted checks passed; full gates open | Windows failure at `055b938`; correction awaits native CI |
 | 4 | [P3 Browser / Playwright Verification](03-browser-verification.md) | Planned | Approved | Not run | Not pushed |
 | 5 | [P5 Package / Dependency Intelligence](05-package-intelligence.md) | Planned | Approved | Not run | Not pushed |
 | 6 | [P7 Build Intelligence](07-build-intelligence.md) | Planned | Approved | Not run | Not pushed |
@@ -312,13 +317,13 @@ lifetime, approval transfer, and an existing shell deny missed by process_start.
 | 5. Format | `cargo fmt --check`: passed after formatting. |
 | 6. Clippy | `cargo clippy --workspace --all-targets --offline --locked -- -D warnings`: passed. |
 | 7. Integration | 15 supervisor test entries (12 substantive cases, 3 helper entries), 2 public process contract tests, and 2 packaged-binary entries passed. Covers descendant cleanup, held pipes, startup concurrency/cancellation, owner isolation, literal stdin, output bounds and private CLI entry before normal initialization. |
-| 8. Security | Current policy on all six tools, cross-shell denies, exact one-call consent, changed/expired/revoked consent, hard contracts, role ceilings, cwd escape, environment injection, restart revocation and no one-call replay all passed locally. Unix symlink behavior awaits native CI. |
+| 8. Security | Current policy on all six tools, cross-shell denies, exact one-call consent, changed/expired/revoked consent, hard contracts, role ceilings, cwd escape, environment injection, restart revocation and no one-call replay passed. Native Linux and macOS CI also passed the cwd symlink regression. |
 | 9. Normal path | `process_manager_integration_tests`: 2 entries passed, including the normal `Agent::run_loop` fixture in both shared and nonshared executor modes. Covers enabled/disabled settings, deferred discovery, reuse, token-governor output plus `retrieve_output`, and shutdown. |
 | 10. Graph | `graph_managed_process`: 5 tests passed. Includes authenticated multi-worker lease reuse/final release, role/mode/contract denial, composed native output retrieval, and an actual saved Graph controller dispatch with host provenance and worker-exit cleanup. |
 | 11. Evaluation | One explicit ignored packaged lifecycle evaluation passed; [Windows after artifact](evidence/p2-process-after-windows.json) is compared with the unchanged [baseline](evidence/p2-process-baseline.json). Two requests reuse one server, stdin succeeds, 5 MiB output is bounded, and ordinary descendants disappear after shutdown/host loss. |
 | 12. Docs | [Managed process guide](../../../process-manager.md), documentation index, plan and ledger updated. Lists limits, approval/restart behavior, port provenance and Unix group escape limitation. |
 | 13. Diff review | Reviewed ownership/lock order, reservation cleanup, current authority, private helper protocol, environment, restart reconciliation, PID lifetime, session/Graph shutdown, bounded I/O, and test fixtures. Existing background shell APIs remain available; their model-facing endpoints reject managed IDs. Solo review per user instruction. |
-| 14. CI | Pending exact feature head. The existing Windows/Linux/macOS native matrix now also runs process authorization, supervisor/public contracts, Graph, normal Agent, packaged executable and explicit lifecycle evaluation. Evaluation JSON is uploaded per platform. P2 is not complete until this gate passes. |
+| 14. CI | [PR #10](https://github.com/J12003LPZ/davinci/pull/10), head `bfc60e3f698ac30f9fb7500fc24490d028da2439`: [CI run 35247901869](https://github.com/J12003LPZ/davinci/actions/runs/35247901869) passed all 22 jobs; workflow lint 35247901761 and security interoperability 35247901735 passed. Windows/Linux/macOS each passed 11 process unit, 2 public contract, 15 supervisor, 5 Graph, 2 normal Agent, 2 packaged entry and 1 explicit lifecycle evaluation entries. [Platform evidence](evidence/p2-ci-platforms.json) preserves actual evaluation objects and test-result lines from each successful job. |
 
 All shell commands were invoked through RTK. Package logs were summarized by
 deterministically parsing Cargo's result lines; zero-test/doc targets are not
@@ -365,5 +370,91 @@ after the correction. No shell-string fallback or dependency install was added.
   Live resources and output rings are not serialized into CacheRuntime.
 - Tests include the reusable Node server fixture, frozen old-host baseline,
   packaged-binary evaluation, normal-session and Graph dispatch integrations.
-- Remaining required evidence: exact-head CI and native Unix behavior. Next
-  project is P4, after CI passes; its process dependency is this shared adapter.
+- All fourteen P2 gates passed before P4 began. PR #10 remains open and unmerged.
+  Next project is P4, using the approved transactional-edit plan. Platform
+  evidence is recorded in the next branch to preserve the tested P2 head.
+
+## P4 current checkpoint
+
+The Windows short-name follow-up preserves aliases through edit/delete/recovery
+and journals interrupted alias publication. Its 49 focused unit tests, 30
+transaction integration/evaluation cases and the formerly failing normal-agent
+CI test pass locally. Native exact-head CI remains required; P4 is still open.
+
+Implementation is in draft [PR #11](https://github.com/J12003LPZ/davinci/pull/11)
+on `codex/transactional-edits-01a0ad48` in the isolated worktree. The latest
+checkpoint in the [P4 plan](04-transactional-edits.md) supersedes the historical
+notes below. P4 remains incomplete; P3 has not started. The plan records executed
+RED/GREEN checks and limitations. Ordinary mutations and explicit transaction
+tools share durable provenance, current authority and conflict-safe recovery.
+Source-bound command receipts and conservative Cargo target-root coverage are
+connected to normal dispatch. Git commit observation is available through
+`patch_status` with `observe_commit: true`, with current metadata authority and
+exact committed-image checks. Normal previews capture an observed base revision
+when current metadata policy allows it; otherwise the revision remains unknown.
+Policies with read-deny rules conservatively prevent Git observation until its
+internal metadata reads can be authorized individually.
+
+The latest changes passed three Git observation integration tests, 56 permission
+tests, 23 approval-focused tests, and all 35 turn tests. The latter include real
+command verification and one-time transaction read approval. Agent library
+Clippy with warnings denied passed. These targeted results do not close the
+affected-package, Graph end-to-end, fault-injection, metadata, eval, or platform
+CI gates. P3 has not started. The paragraphs below retain earlier checkpoint
+evidence; the current status and latest P4 plan entry supersede their pending items.
+
+The recovery follow-up adds atomic no-clobber active-marker publication and
+cleanup after failed rollback preparation. Four storage fault-injection tests
+passed across marker, apply and rollback journal failures. The 18-case transaction
+integration suite passed after fixing cancellation during the final authority
+check; an additional interrupted-rollback recovery test passed separately.
+Agent-library Clippy passed. These results advance recovery coverage without
+closing the remaining P4 platform, metadata, integration or evaluation gates.
+
+Graph provenance follow-up: the real parent launcher exposed a child agent-ID
+mismatch. The child now validates and retains the parent-assigned ID. The launcher
+recovery fixture passed, as did the two-prompt write/rollback regression and all
+four CLI transaction tests. The launcher fixture deliberately has no submitted
+Graph artifact and is correctly rejected as incomplete; full successful Graph
+lifecycle coverage remains open. See the P4 plan for the exact evidence scope.
+
+The subsequent real-launcher test now covers successful edit plus `graph_submit`
+using a bounded offline call sequence. Parent acceptance, exact artifact content,
+transaction provenance, effect recording and authorized recovery passed. This
+closes the missing successful worker lifecycle case; it does not claim a full
+multi-node Graph run or completion of P4's metadata/package/CI gates.
+
+Windows metadata follow-up now records/restores owner and primary group alongside
+the DACL. Two metadata regressions and 29 transaction/commit/verification tests
+passed, including non-default group recovery and refusal after group-only external
+changes. Unix metadata behavior and the final package/review/CI gates remain open.
+
+Unix owner/group and full permission-mode preservation are now implemented with
+journal validation. Serialization and validation tests passed on Windows; two
+Unix-only filesystem regressions await Linux/macOS execution. Unix extended
+attributes/ACLs are still outstanding, so this is not a completed metadata gate.
+
+Bounded Linux/macOS extended-attribute capture and restoration now feed the same
+transaction images and stale-state checks. Local parsing/bounds tests and Clippy
+passed; native attribute tests are added but unexecuted. macOS ACL handling and
+native platform validation remain open before P4 can pass its metadata gate.
+
+P4 foreground shell capture now rejects incomplete evidence on reader errors,
+panics and stream overflow. Output retention is bounded at 16 MiB per stream;
+overflow is drained and reported as failure before receipt creation. Four focused
+capture tests, two receipt tests and four transaction-verification integration
+tests passed locally, as did affected Clippy. Descendant-held pipe lifecycle,
+macOS ACLs, native platform tests and the final P4 completion gates remain open.
+
+The macOS ACL adapter is now implemented with bounded portable serialization,
+descriptor-based restoration, journal validation and metadata-only conflict
+detection. The format test and 29 existing transaction integration cases passed
+on Windows, as did affected Clippy. Native macOS recovery/conflict tests are
+added but unexecuted; native compilation/runtime evidence remains required.
+
+The affected agent/coding-agent package gate passed 3,265 tests (21 ignored) on
+Windows. A subsequent red/green fix now discovers durable transactions for
+resumed sessions and agents without a runtime ledger. Actual Cargo verification
+passes the eight-case success/failure/authorization matrix; two discovery tests
+cover owner boundaries and bounded reads. P4 still requires native platform
+validation, descendant-pipe lifecycle completion, final checks, review and CI.

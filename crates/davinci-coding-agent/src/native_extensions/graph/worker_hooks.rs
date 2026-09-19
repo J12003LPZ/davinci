@@ -4,6 +4,7 @@
 //!
 //! ```text
 //! PI_GRAPH_ROLE          - the worker's role (drives bash policy + tool bans)
+//! PI_GRAPH_NODE_ID       - parent-owned graph task identity
 //! PI_GRAPH_EXPECT        - the artifact kind graph_submit validates against
 //! PI_GRAPH_ARTIFACT_PATH - absolute path graph_submit writes to
 //! PI_GRAPH_EXTRA_TOOLS   - legacy parent's full --tools allowlist
@@ -50,6 +51,7 @@ pub(crate) fn submit_test_guard() -> std::sync::MutexGuard<'static, ()> {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GraphWorkerContext {
+    pub node_id: String,
     pub role: Role,
     pub expect: ArtifactKind,
     pub artifact_path: PathBuf,
@@ -81,7 +83,7 @@ impl GraphWorkerContext {
             // legacy uncontracted worker. Returning None prevents graph hooks from admitting it.
             _ => return None,
         };
-        Self::from_parts_full(
+        let mut context = Self::from_parts_full(
             std::env::var("PI_GRAPH_ROLE").ok().as_deref(),
             std::env::var("PI_GRAPH_EXPECT").ok().as_deref(),
             std::env::var("PI_GRAPH_ARTIFACT_PATH").ok().as_deref(),
@@ -91,7 +93,14 @@ impl GraphWorkerContext {
                 .as_deref(),
             has_coordinator,
             task_contract,
-        )
+        )?;
+        if let Ok(node_id) = std::env::var("PI_GRAPH_NODE_ID") {
+            if node_id.is_empty() || node_id.len() > 256 || node_id.chars().any(char::is_control) {
+                return None;
+            }
+            context.node_id = node_id;
+        }
+        Some(context)
     }
 
     #[allow(dead_code)]
@@ -147,6 +156,8 @@ impl GraphWorkerContext {
         ensure_governor_recovery_tool(&mut tools);
         let allowed_tools: BTreeSet<String> = tools.into_iter().collect();
         Some(Self {
+            // Legacy hosts still get an ownership boundary; current hosts send the task ID.
+            node_id: artifact_path.to_string(),
             role,
             expect,
             artifact_path: PathBuf::from(artifact_path),
@@ -239,7 +250,14 @@ impl GraphWorkerContext {
             if self.role == Role::Writer
                 && matches!(
                     tool_name,
-                    "write" | "edit" | "notebook_edit" | "apply_patch"
+                    "write"
+                        | "edit"
+                        | "notebook_edit"
+                        | "apply_patch"
+                        | "patch_preview"
+                        | "patch_apply"
+                        | "patch_status"
+                        | "patch_rollback"
                 )
             {
                 let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
@@ -616,6 +634,17 @@ mod tests {
         assert!(ctx
             .block_reason("write", &json!({"path": "README.md"}))
             .is_some());
+        for tool in ["patch_apply", "patch_rollback", "patch_status"] {
+            assert!(ctx
+                .block_reason(tool, &json!({"id":"fixture", "paths":["crates/a.rs"]}))
+                .is_none());
+            assert!(ctx
+                .block_reason(
+                    tool,
+                    &json!({"id":"fixture", "paths":["crates/a.rs", "README.md"]})
+                )
+                .is_some());
+        }
         let shell = ctx
             .block_reason("bash", &json!({"command": "cargo test"}))
             .expect("contracted graph shell must fail closed without a sandbox");
@@ -653,8 +682,17 @@ mod tests {
         std::env::set_var("PI_CONTRACT_DIGEST", "mismatched");
         assert!(GraphWorkerContext::from_env().is_none());
 
+        std::env::set_var("PI_CONTRACT_DIGEST", &contract.digest);
+        std::env::set_var("PI_GRAPH_NODE_ID", "writer-17");
+        assert_eq!(GraphWorkerContext::from_env().unwrap().node_id, "writer-17");
+        for invalid in ["", "bad\nnode"] {
+            std::env::set_var("PI_GRAPH_NODE_ID", invalid);
+            assert!(GraphWorkerContext::from_env().is_none());
+        }
+
         for key in [
             "PI_GRAPH_ROLE",
+            "PI_GRAPH_NODE_ID",
             "PI_GRAPH_EXPECT",
             "PI_GRAPH_ARTIFACT_PATH",
             "PI_GRAPH_EXTRA_TOOLS",

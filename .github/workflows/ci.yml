@@ -48,6 +48,35 @@ jobs:
           name: process-evaluation-${{ runner.os }}
           path: ${{ runner.temp }}/process-evaluation.json
           if-no-files-found: error
+      - name: Native transaction metadata and authorization
+        run: cargo test -p davinci-agent --locked --lib transaction
+      - name: Native directory lease lifetime
+        run: cargo test -p davinci-agent --locked --lib directory_lease
+      - name: Supervisor output capture integrity
+        run: cargo test -p davinci-agent --locked --lib supervisor_capture
+      - name: Foreground supervised command lifecycle
+        run: cargo test -p davinci-agent --locked --lib foreground_supervisor_capture_and_cancellation
+      - name: Transaction recovery, commit evidence and verification
+        run: cargo test -p davinci-agent --locked --test transactions --test transaction_commit --test transaction_verification
+      - name: Transaction CLI and intelligence integration
+        run: cargo test -p davinci-coding-agent --locked --test transaction_cli --test transaction_intelligence
+      - name: Build transaction worker fixture
+        run: cargo build -p davinci-coding-agent --locked --bin davinci
+      - name: Transaction worker submit and recovery
+        env:
+          PI_GRAPH_WORKER_EXECUTABLE: ${{ github.workspace }}/target/debug/davinci${{ runner.os == 'Windows' && '.exe' || '' }}
+          PI_OFFLINE_TOOL_CALL: '[{"name":"write","arguments":{"path":"a.txt","content":"worker edit"}},{"name":"graph_submit","arguments":{"artifact":{"changedFiles":["a.txt"],"summary":"Updated a.txt transactionally","deviations":[],"planInvalidated":false}}}]'
+        run: cargo test -p davinci-coding-agent --locked --lib transaction_parent_launch_accepts_submitted_edit_and_preserves_recovery -- --ignored
+      - name: Offline transaction recovery evaluation
+        env:
+          DAVINCI_TRANSACTION_EVAL_ARTIFACT: ${{ runner.temp }}/transaction-evaluation.json
+        run: cargo test -p davinci-agent --locked --test transaction_eval
+      - name: Preserve native transaction measurements
+        uses: actions/upload-artifact@v4
+        with:
+          name: transaction-evaluation-${{ runner.os }}
+          path: ${{ runner.temp }}/transaction-evaluation.json
+          if-no-files-found: error
 
   voice-native:
     strategy:

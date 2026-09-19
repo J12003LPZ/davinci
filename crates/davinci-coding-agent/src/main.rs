@@ -505,16 +505,46 @@ fn synchronize_provider_system_prompt(agent: &mut Agent) {
 /// `{"name": "bash", "arguments": {"command": "git status"}}` — that makes the
 /// first reply of a turn that tool call, so the tool path and the permission
 /// question in front of it can be driven without a provider; the reply that
-/// follows the tool result is the usual character-count stub.
+/// follows the tool result is the usual character-count stub. An array supplies
+/// up to 32 sequential calls, advancing only after successful tool results.
 fn offline_stub_message(current: &Agent, last_user: usize) -> AssistantMessage {
     let scripted = std::env::var("PI_OFFLINE_TOOL_CALL")
         .ok()
         .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok())
-        .filter(|_| {
-            current
-                .messages
-                .last()
-                .is_some_and(|message| message.role == "user")
+        .and_then(|fixture| {
+            let is_prompt = |message: &davinci_ai::ChatMessage| {
+                message.role == "user" && !message.extra.contains_key("davinciCapabilityReminder")
+            };
+            let Some(calls) = fixture.as_array() else {
+                return current
+                    .messages
+                    .last()
+                    .is_some_and(is_prompt)
+                    .then_some(fixture);
+            };
+            if calls.len() > 32 {
+                return None;
+            }
+            let start = current.messages.iter().rposition(is_prompt)?;
+            let turn = &current.messages[start..];
+            let last = turn
+                .iter()
+                .rev()
+                .find(|message| !message.extra.contains_key("davinciCapabilityReminder"))?;
+            if !is_prompt(last) && last.role != "toolResult" {
+                return None;
+            }
+            if turn
+                .iter()
+                .any(|message| message.role == "toolResult" && message.is_error == Some(true))
+            {
+                return None;
+            }
+            let completed = turn
+                .iter()
+                .filter(|message| message.role == "toolResult")
+                .count();
+            calls.get(completed).cloned()
         });
     let (content, stop_reason) = match scripted {
         Some(call) => (
@@ -659,12 +689,30 @@ fn build_agent(parsed: &Args, session_dir: &Path, cwd: &Path) -> Result<Agent, S
         settings.cache.clone().unwrap_or_default(),
         default_agent_dir(),
     );
+    agent.tool_context.transactions_disabled = settings
+        .editing_transactions
+        .as_ref()
+        .is_some_and(|config| !config.enabled);
+    if agent.tool_context.transactions_disabled {
+        agent
+            .tools
+            .retain(|name| !davinci_agent::runtime::transactions::is_tool(name));
+        agent
+            .tool_registry
+            .retain(|name| !davinci_agent::runtime::transactions::is_tool(name));
+    }
     agent.tool_context.semantic = Some(Arc::new(
         davinci_coding_agent::semantic::NativeSemanticService::with_permissions_and_cache(
             agent.permissions.clone(),
             agent.tool_context.cache.clone(),
         ),
     ));
+    agent.tool_context.foreground_supervisor = std::env::current_exe().ok().map(|executable| {
+        davinci_agent::jobs::supervisor::SupervisorCommand {
+            executable,
+            argv: vec!["--internal-process-supervisor".into()],
+        }
+    });
     if settings
         .process_manager
         .as_ref()
@@ -790,7 +838,18 @@ fn build_agent(parsed: &Args, session_dir: &Path, cwd: &Path) -> Result<Agent, S
     agent.apply_extension_tools(&names);
     sync_visual_verification_availability(&mut agent, &host);
     let graph_worker = crate::native_extensions::graph_worker_context();
+    if std::env::var_os("PI_GRAPH_ROLE").is_some() && graph_worker.is_none() {
+        return Err("invalid Graph worker context; refusing ordinary-session fallback".into());
+    }
     if let Some(graph_worker) = &graph_worker {
+        agent.tool_context.transaction_owner.graph_node = Some(graph_worker.node_id.clone());
+        if let Some(id) = std::env::var_os("DAVINCI_AGENT_ID") {
+            agent.tool_context.transaction_owner.agent_id = id
+                .to_str()
+                .ok_or("invalid Graph worker agent identity")?
+                .parse()
+                .map_err(|_| "invalid Graph worker agent identity")?;
+        }
         // The parent-owned graph contract is the authorization surface. The
         // initial provider projection is a separate, smaller view: a worker
         // may discover any authorized deferred schema through tool_search,
@@ -799,6 +858,10 @@ fn build_agent(parsed: &Args, session_dir: &Path, cwd: &Path) -> Result<Agent, S
             .allowed_tools
             .iter()
             .filter(|tool| !parsed.exclude_tools.contains(tool))
+            .filter(|tool| {
+                !agent.tool_context.transactions_disabled
+                    || !davinci_agent::runtime::transactions::is_tool(tool)
+            })
             .cloned()
             .collect();
         let initial_source: Vec<String> = match std::env::var("PI_GRAPH_INITIAL_TOOLS") {
@@ -1924,7 +1987,14 @@ fn complete_prompt_with_host(
     )));
     let mut runtime_handle = davinci_agent::RuntimeHandle::new(
         davinci_agent::RunId::new(),
-        davinci_agent::AgentId::new(),
+        // A Graph process owns one agent across all of its turns. Preserve the
+        // parent's identity (or the process-local fallback for legacy launchers).
+        // Generating a new identity here breaks transaction ownership on turn two.
+        if agent.tool_context.transaction_owner.graph_node.is_some() {
+            agent.tool_context.transaction_owner.agent_id
+        } else {
+            davinci_agent::AgentId::new()
+        },
         runtime_bus.clone(),
     )
     .with_cache(agent.tool_context.cache.clone());
@@ -10329,6 +10399,64 @@ mod tests {
     }
 
     #[test]
+    fn graph_transaction_owner_survives_multiple_prompt_turns() {
+        let _env_lock = OFFLINE_TOOL_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        let _config = EnvRestore::set("PI_CODING_AGENT_DIR", &dir.path().to_string_lossy());
+        let _current = EnvRestore::set("DAVINCI_CODING_AGENT_DIR", &dir.path().to_string_lossy());
+        let _tool = EnvRestore::set(
+            "PI_OFFLINE_TOOL_CALL",
+            r#"{"name":"write","arguments":{"path":"a.txt","content":"worker edit"}}"#,
+        );
+        let mut agent = Agent::new("offline Graph transaction fixture");
+        agent.cwd = dir.path().to_path_buf();
+        agent.tools = vec!["write".into(), "patch_rollback".into()];
+        agent.tool_registry = agent.tools.clone();
+        agent.set_permission_mode(davinci_agent::PermissionMode::AlwaysApprove);
+        agent.tool_context.transaction_owner.graph_node = Some("writer-1".into());
+        let owner = agent.tool_context.transaction_owner.agent_id;
+        let parsed = Args {
+            offline: true,
+            no_extensions: true,
+            ..Args::default()
+        };
+        let host = Arc::new(Mutex::new(ExtensionHost::default()));
+        agent.prompt("write the file");
+        let (_, first) = complete_prompt_with_host(&parsed, &mut agent, Some(host.clone()), false);
+        assert_eq!(
+            std::fs::read(dir.path().join("a.txt")).unwrap(),
+            b"worker edit"
+        );
+        assert_eq!(agent.runtime.as_ref().unwrap().agent_id, owner);
+        let id = first
+            .iter()
+            .find_map(|event| match event {
+                AgentEvent::ToolExecutionEnd {
+                    is_error: false,
+                    details: Some(details),
+                    ..
+                } => details["transaction"]["id"].as_str().map(str::to_owned),
+                _ => None,
+            })
+            .expect("successful transaction");
+        let _rollback = EnvRestore::set(
+            "PI_OFFLINE_TOOL_CALL",
+            &serde_json::json!({
+                "name":"patch_rollback", "arguments":{"id":id,"paths":["a.txt"]}
+            })
+            .to_string(),
+        );
+        agent.prompt("undo the file");
+        let (_, second) = complete_prompt_with_host(&parsed, &mut agent, Some(host), false);
+        assert_eq!(agent.runtime.as_ref().unwrap().agent_id, owner);
+        assert!(second.iter().any(|event| matches!(event,
+            AgentEvent::ToolExecutionEnd { tool_name, is_error: false, .. } if tool_name == "patch_rollback")), "{second:?}");
+        assert!(!dir.path().join("a.txt").exists());
+    }
+
+    #[test]
     fn f03_sessionless_worker_prompt_uses_parent_coordinator() {
         let _env_lock = OFFLINE_TOOL_ENV_LOCK
             .lock()
@@ -10670,6 +10798,60 @@ mod tests {
             .push(davinci_ai::ChatMessage::text("toolResult", "ok"));
         let after = offline_stub_message(&agent, 14);
         assert_eq!(after.stop_reason, Some(StopReason::Stop));
+        let mut reminder = davinci_ai::ChatMessage::text("user", "verify the edit");
+        reminder.extra.insert(
+            "davinciCapabilityReminder".into(),
+            serde_json::json!("verification_required"),
+        );
+        agent.messages.push(reminder);
+        assert_eq!(
+            offline_stub_message(&agent, 15).stop_reason,
+            Some(StopReason::Stop)
+        );
+    }
+
+    #[test]
+    fn offline_tool_sequence_waits_for_results_and_stops_on_failure() {
+        let _lock = OFFLINE_TOOL_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _fixture = EnvRestore::set(
+            "PI_OFFLINE_TOOL_CALL",
+            r#"[{"name":"write","arguments":{}},{"name":"graph_submit","arguments":{}}]"#,
+        );
+        let mut agent = Agent::new("fixture");
+        agent.prompt("edit and submit");
+        let call_name = |agent: &Agent| match offline_stub_message(agent, 15).content.first() {
+            Some(ContentBlock::ToolCall { name, .. }) => Some(name.clone()),
+            _ => None,
+        };
+        assert_eq!(call_name(&agent).as_deref(), Some("write"));
+        agent
+            .messages
+            .push(davinci_ai::ChatMessage::text("assistant", "waiting"));
+        assert_eq!(call_name(&agent), None);
+        agent.messages.push(davinci_ai::ChatMessage::tool_result(
+            "one", "write", "ok", false,
+        ));
+        let mut reminder = davinci_ai::ChatMessage::text("user", "verify");
+        reminder
+            .extra
+            .insert("davinciCapabilityReminder".into(), serde_json::json!(true));
+        agent.messages.push(reminder);
+        assert_eq!(call_name(&agent).as_deref(), Some("graph_submit"));
+        agent.messages.push(davinci_ai::ChatMessage::tool_result(
+            "two",
+            "graph_submit",
+            "ok",
+            false,
+        ));
+        assert_eq!(call_name(&agent), None);
+        agent.prompt("next real turn");
+        assert_eq!(call_name(&agent).as_deref(), Some("write"));
+        agent.messages.push(davinci_ai::ChatMessage::tool_result(
+            "three", "write", "denied", true,
+        ));
+        assert_eq!(call_name(&agent), None);
     }
 
     #[test]

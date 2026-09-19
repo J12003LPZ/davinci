@@ -1,5 +1,6 @@
 //! Authorized session adapter for JobBook's supervised ownership primitives.
 mod command;
+pub(crate) use command::direct as resolve_native_executable;
 mod schemas;
 pub use schemas::tool_specs;
 
