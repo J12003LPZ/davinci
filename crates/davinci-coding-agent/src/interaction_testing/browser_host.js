@@ -30,8 +30,12 @@ function createArtifactSink(directory) {
 
 async function main() {
   if (process.argv.length !== 3) throw new Error('Invalid browser host arguments');
-  const file = path.resolve(process.argv[2]);
-  if (path.dirname(file) !== __dirname || fs.statSync(file).size > 16 * 1024) {
+  // macOS exposes the temporary directory through a symlink (`/var` to
+  // `/private/var`). Canonicalize both sides before enforcing that the host
+  // can only read the Rust-owned config beside its materialized script.
+  const hostDirectory = fs.realpathSync(__dirname);
+  const file = fs.realpathSync(path.resolve(process.argv[2]));
+  if (path.dirname(file) !== hostDirectory || fs.statSync(file).size > 16 * 1024) {
     throw new Error('Invalid browser host configuration');
   }
   const config = JSON.parse(fs.readFileSync(file, 'utf8'));
