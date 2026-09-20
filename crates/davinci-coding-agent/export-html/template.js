@@ -98,14 +98,12 @@
           }
         }
 
-        // Sort children by timestamp
-        function sortChildren(node) {
+        // Sort each node directly; a session can have thousands of ancestors.
+        for (const node of nodeMap.values()) {
           node.children.sort((a, b) =>
             new Date(a.entry.timestamp).getTime() - new Date(b.entry.timestamp).getTime()
           );
-          node.children.forEach(sortChildren);
         }
-        roots.forEach(sortChildren);
 
         return roots;
       }
@@ -116,7 +114,7 @@
       function buildActivePathIds(targetId) {
         const ids = new Set();
         let current = byId.get(targetId);
-        while (current) {
+        while (current && !ids.has(current.id)) {
           ids.add(current.id);
           // Stop if no parent or self-referencing (root)
           if (!current.parentId || current.parentId === current.id) {
@@ -132,16 +130,18 @@
        */
       function getPath(targetId) {
         const path = [];
+        const seen = new Set();
         let current = byId.get(targetId);
-        while (current) {
-          path.unshift(current);
+        while (current && !seen.has(current.id)) {
+          seen.add(current.id);
+          path.push(current);
           // Stop if no parent or self-referencing (root)
           if (!current.parentId || current.parentId === current.id) {
             break;
           }
           current = byId.get(current.parentId);
         }
-        return path;
+        return path.reverse();
       }
 
       // Tree node lookup for finding leaves
@@ -156,12 +156,13 @@
         // Build tree node map lazily
         if (!treeNodeMap) {
           treeNodeMap = new Map();
-          const tree = buildTree();
-          function mapNodes(node) {
+          const stack = buildTree();
+          while (stack.length > 0) {
+            const node = stack.pop();
+            if (treeNodeMap.has(node.entry.id)) continue;
             treeNodeMap.set(node.entry.id, node);
-            node.children.forEach(mapNodes);
+            for (const child of node.children) stack.push(child);
           }
-          tree.forEach(mapNodes);
         }
 
         const node = treeNodeMap.get(nodeId);
@@ -169,7 +170,9 @@
 
         // Follow the newest (last) child at each level
         let current = node;
-        while (current.children.length > 0) {
+        const seen = new Set();
+        while (current.children.length > 0 && !seen.has(current.entry.id)) {
+          seen.add(current.entry.id);
           current = current.children[current.children.length - 1];
         }
         return current.entry.id;
@@ -186,15 +189,21 @@
 
         // Mark which subtrees contain the active leaf
         const containsActive = new Map();
-        function markActive(node) {
-          let has = activePathIds.has(node.entry.id);
-          for (const child of node.children) {
-            if (markActive(child)) has = true;
-          }
-          containsActive.set(node, has);
-          return has;
+        const pending = [...roots];
+        const postorder = [];
+        const visited = new Set();
+        while (pending.length > 0) {
+          const node = pending.pop();
+          if (visited.has(node)) continue;
+          visited.add(node);
+          postorder.push(node);
+          for (const child of node.children) pending.push(child);
         }
-        roots.forEach(markActive);
+        for (let i = postorder.length - 1; i >= 0; i--) {
+          const node = postorder[i];
+          containsActive.set(node, activePathIds.has(node.entry.id) ||
+            node.children.some(child => containsActive.get(child)));
+        }
 
         // Stack: [node, indent, justBranched, showConnector, isLast, gutters, isVirtualRootChild]
         const stack = [];
@@ -208,8 +217,11 @@
           stack.push([orderedRoots[i], multipleRoots ? 1 : 0, multipleRoots, multipleRoots, isLast, [], multipleRoots]);
         }
 
+        const flattened = new Set();
         while (stack.length > 0) {
           const [node, indent, justBranched, showConnector, isLast, gutters, isVirtualRootChild] = stack.pop();
+          if (flattened.has(node)) continue;
+          flattened.add(node);
 
           result.push({ node, indent, showConnector, isLast, gutters, isVirtualRootChild, multipleRoots });
 
@@ -442,8 +454,10 @@
 
         // Find nearest visible ancestor for a node
         function findVisibleAncestor(nodeId) {
+          const seen = new Set([nodeId]);
           let currentId = entryMap.get(nodeId)?.node.entry.parentId;
-          while (currentId != null) {
+          while (currentId != null && !seen.has(currentId)) {
+            seen.add(currentId);
             if (visibleIds.has(currentId)) {
               return currentId;
             }

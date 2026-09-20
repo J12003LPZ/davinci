@@ -170,16 +170,10 @@ fn parse_decision_intelligence<'de, D: serde::Deserializer<'de>>(
     Ok(value.map(|value| serde_json::from_value(value).unwrap_or_default()))
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(default, rename_all = "camelCase", deny_unknown_fields)]
 pub struct DecisionIntelligenceSettings {
     pub enabled: bool,
-}
-
-impl Default for DecisionIntelligenceSettings {
-    fn default() -> Self {
-        Self { enabled: false }
-    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]

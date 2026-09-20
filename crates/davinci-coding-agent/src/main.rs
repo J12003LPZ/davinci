@@ -2169,6 +2169,13 @@ fn complete_prompt_with_host(
         })));
     }
     synchronize_provider_system_prompt(agent);
+    agent.set_provider_context_overhead_tokens(Some(
+        serde_json::to_vec(&provider_tools(agent))
+            .expect("tool schemas are JSON")
+            .len() as u64
+            + 128,
+    ));
+    agent.set_provider_output_limit(model.as_ref().map(|m| m.max_tokens));
     let mut context_visibility = (agent.stats.pruned_results, agent.stats.compactions);
     // Session calls settle after the loop. Hold the final terminal event until
     // their result is known so streaming clients receive one final outcome.
@@ -2209,6 +2216,7 @@ fn complete_prompt_with_host(
                         model,
                         &current.messages_for_provider(),
                         &system,
+                        current.context_vm_provider_output_limit(),
                     )
                     .map(CompleteOutput::from)
                 }
@@ -2243,7 +2251,7 @@ fn complete_prompt_with_host(
                             timeout_ms: current.provider_timeout_ms,
                             max_retries: current.provider_max_retries,
                             max_retry_delay_ms: Some(current.provider_max_retry_delay_ms),
-                            max_tokens: None,
+                            max_tokens: current.context_vm_provider_output_limit(),
                             websocket_connect_timeout_ms: load_settings(&default_agent_dir())
                                 .websocket_connect_timeout_ms,
                             transport: current.transport.clone(),

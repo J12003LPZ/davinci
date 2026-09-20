@@ -62,12 +62,31 @@ impl Classification {
     }
 }
 
+#[cfg(test)]
 pub fn build_plan(
     root: &Path,
     args: &VerificationPlanArgs,
     transaction_files: Option<Vec<String>>,
     transaction_identity: Option<String>,
     config: &VerificationPlannerConfig,
+) -> Result<VerificationPlan, String> {
+    build_plan_with_snapshot(
+        root,
+        args,
+        transaction_files,
+        transaction_identity,
+        config,
+        None,
+    )
+}
+
+pub fn build_plan_with_snapshot(
+    root: &Path,
+    args: &VerificationPlanArgs,
+    transaction_files: Option<Vec<String>>,
+    transaction_identity: Option<String>,
+    config: &VerificationPlannerConfig,
+    snapshot: Option<&super::super::engineering_snapshot::EngineeringSnapshot>,
 ) -> Result<VerificationPlan, String> {
     let config = config.clone().bounded();
     let mut paths = args.files.clone();
@@ -178,7 +197,9 @@ pub fn build_plan(
             );
         }
         if classification.frontend || classification.source || classification.public_api {
-            if has_script(root, manager, "typecheck") || matches!(manager, PackageManager::Cargo) {
+            if has_script(root, manager, "typecheck", snapshot)
+                || matches!(manager, PackageManager::Cargo)
+            {
                 add_requirement(
                     &mut requirements,
                     "typecheck",
@@ -192,7 +213,7 @@ pub fn build_plan(
                     StepSpec::typecheck(manager, root, &source_identity),
                 );
             }
-            if has_script(root, manager, "lint") {
+            if has_script(root, manager, "lint", snapshot) {
                 add_requirement(
                     &mut requirements,
                     "lint",
@@ -550,10 +571,25 @@ fn classify_path(
     }
 }
 
-fn has_script(root: &Path, manager: PackageManager, name: &str) -> bool {
+fn has_script(
+    root: &Path,
+    manager: PackageManager,
+    name: &str,
+    snapshot: Option<&super::super::engineering_snapshot::EngineeringSnapshot>,
+) -> bool {
     match manager {
         PackageManager::Cargo => matches!(name, "typecheck" | "lint"),
         PackageManager::Npm | PackageManager::Pnpm | PackageManager::Yarn | PackageManager::Bun => {
+            if let Some(script) = snapshot.and_then(|facts| {
+                facts
+                    .metadata
+                    .packages
+                    .iter()
+                    .find(|package| package.path == ".")
+                    .and_then(|package| package.scripts.get(name))
+            }) {
+                return !script.trim().is_empty();
+            }
             let Ok(raw) = fs::read_to_string(root.join("package.json")) else {
                 return false;
             };

@@ -18,6 +18,8 @@ pub enum DecisionProviderHealth {
 
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
 pub enum DecisionError {
+    #[error("decision intelligence local worker is busy")]
+    Busy,
     #[error("decision intelligence is disabled")]
     Disabled,
     #[error("decision intelligence credential is invalid")]
@@ -41,6 +43,7 @@ pub enum DecisionError {
 impl DecisionError {
     pub const fn health(&self) -> DecisionProviderHealth {
         match self {
+            Self::Busy => DecisionProviderHealth::Ready,
             Self::Disabled => DecisionProviderHealth::Disabled,
             Self::CredentialInvalid | Self::HttpStatus(401) => {
                 DecisionProviderHealth::CredentialInvalid
@@ -75,4 +78,11 @@ pub trait DecisionProvider: Send + Sync {
         request: &DecisionRequest,
         budget: Duration,
     ) -> Result<DecisionResponse, DecisionError>;
+    fn evaluate_shadow(
+        &self,
+        request: &DecisionRequest,
+        budget: Duration,
+    ) -> Result<DecisionResponse, DecisionError> {
+        self.evaluate(request, budget)
+    }
 }

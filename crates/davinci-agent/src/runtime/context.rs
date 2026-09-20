@@ -73,6 +73,16 @@ pub struct ContextItem {
 }
 
 impl ContextItem {
+    pub fn is_mandatory(&self) -> bool {
+        self.provenance.get("mandatory").and_then(Value::as_bool) == Some(true)
+            || self
+                .provenance
+                .get("provenance_kind")
+                .and_then(Value::as_str)
+                == Some("mandatory_policy")
+            || self.source.contains("mandatory")
+    }
+
     pub fn stable_id(&self) -> String {
         if let Some(id) = self.provenance.get("id").and_then(|v| v.as_str()) {
             return id.to_string();
@@ -159,12 +169,14 @@ fn compute_cache_key(items: &[ContextItem]) -> String {
 #[derive(Default, Clone)]
 pub struct ContextBroker {
     sources: Arc<RwLock<Vec<Arc<dyn ContextSource>>>>,
+    revision: Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl ContextBroker {
     pub fn new() -> Self {
         Self {
             sources: Arc::new(RwLock::new(Vec::new())),
+            revision: Default::default(),
         }
     }
 
@@ -172,7 +184,16 @@ impl ContextBroker {
     pub fn register_context_source(&self, source: Arc<dyn ContextSource>) {
         if let Ok(mut sources) = self.sources.write() {
             sources.push(source);
+            self.invalidate();
         }
+    }
+
+    pub fn revision(&self) -> u64 {
+        self.revision.load(std::sync::atomic::Ordering::Acquire)
+    }
+    pub fn invalidate(&self) {
+        self.revision
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
     }
 
     /// Build a bounded, deterministically ordered context packet for the request.
@@ -264,8 +285,8 @@ impl ContextBroker {
         let mut total_tokens = 0u64;
 
         for item in deduplicated {
-            if total_tokens + item.estimated_tokens <= request.max_tokens {
-                total_tokens += item.estimated_tokens;
+            if total_tokens.saturating_add(item.estimated_tokens) <= request.max_tokens {
+                total_tokens = total_tokens.saturating_add(item.estimated_tokens);
                 selected.push(item.clone());
                 ledger.push((item, true, Some("selected".to_string())));
             } else {

@@ -124,11 +124,12 @@ impl Agent {
             // summarize. Active Context VM keeps Agent.messages untouched and
             // folds its derived state instead.
             let tokens = if active_context_vm {
+                self.invalidate_context_image();
                 let events = self.context_vm_events_for_runtime();
                 if let Some(runtime) = &self.runtime {
                     let _ = runtime.context_vm.append_delta(&events);
                 }
-                self.context_vm_image()
+                self.prepared_context_image()
                     .map(|image| self.context_vm_estimated_provider_tokens(&image))
                     .unwrap_or_else(|_| self.estimated_context_tokens())
             } else {
@@ -137,7 +138,7 @@ impl Agent {
             };
             self.stats.note_context(tokens);
             if self.auto_compaction && active_context_vm {
-                let decision = self.runtime.as_ref().and_then(|runtime| {
+                let decision = self.runtime.as_ref().map(|runtime| {
                     let root = runtime.context_vm.root();
                     let delta_tokens = root
                         .deltas
@@ -145,20 +146,18 @@ impl Agent {
                         .map(|page| page.estimated_tokens)
                         .sum::<u64>();
                     let config = runtime.context_vm.config();
-                    Some(
-                        crate::runtime::context_vm::ContextFoldPolicy {
-                            max_delta_pages: config.max_delta_pages,
-                            max_delta_tokens: config.max_delta_tokens,
-                            window_pressure_percent: config.window_pressure_percent,
-                        }
-                        .decide(
-                            &root,
-                            delta_tokens,
-                            tokens,
-                            self.context_window,
-                            false,
-                            false,
-                        ),
+                    crate::runtime::context_vm::ContextFoldPolicy {
+                        max_delta_pages: config.max_delta_pages,
+                        max_delta_tokens: config.max_delta_tokens,
+                        window_pressure_percent: config.window_pressure_percent,
+                    }
+                    .decide(
+                        &root,
+                        delta_tokens,
+                        tokens,
+                        self.context_window,
+                        false,
+                        false,
                     )
                 });
                 if decision.is_some_and(|decision| decision.should_fold) {
@@ -175,6 +174,19 @@ impl Agent {
                     && self.compact(None).compacted
                 {
                     self.stats.compactions += 1;
+                }
+            }
+
+            // Folding/rebuilding gets the first chance to recover. Every
+            // active-VM dispatch requires an admitted image; a storage failure
+            // must not bypass the budget through the legacy accessor fallback.
+            if active_context_vm {
+                if let Err(error) = self.prepared_context_image() {
+                    self.is_streaming = false;
+                    self.flush_pending_bash_messages();
+                    return Err(format!(
+                        "Request blocked: context compilation failed: {error}"
+                    ));
                 }
             }
 
@@ -2442,7 +2454,6 @@ fn tool_result_message(
         tool_name: Some(name.to_string()),
         is_error: Some(result.is_error),
         extra,
-        ..ChatMessage::default()
     }
 }
 

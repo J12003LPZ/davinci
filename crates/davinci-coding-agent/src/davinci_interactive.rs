@@ -4663,9 +4663,9 @@ pub fn run(
                 // burst of keys the console delivers is reassembled into this
                 // event by the paste filter behind `poll_event`.
                 crossterm::event::Event::Paste(text) => {
-                    if model.overlay == Some(Overlay::SecretInput) {
-                        model.paste(&text);
-                    } else if !voice.paste(&mut model, &text) {
+                    if model.overlay == Some(Overlay::SecretInput)
+                        || !voice.paste(&mut model, &text)
+                    {
                         model.paste(&text);
                     }
                 }
@@ -7679,18 +7679,42 @@ fn submit_prompt(shell: &mut Shell<'_>, text: &str, images: &[davinci_ai::Messag
                 .collect::<Vec<_>>()
         })
         .unwrap_or_default();
-    let metadata = davinci_coding_agent::decision_state::DecisionMetadata::from_workspace(
+    let mut metadata = davinci_coding_agent::decision_state::DecisionMetadata::from_workspace(
         shell.cwd,
         &recent_paths,
         &capability_names,
     );
-    let decision_request = davinci_coding_agent::decision_state::build_request_with_metadata(
-        davinci_agent::new_message_id(),
-        &expanded,
-        davinci_agent::decision::risk::DecisionRisk::Planning,
-        metadata,
-    );
-    let _ = shell.agent.evaluate_decision_shadow(&decision_request);
+    let snapshots = shell
+        .host
+        .try_lock()
+        .ok()
+        .and_then(|host| host.engineering_snapshots());
+    if let Some(runtime) = shell.agent.decision_runtime() {
+        let cwd = shell.cwd.to_path_buf();
+        let task = expanded.clone();
+        let _ = runtime.enqueue_shadow_with(move || {
+            // A prior turn's observation is reusable only after freshness/root
+            // validation. New-turn invalidation or a concurrent scan yields
+            // unknown facts; neither causes work on the submit thread.
+            if let Some(snapshot) = snapshots.and_then(|facts| facts.peek_current(&cwd)) {
+                metadata.apply_snapshot(
+                    snapshot.workspace_dirty,
+                    snapshot.index.files.keys().map(String::as_str),
+                    snapshot
+                        .metadata
+                        .packages
+                        .iter()
+                        .flat_map(|p| p.dependencies.iter().map(String::as_str)),
+                );
+            }
+            davinci_coding_agent::decision_state::build_request_with_metadata(
+                davinci_agent::new_message_id(),
+                &task,
+                davinci_agent::decision::risk::DecisionRisk::Planning,
+                metadata,
+            )
+        });
+    }
     if let Some(runtime) = shell.agent.decision_runtime() {
         if let Some(health) = runtime.take_health_transition() {
             if let Some(notice) = decision_health_notice(health) {

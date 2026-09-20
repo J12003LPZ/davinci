@@ -150,3 +150,111 @@ fn guarded_policy_only_adds_available_authorized_non_vetoed_capabilities() {
         vec!["mandatory_verification", "browser"]
     );
 }
+
+#[test]
+fn shadow_submit_returns_while_provider_is_blocked_and_does_not_queue_work() {
+    let entered = Arc::new(Barrier::new(2));
+    let release = Arc::new(Barrier::new(2));
+    let provider = Arc::new(FixtureProvider {
+        calls: AtomicUsize::new(0),
+        entered: Some(entered.clone()),
+        release: Some(release.clone()),
+        result: Ok(success_payload()),
+    });
+    let runtime = Arc::new(DecisionRuntime::new(provider.clone()));
+    runtime.enable();
+    let (tx, rx) = std::sync::mpsc::channel();
+    let submit = runtime.clone();
+    thread::spawn(move || tx.send(submit.enqueue_shadow(request())).unwrap());
+    // A blocking implementation cannot reach this result before release.
+    assert!(rx.recv_timeout(Duration::from_secs(1)).unwrap().is_ok());
+    entered.wait();
+    let generation = runtime.generation();
+    assert_eq!(runtime.enqueue_shadow(request()), Err(DecisionError::Busy));
+    assert_eq!(runtime.generation(), generation);
+    assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
+    release.wait();
+    let deadline = std::time::Instant::now() + Duration::from_secs(1);
+    while runtime.audit().snapshot().is_empty() && std::time::Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(1));
+    }
+    assert_eq!(
+        runtime.audit().snapshot()[0].outcome,
+        davinci_agent::decision::audit::DecisionAuditOutcome::Success
+    );
+}
+
+#[test]
+fn runtime_enforces_hard_deadline_even_when_provider_ignores_it() {
+    use davinci_agent::decision::provider::DecisionProviderHealth;
+    use davinci_agent::decision::HARD_DECISION_BUDGET;
+    let entered = Arc::new(Barrier::new(2));
+    let release = Arc::new(Barrier::new(2));
+    let provider = Arc::new(FixtureProvider {
+        calls: AtomicUsize::new(0),
+        entered: Some(entered.clone()),
+        release: Some(release.clone()),
+        result: Ok(success_payload()),
+    });
+    let runtime = Arc::new(DecisionRuntime::new(provider.clone()));
+    runtime.enable();
+    let pending = runtime.clone();
+    let start = std::time::Instant::now();
+    let handle = thread::spawn(move || pending.evaluate(&request()));
+    entered.wait();
+    assert!(matches!(
+        handle.join().unwrap(),
+        Err(DecisionError::Unavailable(_))
+    ));
+    assert!(start.elapsed() >= HARD_DECISION_BUDGET);
+    assert!(start.elapsed() < HARD_DECISION_BUDGET + Duration::from_secs(2));
+    assert_eq!(runtime.telemetry().snapshot().timeouts, 1);
+    assert_eq!(runtime.telemetry().snapshot().soft_deadline_misses, 1);
+    // The orphaned provider worker remains bounded until it actually finishes.
+    runtime.enable();
+    assert_eq!(runtime.evaluate(&request()), Err(DecisionError::Busy));
+    assert_eq!(runtime.health(), DecisionProviderHealth::Ready);
+    assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
+    release.wait();
+}
+
+#[test]
+fn shadow_fact_preparation_is_nonblocking_and_covered_by_the_worker_bound() {
+    let provider = Arc::new(FixtureProvider {
+        calls: AtomicUsize::new(0),
+        entered: None,
+        release: None,
+        result: Ok(success_payload()),
+    });
+    let runtime = Arc::new(DecisionRuntime::new(provider.clone()));
+    runtime.enable();
+    let (release, waiting) = std::sync::mpsc::channel();
+    let (submitted, returned) = std::sync::mpsc::channel();
+    let job = runtime.clone();
+    let submit = thread::spawn(move || {
+        submitted
+            .send(job.enqueue_shadow_with(move || {
+                waiting.recv_timeout(Duration::from_secs(2)).unwrap();
+                request()
+            }))
+            .unwrap();
+    });
+    assert!(returned
+        .recv_timeout(Duration::from_secs(1))
+        .unwrap()
+        .is_ok());
+    assert_eq!(provider.calls.load(Ordering::SeqCst), 0);
+    assert_eq!(runtime.enqueue_shadow(request()), Err(DecisionError::Busy));
+    runtime.disable();
+    release.send(()).unwrap();
+    submit.join().unwrap();
+    let deadline = std::time::Instant::now() + Duration::from_secs(1);
+    while runtime.audit().snapshot().is_empty() && std::time::Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(1));
+    }
+    assert_eq!(provider.calls.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        runtime.audit().snapshot()[0].outcome,
+        davinci_agent::decision::audit::DecisionAuditOutcome::Stale
+    );
+}

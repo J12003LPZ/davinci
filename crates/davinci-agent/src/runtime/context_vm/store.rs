@@ -4,6 +4,7 @@ use crate::runtime::cache::{
     CacheRuntime,
 };
 use serde::{Deserialize, Serialize};
+use std::sync::{Arc, RwLock};
 
 pub const CONTEXT_OBJECT_SCHEMA: u32 = 1;
 pub const CONTEXT_OBJECT_ALGORITHM: &str = "context-object-v1";
@@ -19,11 +20,22 @@ pub enum ContextObject {
 #[derive(Debug, Clone)]
 pub struct ContextObjectStore {
     cache: CacheRuntime,
+    metrics: Arc<RwLock<super::ContextVmMetrics>>,
 }
 
 impl ContextObjectStore {
     pub fn new(cache: CacheRuntime) -> Self {
-        Self { cache }
+        Self::with_metrics(
+            cache,
+            Arc::new(RwLock::new(super::ContextVmMetrics::default())),
+        )
+    }
+
+    pub(crate) fn with_metrics(
+        cache: CacheRuntime,
+        metrics: Arc<RwLock<super::ContextVmMetrics>>,
+    ) -> Self {
+        Self { cache, metrics }
     }
 
     pub fn cache(&self) -> &CacheRuntime {
@@ -48,6 +60,20 @@ impl ContextObjectStore {
     }
 
     pub fn load(&self, page: &ContextPageRef) -> Result<ContextObject, CacheError> {
+        let result = self.load_inner(page);
+        let mut metrics = self
+            .metrics
+            .write()
+            .unwrap_or_else(|error| error.into_inner());
+        if result.is_ok() {
+            metrics.page_lookup_hits = metrics.page_lookup_hits.saturating_add(1);
+        } else {
+            metrics.page_lookup_misses = metrics.page_lookup_misses.saturating_add(1);
+        }
+        result
+    }
+
+    fn load_inner(&self, page: &ContextPageRef) -> Result<ContextObject, CacheError> {
         let request = request_for(&page.id, &page.content_hash);
         let Some(object) = self.cache.get::<ContextObject>(&request, || Ok(()))? else {
             return Err(CacheError::Compute(

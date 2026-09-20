@@ -146,7 +146,26 @@ impl SessionClient {
             version: PROTOCOL_VERSION,
         });
         match message {
-            ServerMessage::Hello { snapshot, .. } => {
+            ServerMessage::Hello {
+                version, snapshot, ..
+            } => {
+                let mismatch = if version != PROTOCOL_VERSION {
+                    Some(format!(
+                        "Unsupported server hello protocol version: {version}"
+                    ))
+                } else if snapshot.protocol_version != PROTOCOL_VERSION {
+                    Some(format!(
+                        "Unsupported snapshot protocol version: {}",
+                        snapshot.protocol_version
+                    ))
+                } else {
+                    None
+                };
+                if let Some(message) = mismatch {
+                    inner.connected = false;
+                    inner.state.reset();
+                    return Err(ClientError::Protocol(message));
+                }
                 inner.state.apply_server_snapshot(snapshot.clone());
                 for event in events {
                     inner.state.apply_event(&event);
@@ -673,6 +692,35 @@ mod tests {
     use davinci_protocol::{SessionMetadata, SessionPhase};
     use std::cell::RefCell;
     use std::rc::Rc;
+
+    #[test]
+    fn audit_regression_rejects_incompatible_dispatch_hello() {
+        for (version, snapshot_version, expected) in [
+            (PROTOCOL_VERSION + 1, PROTOCOL_VERSION, "server hello"),
+            (PROTOCOL_VERSION, PROTOCOL_VERSION + 1, "snapshot"),
+        ] {
+            let client = SessionClient::new(move |_| {
+                (
+                    ServerMessage::Hello {
+                        version,
+                        connection_id: "test".into(),
+                        snapshot: ServerSnapshot {
+                            server_id: "test".into(),
+                            protocol_version: snapshot_version,
+                            revision: 0,
+                            sessions: Vec::new(),
+                            models: Vec::new(),
+                        },
+                    },
+                    Vec::new(),
+                )
+            });
+            let error = client.connect().unwrap_err().to_string();
+            assert!(error.contains(expected), "{error}");
+            assert!(!client.connected());
+            assert!(client.snapshot().is_none());
+        }
+    }
 
     #[derive(Default)]
     struct FakeServer {

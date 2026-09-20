@@ -575,10 +575,13 @@ fn install_remote_package(
     spec: &str,
     local: bool,
 ) -> Result<(), String> {
+    let cwd = std::env::current_dir().map_err(|error| error.to_string())?;
+    if kind == "git" {
+        git_checkout_path(agent_dir, local, &cwd, spec)?;
+    }
     if std::env::var("PI_INSTALL_DRY_RUN").is_ok() {
         return Ok(());
     }
-    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     let fixture = match kind {
         "npm" => std::env::var_os("PI_NPM_PACKAGE_DIR").map(PathBuf::from),
         _ => std::env::var_os("PI_GIT_PACKAGE_DIR").map(PathBuf::from),
@@ -592,7 +595,7 @@ fn install_remote_package(
                 .join("node_modules")
                 .join(name)
         } else {
-            git_checkout_path(agent_dir, local, &cwd, spec)
+            git_checkout_path(agent_dir, local, &cwd, spec)?
         };
         copy_dir(&fixture, &dest)?;
         return Ok(());
@@ -606,15 +609,72 @@ fn install_remote_package(
     install_git_live(agent_dir, local, &cwd, spec)
 }
 
-fn git_checkout_path(agent_dir: &Path, local: bool, cwd: &Path, spec: &str) -> PathBuf {
+fn git_checkout_path(
+    agent_dir: &Path,
+    local: bool,
+    cwd: &Path,
+    spec: &str,
+) -> Result<PathBuf, String> {
     let (url, _) = parse_git_source(spec);
+    // Inspect the raw path before URL or filesystem normalization can erase
+    // parent components. A checkout may subsequently be recursively replaced.
+    let raw = url
+        .strip_prefix("https://")
+        .or_else(|| url.strip_prefix("http://"))
+        .or_else(|| url.strip_prefix("ssh://"))
+        .unwrap_or(&url);
+    let (host, path) = if let Some(scp) = raw.strip_prefix("git@") {
+        if !url.contains("://") {
+            scp.split_once(':')
+        } else {
+            raw.split_once('/')
+        }
+    } else {
+        raw.split_once('/')
+    }
+    .ok_or("Invalid Git checkout path")?;
+    if host.is_empty() || path.contains(':') {
+        return Err("Invalid Git checkout path".into());
+    }
     let host_path = url
         .trim_start_matches("https://")
         .trim_start_matches("http://")
         .trim_start_matches("ssh://")
         .trim_start_matches("git@")
         .replace(':', "/");
-    git_install_root(agent_dir, local, cwd).join(host_path.trim_end_matches(".git"))
+    let relative = host_path.trim_end_matches(".git");
+    for part in relative.split('/') {
+        let device = part
+            .split('.')
+            .next()
+            .unwrap_or_default()
+            .to_ascii_uppercase();
+        if part.is_empty()
+            || part == "."
+            || part == ".."
+            || part.ends_with(['.', ' '])
+            || part
+                .chars()
+                .any(|c| c.is_control() || "<>:\"\\|?*".contains(c))
+            || matches!(
+                device.as_str(),
+                "CON" | "PRN" | "AUX" | "NUL" | "CONIN$" | "CONOUT$"
+            )
+            || ["COM", "LPT"].iter().any(|prefix| {
+                device.strip_prefix(prefix).is_some_and(|number| {
+                    matches!(number, "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9")
+                })
+            })
+        {
+            return Err("Invalid Git checkout path".into());
+        }
+    }
+    let root = git_install_root(agent_dir, local, cwd);
+    let destination = root.join(relative);
+    if davinci_agent::check_path_boundary(&root, &destination) != (false, false) {
+        return Err("Git checkout escapes the package directory".into());
+    }
+    Ok(destination)
 }
 
 fn npm_command(agent_dir: &Path) -> Result<Vec<String>, String> {
@@ -681,9 +741,9 @@ fn install_npm_live(agent_dir: &Path, local: bool, cwd: &Path, spec: &str) -> Re
 
 fn install_git_live(agent_dir: &Path, local: bool, cwd: &Path, spec: &str) -> Result<(), String> {
     let (url, git_ref) = parse_git_source(spec);
-    let dest = git_checkout_path(agent_dir, local, cwd, spec);
+    let dest = git_checkout_path(agent_dir, local, cwd, spec)?;
     if dest.exists() {
-        let _ = fs::remove_dir_all(&dest);
+        fs::remove_dir_all(&dest).map_err(|error| error.to_string())?;
     }
     if let Some(parent) = dest.parent() {
         fs::create_dir_all(parent).map_err(|err| err.to_string())?;
@@ -821,7 +881,7 @@ fn source_has_update(source: &str, local: bool, agent_dir: &Path, cwd: &Path) ->
             }
         }
         ParsedSource::Git(url) => {
-            let installed = git_checkout_path(agent_dir, local, cwd, &url);
+            let installed = git_checkout_path(agent_dir, local, cwd, &url).ok()?;
             if !installed.exists() {
                 return None;
             }
@@ -1114,6 +1174,93 @@ pub fn managed_bin_dir(agent_dir: &Path) -> PathBuf {
 mod tests {
     use super::*;
     use tempfile::tempdir;
+
+    #[test]
+    fn audit_regression_git_install_rejects_escaping_checkout() {
+        let dir = tempdir().unwrap();
+        let agent = dir.path().join("agent");
+        let escaped = agent.join("escaped");
+        fs::create_dir_all(&escaped).unwrap();
+        fs::write(escaped.join("keep.txt"), "untouched").unwrap();
+        for source in [
+            "git:https://github.com/../../escaped.git",
+            "git@host:../../escaped.git",
+            "https://host/a/../../escaped.git",
+            "https://host/..\\..\\escaped.git",
+            "https://host/a/../escaped.git",
+            "https://host/a/.. /escaped.git",
+            "https://host/a/C:/escaped.git",
+            "https://host/a/NUL.git",
+            "https://host//escaped.git",
+            "https://host/a./escaped.git",
+        ] {
+            assert!(
+                git_checkout_path(&agent, false, dir.path(), source).is_err(),
+                "accepted {source}"
+            );
+            assert_eq!(
+                fs::read_to_string(escaped.join("keep.txt")).unwrap(),
+                "untouched"
+            );
+        }
+    }
+
+    #[test]
+    fn git_checkout_preserves_normal_host_paths_and_refs() {
+        let dir = tempdir().unwrap();
+        for source in [
+            "git:https://github.com/org/repo.git@v1.2.3",
+            "git@github.com:org/repo.git@main",
+            "https://github.com/org/repo.git",
+        ] {
+            assert_eq!(
+                git_checkout_path(dir.path(), false, dir.path(), source).unwrap(),
+                dir.path().join("git/github.com/org/repo"),
+            );
+        }
+        assert_eq!(
+            git_checkout_path(
+                dir.path(),
+                true,
+                dir.path(),
+                "ssh://git@host:2222/org/repo.git"
+            )
+            .unwrap(),
+            dir.path().join(".pi/git/host/2222/org/repo"),
+        );
+    }
+
+    #[test]
+    #[cfg(any(unix, windows))]
+    fn git_install_rejects_a_linked_checkout_parent() {
+        let dir = tempdir().unwrap();
+        let outside = tempdir().unwrap();
+        let root = dir.path().join("git");
+        fs::create_dir_all(&root).unwrap();
+        fs::create_dir_all(outside.path().join("repo")).unwrap();
+        let sentinel = outside.path().join("repo/keep.txt");
+        fs::write(&sentinel, "untouched").unwrap();
+        let link = root.join("host");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(outside.path(), &link).unwrap();
+        #[cfg(windows)]
+        assert!(
+            std::os::windows::fs::symlink_dir(outside.path(), &link).is_ok()
+                || std::process::Command::new("cmd")
+                    .args(["/C", "mklink", "/J"])
+                    .arg(&link)
+                    .arg(outside.path())
+                    .output()
+                    .unwrap()
+                    .status
+                    .success(),
+            "could not create the confinement fixture"
+        );
+        let result =
+            install_remote_package(dir.path(), "git", "repo", "https://host/repo.git", false);
+        assert!(result.unwrap_err().contains("escapes"));
+        assert_eq!(fs::read_to_string(sentinel).unwrap(), "untouched");
+    }
 
     #[test]
     fn update_self_copies_binary_and_rejects_conflicts() {

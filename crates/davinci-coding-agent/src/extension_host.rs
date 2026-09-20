@@ -491,6 +491,12 @@ impl ExtensionHost {
             .record_pruning();
     }
 
+    pub fn engineering_snapshots(
+        &self,
+    ) -> Option<crate::native_extensions::engineering_snapshot::EngineeringSnapshots> {
+        Some(self.native.try_lock().ok()?.engineering.clone())
+    }
+
     pub fn native_after_tool(
         &self,
         name: &str,
@@ -668,6 +674,9 @@ impl ExtensionHost {
     }
 
     pub fn emit_before_agent_start(&mut self, prompt: &str, images: &[davinci_ai::MessageContent]) {
+        if let Ok(native) = self.native.lock() {
+            native.engineering.invalidate();
+        }
         self.dispatch_js_with_payload(
             &ExtensionEvent::BeforeAgentStart,
             Some(serde_json::json!({

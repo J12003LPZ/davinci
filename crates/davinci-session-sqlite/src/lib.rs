@@ -1,6 +1,7 @@
 //! SQLite session backend matching `@earendil-works/pi-session-backend-sqlite-node`.
 
 mod branch_cache;
+mod transaction;
 
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -112,39 +113,38 @@ impl SqliteSessionStore {
     }
 
     pub fn upsert_session(&self, session: &JsonlSession) -> Result<(), SessionError> {
-        self.conn
-            .execute(
-                "INSERT INTO sessions (id, created_at, cwd, parent_session_id, metadata)
+        transaction::atomic(&self.conn, || {
+            self.conn
+                .execute(
+                    "INSERT INTO sessions (id, created_at, cwd, parent_session_id, metadata)
                  VALUES (?1, ?2, ?3, ?4, ?5)
                  ON CONFLICT(id) DO UPDATE SET
                     cwd = excluded.cwd,
                     parent_session_id = excluded.parent_session_id,
                     metadata = excluded.metadata",
-                params![
-                    session.header.id,
-                    session.header.created_at as i64,
-                    session.header.cwd,
-                    session.header.parent_session_id,
-                    session
-                        .header
-                        .metadata
-                        .as_ref()
-                        .map(|value| value.to_string())
-                ],
-            )
-            .map_err(|err| SessionError::storage(format!("Unable to upsert session: {err}")))?;
-        for entry in &session.entries {
-            self.insert_entry_row(&session.header.id, entry)?;
-        }
-        self.rebuild_branch_cache(&session.header.id)?;
-        Ok(())
+                    params![
+                        session.header.id,
+                        session.header.created_at as i64,
+                        session.header.cwd,
+                        session.header.parent_session_id,
+                        session
+                            .header
+                            .metadata
+                            .as_ref()
+                            .map(|value| value.to_string())
+                    ],
+                )
+                .map_err(|err| SessionError::storage(format!("Unable to upsert session: {err}")))?;
+            for entry in &session.entries {
+                self.insert_entry_row(&session.header.id, entry)?;
+            }
+            self.rebuild_branch_cache(&session.header.id)?;
+            Ok(())
+        })
     }
 
     pub fn insert_entry(&self, session_id: &str, entry: &SessionEntry) -> Result<(), SessionError> {
-        self.conn
-            .execute("BEGIN IMMEDIATE", [])
-            .map_err(|err| SessionError::storage(format!("Unable to begin entry write: {err}")))?;
-        let result = (|| {
+        transaction::atomic(&self.conn, || {
             self.insert_entry_row(session_id, entry)?;
             append_entry_to_branch_cache(
                 &self.conn,
@@ -155,19 +155,7 @@ impl SqliteSessionStore {
                 entry.custom_type.as_deref(),
                 entry.parent_id.as_deref(),
             )
-        })();
-        match result {
-            Ok(()) => {
-                self.conn.execute("COMMIT", []).map_err(|err| {
-                    SessionError::storage(format!("Unable to commit entry write: {err}"))
-                })?;
-                Ok(())
-            }
-            Err(error) => {
-                let _ = self.conn.execute("ROLLBACK", []);
-                Err(error)
-            }
-        }
+        })
     }
 
     fn insert_entry_row(&self, session_id: &str, entry: &SessionEntry) -> Result<(), SessionError> {
@@ -333,26 +321,30 @@ impl SqliteSessionStore {
     }
 
     pub fn create_repo_session(&self, id: &str) -> Result<davinci_session::Session, SessionError> {
-        self.conn
-            .execute(
-                "INSERT INTO sessions (id, created_at, cwd, parent_session_id, metadata)
+        transaction::atomic(&self.conn, || {
+            self.conn
+                .execute(
+                    "INSERT INTO sessions (id, created_at, cwd, parent_session_id, metadata)
                  VALUES (?1, ?2, '', NULL, NULL)",
-                params![id, now_ms_i64()],
-            )
-            .map_err(|err| SessionError::storage(format!("Unable to create session: {err}")))?;
-        self.conn
+                    params![id, now_ms_i64()],
+                )
+                .map_err(|err| SessionError::storage(format!("Unable to create session: {err}")))?;
+            self.conn
             .execute(
                 "INSERT INTO lanes (session_id, lane, leaf_id, open_operation_id) VALUES (?1, 'main', NULL, NULL)",
                 params![id],
             )
             .map_err(|err| SessionError::storage(format!("Unable to create main lane: {err}")))?;
-        self.conn
-            .execute(
-                "INSERT INTO session_sequences (session_id, next_seq) VALUES (?1, 1)",
-                params![id],
-            )
-            .map_err(|err| SessionError::storage(format!("Unable to create sequence: {err}")))?;
-        Ok(davinci_session::Session::new(id))
+            self.conn
+                .execute(
+                    "INSERT INTO session_sequences (session_id, next_seq) VALUES (?1, 1)",
+                    params![id],
+                )
+                .map_err(|err| {
+                    SessionError::storage(format!("Unable to create sequence: {err}"))
+                })?;
+            Ok(davinci_session::Session::new(id))
+        })
     }
 
     pub fn persist_log_item(
@@ -360,15 +352,16 @@ impl SqliteSessionStore {
         session_id: &str,
         item: &davinci_session::LogItem,
     ) -> Result<(), SessionError> {
-        match item {
-            davinci_session::LogItem::Entry { entry, .. } => {
-                self.insert_entry(session_id, entry)?
-            }
-            davinci_session::LogItem::Record { record, .. } => {
-                let payload = serde_json::to_string(record).map_err(|err| {
-                    SessionError::storage(format!("Unable to encode record: {err}"))
-                })?;
-                self.conn
+        transaction::atomic(&self.conn, || {
+            match item {
+                davinci_session::LogItem::Entry { entry, .. } => {
+                    self.insert_entry(session_id, entry)?
+                }
+                davinci_session::LogItem::Record { record, .. } => {
+                    let payload = serde_json::to_string(record).map_err(|err| {
+                        SessionError::storage(format!("Unable to encode record: {err}"))
+                    })?;
+                    self.conn
                     .execute(
                         "INSERT INTO records (session_id, seq, id, lane, run_id, type, op_kind, timestamp, payload)
                          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
@@ -389,92 +382,99 @@ impl SqliteSessionStore {
                         ],
                     )
                     .map_err(|err| SessionError::storage(format!("Unable to insert record: {err}")))?;
-            }
-            davinci_session::LogItem::Lane { seq, lane, leaf_id } => {
-                self.conn
-                    .execute(
-                        "INSERT INTO lanes (session_id, lane, leaf_id, open_operation_id)
+                }
+                davinci_session::LogItem::Lane { seq, lane, leaf_id } => {
+                    self.conn
+                        .execute(
+                            "INSERT INTO lanes (session_id, lane, leaf_id, open_operation_id)
                          VALUES (?1, ?2, ?3, NULL)
                          ON CONFLICT(session_id, lane) DO UPDATE SET leaf_id = excluded.leaf_id",
-                        params![session_id, lane, leaf_id],
-                    )
-                    .map_err(|err| {
-                        SessionError::storage(format!("Unable to upsert lane: {err}"))
-                    })?;
-                self.conn
+                            params![session_id, lane, leaf_id],
+                        )
+                        .map_err(|err| {
+                            SessionError::storage(format!("Unable to upsert lane: {err}"))
+                        })?;
+                    self.conn
                     .execute(
                         "INSERT INTO lane_moves (session_id, seq, lane, leaf_id) VALUES (?1, ?2, ?3, ?4)",
                         params![session_id, *seq as i64, lane, leaf_id],
                     )
                     .map_err(|err| SessionError::storage(format!("Unable to insert lane move: {err}")))?;
-            }
-            davinci_session::LogItem::FactName { seq, name } => {
-                self.conn
+                }
+                davinci_session::LogItem::FactName { seq, name } => {
+                    self.conn
                     .execute(
                         "INSERT INTO facts (session_id, seq, kind, key, value) VALUES (?1, ?2, 'name', NULL, ?3)",
                         params![session_id, *seq as i64, name],
                     )
                     .map_err(|err| SessionError::storage(format!("Unable to insert name fact: {err}")))?;
-            }
-            davinci_session::LogItem::FactLabel {
-                seq,
-                target_id,
-                label,
-            } => {
-                self.conn
+                }
+                davinci_session::LogItem::FactLabel {
+                    seq,
+                    target_id,
+                    label,
+                } => {
+                    self.conn
                     .execute(
                         "INSERT INTO facts (session_id, seq, kind, key, value) VALUES (?1, ?2, 'label', ?3, ?4)",
                         params![session_id, *seq as i64, target_id, label],
                     )
                     .map_err(|err| SessionError::storage(format!("Unable to insert label fact: {err}")))?;
+                }
             }
-        }
-        self.conn
-            .execute(
-                "UPDATE session_sequences SET next_seq = ?1 WHERE session_id = ?2",
-                params![item.seq() as i64 + 1, session_id],
-            )
-            .map_err(|err| SessionError::storage(format!("Unable to update sequence: {err}")))?;
-        Ok(())
+            self.conn
+                .execute(
+                    "UPDATE session_sequences SET next_seq = ?1 WHERE session_id = ?2",
+                    params![item.seq() as i64 + 1, session_id],
+                )
+                .map_err(|err| {
+                    SessionError::storage(format!("Unable to update sequence: {err}"))
+                })?;
+            Ok(())
+        })
     }
 
     pub fn persist_session(&self, session: &davinci_session::Session) -> Result<(), SessionError> {
-        self.conn
-            .execute(
-                "UPDATE sessions SET parent_session_id = ?1, created_at = ?2 WHERE id = ?3",
-                params![
-                    session.parent_session_id,
-                    session.created_at as i64,
-                    session.id
-                ],
-            )
-            .map_err(|err| {
-                SessionError::storage(format!("Unable to update session metadata: {err}"))
-            })?;
-        let next: i64 = self
-            .conn
-            .query_row(
-                "SELECT next_seq FROM session_sequences WHERE session_id = ?1",
-                [&session.id],
-                |row| row.get(0),
-            )
-            .unwrap_or(1);
-        for item in session.get_log(&davinci_session::LogOptions::default())? {
-            if item.seq() as i64 >= next {
-                self.persist_log_item(&session.id, &item)?;
-            }
-        }
-        for pointer in session.get_lanes() {
+        transaction::atomic(&self.conn, || {
             self.conn
                 .execute(
-                    "INSERT INTO lanes (session_id, lane, leaf_id, open_operation_id)
+                    "UPDATE sessions SET parent_session_id = ?1, created_at = ?2 WHERE id = ?3",
+                    params![
+                        session.parent_session_id,
+                        session.created_at as i64,
+                        session.id
+                    ],
+                )
+                .map_err(|err| {
+                    SessionError::storage(format!("Unable to update session metadata: {err}"))
+                })?;
+            let next: i64 = self
+                .conn
+                .query_row(
+                    "SELECT next_seq FROM session_sequences WHERE session_id = ?1",
+                    [&session.id],
+                    |row| row.get(0),
+                )
+                .unwrap_or(1);
+            for item in session.get_log(&davinci_session::LogOptions::default())? {
+                if item.seq() as i64 >= next {
+                    self.persist_log_item(&session.id, &item)?;
+                }
+            }
+            for pointer in session.get_lanes() {
+                self.conn
+                    .execute(
+                        "INSERT INTO lanes (session_id, lane, leaf_id, open_operation_id)
                      VALUES (?1, ?2, ?3, NULL)
                      ON CONFLICT(session_id, lane) DO UPDATE SET leaf_id = excluded.leaf_id",
-                    params![session.id, pointer.lane, pointer.leaf_id],
-                )
-                .map_err(|err| SessionError::storage(format!("Unable to persist lane: {err}")))?;
-        }
-        Ok(())
+                        params![session.id, pointer.lane, pointer.leaf_id],
+                    )
+                    .map_err(|err| {
+                        SessionError::storage(format!("Unable to persist lane: {err}"))
+                    })?;
+            }
+            Ok(())
+        })
     }
 
     pub fn open_repo_session(&self, id: &str) -> Result<davinci_session::Session, SessionError> {
@@ -694,6 +694,145 @@ pub fn now_ms_i64() -> i64 {
 mod tests {
     use super::*;
     use tempfile::tempdir;
+
+    #[test]
+    fn audit_regression_create_rolls_back_after_lane_failure() {
+        let dir = tempdir().unwrap();
+        let store = SqliteSessionStore::open(&dir.path().join("sessions.db")).unwrap();
+        store.conn.execute_batch("CREATE TRIGGER fail_lane BEFORE INSERT ON lanes BEGIN SELECT RAISE(ABORT, 'injected lane failure'); END;").unwrap();
+        assert!(store.create_repo_session("failed").is_err());
+        assert_eq!(
+            store
+                .conn
+                .query_row("SELECT count(*) FROM sessions", [], |row| row
+                    .get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+        store.conn.execute_batch("DROP TRIGGER fail_lane").unwrap();
+        store.create_repo_session("failed").unwrap();
+    }
+
+    #[test]
+    fn audit_regression_log_item_rolls_back_after_sequence_failure() {
+        use davinci_session::LogItem;
+        let dir = tempdir().unwrap();
+        let store = SqliteSessionStore::open(&dir.path().join("sessions.db")).unwrap();
+        store.create_repo_session("atomic").unwrap();
+        store.conn.execute_batch("CREATE TRIGGER fail_sequence BEFORE UPDATE ON session_sequences BEGIN SELECT RAISE(ABORT, 'injected sequence failure'); END;").unwrap();
+        let entry = SessionEntry {
+            id: "entry".into(),
+            seq: 1,
+            ..SessionEntry::message("user", serde_json::json!("test"))
+        };
+        // An entry writes both authoritative rows and the derived branch cache.
+        let items = [
+            LogItem::Entry { seq: 1, entry },
+            LogItem::FactName {
+                seq: 1,
+                name: Some("name".into()),
+            },
+        ];
+        for item in items {
+            assert!(store.persist_log_item("atomic", &item).is_err());
+            for table in ["entries", "branch_entries", "branch_tips", "facts"] {
+                let count: i64 = store
+                    .conn
+                    .query_row(&format!("SELECT count(*) FROM {table}"), [], |row| {
+                        row.get(0)
+                    })
+                    .unwrap();
+                assert_eq!(count, 0, "partial state in {table}");
+            }
+        }
+        assert_eq!(
+            store
+                .conn
+                .query_row("SELECT next_seq FROM session_sequences", [], |row| row
+                    .get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
+    }
+
+    #[test]
+    fn audit_regression_import_and_cache_rebuild_are_atomic() {
+        let dir = tempdir().unwrap();
+        let store = SqliteSessionStore::open(&dir.path().join("sessions.db")).unwrap();
+        let mut session = JsonlSession::create(dir.path(), "original", None).unwrap();
+        session
+            .append_entry(SessionEntry::message("user", serde_json::json!("root")))
+            .unwrap();
+        store.import_jsonl(&session).unwrap();
+        let root = session.entries[0].id.clone();
+        let original_ids = store.cached_branch_ids(&session.header.id, &root).unwrap();
+        store.conn.execute_batch("CREATE TRIGGER fail_tip BEFORE INSERT ON branch_tips BEGIN SELECT RAISE(ABORT, 'injected cache failure'); END;").unwrap();
+        assert!(store.rebuild_branch_cache(&session.header.id).is_err());
+        assert_eq!(
+            store.cached_branch_ids(&session.header.id, &root).unwrap(),
+            original_ids
+        );
+        session.header.cwd = "modified".into();
+        session
+            .append_entry(SessionEntry::message("assistant", serde_json::json!("new")))
+            .unwrap();
+        assert!(store.import_jsonl(&session).is_err());
+        assert_eq!(
+            store
+                .conn
+                .query_row("SELECT cwd FROM sessions", [], |row| row
+                    .get::<_, String>(0))
+                .unwrap(),
+            "original"
+        );
+        assert_eq!(
+            store
+                .conn
+                .query_row("SELECT count(*) FROM entries", [], |row| row
+                    .get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            store.cached_branch_ids(&session.header.id, &root).unwrap(),
+            original_ids
+        );
+    }
+
+    #[test]
+    fn audit_regression_persist_session_rolls_back_late_failure() {
+        let dir = tempdir().unwrap();
+        let store = SqliteSessionStore::open(&dir.path().join("sessions.db")).unwrap();
+        let mut session = store.create_repo_session("atomic").unwrap();
+        session
+            .append_entry(davinci_session::user_message_entry("root", "root"), "main")
+            .unwrap();
+        session.set_name(Some("name"));
+        store.conn.execute_batch("CREATE TRIGGER fail_name BEFORE INSERT ON facts BEGIN SELECT RAISE(ABORT, 'injected late failure'); END;").unwrap();
+        assert!(store.persist_session(&session).is_err());
+        assert_eq!(
+            store
+                .conn
+                .query_row("SELECT count(*) FROM entries", [], |row| row
+                    .get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            store
+                .conn
+                .query_row("SELECT next_seq FROM session_sequences", [], |row| row
+                    .get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
+        store.conn.execute_batch("DROP TRIGGER fail_name").unwrap();
+        store.persist_session(&session).unwrap();
+        assert_eq!(
+            store.open_repo_session("atomic").unwrap().get_name(),
+            Some("name")
+        );
+    }
 
     #[test]
     fn writer_lease_and_fts_roundtrip() {

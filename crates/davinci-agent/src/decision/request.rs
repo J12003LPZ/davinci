@@ -93,3 +93,12 @@ impl DecisionRequest {
         Ok(encoded)
     }
 }
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkspaceDirtyState {
+    Clean,
+    Dirty,
+    #[default]
+    Unknown,
+}

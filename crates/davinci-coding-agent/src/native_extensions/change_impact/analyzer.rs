@@ -10,7 +10,6 @@ use crate::native_extensions::{
     package_intelligence::PackageIntelligence,
     repo_intelligence::{parse_source, RepoIntelligence, SourceRange},
     test_impact::TestImpact,
-    workspace_metadata::WorkspaceMetadata,
 };
 use serde_json::{json, Value};
 use std::{collections::BTreeSet, fs, path::Path};
@@ -20,7 +19,7 @@ pub struct ChangeImpactAnalyzer<'a> {
     config: &'a ChangeImpactConfig,
     repo: &'a RepoIntelligence,
     test_impact: &'a TestImpact,
-    package_intelligence: &'a PackageIntelligence,
+    _package_intelligence: &'a PackageIntelligence,
     build_intelligence: &'a BuildIntelligence,
     git_intelligence: &'a GitIntelligence,
     language: &'a LanguageIntelligence,
@@ -43,7 +42,7 @@ impl<'a> ChangeImpactAnalyzer<'a> {
             config,
             repo,
             test_impact,
-            package_intelligence,
+            _package_intelligence: package_intelligence,
             build_intelligence,
             git_intelligence,
             language,
@@ -550,103 +549,55 @@ impl<'a> ChangeImpactAnalyzer<'a> {
         let mut items = Vec::new();
         let mut affected_packages = BTreeSet::new();
 
-        if let Ok(index) = self.repo.refresh() {
-            if let Ok(meta) = WorkspaceMetadata::discover(self.repo, &index, &|_| Ok(())) {
-                for pkg in &meta.packages {
-                    let pkg_name = pkg.name.clone().unwrap_or_else(|| pkg.path.clone());
-                    let pkg_dir = pkg.path.trim_end_matches("/package.json");
-                    for f in files {
-                        if f.starts_with(pkg_dir) || pkg_dir.is_empty() || pkg_dir == "." {
-                            affected_packages.insert(pkg_name.clone());
-                            let details = self
-                                .package_intelligence
-                                .execute_tool("package_resolve", &json!({ "name": pkg_name }))
-                                .ok()
-                                .and_then(|r| r.details);
-                            items.push(ImpactItem {
-                                name: pkg_name.clone(),
-                                path: pkg.path.clone(),
-                                evidence_source: EvidenceSource::Package,
-                                description: format!(
-                                    "Package '{pkg_name}' contains modified file '{f}'"
-                                ),
-                                range: None,
-                                details,
-                            });
-                            break;
-                        }
-                    }
-                }
-
-                // Check downstream package dependencies
-                let mut dependents = Vec::new();
-                for affected in &affected_packages {
-                    for pkg in &meta.packages {
-                        let pkg_name = pkg.name.clone().unwrap_or_else(|| pkg.path.clone());
-                        if pkg.dependencies.contains(affected) {
-                            dependents.push((pkg_name, affected.clone(), pkg.path.clone()));
-                        }
-                    }
-                }
-
-                for (dep, affected, path) in dependents {
-                    affected_packages.insert(dep.clone());
-                    let details = self
-                        .package_intelligence
-                        .execute_tool("package_resolve", &json!({ "name": dep }))
-                        .ok()
-                        .and_then(|r| r.details);
+        if let Ok(snapshot) = self.test_impact.workspace_facts(files, false) {
+            let meta = &snapshot.metadata;
+            for pkg in &meta.packages {
+                let pkg_name = pkg.name.clone().unwrap_or_else(|| pkg.path.clone());
+                if let Some(file) = files
+                    .iter()
+                    .find(|file| pkg.path == "." || file.starts_with(&format!("{}/", pkg.path)))
+                {
+                    affected_packages.insert(pkg_name.clone());
                     items.push(ImpactItem {
-                        name: dep.clone(),
-                        path,
+                        name: pkg_name.clone(),
+                        path: pkg.path.clone(),
                         evidence_source: EvidenceSource::Package,
                         description: format!(
-                            "Downstream package '{dep}' depends on affected package '{affected}'"
+                            "Package '{pkg_name}' contains modified file '{file}'"
                         ),
                         range: None,
-                        details,
+                        details: Some(
+                            json!({"manifest":pkg.manifest,"source_identity":snapshot.identity}),
+                        ),
                     });
                 }
             }
-
-            if affected_packages.is_empty() {
-                for meta_path in &index.metadata {
-                    if meta_path.ends_with("package.json") {
-                        let pkg_dir = meta_path
-                            .trim_end_matches("/package.json")
-                            .trim_end_matches("package.json")
-                            .trim_end_matches('/');
-                        for f in files {
-                            let in_pkg = if pkg_dir.is_empty() {
-                                !f.contains('/')
-                            } else {
-                                f.starts_with(pkg_dir)
-                            };
-                            if in_pkg {
-                                if let Ok(body) = self.repo.read_project_file(meta_path, 64 * 1024)
-                                {
-                                    if let Ok(val) = serde_json::from_str::<Value>(&body) {
-                                        let name =
-                                            val["name"].as_str().unwrap_or(pkg_dir).to_string();
-                                        if !affected_packages.contains(&name) {
-                                            affected_packages.insert(name.clone());
-                                            items.push(ImpactItem {
-                                                name: name.clone(),
-                                                path: meta_path.clone(),
-                                                evidence_source: EvidenceSource::Package,
-                                                description: format!(
-                                                    "Package manifest '{meta_path}' covers modified file '{f}'"
-                                                ),
-                                                range: None,
-                                                details: Some(val),
-                                            });
-                                        }
-                                    }
-                                }
-                                break;
-                            }
-                        }
+            // Fixed point is bounded by the number of packages, including cycles.
+            loop {
+                let mut added = Vec::new();
+                for pkg in &meta.packages {
+                    let name = pkg.name.clone().unwrap_or_else(|| pkg.path.clone());
+                    if affected_packages.contains(&name) {
+                        continue;
                     }
+                    if let Some(dependency) = pkg
+                        .dependencies
+                        .iter()
+                        .find(|dep| affected_packages.contains(*dep))
+                    {
+                        added.push((name, pkg.path.clone(), dependency.clone()));
+                    }
+                }
+                if added.is_empty() {
+                    break;
+                }
+                for (name, path, dependency) in added {
+                    affected_packages.insert(name.clone());
+                    items.push(ImpactItem { name: name.clone(), path,
+                        evidence_source: EvidenceSource::Package,
+                        description: format!("Downstream package '{name}' depends on affected package '{dependency}'"),
+                        range: None, details: Some(json!({"source_identity":snapshot.identity})),
+                    });
                 }
             }
         }

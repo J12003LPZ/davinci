@@ -9,7 +9,7 @@ use davinci_agent::runtime::contracts::redact_secrets;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AvailableCapabilities {
     pub browser: bool,
@@ -24,16 +24,37 @@ pub struct AvailableCapabilities {
     pub verification_planner: bool,
 }
 
-impl Default for AvailableCapabilities {
-    fn default() -> Self {
-        Self {
-            browser: false,
-            git: false,
-            package_intelligence: false,
-            test_impact: false,
-            change_impact: false,
-            verification_planner: false,
-        }
+pub use davinci_agent::decision::request::WorkspaceDirtyState;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum CapabilityId {
+    BrowserVerification,
+    GitIntelligence,
+    PackageIntelligence,
+    TestImpact,
+    ChangeImpact,
+    VerificationPlanner,
+}
+
+impl CapabilityId {
+    fn from_registered_tool(name: &str) -> Option<Self> {
+        use crate::native_extensions as native;
+        [
+            (Self::BrowserVerification, native::browser::TOOL_NAMES),
+            (Self::GitIntelligence, native::git_intelligence::TOOL_NAMES),
+            (
+                Self::PackageIntelligence,
+                native::package_intelligence::TOOL_NAMES,
+            ),
+            (Self::TestImpact, native::test_impact::TOOL_NAMES),
+            (Self::ChangeImpact, native::change_impact::TOOL_NAMES),
+            (
+                Self::VerificationPlanner,
+                native::verification_planner::TOOL_NAMES,
+            ),
+        ]
+        .into_iter()
+        .find_map(|(id, names)| names.contains(&name).then_some(id))
     }
 }
 
@@ -42,13 +63,42 @@ pub struct DecisionMetadata {
     pub languages: Vec<String>,
     pub framework_signals: Vec<String>,
     pub recent_file_kinds: Vec<String>,
-    pub has_uncommitted_changes: bool,
+    pub workspace_dirty: WorkspaceDirtyState,
     pub available_capabilities: AvailableCapabilities,
 }
 
 impl DecisionMetadata {
+    pub fn apply_snapshot<'a>(
+        &mut self,
+        dirty: WorkspaceDirtyState,
+        paths: impl Iterator<Item = &'a str>,
+        dependencies: impl Iterator<Item = &'a str>,
+    ) {
+        self.workspace_dirty = dirty;
+        self.languages = paths
+            .filter_map(file_kind)
+            .filter_map(language_for_file_kind)
+            .map(str::to_owned)
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect();
+        self.framework_signals = dependencies
+            .filter_map(|name| match name {
+                "react" => Some("react"),
+                "next" => Some("nextjs"),
+                "vue" => Some("vue"),
+                "svelte" => Some("svelte"),
+                "@angular/core" => Some("angular"),
+                _ => None,
+            })
+            .map(str::to_owned)
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect();
+    }
+
     pub fn from_workspace(
-        cwd: &Path,
+        _cwd: &Path,
         recent_paths: &[String],
         capability_names: &[String],
     ) -> Self {
@@ -65,44 +115,24 @@ impl DecisionMetadata {
             .map(str::to_owned)
             .collect();
 
-        let mut framework_signals = BTreeSet::new();
-        for (signal, markers) in [
-            (
-                "nextjs",
-                &["next.config.js", "next.config.mjs", "next.config.ts"][..],
-            ),
-            (
-                "vite",
-                &["vite.config.js", "vite.config.mjs", "vite.config.ts"][..],
-            ),
-            ("nuxt", &["nuxt.config.js", "nuxt.config.ts"][..]),
-            ("angular", &["angular.json"][..]),
-            ("svelte", &["svelte.config.js", "svelte.config.ts"][..]),
-            ("django", &["manage.py"][..]),
-        ] {
-            if markers.iter().any(|marker| cwd.join(marker).is_file()) {
-                framework_signals.insert(signal.to_owned());
-            }
-        }
-
+        let capabilities: BTreeSet<_> = capability_names
+            .iter()
+            .filter_map(|name| CapabilityId::from_registered_tool(name))
+            .collect();
         let available_capabilities = AvailableCapabilities {
-            browser: has_capability(capability_names, |name| name.starts_with("browser_")),
-            git: cwd.join(".git").exists(),
-            package_intelligence: has_capability(capability_names, |name| name.contains("package")),
-            test_impact: has_capability(capability_names, |name| {
-                name.starts_with("test_") || name.contains("test_impact")
-            }),
-            change_impact: has_capability(capability_names, |name| name.contains("impact")),
-            verification_planner: has_capability(capability_names, |name| {
-                name.contains("verification")
-            }),
+            browser: capabilities.contains(&CapabilityId::BrowserVerification),
+            git: capabilities.contains(&CapabilityId::GitIntelligence),
+            package_intelligence: capabilities.contains(&CapabilityId::PackageIntelligence),
+            test_impact: capabilities.contains(&CapabilityId::TestImpact),
+            change_impact: capabilities.contains(&CapabilityId::ChangeImpact),
+            verification_planner: capabilities.contains(&CapabilityId::VerificationPlanner),
         };
 
         Self {
             languages,
-            framework_signals: framework_signals.into_iter().collect(),
+            framework_signals: Vec::new(),
             recent_file_kinds: kinds.into_iter().collect(),
-            has_uncommitted_changes: !recent_paths.is_empty(),
+            workspace_dirty: WorkspaceDirtyState::Unknown,
             available_capabilities,
         }
     }
@@ -117,7 +147,7 @@ pub struct DecisionState {
     pub languages: Vec<String>,
     pub framework_signals: Vec<String>,
     pub recent_file_kinds: Vec<String>,
-    pub has_uncommitted_changes: bool,
+    pub workspace_dirty: WorkspaceDirtyState,
     pub available_capabilities: AvailableCapabilities,
 }
 
@@ -128,17 +158,19 @@ impl DecisionState {
 
     pub fn from_task_with_metadata(task: &str, metadata: DecisionMetadata) -> Self {
         let task = truncate_chars(
-            &redact_paths(&redact_environment_assignments(&redact_secrets(task))),
+            &redact_paths(&redact_environment_assignments(&redact_secrets(
+                &suppress_pasted_bodies(task),
+            ))),
             MAX_TASK_CHARS,
         );
         let mut state = Self {
-            schema_version: 1,
+            schema_version: 2,
             task,
             task_signals: Vec::new(),
             languages: metadata.languages,
             framework_signals: metadata.framework_signals,
             recent_file_kinds: metadata.recent_file_kinds,
-            has_uncommitted_changes: metadata.has_uncommitted_changes,
+            workspace_dirty: metadata.workspace_dirty,
             available_capabilities: metadata.available_capabilities,
         };
         state.refresh_task_signals();
@@ -288,6 +320,45 @@ fn questions() -> BTreeMap<String, DecisionQuestion> {
     questions
 }
 
+// Routing needs intent, not pasted source. Ordinary prose still undergoes
+// secret/path redaction; this is minimization, not a confidentiality guarantee.
+fn suppress_pasted_bodies(value: &str) -> String {
+    let mut fence: Option<&str> = None;
+    let mut output = String::new();
+    for line in value.lines() {
+        let trimmed = line.trim_start();
+        let marker = if trimmed.starts_with("```") {
+            Some("```")
+        } else if trimmed.starts_with("~~~") {
+            Some("~~~")
+        } else {
+            None
+        };
+        if let Some(active) = fence {
+            if marker == Some(active) {
+                fence = None;
+            }
+            continue;
+        }
+        if let Some(marker) = marker {
+            fence = Some(marker);
+            output.push_str("[omitted code block]\n");
+            continue;
+        }
+        if trimmed.starts_with("diff --git ")
+            || trimmed.starts_with("@@ ")
+            || trimmed.starts_with("Traceback (most recent call last):")
+            || trimmed.starts_with("stack backtrace:")
+        {
+            output.push_str("[omitted patch or stack dump]");
+            break;
+        }
+        output.push_str(line);
+        output.push('\n');
+    }
+    output
+}
+
 fn truncate_chars(value: &str, max_chars: usize) -> String {
     value.chars().take(max_chars).collect()
 }
@@ -410,10 +481,6 @@ fn looks_like_path(token: &str) -> bool {
     )
 }
 
-fn has_capability(capability_names: &[String], predicate: impl Fn(&str) -> bool) -> bool {
-    capability_names.iter().any(|name| predicate(name))
-}
-
 fn file_kind(path: &str) -> Option<&'static str> {
     let file_name = path.rsplit(['/', '\\']).next()?;
     if file_name.starts_with('.') && !file_name[1..].contains('.') {
@@ -476,6 +543,32 @@ mod tests {
     use std::path::Path;
 
     use super::*;
+
+    #[test]
+    fn recent_paths_and_similarly_named_tools_do_not_claim_git_or_capabilities() {
+        let metadata = DecisionMetadata::from_workspace(
+            Path::new("."),
+            &["changed.rs".into()],
+            &[
+                "fake_package_helper".into(),
+                "test_fake".into(),
+                "unrelated_impact".into(),
+            ],
+        );
+        let state = DecisionState::from_task_with_metadata("route task", metadata).to_value();
+        assert_eq!(state["workspaceDirty"], "unknown");
+        for key in ["git", "packageIntelligence", "testImpact", "changeImpact"] {
+            assert_eq!(state["availableCapabilities"][key], false);
+        }
+    }
+
+    #[test]
+    fn pasted_code_and_diffs_are_removed_before_routing() {
+        let state = DecisionState::from_task("Fix this function\n```rust\nfn proprietary_algorithm() {}\n```\nand verify it\ndiff --git a/private.rs b/private.rs\n+ proprietary_implementation();");
+        assert!(!state.task.contains("proprietary"));
+        assert!(state.task.contains("Fix this function"));
+        assert!(state.task.contains("verify it"));
+    }
 
     #[test]
     fn serialized_state_contains_only_the_bounded_contract() {

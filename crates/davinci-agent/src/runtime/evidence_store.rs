@@ -4,10 +4,11 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::fs;
-use std::io::Read;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
+use super::cache::directory::Directory;
 use super::evidence::{ArtifactRef, AssertionCounts};
 use super::ids::{EvidenceId, TaskId};
 
@@ -145,20 +146,40 @@ impl VerificationEvidenceStore {
         let file_name = format!("{}.bin", &sha256);
         let target_path = self.dir.join(&file_name);
 
-        // Write artifact blob atomically
-        if !target_path.exists() {
-            fs::write(&target_path, data).map_err(|e| e.to_string())?;
-        }
-
         let id = format!("artifact_{}", &sha256[..12]);
-        Ok(ArtifactRef {
+        let artifact = ArtifactRef {
             id,
             sha256,
             media_type: media_type.to_string(),
             size: data.len() as u64,
             relative_store_path: file_name,
             redaction: None,
-        })
+        };
+        if target_path.exists() {
+            self.get_artifact(&artifact)?;
+            return Ok(artifact);
+        }
+
+        // Publish only a complete blob. Never overwrite a content-addressed
+        // artifact, including one concurrently published by another writer.
+        let root = self.dir.canonicalize().map_err(|e| e.to_string())?;
+        let directory = Directory::open(&root, false).map_err(|e| e.to_string())?;
+        let temporary = format!("{}.tmp", uuid::Uuid::new_v4());
+        let result = (|| {
+            let mut pending = directory.file(&temporary, true)?;
+            pending.write_all(data)?;
+            pending.sync_all()?;
+            drop(pending);
+            directory.publish(&temporary, &artifact.relative_store_path)
+        })();
+        let _ = directory.remove(&temporary);
+        if let Err(error) = result {
+            if error.kind() != std::io::ErrorKind::AlreadyExists {
+                return Err(error.to_string());
+            }
+            self.get_artifact(&artifact)?;
+        }
+        Ok(artifact)
     }
 
     /// Retrieve an artifact verifying bounds, non-escape, existence, size, and SHA-256.
@@ -298,6 +319,40 @@ pub fn sanitize_display_output(text: &str) -> String {
 mod tests {
     use super::*;
     use tempfile::tempdir;
+
+    #[test]
+    fn audit_regression_rejects_corrupt_existing_artifact() {
+        let dir = tempdir().unwrap();
+        let store = VerificationEvidenceStore::new(dir.path());
+        let data = b"verified evidence";
+        let artifact = store.store_artifact("text/plain", data).unwrap();
+        let target = dir.path().join(&artifact.relative_store_path);
+        for corrupt in [b"truncated".as_slice(), b"modified evidence".as_slice()] {
+            fs::write(&target, corrupt).unwrap();
+            assert!(store.store_artifact("text/plain", data).is_err());
+            assert_eq!(fs::read(&target).unwrap(), corrupt);
+        }
+    }
+
+    #[test]
+    fn artifact_concurrent_writers_publish_complete_identical_blobs() {
+        let dir = tempdir().unwrap();
+        let store = VerificationEvidenceStore::new(dir.path());
+        let data = vec![42; 256 * 1024];
+        std::thread::scope(|scope| {
+            for _ in 0..8 {
+                let store = &store;
+                let data = &data;
+                scope.spawn(move || {
+                    let artifact = store
+                        .store_artifact("application/octet-stream", data)
+                        .unwrap();
+                    assert_eq!(store.get_artifact(&artifact).unwrap(), *data);
+                });
+            }
+        });
+        assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 1);
+    }
 
     #[test]
     fn f06_no_skipped_success() {

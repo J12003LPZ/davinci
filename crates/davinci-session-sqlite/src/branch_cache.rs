@@ -6,23 +6,26 @@ use serde_json::Value;
 use uuid::Uuid;
 
 pub fn delete_branch_cache(conn: &Connection, session_id: &str) -> Result<(), SessionError> {
-    conn.execute(
-        "DELETE FROM branch_tips WHERE session_id = ?1",
-        [session_id],
-    )
-    .map_err(|err| SessionError::storage(format!("Unable to delete branch tips: {err}")))?;
-    conn.execute(
-        "DELETE FROM branch_entries WHERE session_id = ?1",
-        [session_id],
-    )
-    .map_err(|err| SessionError::storage(format!("Unable to delete branch entries: {err}")))?;
-    Ok(())
+    crate::transaction::atomic(conn, || {
+        conn.execute(
+            "DELETE FROM branch_tips WHERE session_id = ?1",
+            [session_id],
+        )
+        .map_err(|err| SessionError::storage(format!("Unable to delete branch tips: {err}")))?;
+        conn.execute(
+            "DELETE FROM branch_entries WHERE session_id = ?1",
+            [session_id],
+        )
+        .map_err(|err| SessionError::storage(format!("Unable to delete branch entries: {err}")))?;
+        Ok(())
+    })
 }
 
 pub fn rebuild_branch_cache(conn: &Connection, session_id: &str) -> Result<(), SessionError> {
-    let mut stmt = conn
-        .prepare(
-            "SELECT leaf.id
+    crate::transaction::atomic(conn, || {
+        let mut stmt = conn
+            .prepare(
+                "SELECT leaf.id
              FROM entries AS leaf
              WHERE leaf.session_id = ?1
                AND NOT EXISTS (
@@ -30,19 +33,20 @@ pub fn rebuild_branch_cache(conn: &Connection, session_id: &str) -> Result<(), S
                    WHERE child.session_id = leaf.session_id AND child.parent_id = leaf.id
                )
              ORDER BY leaf.seq",
-        )
-        .map_err(|err| SessionError::storage(format!("Unable to list branch tips: {err}")))?;
-    let tips = stmt
-        .query_map([session_id], |row| row.get::<_, String>(0))
-        .map_err(|err| SessionError::storage(format!("Unable to query branch tips: {err}")))?
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|err| SessionError::storage(format!("Unable to read branch tips: {err}")))?;
-    drop(stmt);
-    delete_branch_cache(conn, session_id)?;
-    for tip in tips {
-        build_cached_branch(conn, session_id, &tip)?;
-    }
-    Ok(())
+            )
+            .map_err(|err| SessionError::storage(format!("Unable to list branch tips: {err}")))?;
+        let tips = stmt
+            .query_map([session_id], |row| row.get::<_, String>(0))
+            .map_err(|err| SessionError::storage(format!("Unable to query branch tips: {err}")))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|err| SessionError::storage(format!("Unable to read branch tips: {err}")))?;
+        drop(stmt);
+        delete_branch_cache(conn, session_id)?;
+        for tip in tips {
+            build_cached_branch(conn, session_id, &tip)?;
+        }
+        Ok(())
+    })
 }
 
 pub fn build_cached_branch(
@@ -89,8 +93,44 @@ pub fn append_entry_to_branch_cache(
     custom_type: Option<&str>,
     parent_id: Option<&str>,
 ) -> Result<(), SessionError> {
-    let Some(parent_id) = parent_id else {
+    crate::transaction::atomic(conn, || {
+        let Some(parent_id) = parent_id else {
+            let branch_id = Uuid::now_v7().to_string();
+            insert_branch_entry(
+                conn,
+                session_id,
+                &branch_id,
+                entry_id,
+                entry_seq,
+                entry_type,
+                custom_type,
+            )?;
+            insert_branch_tip(conn, session_id, entry_id, &branch_id)?;
+            return Ok(());
+        };
+
+        if let Some(tip_branch_id) = read_branch_tip_branch_id(conn, session_id, parent_id)? {
+            extend_branch(
+                conn,
+                session_id,
+                &tip_branch_id,
+                parent_id,
+                entry_id,
+                entry_seq,
+                entry_type,
+                custom_type,
+            )?;
+            return Ok(());
+        }
+
+        let Some(source) = read_branch_containing_entry(conn, session_id, parent_id)? else {
+            return Err(SessionError::invalid_entry(format!(
+                "Branch cache has no branch containing parent entry {parent_id}"
+            )));
+        };
+
         let branch_id = Uuid::now_v7().to_string();
+        copy_branch_entries_through_seq(conn, session_id, &branch_id, &source.0, source.1)?;
         insert_branch_entry(
             conn,
             session_id,
@@ -101,42 +141,8 @@ pub fn append_entry_to_branch_cache(
             custom_type,
         )?;
         insert_branch_tip(conn, session_id, entry_id, &branch_id)?;
-        return Ok(());
-    };
-
-    if let Some(tip_branch_id) = read_branch_tip_branch_id(conn, session_id, parent_id)? {
-        extend_branch(
-            conn,
-            session_id,
-            &tip_branch_id,
-            parent_id,
-            entry_id,
-            entry_seq,
-            entry_type,
-            custom_type,
-        )?;
-        return Ok(());
-    }
-
-    let Some(source) = read_branch_containing_entry(conn, session_id, parent_id)? else {
-        return Err(SessionError::invalid_entry(format!(
-            "Branch cache has no branch containing parent entry {parent_id}"
-        )));
-    };
-
-    let branch_id = Uuid::now_v7().to_string();
-    copy_branch_entries_through_seq(conn, session_id, &branch_id, &source.0, source.1)?;
-    insert_branch_entry(
-        conn,
-        session_id,
-        &branch_id,
-        entry_id,
-        entry_seq,
-        entry_type,
-        custom_type,
-    )?;
-    insert_branch_tip(conn, session_id, entry_id, &branch_id)?;
-    Ok(())
+        Ok(())
+    })
 }
 
 pub fn read_cached_branch_ids(

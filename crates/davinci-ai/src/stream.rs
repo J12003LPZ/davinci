@@ -257,26 +257,7 @@ fn read_provider_stream(
     // silent — a stalled request answers `esc` at once instead of at its next
     // token. When the receiver goes away the reader ends at its next line and
     // the connection closes with it.
-    let (line_tx, line_rx) = mpsc::channel::<std::io::Result<String>>();
-    std::thread::spawn(move || {
-        use std::io::BufRead;
-        let mut reader = std::io::BufReader::new(response.into_reader());
-        loop {
-            let mut line = String::new();
-            match reader.read_line(&mut line) {
-                Ok(0) => break,
-                Ok(_) => {
-                    if line_tx.send(Ok(line)).is_err() {
-                        break;
-                    }
-                }
-                Err(err) => {
-                    let _ = line_tx.send(Err(err));
-                    break;
-                }
-            }
-        }
-    });
+    let line_rx = crate::stream_reader::response_lines(response.into_reader());
     let mut framer = crate::stream_decoder::SseFramer::default();
     let mut events = Vec::new();
     let mut raw = String::new();
@@ -311,6 +292,10 @@ fn read_provider_stream(
             Err(mpsc::RecvTimeoutError::Disconnected) => break,
         };
         if frames == 0 {
+            if raw.len().saturating_add(line.len()) > crate::stream_reader::MAX_FRAME_BYTES {
+                read_error = Some("non-streaming provider response exceeds 16 MiB".into());
+                break;
+            }
             raw.push_str(&line);
         }
         let trimmed = line.trim_end_matches(['\n', '\r']);
@@ -338,7 +323,7 @@ fn read_provider_stream(
     if read_error.is_some() && frames > 0 && (framer.saw_done() || decoder.is_done()) {
         read_error = None;
     }
-    if !aborted && !decoder.is_done() {
+    if !aborted && read_error.is_none() && !decoder.is_done() {
         if let Some(frame) = framer.flush() {
             frames += 1;
             raw.clear();
@@ -894,7 +879,8 @@ pub(crate) fn responses_call_id(id: &str) -> &str {
     id.split_once('|').map(|(call_id, _)| call_id).unwrap_or(id)
 }
 
-pub(crate) fn openai_responses_input(messages: &[ChatMessage]) -> Vec<Value> {
+#[doc(hidden)]
+pub fn openai_responses_input(messages: &[ChatMessage]) -> Vec<Value> {
     let mut input = Vec::new();
     for message in messages {
         if message.role == "toolResult" {

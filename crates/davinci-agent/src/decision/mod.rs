@@ -47,6 +47,8 @@ pub struct DecisionRuntime {
     last_reported_health: Mutex<DecisionProviderHealth>,
     telemetry: Arc<DecisionTelemetry>,
     audit: Arc<DecisionAuditLog>,
+    shadow_busy: AtomicBool,
+    provider_busy: Arc<AtomicBool>,
 }
 
 impl fmt::Debug for DecisionRuntime {
@@ -70,6 +72,8 @@ impl DecisionRuntime {
             last_reported_health: Mutex::new(DecisionProviderHealth::Disabled),
             telemetry: Arc::new(DecisionTelemetry::default()),
             audit: Arc::new(DecisionAuditLog::default()),
+            shadow_busy: AtomicBool::new(false),
+            provider_busy: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -166,26 +170,107 @@ impl DecisionRuntime {
     }
 
     pub fn evaluate(&self, request: &DecisionRequest) -> Result<DecisionResponse, DecisionError> {
+        self.evaluate_generation(request, self.generation(), false)
+    }
+
+    /// At most one background call; busy shadow samples are dropped rather
+    /// than adding a queue or blocking the user's model request.
+    pub fn enqueue_shadow(self: &Arc<Self>, request: DecisionRequest) -> Result<(), DecisionError> {
+        request.validate_size()?;
+        self.enqueue_shadow_with(move || request)
+    }
+
+    /// Optional fact validation also belongs off the main-provider submit path.
+    /// The same single-worker bound covers request preparation and inference.
+    pub fn enqueue_shadow_with(
+        self: &Arc<Self>,
+        prepare: impl FnOnce() -> DecisionRequest + Send + 'static,
+    ) -> Result<(), DecisionError> {
         if !self.is_enabled() {
             return Err(DecisionError::Disabled);
         }
-        request.validate_size()?;
-        if let Some(error) = self.cooldown_error() {
-            self.telemetry.record_fallback();
-            return Err(error);
-        }
-
         let generation = self.generation();
+        if self
+            .shadow_busy
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            self.telemetry.record_fallback();
+            return Err(DecisionError::Busy);
+        }
+        let runtime = Arc::clone(self);
+        std::thread::Builder::new()
+            .name("jev-shadow".into())
+            .spawn(move || {
+                struct Release(Arc<DecisionRuntime>);
+                impl Drop for Release {
+                    fn drop(&mut self) {
+                        self.0.shadow_busy.store(false, Ordering::Release);
+                    }
+                }
+                let release = Release(runtime);
+                let request = prepare();
+                let _ = release.0.evaluate_generation(&request, generation, true);
+            })
+            .map_err(|_| {
+                self.shadow_busy.store(false, Ordering::Release);
+                DecisionError::Unavailable("shadow worker could not start".into())
+            })?;
+        Ok(())
+    }
+
+    fn evaluate_generation(
+        &self,
+        request: &DecisionRequest,
+        generation: u64,
+        shadow: bool,
+    ) -> Result<DecisionResponse, DecisionError> {
+        request.validate_size()?;
         let provider = self
             .provider
             .read()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .unwrap_or_else(|e| e.into_inner())
             .clone();
         let provider_name = provider.name().to_owned();
         let model = provider.model().to_owned();
+        if self.generation() != generation {
+            self.telemetry.record_fallback();
+            self.audit.push(record_for(
+                request,
+                provider_name,
+                model,
+                0,
+                DecisionAuditOutcome::Stale,
+            ));
+            return Err(DecisionError::StaleResponse);
+        }
+        if !self.is_enabled() {
+            return Err(DecisionError::Disabled);
+        }
+        if let Some(error) = self.cooldown_error() {
+            self.telemetry.record_fallback();
+            self.audit.push(record_for(
+                request,
+                provider_name,
+                model,
+                0,
+                DecisionAuditOutcome::Fallback,
+            ));
+            return Err(error);
+        }
         let started = Instant::now();
         self.telemetry.record_request();
-        let result = provider.evaluate(request, NORMAL_DECISION_BUDGET.min(HARD_DECISION_BUDGET));
+        let result = self.call_provider(provider, request.clone(), shadow);
+        if started.elapsed() >= NORMAL_DECISION_BUDGET {
+            self.telemetry.record_soft_deadline_miss();
+        }
+        let result = if started.elapsed() >= HARD_DECISION_BUDGET {
+            Err(DecisionError::Unavailable(
+                "hard decision deadline exceeded".into(),
+            ))
+        } else {
+            result
+        };
         let latency_ms = started.elapsed().as_millis() as u64;
 
         if self.generation() != generation {
@@ -225,7 +310,9 @@ impl DecisionRuntime {
                 Ok(response)
             }
             Err(error) => {
-                self.update_health(&error);
+                if error != DecisionError::Busy {
+                    self.update_health(&error);
+                }
                 if matches!(error, DecisionError::Unavailable(_))
                     && latency_ms >= NORMAL_DECISION_BUDGET.as_millis() as u64
                 {
@@ -243,6 +330,48 @@ impl DecisionRuntime {
                 Err(error)
             }
         }
+    }
+
+    fn call_provider(
+        &self,
+        provider: Arc<dyn DecisionProvider>,
+        request: DecisionRequest,
+        shadow: bool,
+    ) -> Result<DecisionResponse, DecisionError> {
+        if self
+            .provider_busy
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return Err(DecisionError::Busy);
+        }
+        let started = Instant::now();
+        let busy = self.provider_busy.clone();
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+        std::thread::Builder::new()
+            .name("jev-provider".into())
+            .spawn(move || {
+                struct Release(Arc<AtomicBool>);
+                impl Drop for Release {
+                    fn drop(&mut self) {
+                        self.0.store(false, Ordering::Release);
+                    }
+                }
+                let release = Release(busy);
+                let result = if shadow {
+                    provider.evaluate_shadow(&request, HARD_DECISION_BUDGET)
+                } else {
+                    provider.evaluate(&request, HARD_DECISION_BUDGET)
+                };
+                drop(release);
+                let _ = tx.send(result);
+            })
+            .map_err(|_| {
+                self.provider_busy.store(false, Ordering::Release);
+                DecisionError::Unavailable("provider worker could not start".into())
+            })?;
+        rx.recv_timeout(HARD_DECISION_BUDGET.saturating_sub(started.elapsed()))
+            .map_err(|_| DecisionError::Unavailable("hard decision deadline exceeded".into()))?
     }
 
     fn cooldown_error(&self) -> Option<DecisionError> {

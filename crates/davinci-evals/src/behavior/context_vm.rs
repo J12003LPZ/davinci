@@ -12,6 +12,7 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ContextVmEvalResult {
     pub fixture: String,
+    /// Conservative serialized-byte token ceilings for both views, not billed usage.
     pub legacy_tokens: u64,
     pub vm_tokens: u64,
     pub required_facts: u64,
@@ -33,6 +34,9 @@ struct ContextVmFixture {
     page_out: bool,
 }
 
+#[path = "context_vm_adversarial.rs"]
+mod adversarial;
+
 const FIXTURES: &str = include_str!("../../fixtures/behavior/context-vm.json");
 
 pub fn run_context_vm_evals() -> Vec<ContextVmEvalResult> {
@@ -40,6 +44,7 @@ pub fn run_context_vm_evals() -> Vec<ContextVmEvalResult> {
         .expect("Context VM fixtures are valid JSON")
         .into_iter()
         .map(run_fixture)
+        .chain(adversarial::run())
         .collect()
 }
 
@@ -63,9 +68,9 @@ fn run_fixture(fixture: ContextVmFixture) -> ContextVmEvalResult {
     }
 
     let events = events_from_messages(&messages);
-    let legacy_tokens = events
+    let legacy_tokens = messages
         .iter()
-        .map(|event| (event.visible_text.len() as u64).div_ceil(4))
+        .map(davinci_agent::provider_budget::message_token_ceiling)
         .sum();
     let directory = tempfile::tempdir().expect("fixture cache directory");
     let runtime = ContextVmRuntime::new(
@@ -159,6 +164,7 @@ pub fn context_vm_fixture_names() -> Vec<String> {
         .expect("Context VM fixtures are valid JSON")
         .into_iter()
         .map(|fixture| fixture.fixture)
+        .chain(adversarial::names())
         .collect()
 }
 
@@ -178,6 +184,8 @@ mod tests {
                 "repeated-two-and-five-fold-continuation",
                 "missing-corrupt-page-replay",
                 "no-session-transient-agent",
+                "adversarial-correction-rejection-verification",
+                "adversarial-policy-and-forged-provenance",
             ]
         );
     }
@@ -185,7 +193,7 @@ mod tests {
     #[test]
     fn context_vm_differential_replay_recovers_every_required_fixture_fact() {
         let results = run_context_vm_evals();
-        assert_eq!(results.len(), 7);
+        assert_eq!(results.len(), 9);
         assert!(results.iter().all(|result| {
             result.recovered_facts == result.required_facts
                 && result.lost_constraints == 0
@@ -197,7 +205,7 @@ mod tests {
             .iter()
             .find(|result| result.fixture == "missing-corrupt-page-replay")
             .unwrap();
-        assert!(missing.page_faults >= 2);
+        assert_eq!(missing.page_faults, 1);
         assert!(missing.page_fault_hits >= 1);
         let page_fault_misses = missing.page_faults.saturating_sub(missing.page_fault_hits);
         let recovery_rate = missing.page_fault_hits as f64

@@ -41,6 +41,7 @@ pub struct VerificationPlanner {
     permissions: Arc<RwLock<Arc<PermissionState>>>,
     cancellation: Arc<RwLock<Option<Arc<AtomicBool>>>>,
     telemetry: Arc<Mutex<VerificationTelemetry>>,
+    snapshots: Option<super::engineering_snapshot::EngineeringSnapshots>,
 }
 
 impl Default for VerificationPlanner {
@@ -65,7 +66,16 @@ impl VerificationPlanner {
             )))),
             cancellation: Arc::new(RwLock::new(None)),
             telemetry: Arc::new(Mutex::new(VerificationTelemetry::default())),
+            snapshots: None,
         }
+    }
+
+    pub fn with_snapshots(
+        mut self,
+        snapshots: super::engineering_snapshot::EngineeringSnapshots,
+    ) -> Self {
+        self.snapshots = Some(snapshots);
+        self
     }
 
     pub fn set_permissions(&self, permissions: Arc<PermissionState>) {
@@ -191,12 +201,17 @@ impl VerificationPlanner {
             return Ok(self.cancelled_result("planning cancelled after input authorization"));
         }
 
-        let plan = rules::build_plan(
+        let snapshot = self
+            .snapshots
+            .as_ref()
+            .and_then(|facts| facts.peek_current(cwd));
+        let plan = rules::build_plan_with_snapshot(
             cwd,
             &request,
             transaction_files,
             transaction_identity,
             &self.config,
+            snapshot.as_deref(),
         )?;
         serde_json::to_value(plan).map_err(|error| error.to_string())
     }

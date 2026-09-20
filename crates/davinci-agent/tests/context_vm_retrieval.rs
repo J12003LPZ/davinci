@@ -64,7 +64,11 @@ fn retrieve_context_supports_exact_sources_bounded_lines_and_page_fault_metrics(
         "context page unavailable; replay/rebuild required"
     );
     let metrics = runtime.metrics();
-    assert_eq!(metrics.page_faults, 2);
-    assert_eq!(metrics.page_fault_hits, 1);
+    assert_eq!(metrics.page_faults, 3);
+    assert_eq!(metrics.page_fault_hits, 2);
     assert_eq!(metrics.page_fault_misses, 1);
+    assert_eq!(metrics.semantic_page_faults, 3);
+    assert_eq!(metrics.retrieval_hits, 2);
+    assert_eq!(metrics.retrieval_misses, 1);
+    assert_eq!(metrics.context_recovery_rate(), 2.0 / 3.0);
 }

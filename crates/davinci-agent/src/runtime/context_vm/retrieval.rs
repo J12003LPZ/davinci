@@ -28,16 +28,22 @@ pub fn retrieve(
     if request.page.is_some() == request.source_ref.is_some() {
         return Err("exactly one of page or sourceRef is required".into());
     }
+    if request.limit > 400 {
+        return Err("limit must be <= 400".into());
+    }
+    let result = retrieve_inner(runtime, request);
+    runtime.note_page_fault(result.is_ok());
+    result
+}
+
+fn retrieve_inner(
+    runtime: &ContextVmRuntime,
+    request: &RetrieveContextRequest,
+) -> Result<RetrieveContextResult, String> {
     let (source, content) = if let Some(page) = request.page.as_deref() {
         retrieve_page(runtime, page)?
     } else if let Some(source_ref) = request.source_ref.as_deref() {
-        let sources = runtime
-            .source_contents
-            .read()
-            .unwrap_or_else(|error| error.into_inner());
-        let Some(content) = sources.get(source_ref).cloned() else {
-            return Err("unknown context source_ref".into());
-        };
+        let content = runtime.source_content(source_ref)?;
         (source_ref.to_string(), content)
     } else {
         return Err("exactly one of page or sourceRef is required".into());
@@ -53,9 +59,6 @@ pub fn retrieve(
     } else {
         request.limit
     };
-    if limit > 400 {
-        return Err("limit must be <= 400".into());
-    }
     let end = offset.saturating_add(limit).min(lines.len());
     let truncated = end < lines.len();
     Ok(RetrieveContextResult {
@@ -101,14 +104,12 @@ fn retrieve_page(runtime: &ContextVmRuntime, requested: &str) -> Result<(String,
         .cloned()
         .or_else(|| parse_page_ref(page_id));
     let Some(page) = page else {
-        runtime.note_page_fault(false);
         return Err("context page unavailable; replay/rebuild required".into());
     };
-    let object = runtime.store.load(&page).map_err(|_| {
-        runtime.note_page_fault(false);
-        "context page unavailable; replay/rebuild required".to_string()
-    })?;
-    runtime.note_page_fault(true);
+    let object = runtime
+        .store
+        .load(&page)
+        .map_err(|_| "context page unavailable; replay/rebuild required".to_string())?;
     let content = serde_json::to_string_pretty(&object)
         .map_err(|error| format!("context page render failed: {error}"))?;
     Ok((format!("ctx://page/{}", page.id), content))

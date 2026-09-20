@@ -48,11 +48,59 @@ impl ContextCompiler {
             entries.push(entry);
         }
 
+        let latest_user = request
+            .hot_events
+            .iter()
+            .rev()
+            .find(|event| event.kind == ContextEventKind::User);
+        let newest = request.hot_events.last();
+        let required = |event: &ContextEvent| {
+            latest_user.is_some_and(|last| last.source_ref == event.source_ref)
+                || newest.is_some_and(|last| last.source_ref == event.source_ref)
+        };
+        let mut selected_hot = request
+            .hot_events
+            .iter()
+            .filter(|event| {
+                required(event)
+                    || request.root.hot_event_refs.is_empty()
+                    || request
+                        .root
+                        .hot_event_refs
+                        .iter()
+                        .any(|source| source == &event.source_ref)
+            })
+            .collect::<Vec<_>>();
+        let required_tokens = selected_hot
+            .iter()
+            .filter(|event| required(event))
+            .map(|event| event_entry(event).estimated_tokens)
+            .fold(0u64, u64::saturating_add);
+        if used_tokens.saturating_add(required_tokens) > request.max_tokens {
+            return Err(super::CONTEXT_BUDGET_EXCEEDED.into());
+        }
+        let optional_limit = request.max_tokens - required_tokens;
+
+        for entry in request
+            .broker_packet
+            .items
+            .iter()
+            .map(broker_entry)
+            .filter(|e| e.mandatory)
+        {
+            used_tokens = used_tokens.saturating_add(entry.estimated_tokens);
+            if used_tokens > optional_limit {
+                return Err(super::CONTEXT_BUDGET_EXCEEDED.into());
+            }
+            messages.push(ChatMessage::text("custom", entry.content.clone()));
+            entries.push(entry);
+        }
+
         for page in &request.root.episodes {
             let object = self.load_page(page)?;
             let content = episode_descriptor(&object)?;
             let entry = page_entry(page, "episode", content, false);
-            if used_tokens.saturating_add(entry.estimated_tokens) > request.max_tokens {
+            if used_tokens.saturating_add(entry.estimated_tokens) > optional_limit {
                 continue;
             }
             used_tokens = used_tokens.saturating_add(entry.estimated_tokens);
@@ -62,7 +110,10 @@ impl ContextCompiler {
 
         for item in &request.broker_packet.items {
             let entry = broker_entry(item);
-            if used_tokens.saturating_add(entry.estimated_tokens) > request.max_tokens {
+            if entry.mandatory {
+                continue;
+            }
+            if used_tokens.saturating_add(entry.estimated_tokens) > optional_limit {
                 continue;
             }
             used_tokens = used_tokens.saturating_add(entry.estimated_tokens);
@@ -70,35 +121,30 @@ impl ContextCompiler {
             entries.push(entry);
         }
 
-        let mut selected_hot = request
-            .hot_events
-            .iter()
-            .filter(|event| {
-                request.root.hot_event_refs.is_empty()
-                    || request
-                        .root
-                        .hot_event_refs
-                        .iter()
-                        .any(|source| source == &event.source_ref)
-            })
-            .collect::<Vec<_>>();
         let mut selected_from_tail = Vec::new();
+        let mut optional_remaining = optional_limit.saturating_sub(used_tokens);
         while let Some(event) = selected_hot.pop() {
-            let estimate = estimate_tokens(event.visible_text.len());
-            if used_tokens.saturating_add(estimate) <= request.max_tokens
-                || selected_from_tail.is_empty()
-            {
+            let estimate = event_entry(event).estimated_tokens;
+            if required(event) || estimate <= optional_remaining {
+                if !required(event) {
+                    optional_remaining -= estimate;
+                }
                 used_tokens = used_tokens.saturating_add(estimate);
                 selected_from_tail.push(event);
-            } else {
-                break;
             }
         }
         selected_from_tail.reverse();
         for event in selected_from_tail {
-            let entry = event_entry(event);
+            let mut entry = event_entry(event);
+            entry.mandatory |= required(event);
             messages.push(event_message(event));
             entries.push(entry);
+        }
+
+        // Required state and the newest event must never be silently truncated.
+        // Budget rejection is distinct from recoverable derived-cache errors.
+        if used_tokens > request.max_tokens {
+            return Err(super::CONTEXT_BUDGET_EXCEEDED.into());
         }
 
         let prefix_digest = digest(
@@ -176,8 +222,8 @@ fn broker_entry(item: &ContextItem) -> ContextImageEntry {
         source_ref: source_ref.clone(),
         content_hash: ContextManifestEntry::hash_content(&item.content),
         content: wrap_untrusted_data(&source_ref, &item.content),
-        estimated_tokens: item.estimated_tokens,
-        mandatory: source_ref.contains("mandatory"),
+        estimated_tokens: estimate_tokens(wrap_untrusted_data(&source_ref, &item.content).len()),
+        mandatory: item.is_mandatory(),
         stable_for_cache: item.stable_for_cache,
     }
 }
@@ -196,7 +242,7 @@ fn event_entry(event: &ContextEvent) -> ContextImageEntry {
         source_ref: event.source_ref.clone(),
         content_hash: event.content_hash.clone(),
         content: wrap_untrusted_data(&event.source_ref, &event.visible_text),
-        estimated_tokens: estimate_tokens(event.visible_text.len()),
+        estimated_tokens: crate::provider_budget::message_token_ceiling(&event_message(event)),
         mandatory: matches!(event.kind, ContextEventKind::User),
         stable_for_cache: false,
     }
@@ -206,10 +252,20 @@ fn event_message(event: &ContextEvent) -> ChatMessage {
     let role = match event.kind {
         ContextEventKind::User => "user",
         ContextEventKind::Assistant => "assistant",
-        ContextEventKind::ToolResult => "toolResult",
+        ContextEventKind::ToolResult => "custom",
         ContextEventKind::Custom => "custom",
     };
-    ChatMessage::text(role, &event.visible_text)
+    if matches!(
+        event.kind,
+        ContextEventKind::ToolResult | ContextEventKind::Custom
+    ) {
+        ChatMessage::text(
+            role,
+            wrap_untrusted_data(&event.source_ref, &event.visible_text),
+        )
+    } else {
+        ChatMessage::text(role, &event.visible_text)
+    }
 }
 
 fn object_content(object: &ContextObject) -> Result<String, String> {
@@ -245,7 +301,7 @@ fn episode_descriptor(object: &ContextObject) -> Result<String, String> {
         });
         let rendered = serde_json::to_string(&value)
             .map_err(|error| format!("context episode render failed: {error}"))?;
-        // Keep the wrapped provider-facing descriptor below 160 tokens. The
+        // Keep the descriptor bounded; the compiler accounts for its envelope. The
         // complete Episode page remains available through retrieve_context.
         if rendered.len() <= 512 {
             return Ok(rendered);
@@ -295,5 +351,6 @@ fn broker_provenance(item: &ContextItem) -> ProvenanceKind {
 }
 
 fn estimate_tokens(bytes: usize) -> u64 {
-    bytes.div_ceil(4).max(1) as u64
+    // Includes custom-message envelope and provider framing.
+    bytes as u64 + 128
 }

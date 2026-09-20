@@ -73,8 +73,7 @@ impl DecisionAuditLog {
 
 pub fn state_hash(state: &Value) -> String {
     let canonical = serde_json::to_vec(state).unwrap_or_default();
-    let digest = Sha256::digest(canonical);
-    digest.iter().map(|byte| format!("{byte:02x}")).collect()
+    format!("{:x}", Sha256::digest(canonical))
 }
 
 pub fn record_for(

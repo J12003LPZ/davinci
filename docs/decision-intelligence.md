@@ -56,31 +56,49 @@ finite `noul` value in `[0, 1]`. No `/model` discovery request is used.
 
 ## Request privacy contract
 
-The request state is schema version 1 and contains only:
+The request state is schema version 2 and contains only:
 
 - a redacted, Unicode-capped current task;
 - derived task signals;
 - language and framework signals;
 - recent file-kind categories;
-- whether the workspace has uncommitted changes; and
+- typed workspace state: clean, dirty, or unknown; and
 - boolean availability flags for supported capabilities.
 
 The serialized request is capped at 12 KiB and the task is capped at 4096
-Unicode scalar values. Source bodies, absolute or raw paths, file names,
-`.env` contents, environment values, credentials, authorization headers, raw
-diffs, raw tool/test/build/browser output, cookies, network details, memory or
-skill bodies, system prompts, hidden reasoning, and prior transcript content
-are excluded.
+Unicode scalar values. DaVinci does not automatically read or send repository
+source files, raw tool output, prior transcripts, system prompts, or memory and
+skill bodies to Jev. The **current user task is sent** after secret/path
+redaction. Fenced code blocks and recognized diffs/stack dumps are removed.
+Unrecognized source pasted as ordinary prose can remain; redaction is not a
+guarantee that arbitrary private text will be detected.
 
-The current task passes through the agent secret-redaction contract before it
-is placed in the state. Provider responses are capped at 32 KiB and are
-accepted only when their answer set exactly matches the requested questions.
+Workspace dirtiness remains unknown without an authoritative Git observation.
+Edited UI paths do not imply a dirty worktree. Capability flags use exact native
+tool registrations. When engineering tools have already computed a shared
+snapshot, the shadow worker validates its root and file/directory stamps before
+reusing language and dependency signals. Missing, invalidated, or busy snapshots
+supply no additional facts. No workspace scan runs on user submission.
+
+Provider responses are capped at 32 KiB and accepted only when their answer
+set exactly matches the requested questions.
 
 ## Provider and failure behavior
 
-Normal decision requests have a soft budget of 800 ms and a hard budget of
-1500 ms. Validation uses a 5-second timeout. At most one bounded retry is
-allowed for 429, 529, or a transport reset when the hard budget permits it.
+Normal decision requests have an 800 ms first-attempt target and a 1500 ms
+absolute caller deadline across attempts. The first attempt receives at most
+800 ms; one retry is permitted only for a retryable error and within the
+remaining hard budget. Shadow requests use one attempt. Credential validation
+uses a separate 5-second probe.
+
+Shadow preparation and inference run on a background worker concurrently with
+the normal coding turn. There is one shadow slot and no queue; a busy slot drops
+the sample. TypeSafe owns a persistent HTTP agent and connection pool.
+
+The deadline covers the caller even if synchronous provider code or OS DNS
+resolution does not return. Such a call can retain one worker until it exits;
+the busy guard then makes later samples fall back instead of accumulating
+threads. It does not delay the main coding provider or apply a late answer.
 
 The provider maps failures to these health states:
 
@@ -148,7 +166,7 @@ outcome, applied actions, and disagreement metadata. It never stores the task,
 full request, full response, credential, authorization material, or raw tool
 output.
 
-Telemetry records request/success/failure counts, timeouts, explicit HTTP
+Telemetry records request/success/failure counts, soft-deadline misses, timeouts, explicit HTTP
 401/422/429/529 counts, schema failures, fallbacks, additions, disagreements,
 reported provider token usage, and latency. It also keeps a small bounded
 rolling set of per-answer metadata:

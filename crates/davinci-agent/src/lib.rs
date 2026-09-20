@@ -22,8 +22,11 @@ pub mod mcp;
 pub mod notebook;
 mod permission;
 pub mod planning;
+mod prepared_context;
 pub mod prompt;
+pub mod provider_budget;
 mod pruning;
+pub use prepared_context::PreparedContextImage;
 mod queues;
 mod scheduler;
 pub mod semantic;
@@ -399,6 +402,10 @@ pub struct Agent {
     ephemeral_context: Vec<ChatMessage>,
     /// Host-supplied schema estimate, excluding the system prompt and messages.
     provider_context_overhead_tokens: Option<u64>,
+    provider_output_limit: Option<u64>,
+    prepared_context_image: Arc<Mutex<Option<PreparedContextImage>>>,
+    prepared_context_generation: u64,
+    prepared_manifest_revisions: (u64, u64),
     /// Request-local suffix appended to the current prompt after repository context.
     provider_system_prompt_suffix: Option<String>,
     /// Last prepared context manifest before provider dispatch.
@@ -508,6 +515,10 @@ impl Agent {
             pending_prompt_messages: Vec::new(),
             ephemeral_context: Vec::new(),
             provider_context_overhead_tokens: None,
+            provider_output_limit: None,
+            prepared_context_image: Arc::new(Mutex::new(None)),
+            prepared_context_generation: 0,
+            prepared_manifest_revisions: (0, 0),
             provider_system_prompt_suffix: None,
             last_prepared_manifest: None,
             runtime: None,
@@ -572,6 +583,9 @@ impl Agent {
                 .then(|| (source, session.header.id.clone(), runtime.run_id))
         });
         if let Some(session) = &self.session {
+            runtime
+                .context_vm
+                .bind_session_source(session.path.clone(), session.header.id.clone());
             if let Some((root, through_seq)) = runtime::context_vm::latest_persisted_root(
                 &session.entries,
                 session.leaf_id.as_deref(),
@@ -605,6 +619,16 @@ impl Agent {
         if let Some(runtime) = &self.decision_runtime {
             runtime.disable();
         }
+    }
+
+    pub fn enqueue_decision_shadow(
+        &self,
+        request: &decision::request::DecisionRequest,
+    ) -> Result<(), decision::provider::DecisionError> {
+        self.decision_runtime
+            .as_ref()
+            .ok_or(decision::provider::DecisionError::Disabled)?
+            .enqueue_shadow(request.clone())
     }
 
     pub fn evaluate_decision_shadow(
@@ -1168,7 +1192,7 @@ impl Agent {
         self.legacy_messages_for_provider()
     }
 
-    pub fn context_vm_image(&self) -> Result<runtime::ContextImage, String> {
+    fn build_context_vm_image(&self) -> Result<runtime::ContextImage, String> {
         let Some(runtime) = &self.runtime else {
             return Err("context VM runtime is unavailable".into());
         };
@@ -1206,10 +1230,16 @@ impl Agent {
                 provenance: serde_json::json!({"provenance_kind":"user_decision"}),
             });
         }
-        let max_tokens = self
-            .context_window
-            .saturating_sub(self.provider_context_overhead_tokens.unwrap_or(0))
-            .max(1);
+        let budget = self.provider_context_budget();
+        let live = self.live_tool_exchange();
+        let live_tokens = live
+            .iter()
+            .map(provider_budget::message_token_ceiling)
+            .fold(0u64, u64::saturating_add);
+        if budget.reserved().saturating_add(live_tokens) >= budget.window {
+            return Err(runtime::context_vm::CONTEXT_BUDGET_EXCEEDED.into());
+        }
+        let max_tokens = budget.working_set_budget().saturating_sub(live_tokens);
         let direct_tokens = items.iter().map(|item| item.estimated_tokens).sum::<u64>();
         let goal = self
             .last_real_user_request
@@ -1232,18 +1262,110 @@ impl Agent {
             max_tokens.saturating_sub(direct_tokens),
             runtime::AgentKind::Main,
         );
-        let broker_packet = runtime.context_broker.build_context(&request);
+        let (broker_packet, ledger) = runtime.context_broker.build_context_with_ledger(&request);
         let mut all_items = items;
         all_items.extend(broker_packet.items);
+        // The legacy broker remains bounded. Mandatory candidates omitted by
+        // its preselection still reach the authoritative compiler budget gate.
+        all_items.extend(ledger.into_iter().filter_map(|(item, selected, reason)| {
+            (!selected && reason.as_deref() == Some("over_budget") && item.is_mandatory())
+                .then_some(item)
+        }));
         let broker_tokens = all_items.iter().map(|item| item.estimated_tokens).sum();
         let broker_packet = runtime::ContextPacket {
             items: all_items,
             estimated_tokens: broker_tokens,
             cache_key: format!("agent-context:{}", broker_packet.cache_key),
         };
-        runtime
+        let mut image = runtime
             .context_vm
-            .compile(&events, &broker_packet, max_tokens)
+            .compile(&events, &broker_packet, max_tokens)?;
+        // The most recent, complete tool exchange remains protocol data. Older
+        // exchanges are evidence only. Reserve this suffix before compilation.
+        for (index, message) in live.iter().enumerate() {
+            let content = serde_json::to_string(message).map_err(|e| e.to_string())?;
+            image.entries.push(runtime::ContextImageEntry {
+                id: format!("live-tool-exchange:{index}"),
+                source_ref: format!("live-tool-exchange:{index}"),
+                category: "live_tool_exchange".into(),
+                provenance_kind: runtime::context_manifest::ProvenanceKind::ToolEvidence,
+                content_hash: runtime::cache::digest(content.as_bytes()),
+                estimated_tokens: provider_budget::message_token_ceiling(message),
+                content,
+                mandatory: true,
+                stable_for_cache: false,
+            });
+        }
+        image.messages.extend(live);
+        image.estimated_tokens = image.estimated_tokens.saturating_add(live_tokens);
+        Ok(image)
+    }
+
+    fn live_tool_exchange(&self) -> Vec<ChatMessage> {
+        if self.messages.last().is_none_or(|m| m.role != "toolResult") {
+            return Vec::new();
+        }
+        let Some(start) = self.messages.iter().rposition(|m| m.role == "assistant") else {
+            return Vec::new();
+        };
+        let mut calls = std::collections::HashSet::new();
+        for content in &self.messages[start].content {
+            if let MessageContent::ToolCall { id, .. } = content {
+                if id.is_empty() || !calls.insert(id.as_str()) {
+                    return Vec::new();
+                }
+            }
+        }
+        let results = &self.messages[start + 1..];
+        let ids = results
+            .iter()
+            .filter_map(|m| m.tool_call_id.as_deref())
+            .collect::<std::collections::HashSet<_>>();
+        if calls.is_empty()
+            || calls != ids
+            || results.len() != ids.len()
+            || results.iter().any(|m| m.role != "toolResult")
+        {
+            return Vec::new();
+        }
+        convert_to_llm_for_provider(&self.messages[start..], self.block_images)
+    }
+
+    pub fn provider_context_budget(&self) -> provider_budget::ProviderContextBudget {
+        let requested_reasoning = if self.thinking_level == ThinkingLevel::Off {
+            0
+        } else {
+            u64::from(davinci_ai::thinking_budget_for_level(
+                self.thinking_level,
+                self.thinking_budgets.as_ref(),
+            ))
+        };
+        let total_output = self
+            .compaction
+            .reserve_tokens
+            .max(requested_reasoning.saturating_add(1024))
+            .min(self.provider_output_limit.unwrap_or(u64::MAX));
+        let reasoning = requested_reasoning.min(total_output.saturating_sub(1024));
+        provider_budget::ProviderContextBudget {
+            window: self.context_window,
+            system: provider_budget::text_token_ceiling(&self.provider_system_prompt()),
+            tools: self.provider_context_overhead_tokens.unwrap_or_else(|| {
+                serde_json::to_vec(&self.provider_tool_specs())
+                    .map_or(u64::MAX, |v| v.len() as u64 + 128)
+            }),
+            reasoning_reserve: reasoning,
+            output_reserve: total_output.saturating_sub(reasoning),
+            safety_margin: 256,
+        }
+    }
+
+    pub fn set_provider_output_limit(&mut self, limit: Option<u64>) {
+        self.provider_output_limit = limit;
+    }
+
+    pub fn context_vm_provider_output_limit(&self) -> Option<u64> {
+        (self.context_vm_mode() == ContextVmMode::Active)
+            .then(|| self.provider_context_budget().output_limit())
     }
 
     pub(crate) fn context_vm_events_for_runtime(&self) -> Vec<runtime::context_vm::ContextEvent> {
@@ -1258,7 +1380,7 @@ impl Agent {
     }
 
     fn record_context_vm_shadow(&self, legacy: &[ChatMessage]) {
-        let Ok(image) = self.context_vm_image() else {
+        let Ok(image) = self.prepared_context_image() else {
             return;
         };
         let events = self
@@ -1287,8 +1409,8 @@ impl Agent {
                 legacy
             }
             ContextVmMode::Active => self
-                .context_vm_image()
-                .map(|image| image.messages)
+                .prepared_context_image()
+                .map(|image| image.messages.clone())
                 .unwrap_or_else(|_| self.legacy_messages_for_provider()),
         }
     }
@@ -1306,7 +1428,7 @@ impl Agent {
     /// tool schemas count too. This is a byte heuristic, not a tokenizer or upper bound.
     pub fn estimated_context_tokens(&self) -> u64 {
         if self.context_vm_mode() == ContextVmMode::Active {
-            if let Ok(image) = self.context_vm_image() {
+            if let Ok(image) = self.prepared_context_image() {
                 return self.context_vm_estimated_provider_tokens(&image);
             }
         }
@@ -1338,18 +1460,11 @@ impl Agent {
     }
 
     fn context_vm_estimated_provider_tokens(&self, image: &runtime::ContextImage) -> u64 {
-        let system_tokens = (self.provider_system_prompt().len() as u64).div_ceil(4);
-        let overhead = self.provider_context_overhead_tokens.unwrap_or_else(|| {
-            let specs = self.provider_tool_specs();
-            (serde_json::to_vec(&specs)
-                .expect("tool schemas are JSON")
-                .len() as u64)
-                .div_ceil(4)
-        });
+        let budget = self.provider_context_budget();
         image
             .estimated_tokens
-            .saturating_add(system_tokens)
-            .saturating_add(overhead)
+            .saturating_add(budget.system)
+            .saturating_add(budget.tools)
     }
 
     /// Set once per request configuration using the actual tool catalog.
@@ -1387,6 +1502,10 @@ impl Agent {
         use runtime::context_manifest::{
             ContextManifestEntry, PreparedContextManifest, ProvenanceKind,
         };
+        if self.prepared_manifest_revisions != (source_revision, overlay_revision) {
+            self.prepared_manifest_revisions = (source_revision, overlay_revision);
+            self.invalidate_context_image();
+        }
         let mut entries = Vec::new();
 
         // 1. Mandatory system prompt
@@ -1428,7 +1547,27 @@ impl Agent {
         ));
 
         let active_image = if self.context_vm_mode() == ContextVmMode::Active {
-            self.context_vm_image().ok()
+            match self.prepared_context_image() {
+                Ok(image) => Some(image),
+                Err(error) => {
+                    if error == runtime::context_vm::CONTEXT_BUDGET_EXCEEDED {
+                        entries.push(ContextManifestEntry::new(
+                            "context_vm_budget",
+                            "context_vm",
+                            ProvenanceKind::MandatoryPolicy,
+                            "agent::context_vm",
+                            ContextManifestEntry::hash_content(&error),
+                            0,
+                            false,
+                            Some(error),
+                            true,
+                            "unavailable",
+                            None,
+                        ));
+                    }
+                    None
+                }
+            }
         } else {
             None
         };
@@ -2187,17 +2326,37 @@ impl Agent {
     pub fn fold_context(
         &mut self,
         reason: runtime::context_vm::FoldReason,
-        _custom_instructions: Option<&str>,
+        custom_instructions: Option<&str>,
     ) -> Result<runtime::ContextRoot, String> {
         let Some(runtime) = &self.runtime else {
             return Err("context VM runtime is unavailable".into());
         };
         let events = self.context_vm_events_for_runtime();
-        let runtime = runtime;
-        let root = runtime.context_vm.fold(reason, &events)?;
+        let parent = runtime
+            .context_vm
+            .load_state_from_root()
+            .unwrap_or_default();
+        let proposal = self.summarizer.as_ref().and_then(|summarizer| {
+            let request = runtime::context_vm::fold_request(
+                &parent,
+                &events,
+                custom_instructions,
+                self.context_window,
+                &self.provider,
+                &self.model_id,
+            )?;
+            let response = summarizer.summarize(&request).ok()?;
+            if compaction::get_summarization_failure(&response, "context fold").is_some() {
+                return None;
+            }
+            runtime::context_vm::parse_checkpoint_proposal(&response.text).ok()
+        });
+        let root = runtime
+            .context_vm
+            .fold_with_proposal(reason, &events, proposal)?;
         let prefix_digest = self
-            .context_vm_image()
-            .map(|image| image.prefix_digest)
+            .prepared_context_image()
+            .map(|image| image.prefix_digest.clone())
             .unwrap_or_default();
         let (before_tokens, after_tokens) = runtime.context_vm.last_fold_tokens().unwrap_or((0, 0));
         if let Some(session) = &mut self.session {

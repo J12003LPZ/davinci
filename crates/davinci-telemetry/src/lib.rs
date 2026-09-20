@@ -2,6 +2,7 @@
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::collections::VecDeque;
 
 pub type AttributeValue = Value;
 
@@ -337,19 +338,25 @@ impl LocalBehaviorReport {
     }
 }
 
-static BEHAVIOR_LOG: std::sync::Mutex<Vec<BehaviorTelemetry>> = std::sync::Mutex::new(Vec::new());
+/// Retain the most recent settled runs; telemetry is not a durable audit log.
+pub const BEHAVIOR_LOG_CAPACITY: usize = 4096;
+static BEHAVIOR_LOG: std::sync::Mutex<VecDeque<BehaviorTelemetry>> =
+    std::sync::Mutex::new(VecDeque::new());
 
 /// Record a local behavioral telemetry entry from a settled agent turn.
 pub fn record_behavior_telemetry(entry: BehaviorTelemetry) {
     if let Ok(mut log) = BEHAVIOR_LOG.lock() {
-        log.push(entry);
+        if log.len() == BEHAVIOR_LOG_CAPACITY {
+            log.pop_front();
+        }
+        log.push_back(entry);
     }
 }
 
-/// Retrieve all recorded behavioral telemetry entries from the local store.
+/// Retrieve retained runs in chronological order, up to `BEHAVIOR_LOG_CAPACITY`.
 pub fn get_behavior_telemetry() -> Vec<BehaviorTelemetry> {
     if let Ok(log) = BEHAVIOR_LOG.lock() {
-        log.clone()
+        log.iter().cloned().collect()
     } else {
         Vec::new()
     }
@@ -365,6 +372,37 @@ pub fn clear_behavior_telemetry() {
 #[cfg(test)]
 mod behavior_telemetry_tests {
     use super::*;
+
+    #[test]
+    fn audit_regression_behavior_log_retains_only_recent_runs() {
+        clear_behavior_telemetry();
+        for index in 0..4098 {
+            record_behavior_telemetry(BehaviorTelemetry {
+                prompt_profile: "stable".into(),
+                prompt_version: 2,
+                prompt_stable_hash_prefix: String::new(),
+                model_family: "test".into(),
+                model_policy: "default".into(),
+                model_policy_version: 0,
+                model_turns: index,
+                tool_calls: 0,
+                permission_prompts: 0,
+                permission_denials: 0,
+                files_changed_count: 0,
+                verification_commands_run: 0,
+                verification_failures: 0,
+                capability_incomplete_evidence: 0,
+                aborted: false,
+                user_steers: 0,
+            });
+        }
+        let retained = get_behavior_telemetry();
+        assert_eq!(retained.len(), 4096);
+        assert_eq!(retained.first().unwrap().model_turns, 2);
+        assert_eq!(retained.last().unwrap().model_turns, 4097);
+        clear_behavior_telemetry();
+        assert!(get_behavior_telemetry().is_empty());
+    }
 
     #[test]
     fn behavior_telemetry_serialization_contains_only_aggregate_metrics() {
@@ -471,8 +509,6 @@ mod behavior_telemetry_tests {
 
     #[test]
     fn local_behavior_report_aggregates_and_formats_correctly() {
-        clear_behavior_telemetry();
-
         let mut runs = Vec::new();
         for i in 0..42 {
             runs.push(BehaviorTelemetry {

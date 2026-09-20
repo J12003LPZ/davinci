@@ -22,10 +22,12 @@ pub struct DecisionAnswerTelemetry {
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct DecisionTelemetrySnapshot {
     pub requests: u64,
     pub successes: u64,
     pub timeouts: u64,
+    pub soft_deadline_misses: u64,
     pub credential_invalid: u64,
     pub schema_mismatch: u64,
     pub http_401: u64,
@@ -132,7 +134,8 @@ impl DecisionTelemetry {
                     snapshot.http_529 += 1;
                 }
                 DecisionError::Unavailable(_) => snapshot.network_failures += 1,
-                DecisionError::StaleResponse
+                DecisionError::Busy
+                | DecisionError::StaleResponse
                 | DecisionError::InvalidRequest(_)
                 | DecisionError::Disabled => {}
                 DecisionError::HttpStatus(_) => snapshot.network_failures += 1,
@@ -142,6 +145,9 @@ impl DecisionTelemetry {
 
     pub fn record_timeout(&self) {
         self.with_snapshot(|snapshot| snapshot.timeouts += 1);
+    }
+    pub fn record_soft_deadline_miss(&self) {
+        self.with_snapshot(|snapshot| snapshot.soft_deadline_misses += 1);
     }
 
     pub fn record_fallback(&self) {

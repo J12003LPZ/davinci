@@ -1,61 +1,31 @@
 # davinci-ai
 
-`davinci-ai` is the provider integration and model communication engine. It abstracts multi-provider API protocols, real-time Server-Sent Events (SSE) streaming, prompt caching, OAuth token lifecycles, and model catalog resolution.
+Provider authentication, model discovery, request shaping and streaming.
+Start with [src/lib.rs](src/lib.rs), which defines the public types and exports;
+its module declarations identify the active implementation.
 
----
+| Concern | Source |
+| --- | --- |
+| Request/response orchestration | [stream.rs](src/stream.rs), [request_shape.rs](src/request_shape.rs) |
+| SSE body reading and limits | [stream_reader.rs](src/stream_reader.rs) |
+| Responses, Anthropic and Chat Completions decoding | `src/stream_decoder*.rs` |
+| Codex transport and connection state | [codex.rs](src/codex.rs), [codex_ws.rs](src/codex_ws.rs) |
+| Credentials and provider auth | [auth.rs](src/auth.rs) |
+| OAuth coordination, provider flows and callback listener | [oauth.rs](src/oauth.rs), [oauth_providers.rs](src/oauth_providers.rs), [oauth_callback.rs](src/oauth_callback.rs) |
+| Model metadata and prices | [catalog.rs](src/catalog.rs), [catalog_include.rs](src/catalog_include.rs), [catalogs/](catalogs/) |
+| Prompt-cache controls | [cache.rs](src/cache.rs) |
+| Optional wire tracing | [trace.rs](src/trace.rs) |
 
-## Key Capabilities
+The SSE reader applies backpressure and limits each raw frame, including its
+blank terminator, to 16 MiB. Foreground abort polling does not interrupt a worker
+already blocked in a socket read; that worker still depends on transport timeout.
+Final decoded messages retain the accepted response.
 
-- **Unified Streaming Pipeline (`stream.rs`)**:
-  - Asynchronous background reading of SSE HTTP bodies, piping decoded frames directly into the agent sink.
-  - Abort signals polled between frames for instant cancellation.
-- **Provider Protocol Decoders**:
-  - `stream_decoder_anthropic.rs`: Anthropic Messages API (`content_block_delta`, `message_delta`, usage reporting).
-  - `stream_decoder.rs`: OpenAI Responses / Codex WebSocket streaming.
-  - `stream_decoder_completions.rs`: OpenAI Chat Completions SSE format.
-- **Provider Coverage**:
-  - Anthropic (Claude 3.5 Sonnet, Claude 3 Opus/Haiku)
-  - OpenAI (GPT-4o, o1, o3-mini)
-  - OpenAI Codex (Internal & Enterprise models)
-  - Amazon Bedrock (Converse Stream)
-  - Google Gemini (Gemini 1.5 Pro/Flash, 2.0 Flash)
-  - Local Models (Ollama, vLLM, llama.cpp)
-  - Cloud Providers (Groq, Mistral, OpenRouter, Azure OpenAI)
-- **Prompt Cache Parity (`cache.rs`)**:
-  - Supports cache breakpoints and retention markers across Anthropic, OpenAI, and Bedrock.
-  - Granular retention configuration (`short`, `long`, `none`) via environment flags (`PI_CACHE_RETENTION`).
-- **Authentication & OAuth (`auth.rs`, `oauth.rs`)**:
-  - Browser-based OAuth PKCE flow and Device Code flow for headless/remote environments.
-  - Automatic token refresh and secure persistence.
-- **Model Catalog & Cost Tracking (`catalog.rs`, `catalogs.json`)**:
-  - Token cost calculations, max context window limits, and thinking budget specifications.
+Tests are inline and use fixtures, loopback servers and local subprocesses:
 
----
-
-## Directory Structure
-
-```
-davinci-ai/
-├── src/
-│   ├── stream.rs                      # Streaming orchestrator and thread sink
-│   ├── stream_decoder.rs              # Codex / Responses format decoder
-│   ├── stream_decoder_anthropic.rs    # Anthropic Messages format decoder
-│   ├── stream_decoder_completions.rs  # OpenAI Chat Completions decoder
-│   ├── codex.rs                       # Codex provider implementation
-│   ├── codex_ws.rs                    # Codex WebSocket transport
-│   ├── cache.rs                       # Prompt caching logic
-│   ├── auth.rs                        # API key and credential resolution
-│   ├── oauth.rs                       # OAuth state and flow coordination
-│   ├── catalog.rs                     # Model metadata, token costs, context limits
-│   └── catalogs.json                  # Bundled model database
-└── Cargo.toml
+```sh
+cargo test -p davinci-ai --offline --locked
 ```
 
----
-
-## Debugging
-
-Enable verbose protocol frame tracing:
-```bash
-PI_AI_TRACE=1 cargo test -p davinci-ai
-```
+This check does not establish live provider/OAuth availability. See the
+[workspace architecture](../../docs/ARCHITECTURE.md) for the surrounding runtime.

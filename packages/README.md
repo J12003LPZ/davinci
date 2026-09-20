@@ -5,7 +5,7 @@ This directory contains legacy TypeScript package stubs from the early phases of
 > [!NOTE]
 > **Active Implementation**: The production, authoritative codebase is written in Rust and lives under [`crates/`](../crates/).
 > 
-> **Behavioral Reference**: The complete, authoritative reference TypeScript codebase (~1,169 files) is preserved under [`vendor/pi/`](../vendor/pi/).
+> **Behavioral Reference**: The pinned reference TypeScript codebase is preserved under [`vendor/davinci/`](../vendor/davinci/).
 
 ---
 

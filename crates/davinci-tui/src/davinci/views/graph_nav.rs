@@ -783,3 +783,7 @@ mod tests {
             .any(|n| n.id == "research-a"));
     }
 }
+
+#[cfg(test)]
+#[path = "graph_perf.rs"]
+mod perf;

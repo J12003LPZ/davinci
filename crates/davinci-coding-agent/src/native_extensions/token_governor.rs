@@ -1361,6 +1361,8 @@ impl TokenGovernor {
 
     /// Convert a stored governor output into the Context VM's lossless
     /// artifact reference without copying the output into context state.
+    // Public library API, also compiled into the binary's private module.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn artifact_ref(
         &self,
         id: &str,
@@ -1377,6 +1379,7 @@ impl TokenGovernor {
     /// Resolve a `governor://output/out-...` artifact through the existing output
     /// store. This is the exact retrieval path used by retrieve_output, with
     /// no second in-memory copy or alternate storage format.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn retrieve_artifact(&mut self, uri: &str) -> Result<String, ToolError> {
         let id = uri
             .strip_prefix("governor://output/")

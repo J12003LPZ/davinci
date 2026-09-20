@@ -162,10 +162,12 @@ impl RuntimeHandle {
         let task_registry = TaskRegistry::with_bus(bus.clone());
         let mailbox = AgentMailbox::with_registry_and_bus(registry.clone(), bus.clone());
         let cache = cache::CacheRuntime::default();
-        let mut context_vm_config = context_vm::ContextVmConfig::default();
-        context_vm_config.mode = context_vm::ContextVmMode::from_env_value(
-            std::env::var("DAVINCI_CONTEXT_VM").ok().as_deref(),
-        );
+        let context_vm_config = context_vm::ContextVmConfig {
+            mode: context_vm::ContextVmMode::from_env_value(
+                std::env::var("DAVINCI_CONTEXT_VM").ok().as_deref(),
+            ),
+            ..Default::default()
+        };
         Self {
             context_vm: context_vm::ContextVmRuntime::new(context_vm_config, cache.clone()),
             cache,

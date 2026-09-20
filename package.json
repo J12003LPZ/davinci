@@ -1,7 +1,7 @@
 {
   "name": "davinci",
   "private": true,
-  "description": "Davinci agent harness. TypeScript packages remain authoritative until the Phase 8 Rust gate.",
+  "description": "Davinci Rust agent harness; this workspace retains legacy TypeScript migration packages.",
   "workspaces": [
     "packages/*"
   ],

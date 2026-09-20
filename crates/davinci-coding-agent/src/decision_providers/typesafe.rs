@@ -1,6 +1,5 @@
-use std::io::Read;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use davinci_agent::decision::provider::{DecisionError, DecisionProvider};
 use davinci_agent::decision::request::DecisionRequest;
@@ -45,12 +44,14 @@ pub enum CredentialValidationError {
 #[derive(Clone)]
 pub struct TypeSafeProvider {
     api_key: Zeroizing<String>,
+    http: super::typesafe_http::TypeSafeHttp,
 }
 
 impl TypeSafeProvider {
     pub fn new(api_key: impl Into<String>) -> Self {
         Self {
             api_key: Zeroizing::new(api_key.into()),
+            http: super::typesafe_http::TypeSafeHttp::new(TYPESAFE_URL),
         }
     }
 
@@ -71,7 +72,9 @@ impl TypeSafeProvider {
                 }
             }
         });
-        let raw = send_json(api_key, &body, VALIDATION_TIMEOUT).map_err(map_validation_error)?;
+        let raw = super::typesafe_http::TypeSafeHttp::new(TYPESAFE_URL)
+            .send(api_key, &body, VALIDATION_TIMEOUT, 1)
+            .map_err(map_validation_error)?;
         if raw.len() > MAX_RESPONSE_BYTES {
             return Err(CredentialValidationError::SchemaMismatch);
         }
@@ -114,10 +117,27 @@ impl DecisionProvider for TypeSafeProvider {
         budget: Duration,
     ) -> Result<DecisionResponse, DecisionError> {
         let body = ProviderPayload::from_request(request);
-        let raw = send_json(
+        request.validate_size()?;
+        let raw = self.http.send(
             self.api_key.as_str(),
             &body,
             budget.min(HARD_DECISION_BUDGET),
+            2,
+        )?;
+        parse_and_validate_response(&raw, request)
+    }
+
+    fn evaluate_shadow(
+        &self,
+        request: &DecisionRequest,
+        budget: Duration,
+    ) -> Result<DecisionResponse, DecisionError> {
+        request.validate_size()?;
+        let raw = self.http.send(
+            self.api_key.as_str(),
+            &ProviderPayload::from_request(request),
+            budget.min(HARD_DECISION_BUDGET),
+            1,
         )?;
         parse_and_validate_response(&raw, request)
     }
@@ -160,77 +180,6 @@ pub fn resolve_api_key(auth: &AuthStorage) -> Result<Option<String>, TypeSafeAut
     Ok(Some(key.to_owned()))
 }
 
-fn send_json(
-    api_key: &str,
-    body: &impl Serialize,
-    budget: Duration,
-) -> Result<Vec<u8>, DecisionError> {
-    if api_key.trim().is_empty() {
-        return Err(DecisionError::CredentialInvalid);
-    }
-    let body = serde_json::to_string(body)
-        .map_err(|error| DecisionError::InvalidRequest(error.to_string()))?;
-    let authorization = Zeroizing::new(format!("Bearer {api_key}"));
-    let started = Instant::now();
-    for attempt in 0..2 {
-        let elapsed = started.elapsed();
-        if elapsed >= budget {
-            return Err(DecisionError::Unavailable(
-                "request budget exhausted".into(),
-            ));
-        }
-        let remaining = budget.saturating_sub(elapsed);
-        let agent = ureq::AgentBuilder::new().timeout(remaining).build();
-        let result = agent
-            .post(TYPESAFE_URL)
-            .set("Authorization", authorization.as_str())
-            .set("Content-Type", "application/json")
-            .send_string(&body);
-        match result {
-            Ok(response) => {
-                let status = response.status();
-                if !(200..300).contains(&status) {
-                    if attempt == 0 && matches!(status, 429 | 529) {
-                        continue;
-                    }
-                    return Err(DecisionError::HttpStatus(status as u16));
-                }
-                return read_bounded_response(response);
-            }
-            Err(ureq::Error::Status(status, _)) => {
-                if attempt == 0 && matches!(status, 429 | 529) {
-                    continue;
-                }
-                return Err(DecisionError::HttpStatus(status as u16));
-            }
-            Err(ureq::Error::Transport(_)) => {
-                if attempt == 0 && started.elapsed() < budget {
-                    continue;
-                }
-                return Err(DecisionError::Unavailable(
-                    "provider network request failed".into(),
-                ));
-            }
-        }
-    }
-    Err(DecisionError::Unavailable("provider request failed".into()))
-}
-
-fn read_bounded_response(response: ureq::Response) -> Result<Vec<u8>, DecisionError> {
-    let mut body = Vec::new();
-    response
-        .into_reader()
-        .take((MAX_RESPONSE_BYTES + 1) as u64)
-        .read_to_end(&mut body)
-        .map_err(|_| DecisionError::Unavailable("provider response unreadable".into()))?;
-    if body.len() > MAX_RESPONSE_BYTES {
-        return Err(DecisionError::SchemaMismatch(
-            "decision response exceeds the bounded response size".into(),
-        ));
-    }
-    Ok(body)
-}
-
 fn map_validation_error(error: DecisionError) -> CredentialValidationError {
     match error {
         DecisionError::HttpStatus(401) | DecisionError::CredentialInvalid => {
@@ -245,7 +194,9 @@ fn map_validation_error(error: DecisionError) -> CredentialValidationError {
         DecisionError::HttpStatus(529) | DecisionError::Overloaded => {
             CredentialValidationError::Overloaded
         }
-        DecisionError::Unavailable(_) => CredentialValidationError::Unavailable,
+        DecisionError::Unavailable(_) | DecisionError::Busy => {
+            CredentialValidationError::Unavailable
+        }
         DecisionError::InvalidRequest(_)
         | DecisionError::StaleResponse
         | DecisionError::Disabled => CredentialValidationError::SchemaMismatch,
@@ -326,5 +277,27 @@ mod tests {
         assert!(!encoded.contains("request_id"));
         assert!(!encoded.contains("Authorization"));
         assert!(!encoded.contains("session"));
+    }
+}
+
+#[cfg(test)]
+mod state_contract {
+    #[test]
+    fn version_two_state_serializes_through_the_actual_provider_payload() {
+        let request = crate::decision_state::build_request(
+            "contract",
+            "review this change",
+            davinci_agent::decision::risk::DecisionClass::Ranking,
+        );
+        let wire = serde_json::to_value(super::ProviderPayload::from_request(&request)).unwrap();
+        assert_eq!(wire["state"]["schemaVersion"], 2);
+        assert_eq!(wire["state"]["workspaceDirty"], "unknown");
+        assert!(wire["state"].get("hasUncommittedChanges").is_none());
+        assert_eq!(wire["model"], super::TYPESAFE_MODEL);
+        assert!(wire.get("request_id").is_none());
+        assert!(wire["questions"]
+            .as_object()
+            .unwrap()
+            .contains_key("test_impact_relevant"));
     }
 }

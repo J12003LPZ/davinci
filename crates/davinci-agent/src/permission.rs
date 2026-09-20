@@ -122,6 +122,10 @@ pub fn is_sensitive_file_path(path: &str) -> bool {
     permission_risk::is_protected_path(path)
 }
 
+pub(crate) fn is_secret_file_path(path: &str) -> bool {
+    permission_risk::is_secret_path(path)
+}
+
 pub fn tool_class(tool: &str) -> ToolClass {
     match tool {
         "patch_preview" | "patch_status" => ToolClass::Read,

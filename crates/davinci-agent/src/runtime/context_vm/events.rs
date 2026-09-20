@@ -66,7 +66,11 @@ pub fn events_from_messages(messages: &[ChatMessage]) -> Vec<ContextEvent> {
         .collect()
 }
 
-fn event_from_message(message: &ChatMessage, source_ref: String, seq: u64) -> Option<ContextEvent> {
+pub(super) fn event_from_message(
+    message: &ChatMessage,
+    source_ref: String,
+    seq: u64,
+) -> Option<ContextEvent> {
     let visible_text = visible_text(message);
     if visible_text.is_empty() {
         return None;

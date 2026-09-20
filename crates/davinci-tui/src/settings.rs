@@ -365,7 +365,7 @@ pub fn interactive_settings_list(config: &InteractiveSettingsConfig) -> Settings
                 id: "decision-intelligence".into(),
                 label: "TypeSafe / Jev decision intelligence".into(),
                 description: Some(
-                    "Use TypeSafe Jev for fast structured routing judgments. Sends only a redacted current task and bounded derived metadata; source bodies, credentials, hidden reasoning, and raw tool outputs are never sent.".into(),
+                    "Use TypeSafe Jev for fast structured routing judgments. Sends the current task after secret/path redaction and removal of fenced code, patches, and stack dumps, plus bounded metadata. Does not automatically read or send repository source files. Unfenced source pasted into task prose may remain.".into(),
                 ),
                 current_value: if config.decision_intelligence {
                     "on".into()

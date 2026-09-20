@@ -10,6 +10,64 @@ use davinci_agent::{ContextItem, ContextPacket};
 use davinci_ai::{ChatMessage, MessageContent};
 use davinci_session::SessionEntry;
 
+#[test]
+fn historical_tool_evidence_never_becomes_an_orphan_protocol_result() {
+    let runtime = ContextVmRuntime::new(ContextVmConfig::default(), CacheRuntime::default());
+    let events = events_from_messages(&[
+        ChatMessage::text("user", "inspect"),
+        ChatMessage::tool_result("old-call", "read", "historical evidence", false),
+        ChatMessage::text("user", "continue"),
+    ]);
+    let image = runtime
+        .compile(&events, &ContextPacket::empty(), 100_000)
+        .unwrap();
+    assert!(image.messages.iter().all(|m| m.role != "toolResult"));
+    let wire = davinci_ai::openai_responses_input(&image.messages);
+    assert!(wire
+        .iter()
+        .all(|item| item["type"] != "function_call_output"));
+    assert!(image.messages.iter().any(|m| m.role == "custom"
+        && davinci_ai::content_text(&m.content).contains("historical evidence")));
+}
+
+#[test]
+fn active_vm_keeps_the_current_tool_exchange_paired_on_the_wire() {
+    use davinci_agent::{Agent, AgentId, RunId, RuntimeBus, RuntimeHandle};
+    let mut agent = Agent::new("system");
+    agent.set_runtime(RuntimeHandle::new(
+        RunId::new(),
+        AgentId::new(),
+        RuntimeBus::new(),
+    ));
+    agent.set_context_vm_mode(davinci_agent::runtime::ContextVmMode::Active);
+    agent.messages = vec![
+        ChatMessage::text("user", "read"),
+        ChatMessage {
+            role: "assistant".into(),
+            content: vec![MessageContent::ToolCall {
+                id: "live-call".into(),
+                name: "read".into(),
+                arguments: serde_json::json!({"path":"a"}),
+            }],
+            ..Default::default()
+        },
+        ChatMessage::tool_result("live-call", "read", "result", false),
+    ];
+    let wire = davinci_ai::openai_responses_input(&agent.context_vm_image().unwrap().messages);
+    let calls: Vec<_> = wire
+        .iter()
+        .filter(|v| v["type"] == "function_call")
+        .collect();
+    let results: Vec<_> = wire
+        .iter()
+        .filter(|v| v["type"] == "function_call_output")
+        .collect();
+    assert_eq!(calls.len(), 1);
+    assert_eq!(results.len(), 1);
+    assert_eq!(calls[0]["call_id"], "live-call");
+    assert_eq!(results[0]["call_id"], "live-call");
+}
+
 fn session_message(
     id: &str,
     parent_id: Option<&str>,
@@ -199,7 +257,8 @@ fn repeated_delta_and_fold_retain_original_visible_evidence() {
 
     runtime.rebuild_from_events(&initial).unwrap();
     let with_delta = runtime.append_delta(&all).unwrap();
-    assert_eq!(with_delta.deltas.len(), 1);
+    assert!(with_delta.deltas.is_empty());
+    assert_eq!(with_delta.updates_since_fold, 1);
     let folded = runtime.fold(FoldReason::Manual, &all).unwrap();
     assert!(folded.deltas.is_empty());
     let folded_again = runtime.fold(FoldReason::PhaseBoundary, &all).unwrap();
@@ -258,9 +317,19 @@ fn compiler_omits_optional_episode_under_tight_budget_but_keeps_checkpoint_manif
     let events = events_from_messages(&[ChatMessage::text("user", "retain this constraint")]);
     runtime.fold(FoldReason::Manual, &events).unwrap();
 
-    let image = runtime
-        .compile(&events, &ContextPacket::empty(), 1)
+    let complete = runtime
+        .compile(&events, &ContextPacket::empty(), 10_000)
         .unwrap();
+    let required_budget = complete
+        .entries
+        .iter()
+        .filter(|entry| entry.category != "episode")
+        .map(|entry| entry.estimated_tokens)
+        .sum();
+    let image = runtime
+        .compile(&events, &ContextPacket::empty(), required_budget)
+        .unwrap();
+    assert!(image.estimated_tokens <= required_budget);
     assert!(image
         .entries
         .iter()
@@ -329,7 +398,7 @@ fn compiler_orders_pages_broker_context_and_hot_events() {
         .entries
         .iter()
         .filter(|entry| entry.category == "episode")
-        .all(|entry| entry.estimated_tokens <= 160));
+        .all(|entry| entry.estimated_tokens <= 1024));
     assert!(runtime
         .manifest_entries(&image)
         .iter()
@@ -353,15 +422,15 @@ fn missing_delta_page_replays_from_visible_events_before_projection() {
     ]);
     runtime.rebuild_from_events(&initial).unwrap();
     let root = runtime.append_delta(&all).unwrap();
-    assert_eq!(root.deltas.len(), 1);
+    assert!(root.deltas.is_empty());
 
     let mut broken = root;
-    broken.deltas[0] = ContextPageRef {
+    broken.deltas.push(ContextPageRef {
         id: format!("ctx:delta:{}", "f".repeat(64)),
         kind: ContextPageKind::Delta,
         content_hash: "f".repeat(64),
         estimated_tokens: 1,
-    };
+    });
     runtime.install_root(broken, 2);
 
     let image = runtime
@@ -371,7 +440,8 @@ fn missing_delta_page_replays_from_visible_events_before_projection() {
         .entries
         .iter()
         .any(|entry| entry.content.contains("keep the API")));
-    assert!(runtime.metrics().page_fault_hits >= 1);
+    assert_eq!(runtime.metrics().retrieval_hits, 0);
+    assert!(runtime.metrics().rebuild_successes >= 1);
 }
 
 #[test]
@@ -387,4 +457,110 @@ fn persisted_root_loader_follows_checkpoint_metadata() {
 
     assert_eq!(loaded, root);
     assert_eq!(through_seq, 9);
+}
+
+#[test]
+fn malformed_live_tool_exchanges_are_evidence_not_protocol_messages() {
+    use davinci_agent::{Agent, AgentId, RunId, RuntimeBus, RuntimeHandle};
+    for (calls, results) in [
+        (vec![""], vec![""]),
+        (vec!["a"], vec!["unknown"]),
+        (vec!["a", "a"], vec!["a", "a"]),
+        (vec!["a", "a"], vec!["a"]),
+        (vec!["a", ""], vec!["a"]),
+        (vec!["a", "b"], vec!["a"]),
+        (vec!["a"], vec!["a", "a"]),
+    ] {
+        let mut agent = Agent::new("system");
+        agent.set_runtime(RuntimeHandle::new(
+            RunId::new(),
+            AgentId::new(),
+            RuntimeBus::new(),
+        ));
+        agent.set_context_vm_mode(davinci_agent::runtime::ContextVmMode::Active);
+        agent.messages = vec![
+            ChatMessage::text("user", "inspect"),
+            ChatMessage {
+                role: "assistant".into(),
+                content: calls
+                    .into_iter()
+                    .map(|id| MessageContent::ToolCall {
+                        id: id.into(),
+                        name: "read".into(),
+                        arguments: serde_json::json!({}),
+                    })
+                    .collect(),
+                ..Default::default()
+            },
+        ];
+        agent.messages.extend(
+            results
+                .into_iter()
+                .map(|id| ChatMessage::tool_result(id, "read", "evidence", false)),
+        );
+        let image = agent.prepared_context_image().unwrap();
+        let wire = davinci_ai::openai_responses_input(&image.messages);
+        assert!(
+            wire.iter()
+                .all(|item| item["type"] != "function_call_output"
+                    && item["type"] != "function_call"),
+            "{wire:?}"
+        );
+        assert!(image
+            .messages
+            .iter()
+            .any(|m| davinci_ai::content_text(&m.content).contains("evidence")));
+    }
+}
+
+#[test]
+fn session_sources_stay_on_disk_and_are_checked_against_authoritative_hashes() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut session =
+        davinci_session::JsonlSession::create(directory.path(), "fixture", None).unwrap();
+    session
+        .append_entry(session_message(
+            "user-1",
+            None,
+            1,
+            ChatMessage::text("user", "retain requirement"),
+        ))
+        .unwrap();
+    session
+        .append_entry(session_message(
+            "tool-1",
+            Some("user-1"),
+            2,
+            ChatMessage::tool_result("call", "read", "large source evidence", false),
+        ))
+        .unwrap();
+    let events = events_from_session_branch(&session.entries, session.leaf_id.as_deref());
+    let runtime = ContextVmRuntime::new(ContextVmConfig::default(), CacheRuntime::default());
+    runtime.bind_session_source(session.path.clone(), session.header.id.clone());
+    runtime.rebuild_from_events(&events).unwrap();
+    assert_eq!(runtime.resident_source_bytes(), 0);
+    let request = RetrieveContextRequest {
+        source_ref: Some("session:tool-1".into()),
+        ..Default::default()
+    };
+    assert_eq!(
+        runtime.retrieve(&request).unwrap().content,
+        "large source evidence"
+    );
+    let original = std::fs::read_to_string(&session.path).unwrap();
+    std::fs::write(
+        &session.path,
+        original.replace("large source evidence", "corrupted source evidence"),
+    )
+    .unwrap();
+    assert!(runtime
+        .retrieve(&request)
+        .unwrap_err()
+        .contains("integrity"));
+    std::fs::write(
+        &session.path,
+        original.replace(&session.header.id, "other-session"),
+    )
+    .unwrap();
+    assert!(runtime.retrieve(&request).unwrap_err().contains("identity"));
 }

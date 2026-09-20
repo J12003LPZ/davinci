@@ -602,6 +602,7 @@ pub fn run_js_stream_simple(
     model: &davinci_ai::Model,
     messages: &[davinci_ai::ChatMessage],
     system: &str,
+    max_tokens: Option<u64>,
 ) -> Result<davinci_ai::AssistantMessage, String> {
     let result = run_persistent_js_extension(
         module,
@@ -617,6 +618,8 @@ pub fn run_js_stream_simple(
                 "systemPrompt": system,
                 "messages": messages,
             },
+            "options": max_tokens.map(|limit| serde_json::json!({"maxTokens": limit}))
+                .unwrap_or_else(|| serde_json::json!({})),
         }),
     )?;
     let value = result.result.unwrap_or(Value::Null);
@@ -1182,9 +1185,9 @@ module.exports = (pi) => {
 module.exports = (pi) => {
   pi.registerProvider("fixture-ai", {
     models: [{ id: "echo", name: "echo" }],
-    streamSimple: async (_model, context) => {
+    streamSimple: async (_model, context, options) => {
       const last = (context.messages || []).slice(-1)[0];
-      return { text: "streamed:" + (last && last.content ? JSON.stringify(last.content) : "") };
+      return { text: "streamed:" + (last && last.content ? JSON.stringify(last.content) : "") + ":cap=" + options.maxTokens };
     },
   });
 };
@@ -1215,12 +1218,21 @@ module.exports = (pi) => {
             headers: Default::default(),
             thinking_level_map: Default::default(),
         };
+        let mut agent = davinci_agent::Agent::new("sys");
+        agent.set_runtime(davinci_agent::RuntimeHandle::new(
+            davinci_agent::RunId::new(),
+            davinci_agent::AgentId::new(),
+            davinci_agent::RuntimeBus::new(),
+        ));
+        agent.set_context_vm_mode(davinci_agent::runtime::ContextVmMode::Active);
+        agent.set_provider_output_limit(Some(37));
         let message = run_js_stream_simple(
             &module,
             "fixture-ai",
             &model,
             &[davinci_ai::ChatMessage::text("user", "hi")],
             "sys",
+            agent.context_vm_provider_output_limit(),
         )
         .unwrap();
         stop_persistent_js_extension();
@@ -1233,6 +1245,7 @@ module.exports = (pi) => {
             })
             .unwrap_or_default();
         assert!(text.contains("streamed:"));
+        assert!(text.ends_with(":cap=37"), "{text}");
     }
 
     #[test]

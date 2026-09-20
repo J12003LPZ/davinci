@@ -195,6 +195,22 @@ impl RepoIntelligence {
         self.refresh_observed_authorized(&[], true, authorize)
     }
 
+    /// Consumed watcher events force reconciliation on the next refresh.
+    /// This is a cheap invalidation probe, never a source of repository facts.
+    pub fn has_observed_changes(&self) -> bool {
+        let mut observation = self
+            .shared
+            .observation
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let changes = observation.drain(&self.root);
+        let changed = observation.needs_full || changes.rescan || !changes.paths.is_empty();
+        if changed {
+            observation.needs_full = true;
+        }
+        changed
+    }
+
     /// Warm planning uses observed changes plus fresh inventory and input reads.
     /// Set `force` for full content reconciliation at a verification boundary.
     pub fn refresh_observed_authorized(

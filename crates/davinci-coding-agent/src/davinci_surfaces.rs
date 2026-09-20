@@ -738,13 +738,6 @@ pub fn context_inspector_sheet_from_manifest(
     }
 }
 
-/// Read-only status projection for the Context VM inspector and RPC output.
-/// It reports the derived root and metrics without compiling, folding, or
-/// retrieving any page.
-pub fn context_vm_status(agent: &davinci_agent::Agent) -> crate::output::ContextVmStatusSummary {
-    crate::output::ContextVmStatusSummary::from_agent(agent)
-}
-
 /// Formatted report of interaction test coverage and named capability gaps.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct InteractionCoverageReport {
@@ -1887,7 +1880,7 @@ mod tests {
         let root_before = agent.runtime.as_ref().unwrap().context_vm.root();
         let metrics_before = agent.runtime.as_ref().unwrap().context_vm.metrics();
 
-        let summary = context_vm_status(&agent);
+        let summary = crate::output::ContextVmStatusSummary::from_agent(&agent);
 
         assert_eq!(summary.mode, "active");
         assert_eq!(summary.epoch, root_before.epoch);

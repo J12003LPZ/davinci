@@ -279,14 +279,14 @@ The repository is organized into distinct functional domains:
 
 ```
 pi-rust/
-├── crates/             # 13 production Rust crates (the active implementation)
+├── crates/             # 14 active Rust workspace crates
 │   └── README.md       # Crate architecture & dependency guide
 ├── docs/               # Architecture specs, plans, UI mockups & security reviews
 │   └── README.md       # Full documentation index & navigation hub
 ├── scripts/            # Build & installation scripts (pwsh, bash)
 ├── packages/           # Legacy TypeScript monorepo stubs from initial porting
 │   └── README.md       # Legacy package context
-├── vendor/             # Upstream behavioral reference source (vendor/pi)
+├── vendor/             # Pinned behavioral reference source (vendor/davinci)
 ├── Cargo.toml          # Cargo workspace root configuration
 ├── Makefile            # Standard developer commands (build, test, fmt, clippy)
 ├── CLAUDE.md           # Instructions for AI coding assistants
@@ -295,7 +295,9 @@ pi-rust/
 
 ### Workspace Crates
 
-Dependencies flow strictly bottom-up; `davinci-coding-agent` is the primary executable binary. See [`crates/README.md`](crates/README.md) for the detailed architecture.
+`davinci-coding-agent` builds the primary executable. Start with the
+[architecture guide](docs/ARCHITECTURE.md) for entry points, control flow, configuration
+and validation boundaries; [`crates/README.md`](crates/README.md) groups the workspace crates.
 
 | Crate | Role | Documentation |
 | :--- | :--- | :--- |
@@ -312,6 +314,7 @@ Dependencies flow strictly bottom-up; `davinci-coding-agent` is the primary exec
 | `davinci-telemetry` | Telemetry events, OpenTelemetry, metrics | [`crates/davinci-telemetry/README.md`](crates/davinci-telemetry/README.md) |
 | `davinci-evals` | Automated evaluation harness and benchmark runners | [`crates/davinci-evals/README.md`](crates/davinci-evals/README.md) |
 | `davinci-parity` | Golden fixtures and differential parity testing | [`crates/davinci-parity/README.md`](crates/davinci-parity/README.md) |
+| `davinci-voice` | Audio capture, speech engine and worker process | [`crates/davinci-voice/`](crates/davinci-voice/) |
 
 
 ## Development
@@ -324,7 +327,10 @@ make clippy    # cargo clippy --workspace --all-targets -- -D warnings
 cargo run -p davinci-parity                            # golden-fixture parity corpora
 ```
 
-Tests are fixture-only and never touch the network: anything that would call a provider, an installer, a browser, or an update server is driven by a `PI_*` fixture environment variable read at the call site.
+Scope test runs to affected modules and their callers. Local fixtures may start
+loopback servers or subprocesses; live provider, browser, voice and benchmark
+verification are separate checks. The exported session viewer has a Node gate:
+`node --test crates/davinci-coding-agent/export-html/template.test.cjs`.
 
 ## License
 

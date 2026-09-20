@@ -26,9 +26,12 @@ pub mod responses_ledger;
 mod retry;
 mod shell;
 mod stream;
+#[doc(hidden)]
+pub use stream::openai_responses_input;
 mod stream_decoder;
 mod stream_decoder_anthropic;
 mod stream_decoder_completions;
+mod stream_reader;
 mod thinking;
 pub mod trace;
 

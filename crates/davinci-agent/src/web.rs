@@ -1277,6 +1277,17 @@ pub fn search_parameters() -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn audit_regression_rejects_malformed_punycode_hosts() {
+        for raw in ["https://xn--example-.org/", "https://example.org.xn--/"] {
+            assert!(parse_url(raw).is_err(), "accepted malformed host: {raw}");
+        }
+        assert_eq!(
+            parse_url("https://bücher.example/").unwrap().host_str(),
+            Some("xn--bcher-kva.example")
+        );
+    }
     use std::sync::{Mutex, MutexGuard};
 
     static ENV: Mutex<()> = Mutex::new(());

@@ -32,6 +32,7 @@ pub struct BuildIntelligence {
     cache: CacheRuntime,
     config: BuildIntelligenceConfig,
     telemetry: Arc<Mutex<BuildTelemetry>>,
+    snapshots: Option<super::engineering_snapshot::EngineeringSnapshots>,
 }
 
 impl Default for BuildIntelligence {
@@ -47,7 +48,16 @@ impl BuildIntelligence {
             cache,
             config,
             telemetry: Arc::new(Mutex::new(BuildTelemetry::default())),
+            snapshots: None,
         }
+    }
+
+    pub fn with_snapshots(
+        mut self,
+        snapshots: super::engineering_snapshot::EngineeringSnapshots,
+    ) -> Self {
+        self.snapshots = Some(snapshots);
+        self
     }
 
     pub fn with_root(root: &Path, cache: CacheRuntime) -> Self {
@@ -359,9 +369,22 @@ impl BuildIntelligence {
 
     fn compute_cache_key(&self, tool: &str, args: &Value) -> Option<CacheKey> {
         let mut deps = Vec::new();
-        let manifest = self.root.join("package.json");
-        if let Ok(bytes) = fs::read(&manifest) {
-            deps.push(CacheDependency::PackageManifestHash(digest(&bytes)));
+        let snapshot = self
+            .snapshots
+            .as_ref()
+            .and_then(|facts| facts.peek_current(&self.root));
+        let content_hash = |path: &str| {
+            snapshot
+                .as_ref()
+                .and_then(|facts| facts.metadata.hashes.get(path).cloned())
+                .or_else(|| {
+                    fs::read(self.root.join(path))
+                        .ok()
+                        .map(|bytes| digest(&bytes))
+                })
+        };
+        if let Some(hash) = content_hash("package.json") {
+            deps.push(CacheDependency::PackageManifestHash(hash));
         }
         for cfg in [
             "pnpm-lock.yaml",
@@ -369,9 +392,8 @@ impl BuildIntelligence {
             "yarn.lock",
             "bun.lockb",
         ] {
-            let p = self.root.join(cfg);
-            if let Ok(bytes) = fs::read(&p) {
-                deps.push(CacheDependency::LockfileHash(digest(&bytes)));
+            if let Some(hash) = content_hash(cfg) {
+                deps.push(CacheDependency::LockfileHash(hash));
                 break;
             }
         }
@@ -381,9 +403,8 @@ impl BuildIntelligence {
             "pnpm-workspace.yaml",
             "tsconfig.json",
         ] {
-            let p = self.root.join(cfg);
-            if let Ok(bytes) = fs::read(&p) {
-                deps.push(CacheDependency::ConfigHash(digest(&bytes)));
+            if let Some(hash) = content_hash(cfg) {
+                deps.push(CacheDependency::ConfigHash(hash));
             }
         }
 

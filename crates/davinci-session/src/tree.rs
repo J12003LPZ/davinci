@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::Path;
 
@@ -73,7 +73,11 @@ pub fn build_session_path<'a>(
     }
     let mut path = Vec::new();
     let mut current = Some(leaf);
+    let mut seen = HashSet::new();
     while let Some(entry) = current {
+        if !seen.insert(entry.id.as_str()) {
+            break;
+        }
         path.push(entry);
         current = entry
             .parent_id
@@ -129,7 +133,11 @@ pub fn branch_entries<'a>(
     }
     let mut path = Vec::new();
     let mut current = leaf_id.and_then(|id| by_id.get(id).copied());
+    let mut seen = HashSet::new();
     while let Some(entry) = current {
+        if !seen.insert(entry.id.as_str()) {
+            break;
+        }
         path.push(entry);
         current = entry
             .parent_id
@@ -366,4 +374,84 @@ pub fn export_session_jsonl(session: &JsonlSession, output: &Path) -> Result<Str
     fs::write(output, format!("{}\n", lines.join("\n")))
         .map_err(|err| SessionError::storage(format!("Unable to write JSONL export: {err}")))?;
     Ok(output.display().to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn entry(id: &str, parent: Option<&str>) -> SessionEntry {
+        SessionEntry {
+            id: id.into(),
+            parent_id: parent.map(str::to_string),
+            ..SessionEntry::message("user", json!("test"))
+        }
+    }
+
+    #[test]
+    fn audit_regression_cyclic_parent_walks_terminate() {
+        // Run potentially cyclic walks in a child so a regression fails within
+        // a bounded time rather than hanging the entire session test suite.
+        const CHILD: &str = "DAVINCI_CYCLE_TEST_CHILD";
+        if std::env::var_os(CHILD).is_some() {
+            for entries in [
+                vec![entry("a", Some("a"))],
+                vec![
+                    entry("a", Some("b")),
+                    entry("b", Some("a")),
+                    entry("c", Some("b")),
+                ],
+            ] {
+                let leaf = &entries.last().unwrap().id;
+                for path in [
+                    build_session_path(&entries, Some(leaf)),
+                    branch_entries(&entries, Some(leaf)),
+                ] {
+                    assert_eq!(path.len(), entries.len());
+                    assert_eq!(path.last().unwrap().id, *leaf);
+                }
+            }
+            return;
+        }
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "tree::tests::audit_regression_cyclic_parent_walks_terminate",
+            ])
+            .env(CHILD, "1")
+            .stdout(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            if let Some(status) = child.try_wait().unwrap() {
+                assert!(status.success(), "cyclic parent walk failed");
+                break;
+            }
+            if std::time::Instant::now() >= deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("cyclic parent walk did not terminate");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+
+    #[test]
+    fn deep_paths_keep_order_and_missing_leaf_semantics() {
+        let entries = (0usize..20_000)
+            .map(|index| {
+                entry(
+                    &index.to_string(),
+                    index.checked_sub(1).map(|i| i.to_string()).as_deref(),
+                )
+            })
+            .collect::<Vec<_>>();
+        let path = build_session_path(&entries, Some("missing"));
+        assert_eq!(path.len(), entries.len());
+        assert_eq!(path.first().unwrap().id, "0");
+        assert_eq!(path.last().unwrap().id, "19999");
+        assert!(branch_entries(&entries, Some("missing")).is_empty());
+        assert!(branch_entries(&entries, None).is_empty());
+    }
 }

@@ -5,17 +5,23 @@ mod metrics;
 mod reducer;
 mod retrieval;
 mod shadow;
+mod sources;
 mod store;
 mod types;
+
+pub(crate) const CONTEXT_BUDGET_EXCEEDED: &str =
+    "mandatory context exceeds the compilation token budget";
 
 pub use compiler::{ContextCompileRequest, ContextCompiler};
 pub use events::{
     events_from_messages, events_from_session_branch, ContextEvent, ContextEventKind,
 };
+pub(crate) use fold::fold_request;
 pub use fold::{ContextFoldDecision, ContextFoldPolicy, FoldReason};
 pub use metrics::ContextVmMetrics;
 pub use reducer::{
     parse_checkpoint_proposal, CheckpointProposal, ContextStateReducer, ProposedStateValue,
+    RetiredState, StateSlot, StateTransition, TransitionKind,
 };
 pub use retrieval::{retrieve_context_tool, RetrieveContextRequest, RetrieveContextResult};
 pub use shadow::{compare_shadow_views, ShadowComparison};
@@ -51,6 +57,7 @@ pub struct ContextVmRuntime {
     pub(crate) state: Arc<RwLock<ContextVmState>>,
     pub(crate) events: Arc<RwLock<Vec<ContextEvent>>>,
     pub(crate) source_contents: Arc<RwLock<HashMap<String, String>>>,
+    session_source: Arc<RwLock<Option<sources::SessionSource>>>,
     metrics: Arc<RwLock<ContextVmMetrics>>,
 }
 
@@ -65,13 +72,15 @@ impl std::fmt::Debug for ContextVmRuntime {
 
 impl ContextVmRuntime {
     pub fn new(config: ContextVmConfig, cache: CacheRuntime) -> Self {
+        let metrics = Arc::new(RwLock::new(ContextVmMetrics::default()));
         Self {
             config,
-            store: ContextObjectStore::new(cache),
+            store: ContextObjectStore::with_metrics(cache, metrics.clone()),
             state: Arc::new(RwLock::new(ContextVmState::default())),
             events: Arc::new(RwLock::new(Vec::new())),
             source_contents: Arc::new(RwLock::new(HashMap::new())),
-            metrics: Arc::new(RwLock::new(ContextVmMetrics::default())),
+            session_source: Arc::new(RwLock::new(None)),
+            metrics,
         }
     }
 
@@ -138,6 +147,22 @@ impl ContextVmRuntime {
     }
 
     pub fn rebuild_from_events(&self, events: &[ContextEvent]) -> Result<ContextRoot, String> {
+        self.bump_metrics(|metrics| {
+            metrics.rebuild_attempts = metrics.rebuild_attempts.saturating_add(1)
+        });
+        let result = self.rebuild_inner(events);
+        self.bump_metrics(|metrics| {
+            if result.is_ok() {
+                metrics.rebuilds = metrics.rebuilds.saturating_add(1);
+                metrics.rebuild_successes = metrics.rebuild_successes.saturating_add(1);
+            } else {
+                metrics.rebuild_failures = metrics.rebuild_failures.saturating_add(1);
+            }
+        });
+        result
+    }
+
+    fn rebuild_inner(&self, events: &[ContextEvent]) -> Result<ContextRoot, String> {
         self.record_events(events);
         let parent = CheckpointState::default();
         let delta = ContextStateReducer::deterministic_delta(&parent, events);
@@ -155,10 +180,10 @@ impl ContextVmRuntime {
             episodes: Vec::new(),
             hot_event_refs: self.hot_refs(events),
             evidence_refs: evidence_refs(events),
+            updates_since_fold: 0,
         };
         let last_source_seq = events.iter().map(|event| event.seq).max().unwrap_or(0);
         self.install_root(root.clone(), last_source_seq);
-        self.bump_metrics(|metrics| metrics.rebuilds = metrics.rebuilds.saturating_add(1));
         Ok(root)
     }
 
@@ -168,28 +193,31 @@ impl ContextVmRuntime {
         broker_packet: &ContextPacket,
         max_tokens: u64,
     ) -> Result<ContextImage, String> {
-        self.record_events(events);
+        let diverged = self.record_events(events);
+        let current = self.root();
+        if diverged
+            || current.checkpoint.is_none()
+            || current
+                .hot_event_refs
+                .iter()
+                .any(|source| !events.iter().any(|event| &event.source_ref == source))
+            || current
+                .checkpoint
+                .iter()
+                .chain(&current.deltas)
+                .chain(&current.episodes)
+                .any(|page| self.store.load(page).is_err())
+        {
+            self.rebuild_from_events(events)?;
+        }
         {
             let mut contents = self
                 .source_contents
                 .write()
-                .unwrap_or_else(|error| error.into_inner());
+                .unwrap_or_else(|e| e.into_inner());
             for item in &broker_packet.items {
                 contents.insert(item.source.clone(), item.content.clone());
             }
-        }
-        let current = self.root();
-        if current.checkpoint.is_none() {
-            self.rebuild_from_events(events)?;
-        } else if current
-            .checkpoint
-            .iter()
-            .chain(&current.deltas)
-            .chain(&current.episodes)
-            .any(|page| self.store.load(page).is_err())
-        {
-            self.rebuild_from_events(events)?;
-            self.note_page_fault(true);
         }
         let mut root = self.root();
         root.hot_event_refs = self.hot_refs(events);
@@ -229,15 +257,14 @@ impl ContextVmRuntime {
     }
 
     pub fn append_delta(&self, events: &[ContextEvent]) -> Result<ContextRoot, String> {
-        self.record_events(events);
-        if self.root().checkpoint.is_none() {
+        let diverged = self.record_events(events);
+        if diverged || self.root().checkpoint.is_none() {
             self.rebuild_from_events(events)?;
         }
         let parent = match self.load_state_from_root() {
             Ok(state) => state,
             Err(_) => {
                 self.rebuild_from_events(events)?;
-                self.note_page_fault(true);
                 self.load_state_from_root()?
             }
         };
@@ -261,10 +288,12 @@ impl ContextVmRuntime {
         }
         let page = self
             .store
-            .save(&ContextObject::Delta(delta.clone()))
+            .save(&ContextObject::Checkpoint(delta.checkpoint_patch.clone()))
             .map_err(|error| error.to_string())?;
         let mut root = self.root();
-        root.deltas.push(page);
+        root.checkpoint = Some(page);
+        root.deltas.clear();
+        root.updates_since_fold = root.updates_since_fold.saturating_add(1);
         root.hot_event_refs = self.hot_refs(events);
         root.evidence_refs = evidence_refs(events);
         self.install_root(root.clone(), delta.through_seq);
@@ -272,15 +301,23 @@ impl ContextVmRuntime {
     }
 
     pub fn fold(&self, reason: FoldReason, events: &[ContextEvent]) -> Result<ContextRoot, String> {
-        self.record_events(events);
-        if self.root().checkpoint.is_none() {
+        self.fold_with_proposal(reason, events, None)
+    }
+
+    pub fn fold_with_proposal(
+        &self,
+        reason: FoldReason,
+        events: &[ContextEvent],
+        proposal: Option<CheckpointProposal>,
+    ) -> Result<ContextRoot, String> {
+        let diverged = self.record_events(events);
+        if diverged || self.root().checkpoint.is_none() {
             self.rebuild_from_events(events)?;
         }
         let before = match self.load_state_from_root() {
             Ok(state) => state,
             Err(_) => {
                 self.rebuild_from_events(events)?;
-                self.note_page_fault(true);
                 self.load_state_from_root()?
             }
         };
@@ -289,7 +326,11 @@ impl ContextVmRuntime {
             .filter(|event| event.seq > before.through_seq)
             .cloned()
             .collect::<Vec<_>>();
-        let state = ContextStateReducer::deterministic_delta(&before, &new_events).checkpoint_patch;
+        let fallback =
+            ContextStateReducer::deterministic_delta(&before, &new_events).checkpoint_patch;
+        let state = proposal
+            .map(|p| ContextStateReducer::validate_proposal(&fallback, events, p))
+            .unwrap_or(fallback);
         let checkpoint = self
             .store
             .save(&ContextObject::Checkpoint(state.clone()))
@@ -338,6 +379,7 @@ impl ContextVmRuntime {
             episodes,
             hot_event_refs: self.hot_refs(events),
             evidence_refs: evidence_refs(events),
+            updates_since_fold: 0,
         };
         let before_tokens = estimate_state_tokens(&before);
         let after_tokens = estimate_state_tokens(&state);
@@ -367,10 +409,13 @@ impl ContextVmRuntime {
 
     pub(crate) fn note_page_fault(&self, hit: bool) {
         self.bump_metrics(|metrics| {
+            metrics.semantic_page_faults = metrics.semantic_page_faults.saturating_add(1);
             metrics.page_faults = metrics.page_faults.saturating_add(1);
             if hit {
+                metrics.retrieval_hits = metrics.retrieval_hits.saturating_add(1);
                 metrics.page_fault_hits = metrics.page_fault_hits.saturating_add(1);
             } else {
+                metrics.retrieval_misses = metrics.retrieval_misses.saturating_add(1);
                 metrics.page_fault_misses = metrics.page_fault_misses.saturating_add(1);
             }
         });
@@ -417,7 +462,7 @@ impl ContextVmRuntime {
         ContextCompiler::new(self.store.clone()).manifest_entries(image)
     }
 
-    fn load_state_from_root(&self) -> Result<CheckpointState, String> {
+    pub fn load_state_from_root(&self) -> Result<CheckpointState, String> {
         let root = self.root();
         let Some(checkpoint) = root.checkpoint else {
             return Ok(CheckpointState::default());
@@ -441,18 +486,44 @@ impl ContextVmRuntime {
         Ok(state)
     }
 
-    fn record_events(&self, events: &[ContextEvent]) {
-        *self
-            .events
-            .write()
-            .unwrap_or_else(|error| error.into_inner()) = events.to_vec();
+    fn record_events(&self, events: &[ContextEvent]) -> bool {
+        let mut old = self.events.write().unwrap_or_else(|e| e.into_inner());
+        let diverged = !old.is_empty()
+            && (events.len() < old.len()
+                || old.iter().zip(events).any(|(a, b)| {
+                    a.source_ref != b.source_ref
+                        || a.content_hash != b.content_hash
+                        || a.seq != b.seq
+                }));
+        *old = events
+            .iter()
+            .map(|event| ContextEvent {
+                seq: event.seq,
+                source_ref: event.source_ref.clone(),
+                content_hash: event.content_hash.clone(),
+                kind: event.kind,
+                provenance_kind: event.provenance_kind,
+                visible_text: String::new(),
+                artifact_refs: event.artifact_refs.clone(),
+            })
+            .collect();
+        drop(old);
         let mut contents = self
             .source_contents
             .write()
             .unwrap_or_else(|error| error.into_inner());
+        let disk_backed = self
+            .session_source
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_some();
+        contents.clear();
         for event in events {
-            contents.insert(event.source_ref.clone(), event.visible_text.clone());
+            if !disk_backed || !event.source_ref.starts_with("session:") {
+                contents.insert(event.source_ref.clone(), event.visible_text.clone());
+            }
         }
+        diverged
     }
 
     fn hot_refs(&self, events: &[ContextEvent]) -> Vec<String> {

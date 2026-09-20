@@ -4,11 +4,14 @@ mod commands;
 mod tools;
 pub use tools::{tool_spec, TOOL_NAMES};
 
-use super::{repo_intelligence::RepoIntelligence, workspace_metadata::WorkspaceMetadata};
+use super::{
+    engineering_snapshot::{EngineeringSnapshot, EngineeringSnapshots},
+    repo_intelligence::RepoIntelligence,
+};
 use analysis::TestMapping;
 use davinci_agent::{
     runtime::cache::{
-        digest, CacheDependency, CacheError, CacheKey, CacheNamespace, CachePolicy, CacheRequest,
+        CacheDependency, CacheError, CacheKey, CacheNamespace, CachePolicy, CacheRequest,
         CacheRuntime,
     },
     PermissionMode, PermissionPolicy, PermissionState, PermissionVerdict, ToolError, ToolResult,
@@ -58,6 +61,7 @@ fn default_limit() -> usize {
 pub struct TestImpact {
     root: PathBuf,
     repo: RepoIntelligence,
+    snapshots: Option<EngineeringSnapshots>,
     cache: CacheRuntime,
     config: TestImpactConfig,
     permissions: Arc<RwLock<Arc<PermissionState>>>,
@@ -93,6 +97,7 @@ impl TestImpact {
         Self {
             root: root.to_path_buf(),
             repo,
+            snapshots: None,
             cache,
             config,
             permissions: Arc::new(RwLock::new(Arc::new(PermissionState::new(
@@ -102,6 +107,33 @@ impl TestImpact {
             telemetry: Default::default(),
         }
     }
+    pub fn with_snapshots(mut self, snapshots: EngineeringSnapshots) -> Self {
+        self.snapshots = Some(snapshots);
+        self
+    }
+
+    pub(crate) fn workspace_facts(
+        &self,
+        changed: &[String],
+        force: bool,
+    ) -> Result<Arc<EngineeringSnapshot>, String> {
+        self.workspace_facts_with_usage(changed, force)
+            .map(|(snapshot, _)| snapshot)
+    }
+
+    fn workspace_facts_with_usage(
+        &self,
+        changed: &[String],
+        force: bool,
+    ) -> Result<(Arc<EngineeringSnapshot>, bool), String> {
+        let temporary = EngineeringSnapshots::default();
+        let snapshots = self.snapshots.as_ref().unwrap_or(&temporary);
+        snapshots.get_with_usage(&self.root, &self.repo, changed, force, &|path| {
+            self.authorize("read", &json!({"path":path}), &[])
+                .map_err(|e| e.to_string())
+        })
+    }
+
     pub fn set_permissions(&self, permissions: Arc<PermissionState>) {
         *self.permissions.write().unwrap_or_else(|e| e.into_inner()) = permissions;
     }
@@ -110,7 +142,7 @@ impl TestImpact {
     }
     pub fn status(&self) -> Value {
         json!({"enabled":self.config.enabled,"languages":["typescript","javascript"],"cache_namespace":"test",
-            "repository":self.repo.status(),"telemetry":*self.telemetry.lock().unwrap_or_else(|e| e.into_inner())})
+            "repository":self.repo.status(),"engineering_snapshot":self.snapshots.as_ref().map(EngineeringSnapshots::status),"telemetry":*self.telemetry.lock().unwrap_or_else(|e| e.into_inner())})
     }
     fn authorize(&self, name: &str, args: &Value, paths: &[String]) -> Result<(), CacheError> {
         if self
@@ -218,15 +250,12 @@ impl TestImpact {
             .collect::<Result<_, _>>()?;
         self.authorize(name, args, &changed.iter().cloned().collect::<Vec<_>>())
             .map_err(|e| e.to_string())?;
-        let authorize_path = |path: &str| {
-            self.authorize("read", &json!({"path":path}), &[])
-                .map_err(|e| e.to_string())
-        };
-        let index = self.repo.refresh_observed_authorized(
+        let (snapshot, snapshot_hit) = self.workspace_facts_with_usage(
             &changed.iter().cloned().collect::<Vec<_>>(),
             request.refresh,
-            &authorize_path,
         )?;
+        let index = &snapshot.index;
+        let metadata = &snapshot.metadata;
         for id in request.symbol_ids {
             let symbol = index
                 .files
@@ -243,21 +272,7 @@ impl TestImpact {
             .chain(index.metadata.iter())
             .cloned()
             .collect();
-        let metadata = WorkspaceMetadata::discover(&self.repo, &index, &authorize_path)?;
-        let identity = digest(
-            &serde_json::to_vec(&(
-                &index.root,
-                &index.parser_version,
-                &index.config_identity,
-                index
-                    .files
-                    .iter()
-                    .map(|(path, file)| (path, &file.content_hash))
-                    .collect::<Vec<_>>(),
-                &metadata.hashes,
-            ))
-            .map_err(|e| e.to_string())?,
-        );
+        let identity = snapshot.identity.clone();
         let cache_request = CacheRequest::new(
             CacheKey::new(
                 CacheNamespace::Test,
@@ -281,11 +296,11 @@ impl TestImpact {
                     &cache_request,
                     || self.authorize(name, args, &[]),
                     None,
-                    || Ok(TestMapping::from_index(&index)),
+                    || Ok(TestMapping::from_index(index)),
                 )
                 .map_err(|e| e.to_string())?,
         };
-        let (mut rows, mut warnings) = mapping.select(&changed, &metadata);
+        let (mut rows, mut warnings) = mapping.select(&changed, metadata);
         for path in &changed {
             if !index.files.contains_key(path) && !index.metadata.contains(path) {
                 warnings.push(format!("changed source absent from current index: {path}; broader verification required"));
@@ -293,11 +308,11 @@ impl TestImpact {
         }
         let (first, broader, command_warnings) = commands::plans(
             &rows,
-            &metadata,
+            metadata,
             &changed,
             !warnings.is_empty() || !metadata.warnings.is_empty(),
         );
-        warnings.extend(metadata.warnings);
+        warnings.extend(metadata.warnings.iter().cloned());
         warnings.extend(command_warnings);
         let total = rows.len();
         rows.truncate(request.limit);
@@ -326,8 +341,8 @@ impl TestImpact {
             "truncated":remaining>0,"partial":!warnings.is_empty(),"warnings":warnings,
             "changed":changed,"first_tier":first,"broader_verification":broader,
             "source_identity":identity,"history":"not available",
-            "freshness":{"mode":index.refresh_mode,"full_refresh_required_before_completion":true},
-            "telemetry":{"mapping_cache_hit":cache_hit,"source_bytes_read":index.bytes_read,"source_files_read":index.files_read,"metadata_bytes_read":metadata.bytes_read,"reparsed":index.reparsed,"refresh_mode":index.refresh_mode,
+            "freshness":{"mode":if snapshot_hit { "shared_snapshot" } else { &index.refresh_mode },"full_refresh_required_before_completion":true},
+            "telemetry":{"mapping_cache_hit":cache_hit,"snapshot_hit":snapshot_hit,"source_bytes_read":if snapshot_hit { 0 } else { index.bytes_read },"source_files_read":if snapshot_hit { 0 } else { index.files_read },"metadata_bytes_read":if snapshot_hit { 0 } else { metadata.bytes_read },"reparsed":if snapshot_hit { 0 } else { index.reparsed },"refresh_mode":if snapshot_hit { "shared_snapshot" } else { &index.refresh_mode },
                 "tests_selected":total,"indexed_tests_not_selected":mapping.tests.len().saturating_sub(total)}
         }))
     }

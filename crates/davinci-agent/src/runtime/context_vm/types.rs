@@ -71,6 +71,7 @@ pub struct StateValue<T> {
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct CheckpointState {
     pub through_seq: u64,
     pub goals: Vec<StateValue<String>>,
@@ -82,6 +83,8 @@ pub struct CheckpointState {
     pub modified_files: Vec<StateValue<String>>,
     pub verification: Vec<StateValue<String>>,
     pub narrative: Option<StateValue<String>>,
+    /// Bounded recent lifecycle evidence. Full historical pages remain pageable.
+    pub retired: Vec<super::reducer::RetiredState>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -107,6 +110,8 @@ pub struct ContextRoot {
     pub episodes: Vec<ContextPageRef>,
     pub hot_event_refs: Vec<String>,
     pub evidence_refs: Vec<String>,
+    #[serde(default)]
+    pub updates_since_fold: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

@@ -5,6 +5,7 @@ pub mod build_intelligence;
 pub mod change_impact;
 pub mod content_router;
 pub mod ecosystem;
+pub mod engineering_snapshot;
 pub mod git_intelligence;
 pub mod graph;
 pub mod language_intelligence;
@@ -46,6 +47,8 @@ use std::sync::Arc;
 /// Shared adapter for Context VM artifact retrieval. Keeping this at the
 /// native-extension boundary lets callers use the governor's existing
 /// retrieve_output store rather than duplicating tool-result bytes.
+// Public library API; this module is also compiled privately into the binary.
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn retrieve_context_artifact(
     governor: &mut TokenGovernor,
     uri: &str,
@@ -312,6 +315,7 @@ pub fn graph_worker_context() -> Option<GraphWorkerContext> {
 pub struct NativeExtensionHost {
     pub browser: browser::BrowserController,
     pub test_impact: test_impact::TestImpact,
+    pub engineering: engineering_snapshot::EngineeringSnapshots,
     pub package_intelligence: package_intelligence::PackageIntelligence,
     pub build_intelligence: build_intelligence::BuildIntelligence,
     pub git_intelligence: git_intelligence::GitIntelligence,
@@ -376,6 +380,7 @@ impl NativeExtensionHost {
             .unwrap_or_default();
         let repo_intelligence =
             repo_intelligence::RepoIntelligence::new(cwd, &repo_agent_dir, repo_config);
+        let engineering = engineering_snapshot::EngineeringSnapshots::default();
         let test_impact = test_impact::TestImpact::new(
             cwd,
             repo_intelligence.clone(),
@@ -383,7 +388,8 @@ impl NativeExtensionHost {
             crate::settings::load_merged_settings(&repo_agent_dir, cwd)
                 .test_impact
                 .unwrap_or_default(),
-        );
+        )
+        .with_snapshots(engineering.clone());
         let package_config = crate::settings::load_merged_settings(&repo_agent_dir, cwd)
             .package_intelligence
             .unwrap_or_default();
@@ -393,7 +399,8 @@ impl NativeExtensionHost {
             .build_intelligence
             .unwrap_or_default();
         let build_intelligence =
-            build_intelligence::BuildIntelligence::new(cwd, cache.clone(), build_config);
+            build_intelligence::BuildIntelligence::new(cwd, cache.clone(), build_config)
+                .with_snapshots(engineering.clone());
         let git_config = crate::settings::load_merged_settings(&repo_agent_dir, cwd)
             .git_intelligence
             .unwrap_or_default();
@@ -428,7 +435,8 @@ impl NativeExtensionHost {
                 .verification_planner
                 .unwrap_or_default();
         let verification_planner =
-            verification_planner::VerificationPlanner::new(cwd, verification_planner_config);
+            verification_planner::VerificationPlanner::new(cwd, verification_planner_config)
+                .with_snapshots(engineering.clone());
         let workspace_snapshot_config = crate::settings::load_merged_settings(&repo_agent_dir, cwd)
             .workspace_snapshots
             .unwrap_or_default();
@@ -454,6 +462,7 @@ impl NativeExtensionHost {
                     .unwrap_or_default(),
             ),
             test_impact,
+            engineering,
             package_intelligence,
             build_intelligence,
             git_intelligence,
@@ -528,6 +537,16 @@ impl NativeExtensionHost {
     }
 
     pub fn after_tool(&mut self, name: &str, args: &Value, result: ToolResult) -> ToolResult {
+        if !matches!(name, "read" | "grep" | "find" | "ls")
+            && !test_impact::TOOL_NAMES.contains(&name)
+            && !package_intelligence::TOOL_NAMES.contains(&name)
+            && !build_intelligence::TOOL_NAMES.contains(&name)
+            && !git_intelligence::TOOL_NAMES.contains(&name)
+            && !change_impact::TOOL_NAMES.contains(&name)
+            && !verification_planner::TOOL_NAMES.contains(&name)
+        {
+            self.engineering.invalidate();
+        }
         self.governor.after_tool(name, args, result)
     }
 

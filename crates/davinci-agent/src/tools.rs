@@ -2254,6 +2254,19 @@ struct RgStream {
     aborted: bool,
 }
 
+fn is_secret_search_path(path: &Path) -> bool {
+    crate::permission::is_secret_file_path(&path.to_string_lossy())
+        || path.canonicalize().is_ok_and(|resolved| {
+            crate::permission::is_secret_file_path(&resolved.to_string_lossy())
+        })
+}
+
+/// Recursive permission applies to the search root, not every descendant.
+/// Secret files require an explicit path that the permission gate can approve.
+fn excludes_secret_descendants(search_path: &Path) -> bool {
+    search_path.is_dir() && !is_secret_search_path(search_path)
+}
+
 /// Read ripgrep's `--json` output as it arrives (grep.ts reads it line by
 /// line through `readline` for the same reason): the read stops the moment
 /// `limit` matches have been collected or the turn is aborted, so the
@@ -2268,10 +2281,11 @@ fn stream_rg_matches<R: std::io::Read + Send + 'static>(
     pipe: R,
     limit: usize,
     context: &ToolContext,
+    exclude_secrets: bool,
 ) -> RgStream {
     use std::io::BufRead;
     use std::sync::mpsc::{self, RecvTimeoutError};
-    let (sender, receiver) = mpsc::channel::<String>();
+    let (sender, receiver) = mpsc::sync_channel::<String>(64);
     std::thread::spawn(move || {
         for line in std::io::BufReader::new(pipe).lines() {
             let Ok(line) = line else {
@@ -2288,9 +2302,16 @@ fn stream_rg_matches<R: std::io::Read + Send + 'static>(
         aborted: false,
     };
     loop {
+        if context.is_aborted() {
+            stream.aborted = true;
+            break;
+        }
         match receiver.recv_timeout(std::time::Duration::from_millis(10)) {
             Ok(line) => {
                 if let Some(found) = parse_rg_match(&line) {
+                    if exclude_secrets && is_secret_search_path(&found.0) {
+                        continue;
+                    }
                     stream.matches.push(found);
                     if stream.matches.len() >= limit {
                         stream.limit_reached = true;
@@ -2298,12 +2319,7 @@ fn stream_rg_matches<R: std::io::Read + Send + 'static>(
                     }
                 }
             }
-            Err(RecvTimeoutError::Timeout) => {
-                if context.is_aborted() {
-                    stream.aborted = true;
-                    break;
-                }
-            }
+            Err(RecvTimeoutError::Timeout) => {}
             Err(RecvTimeoutError::Disconnected) => break,
         }
     }
@@ -2317,6 +2333,7 @@ fn run_rg_streaming(
     args: &[String],
     limit: usize,
     context: &ToolContext,
+    exclude_secrets: bool,
 ) -> Result<Option<(Vec<RgMatch>, bool)>, ToolError> {
     use std::io::Read;
     use std::process::Stdio;
@@ -2347,7 +2364,7 @@ fn run_rg_streaming(
         })
     });
     let stream = match child.stdout.take() {
-        Some(pipe) => stream_rg_matches(pipe, limit, context),
+        Some(pipe) => stream_rg_matches(pipe, limit, context, exclude_secrets),
         None => RgStream {
             matches: Vec::new(),
             limit_reached: false,
@@ -2414,7 +2431,12 @@ fn grep_tool(
         .unwrap_or(GREP_DEFAULT_LIMIT)
         .max(1);
     let args = build_rg_args(pattern, &search_path, glob, ignore_case, literal);
-    let Some((raw_matches, match_limit_reached)) = run_rg_streaming(&args, limit, tool_context)?
+    let Some((raw_matches, match_limit_reached)) = run_rg_streaming(
+        &args,
+        limit,
+        tool_context,
+        excludes_secret_descendants(&search_path),
+    )?
     else {
         return grep_tool_native(cwd, input, tool_context);
     };
@@ -2642,11 +2664,14 @@ fn grep_tool_native(
     // Walk first, scan after: the walk is cheap directory metadata, the
     // scan is the file reads, and only the scan is worth spreading out.
     let mut files: Vec<PathBuf> = Vec::new();
+    let exclude_secrets = excludes_secret_descendants(&search_path);
     walk_files(
         &search_path,
         &IgnoreRules::load(&search_path),
         &mut |file| {
-            if glob.is_none_or(|glob| path_glob_match(glob, file, &search_path)) {
+            if glob.is_none_or(|glob| path_glob_match(glob, file, &search_path))
+                && !(exclude_secrets && is_secret_search_path(file))
+            {
                 files.push(file.to_path_buf());
             }
             // A large tree is abandoned at the next file once the turn is
@@ -3993,6 +4018,50 @@ mod tests {
         assert!(not_dir.to_string().starts_with("Not a directory:"));
     }
 
+    #[test]
+    fn audit_regression_recursive_grep_omits_credentials() {
+        let dir = tempdir().unwrap();
+        fs::create_dir_all(dir.path().join("nested/secrets")).unwrap();
+        for name in [
+            ".env",
+            ".env.local",
+            "ID_RSA_backup",
+            "key.pem",
+            "nested/secrets/token.txt",
+        ] {
+            fs::write(dir.path().join(name), "needle PRIVATE_FIXTURE\n").unwrap();
+        }
+        fs::write(dir.path().join("public.txt"), "needle PUBLIC_FIXTURE\n").unwrap();
+        for native in [false, true] {
+            for glob in ["**/*", ".env", "**/.env*", "[.]env", "*.pem"] {
+                let input =
+                    serde_json::json!({"pattern":"needle", "path":".", "glob":glob, "context":1});
+                let result = if native {
+                    grep_tool_native(dir.path(), &input, &ToolContext::default())
+                } else {
+                    grep_tool(dir.path(), &input, &ToolContext::default())
+                }
+                .unwrap();
+                assert!(
+                    !result.content.contains("PRIVATE_FIXTURE"),
+                    "credential exposed for glob {glob}, native={native}"
+                );
+                if glob == "**/*" {
+                    assert!(result.content.contains("PUBLIC_FIXTURE"));
+                }
+            }
+            // The caller's permission gate still authorizes an explicit secret path.
+            let input = serde_json::json!({"pattern":"needle", "path":".env"});
+            let explicit = if native {
+                grep_tool_native(dir.path(), &input, &ToolContext::default())
+            } else {
+                grep_tool(dir.path(), &input, &ToolContext::default())
+            }
+            .unwrap();
+            assert!(explicit.content.contains("PRIVATE_FIXTURE"));
+        }
+    }
+
     /// A ripgrep stdout that never ends: one match event per read, forever.
     struct EndlessRg(usize);
 
@@ -4027,7 +4096,7 @@ mod tests {
 
     #[test]
     fn grep_stops_reading_ripgrep_at_the_match_limit() {
-        let stream = stream_rg_matches(EndlessRg(0), 5, &ToolContext::default());
+        let stream = stream_rg_matches(EndlessRg(0), 5, &ToolContext::default(), false);
         assert_eq!(stream.matches.len(), 5);
         assert!(stream.limit_reached);
         assert!(!stream.aborted);
@@ -4058,6 +4127,7 @@ mod tests {
             },
             5,
             &context,
+            false,
         );
         assert!(stream.aborted);
         assert!(stream.matches.is_empty());
