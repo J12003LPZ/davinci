@@ -29,7 +29,9 @@ pub enum TypeSafeAuthError {
 pub enum CredentialValidationError {
     #[error("TypeSafe credential is empty")]
     Empty,
-    #[error("TypeSafe rejected the credential")]
+    #[error(
+        "TypeSafe rejected the credential; use an active direct TypeSafe API key from console.typesafe.ai"
+    )]
     Invalid,
     #[error("TypeSafe rejected the validation request schema")]
     SchemaMismatch,
@@ -49,16 +51,18 @@ pub struct TypeSafeProvider {
 
 impl TypeSafeProvider {
     pub fn new(api_key: impl Into<String>) -> Self {
+        let raw = Zeroizing::new(api_key.into());
+        let api_key = normalize_api_key(raw.as_str())
+            .unwrap_or_default()
+            .to_owned();
         Self {
-            api_key: Zeroizing::new(api_key.into()),
+            api_key: Zeroizing::new(api_key),
             http: super::typesafe_http::TypeSafeHttp::new(TYPESAFE_URL),
         }
     }
 
     pub fn validate_api_key(api_key: &str) -> Result<(), CredentialValidationError> {
-        if api_key.trim().is_empty() {
-            return Err(CredentialValidationError::Empty);
-        }
+        let api_key = normalize_api_key(api_key).ok_or(CredentialValidationError::Empty)?;
         let body = serde_json::json!({
             "state": {
                 "probe": "davinci_typesafe_credential_validation",
@@ -161,12 +165,36 @@ impl<'a> ProviderPayload<'a> {
     }
 }
 
+/// Normalize text copied from a credential field or an Authorization header.
+///
+/// TypeSafe expects the raw key in its Bearer header. Accepting the common
+/// copied forms here prevents DaVinci from accidentally sending surrounding
+/// whitespace or a duplicated `Bearer` scheme as part of the key.
+pub fn normalize_api_key(api_key: &str) -> Option<&str> {
+    let trimmed = api_key.trim();
+    let credential = match (trimmed.get(..14), trimmed.get(14..)) {
+        (Some(header), Some(rest)) if header.eq_ignore_ascii_case("authorization:") => rest.trim(),
+        _ => trimmed,
+    };
+    let normalized = match (credential.get(..6), credential.get(6..)) {
+        (Some(scheme), Some(rest)) if scheme.eq_ignore_ascii_case("bearer") && rest.is_empty() => {
+            ""
+        }
+        (Some(scheme), Some(rest))
+            if scheme.eq_ignore_ascii_case("bearer")
+                && rest.chars().next().is_some_and(char::is_whitespace) =>
+        {
+            rest.trim()
+        }
+        _ => trimmed,
+    };
+    (!normalized.is_empty()).then_some(normalized)
+}
+
 pub fn resolve_api_key(auth: &AuthStorage) -> Result<Option<String>, TypeSafeAuthError> {
     if let Ok(value) = std::env::var("TYPESAFE_API_KEY") {
-        if value.trim().is_empty() {
-            return Err(TypeSafeAuthError::InvalidEnvironment);
-        }
-        return Ok(Some(value));
+        let key = normalize_api_key(&value).ok_or(TypeSafeAuthError::InvalidEnvironment)?;
+        return Ok(Some(key.to_owned()));
     }
     let Some(credential) = auth.get("typesafe") else {
         return Ok(None);
@@ -174,9 +202,7 @@ pub fn resolve_api_key(auth: &AuthStorage) -> Result<Option<String>, TypeSafeAut
     let Some(key) = credential.key.as_deref() else {
         return Err(TypeSafeAuthError::InvalidStoredCredential);
     };
-    if key.trim().is_empty() {
-        return Err(TypeSafeAuthError::InvalidStoredCredential);
-    }
+    let key = normalize_api_key(key).ok_or(TypeSafeAuthError::InvalidStoredCredential)?;
     Ok(Some(key.to_owned()))
 }
 
@@ -232,6 +258,26 @@ mod tests {
             TypeSafeProvider::validate_api_key(""),
             Err(CredentialValidationError::Empty)
         );
+    }
+
+    #[test]
+    fn pasted_credentials_are_normalized_before_use() {
+        for candidate in [
+            "direct-key",
+            " direct-key ",
+            "Bearer direct-key",
+            "bearer\tdirect-key\r\n",
+            "Authorization: Bearer direct-key",
+            "authorization:\tBEARER\tdirect-key\r\n",
+        ] {
+            assert_eq!(normalize_api_key(candidate), Some("direct-key"));
+        }
+        assert_eq!(normalize_api_key("  "), None);
+        assert_eq!(normalize_api_key("Bearer  \r\n"), None);
+        assert_eq!(normalize_api_key("Authorization: Bearer  \r\n"), None);
+
+        let provider = TypeSafeProvider::new(" Bearer direct-key\r\n");
+        assert_eq!(provider.api_key.as_str(), "direct-key");
     }
 
     #[test]

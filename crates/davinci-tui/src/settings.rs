@@ -375,6 +375,16 @@ pub fn interactive_settings_list(config: &InteractiveSettingsConfig) -> Settings
                 values: vec!["off".into(), "on".into()],
             },
             SettingItem {
+                id: "typesafe-api-key".into(),
+                label: "TypeSafe / Jev API key".into(),
+                description: Some(
+                    "Replace the stored key through a masked prompt. DaVinci validates the new key before saving it and keeps the previous key if validation fails. A successful replacement enables decision intelligence."
+                        .into(),
+                ),
+                current_value: "replace".into(),
+                values: vec!["replace".into()],
+            },
+            SettingItem {
                 id: "transport".into(),
                 label: "Transport".into(),
                 description: Some(
@@ -581,5 +591,20 @@ mod tests {
         assert_eq!(item.label, "Tool output");
         assert_eq!(item.current_value, "false");
         assert_eq!(item.values, vec!["true", "false"]);
+    }
+
+    #[test]
+    fn typesafe_key_replacement_is_an_explicit_secret_free_action() {
+        let list = interactive_settings_list(&InteractiveSettingsConfig::default());
+        let item = list
+            .items
+            .iter()
+            .find(|item| item.id == "typesafe-api-key")
+            .expect("TypeSafe API key action");
+
+        assert_eq!(item.label, "TypeSafe / Jev API key");
+        assert_eq!(item.current_value, "replace");
+        assert_eq!(item.values, vec!["replace"]);
+        assert!(!format!("{item:?}").contains("apikey_"));
     }
 }

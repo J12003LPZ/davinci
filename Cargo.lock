@@ -545,6 +545,7 @@ dependencies = [
  "davinci-agent",
  "davinci-ai",
  "davinci-coding-agent",
+ "davinci-tui",
  "regex",
  "serde",
  "serde_json",

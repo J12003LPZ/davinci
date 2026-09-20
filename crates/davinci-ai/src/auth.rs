@@ -291,14 +291,32 @@ pub(crate) fn home_dir() -> Option<std::path::PathBuf> {
 }
 
 pub fn default_auth_path() -> PathBuf {
-    if let Ok(dir) = std::env::var("PI_CODING_AGENT_DIR") {
-        return PathBuf::from(dir).join("auth.json");
+    let home = home_dir().unwrap_or_else(|| PathBuf::from("."));
+    let override_dir = std::env::var("DAVINCI_CODING_AGENT_DIR")
+        .or_else(|_| std::env::var("PI_CODING_AGENT_DIR"))
+        .ok();
+    auth_path_for(&home, override_dir.as_deref())
+}
+
+fn auth_path_for(home: &Path, override_dir: Option<&str>) -> PathBuf {
+    if let Some(dir) = override_dir {
+        let dir = if dir == "~" {
+            home.to_path_buf()
+        } else if let Some(rest) = dir.strip_prefix("~/") {
+            home.join(rest)
+        } else {
+            PathBuf::from(dir)
+        };
+        return dir.join("auth.json");
     }
-    home_dir()
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join(".pi")
-        .join("agent")
-        .join("auth.json")
+    let current = home.join(".davinci/agent/auth.json");
+    let legacy = home.join(".pi/agent/auth.json");
+    // A newly created settings/catalog directory must not hide existing logins.
+    if current.exists() || !legacy.exists() {
+        current
+    } else {
+        legacy
+    }
 }
 
 pub fn env_api_key(spec: &ProviderSpec, env: &HashMap<String, String>) -> Option<(String, String)> {
@@ -701,6 +719,24 @@ pub fn parse_copilot_available_model_ids(raw: &str) -> Vec<String> {
 mod tests {
     use super::*;
     use tempfile::tempdir;
+
+    #[test]
+    fn auth_path_keeps_legacy_logins_when_current_catalog_directory_exists() {
+        let home = tempdir().unwrap();
+        let current = home.path().join(".davinci/agent/auth.json");
+        let legacy = home.path().join(".pi/agent/auth.json");
+        fs::create_dir_all(current.parent().unwrap()).unwrap();
+        fs::create_dir_all(legacy.parent().unwrap()).unwrap();
+        assert_eq!(auth_path_for(home.path(), None), current);
+        fs::write(&legacy, "{}").unwrap();
+        assert_eq!(auth_path_for(home.path(), None), legacy);
+        assert_eq!(
+            auth_path_for(home.path(), Some("~/isolated")),
+            home.path().join("isolated/auth.json")
+        );
+        fs::write(&current, "{}").unwrap();
+        assert_eq!(auth_path_for(home.path(), None), current);
+    }
 
     #[test]
     fn stored_api_key_wins_over_env() {

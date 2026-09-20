@@ -4338,6 +4338,13 @@ pub fn run(
                     // terminal hooks so the candidate cannot enter any other
                     // input path or transcript.
                     if model.overlay == Some(Overlay::SecretInput) {
+                        if paste_secret_clipboard(
+                            &mut model,
+                            key,
+                            crate::external_editor::clipboard_text,
+                        ) {
+                            continue;
+                        }
                         let next = match app::handle_key(&mut model, key) {
                             Flow::SecretInputSubmitted(candidate) => on_secret_input(
                                 &mut Shell {
@@ -5555,7 +5562,7 @@ fn open_login_sheet(parsed: &crate::args::Args, model: &mut Model) {
         .collect();
     model.login_index = 0;
     model.device_code = None;
-    model.facts.auth_path = home_label(&crate::default_agent_dir().join("auth.json"));
+    model.facts.auth_path = home_label(&davinci_ai::default_auth_path());
     model.facts.auth_mode = if cfg!(unix) {
         "0600".into()
     } else {
@@ -8075,6 +8082,18 @@ fn cycle_setting(shell: &mut Shell<'_>, index: usize) -> Next {
     let key = row.key.clone();
     let current = row.value.clone();
     let project = row.project;
+    if key == "typesafe-api-key" {
+        if let Some(reason) = typesafe_key_replacement_blocker(
+            &shell.model.settings_rows,
+            std::env::var_os("TYPESAFE_API_KEY").is_some(),
+        ) {
+            shell.note(reason);
+            return Next::Go;
+        }
+        shell.model.settings_index = index;
+        open_typesafe_key_input(shell.model);
+        return Next::Go;
+    }
     if key == "decision-intelligence" {
         return cycle_decision_intelligence(shell, index, current == "on", project);
     }
@@ -8110,6 +8129,49 @@ fn cycle_setting(shell: &mut Shell<'_>, index: usize) -> Next {
     Next::Go
 }
 
+fn typesafe_key_replacement_blocker(
+    rows: &[SettingRow],
+    environment_override: bool,
+) -> Option<&'static str> {
+    if environment_override {
+        return Some(
+            "TYPESAFE_API_KEY controls the current TypeSafe credential. Unset or change that environment variable, then restart DaVinci.",
+        );
+    }
+    if rows
+        .iter()
+        .any(|row| row.key == "decision-intelligence" && row.project && row.value == "off")
+    {
+        return Some("TypeSafe / Jev decision intelligence is disabled by project settings");
+    }
+    None
+}
+
+fn paste_secret_clipboard(
+    model: &mut Model,
+    key: crossterm::event::KeyEvent,
+    read_text: impl FnOnce() -> Option<String>,
+) -> bool {
+    use crossterm::event::{KeyCode, KeyEventKind, KeyModifiers};
+    if model.overlay != Some(Overlay::SecretInput)
+        || key.kind == KeyEventKind::Release
+        || key.code != KeyCode::Char('v')
+        || !key.modifiers.contains(KeyModifiers::CONTROL)
+    {
+        return false;
+    }
+    if let Some(text) = read_text() {
+        let text = zeroize::Zeroizing::new(text);
+        model.paste(&text);
+    }
+    true
+}
+
+fn open_typesafe_key_input(model: &mut Model) {
+    model.secret_input = Some(davinci_tui::davinci::views::secret_input::SecretInputState::new());
+    model.overlay = Some(Overlay::SecretInput);
+}
+
 fn cycle_decision_intelligence(
     shell: &mut Shell<'_>,
     index: usize,
@@ -8143,9 +8205,7 @@ fn cycle_decision_intelligence(
     let key = match davinci_coding_agent::decision_providers::typesafe::resolve_api_key(&auth) {
         Ok(Some(key)) => key,
         Ok(None) => {
-            shell.model.secret_input =
-                Some(davinci_tui::davinci::views::secret_input::SecretInputState::new());
-            shell.model.overlay = Some(Overlay::SecretInput);
+            open_typesafe_key_input(shell.model);
             return Next::Go;
         }
         Err(error) => {
@@ -8166,7 +8226,17 @@ fn enable_typesafe_with_key(
     candidate: String,
     persist_credential: bool,
 ) -> Next {
-    let candidate = zeroize::Zeroizing::new(candidate);
+    let raw_candidate = zeroize::Zeroizing::new(candidate);
+    let candidate = match davinci_coding_agent::decision_providers::typesafe::normalize_api_key(
+        raw_candidate.as_str(),
+    ) {
+        Some(candidate) => zeroize::Zeroizing::new(candidate.to_owned()),
+        None => {
+            shell.note("TypeSafe credential validation failed: TypeSafe credential is empty");
+            return Next::Go;
+        }
+    };
+    drop(raw_candidate);
     if let Err(error) =
         davinci_coding_agent::decision_providers::typesafe::TypeSafeProvider::validate_api_key(
             &candidate,
@@ -8231,7 +8301,11 @@ fn enable_typesafe_with_key(
     crate::sync_agent_from_settings(shell.agent);
     open_settings_sheet(shell.agent, shell.model);
     shell.model.settings_index = index.min(shell.model.settings_rows.len().saturating_sub(1));
-    shell.say("TypeSafe / Jev decision intelligence enabled");
+    if persist_credential {
+        shell.say("TypeSafe / Jev API key saved and decision intelligence enabled");
+    } else {
+        shell.say("TypeSafe / Jev decision intelligence enabled");
+    }
     Next::Go
 }
 
@@ -9357,6 +9431,66 @@ mod tests {
         assert_eq!(result.unwrap_err(), "disk full");
         assert_eq!(row.value, "on");
         assert!(row.project);
+    }
+
+    #[test]
+    fn typesafe_key_clipboard_paste_stays_in_secret_input() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        use davinci_tui::davinci::app::{self, Flow};
+        let mut model = model();
+        open_typesafe_key_input(&mut model);
+        assert!(paste_secret_clipboard(
+            &mut model,
+            KeyEvent::new(KeyCode::Char('v'), KeyModifiers::CONTROL),
+            || Some("test_KEY".into()),
+        ));
+        assert_eq!(model.composer.to_string(), "");
+        let Flow::SecretInputSubmitted(value) = app::handle_key(
+            &mut model,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+        ) else {
+            panic!("credential was not submitted")
+        };
+        assert_eq!(value.into_inner(), "test_KEY");
+        assert!(!paste_secret_clipboard(
+            &mut model,
+            KeyEvent::new(KeyCode::Char('v'), KeyModifiers::CONTROL),
+            || panic!("clipboard must not be read without secret overlay"),
+        ));
+    }
+
+    #[test]
+    fn opening_typesafe_key_replacement_uses_the_masked_secret_overlay() {
+        let mut model = model();
+
+        open_typesafe_key_input(&mut model);
+
+        assert_eq!(model.overlay, Some(Overlay::SecretInput));
+        assert!(model.secret_input.is_some());
+        assert_eq!(model.composer.to_string(), "");
+    }
+
+    #[test]
+    fn typesafe_key_replacement_respects_environment_and_project_overrides() {
+        let enabled = SettingRow {
+            key: "decision-intelligence".into(),
+            value: "on".into(),
+            ..SettingRow::default()
+        };
+        assert_eq!(typesafe_key_replacement_blocker(&[enabled], false), None);
+
+        let project_disabled = SettingRow {
+            key: "decision-intelligence".into(),
+            value: "off".into(),
+            project: true,
+            ..SettingRow::default()
+        };
+        assert!(typesafe_key_replacement_blocker(&[project_disabled], false)
+            .unwrap()
+            .contains("project settings"));
+        assert!(typesafe_key_replacement_blocker(&[], true)
+            .unwrap()
+            .contains("TYPESAFE_API_KEY"));
     }
 
     #[test]

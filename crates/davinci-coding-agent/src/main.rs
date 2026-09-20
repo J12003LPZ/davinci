@@ -1353,8 +1353,7 @@ fn load_model_runtime(parsed: &Args) -> ModelRuntimeSnapshot {
             }
         }
     }
-    let auth_path = agent_dir.join("auth.json");
-    let mut storage = AuthStorage::open(&auth_path).unwrap_or_else(|_| AuthStorage::in_memory());
+    let mut storage = AuthStorage::create().unwrap_or_else(|_| AuthStorage::in_memory());
     if let Some(key) = parsed.api_key.as_deref() {
         let provider = parsed
             .provider
@@ -10956,7 +10955,9 @@ mod tests {
         static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
         let _lock = ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
         let dir = tempfile::tempdir().expect("temp auth dir");
-        let _agent_dir = EnvRestore::set("PI_CODING_AGENT_DIR", &dir.path().to_string_lossy());
+        let legacy = tempfile::tempdir().expect("legacy auth dir");
+        let _agent_dir = EnvRestore::set("DAVINCI_CODING_AGENT_DIR", &dir.path().to_string_lossy());
+        let _legacy_dir = EnvRestore::set("PI_CODING_AGENT_DIR", &legacy.path().to_string_lossy());
         let _oauth_code = EnvRestore::set("PI_OAUTH_CODE", "pi-fixture-code");
 
         assert_eq!(
@@ -10965,6 +10966,7 @@ mod tests {
         );
 
         let storage = AuthStorage::open(&dir.path().join("auth.json")).expect("persisted auth");
+        assert!(!legacy.path().join("auth.json").exists());
         let credential = storage
             .get("openai-codex")
             .expect("credential stored under exact provider id");
@@ -10981,6 +10983,32 @@ mod tests {
             .is_none(),
             "plain test fixture token must not bypass Codex account-bound JWT validation"
         );
+        let payload = base64::Engine::encode(
+            &base64::engine::general_purpose::URL_SAFE_NO_PAD,
+            br#"{"https://api.openai.com/auth":{"chatgpt_account_id":"test-account"}}"#,
+        );
+        let mut storage = AuthStorage::create().unwrap();
+        storage
+            .login_oauth(
+                "openai-codex",
+                format!("e30.{payload}.signature"),
+                None,
+                None,
+            )
+            .unwrap();
+        let parsed = Args {
+            no_extensions: true,
+            ..Args::default()
+        };
+        let snapshot = load_model_runtime(&parsed);
+        assert!(snapshot
+            .available
+            .iter()
+            .any(|model| model.provider == "openai-codex"));
+        let mut agent = Agent::new("fixture");
+        apply_resolved_models(&parsed, &mut agent).unwrap();
+        assert_eq!(agent.provider, "openai-codex");
+        assert!(!agent.model_id.is_empty());
     }
 
     #[test]

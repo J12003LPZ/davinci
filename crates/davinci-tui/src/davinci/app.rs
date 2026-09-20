@@ -1295,7 +1295,7 @@ fn handle_overlay_key(
             secret.backspace();
             return Flow::Continue;
         }
-        if key.modifiers.is_empty() {
+        if key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT {
             if let KeyCode::Char(character) = key.code {
                 secret.insert_text(&character.to_string());
             }
@@ -2935,6 +2935,25 @@ mod section_input_regressions {
         assert_eq!(flow, Flow::Continue);
         assert!(m.secret_input.is_none());
         assert!(m.overlay.is_none());
+    }
+
+    #[test]
+    fn secret_input_preserves_shifted_key_characters() {
+        let mut m = model("1a");
+        m.secret_input = Some(crate::davinci::views::secret_input::SecretInputState::new());
+        m.overlay = Some(Overlay::SecretInput);
+        for (ch, mods) in [
+            ('a', KeyModifiers::NONE),
+            ('_', KeyModifiers::SHIFT),
+            ('B', KeyModifiers::SHIFT),
+        ] {
+            press_mods(&mut m, KeyCode::Char(ch), mods);
+        }
+        let Flow::SecretInputSubmitted(value) = press(&mut m, KeyCode::Enter) else {
+            panic!("credential was not submitted");
+        };
+        assert_eq!(value.into_inner(), "a_B");
+        assert_eq!(&*m.composer, "");
     }
 
     #[test]

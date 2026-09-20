@@ -36,12 +36,31 @@ Credential resolution is deliberately separate from ordinary model selection:
 3. An empty or invalid environment override is an explicit failure; it does
    not silently fall back to the stored key.
 
+Login, model discovery, and TypeSafe use the same credential store. An explicit
+`DAVINCI_CODING_AGENT_DIR` (or legacy `PI_CODING_AGENT_DIR`) selects its
+`auth.json`. Otherwise, DaVinci uses `~/.davinci/agent/auth.json` when present,
+retains an existing `~/.pi/agent/auth.json` when the new store is absent, and
+creates the new store for fresh installations. Creating a settings or model
+cache directory therefore does not hide existing logins.
+
 The settings flow accepts paste, masks the candidate, rejects voice input while
-the secret overlay has focus, and caps input at 8192 UTF-8 bytes. Enter first
-performs a real credential validation request. The key is persisted and the
-setting is enabled only after validation succeeds. If settings persistence
-fails after a new key was stored, the previous credential is restored (or the
-new entry is removed) and the feature remains off. Esc and Ctrl+C cancel.
+the secret overlay has focus, and caps input at 8192 UTF-8 bytes. Surrounding
+whitespace, an optional copied `Bearer` prefix, and a complete copied
+`Authorization: Bearer ...` header are normalized before validation and storage.
+Enter first performs a real credential validation request. The key is persisted
+and the setting is enabled only after validation succeeds. If
+settings persistence fails after a new key was stored, the previous credential
+is restored (or the new entry is removed) and the feature remains off. Esc and
+Ctrl+C cancel.
+
+To replace an existing stored key from the DaVinci terminal, open `/settings`,
+select **TypeSafe / Jev API key**, and press Enter. The replacement uses the
+same masked, validate-before-save flow. Ctrl+V pastes text directly into the
+masked field; typed uppercase letters and underscores are preserved.
+A cancelled or rejected replacement
+leaves the previous credential active. When `TYPESAFE_API_KEY` is present, the
+environment controls the current credential; DaVinci explains that it must be
+changed or unset outside the settings sheet and then restarted.
 
 The validation request is a bounded probe to:
 

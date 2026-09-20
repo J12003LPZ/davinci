@@ -34,6 +34,7 @@ pub fn group_rank(key: &str) -> usize {
         "steering-mode"
         | "follow-up-mode"
         | "decision-intelligence"
+        | "typesafe-api-key"
         | "default-project-trust"
         | "double-escape-action"
         | "tree-filter-mode"

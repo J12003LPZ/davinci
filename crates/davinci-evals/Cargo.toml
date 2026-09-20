@@ -20,4 +20,5 @@ uuid.workspace = true
 regex.workspace = true
 
 [dev-dependencies]
+davinci-tui = { path = "../davinci-tui" }
 tempfile.workspace = true

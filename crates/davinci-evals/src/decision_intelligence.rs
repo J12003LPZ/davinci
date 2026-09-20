@@ -218,6 +218,8 @@ pub fn run_offline_eval() -> DecisionIntelligenceEvalReport {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use davinci_coding_agent::decision_providers::typesafe::normalize_api_key;
+    use davinci_coding_agent::settings::{to_interactive_config, Settings};
 
     #[test]
     fn ten_required_scenarios_preserve_the_deterministic_floor() {
@@ -234,5 +236,52 @@ mod tests {
         assert!(report.input_token_estimate > 0);
         assert_eq!(report.jev_usage_tokens, 0);
         assert!(report.guarded_policy_is_explicit);
+    }
+
+    #[test]
+    fn credential_entry_eval_accepts_common_copy_formats() {
+        let variants = [
+            "typesafe-key",
+            " typesafe-key ",
+            "Bearer typesafe-key",
+            "BEARER\ttypesafe-key\r\n",
+            "Authorization: Bearer typesafe-key",
+            "authorization:\tBEARER\ttypesafe-key\r\n",
+        ];
+        assert!(variants
+            .into_iter()
+            .all(|candidate| normalize_api_key(candidate) == Some("typesafe-key")));
+    }
+
+    #[test]
+    fn credential_entry_eval_round_trips_masked_paste() {
+        use davinci_tui::davinci::views::secret_input::SecretInputState;
+        for candidate in [
+            "apikey_Example_123",
+            " Bearer apikey_Example_123 ",
+            "Authorization: Bearer apikey_Example_123",
+        ] {
+            let mut field = SecretInputState::new();
+            field.insert_text(candidate);
+            assert!(!format!("{field:?}").contains("apikey_Example_123"));
+            let submitted = field.begin_validation().expect("credential");
+            assert_eq!(normalize_api_key(&submitted), Some("apikey_Example_123"));
+            assert_eq!(field.masked_len(), 0);
+        }
+    }
+
+    #[test]
+    fn credential_rotation_eval_is_discoverable_without_rendering_the_secret() {
+        let config = to_interactive_config(&Settings::default(), "dark");
+        let action = davinci_tui::interactive_settings_list(&config)
+            .items
+            .into_iter()
+            .find(|item| item.id == "typesafe-api-key")
+            .expect("terminal credential replacement action");
+
+        assert_eq!(action.label, "TypeSafe / Jev API key");
+        assert_eq!(action.current_value, "replace");
+        assert_eq!(action.values, ["replace"]);
+        assert!(!format!("{action:?}").contains("typesafe-key"));
     }
 }
