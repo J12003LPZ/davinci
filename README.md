@@ -1,337 +1,954 @@
-# Davinci Agent Harness
+# DaVinci
 
-A terminal coding agent: a product-equivalent Rust rewrite of the TypeScript CLI [`pi`](https://github.com/earendil-works/pi) (vendor pin `853a80d26c90a14c1886f0ebb8ffaae133ca2185`).
+[![CI](https://github.com/J12003LPZ/davinci/actions/workflows/ci.yml/badge.svg)](https://github.com/J12003LPZ/davinci/actions/workflows/ci.yml)
+[![Workflow lint](https://github.com/J12003LPZ/davinci/actions/workflows/workflow-lint.yml/badge.svg)](https://github.com/J12003LPZ/davinci/actions/workflows/workflow-lint.yml)
+[![Security SARIF](https://github.com/J12003LPZ/davinci/actions/workflows/security-sarif.yml/badge.svg)](https://github.com/J12003LPZ/davinci/actions/workflows/security-sarif.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
-Same flags, same `~/.davinci` (and legacy `~/.pi`) sessions, same provider credentials, same `--print` and `--mode rpc` — one static binary, no Node runtime required (Node is optional, and only for JavaScript extensions).
+**DaVinci is a native Rust AI coding-agent harness for the terminal.**
 
-The interactive terminal UI opens the davinci shell described below. `--legacy-tui` keeps the original.
+It combines an interactive coding assistant, multi-provider model runtime, permission system, persistent sessions, engineering intelligence, multi-agent orchestration, deterministic verification, security analysis, memory and learning, MCP, extensions, and optional local voice input in one CLI.
 
-The TypeScript sources under `vendor/davinci` are reference-only. Do not delete them.
+DaVinci began as a Rust-compatible rewrite of the TypeScript [pi](https://github.com/earendil-works/pi) coding agent and has grown into a larger native harness. The pinned TypeScript source under [vendor/davinci](vendor/davinci) remains a behavioral compatibility reference. The active product is the Rust workspace in this repository.
+
+> **Workspace version:** 1.0.70  
+> **Rust toolchain:** 1.83.0  
+> **Primary executable:** davinci
 
 ---
 
-## Install
+## Contents
 
-Requires Rust 1.83.0 (pinned in `rust-toolchain.toml`).
+- [What DaVinci does](#what-davinci-does)
+- [Installation](#installation)
+- [Quick start](#quick-start)
+- [Models and authentication](#models-and-authentication)
+- [Permissions and project trust](#permissions-and-project-trust)
+- [Execution modes](#execution-modes)
+- [Major capabilities](#major-capabilities)
+- [Sessions and persistence](#sessions-and-persistence)
+- [Configuration](#configuration)
+- [Extensions and MCP](#extensions-and-mcp)
+- [Local voice input](#local-voice-input)
+- [Architecture](#architecture)
+- [Repository layout](#repository-layout)
+- [Development](#development)
+- [Documentation](#documentation)
+- [Compatibility](#compatibility)
+- [Security notes](#security-notes)
+- [License](#license)
 
-```bash
-make install          # cargo install --path crates/davinci-coding-agent --force
-# or
-make build            # cargo build -p davinci-coding-agent  ->  ./target/debug/davinci
-```
+---
+
+## What DaVinci does
+
+DaVinci is the runtime around an AI coding model, not just a chat interface. It gives a model a controlled view of a repository and tools for understanding, changing, testing, and verifying code.
+
+At a high level, DaVinci can:
+
+- run as an interactive terminal coding assistant or non-interactive CLI;
+- work with multiple model providers and reasoning levels;
+- read, search, edit, write, and execute commands in a repository;
+- require approvals or enforce planning/read-only policies before mutations;
+- preserve resumable and branchable session history;
+- inspect repository structure, packages, build systems, Git state, language semantics, tests, and change impact;
+- use subagents, persistent agent teams, workflows, or a deterministic engineering graph for larger tasks;
+- manage long-running processes and isolated worktrees;
+- perform transactional edits with verification evidence;
+- bound context growth through compaction, the Token Governor, artifact storage, and an optional Context VM;
+- keep local repository-scoped memory and distill successful procedures into reusable skills;
+- run security analysis and produce auditable JSON, Markdown, and SARIF output;
+- connect to MCP servers and JavaScript extensions;
+- expose text, JSON, RPC, client/server, and Rust embedding surfaces;
+- provide optional local CPU speech-to-text in the terminal composer.
+
+### Product surfaces
+
+| Surface | Purpose |
+| --- | --- |
+| Interactive TUI | Main terminal coding experience |
+| --print / -p | Run one prompt non-interactively and exit |
+| --mode json | Stream newline-delimited machine-readable events |
+| --mode rpc | JSON-RPC over stdio for embedding and integrations |
+| davinci server / client | Experimental typed client/server transport |
+| Rust library | Programmatic embedding through davinci-coding-agent |
+| MCP | Native MCP client |
+| JavaScript extensions | Optional Node-hosted compatibility/extension layer |
+
+---
+
+## Installation
+
+DaVinci is currently installed from source. This repository does not currently publish prebuilt GitHub release assets.
+
+### Requirements
+
+For the core CLI:
+
+- Git
+- Rust **1.83.0** with Cargo
+- rustfmt and clippy for development
+
+The repository pins the toolchain in [rust-toolchain.toml](rust-toolchain.toml). A normal rustup installation will select the required Rust version automatically.
+
+Optional dependencies:
+
+- **Node.js** — required only for JavaScript extensions, selected compatibility features, and some test fixtures. The core Rust CLI does not require Node.
+- **CMake and a C++17 compiler** — required to build the native local voice worker.
+- **Linux local voice builds** — ALSA development headers and pkg-config.
+- **Language intelligence** — may require project-local language-server packages such as TypeScript and typescript-language-server.
+
+### 1. Clone the repository
+
+~~~bash
+git clone https://github.com/J12003LPZ/davinci.git
+cd davinci
+~~~
+
+### 2. Install the core CLI
+
+If you only want the davinci executable:
+
+~~~bash
+cargo install --path crates/davinci-coding-agent --locked --force
+~~~
+
+Or build without installing:
+
+~~~bash
+cargo build --release -p davinci-coding-agent --locked
+./target/release/davinci --version
+~~~
+
+Windows PowerShell:
+
+~~~powershell
+cargo build --release -p davinci-coding-agent --locked
+.\target\release\davinci.exe --version
+~~~
+
+### 3. Install DaVinci with local voice support
+
+The repository install scripts build both davinci and the matching davinci-voice-worker.
+
+Linux/macOS:
+
+~~~bash
+./scripts/install.sh
+~~~
+
+Windows PowerShell:
+
+~~~powershell
+pwsh .\scripts\install-davinci.ps1
+~~~
+
+The scripts install into Cargo's binary directory, normally:
+
+- Linux/macOS: ~/.cargo/bin
+- Windows: %USERPROFILE%\.cargo\bin
+
+Make sure that directory is on PATH.
+
+### Linux packages for local voice
+
+On Debian/Ubuntu-family systems:
+
+~~~bash
+sudo apt-get update
+sudo apt-get install -y build-essential cmake pkg-config libasound2-dev
+~~~
+
+### Verify the installation
+
+~~~bash
+davinci --version
+davinci --help
+~~~
+
+---
 
 ## Quick start
 
-```bash
-davinci                                  # interactive TUI
-davinci "List all .ts files in src/"     # interactive, with an opening prompt
-davinci -p "explain src/main.rs"         # print mode: run, print, exit
-davinci --mode json -p "fix the build"   # newline-delimited JSON event stream
-davinci --mode rpc                       # JSON-RPC over stdio, for embedding
-davinci @notes.md @screenshot.png "what changed?"
-```
+Start the interactive TUI in the current repository:
 
-Print mode is also selected automatically when stdin or stdout is not a TTY, so `davinci` composes in pipelines.
+~~~bash
+davinci
+~~~
 
----
+Start with an initial task:
 
-## Features
+~~~bash
+davinci "Explain this codebase and identify the main entry points."
+~~~
 
-### Agent core
+Run one task and exit:
 
-Eight built-in tools: `read`, `write`, `edit`, `bash`, `powershell`, `grep`, `find`, `ls`.
+~~~bash
+davinci -p "Find the cause of the failing tests and explain it."
+~~~
 
-- `read` returns text or attaches images (jpg/png/gif/webp/bmp), truncating at 2000 lines / 50 KB with `offset` and `limit` for the rest.
-- `edit` is exact-text replacement with a batch form; every edit is matched against the original file and must be unique and non-overlapping.
-- `grep` and `find` respect `.gitignore` and prefer fast managed binaries (`rg`, `fd`) when present, with pure-Rust fallbacks when they are not.
-- `powershell` is a Windows-native addition: it prefers `pwsh`, falls back to `powershell`, and forces UTF-8 console encoding.
+Include files or images:
 
-Tool exposure is controlled per run with `--tools`, `--exclude-tools`, `--no-tools`, and `--no-builtin-tools`.
+~~~bash
+davinci @README.md @screenshot.png "Review these."
+~~~
 
-Project-local configuration is trusted explicitly. If a repository contains `.davinci/settings.json`, `.davinci/extensions`, `.davinci/skills` (or legacy `.pi/` equivalents), `SYSTEM.md`, or `APPEND_SYSTEM.md`, davinci asks before honoring it and remembers the answer in `~/.davinci/agent/trust.json` (or `~/.pi/agent/trust.json`). `--approve` / `--no-approve` override for one run; `/trust` changes the stored decision. Repositories with no such files need no decision at all.
+Choose a provider/model:
 
-`AGENTS.md` and `CLAUDE.md` are discovered and loaded as context (disable with `--no-context-files`).
+~~~bash
+davinci --model openai/gpt-4o "Review this repository."
+~~~
 
-### Prompt profiles & behavioral control
+Set a reasoning level:
 
-The prompt system supports versioned behavioral profiles with deterministic caching, privacy-safe dogfood telemetry, and instant rollback:
+~~~bash
+davinci --thinking high "Investigate this bug."
+~~~
 
-- `--prompt-profile <stable|preview|legacy-v1>` (or setting `"promptProfile": "stable"`, or emergency override `DAVINCI_PROMPT_PROFILE=legacy-v1` / `PI_PROMPT_PROFILE=legacy-v1`).
-  - `stable`: Default versioned production prompt contract (v2) with scope discipline, exploration-before-mutation, and verification guarantees.
-  - `preview`: Candidate prompt revisions for dogfooding and early evaluation before graduation.
-  - `legacy-v1`: Bit-for-bit frozen compatibility baseline reproducing the initial launch harness prompt.
-- **Identity & Status**: `/status` in the interactive shell displays the active prompt profile, version, and hash prefix (e.g. `prompt: stable v2 · <sha256:8>`), along with aggregate local metrics.
-- **Behavioral Evaluation Suite**: Run `cargo test -p davinci-evals behavior::` for the offline PR gate, `cargo run -p davinci-evals -- optimization gate --offline` for the eight deterministic harness ablations, `cargo run -p davinci-evals -- competitor probe` to report local Codex, Hermes, OpenCode, and Claude availability without scoring, or `cargo run -p davinci-evals -- run-ab` for paired A/B comparisons.
-- Full specifications: [`docs/prompt-engineering.md`](docs/prompt-engineering.md), [`docs/behavioral-evals.md`](docs/behavioral-evals.md), [`docs/release-quality.md`](docs/release-quality.md).
+Run with a restricted tool surface:
 
-### Sessions
+~~~bash
+davinci --tools read,grep,find,ls -p "Review the code without changing anything."
+~~~
 
-Sessions are JSONL files under `~/.davinci/agent/sessions/` (or legacy `~/.pi/agent/sessions/`), grouped by a cwd-encoded directory (`--C--Users-me-project--/`) byte-compatible with TypeScript pi. Override with `--session-dir`, `DAVINCI_CODING_AGENT_SESSION_DIR`, `PI_CODING_AGENT_SESSION_DIR`, or the `sessionDir` setting.
+Continue or resume work:
 
-- `--continue` resumes the latest session for this directory; `--resume` opens a searchable picker.
-- `--session <path|id>` accepts a path or a partial UUID; `--session-id` creates a named id if missing.
-- `--fork` branches an existing session, `/clone` copies one, and `/tree` navigates the branch tree — conversations are a tree of lanes, not a single line.
-- `--no-session` runs ephemerally; `--export file.jsonl` renders a session to standalone HTML.
-- An optional SQLite backend keeps a derived branch cache (root-to-leaf paths per branch) for large session stores.
+~~~bash
+davinci --continue
+davinci --resume
+~~~
 
-### Terminal UI
+Machine-readable output:
 
-`davinci` opens the **davinci shell** (`crates/davinci-tui/src/davinci/`, built on
-ratatui). Its visual language is specified in `docs/ui/design.md` and drawn in
-`docs/ui/Pi TUI Mockups.dc.html` across eleven screens: a truecolor
-copper/verdigris palette where copper carries state and verdigris carries
-location, a fixed glyph vocabulary (`✓ ◉ ○ ◌ × ! Δ ↳ ⌕ ◆`) so every state
-reads under `NO_COLOR`, proportion meters instead of bare numbers, prose
-wrapped at 74 columns however wide the terminal, and exactly two things that
-move — a caret blink and one 4-frame spinner, both off a single 250ms clock
-and both static under `--no-animation`. One instrument at a time: each is
-summoned with a chord, used, and dismissed with `esc`, and states its own
-exits in its footer. When the binary is installed under another name (for
-example `davinci`), the startup mark and agent label follow it.
+~~~bash
+davinci --mode json -p "Run the relevant tests and summarize the result."
+~~~
 
-Instruments: `ctrl+p` Instrumenta (commands), `ctrl+s` Memoria (sessions),
-`ctrl+r` Memoria (vector recall), `ctrl+o` Cogitator (models), `ctrl+e` Codex
-(workspace, ≥120 columns), `ctrl+l` Disegno (plan), `ctrl+g` Grafo (code
-graph), `ctrl+u` Mensura (token governor). `ctrl+c` interrupts the run and
-never the app.
+JSON-RPC over stdio:
 
-- Startup identity mark, then a transcript where user turns are `> text`,
-  agent turns open with `◆ <name>`, and each tool call is one line
-  (`✓ manus · cargo test  0.42s`) with failures expanding to a few lines.
-- Live turns run on a worker thread: tool lines appear as they happen, a
-  4-frame spinner shows the current work verb, `Esc` interrupts the run, and
-  `Enter` queues follow-up prompts while the agent is busy.
-- Status bar: `dir · branch · Δfiles +added -removed` on the left, model and
-  a context meter (`━━━╸──── 47k/200k`) on the right.
-- `/model` lists every catalog model; providers without credentials show
-  dimmed with their `/login` hint instead of being hidden.
-- `tab` completes slash commands and workspace paths, as far as every
-  candidate agrees and no further. `shift+enter` (or `alt+enter`, or `ctrl+j`)
-  adds a line.
+~~~bash
+davinci --mode rpc
+~~~
 
-#### `--legacy-tui`
+Disable supported startup network work:
 
-`--legacy-tui`, or `PI_DAVINCI=0`, opens the previous custom renderer. It is
-still the only mode with these:
-
-- Markdown with syntax-aware code blocks, OSC-8 hyperlinks, LaTeX, and diff rendering.
-- Mermaid diagrams rendered as terminal graphics — `off`, `final`, or `streaming` (default: draws while the answer streams).
-- Inline images via the Kitty graphics protocol or iTerm inline images, tracked across scrolling.
-- Themes (`dark`, `light`, `pi`, plus your own via `--theme`), fuzzy slash-command autocomplete, mouse and scrollback support, and a fullscreen alt-screen mode (`--tui-mode fullscreen`) with in-scrollback search.
-- Emacs-style line editing, kill ring, undo, and `Ctrl+G` to drop into `$EDITOR`.
-- Extension select / input / editor dialogs.
-- Keybindings are data: defaults live in code and are overridable in `~/.pi/agent/keybindings.json`. Highlights — `Shift+Tab` cycle thinking level, `Ctrl+P` cycle model, `Ctrl+L` model picker, `Ctrl+O` expand tool output, `Ctrl+T` toggle thinking, `Ctrl+V` paste image, `Esc` interrupt.
-
-Built-in slash commands: `/settings /model /tree /thinking /scoped-models /export /import /share /copy /name /session /changelog /hotkeys /fork /clone /trust /login /logout /new /compact /resume /reload /llama /quit`.
-
-### Models and providers
-
-39 providers and roughly 1,290 model entries ship compiled into the binary; `pi update` refreshes the catalogs into `~/.pi/agent`.
-
-Wire protocols implemented natively: `anthropic-messages`, `openai-responses`, `openai-completions`, `openai-codex-responses`, `azure-openai-responses`, `google-generative-ai`, `google-vertex`, `bedrock-converse-stream` (with SigV4 signing), `mistral-conversations`.
-
-- `--model` accepts `provider/id` patterns with an optional `:thinking` suffix; `--models` sets the `Ctrl+P` cycle ring; `--list-models` fuzzy-searches the catalog.
-- `--thinking off|minimal|low|medium|high|xhigh|max` maps to each provider's own reasoning-budget field.
-- GPT-6 Astra (`openai-codex/gpt-6-astra`) uses the normal OpenAI Codex OAuth/Responses path. DaVinci automatically applies a compact `gpt6-astra` model-policy layer to built-in prompt profiles; prompt profile and model policy are independent. A custom `--system-prompt` replacement bypasses the built-in model policy. Astra does not advertise `off` reasoning; `minimal` maps to `low`.
-- `/login` supports API keys, browser OAuth with PKCE (Anthropic, OpenAI Codex, OpenRouter, xAI, GitHub Copilot, Kimi, Radius), and device-code flow. Credentials live in `~/.pi/agent/auth.json`; Vertex also reads gcloud ADC. Provider API keys can come from the usual environment variables instead.
-- `pi auth print-api-key` / `print-bearer-token` expose a credential (refreshing OAuth if expired) for external clients.
-
-### Extensions
-
-Two tiers, both indistinguishable from built-ins at the prompt.
-
-**JavaScript extensions** run in a Node subprocess driven by an embedded runner. They can register tools, slash commands, CLI flags, autocomplete providers, model providers, OAuth providers, custom tool renderers, and terminal-input handlers. Discovered from `~/.pi/agent/extensions/*/pi.extension.json`, loaded explicitly with `-e`, or installed with `pi install <npm-spec|git-url|path>` (`-l` for project scope). `pi list`, `pi remove`, and `pi config` (a TUI for enabling/disabling package resources) manage them.
-
-**Native Rust extensions** are compiled in and always available — no Node, no subprocess:
-
-| | commands | tools |
-| --- | --- | --- |
-| Graph engineer | `/graph`, `/graph-resume`, `/graph-status`, `/graph-view`, `/graph-abort` | `graph_run`, `graph_status` |
-| Token governor | `/governor-status`, `/governor-reset` | `retrieve_output` |
-| Vector memory | `/memory-status`, `/memory-search`, `/memory-reindex`, `/memory-clear` | `memory_search` |
-| Security scan | `/sec-status`, `/sec-report`, `/sec-abort` | 14 `sec_*` tools |
+~~~bash
+davinci --offline
+~~~
 
 ---
 
-## Graph engineer
+## Models and authentication
 
-```
-/graph <goal> [--simple|--complex] [--dry-run]
-```
+DaVinci ships a compiled model/provider catalog and native request/streaming support for multiple provider protocols.
 
-Runs one coding task as an explicit execution graph of isolated `pi` child processes rather than as one long conversation. The controller is deterministic Rust; models only ever run inside a worker child, and the only thing that crosses a node boundary is a schema-validated JSON artifact.
+Examples:
 
-**Pipeline:** `classify → investigate → plan → implement → verify → review`.
+~~~bash
+davinci --list-models
+davinci --list-models claude
+davinci --provider openai --model gpt-4o
+davinci --model anthropic/claude-sonnet-4
+~~~
 
-| Role | Artifact it owes | Tools it gets | Shell policy |
-| --- | --- | --- | --- |
-| classifier | `classification` | `graph_submit` only | none |
-| researcher / test-analyzer / reviewer | `evidence` / `review` | read, grep, find, ls, bash | read-only / read-and-test |
-| historian | `evidence` | read, grep, bash | read-only |
-| planner | `plan` | read, grep, find, ls | none |
-| writer | `patch-report` | read, grep, find, ls, bash, edit, write | write, but no git state changes |
+Supported reasoning-level names are:
 
-Least privilege is enforced twice — as the child process's `--tools` allowlist, and again inside the child, because the danger of `bash` lives in its command text rather than its name. The writer is the only node that may mutate files, and no node may run `git commit`, `push`, `reset`, `checkout`, or any other git state change: committing is reserved for the human operator. A destructive-pattern list (36 rules covering `rm`, redirects, package installs, `sudo`, PowerShell equivalents) blocks the obvious ways around a read-only policy. Once a worker calls `graph_submit`, every further tool call in that process is refused.
+~~~text
+off
+minimal
+low
+medium
+high
+xhigh
+max
+~~~
 
-**Verification has no model in it at all.** "Did the tests pass?" is an exit code. Verify commands come from `.pi/graph.json`, or are auto-detected (Cargo: `cargo fmt --check`, `cargo clippy … -D warnings`, `cargo test --workspace`; npm: `npm run check` / `typecheck` / `lint` / `npm test`). Test commands proposed by the planner are filtered through the same read-and-test shell policy before they run, and a command the planner invented that does not exist is marked skipped rather than failing the run and burning a revision cycle.
+The effective levels depend on the selected provider and model.
 
-Failures loop rather than abort: a failed verification or a `changes_required` review sends the work back to the writer, bounded by `maxRevisionCycles`; a `planInvalidated` patch report triggers a replan, bounded by `maxReplans`. A run with no review artifact is blocked — nothing is approved by default.
+### Credentials
 
-`--simple` collapses the graph to `classify → implement → verify`. `--complex` forces the full path and enables milestone decomposition (up to 8 milestones, each with its own plan/implement/verify/review). `--dry-run` exercises the whole graph with canned artifacts and skipped shell commands, spending no tokens.
+DaVinci can use provider API keys from environment variables and supports OAuth/authentication flows for providers that implement them.
 
-Runs are persisted under `.pi/graph/runs/<runId>/` (`state.json`, `artifacts/`, `logs/`), so `/graph-resume` can replay completed nodes without respawning their workers — with the guard that if the previous run had already entered a revision loop, only the investigation nodes are reused, because a superseded plan or patch should not be replayed. `/graph-view` tails a live worker transcript. The newest 20 finished runs are retained.
+Common variables include:
 
-Everything is bounded, and every budget is off by default rather than silently guessing: `maxResearchers` (3), `maxParallelWorkers` (3), `maxWorkers`, `maxRevisionCycles` (3), `maxReplans` (2), `maxCostUsd`, `runDeadlineMs`, and per-role worker timeouts. Per-role model pins let a cheap model classify and an expensive one write. A background run never outlives its session: session shutdown aborts every run and kills the worker process tree.
+~~~text
+ANTHROPIC_API_KEY
+OPENAI_API_KEY
+GEMINI_API_KEY
+OPENROUTER_API_KEY
+XAI_API_KEY
+MISTRAL_API_KEY
+GROQ_API_KEY
+CEREBRAS_API_KEY
+AWS_PROFILE
+AWS_ACCESS_KEY_ID
+AWS_SECRET_ACCESS_KEY
+AWS_REGION
+~~~
 
-**Hardened Invariants:**
-- **Explicit execution topology**: Runs execute against a validated, persisted DAG definition (`GraphDefinition`). DAG validation strictly forbids cycles, review bypass, missing verification, and concurrent mutation-capable writers.
-- **Active run deadlines**: Enforces `run_deadline_ms` across the run and per worker, actively terminating long-running child processes when wall-clock limits expire.
-- **Deterministic replay fingerprints**: Completed tasks persist a `ReplayFingerprint` (graph version, config hash, repo state, briefing hash, contract hash). Incompatible cached nodes are rejected and re-executed with explicit diagnostics; tasks superseded by a revision cycle are never replayed.
-- **Graph-owned mutation provenance**: Changes made by writer nodes are captured deterministically against a pre-mutation baseline, excluding pre-existing uncommitted user edits and preserving Git index integrity.
-- **Complete review coverage**: Large mutations exceeding review context thresholds are deterministically split into line-bounded `ReviewChunk`s with stable IDs. `ReviewCoverage` ensures every chunk is reviewed before final approval is possible.
+Run davinci --help for the current complete provider/environment list.
 
-Configure in `.pi/graph.json` (no file means all defaults and no errors; a malformed file reports the problem and proceeds on defaults):
+When an interactive authentication flow stores credentials, they are written under the resolved DaVinci agent directory.
 
-```json
-{
-  "budgets": { "maxResearchers": 3, "maxRevisionCycles": 3, "maxCostUsd": 5.0 },
-  "models": { "classifier": "google/gemini-2.5-flash", "writer": "anthropic/claude-opus-4-6" },
-  "verifyCommands": [{ "name": "test", "command": "cargo test --workspace" }],
-  "workerExtraTools": []
-}
-```
+---
 
-## Token governor
+## Permissions and project trust
 
-Large tool outputs are the fastest way to burn a context window, and most of a 4,000-line build log is not the part that matters.
+DaVinci treats tool execution as a controlled runtime boundary.
 
-When a tool result crosses 8 KB or 200 lines, the governor replaces it with a digest — first 15 lines, up to 60 "notable" lines (matching `error`, `warn`, `fail`, `panic`, `exception`, `todo`, `fixme`), last 30 lines, runs of identical lines collapsed — and writes the full text to disk under a content-addressed id. The model gets a footer telling it how many lines were omitted, and can call `retrieve_output` to read the original back losslessly, by line range or filtered by substring. Nothing is lost; it just stops being resident.
+### Permission modes
 
-Two other savings, both on by default:
+| Mode | Behavior |
+| --- | --- |
+| manual | Ask before protected actions |
+| accept-edits | Allow normal edits while retaining stronger gates |
+| plan-mode | Read-only planning; mutations are denied |
+| auto | Allow lower-risk actions and escalate higher-risk ones |
+| always-approve | Remove harness approval prompts while retaining explicit policy and OS boundaries |
 
-- **Read dedup.** Re-reading a file whose content hash has not changed returns `[unchanged read: …; the previous output is still valid]` instead of the file again.
-- **Anti-loop.** A `grep`, `find`, or `ls` call identical to an earlier one — same normalized arguments, same repository state (git HEAD plus `git status --porcelain`) — is blocked with a note to change the query or re-read the previous result. Only calls that actually succeeded enter the ledger, so a failed search stays retryable, and the ledger is bounded at 200 entries.
+Examples:
 
-Error results, `memory_search`, and `retrieve_output` itself are never compressed. Every path fails open: if the store cannot be written, the output simply passes through uncompressed. `/governor-status` shows the counters; `/governor-reset` clears the ledgers.
+~~~bash
+davinci --permission-mode manual
+davinci --permission-mode plan-mode
+davinci --permission-mode auto
+~~~
 
-Configure in `~/.pi/agent/token-governor.json` (`compressThresholdBytes`, `compressThresholdLines`, `keepHeadLines`, `keepTailLines`, `maxImportantLines`, `dedupeReads`, `antiLoop`, `storeDir`) or with the matching `PI_TOKEN_GOVERNOR_*` environment variables.
+The Codex-style --sandbox alias is also accepted:
 
-## Vector memory
+~~~bash
+davinci --sandbox read-only
+davinci --sandbox workspace-write
+davinci --sandbox full-access
+~~~
 
-Durable, per-repository memory that survives sessions and compaction.
+These are **application policy presets, not an operating-system sandbox**.
 
-Conversation turns are chunked (4,000 chars), classified (`Task`, `Decision`, `Fact`, `Conversation`), redacted of secrets, and stored locally at `.pi/vector-memory/records.jsonl`, scoped to the repository's git origin so another checkout's notes never leak in. Retrieval is hybrid: `0.6 × dense + 0.3 × lexical + 0.1 × importance`, with hits below `minimumScore` dropped.
+### Project trust
 
-It runs fully offline by default. Qdrant and Ollama are optional accelerators — if no embeddings exist locally, no embedding request is made at all, and lexical scoring answers on its own, so a missing daemon costs a fallback rather than a timeout. When automatic retrieval is on, matching memories are injected as ephemeral context ahead of the turn, wrapped in a `<pi-memory>` block that explicitly marks the content as data and not instructions.
+Project-local configuration, skills, extensions, and other executable/configurable resources require project trust before DaVinci honors them.
 
-`/memory-search <query>` searches it directly, `memory_search` exposes the same thing to the model, `/memory-status` reports record counts and daemon health, `/memory-reindex` reloads, `/memory-clear` wipes the store.
+One-run overrides:
 
-Configure in `~/.pi/agent/vector-memory.json` (`enabled`, `ollamaUrl`, `embeddingModel`, `qdrantUrl`, `collection`, `automaticRetrieval`, `resultLimit`, `maxInjectedTokens`, `minimumScore`, …) or with `PI_MEMORY_*` environment variables.
+~~~bash
+davinci --approve
+davinci --no-approve
+~~~
 
-## Security scan
+AGENTS.md and CLAUDE.md can be loaded as repository context. Disable context-file discovery with:
 
-A deterministic local scan with hash-sealed, immutable artifacts — built so a result can be audited later rather than merely believed.
+~~~bash
+davinci --no-context-files
+~~~
 
-The scanner enumerates in-scope files (no symlinks; `.git`, `node_modules`, and `target` excluded; over 2 MiB or binary is skipped and counted), applies fixed rules, and records candidates and findings. Evidence is redacted before it is written anywhere: private key material, `sk-`/`ghp_`/`Bearer` tokens, and `password=` values never reach an artifact.
+---
 
-Artifacts are written outside the repository, under the system temp directory, as `findings.json`, `candidates.json`, `coverage.json`, `report.md`, `report.sarif`, and a `scan-manifest.json` with a SHA-256 seal. Completing a scan makes it immutable — a later mutation attempt is refused, and `sec_tracking_validate` re-verifies every sealed artifact's hash and length and reports any drift. Network access is off by default and tracked in the coverage report.
+## Execution modes
 
-Fourteen `sec_*` tools drive the lifecycle (start, scope, progress, candidate record/list/validate, attack-path analysis, deep scan, complete, cancel); `/sec-status`, `/sec-report`, and `/sec-abort` drive it from the prompt.
+DaVinci provides several orchestration models for different task sizes.
 
-## Self-improving learning
+### Normal agent
 
-Turn settled agent turns into durable memory and reusable procedural skills (`SKILL.md`) with a fail-open background review loop.
+The default interactive turn loop for direct coding tasks, questions, focused fixes, and ordinary repository work.
 
-- **Fail-open & Non-blocking:** Background reviews run on asynchronous worker threads and are cancelled cooperatively when a new turn begins. Normal agent execution never fails due to learning operations.
-- **Review Gating:** Evaluates turn evidence with `should_review_evidence`, skipping low-signal read-only turns to cut reviewer input tokens by >= 40% while preserving 100% of accepted high-confidence artifacts. Memory indexing remains active.
-- **Exact Version Attribution:** Skills carry explicit `SkillVersionRef (name, version, content_hash)`. Graph execution outcomes (`VerifiedSuccess`, `VerifiedFailure`, `Neutral`) update only the specific targeted version ledger record.
-- **Closed-Loop Graph Learning:** Verified graph completions persist high-confidence memories and project skills. Later runs with related goals automatically retrieve these exact skill versions and memories into worker context, and successful verification increments the skill version's success counter.
-- **Conditional Security Gate:** Graph changes undergo deterministic change-risk classification (`assess_change_risk`); high-risk mutations or `always` policy trigger non-interactive security verification (`verify_changed_surface`) before review, blocking approval on unmitigated blockers.
-- **Commands:** `/learn` to distill procedures in the foreground; `/learning-status`, `/learning-pending`, `/learning-approve <id>`, `/learning-reject <id>`, `/skill-list`, and `/skill-view <name>`.
-- Full documentation in [`docs/learning.md`](docs/learning.md).
+### One-shot subagents
+
+Bounded isolated workers for delegated research or implementation. Workers use a scoped tool set and isolated context.
+
+### Agent teams
+
+Persistent collaborating agents with typed mailboxes, task tracking, atomic task claims, and event-driven coordination.
+
+### Workflows
+
+Repeatable DAG-based orchestration for structured multi-phase work. Workflows support bounded state, artifact handoff, retries, and fan-out/fan-in join policies.
+
+### Graph engineering
+
+The /graph path is the deterministic engineering pipeline for larger code changes:
+
+~~~text
+classify -> investigate -> plan -> implement -> verify -> review
+~~~
+
+Graph workers use isolated contexts and explicit role/tool policies. Verification is deterministic: tests and commands succeed or fail by actual exit status rather than by a model deciding that they probably passed.
+
+Graph supports:
+
+- revision loops;
+- replanning when a plan becomes invalid;
+- worktree isolation;
+- execution budgets and deadlines;
+- mutation provenance;
+- security gates;
+- complete review-chunk coverage;
+- replay fingerprints and resumable runs;
+- bounded memory/skill context injection.
+
+See [Runtime orchestration](docs/runtime-orchestration.md) and [Ecosystem architecture](docs/ecosystem.md).
+
+---
+
+## Major capabilities
+
+### Coding tools
+
+The primary built-in tool surface includes:
+
+- read
+- write
+- edit
+- bash
+- powershell
+- grep
+- find
+- ls
+
+Native capabilities and extensions register additional tools.
+
+Tool exposure can be changed per run:
+
+~~~bash
+davinci --tools read,grep,find,ls
+davinci --exclude-tools bash,powershell
+davinci --no-tools
+davinci --no-builtin-tools
+~~~
+
+### Repository and workspace intelligence
+
+DaVinci can build and reuse structured information about the active checkout instead of repeatedly rediscovering the same facts.
+
+Native engineering subsystems include:
+
+- repository indexing and symbol/module relationships;
+- workspace metadata and snapshots;
+- package/dependency intelligence;
+- build-system intelligence;
+- Git intelligence;
+- change-impact analysis;
+- test-impact analysis;
+- verification planning;
+- language/framework signals.
+
+Shared engineering snapshots are invalidated on relevant mutations and reused only when workspace identity and observed stamps remain valid.
+
+### Language intelligence
+
+DaVinci can talk to installed language servers through a bounded read-only semantic layer.
+
+The TypeScript integration includes operations such as:
+
+- definition;
+- references;
+- implementations;
+- hover;
+- document symbols;
+- workspace symbols;
+- call hierarchy;
+- diagnostics.
+
+DaVinci does not silently install or download a language server. Install the relevant project language-server packages yourself.
+
+See [Language intelligence](docs/language-intelligence.md).
+
+### Test impact and verification planning
+
+The test-impact system identifies relevant tests from observed repository structure and changes. Verification planning combines repository, build, and change facts into a bounded verification strategy.
+
+These systems are planning inputs; actual test/build exit codes remain the authority.
+
+See [Test impact](docs/test-impact.md).
+
+### Managed processes
+
+DaVinci has a native process supervisor for long-lived commands and tool-owned processes, including lifecycle, ownership, cancellation, output capture, and process-tree cleanup.
+
+See [Process manager](docs/process-manager.md).
+
+### Transactional edits
+
+Mutation-heavy workflows can use transaction boundaries that preserve recovery state, execution evidence, and verification information instead of treating file writes as unrelated operations.
+
+See [Transactional edits](docs/transactional-edits.md).
+
+### Token Governor
+
+Large tool results do not need to stay fully resident in model context.
+
+The Token Governor can:
+
+- keep bounded summaries in context;
+- preserve exact original output in an artifact store;
+- recover exact ranges later through retrieve_output;
+- deduplicate unchanged reads;
+- detect repeated low-value search/list loops;
+- compact structured output through specialized representations.
+
+Compaction changes what remains resident; it does not discard the authoritative stored output.
+
+### Context VM
+
+The optional Context VM compiles a bounded provider working set from authoritative session history while keeping original history as the source of truth.
+
+Rollout modes:
+
+~~~text
+off
+shadow
+active
+~~~
+
+It provides:
+
+- explicit provider-context budgets;
+- immutable prepared context images;
+- fold/checkpoint state;
+- protocol-safe live tool exchanges;
+- artifact-backed historical evidence;
+- source provenance and retrieval;
+- admission failure before provider dispatch when required context cannot fit.
+
+The feature is opt-in and can be evaluated in shadow mode before active use.
+
+See [Context VM](docs/context-vm.md).
+
+### Vector memory
+
+DaVinci can retain local repository-scoped memories across sessions and context compaction.
+
+The memory system supports:
+
+- repository-scoped records;
+- secret redaction;
+- lexical retrieval;
+- optional local embeddings;
+- optional Ollama/Qdrant acceleration;
+- bounded automatic injection;
+- direct memory search.
+
+Retrieved memory is treated as untrusted data context, not as new instructions.
+
+### Self-improving learning and skills
+
+Settled turns and verified graph outcomes can be distilled into reusable procedural skills.
+
+The learning system tracks exact skill versions and content hashes. Successful procedures can be reused by later graph runs without allowing learned content to bypass deterministic verification.
+
+See [Learning](docs/learning.md).
+
+### Security scanning
+
+DaVinci includes a native security-analysis pipeline with bounded evidence and auditable output.
+
+Depending on mode and configuration, it can produce:
+
+- candidate and finding records;
+- coverage information;
+- Markdown reports;
+- JSON reports;
+- SARIF;
+- content hashes and sealed evidence;
+- resumable/interrupted checkpoints.
+
+Security analysis does not replace independent review, and an empty report is not a guarantee that a repository is secure.
+
+See [Security scan](docs/security-scan.md).
+
+### Decision intelligence
+
+TypeSafe / Jev is an optional provider-neutral decision-observation layer.
+
+The current Phase 1 implementation is shadow-only: validated observations and telemetry may be collected, but they do not weaken or replace deterministic routing, permissions, verification, security, or workspace boundaries.
+
+It is disabled by default.
+
+See [Decision intelligence](docs/decision-intelligence.md).
+
+### Browser and interaction tooling
+
+The native extension host contains browser/interaction capabilities used by selected verification and engineering workflows. CI includes dedicated cross-platform interaction and browser gates.
+
+### Prompt profiles
+
+Built-in prompt behavior is versioned independently of the model:
+
+~~~bash
+davinci --prompt-profile stable
+davinci --prompt-profile preview
+davinci --prompt-profile legacy-v1
+~~~
+
+See [Prompt engineering](docs/prompt-engineering.md) and [Behavioral evaluations](docs/behavioral-evals.md).
+
+---
+
+## Sessions and persistence
+
+DaVinci stores conversations as branchable session history rather than only ephemeral chat state.
+
+Common commands:
+
+~~~bash
+davinci --continue
+davinci --resume
+davinci --session <path-or-id>
+davinci --session-id <id>
+davinci --fork <path-or-id>
+davinci --no-session
+~~~
+
+New installations normally use:
+
+~~~text
+~/.davinci/agent/sessions/
+~~~
+
+If an existing legacy Pi directory is present, DaVinci can continue using:
+
+~~~text
+~/.pi/agent/
+~~~
+
+Session history is JSONL-compatible. An optional SQLite layer provides derived indexing and branch/fact cache state.
+
+Export a session to standalone HTML:
+
+~~~bash
+davinci --export session.jsonl output.html
+~~~
 
 ---
 
 ## Configuration
 
-| Path | What |
-| --- | --- |
-| `~/.pi/agent/settings.json` | user settings |
-| `~/.pi/agent/auth.json` | provider credentials |
-| `~/.pi/agent/keybindings.json` | key overrides |
-| `~/.pi/agent/trust.json` | per-project trust decisions |
-| `~/.pi/agent/sessions/` | session JSONL, grouped by encoded cwd |
-| `~/.pi/agent/{extensions,skills,prompts,themes}/` | user resources |
-| `~/.pi/agent/token-governor.json` | token governor |
-| `~/.pi/agent/vector-memory.json` | vector memory |
-| `<project>/.pi/settings.json` | project settings (requires trust) |
-| `<project>/.pi/graph.json` | graph budgets, per-role models, verify commands |
-| `<project>/.pi/graph/runs/` | graph run state and artifacts |
-| `<project>/.pi/vector-memory/records.jsonl` | repository memory |
+### User directory resolution
 
-`PI_CODING_AGENT_DIR` relocates the agent directory, `PI_CODING_AGENT_SESSION_DIR` the session store, `PI_OFFLINE=1` (or `--offline`) disables all startup network work, and `PI_NODE` points at a specific Node binary. Provider keys are read from the conventional variables (`ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `GEMINI_API_KEY`, `AWS_*`, and so on) — `pi --help` lists them all.
+DaVinci resolves its user agent directory in this order:
+
+1. DAVINCI_CODING_AGENT_DIR
+2. legacy PI_CODING_AGENT_DIR
+3. existing ~/.davinci/agent
+4. existing legacy ~/.pi/agent
+5. otherwise ~/.davinci/agent
+
+Session-directory overrides use the same DaVinci-first, Pi-compatible policy.
+
+### Common user files
+
+Under the resolved agent directory:
+
+~~~text
+settings.json
+auth.json
+models.json
+mcp.json
+keybindings.json
+sessions/
+extensions/
+skills/
+themes/
+workflows/
+learning/
+voice/
+security-scans/
+~~~
+
+Not every installation will contain every path.
+
+### Project configuration
+
+Project-local resources are supported under DaVinci/Pi-compatible project directories and are subject to project trust. Depending on the subsystem, project resources may contain settings, graph/workflow configuration, skills, memory, and other scoped state.
+
+### Useful environment variables
+
+~~~text
+DAVINCI_CODING_AGENT_DIR
+DAVINCI_CODING_AGENT_SESSION_DIR
+PI_CODING_AGENT_DIR
+PI_CODING_AGENT_SESSION_DIR
+PI_OFFLINE
+PI_NODE
+~~~
+
+Provider-specific credentials use the provider's normal environment variables.
 
 ---
 
-## Repository Structure & Navigation
+## Extensions and MCP
 
-The repository is organized into distinct functional domains:
+### JavaScript extensions
 
-```
-pi-rust/
-├── crates/             # 14 active Rust workspace crates
-│   └── README.md       # Crate architecture & dependency guide
-├── docs/               # Architecture specs, plans, UI mockups & security reviews
-│   └── README.md       # Full documentation index & navigation hub
-├── scripts/            # Build & installation scripts (pwsh, bash)
-├── packages/           # Legacy TypeScript monorepo stubs from initial porting
-│   └── README.md       # Legacy package context
-├── vendor/             # Pinned behavioral reference source (vendor/davinci)
-├── Cargo.toml          # Cargo workspace root configuration
-├── Makefile            # Standard developer commands (build, test, fmt, clippy)
-├── CLAUDE.md           # Instructions for AI coding assistants
-└── README.md           # Product overview and user documentation
-```
+JavaScript extensions run in a Node subprocess and can add:
 
-### Workspace Crates
+- tools;
+- slash commands;
+- CLI flags;
+- autocomplete providers;
+- model/provider integrations;
+- authentication flows;
+- custom rendering/input behavior.
 
-`davinci-coding-agent` builds the primary executable. Start with the
-[architecture guide](docs/ARCHITECTURE.md) for entry points, control flow, configuration
-and validation boundaries; [`crates/README.md`](crates/README.md) groups the workspace crates.
+Node is optional unless this layer is used.
 
-| Crate | Role | Documentation |
-| :--- | :--- | :--- |
-| `davinci-coding-agent` | CLI entry point (`davinci`), interactive shell, extensions | [`crates/davinci-coding-agent/README.md`](crates/davinci-coding-agent/README.md) |
-| `davinci-agent` | Agent loop, tool execution engine, permissions, scheduler | [`crates/davinci-agent/README.md`](crates/davinci-agent/README.md) |
-| `davinci-ai` | Providers, auth/OAuth, streaming, model catalog, cost | [`crates/davinci-ai/README.md`](crates/davinci-ai/README.md) |
-| `davinci-tui` | Terminal UI (Ratatui), instruments, sheets, themes | [`crates/davinci-tui/README.md`](crates/davinci-tui/README.md) |
-| `davinci-session` | JSONL session store, discovery, turn history | [`crates/davinci-session/README.md`](crates/davinci-session/README.md) |
-| `davinci-session-sqlite` | SQLite branch cache and session indexing | [`crates/davinci-session-sqlite/README.md`](crates/davinci-session-sqlite/README.md) |
-| `davinci-mcp` | Native Model Context Protocol (MCP) client & transports | [`crates/davinci-mcp/README.md`](crates/davinci-mcp/README.md) |
-| `davinci-protocol` | Length-prefixed CBOR wire framing and RPC types | [`crates/davinci-protocol/README.md`](crates/davinci-protocol/README.md) |
-| `davinci-client` | Client SDK for communicating with the agent daemon | [`crates/davinci-client/README.md`](crates/davinci-client/README.md) |
-| `davinci-server` | Standalone background RPC daemon server | [`crates/davinci-server/README.md`](crates/davinci-server/README.md) |
-| `davinci-telemetry` | Telemetry events, OpenTelemetry, metrics | [`crates/davinci-telemetry/README.md`](crates/davinci-telemetry/README.md) |
-| `davinci-evals` | Automated evaluation harness and benchmark runners | [`crates/davinci-evals/README.md`](crates/davinci-evals/README.md) |
-| `davinci-parity` | Golden fixtures and differential parity testing | [`crates/davinci-parity/README.md`](crates/davinci-parity/README.md) |
-| `davinci-voice` | Audio capture, speech engine and worker process | [`crates/davinci-voice/`](crates/davinci-voice/) |
+Package-management commands include:
 
+~~~bash
+davinci install <source>
+davinci remove <source>
+davinci list
+davinci config
+~~~
+
+### MCP
+
+DaVinci includes a native Model Context Protocol client.
+
+User MCP configuration is loaded from the resolved agent directory, normally:
+
+~~~text
+~/.davinci/agent/mcp.json
+~~~
+
+Project-local MCP/configuration is subject to trust and permission policy.
+
+See [davinci-mcp](crates/davinci-mcp).
+
+---
+
+## Local voice input
+
+Local voice input is experimental and is available in the default interactive DaVinci terminal composer.
+
+It uses a separate davinci-voice-worker and local CPU speech recognition. Dictation inserts editable text at the cursor; it does **not** automatically send or execute the transcription.
+
+Useful commands:
+
+~~~bash
+davinci voice status
+davinci voice devices
+davinci voice model list
+davinci voice model install base
+davinci voice model import base /path/to/ggml-base.bin
+~~~
+
+Supported local model sizes are tiny, base, and small.
+
+For setup, privacy behavior, platform requirements, model verification, and current limitations, see [Local voice input](docs/voice-input.md).
+
+---
+
+## Architecture
+
+DaVinci is a 14-crate active Rust workspace.
+
+~~~mermaid
+flowchart TD
+    CLI["CLI / TUI / SDK / RPC"] --> Agent["Agent runtime"]
+    CLI --> UI["davinci-tui"]
+
+    Agent --> AI["Provider + model runtime"]
+    Agent --> Policy["Permissions / contracts / trust"]
+    Agent --> Runtime["Tasks / teams / workflows / graph"]
+    Agent --> Context["Context VM / compaction / governor"]
+
+    Policy --> Tools["Built-ins / native capabilities / MCP / JS extensions"]
+    Runtime --> Tools
+    Tools --> Agent
+
+    Agent --> Sessions["JSONL sessions / SQLite derived state"]
+    Agent --> Evidence["Artifacts / receipts / verification evidence"]
+    Agent --> UI
+~~~
+
+Primary crate responsibilities:
+
+| Crate | Responsibility |
+| --- | --- |
+| davinci-coding-agent | CLI, startup, TUI integration, settings/trust, extensions, SDK |
+| davinci-agent | Turns, tools, permissions, planning, jobs, orchestration, context/evidence runtime |
+| davinci-ai | Models, auth/OAuth, provider requests, retries, streaming, usage |
+| davinci-tui | Terminal UI, editor, instruments, themes, voice UI state |
+| davinci-voice | Local speech worker and audio contracts |
+| davinci-session | Session discovery, JSONL history, branches |
+| davinci-session-sqlite | SQLite persistence, migrations, branch/fact caches |
+| davinci-mcp | MCP client and transports |
+| davinci-protocol | Typed IPC schemas and CBOR framing |
+| davinci-client | Client transport and handshake |
+| davinci-server | Background session/controller server |
+| davinci-telemetry | Runtime telemetry contracts |
+| davinci-evals | Behavioral and engineering evaluation harnesses |
+| davinci-parity | Golden and differential compatibility fixtures |
+
+For entry points and control flow, start with [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
+
+---
+
+## Repository layout
+
+~~~text
+davinci/
+├── crates/
+│   ├── davinci-coding-agent/   # Main CLI and product assembly
+│   ├── davinci-agent/          # Agent/runtime/orchestration engine
+│   ├── davinci-ai/             # Providers, models, auth, streaming
+│   ├── davinci-tui/            # Terminal interface
+│   ├── davinci-voice/          # Local voice worker
+│   └── ...                     # Protocol, sessions, MCP, server, evals, etc.
+├── docs/                       # Architecture and capability documentation
+├── scripts/                    # Installation and validation scripts
+├── vendor/davinci/             # Pinned TypeScript behavioral reference
+├── packages/                   # Retained migration/compatibility material
+├── .github/workflows/          # CI, behavior, security, lint, evaluation workflows
+├── Cargo.toml                  # Rust workspace
+├── Cargo.lock                  # Locked dependency graph
+├── rust-toolchain.toml         # Rust 1.83.0
+└── README.md
+~~~
+
+crates/davinci-core is retained as an archived early port and is not an active workspace member.
+
+---
 
 ## Development
 
-```bash
-make build     # cargo build -p davinci-coding-agent
-make test      # cargo test --workspace
-make fmt       # cargo fmt --check
-make clippy    # cargo clippy --workspace --all-targets -- -D warnings
-cargo run -p davinci-parity                            # golden-fixture parity corpora
-```
+### Build
 
-Scope test runs to affected modules and their callers. Local fixtures may start
-loopback servers or subprocesses; live provider, browser, voice and benchmark
-verification are separate checks. The exported session viewer has a Node gate:
-`node --test crates/davinci-coding-agent/export-html/template.test.cjs`.
+~~~bash
+cargo build -p davinci-coding-agent
+~~~
+
+Release build:
+
+~~~bash
+cargo build --release -p davinci-coding-agent --locked
+~~~
+
+### Test
+
+All active workspace crates:
+
+~~~bash
+cargo test --workspace
+~~~
+
+Static checks:
+
+~~~bash
+cargo fmt --all --check
+cargo clippy --workspace --all-targets -- -D warnings
+~~~
+
+Repository-pinned/offline validation, once dependencies are cached:
+
+~~~bash
+cargo check --workspace --all-targets --offline --locked
+cargo clippy --workspace --all-targets --offline --locked -- -D warnings
+~~~
+
+Exported-session viewer test:
+
+~~~bash
+node --test crates/davinci-coding-agent/export-html/template.test.cjs
+~~~
+
+### Make targets
+
+~~~bash
+make build
+make test
+make fmt
+make clippy
+make install
+~~~
+
+### Evaluation suites
+
+The repository includes deterministic evaluation and regression infrastructure for prompt behavior, orchestration, engineering tools, security, browser behavior, parity, and runtime invariants.
+
+Examples:
+
+~~~bash
+cargo test -p davinci-evals behavior::
+cargo test -p davinci-coding-agent ecosystem_loop_ -- --nocapture
+cargo test -p davinci-coding-agent ecosystem_invariants_ -- --nocapture
+cargo run -p davinci-parity
+~~~
+
+Some tests intentionally require external software, a browser, language server, audio stack, or live provider credentials. Offline fixture tests do not prove those external integrations.
+
+---
+
+## Documentation
+
+Start here:
+
+- [Architecture and navigation](docs/ARCHITECTURE.md)
+- [Documentation index](docs/README.md)
+- [Runtime orchestration](docs/runtime-orchestration.md)
+- [Context VM](docs/context-vm.md)
+- [Closed ecosystem integration](docs/ecosystem.md)
+- [Repository intelligence](docs/repo-intelligence.md)
+- [Language intelligence](docs/language-intelligence.md)
+- [Test impact](docs/test-impact.md)
+- [Managed processes](docs/process-manager.md)
+- [Transactional edits](docs/transactional-edits.md)
+- [Security scan](docs/security-scan.md)
+- [Learning](docs/learning.md)
+- [Local voice input](docs/voice-input.md)
+- [Decision intelligence](docs/decision-intelligence.md)
+- [Prompt engineering](docs/prompt-engineering.md)
+- [Behavioral evaluations](docs/behavioral-evals.md)
+
+Historical implementation plans and archived milestones live under docs/superpowers and docs/archive. Current code and current capability guides are the source of truth for shipped behavior.
+
+---
+
+## Compatibility
+
+DaVinci intentionally retains compatibility with parts of the original Pi ecosystem.
+
+Compatibility includes:
+
+- legacy PI_* environment variables;
+- discovery of existing ~/.pi/agent state;
+- Pi-style session/history layout;
+- project resource compatibility;
+- JavaScript extension hosting;
+- preserved TypeScript behavioral reference fixtures.
+
+New DaVinci installations prefer:
+
+~~~text
+~/.davinci/agent
+DAVINCI_CODING_AGENT_DIR
+DAVINCI_CODING_AGENT_SESSION_DIR
+~~~
+
+Existing legacy state does not need to be migrated immediately.
+
+---
+
+## Security notes
+
+DaVinci can execute model-requested shell commands and can modify files when the active permission policy allows it.
+
+Important boundaries:
+
+- approval modes are application-level policy, not an OS sandbox;
+- project-local executable/configurable resources are protected by project trust;
+- credentials should never be committed to the repository;
+- language servers, MCP servers, extensions, build tools, browsers, and child processes run with the user's OS permissions unless separately sandboxed;
+- security-scan results are evidence, not a guarantee that vulnerabilities are absent;
+- use --offline when you explicitly want supported startup network operations disabled.
+
+Review [docs/security](docs/security/) before deploying DaVinci in a sensitive environment.
+
+---
 
 ## License
 
-MIT, matching upstream pi.
+DaVinci is licensed under the [MIT License](LICENSE).
+
+The repository also contains vendored/reference components with their own licenses and notices. Local voice native dependencies and model provenance are documented under [crates/davinci-voice](crates/davinci-voice) and [docs/voice-input.md](docs/voice-input.md).
