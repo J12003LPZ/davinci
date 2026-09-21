@@ -1,0 +1,47 @@
+name: Pinned terminal parity workbench
+
+on:
+  push:
+    branches: [J12003LPZ/terminal-ui-rebuild-20260920]
+    paths: ['.github/workflows/terminal-parity-workbench.yml']
+
+permissions:
+  contents: read
+
+jobs:
+  reference-inputs:
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    steps:
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Download and verify the approved reference executable
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/parity-inputs/reference" "$RUNNER_TEMP/parity-inputs/emulator"
+          curl --fail --location --retry 2 https://github.com/anthropics/claude-code/releases/download/v2.1.278/claude-linux-x64.tar.gz -o "$RUNNER_TEMP/reference.tar.gz"
+          echo "1d1f9950b96acb5a50bf342a3d3bd51cdf40b1714b2ca3ce2319ba8e8e7f3633  $RUNNER_TEMP/reference.tar.gz" | sha256sum --check
+          tar -xzf "$RUNNER_TEMP/reference.tar.gz" -C "$RUNNER_TEMP/parity-inputs/reference"
+          binary=$(find "$RUNNER_TEMP/parity-inputs/reference" -type f -name claude -print -quit)
+          test -n "$binary"
+          chmod u+x "$binary"
+          "$binary" --version | tee "$RUNNER_TEMP/parity-inputs/version.txt"
+          grep -Fx '2.1.278 (Claude Code)' "$RUNNER_TEMP/parity-inputs/version.txt"
+      - name: Install capture-only terminal parser
+        shell: bash
+        run: |
+          set -euo pipefail
+          npm install --prefix "$RUNNER_TEMP/parity-inputs/emulator" --ignore-scripts --no-audit --no-fund @xterm/headless@5.5.0
+          node --version > "$RUNNER_TEMP/parity-inputs/node-version.txt"
+          cd "$RUNNER_TEMP/parity-inputs"
+          find . -type f -print0 | sort -z | xargs -0 sha256sum > "$RUNNER_TEMP/parity-sha256.txt"
+          cp "$RUNNER_TEMP/parity-sha256.txt" sha256.txt
+          tar -czf "$RUNNER_TEMP/parity-inputs.tar.gz" .
+      - uses: actions/upload-artifact@v4
+        with:
+          name: terminal-parity-inputs-${{ github.sha }}
+          path: ${{ runner.temp }}/parity-inputs.tar.gz
+          retention-days: 1
+          if-no-files-found: error
