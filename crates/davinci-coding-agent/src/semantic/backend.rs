@@ -819,7 +819,10 @@ fn resolve_target(cwd: &Path, file_path: &str) -> Result<PathBuf, String> {
     let canonical = target
         .canonicalize()
         .map_err(|error| format!("Could not resolve semantic document: {error}"))?;
-    if !is_path_in_root(&canonical, cwd) {
+    let root = cwd
+        .canonicalize()
+        .map_err(|error| format!("Could not resolve semantic workspace: {error}"))?;
+    if !is_path_in_root(&canonical, &root) {
         return Err(format!(
             "Semantic document {} is outside workspace root {}",
             canonical.display(),
@@ -898,12 +901,16 @@ fn parse_location(value: &Value, cwd: &Path, root: &Path) -> Option<Location> {
         .get("range")
         .or_else(|| value.get("targetRange"))
         .and_then(parse_range)?;
-    let path = normalize_verbatim_path(uri_to_path(uri).ok()?.canonicalize().ok()?);
-    if !is_path_in_root(&path, root) {
+    // Resolve both sides: temp directories and workspace aliases can differ
+    // from their canonical spelling (including Windows short names/casing).
+    let path = uri_to_path(uri).ok()?.canonicalize().ok()?;
+    let root = root.canonicalize().ok()?;
+    let cwd = cwd.canonicalize().ok()?;
+    if !is_path_in_root(&path, &root) {
         return None;
     }
     let display_path = path
-        .strip_prefix(normalize_verbatim_path(cwd.to_path_buf()))
+        .strip_prefix(&cwd)
         .unwrap_or(&path)
         .to_string_lossy()
         .replace('\\', "/");
@@ -1236,6 +1243,36 @@ mod tests {
         let locations = parse_locations(&response, root.path(), root.path());
         assert_eq!(locations.len(), 1);
         assert_eq!(locations[0].path, "src/lib.rs");
+    }
+
+    #[test]
+    fn semantic_definition_accepts_workspace_alias_without_exposing_absolute_path() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().join("Workspace");
+        std::fs::create_dir(&root).unwrap();
+        std::fs::write(root.join("file.rs"), "fn target() {}\n").unwrap();
+        #[cfg(windows)]
+        let alias = dir.path().join("workspace");
+        #[cfg(unix)]
+        let alias = {
+            let alias = dir.path().join("alias");
+            std::os::unix::fs::symlink(&root, &alias).unwrap();
+            alias
+        };
+        let response = json!({
+            "uri": path_to_uri(&root.join("file.rs")),
+            "range": {
+                "start": {"line": 0, "character": 0},
+                "end": {"line": 0, "character": 2}
+            }
+        });
+        let locations = parse_locations(&response, &alias, &alias);
+        assert_eq!(locations.len(), 1);
+        assert_eq!(locations[0].path, "file.rs");
+        assert_eq!(
+            resolve_target(&alias, "file.rs").unwrap(),
+            root.join("file.rs").canonicalize().unwrap()
+        );
     }
 
     #[test]

@@ -3460,12 +3460,15 @@ mod tests {
     fn graph_deadline_controller_aborts_run_when_worker_exceeds_deadline() {
         let dir = tempfile::tempdir().unwrap();
         let budgets = GraphBudgets {
-            run_deadline_ms: 50,
+            run_deadline_ms: 60_000,
             ..Default::default()
         };
 
-        let runner: Arc<WorkerRunner> = Arc::new(|_spec, _abort, _on_progress| {
-            std::thread::sleep(Duration::from_millis(60));
+        let runner: Arc<WorkerRunner> = Arc::new(|spec, _abort, _on_progress| {
+            // This tests propagation of the worker's deadline outcome. The
+            // process tests cover elapsed deadlines; a 50ms setup budget here
+            // could expire during checkpoint I/O before any worker was started.
+            assert!(spec.run_deadline.is_some());
             WorkerResult {
                 ok: false,
                 run_deadline_exceeded: true,

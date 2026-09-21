@@ -1856,13 +1856,14 @@ mod tests {
     }
 
     fn davinci_binary() -> std::path::PathBuf {
-        let mut path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-        path.push("../../target");
-        path.push(if cfg!(debug_assertions) {
-            "debug"
-        } else {
-            "release"
-        });
+        // Cargo puts this test executable in <target>/<profile>/deps, including
+        // custom target directories and target triples. Use that same build.
+        let executable = std::env::current_exe().expect("test executable path");
+        let mut path = executable
+            .parent()
+            .and_then(std::path::Path::parent)
+            .expect("Cargo test executable in profile/deps")
+            .to_path_buf();
         path.push(if cfg!(windows) {
             "davinci.exe"
         } else {

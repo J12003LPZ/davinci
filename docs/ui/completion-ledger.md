@@ -8,7 +8,7 @@ Binding scope: approved parity specification plus the user's 2026-09-21 continua
 - Branch: `J12003LPZ/claude-parity-graph-completion`.
 - Worktree: `C:/Users/sergi/Desktop/davinci-parity-completion`.
 - Starting commit: `cb7c7f479a2156f29d6f6e8c0c99bec0d9473952`, fetched rebuild branch, clean before recovery.
-- Current task: fail-closed controller checkpoint persistence, followed by durable recovery and reference coverage.
+- Current task: host integration failure repair, followed by durable recovery and reference coverage.
 - UI recovery published as `6b6fc73`, draft PR [#29](https://github.com/J12003LPZ/davinci/pull/29). Graph verification recovery committed as `5e8dfcc`.
 - Completion: NOT established. No native visual parity or complete graph recovery claim.
 
@@ -86,6 +86,14 @@ Checkpoint hardening published as `c26d8d27c4bc0bc2135a0af84272f4baa543897f`. Ex
 
 ## Sidecar persistence follow-up
 
-Extended failure injection reproduced execution advancing when the artifact directory alone became unwritable. Artifact, replay fingerprint, context packet and mutation writes now participate in the same latched checkpoint operation. Successful worker results are durably written by the controller before success is published. Redundant graph-definition writes were removed; save_run persists the definition. Graph suite: 375 passed, five ignored after this change. This prevents ignored sidecar errors but is not yet a versioned multi-file checkpoint or side-effect receipt protocol.
+Extended failure injection reproduced execution advancing when the artifact directory alone became unwritable. Artifact, replay fingerprint, context packet and mutation writes now participate in the same latched checkpoint operation. Successful worker results are durably written by the controller before success is published. Redundant graph-definition writes were removed; save_run persists the definition. Graph suite: 375 passed, five ignored after this change. Published as `c563f1c75c47bdd3801eb535b015fae8939246d9`; host library/test clippy, formatting and whitespace passed. This prevents ignored sidecar errors but is not yet a versioned multi-file checkpoint or side-effect receipt protocol.
 
-Earlier UI CI at `6b6fc73` failed host library integration on both platforms. Windows evidence identifies two semantic backend definition-location regressions (zero locations instead of one), with 1087 passing and 12 ignored. Local evidence: `ui-windows-ci.log`. Inspect Linux evidence and reproduce/fix the location handling before the final host gate.
+Earlier UI CI at `6b6fc73` failed host library integration on both platforms. Windows evidence identifies two semantic backend definition-location regressions (zero locations instead of one), with 1087 passing and 12 ignored. Linux had 1089 passing, 12 ignored and two failures: `capped_results_use_existing_governor_retrieval` and `graph_worker_processes_share_parent_language_session`. Evidence: `ui-windows-ci.log` and `ui-linux-ci.log` in the external evidence directory.
+
+## Host integration follow-up
+
+The original Windows pair passed in isolation. A new workspace-alias regression failed with zero locations; canonicalizing the target while retaining an unresolved root caused the rejection. Both root and target are now resolved before containment checks, and display paths remain relative. Semantic backend suite: eight passed, one subprocess helper ignored; outside-root rejection still passed.
+
+Graph workflow at `c26d8d2` passed Linux graph, shell policy and lint steps. Its Windows graph step failed `graph_deadline_controller_aborts_run_when_worker_exceeds_deadline`: the 50ms lifetime could expire during durable checkpoint I/O before task creation. The test now deterministically injects a worker deadline outcome with a generous setup budget; actual process timeout remains covered separately. Both `graph_deadline` tests passed locally. That historical workflow was ultimately cancelled by the next push and is not a final exact-revision pass.
+
+Windows full host library after these repairs: 1097 passed, 12 ignored. Linux isolated manager suite: six passed in disposable Rust 1.83 Docker execution. Broader Linux execution passed the two original manager failures but exposed five fixture failures: four security CLI fixtures assumed the default target directory, and the learning-sync fixture wrote to the source checkout. The fixtures now resolve the CLI beside the running test build and store learning data in temporary directories. All five changed fixtures passed on Windows. Linux full rerun: 1099 passed, 12 ignored with a read-only source mount and separate Cargo target volume. Host library/test clippy, formatting and whitespace passed; author diff review completed. The original Linux CI failures were not reproduced locally; their resolution is not claimed. Exact-revision remote gates and all native visual gates remain open.

@@ -1228,7 +1228,13 @@ mod tests {
 
     #[test]
     fn test_sync_active_learning_memories_into_vector_memory() {
-        let mut host = NativeExtensionHost::default();
+        let root = tempfile::tempdir().unwrap();
+        let agent_dir = tempfile::tempdir().unwrap();
+        let mut host = NativeExtensionHost {
+            learning: LearningController::new(root.path(), Some(agent_dir.path()), None),
+            memory: VectorMemory::with_config(root.path().into(), VectorMemoryConfig::default()),
+            ..NativeExtensionHost::default()
+        };
         let cand = LearningCandidate {
             id: "cand-mem-1".into(),
             scope: LearningScope::Project,
