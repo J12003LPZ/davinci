@@ -351,8 +351,7 @@ impl<'a> ToolTransaction<'a> {
             self.coordinator
                 .apply(id, &authority, self.context.abort.as_deref())
         };
-        let mut applied =
-            result.map_err(|e| ToolError::Failed(format!("{e}; transaction {id}")))?;
+        let applied = result.map_err(|e| ToolError::Failed(format!("{e}; transaction {id}")))?;
         let reports = if rollback && reports.is_some() {
             Some(
                 self.coordinator
@@ -362,6 +361,7 @@ impl<'a> ToolTransaction<'a> {
         } else {
             reports
         };
+        let mut handoff_error = None;
         if let (Some(runtime), Some(reports)) = (&self.context.runtime, reports) {
             match runtime.effect_ledger.write() {
                 Ok(mut ledger) => {
@@ -374,19 +374,19 @@ impl<'a> ToolTransaction<'a> {
                                 report.before_bytes.as_deref(),
                                 report.after_bytes.as_deref(),
                             ) {
-                                if applied.warnings.len() < 8 {
-                                    applied.warnings.push(format!("Graph effect handoff failed; durable transaction {} retained: {error}",applied.id));
-                                }
+                                handoff_error.get_or_insert(error);
                             }
                         }
                         ledger.push(report.effect);
                     }
                 }
-                Err(_) => applied.warnings.push(format!(
-                    "Runtime effect ledger unavailable; durable transaction {} retained",
-                    applied.id
-                )),
+                Err(_) => {
+                    handoff_error = Some("runtime effect ledger unavailable".into());
+                }
             }
+        }
+        if let Some(error) = handoff_error {
+            return Err(ToolError::Durability(format!("Effect handoff failed after mutation; durable transaction {} retained: {error}. Reconcile before retrying", applied.id)));
         }
         Ok(applied)
     }

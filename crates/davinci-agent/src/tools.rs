@@ -261,6 +261,8 @@ pub enum ToolError {
     Unknown(String),
     #[error("{0}")]
     Failed(String),
+    #[error("{0}")]
+    Durability(String),
 }
 
 pub fn tool_specs() -> Vec<AgentTool> {

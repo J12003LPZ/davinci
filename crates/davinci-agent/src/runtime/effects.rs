@@ -128,17 +128,24 @@ pub fn append_effect_report(
             MAX_EFFECT_REPORT_BYTES
         ));
     }
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).map_err(|e| format!("create effect report directory: {e}"))?;
-    }
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    fs::create_dir_all(parent).map_err(|e| format!("create effect report directory: {e}"))?;
     let mut file = OpenOptions::new()
         .create(true)
         .append(true)
         .open(path)
         .map_err(|e| format!("open effect report: {e}"))?;
     file.write_all(&line)
-        .and_then(|_| file.sync_data())
-        .map_err(|e| format!("persist effect report: {e}"))
+        .and_then(|_| file.sync_all())
+        .map_err(|e| format!("persist effect report: {e}"))?;
+    #[cfg(unix)]
+    fs::File::open(parent)
+        .and_then(|directory| directory.sync_all())
+        .map_err(|e| format!("persist effect report directory: {e}"))?;
+    Ok(())
 }
 
 /// Read and validate a bounded JSONL effect report.

@@ -283,10 +283,18 @@ impl ToolCallLedger {
             .map_err(|err| err.to_string())
             .and_then(|bytes| atomic_write_json(path, &bytes));
         if let Err(error) = &result {
-            self.persistence_error = Some(format!("Tool ledger persistence failed: {error}. Reopen and reconcile the session before dispatching more tools."));
-            self.condvar.notify_all();
+            self.fail_persistence(format!("Tool ledger persistence failed: {error}"));
         }
         self.ensure_durable()
+    }
+
+    pub(crate) fn fail_persistence(&mut self, error: String) {
+        if self.persistence_error.is_none() {
+            self.persistence_error = Some(format!(
+                "{error}. Reopen and reconcile the session before dispatching more tools."
+            ));
+        }
+        self.condvar.notify_all();
     }
 
     fn ensure_durable(&self) -> Result<(), String> {

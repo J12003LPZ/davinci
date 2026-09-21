@@ -1420,12 +1420,18 @@ impl Agent {
             let preimages: Vec<crate::runtime::checkpoints::FileCapture> =
                 if mutating && !coordinated {
                     if let Some(runtime) = &self.runtime {
-                        targets
+                        match targets
                             .iter()
-                            .filter_map(|target| {
-                                runtime.blob_store.capture_file(task_id, cwd, target).ok()
-                            })
-                            .collect()
+                            .map(|target| runtime.blob_store.capture_file(task_id, cwd, target))
+                            .collect::<Result<Vec<_>, _>>()
+                        {
+                            Ok(captures) => captures,
+                            Err(error) => {
+                                return self.tool_durability_failure(format!(
+                                    "File checkpoint failed before dispatch: {error}"
+                                ))
+                            }
+                        }
                     } else {
                         Vec::new()
                     }
@@ -1470,12 +1476,15 @@ impl Agent {
                     receipts.retain(|receipt| receipt.operation_id != id);
                 }
             }
-            let executed = match execute_tool_with(cwd, name, args, &context) {
+            let mut executed = match execute_tool_with(cwd, name, args, &context) {
                 Ok(result) => result,
                 Err(crate::tools::ToolError::Unknown(_)) => {
                     if let Some(executor) = &self.custom_tool_executor {
                         match executor.execute_with_context(cwd, name, args, &context) {
                             Ok(result) => result,
+                            Err(crate::tools::ToolError::Durability(error)) => {
+                                self.tool_durability_failure(error)
+                            }
                             Err(err) => crate::ToolResult {
                                 content: err.to_string(),
                                 is_error: true,
@@ -1489,6 +1498,9 @@ impl Agent {
                             details: None,
                         }
                     }
+                }
+                Err(crate::tools::ToolError::Durability(error)) => {
+                    self.tool_durability_failure(error)
                 }
                 Err(err) => crate::ToolResult {
                     content: err.to_string(),
@@ -1522,49 +1534,67 @@ impl Agent {
             if mutating && !executed.is_error {
                 if let Some(runtime) = &self.runtime {
                     for pre in preimages {
-                        if let Ok(post) = runtime.blob_store.capture_file(task_id, cwd, &pre.path) {
-                            let kind = if !pre.exists && post.exists {
-                                crate::runtime::effects::FileEffectKind::Created
-                            } else if pre.exists && !post.exists {
-                                crate::runtime::effects::FileEffectKind::Deleted
-                            } else if pre.mode != post.mode {
-                                crate::runtime::effects::FileEffectKind::ModeChanged
-                            } else {
-                                crate::runtime::effects::FileEffectKind::Modified
-                            };
-                            let mut effect = crate::runtime::effects::OwnedFileEffect::new(
-                                id,
-                                runtime.agent_id,
-                                1,
-                                pre.path,
-                                kind,
-                                task_id,
-                            );
-                            effect.before_blob = pre.blob_hash;
-                            effect.after_blob = post.blob_hash;
-                            effect.before_mode = pre.mode;
-                            effect.after_mode = post.mode;
-                            if let Some(report_path) = std::env::var_os("PI_GRAPH_EFFECT_REPORT") {
-                                let before_bytes = effect
-                                    .before_blob
-                                    .as_deref()
-                                    .and_then(|hash| runtime.blob_store.get_blob(hash));
-                                let after_bytes = effect
-                                    .after_blob
-                                    .as_deref()
-                                    .and_then(|hash| runtime.blob_store.get_blob(hash));
-                                // The in-process ledger remains authoritative for the
-                                // parent; this best-effort sidecar is only the
-                                // cross-process handoff used by graph rewind.
-                                let _ = crate::runtime::effects::append_effect_report(
-                                    std::path::Path::new(&report_path),
-                                    &effect,
-                                    before_bytes.as_deref(),
-                                    after_bytes.as_deref(),
+                        match runtime.blob_store.capture_file(task_id, cwd, &pre.path) {
+                            Ok(post) => {
+                                let kind = if !pre.exists && post.exists {
+                                    crate::runtime::effects::FileEffectKind::Created
+                                } else if pre.exists && !post.exists {
+                                    crate::runtime::effects::FileEffectKind::Deleted
+                                } else if pre.mode != post.mode {
+                                    crate::runtime::effects::FileEffectKind::ModeChanged
+                                } else {
+                                    crate::runtime::effects::FileEffectKind::Modified
+                                };
+                                let mut effect = crate::runtime::effects::OwnedFileEffect::new(
+                                    id,
+                                    runtime.agent_id,
+                                    1,
+                                    pre.path,
+                                    kind,
+                                    task_id,
                                 );
+                                effect.before_blob = pre.blob_hash;
+                                effect.after_blob = post.blob_hash;
+                                effect.before_mode = pre.mode;
+                                effect.after_mode = post.mode;
+                                if let Some(report_path) =
+                                    std::env::var_os("PI_GRAPH_EFFECT_REPORT")
+                                {
+                                    let before_bytes = effect
+                                        .before_blob
+                                        .as_deref()
+                                        .and_then(|hash| runtime.blob_store.get_blob(hash));
+                                    let after_bytes = effect
+                                        .after_blob
+                                        .as_deref()
+                                        .and_then(|hash| runtime.blob_store.get_blob(hash));
+                                    // Graph rewind consumes this report in the parent
+                                    // process, so its persistence is part of success.
+                                    if let Err(error) =
+                                        crate::runtime::effects::append_effect_report(
+                                            std::path::Path::new(&report_path),
+                                            &effect,
+                                            before_bytes.as_deref(),
+                                            after_bytes.as_deref(),
+                                        )
+                                    {
+                                        executed = self.tool_durability_failure(format!(
+                                            "Effect handoff failed after mutation: {error}"
+                                        ));
+                                    }
+                                }
+                                if let Ok(mut effects) = runtime.effect_ledger.write() {
+                                    effects.push(effect);
+                                } else {
+                                    executed = self.tool_durability_failure(
+                                        "Runtime effect ledger unavailable after mutation".into(),
+                                    );
+                                }
                             }
-                            if let Ok(mut effects) = runtime.effect_ledger.write() {
-                                effects.push(effect);
+                            Err(error) => {
+                                executed = self.tool_durability_failure(format!(
+                                    "File checkpoint failed after mutation: {error}"
+                                ));
                             }
                         }
                     }
@@ -1609,6 +1639,26 @@ impl Agent {
             }
         }
         outcome
+    }
+
+    fn tool_durability_failure(&self, error: String) -> crate::ToolResult {
+        if let Ok(mut ledger) = self.tool_ledger.lock() {
+            ledger.fail_persistence(error.clone());
+        }
+        if let Some(runtime) = &self.runtime {
+            runtime
+                .cancellation_token
+                .as_atomic_bool()
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+        if let Some(abort) = &self.abort_signal {
+            abort.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+        crate::ToolResult {
+            content: error,
+            is_error: true,
+            details: Some(serde_json::json!({ "ledger_persistence": true })),
+        }
     }
 
     /// Stage three: the post hook, the events (sent to the sink now, and
@@ -2580,6 +2630,68 @@ pub(crate) fn is_verification_command(cmd: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn graph_effect_handoff_failure_stops_worker_after_mutation() {
+        const CHILD: &str = "DAVINCI_EFFECT_HANDOFF_FIXTURE";
+        let Some(root) = std::env::var_os(CHILD) else {
+            let root = tempfile::tempdir().unwrap();
+            let report = root.path().join("unwritable-report");
+            std::fs::create_dir(&report).unwrap();
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "turn::tests::graph_effect_handoff_failure_stops_worker_after_mutation",
+                    "--nocapture",
+                ])
+                .env(CHILD, root.path())
+                .env("PI_GRAPH_EFFECT_REPORT", report)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        };
+        let root = Path::new(&root);
+        let runtime = crate::RuntimeHandle::new(
+            crate::RunId::new(),
+            crate::AgentId::new(),
+            crate::RuntimeBus::new(),
+        )
+        .with_session("handoff-fixture");
+        let mut agent = Agent::new("effect handoff fixture").with_runtime(runtime.clone());
+        agent.set_permission_mode(crate::PermissionMode::AlwaysApprove);
+        let args = serde_json::json!({"path":"changed.txt", "content":"applied"});
+        assert!(matches!(
+            agent.prepare_tool_call(root, "first", "write", &args, 0),
+            Preparation::Ready { .. }
+        ));
+        let result = agent.run_prepared_call(root, "first", "write", &args, 0);
+        assert!(
+            result.is_error,
+            "an unrecorded graph effect must not report success"
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.join("changed.txt")).unwrap(),
+            "applied"
+        );
+        assert_eq!(runtime.effect_ledger.read().unwrap().len(), 1);
+        agent.post_tool = Some(crate::PostToolHook(Arc::new(|_, _, _, _, _| {
+            panic!("effect handoff failure must bypass hooks")
+        })));
+        agent.finalize_tool_call(root, "first", "write", &args, result);
+        let next = serde_json::json!({"path":"next.txt", "content":"must not run"});
+        assert!(
+            agent
+                .run_prepared_call(root, "second", "write", &next, 0)
+                .is_error
+        );
+        assert!(!root.join("next.txt").exists());
+    }
+
     #[test]
     fn tool_completion_checkpoint_failure_stops_dispatch_and_survives_hooks() {
         for tool_failed in [false, true] {
