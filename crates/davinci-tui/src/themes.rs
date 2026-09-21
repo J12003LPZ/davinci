@@ -1,8 +1,6 @@
-//! Terminal themes. The default dark theme is the da Vinci palette described
-//! in the davinci TUI design spec: yellow carries focus, sepia carries
-//! supporting information, and every state also has a glyph so `NO_COLOR`
-//! still reads. Custom theme JSON files without a `palette` keep the legacy
-//! 16-color rendering.
+//! Terminal themes shared with the native renderer. Dark and light defaults
+//! use neutral surfaces; optional and custom palettes retain their identity.
+//! Custom JSON themes without a `palette` keep the legacy ANSI rendering.
 
 use serde::{Deserialize, Serialize};
 
@@ -43,20 +41,34 @@ pub struct Palette {
 }
 
 impl Palette {
-    /// Design spec §2 truecolor values.
+    /// Use the native truecolor tokens so regular and fullscreen cannot drift.
     pub fn da_vinci() -> Self {
+        Self::from_native("dark")
+    }
+
+    fn from_native(name: &str) -> Self {
+        use crate::davinci::theme::{ColorDepth, Theme as NativeTheme};
+        let theme = NativeTheme::da_vinci(ColorDepth::TrueColor, false).with_name(name);
         Self {
-            surface: "#5E1C16".into(),
-            border: "#9C6C4F".into(),
-            text: "#D8A687".into(),
-            muted: "#C59574".into(),
-            primary: "#F3D90D".into(),
-            secondary: "#D8A687".into(),
-            success: "#D8A687".into(),
-            warning: "#F3D90D".into(),
-            error: "#E6A080".into(),
-            dim: "#9C6C4F".into(),
+            surface: color_hex(theme.surface),
+            border: color_hex(theme.border),
+            text: color_hex(theme.text),
+            muted: color_hex(theme.muted),
+            primary: color_hex(theme.primary),
+            secondary: color_hex(theme.secondary),
+            success: color_hex(theme.success),
+            warning: color_hex(theme.warning),
+            error: color_hex(theme.error),
+            dim: color_hex(theme.border),
         }
+    }
+}
+
+/// Called only with the explicitly constructed truecolor built-ins.
+fn color_hex(color: ratatui::style::Color) -> String {
+    match color {
+        ratatui::style::Color::Rgb(r, g, b) => format!("#{r:02X}{g:02X}{b:02X}"),
+        _ => unreachable!("built-in truecolor theme must contain RGB values"),
     }
 }
 
@@ -275,55 +287,26 @@ impl Theme {
 }
 
 pub fn builtin_themes() -> Vec<Theme> {
-    vec![
-        Theme {
-            name: "dark".into(),
-            background: "#1D1516".into(),
-            foreground: "#D8A687".into(),
-            accent: "#F3D90D".into(),
-            palette: Some(Palette::da_vinci()),
-        },
-        Theme {
-            name: "light".into(),
-            background: "#EAD5B9".into(),
-            foreground: "#1D1516".into(),
-            accent: "#8D150F".into(),
-            palette: Some(Palette {
-                surface: "#E2BE9E".into(),
-                border: "#9C6C4F".into(),
-                text: "#1D1516".into(),
-                muted: "#543829".into(),
-                primary: "#8D150F".into(),
-                secondary: "#182033".into(),
-                success: "#182033".into(),
-                warning: "#5E1C16".into(),
-                error: "#8D150F".into(),
-                dim: "#543829".into(),
-            }),
-        },
-        Theme {
-            name: "vox".into(),
-            background: "#1D1516".into(),
-            foreground: "#E2BE9E".into(),
-            accent: "#F3D90D".into(),
-            palette: Some(Palette {
-                surface: "#8D150F".into(),
-                text: "#E2BE9E".into(),
-                muted: "#E2BE9E".into(),
-                secondary: "#E2BE9E".into(),
-                success: "#E2BE9E".into(),
-                error: "#E2BE9E".into(),
-                ..Palette::da_vinci()
-            }),
-        },
-        Theme {
-            name: "pi".into(),
-            background: "#16161e".into(),
-            foreground: "#c0caf5".into(),
-            accent: "#7dcfff".into(),
-            palette: None,
-        },
-    ]
+    use crate::davinci::theme::{ColorDepth, Theme as NativeTheme};
+    let mut themes = Vec::new();
+    for name in ["dark", "light", "vox"] {
+        let native = NativeTheme::da_vinci(ColorDepth::TrueColor, false).with_name(name);
+        themes.push(Theme {
+            name: name.into(),
+            background: color_hex(native.background),
+            foreground: color_hex(native.text),
+            accent: color_hex(native.primary),
+            palette: Some(Palette::from_native(name)),
+        });
+    }
+    themes.push(Theme {
+        name: "pi".into(),
+        background: "#16161e".into(),
+        foreground: "#c0caf5".into(),
+        accent: "#7dcfff".into(),
+        palette: None,
+    });
+    themes
 }
 
 pub fn load_themes_from_dir(dir: &std::path::Path) -> Vec<Theme> {
@@ -407,14 +390,14 @@ mod tests {
         let theme = builtin_themes().into_iter().next().unwrap();
         assert!(theme.palette.is_some());
         let copper = theme.fg("primary", "x");
-        assert!(copper.contains("38;2;243;217;13"), "{copper:?}");
+        assert!(copper.contains("38;2;217;119;87"), "{copper:?}");
         let verdigris = theme.fg("secondary", "x");
-        assert!(verdigris.contains("38;2;216;166;135"), "{verdigris:?}");
+        assert!(verdigris.contains("38;2;128;191;255"), "{verdigris:?}");
         // Legacy role names stay mapped.
-        assert!(theme.fg("accent", "x").contains("38;2;243;217;13"));
-        assert!(theme.fg("muted", "x").contains("38;2;197;149;116"));
-        assert!(theme.bg("customMessageBg", "x").contains("48;2;94;28;22"));
-        assert!(theme.bg("searchMatchBg", "x").contains("48;2;243;217;13"));
+        assert!(theme.fg("accent", "x").contains("38;2;217;119;87"));
+        assert!(theme.fg("muted", "x").contains("38;2;170;170;170"));
+        assert!(theme.bg("customMessageBg", "x").contains("48;2;36;36;36"));
+        assert!(theme.bg("searchMatchBg", "x").contains("48;2;217;119;87"));
     }
 
     #[test]

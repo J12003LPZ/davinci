@@ -588,10 +588,9 @@ pub fn handle_key(model: &mut Model, key: KeyEvent) -> Flow {
                 Flow::Continue
             };
         }
-        // The shell's own shortcuts are checked before the editor's, because
-        // several of them (`ctrl+u` mensura, `ctrl+b` codex, `ctrl+d` quit)
-        // spell the same bytes as a readline binding. design.md §5 gives those
-        // keys to the instruments, so the editor never sees them.
+        // Explicit shell bindings retain precedence. Defaults must not steal
+        // ordinary editing chords: Ctrl+U belongs to delete-to-line-start;
+        // the usage view is available with Alt+U or its slash command.
         if let Some(flow) = handle_global_key(model, data) {
             return flow;
         }
@@ -1660,10 +1659,10 @@ mod tests {
         let mut m = model(100, 24);
         m.transcript = (0..40).map(|i| Entry::user(&format!("turn {i}"))).collect();
         let rows = compose(&m, 24);
-        assert!(text(&rows[19]).chars().all(|ch| "━╸┄╺".contains(ch)));
+        assert_eq!(text(&rows[19]), "─".repeat(usize::from(m.width)));
         assert!(text(&rows[20]).contains("❯"));
         assert!(!text(&rows[20]).contains("…"), "no placeholder prose");
-        assert!(text(&rows[21]).chars().all(|ch| "━╸┄╺".contains(ch)));
+        assert_eq!(text(&rows[21]), "─".repeat(usize::from(m.width)));
         assert!(text(&rows[22]).contains("/help for shortcuts"));
         assert!(text(&rows[23]).starts_with("  Manual · main"));
     }
@@ -1694,7 +1693,7 @@ mod tests {
         let mut m = model(100, 20);
         m.transcript = vec![Entry::user("run the tests")];
         let rows = compose(&m, 20);
-        assert!(text(&rows[1]).contains("DAVINCI"));
+        assert!(text(&rows[1]).contains("DaVinci"));
         let turn = rows
             .iter()
             .position(|row| text(row).contains("> run the tests"))
@@ -1953,8 +1952,13 @@ mod tests {
             // ctrl+m in the spec; see the note in `handle_key`.
             ('r', Screen::Memoria),
         ] {
-            handle_key(&mut m, ctrl(ch));
-            assert_eq!(m.screen, expected, "ctrl+{ch}");
+            let chord = if expected == Screen::Mensura {
+                KeyEvent::new(KeyCode::Char(ch), KeyModifiers::ALT)
+            } else {
+                ctrl(ch)
+            };
+            handle_key(&mut m, chord);
+            assert_eq!(m.screen, expected, "{ch}");
             handle_key(&mut m, key(KeyCode::Esc));
             assert_eq!(m.screen, Screen::Agent);
         }
@@ -2090,7 +2094,7 @@ mod tests {
                 "{expected} is not on screen"
             );
         }
-        assert!(rows.iter().any(|row| row.contains("DAVINCI")));
+        assert!(rows.iter().any(|row| row.contains("DaVinci")));
         assert!(rows.iter().any(|row| row.contains("23% context")));
     }
 
@@ -2631,7 +2635,7 @@ mod section_behavior_regressions {
             .map(Line::to_string)
             .collect::<Vec<_>>()
             .join("\n");
-        assert!(model_text.contains("SELECT A MODEL"), "{model_text}");
+        assert!(model_text.contains("Select a model"), "{model_text}");
         assert!(model_text.contains(&selected_model), "{model_text}");
 
         let mut settings = fixture("3b", 80, 16);
@@ -2821,7 +2825,7 @@ mod section_layout_regressions {
     fn section_titles_take_priority_over_metadata_on_narrow_terminals() {
         let mut m = fixture("3a", 32, 16);
         m.catalog.resize(12000, m.catalog[0].clone());
-        assert!(chrome::header(&m).to_string().contains("SELECT MODEL"));
+        assert!(chrome::header(&m).to_string().contains("Select model"));
     }
     #[test]
     fn scrolling_a_status_view_is_not_pinned_to_its_running_worker_marker() {

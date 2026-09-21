@@ -523,7 +523,7 @@ mod tests {
     }
 
     #[test]
-    fn picker_matches_reference_and_keeps_current_separate_from_focus() {
+    fn picker_keeps_current_separate_from_focus_and_retains_labels() {
         let mut m = model(140);
         m.catalog = vec![
             crate::davinci::model::CatalogRow {
@@ -545,7 +545,7 @@ mod tests {
         for label in [
             "╭",
             "╯",
-            "SELECT A MODEL",
+            "Select a model",
             "↑↓ model · ←→ reasoning · Enter saves",
             "↑↓ navigate",
             "OpenAI Codex",

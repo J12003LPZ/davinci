@@ -750,7 +750,7 @@ pub fn keymap() -> Vec<KeymapGroup> {
                 ("ctrl+o", "cogitator · model"),
                 ("ctrl+l", "disegno · plan"),
                 ("ctrl+g", "grafo · graph"),
-                ("ctrl+u", "mensura · governor"),
+                ("alt+u", "mensura · governor"),
                 ("ctrl+e", "codex · workspace"),
                 ("esc", "close whichever is open"),
             ],

@@ -11,6 +11,7 @@
 
 use ratatui::style::{Color, Modifier, Style, Stylize};
 use ratatui::text::{Line, Span};
+use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
 use super::theme::{glyph, State, Theme};
@@ -23,31 +24,20 @@ pub fn span(content: impl Into<String>, color: Color) -> Span<'static> {
     Span::styled(content.into(), Style::default().fg(color))
 }
 
-/// Opaque newspaper clipping. Only display headings are uppercased; values,
-/// paths and command text retain their original spelling.
+/// A plain, emphasized heading. The name is retained for existing callers;
+/// labels no longer add paper backgrounds, padding or uppercase conversion.
 pub fn paper_label(text: &str, theme: &Theme, accent: bool) -> Span<'static> {
-    let (ink, paper) = theme.label_colors(accent);
-    let style = Style::default().fg(ink).bg(paper);
     Span::styled(
-        if theme.is_vox() {
-            format!("▚ {} ▞", text.to_uppercase())
-        } else {
-            format!(" {} ", text.to_uppercase())
-        },
-        style.add_modifier(Modifier::BOLD),
+        text.to_string(),
+        Style::default()
+            .fg(if accent { theme.primary } else { theme.text })
+            .add_modifier(Modifier::BOLD),
     )
 }
 
-/// A static, irregular screen-print edge. Texture stays outside readable text
-/// and never animates, so it cannot compete with the working indicator.
+/// A quiet separator, independent of the selected color theme.
 pub fn print_rule(width: u16, theme: &Theme) -> Line<'static> {
-    let pattern = if theme.is_vox() {
-        "━╸▪┄▰━╺┄"
-    } else {
-        "━╸━┄━━╺━"
-    };
-    let edge: String = pattern.chars().cycle().take(width as usize).collect();
-    Line::from(span(edge, theme.border))
+    Line::from(span("─".repeat(usize::from(width)), theme.border))
 }
 
 /// A run of text in one color, on a tinted row.
@@ -84,8 +74,10 @@ pub fn pad(n: u16, background: Option<Color>) -> Span<'static> {
 pub fn run_width(spans: &[Span<'_>]) -> u16 {
     spans
         .iter()
-        .map(|span| UnicodeWidthStr::width(span.content.as_ref()) as u16)
-        .sum()
+        .fold(0usize, |used, span| {
+            used.saturating_add(UnicodeWidthStr::width(span.content.as_ref()))
+        })
+        .min(usize::from(u16::MAX)) as u16
 }
 
 /// An empty row.
@@ -126,15 +118,18 @@ pub fn spread_on(
 /// Cut a run to `width` cells, dropping whole spans from the end and clipping
 /// the one that straddles the edge.
 pub fn truncate_run(spans: Vec<Span<'static>>, width: u16) -> Vec<Span<'static>> {
-    if run_width(&spans) <= width {
+    let total = spans.iter().fold(0usize, |used, span| {
+        used.saturating_add(UnicodeWidthStr::width(span.content.as_ref()))
+    });
+    if total <= usize::from(width) {
         return spans;
     }
     let mut out = Vec::with_capacity(spans.len());
     let mut used = 0u16;
     for span in spans {
-        let span_width = UnicodeWidthStr::width(span.content.as_ref()) as u16;
-        if used + span_width <= width {
-            used += span_width;
+        let span_width = UnicodeWidthStr::width(span.content.as_ref());
+        if span_width <= usize::from(width.saturating_sub(used)) {
+            used += span_width as u16;
             out.push(span);
             continue;
         }
@@ -170,13 +165,13 @@ pub fn clip(text: &str, max: u16) -> String {
     }
     let mut out = String::new();
     let mut used = 0usize;
-    for ch in text.chars() {
-        let w = unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0);
-        if used + w > max as usize {
+    for grapheme in text.graphemes(true) {
+        let cells = UnicodeWidthStr::width(grapheme);
+        if used.saturating_add(cells) > usize::from(max) {
             break;
         }
-        out.push(ch);
-        used += w;
+        out.push_str(grapheme);
+        used += cells;
     }
     out
 }
@@ -208,7 +203,7 @@ fn break_head(word: &str, width: u16) -> String {
     if !head.is_empty() {
         return head;
     }
-    word.chars().next().map(String::from).unwrap_or_default()
+    word.graphemes(true).next().unwrap_or_default().to_string()
 }
 
 /// Wrap prose to the measure. Words longer than the measure are broken.
@@ -779,7 +774,7 @@ pub fn is_strong(span: &Span<'_>) -> bool {
 #[cfg(test)]
 mod tests {
     #[test]
-    fn editorial_labels_use_opaque_ink_and_preserve_monochrome() {
+    fn headings_preserve_case_and_use_no_opaque_background() {
         use super::*;
         use crate::davinci::theme::ColorDepth;
         for depth in [
@@ -790,15 +785,10 @@ mod tests {
             for no_color in [false, true] {
                 let theme = Theme::da_vinci(depth, no_color);
                 let label = paper_label("Review changes", &theme, true);
-                assert_eq!(label.content, " REVIEW CHANGES ");
+                assert_eq!(label.content, "Review changes");
                 assert!(label.style.add_modifier.contains(Modifier::BOLD));
-                if depth != ColorDepth::Basic {
-                    assert_eq!(label.style.fg, Some(theme.background));
-                    assert_eq!(label.style.bg, Some(theme.primary));
-                } else {
-                    assert_eq!(label.style.fg, Some(Color::Black));
-                    assert_eq!(label.style.bg, Some(theme.primary));
-                }
+                assert_eq!(label.style.fg, Some(theme.primary));
+                assert_eq!(label.style.bg, None);
             }
         }
     }

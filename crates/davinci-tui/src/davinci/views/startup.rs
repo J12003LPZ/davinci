@@ -3,7 +3,6 @@
 //! Keeps startup discovery from the native shell; upstream interaction lives in
 //! vendor/davinci/packages/coding-agent/src/modes/interactive/interactive-mode.ts.
 
-use ratatui::style::{Modifier, Stylize};
 use ratatui::text::{Line, Span};
 
 use crate::davinci::model::{Model, Startup};
@@ -14,19 +13,9 @@ use crate::davinci::ui::{blank, indent, paper_label, span, span_strong, truncate
 /// selected model come from the running session, never from sample copy.
 pub fn banner(model: &Model, info: &Startup) -> Vec<Line<'static>> {
     let th = &model.theme;
-    let mark = if model.width >= 48 {
-        [
-            " ▓▓▓▓▓╸      ",
-            " ▓▓  ▓▓      ",
-            " ▓▓  ▓▓      ",
-            " ▓▓▓▓▓╸      ",
-        ]
-    } else {
-        ["", "", "", ""]
-    };
     let facts = [
         vec![
-            paper_label("davinci", th, true),
+            paper_label("DaVinci", th, true),
             span(format!(" v{}", env!("CARGO_PKG_VERSION")), th.muted),
         ],
         vec![
@@ -34,13 +23,10 @@ pub fn banner(model: &Model, info: &Startup) -> Vec<Line<'static>> {
             span(format!(" · {}", model.thinking_level), th.muted),
         ],
         vec![span(info.cwd.clone(), th.muted)],
-        vec![span("CODE / TOOLS / CONTEXT", th.muted).add_modifier(Modifier::BOLD)],
     ];
-    mark.into_iter()
-        .zip(facts)
-        .map(|(art, facts)| {
-            let mut run = vec![span(art, th.text)];
-            run.extend(facts);
+    facts
+        .into_iter()
+        .map(|run| {
             indent(
                 1.min(model.width),
                 truncate_run(run, model.width.saturating_sub(1)),
@@ -98,7 +84,7 @@ fn restored_row(theme: &Theme, restored: bool) -> Vec<Span<'static>> {
 
 /// Row count includes discovered resources.
 pub fn height(model: &Model) -> usize {
-    15 + model.startup.found.len()
+    14 + model.startup.found.len()
 }
 
 #[cfg(test)]
@@ -167,16 +153,16 @@ mod tests {
     }
 
     #[test]
-    fn banner_uses_editorial_masthead() {
+    fn banner_uses_compact_identity_without_editorial_masthead() {
         let m = model(100);
         let art = banner(&m, &m.startup)
             .iter()
             .map(text)
             .collect::<Vec<_>>()
             .join("\n");
-        assert!(art.contains("▓▓▓▓▓╸"));
-        assert!(art.contains("DAVINCI"));
-        assert!(art.contains("CODE / TOOLS / CONTEXT"));
+        assert!(!art.contains("▓▓▓▓▓╸"));
+        assert!(art.contains("DaVinci"));
+        assert!(!art.contains("CODE / TOOLS / CONTEXT"));
         assert!(!art.contains("▐▛███▜▌"));
         assert!(!art.contains("▝▜█████▛▘"));
     }
