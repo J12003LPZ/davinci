@@ -1,0 +1,41 @@
+name: Terminal UI rebuild
+
+on:
+  push:
+    branches: [J12003LPZ/terminal-ui-rebuild-20260920]
+    paths:
+      - 'crates/davinci-tui/**'
+      - '.github/workflows/terminal-ui.yml'
+      - '.github/scripts/terminal_ui_*.py'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: terminal-ui-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: never
+  PI_OFFLINE: '1'
+
+jobs:
+  terminal:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.83.0
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: terminal-ui
+      - name: Rebuild contracts
+        run: cargo test --locked -p davinci-tui --test terminal_rebuild -- --nocapture
+      - name: Entire TUI suite
+        if: always()
+        run: cargo test --locked -p davinci-tui
+      - name: TUI lint
+        if: always()
+        run: cargo clippy --locked -p davinci-tui --all-targets -- -D warnings
