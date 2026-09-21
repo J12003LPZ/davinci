@@ -1,0 +1,75 @@
+name: Terminal reference capture
+
+on:
+  push:
+    branches: [J12003LPZ/terminal-ui-rebuild-20260920]
+    paths:
+      - '.github/workflows/terminal-reference.yml'
+      - '.github/scripts/terminal_reference_capture.py'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: terminal-reference-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  reference:
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Download pinned official reference
+        shell: bash
+        run: |
+          mkdir -p "$RUNNER_TEMP/claude-reference"
+          curl --fail --location --retry 2 https://github.com/anthropics/claude-code/releases/download/v2.1.278/claude-linux-x64.tar.gz -o "$RUNNER_TEMP/claude-reference.tar.gz"
+          echo "1d1f9950b96acb5a50bf342a3d3bd51cdf40b1714b2ca3ce2319ba8e8e7f3633  $RUNNER_TEMP/claude-reference.tar.gz" | sha256sum --check
+          tar -xzf "$RUNNER_TEMP/claude-reference.tar.gz" -C "$RUNNER_TEMP/claude-reference"
+          binary=$(find "$RUNNER_TEMP/claude-reference" -type f -name claude -print -quit)
+          test -n "$binary"
+          chmod u+x "$binary"
+          echo "REFERENCE_CLI=$binary" >> "$GITHUB_ENV"
+          "$binary" --version
+      - name: Install capture-only dependencies
+        run: python3 -m pip install --user pexpect==4.9.0 pyte==0.8.2
+      - name: Capture isolated reference terminal
+        run: python3 .github/scripts/terminal_reference_capture.py
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: claude-reference-${{ github.sha }}
+          path: ${{ runner.temp }}/reference-captures
+          retention-days: 7
+          if-no-files-found: warn
+  offline-inputs:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@1.83.0
+        with:
+          components: rustfmt, clippy
+      - name: Fetch locked public dependencies
+        run: cargo fetch --locked
+      - name: Package isolated build inputs without credentials
+        shell: bash
+        run: |
+          mkdir -p "$RUNNER_TEMP/offline-inputs"
+          git archive --format=tar.gz HEAD > "$RUNNER_TEMP/offline-inputs/source.tar.gz"
+          tar -czf "$RUNNER_TEMP/offline-inputs/rust-toolchain.tar.gz" -C "$(rustc --print sysroot)" bin lib libexec
+          tar -czf "$RUNNER_TEMP/offline-inputs/cargo-registry.tar.gz" -C "$HOME/.cargo" registry
+          rustc --version > "$RUNNER_TEMP/offline-inputs/toolchain-version.txt"
+          sha256sum "$RUNNER_TEMP/offline-inputs/"*.tar.gz > "$RUNNER_TEMP/offline-inputs/checksums.txt"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: terminal-offline-inputs-${{ github.sha }}
+          path: ${{ runner.temp }}/offline-inputs
+          retention-days: 1
+          compression-level: 0
+          if-no-files-found: error
