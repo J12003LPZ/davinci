@@ -304,14 +304,19 @@ pub fn read_task_fingerprint(
     serde_json::from_str(&raw).ok()
 }
 
-#[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TaskAttemptRecord {
     pub task_id: String,
     pub attempt: u32,
     pub status: super::types::TaskStatus,
-    pub exit_code: i32,
+    pub exit_code: Option<i32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub child_pid: Option<u32>,
+    #[serde(default)]
+    pub timed_out: bool,
+    #[serde(default)]
+    pub run_deadline_exceeded: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub artifact_file: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -323,7 +328,6 @@ pub struct TaskAttemptRecord {
     pub fingerprint: Option<super::replay::ReplayFingerprint>,
 }
 
-#[allow(dead_code)]
 pub fn write_task_attempt(
     cwd: &Path,
     run_id: &str,
@@ -893,7 +897,10 @@ mod tests {
             task_id: "research-1".into(),
             attempt: 1,
             status: crate::native_extensions::graph::types::TaskStatus::Failed,
-            exit_code: 1,
+            exit_code: Some(1),
+            child_pid: None,
+            timed_out: false,
+            run_deadline_exceeded: false,
             artifact_file: None,
             error: Some("test error".into()),
             usage: crate::native_extensions::graph::types::WorkerUsage::default(),

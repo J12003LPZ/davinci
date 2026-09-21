@@ -107,6 +107,9 @@ pub struct GraphContinuation {
     #[serde(default)]
     pub saved_security:
         std::collections::BTreeMap<String, crate::native_extensions::SecurityVerification>,
+    /// Authoritative history; companion records may be ahead after a crash.
+    #[serde(default)]
+    pub attempt_history: std::collections::BTreeMap<String, Vec<super::store::TaskAttemptRecord>>,
 }
 
 impl Default for GraphContinuation {
@@ -124,6 +127,7 @@ impl Default for GraphContinuation {
             saved_stage_inputs: Default::default(),
             saved_verifications: Default::default(),
             saved_security: Default::default(),
+            attempt_history: Default::default(),
         }
     }
 }
@@ -145,6 +149,7 @@ pub fn validate_resume(run: &super::types::GraphRun, cwd: &std::path::Path) -> R
     if cursor.version != 1 {
         return Err("Unsupported execution cursor version".into());
     }
+    validate_attempt_history(run, cursor)?;
     if run.saved_definition.is_none() {
         let milestones = run
             .milestones
@@ -365,6 +370,73 @@ pub fn validate_resume(run: &super::types::GraphRun, cwd: &std::path::Path) -> R
                     );
                 }
             }
+        }
+    }
+    Ok(())
+}
+
+fn validate_attempt_history(
+    run: &super::types::GraphRun,
+    cursor: &GraphContinuation,
+) -> Result<(), String> {
+    use super::types::TaskStatus;
+    for (id, records) in &cursor.attempt_history {
+        let invalid = || format!("Checkpoint attempt history is inconsistent for '{id}'");
+        let task = run.task(id).ok_or_else(invalid)?;
+        if !super::store::is_safe_run_id(id)
+            || records
+                .last()
+                .is_none_or(|record| record.attempt != task.attempts)
+        {
+            return Err(invalid());
+        }
+        let mut previous: Option<u32> = None;
+        for record in records {
+            if record.task_id != *id
+                || record.attempt == 0
+                || previous.is_some_and(|value| value.checked_add(1) != Some(record.attempt))
+                || record.started_at.is_none()
+            {
+                return Err(invalid());
+            }
+            let running = record.status == TaskStatus::Running;
+            if running != record.ended_at.is_none()
+                || running != record.exit_code.is_none()
+                || (running && record.attempt != task.attempts)
+                || record.status == TaskStatus::Pending
+            {
+                return Err(invalid());
+            }
+            let fingerprint = record.fingerprint.as_ref().ok_or_else(invalid)?;
+            if fingerprint.contract_hash != super::replay::compute_contract_hash(task.expect)
+                || fingerprint.definition_digest != run.definition_digest
+                || fingerprint.graph_version
+                    != run.definition.as_ref().map_or(run.version, |d| d.version)
+            {
+                return Err(invalid());
+            }
+            if record.status == TaskStatus::Succeeded && record.artifact_file.is_none() {
+                return Err(invalid());
+            }
+            if let Some(path) = &record.artifact_file {
+                let identity = format!("{id}.attempt_{}.artifact", record.attempt);
+                if *path != format!("artifacts/{identity}.json") {
+                    return Err(invalid());
+                }
+                super::store::read_artifact(
+                    std::path::Path::new(&run.cwd),
+                    &run.run_id,
+                    &identity,
+                    task.expect,
+                )
+                .map_err(|errors| {
+                    format!(
+                        "Cannot restore attempt history for '{id}': {}",
+                        errors.join("; ")
+                    )
+                })?;
+            }
+            previous = Some(record.attempt);
         }
     }
     Ok(())

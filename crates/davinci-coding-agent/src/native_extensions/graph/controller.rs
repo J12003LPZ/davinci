@@ -239,6 +239,9 @@ pub struct GraphExecution {
 #[path = "controller_control.rs"]
 mod live_control;
 
+#[path = "controller_attempts.rs"]
+mod attempts;
+
 impl GraphExecution {
     fn completion_inputs(&self) -> Result<String, String> {
         let source = capture_baseline(&self.options.cwd)?;
@@ -319,7 +322,7 @@ impl GraphExecution {
     fn checkpoint_with(
         &self,
         note: Option<&str>,
-        persist_companions: impl FnOnce(&GraphRun) -> std::io::Result<()>,
+        persist_companions: impl FnOnce(&mut GraphRun) -> std::io::Result<()>,
     ) -> bool {
         // Persist under the lock, but report on a clone with the guard dropped:
         // a slow `on_update` must not serialize every worker thread, and an
@@ -351,7 +354,7 @@ impl GraphExecution {
                     gov_stats.as_ref(),
                 ),
             );
-            if let Err(error) = persist_companions(&run).and_then(|()| save_run(&mut run)) {
+            if let Err(error) = persist_companions(&mut run).and_then(|()| save_run(&mut run)) {
                 let reason = format!("checkpoint persistence failed: {error}");
                 *failure = Some(reason.clone());
                 self.exec_abort.store(true, Ordering::SeqCst);
@@ -932,10 +935,6 @@ impl GraphExecution {
                 self.checkpoint(None);
                 return None;
             }
-            if !self.checkpoint(Some(&format!("{task_id}: attempt {attempt} ({role})"))) {
-                return None;
-            }
-
             let attempt_briefing = if attempt == 1 {
                 briefing.clone()
             } else {
@@ -989,6 +988,9 @@ impl GraphExecution {
 
             let worker_agent_id = davinci_agent::AgentId::new();
             spec.runtime_agent_id = Some(worker_agent_id);
+            if !self.begin_attempt(&spec, attempt) {
+                return None;
+            }
             if let Some(runtime) = &self.deps.runtime {
                 let run_snapshot = self.snapshot();
                 let provider = spec
@@ -1073,8 +1075,16 @@ impl GraphExecution {
                         if let Some(task) = run.tasks.iter_mut().find(|entry| entry.id == task_id) {
                             task.last_activity = Some(line.to_string());
                         }
+                        if let Some(record) = run
+                            .continuation
+                            .as_mut()
+                            .and_then(|cursor| cursor.attempt_history.get_mut(&task_id))
+                            .and_then(|records| records.last_mut())
+                        {
+                            record.usage = *usage;
+                        }
                     }
-                    (self.deps.on_update)(&self.snapshot(), Some(&format!("{task_id}: {line}")));
+                    self.checkpoint(Some(&format!("{task_id}: {line}")));
                 };
                 let node_abort = self.register_node_abort(&task_id);
                 spec.node_abort = Some(Arc::clone(&node_abort));
@@ -1143,6 +1153,9 @@ impl GraphExecution {
             }
 
             let run = self.snapshot();
+            if !self.finish_attempt(&spec, attempt, &result) {
+                return None;
+            }
             write_log(
                 Path::new(&run.cwd),
                 &run.run_id,
@@ -3461,6 +3474,10 @@ mod continuation_tests;
 #[cfg(test)]
 #[path = "controller_saved_continuation_tests.rs"]
 mod saved_continuation_tests;
+
+#[cfg(test)]
+#[path = "controller_attempt_tests.rs"]
+mod attempt_tests;
 
 #[cfg(test)]
 #[path = "controller_revision_tests.rs"]
