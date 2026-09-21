@@ -8,7 +8,7 @@ fn block_run_storage(cwd: &Path, run_id: &str, backup: &Path) {
 
 #[test]
 fn checkpoint_failure_prevents_dispatch_and_preserves_last_durable_state() {
-    for stage in 0..3 {
+    for stage in 0..4 {
         let fail_initial = stage == 0;
         let dir = tempfile::tempdir().unwrap();
         if fail_initial {
@@ -33,11 +33,16 @@ fn checkpoint_failure_prevents_dispatch_and_preserves_last_durable_state() {
             },
             ControllerDeps {
                 runner: Arc::new(move |spec, _, _| {
-                    calls.fetch_add(1, Ordering::SeqCst);
+                    let call = calls.fetch_add(1, Ordering::SeqCst);
                     if stage == 2 {
                         let path = spec.artifact_path.parent().unwrap().parent().unwrap();
                         std::fs::rename(path, &worker_backup).unwrap();
                         std::fs::write(path, "blocked storage").unwrap();
+                    }
+                    if stage == 3 && call == 0 {
+                        let path = spec.artifact_path.parent().unwrap();
+                        std::fs::rename(path, &worker_backup).unwrap();
+                        std::fs::write(path, "blocked artifact storage").unwrap();
                     }
                     WorkerResult {
                         ok: true,
@@ -80,7 +85,7 @@ fn checkpoint_failure_prevents_dispatch_and_preserves_last_durable_state() {
         );
         assert_eq!(
             dispatches.load(Ordering::SeqCst),
-            usize::from(stage == 2),
+            usize::from(stage >= 2),
             "stage={stage}"
         );
         assert_eq!(run.phase, Phase::Blocked);
@@ -99,7 +104,11 @@ fn checkpoint_failure_prevents_dispatch_and_preserves_last_durable_state() {
             .as_deref()
             .unwrap()
             .contains("not saved"));
-        if !fail_initial {
+        if stage == 3 {
+            let durable = super::super::store::load_run(dir.path(), &run.run_id).unwrap();
+            assert_eq!(durable.tasks.len(), 1);
+            assert_eq!(durable.tasks[0].status, TaskStatus::Running);
+        } else if !fail_initial {
             let durable: GraphRun =
                 serde_json::from_slice(&std::fs::read(backup.join("state.json")).unwrap()).unwrap();
             assert_eq!(durable.phase, Phase::Classify);

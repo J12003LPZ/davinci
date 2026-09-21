@@ -25,7 +25,7 @@ use super::roles::{
 };
 use super::store::{
     artifact_path, create_run_dir, new_run_id, now_ms, save_run, transcript_path, write_artifact,
-    write_graph_definition, write_log, write_task_fingerprint, write_task_mutation,
+    write_log, write_task_fingerprint, write_task_mutation,
 };
 use super::topology::{
     build_definition, ready_nodes, validate_definition, EdgeCondition, EdgeDefinition, GraphMode,
@@ -282,6 +282,14 @@ impl GraphExecution {
     }
 
     fn checkpoint(&self, note: Option<&str>) -> bool {
+        self.checkpoint_with(note, |_| Ok(()))
+    }
+
+    fn checkpoint_with(
+        &self,
+        note: Option<&str>,
+        persist_companions: impl FnOnce(&GraphRun) -> std::io::Result<()>,
+    ) -> bool {
         // Persist under the lock, but report on a clone with the guard dropped:
         // a slow `on_update` must not serialize every worker thread, and an
         // implementation that re-locks the run must not deadlock.
@@ -311,7 +319,7 @@ impl GraphExecution {
                     gov_stats.as_ref(),
                 ),
             );
-            if let Err(error) = save_run(&mut run) {
+            if let Err(error) = persist_companions(&run).and_then(|()| save_run(&mut run)) {
                 let reason = format!("checkpoint persistence failed: {error}");
                 *failure = Some(reason.clone());
                 self.exec_abort.store(true, Ordering::SeqCst);
@@ -722,7 +730,6 @@ impl GraphExecution {
             if is_compatible {
                 {
                     let mut run = self.run.lock().unwrap_or_else(|error| error.into_inner());
-                    let run_id = run.run_id.clone();
                     if let Some(task_entry) = run.tasks.iter_mut().find(|entry| entry.id == task_id)
                     {
                         task_entry.started_at = Some(now_ms());
@@ -730,16 +737,21 @@ impl GraphExecution {
                         task_entry.fingerprint = stored_fingerprint.clone();
                         task_entry.usage = *usage;
                     }
-                    let _ = write_artifact(&artifact_path(&cwd, &run_id, &task_id), artifact);
-                    if let Some(fp) = stored_fingerprint {
-                        let _ = write_task_fingerprint(&cwd, &run_id, &task_id, fp);
-                    }
                 }
                 if self.options.resume_run.is_none() {
                     self.add_usage(&task_id, usage);
                 }
                 self.end_task(&task_id, TaskStatus::Succeeded, None);
-                if !self.checkpoint(Some(&format!("{task_id}: reused from previous run"))) {
+                if !self.checkpoint_with(
+                    Some(&format!("{task_id}: reused from previous run")),
+                    |run| {
+                        write_artifact(&artifact_path(&cwd, &run.run_id, &task_id), artifact)?;
+                        if let Some(fp) = stored_fingerprint {
+                            write_task_fingerprint(&cwd, &run.run_id, &task_id, fp)?;
+                        }
+                        Ok(())
+                    },
+                ) {
                     return None;
                 }
                 return Some(artifact.clone());
@@ -788,8 +800,6 @@ impl GraphExecution {
 
         {
             let mut run = self.run.lock().unwrap_or_else(|error| error.into_inner());
-            let run_id = run.run_id.clone();
-            let cwd = PathBuf::from(&run.cwd);
             if let Some(t) = run.tasks.iter_mut().find(|entry| entry.id == task_id) {
                 t.context_fingerprint = if context_packet.is_empty() {
                     None
@@ -809,14 +819,19 @@ impl GraphExecution {
                 run.ecosystem_stats.skill_injected_tokens += context_packet.skill_tokens as u64;
                 run.ecosystem_stats.context_packet_tokens += context_packet.estimated_tokens as u64;
                 run.ecosystem_stats.context_fingerprint = Some(context_packet.fingerprint.clone());
-
-                let _ = super::store::write_task_context_packet(
-                    &cwd,
-                    &run_id,
+            }
+        }
+        if !context_packet.is_empty()
+            && !self.checkpoint_with(None, |run| {
+                super::store::write_task_context_packet(
+                    Path::new(&run.cwd),
+                    &run.run_id,
                     &task_id,
                     &context_packet,
-                );
-            }
+                )
+            })
+        {
+            return None;
         }
 
         let mut last_failure_class: Option<WorkerFailureClass> = None;
@@ -1143,9 +1158,11 @@ impl GraphExecution {
                         definition_digest.as_deref(),
                         dry_run,
                     );
-                    let _ = write_task_fingerprint(&cwd, &run_id, &task_id, &fingerprint);
                     self.end_task(&task_id, TaskStatus::Succeeded, None);
-                    if !self.checkpoint(Some(&format!("{task_id}: succeeded"))) {
+                    if !self.checkpoint_with(Some(&format!("{task_id}: succeeded")), |_| {
+                        write_artifact(&artifact_path(&cwd, &run_id, &task_id), &artifact)?;
+                        write_task_fingerprint(&cwd, &run_id, &task_id, &fingerprint)
+                    }) {
                         return None;
                     }
                     return Some(artifact);
@@ -1600,8 +1617,9 @@ fn drive_compiled_saved_graph(
         run.definition_digest = Some(compiled.definition_digest.clone());
     }
     let run_id = execution.snapshot().run_id;
-    let _ = write_graph_definition(&cwd, &run_id, &compiled.topology);
-    execution.checkpoint(Some("saved graph compiled"));
+    if !execution.checkpoint(Some("saved graph compiled")) {
+        return execution.snapshot();
+    }
 
     let initial_baseline = capture_baseline(&cwd).unwrap_or_default();
     let mut cumulative_delta = GraphMutation::default();
@@ -1650,7 +1668,9 @@ fn drive_compiled_saved_graph(
             super::bindings::SupportedStage::Security => execution.set_phase(Phase::Verify),
             super::bindings::SupportedStage::Review => execution.set_phase(Phase::Review),
         }
-        execution.checkpoint(None);
+        if !execution.checkpoint(None) {
+            return execution.snapshot();
+        }
 
         let incoming_deps: Vec<String> = compiled
             .topology
@@ -1802,7 +1822,11 @@ fn drive_compiled_saved_graph(
                 task_entry.mutation = Some(attempt_delta.clone());
             }
             drop(run);
-            let _ = write_task_mutation(&cwd, &run_id, &task_id, &attempt_delta);
+            if !execution.checkpoint_with(None, |_| {
+                write_task_mutation(&cwd, &run_id, &task_id, &attempt_delta)
+            }) {
+                return execution.snapshot();
+            }
         }
 
         if artifact.is_none() && node.required {
@@ -1913,8 +1937,6 @@ fn drive(execution: &GraphExecution) -> GraphRun {
             run.milestones = Some(milestones.clone());
         }
     }
-    let run_id = execution.snapshot().run_id;
-    let _ = write_graph_definition(&cwd, &run_id, &definition);
     let milestone_note = if milestones.len() > 1 && complexity != Complexity::Trivial {
         format!(", {} milestones", milestones.len())
     } else {
@@ -2256,7 +2278,11 @@ fn deliver_goal(
                 task_entry.mutation = Some(attempt_delta.clone());
             }
             drop(run);
-            let _ = write_task_mutation(&cwd, &run_id, &task_id, &attempt_delta);
+            if !execution.checkpoint_with(None, |_| {
+                write_task_mutation(&cwd, &run_id, &task_id, &attempt_delta)
+            }) {
+                return Delivery::Stop;
+            }
         }
 
         if patch.plan_invalidated {

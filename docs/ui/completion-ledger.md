@@ -81,3 +81,11 @@ New failure injection reproduced two worker dispatches despite initial storage f
 Separate regression reproduced verification dispatch after the progress callback cancelled execution. Verification now checks cancellation after that callback. Two storage regressions reproduced the multi-rename fallback and premature state publication before companion writes. Storage now flushes the new file, uses one replacement, and publishes self-contained state last. Unix directory sync is included; power-loss behavior and exact-revision Linux execution are not yet validated.
 
 Final local validation: graph suite 375 passed, five native fixtures ignored; host library/test clippy passed with warnings denied; formatting and diff whitespace passed. Existing atomic replacement and native Windows run round-trip tests passed in the graph suite. Author review completed. This milestone does not yet fix ignored artifact/sidecar errors, full resume state, worker conversations, ownership or the complete visual parity matrix.
+
+Checkpoint hardening published as `c26d8d27c4bc0bc2135a0af84272f4baa543897f`. Exact-revision graph/CI workflows started; workflow lint and SARIF interoperability passed, graph and general CI were still running at inspection.
+
+## Sidecar persistence follow-up
+
+Extended failure injection reproduced execution advancing when the artifact directory alone became unwritable. Artifact, replay fingerprint, context packet and mutation writes now participate in the same latched checkpoint operation. Successful worker results are durably written by the controller before success is published. Redundant graph-definition writes were removed; save_run persists the definition. Graph suite: 375 passed, five ignored after this change. This prevents ignored sidecar errors but is not yet a versioned multi-file checkpoint or side-effect receipt protocol.
+
+Earlier UI CI at `6b6fc73` failed host library integration on both platforms. Windows evidence identifies two semantic backend definition-location regressions (zero locations instead of one), with 1087 passing and 12 ignored. Local evidence: `ui-windows-ci.log`. Inspect Linux evidence and reproduce/fix the location handling before the final host gate.
