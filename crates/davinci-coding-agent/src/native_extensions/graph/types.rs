@@ -1025,6 +1025,8 @@ pub struct WorkerResult {
     pub usage: WorkerUsage,
     pub timed_out: bool,
     pub run_deadline_exceeded: bool,
+    /// The worker lost its durable execution boundary; automatic retry is unsafe.
+    pub recovery_required: bool,
     /// Structured reason for a failed child, when the process did not explain it.
     pub failure_reason: Option<String>,
     #[allow(dead_code)]

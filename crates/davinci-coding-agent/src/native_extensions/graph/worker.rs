@@ -39,6 +39,7 @@ pub struct WorkerEventState {
     pub final_text: String,
     pub stop_reason: Option<String>,
     pub error_message: Option<String>,
+    pub recovery_error: Option<String>,
     /// Last observed tool call or turn, for the live view.
     pub activity: Option<String>,
     /// Bumped whenever `activity` or `usage` changes.
@@ -100,6 +101,28 @@ pub fn parse_worker_event(
         .get("type")
         .and_then(Value::as_str)
         .unwrap_or_default();
+
+    if event_type == "agent_end" {
+        if let Some(error) = event
+            .get("messages")
+            .and_then(Value::as_array)
+            .and_then(|messages| {
+                messages.iter().find_map(|message| {
+                    message
+                        .get("sessionPersistenceError")
+                        .and_then(Value::as_str)
+                })
+            })
+        {
+            state.error_message = Some(error.to_string());
+            state.recovery_error = Some(error.to_string());
+            state.stop_reason = Some("session_persistence".into());
+            state.activity = Some("worker conversation requires recovery".into());
+            state.activity_seq += 1;
+            on_transcript(error);
+        }
+        return;
+    }
 
     if event_type == "tool_execution_start" {
         if let Some(tool_name) = event.get("toolName").and_then(Value::as_str) {
@@ -527,6 +550,15 @@ pub fn run_worker(
         append_transcript(path, &format!("══ exited {}{suffix}", outcome.exit_code));
     }
 
+    finish_worker(spec, outcome, state, &stderr)
+}
+
+fn finish_worker(
+    spec: &WorkerSpec,
+    outcome: super::process::ChildOutcome,
+    state: WorkerEventState,
+    stderr: &str,
+) -> WorkerResult {
     let stderr_tail: String = {
         let count = stderr.chars().count();
         stderr
@@ -543,6 +575,7 @@ pub fn run_worker(
         usage: state.usage,
         timed_out: outcome.timed_out,
         run_deadline_exceeded: outcome.run_deadline_exceeded,
+        recovery_required: state.recovery_error.is_some(),
         failure_reason: None,
         child_pid: Some(outcome.pid),
     };
@@ -550,6 +583,13 @@ pub fn run_worker(
     if outcome.run_deadline_exceeded {
         return WorkerResult {
             failure_reason: Some("run deadline exceeded".to_string()),
+            ..base
+        };
+    }
+
+    if state.recovery_error.is_some() {
+        return WorkerResult {
+            failure_reason: state.recovery_error,
             ..base
         };
     }
@@ -709,6 +749,7 @@ pub fn run_dry_worker(
         usage,
         timed_out: false,
         run_deadline_exceeded: false,
+        recovery_required: false,
         failure_reason: None,
         child_pid: None,
     }
@@ -758,6 +799,7 @@ pub fn run_fixture_worker_with_deadline(
         usage: WorkerUsage::default(),
         timed_out: outcome.timed_out,
         run_deadline_exceeded: outcome.run_deadline_exceeded,
+        recovery_required: false,
         failure_reason: if outcome.run_deadline_exceeded {
             Some("run deadline exceeded".to_string())
         } else if outcome.timed_out {
@@ -777,6 +819,49 @@ mod tests {
     use super::*;
     use crate::native_extensions::graph::types::Role;
     use serde_json::json;
+
+    #[test]
+    fn submitted_artifact_cannot_hide_a_conversation_write_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut spec = spec();
+        spec.artifact_path = dir.path().join("artifact.json");
+        write_artifact(&spec.artifact_path, &canned_artifact(spec.expect)).unwrap();
+        let mut state = WorkerEventState::default();
+        parse_worker_event(&json!({
+            "type":"agent_end", "messages":[{
+                "role":"assistant", "sessionPersistenceError":"Session recovery required: disk failure"
+            }]
+        }).to_string(), &mut state, |_| {});
+        // Later stream output cannot clear the durable-history failure.
+        parse_worker_event(
+            &json!({
+                "type":"message_end", "message":{"role":"assistant", "stopReason":"stop"}
+            })
+            .to_string(),
+            &mut state,
+            |_| {},
+        );
+        let result = finish_worker(
+            &spec,
+            super::super::process::ChildOutcome::default(),
+            state,
+            "",
+        );
+        assert!(!result.ok);
+        assert!(result.recovery_required);
+        assert!(result.artifact.is_none());
+        assert!(
+            spec.artifact_path.is_file(),
+            "preserve the artifact for reconciliation"
+        );
+        let result = finish_worker(
+            &spec,
+            super::super::process::ChildOutcome::default(),
+            WorkerEventState::default(),
+            "",
+        );
+        assert!(result.ok, "ordinary submitted artifacts still complete");
+    }
 
     fn spec() -> WorkerSpec {
         WorkerSpec {

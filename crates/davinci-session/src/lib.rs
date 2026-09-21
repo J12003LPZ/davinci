@@ -61,6 +61,7 @@ pub struct JsonlSession {
     pub entries: Vec<SessionEntry>,
     pub records: Vec<LaneRecord>,
     pub leaf_id: Option<String>,
+    persistence_error: Option<String>,
 }
 
 impl JsonlSession {
@@ -92,10 +93,16 @@ impl JsonlSession {
                 serde_json::Value::Object(map)
             }),
         };
-        let mut file = File::create(&path).map_err(|err| {
-            SessionError::storage(format!("Unable to create session file: {err}"))
-        })?;
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+            .map_err(|err| {
+                SessionError::storage(format!("Unable to create session file: {err}"))
+            })?;
         file.write_all(encode_header(&header).as_bytes())
+            .and_then(|()| file.sync_all())
+            .and_then(|()| sync_parent(&path))
             .map_err(|err| {
                 SessionError::storage(format!("Unable to write session header: {err}"))
             })?;
@@ -105,6 +112,7 @@ impl JsonlSession {
             entries: Vec::new(),
             records: Vec::new(),
             leaf_id: None,
+            persistence_error: None,
         })
     }
 
@@ -146,6 +154,7 @@ impl JsonlSession {
             entries: Vec::new(),
             records: Vec::new(),
             leaf_id: None,
+            persistence_error: None,
         };
         for (index, line) in lines.enumerate() {
             let line_no = index + 2;
@@ -187,11 +196,11 @@ impl JsonlSession {
             entry.id = Uuid::new_v4().to_string();
         }
         entry.parent_id = self.leaf_id.clone();
-        self.leaf_id = Some(entry.id.clone());
         self.write_line(&encode_mutation(&SessionMutation::Entry {
             lane: None,
             entry: entry.clone(),
         }))?;
+        self.leaf_id = Some(entry.id.clone());
         self.entries.push(entry);
         Ok(())
     }
@@ -216,6 +225,7 @@ impl JsonlSession {
             }
         }
         let from_id = self.leaf_id.clone().unwrap_or_else(|| "root".into());
+        let original_leaf = self.leaf_id.clone();
         self.leaf_id = branch_from_id;
         let mut extra = serde_json::Map::new();
         extra.insert("fromId".into(), serde_json::Value::String(from_id));
@@ -225,7 +235,7 @@ impl JsonlSession {
         if let Some(usage) = usage {
             extra.insert("usage".into(), usage);
         }
-        self.append_entry(SessionEntry {
+        let result = self.append_entry(SessionEntry {
             id: String::new(),
             entry_type: "branch_summary".into(),
             parent_id: None,
@@ -234,7 +244,11 @@ impl JsonlSession {
             message: None,
             custom_type: None,
             extra,
-        })?;
+        });
+        if let Err(error) = result {
+            self.leaf_id = original_leaf;
+            return Err(error);
+        }
         Ok(self.leaf_id.clone().unwrap_or_default())
     }
 
@@ -270,6 +284,7 @@ impl JsonlSession {
     }
 
     pub fn set_name(&mut self, name: &str) -> Result<(), SessionError> {
+        let original = self.header.metadata.clone();
         let mut map = match &self.header.metadata {
             Some(serde_json::Value::Object(map)) => map.clone(),
             _ => serde_json::Map::new(),
@@ -284,7 +299,11 @@ impl JsonlSession {
         } else {
             Some(serde_json::Value::Object(map))
         };
-        self.rewrite_header()
+        if let Err(error) = self.rewrite_header() {
+            self.header.metadata = original;
+            return Err(error);
+        }
+        Ok(())
     }
 
     pub fn display_name(&self) -> Option<String> {
@@ -306,37 +325,124 @@ impl JsonlSession {
             + 1
     }
 
-    fn write_line(&self, line: &str) -> Result<(), SessionError> {
-        let mut file = OpenOptions::new()
-            .append(true)
-            .open(&self.path)
-            .map_err(|err| {
-                SessionError::storage(format!("Unable to append session file: {err}"))
-            })?;
-        file.write_all(line.as_bytes())
-            .map_err(|err| SessionError::storage(format!("Unable to append session file: {err}")))
+    pub fn persistence_error(&self) -> Option<&str> {
+        self.persistence_error.as_deref()
     }
 
-    fn rewrite_header(&self) -> Result<(), SessionError> {
-        let rest = fs::read_to_string(&self.path)
-            .map_err(|err| SessionError::storage(format!("Unable to read session file: {err}")))?;
-        let mut lines = rest.lines();
-        let _ = lines.next();
-        let mut body = encode_header(&self.header);
-        for line in lines {
-            body.push_str(line);
-            body.push('\n');
-        }
-        fs::write(&self.path, body).map_err(|err| {
-            SessionError::storage(format!("Unable to rewrite session header: {err}"))
+    fn write_line(&mut self, line: &str) -> Result<(), SessionError> {
+        self.persist(|path| {
+            let mut file = OpenOptions::new().append(true).open(path).map_err(|err| {
+                SessionError::storage(format!("Unable to append session file: {err}"))
+            })?;
+            file.write_all(line.as_bytes())
+                .and_then(|()| file.sync_all())
+                .map_err(|err| {
+                    SessionError::storage(format!("Unable to append session file: {err}"))
+                })
         })
     }
+
+    fn rewrite_header(&mut self) -> Result<(), SessionError> {
+        let header = encode_header(&self.header);
+        self.persist(|path| {
+            let rest = fs::read_to_string(path).map_err(|err| {
+                SessionError::storage(format!("Unable to read session file: {err}"))
+            })?;
+            let mut lines = rest.lines();
+            let _ = lines.next();
+            let mut body = header;
+            for line in lines {
+                body.push_str(line);
+                body.push('\n');
+            }
+            let permissions = fs::metadata(path)
+                .map_err(|err| SessionError::storage(err.to_string()))?
+                .permissions();
+            jsonl_repo::publish_atomically(path, |temporary| {
+                fs::write(temporary, body)
+                    .and_then(|()| fs::set_permissions(temporary, permissions))
+                    .map_err(|err| {
+                        SessionError::storage(format!("Unable to rewrite session header: {err}"))
+                    })
+            })
+        })
+    }
+
+    fn persist(
+        &mut self,
+        write: impl FnOnce(&Path) -> Result<(), SessionError>,
+    ) -> Result<(), SessionError> {
+        if let Some(error) = &self.persistence_error {
+            return Err(SessionError::storage(format!(
+                "Session recovery required: {error}"
+            )));
+        }
+        write(&self.path).inspect_err(|error| {
+            self.persistence_error = Some(error.to_string());
+        })
+    }
+}
+
+fn sync_parent(path: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    if let Some(parent) = path.parent() {
+        File::open(parent)?.sync_all()?;
+    }
+    #[cfg(not(unix))]
+    let _ = path;
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use tempfile::tempdir;
+
+    #[test]
+    fn failed_session_writes_preserve_cursor_and_metadata() {
+        for operation in ["append", "branch", "name"] {
+            let dir = tempdir().unwrap();
+            let mut session =
+                JsonlSession::create(dir.path(), "/fixture", Some("original")).unwrap();
+            session
+                .append_entry(SessionEntry::message("user", serde_json::json!("first")))
+                .unwrap();
+            let original = session.clone();
+            let backup = session.path.with_extension("backup");
+            fs::rename(&session.path, &backup).unwrap();
+            fs::create_dir(&session.path).unwrap();
+            let result = match operation {
+                "append" => {
+                    session.append_entry(SessionEntry::message("user", serde_json::json!("lost")))
+                }
+                "branch" => session
+                    .branch_with_summary(None, "lost", serde_json::json!({}), None, false)
+                    .map(|_| ()),
+                _ => session.set_name("lost"),
+            };
+            assert!(result.is_err());
+            assert_eq!(session.leaf_id, original.leaf_id, "{operation}");
+            assert_eq!(session.entries, original.entries, "{operation}");
+            assert_eq!(session.header, original.header, "{operation}");
+            fs::remove_dir(&session.path).unwrap();
+            fs::rename(&backup, &session.path).unwrap();
+            assert!(session
+                .append_entry(SessionEntry::message(
+                    "user",
+                    serde_json::json!("must reopen")
+                ))
+                .is_err());
+            let mut reopened = JsonlSession::open(&session.path).unwrap();
+            reopened
+                .append_entry(SessionEntry::message(
+                    "user",
+                    serde_json::json!("recovered"),
+                ))
+                .unwrap();
+            assert_eq!(reopened.entries.len(), 2);
+            assert_eq!(reopened.entries[1].parent_id, original.leaf_id);
+        }
+    }
 
     #[test]
     fn create_append_and_reopen_v4() {

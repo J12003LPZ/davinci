@@ -417,6 +417,7 @@ pub fn migrate_v3_to_v4<R: BufRead>(
     };
     let leaf_id = entries.last().map(|e| e.id.clone());
     Ok(JsonlSession {
+        persistence_error: None,
         path: path.to_path_buf(),
         header,
         entries,

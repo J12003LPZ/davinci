@@ -180,13 +180,23 @@ impl JsonlSessionRepo {
             legacy_parent_session_path: None,
             metadata: options.metadata.clone(),
         };
-        fs::write(&path, encode_header(&header)).map_err(|err| {
+        let write_header = || -> std::io::Result<()> {
+            let mut file = OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&path)?;
+            file.write_all(encode_header(&header).as_bytes())?;
+            file.sync_all()?;
+            crate::sync_parent(&path)
+        };
+        write_header().map_err(|err| {
             SessionError::storage(format!(
                 "Failed to initialize session {}: {err}",
                 path.display()
             ))
         })?;
         Ok(JsonlStoredSession {
+            persistence_error: None,
             session: Session::with_metadata(id, created_at, options.parent_session_id),
             info: JsonlSessionInfo::from_header(&header, &path),
         })
@@ -339,19 +349,28 @@ impl JsonlSessionRepo {
     }
 }
 
-fn publish_atomically(
+pub(crate) fn publish_atomically(
     destination: &Path,
     populate: impl FnOnce(&Path) -> Result<(), SessionError>,
 ) -> Result<(), SessionError> {
-    // TS uses `${destinationPath}.tmp` → `file.jsonl.tmp`
-    let temp_path = PathBuf::from(format!("{}.tmp", destination.display()));
+    let temp_path = destination.with_file_name(format!(".session-{}.tmp", Uuid::new_v4()));
     let result = (|| {
         populate(&temp_path)?;
+        OpenOptions::new()
+            .write(true)
+            .open(&temp_path)
+            .and_then(|file| file.sync_all())
+            .map_err(|err| {
+                SessionError::storage(format!("Failed to flush staged session: {err}"))
+            })?;
         fs::rename(&temp_path, destination).map_err(|err| {
             SessionError::storage(format!(
                 "Failed to publish staged file {}: {err}",
                 destination.display()
             ))
+        })?;
+        crate::sync_parent(destination).map_err(|err| {
+            SessionError::storage(format!("Failed to flush session directory: {err}"))
         })
     })();
     if result.is_err() {
@@ -364,6 +383,7 @@ fn publish_atomically(
 pub struct JsonlStoredSession {
     pub session: Session,
     pub info: JsonlSessionInfo,
+    persistence_error: Option<String>,
 }
 
 impl JsonlStoredSession {
@@ -409,6 +429,7 @@ impl JsonlStoredSession {
                         })
                     })?;
                     return Ok(Self {
+                        persistence_error: None,
                         session,
                         info: JsonlSessionInfo::from_header(&header, path),
                     });
@@ -423,14 +444,17 @@ impl JsonlStoredSession {
                     path.display()
                 ))
             })?;
-            file.write_all(b"\n").map_err(|err| {
-                SessionError::storage(format!(
-                    "Failed to repair unterminated session tail {}: {err}",
-                    path.display()
-                ))
-            })?;
+            file.write_all(b"\n")
+                .and_then(|()| file.sync_all())
+                .map_err(|err| {
+                    SessionError::storage(format!(
+                        "Failed to repair unterminated session tail {}: {err}",
+                        path.display()
+                    ))
+                })?;
         }
         Ok(Self {
+            persistence_error: None,
             session,
             info: JsonlSessionInfo::from_header(&header, path),
         })
@@ -497,12 +521,7 @@ impl JsonlStoredSession {
         entry: SessionEntry,
         lane: &str,
     ) -> Result<SessionEntry, SessionError> {
-        let entry = self.session.append_entry(entry, lane)?;
-        self.append_mutation(SessionMutation::Entry {
-            lane: Some(lane.to_string()),
-            entry: entry.clone(),
-        })?;
-        Ok(entry)
+        self.commit_change(|session| session.append_entry(entry, lane))
     }
 
     pub fn append_custom_entry(
@@ -526,42 +545,50 @@ impl JsonlStoredSession {
     }
 
     pub fn append_record(&mut self, record: LaneRecord) -> Result<LaneRecord, SessionError> {
-        let record = self.session.append_record(record)?;
-        self.append_mutation(SessionMutation::Record {
-            lane: record.lane.clone(),
-            record: record.clone(),
-        })?;
-        Ok(record)
+        self.commit_change(|session| session.append_record(record))
     }
 
     pub fn create_lane(&mut self, lane: &str, at: Option<&str>) -> Result<(), SessionError> {
-        self.session.create_lane(lane, at)?;
-        self.persist_last_log()
+        self.commit_change(|session| session.create_lane(lane, at))
     }
 
     pub fn move_lane(&mut self, lane: &str, to: Option<&str>) -> Result<(), SessionError> {
-        self.session.move_lane(lane, to)?;
-        self.persist_last_log()
+        self.commit_change(|session| session.move_lane(lane, to))
     }
 
     pub fn set_name(&mut self, name: Option<&str>) -> Result<(), SessionError> {
-        self.session.set_name(name);
-        self.persist_last_log()
+        self.commit_change(|session| {
+            session.set_name(name);
+            Ok(())
+        })
     }
 
     pub fn set_label(&mut self, id: &str, label: Option<&str>) -> Result<(), SessionError> {
-        self.session.set_label(id, label)?;
-        self.persist_last_log()
+        self.commit_change(|session| session.set_label(id, label))
     }
 
-    fn persist_last_log(&mut self) -> Result<(), SessionError> {
-        let item = self
-            .session
+    fn commit_change<T>(
+        &mut self,
+        change: impl FnOnce(&mut Session) -> Result<T, SessionError>,
+    ) -> Result<T, SessionError> {
+        if let Some(error) = &self.persistence_error {
+            return Err(SessionError::storage(format!(
+                "Session recovery required: {error}"
+            )));
+        }
+        let mut candidate = self.session.clone();
+        let value = change(&mut candidate)?;
+        let item = candidate
             .get_log(&LogOptions::default())?
             .into_iter()
             .last()
             .ok_or_else(|| SessionError::storage("Session log is empty after mutation"))?;
         self.append_mutation(item.into_mutation())
+            .inspect_err(|error| {
+                self.persistence_error = Some(error.to_string());
+            })?;
+        self.session = candidate;
+        Ok(value)
     }
 
     fn append_mutation(&mut self, mutation: SessionMutation) -> Result<(), SessionError> {
@@ -575,6 +602,7 @@ impl JsonlStoredSession {
                 ))
             })?;
         file.write_all(encode_mutation(&mutation).as_bytes())
+            .and_then(|()| file.sync_all())
             .map_err(|err| {
                 SessionError::storage(format!(
                     "Failed to append session {}: {err}",
@@ -591,6 +619,50 @@ mod tests {
     use super::*;
     use crate::repo::{operation_started, EntryOrder, ForkScope};
     use tempfile::tempdir;
+
+    #[test]
+    fn failed_stored_session_writes_preserve_state() {
+        for operation in ["append", "record", "lane", "move", "name", "label"] {
+            let dir = tempdir().unwrap();
+            let repo = JsonlSessionRepo::new(dir.path());
+            let mut session = repo
+                .create(JsonlCreateOptions {
+                    id: Some("fixture".into()),
+                    cwd: "/fixture".into(),
+                    parent_session_id: None,
+                    metadata: None,
+                })
+                .unwrap();
+            let entry = session.append_message("first").unwrap();
+            let original = session.get_log(&LogOptions::default()).unwrap();
+            let path = session.info.path.clone();
+            let backup = path.with_extension("backup");
+            fs::rename(&path, &backup).unwrap();
+            fs::create_dir(&path).unwrap();
+            let result = match operation {
+                "append" => session.append_message("lost").map(|_| ()),
+                "record" => session
+                    .append_record(operation_started("run", "main", "lost"))
+                    .map(|_| ()),
+                "lane" => session.create_lane("lost", Some(&entry)),
+                "move" => session.move_lane("main", None),
+                "name" => session.set_name(Some("lost")),
+                _ => session.set_label(&entry, Some("lost")),
+            };
+            assert!(result.is_err());
+            assert_eq!(
+                session.get_log(&LogOptions::default()).unwrap(),
+                original,
+                "{operation}"
+            );
+            fs::remove_dir(&path).unwrap();
+            fs::rename(&backup, &path).unwrap();
+            assert!(session.append_message("must reopen").is_err());
+            let mut reopened = repo.open(&session.info).unwrap();
+            reopened.append_message("recovered").unwrap();
+            assert_eq!(reopened.get_stats().message_count, 2);
+        }
+    }
 
     #[test]
     fn session_file_name_matches_ts_iso_dashes() {

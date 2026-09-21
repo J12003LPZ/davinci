@@ -1774,6 +1774,19 @@ impl Agent {
         &self.pruned_tool_results
     }
 
+    /// Execution cannot continue after a session write has an uncertain outcome.
+    /// Recovery must reopen the durable session before issuing another request.
+    pub fn ensure_session_persistence(&self) -> Result<(), String> {
+        match self
+            .session
+            .as_ref()
+            .and_then(JsonlSession::persistence_error)
+        {
+            Some(error) => Err(format!("Session recovery required: {error}")),
+            None => Ok(()),
+        }
+    }
+
     fn persist_full_message(&mut self, message: &ChatMessage) {
         if let Some(session) = &mut self.session {
             let mut entry = SessionEntry::message(
@@ -2603,6 +2616,7 @@ impl Agent {
 
     /// Persist current prompt identity as a custom session entry if an active session exists.
     pub fn persist_prompt_session(&mut self) -> Result<(), String> {
+        self.ensure_session_persistence()?;
         let Some(record) = PromptSessionRecord::from_session_state(&self.prompt_session) else {
             return Ok(());
         };
@@ -2619,17 +2633,18 @@ impl Agent {
         }
         let mut extra = serde_json::Map::new();
         extra.insert("data".into(), data);
-        let _ = session.append_entry(davinci_session::SessionEntry {
-            id: String::new(),
-            entry_type: "custom".into(),
-            parent_id: None,
-            seq: 0,
-            timestamp: 0,
-            message: None,
-            custom_type: Some(PROMPT_SESSION_ENTRY_TYPE.into()),
-            extra,
-        });
-        Ok(())
+        session
+            .append_entry(davinci_session::SessionEntry {
+                id: String::new(),
+                entry_type: "custom".into(),
+                parent_id: None,
+                seq: 0,
+                timestamp: 0,
+                message: None,
+                custom_type: Some(PROMPT_SESSION_ENTRY_TYPE.into()),
+                extra,
+            })
+            .map_err(|error| format!("Session recovery required: {error}"))
     }
 
     /// Restore prompt session state and identity from persisted custom session entries.
@@ -5383,16 +5398,28 @@ mod tests {
         std::fs::write(dir.path().join("src.rs"), "fn existing() {}\n").unwrap();
         let mut agent = Agent::new(default_system_prompt());
         agent.cwd = dir.path().to_path_buf();
-        let mut session =
+        let session =
             JsonlSession::create(dir.path(), &dir.path().display().to_string(), None).unwrap();
-        session.path = dir.path().join("missing-parent/session.jsonl");
+        let path = session.path.clone();
         agent.session = Some(session);
         agent.set_permission_mode(PermissionMode::ReadOnly);
         agent.prompt("Propose a change");
-        let events = agent.run_loop(scripted_tool_calls(vec![("propose_plan", serde_json::json!({
+        agent.post_tool = Some(PostToolHook(Arc::new(move |_, _, _, _, result| {
+            std::fs::rename(&path, path.with_extension("backup")).unwrap();
+            std::fs::create_dir(&path).unwrap();
+            result
+        })));
+        let observed = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = observed.clone();
+        agent.event_sink = Some(EventSink(Arc::new(move |event| {
+            sink.lock().unwrap().push(event.clone());
+        })));
+        let error = agent.run_loop(scripted_tool_calls(vec![("propose_plan", serde_json::json!({
             "expected_revision":0, "goal":"Add behavior", "evidence":[{"path":"src.rs","finding":"Existing function"}],
             "steps":[{"id":"implement","change":"Extend existing function","files":["src.rs"],"why":"Requested behavior","verify":["cargo test --offline"]}]
-        }))])).unwrap();
+        }))])).unwrap_err();
+        assert!(error.contains("Session recovery required"));
+        let events = observed.lock().unwrap();
         let ends: Vec<_> = events
             .iter()
             .filter_map(|event| match event {

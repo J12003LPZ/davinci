@@ -1,5 +1,48 @@
 use super::*;
 
+#[test]
+fn worker_history_failure_is_not_retried_or_resumed_as_a_fresh_attempt() {
+    let dir = tempfile::tempdir().unwrap();
+    let controller = super::super::GraphController::new(dir.path().into());
+    let (mut deps, errors) = controller.deps(true, &Arc::new(super::super::ActiveRun::default()));
+    assert!(errors.is_empty());
+    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let observed = calls.clone();
+    deps.runner = Arc::new(move |_, _, _| {
+        observed.fetch_add(1, Ordering::SeqCst);
+        WorkerResult {
+            recovery_required: true,
+            failure_reason: Some("Session recovery required: storage unavailable".into()),
+            ..Default::default()
+        }
+    });
+    let failed = run_graph(
+        RunOptions {
+            goal: "history failure".into(),
+            cwd: dir.path().into(),
+            forced: Some(Complexity::Trivial),
+            dry_run: false,
+            abort: Arc::new(AtomicBool::new(false)),
+            resume_artifacts: HashMap::new(),
+            resume_run: None,
+        },
+        deps,
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    assert_eq!(failed.phase, Phase::Blocked);
+    let durable = super::super::store::load_run_checked(dir.path(), &failed.run_id).unwrap();
+    assert!(durable.tasks.iter().any(|task| task
+        .error
+        .as_deref()
+        .is_some_and(|error| error.contains("reconciliation required"))));
+    let resumed = attempt_fixture(dir.path(), Some(durable), false);
+    assert_eq!(resumed.phase, Phase::Blocked);
+    assert_eq!(
+        resumed.tasks.iter().map(|task| task.attempts).sum::<u32>(),
+        1
+    );
+}
+
 fn attempt_fixture(cwd: &Path, previous: Option<GraphRun>, fail: bool) -> GraphRun {
     let controller = super::super::GraphController::new(cwd.into());
     let (mut deps, errors) = controller.deps(true, &Arc::new(super::super::ActiveRun::default()));

@@ -2201,6 +2201,8 @@ fn complete_prompt_with_host(
             }
         })));
     }
+    let mut loop_failure = None;
+    let mut conversation_failure = None;
     let mut events = agent
         .run_loop(|current| {
             let visibility = (current.stats.pruned_results, current.stats.compactions);
@@ -2321,11 +2323,16 @@ fn complete_prompt_with_host(
         .unwrap_or_else(|err| {
             // A run that failed outright never reached the sink with an end
             // event; give it one, so JSON and RPC clients see the failure.
+            conversation_failure = agent.ensure_session_persistence().err();
+            let reply = conversation_failure.clone()
+                .unwrap_or_else(|| format!("Provider error: {err}"));
+            loop_failure = Some(reply.clone());
+            let mut message = davinci_ai::ChatMessage::text("assistant", &reply);
+            if conversation_failure.is_some() {
+                message.extra.insert("sessionPersistenceError".into(), serde_json::json!(reply));
+            }
             let end = AgentEvent::AgentEnd {
-                messages: vec![davinci_ai::ChatMessage::text(
-                    "assistant",
-                    format!("Provider error: {err}"),
-                )],
+                messages: vec![message],
                 will_retry: false,
             };
             agent.emit_live(end.clone());
@@ -2335,9 +2342,12 @@ fn complete_prompt_with_host(
     // The last assistant message may be a tool call with no text — the
     // reply is then whatever the run ended on, not an empty string that
     // hides a provider error behind "the model returned no text".
-    let mut reply = agent
-        .last_assistant_text()
-        .filter(|text| !text.trim().is_empty())
+    let mut reply = loop_failure
+        .or_else(|| {
+            agent
+                .last_assistant_text()
+                .filter(|text| !text.trim().is_empty())
+        })
         .or_else(|| {
             events.iter().rev().find_map(|event| match event {
                 AgentEvent::AgentEnd { messages, .. } => messages
@@ -2554,10 +2564,18 @@ fn complete_prompt_with_host(
         }
         let _ = host.kinds();
     }
-    if let Some(error) = session_failure {
+    conversation_failure =
+        conversation_failure.or_else(|| agent.ensure_session_persistence().err());
+    if let Some(error) = conversation_failure.clone().or(session_failure) {
         reply = error;
+        let mut message = davinci_ai::ChatMessage::text("assistant", &reply);
+        if conversation_failure.is_some() {
+            message
+                .extra
+                .insert("sessionPersistenceError".into(), serde_json::json!(reply));
+        }
         let end = AgentEvent::AgentEnd {
-            messages: vec![davinci_ai::ChatMessage::text("assistant", &reply)],
+            messages: vec![message],
             will_retry: false,
         };
         if let Some(previous) = events.iter_mut().rev().find(|event| {
@@ -2774,7 +2792,10 @@ fn run_print(parsed: &Args, agent: &mut Agent) -> Result<i32, String> {
         }
     }
     for extra in &prepared.remaining_messages {
-        if approval_required.is_some() || last_reply.starts_with("Runtime recovery required: ") {
+        if approval_required.is_some()
+            || agent.ensure_session_persistence().is_err()
+            || last_reply.starts_with("Runtime recovery required: ")
+        {
             break;
         }
         if extra.trim().is_empty() {
@@ -2954,6 +2975,16 @@ fn to_json_print_event(event: &AgentEvent) -> Result<serde_json::Value, String> 
 
 fn print_text_exit(events: &[AgentEvent]) -> (i32, Option<String>) {
     for event in events.iter().rev() {
+        if let AgentEvent::AgentEnd { messages, .. } = event {
+            if let Some(error) = messages.iter().find_map(|message| {
+                message
+                    .extra
+                    .get("sessionPersistenceError")
+                    .and_then(serde_json::Value::as_str)
+            }) {
+                return (1, Some(error.to_string()));
+            }
+        }
         let AgentEvent::MessageUpdate {
             assistant_message_event,
             ..
@@ -10809,6 +10840,48 @@ mod tests {
             unbound.unwrap_err(),
             "worker task tools require a parent coordinator"
         );
+    }
+
+    #[test]
+    fn session_persistence_failure_reaches_host_reply_and_json_event() {
+        let _env_lock = PROCESS_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        let _config = EnvRestore::set("PI_CODING_AGENT_DIR", &dir.path().to_string_lossy());
+        let _current = EnvRestore::set("DAVINCI_CODING_AGENT_DIR", &dir.path().to_string_lossy());
+        let mut agent = Agent::new("fixture");
+        agent.cwd = dir.path().to_path_buf();
+        let session = JsonlSession::create(dir.path(), dir.path().to_str().unwrap(), None).unwrap();
+        let path = session.path.clone();
+        agent.load_from_session(session).unwrap();
+        agent.record_assistant("previous success must not hide a failed turn");
+        std::fs::rename(&path, path.with_extension("backup")).unwrap();
+        std::fs::create_dir(&path).unwrap();
+        agent.prompt("lost prompt");
+        std::fs::remove_dir(&path).unwrap();
+        std::fs::rename(path.with_extension("backup"), &path).unwrap();
+        let (reply, events) = complete_prompt_with_host(
+            &Args {
+                offline: true,
+                no_extensions: true,
+                ..Args::default()
+            },
+            &mut agent,
+            Some(Arc::new(Mutex::new(ExtensionHost::default()))),
+            false,
+        );
+        assert!(reply.starts_with("Session recovery required:"), "{reply}");
+        assert_eq!(print_text_exit(&events), (1, Some(reply.clone())));
+        let event = to_json_print_event(events.last().unwrap()).unwrap();
+        let mut state = native_extensions::graph::worker::WorkerEventState::default();
+        native_extensions::graph::worker::parse_worker_event(
+            &event.to_string(),
+            &mut state,
+            |_| {},
+        );
+        assert_eq!(state.error_message.as_deref(), Some(reply.as_str()));
+        assert_eq!(state.stop_reason.as_deref(), Some("session_persistence"));
     }
 
     #[test]

@@ -52,6 +52,28 @@ impl Agent {
     fn run_loop_inner<F, T>(
         &mut self,
         emit_prompt_messages: bool,
+        complete: F,
+    ) -> Result<Vec<AgentEvent>, String>
+    where
+        F: FnMut(&Agent) -> Result<T, String>,
+        T: Into<crate::CompleteOutput>,
+    {
+        self.ensure_session_persistence()?;
+        let result = self.run_loop_body(emit_prompt_messages, complete);
+        if let Err(error) = self.ensure_session_persistence() {
+            self.is_streaming = false;
+            if let Some(runtime) = &self.runtime {
+                runtime.mark_turn_failed();
+                runtime.emit_turn_end(false);
+            }
+            return Err(error);
+        }
+        result
+    }
+
+    fn run_loop_body<F, T>(
+        &mut self,
+        emit_prompt_messages: bool,
         mut complete: F,
     ) -> Result<Vec<AgentEvent>, String>
     where
@@ -102,6 +124,7 @@ impl Agent {
         }
 
         loop {
+            self.ensure_session_persistence()?;
             if self.abort_requested() {
                 if let Some(runtime) = &self.runtime {
                     runtime.emit_turn_end(false);
@@ -209,6 +232,7 @@ impl Agent {
                 );
             }
 
+            self.ensure_session_persistence()?;
             self.stats.model_turns += 1;
             let model_started = std::time::Instant::now();
             let completion = self.complete_with_retry(&mut complete, &mut events);
@@ -228,6 +252,7 @@ impl Agent {
             let chat = assistant_to_chat(&assistant);
             self.messages.push(chat.clone());
             self.persist_assistant(&assistant, &chat);
+            self.ensure_session_persistence()?;
             new_messages.push(chat.clone());
             // A closure that streamed live has already shown the sink the
             // start and every update; they are recorded here, not resent.
@@ -401,6 +426,7 @@ impl Agent {
                         );
                         self.messages.push(result.clone());
                         self.persist_chat(&result);
+                        self.ensure_session_persistence()?;
                         new_messages.push(result.clone());
                         self.push_event(
                             &mut events,
@@ -424,6 +450,7 @@ impl Agent {
                         self.after_tool(&name, &mut result);
                         self.messages.push(result.clone());
                         self.persist_chat(&result);
+                        self.ensure_session_persistence()?;
                         new_messages.push(result.clone());
                         self.push_event(
                             &mut events,
@@ -1123,6 +1150,13 @@ impl Agent {
         args: &Value,
         depth: usize,
     ) -> Preparation {
+        if let Err(error) = self.ensure_session_persistence() {
+            return Preparation::Immediate(crate::ToolResult {
+                content: error,
+                is_error: true,
+                details: Some(serde_json::json!({"session_persistence": true})),
+            });
+        }
         let immediate = |content: String, denied: bool| {
             Preparation::Immediate(crate::ToolResult {
                 content,
@@ -1257,6 +1291,13 @@ impl Agent {
         args: &Value,
         depth: usize,
     ) -> crate::ToolResult {
+        if let Err(error) = self.ensure_session_persistence() {
+            return crate::ToolResult {
+                content: error,
+                is_error: true,
+                details: Some(serde_json::json!({"session_persistence": true})),
+            };
+        }
         let dispatch_permit = self.approval_registry.take_dispatch(id);
         if let Err(violation) = self.check_contract_gate(cwd, id, name, args) {
             if let Ok(mut ledger) = self.tool_ledger.lock() {
@@ -2401,10 +2442,7 @@ impl Agent {
     }
 
     fn persist_chat(&mut self, message: &ChatMessage) {
-        if let Some(session) = &mut self.session {
-            let content = serde_json::to_value(&message.content).unwrap_or(Value::Null);
-            let _ = session.append_entry(crate::chat_entry(&message.role, content, &message.extra));
-        }
+        self.persist_full_message(message);
     }
 
     fn persist_assistant(&mut self, assistant: &AssistantMessage, chat: &ChatMessage) {
@@ -2627,6 +2665,10 @@ pub(crate) fn is_verification_command(cmd: &str) -> bool {
         || lower.contains("mvn test")
         || lower.contains("gradle test")
 }
+
+#[cfg(test)]
+#[path = "session_persistence_tests.rs"]
+mod session_persistence_tests;
 
 #[cfg(test)]
 mod tests {

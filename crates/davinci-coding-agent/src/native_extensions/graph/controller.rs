@@ -1156,6 +1156,18 @@ impl GraphExecution {
             if !self.finish_attempt(&spec, attempt, &result) {
                 return None;
             }
+            if result.recovery_required {
+                let error = format!(
+                    "reconciliation required: {}",
+                    result
+                        .failure_reason
+                        .as_deref()
+                        .unwrap_or("worker execution history could not be saved")
+                );
+                self.end_task(&task_id, TaskStatus::Failed, Some(error));
+                self.checkpoint(Some("worker history requires recovery; retry stopped"));
+                return None;
+            }
             write_log(
                 Path::new(&run.cwd),
                 &run.run_id,
