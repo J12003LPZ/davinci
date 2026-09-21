@@ -1,0 +1,51 @@
+name: Graph recovery
+on:
+  push:
+    branches: [J12003LPZ/graph-resume-fix-20260921]
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: graph-recovery-${{ github.ref }}
+  cancel-in-progress: true
+env:
+  PI_OFFLINE: '1'
+  CARGO_TERM_COLOR: never
+  CARGO_INCREMENTAL: '0'
+jobs:
+  graph:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@1.83.0
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: graph-recovery
+      - name: Graph regression baseline
+        run: |
+          cargo test --locked -p davinci-coding-agent --lib native_extensions::graph::
+      - name: Collect source and dependency cache
+        if: always() && contains(github.event.head_commit.message, 'offline workbench')
+        shell: bash
+        run: |
+          set -euo pipefail
+          kit="$RUNNER_TEMP/graph-workbench"
+          mkdir -p "$kit"
+          git archive --format=zip HEAD > "$kit/source.zip"
+          cp -a "$CARGO_HOME/registry" "$kit/registry"
+          git rev-parse HEAD > "$kit/provenance.txt"
+          rustc --version --verbose >> "$kit/provenance.txt"
+          tar -C "$kit" -czf "$RUNNER_TEMP/graph-workbench.tar.gz" source.zip registry provenance.txt
+      - name: Save offline workbench
+        if: always() && contains(github.event.head_commit.message, 'offline workbench')
+        uses: actions/upload-artifact@v4
+        with:
+          name: graph-workbench-${{ github.sha }}
+          path: ${{ runner.temp }}/graph-workbench.tar.gz
+          retention-days: 1
+          if-no-files-found: error
