@@ -11,6 +11,7 @@ use super::briefings::{
     ClassifyInput, ReviewInput,
 };
 use super::config::{detect_verify_commands, read_package_scripts, GraphConfig};
+use super::continuation::{DeliveryCheckpoint, DeliveryStage, GraphContinuation, NodeIndices};
 use super::mutation::{capture_baseline, capture_graph_delta, GraphMutation};
 use super::operations;
 use super::recovery::{
@@ -239,6 +240,33 @@ pub struct GraphExecution {
 mod live_control;
 
 impl GraphExecution {
+    fn completion_inputs(&self) -> Result<String, String> {
+        let source = capture_baseline(&self.options.cwd)?;
+        serde_json::to_string(&(
+            &source.files,
+            &self.deps.config.verify_commands,
+            self.deps.config.security_verification,
+        ))
+        .map(|json| super::replay::compute_input_hash(&json))
+        .map_err(|error| error.to_string())
+    }
+
+    fn save_delivery(
+        &self,
+        delivery: &DeliveryCheckpoint,
+        indices: NodeIndices,
+        note: Option<&str>,
+    ) -> bool {
+        {
+            let mut run = self.run.lock().unwrap_or_else(|error| error.into_inner());
+            let cursor = run
+                .continuation
+                .get_or_insert_with(GraphContinuation::default);
+            cursor.delivery = Some(delivery.clone());
+            cursor.indices = indices;
+        }
+        self.checkpoint(note)
+    }
     #[allow(dead_code)]
     pub fn abort_node(&self, task_id: &str) {
         if let Some(flag) = self
@@ -611,8 +639,34 @@ impl GraphExecution {
             return None;
         }
 
+        if self
+            .snapshot()
+            .task(&task_id)
+            .is_some_and(|existing| existing.status == TaskStatus::Succeeded)
+        {
+            let run = self.snapshot();
+            return match super::store::read_artifact(
+                &self.options.cwd,
+                &run.run_id,
+                &task_id,
+                task.expect,
+            ) {
+                Ok(artifact) => Some(artifact),
+                Err(errors) => {
+                    self.blocked(format!(
+                        "Completed task '{task_id}' cannot be restored: {}",
+                        errors.join("; ")
+                    ));
+                    None
+                }
+            };
+        }
+
         {
             let mut run = self.run.lock().unwrap_or_else(|error| error.into_inner());
+            if let Some(existing) = run.tasks.iter_mut().find(|entry| entry.id == task_id) {
+                existing.status = TaskStatus::Pending;
+            }
             materialize_generated_dependencies(&mut run, &mut task);
             let unmet = run.unmet_dependencies(&task);
             if !unmet.is_empty() {
@@ -825,7 +879,15 @@ impl GraphExecution {
         let mut last_failure_class: Option<WorkerFailureClass> = None;
         let mut retry_context_delta = crate::native_extensions::ecosystem::ContextPacket::empty();
         let mut attempts_run = 0;
-        for attempt in 1..=NODE_ATTEMPTS {
+        let previous_attempts = self
+            .snapshot()
+            .task(&task_id)
+            .map_or(0, |task| task.attempts);
+        for local_attempt in 1..=NODE_ATTEMPTS {
+            let Some(attempt) = previous_attempts.checked_add(local_attempt) else {
+                self.blocked(format!("Attempt counter exhausted for '{task_id}'"));
+                return None;
+            };
             attempts_run = attempt;
             if self.exec_abort.load(Ordering::Relaxed) {
                 self.end_task(&task_id, TaskStatus::Cancelled, None);
@@ -1184,7 +1246,7 @@ impl GraphExecution {
                 }
             }
             let failure_class = classify_worker_failure(&result, Some(&error));
-            let decision = retry_decision(failure_class, attempt as usize);
+            let decision = retry_decision(failure_class, local_attempt as usize);
             last_failure_class = Some(failure_class);
             self.checkpoint(Some(&format!(
                 "{task_id}: attempt {attempt} failed ({failure_class}, {decision:?})"
@@ -1222,25 +1284,6 @@ impl GraphExecution {
             run.blocked_reason = Some(reason.clone());
         }
         self.checkpoint(Some(&format!("blocked: {reason}")));
-    }
-
-    fn reset_task_for_replan(&self, task_id: &str) {
-        let mut run = self.run.lock().unwrap_or_else(|error| error.into_inner());
-        if let Some(task) = run.tasks.iter_mut().find(|task| task.id == task_id) {
-            task.status = TaskStatus::Pending;
-            task.attempts = 0;
-            task.artifact_file = None;
-            task.error = None;
-            task.started_at = None;
-            task.ended_at = None;
-            task.last_activity = None;
-            task.fingerprint = None;
-            task.mutation = None;
-            task.context_fingerprint = None;
-            task.context_tokens = 0;
-            task.memory_refs.clear();
-            task.skill_refs.clear();
-        }
     }
 
     fn task_failure_reason(&self, fallback: &str) -> String {
@@ -1546,10 +1589,8 @@ fn run_graph_internal(
             .as_ref()
             .map(|run| run.control_history.clone())
             .unwrap_or_default(),
-        revision: continuation
-            .as_ref()
-            .and_then(|_| options.resume_run.as_ref().map(|r| r.revision + 1))
-            .unwrap_or(0),
+        revision: 0,
+        continuation: Some(GraphContinuation::default()),
     };
 
     let _workspace_lease = match workspace_lease
@@ -1568,6 +1609,40 @@ fn run_graph_internal(
             return run;
         }
     };
+    if let Some(previous) = options.resume_run.as_deref() {
+        run = previous.clone();
+        let identity = if run.goal != options.goal
+            || run.forced != options.forced
+            || run.dry_run != options.dry_run
+        {
+            Err("Resume options do not match the saved goal and execution mode".into())
+        } else {
+            super::continuation::validate_resume(&run, &options.cwd)
+        };
+        if let Err(error) = identity {
+            run.phase = Phase::Blocked;
+            run.lifecycle = Some(GraphLifecycle::RecoveryRequired);
+            run.blocked_reason = Some(error);
+            (deps.on_update)(&run, Some("resume refused; checkpoint not changed"));
+            return run;
+        }
+        run.revision += 1; // validate_resume checks exhaustion before any write.
+        run.phase = match run
+            .continuation
+            .as_ref()
+            .and_then(|cursor| cursor.delivery.as_ref())
+            .map(|delivery| delivery.stage)
+        {
+            Some(DeliveryStage::Plan) => Phase::Plan,
+            Some(DeliveryStage::Implement) => Phase::Implement,
+            Some(DeliveryStage::Verify) => Phase::Verify,
+            Some(DeliveryStage::Review) => Phase::Review,
+            None if run.classification.is_some() => Phase::Investigate,
+            None => Phase::Classify,
+        };
+        run.lifecycle = Some(GraphLifecycle::Running);
+        run.blocked_reason = None;
+    }
     let _ = create_run_dir(&options.cwd, &run_id);
 
     let run_deadline = remaining_run_deadline(
@@ -1924,15 +1999,21 @@ fn drive(execution: &GraphExecution) -> GraphRun {
         vec![],
         None,
     );
-    let classification = execution.execute_node(
-        classify_task,
-        classify_briefing(&ClassifyInput {
-            goal: &goal,
-            is_git_repo,
-            package_scripts: read_package_scripts(&cwd),
-            max_researchers,
-        }),
-    );
+    let classification = execution
+        .snapshot()
+        .classification
+        .map(Artifact::Classification)
+        .or_else(|| {
+            execution.execute_node(
+                classify_task,
+                classify_briefing(&ClassifyInput {
+                    goal: &goal,
+                    is_git_repo,
+                    package_scripts: read_package_scripts(&cwd),
+                    max_researchers,
+                }),
+            )
+        });
     if execution.cancelled_if_aborted() {
         return execution.snapshot();
     }
@@ -1968,7 +2049,7 @@ fn drive(execution: &GraphExecution) -> GraphRun {
             .lock()
             .unwrap_or_else(|error| error.into_inner());
         run.classification = Some(classification.clone());
-        run.definition = Some(definition.clone());
+        run.definition.get_or_insert_with(|| definition.clone());
         if complexity != Complexity::Trivial && milestones.len() > 1 {
             run.milestones = Some(milestones.clone());
         }
@@ -1983,8 +2064,13 @@ fn drive(execution: &GraphExecution) -> GraphRun {
         classification.task_class
     )));
 
-    let mut evidence_digest = String::new();
-    if complexity != Complexity::Trivial {
+    let prior_evidence = execution
+        .snapshot()
+        .continuation
+        .as_ref()
+        .and_then(|cursor| cursor.evidence_digest.clone());
+    let mut evidence_digest = prior_evidence.clone().unwrap_or_default();
+    if complexity != Complexity::Trivial && prior_evidence.is_none() {
         execution.set_phase(Phase::Investigate);
         execution.checkpoint(None);
         let requests: Vec<_> = classification
@@ -2037,18 +2123,34 @@ fn drive(execution: &GraphExecution) -> GraphRun {
         if execution.cancelled_if_aborted() {
             return execution.snapshot();
         }
+        let failed_kinds = failed_kinds
+            .into_inner()
+            .unwrap_or_else(|error| error.into_inner());
+        if !failed_kinds.is_empty() {
+            execution.blocked("Investigation is incomplete; resume retries unfinished researchers and preserves successful siblings".into());
+            return execution.snapshot();
+        }
         evidence_digest = build_evidence_digest(
             &evidences
                 .into_inner()
                 .unwrap_or_else(|error| error.into_inner()),
-            &failed_kinds
-                .into_inner()
-                .unwrap_or_else(|error| error.into_inner()),
+            &failed_kinds,
             EVIDENCE_DIGEST_MAX_CHARS,
         );
     }
 
-    let mut indices = NodeIndices::default();
+    {
+        let mut run = execution
+            .run
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        run.continuation.as_mut().unwrap().evidence_digest = Some(evidence_digest.clone());
+    }
+    if !execution.checkpoint(Some("investigation checkpoint saved")) {
+        return execution.snapshot();
+    }
+
+    let mut indices = execution.snapshot().continuation.as_ref().unwrap().indices;
     let goals: Vec<String> = if milestones.len() > 1 && complexity != Complexity::Trivial {
         (0..milestones.len())
             .map(|index| milestone_goal(&goal, &milestones, index))
@@ -2058,7 +2160,38 @@ fn drive(execution: &GraphExecution) -> GraphRun {
     };
     let milestone_count = goals.len();
 
-    for (index, goal_text) in goals.iter().enumerate() {
+    let mut completed = execution
+        .snapshot()
+        .continuation
+        .as_ref()
+        .unwrap()
+        .completed_milestones;
+    if completed == milestone_count {
+        let inputs = match execution.completion_inputs() {
+            Ok(inputs) => inputs,
+            Err(error) => {
+                execution.blocked(format!("Cannot validate finalization inputs: {error}"));
+                return execution.snapshot();
+            }
+        };
+        let mut run = execution
+            .run
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let cursor = run.continuation.as_mut().unwrap();
+        if cursor.completion_inputs.as_ref() != Some(&inputs) {
+            let Some(mut delivery) = cursor.completed_delivery.clone() else {
+                drop(run);
+                execution.blocked("Finalization cannot restore completed delivery evidence".into());
+                return execution.snapshot();
+            };
+            delivery.stage = DeliveryStage::Verify;
+            completed = completed.saturating_sub(1);
+            cursor.completed_milestones = completed;
+            cursor.delivery = Some(delivery);
+        }
+    }
+    for (index, goal_text) in goals.iter().enumerate().skip(completed) {
         if milestone_count > 1 {
             {
                 let mut run = execution
@@ -2083,8 +2216,32 @@ fn drive(execution: &GraphExecution) -> GraphRun {
         if matches!(delivery, Delivery::Stop) {
             return execution.snapshot();
         }
+        let completion_inputs = match execution.completion_inputs() {
+            Ok(inputs) => inputs,
+            Err(error) => {
+                execution.blocked(format!("Cannot persist delivery input identity: {error}"));
+                return execution.snapshot();
+            }
+        };
+        {
+            let mut run = execution
+                .run
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            let cursor = run.continuation.as_mut().unwrap();
+            cursor.completed_milestones = index + 1;
+            cursor.indices = indices;
+            cursor.completed_delivery = cursor.delivery.take();
+            cursor.completion_inputs = Some(completion_inputs);
+        }
+        if !execution.checkpoint(Some("milestone complete")) {
+            return execution.snapshot();
+        }
     }
 
+    if execution.cancelled_if_aborted() {
+        return execution.snapshot();
+    }
     execution.set_phase(Phase::Done);
     let note = if milestone_count > 1 {
         format!("done ({milestone_count} milestones delivered)")
@@ -2140,6 +2297,10 @@ fn materialize_generated_dependencies(run: &mut GraphRun, task: &mut GraphTaskSt
     dependencies.sort();
     dependencies.dedup();
     task.depends_on = dependencies;
+    let pending_review = run
+        .continuation
+        .as_ref()
+        .map(|cursor| format!("review-{}", cursor.indices.review.saturating_add(1)));
     let definition = run.definition.as_mut().unwrap();
     if definition.node(&task.id).is_none() {
         definition.nodes.push(NodeDefinition {
@@ -2158,13 +2319,27 @@ fn materialize_generated_dependencies(run: &mut GraphRun, task: &mut GraphTaskSt
             to: task.id.clone(),
             condition: EdgeCondition::OnSuccess,
         }));
-}
-
-#[derive(Default)]
-struct NodeIndices {
-    plan: u32,
-    implement: u32,
-    review: u32,
+    // A revision is a new writer identity, but still owes the current milestone
+    // a review. Persist that edge immediately, including before verification.
+    if task.role == Role::Writer && definition.mode != GraphMode::Simple {
+        if let Some(review_id) = pending_review {
+            if definition.node(&review_id).is_none() {
+                definition.nodes.push(NodeDefinition {
+                    id: review_id.clone(),
+                    role: Role::Reviewer,
+                    expect: ArtifactKind::Review,
+                    required: true,
+                    allows_mutation: false,
+                });
+            }
+            definition.edges.retain(|edge| edge.to != review_id);
+            definition.edges.push(EdgeDefinition {
+                from: task.id.clone(),
+                to: review_id,
+                condition: EdgeCondition::OnSuccess,
+            });
+        }
+    }
 }
 
 fn produce_plan(
@@ -2174,14 +2349,26 @@ fn produce_plan(
     evidence_digest: &str,
     replan_reason: Option<&str>,
 ) -> Option<ImplementationPlan> {
-    indices.plan += 1;
-    let task = GraphTaskState::new(
-        format!("plan-{}", indices.plan),
-        Role::Planner,
-        ArtifactKind::Plan,
-        vec![],
-        None,
-    );
+    let mut delivery = execution
+        .snapshot()
+        .continuation
+        .as_ref()
+        .unwrap()
+        .delivery
+        .clone()
+        .unwrap();
+    let task_id = if let Some(id) = &delivery.plan_task {
+        id.clone()
+    } else {
+        indices.plan += 1;
+        let id = format!("plan-{}", indices.plan);
+        delivery.plan_task = Some(id.clone());
+        id
+    };
+    if !execution.save_delivery(&delivery, *indices, Some("planning cursor saved")) {
+        return None;
+    }
+    let task = GraphTaskState::new(task_id, Role::Planner, ArtifactKind::Plan, vec![], None);
     execution
         .execute_node(
             task,
@@ -2201,77 +2388,187 @@ fn deliver_goal(
     indices: &mut NodeIndices,
 ) -> Delivery {
     let budgets = execution.snapshot().budgets;
-    let mut plan: Option<ImplementationPlan> = None;
-    let mut revision_cycles = 0;
-    let mut replans = 0;
-
-    if complexity != Complexity::Trivial {
-        execution.set_phase(Phase::Plan);
-        execution.checkpoint(None);
-        plan = produce_plan(execution, indices, goal_text, evidence_digest, None);
-        if execution.cancelled_if_aborted() {
-            return Delivery::Stop;
-        }
-        if plan.is_none() {
-            execution.blocked(execution.task_failure_reason("planning failed"));
-            return Delivery::Stop;
-        }
+    let cwd = execution.options.cwd.clone();
+    let mut saved = if let Some(delivery) = execution
+        .snapshot()
+        .continuation
+        .as_ref()
+        .unwrap()
+        .delivery
+        .clone()
+    {
+        delivery
+    } else {
+        let baseline = match capture_baseline(&cwd) {
+            Ok(baseline) => baseline,
+            Err(error) => {
+                execution.blocked(format!("Cannot capture mutation baseline: {error}"));
+                return Delivery::Stop;
+            }
+        };
+        DeliveryCheckpoint::new(baseline, complexity != Complexity::Trivial)
+    };
+    if !execution.save_delivery(&saved, *indices, Some("delivery cursor saved")) {
+        return Delivery::Stop;
     }
-
-    let mut revision_notes: Option<String> = None;
-    let cwd = PathBuf::from(&execution.options.cwd);
-    let milestone_baseline = capture_baseline(&cwd).unwrap_or_default();
-    #[allow(unused_assignments)]
-    let mut cumulative_delta = GraphMutation::default();
+    let mut plan = saved.plan.clone();
+    let mut revision_cycles = saved.revision_cycles;
+    let mut replans = saved.replans;
+    let mut revision_notes = saved.revision_notes.clone();
+    let milestone_baseline = saved.baseline.clone();
     loop {
         if execution.cancelled_if_aborted() {
             return Delivery::Stop;
         }
-
-        execution.set_phase(Phase::Implement);
-        indices.implement += 1;
-        let task_id = format!("implement-{}", indices.implement);
-        let task = GraphTaskState::new(
-            task_id.clone(),
-            Role::Writer,
-            ArtifactKind::PatchReport,
-            vec![],
-            None,
-        );
-        let attempt_baseline = capture_baseline(&cwd).unwrap_or_default();
-        let patch = execution
-            .execute_node(
-                task,
-                implement_briefing(
-                    goal_text,
-                    plan.as_ref(),
-                    evidence_digest,
-                    revision_notes.as_deref(),
-                ),
-            )
-            .and_then(|artifact| artifact.as_patch_report().cloned());
-        if execution.cancelled_if_aborted() {
-            return Delivery::Stop;
-        }
-        let Some(patch) = patch else {
-            let failure = execution
+        if saved.stage == DeliveryStage::Plan {
+            execution.set_phase(Phase::Plan);
+            plan = produce_plan(
+                execution,
+                indices,
+                goal_text,
+                evidence_digest,
+                saved.replan_reason.as_deref(),
+            );
+            if execution.cancelled_if_aborted() {
+                return Delivery::Stop;
+            }
+            if plan.is_none() {
+                execution.blocked(execution.task_failure_reason("planning failed"));
+                return Delivery::Stop;
+            }
+            saved = execution
                 .snapshot()
-                .tasks
-                .iter()
-                .find(|task| task.id == task_id)
-                .and_then(|task| task.error.clone());
-            if failure.as_deref().is_some_and(|error| {
-                classify_worker_failure(&WorkerResult::default(), Some(error))
-                    == WorkerFailureClass::PlanInvalidated
-            }) {
-                let reason = failure.unwrap_or_else(|| "writer invalidated the plan".into());
+                .continuation
+                .as_ref()
+                .unwrap()
+                .delivery
+                .clone()
+                .unwrap();
+            saved.plan = plan.clone();
+            saved.stage = DeliveryStage::Implement;
+            if !execution.save_delivery(&saved, *indices, Some("plan complete")) {
+                return Delivery::Stop;
+            }
+        }
+
+        let patch = if saved.stage == DeliveryStage::Implement {
+            execution.set_phase(Phase::Implement);
+            let task_id = if let Some(id) = &saved.writer_task {
+                id.clone()
+            } else {
+                indices.implement += 1;
+                let id = format!("implement-{}", indices.implement);
+                saved.writer_task = Some(id.clone());
+                id
+            };
+            let task = GraphTaskState::new(
+                task_id.clone(),
+                Role::Writer,
+                ArtifactKind::PatchReport,
+                vec![],
+                None,
+            );
+            let attempt_baseline = if let Some(baseline) = &saved.attempt_baseline {
+                baseline.clone()
+            } else {
+                match capture_baseline(&cwd) {
+                    Ok(baseline) => baseline,
+                    Err(error) => {
+                        execution.blocked(format!("Cannot capture attempt baseline: {error}"));
+                        return Delivery::Stop;
+                    }
+                }
+            };
+            saved.attempt_baseline = Some(attempt_baseline.clone());
+            if !execution.save_delivery(&saved, *indices, Some("writer cursor saved")) {
+                return Delivery::Stop;
+            }
+            let patch = execution
+                .execute_node(
+                    task,
+                    implement_briefing(
+                        goal_text,
+                        plan.as_ref(),
+                        evidence_digest,
+                        revision_notes.as_deref(),
+                    ),
+                )
+                .and_then(|artifact| artifact.as_patch_report().cloned());
+            if execution.cancelled_if_aborted() {
+                return Delivery::Stop;
+            }
+            let Some(patch) = patch else {
+                let failure = execution
+                    .snapshot()
+                    .tasks
+                    .iter()
+                    .find(|task| task.id == task_id)
+                    .and_then(|task| task.error.clone());
+                if failure.as_deref().is_some_and(|error| {
+                    classify_worker_failure(&WorkerResult::default(), Some(error))
+                        == WorkerFailureClass::PlanInvalidated
+                }) {
+                    let reason = failure.unwrap_or_else(|| "writer invalidated the plan".into());
+                    if replans >= budgets.max_replans {
+                        execution
+                            .blocked(format!("plan invalidated {} times: {reason}", replans + 1));
+                        return Delivery::Stop;
+                    }
+                    replans += 1;
+                    {
+                        let mut run = execution
+                            .run
+                            .lock()
+                            .unwrap_or_else(|error| error.into_inner());
+                        run.counters.replans += 1;
+                        run.phase = Phase::Plan;
+                    }
+                    saved.prepare_replan(reason, replans);
+                    if !execution.save_delivery(
+                        &saved,
+                        *indices,
+                        Some("replanning after writer failure"),
+                    ) {
+                        return Delivery::Stop;
+                    }
+                    revision_notes = None;
+                    continue;
+                }
+                execution.blocked(execution.task_failure_reason("implementation failed"));
+                return Delivery::Stop;
+            };
+
+            let attempt_delta = match capture_graph_delta(&cwd, &attempt_baseline) {
+                Ok(delta) => delta,
+                Err(error) => {
+                    execution.blocked(format!("Cannot capture writer mutation: {error}"));
+                    return Delivery::Stop;
+                }
+            };
+            {
+                let mut run = execution
+                    .run
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner());
+                let run_id = run.run_id.clone();
+                if let Some(task_entry) = run.tasks.iter_mut().find(|entry| entry.id == task_id) {
+                    task_entry.mutation = Some(attempt_delta.clone());
+                }
+                drop(run);
+                if !execution.checkpoint_with(None, |_| {
+                    write_task_mutation(&cwd, &run_id, &task_id, &attempt_delta)
+                }) {
+                    return Delivery::Stop;
+                }
+            }
+
+            if patch.plan_invalidated {
+                let reason = patch.invalidation_reason.clone().unwrap_or_default();
                 if replans >= budgets.max_replans {
                     execution.blocked(format!("plan invalidated {} times: {reason}", replans + 1));
                     return Delivery::Stop;
                 }
                 replans += 1;
-                execution.reset_task_for_replan(&task_id);
-                indices.implement = indices.implement.saturating_sub(1);
                 {
                     let mut run = execution
                         .run
@@ -2280,82 +2577,34 @@ fn deliver_goal(
                     run.counters.replans += 1;
                     run.phase = Phase::Plan;
                 }
-                execution.checkpoint(Some("replanning after writer failure"));
-                plan = produce_plan(
-                    execution,
-                    indices,
-                    goal_text,
-                    evidence_digest,
-                    Some(&reason),
-                );
-                if execution.cancelled_if_aborted() {
-                    return Delivery::Stop;
-                }
-                if plan.is_none() {
-                    execution.blocked(execution.task_failure_reason("replanning failed"));
+                saved.prepare_replan(reason, replans);
+                if !execution.save_delivery(&saved, *indices, Some("replanning")) {
                     return Delivery::Stop;
                 }
                 revision_notes = None;
                 continue;
             }
-            execution.blocked(execution.task_failure_reason("implementation failed"));
-            return Delivery::Stop;
+
+            saved.patch = Some(patch.clone());
+            saved.stage = DeliveryStage::Verify;
+            if !execution.save_delivery(&saved, *indices, Some("implementation complete")) {
+                return Delivery::Stop;
+            }
+            patch
+        } else {
+            let Some(patch) = saved.patch.clone() else {
+                execution.blocked("Continuation has no completed patch report".into());
+                return Delivery::Stop;
+            };
+            patch
         };
-
-        let attempt_delta = capture_graph_delta(&cwd, &attempt_baseline).unwrap_or_default();
-        cumulative_delta = capture_graph_delta(&cwd, &milestone_baseline).unwrap_or_default();
-        {
-            let mut run = execution
-                .run
-                .lock()
-                .unwrap_or_else(|error| error.into_inner());
-            let run_id = run.run_id.clone();
-            if let Some(task_entry) = run.tasks.iter_mut().find(|entry| entry.id == task_id) {
-                task_entry.mutation = Some(attempt_delta.clone());
-            }
-            drop(run);
-            if !execution.checkpoint_with(None, |_| {
-                write_task_mutation(&cwd, &run_id, &task_id, &attempt_delta)
-            }) {
+        let cumulative_delta = match capture_graph_delta(&cwd, &milestone_baseline) {
+            Ok(delta) => delta,
+            Err(error) => {
+                execution.blocked(format!("Cannot restore cumulative mutation: {error}"));
                 return Delivery::Stop;
             }
-        }
-
-        if patch.plan_invalidated {
-            let reason = patch.invalidation_reason.clone().unwrap_or_default();
-            if replans >= budgets.max_replans {
-                execution.blocked(format!("plan invalidated {} times: {reason}", replans + 1));
-                return Delivery::Stop;
-            }
-            replans += 1;
-            execution.reset_task_for_replan(&task_id);
-            indices.implement = indices.implement.saturating_sub(1);
-            {
-                let mut run = execution
-                    .run
-                    .lock()
-                    .unwrap_or_else(|error| error.into_inner());
-                run.counters.replans += 1;
-                run.phase = Phase::Plan;
-            }
-            execution.checkpoint(Some("replanning"));
-            plan = produce_plan(
-                execution,
-                indices,
-                goal_text,
-                evidence_digest,
-                Some(&reason),
-            );
-            if execution.cancelled_if_aborted() {
-                return Delivery::Stop;
-            }
-            if plan.is_none() {
-                execution.blocked(execution.task_failure_reason("replanning failed"));
-                return Delivery::Stop;
-            }
-            revision_notes = None;
-            continue;
-        }
+        };
 
         execution.begin_verification();
         execution.checkpoint(None);
@@ -2399,6 +2648,12 @@ fn deliver_goal(
         }
 
         if !verification.passed {
+            if verification.commands.iter().any(|command| {
+                super::verify::looks_like_missing_command(command.exit_code, &command.output_tail)
+            }) {
+                execution.blocked("Verification command is unavailable; repair the environment and resume this run".into());
+                return Delivery::Stop;
+            }
             if nothing_ran(&verification) && !execution.options.dry_run {
                 execution.blocked(
                     "every verification command was plan-invented and does not exist; \
@@ -2421,6 +2676,10 @@ fn deliver_goal(
                 .counters
                 .revision_cycles += 1;
             revision_notes = Some(revision_notes_from(Some(&verification), None, None));
+            saved.prepare_revision(revision_notes.clone(), revision_cycles);
+            if !execution.save_delivery(&saved, *indices, Some("verification revision saved")) {
+                return Delivery::Stop;
+            }
             continue;
         }
 
@@ -2446,6 +2705,14 @@ fn deliver_goal(
 
         let security_verification = if should_scan {
             execution.set_phase(Phase::Verify);
+            let Some(security_index) = indices.security.checked_add(1) else {
+                execution.blocked("Security attempt counter exhausted".into());
+                return Delivery::Stop;
+            };
+            indices.security = security_index;
+            if !execution.save_delivery(&saved, *indices, Some("security cursor saved")) {
+                return Delivery::Stop;
+            }
             let run_id = execution.snapshot().run_id;
             let mut sec_controller =
                 crate::native_extensions::SecurityScanController::new(cwd.clone());
@@ -2460,7 +2727,7 @@ fn deliver_goal(
             };
 
             let mut sec_task = GraphTaskState::new(
-                format!("security-{}", indices.implement),
+                format!("security-{}", indices.security),
                 Role::TestAnalyzer,
                 ArtifactKind::Evidence,
                 vec![format!("implement-{}", indices.implement)],
@@ -2524,6 +2791,13 @@ fn deliver_goal(
             bundle.approval_eligible(policy_mode)
         };
         if !security_eligible {
+            if matches!(
+                security_verification,
+                SecurityVerification::Unavailable { .. }
+            ) {
+                execution.blocked(format!("Security verification unavailable; repair the environment and resume: {security_verification:?}"));
+                return Delivery::Stop;
+            }
             if revision_cycles >= budgets.max_revision_cycles {
                 execution.blocked(format!(
                     "security verification still failing after {revision_cycles} revision cycles: {security_verification:?}"
@@ -2542,6 +2816,10 @@ fn deliver_goal(
                 None,
                 Some(&security_verification),
             ));
+            saved.prepare_revision(revision_notes.clone(), revision_cycles);
+            if !execution.save_delivery(&saved, *indices, Some("security revision saved")) {
+                return Delivery::Stop;
+            }
             continue;
         }
 
@@ -2550,7 +2828,50 @@ fn deliver_goal(
         }
 
         execution.set_phase(Phase::Review);
-        indices.review += 1;
+        let review_inputs = match capture_baseline(&cwd).and_then(|source| {
+            let results: Vec<_> = verification
+                .commands
+                .iter()
+                .map(|command| {
+                    (
+                        &command.name,
+                        &command.command,
+                        command.exit_code,
+                        &command.output_tail,
+                        command.skipped,
+                    )
+                })
+                .collect();
+            serde_json::to_string(&(
+                &source.files,
+                &commands,
+                results,
+                policy_mode,
+                &security_verification,
+                goal_text,
+                &plan,
+            ))
+            .map(|json| super::replay::compute_input_hash(&json))
+            .map_err(|error| error.to_string())
+        }) {
+            Ok(inputs) => inputs,
+            Err(error) => {
+                execution.blocked(format!("Cannot bind review to current inputs: {error}"));
+                return Delivery::Stop;
+            }
+        };
+        if saved.review_inputs.as_ref() != Some(&review_inputs) {
+            saved.review_task = None;
+        }
+        saved.review_inputs = Some(review_inputs);
+        if saved.review_task.is_none() {
+            indices.review += 1;
+            saved.review_task = Some(format!("review-{}", indices.review));
+        }
+        saved.stage = DeliveryStage::Review;
+        if !execution.save_delivery(&saved, *indices, Some("review cursor saved")) {
+            return Delivery::Stop;
+        }
         let graph_diff = cumulative_delta.diff();
 
         let chunks = chunk_graph_mutation(&cumulative_delta, DIFF_MAX_CHARS);
@@ -2779,8 +3100,16 @@ fn deliver_goal(
             Some(&review),
             Some(&security_verification),
         ));
+        saved.prepare_revision(revision_notes.clone(), revision_cycles);
+        if !execution.save_delivery(&saved, *indices, Some("review revision saved")) {
+            return Delivery::Stop;
+        }
     }
 }
+
+#[cfg(test)]
+#[path = "controller_continuation_tests.rs"]
+mod continuation_tests;
 
 #[cfg(test)]
 #[path = "controller_revision_tests.rs"]
@@ -3872,6 +4201,7 @@ mod tests {
                 lifecycle: Some(GraphLifecycle::Running),
                 revision: 0,
                 control_history: Vec::new(),
+                continuation: None,
             }),
             learning: Mutex::new(deps.learning.clone()),
             deps,
@@ -5118,6 +5448,7 @@ mod tests {
                 lifecycle: Some(GraphLifecycle::Running),
                 revision: 0,
                 control_history: Vec::new(),
+                continuation: None,
             }),
             deps: ControllerDeps {
                 runner: Arc::new(|_, _, _| WorkerResult {
@@ -5230,6 +5561,7 @@ mod tests {
                 lifecycle: Some(GraphLifecycle::Running),
                 revision: 0,
                 control_history: Vec::new(),
+                continuation: None,
             }),
             deps: ControllerDeps {
                 runner: Arc::new(|_, _, _| WorkerResult {
@@ -5321,6 +5653,7 @@ mod tests {
                 lifecycle: Some(GraphLifecycle::Paused),
                 revision: 0,
                 control_history: Vec::new(),
+                continuation: None,
             }),
             deps: ControllerDeps {
                 runner: Arc::new(|_, _, _| WorkerResult {
@@ -5429,6 +5762,7 @@ mod tests {
                 lifecycle: Some(GraphLifecycle::Running),
                 revision: 0,
                 control_history: Vec::new(),
+                continuation: None,
             }),
             deps: ControllerDeps {
                 runner: Arc::new(|_, _, _| WorkerResult {

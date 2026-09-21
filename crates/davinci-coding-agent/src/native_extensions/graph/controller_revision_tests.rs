@@ -1,8 +1,13 @@
 use super::super::types::*;
 use super::*;
 
-fn revision_fixture(fail_review: bool, fail_forever: bool, resume: Option<GraphRun>) -> GraphRun {
-    let dir = tempfile::tempdir().unwrap();
+fn revision_fixture(
+    cwd: &Path,
+    fail_review: bool,
+    fail_forever: bool,
+    resume: Option<GraphRun>,
+) -> GraphRun {
+    let resuming = resume.is_some();
     let reviews = Arc::new(AtomicUsize::new(0));
     let verifies = Arc::new(AtomicUsize::new(0));
     let progress_seen = Arc::new(AtomicBool::new(false));
@@ -17,7 +22,10 @@ fn revision_fixture(fail_review: bool, fail_forever: bool, resume: Option<GraphR
                 milestones: Some(vec!["first".into(), "second".into(), "third".into()]),
             }),
             ArtifactKind::Plan => Artifact::Plan(Box::new(ImplementationPlan {
-                steps: vec![],
+                steps: vec![PlanStep {
+                    description: "fixture step".into(),
+                    files: vec![],
+                }],
                 tests_to_add: vec![],
                 tests_to_run: vec![],
                 completion_criteria: vec!["done".into()],
@@ -52,7 +60,7 @@ fn revision_fixture(fail_review: bool, fail_forever: bool, resume: Option<GraphR
     run_graph(
         RunOptions {
             goal: "three milestones with revisions".into(),
-            cwd: dir.path().into(),
+            cwd: cwd.into(),
             forced: None,
             dry_run: false,
             abort: Arc::new(AtomicBool::new(false)),
@@ -63,8 +71,8 @@ fn revision_fixture(fail_review: bool, fail_forever: bool, resume: Option<GraphR
             runner,
             verify_exec: Arc::new(move |_, _, _, _| {
                 assert!(progress_before_exec.swap(false, Ordering::SeqCst));
-                let fail =
-                    fail_forever || (!fail_review && verifies.fetch_add(1, Ordering::SeqCst) == 0);
+                let fail = fail_forever
+                    || (!resuming && !fail_review && verifies.fetch_add(1, Ordering::SeqCst) == 0);
                 (if fail { 1 } else { 0 }, "fixture verification".into(), 1)
             }),
             config: GraphConfig {
@@ -103,7 +111,8 @@ fn revision_fixture(fail_review: bool, fail_forever: bool, resume: Option<GraphR
 
 #[test]
 fn milestone_verification_revision_does_not_use_next_milestone_dependencies() {
-    let run = revision_fixture(false, false, None);
+    let dir = tempfile::tempdir().unwrap();
+    let run = revision_fixture(dir.path(), false, false, None);
     assert_eq!(run.phase, Phase::Done, "{:?}", run.blocked_reason);
     assert_eq!(run.counters.revision_cycles, 1);
     assert_eq!(
@@ -134,7 +143,8 @@ fn milestone_verification_revision_does_not_use_next_milestone_dependencies() {
 
 #[test]
 fn milestone_review_revision_does_not_use_next_milestone_dependencies() {
-    let run = revision_fixture(true, false, None);
+    let dir = tempfile::tempdir().unwrap();
+    let run = revision_fixture(dir.path(), true, false, None);
     assert_eq!(run.phase, Phase::Done, "{:?}", run.blocked_reason);
     assert_eq!(run.counters.revision_cycles, 1);
     validate_definition(run.definition.as_ref().unwrap()).unwrap();
@@ -142,17 +152,28 @@ fn milestone_review_revision_does_not_use_next_milestone_dependencies() {
 
 #[test]
 fn resumed_milestone_revisions_reach_verification_limit_not_topology_failure() {
-    let initial = revision_fixture(false, true, None);
+    let dir = tempfile::tempdir().unwrap();
+    let initial = revision_fixture(dir.path(), false, true, None);
     assert!(initial
         .blocked_reason
         .as_deref()
         .unwrap()
         .contains("verification still failing"));
-    let resumed = revision_fixture(false, false, Some(initial.clone()));
+    let exhausted = revision_fixture(dir.path(), false, true, Some(initial.clone()));
+    assert_eq!(exhausted.phase, Phase::Blocked);
+    assert_eq!(
+        exhausted.counters.revision_cycles,
+        initial.counters.revision_cycles
+    );
+    assert_eq!(
+        exhausted.counters.workers_spawned,
+        initial.counters.workers_spawned
+    );
+    let resumed = revision_fixture(dir.path(), false, false, Some(exhausted));
     assert_eq!(resumed.phase, Phase::Done, "{:?}", resumed.blocked_reason);
     assert_eq!(resumed.run_id, initial.run_id);
     assert_eq!(
         resumed.counters.revision_cycles,
-        initial.counters.revision_cycles + 1
+        initial.counters.revision_cycles
     );
 }

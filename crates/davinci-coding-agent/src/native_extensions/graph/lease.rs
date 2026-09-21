@@ -6,6 +6,23 @@ pub struct WorkspaceLease {
     _file: File,
 }
 
+#[cfg(unix)]
+impl Drop for WorkspaceLease {
+    fn drop(&mut self) {
+        use std::os::fd::AsRawFd;
+        // flock is associated with the open-file description. A concurrent
+        // fork can retain a copy until exec, so closing our descriptor alone
+        // does not necessarily release ownership when this guard is dropped.
+        // SAFETY: the owned file remains open throughout this call.
+        if unsafe { libc::flock(self._file.as_raw_fd(), libc::LOCK_UN) } != 0 {
+            eprintln!(
+                "graph workspace unlock failed: {}",
+                std::io::Error::last_os_error()
+            );
+        }
+    }
+}
+
 impl WorkspaceLease {
     pub fn acquire(cwd: &Path) -> Result<Self, String> {
         let cwd = cwd
@@ -94,6 +111,23 @@ mod tests {
         let first = WorkspaceLease::acquire(root.path()).unwrap();
         assert!(WorkspaceLease::acquire(&root.path().join(".")).is_err());
         drop(first);
+        assert!(WorkspaceLease::acquire(root.path()).is_ok());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dropping_owner_releases_lease_despite_inherited_descriptor() {
+        let root = tempfile::tempdir().unwrap();
+        let first = WorkspaceLease::acquire(root.path()).unwrap();
+        // A concurrent fork inherits this open-file description until exec
+        // closes its CLOEXEC descriptor. A clone reproduces that window.
+        let inherited = first._file.try_clone().unwrap();
+        assert!(WorkspaceLease::acquire(root.path()).is_err());
+        drop(first);
+        let next = WorkspaceLease::acquire(root.path()).unwrap();
+        drop(inherited);
+        assert!(WorkspaceLease::acquire(root.path()).is_err());
+        drop(next);
         assert!(WorkspaceLease::acquire(root.path()).is_ok());
     }
 

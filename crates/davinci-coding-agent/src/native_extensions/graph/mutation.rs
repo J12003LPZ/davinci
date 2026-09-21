@@ -87,9 +87,12 @@ pub fn normalize_rel_path(path: &str) -> String {
     path.replace('\\', "/").trim_start_matches("./").to_string()
 }
 
-// Native change-impact journals are recovery state, not deliverable source.
+// Recovery state must not capture itself inside the next mutation baseline.
 fn is_transaction_journal(path: &str) -> bool {
-    normalize_rel_path(path).starts_with(".davinci-transactions/")
+    let path = normalize_rel_path(path);
+    [".davinci-transactions/", ".davinci/graph/", ".pi/graph/"]
+        .iter()
+        .any(|prefix| path.starts_with(prefix))
 }
 
 fn list_workspace_files(cwd: &Path) -> Vec<String> {
@@ -432,6 +435,31 @@ fn format_modified_file_diff(file: &str, old_bytes: &[u8], new_bytes: &[u8]) -> 
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn graph_checkpoint_files_are_not_part_of_git_mutation_baselines() {
+        let dir = tempfile::tempdir().unwrap();
+        setup_git_repo(dir.path());
+        std::fs::write(dir.path().join("source.txt"), "source").unwrap();
+        for root in [".davinci/graph/run", ".pi/graph/run"] {
+            std::fs::create_dir_all(dir.path().join(root)).unwrap();
+            std::fs::write(dir.path().join(root).join("state.json"), "checkpoint").unwrap();
+        }
+        let baseline = capture_baseline(dir.path()).unwrap();
+        assert_eq!(
+            baseline.files.keys().collect::<Vec<_>>(),
+            [&"source.txt".to_string()]
+        );
+        std::fs::write(
+            dir.path().join(".davinci/graph/run/state.json"),
+            "next checkpoint",
+        )
+        .unwrap();
+        assert!(capture_graph_delta(dir.path(), &baseline)
+            .unwrap()
+            .files
+            .is_empty());
+    }
+
     use super::*;
     use tempfile::tempdir;
 

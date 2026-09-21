@@ -16,6 +16,7 @@
 pub(crate) mod bindings;
 pub(crate) mod briefings;
 pub(crate) mod config;
+pub(crate) mod continuation;
 pub(crate) mod control;
 pub(crate) mod controller;
 mod coordinator_handler;
@@ -587,7 +588,7 @@ impl GraphController {
                 reconciled = true;
             }
         }
-        if reconciled && old_run.current_lifecycle() == types::GraphLifecycle::Running {
+        if reconciled {
             old_run.lifecycle = Some(types::GraphLifecycle::RecoveryRequired);
             store::save_run(&mut old_run)
                 .map_err(|e| format!("Failed to persist reconciled run: {e}"))?;
@@ -607,34 +608,10 @@ impl GraphController {
                 "paused": true,
                 "runId": old_run.run_id,
                 "status": render_now(&old_run),
-                "message": "Run is paused. Use /graph-control or 'p' to resume.",
+                "message": format!("Run is paused. Use /graph-resume {} to resume the saved controller.", old_run.run_id),
             }));
         }
-        // A run that revised or replanned holds several succeeded plan-N /
-        // implement-N / review-N attempts, and the resumed run numbers its own
-        // nodes from 1 again — so replaying by task id would hand back the very
-        // attempt that verification or review rejected. Only investigation
-        // results, which no later attempt supersedes, are safe to reuse there.
-        let superseded = old_run.counters.revision_cycles > 0 || old_run.counters.replans > 0;
-        let mut resume_artifacts = HashMap::new();
-        for task in &old_run.tasks {
-            if task.status != types::TaskStatus::Succeeded || task.artifact_file.is_none() {
-                continue;
-            }
-            let is_investigation = task.id == "classify" || task.id.starts_with("research-");
-            if superseded && !is_investigation {
-                continue;
-            }
-            if let Ok(artifact) =
-                store::read_artifact(&self.cwd, &old_run.run_id, &task.id, task.expect)
-            {
-                let fp = task
-                    .fingerprint
-                    .clone()
-                    .or_else(|| store::read_task_fingerprint(&self.cwd, &old_run.run_id, &task.id));
-                resume_artifacts.insert(task.id.clone(), (artifact, task.usage, fp));
-            }
-        }
+        continuation::validate_resume(&old_run, &self.cwd)?;
         // A dry run resumes as a dry run: its canned artifacts must never be
         // replayed as real node outputs in front of real verification.
         self.start_background(
@@ -643,7 +620,7 @@ impl GraphController {
                 forced: old_run.forced,
                 dry_run: old_run.dry_run,
             },
-            resume_artifacts,
+            HashMap::new(),
             Some(Box::new(old_run)),
             Some(workspace_lease),
         )
@@ -2278,6 +2255,7 @@ mod tests {
             lifecycle: Some(types::GraphLifecycle::Paused),
             revision: 1,
             control_history: Vec::new(),
+            continuation: None,
         };
         store::save_run(&mut run).unwrap();
 
@@ -2349,6 +2327,7 @@ mod tests {
             lifecycle: Some(types::GraphLifecycle::Running),
             revision: 1,
             control_history: Vec::new(),
+            continuation: None,
         };
         store::save_run(&mut run).unwrap();
 

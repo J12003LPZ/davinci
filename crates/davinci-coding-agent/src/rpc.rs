@@ -2167,6 +2167,7 @@ mod tests {
             lifecycle: Some(crate::native_extensions::graph::types::GraphLifecycle::Running),
             revision: 1,
             control_history: Vec::new(),
+            continuation: None,
         };
         crate::native_extensions::graph::store::save_run(&mut run).unwrap();
 

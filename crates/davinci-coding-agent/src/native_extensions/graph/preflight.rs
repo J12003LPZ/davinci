@@ -347,6 +347,7 @@ mod tests {
             lifecycle: None,
             revision: 1,
             control_history: Vec::new(),
+            continuation: None,
         }
     }
 

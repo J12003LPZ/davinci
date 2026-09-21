@@ -1212,6 +1212,7 @@ mod tests {
             lifecycle: None,
             revision: 0,
             control_history: Vec::new(),
+            continuation: None,
         }
     }
 

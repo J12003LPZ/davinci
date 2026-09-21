@@ -555,6 +555,7 @@ mod tests {
             lifecycle: Some(GraphLifecycle::Running),
             revision: 0,
             control_history: Vec::new(),
+            continuation: None,
         }
     }
 
