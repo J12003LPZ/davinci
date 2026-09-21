@@ -27,7 +27,8 @@ jobs:
         with:
           key: graph-recovery
       - name: Graph regression baseline
-        run: cargo test --locked -p davinci-coding-agent --lib native_extensions::graph::
+        run: |
+          cargo test --locked -p davinci-coding-agent --lib native_extensions::graph::
       - name: Collect source and dependency cache
         if: always() && contains(github.event.head_commit.message, 'offline workbench')
         shell: bash
