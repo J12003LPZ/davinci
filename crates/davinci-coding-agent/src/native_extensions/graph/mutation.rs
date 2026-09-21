@@ -87,6 +87,11 @@ pub fn normalize_rel_path(path: &str) -> String {
     path.replace('\\', "/").trim_start_matches("./").to_string()
 }
 
+// Native change-impact journals are recovery state, not deliverable source.
+fn is_transaction_journal(path: &str) -> bool {
+    normalize_rel_path(path).starts_with(".davinci-transactions/")
+}
+
 fn list_workspace_files(cwd: &Path) -> Vec<String> {
     if cwd.join(".git").exists() {
         let mut list = Vec::new();
@@ -138,6 +143,7 @@ fn walk_dir_files(root: &Path) -> Vec<String> {
             let file_name = entry.file_name();
             let name = file_name.to_string_lossy();
             if name == ".git"
+                || (dir == root && name == ".davinci-transactions")
                 || name == ".pi"
                 || name == ".davinci"
                 || name == "target"
@@ -165,6 +171,9 @@ pub fn capture_baseline(cwd: &Path) -> Result<MutationBaseline, String> {
 
     let paths = list_workspace_files(cwd);
     for rel_path in paths {
+        if is_transaction_journal(&rel_path) {
+            continue;
+        }
         let full = cwd.join(&rel_path);
         if let Ok(bytes) = std::fs::read(&full) {
             let hash = sha256_hex(&bytes);
@@ -193,6 +202,9 @@ pub fn capture_graph_delta(
     let mut current_map = BTreeMap::new();
 
     for rel_path in current_paths {
+        if is_transaction_journal(&rel_path) {
+            continue;
+        }
         let full = cwd.join(&rel_path);
         if let Ok(bytes) = std::fs::read(&full) {
             let hash = sha256_hex(&bytes);
@@ -242,6 +254,9 @@ pub fn capture_graph_delta(
 
     // Check for deleted files
     for old_path in baseline.files.keys() {
+        if is_transaction_journal(old_path) {
+            continue;
+        }
         if !current_map.contains_key(old_path) {
             changed_files.push(ChangedFile::deleted(old_path));
             let old_bytes = baseline.contents.get(old_path).cloned().unwrap_or_default();
@@ -436,6 +451,44 @@ mod tests {
             .current_dir(path)
             .output()
             .unwrap();
+    }
+
+    #[test]
+    fn transaction_journals_never_enter_product_review_in_git_or_plain_workspaces() {
+        for git in [false, true] {
+            let dir = tempdir().unwrap();
+            if git {
+                setup_git_repo(dir.path());
+            }
+            let journals = dir.path().join(".davinci-transactions");
+            std::fs::create_dir(&journals).unwrap();
+            std::fs::write(journals.join("old.json"), "old recovery state").unwrap();
+            let mut baseline = capture_baseline(dir.path()).unwrap();
+            assert!(!baseline
+                .files
+                .contains_key(".davinci-transactions/old.json"));
+            // A persisted baseline from an older build may already contain journals.
+            baseline.files.insert(
+                ".davinci-transactions/old.json".into(),
+                FileFingerprint {
+                    hash: "legacy".into(),
+                    len: 18,
+                },
+            );
+            baseline.contents.insert(
+                ".davinci-transactions/old.json".into(),
+                b"old recovery state".to_vec(),
+            );
+            std::fs::remove_file(journals.join("old.json")).unwrap();
+            std::fs::write(journals.join("new.json"), "new recovery state").unwrap();
+            std::fs::write(journals.join("active.lock"), "lock").unwrap();
+            std::fs::write(dir.path().join("product.rs"), "fn product() {}\n").unwrap();
+            let delta = capture_graph_delta(dir.path(), &baseline).unwrap();
+            assert_eq!(delta.files, vec![ChangedFile::added("product.rs")]);
+            assert!(!delta.diff().contains(".davinci-transactions"));
+            assert!(journals.join("new.json").exists());
+            assert!(journals.join("active.lock").exists());
+        }
     }
 
     #[test]

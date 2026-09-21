@@ -55,6 +55,11 @@ resume retains elapsed time against that lifetime limit. Stop remains available
 when a command closes its output pipes early; inherited pipes cannot keep an
 exited command in verification.
 
+Product diffs exclude the root `.davinci-transactions/` recovery journals,
+including entries captured by older baselines. The journals remain on disk;
+their creation or cleanup cannot become a product-review blocker or consume
+revision attempts.
+
 Graph workers inherit the active agent directory's saved compaction settings.
 An explicit token or percentage threshold also controls Context VM window-pressure
 folds, using each worker model's context window. Structural delta folds can still
