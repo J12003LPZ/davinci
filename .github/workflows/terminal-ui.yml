@@ -20,6 +20,19 @@ env:
   PI_OFFLINE: '1'
 
 jobs:
+  source:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - name: Archive tracked source only
+        run: git archive --format=zip --output="$RUNNER_TEMP/terminal-source.zip" HEAD
+      - uses: actions/upload-artifact@v4
+        with:
+          name: terminal-source-${{ github.sha }}
+          path: ${{ runner.temp }}/terminal-source.zip
+          retention-days: 3
+          if-no-files-found: error
   terminal:
     runs-on: ubuntu-latest
     timeout-minutes: 25
