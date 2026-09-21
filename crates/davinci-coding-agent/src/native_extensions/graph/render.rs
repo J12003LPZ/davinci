@@ -563,10 +563,15 @@ pub fn render_run_summary(run: &GraphRun) -> String {
     if let Some(verification) = &run.verification {
         lines.push(format!(
             "- verification: {}",
-            if verification.passed {
-                "passed"
+            if let Some(progress) = &verification.progress {
+                format!(
+                    "running {}/{}: {}",
+                    progress.index, progress.total, progress.command
+                )
+            } else if verification.passed {
+                "passed".into()
             } else {
-                "FAILED"
+                "FAILED".into()
             }
         ));
         for command in &verification.commands {
@@ -650,6 +655,25 @@ mod tests {
             lifecycle: None,
             revision: 0,
         }
+    }
+
+    #[test]
+    fn summary_distinguishes_active_verification_from_failure() {
+        let mut run = run();
+        run.verification = Some(super::super::types::VerificationResult {
+            commands: vec![],
+            passed: false,
+            progress: Some(super::super::types::VerificationProgress {
+                name: "test".into(),
+                command: "cargo test".into(),
+                index: 2,
+                total: 3,
+                started_at: 0,
+            }),
+        });
+        let summary = render_run_summary(&run);
+        assert!(summary.contains("verification: running 2/3: cargo test"));
+        assert!(!summary.contains("FAILED"));
     }
 
     #[test]

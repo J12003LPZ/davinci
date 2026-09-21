@@ -716,6 +716,7 @@ mod tests {
         writer.status = TaskStatus::Failed;
         run.tasks = vec![writer];
         run.verification = Some(VerificationResult {
+            progress: None,
             passed: true,
             commands: vec![],
         });

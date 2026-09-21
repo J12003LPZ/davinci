@@ -297,6 +297,7 @@ mod tests {
     fn verification_evidence_from_graph_truth_table() {
         // 1. One real passing command -> pass
         let res1 = VerificationResult {
+            progress: None,
             passed: true,
             commands: vec![VerificationCommandResult {
                 name: "test".into(),
@@ -314,6 +315,7 @@ mod tests {
 
         // 2. Only skipped commands -> fail
         let res2 = VerificationResult {
+            progress: None,
             passed: true,
             commands: vec![VerificationCommandResult {
                 name: "test".into(),
@@ -330,6 +332,7 @@ mod tests {
 
         // 3. Empty list -> fail
         let res3 = VerificationResult {
+            progress: None,
             passed: true,
             commands: vec![],
         };
@@ -339,6 +342,7 @@ mod tests {
 
         // 4. One failed command -> fail
         let res4 = VerificationResult {
+            progress: None,
             passed: false,
             commands: vec![VerificationCommandResult {
                 name: "test".into(),

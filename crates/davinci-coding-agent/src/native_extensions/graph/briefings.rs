@@ -697,6 +697,7 @@ mod tests {
     #[test]
     fn revision_notes_carry_failures_but_drop_minor_review_nits() {
         let verification = VerificationResult {
+            progress: None,
             commands: vec![VerificationCommandResult {
                 name: "test".into(),
                 command: "cargo test".into(),
@@ -733,6 +734,7 @@ mod tests {
     #[test]
     fn a_passing_verification_contributes_no_revision_notes() {
         let verification = VerificationResult {
+            progress: None,
             commands: vec![],
             passed: true,
         };

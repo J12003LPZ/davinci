@@ -3,12 +3,13 @@
 
 use super::process::{run_child, shell_command};
 use super::types::{
-    ImplementationPlan, VerificationCommandResult, VerificationResult, VerifyCommandSpec,
+    ImplementationPlan, VerificationCommandResult, VerificationProgress, VerificationResult,
+    VerifyCommandSpec,
 };
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 const OUTPUT_TAIL_CHARS: usize = 4000;
 
@@ -196,6 +197,7 @@ pub fn contracted_verify_exec(
     )
 }
 
+#[cfg(test)]
 pub fn run_verification(
     commands: &[VerifyCommandSpec],
     cwd: &Path,
@@ -203,14 +205,56 @@ pub fn run_verification(
     timeout_ms: u64,
     exec: &VerifyExec,
 ) -> VerificationResult {
+    run_verification_with_progress(commands, cwd, abort, timeout_ms, None, exec, |_| {})
+}
+
+pub fn run_verification_with_progress(
+    commands: &[VerifyCommandSpec],
+    cwd: &Path,
+    abort: &Arc<AtomicBool>,
+    timeout_ms: u64,
+    root_deadline: Option<Instant>,
+    exec: &VerifyExec,
+    mut on_progress: impl FnMut(&VerificationResult),
+) -> VerificationResult {
     let mut results = Vec::new();
     let mut interrupted = false;
-    for spec in commands {
+    for (index, spec) in commands.iter().enumerate() {
         if abort.load(Ordering::Relaxed) {
             interrupted = true;
             break;
         }
-        let (exit_code, output, duration_ms) = exec(&spec.command, cwd, abort, timeout_ms);
+        on_progress(&VerificationResult {
+            commands: results.clone(),
+            passed: false,
+            progress: Some(VerificationProgress {
+                name: spec.name.clone(),
+                command: spec.command.clone(),
+                index: index + 1,
+                total: commands.len(),
+                started_at: super::store::now_ms(),
+            }),
+        });
+        let remaining =
+            root_deadline.map(|deadline| deadline.saturating_duration_since(Instant::now()));
+        if remaining == Some(Duration::ZERO) {
+            results.push(deadline_failure());
+            break;
+        }
+        let effective_timeout = match remaining {
+            Some(remaining) => {
+                let remaining_ms = u64::try_from(remaining.as_millis())
+                    .unwrap_or(u64::MAX)
+                    .max(1);
+                if timeout_ms == 0 {
+                    remaining_ms
+                } else {
+                    timeout_ms.min(remaining_ms)
+                }
+            }
+            None => timeout_ms,
+        };
+        let (exit_code, output, duration_ms) = exec(&spec.command, cwd, abort, effective_timeout);
         let skipped =
             spec.from_plan && exit_code != 0 && looks_like_missing_command(exit_code, &output);
         let prefix = if skipped {
@@ -226,12 +270,17 @@ pub fn run_verification(
             output_tail: format!("{prefix}{}", verification_excerpt(&output, exit_code != 0)),
             skipped,
         });
+        if root_deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+            results.push(deadline_failure());
+            break;
+        }
     }
     // "Passed" means something ran and everything that ran succeeded: an
     // empty command list, a list of plan-invented commands that all got
     // skipped, or a list cut short by an abort verified nothing.
     let ran = results.iter().filter(|result| !result.skipped).count();
     let passed = !interrupted
+        && !abort.load(Ordering::Relaxed)
         && ran > 0
         && results
             .iter()
@@ -239,6 +288,18 @@ pub fn run_verification(
     VerificationResult {
         commands: results,
         passed,
+        progress: None,
+    }
+}
+
+fn deadline_failure() -> VerificationCommandResult {
+    VerificationCommandResult {
+        name: "deadline".into(),
+        command: "timeout".into(),
+        exit_code: 1,
+        duration_ms: 0,
+        output_tail: "root deadline exceeded".into(),
+        skipped: false,
     }
 }
 
@@ -277,24 +338,15 @@ pub fn run_verification_with_deadline(
     root_remaining_ms: Option<u64>,
     exec: &VerifyExec,
 ) -> VerificationResult {
-    let effective_timeout = match root_remaining_ms {
-        Some(remaining) => timeout_ms.min(remaining),
-        None => timeout_ms,
-    };
-    if let Some(0) = root_remaining_ms {
-        return VerificationResult {
-            commands: vec![VerificationCommandResult {
-                name: "deadline".into(),
-                command: "timeout".into(),
-                exit_code: 1,
-                duration_ms: 0,
-                output_tail: "root deadline exceeded".into(),
-                skipped: false,
-            }],
-            passed: false,
-        };
-    }
-    run_verification(commands, cwd, abort, effective_timeout, exec)
+    run_verification_with_progress(
+        commands,
+        cwd,
+        abort,
+        timeout_ms,
+        root_remaining_ms.map(|ms| Instant::now() + Duration::from_millis(ms)),
+        exec,
+        |_| {},
+    )
 }
 
 impl VerificationResult {
@@ -347,6 +399,77 @@ mod tests {
             command: command.into(),
             from_plan: false,
         }
+    }
+
+    #[test]
+    fn root_deadline_applies_when_command_timeout_is_unlimited() {
+        let result = run_verification_with_deadline(
+            &[spec("test", "test")],
+            Path::new("."),
+            &Arc::new(AtomicBool::new(false)),
+            0,
+            Some(1000),
+            &|_, _, _, timeout| {
+                assert!(
+                    (1..=1000).contains(&timeout),
+                    "root deadline was disabled: {timeout}"
+                );
+                (0, String::new(), 0)
+            },
+        );
+        assert!(result.passed);
+    }
+
+    #[test]
+    fn root_deadline_is_not_reset_for_the_next_command() {
+        let result = run_verification_with_deadline(
+            &[spec("first", "first"), spec("second", "second")],
+            Path::new("."),
+            &Arc::new(AtomicBool::new(false)),
+            0,
+            Some(20),
+            &|command, _, _, _| {
+                assert_eq!(command, "first", "ran another command after root deadline");
+                std::thread::sleep(Duration::from_millis(30));
+                (0, String::new(), 30)
+            },
+        );
+        assert!(!result.passed);
+        assert_eq!(result.commands.last().unwrap().name, "deadline");
+        assert!(result.progress.is_none());
+    }
+
+    #[test]
+    fn progress_precedes_each_command_and_contains_only_current_attempt_results() {
+        let commands = [spec("first", "first"), spec("second", "second")];
+        let started = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let observed = started.clone();
+        let result = run_verification_with_progress(
+            &commands,
+            Path::new("."),
+            &Arc::new(AtomicBool::new(false)),
+            0,
+            None,
+            &move |_, _, _, _| {
+                assert!(observed.load(Ordering::SeqCst) > 0);
+                (0, "ok".into(), 1)
+            },
+            |snapshot| {
+                let index = started.fetch_add(1, Ordering::SeqCst) + 1;
+                let progress = snapshot.progress.as_ref().unwrap();
+                assert_eq!(progress.index, index);
+                assert_eq!(progress.total, 2);
+                assert_eq!(progress.command, commands[index - 1].command);
+                assert_eq!(snapshot.commands.len(), index - 1);
+                assert!(!snapshot.passed);
+            },
+        );
+        assert_eq!(started.load(Ordering::SeqCst), 2);
+        assert!(result.progress.is_none());
+        assert!(result.passed);
+        let legacy: VerificationResult =
+            serde_json::from_str(r#"{"commands":[],"passed":false}"#).unwrap();
+        assert!(legacy.progress.is_none());
     }
 
     #[test]
@@ -483,6 +606,21 @@ mod tests {
         assert!(only_invented.commands[0].skipped);
         assert!(!only_invented.passed);
         assert!(nothing_ran(&only_invented));
+    }
+
+    #[test]
+    fn an_abort_during_the_final_command_is_not_a_pass() {
+        let result = run_verification(
+            &[spec("last", "last")],
+            Path::new("."),
+            &Arc::new(AtomicBool::new(false)),
+            0,
+            &|_, _, abort, _| {
+                abort.store(true, Ordering::Relaxed);
+                (0, "cancelled at exit".into(), 1)
+            },
+        );
+        assert!(!result.passed);
     }
 
     #[test]

@@ -135,6 +135,26 @@ def main():
         # Reproduce an older saved blocked run whose lifecycle incorrectly says running.
         state_path = next(Path(cwd).glob(".davinci/graph/runs/*/state.json"))
         state = json.loads(state_path.read_text(encoding="utf-8"))
+        verifying = dict(state, phase="verify", lifecycle="running", verification={
+            "passed": False, "commands": [], "progress": {
+                "name": "test", "command": "cargo test --workspace", "index": 3,
+                "total": 8, "startedAt": int(time.time() * 1000),
+            },
+        })
+        state_path.write_text(json.dumps(verifying), encoding="utf-8")
+        terminal = Terminal(executable, cwd, None, 160, 36)
+        try:
+            terminal.pump(8)
+            terminal.send("/graph-status", 0.8)
+            terminal.send("\r", 1)
+            text = terminal.send("g")
+            assert "Verification running" in text, text
+            assert "3/8" in text, text
+            assert "cargo test --workspace" in text, text
+            assert "Verification failed" not in text, text
+            results.append({"verification_command_progress": "passed"})
+        finally:
+            terminal.close()
         state.update(phase="blocked", lifecycle="running",
                      blockedReason="verification still failing after 3 revision cycles")
         state["counters"]["revisionCycles"] = 4

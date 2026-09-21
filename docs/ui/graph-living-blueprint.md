@@ -45,6 +45,16 @@ compiler errors alongside the final output, within the existing 4,000-character
 budget. Revision workers receive this excerpt even when a test prints a large
 event dump. A failed verification command still blocks completion.
 
+During verification, the goal inspector and status summary show the current
+command and its position in the sequence; the inspector also shows elapsed time.
+Each attempt clears the previous attempt's results before publishing progress,
+and completed command results accumulate as the current attempt runs. An explicit
+run deadline applies across the entire sequence, even when the per-command
+timeout is unlimited. Saved definitions apply their deadline before dispatch;
+resume retains elapsed time against that lifetime limit. Stop remains available
+when a command closes its output pipes early; inherited pipes cannot keep an
+exited command in verification.
+
 Graph workers inherit the active agent directory's saved compaction settings.
 An explicit token or percentage threshold also controls Context VM window-pressure
 folds, using each worker model's context window. Structural delta folds can still

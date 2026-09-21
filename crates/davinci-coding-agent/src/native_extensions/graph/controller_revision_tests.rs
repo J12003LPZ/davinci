@@ -5,6 +5,8 @@ fn revision_fixture(fail_review: bool, fail_forever: bool, resume: Option<GraphR
     let dir = tempfile::tempdir().unwrap();
     let reviews = Arc::new(AtomicUsize::new(0));
     let verifies = Arc::new(AtomicUsize::new(0));
+    let progress_seen = Arc::new(AtomicBool::new(false));
+    let progress_before_exec = progress_seen.clone();
     let runner: Arc<WorkerRunner> = Arc::new(move |spec, _, _| {
         let artifact = match spec.expect {
             ArtifactKind::Classification => Artifact::Classification(Classification {
@@ -60,6 +62,7 @@ fn revision_fixture(fail_review: bool, fail_forever: bool, resume: Option<GraphR
         ControllerDeps {
             runner,
             verify_exec: Arc::new(move |_, _, _, _| {
+                assert!(progress_before_exec.swap(false, Ordering::SeqCst));
                 let fail =
                     fail_forever || (!fail_review && verifies.fetch_add(1, Ordering::SeqCst) == 0);
                 (if fail { 1 } else { 0 }, "fixture verification".into(), 1)
@@ -75,7 +78,16 @@ fn revision_fixture(fail_review: bool, fail_forever: bool, resume: Option<GraphR
             session_model: None,
             session_thinking: None,
             project_trusted: false,
-            on_update: Arc::new(|_, _| {}),
+            on_update: Arc::new(move |run, _| {
+                if let Some(verification) = &run.verification {
+                    if let Some(progress) = &verification.progress {
+                        assert_eq!(run.phase, Phase::Verify);
+                        assert_eq!(progress.command, "fixture");
+                        assert!(verification.commands.is_empty(), "stale previous attempt");
+                        progress_seen.store(true, Ordering::SeqCst);
+                    }
+                }
+            }),
             memory: None,
             learning: None,
             governor: None,

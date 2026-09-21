@@ -7044,7 +7044,33 @@ fn graph_verification_facts(verification: Option<&serde_json::Value>) -> Vec<Str
         return Vec::new();
     };
     let mut facts = Vec::new();
-    if let Some(passed) = verification
+    if let Some(progress) = verification
+        .get("progress")
+        .filter(|value| value.is_object())
+    {
+        let index = progress
+            .get("index")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0);
+        let total = progress
+            .get("total")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0);
+        let started = progress
+            .get("startedAt")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0);
+        let elapsed =
+            crate::native_extensions::graph::store::now_ms().saturating_sub(started) / 1000;
+        facts.push(format!(
+            "Verification running · {index}/{total} · {elapsed}s elapsed"
+        ));
+        facts.push(format!(
+            "Running: {} · {}",
+            json_str(progress, "name"),
+            json_str(progress, "command")
+        ));
+    } else if let Some(passed) = verification
         .get("passed")
         .and_then(serde_json::Value::as_bool)
     {
@@ -7088,6 +7114,19 @@ mod graph_canvas_fact_tests {
     use super::*;
     use crate::native_extensions::graph::types::*;
     use serde_json::json;
+
+    #[test]
+    fn verification_progress_does_not_report_a_running_attempt_as_failed() {
+        let value = json!({"passed": false, "commands": [], "progress": {
+            "name": "test", "command": "cargo test --workspace",
+            "index": 3, "total": 4, "startedAt": 0
+        }});
+        let facts = graph_verification_facts(Some(&value)).join("\n");
+        assert!(facts.contains("Verification running"), "{facts}");
+        assert!(facts.contains("3/4"), "{facts}");
+        assert!(facts.contains("cargo test --workspace"), "{facts}");
+        assert!(!facts.contains("Verification failed"), "{facts}");
+    }
 
     #[test]
     fn graph_activity_is_bounded_and_matches_the_selected_run_and_worker() {
@@ -7161,6 +7200,7 @@ mod graph_canvas_fact_tests {
         ];
         run.blocked_reason = Some("required checks failed".into());
         run.verification = Some(VerificationResult {
+            progress: None,
             passed: false,
             commands: vec![VerificationCommandResult {
                 name: "tests".into(),

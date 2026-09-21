@@ -154,12 +154,22 @@ pub fn run_child_with_deadline(
         ..ChildOutcome::default()
     };
 
+    let mut pipes_closed = false;
     loop {
-        match receiver.recv_timeout(POLL_INTERVAL) {
-            Ok(Line::Stdout(line)) => on_stdout(&line),
-            Ok(Line::Stderr(line)) => on_stderr(&line),
-            Err(RecvTimeoutError::Timeout) => {}
-            Err(RecvTimeoutError::Disconnected) => break,
+        if pipes_closed {
+            thread::sleep(POLL_INTERVAL);
+        } else {
+            match receiver.recv_timeout(POLL_INTERVAL) {
+                Ok(Line::Stdout(line)) => on_stdout(&line),
+                Ok(Line::Stderr(line)) => on_stderr(&line),
+                Err(RecvTimeoutError::Timeout) => {}
+                Err(RecvTimeoutError::Disconnected) => pipes_closed = true,
+            }
+        }
+        // Pipe lifetime and process lifetime are independent. A child can close
+        // its pipes early, or leave them inherited by a longer-lived descendant.
+        if child.try_wait()?.is_some() {
+            break;
         }
         if abort.load(Ordering::Relaxed) {
             outcome.aborted = true;
@@ -182,12 +192,20 @@ pub fn run_child_with_deadline(
 
     if !outcome.run_deadline_exceeded && !outcome.aborted {
         let drain_until = Instant::now() + DRAIN_GRACE;
+        let mut pending = Vec::new();
         while Instant::now() < drain_until {
             match receiver.try_recv() {
-                Ok(Line::Stdout(line)) => on_stdout(&line),
-                Ok(Line::Stderr(line)) => on_stderr(&line),
+                Ok(line) => pending.push(line),
                 Err(mpsc::TryRecvError::Empty) => thread::sleep(Duration::from_millis(5)),
                 Err(mpsc::TryRecvError::Disconnected) => break,
+            }
+        }
+        // Bound waiting for inherited pipes, not delivery of already collected
+        // output. Slow callbacks must not drop a worker's final artifact.
+        for line in pending {
+            match line {
+                Line::Stdout(line) => on_stdout(&line),
+                Line::Stderr(line) => on_stderr(&line),
             }
         }
     }
@@ -250,6 +268,127 @@ mod tests {
 
     fn echo(text: &str) -> Command {
         shell_command(&format!("echo {text}"), std::path::Path::new("."))
+    }
+
+    fn fixture(mode: &str) -> Command {
+        let mut command = Command::new(std::env::current_exe().unwrap());
+        command.args([
+            "--exact",
+            "native_extensions::graph::process::tests::pipe_lifecycle_fixture",
+            "--ignored",
+            "--nocapture",
+        ]);
+        command.env("DAVINCI_TEST_PIPE_MODE", mode);
+        command
+    }
+
+    #[test]
+    #[ignore = "subprocess fixture invoked by pipe lifecycle tests"]
+    fn pipe_lifecycle_fixture() {
+        match std::env::var("DAVINCI_TEST_PIPE_MODE").as_deref() {
+            Ok("close") => {
+                #[cfg(windows)]
+                unsafe {
+                    #[link(name = "kernel32")]
+                    extern "system" {
+                        fn GetStdHandle(kind: u32) -> *mut std::ffi::c_void;
+                        fn CloseHandle(handle: *mut std::ffi::c_void) -> i32;
+                    }
+                    CloseHandle(GetStdHandle(-11i32 as u32));
+                    CloseHandle(GetStdHandle(-12i32 as u32));
+                }
+                #[cfg(not(windows))]
+                unsafe {
+                    libc::close(1);
+                    libc::close(2);
+                }
+                thread::sleep(Duration::from_secs(3));
+            }
+            Ok("descendant") => {
+                let mut child = fixture("sleep").spawn().unwrap();
+                // The fixture parent exits while this descendant still owns its pipes.
+                thread::spawn(move || child.wait().unwrap());
+            }
+            Ok("sleep") => thread::sleep(Duration::from_secs(3)),
+            Ok("burst") => {
+                for index in 0..30 {
+                    println!("burst-line-{index}");
+                }
+            }
+            _ => panic!("fixture mode required"),
+        }
+    }
+
+    #[test]
+    fn exited_child_preserves_queued_output_with_slow_callbacks() {
+        let mut lines = Vec::new();
+        let outcome = run_child(
+            fixture("burst"),
+            &Arc::new(AtomicBool::new(false)),
+            0,
+            |line| {
+                thread::sleep(Duration::from_millis(20));
+                lines.push(line.to_string());
+            },
+            |_| {},
+        )
+        .unwrap();
+        assert_eq!(outcome.exit_code, 0);
+        assert_eq!(
+            lines
+                .iter()
+                .filter(|line| line.starts_with("burst-line-"))
+                .count(),
+            30
+        );
+    }
+
+    #[test]
+    fn closed_output_pipes_do_not_disable_the_deadline() {
+        let started = Instant::now();
+        let outcome = run_child(
+            fixture("close"),
+            &Arc::new(AtomicBool::new(false)),
+            300,
+            |_| {},
+            |_| {},
+        )
+        .unwrap();
+        assert!(outcome.timed_out, "{outcome:?}");
+        assert!(started.elapsed() < Duration::from_secs(2));
+    }
+
+    #[test]
+    fn closed_output_pipes_do_not_disable_cancellation() {
+        let abort = Arc::new(AtomicBool::new(false));
+        let flag = abort.clone();
+        let canceller = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(300));
+            flag.store(true, Ordering::Relaxed);
+        });
+        let started = Instant::now();
+        let outcome = run_child(fixture("close"), &abort, 0, |_| {}, |_| {}).unwrap();
+        canceller.join().unwrap();
+        assert!(outcome.aborted, "{outcome:?}");
+        assert!(started.elapsed() < Duration::from_secs(2));
+    }
+
+    #[test]
+    fn exited_child_does_not_wait_for_descendant_output_pipes() {
+        let started = Instant::now();
+        let outcome = run_child(
+            fixture("descendant"),
+            &Arc::new(AtomicBool::new(false)),
+            0,
+            |_| {},
+            |_| {},
+        )
+        .unwrap();
+        assert_eq!(outcome.exit_code, 0);
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "waited for descendant pipe handles"
+        );
     }
 
     #[test]

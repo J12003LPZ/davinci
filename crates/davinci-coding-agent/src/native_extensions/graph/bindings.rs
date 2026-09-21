@@ -276,6 +276,7 @@ pub fn build_briefing_for_stage(
                 }
             }
             let empty_ver = VerificationResult {
+                progress: None,
                 commands: vec![],
                 passed: true,
             };

@@ -37,7 +37,7 @@ use super::types::{
     Role, Severity, TaskStatus, Verdict, VerificationResult, WorkerResult, WorkerSpec, WorkerUsage,
 };
 use super::verify::{
-    collect_verify_commands, nothing_ran, run_verification, CollectInput, VerifyExec,
+    collect_verify_commands, nothing_ran, run_verification_with_progress, CollectInput, VerifyExec,
 };
 use super::worker::WorkerRunner;
 use crate::native_extensions::ecosystem::risk::ChangeRisk;
@@ -312,6 +312,43 @@ impl GraphExecution {
             .lock()
             .unwrap_or_else(|error| error.into_inner())
             .clone()
+    }
+
+    fn verification_progress(&self, progress: &VerificationResult) {
+        self.run
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .verification = Some(progress.clone());
+        self.checkpoint(None);
+    }
+
+    fn begin_verification(&self) {
+        let mut run = self.run.lock().unwrap_or_else(|error| error.into_inner());
+        run.phase = Phase::Verify;
+        run.verification = None;
+    }
+
+    fn verify_commands(
+        &self,
+        commands: &[super::types::VerifyCommandSpec],
+        timeout_ms: u64,
+    ) -> VerificationResult {
+        let result = run_verification_with_progress(
+            commands,
+            &self.options.cwd,
+            &self.exec_abort,
+            timeout_ms,
+            self.run_deadline,
+            self.deps.verify_exec.as_ref(),
+            |progress| self.verification_progress(progress),
+        );
+        if self
+            .run_deadline
+            .is_some_and(|deadline| Instant::now() >= deadline)
+        {
+            self.budget_abort("run deadline exceeded".into());
+        }
+        result
     }
 
     fn budget_abort(&self, reason: String) {
@@ -1347,9 +1384,7 @@ fn run_graph_internal(
         .map(|(run_id, _, _)| run_id.clone())
         .unwrap_or_else(new_run_id);
     let _ = create_run_dir(&options.cwd, &run_id);
-    let budgets: GraphBudgets = deps.config.budgets.clone();
-    let run_deadline = (budgets.run_deadline_ms > 0)
-        .then(|| std::time::Instant::now() + Duration::from_millis(budgets.run_deadline_ms));
+    let mut budgets: GraphBudgets = deps.config.budgets.clone();
     let (saved_def_from_resume, origin_from_resume, digest_from_resume) = options
         .resume_run
         .as_ref()
@@ -1376,6 +1411,17 @@ fn run_graph_internal(
                 digest_from_resume,
             )
         };
+    if let Some(saved_budgets) = saved_definition
+        .as_ref()
+        .and_then(|def| def.budgets.as_ref())
+    {
+        if let Some(ms) = saved_budgets.max_duration_ms {
+            budgets.run_deadline_ms = ms;
+        }
+        if let Some(usd) = saved_budgets.max_cost_usd {
+            budgets.max_cost_usd = usd;
+        }
+    }
     let run = GraphRun {
         version: 1,
         run_id: run_id.clone(),
@@ -1420,6 +1466,12 @@ fn run_graph_internal(
             .unwrap_or(0),
     };
 
+    let run_deadline = remaining_run_deadline(
+        run.budgets.run_deadline_ms,
+        run.counters.started_at,
+        now_ms(),
+        Instant::now(),
+    );
     let exec_abort = Arc::new(AtomicBool::new(options.abort.load(Ordering::Relaxed)));
     let finished = Arc::new(AtomicBool::new(false));
     let watcher = spawn_abort_watcher(
@@ -1452,6 +1504,17 @@ fn run_graph_internal(
     execution.snapshot()
 }
 
+fn remaining_run_deadline(
+    budget_ms: u64,
+    started_at: u64,
+    now: u64,
+    instant: Instant,
+) -> Option<Instant> {
+    (budget_ms > 0).then(|| {
+        instant + Duration::from_millis(budget_ms.saturating_sub(now.saturating_sub(started_at)))
+    })
+}
+
 fn drive_compiled_saved_graph(
     execution: &GraphExecution,
     saved_def: &super::definitions::SavedGraphDefinitionV1,
@@ -1475,14 +1538,6 @@ fn drive_compiled_saved_graph(
             .unwrap_or_else(|error| error.into_inner());
         run.definition = Some(compiled.topology.clone());
         run.definition_digest = Some(compiled.definition_digest.clone());
-        if let Some(budgets) = &compiled.budgets {
-            if let Some(ms) = budgets.max_duration_ms {
-                run.budgets.run_deadline_ms = ms;
-            }
-            if let Some(usd) = budgets.max_cost_usd {
-                run.budgets.max_cost_usd = usd;
-            }
-        }
     }
     let run_id = execution.snapshot().run_id;
     let _ = write_graph_definition(&cwd, &run_id, &compiled.topology);
@@ -1531,7 +1586,7 @@ fn drive_compiled_saved_graph(
             super::bindings::SupportedStage::Research => execution.set_phase(Phase::Investigate),
             super::bindings::SupportedStage::Plan => execution.set_phase(Phase::Plan),
             super::bindings::SupportedStage::Implement => execution.set_phase(Phase::Implement),
-            super::bindings::SupportedStage::Verify => execution.set_phase(Phase::Verify),
+            super::bindings::SupportedStage::Verify => execution.begin_verification(),
             super::bindings::SupportedStage::Security => execution.set_phase(Phase::Verify),
             super::bindings::SupportedStage::Review => execution.set_phase(Phase::Review),
         }
@@ -1557,13 +1612,8 @@ fn drive_compiled_saved_graph(
                 );
                 return execution.snapshot();
             }
-            let mut verification = run_verification(
-                &commands,
-                &cwd,
-                &execution.exec_abort,
-                budgets.verify_command_timeout_ms,
-                execution.deps.verify_exec.as_ref(),
-            );
+            let mut verification =
+                execution.verify_commands(&commands, budgets.verify_command_timeout_ms);
             if execution.options.dry_run && nothing_ran(&verification) {
                 verification.passed = true;
             }
@@ -2182,7 +2232,7 @@ fn deliver_goal(
             continue;
         }
 
-        execution.set_phase(Phase::Verify);
+        execution.begin_verification();
         execution.checkpoint(None);
         let cwd = execution.options.cwd.clone();
         let commands = collect_verify_commands(&CollectInput {
@@ -2200,13 +2250,8 @@ fn deliver_goal(
             );
             return Delivery::Stop;
         }
-        let mut verification: VerificationResult = run_verification(
-            &commands,
-            &cwd,
-            &execution.exec_abort,
-            budgets.verify_command_timeout_ms,
-            execution.deps.verify_exec.as_ref(),
-        );
+        let mut verification: VerificationResult =
+            execution.verify_commands(&commands, budgets.verify_command_timeout_ms);
         // A dry run verifies nothing by design: with no command to pretend
         // to run, it passes instead of revising a change nobody made.
         if execution.options.dry_run && nothing_ran(&verification) {
@@ -3307,6 +3352,18 @@ mod tests {
     }
 
     #[test]
+    fn resumed_run_deadline_uses_remaining_lifetime_budget() {
+        let now = Instant::now();
+        assert_eq!(
+            remaining_run_deadline(1000, 100, 850, now),
+            Some(now + Duration::from_millis(250))
+        );
+        assert_eq!(remaining_run_deadline(1000, 100, 1100, now), Some(now));
+        assert_eq!(remaining_run_deadline(1000, 100, 1200, now), Some(now));
+        assert_eq!(remaining_run_deadline(0, 100, 1200, now), None);
+    }
+
+    #[test]
     fn graph_deadline_controller_aborts_run_when_worker_exceeds_deadline() {
         let dir = tempfile::tempdir().unwrap();
         let budgets = GraphBudgets {
@@ -3653,6 +3710,7 @@ mod tests {
                     }],
                 }],
                 verification: Some(VerificationResult {
+                    progress: None,
                     passed: true,
                     commands: vec![
                         crate::native_extensions::graph::types::VerificationCommandResult {
@@ -4814,7 +4872,11 @@ mod tests {
                 stage: "verify".into(),
                 input_artifacts: vec![],
             }],
-            budgets: None,
+            budgets: Some(SavedBudgets {
+                max_duration_ms: Some(10_000),
+                max_cost_usd: None,
+                max_tokens: None,
+            }),
             verification_policy: None,
             artifact_contract_versions: BTreeMap::new(),
             parameters: vec![],
@@ -4838,7 +4900,11 @@ mod tests {
                 ok: true,
                 ..WorkerResult::default()
             }),
-            verify_exec: Arc::new(move |_, _, _, _| {
+            verify_exec: Arc::new(move |_, _, _, timeout| {
+                assert!(
+                    (1..=10_000).contains(&timeout),
+                    "saved deadline was ignored: {timeout}"
+                );
                 verify_exec_calls_clone.fetch_add(1, Ordering::SeqCst);
                 (1, "cargo test failed: 1 test panicked".into(), 10)
             }),

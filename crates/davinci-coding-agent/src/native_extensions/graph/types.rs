@@ -929,6 +929,18 @@ pub struct VerificationCommandResult {
 pub struct VerificationResult {
     pub commands: Vec<VerificationCommandResult>,
     pub passed: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub progress: Option<VerificationProgress>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct VerificationProgress {
+    pub name: String,
+    pub command: String,
+    pub index: usize,
+    pub total: usize,
+    pub started_at: u64,
 }
 
 // ---------------------------------------------------------------------------
