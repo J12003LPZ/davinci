@@ -417,11 +417,37 @@ pub fn read_task_context_packet(
 }
 
 pub fn load_run(cwd: &Path, run_id: &str) -> Option<GraphRun> {
+    load_run_checked(cwd, run_id).ok()
+}
+
+pub fn load_run_checked(cwd: &Path, run_id: &str) -> Result<GraphRun, String> {
     if !is_safe_run_id(run_id) {
-        return None;
+        return Err("Invalid graph run identity; expected a path-safe run ID.".into());
     }
-    let raw = fs::read_to_string(run_dir(cwd, run_id).join("state.json")).ok()?;
-    let mut run: GraphRun = serde_json::from_str(&raw).ok()?;
+    let raw = fs::read_to_string(run_dir(cwd, run_id).join("state.json"))
+        .map_err(|error| format!("Cannot read checkpoint for run '{run_id}': {error}"))?;
+    let mut run: GraphRun = serde_json::from_str(&raw)
+        .map_err(|error| format!("Invalid checkpoint for run '{run_id}': {error}"))?;
+    if run.version != 1 {
+        return Err(format!(
+            "Unsupported graph checkpoint version {} for run '{run_id}'.",
+            run.version
+        ));
+    }
+    if run.run_id != run_id {
+        return Err(format!(
+            "Checkpoint run identity does not match requested run '{run_id}'."
+        ));
+    }
+    let expected_cwd = cwd
+        .canonicalize()
+        .map_err(|error| format!("Cannot resolve requested graph workspace: {error}"))?;
+    let stored_cwd = Path::new(&run.cwd).canonicalize().map_err(|error| {
+        format!("Cannot resolve checkpoint workspace for run '{run_id}': {error}")
+    })?;
+    if expected_cwd != stored_cwd {
+        return Err(format!("Checkpoint for run '{run_id}' belongs to a different workspace. Open it from its original workspace."));
+    }
     if run.definition.is_none() {
         run.definition = load_graph_definition(cwd, run_id);
     }
@@ -443,7 +469,7 @@ pub fn load_run(cwd: &Path, run_id: &str) -> Option<GraphRun> {
             task.mutation = read_task_mutation(cwd, run_id, &task.id);
         }
     }
-    (run.version == 1).then_some(run)
+    Ok(run)
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -777,6 +803,47 @@ mod tests {
     fn an_unsafe_run_id_never_reaches_the_filesystem() {
         let dir = tempdir().unwrap();
         assert!(load_run(dir.path(), "../../etc/passwd").is_none());
+    }
+
+    #[test]
+    fn loaded_run_is_bound_to_requested_workspace_and_identity() {
+        let dir = tempdir().unwrap();
+        let other = tempdir().unwrap();
+        let mut run = sample_run(dir.path(), "bound-run", "fixture");
+        save_run(&mut run).unwrap();
+        let path = run_dir(dir.path(), "bound-run").join("state.json");
+        let original = fs::read(&path).unwrap();
+        for (field, value) in [
+            ("cwd", other.path().to_string_lossy().into_owned()),
+            ("runId", "other-run".into()),
+        ] {
+            let mut state: Value = serde_json::from_slice(&original).unwrap();
+            state[field] = Value::String(value);
+            fs::write(&path, serde_json::to_vec(&state).unwrap()).unwrap();
+            assert!(load_run(dir.path(), "bound-run").is_none(), "{field}");
+        }
+        fs::write(&path, original).unwrap();
+        assert!(load_run(&dir.path().join("."), "bound-run").is_some());
+    }
+
+    #[test]
+    fn checked_load_explains_missing_corrupt_and_incompatible_checkpoints() {
+        let dir = tempdir().unwrap();
+        assert!(load_run_checked(dir.path(), "missing")
+            .unwrap_err()
+            .contains("Cannot read checkpoint"));
+        let mut run = sample_run(dir.path(), "bad-run", "fixture");
+        save_run(&mut run).unwrap();
+        let path = run_dir(dir.path(), "bad-run").join("state.json");
+        fs::write(&path, b"{").unwrap();
+        assert!(load_run_checked(dir.path(), "bad-run")
+            .unwrap_err()
+            .contains("Invalid checkpoint"));
+        run.version = 2;
+        fs::write(&path, serde_json::to_vec(&run).unwrap()).unwrap();
+        assert!(load_run_checked(dir.path(), "bad-run")
+            .unwrap_err()
+            .contains("Unsupported graph checkpoint version 2"));
     }
 
     #[test]

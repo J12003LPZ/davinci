@@ -553,24 +553,17 @@ impl GraphController {
 
     fn resume(&self, wanted: &str) -> Result<Value, String> {
         let workspace_lease = lease::WorkspaceLease::acquire(&self.cwd)?;
-        let runs = list_runs(&self.cwd);
-        let summary = if wanted.is_empty() {
+        let run_id = if wanted.is_empty() {
+            let runs = list_runs(&self.cwd);
             runs.iter()
                 .find(|run| run.phase != "done" && run.phase != "cancelled")
                 .or_else(|| runs.first())
+                .map(|run| run.run_id.clone())
+                .ok_or_else(|| "No graph runs in this project.".to_string())?
         } else {
-            runs.iter().find(|run| run.run_id == wanted)
+            wanted.to_owned()
         };
-        let Some(summary) = summary else {
-            return Err(if wanted.is_empty() {
-                "No graph runs in this project.".to_string()
-            } else {
-                format!("No graph run \"{wanted}\" in this project.")
-            });
-        };
-        let Some(mut old_run) = load_run(&self.cwd, &summary.run_id) else {
-            return Err(format!("Could not load state for run {}.", summary.run_id));
-        };
+        let mut old_run = store::load_run_checked(&self.cwd, &run_id)?;
         if old_run.phase == types::Phase::Done {
             return Err(format!(
                 "Run {} already finished (done). Start a new /graph instead.",
