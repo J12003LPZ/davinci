@@ -258,6 +258,7 @@ mod tests {
             expect: ArtifactKind::Evidence,
             extra_extensions: vec![],
             runtime_agent_id: None,
+            worker_session: None,
             task_contract: None,
             coordinator_client: None,
             node_abort: None,

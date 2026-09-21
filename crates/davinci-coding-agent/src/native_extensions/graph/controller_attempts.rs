@@ -2,8 +2,8 @@ use super::super::store::{atomic_write, run_dir, write_task_attempt, TaskAttempt
 use super::*;
 
 impl GraphExecution {
-    pub(super) fn begin_attempt(&self, spec: &WorkerSpec, attempt: u32) -> bool {
-        let record = {
+    pub(super) fn begin_attempt(&self, spec: &mut WorkerSpec, attempt: u32) -> bool {
+        let mut record = {
             let run = self.run.lock().unwrap_or_else(|error| error.into_inner());
             TaskAttemptRecord {
                 task_id: spec.task_id.clone(),
@@ -26,6 +26,7 @@ impl GraphExecution {
                     run.definition_digest.as_deref(),
                     run.dry_run,
                 )),
+                worker_session: None,
             }
         };
         self.checkpoint_with(
@@ -34,6 +35,23 @@ impl GraphExecution {
                 spec.task_id, spec.role
             )),
             |run| {
+                let previous = run
+                    .continuation
+                    .as_ref()
+                    .and_then(|continuation| continuation.attempt_history.get(&spec.task_id))
+                    .and_then(|history| history.last())
+                    .and_then(|record| record.worker_session.clone());
+                let binding = super::super::worker_sessions::WorkerSessionBinding::create(
+                    spec,
+                    &run.run_id,
+                    run.revision,
+                    attempt,
+                    self.deps.runtime.as_ref(),
+                    previous.as_ref(),
+                )
+                .map_err(std::io::Error::other)?;
+                spec.worker_session = Some(binding.clone());
+                record.worker_session = Some(binding);
                 write_task_attempt(&spec.cwd, &run.run_id, &spec.task_id, attempt, &record)?;
                 run.continuation
                     .as_mut()

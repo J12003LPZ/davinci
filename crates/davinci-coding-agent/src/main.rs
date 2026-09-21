@@ -584,6 +584,18 @@ fn offline_stub_message(current: &Agent, last_user: usize) -> AssistantMessage {
 }
 
 fn build_agent(parsed: &Args, session_dir: &Path, cwd: &Path) -> Result<Agent, String> {
+    let graph_worker = crate::native_extensions::graph_worker_context();
+    if std::env::var_os("PI_GRAPH_ROLE").is_some() && graph_worker.is_none() {
+        return Err("invalid Graph worker context; refusing ordinary-session fallback".into());
+    }
+    let worker_runtime = crate::native_extensions::graph::worker_sessions::runtime_from_env(
+        parsed,
+        cwd,
+        graph_worker.as_ref(),
+    )?;
+    if worker_runtime.is_some() && parsed.no_session {
+        return Err("bound Graph worker cannot disable its conversation".into());
+    }
     let settings = load_merged_settings_with_override(
         &default_agent_dir(),
         cwd,
@@ -795,6 +807,9 @@ fn build_agent(parsed: &Args, session_dir: &Path, cwd: &Path) -> Result<Agent, S
         run_nested_subagent(&parsed_for_worker, &cwd_for_worker, &mcp_for_worker, req)
     }));
     apply_discovered_resources(parsed, &mut agent);
+    if let Some(runtime) = worker_runtime {
+        agent.set_runtime(runtime);
+    }
     if !parsed.no_session {
         agent.load_from_session(resolve_or_create_session(parsed, session_dir, cwd)?)?;
         // A resumed session opens on the ledger it closed on, in every
@@ -862,10 +877,6 @@ fn build_agent(parsed: &Args, session_dir: &Path, cwd: &Path) -> Result<Agent, S
     }
     agent.apply_extension_tools(&names);
     sync_visual_verification_availability(&mut agent, &host);
-    let graph_worker = crate::native_extensions::graph_worker_context();
-    if std::env::var_os("PI_GRAPH_ROLE").is_some() && graph_worker.is_none() {
-        return Err("invalid Graph worker context; refusing ordinary-session fallback".into());
-    }
     if let Some(graph_worker) = &graph_worker {
         agent.tool_context.transaction_owner.graph_node = Some(graph_worker.node_id.clone());
         if let Some(id) = std::env::var_os("DAVINCI_AGENT_ID") {
@@ -10935,6 +10946,59 @@ mod tests {
         assert!(events
             .windows(2)
             .all(|pair| pair[0].sequence < pair[1].sequence));
+    }
+
+    #[test]
+    fn graph_worker_launch_opens_its_private_bound_conversation() {
+        use crate::native_extensions::graph::worker_sessions::{tests as fixture, SESSION_ENV};
+        let _env_lock = PROCESS_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        let (spec, binding) = fixture::fixture(dir.path());
+        let _config = EnvRestore::set(
+            "PI_CODING_AGENT_DIR",
+            &dir.path().join("config").to_string_lossy(),
+        );
+        let _current = EnvRestore::set(
+            "DAVINCI_CODING_AGENT_DIR",
+            &dir.path().join("config").to_string_lossy(),
+        );
+        let _role = EnvRestore::set("PI_GRAPH_ROLE", spec.role.as_str());
+        let _node = EnvRestore::set("PI_GRAPH_NODE_ID", &spec.task_id);
+        let _expect = EnvRestore::set("PI_GRAPH_EXPECT", spec.expect.as_str());
+        let _artifact = EnvRestore::set(
+            "PI_GRAPH_ARTIFACT_PATH",
+            &spec.artifact_path.to_string_lossy(),
+        );
+        let _tools = EnvRestore::set(
+            "PI_GRAPH_AUTHORIZED_TOOLS",
+            &spec.authorized_tools.join(","),
+        );
+        let _agent = EnvRestore::set("DAVINCI_AGENT_ID", &binding.agent.to_string());
+        let _binding = EnvRestore::set(SESSION_ENV, &serde_json::to_string(&binding).unwrap());
+        let mut args = fixture::launch_args(&spec, dir.path());
+        args.offline = true;
+        let session_dir = binding.session_path.parent().unwrap();
+        let mut agent = build_agent(&args, session_dir, dir.path()).unwrap();
+        let runtime = agent.runtime_for_session().unwrap();
+        assert_eq!(runtime.agent_id, binding.agent);
+        assert_eq!(runtime.parent_agent_id, Some(binding.parent));
+        assert_eq!(runtime.run_id, binding.runtime_run);
+        assert_eq!(agent.session.as_ref().unwrap().path, binding.session_path);
+        agent.prompt("retained worker prompt");
+        agent.record_assistant("retained worker answer");
+        assert!(build_agent(&args, session_dir, dir.path()).is_err());
+        drop(agent);
+        let recovered = build_agent(&args, session_dir, dir.path()).unwrap();
+        assert_eq!(
+            recovered.last_assistant_text().as_deref(),
+            Some("retained worker answer")
+        );
+        assert!(!binding.session_path.with_extension("tasks.jsonl").exists());
+        drop(recovered);
+        args.no_session = true;
+        assert!(build_agent(&args, session_dir, dir.path()).is_err());
     }
 
     #[test]

@@ -38,7 +38,7 @@ use super::types::{
     Role, Severity, TaskStatus, Verdict, VerificationResult, WorkerResult, WorkerSpec, WorkerUsage,
 };
 use super::verify::{
-    collect_verify_commands, nothing_ran, run_verification_with_progress, CollectInput, VerifyExec,
+    collect_verify_commands, nothing_ran, CollectInput, VerifyExec,
 };
 use super::worker::WorkerRunner;
 use crate::native_extensions::ecosystem::risk::ChangeRisk;
@@ -254,6 +254,16 @@ impl GraphExecution {
         .map_err(|error| error.to_string())
     }
 
+    fn verification_inputs(
+        &self,
+        commands: &[super::types::VerifyCommandSpec],
+    ) -> Result<String, String> {
+        let source = capture_baseline(&self.options.cwd)?;
+        serde_json::to_string(&(&source.files, commands))
+            .map(|json| super::replay::compute_input_hash(&json))
+            .map_err(|error| error.to_string())
+    }
+
     fn save_delivery(
         &self,
         delivery: &DeliveryCheckpoint,
@@ -405,10 +415,16 @@ impl GraphExecution {
         self.checkpoint(None);
     }
 
-    fn begin_verification(&self) {
+    fn begin_verification(&self, preserve_partial: bool) {
         let mut run = self.run.lock().unwrap_or_else(|error| error.into_inner());
         run.phase = Phase::Verify;
-        run.verification = None;
+        let has_partial = run
+            .verification
+            .as_ref()
+            .is_some_and(|verification| verification.progress.is_some());
+        if !preserve_partial || !has_partial {
+            run.verification = None;
+        }
     }
 
     fn verify_commands(
@@ -416,12 +432,20 @@ impl GraphExecution {
         commands: &[super::types::VerifyCommandSpec],
         timeout_ms: u64,
     ) -> VerificationResult {
-        let result = run_verification_with_progress(
+        let prior = self
+            .run
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .verification
+            .clone()
+            .filter(|verification| verification.progress.is_some());
+        let result = super::verify::run_verification_with_progress_from(
             commands,
             &self.options.cwd,
             &self.exec_abort,
             timeout_ms,
             self.run_deadline,
+            prior.as_ref(),
             &|command, cwd, abort, timeout| {
                 loop {
                     if !self.wait_until_running() {
@@ -628,6 +652,7 @@ impl GraphExecution {
             transcript_path: Some(transcript_path(Path::new(&run.cwd), &run.run_id, &task.id)),
             project_trusted: self.deps.project_trusted,
             runtime_agent_id: None,
+            worker_session: None,
             task_contract: self.deps.task_contract.clone(),
             coordinator_client: None,
             node_abort: None,
@@ -986,9 +1011,16 @@ impl GraphExecution {
                 spec.timeout_ms = spec.timeout_ms.saturating_mul(2);
             }
 
-            let worker_agent_id = davinci_agent::AgentId::new();
+            let worker_agent_id = self
+                .snapshot()
+                .continuation
+                .as_ref()
+                .and_then(|continuation| continuation.attempt_history.get(&task_id))
+                .and_then(|history| history.last())
+                .and_then(|record| record.worker_session.as_ref())
+                .map_or_else(davinci_agent::AgentId::new, |binding| binding.agent);
             spec.runtime_agent_id = Some(worker_agent_id);
-            if !self.begin_attempt(&spec, attempt) {
+            if !self.begin_attempt(&mut spec, attempt) {
                 return None;
             }
             if let Some(runtime) = &self.deps.runtime {
@@ -1279,6 +1311,18 @@ impl GraphExecution {
             let failure_class = classify_worker_failure(&result, Some(&error));
             let decision = retry_decision(failure_class, local_attempt as usize);
             last_failure_class = Some(failure_class);
+            if !matches!(decision, RetryDecision::Stop | RetryDecision::Replan) {
+                if let Some(binding) = spec.worker_session.as_ref() {
+                    if let Err(reason) = binding.validate_retry_safety() {
+                        let recovery = format!("reconciliation required: {reason}");
+                        self.end_task(&task_id, TaskStatus::Failed, Some(recovery));
+                        self.checkpoint(Some(
+                            "worker side effects require reconciliation; retry stopped",
+                        ));
+                        return None;
+                    }
+                }
+            }
             self.checkpoint(Some(&format!(
                 "{task_id}: attempt {attempt} failed ({failure_class}, {decision:?})"
             )));
@@ -2031,7 +2075,7 @@ fn drive_compiled_saved_graph(
             super::bindings::SupportedStage::Research => execution.set_phase(Phase::Investigate),
             super::bindings::SupportedStage::Plan => execution.set_phase(Phase::Plan),
             super::bindings::SupportedStage::Implement => execution.set_phase(Phase::Implement),
-            super::bindings::SupportedStage::Verify => execution.begin_verification(),
+            super::bindings::SupportedStage::Verify => execution.begin_verification(true),
             super::bindings::SupportedStage::Security => execution.set_phase(Phase::Verify),
             super::bindings::SupportedStage::Review => execution.set_phase(Phase::Review),
         }
@@ -2978,14 +3022,25 @@ fn deliver_goal(
             }
         };
 
-        execution.begin_verification();
-        execution.checkpoint(None);
         let cwd = execution.options.cwd.clone();
         let commands = collect_verify_commands(&CollectInput {
             config_commands: &execution.deps.config.verify_commands,
             detected: &detect_verify_commands(&cwd),
             plan: plan.as_ref(),
         });
+        let verification_inputs = match execution.verification_inputs(&commands) {
+            Ok(inputs) => inputs,
+            Err(error) => {
+                execution.blocked(format!("Cannot bind verification to current inputs: {error}"));
+                return Delivery::Stop;
+            }
+        };
+        let preserve_partial = saved.verification_inputs.as_ref() == Some(&verification_inputs);
+        saved.verification_inputs = Some(verification_inputs);
+        execution.begin_verification(preserve_partial);
+        if !execution.save_delivery(&saved, *indices, Some("verification inputs saved")) {
+            return Delivery::Stop;
+        }
         // An unverified change is never delivered. With nothing to run there
         // is nothing to revise either, so this blocks rather than looping.
         if commands.is_empty() && !execution.options.dry_run {

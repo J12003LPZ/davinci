@@ -74,6 +74,16 @@ impl JsonlSession {
             SessionError::storage(format!("Unable to create session directory: {err}"))
         })?;
         let dir = sessions_root.join(encode_cwd_component(cwd));
+        Self::create_in_directory(&dir, cwd, name)
+    }
+
+    /// Create a conversation in an already selected storage namespace. This
+    /// keeps private task storage independent of workspace filename encoding.
+    pub fn create_in_directory(
+        dir: &Path,
+        cwd: &str,
+        name: Option<&str>,
+    ) -> Result<Self, SessionError> {
         fs::create_dir_all(&dir).map_err(|err| {
             SessionError::storage(format!("Unable to create cwd session directory: {err}"))
         })?;

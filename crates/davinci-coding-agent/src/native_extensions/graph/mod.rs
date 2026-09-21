@@ -40,6 +40,7 @@ pub(crate) mod validate;
 pub(crate) mod verify;
 pub(crate) mod worker;
 pub(crate) mod worker_hooks;
+pub(crate) mod worker_sessions;
 
 #[allow(unused_imports)]
 pub use control::*;
@@ -576,29 +577,93 @@ impl GraphController {
             ));
         }
 
-        // Reconcile running workers using restored_worker_state so crashed "running" workers
-        // become "reconciliation_required" unless live identity is verified.
-        let mut reconciled = false;
-        for task in &mut old_run.tasks {
-            let state = store::restored_worker_state(task.status.as_str(), false);
-            if state == "reconciliation_required" {
-                task.status = types::TaskStatus::Failed;
-                task.error =
-                    Some("worker stopped unexpectedly; reconciliation required".to_string());
-                reconciled = true;
+        // Modern workers can recover an interrupted attempt when their private
+        // conversation lease is free and the durable tool ledger proves there
+        // is no unresolved mutation. Legacy attempts stay fail-closed.
+        let modern_running_bindings = old_run
+            .tasks
+            .iter()
+            .filter(|task| task.status == types::TaskStatus::Running)
+            .all(|task| {
+                old_run
+                    .continuation
+                    .as_ref()
+                    .and_then(|cursor| cursor.attempt_history.get(&task.id))
+                    .and_then(|history| history.last())
+                    .and_then(|record| record.worker_session.as_ref())
+                    .is_some()
+            });
+        let mut resume_validated = false;
+        let reconciled_attempts =
+            match continuation::reconcile_interrupted_attempts(&mut old_run, &self.cwd) {
+                Ok(records) => records,
+                Err(error) if modern_running_bindings => {
+                    old_run.lifecycle = Some(types::GraphLifecycle::RecoveryRequired);
+                    old_run.blocked_reason = Some(error.clone());
+                    store::save_run(&mut old_run)
+                        .map_err(|e| format!("Failed to persist recovery state: {e}"))?;
+                    return Ok(json!({
+                        "resumed": false,
+                        "reconciliationRequired": true,
+                        "runId": old_run.run_id,
+                        "status": render_now(&old_run),
+                        "message": error,
+                    }));
+                }
+                Err(_) => {
+                    for task in &mut old_run.tasks {
+                        if task.status == types::TaskStatus::Running {
+                            task.status = types::TaskStatus::Failed;
+                            task.error = Some(
+                                "worker stopped unexpectedly; reconciliation required".to_string(),
+                            );
+                        }
+                    }
+                    old_run.lifecycle = Some(types::GraphLifecycle::RecoveryRequired);
+                    store::save_run(&mut old_run)
+                        .map_err(|e| format!("Failed to persist reconciled run: {e}"))?;
+                    return Ok(json!({
+                        "resumed": false,
+                        "reconciliationRequired": true,
+                        "runId": old_run.run_id,
+                        "status": render_now(&old_run),
+                        "message": "Run workers crashed and require reconciliation before resuming.",
+                    }));
+                }
+            };
+        if !reconciled_attempts.is_empty() {
+            continuation::validate_resume(&old_run, &self.cwd)?;
+            for record in &reconciled_attempts {
+                let effects = store::artifact_path(&self.cwd, &old_run.run_id, &record.task_id)
+                    .with_extension("effects.jsonl");
+                match std::fs::read(&effects) {
+                    Ok(bytes) => {
+                        store::atomic_write(
+                            &store::run_dir(&self.cwd, &old_run.run_id).join(format!(
+                                "artifacts/{}.attempt_{}.effects.jsonl",
+                                record.task_id, record.attempt
+                            )),
+                            &bytes,
+                        )
+                        .map_err(|e| format!("Failed to archive recovered worker effects: {e}"))?;
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(error) => {
+                        return Err(format!("Failed to read recovered worker effects: {error}"));
+                    }
+                }
+                store::write_task_attempt(
+                    &self.cwd,
+                    &old_run.run_id,
+                    &record.task_id,
+                    record.attempt,
+                    record,
+                )
+                .map_err(|e| format!("Failed to persist recovered worker attempt: {e}"))?;
             }
-        }
-        if reconciled {
-            old_run.lifecycle = Some(types::GraphLifecycle::RecoveryRequired);
             store::save_run(&mut old_run)
-                .map_err(|e| format!("Failed to persist reconciled run: {e}"))?;
-            return Ok(json!({
-                "resumed": false,
-                "reconciliationRequired": true,
-                "runId": old_run.run_id,
-                "status": render_now(&old_run),
-                "message": "Run workers crashed and require reconciliation before resuming.",
-            }));
+                .map_err(|e| format!("Failed to persist recovered run: {e}"))?;
+            resume_validated = true;
         }
 
         // Bare /graph reopens an explicitly Paused run without auto-resuming it
@@ -611,7 +676,9 @@ impl GraphController {
                 "message": format!("Run is paused. Use /graph-resume {} to resume the saved controller.", old_run.run_id),
             }));
         }
-        continuation::validate_resume(&old_run, &self.cwd)?;
+        if !resume_validated {
+            continuation::validate_resume(&old_run, &self.cwd)?;
+        }
         // A dry run resumes as a dry run: its canned artifacts must never be
         // replayed as real node outputs in front of real verification.
         self.start_background(
@@ -1415,6 +1482,13 @@ impl GraphController {
                     store::save_run(&mut run)
                         .map_err(|e| format!("Failed to persist graph run checkpoint: {e}"))?;
                 }
+                let restart_retry = control.action == control::GraphControlAction::RetryNode
+                    && receipt.state == control::ControlReceiptState::Applied;
+                let retry_run_id = run.run_id.clone();
+                drop(_workspace_lease);
+                if restart_retry {
+                    self.resume(&retry_run_id)?;
+                }
                 serde_json::to_value(&receipt).map_err(|e| e.to_string())?
             }
             "graph-resume" => self.resume(args.trim())?,
@@ -2172,6 +2246,79 @@ mod tests {
         drain_active(dir.path());
     }
 
+    #[test]
+    fn idle_retry_control_reopens_controller_and_dispatches_next_attempt() {
+        let _guard = registry_guard();
+        let dir = tempdir().unwrap();
+        let graph_controller = controller(dir.path());
+        let saved = definitions::SavedGraphDefinitionV1 {
+            schema_version: 1,
+            name: "retry-routing".into(),
+            description: "retry routing fixture".into(),
+            graph: definitions::SavedGraphTopology {
+                graph_id: "retry-routing".into(),
+                version: 1,
+                mode: GraphMode::Simple,
+                nodes: vec![topology::NodeDefinition {
+                    id: "survey".into(),
+                    role: types::Role::Researcher,
+                    expect: ArtifactKind::Evidence,
+                    required: true,
+                    allows_mutation: false,
+                }],
+                edges: vec![],
+            },
+            bindings: vec![definitions::SavedStageBinding {
+                node_id: "survey".into(),
+                stage: "research".into(),
+                input_artifacts: vec![],
+            }],
+            budgets: None,
+            verification_policy: None,
+            artifact_contract_versions: Default::default(),
+            parameters: vec![],
+        };
+        let active = Arc::new(ActiveRun::default());
+        let (deps, errors) = graph_controller.deps(true, &active);
+        assert!(errors.is_empty());
+        let options = graph_controller.options(
+            &parse_graph_args("--dry-run retry routing"),
+            Arc::clone(&active.abort),
+            HashMap::new(),
+            None,
+        );
+        let mut run = controller::run_saved_graph(options, deps, saved);
+        assert_eq!(run.phase, Phase::Done);
+        let task = run.task("survey").unwrap();
+        let previous_attempts = task.attempts;
+        assert_eq!(task.status, TaskStatus::Succeeded);
+        let survey = run.tasks.iter_mut().find(|task| task.id == "survey").unwrap();
+        survey.status = TaskStatus::Failed;
+        survey.error = Some("fixture retry".into());
+        run.phase = Phase::Blocked;
+        run.blocked_reason = Some("fixture retry boundary".into());
+        store::save_run(&mut run).unwrap();
+
+        let control = control::GraphControl {
+            operation_id: "retry-routing-op".into(),
+            run_id: run.run_id.clone(),
+            expected_run_revision: run.revision,
+            node_id: Some("survey".into()),
+            expected_attempt: Some(previous_attempts),
+            action: control::GraphControlAction::RetryNode,
+        };
+        let receipt = graph_controller
+            .command("graph-control", &serde_json::to_string(&control).unwrap())
+            .unwrap()
+            .unwrap();
+        assert_eq!(receipt["state"], "applied");
+        drain_active(dir.path());
+
+        let retried = store::load_run_checked(dir.path(), &run.run_id).unwrap();
+        let task = retried.task("survey").unwrap();
+        assert_eq!(task.status, TaskStatus::Succeeded);
+        assert_eq!(task.attempts, previous_attempts + 1);
+    }
     #[test]
     fn test_command_save_without_completed_run_fails() {
         let _guard = registry_guard();

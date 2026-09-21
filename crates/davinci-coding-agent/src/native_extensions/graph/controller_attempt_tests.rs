@@ -69,6 +69,22 @@ fn attempt_fixture(cwd: &Path, previous: Option<GraphRun>, fail: bool) -> GraphR
             task.attempts,
         )
         .expect("attempt must be persisted before dispatch");
+        let encoded = serde_json::to_value(&record).unwrap();
+        assert!(
+            encoded
+                .get("workerSession")
+                .is_some_and(|value| value.is_object()),
+            "each dispatched attempt must retain its private conversation binding"
+        );
+        let binding = record.worker_session.as_ref().unwrap();
+        assert_eq!(spec.worker_session.as_ref(), Some(binding));
+        assert_eq!(binding.agent, spec.runtime_agent_id.unwrap());
+        binding.validate_spec(spec).unwrap();
+        let args =
+            super::super::worker::build_worker_args(spec, Path::new("brief"), Path::new("system"));
+        assert!(!args.iter().any(|arg| arg == "--no-session"));
+        let session_arg = args.iter().position(|arg| arg == "--session").unwrap();
+        assert_eq!(Path::new(&args[session_arg + 1]), binding.session_path);
         assert_eq!(record.status, TaskStatus::Running);
         assert!(record.started_at.is_some());
         assert!(record.ended_at.is_none());
@@ -128,12 +144,18 @@ fn worker_attempts_are_durable_before_dispatch_and_survive_resume() {
     let failed = attempt_fixture(dir.path(), None, true);
     assert_eq!(failed.phase, Phase::Blocked);
     let task = failed.tasks.iter().find(|task| task.attempts > 0).unwrap();
-    assert_eq!(task.attempts, 2);
+    assert_eq!(task.attempts, 2, "{:?}", failed.blocked_reason);
     let task_id = task.id.clone();
     let first =
         super::super::store::read_task_attempt(dir.path(), &failed.run_id, &task_id, 1).unwrap();
     let second =
         super::super::store::read_task_attempt(dir.path(), &failed.run_id, &task_id, 2).unwrap();
+    let first_binding = first.worker_session.clone().unwrap();
+    let second_binding = second.worker_session.clone().unwrap();
+    assert_eq!(second_binding.agent, first_binding.agent);
+    assert_eq!(second_binding.session_id, first_binding.session_id);
+    assert_eq!(second_binding.session_path, first_binding.session_path);
+    assert_eq!(second_binding.attempt, first_binding.attempt + 1);
     for record in [&first, &second] {
         assert_eq!(record.status, TaskStatus::Failed);
         assert_eq!(record.usage.input, 7);
@@ -162,6 +184,10 @@ fn worker_attempts_are_durable_before_dispatch_and_survive_resume() {
     );
     let third =
         super::super::store::read_task_attempt(dir.path(), &failed.run_id, &task_id, 3).unwrap();
+    let third_binding = third.worker_session.as_ref().unwrap();
+    assert_eq!(third_binding.agent, first_binding.agent);
+    assert_eq!(third_binding.session_id, first_binding.session_id);
+    assert_eq!(third_binding.session_path, first_binding.session_path);
     assert_eq!(third.status, TaskStatus::Succeeded);
     let artifact =
         super::super::store::run_dir(dir.path(), &failed.run_id).join(third.artifact_file.unwrap());
@@ -243,4 +269,50 @@ fn attempt_record_write_failure_blocks_dispatch_or_retry() {
             usize::from(!fail_before_dispatch)
         );
     }
+}
+
+#[test]
+fn interrupted_private_worker_reconciles_to_a_safe_retry_boundary() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut run = attempt_fixture(dir.path(), None, true);
+    let task_id = run
+        .tasks
+        .iter()
+        .find(|task| task.attempts > 0)
+        .unwrap()
+        .id
+        .clone();
+    let attempt = run.task(&task_id).unwrap().attempts;
+    {
+        let task = run.tasks.iter_mut().find(|task| task.id == task_id).unwrap();
+        task.status = TaskStatus::Running;
+        task.ended_at = None;
+        task.error = None;
+    }
+    {
+        let record = run
+            .continuation
+            .as_mut()
+            .unwrap()
+            .attempt_history
+            .get_mut(&task_id)
+            .unwrap()
+            .last_mut()
+            .unwrap();
+        record.status = TaskStatus::Running;
+        record.exit_code = None;
+        record.ended_at = None;
+        record.error = None;
+    }
+    let _ = std::fs::remove_file(
+        artifact_path(dir.path(), &run.run_id, &task_id).with_extension("effects.jsonl"),
+    );
+    let recovered =
+        super::super::continuation::reconcile_interrupted_attempts(&mut run, dir.path()).unwrap();
+    assert_eq!(recovered.len(), 1);
+    assert_eq!(recovered[0].attempt, attempt);
+    assert_eq!(recovered[0].status, TaskStatus::Failed);
+    assert_eq!(recovered[0].exit_code, Some(-1));
+    assert_eq!(run.task(&task_id).unwrap().status, TaskStatus::Failed);
+    super::super::continuation::validate_resume(&run, dir.path()).unwrap();
 }

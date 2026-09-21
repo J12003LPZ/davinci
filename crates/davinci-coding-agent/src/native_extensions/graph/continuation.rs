@@ -35,6 +35,8 @@ pub struct DeliveryCheckpoint {
     pub review_task: Option<String>,
     #[serde(default)]
     pub review_inputs: Option<String>,
+    #[serde(default)]
+    pub verification_inputs: Option<String>,
     pub revision_notes: Option<String>,
     pub replan_reason: Option<String>,
     pub revision_cycles: u32,
@@ -47,6 +49,7 @@ impl DeliveryCheckpoint {
         self.writer_task = None;
         self.review_task = None;
         self.review_inputs = None;
+        self.verification_inputs = None;
         self.attempt_baseline = None;
         self.patch = None;
         self.revision_notes = notes;
@@ -77,6 +80,7 @@ impl DeliveryCheckpoint {
             writer_task: None,
             review_task: None,
             review_inputs: None,
+            verification_inputs: None,
             revision_notes: None,
             replan_reason: None,
             revision_cycles: 0,
@@ -130,6 +134,79 @@ impl Default for GraphContinuation {
             attempt_history: Default::default(),
         }
     }
+}
+
+/// Convert a crashed in-flight worker into a failed retry boundary only when
+/// its private conversation is no longer owned and its durable tool ledger is
+/// safe to continue. The caller persists the returned attempt records together
+/// with the updated run before dispatching another worker.
+pub fn reconcile_interrupted_attempts(
+    run: &mut super::types::GraphRun,
+    cwd: &std::path::Path,
+) -> Result<Vec<super::store::TaskAttemptRecord>, String> {
+    use super::types::TaskStatus;
+    let running: Vec<String> = run
+        .tasks
+        .iter()
+        .filter(|task| task.status == TaskStatus::Running)
+        .map(|task| task.id.clone())
+        .collect();
+    if running.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut reconciled = Vec::with_capacity(running.len());
+    for id in running {
+        let attempt = run.task(&id).map(|task| task.attempts).unwrap_or_default();
+        let record = run
+            .continuation
+            .as_ref()
+            .and_then(|cursor| cursor.attempt_history.get(&id))
+            .and_then(|history| history.last())
+            .filter(|record| record.attempt == attempt && record.status == TaskStatus::Running)
+            .cloned()
+            .ok_or_else(|| {
+                format!(
+                    "Interrupted worker '{id}' has no durable running attempt binding; reconciliation required"
+                )
+            })?;
+        let binding = record.worker_session.as_ref().ok_or_else(|| {
+            format!(
+                "Interrupted worker '{id}' has no private conversation binding; reconciliation required"
+            )
+        })?;
+        binding.validate_retry_safety().map_err(|error| {
+            format!("Interrupted worker '{id}' requires reconciliation: {error}")
+        })?;
+        let effects = super::store::artifact_path(cwd, &run.run_id, &id)
+            .with_extension("effects.jsonl");
+        if effects.exists() {
+            davinci_agent::runtime::effects::read_effect_report(&effects).map_err(|error| {
+                format!("Interrupted worker '{id}' has an invalid effect report: {error}")
+            })?;
+        }
+        let ended_at = super::store::now_ms();
+        let reason = "controller interrupted before the worker published a terminal result; recovered ownership is safe to retry".to_string();
+        let mut recovered = record;
+        recovered.status = TaskStatus::Failed;
+        recovered.exit_code = Some(-1);
+        recovered.ended_at = Some(ended_at);
+        recovered.error = Some(reason.clone());
+        if let Some(last) = run
+            .continuation
+            .as_mut()
+            .and_then(|cursor| cursor.attempt_history.get_mut(&id))
+            .and_then(|history| history.last_mut())
+        {
+            *last = recovered.clone();
+        }
+        if let Some(task) = run.tasks.iter_mut().find(|task| task.id == id) {
+            task.status = TaskStatus::Failed;
+            task.ended_at = Some(ended_at);
+            task.error = Some(reason);
+        }
+        reconciled.push(recovered);
+    }
+    Ok(reconciled)
 }
 
 pub fn validate_resume(run: &super::types::GraphRun, cwd: &std::path::Path) -> Result<(), String> {
@@ -417,6 +494,22 @@ fn validate_attempt_history(
             }
             if record.status == TaskStatus::Succeeded && record.artifact_file.is_none() {
                 return Err(invalid());
+            }
+            if let Some(binding) = &record.worker_session {
+                if binding.graph_run != run.run_id
+                    || binding.task_id != *id
+                    || binding.attempt != record.attempt
+                    || binding.role != task.role
+                    || binding.expect != task.expect
+                    || binding.graph_revision > run.revision
+                {
+                    return Err(invalid());
+                }
+                binding
+                    .validate(std::path::Path::new(&run.cwd))
+                    .map_err(|error| {
+                        format!("Cannot restore worker conversation for '{id}': {error}")
+                    })?;
             }
             if let Some(path) = &record.artifact_file {
                 let identity = format!("{id}.attempt_{}.artifact", record.attempt);

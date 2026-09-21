@@ -1,7 +1,7 @@
 //! One node execution = one isolated `pi` child process.
 //!
 //! ```text
-//! pi --mode json -p --no-session --no-extensions --no-skills
+//! pi --mode json -p --session <private attempt history> --no-extensions --no-skills
 //!    --no-prompt-templates --tools <initial schema projection>
 //!    [--model provider/id] [--thinking level] [-a]
 //!    --append-system-prompt <role prompt file> @<briefing file>
@@ -274,11 +274,25 @@ pub fn build_worker_args(
         "--mode".to_string(),
         "json".to_string(),
         "-p".to_string(),
-        "--no-session".to_string(),
         "--no-extensions".to_string(),
         "--permission-mode".to_string(),
         "always-approve".to_string(),
     ];
+    if let Some(binding) = &spec.worker_session {
+        args.extend([
+            "--session".into(),
+            binding.session_path.to_string_lossy().into_owned(),
+            "--session-dir".into(),
+            binding
+                .session_path
+                .parent()
+                .unwrap()
+                .to_string_lossy()
+                .into_owned(),
+        ]);
+    } else {
+        args.push("--no-session".into());
+    }
     // Explicit -e overrides automatic-extension disabling in the worker CLI.
     // Native graph roles do not need MCP subprocesses. Only connect when the
     // parent explicitly authorized an MCP capability for this worker.
@@ -377,6 +391,18 @@ pub fn run_worker(
     abort: &Arc<AtomicBool>,
     on_progress: &mut dyn FnMut(&str, &WorkerUsage),
 ) -> WorkerResult {
+    let session_check = spec
+        .worker_session
+        .as_ref()
+        .ok_or_else(|| "worker attempt has no durable conversation binding".to_string())
+        .and_then(|binding| binding.validate_spec(spec));
+    if let Err(error) = session_check {
+        return WorkerResult {
+            recovery_required: true,
+            failure_reason: Some(error),
+            ..Default::default()
+        };
+    }
     let _ = fs::remove_file(&spec.artifact_path);
 
     let temp_dir = temp_dir_for(&spec.task_id);
@@ -423,6 +449,22 @@ pub fn run_worker(
         spec.expect,
     );
     let mut command = Command::new(executable);
+    command.env_remove(super::worker_sessions::SESSION_ENV);
+    if let Some(binding) = &spec.worker_session {
+        match serde_json::to_string(binding) {
+            Ok(encoded) => {
+                command.env(super::worker_sessions::SESSION_ENV, encoded);
+            }
+            Err(error) => {
+                let _ = fs::remove_dir_all(&temp_dir);
+                return WorkerResult {
+                    recovery_required: true,
+                    failure_reason: Some(error.to_string()),
+                    ..Default::default()
+                };
+            }
+        }
+    }
     let effect_report_path = spec.artifact_path.with_extension("effects.jsonl");
     // Each worker attempt owns one report. Remove a prior attempt so a retry
     // cannot accidentally combine effects from different checkpoints.
@@ -883,6 +925,7 @@ mod tests {
             transcript_path: None,
             project_trusted: true,
             runtime_agent_id: None,
+            worker_session: None,
             task_contract: None,
             coordinator_client: None,
             node_abort: None,

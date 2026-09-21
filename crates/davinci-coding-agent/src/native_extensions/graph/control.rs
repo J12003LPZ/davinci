@@ -188,7 +188,6 @@ pub fn invalidate_descendants_for_retry(
     for task in &mut run.tasks {
         if affected_ids.contains(&task.id) {
             if task.id == retry_node_id {
-                task.attempts += 1;
                 task.status = super::types::TaskStatus::Pending;
                 task.error = None;
                 task.artifact_file = None;
@@ -864,10 +863,10 @@ mod tests {
         assert_eq!(r1_after.status, TaskStatus::Succeeded);
         assert_eq!(r1_after.usage.input, 500);
 
-        // research-2 invalidated and attempts incremented
+        // research-2 invalidated; the controller owns the next attempt allocation
         let r2_after = run.tasks.iter().find(|t| t.id == "research-2").unwrap();
         assert_eq!(r2_after.status, TaskStatus::Pending);
-        assert_eq!(r2_after.attempts, 1);
+        assert_eq!(r2_after.attempts, 0);
         assert_eq!(r2_after.usage.input, 300); // spent usage retained!
     }
 

@@ -1007,6 +1007,7 @@ pub struct WorkerSpec {
     pub transcript_path: Option<std::path::PathBuf>,
     pub project_trusted: bool,
     pub runtime_agent_id: Option<davinci_agent::AgentId>,
+    pub worker_session: Option<super::worker_sessions::WorkerSessionBinding>,
     /// Host-owned immutable task contract snapshot for this worker attempt.
     pub task_contract: Option<davinci_agent::runtime::TaskContract>,
     pub coordinator_client: Option<davinci_agent::runtime::task_transport::TaskCoordinatorClient>,

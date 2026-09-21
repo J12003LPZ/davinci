@@ -311,6 +311,65 @@ pub fn run_verification(
     run_verification_with_progress(commands, cwd, abort, timeout_ms, None, exec, |_| {})
 }
 
+pub fn run_verification_with_progress_from(
+    commands: &[VerifyCommandSpec],
+    cwd: &Path,
+    abort: &Arc<AtomicBool>,
+    timeout_ms: u64,
+    root_deadline: Option<Instant>,
+    prior: Option<&VerificationResult>,
+    exec: &(impl Fn(&str, &Path, &Arc<AtomicBool>, u64) -> (i32, String, u64) + ?Sized),
+    mut on_progress: impl FnMut(&VerificationResult),
+) -> VerificationResult {
+    let mut completed = prior.map_or_else(Vec::new, |result| result.commands.clone());
+    if completed.len() > commands.len()
+        || completed.iter().zip(commands).any(|(result, spec)| {
+            result.name != spec.name || result.command != spec.command
+        })
+    {
+        completed.clear();
+    }
+    let start = completed.len();
+    if start == commands.len() {
+        let ran = completed.iter().filter(|result| !result.skipped).count();
+        let passed = ran > 0
+            && completed.iter().all(|result| result.skipped || result.exit_code == 0);
+        return VerificationResult { commands: completed, passed, progress: None };
+    }
+    let result = run_verification_with_progress(
+        &commands[start..],
+        cwd,
+        abort,
+        timeout_ms,
+        root_deadline,
+        exec,
+        |progress| {
+            let progress_marker = progress.progress.as_ref().map(|item| VerificationProgress {
+                name: item.name.clone(),
+                command: item.command.clone(),
+                index: start + item.index,
+                total: commands.len(),
+                started_at: item.started_at,
+            });
+            on_progress(&VerificationResult {
+                commands: completed
+                    .iter()
+                    .cloned()
+                    .chain(progress.commands.iter().cloned())
+                    .collect(),
+                passed: false,
+                progress: progress_marker,
+            });
+        },
+    );
+    let mut merged = completed;
+    merged.extend(result.commands);
+    let ran = merged.iter().filter(|item| !item.skipped).count();
+    let passed = !abort.load(Ordering::Relaxed)
+        && ran > 0
+        && merged.iter().all(|item| item.skipped || item.exit_code == 0);
+    VerificationResult { commands: merged, passed, progress: None }
+}
 pub fn run_verification_with_progress(
     commands: &[VerifyCommandSpec],
     cwd: &Path,
@@ -637,6 +696,48 @@ mod tests {
         assert!(legacy.progress.is_none());
     }
 
+    #[test]
+    fn partial_verification_resume_keeps_completed_results_and_reruns_interrupted_command() {
+        let commands = [spec("first", "first"), spec("second", "second")];
+        let prior = VerificationResult {
+            commands: vec![VerificationCommandResult {
+                name: "first".into(),
+                command: "first".into(),
+                exit_code: 0,
+                duration_ms: 1,
+                output_tail: "ok".into(),
+                skipped: false,
+            }],
+            passed: false,
+            progress: Some(VerificationProgress {
+                name: "second".into(),
+                command: "second".into(),
+                index: 2,
+                total: 2,
+                started_at: 1,
+            }),
+        };
+        let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen = calls.clone();
+        let result = run_verification_with_progress_from(
+            &commands,
+            Path::new("."),
+            &Arc::new(AtomicBool::new(false)),
+            0,
+            None,
+            Some(&prior),
+            &move |command, _, _, _| {
+                seen.lock().unwrap().push(command.to_string());
+                (0, "ok".into(), 1)
+            },
+            |_| {},
+        );
+        assert_eq!(*calls.lock().unwrap(), ["second"]);
+        assert_eq!(result.commands.len(), 2);
+        assert_eq!(result.commands[0].command, "first");
+        assert_eq!(result.commands[1].command, "second");
+        assert!(result.passed);
+    }
     #[test]
     fn failed_verification_retains_panic_location_before_large_event_dump() {
         let output = format!(

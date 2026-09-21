@@ -326,6 +326,8 @@ pub struct TaskAttemptRecord {
     pub ended_at: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fingerprint: Option<super::replay::ReplayFingerprint>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worker_session: Option<super::worker_sessions::WorkerSessionBinding>,
 }
 
 pub fn write_task_attempt(
@@ -907,6 +909,7 @@ mod tests {
             started_at: Some(100),
             ended_at: Some(200),
             fingerprint: None,
+            worker_session: None,
         };
 
         write_task_attempt(dir.path(), &run_id, "research-1", 1, &record).unwrap();
