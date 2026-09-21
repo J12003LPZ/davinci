@@ -7,7 +7,7 @@ on:
       - 'crates/davinci-agent/src/shell_policy.rs'
       - 'crates/davinci-coding-agent/src/native_extensions/graph/**'
       - '.github/workflows/graph-verification.yml'
-      - '.github/patches/graph-verification.patch'
+      - '.github/patches/graph-*.patch'
 
 permissions:
   contents: read
@@ -40,6 +40,9 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
       - uses: dtolnay/rust-toolchain@1.83.0
         with:
           components: rustfmt, clippy
@@ -52,30 +55,40 @@ jobs:
         run: |
           python - <<'PY'
           import hashlib, pathlib, subprocess
-          patch = pathlib.Path('.github/patches/graph-verification.patch')
-          assert hashlib.sha256(patch.read_bytes()).hexdigest() == 'd476e9d4164faaf45a343e83afdd2a4ff66989ced80cfebf28a9832e5e2411a5'
-          subprocess.run(['git', 'apply', '--check', str(patch)], check=True)
-          subprocess.run(['git', 'apply', str(patch)], check=True)
+          patches = {
+              'graph-verification.patch': 'd476e9d4164faaf45a343e83afdd2a4ff66989ced80cfebf28a9832e5e2411a5',
+              'graph-native-diagnostics.patch': 'a74aa327b287c013a84234b585da65c488612bf02b8b1abee198a40f3a1d1c18',
+          }
+          for name, digest in patches.items():
+              patch = pathlib.Path('.github/patches') / name
+              assert hashlib.sha256(patch.read_bytes()).hexdigest() == digest
+              subprocess.run(['git', 'apply', '--check', str(patch)], check=True)
+              subprocess.run(['git', 'apply', str(patch)], check=True)
           PY
       - name: Formatting and whitespace
         run: |
           cargo fmt --all -- --check
           git diff --check
+          node --version
       - name: Entire graph regression suite
         run: |
           mkdir -p "$RUNNER_TEMP/graph-evidence"
           cargo test --locked -p davinci-coding-agent --lib native_extensions::graph:: 2>&1 | tee "$RUNNER_TEMP/graph-evidence/graph.log"
       - name: Central shell-policy regressions
+        if: always()
         run: |
+          mkdir -p "$RUNNER_TEMP/graph-evidence"
           cargo test --locked -p davinci-agent --lib shell_policy:: 2>&1 | tee "$RUNNER_TEMP/graph-evidence/shell-policy.log"
       - name: Host library and tests lint
+        if: always()
         run: |
+          mkdir -p "$RUNNER_TEMP/graph-evidence"
           cargo clippy --locked -p davinci-coding-agent --lib --tests -- -D warnings 2>&1 | tee "$RUNNER_TEMP/graph-evidence/clippy.log"
       - name: Bind evidence to tested source
         run: |
           python - <<'PY'
           import hashlib, json, os, pathlib
-          paths = ['crates/davinci-agent/src/shell_policy.rs', 'crates/davinci-coding-agent/src/native_extensions/graph/verify.rs']
+          paths = ['crates/davinci-agent/src/shell_policy.rs', 'crates/davinci-coding-agent/src/native_extensions/graph/verify.rs', 'crates/davinci-coding-agent/src/native_extensions/graph/coordinator_handler.rs']
           receipt = {p: hashlib.sha256(pathlib.Path(p).read_bytes()).hexdigest() for p in paths}
           out = pathlib.Path(os.environ['RUNNER_TEMP']) / 'graph-evidence'
           out.mkdir(exist_ok=True)
@@ -109,12 +122,17 @@ jobs:
           set -euo pipefail
           python3 - <<'PY'
           import hashlib, json, os, pathlib, subprocess
-          patch = pathlib.Path('.github/patches/graph-verification.patch')
-          assert hashlib.sha256(patch.read_bytes()).hexdigest() == 'd476e9d4164faaf45a343e83afdd2a4ff66989ced80cfebf28a9832e5e2411a5'
-          subprocess.run(['git', 'apply', '--index', str(patch)], check=True)
+          patches = {
+              'graph-verification.patch': 'd476e9d4164faaf45a343e83afdd2a4ff66989ced80cfebf28a9832e5e2411a5',
+              'graph-native-diagnostics.patch': 'a74aa327b287c013a84234b585da65c488612bf02b8b1abee198a40f3a1d1c18',
+          }
+          for name, digest in patches.items():
+              patch = pathlib.Path('.github/patches') / name
+              assert hashlib.sha256(patch.read_bytes()).hexdigest() == digest
+              subprocess.run(['git', 'apply', '--index', str(patch)], check=True)
           receipts = list((pathlib.Path(os.environ['RUNNER_TEMP']) / 'native-evidence').glob('*/source.json'))
           assert len(receipts) == 2, 'both platform receipts required'
-          paths = ['crates/davinci-agent/src/shell_policy.rs', 'crates/davinci-coding-agent/src/native_extensions/graph/verify.rs']
+          paths = ['crates/davinci-agent/src/shell_policy.rs', 'crates/davinci-coding-agent/src/native_extensions/graph/verify.rs', 'crates/davinci-coding-agent/src/native_extensions/graph/coordinator_handler.rs']
           actual = {p: hashlib.sha256(pathlib.Path(p).read_bytes()).hexdigest() for p in paths}
           for receipt in receipts:
               assert json.loads(receipt.read_text()) == actual, 'tested source mismatch'
