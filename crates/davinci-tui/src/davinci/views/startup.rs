@@ -13,27 +13,26 @@ use crate::davinci::ui::{blank, indent, paper_label, span, span_strong, truncate
 /// selected model come from the running session, never from sample copy.
 pub fn banner(model: &Model, info: &Startup) -> Vec<Line<'static>> {
     let th = &model.theme;
+    // Preserve DaVinci's identity in the reference's eleven-cell logo column.
     let facts = [
         vec![
-            span("✻  ", th.secondary),
+            span("  ▟██▙     ", th.secondary),
             paper_label("DaVinci", th, false),
             span(format!(" v{}", env!("CARGO_PKG_VERSION")), th.muted),
         ],
         vec![
-            span("   ", th.muted),
+            span("  █  █     ", th.secondary),
             span(model.model_name.clone(), th.text),
             span(format!(" · {}", model.thinking_level), th.muted),
         ],
-        vec![span("   ", th.muted), span(info.cwd.clone(), th.muted)],
+        vec![
+            span("  ▜██▛     ", th.secondary),
+            span(info.cwd.clone(), th.muted),
+        ],
     ];
     facts
         .into_iter()
-        .map(|row| {
-            indent(
-                1.min(model.width),
-                truncate_run(row, model.width.saturating_sub(1)),
-            )
-        })
+        .map(|row| Line::from(truncate_run(row, model.width)))
         .collect()
 }
 

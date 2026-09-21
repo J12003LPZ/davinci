@@ -171,7 +171,9 @@ pub fn lines(model: &Model, layout: &GraphLayout, phase: u8) -> Vec<Line<'static
             th.muted
         } else if selected || task.state == State::Active {
             th.primary
-        } else if matches!(task.state, State::Attention | State::Failed) {
+        } else if task.state == State::Failed {
+            th.error
+        } else if task.state == State::Attention {
             th.warning
         } else {
             th.border
@@ -219,7 +221,7 @@ pub fn lines(model: &Model, layout: &GraphLayout, phase: u8) -> Vec<Line<'static
         let label = if node.members.len() > 1 {
             format!("✓ {} ×{}", task.role, node.members.len())
         } else {
-            format!("{} {}", task.state.glyph(), task.id)
+            format!("{} {}", task.state.glyph(), task.display_title())
         };
         let text_style = Style::default()
             .fg(if dimmed { th.muted } else { th.text })
@@ -265,7 +267,7 @@ pub fn lines(model: &Model, layout: &GraphLayout, phase: u8) -> Vec<Line<'static
                 x + 1,
                 y + 3,
                 &ui::clip_ellipsis(
-                    &super::graph_inspector::public_text(&task.usage),
+                    &super::graph_inspector::public_text(task.state_label()),
                     node.rect.width - 2,
                 ),
                 Style::default().fg(th.muted),

@@ -129,7 +129,9 @@ pub fn chrome(model: &Model) -> Option<SheetChrome> {
         Screen::ContextInspector => context_inspector::chrome(model),
     };
     // These surfaces own the keyboard. A drawn-but-inert composer is misleading.
-    chrome.composer = Composer::Hidden;
+    if model.screen != Screen::GraphRun {
+        chrome.composer = Composer::Hidden;
+    }
     chrome.echo = None;
     chrome.escape = Some("esc close");
     if model.screen == Screen::GraphRun {

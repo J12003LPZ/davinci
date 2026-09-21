@@ -90,6 +90,12 @@ fn rebuild_open_close_preserves_the_draft() {
     let cursor = m.composer.cursor();
     m.screen = Screen::Settings;
     app::handle_key(&mut m, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+    assert_eq!(
+        m.screen,
+        Screen::Settings,
+        "first Escape leaves search focus"
+    );
+    app::handle_key(&mut m, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
     assert_eq!(m.screen, Screen::Agent);
     assert_eq!(m.composer.editor().get_text(), "draft with 界 and e\u{301}");
     assert_eq!(m.composer.cursor(), cursor);
@@ -122,6 +128,10 @@ fn rebuild_settings_search_selects_the_source_row_and_keeps_chat_draft() {
         .collect::<Vec<_>>()
         .join("\n");
     assert!(!rows.contains("Auto-compact"));
+    assert_eq!(
+        app::handle_key(&mut m, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+        app::Flow::Continue
+    );
     assert_eq!(
         app::handle_key(&mut m, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
         app::Flow::Choose(Choice::Setting(1))

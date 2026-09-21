@@ -324,7 +324,7 @@ impl Theme {
     /// Apply the built-in setting while retaining terminal capabilities.
     /// Legacy/custom names retain the native dark palette.
     pub fn with_name(&self, name: &str) -> Self {
-        if name == "vox" && !self.no_color {
+        if name == "vox-classic" && !self.no_color {
             let ink = match self.depth_hint() {
                 ColorDepth::TrueColor => rgb(0xE2BE9E),
                 ColorDepth::Ansi256 => Color::Indexed(223),
@@ -556,7 +556,8 @@ mod tests {
             ColorDepth::Basic,
         ] {
             let dark = Theme::da_vinci(depth, false);
-            let vox = dark.with_name("vox");
+            let vox = dark.with_name("vox-classic");
+            assert_eq!(dark.with_name("vox"), dark);
             assert!(vox.is_vox());
             assert_ne!(vox, dark);
             assert_eq!(vox.dim().background, vox.background);

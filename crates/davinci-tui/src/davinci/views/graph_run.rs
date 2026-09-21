@@ -11,6 +11,65 @@ use ratatui::text::Line;
 pub const HEADER_ROWS: u16 = 3;
 const FOOTER_ROWS: u16 = 3;
 
+/// A background run stays discoverable without opening its graph or stealing input.
+pub fn background_lines(model: &Model) -> Vec<Line<'static>> {
+    let Some(run) = model
+        .graph_run
+        .as_ref()
+        .filter(|run| run.outcome().is_none())
+    else {
+        return Vec::new();
+    };
+    let active = run
+        .tasks
+        .iter()
+        .filter(|task| task.state == State::Active)
+        .count();
+    let done = run
+        .tasks
+        .iter()
+        .filter(|task| task.state == State::Done)
+        .count();
+    let blocked = run
+        .tasks
+        .iter()
+        .filter(|task| matches!(task.state, State::Failed | State::Attention))
+        .count();
+    let summary = format!(
+        "Background · {active} working · {done}/{} done{} · /graph-status to inspect",
+        run.tasks.len(),
+        if blocked > 0 {
+            format!(" · {blocked} need attention")
+        } else {
+            String::new()
+        }
+    );
+    let mut rows = vec![Line::from(span(
+        ui::clip_ellipsis(&summary, model.width),
+        if blocked > 0 {
+            model.theme.warning
+        } else {
+            model.theme.muted
+        },
+    ))];
+    let detail = run
+        .blocked_reason
+        .as_deref()
+        .or_else(|| {
+            run.tasks
+                .iter()
+                .find(|task| task.state == State::Active)
+                .map(|task| task.artifact.as_str())
+        })
+        .filter(|text| !text.is_empty())
+        .unwrap_or(&run.goal);
+    rows.push(Line::from(span(
+        ui::clip_ellipsis(&format!("  {}", public_text(detail)), model.width),
+        model.theme.muted,
+    )));
+    rows
+}
+
 fn section_detail(
     width: u16,
     theme: &crate::davinci::theme::Theme,
@@ -49,7 +108,7 @@ pub fn lines_with_layout(model: &Model, height: u16, layout: &GraphLayout) -> Ve
         return structured_window(model, height, layout);
     }
     let done = run.tasks.iter().filter(|t| t.state == State::Done).count();
-    let mut telemetry = vec![format!("{done}/{} workers complete", run.tasks.len())];
+    let mut telemetry = vec![format!("{done}/{} tasks done", run.tasks.len())];
     for (label, value) in [
         ("Phase", &run.phase),
         ("Elapsed", &run.elapsed),
@@ -66,7 +125,7 @@ pub fn lines_with_layout(model: &Model, height: u16, layout: &GraphLayout) -> Ve
             vec![span(
                 public_text(&format!(
                     "{} · {} · Follow {} · {:?}",
-                    run.id,
+                    run.goal,
                     run.outcome().unwrap_or(&run.lifecycle),
                     if model.graph_canvas.follow_live {
                         "on"
@@ -146,9 +205,13 @@ fn controls(model: &Model) -> Vec<Line<'static>> {
         "p pause · x stop · r retry · d diff"
     };
     [
-        "↑↓←→ select · Enter inspect · v focus",
+        if model.graph_canvas.input_focus {
+            "Typing to main conversation · Enter send · Tab graph"
+        } else {
+            "↑↓←→ select · Enter inspect · Tab input"
+        },
         control,
-        "g goal · f follow · PgUp/Dn pan/details",
+        "v focus · g goal · f follow · PgUp/Dn",
     ]
     .into_iter()
     .map(|text| {
@@ -163,6 +226,42 @@ fn controls(model: &Model) -> Vec<Line<'static>> {
 /// A bounded, keyboard-complete ledger; details never push selection offscreen.
 fn structured_window(model: &Model, height: u16, layout: &GraphLayout) -> Vec<Line<'static>> {
     let run = model.graph_run.as_ref().unwrap();
+    if height < 10 {
+        let mut rows = vec![Line::from(span(
+            ui::clip_ellipsis(
+                &format!("{} · {}", public_text(&run.goal), run.phase),
+                model.width,
+            ),
+            model.theme.muted,
+        ))];
+        let room = height.saturating_sub(2) as usize;
+        let anchor = model.graph_canvas.list_scroll.unwrap_or_else(|| {
+            run.tasks
+                .iter()
+                .position(|t| Some(t.id.as_str()) == run.selected_node_id.as_deref())
+                .unwrap_or(0)
+        });
+        let tasks = run
+            .tasks
+            .iter()
+            .map(|task| {
+                ui::section_row(
+                    model.width,
+                    &model.theme,
+                    Some(task.id.as_str()) == run.selected_node_id.as_deref(),
+                    &public_text(&format!("{} {}", task.state.glyph(), task.display_title())),
+                    task.state_label(),
+                )
+            })
+            .collect();
+        rows.extend(ui::window(tasks, room, anchor, &model.theme));
+        rows.push(Line::from(span(
+            ui::clip_ellipsis("↑↓ select · Enter details · Tab input", model.width),
+            model.theme.muted,
+        )));
+        rows.truncate(height as usize);
+        return rows;
+    }
     let line = |text: String| {
         Line::from(span(
             ui::clip_ellipsis(&public_text(&text), model.width),
@@ -221,7 +320,7 @@ fn structured_window(model: &Model, height: u16, layout: &GraphLayout) -> Vec<Li
                 &public_text(&format!(
                     "{} {}{}",
                     task.state.glyph(),
-                    task.id,
+                    task.display_title(),
                     if task.state == State::Attention {
                         " · blocked".into()
                     } else if task.status.is_empty() {
@@ -413,9 +512,16 @@ pub fn chrome(model: &Model) -> SheetChrome {
                     &public_text(&run.cost_cap),
                 )
             }),
-        hints: vec![hint(th, "Graph controls above")],
+        hints: vec![hint(
+            th,
+            if model.graph_canvas.input_focus {
+                "Message target: main conversation"
+            } else {
+                "Tab focuses the conversation input"
+            },
+        )],
         escape: Some("esc close"),
-        composer: Composer::Hidden,
+        composer: Composer::Prompt("Message the main conversation…"),
         ..SheetChrome::default()
     }
 }
@@ -528,7 +634,7 @@ mod tests {
         let run = m.graph_run.as_mut().unwrap();
         run.cost_cap.clear();
         assert!(chrome(&m).status_right.is_none());
-        assert!(text(&m).contains("workers complete"));
+        assert!(text(&m).contains("tasks done"));
     }
     #[test]
     fn unavailable_and_narrow_runs_are_readable() {

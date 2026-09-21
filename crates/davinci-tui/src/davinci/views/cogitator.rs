@@ -1,5 +1,5 @@
 //! Model selection: a compact quick picker and the full `/model` catalog.
-//! The full catalog uses a rounded panel with inline descriptions and an
+//! The full catalog uses a numbered, unboxed panel with factual descriptions and an
 //! independent current-model marker. Runtime selection remains index-based.
 
 use ratatui::text::Line;
@@ -98,7 +98,6 @@ pub fn visible_indices(model: &Model) -> Vec<usize> {
 /// The catalog keeps source order so row indices still identify runtime choices.
 pub fn catalog(model: &Model) -> Vec<Line<'static>> {
     let th = &model.theme;
-    let (accent, _) = th.model_picker_colors();
     if model.catalog.is_empty() {
         return section_detail(
             model.width,
@@ -114,49 +113,35 @@ pub fn catalog(model: &Model) -> Vec<Line<'static>> {
             "No matching models. Backspace to edit the search.",
         );
     }
-    let selected = if indices.contains(&model.catalog_index) {
-        model.catalog_index
-    } else {
-        indices[0]
-    };
-    let mut rows = Vec::new();
-    let name_width = model
-        .catalog
+    let name_width = indices
         .iter()
-        .map(|item| {
-            text_width(if item.id.is_empty() {
-                &item.name
+        .map(|index| {
+            let entry = &model.catalog[*index];
+            text_width(if entry.id.is_empty() {
+                &entry.name
             } else {
-                &item.id
-            })
+                &entry.id
+            }) + 4
         })
         .max()
         .unwrap_or(0)
-        .min(36)
-        .min(model.width.saturating_sub(6));
-    let mut provider = None;
-    for index in indices {
-        let entry = &model.catalog[index];
-        if provider != Some(entry.provider.as_str()) {
-            provider = Some(entry.provider.as_str());
-            let mut heading = vec![ui::span_strong(provider_label(&entry.provider), accent, th)];
-            if entry.provider == "openai-codex" && model.width >= 90 {
-                heading.push(span(
-                    "   Fast, capable models for coding, reasoning, and agentic tasks",
-                    th.muted,
-                ));
-            }
-            rows.push(Line::from(ui::truncate_run(heading, model.width)));
-        }
-        rows.push(catalog_row(
-            model,
-            entry,
-            index == selected,
-            is_current_model(model, entry),
-            name_width,
-        ));
-    }
-    rows
+        .min(38)
+        .min(model.width.saturating_sub(12));
+    indices
+        .iter()
+        .enumerate()
+        .map(|(ordinal, index)| {
+            let entry = &model.catalog[*index];
+            catalog_row(
+                model,
+                entry,
+                *index == model.catalog_index,
+                is_current_model(model, entry),
+                name_width,
+                ordinal + 1,
+            )
+        })
+        .collect()
 }
 
 /// Content-sized rounded panel, with the header fixed while the list scrolls.
@@ -166,27 +151,8 @@ pub fn screen(model: &Model, height: usize) -> Vec<Line<'static>> {
 
 /// Exact height of the full picker before terminal-height clipping.
 pub fn screen_height(model: &Model) -> usize {
-    let controls = usize::from(model.width.saturating_sub(6) < 76);
-    let reasoning = usize::from(
-        model
-            .catalog
-            .get(model.catalog_index % model.catalog.len().max(1))
-            .and_then(|row| row.reasoning_levels.get(row.reasoning_index))
-            .is_some(),
-    );
-    let notice = usize::from(
-        model
-            .catalog
-            .get(model.catalog_index % model.catalog.len().max(1))
-            .is_some_and(|entry| {
-                matches!(entry.credential, Credential::Absent | Credential::Expired)
-            })
-            || window_warning(model).is_some()
-            || model.section_notice.is_some(),
-    );
-    // Command echo + gap, panel borders, title/help/rule, optional controls and
-    // reasoning rows, the catalog itself, and an optional warning row.
-    7 + controls + reasoning + catalog(model).len() + notice
+    // Divider, title, description, spacing, results, optional effort/notices, footer.
+    (catalog(model).len() + 11).min(usize::from(model.height.saturating_sub(4)).max(8))
 }
 
 /// Model argument completion shares the catalog presentation; its values and
@@ -256,123 +222,77 @@ pub fn suggestions(model: &Model) -> Option<Vec<Line<'static>>> {
 
 fn picker_panel(model: &Model, height: usize, echo: bool) -> Vec<Line<'static>> {
     let th = &model.theme;
-    let inner = Model {
-        width: model.width.saturating_sub(6),
-        ..model.clone()
-    };
-    let entries = catalog(&inner);
+    let entries = catalog(model);
     let anchor = model
         .section_offset
         .unwrap_or_else(|| ui::focused_row(&entries).unwrap_or(0));
-    if height < 10 || model.width < 8 {
+    if height < 8 || model.width < 12 {
         return ui::window(entries, height, anchor, th)
             .into_iter()
             .map(|row| Line::from(ui::truncate_run(row.spans, model.width)))
             .collect();
     }
-    let width = inner.width;
-    let controls = if !echo {
-        "↑↓ move   tab/↵ take   esc close"
-    } else if model.section_offset.is_some() {
-        "↑↓ navigate   ↵ back   esc close"
-    } else if width >= 76 {
-        "↑↓ navigate   ↵ select   esc close"
-    } else {
-        "↑↓ move  ↵ select  esc close"
-    };
-    let mut header = vec![ui::paper_label("Select a model", th, false)];
-    let separate_controls = width < 76;
-    if !separate_controls {
-        let gap = width.saturating_sub(ui::run_width(&header) + text_width(controls));
-        header.push(span(" ".repeat(gap as usize), th.muted));
-        header.push(span(controls, th.muted));
-    }
-    let mut content = vec![
-        Line::from(header),
-        Line::from(span(
-            if echo {
-                "Type to filter · ↑↓ model · ←→ reasoning · Enter saves"
-            } else {
-                "Choose a model"
-            },
-            th.muted,
-        )),
+    let bounded = |spans| Line::from(ui::truncate_run(spans, model.width));
+    let detail = |text: String, color| bounded(vec![span("   ", th.text), span(text, color)]);
+    let mut out = vec![
+        Line::from(span("▔".repeat(usize::from(model.width)), th.border)),
+        bounded(vec![span("   ", th.text), ui::span_strong("Select model", th.text, th)]),
+        detail("Choose from your configured providers. Model names and availability reflect your configuration.".into(), th.text),
+        ui::blank(),
     ];
-    if separate_controls {
-        content.push(Line::from(span(controls, th.muted)));
+    if !model.catalog_query.is_empty() {
+        out.push(detail(format!("Search: {}", model.catalog_query), th.muted));
     }
-    if echo {
-        if let Some(row) = model
-            .catalog
-            .get(model.catalog_index % model.catalog.len().max(1))
-        {
-            if let Some(level) = row.reasoning_levels.get(row.reasoning_index) {
-                content.push(Line::from(span(
-                    format!("Reasoning: ◀ {level} ▶"),
-                    th.primary,
-                )));
-            }
-        }
-    }
-    content.push(Line::from(span(
-        if model.catalog_query.is_empty() {
-            "Search models…".to_string()
-        } else {
-            format!("Search: {}", model.catalog_query)
-        },
-        th.muted,
-    )));
-    let selected = model
-        .catalog
-        .get(model.catalog_index % model.catalog.len().max(1));
-    let mut notices = Vec::new();
+    let selected = visible_indices(model)
+        .contains(&model.catalog_index)
+        .then(|| model.catalog.get(model.catalog_index))
+        .flatten();
+    let mut footer = vec![ui::blank()];
     if let Some(entry) = selected {
+        if let Some(level) = entry.reasoning_levels.get(entry.reasoning_index) {
+            footer.push(detail(
+                format!("● {level} effort  ←/→ to adjust"),
+                th.primary,
+            ));
+        }
         if matches!(entry.credential, Credential::Absent | Credential::Expired) {
-            notices.push(format!(
-                "{} · /login {}",
-                super::login::state_label(entry.credential),
-                entry.provider
+            footer.push(detail(
+                format!(
+                    "{} · /login {}",
+                    super::login::state_label(entry.credential),
+                    entry.provider
+                ),
+                th.warning,
             ));
         }
     }
     if let Some(warning) = window_warning(model) {
-        notices.push(warning);
+        footer.push(detail(warning, th.warning));
     }
     if let Some(notice) = &model.section_notice {
-        notices.push(notice.clone());
+        footer.push(detail(notice.clone(), th.warning));
     }
-    let notice_rows = usize::from(!notices.is_empty());
-    let room = height
-        .saturating_sub(2 + usize::from(echo) * 2 + content.len() + notice_rows)
-        .max(1);
-    content.extend(ui::window(entries, room, anchor, th));
-    if notice_rows > 0 {
-        content.push(Line::from(span(notices.join(" · "), th.warning)));
+    footer.push(ui::blank());
+    footer.push(detail(
+        if echo && model.width < 60 {
+            "Enter save · s session · Esc cancel".into()
+        } else if echo {
+            "Enter to save default · s for this session only · / to filter · Esc to cancel".into()
+        } else {
+            "↑↓ move · tab/↵ take · esc close".into()
+        },
+        th.muted,
+    ));
+    // On short terminals preserve selection and action guidance before decoration.
+    let footer_room = height.saturating_sub(out.len() + 1);
+    if footer.len() > footer_room {
+        let hint = footer.pop().unwrap();
+        footer.truncate(footer_room.saturating_sub(1));
+        footer.push(hint);
     }
-    let border = |left: &str, right: &str| {
-        Line::from(span(
-            format!(
-                "{left}{}{right}",
-                "─".repeat(model.width.saturating_sub(2) as usize)
-            ),
-            th.border,
-        ))
-    };
-    let mut out = Vec::new();
-    if echo {
-        out.extend([Line::from(span("> /model", th.text)), ui::blank()]);
-    }
-    out.push(border("╭", "╮"));
-    for row in content {
-        let mut run = ui::truncate_run(row.spans, width);
-        let padding = width.saturating_sub(ui::run_width(&run));
-        let mut framed = vec![span("│  ", th.border)];
-        framed.append(&mut run);
-        framed.push(span(" ".repeat(padding as usize), th.text));
-        framed.push(span("  │", th.border));
-        out.push(Line::from(framed));
-    }
-    out.push(border("╰", "╯"));
+    let room = height.saturating_sub(out.len() + footer.len());
+    out.extend(ui::window(entries, room, anchor, th));
+    out.extend(footer);
     out.truncate(height);
     out
 }
@@ -395,22 +315,38 @@ fn provider_label(provider: &str) -> &str {
 }
 
 fn model_description(entry: &crate::davinci::model::CatalogRow) -> String {
-    match entry.id.as_str() {
-        "gpt-6-astra" => "Latest and most capable model".into(),
-        "gpt-5.6-luna" => "Balanced performance for most tasks".into(),
-        "gpt-5.6-sol" => "High reasoning for complex problems".into(),
-        "gpt-5.6-terra" => "Optimized for long context and deep work".into(),
-        "gpt-5.5" => "Reliable and efficient".into(),
-        "gpt-5.4-mini" => "Faster, lightweight model".into(),
-        _ if entry.thinking != "none" => format!("Reasoning model · {} context", entry.window),
-        _ => format!("{} context", entry.window),
+    let mut facts = vec![provider_label(&entry.provider).to_string()];
+    if !entry.window.is_empty() {
+        facts.push(format!("{} context", entry.window));
     }
+    if !entry.reasoning_levels.is_empty() {
+        facts.push("Adjustable effort".into());
+    }
+    facts
+        .into_iter()
+        .filter(|value| !value.is_empty())
+        .collect::<Vec<_>>()
+        .join(" · ")
 }
 
 fn is_current_model(model: &Model, entry: &crate::davinci::model::CatalogRow) -> bool {
-    model.model_name == entry.id
-        || model.model_name == entry.name
-        || entry.name.ends_with(&format!("/{}", model.model_name))
+    if !model.active_provider.is_empty() {
+        return model.active_provider == entry.provider && model.model_name == entry.id;
+    }
+    if model.model_name == format!("{}/{}", entry.provider, entry.id) {
+        return true;
+    }
+    // An unqualified identifier is only unambiguous when exactly one provider owns it.
+    let matches = |candidate: &crate::davinci::model::CatalogRow| {
+        model.model_name == candidate.id || model.model_name == candidate.name
+    };
+    matches(entry)
+        && model
+            .catalog
+            .iter()
+            .filter(|candidate| matches(candidate))
+            .count()
+            == 1
 }
 
 fn catalog_row(
@@ -419,50 +355,30 @@ fn catalog_row(
     focused: bool,
     current: bool,
     name_width: u16,
+    ordinal: usize,
 ) -> Line<'static> {
     let th = &model.theme;
-    let (accent, _background) = th.model_picker_colors();
-    let width = model.width;
+    let color = if focused { th.primary } else { th.text };
     let name = if entry.id.is_empty() {
         &entry.name
     } else {
         &entry.id
     };
-    let mut run = vec![
-        span(if focused { ui::SELECTION_BAR } else { "   " }, accent),
-        span(
-            if current { "●  " } else { "○  " },
-            if current { accent } else { th.muted },
-        ),
-        ui::span_strong(ui::clip_ellipsis(name, name_width), th.text, th),
+    let label = format!("{ordinal}. {name}{}", if current { " ✔" } else { "" });
+    let clipped = ui::clip_ellipsis(&label, name_width);
+    let mut spans = vec![
+        span(if focused { "   ❯ " } else { "     " }, color),
+        span(clipped.clone(), color),
     ];
-    let badge = false;
-    if width >= 65 {
-        let pad = name_width.saturating_sub(text_width(name)) + 3;
-        run.push(span(" ".repeat(pad as usize), th.text));
-        let room = width.saturating_sub(ui::run_width(&run) + if badge { 10 } else { 0 });
-        run.push(span(
-            ui::clip_ellipsis(&model_description(entry), room),
-            th.muted,
+    if model.width >= 60 {
+        let padding = name_width.saturating_sub(text_width(&clipped)) + 2;
+        spans.push(span(" ".repeat(usize::from(padding)), color));
+        spans.push(span(
+            model_description(entry),
+            if focused { color } else { th.muted },
         ));
     }
-    let padding = width.saturating_sub(ui::run_width(&run) + if badge { 8 } else { 0 });
-    run.push(span(" ".repeat(padding as usize), th.text));
-    if focused {
-        for item in &mut run {
-            item.style.fg = Some(accent);
-        }
-    }
-    if badge {
-        run.push(ratatui::text::Span::styled(
-            " LATEST ",
-            ratatui::style::Style::default()
-                .fg(th.background)
-                .bg(accent)
-                .add_modifier(ratatui::style::Modifier::BOLD),
-        ));
-    }
-    Line::from(ui::truncate_run(run, width))
+    Line::from(ui::truncate_run(spans, model.width))
 }
 
 /// Warn about the model under consideration, not an unrelated small model.
@@ -577,22 +493,21 @@ mod tests {
         let drawn = text(&screen(&m, 24));
         assert!(!drawn.contains("LATEST"));
         for label in [
-            "╭",
-            "╯",
-            "Select a model",
-            "Type to filter · ↑↓ model · ←→ reasoning · Enter saves",
-            "↑↓ navigate",
+            "▔",
+            "Select model",
+            "Enter to save default",
+            "/ to filter",
             "OpenAI Codex",
-            "Latest and most capable model",
-            "Balanced performance for most tasks",
+            "gpt-6-astra",
+            "gpt-5.6-luna",
         ] {
             assert!(drawn.contains(label), "{label}: {drawn}");
         }
         let rows = catalog(&m);
-        assert!(rows[1].to_string().contains("●"));
-        assert!(rows[2].to_string().contains("○"));
-        assert_eq!(ui::focused_row(&rows), Some(2));
-        assert!(rows[2]
+        assert!(rows[0].to_string().contains("✔"));
+        assert!(!rows[1].to_string().contains("✔"));
+        assert_eq!(ui::focused_row(&rows), Some(1));
+        assert!(rows[1]
             .spans
             .iter()
             .all(|s| s.style.fg == Some(m.theme.model_picker_colors().0)));
@@ -672,8 +587,8 @@ mod tests {
                 let rows = screen(&m, height);
                 assert!(rows.len() <= height);
                 assert!(rows.iter().all(|row| ui::run_width(&row.spans) <= width));
-                if width >= 8 && height >= 10 {
-                    assert!(rows.last().unwrap().to_string().ends_with('╯'));
+                if width >= 40 && height >= 10 {
+                    assert!(rows.last().unwrap().to_string().contains("Enter"));
                 }
             }
         }

@@ -1,89 +1,76 @@
-//! The only box allowed mid-turn (design.md §6): a ledger of ✓ / ◉ / ○ steps
-//! with the active step's target appended in border color. Below 100 columns it
-//! collapses to one line, `⟐ studying <path>` (screen `1g`).
-//!
-//! Mirrors `docs/ui/davinci_tui/lib/davinci/views/studio.ex`.
-
-use ratatui::text::Line;
-
+//! Compact task checklist inside the conversation. Each task stays readable
+//! at ordinary terminal widths; raw orchestration metadata belongs in inspectors.
 use crate::davinci::model::{Model, Step};
 use crate::davinci::theme::State;
-use crate::davinci::ui::{clip_ellipsis, span, span_strong, Surface, MEASURE};
+use crate::davinci::ui::{self, clip_ellipsis, span, span_strong, MEASURE};
+use ratatui::text::Line;
 
 pub fn lines(model: &Model, steps: &[Step]) -> Vec<Line<'static>> {
-    if model.narrow() {
-        collapsed(model, steps)
-    } else {
-        expanded(model, steps)
-    }
-}
-
-/// Row count, known before rendering, so the transcript can budget for it.
-pub fn height(model: &Model, steps: &[Step]) -> usize {
-    if model.narrow() {
-        1
-    } else {
-        steps.len() + 2
-    }
-}
-
-fn active_step(steps: &[Step]) -> Option<&Step> {
-    steps
-        .iter()
-        .find(|step| step.state == State::Active)
-        .or_else(|| steps.first())
-}
-
-fn collapsed(model: &Model, steps: &[Step]) -> Vec<Line<'static>> {
-    let th = &model.theme;
-    let Some(step) = active_step(steps) else {
+    if steps.is_empty() {
         return Vec::new();
-    };
-    let subject = step.target.clone().unwrap_or_else(|| step.verb.clone());
-    vec![Line::from(vec![
-        span(
-            format!("{} ", th.spinner(model.tick, model.animate)),
-            th.primary,
-        ),
-        span("studying ", th.muted),
-        span(
-            clip_ellipsis(&subject, model.width.saturating_sub(14)),
-            th.secondary,
-        ),
-    ])]
-}
-
-fn expanded(model: &Model, steps: &[Step]) -> Vec<Line<'static>> {
+    }
     let th = &model.theme;
-    let width = model.width.min(MEASURE + 6);
-    let mut surface = Surface::new(width, th).title(vec![span("STUDIO", th.primary)]);
-
+    if model.width < 60 {
+        let task = steps
+            .iter()
+            .find(|step| step.state == State::Active)
+            .unwrap_or(&steps[0]);
+        let text = format!(
+            "{} {}{}",
+            task.state.glyph(),
+            task.verb,
+            task.target
+                .as_ref()
+                .map(|target| format!(" · {target}"))
+                .unwrap_or_default()
+        );
+        return vec![Line::from(span(clip_ellipsis(&text, model.width), th.text))];
+    }
+    let complete = steps
+        .iter()
+        .filter(|step| step.state == State::Done)
+        .count();
+    let mut rows = vec![Line::from(span(
+        format!("  Tasks · {complete}/{} complete", steps.len()),
+        th.muted,
+    ))];
     for step in steps {
         let glyph = if step.state == State::Active {
             th.spinner(model.tick, model.animate).to_string()
         } else {
             step.state.glyph().to_string()
         };
-        let verb_color = if step.state == State::Queued {
-            th.muted
-        } else {
-            th.text
-        };
-        let mut row = vec![
+        let mut spans = vec![
+            span("  ", th.muted),
             span_strong(format!("{glyph} "), th.state_color(step.state), th),
-            span(step.verb.clone(), verb_color),
+            span(
+                step.verb.clone(),
+                if step.state == State::Queued {
+                    th.muted
+                } else {
+                    th.text
+                },
+            ),
         ];
         if let Some(target) = &step.target {
-            row.push(span(" · ", th.border));
-            row.push(span(
-                clip_ellipsis(target, width.saturating_sub(40)),
-                th.border,
-            ));
+            spans.push(span(format!(" · {target}"), th.muted));
         }
-        surface = surface.row(row);
+        rows.push(Line::from(ui::truncate_run(
+            spans,
+            model.width.min(MEASURE + 6),
+        )));
     }
+    rows
+}
 
-    surface.lines()
+pub fn height(model: &Model, steps: &[Step]) -> usize {
+    if steps.is_empty() {
+        0
+    } else if model.width < 60 {
+        1
+    } else {
+        steps.len() + 1
+    }
 }
 
 #[cfg(test)]
@@ -124,9 +111,9 @@ mod tests {
     fn at_a_hundred_columns_it_is_a_box_with_one_row_per_step() {
         let m = model(100);
         let rows = lines(&m, &steps());
-        assert_eq!(rows.len(), 6);
+        assert_eq!(rows.len(), 5);
         assert_eq!(rows.len(), height(&m, &steps()));
-        assert!(text(&rows[0]).starts_with("╭─ STUDIO ─"));
+        assert!(text(&rows[0]).starts_with("  Tasks · 2/4 complete"));
         assert!(text(&rows[1]).contains("✓ surveyed workspace"));
         assert!(text(&rows[4]).contains("○ verify provider abstraction"));
     }
@@ -138,7 +125,7 @@ mod tests {
         for (tick, frame) in [(0u64, '◜'), (1, '◝'), (2, '◞'), (3, '◟')] {
             m.tick = tick;
             let drawn = text(&lines(&m, &steps)[3]);
-            assert!(drawn.starts_with(&format!("│ {frame} ")), "{drawn}");
+            assert!(drawn.starts_with(&format!("  {frame} ")), "{drawn}");
         }
         let drawn = text(&lines(&m, &steps)[3]);
         assert!(drawn.contains("examining session persistence"));
@@ -151,24 +138,24 @@ mod tests {
         m.animate = false;
         m.tick = 3;
         let drawn = text(&lines(&m, &steps())[3]);
-        assert!(drawn.starts_with("│ ◉ "), "{drawn}");
+        assert!(drawn.starts_with("  ◉ "), "{drawn}");
     }
 
     #[test]
     fn below_a_hundred_columns_it_collapses_to_one_line() {
-        let m = model(80);
+        let m = model(50);
         let rows = lines(&m, &steps());
         assert_eq!(rows.len(), 1);
         assert_eq!(height(&m, &steps()), 1);
         let drawn = text(&rows[0]);
-        assert!(drawn.contains("studying "), "{drawn}");
-        assert!(drawn.contains("store.rs"), "{drawn}");
+        assert!(drawn.contains("examining session"), "{drawn}");
+        assert!(drawn.ends_with('…'), "{drawn}");
         assert!(!drawn.contains('╭'), "no box below 100 columns: {drawn}");
     }
 
     #[test]
     fn a_collapsed_ledger_with_no_active_step_falls_back_to_the_first() {
-        let m = model(80);
+        let m = model(50);
         let steps = vec![Step::new(State::Done, "surveyed workspace", None)];
         let drawn = text(&lines(&m, &steps)[0]);
         assert!(drawn.contains("surveyed workspace"), "{drawn}");
@@ -184,6 +171,9 @@ mod tests {
         let m = model(200);
         let rows = lines(&m, &steps());
         let width = crate::davinci::ui::run_width(&rows[0].spans);
-        assert_eq!(width, MEASURE + 6);
+        assert!(width <= MEASURE + 6);
+        assert!(rows
+            .iter()
+            .all(|row| crate::davinci::ui::run_width(&row.spans) <= MEASURE + 6));
     }
 }

@@ -49,11 +49,11 @@ pub fn inspector_lines(
     let mut rows = vec![Line::from(ui::span(
         ui::clip_ellipsis(
             if model.graph_canvas.inspecting_goal {
-                "MAIN GOAL · g worker activity"
+                "Goal · g worker activity"
             } else if run.inspecting_node {
-                "INSPECTOR · public execution"
+                "Agent details"
             } else {
-                "WORKER ACTIVITY · Enter details"
+                "Activity · Enter details"
             },
             width,
         ),
@@ -128,7 +128,16 @@ fn inspector_facts(model: &Model, selected: Option<&str>, width: u16) -> Vec<Lin
         );
         add("", "Enter expands its real members");
     } else if let Some(task) = task {
-        add("", &format!("{} {}", task.state.glyph(), task.id));
+        add(
+            "",
+            &format!("{} {}", task.state.glyph(), task.display_title()),
+        );
+        if let Some(branch) = &task.branch {
+            add("Branch: ", branch);
+        }
+        if let Some(worktree) = &task.worktree {
+            add("Worktree: ", worktree);
+        }
         add("Status: ", &task.status);
         add("Phase: ", &task.phase);
         add("Work: ", &task.artifact);
@@ -143,6 +152,7 @@ fn inspector_facts(model: &Model, selected: Option<&str>, width: u16) -> Vec<Lin
             add("Artifact: ", path);
         }
         if run.inspecting_node {
+            add("Task ID: ", &task.id);
             add("Role: ", &task.role);
             add("Policy: ", &task.policy);
             add("Dependencies: ", &task.dependencies.join(", "));

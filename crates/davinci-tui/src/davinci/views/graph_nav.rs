@@ -106,6 +106,8 @@ pub fn handle_mouse(
     }
     match mouse.kind {
         MouseEventKind::Down(MouseButton::Left) => {
+            model.graph_canvas.input_focus = false;
+            model.dismiss_suggestions();
             let point = (mouse.column as i32 + frame.offset.0, y + frame.offset.1);
             if let Some(node) = frame.layout.nodes.iter().find(|n| {
                 point.0 >= n.rect.x as i32

@@ -8,7 +8,10 @@ use davinci_tui::davinci::{
 
 fn model() -> Model {
     let mut m = Model::new(
-        Theme::da_vinci(ColorDepth::TrueColor, false), 120, 40, false,
+        Theme::da_vinci(ColorDepth::TrueColor, false),
+        120,
+        40,
+        false,
     );
     m.graph_run = Some(fixtures::blueprint_graph());
     m
@@ -21,7 +24,10 @@ fn control(m: &mut Model, ch: char) -> app::Flow {
 }
 fn frame(m: &Model) -> String {
     app::compose(m, m.height)
-        .iter().map(ToString::to_string).collect::<Vec<_>>().join("\n")
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 #[test]
@@ -42,7 +48,10 @@ fn graph_tab_moves_to_input_without_running_graph_shortcuts() {
         assert_eq!(key(&mut m, KeyCode::Char(ch)), app::Flow::Continue);
     }
     assert_eq!(m.composer.editor().get_text(), "Draft xpr");
-    assert_eq!(m.graph_run.as_ref().unwrap().phase, fixtures::blueprint_graph().phase);
+    assert_eq!(
+        m.graph_run.as_ref().unwrap().phase,
+        fixtures::blueprint_graph().phase
+    );
 }
 
 #[test]
@@ -51,7 +60,10 @@ fn graph_input_submits_to_the_conversation_not_the_selected_worker() {
     m.screen = Screen::GraphRun;
     key(&mut m, KeyCode::Tab);
     m.composer.set_text("Explain the existing tests");
-    assert_eq!(key(&mut m, KeyCode::Enter), app::Flow::Submit("Explain the existing tests".into()));
+    assert_eq!(
+        key(&mut m, KeyCode::Enter),
+        app::Flow::Submit("Explain the existing tests".into())
+    );
     assert!(m.graph_run.is_some());
 }
 
@@ -73,7 +85,10 @@ fn background_status_does_not_replace_the_prompt() {
     m.screen = Screen::Agent;
     m.composer.set_text("Continue another question");
     let text = frame(&m);
-    assert!(text.contains("Background"), "missing background status: {text}");
+    assert!(
+        text.contains("Background"),
+        "missing background status: {text}"
+    );
     assert!(text.contains("Continue another question"));
     assert_eq!(m.screen, Screen::Agent);
 }
@@ -83,7 +98,15 @@ fn graph_view_never_overflows_after_resize() {
     let mut m = model();
     m.screen = Screen::GraphRun;
     m.composer.set_text("Do not lose this draft 👩‍💻");
-    for (width, height) in [(40,12),(80,24),(100,30),(120,40),(160,50),(1,1),(0,0)] {
+    for (width, height) in [
+        (40, 12),
+        (80, 24),
+        (100, 30),
+        (120, 40),
+        (160, 50),
+        (1, 1),
+        (0, 0),
+    ] {
         m.width = width;
         m.height = height;
         let rows = app::compose(&m, height);

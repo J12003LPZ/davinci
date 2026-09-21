@@ -79,7 +79,7 @@ impl Keybindings {
             if !self.explicit.contains(tools) {
                 effective
                     .bindings
-                    .insert(tools.into(), vec!["ctrl+t".into()]);
+                    .insert(tools.into(), vec!["ctrl+o".into()]);
             }
             return (effective, None);
         }
@@ -91,7 +91,7 @@ impl Keybindings {
         if !self.explicit.contains(tools) {
             effective
                 .bindings
-                .insert(tools.into(), vec!["alt+t".into()]);
+                .insert(tools.into(), vec!["ctrl+o".into()]);
         }
         let tools_conflict = !self.explicit.contains(tools)
             && self.bindings.iter().any(|(action, keys)| {
@@ -100,7 +100,7 @@ impl Keybindings {
                     && !action.starts_with("app.tree.")
                     && !action.starts_with("app.models.")
                     && !action.starts_with("app.session.")
-                    && keys.iter().any(|key| key_to_bytes(key) == "\x1bt")
+                    && keys.iter().any(|key| key_to_bytes(key) == "\x0f")
             });
         if tools_conflict {
             effective.bindings.insert(tools.into(), Vec::new());
@@ -125,7 +125,7 @@ impl Keybindings {
         (
             effective,
             tools_conflict.then(|| {
-                "Alt+T is explicitly assigned; choose a tool-expansion shortcut in keybindings"
+                "Ctrl+O is explicitly assigned; choose a tool-expansion shortcut in keybindings"
                     .into()
             }),
         )
@@ -167,9 +167,9 @@ fn default_pairs() -> &'static [(&'static str, &'static [&'static str])] {
         // Alt+T already expands tools with voice enabled, so thinking uses Alt+Shift+T.
         ("app.permissions.cycle", &["shift+tab", "ctrl+tab"]),
         ("app.thinking.cycle", &["alt+shift+t"]),
-        ("app.model.cycleForward", &["ctrl+p"]),
+        ("app.model.cycleForward", &["ctrl+alt+n"]),
         ("app.model.cycleBackward", &["shift+ctrl+p"]),
-        ("app.model.select", &["ctrl+l"]),
+        ("app.model.select", &["alt+p"]),
         ("app.tools.expand", &["ctrl+o"]),
         ("app.thinking.toggle", &["ctrl+t"]),
         ("app.editor.external", &["ctrl+g"]),
@@ -179,15 +179,15 @@ fn default_pairs() -> &'static [(&'static str, &'static [&'static str])] {
         ("app.clipboard.pasteImage", &["ctrl+v"]),
         ("davinci.interrupt", &["ctrl+c"]),
         ("davinci.quit", &["ctrl+d"]),
-        ("davinci.instrumenta.toggle", &["ctrl+p"]),
+        ("davinci.instrumenta.toggle", &["ctrl+alt+p"]),
         ("davinci.sessions.toggle", &["ctrl+s"]),
-        ("davinci.cogitator.toggle", &["ctrl+o"]),
-        ("davinci.plan.toggle", &["ctrl+l"]),
-        ("davinci.grafo.toggle", &["ctrl+g"]),
+        ("davinci.cogitator.toggle", &["alt+p"]),
+        ("davinci.plan.toggle", &["ctrl+alt+l"]),
+        ("davinci.grafo.toggle", &["ctrl+alt+g"]),
         ("davinci.mensura.toggle", &["ctrl+alt+u"]),
-        ("davinci.memoria.toggle", &["ctrl+r"]),
-        ("davinci.codex.toggle", &["ctrl+e"]),
-        ("davinci.tools.expand", &["ctrl+t"]),
+        ("davinci.memoria.toggle", &["ctrl+alt+r"]),
+        ("davinci.codex.toggle", &["ctrl+alt+e"]),
+        ("davinci.tools.expand", &["ctrl+o"]),
         (
             "davinci.composer.newLine",
             &["shift+enter", "alt+enter", "ctrl+j"],
@@ -228,8 +228,8 @@ fn default_pairs() -> &'static [(&'static str, &'static [&'static str])] {
         ("tui.select.cancel", &["escape"]),
         ("tui.editor.cursorUp", &["up"]),
         ("tui.editor.cursorDown", &["down"]),
-        ("tui.editor.historyPrevious", &[]),
-        ("tui.editor.historyNext", &[]),
+        ("tui.editor.historyPrevious", &["ctrl+p"]),
+        ("tui.editor.historyNext", &["ctrl+n"]),
         ("tui.editor.pageUp", &["pageUp", "ctrl+pageUp"]),
         ("tui.editor.pageDown", &["pageDown", "ctrl+pageDown"]),
         ("tui.editor.cursorLeft", &["left", "ctrl+b"]),
@@ -366,7 +366,22 @@ pub fn key_to_bytes(key: &str) -> String {
         "ctrl+shift+down" => "\x1b[1;6B".into(),
         "ctrl+up" => "\x1b[1;5A".into(),
         "ctrl+down" => "\x1b[1;5B".into(),
-        other => other.to_string(),
+        other => {
+            let parsed = crate::keys::parse_key(other);
+            let bytes = parsed.name.as_bytes();
+            if parsed.ctrl
+                && parsed.alt
+                && !parsed.shift
+                && bytes.len() == 1
+                && bytes[0].is_ascii_alphabetic()
+            {
+                return format!(
+                    "\x1b{}",
+                    char::from(bytes[0].to_ascii_lowercase() - b'a' + 1)
+                );
+            }
+            other.to_string()
+        }
     }
 }
 
@@ -441,15 +456,15 @@ mod tests {
         assert!(notice.is_none());
         assert!(keys.matches("\x14", "davinci.voice.toggle"));
         assert!(keys.matches("\x1b[116;5u", "davinci.voice.toggle"));
-        assert!(keys.matches("\x1bt", "davinci.tools.expand"));
+        assert!(keys.matches("\x0f", "davinci.tools.expand"));
         assert!(keys.matches("\x14", "app.tree.filter.noTools"));
         assert!(keys.matches("\x14", "app.thinking.toggle"));
         assert_eq!(keys.with_voice(false).0, original);
         let (keys, notice) =
-            Keybindings::from_json(r#"{"tui.editor.yank":"alt+t"}"#).with_voice(true);
+            Keybindings::from_json(r#"{"tui.editor.yank":"ctrl+o"}"#).with_voice(true);
         assert!(notice.is_some());
         assert!(keys.keys_for("davinci.tools.expand").is_empty());
-        assert!(keys.matches("\x1bt", "tui.editor.yank"));
+        assert!(keys.matches("\x0f", "tui.editor.yank"));
         for raw in [
             r#"{"davinci.tools.expand":"ctrl+t"}"#,
             r#"{"davinci.voice.toggle":"ctrl+p"}"#,
@@ -471,7 +486,7 @@ mod tests {
         assert!(Keybindings::defaults().matches("\x07", "app.editor.external"));
         assert!(Keybindings::defaults().matches("\x1b\r", "app.message.followUp"));
         assert!(Keybindings::defaults().matches("\x16", "app.clipboard.pasteImage"));
-        assert!(Keybindings::defaults().matches("\x0c", "app.model.select"));
+        assert!(Keybindings::defaults().matches("\x1bp", "app.model.select"));
         assert!(Keybindings::defaults().matches("\x0f", "app.tools.expand"));
         assert_eq!(
             Keybindings::defaults()
@@ -500,9 +515,7 @@ mod tests {
         assert!(Keybindings::defaults().matches("\x1b[45;5u", "tui.editor.undo"));
         assert!(Keybindings::defaults().matches("\x1b[A", "tui.editor.cursorUp"));
         assert!(Keybindings::defaults().matches("\x1b[B", "tui.editor.cursorDown"));
-        assert!(Keybindings::defaults()
-            .keys_for("tui.editor.historyPrevious")
-            .is_empty());
+        assert!(Keybindings::defaults().matches("\x10", "tui.editor.historyPrevious"));
         assert!(Keybindings::defaults().matches("\x1b[5~", "tui.editor.pageUp"));
         assert!(Keybindings::defaults().matches("\x1b[6~", "tui.editor.pageDown"));
         let migrated = Keybindings::from_json(r#"{"clear":"ctrl+u"}"#);

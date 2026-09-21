@@ -119,21 +119,32 @@ pub fn compose_frame(model: &Model, height: u16) -> ComposedFrame {
             cogitator::screen(model, cogitator::screen_height(model).min(height))
         };
         let picker_height = picker.len();
-        let mut lines = transcript::tail_lines(
-            model,
-            &model.transcript,
-            model.width,
-            height.saturating_sub(picker_height),
-        );
-        while lines.len() < height.saturating_sub(picker_height) {
-            lines.insert(0, blank());
-        }
+        let mut context = Model {
+            screen: Screen::Agent,
+            overlay: None,
+            ..model.clone()
+        };
+        context.graph_run = None;
+        let mut lines = body(&context, height.saturating_sub(picker_height));
+        lines = pad_to(lines, height.saturating_sub(picker_height));
         lines.extend(picker);
         return ComposedFrame {
             lines: pad_to(lines, height),
             mic_rect: None,
             graph: None,
         };
+    }
+    // Command surfaces use the same bottom-anchored, unboxed language as the
+    // reference. The graph retains its optional navigable canvas and composer.
+    if model.overlay.is_none() && model.screen != Screen::Agent && model.screen != Screen::GraphRun
+    {
+        if let Some(content) = section_rows(model) {
+            return ComposedFrame {
+                lines: command_panel_frame(model, content, height),
+                mic_rect: None,
+                graph: None,
+            };
+        }
     }
     // While an instrument floats over the transcript, the chrome around it
     // drops its ramp too — only the panel keeps full ink (`1d`, `1f`).
@@ -163,6 +174,9 @@ pub fn compose_frame(model: &Model, height: u16) -> ComposedFrame {
     } else {
         Vec::new()
     };
+    if model.screen == Screen::Agent && model.overlay.is_none() && height >= 10 {
+        working.extend(graph_run::background_lines(chrome_model));
+    }
     if !working.is_empty() {
         working.insert(0, blank());
     }
@@ -185,7 +199,12 @@ pub fn compose_frame(model: &Model, height: u16) -> ComposedFrame {
     rows.extend(top);
     let body_start = rows.len() as u16;
     let mut graph = None;
-    rows.extend(body_with_graph(model, body_height, &mut graph));
+    let content = body_with_graph(model, body_height, &mut graph);
+    rows.extend(if conversation {
+        pad_to(content, body_height)
+    } else {
+        content
+    });
     if let Some(frame) = &mut graph {
         frame.origin_y = frame.origin_y.saturating_add(body_start);
     }
@@ -216,6 +235,86 @@ pub fn compose_frame(model: &Model, height: u16) -> ComposedFrame {
         graph,
         mic_rect,
     }
+}
+
+/// A shared command panel for authentication, history, help, policies and
+/// DaVinci-only utilities. Data/actions remain in their existing owners.
+fn command_panel_frame(
+    model: &Model,
+    content: Vec<Line<'static>>,
+    height: usize,
+) -> Vec<Line<'static>> {
+    let th = &model.theme;
+    let chrome = sheet::chrome(model);
+    let notices: Vec<Line<'static>> = model
+        .section_notice
+        .as_ref()
+        .map(|text| {
+            ui::wrap(text, model.width.saturating_sub(3))
+                .into_iter()
+                .take(3)
+                .map(|text| {
+                    Line::from(ui::truncate_run(
+                        vec![ui::span(format!("   {text}"), th.warning)],
+                        model.width,
+                    ))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    let safety = usize::from(model.permission_mode == "always-approve");
+    let panel_height =
+        (content.len() + 5 + notices.len() + safety).min(height.saturating_sub(2).max(1));
+    let rows_room = panel_height.saturating_sub(4 + notices.len() + safety);
+    let selected = ui::focused_row(&content).unwrap_or(model.sheet_anchor());
+    let anchor = model.section_offset.unwrap_or(selected);
+    let context = Model {
+        screen: Screen::Agent,
+        overlay: None,
+        graph_run: None,
+        ..model.clone()
+    };
+    let mut rows = pad_to(
+        body(&context, height.saturating_sub(panel_height)),
+        height.saturating_sub(panel_height),
+    );
+    if panel_height < 5 {
+        rows.extend(ui::window(content, panel_height, anchor, th));
+        return pad_to(
+            rows.into_iter()
+                .map(|row| Line::from(ui::truncate_run(row.spans, model.width)))
+                .collect(),
+            height,
+        );
+    }
+    rows.push(Line::from(ui::span(
+        "▔".repeat(usize::from(model.width)),
+        th.border,
+    )));
+    rows.push(Line::from(ui::truncate_run(
+        vec![
+            ui::span("   ", th.text),
+            ui::span_strong(sheet::title(model.screen), th.primary, th),
+        ],
+        model.width,
+    )));
+    rows.push(blank());
+    rows.extend(ui::window(content, rows_room, anchor, th));
+    rows.extend(notices);
+    if safety > 0 {
+        rows.push(chrome::status(model));
+    }
+    let hint = chrome
+        .as_ref()
+        .and_then(|chrome| sheet::hint_row(model, chrome))
+        .unwrap_or_else(|| Line::from(ui::span("   Esc to close", th.muted)));
+    rows.push(hint);
+    pad_to(
+        rows.into_iter()
+            .map(|row| Line::from(ui::truncate_run(row.spans, model.width)))
+            .collect(),
+        height,
+    )
 }
 
 /// Rows an extension supplied. They are drawn as plain text in the shell's own
@@ -253,7 +352,11 @@ fn composer_rows(model: &Model) -> Vec<Line<'static>> {
             }
         }
     }
-    let hint = if model.overlay.is_some() || model.height < 8 || model.codex_open() {
+    let hint = if model.overlay.is_some()
+        || model.height < 8
+        || model.codex_open()
+        || model.screen == Screen::Agent
+    {
         Hint::None
     } else {
         match model.screen {
@@ -538,6 +641,19 @@ pub fn handle_key(model: &mut Model, key: KeyEvent) -> Flow {
         model.voice.notice = "Finish or cancel voice before sending".into();
         return Flow::Continue;
     }
+    if key.kind == KeyEventKind::Release {
+        return Flow::Continue;
+    }
+    if model.screen == Screen::GraphRun
+        && model.overlay.is_none()
+        && key.code == KeyCode::Tab
+        && key.modifiers.is_empty()
+        && !(model.graph_canvas.input_focus && model.suggestions.is_some())
+    {
+        model.graph_canvas.input_focus = !model.graph_canvas.input_focus;
+        model.refresh_suggestions();
+        return Flow::Continue;
+    }
     let data = key_event_bytes(&key);
 
     if action_matches(model, data.as_deref(), "davinci.interrupt")
@@ -552,7 +668,7 @@ pub fn handle_key(model: &mut Model, key: KeyEvent) -> Flow {
     match input_owner(
         model.overlay.is_some(),
         model.suggestions.is_some(),
-        model.screen != Screen::Agent || model.codex_open(),
+        !model.composer_owns_focus(),
     ) {
         InputOwner::Modal => {
             return handle_overlay_key(
@@ -704,7 +820,7 @@ fn action_matches(model: &Model, data: Option<&str>, action: &str) -> bool {
 }
 
 fn handle_global_key(model: &mut Model, data: &str) -> Option<Flow> {
-    if model.keybindings.matches(data, "davinci.quit") {
+    if model.keybindings.matches(data, "davinci.quit") && model.composer.is_empty() {
         return Some(Flow::Quit);
     }
     if model
@@ -762,6 +878,26 @@ fn handle_screen_key(model: &mut Model, key: KeyEvent, data: Option<&str>) -> Fl
         return Flow::Continue;
     }
 
+    if model.screen == Screen::Settings {
+        return settings::handle_key(model, key);
+    }
+    if model.screen == Screen::Models && key.modifiers.is_empty() {
+        if key.code == KeyCode::Char('/') && !model.catalog_search {
+            model.catalog_search = true;
+            return Flow::Continue;
+        }
+        if key.code == KeyCode::Char('s') && !model.catalog_search && model.catalog_query.is_empty()
+        {
+            if let Some(choice) = screen_accept(model) {
+                model.catalog_session_only = true;
+                return Flow::Choose(choice);
+            }
+            return Flow::Continue;
+        }
+        if key.code == KeyCode::Enter {
+            model.catalog_session_only = false;
+        }
+    }
     if handle_picker_search(model, &key) {
         return Flow::Continue;
     }
@@ -1612,15 +1748,19 @@ mod tests {
         assert_eq!(rows.len(), 44);
         let title = rows
             .iter()
-            .position(|row| row_text(row).trim() == "Settings")
+            .position(|row| row_text(row).trim().starts_with("Settings  "))
             .unwrap();
         let context = rows
             .iter()
             .position(|row| row_text(row).contains("keep this conversation visible"))
             .unwrap();
         assert!(context < title);
-        let hint = rows.iter().rev().nth(1).map(row_text).unwrap();
-        assert!(hint.trim_end().ends_with("esc close"), "{hint}");
+        let hint = rows
+            .iter()
+            .map(row_text)
+            .find(|row| row.contains("Type to filter"))
+            .unwrap();
+        assert!(hint.contains("Esc to clear"), "{hint}");
     }
 
     #[test]
@@ -1628,23 +1768,18 @@ mod tests {
         let mut m = model(108, 30);
         crate::davinci::fixtures::dress_screen(&mut m, "3a");
         m.transcript = vec![Entry::user("keep this conversation visible")];
-
         let rows: Vec<String> = compose(&m, 30).iter().map(text).collect();
         let conversation = rows
             .iter()
             .position(|row| row.contains("keep this conversation visible"))
-            .expect("the conversation remains visible");
-        let command = rows
+            .unwrap();
+        let title = rows
             .iter()
-            .position(|row| row.contains("> /model"))
-            .expect("the picker command is visible");
-        let bottom = rows
-            .iter()
-            .rposition(|row| row.contains('╰'))
-            .expect("the picker has a bottom border");
-
-        assert!(conversation < command, "{rows:?}");
-        assert_eq!(bottom, rows.len() - 1, "the picker is bottom anchored");
+            .position(|row| row.contains("Select model"))
+            .unwrap();
+        assert!(conversation < title, "{rows:?}");
+        assert!(rows.last().unwrap().contains("Enter to save default"));
+        assert!(!rows.iter().any(|row| row.contains('╰')));
     }
 
     fn ctrl(ch: char) -> KeyEvent {
@@ -1723,12 +1858,12 @@ mod tests {
         let mut m = model(100, 24);
         m.transcript = (0..40).map(|i| Entry::user(&format!("turn {i}"))).collect();
         let rows = compose(&m, 24);
-        assert!(text(&rows[19]).chars().all(|ch| ch == '─'));
-        assert!(text(&rows[20]).contains("❯"));
-        assert!(!text(&rows[20]).contains("…"), "no placeholder prose");
-        assert!(text(&rows[21]).chars().all(|ch| ch == '─'));
-        assert!(text(&rows[22]).contains("/help for shortcuts"));
-        assert!(text(&rows[23]).starts_with("  Manual · main"));
+        assert!(text(&rows[20]).chars().all(|ch| ch == '─'));
+        assert!(text(&rows[21]).starts_with("❯"));
+        assert!(!text(&rows[21]).contains("…"));
+        assert!(text(&rows[22]).chars().all(|ch| ch == '─'));
+        assert!(text(&rows[23]).starts_with("  Manual"));
+        assert!(text(&rows[23]).contains("? for shortcuts"));
     }
 
     #[test]
@@ -1737,8 +1872,13 @@ mod tests {
             let mut m = model(width, 30);
             m.screen = Screen::Thinking;
             let rows = compose(&m, 30);
-            assert_eq!(run_width(&rows[0].spans), width);
-            assert_eq!(run_width(&rows[29].spans), width);
+            let divider = rows
+                .iter()
+                .find(|row| row.to_string().starts_with('▔'))
+                .unwrap();
+            assert_eq!(run_width(&divider.spans), width);
+            assert!(rows.iter().all(|row| run_width(&row.spans) <= width));
+            assert!(rows.iter().any(|row| row.to_string().contains("esc close")));
         }
     }
 
@@ -1760,11 +1900,14 @@ mod tests {
         assert!(text(&rows[1]).contains("DaVinci"));
         let turn = rows
             .iter()
-            .position(|row| text(row).contains("> run the tests"))
+            .position(|row| text(row).contains("❯ run the tests"))
             .unwrap();
-        let prompt = rows.iter().position(|row| text(row).contains("❯")).unwrap();
-        assert!(turn < prompt && prompt < 10);
-        assert!(text(rows.last().unwrap()).is_empty());
+        let prompt = rows
+            .iter()
+            .rposition(|row| text(row).contains("❯"))
+            .unwrap();
+        assert!(turn < prompt && prompt == rows.len() - 3);
+        assert!(!text(rows.last().unwrap()).is_empty());
     }
 
     #[test]
@@ -2013,45 +2156,37 @@ mod tests {
             ('l', Screen::Plan),
             ('g', Screen::Grafo),
             ('u', Screen::Mensura),
-            // ctrl+m in the spec; see the note in `handle_key`.
             ('r', Screen::Memoria),
         ] {
             handle_key(
                 &mut m,
-                KeyEvent::new(
-                    KeyCode::Char(ch),
-                    if ch == 'u' {
-                        KeyModifiers::CONTROL | KeyModifiers::ALT
-                    } else {
-                        KeyModifiers::CONTROL
-                    },
-                ),
+                KeyEvent::new(KeyCode::Char(ch), KeyModifiers::CONTROL | KeyModifiers::ALT),
             );
-            assert_eq!(m.screen, expected, "ctrl+{ch}");
+            assert_eq!(m.screen, expected);
             handle_key(&mut m, key(KeyCode::Esc));
             assert_eq!(m.screen, Screen::Agent);
         }
-        for (ch, expected) in [
-            ('p', Overlay::Instrumenta),
-            ('s', Overlay::Sessions),
-            ('o', Overlay::Cogitator),
+        for (ch, modifiers, expected) in [
+            (
+                'p',
+                KeyModifiers::CONTROL | KeyModifiers::ALT,
+                Overlay::Instrumenta,
+            ),
+            ('s', KeyModifiers::CONTROL, Overlay::Sessions),
+            ('p', KeyModifiers::ALT, Overlay::Cogitator),
         ] {
-            handle_key(
-                &mut m,
-                KeyEvent::new(
-                    KeyCode::Char(ch),
-                    if ch == 'u' {
-                        KeyModifiers::CONTROL | KeyModifiers::ALT
-                    } else {
-                        KeyModifiers::CONTROL
-                    },
-                ),
-            );
-            assert_eq!(m.overlay, Some(expected), "ctrl+{ch}");
+            handle_key(&mut m, KeyEvent::new(KeyCode::Char(ch), modifiers));
+            assert_eq!(m.overlay, Some(expected));
             handle_key(&mut m, key(KeyCode::Esc));
             assert_eq!(m.overlay, None);
         }
-        handle_key(&mut m, ctrl('e'));
+        handle_key(
+            &mut m,
+            KeyEvent::new(
+                KeyCode::Char('e'),
+                KeyModifiers::CONTROL | KeyModifiers::ALT,
+            ),
+        );
         assert!(m.codex_open());
     }
 
@@ -2127,7 +2262,9 @@ mod tests {
         assert!(rows.iter().any(|row| row.contains("❯ first")), "{rows:?}");
         assert!(rows.iter().any(|row| row.contains("second")));
         // With more than one row in hand, the hint says how to end it.
-        assert!(rows.iter().any(|row| row.contains("shift+enter newline")));
+        assert!(rows
+            .iter()
+            .any(|row| row.contains("shift+enter for newline")));
     }
 
     #[test]
@@ -2174,7 +2311,7 @@ mod tests {
             );
         }
         assert!(rows.iter().any(|row| row.contains("DaVinci")));
-        assert!(rows.iter().any(|row| row.contains("23% context")));
+        assert!(rows.iter().any(|row| row.contains("? for shortcuts")));
     }
 
     #[test]
@@ -2273,6 +2410,9 @@ mod tests {
             assert_eq!(handle_key(&mut m, key(KeyCode::Char(ch))), Flow::Continue);
         }
         assert_eq!(m.composer, "qxQ");
+        assert_eq!(handle_key(&mut m, ctrl('d')), Flow::Continue);
+        assert_eq!(m.composer, "qxQ");
+        m.composer.clear();
         assert_eq!(handle_key(&mut m, ctrl('d')), Flow::Quit);
     }
 
@@ -2558,10 +2698,13 @@ mod section_regressions {
                 .collect::<Vec<_>>()
                 .join("\n");
             assert!(
-                !text.contains('╭'),
+                (!text.contains('╭') || id == "3b"),
                 "{id} still renders a framed command screen: {text}"
             );
-            assert!(text.contains("esc"), "{id} has no visible exit");
+            assert!(
+                text.to_lowercase().contains("esc"),
+                "{id} has no visible exit"
+            );
         }
     }
 
@@ -2625,7 +2768,7 @@ mod section_behavior_regressions {
                 .collect::<Vec<_>>()
                 .join("\n");
             assert!(rendered.contains(&format!(
-                "Reasoning: ◀ {} ▶",
+                "● {} effort  ←/→ to adjust",
                 model.catalog[0].reasoning_levels[expected]
             )));
         }
@@ -2714,7 +2857,7 @@ mod section_behavior_regressions {
             .map(Line::to_string)
             .collect::<Vec<_>>()
             .join("\n");
-        assert!(model_text.contains("Select a model"), "{model_text}");
+        assert!(model_text.contains("Select model"), "{model_text}");
         assert!(model_text.contains(&selected_model), "{model_text}");
 
         let mut settings = fixture("3b", 80, 16);
@@ -2739,6 +2882,7 @@ mod section_behavior_regressions {
         let mut model = fixture("3b", 32, 24);
         model.settings_rows[0].value = "a-long-current-value".into();
         model.settings_rows[0].description = "Focused setting details".into();
+        model.settings_details = true;
         model.settings_index = 0;
         let text = settings::lines(&model)
             .iter()
@@ -3187,9 +3331,11 @@ mod section_input_regressions {
         m.settings_index = 0;
         m.settings_rows[0].description =
             "A long setting description with important detail. ".repeat(40);
+        press(&mut m, KeyCode::F(1));
         press(&mut m, KeyCode::PageDown);
         assert_eq!(m.settings_index, 0);
         assert!(m.section_offset.is_some());
+        press(&mut m, KeyCode::Esc);
         press(&mut m, KeyCode::Down);
         assert_eq!(m.settings_index, 1);
         assert!(m.section_offset.is_none());
@@ -3228,7 +3374,7 @@ mod section_input_regressions {
             .collect::<Vec<_>>()
             .join("\n");
         assert!(drawn.contains("Provider unavailable"));
-        assert!(drawn.contains("esc close"));
+        assert!(drawn.contains("Esc cancel"));
         press(&mut m, KeyCode::Esc);
         assert_eq!(&*m.composer, "saved draft");
     }

@@ -1,10 +1,9 @@
 //! The transcript is the interface (design.md §1). No bubbles, no timestamps,
-//! user turns have a quiet background, replies start with a bullet, and tool
+//! user turns retain the prompt glyph, replies start with a bullet, and tool
 //! results hang from an indented elbow. Prose keeps a readable measure.
 //!
 //! Mirrors `docs/ui/davinci_tui/lib/davinci/views/transcript.ex`.
 
-use ratatui::style::Style;
 use ratatui::text::Line;
 
 use super::{markdown, studio};
@@ -61,16 +60,15 @@ fn entry_lines(model: &Model, entry: &Entry, width: u16) -> Vec<Line<'static>> {
         Entry::Gap => vec![blank()],
 
         Entry::User(text) => {
-            crate::wrap_text_with_ansi(text, width.saturating_sub(4).max(1) as usize)
+            crate::wrap_text_with_ansi(text, width.saturating_sub(2).max(1) as usize)
                 .into_iter()
                 .enumerate()
                 .map(|(row, text)| {
-                    let prompt = if row == 0 { "> " } else { "  " };
+                    let prompt = if row == 0 { "❯ " } else { "  " };
                     Line::from(truncate_run(
-                        vec![span(format!(" {prompt}{text} "), th.text)],
+                        vec![span(format!("{prompt}{text}"), th.text)],
                         width,
                     ))
-                    .style(Style::default().bg(th.surface))
                 })
                 .collect()
         }
@@ -499,8 +497,8 @@ mod tests {
         let m = model(100);
         let rows = lines(&m, &[Entry::user("run the tests")], 100);
         assert_eq!(rows.len(), 1);
-        assert_eq!(text(&rows[0]), " > run the tests ");
-        assert_eq!(rows[0].style.bg, Some(m.theme.surface));
+        assert_eq!(text(&rows[0]), "❯ run the tests");
+        assert!(rows[0].style.bg.is_none());
         assert_eq!(rows[0].spans[0].style.fg, Some(m.theme.text));
     }
 
@@ -522,7 +520,7 @@ mod tests {
             !texts.iter().any(|row| row.contains("davinci")),
             "{texts:?}"
         );
-        assert_eq!(texts[0], " > hello ");
+        assert_eq!(texts[0], "❯ hello");
         assert_eq!(texts[2], "● Hello! How can I help?");
     }
 
@@ -761,12 +759,12 @@ mod tests {
     fn screen_1b_renders_the_studio_box_and_screen_1g_collapses_it() {
         let wide = model(100);
         let drawn: Vec<String> = lines(&wide, &transcript(), 100).iter().map(text).collect();
-        assert!(drawn.iter().any(|row| row.starts_with("╭─ STUDIO ─")));
+        assert!(drawn.iter().any(|row| row.starts_with("  Tasks ·")));
 
         let narrow = model(80);
         let drawn: Vec<String> = lines(&narrow, &transcript(), 80).iter().map(text).collect();
         assert!(!drawn.iter().any(|row| row.contains("STUDIO")));
-        assert!(drawn.iter().any(|row| row.contains("studying")));
+        assert!(drawn.iter().any(|row| row.contains("Tasks ·")));
     }
 
     #[test]
@@ -791,7 +789,9 @@ mod tests {
             .map(text)
             .filter(|row| row.contains('╭') || row.contains('╰'))
             .collect();
-        assert_eq!(boxed.len(), 2, "only Studio is boxed: {boxed:?}");
-        assert!(boxed[0].contains("STUDIO"));
+        assert!(
+            boxed.is_empty(),
+            "task checklists must not box the conversation: {boxed:?}"
+        );
     }
 }

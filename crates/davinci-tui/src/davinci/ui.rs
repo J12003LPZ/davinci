@@ -1309,7 +1309,7 @@ pub fn focused_row(rows: &[Line<'_>]) -> Option<usize> {
     rows.iter().position(|row| {
         row.spans
             .iter()
-            .any(|s| s.content.as_ref() == SELECTION_BAR)
+            .any(|s| s.content.as_ref() == SELECTION_BAR || s.content.trim() == "❯")
     })
 }
 

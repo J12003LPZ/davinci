@@ -1976,7 +1976,7 @@ mod tests {
             "pi 0.84.4",
             vec!["google/gemini".into(), "anthropic/sonnet".into()],
         );
-        assert_eq!(session.handle_bytes("\x10"), SessionAction::CycleModel);
+        assert_eq!(session.handle_bytes("\x1b\x0e"), SessionAction::CycleModel);
         assert_eq!(session.current_model(), Some("anthropic/sonnet"));
         assert_eq!(
             session.handle_bytes("\x1b[Z"),
@@ -1993,7 +1993,7 @@ mod tests {
             SessionAction::ToggleHideThinking
         );
         assert!(session.chrome.transcript.hide_thinking_block);
-        assert_eq!(session.handle_bytes("\x0c"), SessionAction::OpenModel);
+        assert_eq!(session.handle_bytes("\x1bp"), SessionAction::OpenModel);
         session.close_overlays();
         session.chrome.tool_cards.push(crate::ToolCard::start(
             "bash",
@@ -2450,7 +2450,7 @@ mod tests {
             SessionAction::CustomEditorInput("\x1b[D".into())
         );
         assert_eq!(session.handle_bytes("\x03"), SessionAction::Quit);
-        assert_eq!(session.handle_bytes("\x0c"), SessionAction::OpenModel);
+        assert_eq!(session.handle_bytes("\x1bp"), SessionAction::OpenModel);
     }
 
     #[test]

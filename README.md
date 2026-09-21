@@ -7,6 +7,8 @@
 
 **DaVinci is a native Rust AI coding-agent harness for the terminal.**
 
+> **Terminal rebuild branch:** see the [implementation and review guide](docs/ui/terminal-rebuild.md) for the new shell, settings/model selectors, optional graph input, rendered previews and verification limitations.
+
 It combines an interactive coding assistant, multi-provider model runtime, permission system, persistent sessions, engineering intelligence, multi-agent orchestration, deterministic verification, security analysis, memory and learning, MCP, extensions, and optional local voice input in one CLI.
 
 DaVinci began as a Rust-compatible rewrite of the TypeScript [pi](https://github.com/earendil-works/pi) coding agent and has grown into a larger native harness. The pinned TypeScript source under [vendor/davinci](vendor/davinci) remains a behavioral compatibility reference. The active product is the Rust workspace in this repository.

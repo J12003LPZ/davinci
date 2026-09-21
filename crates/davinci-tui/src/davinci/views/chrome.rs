@@ -132,34 +132,27 @@ fn conversation_status(model: &Model) -> Line<'static> {
     } else {
         vec![span(format!("  {}", model.permission_label()), th.primary)]
     };
-    if model.width >= 72 && !model.branch.is_empty() {
-        left.push(span(format!(" · {}", model.branch), th.muted));
+    if model.width >= 40 {
+        left.push(span(" · ? for shortcuts", th.muted));
     }
-    let (files, adds, dels) = model.changes;
-    if files > 0 && model.width >= 100 {
-        left.push(span(format!(" · {files} files "), th.muted));
-        left.push(span(format!("+{adds}"), th.success));
-        left.push(span(format!(" -{dels}"), th.error));
+    if model.exit_armed {
+        left.push(span(" · ctrl+c again to exit", th.warning));
+    } else if !model.voice.notice.is_empty() {
+        left.push(span(format!(" · {}", model.voice.notice), th.muted));
+    } else if model.composer.contains('\n') && model.width >= 80 {
+        left.push(span(" · shift+enter for newline", th.muted));
     }
     if let Some(jobs) = jobs_note(model) {
         left.push(span(format!(" · {jobs}"), th.muted));
     }
-    let mut right = Vec::new();
-    if model.context.1 > 0 && model.width >= 48 {
-        right.push(span(
-            format!("{}% context", (model.context_fraction() * 100.0) as u32),
-            th.muted,
-        ));
-    }
-    if model.width >= 72 {
-        if !right.is_empty() {
-            right.push(span(" · ", th.muted));
-        }
-        right.push(span(
-            format!("thinking {} ", model.thinking_level),
-            th.secondary,
-        ));
-    }
+    let right = if model.context_fraction() >= 0.8 && model.width >= 80 {
+        vec![span(
+            format!("{}% context ", (model.context_fraction() * 100.0) as u32),
+            th.warning,
+        )]
+    } else {
+        Vec::new()
+    };
     spread(model.width, left, right)
 }
 
@@ -370,7 +363,7 @@ fn status_right(model: &Model) -> Vec<Span<'static>> {
             span(th.pie(fraction), th.primary),
             span(format!(" {percent}%"), th.muted),
             span(" · ", th.border),
-            span("ctrl+p commands", th.muted),
+            span("ctrl+alt+p commands", th.muted),
         ];
     }
 
@@ -426,7 +419,7 @@ pub fn composer(model: &Model, lines: Option<&[String]>, hint: Hint) -> Vec<Line
     let entries: Vec<String> =
         owned.unwrap_or_else(|| model.composer.split('\n').map(str::to_string).collect());
     let last = entries.len().saturating_sub(1);
-    let overlaid = model.overlay.is_some();
+    let overlaid = !model.composer_owns_focus();
     let border = th.border;
     // An empty composer carries no placeholder prose — the prompt glyph and
     // the caret are the whole invitation, as in every terminal agent. An open
@@ -510,7 +503,7 @@ pub fn composer(model: &Model, lines: Option<&[String]>, hint: Hint) -> Vec<Line
         if index == caret_row && !overlaid && !caret_here {
             row.push(Span::styled(" ", caret_style));
         }
-        let mut run = vec![pad(2.min(model.width), None)];
+        let mut run = Vec::new();
         run.extend(row);
         rows.push(Line::from(crate::davinci::ui::truncate_run(
             run,
@@ -850,14 +843,14 @@ fn hint_line(model: &Model, hint: Hint, rows_typed: usize) -> Line<'static> {
                     binding
                 };
                 if model.width >= 72 {
-                    format!("  /help for shortcuts · ctrl+p commands · {binding} mode")
+                    format!("  /help for shortcuts · ctrl+alt+p commands · {binding} mode")
                 } else if model.width >= 40 {
                     format!("  /help · {binding} mode")
                 } else {
                     format!("{binding} mode")
                 }
             }
-            None => "  /help for shortcuts · ctrl+p commands".into(),
+            None => "  /help for shortcuts · ctrl+alt+p commands".into(),
         };
         return spread(
             model.width,
@@ -1041,10 +1034,10 @@ mod tests {
         let rows = suggestions(&m);
         let drawn = rows.iter().map(text).collect::<Vec<_>>().join("\n");
         for label in [
-            "Select a model",
+            "Select model",
             "OpenAI Codex",
             "gpt-6-astra",
-            "Balanced performance for most tasks",
+            "gpt-5.6-luna",
         ] {
             assert!(drawn.contains(label), "{label}: {drawn}");
         }
@@ -1153,17 +1146,20 @@ mod tests {
 
     #[test]
     fn conversation_status_names_permissions_and_context_usage() {
-        let drawn = text(&status(&model(100)));
-        assert!(drawn.starts_with("  Manual"), "{drawn}");
-        assert!(drawn.contains("23% context"), "{drawn}");
-        assert!(drawn.contains("thinking "), "{drawn}");
+        let mut m = model(100);
+        let drawn = text(&status(&m));
+        assert!(drawn.starts_with("  Manual"));
+        assert!(drawn.contains("? for shortcuts"));
+        assert!(!drawn.contains("23% context"));
+        m.context = (180_000, 200_000);
+        assert!(text(&status(&m)).contains("90% context"));
     }
 
     #[test]
     fn a_narrow_status_bar_keeps_permissions_and_labels_the_percentage() {
         for width in [72u16, 90] {
             let drawn = text(&status(&model(width)));
-            assert!(drawn.contains("23% context"), "{drawn}");
+            assert!(drawn.contains("? for shortcuts"), "{drawn}");
             assert!(drawn.contains("Manual"), "{drawn}");
         }
     }
@@ -1171,7 +1167,7 @@ mod tests {
     #[test]
     fn the_status_bar_left_names_the_screen_in_hand() {
         let mut m = model(120);
-        assert!(text(&status(&m)).starts_with("  Manual · main · 3 files +42 -11"));
+        assert!(text(&status(&m)).starts_with("  Manual · ? for shortcuts"));
         m.toggle_screen(Screen::Grafo);
         let drawn = text(&status(&m));
         assert!(drawn.contains("Code graph"), "{drawn}");
@@ -1194,7 +1190,7 @@ mod tests {
             !prompt_row.contains("…"),
             "an empty composer carries no placeholder prose: {prompt_row}"
         );
-        assert!(text(&rows[3]).contains("/help for shortcuts · ctrl+p commands"));
+        assert!(text(&rows[3]).contains("/help for shortcuts · ctrl+alt+p commands"));
         assert!(text(&rows[3])
             .trim_end()
             .ends_with("shift+enter for newline"));
@@ -1320,7 +1316,7 @@ mod tests {
             }
             column += UnicodeWidthStr::width(span.content.as_ref());
         }
-        caret.map(|at| at.saturating_sub(4))
+        caret.map(|at| at.saturating_sub(2))
     }
 
     #[test]

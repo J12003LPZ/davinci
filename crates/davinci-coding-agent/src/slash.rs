@@ -17,6 +17,7 @@ pub fn builtin_slash_commands() -> Vec<SlashCommand> {
             Some("[focus]"),
         ),
         ("settings", "Open settings menu", None),
+        ("config", "Open configuration (alias for /settings)", None),
         (
             "model",
             "Select model (opens selector UI)",
@@ -92,7 +93,7 @@ pub fn builtin_slash_commands() -> Vec<SlashCommand> {
             Some("[diff|fork|rewind|explain|dry-run|verify|budget|export]"),
         ),
         ("help", "Show all commands and shortcuts", None),
-        ("quit", "Quit pi", None),
+        ("quit", "Quit DaVinci", None),
     ]
     .into_iter()
     .map(|(name, description, hint)| SlashCommand {
@@ -211,7 +212,7 @@ pub fn parse_line(line: &str) -> SlashAction {
         "reload" => SlashAction::Reload,
         "import" => SlashAction::Import(args.to_string()),
         "share" => SlashAction::Share,
-        "settings" => SlashAction::Settings,
+        "settings" | "config" => SlashAction::Settings,
         "hotkeys" => SlashAction::Hotkeys,
         "session" if args == "info" || args == "stats" => SlashAction::SessionInfo,
         "session" => SlashAction::Resume,
@@ -404,5 +405,17 @@ mod tests {
             SlashAction::Prompt("/graph run security-audit".into())
         );
         assert_eq!(parse_line("/graph"), SlashAction::Prompt("/graph".into()));
+    }
+    #[test]
+    fn terminal_config_alias_opens_the_existing_settings_without_new_storage() {
+        assert_eq!(parse_line("/config"), SlashAction::Settings);
+        assert_eq!(parse_line("/settings"), SlashAction::Settings);
+        assert_eq!(
+            builtin_slash_commands()
+                .iter()
+                .filter(|c| c.name == "config")
+                .count(),
+            1
+        );
     }
 }

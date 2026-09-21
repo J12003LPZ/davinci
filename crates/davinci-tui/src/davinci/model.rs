@@ -1128,6 +1128,8 @@ pub struct ExportLedger {
 /// Presentation state survives snapshot refreshes without owning execution state.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GraphCanvasState {
+    /// Keyboard focus is independent from the running worker and selected node.
+    pub input_focus: bool,
     pub follow_live: bool,
     pub view_mode: GraphViewMode,
     pub pan_x: i32,
@@ -1144,6 +1146,7 @@ pub struct GraphCanvasState {
 impl Default for GraphCanvasState {
     fn default() -> Self {
         Self {
+            input_focus: false,
             follow_live: true,
             view_mode: GraphViewMode::Overview,
             pan_x: 0,
@@ -1167,6 +1170,11 @@ pub enum GraphViewMode {
 #[derive(Debug, Clone, Default)]
 pub struct GraphTask {
     pub id: String,
+    /// User-facing task description supplied by the actual graph snapshot.
+    pub title: String,
+    /// Optional execution facts. Missing values must never be invented.
+    pub branch: Option<String>,
+    pub worktree: Option<String>,
     pub status: String,
     pub phase: String,
     pub artifact_file: Option<String>,
@@ -1181,6 +1189,30 @@ pub struct GraphTask {
     pub error: Option<String>,
     pub recent_tools: Vec<String>,
     pub public_contract: Option<String>,
+}
+
+impl GraphTask {
+    pub fn display_title(&self) -> &str {
+        if self.title.trim().is_empty() {
+            &self.id
+        } else {
+            &self.title
+        }
+    }
+    pub fn state_label(&self) -> &str {
+        match self.status.as_str() {
+            "cancelled" => "Cancelled",
+            "ready" => "Ready",
+            _ => match self.state {
+                State::Active => "Working",
+                State::Done => "Done",
+                State::Failed => "Failed",
+                State::Attention => "Blocked",
+                State::Skipped => "Skipped",
+                _ => "Waiting",
+            },
+        }
+    }
 }
 
 /// A task running as a graph of isolated workers (`5a`).
@@ -1717,6 +1749,7 @@ pub struct Model {
     pub cwd: String,
     pub branch: String,
     pub model_name: String,
+    pub active_provider: String,
     /// Active thinking/reasoning level for the model in hand (`off`, `high`, ...).
     pub thinking_level: String,
     /// The runtime-confirmed permission mode (`ask`, `edits`, `read-only`,
@@ -1787,10 +1820,15 @@ pub struct Model {
     pub catalog: Vec<CatalogRow>,
     pub catalog_index: usize,
     pub catalog_query: String,
+    pub catalog_session_only: bool,
+    pub catalog_search: bool,
     /// `3b` — the settings sheet.
     pub settings_rows: Vec<SettingRow>,
     pub settings_index: usize,
     pub settings_query: String,
+    pub settings_details: bool,
+    pub settings_tab: usize,
+    pub settings_focus: super::views::settings::Focus,
     /// `3c` — the thinking sheet.
     pub thinking_rows: Vec<ThinkingRow>,
     pub thinking_index: usize,
@@ -1898,6 +1936,7 @@ impl Model {
             cwd: String::new(),
             branch: String::new(),
             model_name: String::new(),
+            active_provider: String::new(),
             thinking_level: "off".into(),
             permission_mode: "ask".into(),
             show_tool_output: false,
@@ -1933,9 +1972,14 @@ impl Model {
             catalog: Vec::new(),
             catalog_index: 0,
             catalog_query: String::new(),
+            catalog_session_only: false,
+            catalog_search: false,
             settings_rows: Vec::new(),
             settings_index: 0,
             settings_query: String::new(),
+            settings_details: false,
+            settings_tab: 1,
+            settings_focus: super::views::settings::Focus::Search,
             thinking_rows: Vec::new(),
             thinking_index: 0,
             providers: Vec::new(),
@@ -2202,9 +2246,39 @@ impl Model {
             }
             return;
         }
-        if (self.screen != Screen::Agent || self.overlay.is_some() || self.codex_open())
-            && self.overlay != Some(Overlay::Instrumenta)
-        {
+        // Selectors own their search input independently of the conversation.
+        // Bracketed paste must not silently replace a preserved chat draft.
+        if self.overlay.is_none() && !self.codex_open() {
+            let search = text.split_whitespace().collect::<Vec<_>>().join(" ");
+            if self.screen == Screen::Settings
+                && self.settings_tab == 1
+                && self.settings_focus == super::views::settings::Focus::Search
+                && !self.settings_details
+            {
+                self.settings_query.push_str(&search);
+                let indices = super::views::settings::visible_indices(self);
+                if !indices.contains(&self.settings_index) {
+                    if let Some(first) = indices.first() {
+                        self.settings_index = *first;
+                    }
+                }
+                self.section_offset = None;
+                return;
+            }
+            if self.screen == Screen::Models {
+                self.catalog_search = true;
+                self.catalog_query.push_str(&search);
+                let indices = super::views::cogitator::visible_indices(self);
+                if !indices.contains(&self.catalog_index) {
+                    if let Some(first) = indices.first() {
+                        self.catalog_index = *first;
+                    }
+                }
+                self.section_offset = None;
+                return;
+            }
+        }
+        if !self.composer_owns_focus() && self.overlay != Some(Overlay::Instrumenta) {
             return;
         }
         let text = text.replace("\r\n", "\n").replace('\r', "\n");
@@ -2232,8 +2306,17 @@ impl Model {
     /// it. Slash names and their arguments are matched in memory; only an `@`
     /// token reaches the disk, which is what keeps this cheap enough to run on
     /// each keystroke.
+    /// This same predicate controls editor routing, completions and the caret.
+    /// A graph may be visible without receiving any of the user's text.
+    pub fn composer_owns_focus(&self) -> bool {
+        self.overlay.is_none()
+            && !self.codex_open()
+            && (self.screen == Screen::Agent
+                || (self.screen == Screen::GraphRun && self.graph_canvas.input_focus))
+    }
+
     pub fn refresh_suggestions(&mut self) {
-        if self.overlay.is_some() || self.screen != Screen::Agent || self.codex_open() {
+        if !self.composer_owns_focus() {
             self.suggestions = None;
             self.suggestion_index = 0;
             return;
@@ -2517,6 +2600,7 @@ impl Model {
 
     /// esc closes the instrument in hand and returns to the transcript.
     pub fn close(&mut self) {
+        self.graph_canvas.input_focus = false;
         self.section_offset = None;
         self.overlay_offset = None;
         self.section_notice = None;

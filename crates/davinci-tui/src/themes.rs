@@ -302,7 +302,15 @@ pub fn builtin_themes() -> Vec<Theme> {
             }),
         },
         Theme {
+            // Existing shipped preset names upgrade without rewriting user files.
             name: "vox".into(),
+            background: "#1F1F1F".into(),
+            foreground: "#E6E6E6".into(),
+            accent: "#B1B9F9".into(),
+            palette: Some(Palette::da_vinci()),
+        },
+        Theme {
+            name: "vox-classic".into(),
             background: "#1D1516".into(),
             foreground: "#E2BE9E".into(),
             accent: "#F3D90D".into(),
@@ -359,8 +367,8 @@ mod tests {
         let themes = builtin_themes();
         assert_eq!(themes[0].name, "dark");
         let vox = themes.iter().find(|theme| theme.name == "vox").unwrap();
-        assert_eq!(vox.background, "#1D1516");
-        assert_eq!(vox.palette.as_ref().unwrap().surface, "#8D150F");
+        assert_eq!(vox.background, themes[0].background);
+        assert_eq!(vox.palette, themes[0].palette);
         assert!(crate::first_time::THEME_OPTIONS
             .iter()
             .any(|(name, _)| *name == "vox"));

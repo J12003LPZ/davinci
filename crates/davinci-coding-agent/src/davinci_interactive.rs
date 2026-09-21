@@ -2238,6 +2238,12 @@ fn run_extension_command(shell: &mut Shell<'_>, line: &str) -> Option<Next> {
     run_extension_command_inner(shell, line, true)
 }
 
+/// Starting or resuming work is not a request to replace the conversation.
+fn graph_command_opens_view(name: &str, args: &str) -> bool {
+    matches!(name, "graph-status" | "graph-view")
+        || (name == "graph" && !graph_setup::is_launch(args))
+}
+
 fn run_extension_command_inner(shell: &mut Shell<'_>, line: &str, setup: bool) -> Option<Next> {
     let (name, args) = crate::parse_extension_command(line);
     if name.is_empty() {
@@ -2352,12 +2358,16 @@ fn run_extension_command_inner(shell: &mut Shell<'_>, line: &str, setup: bool) -
             "graph" | "graph-status" | "graph-view" => match graph_sheet(&value) {
                 Some(sheet) => {
                     graph_feedback::refresh(shell.model, sheet);
-                    open_sheet(shell.model, Screen::GraphRun);
+                    if graph_command_opens_view(&name, &args) {
+                        open_sheet(shell.model, Screen::GraphRun);
+                    }
                 }
                 // `graph-view` answers with a worker transcript, not the run;
                 // the sheet is still the place to watch it from.
                 None if refresh_graph_sheet(shell.model, shell.host) => {
-                    open_sheet(shell.model, Screen::GraphRun);
+                    if graph_command_opens_view(&name, &args) {
+                        open_sheet(shell.model, Screen::GraphRun);
+                    }
                 }
                 None => push_command_result(shell.model, &name, &value),
             },
@@ -2367,9 +2377,7 @@ fn run_extension_command_inner(shell: &mut Shell<'_>, line: &str, setup: bool) -
             "graph-resume"
                 if value.get("started").and_then(serde_json::Value::as_bool) == Some(true) =>
             {
-                if refresh_graph_sheet(shell.model, shell.host) {
-                    open_sheet(shell.model, Screen::GraphRun);
-                } else {
+                if !refresh_graph_sheet(shell.model, shell.host) {
                     push_command_result(shell.model, &name, &value);
                 }
             }
@@ -4024,6 +4032,7 @@ fn adopt_model(parsed: &crate::args::Args, agent: &mut Agent, model: &mut Model)
         .position(|item| item.provider == agent.provider && item.id == agent.model_id)
         .unwrap_or(model.model_index);
     model.model_name = agent.model_id.clone();
+    model.active_provider = agent.provider.clone();
     model.context.1 = agent.context_window;
     sync_thinking_state(agent, model);
 }
@@ -4050,6 +4059,7 @@ pub fn run(
     dresser.request();
     crate::davinci_surfaces::dress_from_extensions(&mut model, &cwd, agent);
     model.model_name = agent.model_id.clone();
+    model.active_provider = agent.provider.clone();
     model.config_path = crate::default_agent_dir()
         .join("config.json")
         .display()
@@ -5353,6 +5363,16 @@ fn open_models_sheet(parsed: &crate::args::Args, agent: &Agent, model: &mut Mode
         .iter()
         .map(|item| format!("{}/{}", item.provider, item.id))
         .collect();
+    model.catalog_session_only = false;
+    model.catalog_search = false;
+    let prior_model = if model.screen == Screen::Models {
+        model
+            .catalog
+            .get(model.catalog_index)
+            .map(|row| (row.provider.clone(), row.id.clone()))
+    } else {
+        None
+    };
     model.catalog = snapshot
         .all
         .iter()
@@ -5413,6 +5433,15 @@ fn open_models_sheet(parsed: &crate::args::Args, agent: &Agent, model: &mut Mode
         })
         .collect();
     model.catalog_index = order_catalog(&mut model.catalog, &agent.provider, &agent.model_id);
+    if let Some((provider, id)) = prior_model {
+        if let Some(index) = model
+            .catalog
+            .iter()
+            .position(|row| row.provider == provider && row.id == id)
+        {
+            model.catalog_index = index;
+        }
+    }
     let providers: std::collections::BTreeSet<&str> = model
         .catalog
         .iter()
@@ -5470,6 +5499,18 @@ fn open_settings_sheet(agent: &Agent, model: &mut Model) {
         &crate::settings::to_interactive_config(&merged, "dark"),
     );
     apply_theme_setting(model, &merged);
+    let prior_setting = if model.screen == Screen::Settings {
+        model
+            .settings_rows
+            .get(model.settings_index)
+            .map(|row| row.key.clone())
+    } else {
+        model.settings_tab = 1;
+        model.settings_focus = davinci_tui::davinci::views::settings::Focus::Search;
+        model.settings_details = false;
+        model.settings_query.clear();
+        None
+    };
     model.settings_rows = merged_list
         .items
         .into_iter()
@@ -5498,7 +5539,9 @@ fn open_settings_sheet(agent: &Agent, model: &mut Model) {
     model
         .settings_rows
         .sort_by_key(|row| davinci_tui::davinci::views::settings::group_rank(&row.key));
-    model.settings_index = 0;
+    model.settings_index = prior_setting
+        .and_then(|key| model.settings_rows.iter().position(|row| row.key == key))
+        .unwrap_or(0);
     model.facts.settings_keys = model.settings_rows.len();
     open_sheet(model, Screen::Settings);
 }
@@ -6806,6 +6849,15 @@ fn graph_sheet(value: &serde_json::Value) -> Option<GraphRunSheet> {
                 })
                 .unwrap_or_default();
             GraphTask {
+                title: graph_public_text(&focus),
+                branch: task
+                    .get("branch")
+                    .and_then(serde_json::Value::as_str)
+                    .map(graph_public_text),
+                worktree: task
+                    .get("worktree")
+                    .and_then(serde_json::Value::as_str)
+                    .map(graph_public_text),
                 id,
                 policy: policy_of_role(&role).into(),
                 artifact: graph_public_text(&artifact),
@@ -8009,6 +8061,7 @@ fn on_choice(shell: &mut Shell<'_>, choice: Choice) -> Next {
                 ));
                 return Next::Go;
             }
+            let session_only = shell.model.catalog_session_only;
             shell.model.close();
             shell.agent.provider = row.provider.clone();
             shell.agent.model_id = row.id.clone();
@@ -8033,12 +8086,19 @@ fn on_choice(shell: &mut Shell<'_>, choice: Choice) -> Next {
                 );
                 sync_thinking_state(shell.agent, shell.model);
             }
-            match persist_model_choice(shell.agent) {
-                Ok(()) => shell.say(&format!("model {} / {}", row.provider, row.id)),
-                Err(err) => shell.say(&format!(
-                    "model {} / {} · this run only ({err})",
+            if session_only {
+                shell.say(&format!(
+                    "model {} / {} · this session only",
                     row.provider, row.id
-                )),
+                ));
+            } else {
+                match persist_model_choice(shell.agent) {
+                    Ok(()) => shell.say(&format!("model {} / {}", row.provider, row.id)),
+                    Err(err) => shell.say(&format!(
+                        "model {} / {} · this run only ({err})",
+                        row.provider, row.id
+                    )),
+                }
             }
             refresh_thinking_sheet(shell.agent, shell.model);
             Next::Go
@@ -9284,6 +9344,7 @@ fn refresh_context(model: &mut Model, agent: &Agent) {
         agent.context_window,
     );
     model.model_name = agent.model_id.clone();
+    model.active_provider = agent.provider.clone();
 }
 
 #[cfg(test)]
@@ -12622,5 +12683,21 @@ mod tests {
         assert_eq!(modal.irreversible_effects[0].operation_id, "op-1");
         assert!(modal.irreversible_effects[0].details.contains("[REDACTED]"));
         assert!(!modal.irreversible_effects[0].details.contains("secret123"));
+    }
+}
+
+#[cfg(test)]
+mod terminal_rebuild_host_contracts {
+    use super::*;
+    #[test]
+    fn starting_a_graph_does_not_force_the_canvas_open() {
+        assert!(!graph_command_opens_view(
+            "graph",
+            "Inspect the parser and implement recovery"
+        ));
+        assert!(!graph_command_opens_view("graph", "run saved-example"));
+        assert!(graph_command_opens_view("graph-status", ""));
+        assert!(graph_command_opens_view("graph-view", ""));
+        assert!(!graph_command_opens_view("model", ""));
     }
 }
