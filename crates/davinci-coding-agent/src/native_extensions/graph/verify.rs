@@ -338,6 +338,12 @@ pub fn run_verification_with_progress(
                 started_at: super::store::now_ms(),
             }),
         });
+        // The progress callback persists the impending command. A failed
+        // checkpoint cancels execution before the command can have effects.
+        if abort.load(Ordering::Relaxed) {
+            interrupted = true;
+            break;
+        }
         let remaining =
             root_deadline.map(|deadline| deadline.saturating_duration_since(Instant::now()));
         if remaining == Some(Duration::ZERO) {
@@ -482,6 +488,21 @@ mod tests {
     use super::*;
     use crate::native_extensions::graph::types::{PlanStep, PlanTest};
 
+    #[test]
+    fn abort_from_progress_prevents_command_dispatch() {
+        let abort = Arc::new(AtomicBool::new(false));
+        let result = run_verification_with_progress(
+            &[spec("fixture", "fixture")],
+            Path::new("."),
+            &abort,
+            0,
+            None,
+            &|_, _, _, _| panic!("command dispatched after progress aborted"),
+            |_| abort.store(true, Ordering::SeqCst),
+        );
+        assert!(!result.passed);
+        assert!(result.commands.is_empty());
+    }
     fn plan(tests_to_run: Vec<&str>) -> ImplementationPlan {
         ImplementationPlan {
             steps: vec![PlanStep {

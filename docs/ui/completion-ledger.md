@@ -8,7 +8,8 @@ Binding scope: approved parity specification plus the user's 2026-09-21 continua
 - Branch: `J12003LPZ/claude-parity-graph-completion`.
 - Worktree: `C:/Users/sergi/Desktop/davinci-parity-completion`.
 - Starting commit: `cb7c7f479a2156f29d6f6e8c0c99bec0d9473952`, fetched rebuild branch, clean before recovery.
-- Current task: recover checksum-pinned UI source, validate it, publish a draft checkpoint; then audit graph recovery and reference coverage.
+- Current task: fail-closed controller checkpoint persistence, followed by durable recovery and reference coverage.
+- UI recovery published as `6b6fc73`, draft PR [#29](https://github.com/J12003LPZ/davinci/pull/29). Graph verification recovery committed as `5e8dfcc`.
 - Completion: NOT established. No native visual parity or complete graph recovery claim.
 
 ## State inventory, verified 2026-09-21
@@ -56,9 +57,27 @@ Checkpoint review: recovered source was reviewed by the implementation author, p
 
 ## Open gates and next action
 
-1. Finish recovered UI tests and inspect final source diff; commit/push ordinary source, remove active dependence on CI patch application.
+1. UI recovery checkpoint published; graph verification recovery validated locally. Continue controller persistence and recovery repairs.
 2. Obtain genuine 2.1.278 reference, all current surfaces/nested states, full viewport/theme/renderer matrix, cell/style comparison and interaction traces. Candidate snapshots alone cannot pass.
 3. Trace actual graph dispatch/artifact/verification/review/checkpoint controls and implement missing durable sessions, receipts, ownership, resume invariants with offline failure injection.
 4. Validate host input/background execution, process supervision/isolation/cleanup, no competing writers, and graph stop/resume against disposable fixtures.
 5. Run required exact-revision Linux/Windows Rust and native gates; native Windows Terminal/IME/human comparison remains unverified.
 6. Publish branch/commit and draft PR with exact results; keep draft until all gates pass. Do not merge, install or restart user's harness or touch real saved graphs.
+
+## Graph verification recovery checkpoint
+
+Recovered both graph patches as ordinary source after verifying their pinned Git-object SHA256 values. Reproduced Cargo rejecting `cargo fmt --check --offline`; corrected `cargo --offline fmt --check` exits successfully. Focused verification tests: 21 passed. Entire graph library suite: 371 passed, five ignored native fixtures. Central shell policy suite: 15 passed. Formatting and workflow YAML parse passed. Graph CI now verifies committed source and does not apply or publish patches. Author diff review completed for this recovery.
+
+## Native reference capture progress
+
+Disposable Windows ConPTY at 120x40 reached the real 2.1.278 Settings and model picker. Evidence under the external evidence directory `reference/native-captures`. The startup capture is an API-key approval dialog and the attempted help capture is Rewind; neither is valid welcome/help evidence. Renderer classification, complete navigation traces, Windows Terminal font/IME, other viewports/themes and visual parity remain unverified. Only a disposable fixture profile/project was used; no installed harness was changed.
+
+Controller audit found ignored checkpoint writes and fresh-state reconstruction on resume. These remain open; passing existing graph tests does not establish recovery correctness.
+
+## Controller checkpoint hardening
+
+New failure injection reproduced two worker dispatches despite initial storage failure. The regression now covers initial creation, the pre-dispatch checkpoint, and a save immediately after a worker returns. A latched persistence error stops dispatch/verification, keeps the returned run blocked, reports the stopped state as not saved, and prevents subsequent implicit checkpoint retries. The last durable snapshot remains available.
+
+Separate regression reproduced verification dispatch after the progress callback cancelled execution. Verification now checks cancellation after that callback. Two storage regressions reproduced the multi-rename fallback and premature state publication before companion writes. Storage now flushes the new file, uses one replacement, and publishes self-contained state last. Unix directory sync is included; power-loss behavior and exact-revision Linux execution are not yet validated.
+
+Final local validation: graph suite 375 passed, five native fixtures ignored; host library/test clippy passed with warnings denied; formatting and diff whitespace passed. Existing atomic replacement and native Windows run round-trip tests passed in the graph suite. Author review completed. This milestone does not yet fix ignored artifact/sidecar errors, full resume state, worker conversations, ownership or the complete visual parity matrix.

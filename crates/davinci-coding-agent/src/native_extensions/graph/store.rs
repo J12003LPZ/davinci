@@ -190,8 +190,8 @@ fn prune_finished_runs(cwd: &Path) {
 }
 
 /// Publish `content` at `path` without ever leaving a half-written file there.
-/// Windows will not replace an existing file through `rename`, so the previous
-/// snapshot is moved aside first and restored if the publish fails.
+/// Flush the new image before replacing the previous one in a single rename.
+/// A failed replacement must leave the previous checkpoint at its original name.
 pub fn atomic_write(path: &Path, content: &[u8]) -> std::io::Result<()> {
     atomic_write_with(path, content, |from, to| fs::rename(from, to))
 }
@@ -202,44 +202,29 @@ where
 {
     let parent = path.parent().unwrap_or(Path::new("."));
     fs::create_dir_all(parent)?;
-    let nonce = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|elapsed| elapsed.as_nanos())
-        .unwrap_or_default();
     let file_name = path
         .file_name()
         .map(|name| name.to_string_lossy().into_owned())
         .unwrap_or_else(|| "state".into());
-    let temporary = parent.join(format!(".{file_name}.{}.{nonce}.tmp", std::process::id()));
-    if let Err(error) = fs::write(&temporary, content) {
+    let temporary = parent.join(format!(".{file_name}.{}.tmp", uuid::Uuid::new_v4()));
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&temporary)?;
+    let result = (|| {
+        use std::io::Write;
+        file.write_all(content)?;
+        file.sync_all()?;
+        drop(file);
+        rename(&temporary, path)?;
+        #[cfg(unix)]
+        fs::File::open(parent)?.sync_all()?;
+        Ok(())
+    })();
+    if result.is_err() {
         let _ = fs::remove_file(&temporary);
-        return Err(error);
     }
-    match rename(&temporary, path) {
-        Ok(()) => Ok(()),
-        Err(_) if path.exists() => {
-            let backup = parent.join(format!(".{file_name}.{nonce}.bak"));
-            if let Err(error) = rename(path, &backup) {
-                let _ = fs::remove_file(&temporary);
-                return Err(error);
-            }
-            match rename(&temporary, path) {
-                Ok(()) => {
-                    let _ = fs::remove_file(&backup);
-                    Ok(())
-                }
-                Err(error) => {
-                    let _ = rename(&backup, path);
-                    let _ = fs::remove_file(&temporary);
-                    Err(error)
-                }
-            }
-        }
-        Err(error) => {
-            let _ = fs::remove_file(&temporary);
-            Err(error)
-        }
-    }
+    result
 }
 
 pub fn write_graph_definition(
@@ -262,12 +247,8 @@ pub fn load_graph_definition(cwd: &Path, run_id: &str) -> Option<super::topology
 }
 
 pub fn save_run(run: &mut GraphRun) -> std::io::Result<()> {
-    run.updated_at = now_ms();
     let cwd = PathBuf::from(&run.cwd);
     let state_path = run_dir(&cwd, &run.run_id).join("state.json");
-    let content = serde_json::to_vec_pretty(run)
-        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
-    atomic_write(&state_path, &content)?;
 
     if let Some(definition) = &run.definition {
         let graph_path = run_dir(&cwd, &run.run_id).join("graph.json");
@@ -283,6 +264,14 @@ pub fn save_run(run: &mut GraphRun) -> std::io::Result<()> {
             atomic_write(&saved_path, yaml_str.as_bytes())?;
         }
     }
+    // The self-contained run state is the commit record. Publish it only after
+    // all companion writes succeed, and retain the previous timestamp on error.
+    let mut snapshot = run.clone();
+    snapshot.updated_at = now_ms();
+    let content = serde_json::to_vec_pretty(&snapshot)
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+    atomic_write(&state_path, &content)?;
+    run.updated_at = snapshot.updated_at;
     Ok(())
 }
 
@@ -650,6 +639,53 @@ mod tests {
         run.goal = "second".into();
         save_run(&mut run).unwrap();
         assert_eq!(load_run(dir.path(), &run_id).unwrap().goal, "second");
+    }
+
+    #[test]
+    fn failed_companion_write_does_not_publish_new_run_state() {
+        let dir = tempdir().unwrap();
+        let mut run = sample_run(dir.path(), "fixture", "durable goal");
+        save_run(&mut run).unwrap();
+        let state = run_dir(dir.path(), &run.run_id).join("state.json");
+        let before = fs::read(&state).unwrap();
+        let timestamp = run.updated_at;
+        let graph = run_dir(dir.path(), &run.run_id).join("graph.json");
+        fs::create_dir(&graph).unwrap();
+        fs::write(graph.join("block"), "fixture").unwrap();
+        run.goal = "uncommitted goal".into();
+        run.definition = Some(super::super::topology::GraphDefinition {
+            graph_id: "fixture".into(),
+            version: 1,
+            mode: super::super::topology::GraphMode::Simple,
+            nodes: vec![],
+            edges: vec![],
+        });
+        assert!(save_run(&mut run).is_err());
+        assert_eq!(fs::read(state).unwrap(), before);
+        assert_eq!(run.updated_at, timestamp);
+    }
+
+    #[test]
+    fn failed_replace_never_moves_the_previous_checkpoint_aside() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("state.json");
+        fs::write(&path, b"old").unwrap();
+        let mut calls = 0;
+        let result = atomic_write_with(&path, b"new", |_, _| {
+            calls += 1;
+            assert_eq!(
+                calls, 1,
+                "a failed atomic replace must not fall back to multiple renames"
+            );
+            assert_eq!(fs::read(&path).unwrap(), b"old");
+            Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "fixture",
+            ))
+        });
+        assert!(result.is_err());
+        assert_eq!(fs::read(&path).unwrap(), b"old");
+        assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 1);
     }
 
     #[test]

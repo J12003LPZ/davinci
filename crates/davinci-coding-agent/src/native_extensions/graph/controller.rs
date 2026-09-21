@@ -229,6 +229,7 @@ pub struct GraphExecution {
     /// or a session shutdown all funnel here.
     exec_abort: Arc<AtomicBool>,
     budget_abort_reason: Mutex<Option<String>>,
+    persistence_error: Mutex<Option<String>>,
     run_deadline: Option<std::time::Instant>,
     pub active_workers: Arc<AtomicUsize>,
     pub node_aborts: Arc<Mutex<HashMap<String, Arc<AtomicBool>>>>,
@@ -280,12 +281,21 @@ impl GraphExecution {
         }
     }
 
-    fn checkpoint(&self, note: Option<&str>) {
+    fn checkpoint(&self, note: Option<&str>) -> bool {
         // Persist under the lock, but report on a clone with the guard dropped:
         // a slow `on_update` must not serialize every worker thread, and an
         // implementation that re-locks the run must not deadlock.
-        let snapshot = {
+        let (snapshot, failure) = {
             let mut run = self.run.lock().unwrap_or_else(|error| error.into_inner());
+            let mut failure = self
+                .persistence_error
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            // A failed save is terminal for this execution. Retrying implicitly
+            // could overwrite the last durable checkpoint with partial state.
+            if failure.is_some() {
+                return false;
+            }
             if matches!(run.phase, Phase::Done | Phase::Blocked | Phase::Cancelled) {
                 run.lifecycle = Some(GraphLifecycle::Stopped);
             }
@@ -301,14 +311,44 @@ impl GraphExecution {
                     gov_stats.as_ref(),
                 ),
             );
-            let _ = save_run(&mut run);
-            run.clone()
+            if let Err(error) = save_run(&mut run) {
+                let reason = format!("checkpoint persistence failed: {error}");
+                *failure = Some(reason.clone());
+                self.exec_abort.store(true, Ordering::SeqCst);
+                run.phase = Phase::Blocked;
+                run.lifecycle = Some(GraphLifecycle::Stopped);
+                run.blocked_reason = Some(reason);
+            }
+            (run.clone(), failure.clone())
         };
-        (self.deps.on_update)(&snapshot, note);
+        if let Some(reason) = failure {
+            (self.deps.on_update)(
+                &snapshot,
+                Some(&format!("{reason}; stopped state not saved")),
+            );
+            false
+        } else {
+            (self.deps.on_update)(&snapshot, note);
+            true
+        }
     }
 
     fn snapshot(&self) -> GraphRun {
-        self.run
+        let mut snapshot = self
+            .run
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .clone();
+        if let Some(reason) = self.persistence_failure() {
+            snapshot.phase = Phase::Blocked;
+            snapshot.lifecycle = Some(GraphLifecycle::Stopped);
+            snapshot.blocked_reason = Some(reason);
+        }
+        snapshot
+    }
+
+    fn persistence_failure(&self) -> Option<String> {
+        self.persistence_error
             .lock()
             .unwrap_or_else(|error| error.into_inner())
             .clone()
@@ -699,7 +739,9 @@ impl GraphExecution {
                     self.add_usage(&task_id, usage);
                 }
                 self.end_task(&task_id, TaskStatus::Succeeded, None);
-                self.checkpoint(Some(&format!("{task_id}: reused from previous run")));
+                if !self.checkpoint(Some(&format!("{task_id}: reused from previous run"))) {
+                    return None;
+                }
                 return Some(artifact.clone());
             }
         }
@@ -811,7 +853,9 @@ impl GraphExecution {
                 self.checkpoint(None);
                 return None;
             }
-            self.checkpoint(Some(&format!("{task_id}: attempt {attempt} ({role})")));
+            if !self.checkpoint(Some(&format!("{task_id}: attempt {attempt} ({role})"))) {
+                return None;
+            }
 
             let attempt_briefing = if attempt == 1 {
                 briefing.clone()
@@ -974,7 +1018,11 @@ impl GraphExecution {
                 });
 
                 self.active_workers.fetch_add(1, Ordering::SeqCst);
-                let mut run_res = (self.deps.runner)(&spec, &runner_abort, &mut on_progress);
+                let mut run_res = if runner_abort.load(Ordering::SeqCst) {
+                    WorkerResult::default()
+                } else {
+                    (self.deps.runner)(&spec, &runner_abort, &mut on_progress)
+                };
                 self.active_workers.fetch_sub(1, Ordering::SeqCst);
                 watcher_stop.store(true, Ordering::Relaxed);
                 let _ = watcher_handle.join();
@@ -1055,6 +1103,9 @@ impl GraphExecution {
                 self.checkpoint(Some(&format!("{task_id}: stopped by budget")));
                 return None;
             }
+            if self.persistence_failure().is_some() {
+                return None;
+            }
             if result.ok {
                 if let Some(artifact) = result.artifact {
                     let (run_version, cwd, run_id, definition_digest, dry_run) = {
@@ -1094,7 +1145,9 @@ impl GraphExecution {
                     );
                     let _ = write_task_fingerprint(&cwd, &run_id, &task_id, &fingerprint);
                     self.end_task(&task_id, TaskStatus::Succeeded, None);
-                    self.checkpoint(Some(&format!("{task_id}: succeeded")));
+                    if !self.checkpoint(Some(&format!("{task_id}: succeeded"))) {
+                        return None;
+                    }
                     return Some(artifact);
                 }
             }
@@ -1194,6 +1247,9 @@ impl GraphExecution {
 
     /// True when the run was finalized and the caller must stop.
     fn cancelled_if_aborted(&self) -> bool {
+        if self.persistence_failure().is_some() {
+            return true;
+        }
         if let Some(reason) = self.budget_abort_reason() {
             self.blocked(reason);
             return true;
@@ -1264,6 +1320,9 @@ impl GraphExecution {
     }
 
     pub fn record_skill_outcomes(&self, run: &GraphRun) {
+        if self.persistence_failure().is_some() {
+            return;
+        }
         let Some(ref verification) = run.verification else {
             return;
         };
@@ -1488,6 +1547,7 @@ fn run_graph_internal(
         options,
         exec_abort,
         budget_abort_reason: Mutex::new(None),
+        persistence_error: Mutex::new(None),
         run_deadline,
         active_workers: Arc::new(AtomicUsize::new(0)),
         node_aborts: Arc::new(Mutex::new(HashMap::new())),
@@ -1784,6 +1844,9 @@ fn drive_compiled_saved_graph(
 }
 
 fn drive(execution: &GraphExecution) -> GraphRun {
+    if execution.cancelled_if_aborted() {
+        return execution.snapshot();
+    }
     let saved_def = execution.snapshot().saved_definition.clone();
     if let Some(saved_def) = saved_def {
         return drive_compiled_saved_graph(execution, &saved_def);
@@ -2660,6 +2723,10 @@ fn deliver_goal(
 #[cfg(test)]
 #[path = "controller_revision_tests.rs"]
 mod revision_tests;
+
+#[cfg(test)]
+#[path = "controller_persistence_tests.rs"]
+mod persistence_tests;
 
 #[cfg(test)]
 mod tests {
@@ -3745,6 +3812,7 @@ mod tests {
             options,
             exec_abort: Arc::new(AtomicBool::new(false)),
             budget_abort_reason: Mutex::new(None),
+            persistence_error: Mutex::new(None),
             run_deadline: None,
             active_workers: Arc::new(AtomicUsize::new(0)),
             node_aborts: Arc::new(Mutex::new(HashMap::new())),
@@ -5017,6 +5085,7 @@ mod tests {
             },
             exec_abort: Arc::new(AtomicBool::new(false)),
             budget_abort_reason: Mutex::new(None),
+            persistence_error: Mutex::new(None),
             run_deadline: None,
             active_workers: Arc::new(AtomicUsize::new(1)),
             node_aborts: Arc::new(Mutex::new(HashMap::new())),
@@ -5127,6 +5196,7 @@ mod tests {
             },
             exec_abort: Arc::new(AtomicBool::new(false)),
             budget_abort_reason: Mutex::new(None),
+            persistence_error: Mutex::new(None),
             run_deadline: None,
             active_workers: Arc::new(AtomicUsize::new(0)),
             node_aborts: Arc::new(Mutex::new(HashMap::new())),
@@ -5216,6 +5286,7 @@ mod tests {
             },
             exec_abort: Arc::new(AtomicBool::new(false)),
             budget_abort_reason: Mutex::new(None),
+            persistence_error: Mutex::new(None),
             run_deadline: Some(past_deadline),
             active_workers: Arc::new(AtomicUsize::new(0)),
             node_aborts: Arc::new(Mutex::new(HashMap::new())),
@@ -5324,6 +5395,7 @@ mod tests {
             },
             exec_abort: Arc::new(AtomicBool::new(false)),
             budget_abort_reason: Mutex::new(None),
+            persistence_error: Mutex::new(None),
             run_deadline: None,
             active_workers: Arc::new(AtomicUsize::new(0)),
             node_aborts: Arc::new(Mutex::new(HashMap::new())),
