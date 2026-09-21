@@ -10885,6 +10885,59 @@ mod tests {
     }
 
     #[test]
+    fn host_worker_session_preserves_parent_authority_across_turns() {
+        let _env_lock = PROCESS_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        let _config = EnvRestore::set("PI_CODING_AGENT_DIR", &dir.path().to_string_lossy());
+        let _current = EnvRestore::set("DAVINCI_CODING_AGENT_DIR", &dir.path().to_string_lossy());
+        let run = davinci_agent::RunId::new();
+        let child = davinci_agent::AgentId::new();
+        let parent = davinci_agent::AgentId::new();
+        let mut agent = Agent::new("fixture").with_runtime(
+            davinci_agent::RuntimeHandle::new(run, child, davinci_agent::RuntimeBus::new())
+                .with_parent(parent),
+        );
+        agent.cwd = dir.path().to_path_buf();
+        agent
+            .load_from_session(JsonlSession::create(dir.path(), "worker", None).unwrap())
+            .unwrap();
+        let path = agent.session.as_ref().unwrap().path.clone();
+        let parsed = Args {
+            offline: true,
+            no_extensions: true,
+            ..Args::default()
+        };
+        for prompt in ["first", "second"] {
+            agent.prompt(prompt);
+            let (reply, _) = complete_prompt_with_host(
+                &parsed,
+                &mut agent,
+                Some(Arc::new(Mutex::new(ExtensionHost::default()))),
+                false,
+            );
+            assert!(!reply.contains("recovery required"), "{reply}");
+            let runtime = agent.runtime_for_session().unwrap();
+            assert_eq!(runtime.run_id, run);
+            assert_eq!(runtime.agent_id, child);
+            assert_eq!(runtime.parent_agent_id, Some(parent));
+            assert!(!path.with_extension("tasks.jsonl").exists());
+        }
+        let events = davinci_session::read_runtime_log::<davinci_agent::RuntimeEventEnvelope>(
+            &davinci_session::runtime_log_path(&path),
+        )
+        .unwrap();
+        assert!(!events.is_empty());
+        assert!(events
+            .iter()
+            .all(|event| event.parent_agent_id == Some(parent)));
+        assert!(events
+            .windows(2)
+            .all(|pair| pair[0].sequence < pair[1].sequence));
+    }
+
+    #[test]
     fn f03_post_turn_session_failure_reaches_reply_and_event_sink() {
         let _env_lock = PROCESS_ENV_LOCK
             .lock()

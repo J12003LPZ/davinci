@@ -2574,7 +2574,7 @@ impl Agent {
 
     /// Activate durable task state before replacing the active session.
     /// Reloading the live source preserves its writer lease and worker handles.
-    pub fn load_from_session(&mut self, session: JsonlSession) -> Result<(), String> {
+    pub fn load_from_session(&mut self, mut session: JsonlSession) -> Result<(), String> {
         let source = std::fs::canonicalize(&session.path).map_err(|error| {
             format!("Runtime recovery required: session source could not be resolved: {error}")
         })?;
@@ -2582,12 +2582,25 @@ impl Agent {
             self.runtime_session
                 .as_ref()
                 .is_some_and(|(path, id, _)| *path == source && *id == session.header.id)
-                && runtime.task_registry.is_durable()
+                && (runtime.task_registry.is_durable() || runtime.parent_agent_id.is_some())
         });
+        let worker = self
+            .runtime
+            .as_ref()
+            .filter(|runtime| runtime.parent_agent_id.is_some());
+        if worker.is_some() && self.session.is_some() && current.is_none() {
+            return Err(
+                "Runtime recovery required: a worker cannot switch its bound conversation".into(),
+            );
+        }
         let session_changed = current.is_none();
-        let candidate = match current {
-            Some(runtime) => runtime.clone(),
-            None => runtime::session::restore_session_runtime(
+        let candidate = match (current, worker) {
+            (Some(runtime), _) => runtime.clone(),
+            (None, Some(worker)) => {
+                runtime::session::restore_worker_session_runtime(worker.clone(), &mut session)
+                    .map_err(|error| format!("Runtime recovery required: {error}"))?
+            }
+            (None, None) => runtime::session::restore_session_runtime(
                 RuntimeHandle::new(RunId::new(), AgentId::new(), RuntimeBus::new()),
                 &session,
             )
@@ -3091,6 +3104,9 @@ pub fn capability_toolbox_ablation() -> Result<(bool, bool, u64, u64), String> {
         queried.len() as u64,
     ))
 }
+
+#[cfg(test)]
+mod worker_session_tests;
 
 #[cfg(test)]
 mod tests {
