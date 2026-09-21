@@ -105,7 +105,7 @@ mod tests {
         assert_eq!(
             format_resume_command(true, true, Some(&file), Some("test-session"), None, true)
                 .as_deref(),
-            Some("pi --session test-session")
+            Some("davinci --session test-session")
         );
         assert_eq!(
             format_resume_command(
@@ -117,7 +117,7 @@ mod tests {
                 false,
             )
             .as_deref(),
-            Some("pi --session-dir /tmp/custom-pi-sessions --session test-session")
+            Some("davinci --session-dir /tmp/custom-pi-sessions --session test-session")
         );
         assert_eq!(
             format_resume_command(
@@ -129,7 +129,7 @@ mod tests {
                 false,
             )
             .as_deref(),
-            Some("pi --session-dir '/tmp/custom pi sessions' --session test-session")
+            Some("davinci --session-dir '/tmp/custom pi sessions' --session test-session")
         );
         assert_eq!(
             format_resume_command(
@@ -141,7 +141,7 @@ mod tests {
                 false,
             )
             .as_deref(),
-            Some("pi --session-dir '/tmp/custom pi'\\''s sessions' --session test-session")
+            Some("davinci --session-dir '/tmp/custom pi'\\''s sessions' --session test-session")
         );
         assert!(format_resume_command(false, true, Some(&file), Some("id"), None, true).is_none());
         assert!(format_resume_command(true, false, Some(&file), Some("id"), None, true).is_none());

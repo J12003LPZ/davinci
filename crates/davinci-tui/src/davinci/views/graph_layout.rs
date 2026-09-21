@@ -47,12 +47,15 @@ pub fn layout_graph(
 ) -> GraphLayout {
     let mode = match (width, height) {
         (0..=49, _) | (_, 0..=11) => GraphResponsiveMode::Structured,
-        (120.., 24..) => GraphResponsiveMode::Full,
+        (100.., 16..) => GraphResponsiveMode::Full,
         (72.., _) => GraphResponsiveMode::Adaptive,
         _ => GraphResponsiveMode::Compact,
     };
     let inspector = match mode {
-        GraphResponsiveMode::Full => Rect::new(width - 32, 0, 32, height),
+        GraphResponsiveMode::Full => {
+            let panel_width = (width / 3).clamp(36, 72);
+            Rect::new(width - panel_width, 0, panel_width, height)
+        }
         GraphResponsiveMode::Adaptive | GraphResponsiveMode::Compact => {
             let drawer = (height / 3).clamp(4, 9);
             Rect::new(0, height - drawer, width, drawer)
@@ -387,6 +390,8 @@ mod tests {
             (50, 30, GraphResponsiveMode::Compact),
             (80, 30, GraphResponsiveMode::Adaptive),
             (120, 30, GraphResponsiveMode::Full),
+            (120, 21, GraphResponsiveMode::Full),
+            (109, 21, GraphResponsiveMode::Full),
             (120, 5, GraphResponsiveMode::Structured),
         ] {
             let layout = layout_graph(&diamond(), &GraphCanvasState::default(), width, height);

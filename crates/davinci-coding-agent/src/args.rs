@@ -3,9 +3,8 @@ use davinci_protocol::ThinkingLevel;
 use davinci_tui::TuiMode;
 use std::collections::BTreeMap;
 
-pub const APP_NAME: &str = "pi";
-/// TS `APP_TITLE`: `π` when `APP_NAME` is the default `"pi"`.
-pub const APP_TITLE: &str = "π";
+pub const APP_NAME: &str = "davinci";
+pub const APP_TITLE: &str = "DaVinci";
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// TS `InteractiveMode.updateTerminalTitle`.
@@ -60,6 +59,7 @@ pub struct Args {
     pub no_builtin_tools: bool,
     pub extensions: Vec<String>,
     pub no_extensions: bool,
+    pub no_mcp: bool,
     pub print: bool,
     pub export: Option<String>,
     pub no_skills: bool,
@@ -248,6 +248,8 @@ pub fn parse_args(args: &[String]) -> Args {
             result.extensions.push(args[i].clone());
         } else if arg == "--no-extensions" || arg == "-ne" {
             result.no_extensions = true;
+        } else if arg == "--no-mcp" {
+            result.no_mcp = true;
         } else if arg == "--skill" && i + 1 < args.len() {
             i += 1;
             result.skills.push(args[i].clone());
@@ -418,6 +420,25 @@ mod tests {
     use std::path::Path;
 
     #[test]
+    fn no_mcp_is_a_boolean_native_flag() {
+        let parsed = parse_args(&["--no-mcp".into(), "explain this".into()]);
+        assert!(parsed.unknown_flags.is_empty());
+        assert!(parsed.no_mcp);
+        assert_eq!(parsed.messages, vec!["explain this"]);
+    }
+
+    #[test]
+    fn help_uses_davinci_branding_and_explains_native_tools() {
+        let help = print_help();
+        assert!(help.starts_with("davinci -"));
+        assert!(help.contains("--no-mcp"));
+        assert!(help.contains("Native intelligence"));
+        assert!(!help
+            .lines()
+            .any(|line| line.trim_start().starts_with("pi ")));
+    }
+
+    #[test]
     fn the_ui_flags_are_boolean_and_never_swallow_the_message_after_them() {
         let args =
             |list: &[&str]| parse_args(&list.iter().map(|s| s.to_string()).collect::<Vec<_>>());
@@ -472,18 +493,18 @@ mod tests {
     }
 
     #[test]
-    fn terminal_title_matches_ts_update_terminal_title() {
+    fn terminal_title_uses_davinci_name_and_project() {
         assert_eq!(
             format_terminal_title(None, Path::new("/tmp/project")),
-            "π - project"
+            "DaVinci - project"
         );
         assert_eq!(
             format_terminal_title(Some("demo"), Path::new("/tmp/project")),
-            "π - demo - project"
+            "DaVinci - demo - project"
         );
         assert_eq!(
             format_terminal_title(Some("  "), Path::new("/tmp/project")),
-            "π - project"
+            "DaVinci - project"
         );
     }
 

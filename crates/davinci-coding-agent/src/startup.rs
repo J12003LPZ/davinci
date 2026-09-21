@@ -180,7 +180,7 @@ mod tests {
             .any(|(_, line)| line.contains("Package Updates Available")));
         assert!(formatted
             .iter()
-            .any(|(_, line)| line.contains("pi update --extensions")));
+            .any(|(_, line)| line.contains("davinci update --extensions")));
     }
 
     #[test]

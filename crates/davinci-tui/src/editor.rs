@@ -258,11 +258,7 @@ impl Editor {
             self.paste_counter += 1;
             let paste_id = self.paste_counter;
             self.pastes.insert(paste_id, filtered.clone());
-            let marker = if lines > 10 {
-                format!("[paste #{paste_id} +{lines} lines]")
-            } else {
-                format!("[paste #{paste_id} {total_chars} chars]")
-            };
+            let marker = format!("[paste #{paste_id} {total_chars} chars]");
             self.insert_str_internal(&marker);
             return;
         }
@@ -1423,7 +1419,10 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
         editor.handle_paste(&big);
-        assert!(editor.get_text().contains("[paste #1 +20 lines]"));
+        assert_eq!(
+            editor.get_text(),
+            format!("[paste #1 {} chars]", big.chars().count())
+        );
         editor.insert('A');
         editor.move_line_start();
         editor.move_right();

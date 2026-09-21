@@ -28,7 +28,8 @@ use super::store::{
     write_graph_definition, write_log, write_task_fingerprint, write_task_mutation,
 };
 use super::topology::{
-    build_definition, ready_nodes, validate_definition, GraphMode, GraphRunState,
+    build_definition, ready_nodes, validate_definition, EdgeCondition, EdgeDefinition, GraphMode,
+    GraphRunState, NodeDefinition,
 };
 use super::types::{
     Artifact, ArtifactKind, Complexity, EvidenceArtifact, GraphBudgets, GraphCounters,
@@ -285,6 +286,9 @@ impl GraphExecution {
         // implementation that re-locks the run must not deadlock.
         let snapshot = {
             let mut run = self.run.lock().unwrap_or_else(|error| error.into_inner());
+            if matches!(run.phase, Phase::Done | Phase::Blocked | Phase::Cancelled) {
+                run.lifecycle = Some(GraphLifecycle::Stopped);
+            }
             let gov_stats = self.deps.governor.as_ref().map(|g| g.stats());
             if let Some(ref gs) = gov_stats {
                 run.ecosystem_stats.governor_bytes_omitted = gs.bytes_withheld;
@@ -496,7 +500,7 @@ impl GraphExecution {
         }
     }
 
-    fn execute_node(&self, task: GraphTaskState, briefing: String) -> Option<Artifact> {
+    fn execute_node(&self, mut task: GraphTaskState, briefing: String) -> Option<Artifact> {
         let task_id = task.id.clone();
         let role = task.role;
 
@@ -536,6 +540,7 @@ impl GraphExecution {
 
         {
             let mut run = self.run.lock().unwrap_or_else(|error| error.into_inner());
+            materialize_generated_dependencies(&mut run, &mut task);
             let unmet = run.unmet_dependencies(&task);
             if !unmet.is_empty() {
                 let mut refused = task.clone();
@@ -581,11 +586,13 @@ impl GraphExecution {
                 }
             }
 
-            if !run
+            if let Some(pending) = run
                 .tasks
-                .iter()
-                .any(|entry| entry.id == task_id && entry.status == TaskStatus::Pending)
+                .iter_mut()
+                .find(|entry| entry.id == task_id && entry.status == TaskStatus::Pending)
             {
+                pending.depends_on = task.depends_on.clone();
+            } else {
                 run.tasks.push(task.clone());
             }
         }
@@ -1919,6 +1926,69 @@ fn drive(execution: &GraphExecution) -> GraphRun {
     execution.snapshot()
 }
 
+/// Generated milestone templates cannot predict how many writer/review attempts
+/// verification will need. Bind dispatched attempts to the actual preceding work
+/// instead of interpreting their ordinal as a milestone number. Saved graphs
+/// retain their explicit topology and may never be rebound this way.
+fn materialize_generated_dependencies(run: &mut GraphRun, task: &mut GraphTaskState) {
+    if run.saved_definition.is_some() || run.definition.is_none() {
+        return;
+    }
+    let is_new_plan =
+        task.role == Role::Planner && run.definition.as_ref().unwrap().node(&task.id).is_none();
+    if !matches!(task.role, Role::Writer | Role::Reviewer) && !is_new_plan {
+        return;
+    }
+    let succeeded =
+        |entry: &&GraphTaskState| entry.id != task.id && entry.status == TaskStatus::Succeeded;
+    let mut dependencies = task.depends_on.clone();
+    if task.role == Role::Writer {
+        if let Some(plan) = run
+            .tasks
+            .iter()
+            .rev()
+            .filter(succeeded)
+            .find(|t| t.role == Role::Planner)
+        {
+            dependencies.push(plan.id.clone());
+        }
+    }
+    let previous = run.tasks.iter().rev().filter(succeeded).find(|entry| {
+        if task.role == Role::Reviewer {
+            entry.role == Role::Writer
+        } else {
+            matches!(
+                entry.role,
+                Role::Writer | Role::Reviewer | Role::Planner | Role::Classifier
+            )
+        }
+    });
+    if let Some(previous) = previous {
+        dependencies.push(previous.id.clone());
+    }
+    dependencies.sort();
+    dependencies.dedup();
+    task.depends_on = dependencies;
+    let definition = run.definition.as_mut().unwrap();
+    if definition.node(&task.id).is_none() {
+        definition.nodes.push(NodeDefinition {
+            id: task.id.clone(),
+            role: task.role,
+            expect: task.expect,
+            required: true,
+            allows_mutation: task.role == Role::Writer,
+        });
+    }
+    definition.edges.retain(|edge| edge.to != task.id);
+    definition
+        .edges
+        .extend(task.depends_on.iter().map(|dependency| EdgeDefinition {
+            from: dependency.clone(),
+            to: task.id.clone(),
+            condition: EdgeCondition::OnSuccess,
+        }));
+}
+
 #[derive(Default)]
 struct NodeIndices {
     plan: u32,
@@ -2541,6 +2611,10 @@ fn deliver_goal(
         ));
     }
 }
+
+#[cfg(test)]
+#[path = "controller_revision_tests.rs"]
+mod revision_tests;
 
 #[cfg(test)]
 mod tests {

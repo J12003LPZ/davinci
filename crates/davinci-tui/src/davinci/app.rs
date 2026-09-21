@@ -612,13 +612,12 @@ pub fn handle_key(model: &mut Model, key: KeyEvent) -> Flow {
             return Flow::Continue;
         }
         if model.keybindings.matches(data, "tui.input.submit") {
-            let sent = model.composer.to_string();
+            let sent = model.composer.editor().get_expanded_text();
+            if sent.trim().is_empty() {
+                return Flow::Continue;
+            }
             model.submit();
-            return if sent.trim().is_empty() {
-                Flow::Continue
-            } else {
-                Flow::Submit(sent)
-            };
+            return Flow::Submit(sent);
         }
         if model.keybindings.matches(data, "tui.select.cancel") {
             model.close();
@@ -893,6 +892,12 @@ fn handle_screen_key(model: &mut Model, key: KeyEvent, data: Option<&str>) -> Fl
                     index,
                 });
             }
+            KeyCode::Char('s') => {
+                return Flow::Choose(Choice::GraphAction {
+                    action: "resume",
+                    index,
+                });
+            }
             KeyCode::Char('x') => {
                 return Flow::Choose(Choice::GraphAction {
                     action: "stop",
@@ -1018,6 +1023,7 @@ mod graph_input_tests {
         assert_eq!(model.screen, Screen::GraphRun);
         for (key, action) in [
             ('p', "pause_resume"),
+            ('s', "resume"),
             ('x', "stop"),
             ('r', "retry"),
             ('d', "diff"),
@@ -1977,6 +1983,27 @@ mod tests {
 
         let flow = handle_key(&mut m, key(KeyCode::Enter));
         assert_eq!(flow, Flow::Submit("run the tests".to_string()));
+    }
+
+    #[test]
+    fn submit_flow_expands_the_paste_marker_for_the_host() {
+        let mut m = model(120, 30);
+        let text = format!("{}\nsecond line\n", "界".repeat(1100));
+        m.paste(&text);
+        assert!(m.composer.contains("[paste #1"));
+        assert!(!m.running);
+        assert_eq!(handle_key(&mut m, key(KeyCode::Enter)), Flow::Submit(text));
+        assert!(m.composer.is_empty());
+    }
+
+    #[test]
+    fn whitespace_paste_does_not_start_a_phantom_turn() {
+        let mut m = model(120, 30);
+        m.paste(&" \n".repeat(600));
+        let draft = m.composer.to_string();
+        assert_eq!(handle_key(&mut m, key(KeyCode::Enter)), Flow::Continue);
+        assert!(!m.running);
+        assert_eq!(m.composer.to_string(), draft);
     }
 
     #[test]

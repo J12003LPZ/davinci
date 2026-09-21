@@ -271,7 +271,7 @@ pub fn save_run(run: &mut GraphRun) -> std::io::Result<()> {
 
     if let Some(definition) = &run.definition {
         let graph_path = run_dir(&cwd, &run.run_id).join("graph.json");
-        if !graph_path.exists() {
+        if run.saved_definition.is_none() || !graph_path.exists() {
             write_graph_definition(&cwd, &run.run_id, definition)?;
         }
     }
@@ -540,10 +540,27 @@ pub fn write_log(cwd: &Path, run_id: &str, task_id: &str, content: &str) {
 }
 
 /// The tail of a worker's live transcript, for `/graph-view`.
-pub fn read_transcript(path: &Path) -> Vec<String> {
-    fs::read_to_string(path)
-        .map(|content| content.lines().map(str::to_string).collect())
-        .unwrap_or_default()
+/// The live inspector must not reread an entire growing log every second.
+pub fn read_transcript_tail(path: &Path) -> Vec<String> {
+    use std::io::{Read, Seek, SeekFrom};
+    let read = || -> std::io::Result<Vec<String>> {
+        let mut file = fs::File::open(path)?;
+        let start = file.metadata()?.len().saturating_sub(64 * 1024);
+        file.seek(SeekFrom::Start(start))?;
+        let mut bytes = Vec::new();
+        file.take(64 * 1024).read_to_end(&mut bytes)?;
+        // A tail can start inside a UTF-8 code point or a partial log line.
+        let text = String::from_utf8_lossy(&bytes);
+        let lines: Vec<_> = text.lines().skip(usize::from(start > 0)).collect();
+        Ok(lines
+            .into_iter()
+            .rev()
+            .take(200)
+            .rev()
+            .map(str::to_owned)
+            .collect())
+    };
+    read().unwrap_or_default()
 }
 
 #[cfg(test)]
@@ -553,6 +570,25 @@ mod tests {
         ArtifactKind, GraphBudgets, GraphCounters, Phase, ReviewDecision, Verdict,
     };
     use tempfile::tempdir;
+
+    #[test]
+    fn live_transcript_tail_is_bounded_and_preserves_recent_unicode() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("worker.live.log");
+        assert!(read_transcript_tail(&path).is_empty());
+        fs::write(
+            &path,
+            format!(
+                "{}\nrecent 界 activity\n",
+                "old 界 activity\n".repeat(10000)
+            ),
+        )
+        .unwrap();
+        let tail = read_transcript_tail(&path);
+        assert_eq!(tail.len(), 200);
+        assert_eq!(tail.last().unwrap(), "recent 界 activity");
+        assert!(tail.iter().all(|line| !line.contains('\u{fffd}')));
+    }
 
     fn sample_run(cwd: &Path, run_id: &str, goal: &str) -> GraphRun {
         GraphRun {

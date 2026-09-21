@@ -560,7 +560,8 @@ impl Agent {
         agent
     }
 
-    pub fn set_runtime(&mut self, runtime: RuntimeHandle) {
+    pub fn set_runtime(&mut self, mut runtime: RuntimeHandle) {
+        runtime.ensure_conversation_identity_current();
         self.tool_context
             .mcp
             .register_with(&runtime.capability_registry);

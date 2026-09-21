@@ -129,14 +129,13 @@ pub fn install_panic_hook() {
 ///
 /// Unix terminals hand crossterm the `ESC[200~ … ESC[201~` byte stream and
 /// crossterm parses it into one `Event::Paste`. The Windows console API has no
-/// such notion: once `?2004h` is written, Windows Terminal still wraps a paste
-/// in the markers, but ConPTY converts every byte into an individual key
-/// event, so the markers and the pasted block arrive as a burst of keys — and
-/// every newline in the block used to read as a submit. This filter watches
-/// the key stream for the markers and reassembles the block, exactly as the
-/// legacy chrome's `StdinBuffer` does at the byte level.
+/// such notion: pasted characters can arrive as individual key events, with
+/// ConPTY stripping the surrounding markers. This filter reassembles markers
+/// when preserved, and uses the Windows burst fallback when they are absent,
+/// so pasted newlines are not treated as submit keys.
 #[derive(Debug, Default)]
 struct PasteFilter {
+    burst: Option<super::paste_burst::PasteBurst>,
     /// Keys held while a start marker is being matched. If the match fails
     /// they are handed back untouched.
     held: Vec<KeyEvent>,
@@ -155,8 +154,8 @@ struct PasteFilter {
 
 const PASTE_START: &[char] = &['[', '2', '0', '0', '~'];
 const PASTE_END: &[char] = &['[', '2', '0', '1', '~'];
-/// How long a partial marker may sit before it is flushed as real keys. A
-/// paste burst arrives in one batch; a human typing `ESC [` cannot beat this.
+/// How long an ambiguous start marker may sit before it is flushed as keys.
+/// Once a paste starts, gaps between chunks must never turn text into commands.
 const PASTE_MARKER_PATIENCE: Duration = Duration::from_millis(60);
 
 impl PasteFilter {
@@ -180,11 +179,27 @@ impl PasteFilter {
             // Anything that is not a key press passes straight through; a
             // resize in the middle of a paste is delivered in order.
             other => {
-                self.ready.push_back(other);
+                self.emit_unbracketed(other);
                 return;
             }
         };
 
+        // A lost closing marker must remain fail-closed for Enter. Ctrl+C is
+        // an explicit recovery action, never a timeout that can submit text.
+        if self.pasting.is_some()
+            && key.code == KeyCode::Char('c')
+            && key.modifiers.contains(KeyModifiers::CONTROL)
+        {
+            let mut block = self.pasting.take().unwrap_or_default();
+            if self.end_matched > 0 {
+                block.push('\u{1b}');
+                block.extend(&PASTE_END[..self.end_matched - 1]);
+            }
+            self.end_matched = 0;
+            self.ready.push_back(Event::Paste(block));
+            self.ready.push_back(Event::Key(key));
+            return;
+        }
         if let Some(text) = self.pasting.as_mut() {
             // Matching the end marker. A stray escape inside the pasted block
             // is folded back into the text when the match fails.
@@ -235,11 +250,22 @@ impl PasteFilter {
         }
 
         if key.code == KeyCode::Esc && key.modifiers.is_empty() {
+            if let Some(burst) = &mut self.burst {
+                self.ready.extend(burst.flush());
+            }
             self.held.push(key);
             self.start_matched = 1;
             return;
         }
-        self.ready.push_back(Event::Key(key));
+        self.emit_unbracketed(Event::Key(key));
+    }
+
+    fn emit_unbracketed(&mut self, event: Event) {
+        if let Some(burst) = &mut self.burst {
+            self.ready.extend(burst.feed(event, Instant::now()));
+        } else {
+            self.ready.push_back(event);
+        }
     }
 
     fn flush_held(&mut self) {
@@ -250,10 +276,12 @@ impl PasteFilter {
     }
 
     /// Nothing more is immediately available. A partial start marker older
-    /// than the patience window was a real escape: hand it back. A paste
-    /// whose end marker never came is delivered as it stands rather than
-    /// freezing the interface waiting for it.
+    /// than the patience window was a real escape: hand it back. An active
+    /// paste stays buffered until its closing marker, even across slow chunks.
     fn idle(&mut self) {
+        if let Some(burst) = &mut self.burst {
+            self.ready.extend(burst.idle(Instant::now()));
+        }
         let stale = self
             .last_fed
             .is_none_or(|at| at.elapsed() >= PASTE_MARKER_PATIENCE);
@@ -262,16 +290,6 @@ impl PasteFilter {
         }
         if self.start_matched > 0 {
             self.flush_held();
-        }
-        if let Some(mut block) = self.pasting.take() {
-            if self.end_matched > 0 {
-                block.push('\u{1b}');
-                for matched in &PASTE_END[..self.end_matched - 1] {
-                    block.push(*matched);
-                }
-                self.end_matched = 0;
-            }
-            self.ready.push_back(Event::Paste(block));
         }
     }
 
@@ -286,7 +304,7 @@ impl PasteFilter {
     /// Whether a partial marker is held, so the caller polls again quickly
     /// instead of sleeping a full tick on what may be a real escape.
     fn holding(&self) -> bool {
-        self.start_matched > 0
+        self.start_matched > 0 || self.burst.as_ref().is_some_and(|burst| burst.pending())
     }
 }
 
@@ -331,7 +349,10 @@ impl Session {
         Ok(Self {
             terminal,
             keyboard: Keyboard { disambiguated },
-            paste: PasteFilter::default(),
+            paste: PasteFilter {
+                burst: cfg!(windows).then(super::paste_burst::PasteBurst::default),
+                ..PasteFilter::default()
+            },
             mic_rect: None,
             rendered_lines: Vec::new(),
             selection_anchor: None,
@@ -380,7 +401,7 @@ impl Session {
             // a real marker is already in the queue, and a real escape should
             // not sit swallowed for a full tick.
             let wait = if self.paste.holding() {
-                timeout.min(PASTE_MARKER_PATIENCE)
+                timeout.min(super::paste_burst::TYPING_WAIT)
             } else {
                 timeout
             };
@@ -752,8 +773,7 @@ mod tests {
 
     #[test]
     fn a_marker_wrapped_burst_of_keys_reassembles_into_one_paste() {
-        // What ConPTY hands crossterm when Windows Terminal brackets a paste:
-        // every byte of the markers and the block as an individual key event.
+        // A key stream from a console path that preserves paste markers.
         let mut filter = PasteFilter::default();
         feed_str(
             &mut filter,
@@ -816,12 +836,23 @@ mod tests {
     }
 
     #[test]
-    fn a_paste_missing_its_end_marker_is_still_delivered_on_idle() {
+    fn a_slow_paste_waits_for_its_end_marker_and_preserves_newlines() {
         let mut filter = PasteFilter::default();
-        feed_str(&mut filter, "\u{1b}[200~orphan");
+        feed_str(&mut filter, "\u{1b}[200~first");
         filter.last_fed = Some(Instant::now() - Duration::from_millis(200));
         filter.idle();
-        assert_eq!(drain(&mut filter), vec![Event::Paste("orphan".to_string())]);
+        assert!(drain(&mut filter).is_empty());
+        feed_str(&mut filter, "\nsecond\n\u{1b}[20");
+        filter.last_fed = Some(Instant::now() - Duration::from_secs(2));
+        filter.idle();
+        assert!(drain(&mut filter).is_empty());
+        feed_str(&mut filter, "1~");
+        assert_eq!(
+            drain(&mut filter),
+            vec![Event::Paste("first\nsecond\n".into())]
+        );
+        filter.feed(key(KeyCode::Enter));
+        assert_eq!(drain(&mut filter), vec![key(KeyCode::Enter)]);
     }
 
     #[test]
@@ -837,6 +868,19 @@ mod tests {
                 Event::Paste("beforeafter".to_string())
             ]
         );
+    }
+
+    #[test]
+    fn interrupted_paste_can_be_recovered_with_control_c_without_submitting() {
+        let mut filter = PasteFilter::default();
+        feed_str(&mut filter, "\u{1b}[200~draft\n");
+        let cancel = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
+        filter.feed(Event::Key(cancel));
+        assert_eq!(
+            drain(&mut filter),
+            vec![Event::Paste("draft\n".into()), Event::Key(cancel)]
+        );
+        assert!(filter.pasting.is_none());
     }
 
     #[test]

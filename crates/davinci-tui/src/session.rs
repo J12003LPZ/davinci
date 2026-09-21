@@ -2514,7 +2514,7 @@ mod tests {
             .chrome
             .editor
             .buffer
-            .contains("[paste #1 +12 lines]"));
+            .contains(&format!("[paste #1 {} chars]", big.chars().count())));
         assert_eq!(session.handle_bytes("\r"), SessionAction::Submit(big));
         session.chrome.editor.set_text(
             (0..40)

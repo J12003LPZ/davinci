@@ -770,10 +770,12 @@ fn build_agent(parsed: &Args, session_dir: &Path, cwd: &Path) -> Result<Agent, S
             .retain(|name| !davinci_agent::tools::is_managed_process_tool(name));
     }
     let trusted = is_trusted(&settings, cwd, parsed.project_trust_override);
-    agent.attach_mcp(davinci_agent::McpRegistry::connect(
-        &mcp::load(&default_agent_dir(), cwd, trusted),
-        cwd,
-    ));
+    if !parsed.no_mcp {
+        agent.attach_mcp(davinci_agent::McpRegistry::connect(
+            &mcp::load(&default_agent_dir(), cwd, trusted),
+            cwd,
+        ));
+    }
     // Overflowing batch output is kept where the model can `read` it
     // back, under the agent dir so a fixture dir keeps tests contained.
     agent.evidence = Some(davinci_agent::EvidenceStore::new(
@@ -2089,6 +2091,13 @@ fn complete_prompt_with_host(
         .unwrap_or_else(|error| error.into_inner())
         .register_with(&runtime_handle.capability_registry);
     agent.set_runtime(runtime_handle);
+    // Print/RPC turns need the same native permission, model and runtime
+    // bindings as the interactive shell before a discovered tool executes.
+    apply_graph_session_context(
+        parsed,
+        agent,
+        &host.lock().unwrap_or_else(|error| error.into_inner()),
+    );
     bind_test_impact_context(
         agent,
         &host.lock().unwrap_or_else(|error| error.into_inner()),
@@ -5965,7 +5974,10 @@ fn handle_user_line(
         SlashAction::Mcp => {
             let rows = agent.tool_context.mcp.rows();
             let text = if rows.is_empty() {
-                "no MCP servers configured — edit ~/.pi/agent/mcp.json".into()
+                format!(
+                    "no MCP servers connected — config: {}",
+                    default_agent_dir().join("mcp.json").display()
+                )
             } else {
                 rows.into_iter()
                     .map(|row| {
@@ -10393,7 +10405,7 @@ mod tests {
     }
     use super::*;
 
-    static OFFLINE_TOOL_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    static PROCESS_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     #[test]
     fn provider_context_accounting_includes_runtime_identity() {
@@ -10478,6 +10490,9 @@ mod tests {
 
     #[test]
     fn f03_graph_session_context_binds_current_parent_runtime() {
+        let _env_lock = PROCESS_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
         let dir = tempfile::tempdir().unwrap();
         let _config = EnvRestore::set("PI_CODING_AGENT_DIR", &dir.path().to_string_lossy());
         let _current = EnvRestore::set("DAVINCI_CODING_AGENT_DIR", &dir.path().to_string_lossy());
@@ -10519,6 +10534,9 @@ mod tests {
 
     #[test]
     fn f05_graph_session_context_carries_active_task_contract() {
+        let _env_lock = PROCESS_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
         let dir = tempfile::tempdir().unwrap();
         let _config = EnvRestore::set("PI_CODING_AGENT_DIR", &dir.path().to_string_lossy());
         let _current = EnvRestore::set("DAVINCI_CODING_AGENT_DIR", &dir.path().to_string_lossy());
@@ -10621,7 +10639,7 @@ mod tests {
 
     #[test]
     fn graph_transaction_owner_survives_multiple_prompt_turns() {
-        let _env_lock = OFFLINE_TOOL_ENV_LOCK
+        let _env_lock = PROCESS_ENV_LOCK
             .lock()
             .unwrap_or_else(|error| error.into_inner());
         let dir = tempfile::tempdir().unwrap();
@@ -10679,7 +10697,7 @@ mod tests {
 
     #[test]
     fn f03_sessionless_worker_prompt_uses_parent_coordinator() {
-        let _env_lock = OFFLINE_TOOL_ENV_LOCK
+        let _env_lock = PROCESS_ENV_LOCK
             .lock()
             .unwrap_or_else(|error| error.into_inner());
         let dir = tempfile::tempdir().unwrap();
@@ -10795,6 +10813,9 @@ mod tests {
 
     #[test]
     fn f03_post_turn_session_failure_reaches_reply_and_event_sink() {
+        let _env_lock = PROCESS_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
         for missing in [false, true] {
             let dir = tempfile::tempdir().unwrap();
             let _config = EnvRestore::set("PI_CODING_AGENT_DIR", &dir.path().to_string_lossy());
@@ -10863,6 +10884,9 @@ mod tests {
 
     #[test]
     fn f03_prompt_recovery_failure_preserves_runtime_and_settles_host() {
+        let _env_lock = PROCESS_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
         let dir = tempfile::tempdir().unwrap();
         let _config = EnvRestore::set("PI_CODING_AGENT_DIR", &dir.path().to_string_lossy());
         let _current_config =
@@ -10952,8 +10976,9 @@ mod tests {
 
     #[test]
     fn codex_fixture_login_persists_exact_provider_without_aliasing() {
-        static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-        let _lock = ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+        let _lock = PROCESS_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
         let dir = tempfile::tempdir().expect("temp auth dir");
         let legacy = tempfile::tempdir().expect("legacy auth dir");
         let _agent_dir = EnvRestore::set("DAVINCI_CODING_AGENT_DIR", &dir.path().to_string_lossy());
@@ -11013,7 +11038,7 @@ mod tests {
 
     #[test]
     fn the_offline_tool_call_fixture_scripts_one_call_then_the_usual_stub() {
-        let _lock = OFFLINE_TOOL_ENV_LOCK
+        let _lock = PROCESS_ENV_LOCK
             .lock()
             .unwrap_or_else(|error| error.into_inner());
         std::env::remove_var("PI_OFFLINE_TOOL_CALL");
@@ -11062,9 +11087,7 @@ mod tests {
 
     #[test]
     fn offline_tool_sequence_waits_for_results_and_stops_on_failure() {
-        let _lock = OFFLINE_TOOL_ENV_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let _lock = PROCESS_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let _fixture = EnvRestore::set(
             "PI_OFFLINE_TOOL_CALL",
             r#"[{"name":"write","arguments":{}},{"name":"graph_submit","arguments":{}}]"#,
@@ -12045,6 +12068,9 @@ mod tests {
 
     #[test]
     fn offline_flag_sets_ts_env_vars() {
+        let _env_lock = PROCESS_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
         let previous_offline = std::env::var("PI_OFFLINE").ok();
         let previous_skip = std::env::var("PI_SKIP_VERSION_CHECK").ok();
         std::env::remove_var("PI_OFFLINE");
@@ -12230,6 +12256,9 @@ mod tests {
 
     #[test]
     fn radius_share_uses_fixture_url() {
+        let _env_lock = PROCESS_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
         std::env::set_var("PI_RADIUS_TOKEN", "fixture-token");
         std::env::set_var("PI_RADIUS_ARTIFACT_URL", "https://example.test/session/abc");
         std::env::remove_var("PI_SHARE_DRY_RUN");
@@ -12427,9 +12456,18 @@ mod tests {
 
     #[test]
     fn rebind_print_extensions_rediscovers_skills_and_emits_session_start() {
+        let _env_lock = PROCESS_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
         let dir = tempfile::tempdir().unwrap();
-        let previous = std::env::var("PI_CODING_AGENT_DIR").ok();
-        std::env::set_var("PI_CODING_AGENT_DIR", dir.path().join("agent"));
+        let _agent_dir = EnvRestore::set(
+            "PI_CODING_AGENT_DIR",
+            &dir.path().join("agent").to_string_lossy(),
+        );
+        let _current_dir = EnvRestore::set(
+            "DAVINCI_CODING_AGENT_DIR",
+            &dir.path().join("agent").to_string_lossy(),
+        );
         let skill_dir = dir.path().join(".pi").join("skills").join("demo");
         std::fs::create_dir_all(&skill_dir).unwrap();
         std::fs::write(
@@ -12445,10 +12483,6 @@ mod tests {
         };
         let mut host = ExtensionHost::default();
         rebind_print_extensions(&parsed, &mut agent, &mut host);
-        match previous {
-            Some(value) => std::env::set_var("PI_CODING_AGENT_DIR", value),
-            None => std::env::remove_var("PI_CODING_AGENT_DIR"),
-        }
         assert!(
             agent.skills.iter().any(|skill| skill.name == "demo"),
             "print-mode rebind should rediscover project skills: {:?}",
@@ -12466,9 +12500,18 @@ mod tests {
 
     #[test]
     fn show_loaded_resources_lists_context_skills_and_expands() {
+        let _env_lock = PROCESS_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
         let dir = tempfile::tempdir().unwrap();
-        let previous = std::env::var("PI_CODING_AGENT_DIR").ok();
-        std::env::set_var("PI_CODING_AGENT_DIR", dir.path().join("agent"));
+        let _agent_dir = EnvRestore::set(
+            "PI_CODING_AGENT_DIR",
+            &dir.path().join("agent").to_string_lossy(),
+        );
+        let _current_dir = EnvRestore::set(
+            "DAVINCI_CODING_AGENT_DIR",
+            &dir.path().join("agent").to_string_lossy(),
+        );
         let skill_dir = dir.path().join(".pi").join("skills").join("demo");
         std::fs::create_dir_all(&skill_dir).unwrap();
         std::fs::write(
@@ -12505,10 +12548,6 @@ mod tests {
         show_loaded_resources(&mut session, &agent, &ExtensionHost::default(), &parsed);
         let quiet = session.chrome.render_document(80).join("\n");
         assert!(!quiet.contains("[Skills]"), "{quiet}");
-        match previous {
-            Some(value) => std::env::set_var("PI_CODING_AGENT_DIR", value),
-            None => std::env::remove_var("PI_CODING_AGENT_DIR"),
-        }
     }
 
     #[test]
@@ -12540,9 +12579,13 @@ mod tests {
 
     #[test]
     fn streaming_turn_delivers_offline_reply_to_transcript() {
+        let _env_lock = PROCESS_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
         let dir = tempfile::tempdir().unwrap();
-        let previous = std::env::var("PI_CODING_AGENT_DIR").ok();
-        std::env::set_var("PI_CODING_AGENT_DIR", dir.path());
+        let _agent_dir = EnvRestore::set("PI_CODING_AGENT_DIR", &dir.path().to_string_lossy());
+        let _current_dir =
+            EnvRestore::set("DAVINCI_CODING_AGENT_DIR", &dir.path().to_string_lossy());
         let theme = builtin_themes()[0].clone();
         let mut session = InteractiveSession::new(theme, "davinci", vec![]);
         session.width = 100;
@@ -12580,10 +12623,6 @@ mod tests {
         )
         .unwrap();
         ACTIVE_PANES.with(|slot| *slot.borrow_mut() = None);
-        match previous {
-            Some(value) => std::env::set_var("PI_CODING_AGENT_DIR", value),
-            None => std::env::remove_var("PI_CODING_AGENT_DIR"),
-        }
         assert!(ok);
         let doc = session.chrome.render_document(100).join("\n");
         let plain = davinci_tui::strip_terminal_sequences(&doc);
@@ -12693,9 +12732,18 @@ mod tests {
 
     #[test]
     fn apply_discovered_resources_keeps_cli_skill_paths() {
+        let _env_lock = PROCESS_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
         let dir = tempfile::tempdir().unwrap();
-        let previous = std::env::var("PI_CODING_AGENT_DIR").ok();
-        std::env::set_var("PI_CODING_AGENT_DIR", dir.path().join("agent"));
+        let _agent_dir = EnvRestore::set(
+            "PI_CODING_AGENT_DIR",
+            &dir.path().join("agent").to_string_lossy(),
+        );
+        let _current_dir = EnvRestore::set(
+            "DAVINCI_CODING_AGENT_DIR",
+            &dir.path().join("agent").to_string_lossy(),
+        );
         let extra = dir.path().join("extra-skill.md");
         std::fs::write(
             &extra,
@@ -12719,14 +12767,13 @@ mod tests {
                 .map(|skill| &skill.name)
                 .collect::<Vec<_>>()
         );
-        match previous {
-            Some(value) => std::env::set_var("PI_CODING_AGENT_DIR", value),
-            None => std::env::remove_var("PI_CODING_AGENT_DIR"),
-        }
     }
 
     #[test]
     fn suspend_dry_run_sets_status() {
+        let _env_lock = PROCESS_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
         let theme = builtin_themes().into_iter().next().expect("theme");
         let mut session = InteractiveSession::new(theme, "pi", vec!["google/gemini".into()]);
         std::env::set_var("PI_SUSPEND_DRY_RUN", "1");
@@ -12744,6 +12791,9 @@ mod tests {
 
     #[test]
     fn sqlite_session_backend_upserts_created_session() {
+        let _env_lock = PROCESS_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
         let dir = tempfile::tempdir().unwrap();
         let session_dir = dir.path().join("sessions");
         std::env::set_var("PI_SESSION_BACKEND", "sqlite");
@@ -12842,11 +12892,15 @@ mod tests {
 
     #[test]
     fn bare_logout_without_stored_credentials_matches_ts() {
+        let _env_lock = PROCESS_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
         let dir = tempfile::tempdir().unwrap();
-        std::env::set_var("PI_CODING_AGENT_DIR", dir.path());
+        let _agent_dir = EnvRestore::set("PI_CODING_AGENT_DIR", &dir.path().to_string_lossy());
+        let _current_dir =
+            EnvRestore::set("DAVINCI_CODING_AGENT_DIR", &dir.path().to_string_lossy());
         let (parsed, mut agent, mut session) = test_session();
         handle_user_line(&parsed, &mut agent, &mut session, "/logout", None).unwrap();
-        std::env::remove_var("PI_CODING_AGENT_DIR");
         assert!(session.chrome.oauth_selector.is_none());
         assert!(session
             .chrome
@@ -13040,6 +13094,9 @@ mod tests {
 
     #[test]
     fn resume_fixture_opens_selected_session() {
+        let _env_lock = PROCESS_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
         let dir = tempfile::tempdir().unwrap();
         let session = JsonlSession::create(dir.path(), "/tmp/resume-pick", Some("picked")).unwrap();
         std::env::set_var("PI_RESUME_SESSION", session.path.display().to_string());

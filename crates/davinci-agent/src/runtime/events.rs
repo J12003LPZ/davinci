@@ -58,8 +58,11 @@ impl AgentRecord {
     }
 }
 
+pub const RUNTIME_EVENT_SCHEMA_VERSION: u16 = 1;
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct RuntimeEventEnvelope {
+    #[serde(default = "default_runtime_event_schema_version")]
     pub schema_version: u16, // starts at 1
     pub event_id: Uuid,
     pub sequence: u64,
@@ -69,6 +72,10 @@ pub struct RuntimeEventEnvelope {
     pub agent_id: Option<AgentId>,
     pub parent_agent_id: Option<AgentId>,
     pub payload: RuntimeEvent,
+}
+
+fn default_runtime_event_schema_version() -> u16 {
+    RUNTIME_EVENT_SCHEMA_VERSION
 }
 
 impl RuntimeEventEnvelope {
@@ -81,7 +88,7 @@ impl RuntimeEventEnvelope {
         payload: RuntimeEvent,
     ) -> Self {
         Self {
-            schema_version: 1,
+            schema_version: RUNTIME_EVENT_SCHEMA_VERSION,
             event_id: Uuid::now_v7(),
             sequence,
             timestamp_ms: std::time::SystemTime::now()
@@ -355,6 +362,33 @@ mod tests {
         let serialized = serde_json::to_string(&envelope).unwrap();
         let deserialized: RuntimeEventEnvelope = serde_json::from_str(&serialized).unwrap();
         assert_eq!(envelope, deserialized);
+    }
+
+    #[test]
+    fn runtime_event_envelope_legacy_schema_version_defaults() {
+        let envelope = RuntimeEventEnvelope::new(
+            7,
+            RunId::new(),
+            Some("legacy-session".into()),
+            None,
+            None,
+            RuntimeEvent::TurnStarted,
+        );
+
+        let mut legacy_json = serde_json::to_value(&envelope).unwrap();
+        legacy_json
+            .as_object_mut()
+            .unwrap()
+            .remove("schema_version");
+
+        let deserialized: RuntimeEventEnvelope = serde_json::from_value(legacy_json).unwrap();
+        assert_eq!(deserialized.schema_version, RUNTIME_EVENT_SCHEMA_VERSION);
+
+        let serialized = serde_json::to_value(&envelope).unwrap();
+        assert_eq!(
+            serialized.get("schema_version"),
+            Some(&json!(RUNTIME_EVENT_SCHEMA_VERSION))
+        );
     }
 
     #[test]

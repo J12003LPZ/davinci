@@ -48,10 +48,12 @@ pub fn inspector_lines(
         .min(count.saturating_sub(room));
     let mut rows = vec![Line::from(ui::span(
         ui::clip_ellipsis(
-            if run.inspecting_node {
+            if model.graph_canvas.inspecting_goal {
+                "MAIN GOAL · g worker activity"
+            } else if run.inspecting_node {
                 "INSPECTOR · public execution"
             } else {
-                "INSPECTOR · Enter for details"
+                "WORKER ACTIVITY · Enter details"
             },
             width,
         ),
@@ -108,7 +110,18 @@ fn inspector_facts(model: &Model, selected: Option<&str>, width: u16) -> Vec<Lin
             );
         }
     };
-    if let Some(group) = &model.graph_canvas.selected_group {
+    if model.graph_canvas.inspecting_goal {
+        add("Status: ", &run.lifecycle);
+        add("Phase: ", &run.phase);
+        add("Original prompt: ", &run.goal);
+        add("Progress", " ");
+        for task in &run.tasks {
+            add(
+                "",
+                &format!("{} {} · {}", task.state.glyph(), task.id, task.status),
+            );
+        }
+    } else if let Some(group) = &model.graph_canvas.selected_group {
         add(
             "Completed group: ",
             group.strip_prefix("fold:").unwrap_or(group),
@@ -119,6 +132,9 @@ fn inspector_facts(model: &Model, selected: Option<&str>, width: u16) -> Vec<Lin
         add("Status: ", &task.status);
         add("Phase: ", &task.phase);
         add("Work: ", &task.artifact);
+        for activity in task.recent_tools.iter().rev() {
+            add("Activity: ", activity);
+        }
         if let Some(error) = &task.error {
             add("Reason: ", error);
         }
@@ -134,9 +150,6 @@ fn inspector_facts(model: &Model, selected: Option<&str>, width: u16) -> Vec<Lin
             if task.attempts > 0 {
                 add("Attempts: ", &task.attempts.to_string());
             }
-            for tool in &task.recent_tools {
-                add("Recent Tool: ", tool);
-            }
             if let Some(contract) = &task.public_contract {
                 add("Public Contract: ", contract);
             }
@@ -145,6 +158,9 @@ fn inspector_facts(model: &Model, selected: Option<&str>, width: u16) -> Vec<Lin
         add("", "Arrows select a worker; Enter inspects");
     }
     add("Run phase: ", &run.phase);
+    if !model.graph_canvas.inspecting_goal {
+        add("Main goal (g): ", &run.goal);
+    }
     if let Some(reason) = &run.blocked_reason {
         add("Run blocked: ", reason);
     }
@@ -162,6 +178,59 @@ mod tests {
         theme::{ColorDepth, Theme},
         ui,
     };
+
+    #[test]
+    fn selection_shows_activity_without_enter_and_goal_is_readable() {
+        let mut model = Model::new(Theme::da_vinci(ColorDepth::TrueColor, true), 140, 45, false);
+        let mut run = fixtures::blueprint_graph();
+        run.inspecting_node = false;
+        run.goal = "Original user goal with a final acceptance criterion".into();
+        run.tasks[5].recent_tools = vec!["cargo test worker_activity".into()];
+        model.graph_run = Some(run);
+        let text = inspector_lines(&model, Some("writer"), 60, 100)
+            .iter()
+            .map(Line::to_string)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(text.contains("cargo test worker_activity"), "{text}");
+        assert!(text.contains("Original user goal"), "{text}");
+    }
+
+    #[test]
+    fn goal_panel_remains_bounded_and_pages_to_the_original_prompt_end() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        for width in [40, 80, 109, 120, 240] {
+            let mut model = Model::new(
+                Theme::da_vinci(ColorDepth::TrueColor, true),
+                width,
+                30,
+                false,
+            );
+            model.screen = crate::davinci::model::Screen::GraphRun;
+            let mut run = fixtures::blueprint_graph();
+            run.goal = "Original goal acceptance criterion ".repeat(100) + "GOAL_END";
+            run.control_status = Some("Retry requested".into());
+            model.graph_run = Some(run);
+            assert!(super::super::graph_nav::handle_key(
+                &mut model,
+                KeyEvent::new(KeyCode::Char('g'), KeyModifiers::NONE)
+            ));
+            assert!(model.graph_canvas.inspecting_goal);
+            let frame = crate::davinci::app::compose_frame(&model, 30);
+            assert!(frame.lines.len() <= 30);
+            assert!(frame
+                .lines
+                .iter()
+                .all(|row| ui::run_width(&row.spans) <= width));
+            let facts = inspector_facts(&model, Some("writer"), width);
+            assert!(facts.iter().any(|row| row.to_string().contains("GOAL_END")));
+            assert!(super::super::graph_nav::handle_key(
+                &mut model,
+                KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)
+            ));
+            assert!(!model.graph_canvas.inspecting_goal);
+        }
+    }
 
     #[test]
     fn graph_inspector_public_facts_privacy_and_width() {

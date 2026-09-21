@@ -95,7 +95,52 @@ fn global_package(search_path: &OsStr, name: &str) -> Option<Package> {
         .find_map(|path| {
             read_package(&path.join("node_modules").join(name))
                 .or_else(|| read_package(&path.join("../lib/node_modules").join(name)))
+                .or_else(|| pnpm_shim_package(&path, name))
         })
+}
+
+/// Read the package location from a pnpm Windows shim as bounded data. Never
+/// execute the shim or interpret shell substitutions; the manifest's entry point
+/// still goes through `package_command` and the normal launch permission gate.
+fn pnpm_shim_package(bin_dir: &Path, name: &str) -> Option<Package> {
+    let file = std::fs::File::open(bin_dir.join(format!("{name}.CMD"))).ok()?;
+    let mut bytes = Vec::new();
+    file.take(8193).read_to_end(&mut bytes).ok()?;
+    if bytes.len() > 8192 {
+        return None;
+    }
+    let text = std::str::from_utf8(&bytes).ok()?;
+    for quoted in text.split('"').skip(1).step_by(2) {
+        let Some(relative) = quoted.strip_prefix("%~dp0") else {
+            continue;
+        };
+        if relative.contains(['%', '!', '\r', '\n']) {
+            continue;
+        }
+        let relative = relative.replace('\\', "/");
+        let relative = relative.trim_start_matches('/');
+        if !relative.starts_with("../global/")
+            || !relative.contains(&format!("/node_modules/{name}/"))
+        {
+            continue;
+        }
+        let Some(entry) = bin_dir
+            .join(relative)
+            .canonicalize()
+            .ok()
+            .filter(|p| p.is_file())
+        else {
+            continue;
+        };
+        for parent in entry.ancestors().skip(1).take(4) {
+            if let Some(package) = read_package(parent) {
+                if package.manifest["name"].as_str() == Some(name) {
+                    return Some(package);
+                }
+            }
+        }
+    }
+    None
 }
 
 fn version(package: &Package) -> Option<String> {
@@ -144,7 +189,14 @@ pub(super) fn discover(
     backend: Backend,
     search_path: &OsStr,
 ) -> Result<Vec<ServerCommand>> {
-    let typescript = local_package(workspace, project, "typescript");
+    let preview = local_package(workspace, project, "@typescript/native-preview");
+    let typescript = local_package(workspace, project, "typescript").or_else(|| {
+        // A global compatibility compiler must not displace a project-native
+        // toolchain. Explicit compatibility mode may still use that fallback.
+        (preview.is_none() || backend == Backend::TypeScriptLanguageServer)
+            .then(|| global_package(search_path, "typescript"))
+            .flatten()
+    });
     let ts_version = typescript.as_ref().and_then(version);
     let tsserver = typescript
         .as_ref()
@@ -156,7 +208,6 @@ pub(super) fn discover(
             .and_then(|v| v.split('.').next()?.parse::<u32>().ok())
             .is_some_and(|major| major >= 7)
     });
-    let preview = local_package(workspace, project, "@typescript/native-preview");
     let mut candidates = Vec::new();
     if backend != Backend::TypeScriptLanguageServer {
         let native = native_ts
@@ -368,6 +419,82 @@ mod tests {
             std::fs::write(entry, "#!/usr/bin/env node\n").unwrap();
         }
         std::fs::write(path.join("package.json"), manifest.to_string()).unwrap();
+    }
+
+    #[test]
+    fn pnpm_windows_shim_discovers_package_without_executing_shell() {
+        let dir = tempfile::tempdir().unwrap();
+        let bin = dir.path().join("bin");
+        std::fs::create_dir(&bin).unwrap();
+        let store = dir.path().join("global/v11/hash");
+        package(
+            &store,
+            "typescript-language-server",
+            "5.3.0",
+            Some(("typescript-language-server", "lib/cli.mjs")),
+        );
+        std::fs::write(bin.join("typescript-language-server.CMD"),
+            "@SETLOCAL\nnode \"%~dp0\\..\\global\\v11\\hash\\node_modules\\typescript-language-server\\lib\\cli.mjs\" %*\n").unwrap();
+        let found = global_package(bin.as_os_str(), "typescript-language-server").unwrap();
+        assert_eq!(version(&found).as_deref(), Some("5.3.0"));
+        let (program, args) = package_command(
+            &found,
+            "typescript-language-server",
+            &std::env::var_os("PATH").unwrap(),
+        )
+        .unwrap();
+        assert!(!program.to_string_lossy().to_lowercase().ends_with(".cmd"));
+        assert!(args[0].ends_with("cli.mjs"));
+        std::fs::write(bin.join("typescript-language-server.CMD"),
+            "node \"%~dp0\\..\\global\\%UNTRUSTED%\\node_modules\\typescript-language-server\\lib\\cli.mjs\" %*\n").unwrap();
+        assert!(global_package(bin.as_os_str(), "typescript-language-server").is_none());
+        std::fs::write(bin.join("typescript-language-server.CMD"), "x".repeat(8193)).unwrap();
+        assert!(global_package(bin.as_os_str(), "typescript-language-server").is_none());
+    }
+
+    #[test]
+    fn global_compiler_fallback_never_overrides_project_typescript() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("project");
+        let global = dir.path().join("global-bin");
+        std::fs::create_dir(&root).unwrap();
+        package(
+            &global,
+            "typescript",
+            "5.8.1",
+            Some(("tsserver", "lib/tsserver.js")),
+        );
+        package(
+            &global,
+            "typescript-language-server",
+            "5.3.0",
+            Some(("typescript-language-server", "lib/cli.mjs")),
+        );
+        let paths = std::iter::once(global.clone())
+            .chain(std::env::split_paths(&std::env::var_os("PATH").unwrap()).collect::<Vec<_>>());
+        let search = std::env::join_paths(paths).unwrap();
+        let found = discover(&root, &root, Backend::Auto, &search).unwrap();
+        assert_eq!(found[0].typescript_version.as_deref(), Some("5.8.1"));
+        package(
+            &root,
+            "@typescript/native-preview",
+            "7.0.0-dev",
+            Some(("tsgo", "bin/tsgo")),
+        );
+        let found = discover(&root, &root, Backend::Auto, &search).unwrap();
+        assert_eq!(found[0].kind, Backend::TypeScriptNative);
+        package(
+            &root,
+            "typescript",
+            "5.7.0",
+            Some(("tsserver", "lib/tsserver.js")),
+        );
+        let found = discover(&root, &root, Backend::Auto, &search).unwrap();
+        assert_eq!(found[0].typescript_version.as_deref(), Some("5.7.0"));
+        assert!(found[0].initialization_options["tsserver"]["path"]
+            .as_str()
+            .unwrap()
+            .contains("project"));
     }
 
     #[test]

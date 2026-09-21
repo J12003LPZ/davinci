@@ -96,6 +96,41 @@ fn tail(text: &str, max_chars: usize) -> String {
     text.chars().skip(skip).collect()
 }
 
+/// Preserve actionable failure locations even when a test dumps a large value.
+fn verification_excerpt(output: &str, failed: bool) -> String {
+    if !failed || output.chars().count() <= OUTPUT_TAIL_CHARS {
+        return tail(output, OUTPUT_TAIL_CHARS);
+    }
+    let mut diagnostics = String::new();
+    let mut context = 0;
+    for line in output.lines() {
+        let trimmed = line.trim_start();
+        if (trimmed.starts_with("thread '") && trimmed.contains("panicked at"))
+            || trimmed.starts_with("error:")
+            || trimmed.starts_with("error[")
+            || trimmed.starts_with("assertion")
+        {
+            context = 3;
+        }
+        if context > 0 {
+            let remaining = 1200usize.saturating_sub(diagnostics.chars().count());
+            if remaining <= 1 {
+                break;
+            }
+            diagnostics.extend(line.chars().take(remaining.saturating_sub(1).min(300)));
+            diagnostics.push('\n');
+            context -= 1;
+        }
+    }
+    if diagnostics.is_empty() {
+        return tail(output, OUTPUT_TAIL_CHARS);
+    }
+    diagnostics.push_str("\n[... final output ...]\n");
+    let remaining = OUTPUT_TAIL_CHARS - diagnostics.chars().count();
+    diagnostics.push_str(&tail(output, remaining));
+    diagnostics
+}
+
 /// Executes one command string. Split out so tests can drive verification
 /// without touching a shell.
 pub type VerifyExec =
@@ -188,7 +223,7 @@ pub fn run_verification(
             command: spec.command.clone(),
             exit_code,
             duration_ms,
-            output_tail: format!("{prefix}{}", tail(&output, OUTPUT_TAIL_CHARS)),
+            output_tail: format!("{prefix}{}", verification_excerpt(&output, exit_code != 0)),
             skipped,
         });
     }
@@ -312,6 +347,50 @@ mod tests {
             command: command.into(),
             from_plan: false,
         }
+    }
+
+    #[test]
+    fn failed_verification_retains_panic_location_before_large_event_dump() {
+        let output = format!(
+            "thread 'tests::worker' panicked at src/main.rs:42:9:\nassertion failed: coordinator event accepted\n{}\nfailures:\n    tests::worker\ntest result: FAILED\n",
+            "runtime event dump ".repeat(1000)
+        );
+        let result = run_verification(
+            &[spec("test", "cargo test")],
+            Path::new("."),
+            &Arc::new(AtomicBool::new(false)),
+            1000,
+            &move |_, _, _, _| (101, output.clone(), 1),
+        );
+        let diagnostic = &result.commands[0].output_tail;
+        assert!(diagnostic.contains("src/main.rs:42:9"));
+        assert!(diagnostic.contains("assertion failed: coordinator event accepted"));
+        assert!(diagnostic.contains("test result: FAILED"));
+        assert!(diagnostic.chars().count() <= OUTPUT_TAIL_CHARS);
+        assert!(!result.passed);
+    }
+
+    #[test]
+    fn failure_excerpt_bounds_unicode_and_preserves_success_tail() {
+        let output = format!(
+            "error: first failure\n{}\nerror[E0001]: second failure\n{}\nFAILED",
+            "x".repeat(5000),
+            "界".repeat(5000)
+        );
+        let excerpt = verification_excerpt(&output, true);
+        assert!(excerpt.contains("first failure"));
+        assert!(excerpt.contains("second failure"));
+        assert!(excerpt.ends_with("FAILED"));
+        assert_eq!(excerpt.chars().count(), OUTPUT_TAIL_CHARS);
+        assert_eq!(
+            verification_excerpt(&output, false),
+            tail(&output, OUTPUT_TAIL_CHARS)
+        );
+        let unstructured = "界".repeat(5000);
+        assert_eq!(
+            verification_excerpt(&unstructured, true),
+            tail(&unstructured, OUTPUT_TAIL_CHARS)
+        );
     }
 
     #[test]

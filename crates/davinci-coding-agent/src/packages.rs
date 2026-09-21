@@ -1277,8 +1277,8 @@ mod tests {
         let agent = dir.path().join("agent");
         fs::create_dir_all(&agent).unwrap();
         let message = self_update_binary(&agent, true).unwrap();
-        assert!(message.starts_with("Updated pi from "));
-        assert!(managed_bin_dir(&agent).join("pi").exists());
+        assert!(message.starts_with("Updated davinci from "));
+        assert!(managed_bin_dir(&agent).join("davinci").exists());
     }
 
     #[test]

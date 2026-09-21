@@ -1,22 +1,22 @@
-pi - AI coding assistant with read, bash, edit, write tools
+davinci - AI coding assistant with read, bash, edit, write tools
 
 Usage:
-  pi [options] [--] [@files...] [messages...]
+  davinci [options] [--] [@files...] [messages...]
 
 Commands:
   davinci voice status|devices|model list   Experimental local CPU dictation setup
   davinci voice model install <id>         Download an approved tiny/base/small model
   davinci voice model import <id> <path>   Verify and import a local model (offline)
-  pi install <source> [-l]     Install extension source and add to settings
-  pi remove <source> [-l]      Remove extension source from settings
-  pi uninstall <source> [-l]   Alias for remove
-  pi update [source|self|pi]   Update pi, extensions, or model catalogs
-  pi list                      List installed extensions from settings
-  pi config [-l]               Open TUI to enable/disable package resources (Tab switches scope)
-  pi auth <command>            Print credentials or check provider readiness
-  pi server --listen unix:///path   Experimental protocol server
-  pi client --connect unix:///path  Experimental protocol client
-  pi <command> --help          Show help for install/remove/uninstall/update/list/config/auth/server/client
+  davinci install <source> [-l]     Install extension source and add to settings
+  davinci remove <source> [-l]      Remove extension source from settings
+  davinci uninstall <source> [-l]   Alias for remove
+  davinci update [source|self]   Update davinci, extensions, or model catalogs
+  davinci list                      List installed extensions from settings
+  davinci config [-l]               Open TUI to enable/disable package resources (Tab switches scope)
+  davinci auth <command>            Print credentials or check provider readiness
+  davinci server --listen unix:///path   Experimental protocol server
+  davinci client --connect unix:///path  Experimental protocol client
+  davinci <command> --help          Show help for install/remove/uninstall/update/list/config/auth/server/client
 
 Options:
   --provider <name>              Provider name (default: google)
@@ -45,7 +45,8 @@ Options:
   --sandbox <preset>             Same flag, Codex names: read-only, workspace-write, full-access (a policy preset, not an OS sandbox)
   --thinking <level>             Set thinking level: off, minimal, low, medium, high, xhigh, max
   --extension, -e <path>         Load an extension file (can be used multiple times)
-  --no-extensions, -ne           Disable extension discovery (explicit -e paths still work)
+  --no-extensions, -ne           Disable JS extension discovery (native intelligence stays enabled)
+  --no-mcp                      Skip all MCP server connections for this run
   --skill <path>                 Load a skill file or directory (can be used multiple times)
   --no-skills, -ns               Disable skills discovery and loading
   --prompt-template <path>       Load a prompt template file or directory (can be used multiple times)
@@ -66,69 +67,75 @@ Options:
   --help, -h                     Show this help
   --version, -v                  Show version number
 
+Native intelligence (also available in -p and with --no-extensions):
+  tool_search discovers graph_run, memory_search, retrieve_output, and lsp_* tools.
+  JavaScript/TypeScript semantic tools start their language server only on demand.
+  /lsp-status, /governor-status, /memory-status show native service health.
+  Use --no-mcp for small tasks that only need native tools.
+
 Extensions can register additional flags (e.g., --plan from plan-mode extension).
 
 Examples:
   # Print a provider API key for an external client
-  pi auth print-api-key --provider openai
+  davinci auth print-api-key --provider openai
 
   # Print an OAuth bearer token for an external client (refreshes if expired)
-  pi auth print-bearer-token --provider openai-codex
+  davinci auth print-bearer-token --provider openai-codex
 
   # Interactive mode
-  pi
+  davinci
 
   # Interactive mode with initial prompt
-  pi "List all .ts files in src/"
+  davinci "List all .ts files in src/"
 
   # Include files in initial message
-  pi @prompt.md @image.png "What color is the sky?"
+  davinci @prompt.md @image.png "What color is the sky?"
 
   # Non-interactive mode (process and exit)
-  pi -p "List all .ts files in src/"
+  davinci -p "List all .ts files in src/"
 
   # Prompt beginning with a dash
-  pi -p -- "- Summarize these points"
+  davinci -p -- "- Summarize these points"
 
   # Multiple messages (interactive)
-  pi "Read package.json" "What dependencies do we have?"
+  davinci "Read package.json" "What dependencies do we have?"
 
   # Continue previous session
-  pi --continue "What did we discuss?"
+  davinci --continue "What did we discuss?"
 
   # Start a named session
-  pi --name "Refactor auth module"
+  davinci --name "Refactor auth module"
 
   # Use different model
-  pi --provider openai --model gpt-4o-mini "Help me refactor this code"
+  davinci --provider openai --model gpt-4o-mini "Help me refactor this code"
 
   # Use model with provider prefix (no --provider needed)
-  pi --model openai/gpt-4o "Help me refactor this code"
+  davinci --model openai/gpt-4o "Help me refactor this code"
 
   # Use model with thinking level shorthand
-  pi --model sonnet:high "Solve this complex problem"
+  davinci --model sonnet:high "Solve this complex problem"
 
   # Limit model cycling to specific models
-  pi --models claude-sonnet,claude-haiku,gpt-4o
+  davinci --models claude-sonnet,claude-haiku,gpt-4o
 
   # Limit to a specific provider with glob pattern
-  pi --models "github-copilot/*"
+  davinci --models "github-copilot/*"
 
   # Cycle models with fixed thinking levels
-  pi --models sonnet:high,haiku:low
+  davinci --models sonnet:high,haiku:low
 
   # Start with a specific thinking level
-  pi --thinking high "Solve this complex problem"
+  davinci --thinking high "Solve this complex problem"
 
   # Read-only mode (no file modifications possible)
-  pi --tools read,grep,find,ls -p "Review the code in src/"
+  davinci --tools read,grep,find,ls -p "Review the code in src/"
 
   # Disable one tool while keeping the rest available
-  pi --exclude-tools ask_question
+  davinci --exclude-tools ask_question
 
   # Export a session file to HTML
-  pi --export ~/.pi/agent/sessions/--path--/session.jsonl
-  pi --export session.jsonl output.html
+  davinci --export ~/.davinci/agent/sessions/--path--/session.jsonl
+  davinci --export session.jsonl output.html
 
 Permission Modes (interactive):
   Shift+Tab                       Cycle Manual -> Accept Edits -> Plan Mode -> Auto Mode
@@ -189,7 +196,8 @@ Environment Variables:
   AWS_SECRET_ACCESS_KEY            - AWS secret key for Amazon Bedrock
   AWS_BEARER_TOKEN_BEDROCK         - Bedrock API key (bearer token)
   AWS_REGION                       - AWS region for Amazon Bedrock (e.g., us-east-1)
-  PI_CODING_AGENT_DIR              - Config directory (default: ~/.pi/agent)
+  DAVINCI_CODING_AGENT_DIR         - Config directory (default: ~/.davinci/agent)
+  PI_CODING_AGENT_DIR              - Legacy config directory override
   PI_SESSION_DIR                   - Session storage directory (overridden by --session-dir)
   PI_PACKAGE_DIR                   - Override package directory (for Nix/Guix store paths)
   PI_OFFLINE                       - Disable startup network operations when set to 1/true/yes

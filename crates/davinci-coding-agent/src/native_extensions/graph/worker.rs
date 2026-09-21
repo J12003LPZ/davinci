@@ -257,6 +257,15 @@ pub fn build_worker_args(
         "always-approve".to_string(),
     ];
     // Explicit -e overrides automatic-extension disabling in the worker CLI.
+    // Native graph roles do not need MCP subprocesses. Only connect when the
+    // parent explicitly authorized an MCP capability for this worker.
+    if !spec
+        .authorized_tools
+        .iter()
+        .any(|name| name == "mcp_read" || name.starts_with("mcp__"))
+    {
+        args.push("--no-mcp".to_string());
+    }
     // Only an already trusted project may supply these executable modules.
     for extension in spec
         .extra_extensions
@@ -827,6 +836,7 @@ mod tests {
         assert!(joined.contains("--mode json"));
         assert!(joined.contains("--no-session"));
         assert!(joined.contains("--no-extensions"));
+        assert!(args.contains(&"--no-mcp".to_string()));
         assert!(joined.contains("--no-skills"));
         assert!(joined.contains("--no-prompt-templates"));
         let tools_index = args.iter().position(|arg| arg == "--tools").unwrap();
@@ -837,6 +847,14 @@ mod tests {
         assert!(joined.contains("-e governor"));
         assert!(joined.contains("-a"));
         assert!(args.last().unwrap().starts_with('@'));
+    }
+
+    #[test]
+    fn explicit_mcp_authorization_preserves_worker_connections() {
+        let mut worker = spec();
+        worker.authorized_tools.push("mcp__docs__search".into());
+        let args = build_worker_args(&worker, Path::new("brief.md"), Path::new("system.md"));
+        assert!(!args.contains(&"--no-mcp".into()));
     }
 
     #[test]

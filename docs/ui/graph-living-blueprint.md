@@ -1,11 +1,55 @@
 # Graph Run: Living Blueprint
 
 Interactive `/graph` uses a terminal-cell workflow canvas. `Grafo` remains the
-separate code/symbol dependency study. The graph controller, permissions,
-scheduler, persistence, replay, verification and non-interactive output are not
-changed by this presentation.
+separate code/symbol dependency study.
+
+## Choose models before starting
+
+Submitting a new interactive `/graph` goal or saved run opens Graph Setup before
+workers start. Select a role, type or paste a model name to filter the available
+catalog, and press Enter to choose it. Each of classifier, researcher,
+test-analyzer, historian, planner, writer and reviewer can use a different model.
+The picker uses exact provider/model IDs from the configured catalog.
+
+Select **Start graph** to apply the choices and launch. Choices remain available
+for later graphs in this session; they do not change the main chat model or write
+project configuration. **Use session model for all roles** clears role overrides.
+Escape returns from a model picker to the roles; Escape at the role list cancels
+without launching workers or saving the draft choices. Unavailable configured
+models must be replaced before launch. Non-interactive graph commands retain
+their existing configuration behavior.
 
 ## Reading and controlling the run
+
+Terminal runs show **COMPLETED**, **BLOCKED - goal not completed**, or
+**CANCELLED** and add one final result to the conversation, with the reason,
+verification details, elapsed time, cost and artifact directory. Finishing all
+workers does not imply that verification passed. Results are also reported when
+the graph sheet is closed. Older blocked runs with a stale `running` lifecycle
+are displayed as stopped.
+
+Press **s** on a blocked or cancelled graph to resume it, or use
+`/graph-resume <run-id>`. The controller preserves the goal, run identity and
+accumulated spend; superseded implementation artifacts are not replayed as new
+work. A completed graph requires a new goal. Resume does not fix a missing goal
+specification: check the original prompt with **g** before continuing.
+
+Generated graphs bind revision attempts to the actual preceding writer, plan and
+review, so a retry cannot accidentally wait for the next milestone's review.
+Saved graph definitions retain their explicit dependencies. The revision display
+reports a lifetime total and a per-milestone limit separately; an explicit resume
+starts a new delivery attempt without erasing prior revision or cost totals.
+
+Failed verification excerpts preserve panic locations, assertion details and
+compiler errors alongside the final output, within the existing 4,000-character
+budget. Revision workers receive this excerpt even when a test prints a large
+event dump. A failed verification command still blocks completion.
+
+Graph workers inherit the active agent directory's saved compaction settings.
+An explicit token or percentage threshold also controls Context VM window-pressure
+folds, using each worker model's context window. Structural delta folds can still
+happen earlier to bound the event log. Disabling automatic compaction disables
+these automatic folds; explicit manual folding remains separate.
 
 Cards follow actual dependencies from left to right. `◉` and heavy borders mark
 active workers; `×` marks failure; `!` and a reason mark blocked work. Completed
@@ -21,6 +65,7 @@ presentation without changing their persisted status.
 | Esc | Close inspection/diff context, then expanded groups, then the sheet. A selected worker remains individually visible. |
 | `f` | Explicitly restore follow and recenter on active work. |
 | `v` | Toggle Overview/Focus; focus emphasizes selected/active ancestry and descendants, without changing execution. |
+| `g` | Toggle the original prompt and worker progress in the inspector. PgUp/PgDn scroll it; Esc returns to worker activity. |
 | `p` / `x` / `r` / `d` | Preserve the existing pause/resume, stop, retry and diff action bridge. Synthetic summaries cannot become worker control targets. |
 | PgUp / PgDn | Page open details; otherwise pan vertically or page the narrow ledger. |
 | Left click | Select a visible card using its rendered geometry. |
@@ -41,8 +86,8 @@ not reorder first-seen peers; unchanged topology retains its geometry.
 
 | Available size | Presentation |
 |---|---|
-| Width ≥120 and usable graph body ≥24 rows | Full cards and a 32-column right inspector |
-| Width 72–119 (or a shorter wide body) | Canvas and bottom inspector |
+| Width ≥100 and usable graph body ≥16 rows | Full cards and a right inspector using one third of the width (36–72 columns) |
+| Width 72–99 (or a shorter wide body) | Canvas and bottom inspector |
 | Width 50–71 | Compact cards and bottom inspector |
 | Width <50 or graph body <12 rows | Bounded worker ledger with inspection and controls |
 
@@ -61,6 +106,25 @@ phase, blocked reason and verification outcomes from the graph snapshot.
 Artifact directories use the existing graph-store path helper. Owner, recent
 tools and public contract are displayed only when supplied; absent data is
 omitted. The TUI never opens graph persistence files.
+
+Selecting a worker shows its current work and recent public transcript without
+requiring Enter. The host refreshes the selected worker's activity once per
+second using `graph-view`, and checks both run and worker IDs before displaying
+it. The log read is limited to the last 64 KiB; the panel retains up to 40 recent
+entries, newest first. Enter exposes additional metadata and enables paging.
+The original goal remains available with `g` even when a control notice occupies
+the header. Common credential formats are redacted from goals and activity
+before they reach the display.
+
+Long clipboard pastes remain drafts, shown as `[paste #1 1234 chars]` when over
+1,000 characters or 10 lines. Windows hosts that strip paste markers use input
+burst detection with a 500ms quiet window; wait for the marker before pressing
+Enter. Unmarked chunks separated by longer pauses cannot be identified as one
+paste. Explicit bracketed pastes do not have that timing limitation.
+Enter expands the marker on submission. Pauses
+between bracketed-paste chunks never turn pasted newlines into submit keys.
+If a terminal loses the closing paste marker, Ctrl+C releases the buffered text
+and performs the usual cancel action.
 
 Verification shows command/name, outcome, exit code, skip status and elapsed
 time; raw output tails and private context fingerprints are not passed through.

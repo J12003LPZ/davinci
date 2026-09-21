@@ -1135,6 +1135,7 @@ pub struct GraphCanvasState {
     pub expanded_groups: std::collections::BTreeSet<String>,
     pub selected_group: Option<String>,
     pub inspector_scroll: usize,
+    pub inspecting_goal: bool,
     /// First-seen peer order, retained across snapshots of the same run.
     pub node_order: Vec<String>,
     pub list_scroll: Option<usize>,
@@ -1150,6 +1151,7 @@ impl Default for GraphCanvasState {
             expanded_groups: Default::default(),
             selected_group: None,
             inspector_scroll: 0,
+            inspecting_goal: false,
             node_order: Vec::new(),
             list_scroll: None,
         }
@@ -1213,11 +1215,31 @@ pub struct GraphRunSheet {
     pub showing_diff: bool,
 }
 
+impl GraphRunSheet {
+    pub fn outcome(&self) -> Option<&'static str> {
+        match self.phase.as_str() {
+            "done" => Some("COMPLETED"),
+            "blocked" => Some("BLOCKED - goal not completed"),
+            "cancelled" => Some("CANCELLED"),
+            _ => None,
+        }
+    }
+
+    pub fn can_resume(&self) -> bool {
+        matches!(self.phase.as_str(), "blocked" | "cancelled")
+            || matches!(
+                self.lifecycle.as_str(),
+                "paused" | "pause_requested" | "recovery_required"
+            )
+    }
+}
+
 pub fn graph_view_action(key: &str) -> Option<&'static str> {
     match key {
         "p" => Some("pause_resume"),
         "x" => Some("stop"),
         "r" => Some("retry"),
+        "s" => Some("resume"),
         "d" => Some("diff"),
         "enter" => Some("inspect"),
         "f" => Some("follow"),
@@ -2185,7 +2207,9 @@ impl Model {
         if self.overlay == Some(Overlay::Instrumenta) {
             self.type_char(&text.replace('\n', " "));
         } else {
-            self.type_char(&text);
+            self.mark_caret_moved();
+            self.composer.editor_mut().handle_paste(&text);
+            self.refresh_suggestions();
         }
     }
 
@@ -3115,6 +3139,22 @@ mod tests {
         m.toggle_overlay(Overlay::Instrumenta);
         m.paste("one\ntwo");
         assert_eq!(m.query, "one two");
+    }
+
+    #[test]
+    fn long_pastes_are_compact_drafts_with_lossless_expansion() {
+        for text in ["x".repeat(1001), "line\n".repeat(20), "界".repeat(1001)] {
+            let mut m = model(100);
+            let transcript_len = m.transcript.len();
+            m.paste(&text);
+            assert_eq!(
+                m.composer.to_string(),
+                format!("[paste #1 {} chars]", text.chars().count())
+            );
+            assert_eq!(m.transcript.len(), transcript_len);
+            assert_eq!(m.composer.editor().get_expanded_text(), text);
+            assert_eq!(m.composer.editor_mut().submit(), text.trim());
+        }
     }
 
     #[test]

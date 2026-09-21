@@ -73,7 +73,7 @@ pub use render::{
     GraphCommand, ParsedGraphArgs,
 };
 use serde_json::{json, Value};
-use store::{list_runs, load_run, read_transcript, transcript_path};
+use store::{list_runs, load_run, transcript_path};
 use verify::{contracted_verify_exec, default_verify_exec, dry_run_verify_exec};
 use worker::{run_dry_worker, run_worker};
 
@@ -302,6 +302,7 @@ pub struct GraphController {
     cwd: PathBuf,
     session_model: Option<String>,
     session_thinking: Option<String>,
+    session_role_models: Option<std::collections::BTreeMap<Role, String>>,
     project_trusted: bool,
     pub memory: Option<crate::native_extensions::VectorMemory>,
     pub learning: Option<crate::native_extensions::LearningController>,
@@ -327,6 +328,7 @@ impl GraphController {
             cwd,
             session_model: None,
             session_thinking: None,
+            session_role_models: None,
             project_trusted: false,
             memory: None,
             learning: None,
@@ -382,17 +384,35 @@ impl GraphController {
         self.project_trusted = project_trusted;
     }
 
+    pub fn role_models(&self) -> std::collections::BTreeMap<Role, String> {
+        self.session_role_models.clone().unwrap_or_else(|| {
+            if self.project_trusted {
+                load_config(&self.cwd).config.models
+            } else {
+                Default::default()
+            }
+        })
+    }
+
+    /// Explicit interactive choices override project defaults for this session.
+    pub fn set_role_models(&mut self, models: std::collections::BTreeMap<Role, String>) {
+        self.session_role_models = Some(models);
+    }
+
     /// Returns the dependencies plus any `graph.json` complaints worth showing.
     fn deps(&self, dry_run: bool, active: &Arc<ActiveRun>) -> (ControllerDeps, Vec<String>) {
         // A malformed graph.json is reported, then ignored: the run proceeds
         // on defaults rather than refusing to start.
         // Repository configuration is not explicit user authorization to run
         // extensions or verification commands. Ignore it until trust is granted.
-        let loaded = if self.project_trusted {
+        let mut loaded = if self.project_trusted {
             load_config(&self.cwd)
         } else {
             config::LoadedConfig::default()
         };
+        if let Some(models) = &self.session_role_models {
+            loaded.config.models = models.clone();
+        }
         let sink = Arc::clone(active);
         let deps = ControllerDeps {
             runner: if dry_run {
@@ -700,8 +720,7 @@ impl GraphController {
                            "error": format!("No task \"{task_id}\" in run {}", run.run_id)});
         };
         let path = transcript_path(Path::new(&run.cwd), &run.run_id, &chosen.id);
-        let transcript = read_transcript(&path);
-        let tail: Vec<String> = transcript.iter().rev().take(200).rev().cloned().collect();
+        let tail = store::read_transcript_tail(&path);
         json!({
             "runId": run.run_id,
             "taskId": chosen.id,
@@ -1402,6 +1421,27 @@ mod tests {
         controller
     }
 
+    #[test]
+    fn interactive_role_models_reach_worker_dependencies_without_project_trust() {
+        let dir = tempdir().unwrap();
+        let mut controller = controller(dir.path());
+        controller.set_session_context(Some("provider/chat".into()), Some("high".into()), false);
+        let models = std::collections::BTreeMap::from([
+            (Role::Researcher, "provider/luna".into()),
+            (Role::Planner, "provider/sol".into()),
+        ]);
+        controller.set_role_models(models.clone());
+        let active = Arc::new(ActiveRun::default());
+        let (deps, errors) = controller.deps(true, &active);
+        assert!(errors.is_empty());
+        assert_eq!(deps.config.models, models);
+        assert_eq!(deps.session_model.as_deref(), Some("provider/chat"));
+        assert!(!deps.project_trusted);
+        assert!(deps.config.worker_extensions.is_empty());
+        controller.set_role_models(Default::default());
+        assert!(controller.deps(true, &active).0.config.models.is_empty());
+    }
+
     fn drain_active(cwd: &Path) {
         // A dry run finishes in milliseconds; wait for it so the next test in
         // the same directory is not refused as "already active".
@@ -1824,6 +1864,38 @@ mod tests {
 
         let err = controller.command("graph", "save no-run").unwrap_err();
         assert!(err.contains("No graph run found"));
+    }
+
+    #[test]
+    fn blocked_graph_can_resume_with_same_identity_and_preserved_spend() {
+        let _guard = registry_guard();
+        let dir = tempdir().unwrap();
+        let controller = controller(dir.path());
+        let mut run = controller
+            .run_to_completion(parse_graph_args("--dry-run --simple resume regression"))
+            .unwrap();
+        assert_eq!(run.lifecycle, Some(types::GraphLifecycle::Stopped));
+        run.phase = Phase::Blocked;
+        run.lifecycle = Some(types::GraphLifecycle::Running); // Older saved runs.
+        run.blocked_reason = Some("verification still failing after 3 revision cycles".into());
+        run.counters.revision_cycles = 3;
+        run.counters.cost_usd = 6.83;
+        assert_eq!(run.current_lifecycle(), types::GraphLifecycle::Stopped);
+        store::save_run(&mut run).unwrap();
+        let response = controller
+            .command("graph-resume", &run.run_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(response["started"], true);
+        drain_active(dir.path());
+        let resumed = load_run(dir.path(), &run.run_id).unwrap();
+        assert_eq!(resumed.run_id, run.run_id);
+        assert_eq!(resumed.goal, run.goal);
+        assert_eq!(resumed.phase, Phase::Done);
+        assert_eq!(resumed.lifecycle, Some(types::GraphLifecycle::Stopped));
+        assert!(resumed.blocked_reason.is_none());
+        assert!(resumed.counters.cost_usd >= 6.83);
+        assert!(resumed.counters.revision_cycles >= 3);
     }
 
     #[test]

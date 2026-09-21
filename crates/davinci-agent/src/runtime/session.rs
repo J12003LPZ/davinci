@@ -60,6 +60,20 @@ pub fn restore_session_runtime_with_legacy_recovery(
         .rehydrate_from_events(&events)
         .map_err(|error| format!("runtime registry could not be replayed: {error}"))?;
     runtime.mailbox.rehydrate_from_events(&events);
+    let persisted_identity = events
+        .iter()
+        .find_map(|event| event.agent_id.map(|agent_id| (event.run_id, agent_id)));
+    if let Some((run_id, agent_id)) = persisted_identity {
+        runtime.run_id = run_id;
+        runtime.agent_id = agent_id;
+    }
+    let conversation_events: Vec<_> = events
+        .iter()
+        .filter(|event| {
+            event.agent_id == Some(runtime.agent_id) && event.session_id == runtime.session_id
+        })
+        .cloned()
+        .collect();
     let key = serde_json::to_string(&(source, &session.header.id))
         .map_err(|error| format!("session source key could not be encoded: {error}"))?;
     let (tasks, run_id) =
@@ -75,6 +89,7 @@ pub fn restore_session_runtime_with_legacy_recovery(
         }
     }
     runtime.run_id = run_id;
+    runtime.restore_conversation(&conversation_events)?;
     runtime.task_registry = tasks.with_observers(runtime.bus.clone());
     let subscriber = RuntimeLogSubscriber::open(&path)
         .map_err(|error| format!("runtime log could not be opened for observation: {error}"))?;
@@ -106,7 +121,11 @@ impl RuntimeLogSubscriber {
 impl RuntimeSubscriber for RuntimeLogSubscriber {
     fn on_event(&self, event: &RuntimeEventEnvelope) -> RuntimeDecision {
         if let Ok(mut writer) = self.writer.lock() {
-            let _ = writer.append(event);
+            if let Err(error) = writer.append(event) {
+                eprintln!("[davinci-runtime] runtime sidecar append failed: {error}");
+            }
+        } else {
+            eprintln!("[davinci-runtime] runtime sidecar lock failed");
         }
         RuntimeDecision::Continue
     }

@@ -182,7 +182,7 @@ pub fn handle_key(
             | KeyCode::Esc
             | KeyCode::PageUp
             | KeyCode::PageDown
-            | KeyCode::Char('f' | 'v' | 'x' | 'r' | 'd')
+            | KeyCode::Char('f' | 'v' | 'g' | 'x' | 'r' | 'd')
     );
     if !relevant || model.graph_run.is_none() {
         return false;
@@ -193,6 +193,10 @@ pub fn handle_key(
         .or_else(|| super::graph_run::layout_for(model, model.height.saturating_sub(3)))
         .unwrap();
     match key.code {
+        KeyCode::Char('g') => {
+            model.graph_canvas.inspecting_goal = !model.graph_canvas.inspecting_goal;
+            model.graph_canvas.inspector_scroll = 0;
+        }
         KeyCode::Char('f') => {
             model.graph_canvas.follow_live = true;
             model.graph_canvas.list_scroll = None;
@@ -205,6 +209,7 @@ pub fn handle_key(
             };
         }
         KeyCode::Up | KeyCode::Down | KeyCode::Left | KeyCode::Right => {
+            model.graph_canvas.inspecting_goal = false;
             let direction = match key.code {
                 KeyCode::Up => NavDirection::Up,
                 KeyCode::Down => NavDirection::Down,
@@ -238,6 +243,11 @@ pub fn handle_key(
             model.graph_canvas.inspector_scroll = 0;
         }
         KeyCode::Esc => {
+            if model.graph_canvas.inspecting_goal {
+                model.graph_canvas.inspecting_goal = false;
+                model.graph_canvas.inspector_scroll = 0;
+                return true;
+            }
             let run = model.graph_run.as_mut().unwrap();
             if run.inspecting_node || run.showing_diff {
                 run.inspecting_node = false;
@@ -250,7 +260,9 @@ pub fn handle_key(
         }
         KeyCode::PageUp | KeyCode::PageDown => {
             let amount = if key.code == KeyCode::PageUp { -5 } else { 5 };
-            if model.graph_run.as_ref().unwrap().inspecting_node {
+            if model.graph_canvas.inspecting_goal
+                || model.graph_run.as_ref().unwrap().inspecting_node
+            {
                 let (width, height) =
                     if layout.mode == super::graph_layout::GraphResponsiveMode::Structured {
                         (model.width, layout.canvas.height.saturating_sub(3))
@@ -402,6 +414,7 @@ pub fn select(
     run.selected_node_id = (node.members.len() == 1).then(|| id.into());
     run.selected_index = node.task_index;
     canvas.inspector_scroll = 0;
+    canvas.inspecting_goal = false;
     canvas.pan_x = x
         .min(node.rect.x as i32)
         .max(node.rect.right() as i32 - layout.canvas.width as i32)

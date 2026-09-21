@@ -10,6 +10,7 @@
 pub mod app;
 pub mod fixtures;
 pub mod model;
+mod paste_burst;
 pub mod runtime;
 pub mod term;
 pub mod theme;

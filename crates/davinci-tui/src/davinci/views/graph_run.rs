@@ -67,7 +67,7 @@ pub fn lines_with_layout(model: &Model, height: u16, layout: &GraphLayout) -> Ve
                 public_text(&format!(
                     "{} · {} · Follow {} · {:?}",
                     run.id,
-                    run.lifecycle,
+                    run.outcome().unwrap_or(&run.lifecycle),
                     if model.graph_canvas.follow_live {
                         "on"
                     } else {
@@ -140,19 +140,15 @@ pub fn lines_with_layout(model: &Model, height: u16, layout: &GraphLayout) -> Ve
 }
 
 fn controls(model: &Model) -> Vec<Line<'static>> {
-    let control = if model
-        .graph_run
-        .as_ref()
-        .is_some_and(|r| r.lifecycle == "paused")
-    {
-        "p resume · x stop · r retry · d diff"
+    let control = if model.graph_run.as_ref().is_some_and(|r| r.can_resume()) {
+        "s resume graph · r retry · d diff"
     } else {
         "p pause · x stop · r retry · d diff"
     };
     [
         "↑↓←→ select · Enter inspect · v focus",
         control,
-        "f follow · PgUp/Dn pan/details",
+        "g goal · f follow · PgUp/Dn pan/details",
     ]
     .into_iter()
     .map(|text| {
@@ -176,7 +172,7 @@ fn structured_window(model: &Model, height: u16, layout: &GraphLayout) -> Vec<Li
     let mut rows = vec![
         line(format!(
             "{} · Follow {} · {:?}",
-            run.lifecycle,
+            run.outcome().unwrap_or(&run.lifecycle),
             if model.graph_canvas.follow_live {
                 "on"
             } else {
@@ -209,7 +205,7 @@ fn structured_window(model: &Model, height: u16, layout: &GraphLayout) -> Vec<Li
             .or_else(|| run.tasks.iter().position(|t| t.state == State::Active))
             .unwrap_or(0)
     });
-    let list_room = if run.inspecting_node {
+    let list_room = if run.inspecting_node || model.graph_canvas.inspecting_goal {
         room.min(3)
     } else {
         room
@@ -246,7 +242,7 @@ fn structured_window(model: &Model, height: u16, layout: &GraphLayout) -> Vec<Li
     while rows.len() < HEADER_ROWS as usize + list_room {
         rows.push(Line::default());
     }
-    if run.inspecting_node {
+    if run.inspecting_node || model.graph_canvas.inspecting_goal {
         rows.extend(inspector_lines(
             model,
             selected,

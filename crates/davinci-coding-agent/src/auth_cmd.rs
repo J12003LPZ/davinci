@@ -53,9 +53,9 @@ pub fn is_auth_command_help(args: &[String]) -> bool {
 
 pub fn print_auth_command_help() -> &'static str {
     "Usage:
-  pi auth print-api-key [--provider <provider>] [--model <model>]
-  pi auth print-bearer-token [--provider <provider>] [--model <model>] [--min-expiry <duration>]
-  pi auth check [--provider <provider>] [--model <model>] [--json] [--credentials] [--no-refresh]
+  davinci auth print-api-key [--provider <provider>] [--model <model>]
+  davinci auth print-bearer-token [--provider <provider>] [--model <model>] [--min-expiry <duration>]
+  davinci auth check [--provider <provider>] [--model <model>] [--json] [--credentials] [--no-refresh]
 
 Auth commands require at least one of --provider or --model. Checks refresh expired OAuth credentials by default; --no-refresh prevents this. --credentials emits the credential, or includes it in JSON output."
 }

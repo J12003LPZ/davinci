@@ -18,6 +18,7 @@ pub mod context_vm;
 pub mod contract_executor;
 pub mod contracts;
 pub mod control;
+pub mod conversation;
 pub mod effects;
 pub mod events;
 pub mod evidence;
@@ -83,6 +84,10 @@ pub use control::{
     WorkerControlAction, WorkerControlCommand, WorkerControlReceipt, WorkerController,
     WorkerSnapshot,
 };
+pub use conversation::{
+    ConversationError, ConversationIdentity, ConversationRuntime, ConversationSnapshot,
+    ConversationState, TurnOutcome,
+};
 pub use effects::{effect_rewind_action, ExternalEffectReceipt, FileEffectKind, OwnedFileEffect};
 pub use events::{AgentKind, AgentRecord, AgentState, RuntimeEvent, RuntimeEventEnvelope};
 pub use evidence::{
@@ -141,6 +146,7 @@ pub struct RuntimeHandle {
     pub progress_watchdog: Arc<Mutex<ProgressWatchdog>>,
     pub blob_store: BlobStore,
     pub effect_ledger: Arc<std::sync::RwLock<Vec<OwnedFileEffect>>>,
+    pub conversation: Arc<Mutex<ConversationRuntime>>,
 }
 
 impl std::fmt::Debug for RuntimeHandle {
@@ -190,6 +196,7 @@ impl RuntimeHandle {
             progress_watchdog: Arc::new(Mutex::new(ProgressWatchdog::new())),
             blob_store: BlobStore::new(),
             effect_ledger: Arc::new(std::sync::RwLock::new(Vec::new())),
+            conversation: Arc::new(Mutex::new(ConversationRuntime::new(run_id, agent_id, None))),
         }
     }
 
@@ -237,7 +244,9 @@ impl RuntimeHandle {
         self.run_id = previous.run_id;
         self.agent_id = previous.agent_id;
         self.parent_agent_id = previous.parent_agent_id;
+        self.session_id = previous.session_id.clone();
         self.sequence = previous.sequence.clone();
+        self.conversation = previous.conversation.clone();
         previous.bus.replace_turn_subscribers_from(&self.bus);
         self.bus = previous.bus.clone();
         self.registry = previous.registry.clone();
@@ -265,6 +274,7 @@ impl RuntimeHandle {
         self.parent_agent_id = worker.parent_agent_id;
         self.session_id = worker.session_id.clone();
         self.sequence = worker.sequence.clone();
+        self.conversation = worker.conversation.clone();
         self.cancellation_token = worker.cancellation_token.clone();
         self.registry = worker.registry.clone();
         self.task_registry = worker.task_registry.clone();
@@ -294,6 +304,7 @@ impl RuntimeHandle {
         worker.agent_id = child;
         worker.parent_agent_id = Some(self.agent_id);
         worker.sequence = Arc::new(AtomicU64::new(0));
+        worker.ensure_conversation_identity_current();
         worker.cancellation_token =
             cancellation.unwrap_or_else(|| self.cancellation_token.child_token());
         Ok(worker)
@@ -302,6 +313,27 @@ impl RuntimeHandle {
     pub fn with_context_broker(mut self, broker: ContextBroker) -> Self {
         self.context_broker = broker;
         self
+    }
+
+    /// Detach a cloned runtime's projection when it is rebound to another worker.
+    pub(crate) fn ensure_conversation_identity_current(&mut self) {
+        let identity = ConversationIdentity {
+            run_id: self.run_id,
+            agent_id: self.agent_id,
+            session_id: self.session_id.clone(),
+        };
+        let matches = self
+            .conversation
+            .lock()
+            .map(|conversation| conversation.snapshot().identity == identity)
+            .unwrap_or(false);
+        if !matches {
+            self.conversation = Arc::new(Mutex::new(ConversationRuntime::new(
+                self.run_id,
+                self.agent_id,
+                self.session_id.clone(),
+            )));
+        }
     }
 
     pub fn with_cancellation_token(mut self, token: CancellationToken) -> Self {
@@ -315,8 +347,28 @@ impl RuntimeHandle {
     }
 
     pub fn with_session(mut self, session_id: impl Into<String>) -> Self {
-        self.session_id = Some(session_id.into());
+        let session_id = session_id.into();
+        self.session_id = Some(session_id.clone());
+        if let Ok(mut conversation) = self.conversation.lock() {
+            conversation.set_session_id(Some(session_id));
+        }
         self
+    }
+
+    pub fn restore_conversation(&mut self, events: &[RuntimeEventEnvelope]) -> Result<(), String> {
+        let identity = ConversationIdentity {
+            run_id: self.run_id,
+            agent_id: self.agent_id,
+            session_id: self.session_id.clone(),
+        };
+        let restored = ConversationRuntime::replay(identity, events)
+            .map_err(|e| format!("conversation runtime could not be replayed: {e}"))?;
+        self.conversation = Arc::new(Mutex::new(restored));
+        self.sequence.store(
+            events.iter().map(|event| event.sequence).max().unwrap_or(0),
+            Ordering::SeqCst,
+        );
+        Ok(())
     }
 
     pub fn with_parent(mut self, parent_id: AgentId) -> Self {
@@ -345,6 +397,12 @@ impl RuntimeHandle {
             self.parent_agent_id,
             payload,
         );
+        if let Ok(mut conversation) = self.conversation.lock() {
+            if let Err(error) = conversation.apply(&envelope) {
+                eprintln!("[davinci-runtime] rejected observe event: {error}");
+                return;
+            }
+        }
         self.bus.emit_observe(envelope);
     }
 
@@ -357,7 +415,32 @@ impl RuntimeHandle {
             self.parent_agent_id,
             payload,
         );
+        if let Ok(mut conversation) = self.conversation.lock() {
+            conversation
+                .apply(&envelope)
+                .map_err(|error| error.to_string())?;
+        }
         self.bus.emit_decision(envelope)
+    }
+
+    pub fn emit_turn_end(&self, success: bool) {
+        self.emit_observe(RuntimeEvent::TurnEnded { success });
+    }
+
+    pub fn mark_turn_failed(&self) {
+        if let Ok(mut conversation) = self.conversation.lock() {
+            let _ = conversation.mark_turn_failed();
+        }
+    }
+
+    pub fn emit_session_started(&self, resumed: bool) {
+        self.emit_observe(RuntimeEvent::SessionStarted { resumed });
+    }
+
+    pub fn emit_session_ended(&self, reason: impl Into<String>) {
+        self.emit_observe(RuntimeEvent::SessionEnded {
+            reason: reason.into(),
+        });
     }
 
     pub fn is_cancelled(&self) -> bool {
@@ -393,5 +476,55 @@ impl RuntimeHandle {
             .map_err(|e| format!("task registry rehydration failed: {e}"))?;
         self.mailbox.rehydrate_from_events(events);
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod conversation_identity_tests {
+    use super::*;
+    #[test]
+    fn worker_refresh_preserves_conversation_and_sequence() {
+        let worker = RuntimeHandle::new(RunId::new(), AgentId::new(), RuntimeBus::new());
+        worker.emit_session_started(false);
+        let refreshed = RuntimeHandle::new(RunId::new(), AgentId::new(), RuntimeBus::new())
+            .with_worker_state_from(&worker);
+        assert!(Arc::ptr_eq(&refreshed.conversation, &worker.conversation));
+        refreshed.emit_session_started(true);
+        assert_eq!(
+            refreshed
+                .conversation
+                .lock()
+                .unwrap()
+                .snapshot()
+                .last_sequence,
+            2
+        );
+    }
+    #[test]
+    fn cloned_worker_identity_detaches_without_resetting_parent() {
+        let parent = RuntimeHandle::new(RunId::new(), AgentId::new(), RuntimeBus::new());
+        parent.emit_session_started(false);
+        let mut worker = parent.clone();
+        worker.agent_id = AgentId::new();
+        worker.ensure_conversation_identity_current();
+        assert!(!Arc::ptr_eq(&worker.conversation, &parent.conversation));
+        worker.emit_session_started(false);
+        assert_eq!(
+            worker
+                .conversation
+                .lock()
+                .unwrap()
+                .snapshot()
+                .identity
+                .agent_id,
+            worker.agent_id
+        );
+        assert_eq!(
+            parent.conversation.lock().unwrap().snapshot().last_sequence,
+            1
+        );
+        let retained = worker.conversation.clone();
+        worker.ensure_conversation_identity_current();
+        assert!(Arc::ptr_eq(&worker.conversation, &retained));
     }
 }

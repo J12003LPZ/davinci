@@ -23,6 +23,8 @@ use davinci_tui::davinci::model::{
 use davinci_tui::davinci::theme::State;
 
 use crate::extension_host::ExtensionHost;
+mod graph_feedback;
+mod graph_setup;
 
 struct NativeApproval {
     request: ToolApprovalRequest,
@@ -2233,9 +2235,17 @@ pub fn instrument_of_command(name: &str) -> &'static str {
 /// classifying it. Mirrors the extension-command arm of `prepare_user_input`
 /// in `main.rs`, which the legacy chrome runs before every prompt.
 fn run_extension_command(shell: &mut Shell<'_>, line: &str) -> Option<Next> {
+    run_extension_command_inner(shell, line, true)
+}
+
+fn run_extension_command_inner(shell: &mut Shell<'_>, line: &str, setup: bool) -> Option<Next> {
     let (name, args) = crate::parse_extension_command(line);
     if name.is_empty() {
         return None;
+    }
+    if setup && name == "graph" && graph_setup::is_launch(&args) {
+        graph_setup::open(shell, &args);
+        return Some(Next::Go);
     }
 
     let outcome = if matches!(
@@ -2341,7 +2351,7 @@ fn run_extension_command(shell: &mut Shell<'_>, line: &str) -> Option<Next> {
             }
             "graph" | "graph-status" | "graph-view" => match graph_sheet(&value) {
                 Some(sheet) => {
-                    davinci_tui::davinci::views::graph_nav::refresh(shell.model, sheet);
+                    graph_feedback::refresh(shell.model, sheet);
                     open_sheet(shell.model, Screen::GraphRun);
                 }
                 // `graph-view` answers with a worker transcript, not the run;
@@ -2601,13 +2611,16 @@ pub enum Done {
 /// index of the row chosen.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Question {
+    GraphSetup(graph_setup::Setup),
     /// Whether this project's `.pi` resources may be used.
     Trust {
         path: String,
         options: Vec<crate::trust::ProjectTrustOption>,
     },
     /// Which stored credential to remove.
-    Logout { providers: Vec<String> },
+    Logout {
+        providers: Vec<String>,
+    },
     /// The one thing first-run has to ask. The old setup also asked for a
     /// theme; davinci has one palette, negotiated from the terminal rather
     /// than chosen (design.md §2), so only the analytics question remains.
@@ -2619,6 +2632,7 @@ impl Question {
     /// says what is being decided, and one row per answer.
     pub fn ask(&self, _agent: &Agent) -> Ask {
         match self {
+            Question::GraphSetup(setup) => setup.ask(_agent),
             Question::Trust { path, options } => Ask {
                 title: "Trust".into(),
                 name: "TRUST".into(),
@@ -4300,13 +4314,17 @@ pub fn run(
         for notices in startup_checks.try_iter() {
             model.transcript.extend(startup_notice_entries(&notices));
         }
-        if matches!(model.screen, Screen::GraphRun | Screen::Securitas)
-            && last_graph_refresh.elapsed() >= Duration::from_secs(1)
-        {
+        if last_graph_refresh.elapsed() >= Duration::from_secs(1) {
             last_graph_refresh = Instant::now();
-            if model.screen == Screen::GraphRun {
+            if model.screen == Screen::GraphRun
+                || model
+                    .graph_run
+                    .as_ref()
+                    .is_some_and(|run| run.outcome().is_none())
+            {
                 refresh_graph_sheet(&mut model, &host);
-            } else {
+            }
+            if model.screen == Screen::Securitas {
                 let locked = host.lock().unwrap_or_else(|e| e.into_inner());
                 if let Ok(Some(value)) = locked.execute_native_command("sec-report", "") {
                     model.security = Some(security_sheet(&value));
@@ -4372,6 +4390,9 @@ pub fn run(
                             Next::Leave => break Ok(0),
                             Next::Fail(err) => break Err(err),
                         }
+                        continue;
+                    }
+                    if graph_setup::key(&mut model, &mut pending, agent, key) {
                         continue;
                     }
                     // An extension's registered shortcut gets the chord before
@@ -4670,6 +4691,9 @@ pub fn run(
                 // burst of keys the console delivers is reassembled into this
                 // event by the paste filter behind `poll_event`.
                 crossterm::event::Event::Paste(text) => {
+                    if graph_setup::paste(&mut model, &mut pending, agent, &text) {
+                        continue;
+                    }
                     if model.overlay == Some(Overlay::SecretInput)
                         || !voice.paste(&mut model, &text)
                     {
@@ -6714,7 +6738,7 @@ fn graph_sheet(value: &serde_json::Value) -> Option<GraphRunSheet> {
                     if activity.is_empty() {
                         format!("{expect} · working")
                     } else {
-                        clip(&activity, 48)
+                        activity
                     }
                 }
                 "failed" => format!("failed · {}", clip(&json_str(task, "error"), 44)),
@@ -6784,7 +6808,7 @@ fn graph_sheet(value: &serde_json::Value) -> Option<GraphRunSheet> {
             GraphTask {
                 id,
                 policy: policy_of_role(&role).into(),
-                artifact,
+                artifact: graph_public_text(&artifact),
                 usage,
                 state,
                 dependencies,
@@ -6938,7 +6962,7 @@ fn graph_sheet(value: &serde_json::Value) -> Option<GraphRunSheet> {
         _ => String::new(),
     };
     Some(GraphRunSheet {
-        goal: json_str(run, "goal"),
+        goal: graph_public_text(&json_str(run, "goal")),
         phases,
         shape,
         tasks,
@@ -6958,7 +6982,8 @@ fn graph_sheet(value: &serde_json::Value) -> Option<GraphRunSheet> {
             number(&budgets, "maxWorkers"),
         ),
         parallel: number(&budgets, "maxParallelWorkers").to_string(),
-        cycles: capped(
+        cycles: format!(
+            "{} total (limit {}/milestone)",
             number(&counters, "revisionCycles"),
             number(&budgets, "maxRevisionCycles"),
         ),
@@ -6992,15 +7017,14 @@ fn graph_sheet(value: &serde_json::Value) -> Option<GraphRunSheet> {
             })
             .map(|stats| stats.render_compact_lines())
             .unwrap_or_default(),
-        lifecycle: run
-            .get("lifecycle")
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or(if matches!(phase.as_str(), "done" | "cancelled") {
-                "stopped"
-            } else {
-                "running"
-            })
-            .into(),
+        lifecycle: if matches!(phase.as_str(), "done" | "blocked" | "cancelled") {
+            "stopped"
+        } else {
+            run.get("lifecycle")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("running")
+        }
+        .into(),
         phase,
         blocked_reason: run
             .get("blockedReason")
@@ -7064,6 +7088,42 @@ mod graph_canvas_fact_tests {
     use super::*;
     use crate::native_extensions::graph::types::*;
     use serde_json::json;
+
+    #[test]
+    fn graph_activity_is_bounded_and_matches_the_selected_run_and_worker() {
+        let mut sheet = graph_sheet(&json!({"run": snapshot()})).unwrap();
+        let view = json!({"runId": sheet.id, "taskId": "writer", "transcript": [
+            "read src/main.rs", "thinking: PRIVATE_SENTINEL", "cargo test complete"
+        ]});
+        apply_graph_activity(&mut sheet, "review", &view);
+        assert!(sheet.tasks[1].recent_tools.is_empty());
+        apply_graph_activity(&mut sheet, "writer", &view);
+        assert_eq!(sheet.tasks[0].recent_tools.len(), 3);
+        assert!(!sheet.tasks[0]
+            .recent_tools
+            .join(" ")
+            .contains("PRIVATE_SENTINEL"));
+        assert!(sheet.tasks[0].recent_tools[2].contains("cargo test"));
+        let previous = sheet.tasks[0].recent_tools.clone();
+        let mut wrong = view.clone();
+        wrong["runId"] = json!("different-run");
+        apply_graph_activity(&mut sheet, "writer", &wrong);
+        assert_eq!(sheet.tasks[0].recent_tools, previous);
+    }
+
+    #[test]
+    fn graph_goal_and_activity_redact_credentials_before_display() {
+        let mut run = snapshot();
+        run.goal = "Fix login using apikey_fixture_not_a_real_key and Bearer fake-token".into();
+        let sheet = graph_sheet(&json!({"run": run})).unwrap();
+        assert!(sheet.goal.contains("Fix login"));
+        assert!(!sheet.goal.contains("fixture_not_a_real_key"));
+        assert!(!sheet.goal.contains("fake-token"));
+        assert_eq!(
+            graph_public_text("password=fixture-password"),
+            "password=[REDACTED]"
+        );
+    }
 
     fn snapshot() -> GraphRun {
         let mut run: GraphRun = serde_json::from_value(json!({
@@ -7138,7 +7198,7 @@ mod graph_canvas_fact_tests {
             .display()
             .to_string()
         );
-        assert_eq!(sheet.lifecycle, "running");
+        assert_eq!(sheet.lifecycle, "stopped");
         assert!(sheet
             .verification
             .iter()
@@ -7147,6 +7207,18 @@ mod graph_canvas_fact_tests {
         assert!(sheet.tasks[0].owner.is_empty() && sheet.tasks[0].recent_tools.is_empty());
         assert!(sheet.tasks[0].public_contract.is_none());
         assert!(!format!("{sheet:?}").contains("PRIVATE_"));
+    }
+
+    #[test]
+    fn graph_revision_counter_distinguishes_lifetime_total_from_delivery_limit() {
+        let mut run = snapshot();
+        run.counters.revision_cycles = 4;
+        run.budgets.max_revision_cycles = 3;
+        let sheet = graph_sheet(&json!({"run": run})).unwrap();
+        assert_eq!(sheet.cycles, "4 total (limit 3/milestone)");
+        run.budgets.max_revision_cycles = 0;
+        let sheet = graph_sheet(&json!({"run": run})).unwrap();
+        assert_eq!(sheet.cycles, "4 total (limit 0/milestone)");
     }
 
     #[test]
@@ -7215,13 +7287,61 @@ fn refresh_graph_sheet(model: &mut Model, host: &Arc<Mutex<ExtensionHost>>) -> b
     match status {
         Ok(Some(value)) => match graph_sheet(&value) {
             Some(sheet) => {
-                davinci_tui::davinci::views::graph_nav::refresh(model, sheet);
+                graph_feedback::refresh(model, sheet);
+                if let Some(selected) = model
+                    .graph_run
+                    .as_ref()
+                    .and_then(|run| run.selected_node_id.clone())
+                {
+                    let view = host
+                        .lock()
+                        .unwrap_or_else(|err| err.into_inner())
+                        .execute_native_command("graph-view", &selected);
+                    if let Ok(Some(value)) = view {
+                        if let Some(run) = model.graph_run.as_mut() {
+                            apply_graph_activity(run, &selected, &value);
+                        }
+                    }
+                }
                 true
             }
             None => false,
         },
         _ => false,
     }
+}
+
+/// Never attach a transcript from a different run or a fallback worker.
+fn apply_graph_activity(run: &mut GraphRunSheet, selected: &str, value: &serde_json::Value) {
+    if value.get("runId").and_then(serde_json::Value::as_str) != Some(run.id.as_str())
+        || value.get("taskId").and_then(serde_json::Value::as_str) != Some(selected)
+    {
+        return;
+    }
+    if let Some(task) = run.tasks.iter_mut().find(|task| task.id == selected) {
+        task.recent_tools = value
+            .get("transcript")
+            .and_then(serde_json::Value::as_array)
+            .map(|rows| {
+                rows.iter()
+                    .rev()
+                    .take(40)
+                    .rev()
+                    .filter_map(serde_json::Value::as_str)
+                    .map(graph_public_text)
+                    .collect()
+            })
+            .unwrap_or_default();
+    }
+}
+
+fn graph_public_text(value: &str) -> String {
+    static DIRECT_KEY: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let direct_key =
+        DIRECT_KEY.get_or_init(|| regex::Regex::new(r"apikey_[A-Za-z0-9_-]+").unwrap());
+    let value = direct_key.replace_all(value, "[REDACTED]");
+    let value = crate::native_extensions::vector_memory::redact_secrets(&value);
+    davinci_tui::davinci::views::graph_inspector::public_text(&value)
 }
 
 /// Everything a composer line or a chosen row may need. Bundled because the
@@ -7828,6 +7948,9 @@ fn on_choice(shell: &mut Shell<'_>, choice: Choice) -> Next {
             let Some(question) = shell.pending.take() else {
                 return Next::Go;
             };
+            if let Question::GraphSetup(setup) = question {
+                return graph_setup::choose(shell, setup, index);
+            }
             match answer(shell, &question, index) {
                 Ok(text) => shell.say(&text),
                 Err(err) => shell.note(&err),
@@ -8312,6 +8435,7 @@ fn enable_typesafe_with_key(
 /// Carry out the row chosen from a question.
 fn answer(shell: &mut Shell<'_>, question: &Question, index: usize) -> Result<String, String> {
     match question {
+        Question::GraphSetup(_) => Err("Graph setup must be handled by the launch flow".into()),
         Question::Trust { options, .. } => {
             let Some(option) = options.get(index) else {
                 return Err("that trust option is gone".into());
@@ -8768,6 +8892,24 @@ fn apply_context_inspector_action(shell: &mut Shell<'_>, action: &str, index: us
 }
 
 fn apply_graph_action(shell: &mut Shell<'_>, action: &str, index: usize) -> Next {
+    if action == "resume"
+        || (action == "pause_resume"
+            && shell
+                .model
+                .graph_run
+                .as_ref()
+                .is_some_and(|run| run.can_resume()))
+    {
+        let Some(run) = shell.model.graph_run.as_ref() else {
+            return Next::Go;
+        };
+        if !run.can_resume() {
+            shell.note("This graph cannot be resumed. Start a new /graph goal.");
+            return Next::Go;
+        }
+        let command = format!("/graph-resume {}", run.id);
+        return run_extension_command(shell, &command).unwrap_or(Next::Go);
+    }
     let Some(sheet) = shell.model.graph_run.as_mut() else {
         return Next::Go;
     };

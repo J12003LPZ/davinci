@@ -81,6 +81,41 @@ pub struct ContextFoldPolicy {
 }
 
 impl ContextFoldPolicy {
+    /// Honor the operator's compaction threshold in active VM mode too.
+    /// Delta maintenance remains independent of the context-pressure trigger.
+    pub fn decide_automatic(
+        &self,
+        root: &ContextRoot,
+        delta_tokens: u64,
+        compiled_tokens: u64,
+        context_window: u64,
+        settings: &crate::CompactionSettings,
+    ) -> ContextFoldDecision {
+        if !settings.enabled {
+            return ContextFoldDecision {
+                should_fold: false,
+                reason: None,
+            };
+        }
+        if settings.threshold.is_some() {
+            if crate::should_compact(compiled_tokens, context_window, settings) {
+                return ContextFoldDecision {
+                    should_fold: true,
+                    reason: Some(FoldReason::WindowPressure),
+                };
+            }
+            return self.decide(root, delta_tokens, 0, 0, false, false);
+        }
+        self.decide(
+            root,
+            delta_tokens,
+            compiled_tokens,
+            context_window,
+            false,
+            false,
+        )
+    }
+
     pub fn decide(
         &self,
         root: &ContextRoot,
@@ -111,5 +146,97 @@ impl ContextFoldPolicy {
             should_fold: reason.is_some(),
             reason,
         }
+    }
+}
+
+#[cfg(test)]
+mod threshold_tests {
+    use super::*;
+    use crate::{CompactionSettings, CompactionThreshold};
+
+    #[test]
+    fn automatic_fold_honors_token_and_percent_thresholds_for_role_windows() {
+        let policy = ContextFoldPolicy {
+            max_delta_pages: 100,
+            max_delta_tokens: u64::MAX,
+            window_pressure_percent: 80,
+        };
+        let root = ContextRoot::default();
+        for window in [128_000, 500_000, 1_000_000] {
+            for threshold in [
+                CompactionThreshold::Tokens(50_000),
+                CompactionThreshold::Percent(25),
+                CompactionThreshold::Percent(90),
+            ] {
+                let settings = CompactionSettings {
+                    enabled: true,
+                    reserve_tokens: 1000,
+                    keep_recent_tokens: 1000,
+                    threshold: Some(threshold),
+                };
+                for tokens in [
+                    20_000,
+                    50_001,
+                    window / 4 + 1,
+                    window * 81 / 100,
+                    window * 91 / 100,
+                ] {
+                    assert_eq!(
+                        policy
+                            .decide_automatic(&root, 0, tokens, window, &settings)
+                            .should_fold,
+                        crate::should_compact(tokens, window, &settings)
+                    );
+                }
+                let disabled = CompactionSettings {
+                    enabled: false,
+                    ..settings
+                };
+                assert!(
+                    !policy
+                        .decide_automatic(&root, 0, window, window, &disabled)
+                        .should_fold
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn explicit_pressure_threshold_keeps_structural_folds_and_default_policy() {
+        let policy = ContextFoldPolicy {
+            max_delta_pages: 3,
+            max_delta_tokens: 2000,
+            window_pressure_percent: 80,
+        };
+        let mut root = ContextRoot::default();
+        let settings = CompactionSettings {
+            enabled: true,
+            reserve_tokens: 1000,
+            keep_recent_tokens: 1000,
+            threshold: Some(CompactionThreshold::Percent(90)),
+        };
+        assert_eq!(
+            policy
+                .decide_automatic(&root, 2000, 3000, 100_000, &settings)
+                .reason,
+            Some(FoldReason::DeltaTokens)
+        );
+        root.updates_since_fold = 3;
+        assert_eq!(
+            policy
+                .decide_automatic(&root, 0, 3000, 100_000, &settings)
+                .reason,
+            Some(FoldReason::DeltaDepth)
+        );
+        let defaults = CompactionSettings {
+            threshold: None,
+            ..settings
+        };
+        assert_eq!(
+            policy
+                .decide_automatic(&root, 0, 80_000, 100_000, &defaults)
+                .reason,
+            Some(FoldReason::WindowPressure)
+        );
     }
 }

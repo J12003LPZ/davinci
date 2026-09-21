@@ -103,6 +103,9 @@ impl Agent {
 
         loop {
             if self.abort_requested() {
+                if let Some(runtime) = &self.runtime {
+                    runtime.emit_turn_end(false);
+                }
                 self.push_event(
                     &mut events,
                     AgentEvent::AgentEnd {
@@ -146,18 +149,19 @@ impl Agent {
                         .map(|page| page.estimated_tokens)
                         .sum::<u64>();
                     let config = runtime.context_vm.config();
+                    let mut settings = self.compaction;
+                    settings.enabled = true;
                     crate::runtime::context_vm::ContextFoldPolicy {
                         max_delta_pages: config.max_delta_pages,
                         max_delta_tokens: config.max_delta_tokens,
                         window_pressure_percent: config.window_pressure_percent,
                     }
-                    .decide(
+                    .decide_automatic(
                         &root,
                         delta_tokens,
                         tokens,
                         self.context_window,
-                        false,
-                        false,
+                        &settings,
                     )
                 });
                 if decision.is_some_and(|decision| decision.should_fold) {
@@ -182,6 +186,9 @@ impl Agent {
             // must not bypass the budget through the legacy accessor fallback.
             if active_context_vm {
                 if let Err(error) = self.prepared_context_image() {
+                    if let Some(runtime) = &self.runtime {
+                        runtime.emit_turn_end(false);
+                    }
                     self.is_streaming = false;
                     self.flush_pending_bash_messages();
                     return Err(format!(
@@ -209,6 +216,10 @@ impl Agent {
             let (assistant, stream_events, streamed_live) = match completion {
                 Ok(output) => output,
                 Err(err) => {
+                    if let Some(runtime) = &self.runtime {
+                        runtime.mark_turn_failed();
+                        runtime.emit_turn_end(false);
+                    }
                     self.is_streaming = false;
                     self.flush_pending_bash_messages();
                     return Err(err);
@@ -253,6 +264,12 @@ impl Agent {
                 assistant.stop_reason,
                 Some(StopReason::Error) | Some(StopReason::Aborted)
             ) {
+                if let Some(runtime) = &self.runtime {
+                    if assistant.stop_reason == Some(StopReason::Error) {
+                        runtime.mark_turn_failed();
+                    }
+                    runtime.emit_turn_end(false);
+                }
                 self.push_event(
                     &mut events,
                     AgentEvent::TurnEnd {
@@ -433,9 +450,7 @@ impl Agent {
                 },
             );
             if let Some(runtime) = &self.runtime {
-                runtime.emit_observe(crate::runtime::RuntimeEvent::TurnEnded {
-                    success: !self.abort_requested(),
-                });
+                runtime.emit_turn_end(!self.abort_requested());
             }
 
             if had_tools && !self.abort_requested() {

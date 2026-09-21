@@ -1,22 +1,29 @@
 //! Load `mcp.json` for the native MCP client.
 //!
-//! No TypeScript counterpart. User file `~/.pi/agent/mcp.json`, then the
-//! project's `.pi/mcp.json` when the project is trusted. `PI_MCP_CONFIG` is a
-//! fixture so tests never touch `~/.pi`.
+//! User agent-directory config, then a trusted project's `.davinci/mcp.json`.
+//! Legacy `.pi/mcp.json` is used only when no DaVinci project file exists.
 
 use std::path::Path;
 
 use davinci_mcp::ConfigFile;
 
 pub fn load(agent_dir: &Path, cwd: &Path, trusted: bool) -> ConfigFile {
-    if let Ok(path) = std::env::var("PI_MCP_CONFIG") {
+    if let Ok(path) =
+        std::env::var("DAVINCI_MCP_CONFIG").or_else(|_| std::env::var("PI_MCP_CONFIG"))
+    {
         return davinci_mcp::load_path(Path::new(&path)).unwrap_or_default();
     }
     let user = davinci_mcp::load_path(&agent_dir.join("mcp.json")).unwrap_or_default();
     if !trusted {
         return user;
     }
-    let project = davinci_mcp::load_path(&cwd.join(".pi").join("mcp.json")).unwrap_or_default();
+    let current = cwd.join(".davinci").join("mcp.json");
+    let path = if current.exists() {
+        current
+    } else {
+        cwd.join(".pi").join("mcp.json")
+    };
+    let project = davinci_mcp::load_path(&path).unwrap_or_default();
     davinci_mcp::merge(user, project)
 }
 
@@ -59,5 +66,12 @@ mod tests {
         let trusted = load(&agent_dir, &project, true);
         assert_eq!(trusted.mcp_servers["user"].command.as_deref(), Some("over"));
         assert!(trusted.mcp_servers.contains_key("project"));
+
+        // An explicit empty DaVinci config must not resurrect legacy servers.
+        std::fs::create_dir(project.join(".davinci")).unwrap();
+        std::fs::write(project.join(".davinci/mcp.json"), r#"{"mcpServers":{}}"#).unwrap();
+        let current = load(&agent_dir, &project, true);
+        assert!(!current.mcp_servers.contains_key("project"));
+        assert_eq!(current.mcp_servers["user"].command.as_deref(), Some("u"));
     }
 }

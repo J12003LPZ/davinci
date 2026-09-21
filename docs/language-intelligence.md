@@ -40,9 +40,31 @@ Project packages are preferred, including hoisted `node_modules` up to the
 workspace boundary. The nearest project TypeScript `lib/tsserver.js` is explicitly
 passed to the compatibility server. This prevents a global server from silently
 substituting another compiler version. Standard npm global package layouts and
-direct PATH executables are fallback locations. Windows launches Node package
-entry points directly; it does not execute `.cmd` or PowerShell shims. With a
-global package manager layout that is not discovered, use project-local packages.
+direct PATH executables are fallback locations. A globally installed TypeScript
+is used only when the project has no TypeScript package. Windows also discovers
+pnpm global language-server packages from the bounded, literal package path in
+their `.CMD` launcher. It launches the manifest's Node entry point directly;
+it never executes the shell shim or expands shell variables.
+
+These tools are native DaVinci capabilities, including in print mode (`-p`) and
+with `--no-extensions`. They do not require legacy token-governor/vector-memory
+JavaScript packages. `tool_search` can discover `lsp_definition`, `memory_search`,
+`retrieve_output`, and `graph_run`. `--no-mcp` prevents native MCP connections for
+tasks that only need built-in tools. Graph workers automatically use it unless
+their parent explicitly authorizes an MCP capability.
+
+DaVinci prefers `DAVINCI_CODING_AGENT_DIR`, then the legacy directory override,
+then an existing `~/.davinci/agent` (with `~/.pi/agent` as a compatibility fallback).
+MCP config uses `DAVINCI_MCP_CONFIG` before `PI_MCP_CONFIG`; otherwise it reads the
+active agent directory and, for trusted projects, `.davinci/mcp.json`. A legacy
+project `.pi/mcp.json` is read only when the DaVinci project file is absent.
+An empty DaVinci project file therefore prevents legacy project servers from
+being picked up, while preserving explicitly configured user servers.
+
+`scripts/eval-native-intelligence.py` exercises native discovery through the
+actual offline CLI, with an MCP sentinel proving that `--no-mcp` starts no server.
+Its optional `--lsp` check resolves real TypeScript and JavaScript definitions
+using already installed packages. No model requests are made.
 
 `auto` considers installed native TypeScript 7+ (`tsc --lsp --stdio`) and the
 native-preview package (`tsgo --lsp --stdio`). A project with a JS-based TypeScript

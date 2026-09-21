@@ -691,10 +691,10 @@ pub struct GraphRun {
 
 impl GraphRun {
     pub fn current_lifecycle(&self) -> GraphLifecycle {
-        if let Some(lifecycle) = self.lifecycle {
-            lifecycle
-        } else if matches!(self.phase, Phase::Done | Phase::Cancelled) {
+        if matches!(self.phase, Phase::Done | Phase::Blocked | Phase::Cancelled) {
             GraphLifecycle::Stopped
+        } else if let Some(lifecycle) = self.lifecycle {
+            lifecycle
         } else {
             GraphLifecycle::Running
         }
