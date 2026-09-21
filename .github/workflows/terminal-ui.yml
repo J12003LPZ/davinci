@@ -5,6 +5,8 @@ on:
     branches: [J12003LPZ/terminal-ui-rebuild-20260920]
     paths:
       - 'crates/davinci-tui/**'
+      - 'crates/davinci-coding-agent/src/davinci_interactive.rs'
+      - 'crates/davinci-coding-agent/src/slash.rs'
       - '.github/workflows/terminal-ui.yml'
       - '.github/scripts/terminal_ui_*.py'
 
@@ -18,94 +20,142 @@ concurrency:
 env:
   CARGO_TERM_COLOR: never
   PI_OFFLINE: '1'
+  CARGO_BUILD_JOBS: '2'
 
 jobs:
   terminal:
     if: github.ref == 'refs/heads/J12003LPZ/terminal-ui-rebuild-20260920'
-    runs-on: ubuntu-latest
-    timeout-minutes: 25
-    permissions:
-      contents: write
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 40
+    defaults:
+      run:
+        shell: bash
     steps:
+      - name: Preserve identical source bytes on both platforms
+        run: git config --global core.autocrlf false
       - uses: actions/checkout@v4
         with:
-          fetch-depth: 1
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
       - uses: dtolnay/rust-toolchain@1.83.0
         with:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
         with:
-          key: terminal-ui
+          key: terminal-workspace
           cache-on-failure: true
-      - name: Apply reviewed source batch
-        if: contains(github.event.head_commit.message, '[ui-exec]')
+      - name: Apply verified source transfer
+        if: contains(github.event.head_commit.message, '[ui-workspace-exec]')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python .github/scripts/terminal_ui_workspace.py
+      - name: Format changed crates and check the workspace
         run: |
-          python3 .github/scripts/terminal_ui_apply.py
-          python3 .github/scripts/terminal_ui_finish.py
-      - name: Format changed crate
-        run: cargo fmt -p davinci-tui
-      - name: Rebuild contracts
-        id: contracts
-        shell: bash
-        run: |
-          mkdir -p "$RUNNER_TEMP/terminal-evidence"
-          cargo test --locked -p davinci-tui --test terminal_rebuild -- --nocapture 2>&1 | tee "$RUNNER_TEMP/terminal-evidence/contracts.log"
-      - name: Entire TUI suite
-        id: suite
-        if: always()
-        shell: bash
+          cargo fmt -p davinci-tui -p davinci-coding-agent
+          cargo fmt --all -- --check
+          git diff --check
+      - name: Full TUI suite
         run: |
           mkdir -p "$RUNNER_TEMP/terminal-evidence"
-          cargo test --locked -p davinci-tui 2>&1 | tee "$RUNNER_TEMP/terminal-evidence/suite.log"
+          cargo test --locked -p davinci-tui 2>&1 | tee "$RUNNER_TEMP/terminal-evidence/tui-tests.log"
       - name: TUI lint
-        id: lint
-        if: always()
-        shell: bash
+        run: cargo clippy --locked -p davinci-tui --all-targets -- -D warnings 2>&1 | tee "$RUNNER_TEMP/terminal-evidence/tui-clippy.log"
+      - name: Build real CLI for integration fixtures
+        run: cargo build --locked -p davinci-coding-agent --bin davinci 2>&1 | tee "$RUNNER_TEMP/terminal-evidence/cli-build.log"
+      - name: Host library integration
         run: |
-          mkdir -p "$RUNNER_TEMP/terminal-evidence"
-          cargo clippy --locked -p davinci-tui --all-targets -- -D warnings 2>&1 | tee "$RUNNER_TEMP/terminal-evidence/clippy.log"
-      - name: Render actual buffer preview
-        if: always()
-        shell: bash
+          umask 077
+          cargo test --locked -p davinci-coding-agent --lib 2>&1 | tee "$RUNNER_TEMP/terminal-evidence/host-library.log"
+      - name: Native interactive binary integration
         run: |
-          mkdir -p "$RUNNER_TEMP/terminal-evidence"
-          cargo run --locked -p davinci-tui --example editorial_preview -- dark > "$RUNNER_TEMP/terminal-evidence/preview.html"
-      - name: Preserve review evidence
-        if: always()
-        shell: bash
+          umask 077
+          cargo test --locked -p davinci-coding-agent --bin davinci 2>&1 | tee "$RUNNER_TEMP/terminal-evidence/host-binary.log"
+      - name: Entire workspace type check
+        run: cargo check --locked --workspace --all-targets 2>&1 | tee "$RUNNER_TEMP/terminal-evidence/workspace-check.log"
+      - name: Render actual dark and light terminal buffers
         run: |
-          mkdir -p "$RUNNER_TEMP/terminal-evidence"
-          git add -N crates/davinci-tui
-          git diff --check > "$RUNNER_TEMP/terminal-evidence/whitespace.log"
-          git diff -- crates/davinci-tui > "$RUNNER_TEMP/terminal-evidence/applied.patch"
-          git rev-parse HEAD > "$RUNNER_TEMP/terminal-evidence/base-commit.txt"
-          python3 - <<'PY'
-          import os, subprocess, zipfile
+          cargo run --locked -p davinci-tui --example editorial_preview -- dark > "$RUNNER_TEMP/terminal-evidence/terminal-dark.html"
+          cargo run --locked -p davinci-tui --example editorial_preview -- light > "$RUNNER_TEMP/terminal-evidence/terminal-light.html"
+      - name: Record exact tested source
+        if: success() && contains(github.event.head_commit.message, '[ui-workspace-exec]')
+        run: |
+          python - <<'PY'
+          import hashlib, json, os, subprocess
           from pathlib import Path
-          paths = subprocess.check_output(['git', 'ls-files', '-z']).decode().split('\0')
-          destination = Path(os.environ['RUNNER_TEMP']) / 'terminal-evidence' / 'source.zip'
-          with zipfile.ZipFile(destination, 'w', zipfile.ZIP_DEFLATED) as archive:
-              for name in paths:
-                  if name and Path(name).is_file():
-                      archive.write(name, name)
+          evidence = Path(os.environ['RUNNER_TEMP']) / 'terminal-evidence'
+          paths = json.loads((evidence / 'changed-files.json').read_text())
+          subprocess.run(['git', 'add', '--', *paths], check=True)
+          changed = subprocess.check_output(['git', 'diff', '--cached', '--name-only']).decode().splitlines()
+          if set(changed) - set(paths):
+              raise RuntimeError('Unexpected changed source path')
+          if subprocess.check_output(['git', 'diff', '--name-only']).strip():
+              raise RuntimeError('Formatter changed an unreviewed path')
+          hashes = {name: hashlib.sha256(Path(name).read_bytes()).hexdigest() for name in paths}
+          (evidence / 'tested-source.json').write_text(json.dumps(hashes, indent=2, sort_keys=True))
+          (evidence / 'source.patch').write_bytes(subprocess.check_output(['git', 'diff', '--cached', '--binary']))
           PY
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: terminal-evidence-${{ github.sha }}
+          name: terminal-workspace-${{ runner.os }}-${{ github.sha }}
           path: ${{ runner.temp }}/terminal-evidence
           retention-days: 7
-          if-no-files-found: error
-      - name: Commit verified implementation to this branch only
-        if: success() && contains(github.event.head_commit.message, '[ui-exec]')
+          if-no-files-found: warn
+
+  publish:
+    needs: terminal
+    if: success() && contains(github.event.head_commit.message, '[ui-workspace-exec]') && github.ref == 'refs/heads/J12003LPZ/terminal-ui-rebuild-20260920'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.83.0
+        with:
+          components: rustfmt
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: terminal-workspace-*-${{ github.sha }}
+          path: ${{ runner.temp }}/tested-evidence
+      - name: Reproduce the tested source exactly
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          python3 .github/scripts/terminal_ui_workspace.py
+          cargo fmt -p davinci-tui -p davinci-coding-agent
+          python3 - <<'PY'
+          import hashlib, json, os, subprocess
+          from pathlib import Path
+          root = Path(os.environ['RUNNER_TEMP'])
+          receipts = list((root / 'tested-evidence').glob('*/tested-source.json'))
+          if len(receipts) != 2:
+              raise RuntimeError('Both native test receipts are required')
+          paths = json.loads((root / 'terminal-evidence/changed-files.json').read_text())
+          actual = {p: hashlib.sha256(Path(p).read_bytes()).hexdigest() for p in paths}
+          for receipt in receipts:
+              if json.loads(receipt.read_text()) != actual:
+                  raise RuntimeError(f'Tested/published source mismatch: {receipt.name}')
+          subprocess.run(['git', 'add', '--', *paths], check=True)
+          if subprocess.check_output(['git', 'diff', '--name-only']).strip():
+              raise RuntimeError('Unexpected unstaged source change')
+          PY
+      - name: Publish to the existing task branch only
         shell: bash
         run: |
           expected=$(git ls-remote origin "refs/heads/J12003LPZ/terminal-ui-rebuild-20260920" | cut -f1)
           test "$expected" = "$GITHUB_SHA"
+          git diff --cached --check
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
-          git add crates/davinci-tui
-          if ! git diff --cached --quiet; then
-            git commit -m "feat(tui): rebuild shared terminal shell and searchable selectors"
-            git push origin HEAD:J12003LPZ/terminal-ui-rebuild-20260920
-          fi
+          git commit -m "feat(tui): rebuild terminal workspace and optional graph input"
+          git push origin HEAD:J12003LPZ/terminal-ui-rebuild-20260920
