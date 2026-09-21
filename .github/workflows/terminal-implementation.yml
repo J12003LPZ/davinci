@@ -14,7 +14,7 @@ permissions:
 
 concurrency:
   group: terminal-implementation-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: false
 
 env:
   CARGO_TERM_COLOR: never
@@ -22,7 +22,7 @@ env:
 
 jobs:
   workbench:
-    if: contains(github.event.head_commit.message, '[workbench]') || contains(github.event.head_commit.message, 'offline Rust workbench')
+    if: contains(github.event.head_commit.message, '[workbench]')
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
@@ -38,11 +38,12 @@ jobs:
           set -euo pipefail
           kit="$RUNNER_TEMP/terminal-workbench"
           mkdir -p "$kit"
-          cargo vendor --locked "$kit/vendor" > "$kit/vendor-config.toml"
+          cargo check --locked -p davinci-tui
+          cp -a "$CARGO_HOME/registry" "$kit/registry"
           cp -a "$(rustc --print sysroot)" "$kit/toolchain"
           rustc --version --verbose > "$kit/provenance.txt"
           git rev-parse HEAD >> "$kit/provenance.txt"
-          tar -C "$kit" -czf "$RUNNER_TEMP/terminal-workbench.tar.gz" toolchain vendor vendor-config.toml provenance.txt
+          tar -C "$kit" -czf "$RUNNER_TEMP/terminal-workbench.tar.gz" toolchain registry provenance.txt
       - uses: actions/upload-artifact@v4
         with:
           name: terminal-workbench-${{ github.sha }}
@@ -52,6 +53,8 @@ jobs:
   terminal:
     runs-on: ubuntu-latest
     timeout-minutes: 25
+    permissions:
+      contents: write
     steps:
       - uses: actions/checkout@v4
         with:
@@ -62,6 +65,21 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           key: terminal-implementation
+      - name: Apply candidate to isolated checkout
+        if: hashFiles('.github/terminal-ui/candidate.patch') != ''
+        run: python .github/terminal-ui/assemble.py apply
+      - name: Format candidate source
+        if: hashFiles('.github/terminal-ui/candidate.patch') != ''
+        shell: bash
+        run: |
+          python - <<'PY'
+          import json, os, pathlib, subprocess
+          paths = json.loads((pathlib.Path(os.environ['RUNNER_TEMP']) / 'terminal-paths.json').read_text())
+          for path in paths:
+              if path.endswith('.rs'):
+                  subprocess.run(['rustfmt', '--edition', '2021', path], check=True)
+          subprocess.run(['git', 'diff', '--check'], check=True)
+          PY
       - name: Rebuild contracts
         run: cargo test --locked -p davinci-tui --test terminal_rebuild -- --nocapture
       - name: Entire TUI suite
@@ -70,3 +88,16 @@ jobs:
       - name: TUI lint
         if: always()
         run: cargo clippy --locked -p davinci-tui --all-targets -- -D warnings
+      - name: Publish tested tree without updating any branch
+        if: success() && hashFiles('.github/terminal-ui/candidate.patch') != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python .github/terminal-ui/assemble.py publish
+      - name: Save candidate tree identity
+        if: success() && hashFiles('.github/terminal-ui/candidate.patch') != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: terminal-candidate-${{ github.sha }}
+          path: ${{ runner.temp }}/terminal-candidate.json
+          retention-days: 3
+          if-no-files-found: error
