@@ -152,11 +152,7 @@ fn atomic_write_json(path: &Path, bytes: &[u8]) -> Result<(), String> {
         .file_name()
         .and_then(|value| value.to_str())
         .unwrap_or("ledger");
-    let temp = parent.join(format!(
-        ".{name}.tmp-{}-{}",
-        std::process::id(),
-        now_millis()
-    ));
+    let temp = parent.join(format!(".{name}.tmp-{}", uuid::Uuid::new_v4()));
     let write_result = (|| -> Result<(), String> {
         let mut file = std::fs::OpenOptions::new()
             .create_new(true)
@@ -166,40 +162,18 @@ fn atomic_write_json(path: &Path, bytes: &[u8]) -> Result<(), String> {
         file.write_all(bytes).map_err(|err| err.to_string())?;
         file.sync_all().map_err(|err| err.to_string())?;
 
-        #[cfg(windows)]
-        if path.exists() {
-            let previous = parent.join(format!(".{name}.previous"));
-            let _ = std::fs::remove_file(&previous);
-            std::fs::rename(path, &previous).map_err(|err| err.to_string())?;
-            if let Err(error) = std::fs::rename(&temp, path) {
-                let _ = std::fs::rename(&previous, path);
-                return Err(error.to_string());
-            }
-            let _ = std::fs::remove_file(previous);
-        }
-        #[cfg(not(windows))]
+        drop(file);
         std::fs::rename(&temp, path).map_err(|err| err.to_string())?;
-        #[cfg(windows)]
-        if !path.exists() {
-            std::fs::rename(&temp, path).map_err(|err| err.to_string())?;
-        }
-
-        if let Ok(directory) = std::fs::File::open(parent) {
-            let _ = directory.sync_all();
-        }
+        #[cfg(unix)]
+        std::fs::File::open(parent)
+            .and_then(|directory| directory.sync_all())
+            .map_err(|err| err.to_string())?;
         Ok(())
     })();
     if write_result.is_err() {
         let _ = std::fs::remove_file(&temp);
     }
     write_result
-}
-
-fn now_millis() -> u128 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis()
 }
 
 fn default_condvar() -> Arc<Condvar> {
@@ -217,6 +191,8 @@ pub struct ToolCallLedger {
     condvar: Arc<Condvar>,
     #[serde(skip, default)]
     persistence_path: Option<PathBuf>,
+    #[serde(skip, default)]
+    persistence_error: Option<String>,
 }
 
 impl Default for ToolCallLedger {
@@ -228,6 +204,7 @@ impl Default for ToolCallLedger {
             record_order: Vec::new(),
             condvar: default_condvar(),
             persistence_path: None,
+            persistence_error: None,
         }
     }
 }
@@ -241,6 +218,7 @@ impl ToolCallLedger {
             record_order: Vec::new(),
             condvar: default_condvar(),
             persistence_path: None,
+            persistence_error: None,
         }
     }
 
@@ -296,12 +274,26 @@ impl ToolCallLedger {
         self.record_order.retain(|id| self.records.contains_key(id));
     }
 
-    pub fn persist(&self) -> Result<(), String> {
+    pub fn persist(&mut self) -> Result<(), String> {
+        self.ensure_durable()?;
         let Some(path) = &self.persistence_path else {
             return Ok(());
         };
-        let bytes = serde_json::to_vec_pretty(self).map_err(|err| err.to_string())?;
-        atomic_write_json(path, &bytes)
+        let result = serde_json::to_vec_pretty(self)
+            .map_err(|err| err.to_string())
+            .and_then(|bytes| atomic_write_json(path, &bytes));
+        if let Err(error) = &result {
+            self.persistence_error = Some(format!("Tool ledger persistence failed: {error}. Reopen and reconcile the session before dispatching more tools."));
+            self.condvar.notify_all();
+        }
+        self.ensure_durable()
+    }
+
+    fn ensure_durable(&self) -> Result<(), String> {
+        match &self.persistence_error {
+            Some(error) => Err(error.clone()),
+            None => Ok(()),
+        }
     }
 
     pub fn records(&self) -> &HashMap<String, ToolCallRecord> {
@@ -425,6 +417,7 @@ impl ToolCallLedger {
         replay_policy: ReplayPolicy,
         side_effect: ToolSideEffect,
     ) -> Result<ReservationOutcome, String> {
+        self.ensure_durable()?;
         let norm_args = normalize_arguments(arguments);
         let arg_digest = canonical_arguments_digest(arguments);
         if let Some(rec) = self.records.get(call_id) {
@@ -509,6 +502,9 @@ impl ToolCallLedger {
         arguments: &Value,
         replay_policy: ReplayPolicy,
     ) -> BeginOutcome {
+        if let Err(error) = self.ensure_durable() {
+            return BeginOutcome::ReplayBlocked(error);
+        }
         let norm_args = normalize_arguments(arguments);
         let arg_digest = canonical_arguments_digest(arguments);
         if let Some(rec) = self.records.get_mut(call_id) {
@@ -580,6 +576,7 @@ impl ToolCallLedger {
         arguments: &Value,
         retries_remaining: u32,
     ) -> Result<RecoveryAction, String> {
+        self.ensure_durable()?;
         let norm_args = normalize_arguments(arguments);
         let arg_digest = canonical_arguments_digest(arguments);
         let record = self
@@ -687,6 +684,7 @@ impl ToolCallLedger {
         let cv = guard.condvar.clone();
         let deadline = std::time::Instant::now() + Duration::from_secs(600);
         loop {
+            guard.ensure_durable()?;
             if abort.is_some_and(|f| f.load(std::sync::atomic::Ordering::SeqCst)) {
                 return Err(format!("Aborted while waiting for tool call `{call_id}`"));
             }

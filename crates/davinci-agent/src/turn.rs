@@ -1072,7 +1072,7 @@ impl Agent {
             Err(err) => crate::ToolResult {
                 content: err,
                 is_error: true,
-                details: None,
+                details: Some(serde_json::json!({ "ledger_wait_error": true })),
             },
         }
     }
@@ -1295,7 +1295,17 @@ impl Agent {
             };
         }
 
-        if let Ok(mut ledger) = self.tool_ledger.lock() {
+        {
+            let mut ledger = match self.tool_ledger.lock() {
+                Ok(ledger) => ledger,
+                Err(_) => {
+                    return crate::ToolResult {
+                        content: "Tool ledger lock poisoned; dispatch stopped".into(),
+                        is_error: true,
+                        details: Some(serde_json::json!({ "ledger_persistence": true })),
+                    }
+                }
+            };
             match ledger.begin_execution_with_policy(
                 id,
                 name,
@@ -1569,6 +1579,19 @@ impl Agent {
             } else {
                 ledger.record_completion(id, &outcome.content, false);
             }
+            if let Err(error) = ledger.persist() {
+                return crate::ToolResult {
+                    content: format!("Tool finished, but its result could not be checkpointed: {error}. Its effects may already exist; do not retry automatically."),
+                    is_error: true,
+                    details: Some(serde_json::json!({ "ledger_persistence": true })),
+                };
+            }
+        } else {
+            return crate::ToolResult {
+                content: "Tool finished, but its ledger lock is poisoned. Reconcile its effects before retrying.".into(),
+                is_error: true,
+                details: Some(serde_json::json!({ "ledger_persistence": true })),
+            };
         }
         if crate::tools::is_coordinated_mutation(name) && !outcome.is_error {
             crate::stats::SharedCounters::add(&self.counters.files_changed_count, 1);
@@ -1609,12 +1632,22 @@ impl Agent {
                     == Some(true),
             )
         });
-        let storage_failure = result
-            .details
-            .as_ref()
-            .and_then(|d| d.get("plan_storage_error"))
-            .and_then(Value::as_bool)
-            .unwrap_or(false);
+        let storage_failure = [
+            "plan_storage_error",
+            "ledger_persistence",
+            "ledger_wait_error",
+            "replay_blocked",
+            "collision",
+        ]
+        .iter()
+        .any(|key| {
+            result
+                .details
+                .as_ref()
+                .and_then(|d| d.get(key))
+                .and_then(Value::as_bool)
+                == Some(true)
+        });
         let replayed = result
             .details
             .as_ref()
@@ -2547,6 +2580,130 @@ pub(crate) fn is_verification_command(cmd: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn tool_completion_checkpoint_failure_stops_dispatch_and_survives_hooks() {
+        for tool_failed in [false, true] {
+            let root = tempfile::tempdir().unwrap();
+            let ledger_path = root.path().join("ledger.json");
+            let saved_path = root.path().join("ledger.saved");
+            let mut agent = Agent::new("failed completion checkpoint");
+            agent.tools = vec!["fixture".into()];
+            agent.permissions = Arc::new(crate::PermissionState::new(
+                crate::PermissionPolicy::new(crate::PermissionMode::AlwaysApprove),
+            ));
+            agent.tool_ledger = Arc::new(std::sync::Mutex::new(
+                crate::tool_ledger::ToolCallLedger::load_bound(&ledger_path, "checkpoint").unwrap(),
+            ));
+            let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let executor_calls = calls.clone();
+            let executor_path = ledger_path.clone();
+            let executor_saved = saved_path.clone();
+            agent.custom_tool_executor = Some(crate::CustomToolExecutor::new(move |_, _, _| {
+                executor_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                std::fs::rename(&executor_path, &executor_saved).unwrap();
+                std::fs::create_dir(&executor_path).unwrap();
+                Ok(crate::ToolResult {
+                    content: "operation finished".into(),
+                    is_error: tool_failed,
+                    details: None,
+                })
+            }));
+            let args = serde_json::json!({});
+            assert!(matches!(
+                agent.prepare_tool_call(root.path(), "first", "fixture", &args, 0),
+                Preparation::Ready { .. }
+            ));
+            let result = agent.run_prepared_call(root.path(), "first", "fixture", &args, 0);
+            assert!(result.is_error);
+            assert_eq!(result.details.as_ref().unwrap()["ledger_persistence"], true);
+            agent.post_tool = Some(crate::PostToolHook(Arc::new(|_, _, _, _, _| {
+                panic!("storage failure must bypass output hooks")
+            })));
+            agent.finalize_tool_call(root.path(), "first", "fixture", &args, result);
+            // Restoring storage must not silently unlatch this process or replay
+            // its uncommitted result to a follower.
+            std::fs::remove_dir(&ledger_path).unwrap();
+            std::fs::rename(&saved_path, &ledger_path).unwrap();
+            assert!(agent.wait_for_tool_call("first").is_error);
+            let Preparation::Immediate(rejected) =
+                agent.prepare_tool_call(root.path(), "second", "fixture", &args, 0)
+            else {
+                panic!("dispatch must stop after a storage failure")
+            };
+            assert!(rejected.is_error);
+            agent.finalize_tool_call(root.path(), "second", "fixture", &args, rejected);
+            assert!(
+                agent
+                    .run_prepared_call(root.path(), "second", "fixture", &args, 0)
+                    .is_error
+            );
+            assert!(agent.tool_ledger.lock().unwrap().persist().is_err());
+            assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+            let mut reopened =
+                crate::tool_ledger::ToolCallLedger::load_bound(&ledger_path, "checkpoint").unwrap();
+            assert!(matches!(
+                reopened
+                    .recover_attempt("first", "fixture", &args, 1)
+                    .unwrap(),
+                crate::tool_ledger::RecoveryAction::Stop(_)
+            ));
+        }
+    }
+
+    #[test]
+    fn tool_completion_survives_restart_after_dispatch() {
+        let root = tempfile::tempdir().unwrap();
+        let ledger_path = root.path().join("ledger.json");
+        let mut agent = Agent::new("durable completion");
+        agent.permissions = Arc::new(crate::PermissionState::new(crate::PermissionPolicy::new(
+            crate::PermissionMode::AlwaysApprove,
+        )));
+        agent.tool_ledger = Arc::new(std::sync::Mutex::new(
+            crate::tool_ledger::ToolCallLedger::load_bound(&ledger_path, "completion").unwrap(),
+        ));
+        let args = serde_json::json!({"path":"result.txt","content":"completed"});
+        assert!(matches!(
+            agent.prepare_tool_call(root.path(), "write-result", "write", &args, 0),
+            Preparation::Ready { .. }
+        ));
+        let result = agent.run_prepared_call(root.path(), "write-result", "write", &args, 0);
+        assert!(!result.is_error, "{}", result.content);
+        assert_eq!(
+            std::fs::read_to_string(root.path().join("result.txt")).unwrap(),
+            "completed"
+        );
+        drop(agent);
+        let mut reopened =
+            crate::tool_ledger::ToolCallLedger::load_bound(&ledger_path, "completion").unwrap();
+        assert!(matches!(
+            reopened.recover_attempt("write-result", "write", &args, 0).unwrap(),
+            crate::tool_ledger::RecoveryAction::Replay { output, is_error: false } if output == result.content
+        ));
+    }
+
+    #[test]
+    fn tool_completion_failure_is_durable_and_not_reexecuted_on_reopen() {
+        let root = tempfile::tempdir().unwrap();
+        let ledger_path = root.path().join("ledger.json");
+        let mut agent = Agent::new("durable failed read");
+        agent.tool_ledger = Arc::new(std::sync::Mutex::new(
+            crate::tool_ledger::ToolCallLedger::load_bound(&ledger_path, "failed").unwrap(),
+        ));
+        let args = serde_json::json!({"path":"missing.txt"});
+        assert!(matches!(
+            agent.prepare_tool_call(root.path(), "read-missing", "read", &args, 0),
+            Preparation::Ready { .. }
+        ));
+        let result = agent.run_prepared_call(root.path(), "read-missing", "read", &args, 0);
+        assert!(result.is_error);
+        drop(agent);
+        let mut reopened =
+            crate::tool_ledger::ToolCallLedger::load_bound(&ledger_path, "failed").unwrap();
+        assert!(
+            matches!(reopened.begin_execution("read-missing", "read", &args), crate::tool_ledger::BeginOutcome::Replay { output, is_error: true } if output == result.content)
+        );
+    }
+
     #[test]
     fn f01_cancelled_approval_finishes_every_tool_without_dispatch() {
         for with_runtime in [false, true] {
