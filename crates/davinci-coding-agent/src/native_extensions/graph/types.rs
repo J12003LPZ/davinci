@@ -687,6 +687,9 @@ pub struct GraphRun {
     pub lifecycle: Option<GraphLifecycle>,
     #[serde(default)]
     pub revision: u64,
+    /// Requests and outcomes are published in the same checkpoint as their state changes.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub control_history: Vec<super::control::GraphControlRecord>,
 }
 
 impl GraphRun {
@@ -1118,6 +1121,7 @@ mod tests {
             updated_at: 0,
             lifecycle: None,
             revision: 0,
+            control_history: Vec::new(),
         };
         let planner = run.tasks[2].clone();
         assert_eq!(run.unmet_dependencies(&planner), vec!["a", "b"]);

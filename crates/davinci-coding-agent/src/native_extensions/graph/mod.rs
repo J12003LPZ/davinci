@@ -104,7 +104,7 @@ pub(crate) struct ActiveRun {
     finished: AtomicBool,
     /// The background run thread, joined on session shutdown.
     handle: Mutex<Option<thread::JoinHandle<()>>>,
-    pub(crate) control_tracker: Mutex<control::ControlTracker>,
+    execution: Mutex<std::sync::Weak<controller::GraphExecution>>,
 }
 
 impl ActiveRun {
@@ -141,18 +141,22 @@ pub(crate) fn active_run(cwd: &Path) -> Option<Arc<ActiveRun>> {
     let runs = active_runs()
         .lock()
         .unwrap_or_else(|error| error.into_inner());
-    runs.get(cwd).cloned().filter(|run| {
+    runs.get(&registry_key(cwd)).cloned().filter(|run| {
         run.snapshot()
             .map(|run| !run.phase.as_str().eq("done"))
             .unwrap_or(true)
     })
 }
 
+fn registry_key(cwd: &Path) -> PathBuf {
+    cwd.canonicalize().unwrap_or_else(|_| cwd.to_path_buf())
+}
+
 fn is_running(cwd: &Path) -> bool {
     active_runs()
         .lock()
         .unwrap_or_else(|error| error.into_inner())
-        .get(cwd)
+        .get(&registry_key(cwd))
         .map(|run| {
             // No snapshot yet means the run thread has not reached its first
             // checkpoint — starting still counts as running. A run whose
@@ -177,7 +181,7 @@ fn refuse_if_active(cwd: &Path) -> Result<(), String> {
     let stopping = active_runs()
         .lock()
         .unwrap_or_else(|error| error.into_inner())
-        .get(cwd)
+        .get(&registry_key(cwd))
         .is_some_and(|run| run.abort.load(Ordering::Relaxed));
     Err(if stopping {
         "The previous graph run is still stopping; wait a moment and retry.".into()
@@ -192,7 +196,7 @@ fn register_run(cwd: &Path, active: Arc<ActiveRun>) {
     let previous = active_runs()
         .lock()
         .unwrap_or_else(|error| error.into_inner())
-        .insert(cwd.to_path_buf(), active);
+        .insert(registry_key(cwd), active);
     if let Some(previous) = previous {
         if previous.is_finished() {
             if let Some(handle) = previous
@@ -1382,31 +1386,55 @@ impl GraphController {
                 let control: control::GraphControl = serde_json::from_str(args.trim())
                     .map_err(|e| format!("Invalid graph control JSON: {e}"))?;
                 if let Some(active) = active_run(&self.cwd).filter(|active| !active.is_finished()) {
-                    let mut snap = active.snapshot.lock().unwrap_or_else(|e| e.into_inner());
-                    if let Some(ref mut run) = *snap {
-                        if run.run_id == control.run_id {
-                            let mut tracker = active
-                                .control_tracker
-                                .lock()
-                                .unwrap_or_else(|e| e.into_inner());
-                            let receipt =
-                                control::reduce_control(run, &control, &mut tracker, 0, true);
-                            if receipt.state == control::ControlReceiptState::Applied {
-                                store::save_run(run).map_err(|e| {
-                                    format!("Failed to persist graph run checkpoint: {e}")
-                                })?;
-                            }
-                            return Ok(Some(serde_json::to_value(&receipt).unwrap_or_default()));
-                        }
-                    }
+                    let execution = active
+                        .execution
+                        .lock()
+                        .map_err(|_| "Graph execution handle poisoned")?
+                        .upgrade()
+                        .ok_or("Graph controller is starting or has stopped; refresh its status")?;
+                    let receipt = execution.apply_control(&control)?;
+                    return serde_json::to_value(receipt)
+                        .map(Some)
+                        .map_err(|error| error.to_string());
                 }
                 let _workspace_lease = lease::WorkspaceLease::acquire(&self.cwd)?;
                 let Some(mut run) = load_run(&self.cwd, &control.run_id) else {
                     return Err(format!("Run '{}' not found", control.run_id));
                 };
                 let mut tracker = control::ControlTracker::new();
-                let receipt = control::reduce_control(&mut run, &control, &mut tracker, 0, true);
-                if receipt.state == control::ControlReceiptState::Applied {
+                let previous_receipts = run.control_history.len();
+                let before = run.clone();
+                let mut receipt =
+                    control::reduce_control(&mut run, &control, &mut tracker, 0, true);
+                let requires_executor = matches!(
+                    control.action,
+                    control::GraphControlAction::Resume | control::GraphControlAction::StopNode
+                ) || before
+                    .tasks
+                    .iter()
+                    .any(|task| task.status == types::TaskStatus::Running);
+                if run.control_history.len() != previous_receipts
+                    && requires_executor
+                    && matches!(
+                        receipt.state,
+                        control::ControlReceiptState::Applied
+                            | control::ControlReceiptState::Accepted
+                    )
+                {
+                    run = before;
+                    receipt.state = control::ControlReceiptState::Rejected;
+                    receipt.accepted_revision = run.revision;
+                    receipt.affected_nodes.clear();
+                    receipt.reason = Some(
+                        "No executing controller. Use /graph-resume with this run ID to reopen it."
+                            .into(),
+                    );
+                    run.control_history.push(control::GraphControlRecord {
+                        request: control.clone(),
+                        receipt: receipt.clone(),
+                    });
+                }
+                if run.control_history.len() != previous_receipts {
                     store::save_run(&mut run)
                         .map_err(|e| format!("Failed to persist graph run checkpoint: {e}"))?;
                 }
@@ -1504,6 +1532,235 @@ mod tests {
     }
 
     #[test]
+    fn live_control_pauses_dispatch_and_resumes_the_executing_controller() {
+        assert_live_pause_boundary(false);
+    }
+
+    #[test]
+    fn live_control_pauses_between_verification_commands() {
+        assert_live_pause_boundary(true);
+    }
+
+    fn assert_live_pause_boundary(verification: bool) {
+        let _registry = registry_guard();
+        let dir = tempdir().unwrap();
+        let controller = controller(&dir.path().join("."));
+        let active = Arc::new(ActiveRun::default());
+        let (mut deps, _) = controller.deps(true, &active);
+        let release = Arc::new(AtomicBool::new(false));
+        let released = release.clone();
+        let (send, receive) = std::sync::mpsc::channel();
+        if verification {
+            deps.config.verify_commands = ["verify-first", "verify-second"]
+                .into_iter()
+                .map(|command| types::VerifyCommandSpec {
+                    name: command.into(),
+                    command: command.into(),
+                    from_plan: false,
+                })
+                .collect();
+            deps.verify_exec = Arc::new(move |command, _, abort, _| {
+                send.send(command.to_string()).unwrap();
+                if command == "verify-first" {
+                    while !released.load(Ordering::SeqCst) && !abort.load(Ordering::SeqCst) {
+                        thread::sleep(Duration::from_millis(5));
+                    }
+                }
+                (0, "fixture passed".into(), 1)
+            });
+        } else {
+            deps.runner = Arc::new(move |spec, abort, progress| {
+                send.send(spec.task_id.clone()).unwrap();
+                if spec.task_id == "classify" {
+                    while !released.load(Ordering::SeqCst) && !abort.load(Ordering::SeqCst) {
+                        thread::sleep(Duration::from_millis(5));
+                    }
+                }
+                worker::run_dry_worker(spec, abort, progress)
+            });
+        }
+        let parsed = ParsedGraphArgs {
+            goal: "live control fixture".into(),
+            forced: None,
+            dry_run: true,
+        };
+        let options = controller.options(&parsed, active.abort.clone(), HashMap::new(), None);
+        register_run(dir.path(), active.clone());
+        let finishing = active.clone();
+        let handle = thread::spawn(move || {
+            let _guard = FinishedOnDrop(finishing);
+            run_graph(options, deps)
+        });
+        assert_eq!(
+            receive.recv_timeout(Duration::from_secs(5)).unwrap(),
+            if verification {
+                "verify-first"
+            } else {
+                "classify"
+            }
+        );
+        let snapshot = active.snapshot().unwrap();
+        let request = control::GraphControl {
+            operation_id: "live-pause".into(),
+            run_id: snapshot.run_id.clone(),
+            expected_run_revision: snapshot.revision,
+            node_id: None,
+            expected_attempt: None,
+            action: control::GraphControlAction::Pause,
+        };
+        let pause = controller.command("graph-control", &serde_json::to_string(&request).unwrap());
+        release.store(true, Ordering::SeqCst);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !active.is_finished()
+            && Instant::now() < deadline
+            && active.snapshot().unwrap().current_lifecycle() != types::GraphLifecycle::Paused
+        {
+            thread::sleep(Duration::from_millis(10));
+        }
+        let paused = active.snapshot().unwrap();
+        let dispatched_while_paused = receive.try_iter().collect::<Vec<_>>();
+        let resume = control::GraphControl {
+            operation_id: "live-resume".into(),
+            expected_run_revision: paused.revision,
+            action: control::GraphControlAction::Resume,
+            ..request
+        };
+        let resumed = controller.command("graph-control", &serde_json::to_string(&resume).unwrap());
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !active.is_finished() && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(10));
+        }
+        active.abort.store(true, Ordering::SeqCst);
+        let completed = handle.join().unwrap();
+        assert_eq!(pause.unwrap().unwrap()["state"], "accepted");
+        assert_eq!(paused.current_lifecycle(), types::GraphLifecycle::Paused);
+        assert!(
+            dispatched_while_paused.is_empty(),
+            "{dispatched_while_paused:?}"
+        );
+        assert_eq!(resumed.unwrap().unwrap()["state"], "applied");
+        assert_eq!(completed.phase, Phase::Done);
+        if verification {
+            assert_eq!(receive.try_iter().collect::<Vec<_>>(), ["verify-second"]);
+        }
+        let durable = store::load_run_checked(dir.path(), &completed.run_id).unwrap();
+        assert_eq!(durable.control_history.len(), 2);
+        assert!(durable
+            .control_history
+            .iter()
+            .all(|entry| entry.receipt.state == control::ControlReceiptState::Applied));
+    }
+
+    #[test]
+    fn live_control_stops_workers_and_fails_closed_when_receipt_cannot_persist() {
+        let _registry = registry_guard();
+        for (action, fail_save) in [
+            (control::GraphControlAction::StopGraph, false),
+            (control::GraphControlAction::StopNode, false),
+            (control::GraphControlAction::StopGraph, true),
+        ] {
+            let dir = tempdir().unwrap();
+            let controller = controller(dir.path());
+            let active = Arc::new(ActiveRun::default());
+            let (mut deps, _) = controller.deps(true, &active);
+            let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let observed = calls.clone();
+            let (send, receive) = std::sync::mpsc::channel();
+            deps.runner = Arc::new(move |_, abort, _| {
+                observed.fetch_add(1, Ordering::SeqCst);
+                send.send(()).unwrap();
+                let deadline = Instant::now() + Duration::from_secs(5);
+                while !abort.load(Ordering::SeqCst) && Instant::now() < deadline {
+                    thread::sleep(Duration::from_millis(5));
+                }
+                types::WorkerResult::default()
+            });
+            let options = controller.options(
+                &ParsedGraphArgs {
+                    goal: "live stop fixture".into(),
+                    forced: None,
+                    dry_run: true,
+                },
+                active.abort.clone(),
+                HashMap::new(),
+                None,
+            );
+            register_run(dir.path(), active.clone());
+            let finishing = active.clone();
+            let handle = thread::spawn(move || {
+                let _guard = FinishedOnDrop(finishing);
+                run_graph(options, deps)
+            });
+            receive.recv_timeout(Duration::from_secs(5)).unwrap();
+            let mut snapshot = active.snapshot().unwrap();
+            if action == control::GraphControlAction::StopGraph && !fail_save {
+                let pause = control::GraphControl {
+                    operation_id: "superseded-pause".into(),
+                    run_id: snapshot.run_id.clone(),
+                    expected_run_revision: snapshot.revision,
+                    node_id: None,
+                    expected_attempt: None,
+                    action: control::GraphControlAction::Pause,
+                };
+                let receipt = controller
+                    .command("graph-control", &serde_json::to_string(&pause).unwrap())
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(receipt["state"], "accepted");
+                snapshot = active.snapshot().unwrap();
+            }
+            if fail_save {
+                let path = store::run_dir(dir.path(), &snapshot.run_id).join("state.json");
+                std::fs::rename(&path, path.with_extension("preserved.json")).unwrap();
+                std::fs::create_dir(&path).unwrap();
+            }
+            let request = control::GraphControl {
+                operation_id: "live-stop".into(),
+                run_id: snapshot.run_id.clone(),
+                expected_run_revision: snapshot.revision,
+                node_id: (action == control::GraphControlAction::StopNode)
+                    .then(|| "classify".into()),
+                expected_attempt: (action == control::GraphControlAction::StopNode).then_some(1),
+                action,
+            };
+            let result =
+                controller.command("graph-control", &serde_json::to_string(&request).unwrap());
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while !active.is_finished() && Instant::now() < deadline {
+                thread::sleep(Duration::from_millis(10));
+            }
+            active.abort.store(true, Ordering::SeqCst);
+            let completed = handle.join().unwrap();
+            assert_eq!(
+                calls.load(Ordering::SeqCst),
+                1,
+                "stop must not trigger automatic retry"
+            );
+            if fail_save {
+                assert!(result
+                    .unwrap_err()
+                    .contains("checkpoint persistence failed"));
+                assert!(completed.control_history.is_empty());
+                assert_eq!(completed.phase, Phase::Blocked);
+            } else {
+                assert_eq!(result.unwrap().unwrap()["state"], "accepted");
+                let durable = store::load_run_checked(dir.path(), &completed.run_id).unwrap();
+                assert_eq!(
+                    durable.control_history.last().unwrap().receipt.state,
+                    control::ControlReceiptState::Applied
+                );
+                if action == control::GraphControlAction::StopGraph {
+                    assert_eq!(
+                        durable.control_history[0].receipt.state,
+                        control::ControlReceiptState::Rejected
+                    );
+                }
+                assert_eq!(durable.tasks[0].status, types::TaskStatus::Cancelled);
+            }
+        }
+    }
+
+    #[test]
     fn interactive_role_models_reach_worker_dependencies_without_project_trust() {
         let dir = tempdir().unwrap();
         let mut controller = controller(dir.path());
@@ -1536,7 +1793,7 @@ mod tests {
         active_runs()
             .lock()
             .unwrap_or_else(|error| error.into_inner())
-            .remove(cwd);
+            .remove(&registry_key(cwd));
     }
 
     #[test]
@@ -1777,7 +2034,7 @@ mod tests {
         active_runs()
             .lock()
             .unwrap_or_else(|error| error.into_inner())
-            .insert(dir.path().to_path_buf(), Arc::clone(&active));
+            .insert(registry_key(dir.path()), Arc::clone(&active));
 
         assert!(!active.abort.load(Ordering::Relaxed));
         let value = controller.command("graph-abort", "").unwrap().unwrap();
@@ -1793,7 +2050,7 @@ mod tests {
         active_runs()
             .lock()
             .unwrap_or_else(|error| error.into_inner())
-            .remove(dir.path());
+            .remove(&registry_key(dir.path()));
     }
 
     #[test]
@@ -2020,6 +2277,7 @@ mod tests {
             updated_at: 0,
             lifecycle: Some(types::GraphLifecycle::Paused),
             revision: 1,
+            control_history: Vec::new(),
         };
         store::save_run(&mut run).unwrap();
 
@@ -2090,6 +2348,7 @@ mod tests {
             updated_at: 0,
             lifecycle: Some(types::GraphLifecycle::Running),
             revision: 1,
+            control_history: Vec::new(),
         };
         store::save_run(&mut run).unwrap();
 

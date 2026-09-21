@@ -2166,6 +2166,7 @@ mod tests {
             updated_at: 0,
             lifecycle: Some(crate::native_extensions::graph::types::GraphLifecycle::Running),
             revision: 1,
+            control_history: Vec::new(),
         };
         crate::native_extensions::graph::store::save_run(&mut run).unwrap();
 
@@ -2192,6 +2193,51 @@ mod tests {
             loaded.current_lifecycle(),
             crate::native_extensions::graph::types::GraphLifecycle::Paused
         );
+
+        // An idle checkpoint cannot truthfully acknowledge an executing resume.
+        let resume = handle_rpc(
+            &mut runtime,
+            RpcCommand {
+                kind: "graph_control".into(),
+                run_id: Some(run_id.clone()),
+                action: Some("resume".into()),
+                operation_id: Some("idle-resume".into()),
+                expected_revision: Some(loaded.revision),
+                ..RpcCommand::default()
+            },
+        );
+        assert!(resume.success);
+        assert_eq!(resume.data.unwrap()["state"], "rejected");
+        let loaded = crate::native_extensions::graph::store::load_run(dir.path(), &run_id).unwrap();
+        assert_eq!(loaded.control_history.len(), 2);
+        assert_eq!(
+            loaded.current_lifecycle(),
+            crate::native_extensions::graph::types::GraphLifecycle::Paused
+        );
+        let mut interrupted = loaded;
+        let mut task = crate::native_extensions::graph::types::GraphTaskState::new(
+            "interrupted-worker",
+            crate::native_extensions::graph::types::Role::Writer,
+            crate::native_extensions::graph::types::ArtifactKind::PatchReport,
+            vec![],
+            None,
+        );
+        task.status = crate::native_extensions::graph::types::TaskStatus::Running;
+        interrupted.tasks.push(task);
+        crate::native_extensions::graph::store::save_run(&mut interrupted).unwrap();
+        let stop = handle_rpc(
+            &mut runtime,
+            RpcCommand {
+                kind: "graph_control".into(),
+                run_id: Some(run_id.clone()),
+                action: Some("stop_graph".into()),
+                operation_id: Some("idle-stop".into()),
+                expected_revision: Some(interrupted.revision),
+                ..RpcCommand::default()
+            },
+        );
+        assert!(stop.success);
+        assert_eq!(stop.data.unwrap()["state"], "rejected");
 
         // 2. Send graph_control to missing run (simulates disconnect / missing target)
         let res_missing = handle_rpc(

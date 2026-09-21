@@ -575,6 +575,7 @@ mod tests {
             definition: None,
             lifecycle: None,
             revision: 0,
+            control_history: Vec::new(),
         };
 
         // Evaluate resume candidates under conservative revision-loop rule

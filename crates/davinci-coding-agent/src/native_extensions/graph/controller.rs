@@ -235,6 +235,9 @@ pub struct GraphExecution {
     pub node_aborts: Arc<Mutex<HashMap<String, Arc<AtomicBool>>>>,
 }
 
+#[path = "controller_control.rs"]
+mod live_control;
+
 impl GraphExecution {
     #[allow(dead_code)]
     pub fn abort_node(&self, task_id: &str) {
@@ -249,12 +252,12 @@ impl GraphExecution {
     }
 
     pub fn register_node_abort(&self, task_id: &str) -> Arc<AtomicBool> {
-        let flag = Arc::new(AtomicBool::new(false));
         self.node_aborts
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .insert(task_id.to_string(), Arc::clone(&flag));
-        flag
+            .entry(task_id.to_string())
+            .or_insert_with(|| Arc::new(AtomicBool::new(false)))
+            .clone()
     }
 
     #[allow(dead_code)]
@@ -307,6 +310,7 @@ impl GraphExecution {
             if matches!(run.phase, Phase::Done | Phase::Blocked | Phase::Cancelled) {
                 run.lifecycle = Some(GraphLifecycle::Stopped);
             }
+            self.acknowledge_controls(&mut run);
             let gov_stats = self.deps.governor.as_ref().map(|g| g.stats());
             if let Some(ref gs) = gov_stats {
                 run.ecosystem_stats.governor_bytes_omitted = gs.bytes_withheld;
@@ -387,7 +391,21 @@ impl GraphExecution {
             &self.exec_abort,
             timeout_ms,
             self.run_deadline,
-            self.deps.verify_exec.as_ref(),
+            &|command, cwd, abort, timeout| {
+                loop {
+                    if !self.wait_until_running() {
+                        return (-1, "verification stopped before dispatch".into(), 0);
+                    }
+                    let run = self.run.lock().unwrap_or_else(|error| error.into_inner());
+                    if run.current_lifecycle() != GraphLifecycle::Running {
+                        continue;
+                    }
+                    self.active_workers.fetch_add(1, Ordering::SeqCst);
+                    break;
+                }
+                let _active = live_control::ActiveOperation(self.active_workers.clone());
+                (self.deps.verify_exec)(command, cwd, abort, timeout)
+            },
             |progress| self.verification_progress(progress),
         );
         if self
@@ -589,38 +607,8 @@ impl GraphExecution {
         let task_id = task.id.clone();
         let role = task.role;
 
-        loop {
-            if self.exec_abort.load(Ordering::Relaxed) {
-                return None;
-            }
-            if let Some(deadline) = self.run_deadline {
-                if Instant::now() >= deadline {
-                    self.budget_abort("run deadline exceeded".into());
-                    return None;
-                }
-            }
-            let lifecycle = self.snapshot().current_lifecycle();
-            if lifecycle == GraphLifecycle::StopRequested || lifecycle == GraphLifecycle::Stopped {
-                return None;
-            }
-            if lifecycle == GraphLifecycle::PauseRequested {
-                if self.active_workers.load(Ordering::SeqCst) == 0 {
-                    let mut run = self.run.lock().unwrap_or_else(|e| e.into_inner());
-                    run.lifecycle = Some(GraphLifecycle::Paused);
-                    drop(run);
-                    self.checkpoint(Some("paused at safe boundary"));
-                }
-                thread::sleep(Duration::from_millis(25));
-                continue;
-            }
-            if lifecycle == GraphLifecycle::Paused {
-                thread::sleep(Duration::from_millis(25));
-                continue;
-            }
-            if graph_dispatch_allowed(lifecycle.as_str(), true, true) {
-                break;
-            }
-            thread::sleep(Duration::from_millis(25));
+        if !self.wait_until_running() {
+            return None;
         }
 
         {
@@ -847,9 +835,17 @@ impl GraphExecution {
             // Budget check and spawn accounting share one critical section so
             // parallel research threads cannot all pass a stale check before
             // any of them records its own spawn.
-            let over_budget = {
+            let over_budget = loop {
+                if !self.wait_until_running() {
+                    self.end_task(&task_id, TaskStatus::Cancelled, None);
+                    self.checkpoint(None);
+                    return None;
+                }
                 let mut run = self.run.lock().unwrap_or_else(|error| error.into_inner());
-                match Self::budget_exceeded(&run, now_ms()) {
+                if run.current_lifecycle() != GraphLifecycle::Running {
+                    continue;
+                }
+                break match Self::budget_exceeded(&run, now_ms()) {
                     Some(reason) => Some(reason),
                     None => {
                         run.counters.workers_spawned += 1;
@@ -861,7 +857,7 @@ impl GraphExecution {
                         }
                         None
                     }
-                }
+                };
             };
             if let Some(reason) = over_budget {
                 self.end_task(&task_id, TaskStatus::Cancelled, Some(reason));
@@ -1047,16 +1043,6 @@ impl GraphExecution {
                     run_res.failure_reason = Some(format!("node {task_id} stopped by operator"));
                 }
 
-                {
-                    let mut run = self.run.lock().unwrap_or_else(|e| e.into_inner());
-                    if run.current_lifecycle() == GraphLifecycle::PauseRequested
-                        && self.active_workers.load(Ordering::SeqCst) == 0
-                    {
-                        run.lifecycle = Some(GraphLifecycle::Paused);
-                        drop(run);
-                        self.checkpoint(Some("paused at safe boundary"));
-                    }
-                }
                 run_res
             };
             let worker_terminal_state = if result.ok {
@@ -1119,6 +1105,15 @@ impl GraphExecution {
                 return None;
             }
             if self.persistence_failure().is_some() {
+                return None;
+            }
+            if self.register_node_abort(&task_id).load(Ordering::SeqCst) {
+                self.end_task(
+                    &task_id,
+                    TaskStatus::Cancelled,
+                    Some("node stopped by operator".into()),
+                );
+                self.checkpoint(Some("node stopped at safe boundary"));
                 return None;
             }
             if result.ok {
@@ -1185,6 +1180,7 @@ impl GraphExecution {
                 let mut run = self.run.lock().unwrap_or_else(|error| error.into_inner());
                 if let Some(task) = run.tasks.iter_mut().find(|entry| entry.id == task_id) {
                     task.error = Some(error.clone());
+                    task.status = TaskStatus::Failed;
                 }
             }
             let failure_class = classify_worker_failure(&result, Some(&error));
@@ -1545,6 +1541,11 @@ fn run_graph_internal(
             .unwrap_or_default(),
         updated_at: 0,
         lifecycle: Some(GraphLifecycle::Running),
+        control_history: options
+            .resume_run
+            .as_ref()
+            .map(|run| run.control_history.clone())
+            .unwrap_or_default(),
         revision: continuation
             .as_ref()
             .and_then(|_| options.resume_run.as_ref().map(|r| r.revision + 1))
@@ -1584,7 +1585,7 @@ fn run_graph_internal(
     );
 
     let learning = Mutex::new(deps.learning.clone());
-    let execution = GraphExecution {
+    let execution = Arc::new(GraphExecution {
         run: Mutex::new(run),
         deps,
         learning,
@@ -1595,7 +1596,15 @@ fn run_graph_internal(
         run_deadline,
         active_workers: Arc::new(AtomicUsize::new(0)),
         node_aborts: Arc::new(Mutex::new(HashMap::new())),
-    };
+    });
+    if let Some(active) = super::active_run(&execution.options.cwd) {
+        if Arc::ptr_eq(&active.abort, &execution.options.abort) {
+            *active
+                .execution
+                .lock()
+                .unwrap_or_else(|error| error.into_inner()) = Arc::downgrade(&execution);
+        }
+    }
     execution.checkpoint(Some(if continuation.is_some() {
         "run continued"
     } else {
@@ -3862,6 +3871,7 @@ mod tests {
                 updated_at: 0,
                 lifecycle: Some(GraphLifecycle::Running),
                 revision: 0,
+                control_history: Vec::new(),
             }),
             learning: Mutex::new(deps.learning.clone()),
             deps,
@@ -5107,6 +5117,7 @@ mod tests {
                 updated_at: 0,
                 lifecycle: Some(GraphLifecycle::Running),
                 revision: 0,
+                control_history: Vec::new(),
             }),
             deps: ControllerDeps {
                 runner: Arc::new(|_, _, _| WorkerResult {
@@ -5218,6 +5229,7 @@ mod tests {
                 updated_at: 0,
                 lifecycle: Some(GraphLifecycle::Running),
                 revision: 0,
+                control_history: Vec::new(),
             }),
             deps: ControllerDeps {
                 runner: Arc::new(|_, _, _| WorkerResult {
@@ -5308,6 +5320,7 @@ mod tests {
                 updated_at: 0,
                 lifecycle: Some(GraphLifecycle::Paused),
                 revision: 0,
+                control_history: Vec::new(),
             }),
             deps: ControllerDeps {
                 runner: Arc::new(|_, _, _| WorkerResult {
@@ -5415,6 +5428,7 @@ mod tests {
                 updated_at: 0,
                 lifecycle: Some(GraphLifecycle::Running),
                 revision: 0,
+                control_history: Vec::new(),
             }),
             deps: ControllerDeps {
                 runner: Arc::new(|_, _, _| WorkerResult {

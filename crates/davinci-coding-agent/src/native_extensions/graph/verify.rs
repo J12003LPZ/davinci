@@ -317,7 +317,7 @@ pub fn run_verification_with_progress(
     abort: &Arc<AtomicBool>,
     timeout_ms: u64,
     root_deadline: Option<Instant>,
-    exec: &VerifyExec,
+    exec: &(impl Fn(&str, &Path, &Arc<AtomicBool>, u64) -> (i32, String, u64) + ?Sized),
     mut on_progress: impl FnMut(&VerificationResult),
 ) -> VerificationResult {
     let mut results = Vec::new();

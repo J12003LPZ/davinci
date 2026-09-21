@@ -64,6 +64,13 @@ pub struct GraphControlReceipt {
     pub reason: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GraphControlRecord {
+    pub request: GraphControl,
+    pub receipt: GraphControlReceipt,
+}
+
 #[derive(Debug, Default, Clone)]
 pub struct ControlTracker {
     seen_ops: HashSet<String>,
@@ -213,6 +220,95 @@ pub fn invalidate_descendants_for_retry(
 }
 
 pub fn reduce_control(
+    run: &mut GraphRun,
+    control: &GraphControl,
+    tracker: &mut ControlTracker,
+    active_workers: usize,
+    checkpoint_durable: bool,
+) -> GraphControlReceipt {
+    let refusal = |state, reason: &str| GraphControlReceipt {
+        operation_id: control.operation_id.clone(),
+        accepted_revision: run.revision,
+        state,
+        affected_nodes: vec![],
+        reason: Some(reason.into()),
+    };
+    if let Some(existing) = run
+        .control_history
+        .iter()
+        .find(|entry| entry.request.operation_id == control.operation_id)
+    {
+        return if existing.request == *control {
+            existing.receipt.clone()
+        } else {
+            refusal(
+                ControlReceiptState::Conflict,
+                "Operation ID was already used for a different request",
+            )
+        };
+    }
+    let invalid = if control.operation_id.trim().is_empty() {
+        Some(refusal(
+            ControlReceiptState::Rejected,
+            "Missing operation ID",
+        ))
+    } else if run.revision == u64::MAX {
+        Some(refusal(
+            ControlReceiptState::Rejected,
+            "Graph revision is exhausted",
+        ))
+    } else if control.action == GraphControlAction::Pause
+        && !matches!(
+            run.current_lifecycle(),
+            GraphLifecycle::Running | GraphLifecycle::PauseRequested | GraphLifecycle::Paused
+        )
+    {
+        Some(refusal(
+            ControlReceiptState::Rejected,
+            "Only a running or paused graph can be paused",
+        ))
+    } else if matches!(
+        control.action,
+        GraphControlAction::StopNode | GraphControlAction::RetryNode
+    ) {
+        match control
+            .node_id
+            .as_ref()
+            .and_then(|id| run.tasks.iter().find(|task| task.id == *id))
+        {
+            None => Some(refusal(
+                ControlReceiptState::Rejected,
+                "Node ID is missing or does not exist in this run",
+            )),
+            Some(task) if control.expected_attempt != Some(task.attempts) => Some(refusal(
+                ControlReceiptState::Conflict,
+                "Node attempt is missing or does not match the current attempt",
+            )),
+            Some(task)
+                if control.action == GraphControlAction::StopNode
+                    && task.status != super::types::TaskStatus::Running =>
+            {
+                Some(refusal(
+                    ControlReceiptState::Rejected,
+                    "Only a running node attempt can be stopped",
+                ))
+            }
+            _ => None,
+        }
+    } else {
+        None
+    };
+    let receipt = invalid.unwrap_or_else(|| {
+        reduce_unrecorded_control(run, control, tracker, active_workers, checkpoint_durable)
+    });
+    run.control_history.push(GraphControlRecord {
+        request: control.clone(),
+        receipt: receipt.clone(),
+    });
+    receipt
+}
+
+fn reduce_unrecorded_control(
     run: &mut GraphRun,
     control: &GraphControl,
     tracker: &mut ControlTracker,
@@ -458,6 +554,7 @@ mod tests {
             updated_at: 0,
             lifecycle: Some(GraphLifecycle::Running),
             revision: 0,
+            control_history: Vec::new(),
         }
     }
 
@@ -466,6 +563,99 @@ mod tests {
         assert_eq!(pause_state(true, 2, true), "pause_requested");
         assert_eq!(pause_state(true, 0, false), "recovery_required");
         assert_eq!(pause_state(true, 0, true), "paused");
+    }
+
+    fn pause_request() -> GraphControl {
+        GraphControl {
+            operation_id: "durable-control".into(),
+            run_id: "run-ctrl-1".into(),
+            expected_run_revision: 0,
+            node_id: None,
+            expected_attempt: None,
+            action: GraphControlAction::Pause,
+        }
+    }
+
+    #[test]
+    fn control_receipt_survives_checkpoint_round_trip() {
+        let mut run = sample_test_run();
+        let request = pause_request();
+        let first = reduce_control(&mut run, &request, &mut ControlTracker::new(), 0, true);
+        let mut reopened: GraphRun =
+            serde_json::from_slice(&serde_json::to_vec(&run).unwrap()).unwrap();
+        let repeated = reduce_control(&mut reopened, &request, &mut ControlTracker::new(), 0, true);
+        assert_eq!(repeated, first);
+        assert_eq!(reopened.revision, 1);
+    }
+
+    #[test]
+    fn control_operation_identity_cannot_be_reused_for_different_arguments() {
+        let mut run = sample_test_run();
+        let mut tracker = ControlTracker::new();
+        let request = pause_request();
+        reduce_control(&mut run, &request, &mut tracker, 0, true);
+        let collision = GraphControl {
+            action: GraphControlAction::StopGraph,
+            ..request
+        };
+        let result = reduce_control(&mut run, &collision, &mut tracker, 0, true);
+        assert_eq!(result.state, ControlReceiptState::Conflict);
+        assert_eq!(run.current_lifecycle(), GraphLifecycle::Paused);
+        assert_eq!(run.revision, 1);
+    }
+
+    #[test]
+    fn control_rejects_stale_attempt_or_unknown_node_without_changing_revision() {
+        for (id, attempt) in [("task-a", 9), ("missing", 0)] {
+            let mut run = sample_test_run();
+            let request = GraphControl {
+                action: GraphControlAction::StopNode,
+                node_id: Some(id.into()),
+                expected_attempt: Some(attempt),
+                ..pause_request()
+            };
+            let result = reduce_control(&mut run, &request, &mut ControlTracker::new(), 0, true);
+            assert!(matches!(
+                result.state,
+                ControlReceiptState::Conflict | ControlReceiptState::Rejected
+            ));
+            assert_eq!(run.revision, 0);
+        }
+    }
+
+    #[test]
+    fn controls_reject_inapplicable_lifecycle_and_node_states() {
+        for phase in [Phase::Done, Phase::Blocked, Phase::Cancelled] {
+            let mut run = sample_test_run();
+            run.phase = phase;
+            let receipt = reduce_control(
+                &mut run,
+                &pause_request(),
+                &mut ControlTracker::new(),
+                0,
+                true,
+            );
+            assert_eq!(receipt.state, ControlReceiptState::Rejected);
+            assert_eq!(run.revision, 0);
+        }
+        for status in [
+            TaskStatus::Pending,
+            TaskStatus::Succeeded,
+            TaskStatus::Failed,
+            TaskStatus::Cancelled,
+        ] {
+            let mut run = sample_test_run();
+            run.tasks[0].status = status;
+            let request = GraphControl {
+                action: GraphControlAction::StopNode,
+                node_id: Some("task-a".into()),
+                expected_attempt: Some(0),
+                ..pause_request()
+            };
+            let receipt = reduce_control(&mut run, &request, &mut ControlTracker::new(), 0, true);
+            assert_eq!(receipt.state, ControlReceiptState::Rejected);
+            assert_eq!(run.revision, 0);
+        }
     }
 
     #[test]
@@ -654,7 +844,13 @@ mod tests {
             run_id: run.run_id.clone(),
             expected_run_revision: 0,
             node_id: Some("research-2".into()),
-            expected_attempt: None,
+            expected_attempt: Some(
+                run.tasks
+                    .iter()
+                    .find(|task| task.id == "research-2")
+                    .unwrap()
+                    .attempts,
+            ),
             action: GraphControlAction::RetryNode,
         };
 
@@ -694,7 +890,13 @@ mod tests {
             run_id: run.run_id.clone(),
             expected_run_revision: 0,
             node_id: Some("implement-1".into()),
-            expected_attempt: None,
+            expected_attempt: Some(
+                run.tasks
+                    .iter()
+                    .find(|task| task.id == "implement-1")
+                    .unwrap()
+                    .attempts,
+            ),
             action: GraphControlAction::RetryNode,
         };
 
@@ -730,7 +932,13 @@ mod tests {
             run_id: run.run_id.clone(),
             expected_run_revision: 0,
             node_id: Some("implement-1".into()),
-            expected_attempt: None,
+            expected_attempt: Some(
+                run.tasks
+                    .iter()
+                    .find(|task| task.id == "implement-1")
+                    .unwrap()
+                    .attempts,
+            ),
             action: GraphControlAction::RetryNode,
         };
 
@@ -764,7 +972,13 @@ mod tests {
             run_id: run.run_id.clone(),
             expected_run_revision: 0,
             node_id: Some("implement-1".into()),
-            expected_attempt: None,
+            expected_attempt: Some(
+                run.tasks
+                    .iter()
+                    .find(|task| task.id == "implement-1")
+                    .unwrap()
+                    .attempts,
+            ),
             action: GraphControlAction::RetryNode,
         };
 
@@ -796,7 +1010,13 @@ mod tests {
             run_id: run.run_id.clone(),
             expected_run_revision: 0,
             node_id: Some("research-1".into()),
-            expected_attempt: None,
+            expected_attempt: Some(
+                run.tasks
+                    .iter()
+                    .find(|task| task.id == "research-1")
+                    .unwrap()
+                    .attempts,
+            ),
             action: GraphControlAction::RetryNode,
         };
 
@@ -824,7 +1044,13 @@ mod tests {
             run_id: run.run_id.clone(),
             expected_run_revision: 0,
             node_id: Some("research-1".into()),
-            expected_attempt: None,
+            expected_attempt: Some(
+                run.tasks
+                    .iter()
+                    .find(|task| task.id == "research-1")
+                    .unwrap()
+                    .attempts,
+            ),
             action: GraphControlAction::RetryNode,
         };
 
