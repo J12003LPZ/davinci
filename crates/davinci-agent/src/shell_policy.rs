@@ -204,7 +204,7 @@ const TEST_PATTERNS: &[&str] = &[
     r"(?i)^\s*pnpm\s+(test|check|typecheck|lint)\b",
     r"(?i)^\s*node\s+.*vitest[/\\]dist[/\\]cli\.js\b",
     r"(?i)^\s*node\s+--test\b",
-    r"(?i)^\s*(?:python|python3|pytest|cargo\s+(?:test|check|clippy|fmt|build|nextest)|go\s+(?:test|vet|build)|dotnet\s+(?:test|build))\b",
+    r"(?i)^\s*(?:python|python3|pytest|cargo(?:\.exe)?(?:\s+\+[a-z0-9_.-]+)?(?:\s+--(?:offline|locked|frozen))*\s+(?:test|check|clippy|fmt|build|nextest)|go\s+(?:test|vet|build)|dotnet\s+(?:test|build))\b",
     r"(?i)^\s*make\s+(test|check|lint|fmt|clippy|build)\b",
     r"(?i)^\s*\.[/\\]test\.sh\b",
 ];
@@ -918,6 +918,34 @@ pub fn evaluate(profile: ShellPolicyProfile, command: &str) -> ShellCommandDecis
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cargo_global_flags_are_test_policy_compatible_without_granting_other_commands() {
+        for command in [
+            "cargo --offline test",
+            "cargo --locked --offline fmt --check",
+            "cargo +1.83.0 --frozen check",
+        ] {
+            assert_eq!(
+                evaluate(ShellPolicyProfile::ReadAndTest, command),
+                ShellCommandDecision::Allowed,
+                "{command}"
+            );
+        }
+        for command in [
+            "cargo --offline publish",
+            "cargo --offline install evil",
+            "cargo --config bad test",
+            "cargo --offline test && git push",
+            "cargo +unsafe/../../x test",
+        ] {
+            assert_ne!(
+                evaluate(ShellPolicyProfile::ReadAndTest, command),
+                ShellCommandDecision::Allowed,
+                "{command}"
+            );
+        }
+    }
 
     #[test]
     fn split_segments_handles_chaining_and_quotes() {
