@@ -39,7 +39,9 @@ jobs:
           cache-on-failure: true
       - name: Apply reviewed source batch
         if: contains(github.event.head_commit.message, '[ui-exec]')
-        run: python3 .github/scripts/terminal_ui_apply.py
+        run: |
+          python3 .github/scripts/terminal_ui_apply.py
+          python3 .github/scripts/terminal_ui_finish.py
       - name: Format changed crate
         run: cargo fmt -p davinci-tui
       - name: Rebuild contracts
@@ -62,6 +64,12 @@ jobs:
         run: |
           mkdir -p "$RUNNER_TEMP/terminal-evidence"
           cargo clippy --locked -p davinci-tui --all-targets -- -D warnings 2>&1 | tee "$RUNNER_TEMP/terminal-evidence/clippy.log"
+      - name: Render actual buffer preview
+        if: always()
+        shell: bash
+        run: |
+          mkdir -p "$RUNNER_TEMP/terminal-evidence"
+          cargo run --locked -p davinci-tui --example editorial_preview -- dark > "$RUNNER_TEMP/terminal-evidence/preview.html"
       - name: Preserve review evidence
         if: always()
         shell: bash
