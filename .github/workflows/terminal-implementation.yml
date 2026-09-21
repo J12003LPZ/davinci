@@ -1,0 +1,72 @@
+name: Terminal implementation
+
+on:
+  push:
+    branches: [J12003LPZ/claude-terminal-implementation-20260921]
+    paths:
+      - 'crates/davinci-tui/**'
+      - 'crates/davinci-coding-agent/**'
+      - '.github/workflows/terminal-implementation.yml'
+      - '.github/terminal-ui/**'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: terminal-implementation-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: never
+  PI_OFFLINE: '1'
+
+jobs:
+  workbench:
+    if: contains(github.event.head_commit.message, '[workbench]') || contains(github.event.head_commit.message, 'offline Rust workbench')
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@1.83.0
+        with:
+          components: rustfmt, clippy
+      - name: Collect pinned offline build inputs
+        shell: bash
+        run: |
+          set -euo pipefail
+          kit="$RUNNER_TEMP/terminal-workbench"
+          mkdir -p "$kit"
+          cargo vendor --locked "$kit/vendor" > "$kit/vendor-config.toml"
+          cp -a "$(rustc --print sysroot)" "$kit/toolchain"
+          rustc --version --verbose > "$kit/provenance.txt"
+          git rev-parse HEAD >> "$kit/provenance.txt"
+          tar -C "$kit" -czf "$RUNNER_TEMP/terminal-workbench.tar.gz" toolchain vendor vendor-config.toml provenance.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: terminal-workbench-${{ github.sha }}
+          path: ${{ runner.temp }}/terminal-workbench.tar.gz
+          retention-days: 1
+          if-no-files-found: error
+  terminal:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@1.83.0
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: terminal-implementation
+      - name: Rebuild contracts
+        run: cargo test --locked -p davinci-tui --test terminal_rebuild -- --nocapture
+      - name: Entire TUI suite
+        if: always()
+        run: cargo test --locked -p davinci-tui
+      - name: TUI lint
+        if: always()
+        run: cargo clippy --locked -p davinci-tui --all-targets -- -D warnings
