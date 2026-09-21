@@ -83,6 +83,18 @@ fn text_width(text: &str) -> u16 {
     unicode_width::UnicodeWidthStr::width(text).min(u16::MAX as usize) as u16
 }
 
+pub fn visible_indices(model: &Model) -> Vec<usize> {
+    model
+        .catalog
+        .iter()
+        .enumerate()
+        .filter_map(|(index, row)| {
+            super::picker::matches(&model.catalog_query, &[&row.name, &row.id, &row.provider])
+                .then_some(index)
+        })
+        .collect()
+}
+
 /// The catalog keeps source order so row indices still identify runtime choices.
 pub fn catalog(model: &Model) -> Vec<Line<'static>> {
     let th = &model.theme;
@@ -94,7 +106,19 @@ pub fn catalog(model: &Model) -> Vec<Line<'static>> {
             "No models in the catalog. Check model configuration or use /login.",
         );
     }
-    let selected = model.catalog_index % model.catalog.len();
+    let indices = visible_indices(model);
+    if indices.is_empty() {
+        return section_detail(
+            model.width,
+            th,
+            "No matching models. Backspace to edit the search.",
+        );
+    }
+    let selected = if indices.contains(&model.catalog_index) {
+        model.catalog_index
+    } else {
+        indices[0]
+    };
     let mut rows = Vec::new();
     let name_width = model
         .catalog
@@ -111,7 +135,8 @@ pub fn catalog(model: &Model) -> Vec<Line<'static>> {
         .min(36)
         .min(model.width.saturating_sub(6));
     let mut provider = None;
-    for (index, entry) in model.catalog.iter().enumerate() {
+    for index in indices {
+        let entry = &model.catalog[index];
         if provider != Some(entry.provider.as_str()) {
             provider = Some(entry.provider.as_str());
             let mut heading = vec![ui::span_strong(provider_label(&entry.provider), accent, th)];
@@ -219,6 +244,7 @@ pub fn suggestions(model: &Model) -> Option<Vec<Line<'static>>> {
         catalog_index: model.suggestion_index,
         section_offset: None,
         section_notice: None,
+        catalog_query: String::new(),
         ..model.clone()
     };
     let height = model
@@ -265,7 +291,7 @@ fn picker_panel(model: &Model, height: usize, echo: bool) -> Vec<Line<'static>> 
         Line::from(header),
         Line::from(span(
             if echo {
-                "↑↓ model · ←→ reasoning · Enter saves"
+                "Type to filter · ↑↓ model · ←→ reasoning · Enter saves"
             } else {
                 "Choose a model"
             },
@@ -288,7 +314,14 @@ fn picker_panel(model: &Model, height: usize, echo: bool) -> Vec<Line<'static>> 
             }
         }
     }
-    content.push(ui::print_rule(width, th));
+    content.push(Line::from(span(
+        if model.catalog_query.is_empty() {
+            "Search models…".to_string()
+        } else {
+            format!("Search: {}", model.catalog_query)
+        },
+        th.muted,
+    )));
     let selected = model
         .catalog
         .get(model.catalog_index % model.catalog.len().max(1));
@@ -388,7 +421,7 @@ fn catalog_row(
     name_width: u16,
 ) -> Line<'static> {
     let th = &model.theme;
-    let (accent, background) = th.model_picker_colors();
+    let (accent, _background) = th.model_picker_colors();
     let width = model.width;
     let name = if entry.id.is_empty() {
         &entry.name
@@ -403,7 +436,7 @@ fn catalog_row(
         ),
         ui::span_strong(ui::clip_ellipsis(name, name_width), th.text, th),
     ];
-    let badge = entry.id == "gpt-6-astra" && width >= 65;
+    let badge = false;
     if width >= 65 {
         let pad = name_width.saturating_sub(text_width(name)) + 3;
         run.push(span(" ".repeat(pad as usize), th.text));
@@ -417,7 +450,7 @@ fn catalog_row(
     run.push(span(" ".repeat(padding as usize), th.text));
     if focused {
         for item in &mut run {
-            item.style.bg = Some(background);
+            item.style.fg = Some(accent);
         }
     }
     if badge {
@@ -542,14 +575,14 @@ mod tests {
         m.model_name = "gpt-6-astra".into();
         m.catalog_index = 1;
         let drawn = text(&screen(&m, 24));
+        assert!(!drawn.contains("LATEST"));
         for label in [
             "╭",
             "╯",
-            "SELECT A MODEL",
-            "↑↓ model · ←→ reasoning · Enter saves",
+            "Select a model",
+            "Type to filter · ↑↓ model · ←→ reasoning · Enter saves",
             "↑↓ navigate",
             "OpenAI Codex",
-            "LATEST",
             "Latest and most capable model",
             "Balanced performance for most tasks",
         ] {
@@ -562,7 +595,7 @@ mod tests {
         assert!(rows[2]
             .spans
             .iter()
-            .all(|s| s.style.bg == Some(m.theme.model_picker_colors().1)));
+            .all(|s| s.style.fg == Some(m.theme.model_picker_colors().0)));
     }
 
     #[test]
@@ -573,6 +606,7 @@ mod tests {
         m.catalog[0].provider = "example-provider".into();
         m.section_notice = Some("Selection failed".into());
         let drawn = text(&screen(&m, 24));
+        assert!(!drawn.contains("LATEST"));
         assert!(drawn.contains("expired"));
         assert!(drawn.contains("/login example-provider"));
         assert!(drawn.contains("Selection failed"));
@@ -602,7 +636,7 @@ mod tests {
         m.toggle_overlay(Overlay::Cogitator);
         let drawn = text(&lines(&m, "config.json"));
         assert!(
-            drawn.contains("SELECT MODEL")
+            drawn.contains("Select model")
                 && drawn.contains("config.json")
                 && drawn.contains("esc cancel")
         );

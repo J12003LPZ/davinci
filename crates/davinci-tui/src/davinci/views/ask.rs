@@ -185,7 +185,7 @@ mod tests {
     fn context_precedes_answers_and_only_focus_expands() {
         let m = model(80);
         let text = text(&m);
-        assert!(text.contains("PROJECT TRUST") && !text.contains('╭'));
+        assert!(text.contains("Project trust") && !text.contains('╭'));
         assert!(
             text.find("Review this project").unwrap() < text.find("Trust this folder").unwrap()
         );

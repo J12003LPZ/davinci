@@ -46,12 +46,12 @@ pub fn group_rank(key: &str) -> usize {
 
 fn group_label(rank: usize) -> &'static str {
     match rank {
-        0 => "GENERAL",
-        1 => "DISPLAY",
-        2 => "AUTOCOMPLETE",
-        3 => "AGENT BEHAVIOR",
-        4 => "NETWORK",
-        _ => "ADVANCED",
+        0 => "General",
+        1 => "Display",
+        2 => "Autocomplete",
+        3 => "Agent behavior",
+        4 => "Network",
+        _ => "Advanced",
     }
 }
 
@@ -70,6 +70,67 @@ fn detail_line(model: &Model, text: impl Into<String>, primary: bool) -> Line<'s
     ui::indent(lead, vec![content])
 }
 
+/// Visible source indices, including keys and descriptions in the search corpus.
+pub fn visible_indices(model: &Model) -> Vec<usize> {
+    model
+        .settings_rows
+        .iter()
+        .enumerate()
+        .filter_map(|(index, row)| {
+            super::picker::matches(
+                &model.settings_query,
+                &[
+                    &row.label,
+                    &row.key,
+                    &row.description,
+                    group_label(group_rank(&row.key)),
+                ],
+            )
+            .then_some(index)
+        })
+        .collect()
+}
+
+/// Compact configuration panel. It occupies only its content, not the entire terminal.
+pub fn screen(model: &Model, height: usize) -> Vec<Line<'static>> {
+    let mut rows = lines(model);
+    let anchor = model
+        .section_offset
+        .or_else(|| ui::focused_row(&rows))
+        .unwrap_or(0);
+    let room = height.saturating_sub(3);
+    let pinned = PINNED_DETAIL_ROWS
+        .min(rows.len())
+        .min(room.saturating_sub(1));
+    let mut visible = rows.drain(..pinned).collect::<Vec<_>>();
+    visible.extend(ui::window(
+        rows,
+        room.saturating_sub(pinned),
+        anchor.saturating_sub(pinned),
+        &model.theme,
+    ));
+    rows = visible;
+    let mut out = vec![ui::indent(
+        2.min(model.width),
+        vec![ui::paper_label("Settings", &model.theme, true)],
+    )];
+    out.extend(rows);
+    out.push(Line::from(span(
+        ui::clip_ellipsis(
+            "  Type to filter · ↑↓ move · enter change · esc close",
+            model.width,
+        ),
+        model.theme.muted,
+    )));
+    out.push(ui::blank());
+    out.truncate(height);
+    out
+}
+
+pub fn screen_height(model: &Model) -> usize {
+    (lines(model).len() + 3).min((model.height as usize * 3 / 4).max(12))
+}
+
 pub fn lines(model: &Model) -> Vec<Line<'static>> {
     let th = &model.theme;
     let width = model.width;
@@ -81,7 +142,22 @@ pub fn lines(model: &Model) -> Vec<Line<'static>> {
         );
     }
 
-    let selected = model.settings_index % model.settings_rows.len();
+    let indices = visible_indices(model);
+    if indices.is_empty() {
+        return vec![
+            detail_line(model, format!("Search: {}", model.settings_query), true),
+            detail_line(
+                model,
+                "No matching settings. Backspace to edit the search.",
+                false,
+            ),
+        ];
+    }
+    let selected = if indices.contains(&model.settings_index) {
+        model.settings_index
+    } else {
+        indices[0]
+    };
     let focused = &model.settings_rows[selected];
     let scope = if focused.project { "project" } else { "user" };
     let mut tail = Vec::new();
@@ -93,7 +169,15 @@ pub fn lines(model: &Model) -> Vec<Line<'static>> {
     }
 
     let mut rows = vec![
-        detail_line(model, "SETTING DETAILS", true),
+        detail_line(
+            model,
+            if model.settings_query.is_empty() {
+                "Search settings…".into()
+            } else {
+                format!("Search: {}", model.settings_query)
+            },
+            true,
+        ),
         detail_line(model, format!("Current: {}", focused.value), false),
         detail_line(model, focused.description.clone(), false),
         detail_line(model, format!("Scope: {scope} · {}", focused.key), false),
@@ -101,7 +185,8 @@ pub fn lines(model: &Model) -> Vec<Line<'static>> {
     ];
 
     let mut previous_group = None;
-    for (index, setting) in model.settings_rows.iter().enumerate() {
+    for index in indices {
+        let setting = &model.settings_rows[index];
         let rank = group_rank(&setting.key);
         if previous_group != Some(rank) {
             rows.extend(ui::section_heading(width, th, group_label(rank)));
@@ -257,19 +342,19 @@ mod tests {
         let drawn = rows.iter().map(Line::to_string).collect::<Vec<_>>();
         let joined = drawn.join("\n");
         for heading in [
-            "GENERAL",
-            "DISPLAY",
-            "AUTOCOMPLETE",
-            "AGENT BEHAVIOR",
-            "NETWORK",
-            "ADVANCED",
+            "General",
+            "Display",
+            "Autocomplete",
+            "Agent behavior",
+            "Network",
+            "Advanced",
         ] {
             assert!(joined.contains(heading), "missing {heading}: {joined}");
         }
         let focus = ui::focused_row(&rows).unwrap();
         let detail = drawn
             .iter()
-            .position(|row| row.contains("SETTING DETAILS"))
+            .position(|row| row.contains("Search settings…"))
             .expect("focused detail header");
         assert!(
             detail < focus,

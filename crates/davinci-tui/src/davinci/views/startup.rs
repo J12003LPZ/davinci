@@ -3,7 +3,6 @@
 //! Keeps startup discovery from the native shell; upstream interaction lives in
 //! vendor/davinci/packages/coding-agent/src/modes/interactive/interactive-mode.ts.
 
-use ratatui::style::{Modifier, Stylize};
 use ratatui::text::{Line, Span};
 
 use crate::davinci::model::{Model, Startup};
@@ -14,36 +13,25 @@ use crate::davinci::ui::{blank, indent, paper_label, span, span_strong, truncate
 /// selected model come from the running session, never from sample copy.
 pub fn banner(model: &Model, info: &Startup) -> Vec<Line<'static>> {
     let th = &model.theme;
-    let mark = if model.width >= 48 {
-        [
-            " ▓▓▓▓▓╸      ",
-            " ▓▓  ▓▓      ",
-            " ▓▓  ▓▓      ",
-            " ▓▓▓▓▓╸      ",
-        ]
-    } else {
-        ["", "", "", ""]
-    };
     let facts = [
         vec![
-            paper_label("davinci", th, true),
+            span("✻  ", th.secondary),
+            paper_label("DaVinci", th, false),
             span(format!(" v{}", env!("CARGO_PKG_VERSION")), th.muted),
         ],
         vec![
+            span("   ", th.muted),
             span(model.model_name.clone(), th.text),
             span(format!(" · {}", model.thinking_level), th.muted),
         ],
-        vec![span(info.cwd.clone(), th.muted)],
-        vec![span("CODE / TOOLS / CONTEXT", th.muted).add_modifier(Modifier::BOLD)],
+        vec![span("   ", th.muted), span(info.cwd.clone(), th.muted)],
     ];
-    mark.into_iter()
-        .zip(facts)
-        .map(|(art, facts)| {
-            let mut run = vec![span(art, th.text)];
-            run.extend(facts);
+    facts
+        .into_iter()
+        .map(|row| {
             indent(
                 1.min(model.width),
-                truncate_run(run, model.width.saturating_sub(1)),
+                truncate_run(row, model.width.saturating_sub(1)),
             )
         })
         .collect()
@@ -52,32 +40,23 @@ pub fn banner(model: &Model, info: &Startup) -> Vec<Line<'static>> {
 pub fn lines(model: &Model, info: &Startup) -> Vec<Line<'static>> {
     let th = &model.theme;
     let width = model.width;
-    let content_width = width.saturating_sub(2);
-    let mut rows = vec![Line::from(restored_row(th, info.restored))];
-    for found in &info.found {
-        rows.push(Line::from(vec![span(found.clone(), th.muted)]));
-    }
-    rows.push(blank());
-    for (command, description) in [
-        ("/graph", "Plan a task and follow its progress"),
-        ("/governor-status", "View compression and token savings"),
-        ("/memory-status", "Browse the memory index"),
-        ("/model", "Choose and manage the active model"),
-        ("/resume", "Resume a previous session"),
-        ("/help", "Show all commands and shortcuts"),
-    ] {
-        rows.push(Line::from(vec![
-            span_strong(format!("{command:<19}"), th.primary, th),
-            span(if width >= 64 { description } else { "" }, th.muted),
-        ]));
-    }
     let mut out = vec![blank()];
     out.extend(banner(model, info));
     out.push(blank());
-    out.extend(
-        rows.into_iter()
-            .map(|row| indent(1.min(width), truncate_run(row.spans, content_width))),
-    );
+    let mut rows = vec![Line::from(restored_row(th, info.restored))];
+    for found in &info.found {
+        rows.push(Line::from(span(found.clone(), th.muted)));
+    }
+    rows.push(Line::from(span(
+        "/help for commands · /model to change models",
+        th.muted,
+    )));
+    out.extend(rows.into_iter().map(|row| {
+        indent(
+            1.min(width),
+            truncate_run(row.spans, width.saturating_sub(1)),
+        )
+    }));
     out.push(blank());
     out
 }
@@ -98,7 +77,7 @@ fn restored_row(theme: &Theme, restored: bool) -> Vec<Span<'static>> {
 
 /// Row count includes discovered resources.
 pub fn height(model: &Model) -> usize {
-    15 + model.startup.found.len()
+    lines(model, &model.startup).len()
 }
 
 #[cfg(test)]
@@ -145,14 +124,7 @@ mod tests {
             .position(|row| row.contains("session restored"))
             .unwrap();
         assert!(rows[restored + 1].contains("loaded 1 context file · 41 skills"));
-        for command in [
-            "/graph",
-            "/governor-status",
-            "/memory-status",
-            "/model",
-            "/resume",
-            "/help",
-        ] {
+        for command in ["/model", "/help"] {
             assert!(
                 rows.iter().any(|row| row.contains(command)),
                 "missing {command}"
@@ -169,15 +141,12 @@ mod tests {
     #[test]
     fn banner_uses_editorial_masthead() {
         let m = model(100);
-        let art = banner(&m, &m.startup)
-            .iter()
-            .map(text)
-            .collect::<Vec<_>>()
-            .join("\n");
-        assert!(art.contains("▓▓▓▓▓╸"));
-        assert!(art.contains("DAVINCI"));
-        assert!(art.contains("CODE / TOOLS / CONTEXT"));
-        assert!(!art.contains("▐▛███▜▌"));
-        assert!(!art.contains("▝▜█████▛▘"));
+        let rows = banner(&m, &m.startup);
+        let art = rows.iter().map(text).collect::<Vec<_>>().join("\n");
+        assert_eq!(rows.len(), 3);
+        assert!(art.contains("DaVinci"));
+        assert!(art.contains(&m.model_name));
+        assert!(!art.contains("▓"));
+        assert!(!art.contains("CODE / TOOLS / CONTEXT"));
     }
 }

@@ -26,28 +26,18 @@ pub fn span(content: impl Into<String>, color: Color) -> Span<'static> {
 /// Opaque newspaper clipping. Only display headings are uppercased; values,
 /// paths and command text retain their original spelling.
 pub fn paper_label(text: &str, theme: &Theme, accent: bool) -> Span<'static> {
-    let (ink, paper) = theme.label_colors(accent);
-    let style = Style::default().fg(ink).bg(paper);
     Span::styled(
-        if theme.is_vox() {
-            format!("▚ {} ▞", text.to_uppercase())
-        } else {
-            format!(" {} ", text.to_uppercase())
-        },
-        style.add_modifier(Modifier::BOLD),
+        text.to_string(),
+        Style::default()
+            .fg(if accent { theme.primary } else { theme.text })
+            .add_modifier(Modifier::BOLD),
     )
 }
 
 /// A static, irregular screen-print edge. Texture stays outside readable text
 /// and never animates, so it cannot compete with the working indicator.
 pub fn print_rule(width: u16, theme: &Theme) -> Line<'static> {
-    let pattern = if theme.is_vox() {
-        "━╸▪┄▰━╺┄"
-    } else {
-        "━╸━┄━━╺━"
-    };
-    let edge: String = pattern.chars().cycle().take(width as usize).collect();
-    Line::from(span(edge, theme.border))
+    Line::from(span("─".repeat(usize::from(width)), theme.border))
 }
 
 /// A run of text in one color, on a tinted row.
@@ -84,8 +74,10 @@ pub fn pad(n: u16, background: Option<Color>) -> Span<'static> {
 pub fn run_width(spans: &[Span<'_>]) -> u16 {
     spans
         .iter()
-        .map(|span| UnicodeWidthStr::width(span.content.as_ref()) as u16)
-        .sum()
+        .fold(0usize, |used, item| {
+            used.saturating_add(UnicodeWidthStr::width(item.content.as_ref()))
+        })
+        .min(usize::from(u16::MAX)) as u16
 }
 
 /// An empty row.
@@ -165,18 +157,16 @@ pub fn indent(n: u16, spans: Vec<Span<'static>>) -> Line<'static> {
 
 /// Truncate to `max` display cells, never mid-grapheme.
 pub fn clip(text: &str, max: u16) -> String {
-    if UnicodeWidthStr::width(text) <= max as usize {
-        return text.to_string();
-    }
+    use unicode_segmentation::UnicodeSegmentation;
     let mut out = String::new();
     let mut used = 0usize;
-    for ch in text.chars() {
-        let w = unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0);
-        if used + w > max as usize {
+    for grapheme in text.graphemes(true) {
+        let cells = UnicodeWidthStr::width(grapheme);
+        if used.saturating_add(cells) > usize::from(max) {
             break;
         }
-        out.push(ch);
-        used += w;
+        out.push_str(grapheme);
+        used = used.saturating_add(cells);
     }
     out
 }
@@ -313,8 +303,6 @@ pub struct Surface {
     inset: u16,
     border: Color,
     background: Option<Color>,
-    paper: Color,
-    ink: Color,
     title: Vec<Span<'static>>,
     right: Vec<Span<'static>>,
     body: Vec<Vec<Span<'static>>>,
@@ -337,8 +325,6 @@ impl Surface {
             inset: 0,
             border: theme.border,
             background: None,
-            paper: theme.text,
-            ink: theme.background,
             title: Vec::new(),
             right: Vec::new(),
             body: Vec::new(),
@@ -367,16 +353,9 @@ impl Surface {
     pub fn title(mut self, title: Vec<Span<'static>>) -> Self {
         self.title = title
             .into_iter()
-            .map(|span| {
-                let style = if self.ink == Color::Reset {
-                    Style::default().fg(Color::Black).bg(self.paper)
-                } else {
-                    Style::default().fg(self.ink).bg(self.paper)
-                };
-                Span::styled(
-                    span.content.to_uppercase(),
-                    style.add_modifier(Modifier::BOLD),
-                )
+            .map(|mut item| {
+                item.style = item.style.add_modifier(Modifier::BOLD);
+                item
             })
             .collect();
         self
@@ -790,15 +769,10 @@ mod tests {
             for no_color in [false, true] {
                 let theme = Theme::da_vinci(depth, no_color);
                 let label = paper_label("Review changes", &theme, true);
-                assert_eq!(label.content, " REVIEW CHANGES ");
+                assert_eq!(label.content, "Review changes");
                 assert!(label.style.add_modifier.contains(Modifier::BOLD));
-                if depth != ColorDepth::Basic {
-                    assert_eq!(label.style.fg, Some(theme.background));
-                    assert_eq!(label.style.bg, Some(theme.primary));
-                } else {
-                    assert_eq!(label.style.fg, Some(Color::Black));
-                    assert_eq!(label.style.bg, Some(theme.primary));
-                }
+                assert_eq!(label.style.fg, Some(theme.primary));
+                assert!(label.style.bg.is_none());
             }
         }
     }
@@ -1291,6 +1265,7 @@ pub fn section_row(
     value: &str,
 ) -> Line<'static> {
     let band = selected.then_some(theme.surface);
+    let width = width.min(96);
     let available = width.saturating_sub(3);
     let value_room = if width < 32 {
         0

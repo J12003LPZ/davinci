@@ -46,7 +46,7 @@ pub fn header(model: &Model) -> Line<'static> {
             section.header_right,
         );
     }
-    let mut left = vec![paper_label("davinci", th, true)];
+    let mut left = vec![paper_label("DaVinci", th, true)];
     if !model.minimal() {
         left.push(span(" · ", th.border));
         left.push(span(model.mode().to_uppercase(), th.text));
@@ -768,7 +768,7 @@ pub fn suggestions(model: &Model) -> Vec<Line<'static>> {
                                     .saturating_sub(gap)
                                     .saturating_sub(3),
                             ),
-                            th.border,
+                            th.muted,
                             tint,
                         ));
                     }
@@ -784,15 +784,19 @@ pub fn suggestions(model: &Model) -> Vec<Line<'static>> {
         ]);
     }
 
-    Surface::new(model.width, th)
-        .border(th.border)
-        .title(vec![span("COMPLETIONS", th.border)])
-        .right(vec![span(
-            format!("{total} · ↑↓ move · tab take · esc close"),
-            th.border,
-        )])
-        .rows(rows)
-        .lines()
+    let mut out = vec![crate::davinci::ui::blank()];
+    out.extend(
+        rows.into_iter()
+            .map(|row| Line::from(crate::davinci::ui::truncate_run(row, model.width))),
+    );
+    out.push(Line::from(span(
+        clip_ellipsis(
+            &format!("   {total} commands · ↑↓ move · tab take · esc close"),
+            model.width,
+        ),
+        th.muted,
+    )));
+    out
 }
 
 /// How many rows [`suggestions`] will occupy, known before it is built.
@@ -972,7 +976,7 @@ mod tests {
         crate::davinci::fixtures::dress_screen(&mut m, "6d");
         let h = text(&header(&m));
         assert!(
-            h.contains("REVIEW CHANGES") && h.contains("7 files · +145 -127"),
+            h.contains("Review changes") && h.contains("7 files · +145 -127"),
             "{h}"
         );
         let s = text(&status(&m));
@@ -1003,7 +1007,7 @@ mod tests {
             "the fold is counted: {drawn:?}"
         );
         assert!(
-            drawn.iter().any(|row| row.contains("26 ·")),
+            drawn.iter().any(|row| row.contains("26 commands")),
             "the header states the real total: {drawn:?}"
         );
         assert_eq!(
@@ -1037,10 +1041,9 @@ mod tests {
         let rows = suggestions(&m);
         let drawn = rows.iter().map(text).collect::<Vec<_>>().join("\n");
         for label in [
-            "SELECT A MODEL",
+            "Select a model",
             "OpenAI Codex",
             "gpt-6-astra",
-            "LATEST",
             "Balanced performance for most tasks",
         ] {
             assert!(drawn.contains(label), "{label}: {drawn}");
@@ -1090,7 +1093,7 @@ mod tests {
     #[test]
     fn the_header_carries_path_branch_and_model_when_there_is_room() {
         let drawn = text(&header(&model(100)));
-        assert!(drawn.starts_with(" DAVINCI  · AGENT"), "{drawn}");
+        assert!(drawn.starts_with("DaVinci · AGENT"), "{drawn}");
         assert!(drawn.contains("davinci-rust │ main │ sonnet"));
     }
 
@@ -1184,7 +1187,7 @@ mod tests {
         assert_eq!(rows.len(), 4);
         assert_eq!(rows[0].spans[0].style.fg, Some(m.theme.border));
         assert_eq!(rows[1].style.bg, None);
-        assert!(text(&rows[0]).chars().all(|ch| "━╸┄╺".contains(ch)));
+        assert!(text(&rows[0]).chars().all(|ch| ch == '─'));
         let prompt_row = text(&rows[1]);
         assert!(prompt_row.contains("❯"), "{prompt_row}");
         assert!(

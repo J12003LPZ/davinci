@@ -112,8 +112,12 @@ pub fn compose_frame(model: &Model, height: u16) -> ComposedFrame {
             graph: None,
         };
     }
-    if model.screen == Screen::Models && model.overlay.is_none() {
-        let picker = cogitator::screen(model, cogitator::screen_height(model).min(height));
+    if matches!(model.screen, Screen::Models | Screen::Settings) && model.overlay.is_none() {
+        let picker = if model.screen == Screen::Settings {
+            settings::screen(model, settings::screen_height(model).min(height))
+        } else {
+            cogitator::screen(model, cogitator::screen_height(model).min(height))
+        };
         let picker_height = picker.len();
         let mut lines = transcript::tail_lines(
             model,
@@ -589,7 +593,7 @@ pub fn handle_key(model: &mut Model, key: KeyEvent) -> Flow {
             };
         }
         // The shell's own shortcuts are checked before the editor's, because
-        // several of them (`ctrl+u` mensura, `ctrl+b` codex, `ctrl+d` quit)
+        // some of them (explicit surface shortcuts and `ctrl+d` quit)
         // spell the same bytes as a readline binding. design.md §5 gives those
         // keys to the instruments, so the editor never sees them.
         if let Some(flow) = handle_global_key(model, data) {
@@ -755,6 +759,10 @@ fn handle_screen_key(model: &mut Model, key: KeyEvent, data: Option<&str>) -> Fl
         {
             model.toggle_codex();
         }
+        return Flow::Continue;
+    }
+
+    if handle_picker_search(model, &key) {
         return Flow::Continue;
     }
 
@@ -1092,16 +1100,65 @@ mod graph_input_tests {
     }
 }
 
+/// Search input belongs to the selector; it must never overwrite the chat draft.
+fn handle_picker_search(model: &mut Model, key: &KeyEvent) -> bool {
+    if !matches!(model.screen, Screen::Models | Screen::Settings)
+        || key.kind == KeyEventKind::Release
+        || key
+            .modifiers
+            .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+    {
+        return false;
+    }
+    let query = if model.screen == Screen::Models {
+        &mut model.catalog_query
+    } else {
+        &mut model.settings_query
+    };
+    match key.code {
+        KeyCode::Char(ch) => query.push(ch),
+        KeyCode::Backspace => {
+            use unicode_segmentation::UnicodeSegmentation;
+            let start = query
+                .grapheme_indices(true)
+                .last()
+                .map(|(at, _)| at)
+                .unwrap_or(0);
+            query.truncate(start);
+        }
+        _ => return false,
+    }
+    let (indices, selected) = if model.screen == Screen::Models {
+        (cogitator::visible_indices(model), &mut model.catalog_index)
+    } else {
+        (settings::visible_indices(model), &mut model.settings_index)
+    };
+    if !indices.contains(selected) {
+        if let Some(first) = indices.first() {
+            *selected = *first;
+        }
+    }
+    model.section_offset = None;
+    true
+}
+
 fn screen_move(model: &mut Model, delta: isize) {
     model.section_offset = None;
     use super::model::wrap_index;
     match model.screen {
         Screen::Models => {
-            model.catalog_index = wrap_index(model.catalog_index, delta, model.catalog.len());
+            model.catalog_index = super::views::picker::step(
+                &cogitator::visible_indices(model),
+                model.catalog_index,
+                delta,
+            );
         }
         Screen::Settings => {
-            model.settings_index =
-                wrap_index(model.settings_index, delta, model.settings_rows.len());
+            model.settings_index = super::views::picker::step(
+                &settings::visible_indices(model),
+                model.settings_index,
+                delta,
+            );
         }
         Screen::Thinking => {
             model.thinking_index =
@@ -1214,10 +1271,12 @@ fn screen_move(model: &mut Model, delta: isize) {
 fn screen_accept(model: &Model) -> Option<Choice> {
     let pick = |index: usize, len: usize| (len > 0).then(|| index % len);
     match model.screen {
-        Screen::Models => pick(model.catalog_index, model.catalog.len()).map(Choice::Catalog),
-        Screen::Settings => {
-            pick(model.settings_index, model.settings_rows.len()).map(Choice::Setting)
-        }
+        Screen::Models => cogitator::visible_indices(model)
+            .contains(&model.catalog_index)
+            .then_some(Choice::Catalog(model.catalog_index)),
+        Screen::Settings => settings::visible_indices(model)
+            .contains(&model.settings_index)
+            .then_some(Choice::Setting(model.settings_index)),
         Screen::Thinking => {
             pick(model.thinking_index, model.thinking_rows.len()).map(Choice::ThinkingLevel)
         }
@@ -1548,14 +1607,18 @@ mod tests {
     fn a_sheet_starts_under_the_header_and_ends_with_its_hint_row() {
         let mut m = model(100, 44);
         crate::davinci::fixtures::dress_screen(&mut m, "3b");
+        m.transcript = vec![Entry::user("keep this conversation visible")];
         let rows = compose(&m, 44);
-        let body_first = row_text(&rows[1]);
-        assert!(
-            !body_first.trim().is_empty(),
-            "first body row is blank: {body_first:?}"
-        );
-        // 3b draws no composer, so the hint row sits directly above the
-        // status bar.
+        assert_eq!(rows.len(), 44);
+        let title = rows
+            .iter()
+            .position(|row| row_text(row).trim() == "Settings")
+            .unwrap();
+        let context = rows
+            .iter()
+            .position(|row| row_text(row).contains("keep this conversation visible"))
+            .unwrap();
+        assert!(context < title);
         let hint = rows.iter().rev().nth(1).map(row_text).unwrap();
         assert!(hint.trim_end().ends_with("esc close"), "{hint}");
     }
@@ -1660,10 +1723,10 @@ mod tests {
         let mut m = model(100, 24);
         m.transcript = (0..40).map(|i| Entry::user(&format!("turn {i}"))).collect();
         let rows = compose(&m, 24);
-        assert!(text(&rows[19]).chars().all(|ch| "━╸┄╺".contains(ch)));
+        assert!(text(&rows[19]).chars().all(|ch| ch == '─'));
         assert!(text(&rows[20]).contains("❯"));
         assert!(!text(&rows[20]).contains("…"), "no placeholder prose");
-        assert!(text(&rows[21]).chars().all(|ch| "━╸┄╺".contains(ch)));
+        assert!(text(&rows[21]).chars().all(|ch| ch == '─'));
         assert!(text(&rows[22]).contains("/help for shortcuts"));
         assert!(text(&rows[23]).starts_with("  Manual · main"));
     }
@@ -1672,7 +1735,7 @@ mod tests {
     fn sheet_header_and_status_bar_fill_one_row_each_at_every_width() {
         for width in [72u16, 80, 100, 120, 160] {
             let mut m = model(width, 30);
-            m.screen = Screen::Settings;
+            m.screen = Screen::Thinking;
             let rows = compose(&m, 30);
             assert_eq!(run_width(&rows[0].spans), width);
             assert_eq!(run_width(&rows[29].spans), width);
@@ -1694,7 +1757,7 @@ mod tests {
         let mut m = model(100, 20);
         m.transcript = vec![Entry::user("run the tests")];
         let rows = compose(&m, 20);
-        assert!(text(&rows[1]).contains("DAVINCI"));
+        assert!(text(&rows[1]).contains("DaVinci"));
         let turn = rows
             .iter()
             .position(|row| text(row).contains("> run the tests"))
@@ -1953,7 +2016,17 @@ mod tests {
             // ctrl+m in the spec; see the note in `handle_key`.
             ('r', Screen::Memoria),
         ] {
-            handle_key(&mut m, ctrl(ch));
+            handle_key(
+                &mut m,
+                KeyEvent::new(
+                    KeyCode::Char(ch),
+                    if ch == 'u' {
+                        KeyModifiers::CONTROL | KeyModifiers::ALT
+                    } else {
+                        KeyModifiers::CONTROL
+                    },
+                ),
+            );
             assert_eq!(m.screen, expected, "ctrl+{ch}");
             handle_key(&mut m, key(KeyCode::Esc));
             assert_eq!(m.screen, Screen::Agent);
@@ -1963,7 +2036,17 @@ mod tests {
             ('s', Overlay::Sessions),
             ('o', Overlay::Cogitator),
         ] {
-            handle_key(&mut m, ctrl(ch));
+            handle_key(
+                &mut m,
+                KeyEvent::new(
+                    KeyCode::Char(ch),
+                    if ch == 'u' {
+                        KeyModifiers::CONTROL | KeyModifiers::ALT
+                    } else {
+                        KeyModifiers::CONTROL
+                    },
+                ),
+            );
             assert_eq!(m.overlay, Some(expected), "ctrl+{ch}");
             handle_key(&mut m, key(KeyCode::Esc));
             assert_eq!(m.overlay, None);
@@ -2090,7 +2173,7 @@ mod tests {
                 "{expected} is not on screen"
             );
         }
-        assert!(rows.iter().any(|row| row.contains("DAVINCI")));
+        assert!(rows.iter().any(|row| row.contains("DaVinci")));
         assert!(rows.iter().any(|row| row.contains("23% context")));
     }
 
@@ -2631,7 +2714,7 @@ mod section_behavior_regressions {
             .map(Line::to_string)
             .collect::<Vec<_>>()
             .join("\n");
-        assert!(model_text.contains("SELECT A MODEL"), "{model_text}");
+        assert!(model_text.contains("Select a model"), "{model_text}");
         assert!(model_text.contains(&selected_model), "{model_text}");
 
         let mut settings = fixture("3b", 80, 16);
@@ -2644,7 +2727,10 @@ mod section_behavior_regressions {
             .map(Line::to_string)
             .collect::<Vec<_>>()
             .join("\n");
-        assert!(settings_text.contains("SETTING DETAILS"), "{settings_text}");
+        assert!(
+            settings_text.contains("Search settings…"),
+            "{settings_text}"
+        );
         assert!(settings_text.contains(&selected_setting), "{settings_text}");
     }
 
@@ -2821,7 +2907,7 @@ mod section_layout_regressions {
     fn section_titles_take_priority_over_metadata_on_narrow_terminals() {
         let mut m = fixture("3a", 32, 16);
         m.catalog.resize(12000, m.catalog[0].clone());
-        assert!(chrome::header(&m).to_string().contains("SELECT MODEL"));
+        assert!(chrome::header(&m).to_string().contains("Select model"));
     }
     #[test]
     fn scrolling_a_status_view_is_not_pinned_to_its_running_worker_marker() {

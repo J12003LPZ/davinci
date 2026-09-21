@@ -33,6 +33,7 @@ pub mod mensura;
 pub mod officina;
 pub mod opera;
 pub mod permissions;
+pub mod picker;
 pub mod recovery;
 pub mod resume;
 pub mod rewind;

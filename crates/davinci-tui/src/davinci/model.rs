@@ -1786,9 +1786,11 @@ pub struct Model {
     /// `3a` — the full model catalog, and its selection.
     pub catalog: Vec<CatalogRow>,
     pub catalog_index: usize,
+    pub catalog_query: String,
     /// `3b` — the settings sheet.
     pub settings_rows: Vec<SettingRow>,
     pub settings_index: usize,
+    pub settings_query: String,
     /// `3c` — the thinking sheet.
     pub thinking_rows: Vec<ThinkingRow>,
     pub thinking_index: usize,
@@ -1930,8 +1932,10 @@ impl Model {
             task_budget: None,
             catalog: Vec::new(),
             catalog_index: 0,
+            catalog_query: String::new(),
             settings_rows: Vec::new(),
             settings_index: 0,
+            settings_query: String::new(),
             thinking_rows: Vec::new(),
             thinking_index: 0,
             providers: Vec::new(),

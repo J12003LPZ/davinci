@@ -190,7 +190,7 @@ mod tests {
         let drawn = text(&rows);
         assert!(rows.len() <= 14);
         for value in [
-            "RESUME SESSION",
+            "Resume session",
             "session-50",
             "above",
             "below",

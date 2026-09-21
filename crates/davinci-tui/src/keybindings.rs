@@ -184,7 +184,7 @@ fn default_pairs() -> &'static [(&'static str, &'static [&'static str])] {
         ("davinci.cogitator.toggle", &["ctrl+o"]),
         ("davinci.plan.toggle", &["ctrl+l"]),
         ("davinci.grafo.toggle", &["ctrl+g"]),
-        ("davinci.mensura.toggle", &["ctrl+u"]),
+        ("davinci.mensura.toggle", &["ctrl+alt+u"]),
         ("davinci.memoria.toggle", &["ctrl+r"]),
         ("davinci.codex.toggle", &["ctrl+e"]),
         ("davinci.tools.expand", &["ctrl+t"]),

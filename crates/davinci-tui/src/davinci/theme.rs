@@ -139,47 +139,47 @@ const fn rgb(hex: u32) -> Color {
 /// Editorial collage palette. Dark red is a paper layer, never small error
 /// text on ink; errors use a readable warm tint and an explicit state glyph.
 const TRUECOLOR: Ramp = Ramp {
-    background: rgb(0x1D1516),
-    surface: rgb(0x5E1C16),
-    surface_alt: rgb(0x182033),
-    border: rgb(0x9C6C4F),
-    text: rgb(0xD8A687),
-    muted: rgb(0xC59574),
-    primary: rgb(0xF3D90D),
-    secondary: rgb(0xD8A687),
-    success: rgb(0xD8A687),
-    warning: rgb(0xF3D90D),
-    error: rgb(0xE6A080),
+    background: rgb(0x1F1F1F),
+    surface: rgb(0x2B2B2B),
+    surface_alt: rgb(0x262626),
+    border: rgb(0x767676),
+    text: rgb(0xE6E6E6),
+    muted: rgb(0xAAAAAA),
+    primary: rgb(0xB1B9F9),
+    secondary: rgb(0xD99B82),
+    success: rgb(0x9BCC8B),
+    warning: rgb(0xE5C07B),
+    error: rgb(0xF38B8B),
 };
 
 /// Aged paper with dark printed ink. Yellow is reserved for headline labels;
 /// crimson is the readable focus color on light surfaces.
 const LIGHT: Ramp = Ramp {
-    background: rgb(0xEAD5B9),
-    surface: rgb(0xE2BE9E),
-    surface_alt: rgb(0xE2BE9E),
-    border: rgb(0x9C6C4F),
-    text: rgb(0x1D1516),
-    muted: rgb(0x543829),
-    primary: rgb(0x8D150F),
-    secondary: rgb(0x182033),
-    success: rgb(0x182033),
-    warning: rgb(0x5E1C16),
-    error: rgb(0x8D150F),
+    background: rgb(0xFFFFFF),
+    surface: rgb(0xF5F5F5),
+    surface_alt: rgb(0xEBEBEB),
+    border: rgb(0x808080),
+    text: rgb(0x202020),
+    muted: rgb(0x595959),
+    primary: rgb(0x4948A0),
+    secondary: rgb(0x8A422D),
+    success: rgb(0x28652E),
+    warning: rgb(0x745007),
+    error: rgb(0xA82A35),
 };
 
 const LIGHT_256: Ramp = Ramp {
-    background: Color::Indexed(223),
-    surface: Color::Indexed(180),
-    surface_alt: Color::Indexed(223),
-    border: Color::Indexed(137),
-    text: Color::Indexed(233),
-    muted: Color::Indexed(52),
-    primary: Color::Indexed(88),
-    secondary: Color::Indexed(234),
-    success: Color::Indexed(234),
-    warning: Color::Indexed(52),
-    error: Color::Indexed(88),
+    background: Color::Indexed(231),
+    surface: Color::Indexed(255),
+    surface_alt: Color::Indexed(254),
+    border: Color::Indexed(244),
+    text: Color::Indexed(234),
+    muted: Color::Indexed(240),
+    primary: Color::Indexed(60),
+    secondary: Color::Indexed(94),
+    success: Color::Indexed(22),
+    warning: Color::Indexed(58),
+    error: Color::Indexed(124),
 };
 
 const LIGHT_BASIC: Ramp = Ramp {
@@ -198,46 +198,46 @@ const LIGHT_BASIC: Ramp = Ramp {
 
 /// "Never blur, never tint — just drop the ramp" (design.md §2).
 const TRUECOLOR_DIM: Ramp = Ramp {
-    background: rgb(0x1D1516),
-    surface: rgb(0x182033),
-    surface_alt: rgb(0x1D1516),
-    border: rgb(0x4A3028),
-    text: rgb(0x80604D),
-    muted: rgb(0x70503E),
-    primary: rgb(0x827522),
-    secondary: rgb(0x75604F),
-    success: rgb(0x75604F),
-    warning: rgb(0x827522),
-    error: rgb(0x805044),
+    background: rgb(0x1F1F1F),
+    surface: rgb(0x262626),
+    surface_alt: rgb(0x202020),
+    border: rgb(0x444444),
+    text: rgb(0x808080),
+    muted: rgb(0x707070),
+    primary: rgb(0x787CA1),
+    secondary: rgb(0x856C61),
+    success: rgb(0x6B8163),
+    warning: rgb(0x8A795B),
+    error: rgb(0x987070),
 };
 
 /// xterm-256 print palette, lifting muted ink for contrast on crimson.
 const ANSI256: Ramp = Ramp {
-    background: Color::Indexed(233),
-    surface: Color::Indexed(52),
-    surface_alt: Color::Indexed(234),
-    border: Color::Indexed(137),
-    text: Color::Indexed(180),
-    muted: Color::Indexed(180),
-    primary: Color::Indexed(220),
+    background: Color::Indexed(234),
+    surface: Color::Indexed(235),
+    surface_alt: Color::Indexed(235),
+    border: Color::Indexed(243),
+    text: Color::Indexed(254),
+    muted: Color::Indexed(248),
+    primary: Color::Indexed(147),
     secondary: Color::Indexed(180),
-    success: Color::Indexed(180),
-    warning: Color::Indexed(220),
-    error: Color::Indexed(180),
+    success: Color::Indexed(150),
+    warning: Color::Indexed(180),
+    error: Color::Indexed(210),
 };
 
 const ANSI256_DIM: Ramp = Ramp {
-    background: Color::Indexed(233),
-    surface: Color::Indexed(234),
-    surface_alt: Color::Indexed(233),
-    border: Color::Indexed(236),
-    text: Color::Indexed(95),
-    muted: Color::Indexed(137),
-    primary: Color::Indexed(100),
-    secondary: Color::Indexed(95),
-    success: Color::Indexed(137),
-    warning: Color::Indexed(100),
-    error: Color::Indexed(137),
+    background: Color::Indexed(234),
+    surface: Color::Indexed(235),
+    surface_alt: Color::Indexed(234),
+    border: Color::Indexed(238),
+    text: Color::Indexed(244),
+    muted: Color::Indexed(242),
+    primary: Color::Indexed(103),
+    secondary: Color::Indexed(137),
+    success: Color::Indexed(65),
+    warning: Color::Indexed(137),
+    error: Color::Indexed(138),
 };
 
 /// `NO_COLOR`: greyscale ramp, active glyphs pure white and bold (design.md §9).
@@ -384,9 +384,9 @@ impl Theme {
     fn is_light(&self) -> bool {
         matches!(
             self.background,
-            Color::Rgb(234, 213, 185)
+            Color::Rgb(255, 255, 255)
                 | Color::Rgb(230, 230, 230)
-                | Color::Indexed(223)
+                | Color::Indexed(231)
                 | Color::Indexed(254)
                 | Color::White
         )
@@ -664,23 +664,25 @@ mod tests {
     #[test]
     fn truecolor_tokens_match_the_spec_table() {
         let theme = Theme::da_vinci(ColorDepth::TrueColor, false);
-        assert_eq!(theme.background, Color::Rgb(0x1D, 0x15, 0x16));
-        assert_eq!(theme.border, Color::Rgb(0x9C, 0x6C, 0x4F));
-        assert_eq!(theme.text, Color::Rgb(0xD8, 0xA6, 0x87));
-        assert_eq!(theme.muted, Color::Rgb(0xC5, 0x95, 0x74));
-        assert_eq!(theme.primary, Color::Rgb(0xF3, 0xD9, 0x0D));
-        assert_eq!(theme.secondary, Color::Rgb(0xD8, 0xA6, 0x87));
-        assert_eq!(theme.success, Color::Rgb(0xD8, 0xA6, 0x87));
-        assert_eq!(theme.warning, Color::Rgb(0xF3, 0xD9, 0x0D));
-        assert_eq!(theme.error, Color::Rgb(0xE6, 0xA0, 0x80));
+        assert_eq!(theme.background, rgb(0x1F1F1F));
+        assert_eq!(theme.surface, rgb(0x2B2B2B));
+        assert_eq!(theme.surface_alt, rgb(0x262626));
+        assert_eq!(theme.border, rgb(0x767676));
+        assert_eq!(theme.text, rgb(0xE6E6E6));
+        assert_eq!(theme.muted, rgb(0xAAAAAA));
+        assert_eq!(theme.primary, rgb(0xB1B9F9));
+        assert_eq!(theme.secondary, rgb(0xD99B82));
+        assert_eq!(theme.success, rgb(0x9BCC8B));
+        assert_eq!(theme.warning, rgb(0xE5C07B));
+        assert_eq!(theme.error, rgb(0xF38B8B));
     }
 
     #[test]
     fn ansi256_is_the_nearest_neighbour_table() {
         let theme = Theme::da_vinci(ColorDepth::Ansi256, false);
-        assert_eq!(theme.primary, Color::Indexed(220));
+        assert_eq!(theme.primary, Color::Indexed(147));
         assert_eq!(theme.secondary, Color::Indexed(180));
-        assert_eq!(theme.border, Color::Indexed(137));
+        assert_eq!(theme.border, Color::Indexed(243));
     }
 
     #[test]
@@ -755,10 +757,10 @@ mod tests {
         assert_ne!(dimmed.muted, theme.muted);
         assert_ne!(dimmed.primary, theme.primary);
         assert_ne!(dimmed.border, theme.border);
-        assert_eq!(dimmed.text, Color::Rgb(0x80, 0x60, 0x4D));
-        assert_eq!(dimmed.muted, Color::Rgb(0x70, 0x50, 0x3E));
-        assert_eq!(dimmed.primary, Color::Rgb(0x82, 0x75, 0x22));
-        assert_eq!(dimmed.border, Color::Rgb(0x4A, 0x30, 0x28));
+        assert_eq!(dimmed.text, rgb(0x808080));
+        assert_eq!(dimmed.muted, rgb(0x707070));
+        assert_eq!(dimmed.primary, rgb(0x787CA1));
+        assert_eq!(dimmed.border, rgb(0x444444));
         assert_eq!(dimmed.dim(), dimmed);
     }
 

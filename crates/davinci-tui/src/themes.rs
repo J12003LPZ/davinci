@@ -46,16 +46,16 @@ impl Palette {
     /// Design spec §2 truecolor values.
     pub fn da_vinci() -> Self {
         Self {
-            surface: "#5E1C16".into(),
-            border: "#9C6C4F".into(),
-            text: "#D8A687".into(),
-            muted: "#C59574".into(),
-            primary: "#F3D90D".into(),
-            secondary: "#D8A687".into(),
-            success: "#D8A687".into(),
-            warning: "#F3D90D".into(),
-            error: "#E6A080".into(),
-            dim: "#9C6C4F".into(),
+            surface: "#2B2B2B".into(),
+            border: "#767676".into(),
+            text: "#E6E6E6".into(),
+            muted: "#AAAAAA".into(),
+            primary: "#B1B9F9".into(),
+            secondary: "#D99B82".into(),
+            success: "#9BCC8B".into(),
+            warning: "#E5C07B".into(),
+            error: "#F38B8B".into(),
+            dim: "#767676".into(),
         }
     }
 }
@@ -278,27 +278,27 @@ pub fn builtin_themes() -> Vec<Theme> {
     vec![
         Theme {
             name: "dark".into(),
-            background: "#1D1516".into(),
-            foreground: "#D8A687".into(),
-            accent: "#F3D90D".into(),
+            background: "#1F1F1F".into(),
+            foreground: "#E6E6E6".into(),
+            accent: "#B1B9F9".into(),
             palette: Some(Palette::da_vinci()),
         },
         Theme {
             name: "light".into(),
-            background: "#EAD5B9".into(),
-            foreground: "#1D1516".into(),
-            accent: "#8D150F".into(),
+            background: "#FFFFFF".into(),
+            foreground: "#202020".into(),
+            accent: "#4948A0".into(),
             palette: Some(Palette {
-                surface: "#E2BE9E".into(),
-                border: "#9C6C4F".into(),
-                text: "#1D1516".into(),
-                muted: "#543829".into(),
-                primary: "#8D150F".into(),
-                secondary: "#182033".into(),
-                success: "#182033".into(),
-                warning: "#5E1C16".into(),
-                error: "#8D150F".into(),
-                dim: "#543829".into(),
+                surface: "#F5F5F5".into(),
+                border: "#767676".into(),
+                text: "#202020".into(),
+                muted: "#595959".into(),
+                primary: "#4948A0".into(),
+                secondary: "#8A422D".into(),
+                success: "#28652E".into(),
+                warning: "#745007".into(),
+                error: "#A82A35".into(),
+                dim: "#595959".into(),
             }),
         },
         Theme {
@@ -407,14 +407,14 @@ mod tests {
         let theme = builtin_themes().into_iter().next().unwrap();
         assert!(theme.palette.is_some());
         let copper = theme.fg("primary", "x");
-        assert!(copper.contains("38;2;243;217;13"), "{copper:?}");
+        assert!(copper.contains("38;2;177;185;249"), "{copper:?}");
         let verdigris = theme.fg("secondary", "x");
-        assert!(verdigris.contains("38;2;216;166;135"), "{verdigris:?}");
+        assert!(verdigris.contains("38;2;217;155;130"), "{verdigris:?}");
         // Legacy role names stay mapped.
-        assert!(theme.fg("accent", "x").contains("38;2;243;217;13"));
-        assert!(theme.fg("muted", "x").contains("38;2;197;149;116"));
-        assert!(theme.bg("customMessageBg", "x").contains("48;2;94;28;22"));
-        assert!(theme.bg("searchMatchBg", "x").contains("48;2;243;217;13"));
+        assert!(theme.fg("accent", "x").contains("38;2;177;185;249"));
+        assert!(theme.fg("muted", "x").contains("38;2;170;170;170"));
+        assert!(theme.bg("customMessageBg", "x").contains("48;2;43;43;43"));
+        assert!(theme.bg("searchMatchBg", "x").contains("48;2;177;185;249"));
     }
 
     #[test]

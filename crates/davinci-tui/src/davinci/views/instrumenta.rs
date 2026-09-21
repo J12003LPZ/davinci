@@ -133,7 +133,7 @@ mod tests {
         m.type_char("commit");
         assert!(!m.filtered_corpus().is_empty() && m.filtered_corpus().len() < all);
         let rows = lines(&m, 32);
-        assert!(rows[0].to_string().contains("COMMANDS") && rows[0].to_string().contains("of 214"));
+        assert!(rows[0].to_string().contains("Commands") && rows[0].to_string().contains("of 214"));
         assert!(rows[1].to_string().contains("Search: commit"));
         assert!(!text(&rows).contains("tab complete"));
     }
@@ -169,7 +169,7 @@ mod tests {
         let drawn = text(&rows);
         assert!(rows.len() <= 12);
         for value in [
-            "COMMANDS",
+            "Commands",
             "Search:",
             "command-120",
             "above",
