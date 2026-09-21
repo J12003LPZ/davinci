@@ -7,8 +7,8 @@ use super::definitions::{
 };
 use super::topology::{GraphDefinition, NodeDefinition};
 use super::types::{
-    ArtifactKind, EvidenceArtifact, GraphRun, ImplementationPlan, ResearchKind, Role, TaskStatus,
-    VerificationResult, VerifyCommandSpec,
+    Artifact, ArtifactKind, EvidenceArtifact, GraphRun, ImplementationPlan, ResearchKind, Role,
+    TaskStatus, VerificationResult, VerifyCommandSpec,
 };
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -215,20 +215,11 @@ pub fn build_briefing_for_stage(
             Ok(super::briefings::research_briefing(goal, kind, goal))
         }
         SupportedStage::Plan => {
-            let mut evidence_digest = String::new();
-            for input_ref in &binding.input_artifacts {
-                if let Some(task) = run.tasks.iter().find(|t| t.id == *input_ref) {
-                    if let Some(ref file) = task.artifact_file {
-                        let path = PathBuf::from(&run.cwd).join(file);
-                        if let Ok(content) = std::fs::read_to_string(&path) {
-                            if !evidence_digest.is_empty() {
-                                evidence_digest.push_str("\n\n");
-                            }
-                            evidence_digest.push_str(&content);
-                        }
-                    }
-                }
-            }
+            let evidence_digest = bound_artifacts(binding, run, cwd)?
+                .iter()
+                .map(|artifact| serde_json::to_string(artifact).map_err(|error| error.to_string()))
+                .collect::<Result<Vec<_>, _>>()?
+                .join("\n\n");
             Ok(super::briefings::plan_briefing(
                 goal,
                 &evidence_digest,
@@ -238,21 +229,20 @@ pub fn build_briefing_for_stage(
         SupportedStage::Implement => {
             let mut plan: Option<ImplementationPlan> = None;
             let mut evidence_digest = String::new();
-            for input_ref in &binding.input_artifacts {
-                if let Some(task) = run.tasks.iter().find(|t| t.id == *input_ref) {
-                    if let Some(ref file) = task.artifact_file {
-                        let path = PathBuf::from(&run.cwd).join(file);
-                        if let Ok(content) = std::fs::read_to_string(&path) {
-                            if let Ok(p) = serde_json::from_str::<ImplementationPlan>(&content) {
-                                plan = Some(p);
-                            } else {
-                                if !evidence_digest.is_empty() {
-                                    evidence_digest.push_str("\n\n");
-                                }
-                                evidence_digest.push_str(&content);
-                            }
-                        }
+            for artifact in bound_artifacts(binding, run, cwd)? {
+                if let Artifact::Plan(value) = artifact {
+                    if plan.replace(*value).is_some() {
+                        return Err(
+                            "Writer binding resolves more than one implementation plan".into()
+                        );
                     }
+                } else {
+                    if !evidence_digest.is_empty() {
+                        evidence_digest.push_str("\n\n");
+                    }
+                    evidence_digest.push_str(
+                        &serde_json::to_string(&artifact).map_err(|error| error.to_string())?,
+                    );
                 }
             }
             Ok(super::briefings::implement_briefing(
@@ -297,6 +287,54 @@ pub fn build_briefing_for_stage(
         }
         SupportedStage::Verify | SupportedStage::Security => Ok(String::new()),
     }
+}
+
+fn bound_artifacts(
+    binding: &CompiledNodeBinding,
+    run: &GraphRun,
+    cwd: &Path,
+) -> Result<Vec<Artifact>, String> {
+    let mut artifacts = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for input in &binding.input_artifacts {
+        let tasks: Vec<_> = if let Some(task) = run.task(input) {
+            vec![task]
+        } else {
+            run.tasks
+                .iter()
+                .filter(|task| {
+                    task.expect.as_str() == input
+                        && task.status == TaskStatus::Succeeded
+                        && task.artifact_file.is_some()
+                })
+                .collect()
+        };
+        if tasks.is_empty() {
+            return Err(format!("Bound artifact '{input}' is unavailable"));
+        }
+        for task in tasks {
+            if task.status != TaskStatus::Succeeded || task.artifact_file.is_none() {
+                return Err(format!(
+                    "Bound task '{}' has no completed artifact",
+                    task.id
+                ));
+            }
+            if seen.insert(&task.id) {
+                artifacts.push(
+                    super::store::read_artifact(cwd, &run.run_id, &task.id, task.expect).map_err(
+                        |errors| {
+                            format!(
+                                "Cannot restore bound task '{}': {}",
+                                task.id,
+                                errors.join("; ")
+                            )
+                        },
+                    )?,
+                );
+            }
+        }
+    }
+    Ok(artifacts)
 }
 
 #[cfg(test)]

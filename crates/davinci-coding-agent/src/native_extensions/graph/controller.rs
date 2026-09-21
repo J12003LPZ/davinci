@@ -12,7 +12,7 @@ use super::briefings::{
 };
 use super::config::{detect_verify_commands, read_package_scripts, GraphConfig};
 use super::continuation::{DeliveryCheckpoint, DeliveryStage, GraphContinuation, NodeIndices};
-use super::mutation::{capture_baseline, capture_graph_delta, GraphMutation};
+use super::mutation::{capture_baseline, capture_graph_delta};
 use super::operations;
 use super::recovery::{
     build_retry_context_delta, classify_worker_failure, retry_decision, RetryDecision,
@@ -668,7 +668,13 @@ impl GraphExecution {
                 existing.status = TaskStatus::Pending;
             }
             materialize_generated_dependencies(&mut run, &mut task);
-            let unmet = run.unmet_dependencies(&task);
+            // Saved topology evaluates OnFailure/Always edges below. Treating
+            // every predecessor as OnSuccess would make recovery unreachable.
+            let unmet = if run.saved_definition.is_some() {
+                Vec::new()
+            } else {
+                run.unmet_dependencies(&task)
+            };
             if !unmet.is_empty() {
                 let mut refused = task.clone();
                 refused.status = TaskStatus::Cancelled;
@@ -1703,6 +1709,66 @@ fn remaining_run_deadline(
     })
 }
 
+fn saved_review_approves(artifact: &Artifact) -> bool {
+    artifact.as_review().is_some_and(|review| {
+        review.verdict == Verdict::Approve
+            && !review
+                .issues
+                .iter()
+                .any(|issue| matches!(issue.severity, Severity::Blocker | Severity::Major))
+    })
+}
+
+fn saved_stage_inputs_unchanged(execution: &GraphExecution, task_id: &str) -> bool {
+    let actual = execution.completion_inputs();
+    let expected = execution
+        .snapshot()
+        .continuation
+        .unwrap()
+        .saved_stage_inputs
+        .get(task_id)
+        .cloned();
+    if actual.as_ref().ok() == expected.as_ref() && expected.is_some() {
+        return true;
+    }
+    let reason = match actual {
+        Ok(_) => format!(
+            "saved stage '{task_id}' inputs changed while it was executing; resume must recheck"
+        ),
+        Err(error) => format!("cannot validate saved stage '{task_id}' inputs: {error}"),
+    };
+    execution.end_task(task_id, TaskStatus::Failed, Some(reason.clone()));
+    execution.blocked(reason);
+    false
+}
+
+fn saved_has_completed_writer_descendant(
+    definition: &super::topology::GraphDefinition,
+    run: &GraphRun,
+    id: &str,
+) -> bool {
+    let mut pending = vec![id.to_string()];
+    let mut seen = std::collections::HashSet::new();
+    while let Some(parent) = pending.pop() {
+        for edge in definition.edges.iter().filter(|edge| edge.from == parent) {
+            if !seen.insert(edge.to.clone()) {
+                continue;
+            }
+            if definition
+                .node(&edge.to)
+                .is_some_and(|node| node.allows_mutation)
+                && run
+                    .task(&edge.to)
+                    .is_some_and(|task| task.status == TaskStatus::Succeeded)
+            {
+                return true;
+            }
+            pending.push(edge.to.clone());
+        }
+    }
+    false
+}
+
 fn drive_compiled_saved_graph(
     execution: &GraphExecution,
     saved_def: &super::definitions::SavedGraphDefinitionV1,
@@ -1732,11 +1798,176 @@ fn drive_compiled_saved_graph(
         return execution.snapshot();
     }
 
-    let initial_baseline = capture_baseline(&cwd).unwrap_or_default();
-    let mut cumulative_delta = GraphMutation::default();
+    let initial_baseline = match execution.snapshot().continuation.unwrap().saved_baseline {
+        Some(baseline) => baseline,
+        None => match capture_baseline(&cwd) {
+            Ok(baseline) => {
+                execution
+                    .run
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .continuation
+                    .as_mut()
+                    .unwrap()
+                    .saved_baseline = Some(baseline.clone());
+                baseline
+            }
+            Err(error) => {
+                execution.blocked(format!("Cannot capture saved graph baseline: {error}"));
+                return execution.snapshot();
+            }
+        },
+    };
+    // Retry unfinished nodes only once per explicit resume. A recorded failure
+    // with an OnFailure edge remains the input to its recovery branch.
+    if execution.options.resume_run.is_some() {
+        // A successful worker submission is not necessarily an approval. The
+        // process may have stopped before the controller interpreted it.
+        for task in execution.snapshot().tasks.iter().filter(|task| {
+            task.status == TaskStatus::Succeeded
+                && compiled
+                    .bindings
+                    .get(&task.id)
+                    .is_some_and(|binding| binding.stage == super::bindings::SupportedStage::Review)
+        }) {
+            match super::store::read_artifact(&cwd, &run_id, &task.id, task.expect) {
+                Ok(artifact) if saved_review_approves(&artifact) => {}
+                Ok(_) => execution.end_task(
+                    &task.id,
+                    TaskStatus::Failed,
+                    Some("review requires changes".into()),
+                ),
+                Err(errors) => {
+                    execution.blocked(format!(
+                        "Cannot restore saved review '{}': {}",
+                        task.id,
+                        errors.join("; ")
+                    ));
+                    return execution.snapshot();
+                }
+            }
+        }
+        let inputs = match execution.completion_inputs() {
+            Ok(inputs) => inputs,
+            Err(error) => {
+                execution.blocked(format!("Cannot validate saved graph inputs: {error}"));
+                return execution.snapshot();
+            }
+        };
+        let mut run = execution
+            .run
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let stale: Vec<_> = run
+            .tasks
+            .iter()
+            .filter(|task| {
+                use super::bindings::SupportedStage;
+                task.status == TaskStatus::Succeeded
+                    && compiled.bindings.get(&task.id).is_some_and(|binding| {
+                        matches!(
+                            binding.stage,
+                            SupportedStage::Verify
+                                | SupportedStage::Security
+                                | SupportedStage::Review
+                        )
+                    })
+                    && run
+                        .continuation
+                        .as_ref()
+                        .unwrap()
+                        .saved_stage_inputs
+                        .get(&task.id)
+                        != Some(&inputs)
+                    && !saved_has_completed_writer_descendant(&compiled.topology, &run, &task.id)
+            })
+            .map(|task| task.id.clone())
+            .collect();
+        for task in &mut run.tasks {
+            let has_failure_edge = compiled.topology.edges.iter().any(|edge| {
+                edge.from == task.id && edge.condition == super::topology::EdgeCondition::OnFailure
+            });
+            if matches!(task.status, TaskStatus::Failed | TaskStatus::Cancelled)
+                && !has_failure_edge
+                || stale.contains(&task.id)
+            {
+                task.status = TaskStatus::Pending;
+            }
+        }
+    }
+    if !execution.checkpoint(Some("saved graph frontier restored")) {
+        return execution.snapshot();
+    }
+    let mut cumulative_delta = match capture_graph_delta(&cwd, &initial_baseline) {
+        Ok(delta) => delta,
+        Err(error) => {
+            execution.blocked(format!("Cannot restore saved graph mutation: {error}"));
+            return execution.snapshot();
+        }
+    };
+
+    // Artifact completion precedes mutation publication. Restore only this
+    // narrow interrupted boundary, before another writer could change it.
+    let snapshot = execution.snapshot();
+    for (index, task) in snapshot.tasks.iter().enumerate() {
+        if task.status != TaskStatus::Succeeded
+            || task.mutation.is_some()
+            || !compiled
+                .topology
+                .node(&task.id)
+                .is_some_and(|node| node.allows_mutation)
+        {
+            continue;
+        }
+        if snapshot.tasks[index + 1..].iter().any(|later| {
+            later.attempts > 0
+                && compiled
+                    .topology
+                    .node(&later.id)
+                    .is_some_and(|node| node.allows_mutation)
+        }) {
+            execution.blocked(format!(
+                "Writer '{}' mutation is missing after a later writer ran; reconciliation required",
+                task.id
+            ));
+            return execution.snapshot();
+        }
+        let delta = snapshot
+            .continuation
+            .as_ref()
+            .unwrap()
+            .saved_attempt_baselines
+            .get(&task.id)
+            .ok_or_else(|| "original attempt baseline is missing".to_string())
+            .and_then(|baseline| capture_graph_delta(&cwd, baseline));
+        let delta = match delta {
+            Ok(delta) => delta,
+            Err(error) => {
+                execution.blocked(format!(
+                    "Cannot restore writer '{}' mutation: {error}",
+                    task.id
+                ));
+                return execution.snapshot();
+            }
+        };
+        execution
+            .run
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .tasks
+            .iter_mut()
+            .find(|entry| entry.id == task.id)
+            .unwrap()
+            .mutation = Some(delta.clone());
+        if !execution.checkpoint_with(Some("saved writer mutation restored"), |_| {
+            write_task_mutation(&cwd, &run_id, &task.id, &delta)
+        }) {
+            return execution.snapshot();
+        }
+    }
 
     loop {
-        if execution.cancelled_if_aborted() {
+        if !execution.wait_until_running() {
             return execution.snapshot();
         }
 
@@ -1789,6 +2020,33 @@ fn drive_compiled_saved_graph(
             .map(|e| e.from.clone())
             .collect();
 
+        if matches!(
+            binding.stage,
+            super::bindings::SupportedStage::Verify
+                | super::bindings::SupportedStage::Security
+                | super::bindings::SupportedStage::Review
+        ) {
+            let inputs = match execution.completion_inputs() {
+                Ok(inputs) => inputs,
+                Err(error) => {
+                    execution.blocked(format!("Cannot capture saved stage inputs: {error}"));
+                    return execution.snapshot();
+                }
+            };
+            execution
+                .run
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .continuation
+                .as_mut()
+                .unwrap()
+                .saved_stage_inputs
+                .insert(task_id.clone(), inputs);
+            if !execution.checkpoint(Some("saved stage inputs persisted")) {
+                return execution.snapshot();
+            }
+        }
+
         if binding.stage == super::bindings::SupportedStage::Verify {
             let budgets = execution.snapshot().budgets;
             let commands = collect_verify_commands(&CollectInput {
@@ -1814,13 +2072,12 @@ fn drive_compiled_saved_graph(
                     .lock()
                     .unwrap_or_else(|error| error.into_inner());
                 run.verification = Some(verification.clone());
+                run.continuation
+                    .as_mut()
+                    .unwrap()
+                    .saved_verifications
+                    .insert(task_id.clone(), verification.clone());
             }
-            execution.checkpoint(Some(if verification.passed {
-                "verification passed"
-            } else {
-                "verification FAILED"
-            }));
-
             let mut task_state =
                 GraphTaskState::new(task_id.clone(), node.role, node.expect, incoming_deps, None);
             task_state.started_at = Some(now_ms());
@@ -1835,7 +2092,21 @@ fn drive_compiled_saved_graph(
                     .run
                     .lock()
                     .unwrap_or_else(|error| error.into_inner());
-                run.tasks.push(task_state);
+                if let Some(existing) = run.tasks.iter_mut().find(|task| task.id == task_id) {
+                    *existing = task_state;
+                } else {
+                    run.tasks.push(task_state);
+                }
+            }
+            if !saved_stage_inputs_unchanged(execution, &task_id) {
+                return execution.snapshot();
+            }
+            if !execution.checkpoint(Some(if verification.passed {
+                "verification passed"
+            } else {
+                "verification FAILED"
+            })) {
+                return execution.snapshot();
             }
             continue;
         }
@@ -1876,7 +2147,21 @@ fn drive_compiled_saved_graph(
                     .run
                     .lock()
                     .unwrap_or_else(|error| error.into_inner());
-                run.tasks.push(sec_task);
+                run.continuation
+                    .as_mut()
+                    .unwrap()
+                    .saved_security
+                    .insert(task_id.clone(), outcome);
+                if let Some(existing) = run.tasks.iter_mut().find(|task| task.id == task_id) {
+                    *existing = sec_task;
+                } else {
+                    run.tasks.push(sec_task);
+                }
+            }
+            if !saved_stage_inputs_unchanged(execution, &task_id)
+                || !execution.checkpoint(Some("security verification complete"))
+            {
+                return execution.snapshot();
             }
             continue;
         }
@@ -1911,19 +2196,74 @@ fn drive_compiled_saved_graph(
             GraphTaskState::new(task_id.clone(), node.role, node.expect, incoming_deps, None);
 
         let attempt_baseline = if node.allows_mutation {
-            capture_baseline(&cwd).unwrap_or_default()
+            let previous = execution
+                .snapshot()
+                .continuation
+                .unwrap()
+                .saved_attempt_baselines
+                .get(&task_id)
+                .cloned();
+            match previous.map(Ok).unwrap_or_else(|| capture_baseline(&cwd)) {
+                Ok(baseline) => {
+                    execution
+                        .run
+                        .lock()
+                        .unwrap_or_else(|error| error.into_inner())
+                        .continuation
+                        .as_mut()
+                        .unwrap()
+                        .saved_attempt_baselines
+                        .insert(task_id.clone(), baseline.clone());
+                    if !execution.checkpoint(Some("saved writer baseline persisted")) {
+                        return execution.snapshot();
+                    }
+                    baseline
+                }
+                Err(error) => {
+                    execution.blocked(format!("Cannot capture saved writer baseline: {error}"));
+                    return execution.snapshot();
+                }
+            }
         } else {
             super::mutation::MutationBaseline::default()
         };
 
-        let artifact = execution.execute_node(task, briefing);
-        if execution.cancelled_if_aborted() {
-            return execution.snapshot();
+        let mut artifact = execution.execute_node(task, briefing);
+        if binding.stage == super::bindings::SupportedStage::Review && artifact.is_some() {
+            if !saved_stage_inputs_unchanged(execution, &task_id) {
+                return execution.snapshot();
+            }
+            if artifact
+                .as_ref()
+                .is_none_or(|artifact| !saved_review_approves(artifact))
+            {
+                execution.end_task(
+                    &task_id,
+                    TaskStatus::Failed,
+                    Some("review requires changes".into()),
+                );
+                if !execution.checkpoint(Some("saved review requires changes")) {
+                    return execution.snapshot();
+                }
+                artifact = None;
+            }
         }
 
         if node.allows_mutation {
-            let attempt_delta = capture_graph_delta(&cwd, &attempt_baseline).unwrap_or_default();
-            cumulative_delta = capture_graph_delta(&cwd, &initial_baseline).unwrap_or_default();
+            let attempt_delta = match capture_graph_delta(&cwd, &attempt_baseline) {
+                Ok(delta) => delta,
+                Err(error) => {
+                    execution.blocked(format!("Cannot capture saved writer mutation: {error}"));
+                    return execution.snapshot();
+                }
+            };
+            cumulative_delta = match capture_graph_delta(&cwd, &initial_baseline) {
+                Ok(delta) => delta,
+                Err(error) => {
+                    execution.blocked(format!("Cannot capture saved graph mutation: {error}"));
+                    return execution.snapshot();
+                }
+            };
             let mut run = execution
                 .run
                 .lock()
@@ -1938,6 +2278,10 @@ fn drive_compiled_saved_graph(
             }) {
                 return execution.snapshot();
             }
+        }
+
+        if execution.cancelled_if_aborted() {
+            return execution.snapshot();
         }
 
         if artifact.is_none() && node.required {
@@ -1968,6 +2312,9 @@ fn drive_compiled_saved_graph(
         }
     }
 
+    if execution.cancelled_if_aborted() {
+        return execution.snapshot();
+    }
     if failed_required && execution.snapshot().blocked_reason.is_none() {
         execution.blocked("one or more required nodes failed or were unreachable".to_string());
     } else if execution.snapshot().blocked_reason.is_none() {
@@ -3110,6 +3457,10 @@ fn deliver_goal(
 #[cfg(test)]
 #[path = "controller_continuation_tests.rs"]
 mod continuation_tests;
+
+#[cfg(test)]
+#[path = "controller_saved_continuation_tests.rs"]
+mod saved_continuation_tests;
 
 #[cfg(test)]
 #[path = "controller_revision_tests.rs"]

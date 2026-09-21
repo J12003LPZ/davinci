@@ -98,6 +98,15 @@ pub struct GraphContinuation {
     #[serde(default)]
     pub completion_inputs: Option<String>,
     pub saved_baseline: Option<MutationBaseline>,
+    #[serde(default)]
+    pub saved_attempt_baselines: std::collections::BTreeMap<String, MutationBaseline>,
+    #[serde(default)]
+    pub saved_stage_inputs: std::collections::BTreeMap<String, String>,
+    #[serde(default)]
+    pub saved_verifications: std::collections::BTreeMap<String, super::types::VerificationResult>,
+    #[serde(default)]
+    pub saved_security:
+        std::collections::BTreeMap<String, crate::native_extensions::SecurityVerification>,
 }
 
 impl Default for GraphContinuation {
@@ -111,6 +120,10 @@ impl Default for GraphContinuation {
             completed_delivery: None,
             completion_inputs: None,
             saved_baseline: None,
+            saved_attempt_baselines: Default::default(),
+            saved_stage_inputs: Default::default(),
+            saved_verifications: Default::default(),
+            saved_security: Default::default(),
         }
     }
 }
@@ -229,19 +242,77 @@ pub fn validate_resume(run: &super::types::GraphRun, cwd: &std::path::Path) -> R
         super::topology::validate_definition(definition)
             .map_err(|error| format!("Invalid checkpoint topology: {error}"))?;
     }
+    let saved_plan = run
+        .saved_definition
+        .as_ref()
+        .map(super::bindings::compile_saved_definition)
+        .transpose()?;
+    if let Some(plan) = &saved_plan {
+        if run.definition_digest.as_ref() != Some(&plan.definition_digest)
+            || run
+                .definition
+                .as_ref()
+                .is_some_and(|definition| *definition != plan.topology)
+            || (!run.tasks.is_empty() && run.definition.is_none())
+        {
+            return Err("Saved checkpoint definition differs from its compiled identity".into());
+        }
+        if !run.tasks.is_empty() && cursor.saved_baseline.is_none() {
+            return Err("Saved checkpoint has no original mutation baseline".into());
+        }
+        for task in &run.tasks {
+            let node = plan
+                .topology
+                .node(&task.id)
+                .ok_or_else(|| format!("Saved checkpoint contains unknown task '{}'", task.id))?;
+            if task.role != node.role || task.expect != node.expect {
+                return Err(format!(
+                    "Saved task '{}' has incompatible role or contract",
+                    task.id
+                ));
+            }
+            if node.allows_mutation
+                && task.attempts > 0
+                && !cursor.saved_attempt_baselines.contains_key(&task.id)
+            {
+                return Err(format!(
+                    "Saved writer '{}' has no original attempt baseline",
+                    task.id
+                ));
+            }
+        }
+    }
     let mut ids = std::collections::HashSet::new();
     for task in &run.tasks {
         if !super::store::is_safe_run_id(&task.id) || !ids.insert(&task.id) {
             return Err("Checkpoint contains an invalid or duplicate task identity".into());
         }
-        if task.status == super::types::TaskStatus::Succeeded
-            && task.artifact_file.is_none()
-            && (task.attempts != 0 || task.role != super::types::Role::TestAnalyzer)
-        {
-            return Err(format!(
-                "Completed task '{}' has no durable artifact",
-                task.id
-            ));
+        if task.status == super::types::TaskStatus::Succeeded && task.artifact_file.is_none() {
+            let native_check = saved_plan
+                .as_ref()
+                .and_then(|plan| plan.bindings.get(&task.id))
+                .map(|binding| binding.stage);
+            let valid = match native_check {
+                Some(super::bindings::SupportedStage::Verify) => cursor
+                    .saved_verifications
+                    .get(&task.id)
+                    .is_some_and(|result| result.passed),
+                Some(super::bindings::SupportedStage::Security) => matches!(
+                    cursor.saved_security.get(&task.id),
+                    Some(crate::native_extensions::SecurityVerification::Passed { .. })
+                ),
+                None if saved_plan.is_none() => {
+                    task.attempts == 0 && task.role == super::types::Role::TestAnalyzer
+                }
+                _ => false,
+            };
+            if !valid || (saved_plan.is_some() && !cursor.saved_stage_inputs.contains_key(&task.id))
+            {
+                return Err(format!(
+                    "Completed task '{}' has no durable artifact or check receipt",
+                    task.id
+                ));
+            }
         }
         if task.status == super::types::TaskStatus::Succeeded && task.artifact_file.is_some() {
             if task.artifact_file.as_deref() != Some(&format!("artifacts/{}.json", task.id)) {
@@ -263,7 +334,12 @@ pub fn validate_resume(run: &super::types::GraphRun, cwd: &std::path::Path) -> R
                 .as_ref()
                 .ok_or_else(|| format!("Completed task '{}' has no input fingerprint", task.id))?;
             if fingerprint.contract_hash != super::replay::compute_contract_hash(task.expect)
-                || fingerprint.graph_version != run.version
+                || fingerprint.graph_version
+                    != run
+                        .definition
+                        .as_ref()
+                        .map_or(run.version, |definition| definition.version)
+                || fingerprint.definition_digest != run.definition_digest
                 || (fingerprint.simulated.unwrap_or(false) && !run.dry_run)
             {
                 return Err(format!(
