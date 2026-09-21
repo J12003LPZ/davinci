@@ -19,6 +19,99 @@ pub struct CollectInput<'a> {
     pub plan: Option<&'a ImplementationPlan>,
 }
 
+/// Normalize only literal Cargo formatting invocations. Cargo's network/lock
+/// switches belong to Cargo, not the external `cargo-fmt` parser. Do not rewrite
+/// shell expressions, quoted paths, or arguments passed through `--` to rustfmt.
+fn cargo_fmt_words(command: &str) -> Option<(Vec<&str>, usize)> {
+    if !command.chars().all(|ch| {
+        ch.is_ascii_alphanumeric() || matches!(ch, ' ' | '\t' | '_' | '-' | '.' | '/' | ':' | '+')
+    }) {
+        return None;
+    }
+    let words: Vec<_> = command.split_whitespace().collect();
+    if !matches!(words.first(), Some(&"cargo") | Some(&"cargo.exe")) {
+        return None;
+    }
+    let mut index = 1;
+    if words.get(index).is_some_and(|word| word.starts_with('+')) {
+        let toolchain = &words[index][1..];
+        if toolchain.is_empty()
+            || !toolchain
+                .chars()
+                .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-' | '.'))
+        {
+            return None;
+        }
+        index += 1;
+    }
+    while words
+        .get(index)
+        .is_some_and(|word| cargo_network_flag(word))
+    {
+        index += 1;
+    }
+    (words.get(index) == Some(&"fmt")).then_some((words, index))
+}
+
+fn cargo_network_flag(word: &str) -> bool {
+    matches!(word, "--offline" | "--locked" | "--frozen")
+}
+
+fn normalize_verify_command(command: &str) -> String {
+    let Some((words, fmt)) = cargo_fmt_words(command) else {
+        return command.to_owned();
+    };
+    let end = words
+        .iter()
+        .position(|word| *word == "--")
+        .unwrap_or(words.len());
+    let misplaced: Vec<_> = words[fmt + 1..end]
+        .iter()
+        .filter(|word| cargo_network_flag(word))
+        .copied()
+        .collect();
+    if misplaced.is_empty() {
+        return command.to_owned();
+    }
+    let mut normalized = words[..fmt].to_vec();
+    for flag in misplaced {
+        if !normalized.contains(&flag) {
+            normalized.push(flag);
+        }
+    }
+    normalized.push("fmt");
+    normalized.extend(
+        words[fmt + 1..end]
+            .iter()
+            .filter(|word| !cargo_network_flag(word))
+            .copied(),
+    );
+    normalized.extend_from_slice(&words[end..]);
+    normalized.join(" ")
+}
+
+/// A planner must not repeat an authoritative formatting check merely by
+/// attaching Cargo network flags. Keep toolchain, package/workspace scope, and
+/// rustfmt arguments in the identity; unrelated commands remain exact matches.
+fn verification_identity(command: &str) -> String {
+    if let Some((words, fmt)) = cargo_fmt_words(command) {
+        if words[fmt + 1..].contains(&"--check") {
+            let end = words
+                .iter()
+                .position(|word| *word == "--")
+                .unwrap_or(words.len());
+            let mut key: Vec<_> = words[..end]
+                .iter()
+                .filter(|word| !cargo_network_flag(word))
+                .copied()
+                .collect();
+            key.extend_from_slice(&words[end..]);
+            return key.join(" ");
+        }
+    }
+    command.to_owned()
+}
+
 pub fn collect_verify_commands(input: &CollectInput<'_>) -> Vec<VerifyCommandSpec> {
     let base = if input.config_commands.is_empty() {
         input.detected
@@ -28,11 +121,19 @@ pub fn collect_verify_commands(input: &CollectInput<'_>) -> Vec<VerifyCommandSpe
     let mut commands: Vec<VerifyCommandSpec> = Vec::new();
     let mut seen: Vec<String> = Vec::new();
     for command in base {
-        if seen.contains(&command.command) {
+        let normalized = normalize_verify_command(&command.command);
+        // Explicit configured commands retain their separate network policy.
+        if commands
+            .iter()
+            .any(|existing| existing.command == normalized)
+        {
             continue;
         }
-        seen.push(command.command.clone());
-        commands.push(command.clone());
+        seen.push(verification_identity(&normalized));
+        commands.push(VerifyCommandSpec {
+            command: normalized,
+            ..command.clone()
+        });
     }
     let mut plan_index = 1;
     for command in input
@@ -40,20 +141,22 @@ pub fn collect_verify_commands(input: &CollectInput<'_>) -> Vec<VerifyCommandSpe
         .map(|plan| plan.tests_to_run.as_slice())
         .unwrap_or(&[])
     {
-        if seen.contains(command) {
+        let command = normalize_verify_command(command);
+        let identity = verification_identity(&command);
+        if seen.contains(&identity) {
             continue;
         }
-        // Plan text is model output: run it through the same shell policy a
-        // TestAnalyzer worker gets instead of executing it unfiltered.
-        if super::roles::is_bash_command_allowed(super::types::BashPolicy::ReadAndTest, command)
+        // Model-generated commands still pass the same central shell policy as
+        // the TestAnalyzer. Normalization must never grant execution authority.
+        if super::roles::is_bash_command_allowed(super::types::BashPolicy::ReadAndTest, &command)
             != super::roles::BashDecision::Allowed
         {
             continue;
         }
-        seen.push(command.clone());
+        seen.push(identity);
         commands.push(VerifyCommandSpec {
             name: format!("plan-test-{plan_index}"),
-            command: command.clone(),
+            command,
             from_plan: true,
         });
         plan_index += 1;
@@ -399,6 +502,47 @@ mod tests {
             command: command.into(),
             from_plan: false,
         }
+    }
+
+    #[test]
+    fn cargo_fmt_offline_is_normalized_before_execution() {
+        let proposed = plan(vec!["cargo fmt --check --offline"]);
+        let commands = collect_verify_commands(&CollectInput {
+            config_commands: &[],
+            detected: &[],
+            plan: Some(&proposed),
+        });
+        assert_eq!(commands.len(), 1);
+        assert_eq!(commands[0].command, "cargo --offline fmt --check");
+    }
+
+    #[test]
+    fn duplicate_fmt_checks_do_not_burn_another_revision_cycle() {
+        let proposed = plan(vec![
+            "cargo fmt --check --offline",
+            "cargo --locked fmt --check",
+        ]);
+        let commands = collect_verify_commands(&CollectInput {
+            config_commands: &[spec("format", "cargo fmt --check")],
+            detected: &[],
+            plan: Some(&proposed),
+        });
+        assert_eq!(commands.len(), 1);
+        assert_eq!(commands[0].name, "format");
+    }
+
+    #[test]
+    fn cargo_global_flags_do_not_discard_legitimate_plan_tests() {
+        let proposed = plan(vec![
+            "cargo --offline test --locked",
+            "cargo +1.83.0 --frozen check",
+        ]);
+        let commands = collect_verify_commands(&CollectInput {
+            config_commands: &[],
+            detected: &[],
+            plan: Some(&proposed),
+        });
+        assert_eq!(commands.len(), 2);
     }
 
     #[test]

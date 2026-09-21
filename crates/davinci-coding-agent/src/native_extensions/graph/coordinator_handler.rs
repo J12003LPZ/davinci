@@ -327,11 +327,13 @@ mod tests {
             if output.content.contains("RELATIVE_SCRIPT_OK") {
                 break;
             }
-            assert!(
-                Instant::now() < until,
-                "relative script failed: {}",
-                output.content
-            );
+            if Instant::now() >= until {
+                let status = worker.client().call("process_status", &json!({"id":id}));
+                panic!(
+                    "relative script failed: {}; process status: {status:?}",
+                    output.content
+                );
+            }
             std::thread::sleep(Duration::from_millis(10));
         }
     }
