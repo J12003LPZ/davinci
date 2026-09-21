@@ -55,14 +55,14 @@ jobs:
       - uses: dtolnay/rust-toolchain@1.83.0
         with:
           components: rustfmt, clippy
-      - name: Fetch locked public dependencies
-        run: cargo fetch --locked
+      - name: Fetch locked Linux dependencies
+        run: cargo fetch --locked --target x86_64-unknown-linux-gnu
       - name: Package isolated build inputs without credentials
         shell: bash
         run: |
           mkdir -p "$RUNNER_TEMP/offline-inputs"
           git archive --format=tar.gz HEAD > "$RUNNER_TEMP/offline-inputs/source.tar.gz"
-          tar -czf "$RUNNER_TEMP/offline-inputs/rust-toolchain.tar.gz" -C "$(rustc --print sysroot)" bin lib libexec
+          tar -czf "$RUNNER_TEMP/offline-inputs/rust-toolchain.tar.gz" -C "$(rustc --print sysroot)" bin lib
           tar -czf "$RUNNER_TEMP/offline-inputs/cargo-registry.tar.gz" -C "$HOME/.cargo" registry
           rustc --version > "$RUNNER_TEMP/offline-inputs/toolchain-version.txt"
           sha256sum "$RUNNER_TEMP/offline-inputs/"*.tar.gz > "$RUNNER_TEMP/offline-inputs/checksums.txt"
