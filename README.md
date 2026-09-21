@@ -13,7 +13,7 @@ It combines an interactive coding assistant, multi-provider model runtime, permi
 
 DaVinci began as a Rust-compatible rewrite of the TypeScript [pi](https://github.com/earendil-works/pi) coding agent and has grown into a larger native harness. The pinned TypeScript source under [vendor/davinci](vendor/davinci) remains a behavioral compatibility reference. The active product is the Rust workspace in this repository.
 
-> **Workspace version:** 1.0.70  
+> **Workspace version:** 1.0.71
 > **Rust toolchain:** 1.83.0  
 > **Primary executable:** davinci
 

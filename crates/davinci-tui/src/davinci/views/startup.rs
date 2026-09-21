@@ -15,17 +15,17 @@ pub fn banner(model: &Model, info: &Startup) -> Vec<Line<'static>> {
     // Preserve DaVinci's identity in the reference's eleven-cell logo column.
     let facts = [
         vec![
-            span(" ▐▛███▛█   ", th.secondary),
+            span(" ██████╗   ", th.text),
             paper_label("DaVinci", th, false),
             span(format!(" v{}", env!("CARGO_PKG_VERSION")), th.muted),
         ],
         vec![
-            span("▝▜██████▀  ", th.secondary),
+            span(" ██   ██║  ", th.text),
             span(model.model_name.clone(), th.text),
             span(format!(" · {}", model.thinking_level), th.muted),
         ],
         vec![
-            span("  ▝▝ ▝▝    ", th.secondary),
+            span(" ██████╔╝  ", th.text),
             span(info.cwd.clone(), th.muted),
         ],
     ];

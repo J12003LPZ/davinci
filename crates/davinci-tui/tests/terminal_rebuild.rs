@@ -197,9 +197,9 @@ fn rebuild_reference_shell_uses_claude_120x40_geometry() {
     m.permission_mode = "ask".into();
     let rows = app::compose(&m, 40);
     assert_eq!(rows.len(), 40);
-    assert!(rows[1].to_string().starts_with(" ▐▛███▛█   DaVinci"));
-    assert!(rows[2].to_string().starts_with("▝▜██████▀  "));
-    assert!(rows[3].to_string().starts_with("  ▝▝ ▝▝    "));
+    assert!(rows[1].to_string().starts_with(" ██████╗   DaVinci"));
+    assert!(rows[2].to_string().starts_with(" ██   ██║  "));
+    assert!(rows[3].to_string().starts_with(" ██████╔╝  "));
     assert!(rows[35].to_string().contains("● high · /effort"));
     assert_eq!(rows[36].to_string(), "─".repeat(120));
     assert!(rows[37].to_string().starts_with("❯"));
