@@ -287,10 +287,17 @@ fn command_panel_frame(
             height,
         );
     }
-    rows.push(Line::from(ui::span(
-        "▔".repeat(usize::from(model.width)),
-        th.border,
-    )));
+    if matches!(
+        model.screen,
+        Screen::TaskBoard | Screen::Agents | Screen::Mcp
+    ) {
+        rows.push(Line::from(ui::span(
+            "▔".repeat(usize::from(model.width)),
+            th.border,
+        )));
+    } else {
+        rows.push(chrome::effort_rule(model));
+    }
     rows.push(Line::from(ui::truncate_run(
         vec![
             ui::span("   ", th.text),

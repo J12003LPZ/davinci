@@ -1,8 +1,8 @@
-//! Behavioral contracts for the terminal rebuild. These are NOT claims of
-//! pixel/cell parity with Claude Code; that requires independent reference frames.
+//! Behavioral contracts for the terminal rebuild. Shared 120x40 geometry and
+//! palette assertions are derived from the validated Claude Code 2.1.278 reference frames.
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use davinci_tui::davinci::{
-    app,
+    app, fixtures,
     model::{CatalogRow, Choice, Model, Screen, SettingRow},
     theme::{ColorDepth, Theme},
     ui, views,
@@ -36,10 +36,11 @@ fn rebuild_clip_preserves_graphemes() {
 fn rebuild_default_theme_uses_neutral_surfaces() {
     let th = Theme::da_vinci(ColorDepth::TrueColor, false);
     for color in [th.background, th.surface, th.surface_alt] {
-        match color {
-            Color::Rgb(r, g, b) => assert!(r == g && g == b, "non-neutral surface: {color:?}"),
-            _ => panic!("expected truecolor theme"),
-        }
+        assert_eq!(
+            color,
+            Color::Reset,
+            "Claude-style terminal chrome must inherit the terminal background"
+        );
     }
     assert_ne!(th.success, th.text, "success needs its own semantic color");
     assert_ne!(
@@ -182,6 +183,45 @@ fn rebuild_zero_search_results_cannot_accept_a_hidden_model() {
         app::handle_key(&mut m, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
         app::Flow::Continue
     );
+}
+
+#[test]
+fn rebuild_reference_shell_uses_claude_120x40_geometry() {
+    let mut m = model();
+    m.width = 120;
+    m.height = 40;
+    m.transcript.clear();
+    m.graph_run = None;
+    m.running = false;
+    m.thinking_level = "high".into();
+    m.permission_mode = "ask".into();
+    let rows = app::compose(&m, 40);
+    assert_eq!(rows.len(), 40);
+    assert!(rows[1].to_string().starts_with(" ▐▛███▛█   DaVinci"));
+    assert!(rows[2].to_string().starts_with("▝▜██████▀  "));
+    assert!(rows[3].to_string().starts_with("  ▝▝ ▝▝    "));
+    assert!(rows[35].to_string().contains("● high · /effort"));
+    assert_eq!(rows[36].to_string(), "─".repeat(120));
+    assert!(rows[37].to_string().starts_with("❯"));
+    assert_eq!(rows[38].to_string(), "─".repeat(120));
+    assert!(rows[39]
+        .to_string()
+        .contains("⏸ manual mode on · ? for shortcuts · ← for agents"));
+}
+
+#[test]
+fn rebuild_model_sheet_matches_reference_height() {
+    let mut m = model();
+    m.width = 120;
+    m.height = 40;
+    fixtures::dress_screen(&mut m, "3a");
+    m.screen = Screen::Models;
+    m.overlay = None;
+    assert_eq!(views::cogitator::screen_height(&m), 16);
+    let rows = app::compose(&m, 40);
+    assert!(rows[24].to_string().contains("/effort"));
+    assert!(rows[25].to_string().contains("Select model"));
+    assert!(rows[39].to_string().contains("Enter to set as default"));
 }
 
 #[test]

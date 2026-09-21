@@ -139,33 +139,33 @@ const fn rgb(hex: u32) -> Color {
 /// Editorial collage palette. Dark red is a paper layer, never small error
 /// text on ink; errors use a readable warm tint and an explicit state glyph.
 const TRUECOLOR: Ramp = Ramp {
-    background: rgb(0x1F1F1F),
-    surface: rgb(0x2B2B2B),
-    surface_alt: rgb(0x262626),
-    border: rgb(0x767676),
-    text: rgb(0xE6E6E6),
-    muted: rgb(0xAAAAAA),
+    background: Color::Reset,
+    surface: Color::Reset,
+    surface_alt: Color::Reset,
+    border: rgb(0x888888),
+    text: Color::Reset,
+    muted: rgb(0x999999),
     primary: rgb(0xB1B9F9),
-    secondary: rgb(0xD99B82),
-    success: rgb(0x9BCC8B),
-    warning: rgb(0xE5C07B),
-    error: rgb(0xF38B8B),
+    secondary: rgb(0xD77757),
+    success: rgb(0x4EBA65),
+    warning: rgb(0xD77757),
+    error: rgb(0xE36D6D),
 };
 
 /// Aged paper with dark printed ink. Yellow is reserved for headline labels;
 /// crimson is the readable focus color on light surfaces.
 const LIGHT: Ramp = Ramp {
-    background: rgb(0xFFFFFF),
-    surface: rgb(0xF5F5F5),
-    surface_alt: rgb(0xEBEBEB),
-    border: rgb(0x808080),
-    text: rgb(0x202020),
-    muted: rgb(0x595959),
-    primary: rgb(0x4948A0),
-    secondary: rgb(0x8A422D),
-    success: rgb(0x28652E),
-    warning: rgb(0x745007),
-    error: rgb(0xA82A35),
+    background: Color::Reset,
+    surface: Color::Reset,
+    surface_alt: Color::Reset,
+    border: rgb(0x999999),
+    text: Color::Reset,
+    muted: rgb(0x666666),
+    primary: rgb(0x5769F7),
+    secondary: rgb(0xD77757),
+    success: rgb(0x2C7A39),
+    warning: rgb(0xB25B00),
+    error: rgb(0xB42318),
 };
 
 const LIGHT_256: Ramp = Ramp {
@@ -383,6 +383,9 @@ impl Theme {
 
     fn is_light(&self) -> bool {
         matches!(
+            self.primary,
+            Color::Rgb(87, 105, 247) | Color::Indexed(60) | Color::Blue
+        ) || matches!(
             self.background,
             Color::Rgb(255, 255, 255)
                 | Color::Rgb(230, 230, 230)

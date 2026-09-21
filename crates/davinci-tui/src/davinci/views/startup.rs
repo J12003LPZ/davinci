@@ -3,11 +3,10 @@
 //! Keeps startup discovery from the native shell; upstream interaction lives in
 //! vendor/davinci/packages/coding-agent/src/modes/interactive/interactive-mode.ts.
 
-use ratatui::text::{Line, Span};
+use ratatui::text::Line;
 
 use crate::davinci::model::{Model, Startup};
-use crate::davinci::theme::{glyph, Theme};
-use crate::davinci::ui::{blank, indent, paper_label, span, span_strong, truncate_run};
+use crate::davinci::ui::{blank, paper_label, span, truncate_run};
 
 /// Compact identity block, also kept above a short conversation. The path and
 /// selected model come from the running session, never from sample copy.
@@ -16,17 +15,17 @@ pub fn banner(model: &Model, info: &Startup) -> Vec<Line<'static>> {
     // Preserve DaVinci's identity in the reference's eleven-cell logo column.
     let facts = [
         vec![
-            span("  ▟██▙     ", th.secondary),
+            span(" ▐▛███▛█   ", th.secondary),
             paper_label("DaVinci", th, false),
             span(format!(" v{}", env!("CARGO_PKG_VERSION")), th.muted),
         ],
         vec![
-            span("  █  █     ", th.secondary),
+            span("▝▜██████▀  ", th.secondary),
             span(model.model_name.clone(), th.text),
             span(format!(" · {}", model.thinking_level), th.muted),
         ],
         vec![
-            span("  ▜██▛     ", th.secondary),
+            span("  ▝▝ ▝▝    ", th.secondary),
             span(info.cwd.clone(), th.muted),
         ],
     ];
@@ -37,41 +36,9 @@ pub fn banner(model: &Model, info: &Startup) -> Vec<Line<'static>> {
 }
 
 pub fn lines(model: &Model, info: &Startup) -> Vec<Line<'static>> {
-    let th = &model.theme;
-    let width = model.width;
     let mut out = vec![blank()];
     out.extend(banner(model, info));
-    out.push(blank());
-    let mut rows = vec![Line::from(restored_row(th, info.restored))];
-    for found in &info.found {
-        rows.push(Line::from(span(found.clone(), th.muted)));
-    }
-    rows.push(Line::from(span(
-        "/help for commands · /model to change models",
-        th.muted,
-    )));
-    out.extend(rows.into_iter().map(|row| {
-        indent(
-            1.min(width),
-            truncate_run(row.spans, width.saturating_sub(1)),
-        )
-    }));
-    out.push(blank());
     out
-}
-
-fn restored_row(theme: &Theme, restored: bool) -> Vec<Span<'static>> {
-    if restored {
-        vec![
-            span_strong(format!("{} ", glyph::DONE), theme.success, theme),
-            span("session restored", theme.muted),
-        ]
-    } else {
-        vec![
-            span_strong(format!("{} ", glyph::QUEUED), theme.muted, theme),
-            span("new session", theme.muted),
-        ]
-    }
 }
 
 /// Row count includes discovered resources.
@@ -82,7 +49,7 @@ pub fn height(model: &Model) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::davinci::theme::ColorDepth;
+    use crate::davinci::theme::{ColorDepth, Theme};
     use crate::davinci::ui::run_width;
 
     fn model(width: u16) -> Model {
@@ -113,28 +80,21 @@ mod tests {
     }
 
     #[test]
-    fn welcome_keeps_session_facts_and_working_commands() {
+    fn welcome_matches_reference_masthead_without_extra_helper_rows() {
         let mut m = model(100);
         m.startup.restored = true;
         m.startup.found = vec!["loaded 1 context file · 41 skills".into()];
         let rows: Vec<String> = lines(&m, &m.startup).iter().map(text).collect();
-        let restored = rows
-            .iter()
-            .position(|row| row.contains("session restored"))
-            .unwrap();
-        assert!(rows[restored + 1].contains("loaded 1 context file · 41 skills"));
-        for command in ["/model", "/help"] {
-            assert!(
-                rows.iter().any(|row| row.contains(command)),
-                "missing {command}"
-            );
-        }
-        assert!(!rows.iter().any(|row| row.contains("/session")));
-        assert!(!rows.iter().any(|row| row.contains("/sessions")));
-        m.startup.restored = false;
-        assert!(lines(&m, &m.startup)
-            .iter()
-            .any(|row| text(row).contains("new session")));
+        assert_eq!(rows.len(), 4);
+        assert!(rows[0].is_empty());
+        let drawn = rows.join("\n");
+        assert!(drawn.contains("DaVinci"));
+        assert!(drawn.contains(&m.model_name));
+        assert!(drawn.contains(&m.startup.cwd));
+        assert!(!drawn.contains("session restored"));
+        assert!(!drawn.contains("new session"));
+        assert!(!drawn.contains("/help"));
+        assert!(!drawn.contains("/model"));
     }
 
     #[test]

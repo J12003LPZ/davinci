@@ -151,8 +151,11 @@ pub fn screen(model: &Model, height: usize) -> Vec<Line<'static>> {
 
 /// Exact height of the full picker before terminal-height clipping.
 pub fn screen_height(model: &Model) -> usize {
-    // Divider, title, description, spacing, results, optional effort/notices, footer.
-    (catalog(model).len() + 11).min(usize::from(model.height.saturating_sub(4)).max(8))
+    // Match Claude Code's fixed-height model sheet at 120x40; longer DaVinci
+    // catalogs scroll instead of growing the panel upward.
+    (catalog(model).len() + 11)
+        .min(16)
+        .min(usize::from(model.height.saturating_sub(4)).max(8))
 }
 
 /// Model argument completion shares the catalog presentation; its values and
@@ -235,11 +238,22 @@ fn picker_panel(model: &Model, height: usize, echo: bool) -> Vec<Line<'static>> 
     let bounded = |spans| Line::from(ui::truncate_run(spans, model.width));
     let detail = |text: String, color| bounded(vec![span("   ", th.text), span(text, color)]);
     let mut out = vec![
-        Line::from(span("▔".repeat(usize::from(model.width)), th.border)),
-        bounded(vec![span("   ", th.text), ui::span_strong("Select model", th.text, th)]),
-        detail("Choose from your configured providers. Model names and availability reflect your configuration.".into(), th.text),
-        ui::blank(),
+        super::chrome::effort_rule(model),
+        bounded(vec![
+            span("   ", th.text),
+            ui::span_strong("Select model", th.text, th),
+        ]),
     ];
+    for text in ui::wrap(
+        "Switch between configured models. Your pick becomes the default for new sessions. Use /model <provider/model> for a specific configured model.",
+        model.width.saturating_sub(3),
+    )
+    .into_iter()
+    .take(2)
+    {
+        out.push(detail(text, th.text));
+    }
+    out.push(ui::blank());
     if !model.catalog_query.is_empty() {
         out.push(detail(format!("Search: {}", model.catalog_query), th.muted));
     }
@@ -249,9 +263,14 @@ fn picker_panel(model: &Model, height: usize, echo: bool) -> Vec<Line<'static>> 
         .flatten();
     let mut footer = vec![ui::blank()];
     if let Some(entry) = selected {
-        if let Some(level) = entry.reasoning_levels.get(entry.reasoning_index) {
+        let level = entry
+            .reasoning_levels
+            .get(entry.reasoning_index)
+            .map(String::as_str)
+            .unwrap_or(&model.thinking_level);
+        if !level.is_empty() {
             footer.push(detail(
-                format!("● {level} effort  ←/→ to adjust"),
+                format!("● {level} effort (default) ←/→ to adjust"),
                 th.primary,
             ));
         }
@@ -277,7 +296,7 @@ fn picker_panel(model: &Model, height: usize, echo: bool) -> Vec<Line<'static>> 
         if echo && model.width < 60 {
             "Enter save · s session · Esc cancel".into()
         } else if echo {
-            "Enter to save default · s for this session only · / to filter · Esc to cancel".into()
+            "Enter to set as default · s to use this session only · Esc to cancel".into()
         } else {
             "↑↓ move · tab/↵ take · esc close".into()
         },
@@ -292,6 +311,9 @@ fn picker_panel(model: &Model, height: usize, echo: bool) -> Vec<Line<'static>> 
     }
     let room = height.saturating_sub(out.len() + footer.len());
     out.extend(ui::window(entries, room, anchor, th));
+    while out.len() + footer.len() < height {
+        out.push(ui::blank());
+    }
     out.extend(footer);
     out.truncate(height);
     out
@@ -495,8 +517,8 @@ mod tests {
         for label in [
             "▔",
             "Select model",
-            "Enter to save default",
-            "/ to filter",
+            "Enter to set as default",
+            "s to use this session only",
             "OpenAI Codex",
             "gpt-6-astra",
             "gpt-5.6-luna",

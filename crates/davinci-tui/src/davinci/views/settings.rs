@@ -290,11 +290,7 @@ pub fn details(model: &Model) -> Vec<Line<'static>> {
 }
 
 fn prefix(model: &Model) -> Vec<Line<'static>> {
-    let mut rows = vec![
-        line(model, "▔".repeat(usize::from(model.width)), true),
-        tabs(model),
-        ui::blank(),
-    ];
+    let mut rows = vec![super::chrome::effort_rule(model), tabs(model), ui::blank()];
     if model.settings_tab == 1 {
         rows.extend(search_box(model));
         rows.push(ui::blank());

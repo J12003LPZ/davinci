@@ -130,10 +130,16 @@ fn conversation_status(model: &Model) -> Line<'static> {
         };
         vec![span_strong(warning, th.warning, th)]
     } else {
-        vec![span(format!("  {}", model.permission_label()), th.primary)]
+        {
+            let label = model.permission_label().to_lowercase();
+            vec![
+                span("  ⏸ ", th.muted),
+                span(format!("{label} mode on"), th.muted),
+            ]
+        }
     };
     if model.width >= 40 {
-        left.push(span(" · ? for shortcuts", th.muted));
+        left.push(span(" · ? for shortcuts · ← for agents", th.muted));
     }
     if model.exit_armed {
         left.push(span(" · ctrl+c again to exit", th.warning));
@@ -391,6 +397,29 @@ fn status_right(model: &Model) -> Vec<Span<'static>> {
     right
 }
 
+/// Claude-style effort affordance shared by the conversation composer and
+/// command sheets. The session's real effort label is preserved.
+pub fn effort_line(model: &Model) -> Line<'static> {
+    spread(
+        model.width,
+        Vec::new(),
+        vec![
+            span("● ", model.theme.primary),
+            span(model.thinking_level.to_lowercase(), model.theme.muted),
+            span(" · /effort  ", model.theme.muted),
+        ],
+    )
+}
+
+pub fn effort_rule(model: &Model) -> Line<'static> {
+    let label = format!(" ● {} · /effort ▔", model.thinking_level.to_lowercase());
+    let label_width = UnicodeWidthStr::width(label.as_str()).min(model.width as usize);
+    let left = "▔".repeat((model.width as usize).saturating_sub(label_width));
+    Line::from(vec![
+        span(left, model.theme.border),
+        span(label, model.theme.muted),
+    ])
+}
 /// Rows for the composer plus its hint row. Grows with content. The box takes
 /// two neutral rules and no side borders. The prompt and caret carry
 /// focus; under an open instrument the theme dims. Recall replaces the input
@@ -454,7 +483,14 @@ pub fn composer(model: &Model, lines: Option<&[String]>, hint: Hint) -> Vec<Line
         .saturating_sub(visible - 1)
         .min(entries.len().saturating_sub(visible));
     let end = (start + visible).min(entries.len());
-    let mut rows = vec![composer_rule(model, border, start, "above")];
+    let mut rows = if model.screen == Screen::Agent && model.overlay.is_none() {
+        vec![
+            effort_line(model),
+            composer_rule(model, border, start, "above"),
+        ]
+    } else {
+        vec![composer_rule(model, border, start, "above")]
+    };
     for (index, entry) in entries.into_iter().enumerate().take(end).skip(start) {
         // An echoed command reads muted, prose bright (`2a`, `2c`).
         let ink = if entry.starts_with('/') {

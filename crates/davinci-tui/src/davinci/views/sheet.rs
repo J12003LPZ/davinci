@@ -137,6 +137,16 @@ pub fn chrome(model: &Model) -> Option<SheetChrome> {
     if model.screen == Screen::GraphRun {
         return Some(chrome);
     }
+    if model.screen == Screen::TaskBoard {
+        // The Background sheet uses Claude's selection/view vocabulary rather
+        // than the generic scrolling footer.
+        chrome.hints = vec![
+            hint(&model.theme, "↑/↓ to select"),
+            hint(&model.theme, "Enter to view"),
+        ];
+        chrome.escape = Some("Esc to close");
+        return Some(chrome);
+    }
     let action = match model.screen {
         Screen::Models | Screen::Thinking => Some("enter select"),
         Screen::Settings => Some("enter change"),
@@ -210,7 +220,7 @@ pub fn title(screen: Screen) -> &'static str {
         Screen::Settings => "Settings",
         Screen::Thinking => "Model thinking level",
         Screen::Login => "Providers",
-        Screen::Keys => "Keyboard shortcuts",
+        Screen::Keys => "Help  General   Commands   Custom commands",
         Screen::Resume => "Resume session",
         Screen::Tree => "Session tree",
         Screen::Compact => "Compaction",
@@ -224,9 +234,11 @@ pub fn title(screen: Screen) -> &'static str {
         Screen::Recovery => "Recovery",
         Screen::Diff => "Review changes",
         Screen::Mcp => "MCP servers",
-        Screen::Permissions => "Permissions",
+        Screen::Permissions => {
+            "Permissions  Recently denied   Allow   Ask   Deny   Auto mode   Workspace"
+        }
         Screen::Workflows => "Workflows",
-        Screen::TaskBoard => "Tasks",
+        Screen::TaskBoard => "Background",
         Screen::Agents => "Agents",
         Screen::ContextInspector => "Context & Memory Inspector",
     }

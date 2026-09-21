@@ -15,11 +15,7 @@ pub fn lines(model: &Model) -> Vec<Line<'static>> {
         .as_ref()
         .filter(|sheet| !sheet.tasks.is_empty())
     else {
-        return section_detail(
-            width,
-            th,
-            "No tasks tracked. Tasks are created during plan execution or via /tasks.",
-        );
+        return section_detail(width, th, "No tasks currently running");
     };
 
     let mut rows = Vec::new();
@@ -98,7 +94,7 @@ pub fn chrome(model: &Model) -> SheetChrome {
             format!("{active} active · {done} done"),
             th.muted,
         )]),
-        hints: vec![hint(th, "↑↓ scroll")],
+        hints: vec![hint(th, "↑/↓ to select"), hint(th, "Enter to view")],
         escape: Some("esc close"),
         composer: Composer::Hidden,
         ..SheetChrome::default()
@@ -150,7 +146,7 @@ mod tests {
             .iter()
             .flat_map(|l| l.spans.iter().map(|s| s.content.as_ref()))
             .collect();
-        assert!(joined.contains("No tasks tracked"));
+        assert!(joined.contains("No tasks currently running"));
     }
 
     #[test]

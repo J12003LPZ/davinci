@@ -3901,8 +3901,15 @@ pub fn perform(
             }
         }
         SlashAction::Mcp => {
-            open_mcp_sheet(agent, model);
-            Ok(Done::Opened)
+            if agent.tool_context.mcp.rows().is_empty() {
+                Ok(Done::Said(
+                    "No MCP servers configured. Run davinci doctor if this is unexpected — it lists MCP config files that failed validation. Otherwise, run davinci mcp --help to learn more."
+                        .into(),
+                ))
+            } else {
+                open_mcp_sheet(agent, model);
+                Ok(Done::Opened)
+            }
         }
         SlashAction::ShowCost => Ok(Done::Said(crate::format_session_cost(parsed, agent))),
         SlashAction::ShowStatus => Ok(Done::Said(crate::format_session_status(parsed, agent))),
