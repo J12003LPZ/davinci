@@ -66,9 +66,11 @@ jobs:
           mkdir -p "$RUNNER_TEMP/graph-evidence"
           cargo test --locked -p davinci-coding-agent --lib native_extensions::graph:: 2>&1 | tee "$RUNNER_TEMP/graph-evidence/graph.log"
       - name: Central shell-policy regressions
-        run: cargo test --locked -p davinci-agent --lib shell_policy:: 2>&1 | tee "$RUNNER_TEMP/graph-evidence/shell-policy.log"
+        run: |
+          cargo test --locked -p davinci-agent --lib shell_policy:: 2>&1 | tee "$RUNNER_TEMP/graph-evidence/shell-policy.log"
       - name: Host library and tests lint
-        run: cargo clippy --locked -p davinci-coding-agent --lib --tests -- -D warnings 2>&1 | tee "$RUNNER_TEMP/graph-evidence/clippy.log"
+        run: |
+          cargo clippy --locked -p davinci-coding-agent --lib --tests -- -D warnings 2>&1 | tee "$RUNNER_TEMP/graph-evidence/clippy.log"
       - name: Bind evidence to tested source
         run: |
           python - <<'PY'
