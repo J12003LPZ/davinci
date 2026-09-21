@@ -1436,17 +1436,27 @@ pub fn run_saved_graph(
     deps: ControllerDeps,
     saved_def: super::definitions::SavedGraphDefinitionV1,
 ) -> GraphRun {
-    run_graph_internal(options, deps, Some(saved_def))
+    run_graph_internal(options, deps, Some(saved_def), None)
 }
 
 pub fn run_graph(options: RunOptions, deps: ControllerDeps) -> GraphRun {
-    run_graph_internal(options, deps, None)
+    run_graph_internal(options, deps, None, None)
+}
+
+pub(super) fn run_graph_owned(
+    options: RunOptions,
+    deps: ControllerDeps,
+    saved_def: Option<super::definitions::SavedGraphDefinitionV1>,
+    workspace_lease: super::lease::WorkspaceLease,
+) -> GraphRun {
+    run_graph_internal(options, deps, saved_def, Some(workspace_lease))
 }
 
 fn run_graph_internal(
     options: RunOptions,
     deps: ControllerDeps,
     explicit_saved_def: Option<super::definitions::SavedGraphDefinitionV1>,
+    workspace_lease: Option<super::lease::WorkspaceLease>,
 ) -> GraphRun {
     let continuation = options.resume_run.as_deref().map(|run| {
         (
@@ -1459,7 +1469,6 @@ fn run_graph_internal(
         .as_ref()
         .map(|(run_id, _, _)| run_id.clone())
         .unwrap_or_else(new_run_id);
-    let _ = create_run_dir(&options.cwd, &run_id);
     let mut budgets: GraphBudgets = deps.config.budgets.clone();
     let (saved_def_from_resume, origin_from_resume, digest_from_resume) = options
         .resume_run
@@ -1498,7 +1507,7 @@ fn run_graph_internal(
             budgets.max_cost_usd = usd;
         }
     }
-    let run = GraphRun {
+    let mut run = GraphRun {
         version: 1,
         run_id: run_id.clone(),
         goal: options.goal.clone(),
@@ -1541,6 +1550,24 @@ fn run_graph_internal(
             .and_then(|_| options.resume_run.as_ref().map(|r| r.revision + 1))
             .unwrap_or(0),
     };
+
+    let _workspace_lease = match workspace_lease
+        .map(Ok)
+        .unwrap_or_else(|| super::lease::WorkspaceLease::acquire(&options.cwd))
+    {
+        Ok(lease) => lease,
+        Err(error) => {
+            if let Some(previous) = options.resume_run.as_deref() {
+                run = previous.clone();
+            }
+            run.phase = Phase::Blocked;
+            run.lifecycle = Some(GraphLifecycle::Stopped);
+            run.blocked_reason = Some(error);
+            (deps.on_update)(&run, Some("workspace ownership refused; state not saved"));
+            return run;
+        }
+    };
+    let _ = create_run_dir(&options.cwd, &run_id);
 
     let run_deadline = remaining_run_deadline(
         run.budgets.run_deadline_ms,

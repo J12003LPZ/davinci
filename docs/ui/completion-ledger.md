@@ -8,7 +8,7 @@ Binding scope: approved parity specification plus the user's 2026-09-21 continua
 - Branch: `J12003LPZ/claude-parity-graph-completion`.
 - Worktree: `C:/Users/sergi/Desktop/davinci-parity-completion`.
 - Starting commit: `cb7c7f479a2156f29d6f6e8c0c99bec0d9473952`, fetched rebuild branch, clean before recovery.
-- Current task: host integration failure repair, followed by durable recovery and reference coverage.
+- Current task: durable graph ownership, workspace validation, live controls and continuation, followed by complete reference coverage.
 - UI recovery published as `6b6fc73`, draft PR [#29](https://github.com/J12003LPZ/davinci/pull/29). Graph verification recovery committed as `5e8dfcc`.
 - Completion: NOT established. No native visual parity or complete graph recovery claim.
 
@@ -111,3 +111,11 @@ Host checkpoint `0bea967` passed graph workflow run `35630027309` on both platfo
 Tool-result checkpointing was published as `077eca3`. A subprocess-isolated regression then reproduced an actual mutation reporting success when its graph effect-report path was unwritable. Effect handoff errors now retain the applied transaction and local effect, fail the tool, latch further dispatch and cancel the worker. Output hooks cannot revive that result. Legacy mutation capture errors are also propagated instead of dropping missing pre/post images. Effect report writes flush data and metadata and sync the parent directory on Unix.
 
 Windows validation: 40 turn-related tests, four effect tests, 38 transaction tests passed; downstream host library/test clippy passed with warnings denied. Linux validation: 40 turn-related tests, four effect tests, 18 platform-applicable transaction tests passed. Evidence: `linux-effect-handoff.log`. This validates failure reporting and retention, not complete cross-process reconciliation or task-attempt ownership. Full worker-session continuation and graph cursor work are still required.
+
+## Workspace controller ownership
+
+Effect handoff published as `78875ec`. OS-held exclusive ownership now guards graph launch, resume reconciliation and idle graph mutations. Windows uses an exclusive file handle; Unix uses nonblocking flock. The canonical workspace and fixed `.davinci/graph/controller.lock` namespace prevent aliases or legacy-store migration from creating separate owners. The lock file is retained; closing the handle, including process death, releases ownership. Resume transfers the held guard into execution without an unlocked handoff. Background launch acquires ownership before reporting started or replacing the process-local registry.
+
+Regression tests first reproduced competing owners and a background launch falsely returning started. Both now pass, together with process-kill release, alias exclusion, legacy/current store exclusion and dispatch/mutation refusal. `PI_OFFLINE=1 cargo test --offline --locked -p davinci-coding-agent --lib native_extensions::graph::` passed on Windows and Linux: 379 passed, five existing native fixtures ignored each. The initial suite exposed a fixture blocking storage before lease acquisition; it now blocks the runs directory to retain its intended post-ownership checkpoint-failure coverage. Windows host library/test clippy with warnings denied, all-workspace formatting and diff whitespace passed. Linux evidence: `linux-workspace-lease.log`. Review was by the implementation author.
+
+This guards cooperating controllers, not yet orphaned workers after a controller crash. Snapshot workspace validation, actual live-control routing, durable receipts, worker sessions and execution cursor recovery remain open. Native reference parity and exact-final-revision full gates remain open.

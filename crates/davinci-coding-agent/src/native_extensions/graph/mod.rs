@@ -22,6 +22,7 @@ mod coordinator_handler;
 pub(crate) mod definitions;
 pub(crate) mod export;
 pub(crate) mod history;
+mod lease;
 pub(crate) mod mutation;
 pub(crate) mod operations;
 pub(crate) mod preflight;
@@ -475,11 +476,15 @@ impl GraphController {
         parsed: ParsedGraphArgs,
         resume_artifacts: HashMap<String, (Artifact, WorkerUsage, Option<ReplayFingerprint>)>,
         resume_run: Option<Box<types::GraphRun>>,
+        workspace_lease: Option<lease::WorkspaceLease>,
     ) -> Result<Value, String> {
         if parsed.goal.trim().is_empty() {
             return Err("Usage: /graph <goal> [--simple|--complex] [--dry-run]".into());
         }
         refuse_if_active(&self.cwd)?;
+        let workspace_lease = workspace_lease
+            .map(Ok)
+            .unwrap_or_else(|| lease::WorkspaceLease::acquire(&self.cwd))?;
         let active = Arc::new(ActiveRun::default());
         let (deps, config_errors) = self.deps(parsed.dry_run, &active);
         let options = self.options(
@@ -497,7 +502,7 @@ impl GraphController {
             // or a panic — so a crashed run cannot wedge `/graph` behind a
             // permanent "already active" for this project.
             let _guard = FinishedOnDrop(finished);
-            let _ = run_graph(options, deps);
+            let _ = controller::run_graph_owned(options, deps, None, workspace_lease);
         });
         active
             .handle
@@ -532,15 +537,22 @@ impl GraphController {
             return Err("graph goal cannot be empty".into());
         }
         refuse_if_active(&self.cwd)?;
+        let workspace_lease = lease::WorkspaceLease::acquire(&self.cwd)?;
         let active = Arc::new(ActiveRun::default());
         let (deps, _config_errors) = self.deps(parsed.dry_run, &active);
         let options = self.options(&parsed, Arc::clone(&active.abort), HashMap::new(), None);
         register_run(&self.cwd, Arc::clone(&active));
         let _guard = FinishedOnDrop(Arc::clone(&active));
-        Ok(run_graph(options, deps))
+        Ok(controller::run_graph_owned(
+            options,
+            deps,
+            None,
+            workspace_lease,
+        ))
     }
 
     fn resume(&self, wanted: &str) -> Result<Value, String> {
+        let workspace_lease = lease::WorkspaceLease::acquire(&self.cwd)?;
         let runs = list_runs(&self.cwd);
         let summary = if wanted.is_empty() {
             runs.iter()
@@ -636,6 +648,7 @@ impl GraphController {
             },
             resume_artifacts,
             Some(Box::new(old_run)),
+            Some(workspace_lease),
         )
     }
 
@@ -899,6 +912,7 @@ impl GraphController {
         dry_run: bool,
     ) -> Result<Value, String> {
         refuse_if_active(&self.cwd)?;
+        let workspace_lease = lease::WorkspaceLease::acquire(&self.cwd)?;
         let active = Arc::new(ActiveRun::default());
         let (deps, config_errors) = self.deps(dry_run, &active);
         let options = RunOptions {
@@ -921,7 +935,7 @@ impl GraphController {
         let _ = origin;
         let handle = thread::spawn(move || {
             let _guard = FinishedOnDrop(finished);
-            let _ = run_saved_graph(options, deps, def);
+            let _ = controller::run_graph_owned(options, deps, Some(def), workspace_lease);
         });
         active
             .handle
@@ -957,6 +971,7 @@ impl GraphController {
         refuse_if_active(&self.cwd)?;
         definitions::validate_saved_definition(&def)?;
         let _bound = definitions::bind_parameters(&def, &params)?;
+        let workspace_lease = lease::WorkspaceLease::acquire(&self.cwd)?;
         let active = Arc::new(ActiveRun::default());
         let (deps, _config_errors) = self.deps(dry_run, &active);
         let options = RunOptions {
@@ -970,7 +985,12 @@ impl GraphController {
         };
         register_run(&self.cwd, Arc::clone(&active));
         let _guard = FinishedOnDrop(Arc::clone(&active));
-        Ok(run_saved_graph(options, deps, def))
+        Ok(controller::run_graph_owned(
+            options,
+            deps,
+            Some(def),
+            workspace_lease,
+        ))
     }
 
     pub fn handle_advanced_command(
@@ -1092,6 +1112,9 @@ impl GraphController {
         strategy_str: Option<&str>,
         authorized: bool,
     ) -> Result<operations::ForkPreview, String> {
+        let _workspace_lease = authorized
+            .then(|| lease::WorkspaceLease::acquire(&self.cwd))
+            .transpose()?;
         if is_running(&self.cwd) {
             return Err(
                 "fork requires a quiescent graph; pause or stop the active run first".into(),
@@ -1125,6 +1148,9 @@ impl GraphController {
         node_id: &str,
         authorized: bool,
     ) -> Result<operations::GraphRewindPreview, String> {
+        let _workspace_lease = authorized
+            .then(|| lease::WorkspaceLease::acquire(&self.cwd))
+            .transpose()?;
         if is_running(&self.cwd) {
             return Err(
                 "rewind requires a quiescent graph; pause or stop the active run first".into(),
@@ -1149,6 +1175,7 @@ impl GraphController {
     }
 
     pub fn verify_command(&self) -> Result<operations::VerifyOnlyReport, String> {
+        let _workspace_lease = lease::WorkspaceLease::acquire(&self.cwd)?;
         let latest = list_runs(&self.cwd)
             .first()
             .cloned()
@@ -1229,6 +1256,9 @@ impl GraphController {
         expected_revision: Option<u64>,
         authorized: bool,
     ) -> Result<Option<Value>, String> {
+        let _workspace_lease = value
+            .map(|_| lease::WorkspaceLease::acquire(&self.cwd))
+            .transpose()?;
         let latest = list_runs(&self.cwd)
             .first()
             .cloned()
@@ -1351,14 +1381,14 @@ impl GraphController {
                                 "Usage: /graph <goal> [--simple|--complex] [--dry-run]".into()
                             );
                         }
-                        self.start_background(parsed, HashMap::new(), None)?
+                        self.start_background(parsed, HashMap::new(), None, None)?
                     }
                 }
             }
             "graph-control" => {
                 let control: control::GraphControl = serde_json::from_str(args.trim())
                     .map_err(|e| format!("Invalid graph control JSON: {e}"))?;
-                if let Some(active) = active_run(&self.cwd) {
+                if let Some(active) = active_run(&self.cwd).filter(|active| !active.is_finished()) {
                     let mut snap = active.snapshot.lock().unwrap_or_else(|e| e.into_inner());
                     if let Some(ref mut run) = *snap {
                         if run.run_id == control.run_id {
@@ -1377,6 +1407,7 @@ impl GraphController {
                         }
                     }
                 }
+                let _workspace_lease = lease::WorkspaceLease::acquire(&self.cwd)?;
                 let Some(mut run) = load_run(&self.cwd, &control.run_id) else {
                     return Err(format!("Run '{}' not found", control.run_id));
                 };
@@ -1419,6 +1450,64 @@ mod tests {
         let mut controller = GraphController::new(cwd.to_path_buf());
         controller.set_session_context(None, None, false);
         controller
+    }
+
+    #[test]
+    fn workspace_lease_blocks_dispatch_resume_and_idle_mutations() {
+        let _registry = registry_guard();
+        let dir = tempdir().unwrap();
+        let controller = controller(dir.path());
+        let owner = lease::WorkspaceLease::acquire(dir.path()).unwrap();
+        let active = Arc::new(ActiveRun::default());
+        let (mut deps, _) = controller.deps(true, &active);
+        deps.runner = Arc::new(|_, _, _| panic!("another owner must prevent dispatch"));
+        let parsed = ParsedGraphArgs {
+            goal: "lease fixture".into(),
+            forced: Some(Complexity::Trivial),
+            dry_run: true,
+        };
+        let options = controller.options(&parsed, active.abort.clone(), HashMap::new(), None);
+        let run = run_graph(options, deps);
+        assert_eq!(run.phase, Phase::Blocked);
+        assert!(run
+            .blocked_reason
+            .as_deref()
+            .unwrap()
+            .contains("ownership unavailable"));
+        assert!(list_runs(dir.path()).is_empty());
+        assert!(controller
+            .start_background(parsed.clone(), HashMap::new(), None, None)
+            .unwrap_err()
+            .contains("ownership unavailable"));
+        assert!(controller
+            .resume("")
+            .unwrap_err()
+            .contains("ownership unavailable"));
+        assert!(controller
+            .verify_command()
+            .unwrap_err()
+            .contains("ownership unavailable"));
+        assert!(controller
+            .rewind_command("writer", true)
+            .unwrap_err()
+            .contains("ownership unavailable"));
+        assert!(controller
+            .fork_command("writer", None, true)
+            .unwrap_err()
+            .contains("ownership unavailable"));
+        assert!(controller
+            .budget_command(Some("workers"), Some("2"), Some(0), true)
+            .unwrap_err()
+            .contains("ownership unavailable"));
+        let control = serde_json::json!({"operationId":"stop", "runId":"owned", "expectedRunRevision":0, "action":"stop_graph"});
+        assert!(controller
+            .command("graph-control", &control.to_string())
+            .unwrap_err()
+            .contains("ownership unavailable"));
+        drop(owner);
+        let (deps, _) = controller.deps(true, &active);
+        let options = controller.options(&parsed, active.abort.clone(), HashMap::new(), None);
+        assert_eq!(run_graph(options, deps).phase, Phase::Done);
     }
 
     #[test]

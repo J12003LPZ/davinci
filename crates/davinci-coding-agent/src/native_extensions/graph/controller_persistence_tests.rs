@@ -12,7 +12,8 @@ fn checkpoint_failure_prevents_dispatch_and_preserves_last_durable_state() {
         let fail_initial = stage == 0;
         let dir = tempfile::tempdir().unwrap();
         if fail_initial {
-            std::fs::write(dir.path().join(".davinci"), "blocked storage").unwrap();
+            std::fs::create_dir_all(dir.path().join(".davinci/graph")).unwrap();
+            std::fs::write(dir.path().join(".davinci/graph/runs"), "blocked storage").unwrap();
         }
         let dispatches = Arc::new(AtomicUsize::new(0));
         let calls = dispatches.clone();
