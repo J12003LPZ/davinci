@@ -20,35 +20,84 @@ env:
   PI_OFFLINE: '1'
 
 jobs:
-  source:
-    runs-on: ubuntu-latest
-    timeout-minutes: 5
-    steps:
-      - uses: actions/checkout@v4
-      - name: Archive tracked source only
-        run: git archive --format=zip --output="$RUNNER_TEMP/terminal-source.zip" HEAD
-      - uses: actions/upload-artifact@v4
-        with:
-          name: terminal-source-${{ github.sha }}
-          path: ${{ runner.temp }}/terminal-source.zip
-          retention-days: 3
-          if-no-files-found: error
   terminal:
+    if: github.ref == 'refs/heads/J12003LPZ/terminal-ui-rebuild-20260920'
     runs-on: ubuntu-latest
     timeout-minutes: 25
+    permissions:
+      contents: write
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
       - uses: dtolnay/rust-toolchain@1.83.0
         with:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
         with:
           key: terminal-ui
+          cache-on-failure: true
+      - name: Apply reviewed source batch
+        if: contains(github.event.head_commit.message, '[ui-exec]')
+        run: python3 .github/scripts/terminal_ui_apply.py
+      - name: Format changed crate
+        run: cargo fmt -p davinci-tui
       - name: Rebuild contracts
-        run: cargo test --locked -p davinci-tui --test terminal_rebuild -- --nocapture
+        id: contracts
+        shell: bash
+        run: |
+          mkdir -p "$RUNNER_TEMP/terminal-evidence"
+          cargo test --locked -p davinci-tui --test terminal_rebuild -- --nocapture 2>&1 | tee "$RUNNER_TEMP/terminal-evidence/contracts.log"
       - name: Entire TUI suite
+        id: suite
         if: always()
-        run: cargo test --locked -p davinci-tui
+        shell: bash
+        run: |
+          mkdir -p "$RUNNER_TEMP/terminal-evidence"
+          cargo test --locked -p davinci-tui 2>&1 | tee "$RUNNER_TEMP/terminal-evidence/suite.log"
       - name: TUI lint
+        id: lint
         if: always()
-        run: cargo clippy --locked -p davinci-tui --all-targets -- -D warnings
+        shell: bash
+        run: |
+          mkdir -p "$RUNNER_TEMP/terminal-evidence"
+          cargo clippy --locked -p davinci-tui --all-targets -- -D warnings 2>&1 | tee "$RUNNER_TEMP/terminal-evidence/clippy.log"
+      - name: Preserve review evidence
+        if: always()
+        shell: bash
+        run: |
+          mkdir -p "$RUNNER_TEMP/terminal-evidence"
+          git add -N crates/davinci-tui
+          git diff --check > "$RUNNER_TEMP/terminal-evidence/whitespace.log"
+          git diff -- crates/davinci-tui > "$RUNNER_TEMP/terminal-evidence/applied.patch"
+          git rev-parse HEAD > "$RUNNER_TEMP/terminal-evidence/base-commit.txt"
+          python3 - <<'PY'
+          import os, subprocess, zipfile
+          from pathlib import Path
+          paths = subprocess.check_output(['git', 'ls-files', '-z']).decode().split('\0')
+          destination = Path(os.environ['RUNNER_TEMP']) / 'terminal-evidence' / 'source.zip'
+          with zipfile.ZipFile(destination, 'w', zipfile.ZIP_DEFLATED) as archive:
+              for name in paths:
+                  if name and Path(name).is_file():
+                      archive.write(name, name)
+          PY
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: terminal-evidence-${{ github.sha }}
+          path: ${{ runner.temp }}/terminal-evidence
+          retention-days: 7
+          if-no-files-found: error
+      - name: Commit verified implementation to this branch only
+        if: success() && contains(github.event.head_commit.message, '[ui-exec]')
+        shell: bash
+        run: |
+          expected=$(git ls-remote origin "refs/heads/J12003LPZ/terminal-ui-rebuild-20260920" | cut -f1)
+          test "$expected" = "$GITHUB_SHA"
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add crates/davinci-tui
+          if ! git diff --cached --quiet; then
+            git commit -m "feat(tui): rebuild shared terminal shell and searchable selectors"
+            git push origin HEAD:J12003LPZ/terminal-ui-rebuild-20260920
+          fi
