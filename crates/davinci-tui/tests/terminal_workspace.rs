@@ -1,9 +1,15 @@
 //! The optional graph is a view, not the owner of the user's conversation.
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-use davinci_tui::davinci::{app, fixtures, model::{Model, Screen}, theme::{ColorDepth, Theme}};
+use davinci_tui::davinci::{
+    app, fixtures,
+    model::{Model, Screen},
+    theme::{ColorDepth, Theme},
+};
 
 fn model() -> Model {
-    let mut m = Model::new(Theme::da_vinci(ColorDepth::TrueColor, false), 120, 40, false);
+    let mut m = Model::new(
+        Theme::da_vinci(ColorDepth::TrueColor, false), 120, 40, false,
+    );
     m.graph_run = Some(fixtures::blueprint_graph());
     m
 }
@@ -14,7 +20,8 @@ fn control(m: &mut Model, ch: char) -> app::Flow {
     app::handle_key(m, KeyEvent::new(KeyCode::Char(ch), KeyModifiers::CONTROL))
 }
 fn frame(m: &Model) -> String {
-    app::compose(m, m.height).iter().map(ToString::to_string).collect::<Vec<_>>().join("\n")
+    app::compose(m, m.height)
+        .iter().map(ToString::to_string).collect::<Vec<_>>().join("\n")
 }
 
 #[test]
@@ -113,4 +120,23 @@ fn ctrl_o_expands_tool_output_instead_of_changing_models() {
     control(&mut m, 'o');
     assert_eq!(m.show_tool_output, !expanded);
     assert!(m.overlay.is_none());
+}
+
+#[test]
+fn graph_input_accepts_multiline_paste_without_submitting() {
+    let mut m = model();
+    m.screen = Screen::GraphRun;
+    key(&mut m, KeyCode::Tab);
+    m.paste("line one\r\nline two 👩‍💻");
+    assert_eq!(m.composer.editor().get_text(), "line one\nline two 👩‍💻");
+    assert!(m.graph_run.is_some());
+}
+
+#[test]
+fn graph_navigation_rejects_paste_into_an_unfocused_conversation() {
+    let mut m = model();
+    m.screen = Screen::GraphRun;
+    m.composer.set_text("Keep existing draft");
+    m.paste("do not insert");
+    assert_eq!(m.composer.editor().get_text(), "Keep existing draft");
 }
