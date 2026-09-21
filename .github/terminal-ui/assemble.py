@@ -1,8 +1,8 @@
-"""Apply a reviewable TUI patch, then publish tested Git objects (never refs).
+"""Apply reviewable TUI patches, then publish tested Git objects (never refs).
 
-This bridge supports GitHub-only editing of large existing Rust modules. The
-candidate patch is removed from the resulting tree; production source is stored
-as ordinary files. A separate, explicit GitHub action must commit/update the ref.
+This bridge supports GitHub-only editing of large existing Rust modules. Staging
+patches are removed from the resulting tree; production source is stored as
+ordinary files. A separate, explicit GitHub action must commit/update the ref.
 """
 import argparse
 import base64
@@ -32,19 +32,29 @@ def checked_path(name):
     return ROOT / path
 
 
+def candidate_patches():
+    patches = [PATCH]
+    patches.extend(str(p) for p in sorted(Path(".github/terminal-ui").glob("candidate-*.patch")))
+    for name in patches:
+        if (ROOT / name).is_symlink() or not (ROOT / name).is_file():
+            raise ValueError(f"Unsafe or missing patch: {name}")
+    return patches
+
+
 def apply():
-    entries = subprocess.check_output(
-        ["git", "apply", "--numstat", "--", PATCH], text=True
-    ).splitlines()
-    if not entries:
-        raise ValueError("Empty candidate patch")
-    for entry in entries:
-        added, removed, name = entry.split("\t", 2)
-        if not added.isdecimal() or not removed.isdecimal():
-            raise ValueError("Binary patches are not supported")
-        checked_path(name)
-    subprocess.run(["git", "apply", "--check", "--index", "--", PATCH], check=True)
-    subprocess.run(["git", "apply", "--index", "--", PATCH], check=True)
+    for patch in candidate_patches():
+        entries = subprocess.check_output(
+            ["git", "apply", "--numstat", "--", patch], text=True
+        ).splitlines()
+        if not entries:
+            raise ValueError(f"Empty candidate patch: {patch}")
+        for entry in entries:
+            added, removed, name = entry.split("\t", 2)
+            if not added.isdecimal() or not removed.isdecimal():
+                raise ValueError("Binary patches are not supported")
+            checked_path(name)
+        subprocess.run(["git", "apply", "--check", "--index", "--", patch], check=True)
+        subprocess.run(["git", "apply", "--index", "--", patch], check=True)
     files = git("diff", "--cached", "--name-only", "-z").split("\0")
     for name in files:
         if name:
@@ -92,7 +102,8 @@ def publish():
         })
         elements.append({"path": name, "mode": mode, "type": "blob", "sha": blob["sha"]})
         files.append({"path": name, "blob_sha": blob["sha"], "sha256": hashlib.sha256(data).hexdigest()})
-    elements.append({"path": PATCH, "mode": "100644", "type": "blob", "sha": None})
+    for patch in candidate_patches():
+        elements.append({"path": patch, "mode": "100644", "type": "blob", "sha": None})
     parent = os.environ["GITHUB_SHA"]
     base = api("GET", f"git/commits/{parent}")["tree"]["sha"]
     tree = api("POST", "git/trees", {"base_tree": base, "tree": elements})
