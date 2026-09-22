@@ -718,6 +718,35 @@ pub fn try_codex_websocket_transport_with(
     abort: Option<&std::sync::Arc<std::sync::atomic::AtomicBool>>,
     on_event: &mut dyn FnMut(&AssistantMessageEvent),
 ) -> Result<CodexWebsocketOutcome, String> {
+    try_codex_websocket_transport_with_affinity(
+        model,
+        body,
+        token,
+        options_transport,
+        session_id,
+        session_id,
+        cache_retention,
+        websocket_connect_timeout_ms,
+        idle_timeout_ms,
+        abort,
+        on_event,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn try_codex_websocket_transport_with_affinity(
+    model: &Model,
+    body: &Value,
+    token: &str,
+    options_transport: Option<&str>,
+    session_id: Option<&str>,
+    affinity_id: Option<&str>,
+    cache_retention: Option<&str>,
+    websocket_connect_timeout_ms: Option<u64>,
+    idle_timeout_ms: Option<u64>,
+    abort: Option<&std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    on_event: &mut dyn FnMut(&AssistantMessageEvent),
+) -> Result<CodexWebsocketOutcome, String> {
     if options_transport == Some("sse") {
         return Ok(CodexWebsocketOutcome::FallbackToSse);
     }
@@ -727,8 +756,10 @@ pub fn try_codex_websocket_transport_with(
         return Ok(CodexWebsocketOutcome::FallbackToSse);
     }
     let account_id = extract_account_id(token)?;
-    let request_id = cache_id
-        .clone()
+    let request_id = affinity_id
+        .filter(|id| !id.is_empty())
+        .map(str::to_string)
+        .or_else(|| cache_id.clone())
         .unwrap_or_else(|| Uuid::new_v4().to_string());
     let headers = build_websocket_headers(&model.headers, &[], &account_id, token, &request_id);
     let timeout = resolve_websocket_connect_timeout_ms(websocket_connect_timeout_ms);

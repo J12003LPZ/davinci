@@ -36,6 +36,27 @@ pub struct StreamOptions {
 #[allow(unused_imports)]
 pub use crate::cache::effective_prompt_cache_key;
 
+fn codex_responses_affinity_id(options: &StreamOptions) -> Option<String> {
+    if crate::cache::cache_retention_from_options(options) == crate::cache::CacheRetention::None {
+        return None;
+    }
+    let conversation_id = options
+        .session_id
+        .as_deref()
+        .filter(|id| !id.is_empty())?;
+
+    // Only an actual root/session-owned conversation may align its Codex
+    // affinity header to a cache partition. Graph workers intentionally run
+    // without session_id, so a shared worker cache key cannot become their
+    // continuation/socket identity.
+    let raw = options
+        .cache_key
+        .as_deref()
+        .filter(|id| !id.is_empty())
+        .unwrap_or(conversation_id);
+    Some(crate::cache::clamp_openai_prompt_cache_key(raw))
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum StopReason {
@@ -454,12 +475,14 @@ pub fn live_complete_with(
     let body = request_body_with(model, messages, system, tools, options);
     if model.api == "openai-codex-responses" {
         if let Some(token) = auth.api_key.as_deref() {
-            match crate::codex::try_codex_websocket_transport_with(
+            let codex_affinity_id = codex_responses_affinity_id(options);
+            match crate::codex::try_codex_websocket_transport_with_affinity(
                 model,
                 &body,
                 token,
                 options.transport.as_deref(),
                 options.session_id.as_deref(),
+                codex_affinity_id.as_deref(),
                 options.cache_retention.as_deref(),
                 options.websocket_connect_timeout_ms,
                 options.timeout_ms,
@@ -550,12 +573,14 @@ pub fn live_complete_streaming_with_sink(
     if model.api == "openai-codex-responses" {
         if let Some(token) = auth.api_key.as_deref() {
             let mut collected = Vec::new();
-            let outcome = crate::codex::try_codex_websocket_transport_with(
+            let codex_affinity_id = codex_responses_affinity_id(options);
+            let outcome = crate::codex::try_codex_websocket_transport_with_affinity(
                 model,
                 &body,
                 token,
                 options.transport.as_deref(),
                 options.session_id.as_deref(),
+                codex_affinity_id.as_deref(),
                 options.cache_retention.as_deref(),
                 options.websocket_connect_timeout_ms,
                 options.timeout_ms,
@@ -657,6 +682,7 @@ fn collect_request_headers(
     options: &StreamOptions,
 ) -> Vec<(String, String)> {
     let session_id = options.session_id.as_deref().filter(|id| !id.is_empty());
+    let codex_affinity_id = codex_responses_affinity_id(options);
     if model.api == "openai-codex-responses" {
         if let Some(token) = &auth.api_key {
             if let Ok(account_id) = crate::codex::extract_account_id(token) {
@@ -670,7 +696,7 @@ fn collect_request_headers(
                     &extra,
                     &account_id,
                     token,
-                    session_id,
+                    codex_affinity_id.as_deref(),
                 );
             }
         }
@@ -3250,6 +3276,34 @@ mod openai_cache_wire_tests {
             headers: Default::default(),
             thinking_level_map: Default::default(),
         }
+    }
+
+    #[test]
+    fn codex_affinity_uses_cache_partition_only_for_session_owned_root() {
+        let root = StreamOptions {
+            session_id: Some("conversation-1".into()),
+            cache_key: Some("shared-root-partition".into()),
+            ..StreamOptions::default()
+        };
+        assert_eq!(
+            codex_responses_affinity_id(&root).as_deref(),
+            Some("shared-root-partition")
+        );
+
+        let worker = StreamOptions {
+            session_id: None,
+            cache_key: Some("shared-worker-bootstrap".into()),
+            ..StreamOptions::default()
+        };
+        assert_eq!(codex_responses_affinity_id(&worker), None);
+
+        let disabled = StreamOptions {
+            session_id: Some("conversation-1".into()),
+            cache_key: Some("partition".into()),
+            cache_retention: Some("none".into()),
+            ..StreamOptions::default()
+        };
+        assert_eq!(codex_responses_affinity_id(&disabled), None);
     }
 
     #[test]
