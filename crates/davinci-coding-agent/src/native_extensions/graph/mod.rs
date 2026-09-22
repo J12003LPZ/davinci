@@ -88,7 +88,28 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 pub use roles::GRAPH_SUBMIT_TOOL;
+pub use worker::{build_worker_args, worker_cache_profile, WorkerCacheProfile};
 pub use worker_hooks::GraphWorkerContext;
+pub use worker_sessions::WorkerSessionBinding;
+
+/// Resolve the concrete worker model identity used by both the launch and
+/// provider cache partition. Empty overrides are ignored; when neither the
+/// trusted role config nor active session supplies a model, callers must use
+/// the conservative no-affinity path instead of inventing a "default" model.
+pub fn resolve_worker_model_identity(
+    role_override: Option<&str>,
+    session_model: Option<&str>,
+) -> Option<String> {
+    role_override
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .or_else(|| {
+            session_model
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+        })
+        .map(str::to_string)
+}
 
 /// How long `/graph` waits for the first checkpoint so it can report the run id.
 const START_REPORT_WAIT: Duration = Duration::from_millis(2000);
