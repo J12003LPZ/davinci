@@ -227,6 +227,13 @@ pub struct OpenAiCacheBenchmarkReport {
     pub treatment_cache_read_tokens: u128,
     pub baseline_cache_write_tokens: u128,
     pub treatment_cache_write_tokens: u128,
+    /// Raw provider input from mutually verified-success pairs only.
+    #[serde(default)]
+    pub paired_baseline_raw_input_tokens: u128,
+    /// Raw provider input from mutually verified-success pairs only.
+    #[serde(default)]
+    pub paired_treatment_raw_input_tokens: u128,
+    /// Efficiency delta computed only from mutually verified-success pairs.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub raw_input_delta_pct: Option<f64>,
 }
@@ -319,6 +326,8 @@ fn build_paired_report_validated(
 
     let mut pair_audit = Vec::new();
     let mut included_efficiency_pairs = 0usize;
+    let mut paired_baseline_raw = 0u128;
+    let mut paired_treatment_raw = 0u128;
     for case in &manifest.cases {
         for repetition in 1..=manifest.repetitions {
             let pair_rows = groups
@@ -354,6 +363,14 @@ fn build_paired_report_validated(
                 PairDisposition::FailedOrBlocked
             } else {
                 included_efficiency_pairs += 1;
+                paired_baseline_raw += baseline
+                    .expect("included pair has baseline")
+                    .metrics
+                    .raw_input_tokens();
+                paired_treatment_raw += treatment
+                    .expect("included pair has treatment")
+                    .metrics
+                    .raw_input_tokens();
                 PairDisposition::IncludedEfficiency
             };
 
@@ -367,8 +384,10 @@ fn build_paired_report_validated(
         }
     }
 
-    let raw_input_delta_pct = (baseline_raw > 0).then(|| {
-        (treatment_raw as f64 - baseline_raw as f64) / baseline_raw as f64 * 100.0
+    let raw_input_delta_pct = (paired_baseline_raw > 0).then(|| {
+        (paired_treatment_raw as f64 - paired_baseline_raw as f64)
+            / paired_baseline_raw as f64
+            * 100.0
     });
 
     Ok(OpenAiCacheBenchmarkReport {
@@ -385,6 +404,8 @@ fn build_paired_report_validated(
         treatment_cache_read_tokens: treatment_read,
         baseline_cache_write_tokens: baseline_write,
         treatment_cache_write_tokens: treatment_write,
+        paired_baseline_raw_input_tokens: paired_baseline_raw,
+        paired_treatment_raw_input_tokens: paired_treatment_raw,
         raw_input_delta_pct,
     })
 }
@@ -537,6 +558,11 @@ mod tests {
         );
         assert_eq!(report.outcome_counts.get("verifiedfailure"), Some(&2));
         assert_eq!(report.treatment_cache_write_tokens, 100);
+        assert_eq!(report.baseline_raw_input_tokens, 1_500);
+        assert_eq!(report.treatment_raw_input_tokens, 1_200);
+        assert_eq!(report.paired_baseline_raw_input_tokens, 1_000);
+        assert_eq!(report.paired_treatment_raw_input_tokens, 1_000);
+        assert_eq!(report.raw_input_delta_pct, Some(0.0));
     }
 
     #[test]
