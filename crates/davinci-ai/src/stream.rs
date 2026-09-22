@@ -27,6 +27,10 @@ pub struct StreamOptions {
     pub session_id: Option<String>,
     pub cache_key: Option<String>,
     pub cache_retention: Option<String>,
+    /// Latest durable native Responses turn from this real conversation.
+    /// It is validated against the current provider projection and stable
+    /// model-visible request contract before use.
+    pub native_responses_resume: Option<crate::responses_ledger::NativeResponsesResumeRecord>,
     pub install_telemetry: Option<bool>,
     /// Set from another thread to stop a live stream between frames. The
     /// message then closes with `StopReason::Aborted`.
@@ -1009,6 +1013,7 @@ pub fn request_body_with(
         _ => openai_body(model, messages, system, tools, options),
     };
     apply_max_tokens_override(&mut body, options);
+    apply_native_responses_resume(&mut body, model, messages, options);
     body
 }
 
@@ -1222,6 +1227,50 @@ fn openai_responses_body(
         }
     }
     body
+}
+
+fn apply_native_responses_resume(
+    body: &mut Value,
+    model: &Model,
+    messages: &[ChatMessage],
+    options: &StreamOptions,
+) {
+    if !native_responses_api(model) {
+        return;
+    }
+    let Some(resume) = options.native_responses_resume.as_ref() else {
+        return;
+    };
+    if !resume.matches_provider_prefix(messages) {
+        if crate::trace::enabled() {
+            crate::trace::log("native responses replay skipped: provider prefix changed");
+        }
+        return;
+    }
+
+    let current = crate::responses_request::PreparedProviderRequest::new(body.clone());
+    if !current
+        .manifest()
+        .stable_contract_compatible_with(&resume.turn.wire_manifest)
+    {
+        if crate::trace::enabled() {
+            crate::trace::log("native responses replay skipped: stable request contract changed");
+        }
+        return;
+    }
+
+    let mut input = resume.turn.full_native_replay_prefix();
+    input.extend(openai_responses_input(
+        &messages[resume.resume_provider_message_count..],
+    ));
+    body["input"] = Value::Array(input);
+    if crate::trace::enabled() {
+        crate::trace::log(&format!(
+            "native responses replay applied baseline_messages={} replay_items={}",
+            resume.resume_provider_message_count,
+            body["input"].as_array().map(Vec::len).unwrap_or(0)
+        ));
+    }
 }
 
 fn apply_max_tokens_override(body: &mut Value, options: &StreamOptions) {
@@ -3501,6 +3550,82 @@ mod openai_cache_wire_tests {
             .unwrap()
             .iter()
             .all(|item| item.pointer("/content/0/prompt_cache_breakpoint").is_none()));
+    }
+
+    #[test]
+    fn durable_native_replay_replaces_generic_assistant_with_exact_provider_items() {
+        let model = public_model(true, "https://api.openai.com/v1");
+        let prior_messages = vec![ChatMessage::text("user", "first")];
+        let prior_body = openai_responses_body(
+            &model,
+            &prior_messages,
+            Some("stable bootstrap"),
+            &[],
+            &StreamOptions {
+                cache_key: Some("partition".into()),
+                cache_retention: Some("short".into()),
+                ..StreamOptions::default()
+            },
+        );
+        let prior_prepared =
+            crate::responses_request::PreparedProviderRequest::new(prior_body);
+        let turn = crate::responses_ledger::NativeResponsesTurn::from_prepared(
+            &prior_prepared,
+            crate::responses_ledger::NativeResponsesOutput {
+                response_id: Some("resp_1".into()),
+                output_items: vec![serde_json::json!({
+                    "type":"reasoning",
+                    "id":"rs_1",
+                    "encrypted_content":"opaque"
+                }), serde_json::json!({
+                    "type":"message",
+                    "id":"msg_1",
+                    "role":"assistant",
+                    "content":[{"type":"output_text","text":"answer"}]
+                })],
+                final_response: None,
+                terminal_event_type: "response.completed".into(),
+            },
+        )
+        .unwrap();
+
+        let assistant = ChatMessage::text("assistant", "answer");
+        let mut resume_projection = prior_messages.clone();
+        resume_projection.push(assistant.clone());
+        let record = crate::responses_ledger::NativeResponsesResumeRecord {
+            turn,
+            resume_provider_message_count: resume_projection.len(),
+            resume_provider_messages_fingerprint:
+                crate::responses_ledger::provider_messages_fingerprint(&resume_projection),
+        };
+
+        let mut current = resume_projection;
+        current.push(ChatMessage::tool_result("call_1", "read", "result", false));
+        let body = request_body_with(
+            &model,
+            &current,
+            Some("stable bootstrap"),
+            &[],
+            &StreamOptions {
+                cache_key: Some("partition".into()),
+                cache_retention: Some("short".into()),
+                native_responses_resume: Some(record),
+                ..StreamOptions::default()
+            },
+        );
+        let input = body["input"].as_array().unwrap();
+        assert!(input.iter().any(|item| item["id"] == "rs_1"));
+        assert!(input.iter().any(|item| item["id"] == "msg_1"));
+        assert_eq!(
+            input.iter().filter(|item| item["role"] == "assistant").count(),
+            0,
+            "generic assistant projection must not duplicate the native output"
+        );
+        assert_eq!(
+            input.last().unwrap()["type"],
+            "function_call_output",
+            "only the new tail follows the exact native replay prefix"
+        );
     }
 
     #[test]
