@@ -10,8 +10,7 @@ use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 
 pub const OPENAI_CACHE_EVAL_SCHEMA_VERSION: u32 = 1;
-pub const OPENAI_CACHE_LIVE_AUTHORIZATION_ENV: &str =
-    "DAVINCI_OPENAI_CACHE_LIVE_AUTHORIZATION";
+pub const OPENAI_CACHE_LIVE_AUTHORIZATION_ENV: &str = "DAVINCI_OPENAI_CACHE_LIVE_AUTHORIZATION";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -82,9 +81,7 @@ impl OpenAiCacheBenchmarkManifest {
     pub fn validate_offline(&self) -> Result<(), String> {
         self.validate_common()?;
         if self.live_authorization.is_some() {
-            return Err(
-                "offline manifest must not embed live provider authorization".into(),
-            );
+            return Err("offline manifest must not embed live provider authorization".into());
         }
         Ok(())
     }
@@ -103,7 +100,10 @@ impl OpenAiCacheBenchmarkManifest {
             ("provider", self.provider.as_str()),
             ("model", self.model.as_str()),
             ("endpoint family", self.endpoint_family.as_str()),
-            ("policy contract revision", self.policy_contract_revision.as_str()),
+            (
+                "policy contract revision",
+                self.policy_contract_revision.as_str(),
+            ),
             ("baseline profile", self.baseline_profile.as_str()),
             ("treatment profile", self.treatment_profile.as_str()),
         ] {
@@ -250,8 +250,7 @@ pub fn build_paired_report(
         BenchmarkSource::OfflineFixture => manifest.validate_offline()?,
         BenchmarkSource::LiveAuthorized => {
             return Err(
-                "live rows require validate_live_authorization before report construction"
-                    .into(),
+                "live rows require validate_live_authorization before report construction".into(),
             )
         }
     }
@@ -276,7 +275,10 @@ fn build_paired_report_validated(
     rows: &[OpenAiCacheBenchmarkRow],
 ) -> Result<OpenAiCacheBenchmarkReport, String> {
     let fingerprint = manifest.fingerprint();
-    if rows.iter().any(|row| row.manifest_fingerprint != fingerprint) {
+    if rows
+        .iter()
+        .any(|row| row.manifest_fingerprint != fingerprint)
+    {
         return Err("benchmark row manifest fingerprint mismatch".into());
     }
     if rows.iter().any(|row| row.source != source) {
@@ -385,8 +387,7 @@ fn build_paired_report_validated(
     }
 
     let raw_input_delta_pct = (paired_baseline_raw > 0).then(|| {
-        (paired_treatment_raw as f64 - paired_baseline_raw as f64)
-            / paired_baseline_raw as f64
+        (paired_treatment_raw as f64 - paired_baseline_raw as f64) / paired_baseline_raw as f64
             * 100.0
     });
 
@@ -576,9 +577,12 @@ mod tests {
             RunOutcome::VerifiedSuccess,
             (100, 0, 0),
         );
-        let missing =
-            build_paired_report(&manifest, BenchmarkSource::OfflineFixture, &[baseline.clone()])
-                .unwrap();
+        let missing = build_paired_report(
+            &manifest,
+            BenchmarkSource::OfflineFixture,
+            &[baseline.clone()],
+        )
+        .unwrap();
         assert_eq!(
             missing.pair_audit[0].disposition,
             PairDisposition::MissingTreatment

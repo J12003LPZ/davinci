@@ -51,8 +51,7 @@ fn resume_record(response_id: &str) -> NativeResponsesResumeRecord {
             },
         },
         resume_provider_message_count: 0,
-        resume_provider_messages_fingerprint:
-            davinci_ai::provider_messages_fingerprint(&[]),
+        resume_provider_messages_fingerprint: davinci_ai::provider_messages_fingerprint(&[]),
     }
 }
 
@@ -73,12 +72,10 @@ fn comparison_diagnostics_are_capability_scoped_and_opt_in() {
         sampled_comparison_response_id(&unsupported, &options, 1),
         None
     );
-    assert!(OpenAiCacheCapabilities::resolve(
-        &supported,
-        supported.base_url.as_deref(),
-        false
-    )
-    .supports_cache_diagnostics);
+    assert!(
+        OpenAiCacheCapabilities::resolve(&supported, supported.base_url.as_deref(), false)
+            .supports_cache_diagnostics
+    );
 }
 
 #[test]
@@ -150,7 +147,7 @@ fn duplicate_terminal_events_use_the_last_provider_diagnostic_once() {
                     "comparison_reusable_tokens":2048
                 }
             }
-        })
+        }),
     ];
     let output = NativeResponsesOutput::from_events(&events).unwrap();
     let diag = ProviderPromptCacheDiagnostics::from_native_output(&output).unwrap();

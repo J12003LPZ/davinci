@@ -96,7 +96,6 @@ pub fn describe_event(event: &serde_json::Value) -> String {
     }
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
