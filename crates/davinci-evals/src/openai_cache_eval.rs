@@ -140,10 +140,10 @@ fn is_git_revision(value: &str) -> bool {
 /// This validates an authorization object only; it never opens a network
 /// connection. Product code must also require a deliberate operator action
 /// before constructing a live runner.
-pub fn validate_live_authorization(
-    manifest: &OpenAiCacheBenchmarkManifest,
+pub fn validate_live_authorization<'a>(
+    manifest: &'a OpenAiCacheBenchmarkManifest,
     environment_approval: Option<&str>,
-) -> Result<&LiveBenchmarkAuthorization, String> {
+) -> Result<&'a LiveBenchmarkAuthorization, String> {
     manifest.validate_common()?;
     let authorization = manifest
         .live_authorization
@@ -173,7 +173,7 @@ pub fn validate_live_authorization(
     Ok(authorization)
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct OpenAiCacheBenchmarkRow {
     pub manifest_fingerprint: String,

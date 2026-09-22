@@ -3627,9 +3627,16 @@ mod openai_cache_wire_tests {
         assert!(input.iter().any(|item| item["id"] == "rs_1"));
         assert!(input.iter().any(|item| item["id"] == "msg_1"));
         assert_eq!(
-            input.iter().filter(|item| item["role"] == "assistant").count(),
+            input
+                .iter()
+                .filter(|item| {
+                    item["role"] == "assistant"
+                        && item.get("id").is_none()
+                        && item.get("type").is_none()
+                })
+                .count(),
             0,
-            "generic assistant projection must not duplicate the native output"
+            "generic assistant projection must not duplicate the exact native output"
         );
         assert_eq!(
             input.last().unwrap()["type"],
