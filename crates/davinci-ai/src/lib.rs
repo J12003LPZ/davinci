@@ -19,6 +19,7 @@ mod models_store;
 mod oauth;
 mod oauth_callback;
 mod oauth_providers;
+pub mod openai_cache_diagnostics;
 pub mod openai_cache_policy;
 mod provider_retry;
 mod providers;
@@ -76,6 +77,12 @@ pub use deferred::{
 pub use http_proxy::{
     resolve_http_proxy_url_for_target, tcp_connect_via_http_proxy,
     UNSUPPORTED_PROXY_PROTOCOL_MESSAGE,
+};
+pub use openai_cache_diagnostics::{
+    configured_comparison_response_id, diagnostics_every_n_from_env, latest_applied_policy,
+    latest_diagnostic, sampled_comparison_response_id, should_sample_comparison,
+    AppliedPromptCachePolicy, ProviderCacheUsageBreakdown, ProviderPromptCacheDiagnostics,
+    OPENAI_CACHE_DIAGNOSTICS_EVERY_N_ENV,
 };
 pub use responses_request::{
     PreparedProviderRequest, WireManifest, WireSegmentCategory, WireSegmentManifest,

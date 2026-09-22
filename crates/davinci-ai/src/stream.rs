@@ -1184,6 +1184,15 @@ fn openai_responses_body(
                 }
                 body["prompt_cache_options"] = prompt_cache_options;
             }
+            if let Some(comparison_response_id) =
+                crate::openai_cache_diagnostics::configured_comparison_response_id(model, options)
+            {
+                if !body["prompt_cache_options"].is_object() {
+                    body["prompt_cache_options"] = serde_json::json!({});
+                }
+                body["prompt_cache_options"]["comparison_response_id"] =
+                    Value::String(comparison_response_id);
+            }
         }
     }
     if !tools.is_empty() {
