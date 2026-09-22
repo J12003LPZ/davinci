@@ -107,9 +107,8 @@ impl ContextVmRuntime {
                 .as_ref()
                 .map(|page| page.content_hash.as_str())
                 .unwrap_or("uninitialized");
-            root.cache_namespace = digest(
-                format!("ctxvm_cache_namespace_v2:{}:{checkpoint}", root.epoch).as_bytes(),
-            );
+            root.cache_namespace =
+                digest(format!("ctxvm_cache_namespace_v2:{}:{checkpoint}", root.epoch).as_bytes());
         }
         let mut state = self
             .state
@@ -456,10 +455,7 @@ impl ContextVmRuntime {
     /// Unlike cache_affinity(), this is expected to change as stable provider
     /// content evolves within one routing/accounting namespace.
     pub fn content_fingerprint(&self) -> String {
-        let state = self
-            .state
-            .read()
-            .unwrap_or_else(|error| error.into_inner());
+        let state = self.state.read().unwrap_or_else(|error| error.into_inner());
         let root = &state.root;
         let checkpoint = root
             .checkpoint

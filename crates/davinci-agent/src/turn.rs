@@ -239,24 +239,20 @@ impl Agent {
             self.stats.model_wall_ms += model_started.elapsed().as_millis() as u64;
             let (assistant, stream_events, streamed_live, native_responses_resume) =
                 match completion {
-                Ok(output) => output,
-                Err(err) => {
-                    if let Some(runtime) = &self.runtime {
-                        runtime.mark_turn_failed();
-                        runtime.emit_turn_end(false);
+                    Ok(output) => output,
+                    Err(err) => {
+                        if let Some(runtime) = &self.runtime {
+                            runtime.mark_turn_failed();
+                            runtime.emit_turn_end(false);
+                        }
+                        self.is_streaming = false;
+                        self.flush_pending_bash_messages();
+                        return Err(err);
                     }
-                    self.is_streaming = false;
-                    self.flush_pending_bash_messages();
-                    return Err(err);
-                }
-            };
+                };
             let chat = assistant_to_chat(&assistant);
             self.messages.push(chat.clone());
-            self.persist_assistant(
-                &assistant,
-                &chat,
-                native_responses_resume.as_ref(),
-            );
+            self.persist_assistant(&assistant, &chat, native_responses_resume.as_ref());
             self.ensure_session_persistence()?;
             new_messages.push(chat.clone());
             // A closure that streamed live has already shown the sink the
@@ -2504,9 +2500,7 @@ impl Agent {
                         seq: 0,
                         timestamp,
                         message: None,
-                        custom_type: Some(
-                            davinci_ai::NATIVE_RESPONSES_TURN_ENTRY_TYPE.to_string(),
-                        ),
+                        custom_type: Some(davinci_ai::NATIVE_RESPONSES_TURN_ENTRY_TYPE.to_string()),
                         extra,
                     });
                 }

@@ -62,9 +62,8 @@ impl OpenAiCacheCapabilities {
 
         let public_openai =
             model.provider == "openai" && model.api == "openai-responses" && !is_oauth;
-        let chatgpt_codex = model.provider == "openai-codex"
-            && model.api == "openai-codex-responses"
-            && is_oauth;
+        let chatgpt_codex =
+            model.provider == "openai-codex" && model.api == "openai-codex-responses" && is_oauth;
 
         if public_openai {
             let explicit = codex.explicit_cache_breakpoints;
@@ -219,8 +218,7 @@ impl PromptCacheWirePlan {
                 },
                 CacheRetention::Short | CacheRetention::Long => Self {
                     emit_cache_key: true,
-                    use_stable_bootstrap_breakpoint: capabilities
-                        .supports_breakpoint_content_types
+                    use_stable_bootstrap_breakpoint: capabilities.supports_breakpoint_content_types
                         && has_trusted_bootstrap,
                     prompt_cache_mode: has_trusted_bootstrap.then_some("implicit"),
                     prompt_cache_ttl: capabilities.supports_ttl_30m.then_some("30m"),
@@ -421,7 +419,10 @@ mod tests {
         let model = model("openai", "openai-responses", true);
         let caps =
             OpenAiCacheCapabilities::resolve(&model, Some("https://api.openai.com/v1"), false);
-        assert_eq!(caps.cache_control_family, CacheControlFamily::ExplicitBoundaries);
+        assert_eq!(
+            caps.cache_control_family,
+            CacheControlFamily::ExplicitBoundaries
+        );
         assert_eq!(
             caps.cache_partition_semantics,
             CachePartitionSemantics::AccountingPartition
@@ -436,7 +437,10 @@ mod tests {
         let model = model("openai", "openai-responses", false);
         let caps =
             OpenAiCacheCapabilities::resolve(&model, Some("https://api.openai.com/v1"), false);
-        assert_eq!(caps.cache_control_family, CacheControlFamily::LegacyImplicit);
+        assert_eq!(
+            caps.cache_control_family,
+            CacheControlFamily::LegacyImplicit
+        );
         assert_eq!(
             caps.cache_partition_semantics,
             CachePartitionSemantics::RoutingHint
@@ -447,8 +451,11 @@ mod tests {
     #[test]
     fn deceptive_proxy_is_conservative_even_for_gpt56() {
         let model = model("openai", "openai-responses", true);
-        let caps =
-            OpenAiCacheCapabilities::resolve(&model, Some("https://api.openai.com.evil.test/v1"), false);
+        let caps = OpenAiCacheCapabilities::resolve(
+            &model,
+            Some("https://api.openai.com.evil.test/v1"),
+            false,
+        );
         assert_eq!(caps, OpenAiCacheCapabilities::unknown());
     }
 
@@ -456,11 +463,8 @@ mod tests {
     fn codex_adapter_semantics_are_not_public_api_semantics() {
         let mut model = model("openai-codex", "openai-codex-responses", true);
         model.base_url = Some("https://chatgpt.com/backend-api".into());
-        let caps = OpenAiCacheCapabilities::resolve(
-            &model,
-            Some("https://chatgpt.com/backend-api"),
-            true,
-        );
+        let caps =
+            OpenAiCacheCapabilities::resolve(&model, Some("https://chatgpt.com/backend-api"), true);
         assert_eq!(
             caps.cache_partition_semantics,
             CachePartitionSemantics::AdapterSpecific

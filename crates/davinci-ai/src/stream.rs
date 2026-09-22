@@ -44,10 +44,7 @@ fn codex_responses_affinity_id(options: &StreamOptions) -> Option<String> {
     if crate::cache::cache_retention_from_options(options) == crate::cache::CacheRetention::None {
         return None;
     }
-    let conversation_id = options
-        .session_id
-        .as_deref()
-        .filter(|id| !id.is_empty())?;
+    let conversation_id = options.session_id.as_deref().filter(|id| !id.is_empty())?;
 
     // Only an actual root/session-owned conversation may align its Codex
     // affinity header to a cache partition. Graph workers intentionally run
@@ -400,7 +397,9 @@ fn read_provider_stream(
         let native = native_responses_api(model)
             .then(|| serde_json::from_str::<Value>(&raw).ok())
             .flatten()
-            .and_then(|value| crate::responses_ledger::NativeResponsesOutput::from_response_value(&value));
+            .and_then(|value| {
+                crate::responses_ledger::NativeResponsesOutput::from_response_value(&value)
+            });
         return Ok((message, synthesized, native));
     }
 
@@ -542,7 +541,7 @@ pub fn live_complete_with(
             ) {
                 Ok(crate::codex::CodexWebsocketOutcome::Message(message)) => {
                     return Ok(message.message)
-                },
+                }
                 Ok(crate::codex::CodexWebsocketOutcome::FallbackToSse) => {}
                 Err(error) => return Err(error),
             }
@@ -687,14 +686,11 @@ pub fn live_complete_streaming_with_sink_envelope(
                     } else {
                         collected
                     };
-                    let native_responses = message
-                        .native_responses
-                        .and_then(|output| {
-                            crate::responses_ledger::NativeResponsesTurn::from_prepared(
-                                &prepared,
-                                output,
-                            )
-                        });
+                    let native_responses = message.native_responses.and_then(|output| {
+                        crate::responses_ledger::NativeResponsesTurn::from_prepared(
+                            &prepared, output,
+                        )
+                    });
                     return Ok(ProviderCompletionEnvelope {
                         message: message.message,
                         stream_events: events,
@@ -779,13 +775,9 @@ pub fn live_complete_streaming_with_sink_envelope(
                         .collect::<Vec<_>>();
                     crate::responses_ledger::NativeResponsesOutput::from_events(&raw_events)
                 } else {
-                    serde_json::from_str::<Value>(&text)
-                        .ok()
-                        .and_then(|value| {
-                            crate::responses_ledger::NativeResponsesOutput::from_response_value(
-                                &value,
-                            )
-                        })
+                    serde_json::from_str::<Value>(&text).ok().and_then(|value| {
+                        crate::responses_ledger::NativeResponsesOutput::from_response_value(&value)
+                    })
                 }
             } else {
                 None
@@ -3412,7 +3404,6 @@ mod tests {
     }
 }
 
-
 #[cfg(test)]
 mod openai_cache_wire_tests {
     use super::*;
@@ -3577,22 +3568,24 @@ mod openai_cache_wire_tests {
                 ..StreamOptions::default()
             },
         );
-        let prior_prepared =
-            crate::responses_request::PreparedProviderRequest::new(prior_body);
+        let prior_prepared = crate::responses_request::PreparedProviderRequest::new(prior_body);
         let turn = crate::responses_ledger::NativeResponsesTurn::from_prepared(
             &prior_prepared,
             crate::responses_ledger::NativeResponsesOutput {
                 response_id: Some("resp_1".into()),
-                output_items: vec![serde_json::json!({
-                    "type":"reasoning",
-                    "id":"rs_1",
-                    "encrypted_content":"opaque"
-                }), serde_json::json!({
-                    "type":"message",
-                    "id":"msg_1",
-                    "role":"assistant",
-                    "content":[{"type":"output_text","text":"answer"}]
-                })],
+                output_items: vec![
+                    serde_json::json!({
+                        "type":"reasoning",
+                        "id":"rs_1",
+                        "encrypted_content":"opaque"
+                    }),
+                    serde_json::json!({
+                        "type":"message",
+                        "id":"msg_1",
+                        "role":"assistant",
+                        "content":[{"type":"output_text","text":"answer"}]
+                    }),
+                ],
                 final_response: None,
                 terminal_event_type: "response.completed".into(),
             },

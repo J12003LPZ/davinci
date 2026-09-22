@@ -1412,15 +1412,10 @@ impl Agent {
             {
                 return None;
             }
-            entry
-                .extra
-                .get("data")
-                .and_then(|value| {
-                    serde_json::from_value::<davinci_ai::NativeResponsesResumeRecord>(
-                        value.clone(),
-                    )
+            entry.extra.get("data").and_then(|value| {
+                serde_json::from_value::<davinci_ai::NativeResponsesResumeRecord>(value.clone())
                     .ok()
-                })
+            })
         })
     }
 

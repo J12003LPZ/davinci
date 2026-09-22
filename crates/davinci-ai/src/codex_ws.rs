@@ -212,8 +212,7 @@ fn process_fixture(
                     Instant::now(),
                 );
             }
-            let native_responses =
-                NativeResponsesOutput::from_events(&fixture_raw_events(corpus));
+            let native_responses = NativeResponsesOutput::from_events(&fixture_raw_events(corpus));
             Ok(CodexWebsocketMessage {
                 message,
                 native_responses,
@@ -249,7 +248,9 @@ fn native_response_items_from_events(events: &[Value]) -> Value {
     // Preserve each raw item verbatim and restore provider output order.
     let mut completed = events
         .iter()
-        .filter(|event| event.get("type").and_then(Value::as_str) == Some("response.output_item.done"))
+        .filter(|event| {
+            event.get("type").and_then(Value::as_str) == Some("response.output_item.done")
+        })
         .filter_map(|event| {
             let item = event.get("item")?.clone();
             let index = event
@@ -1028,7 +1029,6 @@ mod tests {
         crate::codex::close_openai_codex_websocket_sessions(Some(SESSION));
     }
 }
-
 
 #[cfg(test)]
 mod native_replay_cache_tests {

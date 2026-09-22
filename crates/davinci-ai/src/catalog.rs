@@ -115,7 +115,10 @@ pub fn effective_model_cost_rates(model: &Model, raw_input_tokens: u64) -> Model
                 return rates;
             }
 
-            let Some(tiers) = entry.pointer("/cost/tiers").and_then(serde_json::Value::as_array) else {
+            let Some(tiers) = entry
+                .pointer("/cost/tiers")
+                .and_then(serde_json::Value::as_array)
+            else {
                 return rates;
             };
             for tier in tiers {
@@ -140,8 +143,14 @@ pub fn effective_model_cost_rates(model: &Model, raw_input_tokens: u64) -> Model
     let Some((threshold, tier)) = selected else {
         return rates;
     };
-    rates.input = tier.get("input").and_then(serde_json::Value::as_f64).unwrap_or(rates.input);
-    rates.output = tier.get("output").and_then(serde_json::Value::as_f64).unwrap_or(rates.output);
+    rates.input = tier
+        .get("input")
+        .and_then(serde_json::Value::as_f64)
+        .unwrap_or(rates.input);
+    rates.output = tier
+        .get("output")
+        .and_then(serde_json::Value::as_f64)
+        .unwrap_or(rates.output);
     rates.cache_read = tier
         .get("cacheRead")
         .and_then(serde_json::Value::as_f64)

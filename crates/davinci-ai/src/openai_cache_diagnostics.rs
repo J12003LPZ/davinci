@@ -15,8 +15,7 @@ use crate::responses_ledger::{NativeResponsesOutput, NativeResponsesResumeRecord
 use crate::stream::StreamOptions;
 use davinci_protocol::Usage;
 
-pub const OPENAI_CACHE_DIAGNOSTICS_EVERY_N_ENV: &str =
-    "PI_OPENAI_CACHE_DIAGNOSTICS_EVERY_N";
+pub const OPENAI_CACHE_DIAGNOSTICS_EVERY_N_ENV: &str = "PI_OPENAI_CACHE_DIAGNOSTICS_EVERY_N";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -44,17 +43,12 @@ impl ProviderPromptCacheDiagnostics {
             comparison_reusable_tokens: value
                 .get("comparison_reusable_tokens")
                 .and_then(Value::as_u64),
-            cache_missed_tokens: value
-                .get("cache_missed_tokens")
-                .and_then(Value::as_u64),
+            cache_missed_tokens: value.get("cache_missed_tokens").and_then(Value::as_u64),
         })
     }
 
     pub fn from_native_output(output: &NativeResponsesOutput) -> Option<Self> {
-        output
-            .final_response
-            .as_ref()
-            .and_then(Self::from_response)
+        output.final_response.as_ref().and_then(Self::from_response)
     }
 
     /// Provider-reported hit/miss only. Unavailable/expired/unknown results
@@ -95,10 +89,7 @@ impl AppliedPromptCachePolicy {
     }
 
     pub fn from_native_output(output: &NativeResponsesOutput) -> Option<Self> {
-        output
-            .final_response
-            .as_ref()
-            .and_then(Self::from_response)
+        output.final_response.as_ref().and_then(Self::from_response)
     }
 }
 
@@ -162,8 +153,7 @@ pub fn sampled_comparison_response_id(
     if cache_retention_from_options(options) == CacheRetention::None {
         return None;
     }
-    let capabilities =
-        OpenAiCacheCapabilities::resolve(model, model.base_url.as_deref(), false);
+    let capabilities = OpenAiCacheCapabilities::resolve(model, model.base_url.as_deref(), false);
     if !capabilities.supports_cache_diagnostics {
         return None;
     }
@@ -172,19 +162,15 @@ pub fn sampled_comparison_response_id(
     should_sample_comparison(response_id, every_n).then(|| response_id.to_string())
 }
 
-pub fn configured_comparison_response_id(
-    model: &Model,
-    options: &StreamOptions,
-) -> Option<String> {
+pub fn configured_comparison_response_id(model: &Model, options: &StreamOptions) -> Option<String> {
     sampled_comparison_response_id(model, options, diagnostics_every_n_from_env())
 }
 
 pub fn latest_diagnostic(
     record: Option<&NativeResponsesResumeRecord>,
 ) -> Option<ProviderPromptCacheDiagnostics> {
-    record.and_then(|record| {
-        ProviderPromptCacheDiagnostics::from_native_output(&record.turn.output)
-    })
+    record
+        .and_then(|record| ProviderPromptCacheDiagnostics::from_native_output(&record.turn.output))
 }
 
 pub fn latest_applied_policy(

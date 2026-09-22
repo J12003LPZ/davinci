@@ -106,7 +106,6 @@ impl ResponsesItem {
     }
 }
 
-
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct NativeResponsesOutput {
@@ -156,9 +155,7 @@ impl NativeResponsesOutput {
     pub fn from_response_value(value: &Value) -> Option<Self> {
         let response = value.get("response").unwrap_or(value);
         let status = response.get("status").and_then(Value::as_str);
-        let has_error = response
-            .get("error")
-            .is_some_and(|error| !error.is_null());
+        let has_error = response.get("error").is_some_and(|error| !error.is_null());
         if matches!(status, Some("failed" | "cancelled")) || has_error {
             return None;
         }
