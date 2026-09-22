@@ -24,6 +24,33 @@ pub(crate) enum Preparation {
     Ready { lane: crate::scheduler::ToolLane },
 }
 
+struct PendingToolOperationGuard {
+    pending: Option<crate::PendingToolOperation>,
+}
+
+impl PendingToolOperationGuard {
+    fn new(pending: Option<crate::PendingToolOperation>) -> Self {
+        Self { pending }
+    }
+    fn as_ref(&self) -> Option<&crate::PendingToolOperation> {
+        self.pending.as_ref()
+    }
+    fn disarm(&mut self) {
+        self.pending.take();
+    }
+}
+
+impl Drop for PendingToolOperationGuard {
+    fn drop(&mut self) {
+        if let Some(pending) = self.pending.as_ref() {
+            let _ = pending.runtime.dispatcher().cancel_before_start(
+                &pending.admitted,
+                "operation did not reach its dispatch boundary",
+            );
+        }
+    }
+}
+
 impl Agent {
     /// Start a loop after user prompts have already been appended.
     pub fn run_loop<F, T>(&mut self, complete: F) -> Result<Vec<AgentEvent>, String>
@@ -935,6 +962,7 @@ impl Agent {
                     details: Some(serde_json::json!({"denied": true, "cancelled": true})),
                 });
             if owned_reservations.get(index) == Some(&true) {
+                self.cancel_pending_tool_operation(id);
                 if let Ok(mut ledger) = self.tool_ledger.lock() {
                     ledger.cancel_reservation(id);
                 }
@@ -1149,6 +1177,93 @@ impl Agent {
             .unwrap_or_else(|| crate::tool_ledger::classify_side_effect(name))
     }
 
+    fn operation_runtime_for_tool(
+        &self,
+        name: &str,
+    ) -> Option<crate::runtime::operations::ToolOperationRuntime> {
+        let runtime = self.runtime.as_ref()?;
+        let capability = runtime.capability_registry.get(name)?;
+        (capability.source == crate::runtime::CapabilitySource::Builtin)
+            .then(|| runtime.operations.clone())
+            .flatten()
+    }
+
+    fn current_operation_plan(
+        &self,
+        pending: &crate::PendingToolOperation,
+        call_id: &str,
+        name: &str,
+        args: &Value,
+    ) -> Result<
+        (
+            crate::runtime::operations::ToolOperationRuntime,
+            crate::runtime::operations::PlannedToolOperation,
+        ),
+        String,
+    > {
+        let operation_runtime = self
+            .operation_runtime_for_tool(name)
+            .ok_or_else(|| "builtin operation runtime is unavailable".to_owned())?;
+        if !pending
+            .runtime
+            .shares_dispatch_authority(&operation_runtime)
+        {
+            return Err("operation journal, workspace, or owner changed after admission".into());
+        }
+        let runtime = self
+            .runtime
+            .as_ref()
+            .ok_or_else(|| "runtime handle changed after operation admission".to_owned())?;
+        let capability = runtime
+            .capability_registry
+            .get(name)
+            .filter(|capability| capability.source == crate::runtime::CapabilitySource::Builtin)
+            .ok_or_else(|| "builtin capability changed after operation admission".to_owned())?;
+        let contract_digest = self.active_contract().map(|contract| contract.digest);
+        let session_id = runtime.session_id.as_deref();
+        let plan = match pending.origin {
+            crate::ToolOperationOrigin::ProviderCall => operation_runtime.plan_provider_call(
+                runtime.run_id,
+                runtime.agent_id,
+                session_id,
+                call_id,
+                name,
+                args,
+                Some(&capability),
+                contract_digest.as_deref(),
+            ),
+            crate::ToolOperationOrigin::BatchChild {
+                parent,
+                child_index,
+            } => operation_runtime.plan_batch_child(
+                runtime.run_id,
+                runtime.agent_id,
+                session_id,
+                parent,
+                child_index,
+                name,
+                args,
+                Some(&capability),
+                contract_digest.as_deref(),
+            ),
+        };
+        plan.map(|plan| (operation_runtime, plan))
+            .map_err(|error| format!("operation intent could not be rebuilt: {error}"))
+    }
+
+    pub(crate) fn cancel_pending_tool_operation(&self, call_id: &str) {
+        let pending = self
+            .pending_tool_operations
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .remove(call_id);
+        if let Some(pending) = pending {
+            let _ = pending
+                .runtime
+                .dispatcher()
+                .cancel_before_start(&pending.admitted, "scheduler stopped before dispatch");
+        }
+    }
     /// Stage one of a tool call. `depth` is 0 for a call the model made and
     /// 1 for an operation inside a `batch`.
     pub(crate) fn prepare_tool_call(
@@ -1158,6 +1273,25 @@ impl Agent {
         name: &str,
         args: &Value,
         depth: usize,
+    ) -> Preparation {
+        self.prepare_tool_call_with_origin(
+            cwd,
+            id,
+            name,
+            args,
+            depth,
+            crate::ToolOperationOrigin::ProviderCall,
+        )
+    }
+
+    pub(crate) fn prepare_tool_call_with_origin(
+        &self,
+        cwd: &Path,
+        id: &str,
+        name: &str,
+        args: &Value,
+        depth: usize,
+        origin: crate::ToolOperationOrigin,
     ) -> Preparation {
         if let Err(error) = self.ensure_session_persistence() {
             return Preparation::Immediate(crate::ToolResult {
@@ -1184,45 +1318,55 @@ impl Agent {
                 false,
             );
         }
-        let replay_policy = self.replay_policy_for_tool(name);
-        let side_effect = self.side_effect_for_tool(name);
-        if let Ok(mut ledger) = self.tool_ledger.lock() {
-            match ledger.reserve_call_with_metadata(id, name, args, replay_policy, side_effect) {
-                Err(collision_err) => {
-                    return Preparation::Immediate(crate::ToolResult {
-                        content: collision_err,
-                        is_error: true,
-                        details: Some(serde_json::json!({ "collision": true })),
-                    });
-                }
-                Ok(crate::tool_ledger::ReservationOutcome::Replay { output, is_error }) => {
-                    return Preparation::Immediate(crate::ToolResult {
-                        content: output,
-                        is_error,
-                        details: Some(serde_json::json!({ "replayed_from_ledger": true })),
-                    });
-                }
-                Ok(crate::tool_ledger::ReservationOutcome::ReplayBlocked(reason)) => {
-                    return Preparation::Immediate(crate::ToolResult {
-                        content: reason,
-                        is_error: true,
-                        details: Some(serde_json::json!({ "replay_blocked": true })),
-                    });
-                }
-                Ok(crate::tool_ledger::ReservationOutcome::WaitForInFlight) => {
-                    let class = self
-                        .permissions
-                        .lock()
-                        .unwrap_or_else(|err| err.into_inner())
-                        .class_of(name);
-                    let lane = self.lane_for_tool(name, class);
-                    return Preparation::Wait {
-                        call_id: id.to_string(),
-                        lane,
-                    };
-                }
-                Ok(crate::tool_ledger::ReservationOutcome::Reserved) => {
-                    // Identity reserved as Pending; proceed to check pre_tool / permissions
+        let operation_runtime = self.operation_runtime_for_tool(name);
+        let journal_configured = operation_runtime.is_some();
+        let route = self
+            .tool_ledger
+            .lock()
+            .map(|ledger| ledger.execution_authority(id, journal_configured, journal_configured))
+            .unwrap_or(crate::tool_ledger::ToolCallExecutionAuthority::CompatibilityLedger);
+        if route == crate::tool_ledger::ToolCallExecutionAuthority::CompatibilityLedger {
+            let replay_policy = self.replay_policy_for_tool(name);
+            let side_effect = self.side_effect_for_tool(name);
+            if let Ok(mut ledger) = self.tool_ledger.lock() {
+                match ledger.reserve_call_with_metadata(id, name, args, replay_policy, side_effect)
+                {
+                    Err(collision_err) => {
+                        return Preparation::Immediate(crate::ToolResult {
+                            content: collision_err,
+                            is_error: true,
+                            details: Some(serde_json::json!({ "collision": true })),
+                        });
+                    }
+                    Ok(crate::tool_ledger::ReservationOutcome::Replay { output, is_error }) => {
+                        return Preparation::Immediate(crate::ToolResult {
+                            content: output,
+                            is_error,
+                            details: Some(serde_json::json!({ "replayed_from_ledger": true })),
+                        });
+                    }
+                    Ok(crate::tool_ledger::ReservationOutcome::ReplayBlocked(reason)) => {
+                        return Preparation::Immediate(crate::ToolResult {
+                            content: reason,
+                            is_error: true,
+                            details: Some(serde_json::json!({ "replay_blocked": true })),
+                        });
+                    }
+                    Ok(crate::tool_ledger::ReservationOutcome::WaitForInFlight) => {
+                        let class = self
+                            .permissions
+                            .lock()
+                            .unwrap_or_else(|err| err.into_inner())
+                            .class_of(name);
+                        let lane = self.lane_for_tool(name, class);
+                        return Preparation::Wait {
+                            call_id: id.to_string(),
+                            lane,
+                        };
+                    }
+                    Ok(crate::tool_ledger::ReservationOutcome::Reserved) => {
+                        // Identity reserved as Pending; proceed to check pre_tool / permissions
+                    }
                 }
             }
         }
@@ -1287,6 +1431,138 @@ impl Agent {
         // closed inside `lane_for_capability`. Without a runtime, the legacy
         // class-based resolver still keeps unrecognized extensions serial.
         let lane = self.lane_for_tool(name, class);
+        if route == crate::tool_ledger::ToolCallExecutionAuthority::OperationJournal {
+            let Some(operation_runtime) = operation_runtime else {
+                return immediate("Operation journal runtime is unavailable.".into(), true);
+            };
+            let permission_revision = self
+                .permissions
+                .lock()
+                .ok()
+                .and_then(|permissions| permissions.revision());
+            let Some(permission_revision) = permission_revision else {
+                return immediate(
+                    "Operation denied: permission policy revision is unavailable.".into(),
+                    true,
+                );
+            };
+            let Some(capability) = self
+                .runtime
+                .as_ref()
+                .and_then(|runtime| runtime.capability_registry.get(name))
+                .filter(|capability| {
+                    capability.source == crate::runtime::CapabilitySource::Builtin
+                })
+            else {
+                return immediate(
+                    "Operation denied: builtin capability changed during preparation.".into(),
+                    true,
+                );
+            };
+            let contract_digest = self.active_contract().map(|contract| contract.digest);
+            let Some(runtime) = self.runtime.as_ref() else {
+                return immediate("Operation journal runtime is unavailable.".into(), true);
+            };
+            let session_id = runtime.session_id.as_deref();
+            let (run_id, agent_id) = (runtime.run_id, runtime.agent_id);
+            let planned = match origin {
+                crate::ToolOperationOrigin::ProviderCall => operation_runtime.plan_provider_call(
+                    run_id,
+                    agent_id,
+                    session_id,
+                    id,
+                    name,
+                    args,
+                    Some(&capability),
+                    contract_digest.as_deref(),
+                ),
+                crate::ToolOperationOrigin::BatchChild {
+                    parent,
+                    child_index,
+                } => operation_runtime.plan_batch_child(
+                    run_id,
+                    agent_id,
+                    session_id,
+                    parent,
+                    child_index,
+                    name,
+                    args,
+                    Some(&capability),
+                    contract_digest.as_deref(),
+                ),
+            };
+            let plan = match planned {
+                Ok(plan) => plan,
+                Err(error) => {
+                    return immediate(format!("Operation planning failed: {error}"), true)
+                }
+            };
+            let admission = match operation_runtime
+                .dispatcher()
+                .admit(plan.clone(), permission_revision)
+            {
+                Ok(admission) => admission,
+                Err(error) => {
+                    return Preparation::Immediate(crate::ToolResult {
+                        content: format!(
+                            "Operation intent could not be persisted before dispatch: {error}"
+                        ),
+                        is_error: true,
+                        details: Some(serde_json::json!({ "operation_persistence": true })),
+                    });
+                }
+            };
+            match admission {
+                crate::runtime::operations::OperationAdmission::New(admitted) => {
+                    let mut pending_calls = match self.pending_tool_operations.lock() {
+                        Ok(pending_calls) => pending_calls,
+                        Err(_) => {
+                            let _ = operation_runtime.dispatcher().cancel_before_start(
+                                &admitted,
+                                "pending operation state unavailable",
+                            );
+                            return immediate(
+                                "Operation dispatch state is unavailable; no adapter was run."
+                                    .into(),
+                                true,
+                            );
+                        }
+                    };
+                    pending_calls.insert(
+                        id.to_owned(),
+                        crate::PendingToolOperation {
+                            runtime: operation_runtime.clone(),
+                            plan,
+                            admitted,
+                            origin,
+                        },
+                    );
+                }
+                crate::runtime::operations::OperationAdmission::ExistingResult(admitted) => {
+                    return match operation_runtime.dispatcher().replay_result(&admitted) {
+                        Ok(mut result) => {
+                            result.details = Some(
+                                serde_json::json!({ "replayed_from_operation_journal": true }),
+                            );
+                            Preparation::Immediate(result)
+                        }
+                        Err(error) => {
+                            immediate(format!("Operation replay blocked: {error}"), false)
+                        }
+                    };
+                }
+                crate::runtime::operations::OperationAdmission::ExistingInFlight(_) => {
+                    return immediate("Operation is already admitted or in flight; automatic redispatch is blocked.".into(), false);
+                }
+                crate::runtime::operations::OperationAdmission::Collision => {
+                    return Preparation::Immediate(crate::ToolResult {
+                        content: "Operation idempotency key collided with different intent.".into(),
+                        is_error: true,
+                        details: Some(serde_json::json!({ "collision": true })),
+                    });
+                }
+            }
+        }
         Preparation::Ready { lane }
     }
 
@@ -1300,6 +1576,31 @@ impl Agent {
         args: &Value,
         depth: usize,
     ) -> crate::ToolResult {
+        let pending = self
+            .pending_tool_operations
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .remove(id);
+        let mut pending_operation = PendingToolOperationGuard::new(pending);
+        let journal_authoritative = pending_operation.as_ref().is_some();
+
+        if !journal_authoritative
+            && self.operation_runtime_for_tool(name).is_some()
+            && self
+                .tool_ledger
+                .lock()
+                .map(|ledger| {
+                    ledger.execution_authority(id, true, true)
+                        == crate::tool_ledger::ToolCallExecutionAuthority::OperationJournal
+                })
+                .unwrap_or(false)
+        {
+            return crate::ToolResult {
+                content: "Operation was not admitted before dispatch; no adapter was run.".into(),
+                is_error: true,
+                details: Some(serde_json::json!({ "operation_dispatch": true, "denied": true })),
+            };
+        }
         if let Err(error) = self.ensure_session_persistence() {
             return crate::ToolResult {
                 content: error,
@@ -1345,7 +1646,7 @@ impl Agent {
             };
         }
 
-        {
+        if !journal_authoritative {
             let mut ledger = match self.tool_ledger.lock() {
                 Ok(ledger) => ledger,
                 Err(_) => {
@@ -1403,275 +1704,417 @@ impl Agent {
             }
         }
 
-        let outcome = if name == "agent" {
-            let workers = args
-                .get("tasks")
-                .and_then(Value::as_array)
-                .map(Vec::len)
-                .filter(|count| *count > 0)
-                .unwrap_or(1);
-            crate::stats::SharedCounters::add(&self.counters.subagents, workers as u64);
-            let token = self
-                .runtime
-                .as_ref()
-                .map(|rt| rt.cancellation_token.clone());
-            let abort = token
-                .as_ref()
-                .map(|t| t.as_atomic_bool())
-                .or_else(|| self.abort_signal.clone());
-            let permission_mode = Some(self.permission_mode());
-            let parent_agent_id = self.runtime.as_ref().map(|rt| rt.agent_id);
-            let worktree_manager = self
-                .runtime
-                .as_ref()
-                .and_then(|rt| rt.worktree_manager.clone());
-            let active_contract = self.active_contract();
-            let contract_digest = active_contract.as_ref().map(|c| c.digest.clone());
-            let parent = crate::subagent::SubagentParent {
-                provider: Some(self.provider.clone()),
-                model_id: Some(self.model_id.clone()),
-                abort,
-                cancellation_token: token,
-                runtime: self.runtime.clone(),
-                permission_mode,
-                agent_id: parent_agent_id,
-                worktree_manager,
-                contract_digest,
-                active_contract,
-            };
-            match crate::subagent::run_tool(
-                args,
-                &self.tools,
-                self.subagent_runner.as_ref(),
-                &parent,
-            ) {
-                Ok(result) => result,
-                Err(err) => crate::ToolResult {
-                    content: err.to_string(),
-                    is_error: true,
-                    details: None,
-                },
-            }
-        } else if name == "batch" && depth == 0 {
-            self.run_batch(cwd, id, args)
-        } else {
-            let mutating = crate::runtime::workflow::validate::is_mutating_tool(name);
-            let targets = if mutating {
-                crate::runtime::contracts::extract_tool_targets(name, args)
-            } else {
-                Vec::new()
-            };
-            let task_id = self
-                .active_contract()
-                .map(|c| c.task_id)
-                .unwrap_or_default();
-
-            let coordinated = crate::tools::is_coordinated_mutation(name);
-            let preimages: Vec<crate::runtime::checkpoints::FileCapture> =
-                if mutating && !coordinated {
-                    if let Some(runtime) = &self.runtime {
-                        match targets
-                            .iter()
-                            .map(|target| runtime.blob_store.capture_file(task_id, cwd, target))
-                            .collect::<Result<Vec<_>, _>>()
+        let parent_operation_id = pending_operation
+            .as_ref()
+            .map(|pending| pending.admitted.spec.operation_id());
+        let execute = || -> crate::ToolResult {
+            if name == "agent" {
+                let workers = args
+                    .get("tasks")
+                    .and_then(Value::as_array)
+                    .map(Vec::len)
+                    .filter(|count| *count > 0)
+                    .unwrap_or(1);
+                crate::stats::SharedCounters::add(&self.counters.subagents, workers as u64);
+                let token = self
+                    .runtime
+                    .as_ref()
+                    .map(|rt| rt.cancellation_token.clone());
+                let abort = token
+                    .as_ref()
+                    .map(|t| t.as_atomic_bool())
+                    .or_else(|| self.abort_signal.clone());
+                let permission_mode = Some(self.permission_mode());
+                let parent_agent_id = self.runtime.as_ref().map(|rt| rt.agent_id);
+                let worktree_manager = self
+                    .runtime
+                    .as_ref()
+                    .and_then(|rt| rt.worktree_manager.clone());
+                let active_contract = self.active_contract();
+                let contract_digest = active_contract.as_ref().map(|c| c.digest.clone());
+                let parent = crate::subagent::SubagentParent {
+                    provider: Some(self.provider.clone()),
+                    model_id: Some(self.model_id.clone()),
+                    abort,
+                    cancellation_token: token,
+                    runtime: {
+                        let mut runtime = self.runtime.clone();
+                        if let (Some(parent), Some(runtime)) =
+                            (parent_operation_id, runtime.as_mut())
                         {
-                            Ok(captures) => captures,
-                            Err(error) => {
-                                return self.tool_durability_failure(format!(
-                                    "File checkpoint failed before dispatch: {error}"
-                                ))
-                            }
+                            runtime.operations = runtime
+                                .operations
+                                .as_ref()
+                                .map(|operations| operations.with_parent_operation(parent));
                         }
-                    } else {
-                        Vec::new()
-                    }
+                        runtime
+                    },
+                    permission_mode,
+                    agent_id: parent_agent_id,
+                    worktree_manager,
+                    contract_digest,
+                    active_contract,
+                };
+                match crate::subagent::run_tool(
+                    args,
+                    &self.tools,
+                    self.subagent_runner.as_ref(),
+                    &parent,
+                ) {
+                    Ok(result) => result,
+                    Err(err) => crate::ToolResult {
+                        content: err.to_string(),
+                        is_error: true,
+                        details: None,
+                    },
+                }
+            } else if name == "batch" && depth == 0 {
+                self.run_batch_with_parent_operation(cwd, id, args, parent_operation_id)
+            } else {
+                let mutating = crate::runtime::workflow::validate::is_mutating_tool(name);
+                let targets = if mutating {
+                    crate::runtime::contracts::extract_tool_targets(name, args)
                 } else {
                     Vec::new()
                 };
+                let task_id = self
+                    .active_contract()
+                    .map(|c| c.task_id)
+                    .unwrap_or_default();
 
-            // The tool sees the turn's abort flag so a long shell command
-            // or a `job_output` wait ends when the user interrupts.
-            let mut context = self.tool_context.clone();
-            context.command_receipt =
-                matches!(name, "bash" | "powershell" | "exec_command").then(|| {
-                    crate::command_receipt::CommandReceiptCapture::new(
-                        id,
-                        name,
-                        self.active_contract().map(|contract| contract.task_id),
-                    )
-                });
-            context.dispatch_permit = dispatch_permit;
-            context.mutation_attempted =
-                std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-            if coordinated || crate::runtime::transactions::is_tool(name) {
-                context.mutation_authority = Some(
-                    crate::runtime::transactions::MutationAuthority::for_dispatch(
-                        cwd,
-                        name,
-                        args,
-                        self.permissions.clone(),
-                        context.active_contract.clone(),
-                        context.dispatch_permit.clone(),
-                    ),
-                );
-            }
-            context.abort = self
-                .runtime
-                .as_ref()
-                .map(|rt| rt.cancellation_token.as_atomic_bool())
-                .or_else(|| self.abort_signal.clone());
-            self.begin_transaction_verification(cwd, id, name, args, &context);
-            if context.command_receipt.is_some() {
-                if let Ok(mut receipts) = self.command_receipts.lock() {
-                    receipts.retain(|receipt| receipt.operation_id != id);
-                }
-            }
-            let mut executed = match execute_tool_with(cwd, name, args, &context) {
-                Ok(result) => result,
-                Err(crate::tools::ToolError::Unknown(_)) => {
-                    if let Some(executor) = &self.custom_tool_executor {
-                        match executor.execute_with_context(cwd, name, args, &context) {
-                            Ok(result) => result,
-                            Err(crate::tools::ToolError::Durability(error)) => {
-                                self.tool_durability_failure(error)
+                let coordinated = crate::tools::is_coordinated_mutation(name);
+                let preimages: Vec<crate::runtime::checkpoints::FileCapture> =
+                    if mutating && !coordinated {
+                        if let Some(runtime) = &self.runtime {
+                            match targets
+                                .iter()
+                                .map(|target| runtime.blob_store.capture_file(task_id, cwd, target))
+                                .collect::<Result<Vec<_>, _>>()
+                            {
+                                Ok(captures) => captures,
+                                Err(error) => {
+                                    return self.tool_durability_failure(format!(
+                                        "File checkpoint failed before dispatch: {error}"
+                                    ))
+                                }
                             }
-                            Err(err) => crate::ToolResult {
-                                content: err.to_string(),
-                                is_error: true,
-                                details: None,
-                            },
+                        } else {
+                            Vec::new()
                         }
                     } else {
-                        crate::ToolResult {
-                            content: format!("Unknown tool: {name}"),
-                            is_error: true,
-                            details: None,
+                        Vec::new()
+                    };
+
+                // The tool sees the turn's abort flag so a long shell command
+                // or a `job_output` wait ends when the user interrupts.
+                let mut context = self.tool_context.clone();
+                context.command_receipt = matches!(name, "bash" | "powershell" | "exec_command")
+                    .then(|| {
+                        crate::command_receipt::CommandReceiptCapture::new(
+                            id,
+                            name,
+                            self.active_contract().map(|contract| contract.task_id),
+                        )
+                    });
+                context.dispatch_permit = dispatch_permit;
+                context.mutation_attempted =
+                    std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+                if coordinated || crate::runtime::transactions::is_tool(name) {
+                    context.mutation_authority = Some(
+                        crate::runtime::transactions::MutationAuthority::for_dispatch(
+                            cwd,
+                            name,
+                            args,
+                            self.permissions.clone(),
+                            context.active_contract.clone(),
+                            context.dispatch_permit.clone(),
+                        ),
+                    );
+                }
+                context.abort = self
+                    .runtime
+                    .as_ref()
+                    .map(|rt| rt.cancellation_token.as_atomic_bool())
+                    .or_else(|| self.abort_signal.clone());
+                self.begin_transaction_verification(cwd, id, name, args, &context);
+                if context.command_receipt.is_some() {
+                    if let Ok(mut receipts) = self.command_receipts.lock() {
+                        receipts.retain(|receipt| receipt.operation_id != id);
+                    }
+                }
+                let mut executed = match execute_tool_with(cwd, name, args, &context) {
+                    Ok(result) => result,
+                    Err(crate::tools::ToolError::Unknown(_)) => {
+                        if let Some(executor) = &self.custom_tool_executor {
+                            match executor.execute_with_context(cwd, name, args, &context) {
+                                Ok(result) => result,
+                                Err(crate::tools::ToolError::Durability(error)) => {
+                                    self.tool_durability_failure(error)
+                                }
+                                Err(err) => crate::ToolResult {
+                                    content: err.to_string(),
+                                    is_error: true,
+                                    details: None,
+                                },
+                            }
+                        } else {
+                            crate::ToolResult {
+                                content: format!("Unknown tool: {name}"),
+                                is_error: true,
+                                details: None,
+                            }
                         }
                     }
-                }
-                Err(crate::tools::ToolError::Durability(error)) => {
-                    self.tool_durability_failure(error)
-                }
-                Err(err) => crate::ToolResult {
-                    content: err.to_string(),
-                    is_error: true,
-                    details: None,
-                },
-            };
-
-            if let Some(receipt) = context
-                .command_receipt
-                .as_ref()
-                .and_then(|capture| capture.take())
-            {
-                if let Ok(mut receipts) = self.command_receipts.lock() {
-                    receipts.retain(|previous| previous.operation_id != id);
-                    if receipts.len() >= 128 {
-                        receipts.pop_front();
+                    Err(crate::tools::ToolError::Durability(error)) => {
+                        self.tool_durability_failure(error)
                     }
-                    receipts.push_back(receipt);
+                    Err(err) => crate::ToolResult {
+                        content: err.to_string(),
+                        is_error: true,
+                        details: None,
+                    },
+                };
+
+                if let Some(receipt) = context
+                    .command_receipt
+                    .as_ref()
+                    .and_then(|capture| capture.take())
+                {
+                    if let Ok(mut receipts) = self.command_receipts.lock() {
+                        receipts.retain(|previous| previous.operation_id != id);
+                        if receipts.len() >= 128 {
+                            receipts.pop_front();
+                        }
+                        receipts.push_back(receipt);
+                    }
                 }
-            }
-            if coordinated
-                && executed.is_error
-                && context
-                    .mutation_attempted
-                    .load(std::sync::atomic::Ordering::Acquire)
-            {
-                // A failed or conflicted recovery may still have changed a subset of files.
-                self.record_successful_mutation_paths(mutation_paths_from_tool(name, args));
-            }
-            if mutating && !executed.is_error {
-                if let Some(runtime) = &self.runtime {
-                    for pre in preimages {
-                        match runtime.blob_store.capture_file(task_id, cwd, &pre.path) {
-                            Ok(post) => {
-                                let kind = if !pre.exists && post.exists {
-                                    crate::runtime::effects::FileEffectKind::Created
-                                } else if pre.exists && !post.exists {
-                                    crate::runtime::effects::FileEffectKind::Deleted
-                                } else if pre.mode != post.mode {
-                                    crate::runtime::effects::FileEffectKind::ModeChanged
-                                } else {
-                                    crate::runtime::effects::FileEffectKind::Modified
-                                };
-                                let mut effect = crate::runtime::effects::OwnedFileEffect::new(
-                                    id,
-                                    runtime.agent_id,
-                                    1,
-                                    pre.path,
-                                    kind,
-                                    task_id,
-                                );
-                                effect.before_blob = pre.blob_hash;
-                                effect.after_blob = post.blob_hash;
-                                effect.before_mode = pre.mode;
-                                effect.after_mode = post.mode;
-                                if let Some(report_path) =
-                                    std::env::var_os("PI_GRAPH_EFFECT_REPORT")
-                                {
-                                    let before_bytes = effect
-                                        .before_blob
-                                        .as_deref()
-                                        .and_then(|hash| runtime.blob_store.get_blob(hash));
-                                    let after_bytes = effect
-                                        .after_blob
-                                        .as_deref()
-                                        .and_then(|hash| runtime.blob_store.get_blob(hash));
-                                    // Graph rewind consumes this report in the parent
-                                    // process, so its persistence is part of success.
-                                    if let Err(error) =
-                                        crate::runtime::effects::append_effect_report(
-                                            std::path::Path::new(&report_path),
-                                            &effect,
-                                            before_bytes.as_deref(),
-                                            after_bytes.as_deref(),
-                                        )
+                if coordinated
+                    && executed.is_error
+                    && context
+                        .mutation_attempted
+                        .load(std::sync::atomic::Ordering::Acquire)
+                {
+                    // A failed or conflicted recovery may still have changed a subset of files.
+                    self.record_successful_mutation_paths(mutation_paths_from_tool(name, args));
+                }
+                if mutating && !executed.is_error {
+                    if let Some(runtime) = &self.runtime {
+                        for pre in preimages {
+                            match runtime.blob_store.capture_file(task_id, cwd, &pre.path) {
+                                Ok(post) => {
+                                    let kind = if !pre.exists && post.exists {
+                                        crate::runtime::effects::FileEffectKind::Created
+                                    } else if pre.exists && !post.exists {
+                                        crate::runtime::effects::FileEffectKind::Deleted
+                                    } else if pre.mode != post.mode {
+                                        crate::runtime::effects::FileEffectKind::ModeChanged
+                                    } else {
+                                        crate::runtime::effects::FileEffectKind::Modified
+                                    };
+                                    let mut effect = crate::runtime::effects::OwnedFileEffect::new(
+                                        id,
+                                        runtime.agent_id,
+                                        1,
+                                        pre.path,
+                                        kind,
+                                        task_id,
+                                    );
+                                    effect.before_blob = pre.blob_hash;
+                                    effect.after_blob = post.blob_hash;
+                                    effect.before_mode = pre.mode;
+                                    effect.after_mode = post.mode;
+                                    if let Some(report_path) =
+                                        std::env::var_os("PI_GRAPH_EFFECT_REPORT")
                                     {
-                                        executed = self.tool_durability_failure(format!(
-                                            "Effect handoff failed after mutation: {error}"
-                                        ));
+                                        let before_bytes = effect
+                                            .before_blob
+                                            .as_deref()
+                                            .and_then(|hash| runtime.blob_store.get_blob(hash));
+                                        let after_bytes = effect
+                                            .after_blob
+                                            .as_deref()
+                                            .and_then(|hash| runtime.blob_store.get_blob(hash));
+                                        // Graph rewind consumes this report in the parent
+                                        // process, so its persistence is part of success.
+                                        if let Err(error) =
+                                            crate::runtime::effects::append_effect_report(
+                                                std::path::Path::new(&report_path),
+                                                &effect,
+                                                before_bytes.as_deref(),
+                                                after_bytes.as_deref(),
+                                            )
+                                        {
+                                            executed = self.tool_durability_failure(format!(
+                                                "Effect handoff failed after mutation: {error}"
+                                            ));
+                                        }
+                                    }
+                                    if let Ok(mut effects) = runtime.effect_ledger.write() {
+                                        effects.push(effect);
+                                    } else {
+                                        executed = self.tool_durability_failure(
+                                            "Runtime effect ledger unavailable after mutation"
+                                                .into(),
+                                        );
                                     }
                                 }
-                                if let Ok(mut effects) = runtime.effect_ledger.write() {
-                                    effects.push(effect);
-                                } else {
-                                    executed = self.tool_durability_failure(
-                                        "Runtime effect ledger unavailable after mutation".into(),
-                                    );
+                                Err(error) => {
+                                    executed = self.tool_durability_failure(format!(
+                                        "File checkpoint failed after mutation: {error}"
+                                    ));
                                 }
-                            }
-                            Err(error) => {
-                                executed = self.tool_durability_failure(format!(
-                                    "File checkpoint failed after mutation: {error}"
-                                ));
                             }
                         }
                     }
                 }
-            }
 
-            executed
-        };
-        if let Ok(mut ledger) = self.tool_ledger.lock() {
-            if outcome.is_error {
-                ledger.record_failure(id, &outcome.content);
-            } else {
-                ledger.record_completion(id, &outcome.content, false);
+                executed
             }
-            if let Err(error) = ledger.persist() {
-                return crate::ToolResult {
+        };
+        let outcome = if let Some(pending) = pending_operation.as_ref() {
+            let (current_runtime, current_plan) =
+                match self.current_operation_plan(pending, id, name, args) {
+                    Ok(current) => current,
+                    Err(error) => {
+                        return crate::ToolResult {
+                            content: format!("Operation dispatch denied: {error}"),
+                            is_error: true,
+                            details: Some(
+                                serde_json::json!({ "operation_dispatch": true, "denied": true }),
+                            ),
+                        };
+                    }
+                };
+            let current_digest = match current_plan.spec().intent_digest() {
+                Ok(digest) => digest,
+                Err(error) => {
+                    return crate::ToolResult {
+                        content: format!("Operation intent could not be validated: {error}"),
+                        is_error: true,
+                        details: Some(
+                            serde_json::json!({ "operation_dispatch": true, "denied": true }),
+                        ),
+                    };
+                }
+            };
+            let permission_revision = self
+                .permissions
+                .lock()
+                .ok()
+                .and_then(|permissions| permissions.revision());
+            let cancelled = self.abort_requested()
+                || self
+                    .runtime
+                    .as_ref()
+                    .is_some_and(|runtime| runtime.is_cancelled());
+            let dispatch = pending.runtime.dispatcher().dispatch(
+                &pending.admitted,
+                &current_plan,
+                permission_revision,
+                cancelled,
+                || {
+                    let latest_runtime = self
+                        .operation_runtime_for_tool(name)
+                        .ok_or_else(|| "builtin operation runtime disappeared".to_owned())?;
+                    if !pending.runtime.shares_dispatch_authority(&latest_runtime)
+                        || !current_runtime.shares_dispatch_authority(&latest_runtime)
+                    {
+                        return Err(
+                            "operation journal, workspace, or owner changed at dispatch".into()
+                        );
+                    }
+                    latest_runtime.validate_workspace(cwd)?;
+                    if self.abort_requested()
+                        || self
+                            .runtime
+                            .as_ref()
+                            .is_some_and(|runtime| runtime.is_cancelled())
+                    {
+                        return Err("operation was cancelled before dispatch".into());
+                    }
+                    let latest_revision = self
+                        .permissions
+                        .lock()
+                        .ok()
+                        .and_then(|permissions| permissions.revision());
+                    if latest_revision != permission_revision {
+                        return Err("permission policy changed at dispatch".into());
+                    }
+                    self.check_contract_gate(cwd, id, name, args)
+                        .map_err(|error| error.to_string())?;
+                    self.check_contract_dispatch_boundary(cwd, name)
+                        .map_err(|error| error.to_string())?;
+                    if let Some(reason) = self.capability_effect_denial(cwd, name, args) {
+                        return Err(reason);
+                    }
+                    let (_, latest_plan) = self.current_operation_plan(pending, id, name, args)?;
+                    let latest_digest = latest_plan
+                        .spec()
+                        .intent_digest()
+                        .map_err(|error| error.to_string())?;
+                    if latest_digest != current_digest {
+                        return Err("tool payload or task contract changed at dispatch".into());
+                    }
+                    Ok(())
+                },
+                execute,
+            );
+            let dispatch_succeeded = dispatch.is_ok();
+            let mut result = match dispatch {
+                Ok(result) => result,
+                Err(error) => crate::ToolResult {
+                    content: format!(
+                        "Operation dispatch stopped before adapter execution: {error}"
+                    ),
+                    is_error: true,
+                    details: Some(serde_json::json!({
+                        "operation_dispatch": true,
+                        "denied": true
+                    })),
+                },
+            };
+            if dispatch_succeeded {
+                if let Err(error) = pending
+                    .runtime
+                    .dispatcher()
+                    .complete(&pending.admitted, &result)
+                {
+                    let details = result.details.get_or_insert_with(|| serde_json::json!({}));
+                    if !details.is_object() {
+                        *details = serde_json::json!({});
+                    }
+                    details["operation_persistence"] = Value::Bool(true);
+                    details["ledger_persistence"] = Value::Bool(true);
+                    details["operation_result_persistence_error"] =
+                        Value::String(error.to_string());
+                }
+            }
+            result
+        } else {
+            execute()
+        };
+        pending_operation.disarm();
+        if !journal_authoritative {
+            if let Ok(mut ledger) = self.tool_ledger.lock() {
+                if outcome.is_error {
+                    ledger.record_failure(id, &outcome.content);
+                } else {
+                    ledger.record_completion(id, &outcome.content, false);
+                }
+                if let Err(error) = ledger.persist() {
+                    return crate::ToolResult {
                     content: format!("Tool finished, but its result could not be checkpointed: {error}. Its effects may already exist; do not retry automatically."),
                     is_error: true,
                     details: Some(serde_json::json!({ "ledger_persistence": true })),
                 };
-            }
-        } else {
-            return crate::ToolResult {
+                }
+            } else {
+                return crate::ToolResult {
                 content: "Tool finished, but its ledger lock is poisoned. Reconcile its effects before retrying.".into(),
                 is_error: true,
                 details: Some(serde_json::json!({ "ledger_persistence": true })),
             };
+            }
         }
         if crate::tools::is_coordinated_mutation(name) && !outcome.is_error {
             crate::stats::SharedCounters::add(&self.counters.files_changed_count, 1);
@@ -4585,6 +5028,171 @@ mod tests {
         assert_eq!(
             record.side_effect,
             crate::tool_ledger::ToolSideEffect::ReadOnly
+        );
+    }
+}
+
+#[cfg(test)]
+mod operation_dispatch_tests {
+    use super::Preparation;
+    use crate::runtime::operations::{
+        CallerType, ExecutionOwner, ExecutionOwnerId, JournalId, JournalIdentity, OperationContext,
+        OperationJournal, OperationState, RootNamespaceId, ToolOperationRuntime, WorkspaceId,
+        WorkspaceIdentity,
+    };
+    use crate::runtime::{AgentId, RunId, RuntimeBus, RuntimeHandle};
+    use crate::{Agent, ToolExecutionMode};
+    use serde_json::json;
+    use std::sync::Arc;
+
+    fn configured_agent() -> (Agent, tempfile::TempDir, Arc<OperationJournal>) {
+        let workspace = tempfile::tempdir().unwrap();
+        std::fs::write(workspace.path().join("input.txt"), "dispatch fixture").unwrap();
+        let journal_dir = workspace.path().join("journal");
+        let root_namespace_id = RootNamespaceId::new();
+        let identity = JournalIdentity::new(
+            JournalId::new(),
+            WorkspaceIdentity {
+                id: WorkspaceId::new(),
+                binding_version: 1,
+            },
+        )
+        .unwrap();
+        let run_id = RunId::new();
+        let agent_id = AgentId::new();
+        let context = OperationContext {
+            journal_id: identity.journal_id,
+            root_namespace_id,
+            session_id: "operation-dispatch-unit".into(),
+            runtime_run_id: run_id,
+            parent_operation_id: None,
+            agent_id,
+            worker_id: None,
+            task_id: None,
+            graph: None,
+            workspace: identity.workspace.clone(),
+            caller: CallerType::ProviderToolCall,
+            wire_tool_call_id: None,
+        };
+        let journal =
+            Arc::new(OperationJournal::open(&journal_dir, identity, root_namespace_id).unwrap());
+        let operations = ToolOperationRuntime::new(
+            journal.clone(),
+            context,
+            ExecutionOwner::new(ExecutionOwnerId::new(), 1).unwrap(),
+            workspace.path(),
+        )
+        .unwrap();
+        let runtime = RuntimeHandle::new(run_id, agent_id, RuntimeBus::new())
+            .with_operation_runtime(operations);
+        let mut agent = Agent::new("");
+        agent.tools = vec!["read".into(), "batch".into()];
+        agent.tool_execution_mode = ToolExecutionMode::Sequential;
+        agent.cwd = workspace.path().to_path_buf();
+        agent.set_runtime(runtime);
+        (agent, workspace, journal)
+    }
+
+    #[test]
+    fn direct_and_batch_calls_share_journal_admission_and_child_lineage() {
+        let (agent, workspace, journal) = configured_agent();
+        let direct_args = json!({"path": "input.txt"});
+        assert!(matches!(
+            agent.prepare_tool_call(workspace.path(), "direct-1", "read", &direct_args, 0),
+            Preparation::Ready { .. }
+        ));
+        assert!(
+            !agent
+                .run_prepared_call(workspace.path(), "direct-1", "read", &direct_args, 0)
+                .is_error
+        );
+
+        let batch_args = json!({"operations": [{"tool": "read", "args": {"path": "input.txt"}}]});
+        assert!(matches!(
+            agent.prepare_tool_call(workspace.path(), "batch-1", "batch", &batch_args, 0),
+            Preparation::Ready { .. }
+        ));
+        assert!(
+            !agent
+                .run_prepared_call(workspace.path(), "batch-1", "batch", &batch_args, 0)
+                .is_error
+        );
+
+        let snapshot = journal.snapshot().unwrap();
+        assert_eq!(snapshot.operations.len(), 3);
+        let parent = snapshot
+            .operations
+            .iter()
+            .find(|operation| operation.context().wire_tool_call_id.as_deref() == Some("batch-1"))
+            .unwrap();
+        let child_wire_call_id = format!("{}#1", parent.operation_id());
+        let child = snapshot
+            .operations
+            .iter()
+            .find(|operation| {
+                operation.context().wire_tool_call_id.as_deref()
+                    == Some(child_wire_call_id.as_str())
+            })
+            .unwrap();
+        assert_eq!(
+            child.context().parent_operation_id,
+            Some(parent.operation_id())
+        );
+        assert_eq!(
+            child.caller_key().scope,
+            crate::runtime::operations::IdempotencyScope::BatchChild
+        );
+        assert!(agent.tool_ledger.lock().unwrap().records().is_empty());
+    }
+
+    #[test]
+    fn a_scheduler_skipped_operation_is_cancelled_before_effect_start() {
+        let (agent, workspace, journal) = configured_agent();
+        let args = json!({"path": "input.txt"});
+        assert!(matches!(
+            agent.prepare_tool_call(workspace.path(), "scheduler-skip", "read", &args, 0),
+            Preparation::Ready { .. }
+        ));
+        let operation_id = journal.snapshot().unwrap().operations[0].operation_id();
+
+        agent.cancel_pending_tool_operation("scheduler-skip");
+
+        let snapshot = journal.snapshot().unwrap();
+        let attempt = snapshot
+            .attempts
+            .iter()
+            .find(|attempt| attempt.operation_id() == operation_id)
+            .unwrap();
+        assert_eq!(attempt.state(), OperationState::Cancelled);
+        assert_eq!(
+            attempt.effect_status(),
+            crate::runtime::operations::EffectStatus::NotStarted
+        );
+    }
+
+    #[test]
+    fn permission_revision_change_after_admission_stops_before_dispatch() {
+        let (agent, workspace, journal) = configured_agent();
+        let args = json!({"path": "input.txt"});
+        assert!(matches!(
+            agent.prepare_tool_call(workspace.path(), "policy-change", "read", &args, 0),
+            Preparation::Ready { .. }
+        ));
+        let operation_id = journal.snapshot().unwrap().operations[0].operation_id();
+        agent.permissions.lock().unwrap().mode = crate::PermissionMode::Ask;
+
+        let result = agent.run_prepared_call(workspace.path(), "policy-change", "read", &args, 0);
+        assert!(result.is_error);
+        let snapshot = journal.snapshot().unwrap();
+        let attempt = snapshot
+            .attempts
+            .iter()
+            .find(|attempt| attempt.operation_id() == operation_id)
+            .unwrap();
+        assert_eq!(attempt.state(), OperationState::Cancelled);
+        assert_eq!(
+            attempt.effect_status(),
+            crate::runtime::operations::EffectStatus::NotStarted
         );
     }
 }

@@ -142,6 +142,7 @@ pub struct RuntimeHandle {
     pub mailbox: AgentMailbox,
     pub worktree_manager: Option<WorktreeManager>,
     pub workflow_executor: Option<Arc<WorkflowExecutor>>,
+    pub operations: Option<operations::ToolOperationRuntime>,
     pub capability_registry: RuntimeCapabilityRegistry,
     pub project_trusted: bool,
     pub budget_ledger: Option<Arc<ResourceLedger>>,
@@ -192,6 +193,7 @@ impl RuntimeHandle {
             mailbox,
             worktree_manager: None,
             workflow_executor: None,
+            operations: None,
             capability_registry: RuntimeCapabilityRegistry::with_builtins(),
             project_trusted: false,
             budget_ledger: None,
@@ -220,6 +222,11 @@ impl RuntimeHandle {
 
     pub fn with_workflow_executor(mut self, executor: Arc<WorkflowExecutor>) -> Self {
         self.workflow_executor = Some(executor);
+        self
+    }
+
+    pub fn with_operation_runtime(mut self, operations: operations::ToolOperationRuntime) -> Self {
+        self.operations = Some(operations);
         self
     }
 
@@ -254,6 +261,7 @@ impl RuntimeHandle {
         self.registry = previous.registry.clone();
         self.mailbox = previous.mailbox.clone();
         self.task_registry = previous.task_registry.clone();
+        self.operations = previous.operations.clone();
         self.budget_ledger = previous.budget_ledger.clone();
         self.progress_watchdog = previous.progress_watchdog.clone();
         self.worktree_manager = self
@@ -280,6 +288,7 @@ impl RuntimeHandle {
         self.cancellation_token = worker.cancellation_token.clone();
         self.registry = worker.registry.clone();
         self.task_registry = worker.task_registry.clone();
+        self.operations = worker.operations.clone();
         self.mailbox = worker.mailbox.clone();
         self.budget_ledger = worker.budget_ledger.clone();
         self.progress_watchdog = worker.progress_watchdog.clone();
@@ -305,6 +314,9 @@ impl RuntimeHandle {
             Self::new(self.run_id, child, RuntimeBus::new()).with_worker_state_from(self);
         worker.agent_id = child;
         worker.parent_agent_id = Some(self.agent_id);
+        worker.operations = worker
+            .operations
+            .map(|operations| operations.for_worker(child));
         worker.sequence = Arc::new(AtomicU64::new(0));
         worker.ensure_conversation_identity_current();
         worker.cancellation_token =
@@ -484,6 +496,61 @@ impl RuntimeHandle {
 #[cfg(test)]
 mod conversation_identity_tests {
     use super::*;
+
+    fn runtime_with_operations() -> (RuntimeHandle, tempfile::TempDir) {
+        use operations::{
+            ExecutionOwner, ExecutionOwnerId, JournalId, JournalIdentity, OperationContext,
+            OperationJournal, RootNamespaceId, ToolOperationRuntime, WorkspaceId,
+            WorkspaceIdentity,
+        };
+
+        let workspace = tempfile::tempdir().unwrap();
+        let root_namespace_id = RootNamespaceId::new();
+        let identity = JournalIdentity::new(
+            JournalId::new(),
+            WorkspaceIdentity {
+                id: WorkspaceId::new(),
+                binding_version: 1,
+            },
+        )
+        .unwrap();
+        let run_id = RunId::new();
+        let agent_id = AgentId::new();
+        let context = OperationContext {
+            journal_id: identity.journal_id,
+            root_namespace_id: root_namespace_id.clone(),
+            session_id: "runtime-context-test".into(),
+            runtime_run_id: run_id,
+            parent_operation_id: None,
+            agent_id,
+            worker_id: None,
+            task_id: None,
+            graph: None,
+            workspace: identity.workspace.clone(),
+            caller: operations::CallerType::ProviderToolCall,
+            wire_tool_call_id: None,
+        };
+        let journal = Arc::new(
+            OperationJournal::open(
+                &workspace.path().join("journal"),
+                identity,
+                root_namespace_id,
+            )
+            .unwrap(),
+        );
+        let operations = ToolOperationRuntime::new(
+            journal,
+            context,
+            ExecutionOwner::new(ExecutionOwnerId::new(), 1).unwrap(),
+            workspace.path(),
+        )
+        .unwrap();
+        let mut runtime = RuntimeHandle::new(run_id, agent_id, RuntimeBus::new())
+            .with_operation_runtime(operations);
+        runtime.session_id = Some("runtime-context-test".into());
+        (runtime, workspace)
+    }
+
     #[test]
     fn worker_refresh_preserves_conversation_and_sequence() {
         let worker = RuntimeHandle::new(RunId::new(), AgentId::new(), RuntimeBus::new());
@@ -528,5 +595,65 @@ mod conversation_identity_tests {
         let retained = worker.conversation.clone();
         worker.ensure_conversation_identity_current();
         assert!(Arc::ptr_eq(&worker.conversation, &retained));
+    }
+
+    #[test]
+    fn operation_context_survives_continuation_and_is_scoped_to_child_workers() {
+        let (parent, workspace) = runtime_with_operations();
+        let continued = RuntimeHandle::new(RunId::new(), AgentId::new(), RuntimeBus::new())
+            .with_session_state_from(&parent);
+        let continued_context = continued.operations.as_ref().unwrap().context_for(
+            continued.run_id,
+            continued.agent_id,
+            continued.session_id.as_deref(),
+        );
+        assert_eq!(continued_context.runtime_run_id, parent.run_id);
+        assert_eq!(continued_context.agent_id, parent.agent_id);
+        assert_eq!(continued_context.session_id, "runtime-context-test");
+
+        let child_id = AgentId::new();
+        parent
+            .registry
+            .register_agent(AgentRecord {
+                id: child_id,
+                run_id: parent.run_id,
+                parent: Some(parent.agent_id),
+                kind: AgentKind::Subagent,
+                name: "operation-context-child".into(),
+                provider: String::new(),
+                model_id: String::new(),
+                cwd: workspace.path().to_path_buf(),
+                state: AgentState::Starting,
+                task_id: None,
+                worktree: None,
+                started_ms: 1,
+                updated_ms: 1,
+                failure_reason: None,
+            })
+            .unwrap();
+        parent
+            .registry
+            .transition(child_id, AgentState::Running)
+            .unwrap();
+        let child = parent.for_worker(child_id, None).unwrap();
+        let child_context = child.operations.as_ref().unwrap().context_for(
+            child.run_id,
+            child.agent_id,
+            child.session_id.as_deref(),
+        );
+        assert_eq!(child_context.agent_id, child_id);
+        let child_worker_id = child_id.to_string();
+        assert_eq!(
+            child_context.worker_id.as_deref(),
+            Some(child_worker_id.as_str())
+        );
+
+        let parent_context = parent.operations.as_ref().unwrap().context_for(
+            parent.run_id,
+            parent.agent_id,
+            parent.session_id.as_deref(),
+        );
+        assert_eq!(parent_context.agent_id, parent.agent_id);
+        assert!(parent_context.worker_id.is_none());
     }
 }

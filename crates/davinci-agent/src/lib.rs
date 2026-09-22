@@ -304,6 +304,34 @@ pub enum CompletionEvidence {
     NotRequired,
 }
 
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum ToolOperationOrigin {
+    ProviderCall,
+    BatchChild {
+        parent: crate::runtime::operations::OperationId,
+        child_index: usize,
+    },
+}
+
+#[derive(Clone)]
+pub(crate) struct PendingToolOperation {
+    pub(crate) runtime: crate::runtime::operations::ToolOperationRuntime,
+    pub(crate) plan: crate::runtime::operations::PlannedToolOperation,
+    pub(crate) admitted: crate::runtime::operations::AdmittedOperation,
+    pub(crate) origin: ToolOperationOrigin,
+}
+
+impl std::fmt::Debug for PendingToolOperation {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("PendingToolOperation")
+            .field("plan", &self.plan)
+            .field("admitted", &self.admitted)
+            .field("origin", &self.origin)
+            .finish()
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Agent {
     pub system_prompt: String,
@@ -375,6 +403,8 @@ pub struct Agent {
     /// `None` means overflow is truncated with a note and nothing else.
     pub evidence: Option<EvidenceStore>,
     pub tool_ledger: Arc<std::sync::Mutex<ToolCallLedger>>,
+    pub(crate) pending_tool_operations:
+        Arc<Mutex<std::collections::HashMap<String, PendingToolOperation>>>,
     /// Tool-call ids whose results are pruned from the provider view. Only
     /// grows; the session file keeps every body.
     pruned_tool_results: std::collections::HashSet<String>,
@@ -499,6 +529,7 @@ impl Agent {
             prune_settings: PruneSettings::default(),
             evidence: None,
             tool_ledger: Arc::new(std::sync::Mutex::new(ToolCallLedger::default())),
+            pending_tool_operations: Arc::new(Mutex::new(std::collections::HashMap::new())),
             pruned_tool_results: std::collections::HashSet::new(),
             pruned_evidence: std::collections::HashMap::new(),
             base_system_prompt: system_prompt,

@@ -209,7 +209,26 @@ impl Default for ToolCallLedger {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ToolCallExecutionAuthority {
+    CompatibilityLedger,
+    OperationJournal,
+}
+
 impl ToolCallLedger {
+    pub(crate) fn execution_authority(
+        &self,
+        call_id: &str,
+        builtin_capability: bool,
+        journal_configured: bool,
+    ) -> ToolCallExecutionAuthority {
+        if builtin_capability && journal_configured && !self.records.contains_key(call_id) {
+            ToolCallExecutionAuthority::OperationJournal
+        } else {
+            ToolCallExecutionAuthority::CompatibilityLedger
+        }
+    }
+
     pub fn new(session_id: impl Into<String>, lineage_id: impl Into<String>) -> Self {
         Self {
             session_id: session_id.into(),

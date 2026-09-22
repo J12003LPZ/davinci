@@ -8,7 +8,7 @@
 
 **Tech Stack:** Existing Rust 2021 workspace; declared Rust floor 1.83; Serde, UUID, SHA-256, synchronous runtime threads, existing JSONL/domain stores. Proposed journal: the workspace-pinned `rusqlite` dependency with bundled SQLite, behind a bounded writer/coordinator API. No hosted database or required external service.
 
-**Status:** Implementation in progress. Task 00 source audit and evidence documents are complete; no application behavior has changed yet. Tasks 01-23 remain unchecked. The implementation branch is `leonardojeziellopez/unified-execution-recovery-01a0ca95`.
+**Status:** Implementation in progress. Tasks 00-05 are complete and their evidence is recorded below; Tasks 06-23 remain unchecked. The implementation branch is `leonardojeziellopez/unified-execution-recovery-01a0ca95`.
 
 **Repository:** `J12003LPZ/davinci`
 
@@ -545,12 +545,12 @@ then the counter stays at one and only publication is retried.
 
 **Create:** `runtime/operations/planner.rs`, `runtime/operations/adapters/tools.rs`; `crates/davinci-agent/tests/operation_dispatch.rs`.
 
-- [ ] Write red tests proving direct and batch calls use the same admission path, stable child keys survive replay, a planning-only call causes no process/file/network effects, and unknown/custom tools default conservatively.
-- [ ] Extract pure translation without bypassing the existing `prepare_tool_call`, permission, contract, capability, pre-hook, and lane semantics. Keep source-order mutation barriers and parallel read lanes intact.
-- [ ] Introduce a compatibility facade for `ToolCallLedger`. For migrated families it delegates execution truth to the journal; for legacy/shadow families its current semantics remain authoritative.
-- [ ] Pass trusted operation context through `RuntimeHandle` and the tool dispatch context. Preserve context across session continuation and correctly scope it for child agents.
-- [ ] Recheck the approved payload, workspace, permission revision, task contract, cancellation, and owner at the actual resource boundary. A cached grant or restored permit cannot silently authorize changed work.
-- [ ] Test that intent/attempt persistence failure invokes no adapter and that a post-admission denial records a truthful non-executed outcome. Keep active public tool names and provider schemas unchanged.
+- [x] Write red tests proving direct and batch calls use the same admission path, stable child keys survive replay, a planning-only call causes no process/file/network effects, and unknown/custom tools default conservatively.
+- [x] Extract pure translation without bypassing the existing `prepare_tool_call`, permission, contract, capability, pre-hook, and lane semantics. Keep source-order mutation barriers and parallel read lanes intact.
+- [x] Introduce a compatibility facade for `ToolCallLedger`. For migrated families it delegates execution truth to the journal; for legacy/shadow families its current semantics remain authoritative.
+- [x] Pass trusted operation context through `RuntimeHandle` and the tool dispatch context. Preserve context across session continuation and correctly scope it for child agents.
+- [x] Recheck the approved payload, workspace, permission revision, task contract, cancellation, and owner at the actual resource boundary. A cached grant or restored permit cannot silently authorize changed work.
+- [x] Test that intent/attempt persistence failure invokes no adapter and that a post-admission denial records a truthful non-executed outcome. Keep active public tool names and provider schemas unchanged.
 
 **Verify:** `cargo test -p davinci-agent --test operation_dispatch`, plus existing ledger, scheduler, permission, batch, and contract tests selected in Task 00.
 

@@ -39,6 +39,13 @@ pub struct OperationJournal {
 }
 
 impl OperationJournal {
+    pub fn identity(&self) -> &JournalIdentity {
+        &self.identity
+    }
+
+    pub fn root_namespace_id(&self) -> RootNamespaceId {
+        self.root_namespace_id.clone()
+    }
     pub fn open(
         directory_path: &Path,
         identity: JournalIdentity,

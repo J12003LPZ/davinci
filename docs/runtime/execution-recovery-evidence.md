@@ -63,6 +63,34 @@ lower-level API does not make a live user permission decision; the current
 caller facade will enforce that when Task 05 routes tool admission through it.
 All checks were local; CI and non-Windows behavior were not run.
 
+## Task 05 - direct and batch admission through the operation facade
+
+Checks ran on Windows in the isolated implementation worktree. The direct and
+batch paths now share journal admission for built-in capabilities, while
+existing ledger rows and non-built-in tool families retain the compatibility
+ledger route. A focused runtime test also verifies operation context survives
+session continuation and is scoped to a child worker.
+
+| Check | Result |
+|---|---|
+| `rtk cargo test -p davinci-agent --test operation_dispatch --offline --locked` | Passed: 5 tests. Covers replay-stable child keys, planning without adapter effects, conservative unknown/custom-tool defaults, intent-persistence failure, and a non-executed post-admission denial. |
+| `rtk cargo test -p davinci-agent operation_dispatch_tests --lib --offline --locked` | Passed: 2 tests. Covers direct and batch journal admission/lineage, scheduler-skipped cancellation before effects, and permission-revision denial after admission. |
+| `rtk cargo test -p davinci-agent --lib operation_context_survives_continuation_and_is_scoped_to_child_workers --offline --locked` | Passed: 1 test. |
+| `rtk cargo test -p davinci-agent tool_ledger::tests --lib --offline --locked` | Passed: 14 tests. |
+| `rtk cargo test -p davinci-agent scheduler::tests --lib --offline --locked` | Passed: 6 tests. |
+| `rtk cargo test -p davinci-agent permission_state::tests --lib --offline --locked` | Passed: 2 tests. |
+| `rtk cargo test -p davinci-agent approval::tests --lib --offline --locked` | Passed: 10 tests. |
+| `rtk cargo test -p davinci-agent batch::tests --lib --offline --locked` | Passed: 4 tests. |
+| `rtk cargo test -p davinci-agent f05_ --lib --offline --locked` | Passed: 44 tests. |
+| `rtk cargo test -p davinci-agent --lib f01_cancelled_mixed_plan_batch_finishes_every_call --offline --locked` | Passed: 1 test. |
+| `rtk cargo test -p davinci-agent --lib f03_batch_observes_runtime_and_ui_cancellation --offline --locked` | Passed: 1 test. |
+| `rtk cargo test -p davinci-agent --lib a_batch_runs_its_operations_behind_one_result --offline --locked` | Passed: 1 test. |
+| `rtk cargo fmt -p davinci-agent -- --check` | Passed, exit 0. |
+| `git diff --check` | Passed, exit 0. |
+
+No full crate/workspace suite, CI run, or non-Windows validation was performed.
+RTK reported no automatic hook installed, so no token-savings claim is made.
+
 ## Ignored and platform-specific cases
 
 The four ignored tests reported by the workspace run were:

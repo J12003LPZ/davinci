@@ -139,7 +139,18 @@ fn args_summary(args: &Value) -> String {
 impl Agent {
     /// Run one `batch` call. `id` is the batch's own tool-call id; each
     /// operation reports to the post hook as `id#n`.
+    #[cfg(test)]
     pub(crate) fn run_batch(&self, cwd: &Path, id: &str, input: &Value) -> ToolResult {
+        self.run_batch_with_parent_operation(cwd, id, input, None)
+    }
+
+    pub(crate) fn run_batch_with_parent_operation(
+        &self,
+        cwd: &Path,
+        id: &str,
+        input: &Value,
+        parent_operation_id: Option<crate::runtime::operations::OperationId>,
+    ) -> ToolResult {
         let operations = match parse_operations(input) {
             Ok(operations) => operations,
             Err(message) => {
@@ -160,8 +171,20 @@ impl Agent {
                 break;
             }
             let op_id = format!("{id}#{}", index + 1);
-            let preparation =
-                self.prepare_tool_call(cwd, &op_id, &operation.tool, &operation.args, 1);
+            let preparation = match parent_operation_id {
+                Some(parent) => self.prepare_tool_call_with_origin(
+                    cwd,
+                    &op_id,
+                    &operation.tool,
+                    &operation.args,
+                    1,
+                    crate::ToolOperationOrigin::BatchChild {
+                        parent,
+                        child_index: index + 1,
+                    },
+                ),
+                None => self.prepare_tool_call(cwd, &op_id, &operation.tool, &operation.args, 1),
+            };
             owned_reservations.push(matches!(
                 &preparation,
                 crate::turn::Preparation::Ready { .. }
@@ -243,10 +266,12 @@ impl Agent {
         );
         for (index, owned) in owned_reservations.iter().enumerate().skip(results.len()) {
             if *owned {
+                let call_id = format!("{id}#{}", index + 1);
+                self.cancel_pending_tool_operation(&call_id);
                 self.tool_ledger
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())
-                    .cancel_reservation(&format!("{id}#{}", index + 1));
+                    .cancel_reservation(&call_id);
             }
         }
         crate::stats::SharedCounters::add(&self.counters.batch_operations, results.len() as u64);
