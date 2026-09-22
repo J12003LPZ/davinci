@@ -21,6 +21,25 @@ RTK retained the raw Clippy and workspace-test output in
 `%LOCALAPPDATA%/rtk/tee/1790105971_cargo_test.log` on the audit host. RTK
 reported that no automatic hook was installed; no token-savings claim is made.
 
+## Task 02 — durable operation journal
+
+Checks ran on Windows in the isolated task worktree, based on model commit
+`01ed05cc`; the journal changes and this evidence entry are included in the
+Task 02 commit `feat(runtime): add durable operation journal and schema guards`.
+
+| Check | Result |
+|---|---|
+| `cargo test -p davinci-agent --test operation_journal --offline --locked` | Passed: 12 tests, exit 0. Includes child-process reopen, atomic result/event/outbox writes, injected SQLite write failure and poison recovery, corruption refusal/poisoning, bounds, schema/workspace/root guards, and backup checks. |
+| `cargo test -p davinci-agent --test operation_journal --test operation_model --offline --locked` | Passed: 21 tests across both integration targets, exit 0. |
+| `cargo test -p davinci-agent operations::transitions::tests --lib --offline --locked` | Passed: 1 test, 993 filtered out, exit 0. |
+| Targeted `rustfmt --check` on changed Rust files | Passed, exit 0. |
+| `git diff --check` | Passed, exit 0. |
+
+The failed-write regression uses a SQLite trigger; physical disk-full and
+power-loss behavior were not injected. The backup test checks that the closed
+export has no WAL sidecar before opening it as a journal. All checks were local;
+CI and non-Windows platform behavior were not run.
+
 ## Ignored and platform-specific cases
 
 The four ignored tests reported by the workspace run were:

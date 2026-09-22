@@ -466,12 +466,14 @@ cargo test --workspace
 
 **Create:** `runtime/operations/{store,migrations}.rs`; `crates/davinci-agent/tests/operation_journal.rs`.
 
-- [ ] Write red tests for atomic intent creation; result/event/outbox atomicity; reopen durability; schema mismatch; root/workspace mismatch; disk/write failures; bounded record/queue behavior; and a second coordinator trying to own the same root.
-- [ ] Add the workspace `rusqlite` dependency and implement schema version 1 with uniqueness constraints, foreign keys, revision checks, and a private-directory opening policy. Validate current workspace identity before opening an existing journal.
-- [ ] Implement short database transactions behind a bounded coordinator writer. A dispatch barrier waits for durable acknowledgement. Reuse existing platform directory/lease patterns after reviewing them; do not weaken symlink, Windows ACL, or owner checks to accommodate SQLite files.
-- [ ] Implement append-only event history and immutable results; reject oversized payloads in favor of bounded artifact references. Store corruption or failed durable writes poison further affected admission until reopened and reconciled.
-- [ ] Add consistent read snapshots and safe backup/export primitives. Do not copy a live WAL database as an isolated main file and call it a complete backup.
-- [ ] Reopen from another process in tests; verify either the complete committed transaction exists or it does not. Add an explicit integrity-failure path rather than a “skip bad record” fallback.
+- [x] Write red tests for atomic intent creation; result/event/outbox atomicity; reopen durability; schema mismatch; root/workspace mismatch; injected write failures; bounded record/queue behavior; and a second coordinator trying to own the same root.
+- [x] Add the workspace `rusqlite` dependency and implement schema version 1 with uniqueness constraints, foreign keys, revision checks, and a private-directory opening policy. Validate current workspace identity before opening an existing journal.
+- [x] Implement short database transactions behind a bounded coordinator writer. A dispatch barrier waits for durable acknowledgement. Reuse existing platform directory/lease patterns after reviewing them; do not weaken symlink, Windows ACL, or owner checks to accommodate SQLite files.
+- [x] Implement append-only event history and immutable results; reject oversized payloads in favor of bounded artifact references. Store corruption or failed durable writes poison further affected admission until reopened and reconciled.
+- [x] Add consistent read snapshots and safe backup/export primitives. Do not copy a live WAL database as an isolated main file and call it a complete backup.
+- [x] Reopen from another process in tests; verify either the complete committed transaction exists or it does not. Add an explicit integrity-failure path rather than a “skip bad record” fallback.
+
+**Evidence:** The initial red run failed because the journal API did not exist. A later integrity-poison regression test also failed before the fix. After implementation, `cargo test -p davinci-agent --test operation_journal --offline --locked` passed 12 tests, the journal and operation-model integration targets passed 21 combined tests, and `cargo test -p davinci-agent operations::transitions::tests --lib --offline --locked` passed 1 test. The changed Rust files passed targeted rustfmt checking and `git diff --check`. The write-failure path is injected through a SQLite trigger; physical disk-full and power-loss behavior were not exercised. Backup was checked for a standalone database before reopening it.
 
 **Verify:** `cargo test -p davinci-agent --test operation_journal`.
 

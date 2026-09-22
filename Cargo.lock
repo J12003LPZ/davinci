@@ -450,6 +450,7 @@ dependencies = [
  "image",
  "libc",
  "regex",
+ "rusqlite",
  "serde",
  "serde_json",
  "sha2",

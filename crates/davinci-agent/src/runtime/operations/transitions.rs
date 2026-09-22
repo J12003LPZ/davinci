@@ -5,10 +5,12 @@ use super::model::{
     PublicationState, ResultRef, Timestamp, VerificationState,
 };
 use crate::runtime::EvidenceId;
+use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use thiserror::Error;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "event", content = "data", rename_all = "snake_case")]
 pub enum OperationEvent {
     Persist,
     Authorize(AuthorizationReceipt),
