@@ -84,6 +84,11 @@ pub use openai_cache_diagnostics::{
     AppliedPromptCachePolicy, ProviderCacheUsageBreakdown, ProviderPromptCacheDiagnostics,
     OPENAI_CACHE_DIAGNOSTICS_EVERY_N_ENV,
 };
+pub use openai_cache_policy::{
+    BoundaryStrategy, CacheCapabilitySource, CacheControlFamily, CacheIntent,
+    CachePartitionSemantics, EffectiveCacheMode, EffectiveOpenAiCachePolicy,
+    OpenAiCacheCapabilities, PromptCacheWirePlan, OPENAI_CACHE_CONTRACT_REVISION,
+};
 pub use responses_request::{
     PreparedProviderRequest, WireManifest, WireSegmentCategory, WireSegmentManifest,
     WireTrustClass, WIRE_MANIFEST_VERSION,
