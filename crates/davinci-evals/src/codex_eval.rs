@@ -39,18 +39,26 @@ pub struct CodexBenchmarkRunMetrics {
     pub tool_calls: u32,
     pub uncached_input_tokens: u64,
     pub cached_input_tokens: u64,
+    #[serde(default)]
+    pub cache_write_tokens: u64,
     pub output_tokens: u64,
     pub reasoning_tokens: u64,
     pub duplicate_side_effects: u32,
 }
 
 impl CodexBenchmarkRunMetrics {
+    pub fn raw_input_tokens(&self) -> u128 {
+        self.uncached_input_tokens as u128
+            + self.cached_input_tokens as u128
+            + self.cache_write_tokens as u128
+    }
+
     pub fn cached_ratio(&self) -> f64 {
-        let total = self.uncached_input_tokens as f64 + self.cached_input_tokens as f64;
-        if total == 0.0 {
+        let total = self.raw_input_tokens();
+        if total == 0 {
             0.0
         } else {
-            self.cached_input_tokens as f64 / total
+            self.cached_input_tokens as f64 / total as f64
         }
     }
 }
@@ -612,9 +620,11 @@ mod tests {
         let run = CodexBenchmarkRunMetrics {
             uncached_input_tokens: u64::MAX,
             cached_input_tokens: u64::MAX,
+            cache_write_tokens: u64::MAX,
             ..Default::default()
         };
-        assert_eq!(run.cached_ratio(), 0.5);
+        assert_eq!(run.raw_input_tokens(), u64::MAX as u128 * 3);
+        assert!((run.cached_ratio() - (1.0 / 3.0)).abs() < 1e-12);
     }
 
     #[test]

@@ -1,0 +1,38 @@
+{
+  "schemaVersion": 1,
+  "revision": "63f3d2a6d1cb848b768d26935377eb152485235f",
+  "provider": "openai",
+  "model": "gpt-5.6-sol",
+  "endpointFamily": "openai-responses",
+  "policyContractRevision": "openai-cache-2026-09-21-v1",
+  "feature": "explicit_stable_boundary",
+  "baselineProfile": "legacy-provider-default",
+  "treatmentProfile": "explicit-stable-boundary",
+  "repetitions": 2,
+  "cases": [
+    {
+      "id": "append-only",
+      "class": "append_only",
+      "fixture": "public_responses_gpt56.json",
+      "expectedOutcome": "verified_success"
+    },
+    {
+      "id": "stable-prefix-change",
+      "class": "prefix_invalidation",
+      "fixture": "public_responses_gpt56.json",
+      "expectedOutcome": "verified_success"
+    },
+    {
+      "id": "unknown-proxy",
+      "class": "unsupported_backend",
+      "fixture": "unsupported_proxy.json",
+      "expectedOutcome": "verified_success"
+    },
+    {
+      "id": "failed-task-control",
+      "class": "negative_control",
+      "fixture": "failed_task.json",
+      "expectedOutcome": "verified_failure"
+    }
+  ]
+}

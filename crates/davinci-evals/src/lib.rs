@@ -3,6 +3,7 @@
 pub mod artifacts;
 pub mod behavior;
 pub mod codex_eval;
+pub mod openai_cache_eval;
 pub mod competitor;
 pub mod decision_intelligence;
 pub mod engineering;

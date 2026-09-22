@@ -1,0 +1,15 @@
+{
+  "name": "failed-task-control",
+  "source": "offline_fixture",
+  "description": "Sanitized negative control. The verifier fails independently of assistant text.",
+  "baseline": {
+    "outcome": "verified_failure",
+    "verificationExitCode": 1,
+    "changedFiles": []
+  },
+  "treatment": {
+    "outcome": "verified_failure",
+    "verificationExitCode": 1,
+    "changedFiles": []
+  }
+}
