@@ -1,6 +1,6 @@
 {
   "schemaVersion": 1,
-  "revision": "63f3d2a6d1cb848b768d26935377eb152485235f",
+  "revision": "698b0d26eb6ec9845693867adbfde9700a0eaf39",
   "provider": "openai",
   "model": "gpt-5.6-sol",
   "endpointFamily": "openai-responses",
