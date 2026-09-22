@@ -920,8 +920,14 @@ pub fn openai_responses_input(messages: &[ChatMessage]) -> Vec<Value> {
         if text.is_empty() {
             continue;
         }
+        let role = match message.role.as_str() {
+            "developer" => "developer",
+            "system" => "system",
+            _ => "user",
+        };
         input.push(serde_json::json!({
-            "role": "user",
+            "type": "message",
+            "role": role,
             "content": [{"type": "input_text", "text": text}],
         }));
     }
@@ -936,24 +942,58 @@ fn openai_responses_body(
     options: &StreamOptions,
 ) -> Value {
     let codex = model.api == "openai-codex-responses";
-    let input = openai_responses_input(messages);
-    let instructions = system
-        .filter(|value| !value.is_empty())
-        .unwrap_or("You are a helpful assistant.");
+    let retention = crate::cache::cache_retention_from_options(options);
+    let cache_capabilities = if model.api == "openai-responses" {
+        crate::openai_cache_policy::OpenAiCacheCapabilities::resolve(
+            model,
+            model.base_url.as_deref(),
+            false,
+        )
+    } else {
+        crate::openai_cache_policy::OpenAiCacheCapabilities::unknown()
+    };
+    let explicit_public_contract = matches!(
+        cache_capabilities.cache_control_family,
+        crate::openai_cache_policy::CacheControlFamily::ExplicitBoundaries
+    );
+    let trusted_system = system.filter(|value| !value.is_empty());
+    let use_explicit_bootstrap =
+        explicit_public_contract && retention != crate::cache::CacheRetention::None
+            && trusted_system.is_some();
+
+    let mut input = openai_responses_input(messages);
+    if use_explicit_bootstrap {
+        let text = trusted_system.expect("checked above");
+        input.insert(
+            0,
+            serde_json::json!({
+                "type": "message",
+                "role": "developer",
+                "content": [{
+                    "type": "input_text",
+                    "text": text,
+                    "prompt_cache_breakpoint": {"mode": "explicit"}
+                }],
+            }),
+        );
+    }
+
+    let instructions = trusted_system.unwrap_or("You are a helpful assistant.");
     let mut body = serde_json::json!({
         "model": model.id,
         "store": false,
         "stream": false,
-        "instructions": instructions,
         "input": input,
     });
+    if !use_explicit_bootstrap {
+        body["instructions"] = Value::String(instructions.to_string());
+    }
     if codex {
         body["text"] = serde_json::json!({"verbosity": "low"});
         body["include"] = serde_json::json!(["reasoning.encrypted_content"]);
         body["tool_choice"] = Value::String("auto".into());
         body["parallel_tool_calls"] = Value::Bool(true);
     }
-    let retention = crate::cache::cache_retention_from_options(options);
     let session_key = crate::cache::effective_prompt_cache_key(options)
         .filter(|id| !id.is_empty())
         .map(crate::cache::clamp_openai_prompt_cache_key);
@@ -972,25 +1012,39 @@ fn openai_responses_body(
                 }
             }
         }
-        // openai-responses.ts:288-296.
+        // Public Responses cache dialect is capability-scoped. GPT-5.6+
+        // explicit-boundary fields are never inferred for Azure/custom proxies.
         _ => {
             if retention != crate::cache::CacheRetention::None {
                 if let Some(key) = session_key {
                     body["prompt_cache_key"] = Value::String(key);
                 }
             }
-            if retention == crate::cache::CacheRetention::Long
+
+            // Legacy retention remains available only on the older implicit
+            // contract. It is not equivalent to the GPT-5.6 minimum TTL.
+            if !explicit_public_contract
+                && retention == crate::cache::CacheRetention::Long
                 && crate::cache::supports_long_cache_retention(&model.compat)
             {
                 body["prompt_cache_retention"] = Value::String("24h".into());
             }
-            let explicit_mode = model
-                .compat
-                .get("supportsExplicitPromptCacheMode")
-                .and_then(Value::as_bool)
-                .unwrap_or(false);
-            if retention == crate::cache::CacheRetention::None && explicit_mode {
-                body["prompt_cache_options"] = serde_json::json!({"mode": "explicit"});
+
+            if explicit_public_contract {
+                match retention {
+                    crate::cache::CacheRetention::None => {
+                        body["prompt_cache_options"] =
+                            serde_json::json!({"mode": "explicit", "ttl": "30m"});
+                    }
+                    crate::cache::CacheRetention::Short
+                    | crate::cache::CacheRetention::Long
+                        if use_explicit_bootstrap =>
+                    {
+                        body["prompt_cache_options"] =
+                            serde_json::json!({"mode": "implicit", "ttl": "30m"});
+                    }
+                    _ => {}
+                }
             }
         }
     }
@@ -3161,5 +3215,149 @@ mod tests {
         assert!(body.get("top_p").is_none());
         assert!(body.get("top_logprobs").is_none());
         assert_ne!(body["reasoning"]["effort"], "none");
+    }
+}
+
+
+#[cfg(test)]
+mod openai_cache_wire_tests {
+    use super::*;
+    use crate::catalog::ModelCost;
+    use serde_json::json;
+
+    fn public_model(explicit: bool, base_url: &str) -> Model {
+        Model {
+            id: if explicit { "gpt-5.6-sol" } else { "gpt-5" }.into(),
+            name: "cache-test".into(),
+            api: "openai-responses".into(),
+            provider: "openai".into(),
+            base_url: Some(base_url.into()),
+            reasoning: true,
+            input: vec!["text".into()],
+            cost: ModelCost {
+                input: 1.0,
+                output: 1.0,
+                cache_read: 0.1,
+                cache_write: 0.2,
+            },
+            context_window: 272_000,
+            max_tokens: 128_000,
+            compat: if explicit {
+                json!({"supportsExplicitPromptCacheMode": true})
+            } else {
+                json!({})
+            },
+            headers: Default::default(),
+            thinking_level_map: Default::default(),
+        }
+    }
+
+    #[test]
+    fn responses_input_preserves_developer_and_system_authority() {
+        let input = openai_responses_input(&[
+            ChatMessage::text("developer", "developer rules"),
+            ChatMessage::text("system", "system rules"),
+            ChatMessage::text("user", "question"),
+        ]);
+        assert_eq!(input[0]["role"], "developer");
+        assert_eq!(input[1]["role"], "system");
+        assert_eq!(input[2]["role"], "user");
+    }
+
+    #[test]
+    fn verified_gpt56_moves_stable_system_to_developer_breakpoint() {
+        let model = public_model(true, "https://api.openai.com/v1");
+        let body = openai_responses_body(
+            &model,
+            &[ChatMessage::text("user", "variable tail")],
+            Some("stable trusted bootstrap"),
+            &[],
+            &StreamOptions {
+                cache_key: Some("partition".into()),
+                cache_retention: Some("short".into()),
+                ..StreamOptions::default()
+            },
+        );
+
+        assert!(body.get("instructions").is_none());
+        assert_eq!(body["input"][0]["role"], "developer");
+        assert_eq!(
+            body["input"][0]["content"][0]["prompt_cache_breakpoint"]["mode"],
+            "explicit"
+        );
+        assert_eq!(body["prompt_cache_options"]["mode"], "implicit");
+        assert_eq!(body["prompt_cache_options"]["ttl"], "30m");
+        assert_eq!(body["prompt_cache_key"], "partition");
+    }
+
+    #[test]
+    fn verified_gpt56_none_uses_explicit_mode_without_marker() {
+        let model = public_model(true, "https://api.openai.com/v1");
+        let body = openai_responses_body(
+            &model,
+            &[ChatMessage::text("user", "tail")],
+            Some("trusted bootstrap"),
+            &[],
+            &StreamOptions {
+                cache_key: Some("must-not-be-sent".into()),
+                cache_retention: Some("none".into()),
+                ..StreamOptions::default()
+            },
+        );
+
+        assert_eq!(body["instructions"], "trusted bootstrap");
+        assert!(body.get("prompt_cache_key").is_none());
+        assert_eq!(body["prompt_cache_options"]["mode"], "explicit");
+        assert_eq!(body["prompt_cache_options"]["ttl"], "30m");
+        assert!(body["input"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|item| item.pointer("/content/0/prompt_cache_breakpoint").is_none()));
+    }
+
+    #[test]
+    fn deceptive_proxy_never_receives_gpt56_cache_dialect() {
+        let model = public_model(true, "https://api.openai.com.evil.test/v1");
+        let body = openai_responses_body(
+            &model,
+            &[ChatMessage::text("user", "tail")],
+            Some("trusted bootstrap"),
+            &[],
+            &StreamOptions {
+                cache_key: Some("legacy-key".into()),
+                cache_retention: Some("none".into()),
+                ..StreamOptions::default()
+            },
+        );
+
+        assert_eq!(body["instructions"], "trusted bootstrap");
+        assert!(body.get("prompt_cache_options").is_none());
+        assert!(body["input"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|item| item.pointer("/content/0/prompt_cache_breakpoint").is_none()));
+    }
+
+    #[test]
+    fn older_public_responses_keeps_legacy_retention_fields() {
+        let model = public_model(false, "https://api.openai.com/v1");
+        let body = openai_responses_body(
+            &model,
+            &[ChatMessage::text("user", "tail")],
+            Some("trusted bootstrap"),
+            &[],
+            &StreamOptions {
+                cache_key: Some("legacy-key".into()),
+                cache_retention: Some("long".into()),
+                ..StreamOptions::default()
+            },
+        );
+
+        assert_eq!(body["instructions"], "trusted bootstrap");
+        assert_eq!(body["prompt_cache_key"], "legacy-key");
+        assert_eq!(body["prompt_cache_retention"], "24h");
+        assert!(body.get("prompt_cache_options").is_none());
     }
 }

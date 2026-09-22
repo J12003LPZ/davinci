@@ -36,7 +36,7 @@ pub enum CacheCapabilitySource {
     Unknown,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct OpenAiCacheCapabilities {
     pub cache_control_family: CacheControlFamily,
@@ -159,7 +159,7 @@ pub enum BoundaryStrategy {
     AppendOnlyHistory,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct EffectiveOpenAiCachePolicy {
     pub requested_intent: CacheIntent,
