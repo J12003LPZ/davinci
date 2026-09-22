@@ -25,6 +25,7 @@ pub mod evidence;
 pub mod evidence_store;
 pub mod ids;
 pub mod mailbox;
+pub mod operations;
 pub mod progress_watchdog;
 pub mod registry;
 pub mod rewind;
@@ -96,6 +97,7 @@ pub use evidence::{
 };
 pub use ids::{AgentId, EvidenceId, RunId, TaskId, WorkflowId};
 pub use mailbox::{steering_state, AgentMailbox, AgentMessage, MailboxError, SteeringReceipt};
+pub use operations::{OperationAttempt, OperationSpec, OperationState};
 pub use progress_watchdog::*;
 pub use registry::{is_valid_transition, RegistryError, RuntimeRegistry};
 pub use rewind::{

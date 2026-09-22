@@ -135,12 +135,13 @@ pub use runtime::{
     AgentId, AgentKind, AgentRecord, AgentState, CacheIdentity, CacheMissReason, CancellationToken,
     CapabilitySource, ConcurrencyPolicy, ContextBroker, ContextItem, ContextPacket, ContextRequest,
     ContextSource, ContextVmMode, ContractError, ContractExecutor, DeclaredEffect, ExecutionError,
-    ExecutorCapabilities, OutputPolicy, PhaseStatus, PreparedAction, RegistryError, ReplayPolicy,
-    RunId, RuntimeBus, RuntimeCapability, RuntimeCapabilityRegistry, RuntimeDecision, RuntimeEvent,
-    RuntimeEventEnvelope, RuntimeHandle, RuntimeRegistry, RuntimeSubscriber, ScopeViolation,
-    TaskContract, TaskError, TaskId, TaskRecord, TaskRegistry, TaskState, ToolExposureState,
-    WorkflowExecutor, WorkflowId, WorkflowSpec, WorkflowStateStore, WorkflowStatus, WorktreeError,
-    WorktreeLease, WorktreeManager,
+    ExecutorCapabilities, OperationAttempt, OperationSpec, OperationState, OutputPolicy,
+    PhaseStatus, PreparedAction, RegistryError, ReplayPolicy, RunId, RuntimeBus, RuntimeCapability,
+    RuntimeCapabilityRegistry, RuntimeDecision, RuntimeEvent, RuntimeEventEnvelope, RuntimeHandle,
+    RuntimeRegistry, RuntimeSubscriber, ScopeViolation, TaskContract, TaskError, TaskId,
+    TaskRecord, TaskRegistry, TaskState, ToolExposureState, WorkflowExecutor, WorkflowId,
+    WorkflowSpec, WorkflowStateStore, WorkflowStatus, WorktreeError, WorktreeLease,
+    WorktreeManager,
 };
 
 use davinci_ai::{

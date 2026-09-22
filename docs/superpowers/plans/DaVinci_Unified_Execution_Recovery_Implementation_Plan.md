@@ -445,12 +445,14 @@ cargo test --workspace
 
 **Create:** `runtime/operations/{mod,model,identity,transitions,failure}.rs`; `crates/davinci-agent/tests/operation_model.rs`.
 
-- [ ] Write red tests for complete context serialization, distinct logical/attempt identity, unknown schema rejection, absent required ownership, valid transitions, forbidden terminal regression, and cancellation that does not imply effects were undone.
-- [ ] Define `OperationId`, `AttemptId`, `JournalId`, scoped caller key, immutable specification, attempt record, structured result/evidence/link references, effect profile, and typed causal failure. Reuse existing run/agent/task types.
-- [ ] Define explicit schema versions and the complete transition table. Model verification and publication separately from factual execution outcome. Use a checked revision to prevent stale updates.
-- [ ] Define structured reason codes for persistence, authorization, collision, owner loss, process identity mismatch, unknown effect, verification, publication, corruption, and unsupported schema. Preserve original errors as causes rather than string-matching them for safety decisions.
-- [ ] Round-trip old-compatible optional metadata without silently defaulting missing legacy effect certainty to success. Property-test that successful execution cannot transition back to not-started.
-- [ ] Run focused tests and format; commit only the model and its tests, not partial executor rewrites.
+- [x] Write red tests for complete context serialization, distinct logical/attempt identity, unknown schema rejection, absent required ownership, valid transitions, forbidden terminal regression, and cancellation that does not imply effects were undone.
+- [x] Define `OperationId`, `AttemptId`, `JournalId`, scoped caller key, immutable specification, attempt record, structured result/evidence/link references, effect profile, and typed causal failure. Reuse existing run/agent/task types.
+- [x] Define explicit schema versions and the complete transition table. Model verification and publication separately from factual execution outcome. Use a checked revision to prevent stale updates.
+- [x] Define structured reason codes for persistence, authorization, collision, owner loss, process identity mismatch, unknown effect, verification, publication, corruption, and unsupported schema. Preserve original errors as causes rather than string-matching them for safety decisions.
+- [x] Round-trip old-compatible optional metadata without silently defaulting missing legacy effect certainty to success. Property-test that successful execution cannot transition back to not-started.
+- [x] Run focused tests and format; commit only the model and its tests, not partial executor rewrites.
+
+**Evidence:** The pre-implementation run failed because the operations module did not yet exist. After implementation, the focused integration target passed 9 tests, the retry-admission unit test passed 1 test, and rustfmt check passed on all touched Rust files.
 
 **Verify:** `cargo test -p davinci-agent --test operation_model` — new tests are discovered and pass; illegal transitions and missing binding data are rejected.
 
