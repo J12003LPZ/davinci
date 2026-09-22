@@ -189,6 +189,62 @@ impl std::fmt::Display for CachePolicyError {
 
 impl std::error::Error for CachePolicyError {}
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PromptCacheWirePlan {
+    pub emit_cache_key: bool,
+    pub use_stable_bootstrap_breakpoint: bool,
+    pub prompt_cache_mode: Option<&'static str>,
+    pub prompt_cache_ttl: Option<&'static str>,
+    pub legacy_retention: Option<&'static str>,
+}
+
+impl PromptCacheWirePlan {
+    /// Pure request-shape planner for the existing retention setting.
+    ///
+    /// This never selects conversation state and never claims a provider hit.
+    pub fn resolve(
+        capabilities: &OpenAiCacheCapabilities,
+        retention: CacheRetention,
+        has_trusted_bootstrap: bool,
+    ) -> Self {
+        match capabilities.cache_control_family {
+            CacheControlFamily::ExplicitBoundaries => match retention {
+                CacheRetention::None => Self {
+                    emit_cache_key: false,
+                    use_stable_bootstrap_breakpoint: false,
+                    prompt_cache_mode: Some("explicit"),
+                    prompt_cache_ttl: capabilities.supports_ttl_30m.then_some("30m"),
+                    legacy_retention: None,
+                },
+                CacheRetention::Short | CacheRetention::Long => Self {
+                    emit_cache_key: true,
+                    use_stable_bootstrap_breakpoint: capabilities
+                        .supports_breakpoint_content_types
+                        && has_trusted_bootstrap,
+                    prompt_cache_mode: has_trusted_bootstrap.then_some("implicit"),
+                    prompt_cache_ttl: capabilities.supports_ttl_30m.then_some("30m"),
+                    legacy_retention: None,
+                },
+            },
+            CacheControlFamily::LegacyImplicit => Self {
+                emit_cache_key: retention != CacheRetention::None,
+                use_stable_bootstrap_breakpoint: false,
+                prompt_cache_mode: None,
+                prompt_cache_ttl: None,
+                legacy_retention: (retention == CacheRetention::Long).then_some("24h"),
+            },
+            CacheControlFamily::Unknown => Self {
+                emit_cache_key: retention != CacheRetention::None,
+                use_stable_bootstrap_breakpoint: false,
+                prompt_cache_mode: None,
+                prompt_cache_ttl: None,
+                legacy_retention: None,
+            },
+        }
+    }
+}
+
 impl EffectiveOpenAiCachePolicy {
     pub fn resolve(
         capabilities: &OpenAiCacheCapabilities,
@@ -320,6 +376,44 @@ mod tests {
             headers: Default::default(),
             thinking_level_map: Default::default(),
         }
+    }
+
+    #[test]
+    fn wire_plan_places_one_stable_bootstrap_boundary_for_explicit_contract() {
+        let model = model("openai", "openai-responses", true);
+        let caps =
+            OpenAiCacheCapabilities::resolve(&model, Some("https://api.openai.com/v1"), false);
+        let plan = PromptCacheWirePlan::resolve(&caps, CacheRetention::Short, true);
+        assert!(plan.emit_cache_key);
+        assert!(plan.use_stable_bootstrap_breakpoint);
+        assert_eq!(plan.prompt_cache_mode, Some("implicit"));
+        assert_eq!(plan.prompt_cache_ttl, Some("30m"));
+        assert_eq!(plan.legacy_retention, None);
+    }
+
+    #[test]
+    fn wire_plan_explicit_disable_has_no_key_or_boundary() {
+        let model = model("openai", "openai-responses", true);
+        let caps =
+            OpenAiCacheCapabilities::resolve(&model, Some("https://api.openai.com/v1"), false);
+        let plan = PromptCacheWirePlan::resolve(&caps, CacheRetention::None, true);
+        assert!(!plan.emit_cache_key);
+        assert!(!plan.use_stable_bootstrap_breakpoint);
+        assert_eq!(plan.prompt_cache_mode, Some("explicit"));
+        assert_eq!(plan.prompt_cache_ttl, Some("30m"));
+    }
+
+    #[test]
+    fn wire_plan_unknown_backend_never_emits_new_cache_fields() {
+        let plan = PromptCacheWirePlan::resolve(
+            &OpenAiCacheCapabilities::unknown(),
+            CacheRetention::Long,
+            true,
+        );
+        assert!(!plan.use_stable_bootstrap_breakpoint);
+        assert_eq!(plan.prompt_cache_mode, None);
+        assert_eq!(plan.prompt_cache_ttl, None);
+        assert_eq!(plan.legacy_retention, None);
     }
 
     #[test]

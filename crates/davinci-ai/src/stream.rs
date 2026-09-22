@@ -978,17 +978,15 @@ fn openai_responses_body(
     } else {
         crate::openai_cache_policy::OpenAiCacheCapabilities::unknown()
     };
-    let explicit_public_contract = matches!(
-        cache_capabilities.cache_control_family,
-        crate::openai_cache_policy::CacheControlFamily::ExplicitBoundaries
-    );
     let trusted_system = system.filter(|value| !value.is_empty());
-    let use_explicit_bootstrap =
-        explicit_public_contract && retention != crate::cache::CacheRetention::None
-            && trusted_system.is_some();
+    let cache_plan = crate::openai_cache_policy::PromptCacheWirePlan::resolve(
+        &cache_capabilities,
+        retention,
+        trusted_system.is_some(),
+    );
 
     let mut input = openai_responses_input(messages);
-    if use_explicit_bootstrap {
+    if cache_plan.use_stable_bootstrap_breakpoint {
         let text = trusted_system.expect("checked above");
         input.insert(
             0,
@@ -1011,7 +1009,7 @@ fn openai_responses_body(
         "stream": false,
         "input": input,
     });
-    if !use_explicit_bootstrap {
+    if !cache_plan.use_stable_bootstrap_breakpoint {
         body["instructions"] = Value::String(instructions.to_string());
     }
     if codex {
@@ -1038,39 +1036,27 @@ fn openai_responses_body(
                 }
             }
         }
-        // Public Responses cache dialect is capability-scoped. GPT-5.6+
-        // explicit-boundary fields are never inferred for Azure/custom proxies.
+        // Public Responses cache dialect is capability-scoped. The pure
+        // wire planner is the sole authority for new cache fields.
         _ => {
-            if retention != crate::cache::CacheRetention::None {
+            if cache_plan.emit_cache_key {
                 if let Some(key) = session_key {
                     body["prompt_cache_key"] = Value::String(key);
                 }
             }
 
-            // Legacy retention remains available only on the older implicit
-            // contract. It is not equivalent to the GPT-5.6 minimum TTL.
-            if !explicit_public_contract
-                && retention == crate::cache::CacheRetention::Long
-                && crate::cache::supports_long_cache_retention(&model.compat)
-            {
-                body["prompt_cache_retention"] = Value::String("24h".into());
+            if let Some(retention) = cache_plan.legacy_retention {
+                if crate::cache::supports_long_cache_retention(&model.compat) {
+                    body["prompt_cache_retention"] = Value::String(retention.into());
+                }
             }
 
-            if explicit_public_contract {
-                match retention {
-                    crate::cache::CacheRetention::None => {
-                        body["prompt_cache_options"] =
-                            serde_json::json!({"mode": "explicit", "ttl": "30m"});
-                    }
-                    crate::cache::CacheRetention::Short
-                    | crate::cache::CacheRetention::Long
-                        if use_explicit_bootstrap =>
-                    {
-                        body["prompt_cache_options"] =
-                            serde_json::json!({"mode": "implicit", "ttl": "30m"});
-                    }
-                    _ => {}
+            if let Some(mode) = cache_plan.prompt_cache_mode {
+                let mut prompt_cache_options = serde_json::json!({"mode": mode});
+                if let Some(ttl) = cache_plan.prompt_cache_ttl {
+                    prompt_cache_options["ttl"] = Value::String(ttl.into());
                 }
+                body["prompt_cache_options"] = prompt_cache_options;
             }
         }
     }
