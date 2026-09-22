@@ -787,7 +787,7 @@ impl NativeExtensionHost {
                     "localEvidenceSource":"memory/persistent namespace counters above",
                     "transportContinuationSource":"separate Codex websocket/session diagnostics"
                 })))
-            },
+            }
             "governor-status" => Ok(Some(self.governor.status())),
             "governor-reset" => {
                 self.governor.reset();
