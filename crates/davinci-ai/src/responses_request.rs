@@ -56,6 +56,30 @@ pub struct PreparedProviderRequest {
     manifest: WireManifest,
 }
 
+impl WireManifest {
+    /// Fingerprint only stable model-visible contract segments. Conversation
+    /// items and routing metadata are deliberately excluded so a session-owned
+    /// native tape can be considered for replay only when model/tool/trusted
+    /// instruction semantics still match.
+    pub fn stable_contract_fingerprint(&self) -> String {
+        let stable = self
+            .segments
+            .iter()
+            .filter(|segment| {
+                segment.cache_sensitive
+                    && !matches!(segment.category, WireSegmentCategory::ConversationItem)
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        fingerprint_segments(&stable)
+    }
+
+    pub fn stable_contract_compatible_with(&self, previous: &Self) -> bool {
+        self.schema_version == previous.schema_version
+            && self.stable_contract_fingerprint() == previous.stable_contract_fingerprint()
+    }
+}
+
 impl PreparedProviderRequest {
     pub fn new(body: Value) -> Self {
         let request_bytes_before_compression = json_bytes(&body).len();
@@ -347,6 +371,24 @@ mod tests {
         assert_eq!(
             a.manifest.ordered_prefix_fingerprint,
             b.manifest.ordered_prefix_fingerprint
+        );
+    }
+
+    #[test]
+    fn stable_contract_ignores_conversation_and_routing_but_not_tools() {
+        let a = request("one", "partition-a");
+        let b = request("two", "partition-b");
+        assert_eq!(
+            a.manifest().stable_contract_fingerprint(),
+            b.manifest().stable_contract_fingerprint()
+        );
+
+        let mut changed = b.body().clone();
+        changed["tools"][0]["name"] = Value::String("write".into());
+        let changed = PreparedProviderRequest::new(changed);
+        assert_ne!(
+            a.manifest().stable_contract_fingerprint(),
+            changed.manifest().stable_contract_fingerprint()
         );
     }
 

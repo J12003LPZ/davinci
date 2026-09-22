@@ -3,8 +3,12 @@
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 
+use crate::responses_request::{PreparedProviderRequest, WireManifest};
 use crate::{content_text, ChatMessage, MessageContent};
+
+pub const NATIVE_RESPONSES_TURN_ENTRY_TYPE: &str = "openai_responses_native_turn_v1";
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -100,6 +104,161 @@ impl ResponsesItem {
             payload: value.clone(),
         }
     }
+}
+
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NativeResponsesOutput {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub response_id: Option<String>,
+    pub output_items: Vec<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub final_response: Option<Value>,
+    pub terminal_event_type: String,
+}
+
+impl NativeResponsesOutput {
+    /// Extract a lossless terminal Responses output from raw SSE/WebSocket
+    /// event payloads. Failed/errored/unterminated streams are intentionally
+    /// not resumable.
+    pub fn from_events(events: &[Value]) -> Option<Self> {
+        let terminal = events.iter().rev().find(|event| {
+            matches!(
+                event.get("type").and_then(Value::as_str),
+                Some("response.completed" | "response.done" | "response.incomplete")
+            )
+        })?;
+        let terminal_event_type = terminal.get("type")?.as_str()?.to_string();
+        let final_response = terminal.get("response").cloned();
+        let response_id = terminal
+            .pointer("/response/id")
+            .and_then(Value::as_str)
+            .map(str::to_string);
+
+        let output_items = final_response
+            .as_ref()
+            .and_then(|response| response.get("output"))
+            .and_then(Value::as_array)
+            .filter(|items| !items.is_empty())
+            .cloned()
+            .unwrap_or_else(|| completed_output_items(events));
+
+        Some(Self {
+            response_id,
+            output_items,
+            final_response,
+            terminal_event_type,
+        })
+    }
+
+    /// Extract native output from a non-streaming Responses response object.
+    pub fn from_response_value(value: &Value) -> Option<Self> {
+        let response = value.get("response").unwrap_or(value);
+        let status = response.get("status").and_then(Value::as_str);
+        if matches!(status, Some("failed" | "cancelled")) || response.get("error").is_some() {
+            return None;
+        }
+        let output_items = response
+            .get("output")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        if output_items.is_empty() && response.get("id").is_none() {
+            return None;
+        }
+        Some(Self {
+            response_id: response
+                .get("id")
+                .and_then(Value::as_str)
+                .map(str::to_string),
+            output_items,
+            final_response: Some(response.clone()),
+            terminal_event_type: match status {
+                Some("incomplete") => "response.incomplete",
+                _ => "response.completed",
+            }
+            .into(),
+        })
+    }
+}
+
+fn completed_output_items(events: &[Value]) -> Vec<Value> {
+    let mut completed = events
+        .iter()
+        .filter(|event| {
+            event.get("type").and_then(Value::as_str) == Some("response.output_item.done")
+        })
+        .filter_map(|event| {
+            let item = event.get("item")?.clone();
+            let index = event
+                .get("output_index")
+                .and_then(Value::as_u64)
+                .unwrap_or(u64::MAX);
+            Some((index, item))
+        })
+        .collect::<Vec<_>>();
+    completed.sort_by_key(|(index, _)| *index);
+    completed.into_iter().map(|(_, item)| item).collect()
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NativeResponsesTurn {
+    pub request_input_items: Vec<Value>,
+    pub output: NativeResponsesOutput,
+    pub wire_manifest: WireManifest,
+}
+
+impl NativeResponsesTurn {
+    pub fn from_prepared(
+        prepared: &PreparedProviderRequest,
+        output: NativeResponsesOutput,
+    ) -> Option<Self> {
+        let request_input_items = prepared
+            .body()
+            .get("input")
+            .and_then(Value::as_array)?
+            .clone();
+        Some(Self {
+            request_input_items,
+            output,
+            wire_manifest: prepared.manifest().clone(),
+        })
+    }
+
+    pub fn full_native_replay_prefix(&self) -> Vec<Value> {
+        let mut items = self.request_input_items.clone();
+        items.extend(self.output.output_items.clone());
+        items
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NativeResponsesResumeRecord {
+    pub turn: NativeResponsesTurn,
+    pub resume_provider_message_count: usize,
+    pub resume_provider_messages_fingerprint: String,
+}
+
+impl NativeResponsesResumeRecord {
+    pub fn matches_provider_prefix(&self, messages: &[ChatMessage]) -> bool {
+        if messages.len() < self.resume_provider_message_count {
+            return false;
+        }
+        provider_messages_fingerprint(&messages[..self.resume_provider_message_count])
+            == self.resume_provider_messages_fingerprint
+    }
+}
+
+pub fn provider_messages_fingerprint(messages: &[ChatMessage]) -> String {
+    let bytes = serde_json::to_vec(messages).unwrap_or_default();
+    let mut hasher = Sha256::new();
+    hasher.update(b"davinci.responses-provider-projection.v1\0");
+    hasher.update((messages.len() as u64).to_le_bytes());
+    hasher.update(bytes);
+    format!("{:x}", hasher.finalize())
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -282,6 +441,73 @@ impl ResponsesLedger {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn native_output_prefers_terminal_envelope_and_preserves_unknown_fields() {
+        let events = vec![
+            serde_json::json!({
+                "type":"response.output_item.done",
+                "output_index":0,
+                "item":{"type":"reasoning","id":"rs_1","future":1}
+            }),
+            serde_json::json!({
+                "type":"response.completed",
+                "response":{
+                    "id":"resp_1",
+                    "status":"completed",
+                    "output":[{"type":"reasoning","id":"rs_final","opaque":"x"}],
+                    "future_response_field":true
+                }
+            }),
+        ];
+        let output = NativeResponsesOutput::from_events(&events).unwrap();
+        assert_eq!(output.response_id.as_deref(), Some("resp_1"));
+        assert_eq!(output.output_items[0]["id"], "rs_final");
+        assert_eq!(output.output_items[0]["opaque"], "x");
+        assert_eq!(
+            output.final_response.as_ref().unwrap()["future_response_field"],
+            true
+        );
+    }
+
+    #[test]
+    fn failed_or_unterminated_event_stream_is_not_resumable() {
+        assert!(NativeResponsesOutput::from_events(&[
+            serde_json::json!({"type":"response.output_item.done","item":{"type":"message"}}),
+            serde_json::json!({"type":"response.failed","response":{"id":"resp_bad"}}),
+        ])
+        .is_none());
+    }
+
+    #[test]
+    fn resume_record_requires_exact_provider_projection_prefix() {
+        let prefix = vec![ChatMessage::text("user", "first")];
+        let record = NativeResponsesResumeRecord {
+            turn: NativeResponsesTurn {
+                request_input_items: vec![],
+                output: NativeResponsesOutput {
+                    response_id: Some("resp".into()),
+                    output_items: vec![],
+                    final_response: None,
+                    terminal_event_type: "response.completed".into(),
+                },
+                wire_manifest: WireManifest {
+                    schema_version: 1,
+                    ordered_prefix_fingerprint: "x".into(),
+                    request_bytes_before_compression: 0,
+                    segments: vec![],
+                },
+            },
+            resume_provider_message_count: 1,
+            resume_provider_messages_fingerprint: provider_messages_fingerprint(&prefix),
+        };
+        assert!(record.matches_provider_prefix(&prefix));
+        assert!(record.matches_provider_prefix(&[
+            ChatMessage::text("user", "first"),
+            ChatMessage::text("toolResult", "new tail"),
+        ]));
+        assert!(!record.matches_provider_prefix(&[ChatMessage::text("user", "edited")]));
+    }
 
     #[test]
     fn lossless_delta_and_full_replay() {

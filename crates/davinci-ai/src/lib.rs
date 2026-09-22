@@ -80,6 +80,10 @@ pub use responses_request::{
     PreparedProviderRequest, WireManifest, WireSegmentCategory, WireSegmentManifest,
     WireTrustClass, WIRE_MANIFEST_VERSION,
 };
+pub use responses_ledger::{
+    provider_messages_fingerprint, NativeResponsesOutput, NativeResponsesResumeRecord,
+    NativeResponsesTurn, NATIVE_RESPONSES_TURN_ENTRY_TYPE,
+};
 pub use images::{
     generate_images, image_content, images_request_body, AssistantImages, GenerateImagesOptions,
     ImagesContext,
