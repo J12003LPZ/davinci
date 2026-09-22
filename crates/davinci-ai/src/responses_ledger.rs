@@ -156,7 +156,10 @@ impl NativeResponsesOutput {
     pub fn from_response_value(value: &Value) -> Option<Self> {
         let response = value.get("response").unwrap_or(value);
         let status = response.get("status").and_then(Value::as_str);
-        if matches!(status, Some("failed" | "cancelled")) || response.get("error").is_some() {
+        let has_error = response
+            .get("error")
+            .is_some_and(|error| !error.is_null());
+        if matches!(status, Some("failed" | "cancelled")) || has_error {
             return None;
         }
         let output_items = response
@@ -441,6 +444,37 @@ impl ResponsesLedger {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn non_streaming_completed_response_accepts_nullable_error_field() {
+        let response = serde_json::json!({
+            "id": "resp_ok",
+            "status": "completed",
+            "error": null,
+            "incomplete_details": null,
+            "output": [{
+                "type": "message",
+                "id": "msg_ok",
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": "ok"}]
+            }]
+        });
+        let native = NativeResponsesOutput::from_response_value(&response)
+            .expect("nullable error is not a failed response");
+        assert_eq!(native.response_id.as_deref(), Some("resp_ok"));
+        assert_eq!(native.output_items[0]["id"], "msg_ok");
+    }
+
+    #[test]
+    fn non_streaming_non_null_error_is_not_resumable() {
+        let response = serde_json::json!({
+            "id": "resp_bad",
+            "status": "failed",
+            "error": {"type": "invalid_request_error", "message": "bad"},
+            "output": []
+        });
+        assert!(NativeResponsesOutput::from_response_value(&response).is_none());
+    }
 
     #[test]
     fn native_output_prefers_terminal_envelope_and_preserves_unknown_fields() {
