@@ -105,6 +105,10 @@ pub struct Episode {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ContextRoot {
     pub epoch: u64,
+    /// Stable routing/accounting namespace for one compatible Context VM epoch.
+    /// Content evolution is tracked separately by the content fingerprint.
+    #[serde(default)]
+    pub cache_namespace: String,
     pub checkpoint: Option<ContextPageRef>,
     pub deltas: Vec<ContextPageRef>,
     pub episodes: Vec<ContextPageRef>,

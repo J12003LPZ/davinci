@@ -333,6 +333,89 @@ pub fn build_worker_args(
     args
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkerCacheProfile {
+    pub resolved_model: Option<String>,
+    pub cache_key: Option<String>,
+    pub stable_bootstrap_fingerprint: String,
+    pub variable_goal_fingerprint: String,
+    pub stable_bootstrap_bytes: usize,
+    pub variable_goal_bytes: usize,
+    pub private_conversation_bound: bool,
+    pub automatic_memory_injection_suppressed: bool,
+}
+
+/// Build the worker cache identity from stable bootstrap/authority inputs only.
+/// The per-node briefing is fingerprinted separately and deliberately excluded
+/// from the provider partition so compatible workers can reuse the bootstrap.
+pub fn worker_cache_profile(spec: &WorkerSpec) -> WorkerCacheProfile {
+    let mut extensions = spec
+        .extra_extensions
+        .iter()
+        .filter(|_| spec.project_trusted)
+        .cloned()
+        .collect::<Vec<_>>();
+    extensions.sort();
+    let mut authorized_tools = spec.authorized_tools.clone();
+    authorized_tools.sort();
+    let mut initial_tools = spec.initially_exposed_tools.clone();
+    initial_tools.sort();
+    let task_contract = spec
+        .task_contract
+        .as_ref()
+        .map(|contract| contract.digest.as_str())
+        .unwrap_or("");
+
+    let stable_bootstrap = serde_json::json!({
+        "role": spec.role.as_str(),
+        "model": spec.model,
+        "systemPrompt": spec.system_prompt,
+        "artifactContract": super::validate::artifact_contract(spec.expect),
+        "authorizedTools": authorized_tools,
+        "initialTools": initial_tools,
+        "extensions": extensions,
+        "projectTrusted": spec.project_trusted,
+        "taskContract": task_contract,
+    })
+    .to_string();
+    let stable_bootstrap_fingerprint = super::replay::compute_input_hash(&stable_bootstrap);
+    let variable_goal_fingerprint = super::replay::compute_input_hash(&spec.briefing);
+    let resolved_model = spec
+        .model
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
+    let cache_key = if davinci_ai::openai_cache_policy::runtime_features().worker_bootstrap_affinity
+    {
+        resolved_model.as_deref().map(|model| {
+            crate::native_extensions::ecosystem::cache_affinity::derive_worker_cache_key(
+                &spec.cwd.to_string_lossy(),
+                1,
+                spec.role,
+                Some(model),
+                &spec.initially_exposed_tools,
+                &stable_bootstrap,
+                spec.expect,
+            )
+        })
+    } else {
+        None
+    };
+
+    WorkerCacheProfile {
+        resolved_model,
+        cache_key,
+        stable_bootstrap_fingerprint,
+        variable_goal_fingerprint,
+        stable_bootstrap_bytes: stable_bootstrap.len(),
+        variable_goal_bytes: spec.briefing.len(),
+        private_conversation_bound: spec.worker_session.is_some(),
+        automatic_memory_injection_suppressed: true,
+    }
+}
+
 /// A worker runner: given a spec and an abort flag, produce a result.
 pub type WorkerRunner = dyn Fn(&WorkerSpec, &Arc<AtomicBool>, &mut dyn FnMut(&str, &WorkerUsage)) -> WorkerResult
     + Send
@@ -439,15 +522,7 @@ pub fn run_worker(
             ..WorkerResult::default()
         };
     };
-    let cache_key = crate::native_extensions::ecosystem::cache_affinity::derive_worker_cache_key(
-        &spec.cwd.to_string_lossy(),
-        1,
-        spec.role,
-        spec.model.as_deref(),
-        &spec.initially_exposed_tools,
-        &spec.system_prompt,
-        spec.expect,
-    );
+    let cache_profile = worker_cache_profile(spec);
     let mut command = Command::new(executable);
     command.env_remove(super::worker_sessions::SESSION_ENV);
     if let Some(binding) = &spec.worker_session {
@@ -469,6 +544,13 @@ pub fn run_worker(
     // Each worker attempt owns one report. Remove a prior attempt so a retry
     // cannot accidentally combine effects from different checkpoints.
     let _ = fs::remove_file(&effect_report_path);
+    // A parent graph worker may itself have inherited PI_GRAPH_CACHE_KEY.
+    // Never pass that ambient partition through. Only a concrete resolved
+    // model profile may install a new worker-specific affinity key.
+    command.env_remove("PI_GRAPH_CACHE_KEY");
+    if let Some(cache_key) = cache_profile.cache_key.as_deref() {
+        command.env("PI_GRAPH_CACHE_KEY", cache_key);
+    }
     command
         .args(build_worker_args(spec, &briefing_file, &system_prompt_file))
         .current_dir(&spec.cwd)
@@ -483,7 +565,6 @@ pub fn run_worker(
             "PI_GRAPH_INITIAL_TOOLS",
             spec.initially_exposed_tools.join(","),
         )
-        .env("PI_GRAPH_CACHE_KEY", &cache_key)
         .env("PI_GRAPH_SUPPRESS_MEMORY_INJECT", "1");
     if let Err(error) = configure_task_contract_env(&mut command, spec) {
         let _ = fs::remove_dir_all(&temp_dir);

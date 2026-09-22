@@ -115,6 +115,7 @@ fn volatile_hot_tail_does_not_change_stable_cache_affinity() {
     let first = runtime.compile(&initial, &stable_packet, 10_000).unwrap();
     assert!(first.entries.iter().any(|e| e.category == "broker_context"));
     let before = runtime.cache_affinity();
+    let content_before = runtime.content_fingerprint();
 
     let extended = events_from_messages(&[
         ChatMessage::text("user", "keep the API"),
@@ -136,7 +137,16 @@ fn volatile_hot_tail_does_not_change_stable_cache_affinity() {
         ..stable_packet.clone()
     };
     runtime.compile(&extended, &changed_packet, 10_000).unwrap();
-    assert_ne!(runtime.cache_affinity(), before);
+    assert_eq!(
+        runtime.cache_affinity(),
+        before,
+        "stable content evolution must not rotate the provider partition"
+    );
+    assert_ne!(
+        runtime.content_fingerprint(),
+        content_before,
+        "content changes remain observable independently from the partition"
+    );
 
     // Reserve the required state and newest event, leaving no room for the
     // optional broker item. A one-token budget now correctly rejects both.

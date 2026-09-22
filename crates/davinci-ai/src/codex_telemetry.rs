@@ -40,6 +40,19 @@ pub struct CodexTelemetryTokens {
     pub reasoning: u64,
 }
 
+impl CodexTelemetryTokens {
+    pub fn raw_input(&self) -> u64 {
+        self.uncached_input
+            .saturating_add(self.cached_read)
+            .saturating_add(self.cache_write)
+    }
+
+    pub fn provider_cache_read_ratio(&self) -> Option<f64> {
+        let total = self.raw_input();
+        (total > 0).then(|| self.cached_read as f64 / total as f64)
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CodexTelemetryEvent {
     pub timestamp: u64,
@@ -221,6 +234,22 @@ mod tests {
         assert_eq!(json["session_id"], "test_sess");
         assert_eq!(json["tokens"]["cached_read"], 500);
         assert!(!json.to_string().contains("REDACTED"));
+    }
+
+    #[test]
+    fn cache_read_ratio_includes_write_bucket_and_missing_total_is_unknown() {
+        let tokens = CodexTelemetryTokens {
+            cached_read: 400,
+            cache_write: 500,
+            uncached_input: 100,
+            ..Default::default()
+        };
+        assert_eq!(tokens.raw_input(), 1_000);
+        assert!((tokens.provider_cache_read_ratio().unwrap() - 0.4).abs() < 1e-12);
+        assert_eq!(
+            CodexTelemetryTokens::default().provider_cache_read_ratio(),
+            None
+        );
     }
 
     #[test]

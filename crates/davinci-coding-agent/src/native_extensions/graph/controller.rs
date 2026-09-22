@@ -621,6 +621,14 @@ impl GraphExecution {
         let run = self.snapshot();
         let role = task.role;
         let configured_model = self.deps.config.models.get(&role).cloned();
+        let role_model_override = configured_model
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty());
+        let resolved_model = super::resolve_worker_model_identity(
+            role_model_override,
+            self.deps.session_model.as_deref(),
+        );
         let authorized_tools = self.authorized_worker_tools(role);
         let has_recovery = authorized_tools.iter().any(|t| t == "retrieve_output");
         let initially_exposed_tools = initial_worker_tools(role, &authorized_tools);
@@ -631,10 +639,8 @@ impl GraphExecution {
             briefing,
             system_prompt: role_system_prompt_with_recovery(role, has_recovery),
             cwd: PathBuf::from(&run.cwd),
-            model: configured_model
-                .clone()
-                .or_else(|| self.deps.session_model.clone()),
-            thinking_level: configured_model
+            model: resolved_model,
+            thinking_level: role_model_override
                 .is_none()
                 .then(|| self.deps.session_thinking.clone())
                 .flatten(),
@@ -1025,12 +1031,15 @@ impl GraphExecution {
             }
             if let Some(runtime) = &self.deps.runtime {
                 let run_snapshot = self.snapshot();
-                let provider = spec
+                let (provider, model_id) = spec
                     .model
                     .as_deref()
-                    .and_then(|m| m.split_once('/').map(|(p, _)| p))
-                    .unwrap_or("default")
-                    .to_string();
+                    .and_then(|model| model.split_once('/'))
+                    .map(|(provider, model_id)| (provider.to_string(), model_id.to_string()))
+                    .unwrap_or_else(|| (
+                        "unresolved".to_string(),
+                        spec.model.clone().unwrap_or_default(),
+                    ));
                 let record = davinci_agent::AgentRecord {
                     id: worker_agent_id,
                     run_id: runtime.run_id,
@@ -1038,7 +1047,7 @@ impl GraphExecution {
                     kind: davinci_agent::AgentKind::GraphWorker,
                     name: format!("graph-worker-{}-{}", task_id, run_snapshot.run_id),
                     provider,
-                    model_id: spec.model.clone().unwrap_or_default(),
+                    model_id,
                     cwd: spec.cwd.clone(),
                     state: davinci_agent::AgentState::Starting,
                     task_id: None,

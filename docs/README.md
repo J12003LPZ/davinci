@@ -12,6 +12,7 @@ Native capability guides: [repository intelligence](repo-intelligence.md),
 and [browser verification](browser-verification.md).
 Context and routing: [Context VM](context-vm.md), [Jev](decision-intelligence.md),
 and [hardening measurements](context-vm-jev-measurements.md).
+OpenAI provider operations: [cache and Responses efficiency](openai-efficiency.md).
 Program closeout: [engineering program verification](engineering-program-verification.md).
 
 ---

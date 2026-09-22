@@ -19,10 +19,13 @@ mod models_store;
 mod oauth;
 mod oauth_callback;
 mod oauth_providers;
+pub mod openai_cache_diagnostics;
+pub mod openai_cache_policy;
 mod provider_retry;
 mod providers;
 pub mod request_shape;
 pub mod responses_ledger;
+pub mod responses_request;
 mod retry;
 mod shell;
 mod stream;
@@ -44,9 +47,9 @@ pub use auth::{
     CredentialKind, ResolvedAuth,
 };
 pub use catalog::{
-    builtin_catalog_json, builtin_provider_ids, flatten_catalog, load_builtin_models,
-    load_radius_models, models_from_provider_config, openrouter_image_models,
-    radius_models_from_config, Model, ModelCost, KNOWN_PROVIDERS,
+    builtin_catalog_json, builtin_provider_ids, effective_model_cost_rates, flatten_catalog,
+    load_builtin_models, load_radius_models, models_from_provider_config, openrouter_image_models,
+    radius_models_from_config, Model, ModelCost, ModelCostRates, KNOWN_PROVIDERS,
 };
 pub use codex::{
     build_cached_websocket_request_body, build_sse_headers, build_websocket_headers,
@@ -58,8 +61,8 @@ pub use codex::{
     resolve_websocket_connect_timeout_ms, should_fallback_to_sse,
     should_retry_missing_previous_response, should_retry_websocket_connection_limit,
     try_codex_websocket_transport, websocket_connect_timeout_error, websocket_idle_timeout_error,
-    CachedWebSocketContinuation, CodexWebsocketOutcome, OpenAICodexWebSocketDebugStats,
-    DEFAULT_CODEX_BASE_URL, DEFAULT_WEBSOCKET_CONNECT_TIMEOUT_MS,
+    CachedWebSocketContinuation, CodexWebsocketMessage, CodexWebsocketOutcome,
+    OpenAICodexWebSocketDebugStats, DEFAULT_CODEX_BASE_URL, DEFAULT_WEBSOCKET_CONNECT_TIMEOUT_MS,
     OPENAI_BETA_RESPONSES_EXPERIMENTAL, OPENAI_BETA_RESPONSES_WEBSOCKETS,
     PREVIOUS_RESPONSE_NOT_FOUND, REQUEST_COMPRESSION_ZSTD_LEVEL, SESSION_WEBSOCKET_CACHE_TTL_MS,
     SESSION_WEBSOCKET_MAX_AGE_MS, WEBSOCKET_CLOSED_BEFORE_COMPLETED,
@@ -106,11 +109,30 @@ pub use oauth_providers::{
     refresh_oauth_token, token_exchange_request, token_refresh_request, AuthorizeRequest,
     OauthTokens, Pkce, TokenExchangeRequest,
 };
+pub use openai_cache_diagnostics::{
+    configured_comparison_response_id, diagnostics_every_n_from_env, latest_applied_policy,
+    latest_diagnostic, sampled_comparison_response_id, should_sample_comparison,
+    AppliedPromptCachePolicy, ProviderCacheUsageBreakdown, ProviderPromptCacheDiagnostics,
+    OPENAI_CACHE_DIAGNOSTICS_EVERY_N_ENV,
+};
+pub use openai_cache_policy::{
+    BoundaryStrategy, CacheCapabilitySource, CacheControlFamily, CacheIntent,
+    CachePartitionSemantics, EffectiveCacheMode, EffectiveOpenAiCachePolicy,
+    OpenAiCacheCapabilities, PromptCacheWirePlan, OPENAI_CACHE_CONTRACT_REVISION,
+};
 pub use provider_retry::{
     is_retryable_provider_error, provider_error_from_ureq, retry_delay_from_headers,
     retry_provider_request, ProviderError, ProviderRetryOptions,
 };
 pub use providers::{builtin_providers, Provider, ProviderSpec, KNOWN_APIS, PROVIDER_SPECS};
+pub use responses_ledger::{
+    provider_messages_fingerprint, NativeResponsesOutput, NativeResponsesResumeRecord,
+    NativeResponsesTurn, NATIVE_RESPONSES_TURN_ENTRY_TYPE,
+};
+pub use responses_request::{
+    PreparedProviderRequest, WireManifest, WireSegmentCategory, WireSegmentManifest,
+    WireTrustClass, WIRE_MANIFEST_VERSION,
+};
 pub use retry::{is_retryable_assistant_error, is_retryable_error_text};
 pub use shell::{
     command_timeout_from_env, execute_config_command, is_legacy_wsl_bash_path,
@@ -119,10 +141,11 @@ pub use shell::{
 pub use stream::{
     assistant_to_chat, complete_from_events, complete_simple, events_from_complete,
     fixture_complete, live_complete, live_complete_streaming_with,
-    live_complete_streaming_with_sink, live_complete_with, live_stream, parse_sse_block,
-    replay_sse_events, request_body, request_body_with, request_url,
-    resolve_json_schema_strict_sampling, AssistantMessage, AssistantMessageEvent, ContentBlock,
-    StopReason, StreamEvent, StreamOptions,
+    live_complete_streaming_with_sink, live_complete_streaming_with_sink_envelope,
+    live_complete_with, live_stream, parse_sse_block, replay_sse_events, request_body,
+    request_body_with, request_url, resolve_json_schema_strict_sampling, AssistantMessage,
+    AssistantMessageEvent, ContentBlock, ProviderCompletionEnvelope, StopReason, StreamEvent,
+    StreamOptions,
 };
 pub use stream_decoder::{
     decoder_for, frames_of, new_message, supports_incremental_stream, ResponsesDecoder, SseFrame,
@@ -257,16 +280,18 @@ pub fn calculate_usage(
     cache_read: u64,
     cache_write: u64,
 ) -> Usage {
+    let raw_input = input.saturating_add(cache_read).saturating_add(cache_write);
+    let rates = effective_model_cost_rates(model, raw_input);
     Usage::from_tokens(
         input,
         output,
         cache_read,
         cache_write,
         &davinci_protocol::ModelCost {
-            input: model.cost.input,
-            output: model.cost.output,
-            cache_read: model.cost.cache_read,
-            cache_write: model.cost.cache_write,
+            input: rates.input,
+            output: rates.output,
+            cache_read: rates.cache_read,
+            cache_write: rates.cache_write,
         },
     )
 }

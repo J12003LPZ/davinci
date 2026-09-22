@@ -38,14 +38,17 @@ impl RoleCacheStats {
         self.turns = self.turns.saturating_add(other.turns);
     }
 
-    /// Provider cache-read ratio, with no local-cache contribution.
+    /// Provider cache-read ratio over all provider input buckets.
+    ///
+    /// Returns `None` when no provider input was reported so callers do not
+    /// mislabel missing telemetry as a measured 0% cache-read ratio.
     #[allow(dead_code)]
-    pub fn provider_cache_read_ratio(&self) -> f64 {
-        self.cache_read_tokens as f64
-            / self
-                .input_tokens
-                .saturating_add(self.cache_read_tokens)
-                .max(1) as f64
+    pub fn provider_cache_read_ratio(&self) -> Option<f64> {
+        let total_input = self
+            .input_tokens
+            .saturating_add(self.cache_read_tokens)
+            .saturating_add(self.cache_write_tokens);
+        (total_input > 0).then(|| self.cache_read_tokens as f64 / total_input as f64)
     }
 }
 
@@ -428,7 +431,10 @@ mod tests {
         assert_eq!(totals[&Role::Researcher].cache_write_tokens, 8);
         assert_eq!(totals[&Role::Researcher].turns, 3);
         assert_eq!(totals[&Role::Writer].cache_write_tokens, 10);
-        assert!((totals[&Role::Researcher].provider_cache_read_ratio() - 0.25).abs() < 1e-9);
+        let ratio = totals[&Role::Researcher]
+            .provider_cache_read_ratio()
+            .expect("provider input was reported");
+        assert!((ratio - (60.0 / 248.0)).abs() < 1e-9);
     }
 
     #[test]
@@ -444,7 +450,7 @@ mod tests {
         );
         let encoded = serde_json::to_string(&observation).unwrap();
         assert!(observation.miss_reasons.is_empty());
-        assert_eq!(observation.provider_usage.provider_cache_read_ratio(), 0.0);
+        assert_eq!(observation.provider_usage.provider_cache_read_ratio(), None);
         assert!(!encoded.contains("providerCacheHit"));
         assert!(!encoded.contains("localCacheHit"));
     }

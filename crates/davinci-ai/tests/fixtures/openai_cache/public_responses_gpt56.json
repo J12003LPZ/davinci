@@ -1,0 +1,46 @@
+{
+  "name": "public-gpt-5.6-explicit-boundary",
+  "backend": "openai-responses",
+  "origin": "https://api.openai.com/v1",
+  "model": "gpt-5.6-sol",
+  "request": {
+    "model": "gpt-5.6-sol",
+    "store": false,
+    "input": [
+      {
+        "role": "developer",
+        "content": [
+          {
+            "type": "input_text",
+            "text": "stable bootstrap",
+            "prompt_cache_breakpoint": {
+              "mode": "explicit"
+            }
+          }
+        ]
+      },
+      {
+        "role": "user",
+        "content": [
+          {
+            "type": "input_text",
+            "text": "variable tail"
+          }
+        ]
+      }
+    ],
+    "prompt_cache_options": {
+      "mode": "explicit",
+      "ttl": "30m"
+    }
+  },
+  "usage": {
+    "input_tokens": 1000,
+    "input_tokens_details": {
+      "cached_tokens": 400,
+      "cache_write_tokens": 300
+    },
+    "output_tokens": 100,
+    "total_tokens": 1100
+  }
+}

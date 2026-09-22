@@ -96,7 +96,7 @@ string_enum!(ArtifactKind {
     Review => "review",
 });
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[allow(dead_code)]
 pub enum FieldKind {
     String { min_length: usize },
@@ -109,7 +109,7 @@ pub enum FieldKind {
     Object(&'static [FieldRule]),
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub struct FieldRule {
     pub name: &'static str,
     pub required: bool,
@@ -118,7 +118,7 @@ pub struct FieldRule {
     pub description: Option<&'static str>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub struct ArtifactContract {
     pub kind: ArtifactKind,
     pub fields: &'static [FieldRule],

@@ -39,6 +39,7 @@ fn context_vm_env_parsing_is_exact_and_fail_closed() {
 fn context_root_roundtrips_without_losing_page_identity() {
     let root = ContextRoot {
         epoch: 4,
+        cache_namespace: "namespace-v2".into(),
         checkpoint: Some(ContextPageRef {
             id: "ctx:checkpoint:abc".into(),
             kind: ContextPageKind::Checkpoint,

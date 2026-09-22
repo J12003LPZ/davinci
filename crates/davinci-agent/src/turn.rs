@@ -237,21 +237,22 @@ impl Agent {
             let model_started = std::time::Instant::now();
             let completion = self.complete_with_retry(&mut complete, &mut events);
             self.stats.model_wall_ms += model_started.elapsed().as_millis() as u64;
-            let (assistant, stream_events, streamed_live) = match completion {
-                Ok(output) => output,
-                Err(err) => {
-                    if let Some(runtime) = &self.runtime {
-                        runtime.mark_turn_failed();
-                        runtime.emit_turn_end(false);
+            let (assistant, stream_events, streamed_live, native_responses_resume) =
+                match completion {
+                    Ok(output) => output,
+                    Err(err) => {
+                        if let Some(runtime) = &self.runtime {
+                            runtime.mark_turn_failed();
+                            runtime.emit_turn_end(false);
+                        }
+                        self.is_streaming = false;
+                        self.flush_pending_bash_messages();
+                        return Err(err);
                     }
-                    self.is_streaming = false;
-                    self.flush_pending_bash_messages();
-                    return Err(err);
-                }
-            };
+                };
             let chat = assistant_to_chat(&assistant);
             self.messages.push(chat.clone());
-            self.persist_assistant(&assistant, &chat);
+            self.persist_assistant(&assistant, &chat, native_responses_resume.as_ref());
             self.ensure_session_persistence()?;
             new_messages.push(chat.clone());
             // A closure that streamed live has already shown the sink the
@@ -651,6 +652,7 @@ impl Agent {
             AssistantMessage,
             Option<Vec<davinci_ai::AssistantMessageEvent>>,
             bool,
+            Option<davinci_ai::NativeResponsesResumeRecord>,
         ),
         String,
     >
@@ -694,6 +696,7 @@ impl Agent {
                     },
                     None,
                     false,
+                    None,
                 ));
             }
             if attempt > 0 {
@@ -709,6 +712,7 @@ impl Agent {
             match result {
                 Ok(output) => {
                     let output = output.into();
+                    let native_responses_resume = output.native_responses_resume.clone();
                     let message = output.message;
                     if let Some(usage) = &message.usage {
                         self.tool_context.cache.record_provider_usage(
@@ -791,7 +795,12 @@ impl Agent {
                             },
                         );
                     }
-                    return Ok((message, output.stream_events, output.streamed_live));
+                    return Ok((
+                        message,
+                        output.stream_events,
+                        output.streamed_live,
+                        native_responses_resume,
+                    ));
                 }
                 Err(err) => {
                     last_error = Some(err.clone());
@@ -2445,7 +2454,12 @@ impl Agent {
         self.persist_full_message(message);
     }
 
-    fn persist_assistant(&mut self, assistant: &AssistantMessage, chat: &ChatMessage) {
+    fn persist_assistant(
+        &mut self,
+        assistant: &AssistantMessage,
+        chat: &ChatMessage,
+        native_responses_resume: Option<&davinci_ai::NativeResponsesResumeRecord>,
+    ) {
         if let Some(session) = &mut self.session {
             let timestamp = davinci_session::now_ms();
             let mut message = serde_json::json!({
@@ -2475,6 +2489,22 @@ impl Agent {
                 custom_type: None,
                 extra: serde_json::Map::new(),
             });
+            if let Some(record) = native_responses_resume {
+                if let Ok(data) = serde_json::to_value(record) {
+                    let mut extra = serde_json::Map::new();
+                    extra.insert("data".into(), data);
+                    let _ = session.append_entry(davinci_session::SessionEntry {
+                        id: String::new(),
+                        entry_type: "custom".into(),
+                        parent_id: None,
+                        seq: 0,
+                        timestamp,
+                        message: None,
+                        custom_type: Some(davinci_ai::NATIVE_RESPONSES_TURN_ENTRY_TYPE.to_string()),
+                        extra,
+                    });
+                }
+            }
         }
     }
 

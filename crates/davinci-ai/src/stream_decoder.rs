@@ -1012,6 +1012,29 @@ data: {"type":"response.completed","response":{"id":"resp_1","status":"completed
     }
 
     #[test]
+    fn responses_usage_keeps_read_and_write_as_disjoint_input_buckets() {
+        let usage = serde_json::json!({
+            "input_tokens": 1000,
+            "output_tokens": 25,
+            "total_tokens": 1025,
+            "input_tokens_details": {
+                "cached_tokens": 400,
+                "cache_write_tokens": 500
+            },
+            "output_tokens_details": {
+                "reasoning_tokens": 10
+            }
+        });
+        let normalized = responses_usage(&model(), &usage);
+        assert_eq!(normalized.input, 100);
+        assert_eq!(normalized.cache_read, 400);
+        assert_eq!(normalized.cache_write, 500);
+        assert_eq!(normalized.output, 25);
+        assert_eq!(normalized.reasoning, Some(10));
+        assert_eq!(normalized.total_tokens, 1025);
+    }
+
+    #[test]
     fn reasoning_then_text_then_two_tool_calls_keep_their_content_indices() {
         let corpus = r#"
 data: {"type":"response.output_item.added","output_index":0,"item":{"type":"reasoning","id":"rs_1"}}

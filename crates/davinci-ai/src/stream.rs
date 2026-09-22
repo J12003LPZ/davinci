@@ -27,6 +27,10 @@ pub struct StreamOptions {
     pub session_id: Option<String>,
     pub cache_key: Option<String>,
     pub cache_retention: Option<String>,
+    /// Latest durable native Responses turn from this real conversation.
+    /// It is validated against the current provider projection and stable
+    /// model-visible request contract before use.
+    pub native_responses_resume: Option<crate::responses_ledger::NativeResponsesResumeRecord>,
     pub install_telemetry: Option<bool>,
     /// Set from another thread to stop a live stream between frames. The
     /// message then closes with `StopReason::Aborted`.
@@ -35,6 +39,24 @@ pub struct StreamOptions {
 
 #[allow(unused_imports)]
 pub use crate::cache::effective_prompt_cache_key;
+
+fn codex_responses_affinity_id(options: &StreamOptions) -> Option<String> {
+    if crate::cache::cache_retention_from_options(options) == crate::cache::CacheRetention::None {
+        return None;
+    }
+    let conversation_id = options.session_id.as_deref().filter(|id| !id.is_empty())?;
+
+    // Only an actual root/session-owned conversation may align its Codex
+    // affinity header to a cache partition. Graph workers intentionally run
+    // without session_id, so a shared worker cache key cannot become their
+    // continuation/socket identity.
+    let raw = options
+        .cache_key
+        .as_deref()
+        .filter(|id| !id.is_empty())
+        .unwrap_or(conversation_id);
+    Some(crate::cache::clamp_openai_prompt_cache_key(raw))
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -177,6 +199,20 @@ impl AssistantMessageEvent {
 
 pub type StreamEvent = AssistantMessageEvent;
 
+#[derive(Debug, Clone)]
+pub struct ProviderCompletionEnvelope {
+    pub message: AssistantMessage,
+    pub stream_events: Vec<AssistantMessageEvent>,
+    pub native_responses: Option<crate::responses_ledger::NativeResponsesTurn>,
+}
+
+fn native_responses_api(model: &Model) -> bool {
+    matches!(
+        model.api.as_str(),
+        "openai-responses" | "azure-openai-responses" | "openai-codex-responses"
+    )
+}
+
 pub fn parse_sse_block(block: &str) -> Option<Value> {
     let mut data = String::new();
     for line in block.lines() {
@@ -249,7 +285,14 @@ fn read_provider_stream(
     decoder: &mut dyn crate::stream_decoder::StreamDecoder,
     abort: Option<&std::sync::Arc<std::sync::atomic::AtomicBool>>,
     on_event: &mut dyn FnMut(&AssistantMessageEvent),
-) -> Result<(AssistantMessage, Vec<AssistantMessageEvent>), String> {
+) -> Result<
+    (
+        AssistantMessage,
+        Vec<AssistantMessageEvent>,
+        Option<crate::responses_ledger::NativeResponsesOutput>,
+    ),
+    String,
+> {
     use std::sync::atomic::Ordering;
 
     // The body is read on its own thread and handed over line by line, so the
@@ -260,6 +303,7 @@ fn read_provider_stream(
     let line_rx = crate::stream_reader::response_lines(response.into_reader());
     let mut framer = crate::stream_decoder::SseFramer::default();
     let mut events = Vec::new();
+    let mut raw_events = Vec::new();
     let mut raw = String::new();
     let mut frames = 0usize;
     let mut aborted = false;
@@ -308,6 +352,7 @@ fn read_provider_stream(
                     crate::trace::describe_event(&frame.data)
                 ));
             }
+            raw_events.push(frame.data.clone());
             feed(&frame.data, decoder, &mut events, on_event);
             if decoder.is_done() {
                 break;
@@ -327,6 +372,7 @@ fn read_provider_stream(
         if let Some(frame) = framer.flush() {
             frames += 1;
             raw.clear();
+            raw_events.push(frame.data.clone());
             feed(&frame.data, decoder, &mut events, on_event);
         }
     }
@@ -336,10 +382,11 @@ fn read_provider_stream(
             return Err(err);
         }
         if crate::trace::enabled() {
+            // Response bodies can contain user-visible output, provider prompt
+            // fragments in errors, or opaque reasoning. Trace only the size.
             crate::trace::log(&format!(
-                "body was not an event stream ({} bytes): {}",
-                raw.len(),
-                raw.chars().take(300).collect::<String>()
+                "body was not an event stream ({} bytes)",
+                raw.len()
             ));
         }
         let message = parse_provider_response(model, &raw);
@@ -347,7 +394,13 @@ fn read_provider_stream(
         for event in &synthesized {
             on_event(event);
         }
-        return Ok((message, synthesized));
+        let native = native_responses_api(model)
+            .then(|| serde_json::from_str::<Value>(&raw).ok())
+            .flatten()
+            .and_then(|value| {
+                crate::responses_ledger::NativeResponsesOutput::from_response_value(&value)
+            });
+        return Ok((message, synthesized, native));
     }
 
     if aborted {
@@ -361,7 +414,7 @@ fn read_provider_stream(
         };
         on_event(&event);
         events.push(event);
-        return Ok((message, events));
+        return Ok((message, events, None));
     }
 
     let start = events.len();
@@ -380,7 +433,15 @@ fn read_provider_stream(
     for event in &events[start..] {
         on_event(event);
     }
-    Ok((message, events))
+    let native = if native_responses_api(model)
+        && message.stop_reason != Some(StopReason::Error)
+        && message.stop_reason != Some(StopReason::Aborted)
+    {
+        crate::responses_ledger::NativeResponsesOutput::from_events(&raw_events)
+    } else {
+        None
+    };
+    Ok((message, events, native))
 }
 
 pub fn complete_from_events(events: &[AssistantMessageEvent]) -> Option<AssistantMessage> {
@@ -452,21 +513,35 @@ pub fn live_complete_with(
     options: &StreamOptions,
 ) -> Result<AssistantMessage, String> {
     let body = request_body_with(model, messages, system, tools, options);
+    let prepared = crate::responses_request::PreparedProviderRequest::new(body);
+    let body = prepared.body();
+    if crate::trace::enabled() {
+        crate::trace::log(&format!(
+            "prepared request segments={} prefix={} bytes={}",
+            prepared.manifest().segments.len(),
+            prepared.manifest().ordered_prefix_fingerprint,
+            prepared.manifest().request_bytes_before_compression
+        ));
+    }
     if model.api == "openai-codex-responses" {
         if let Some(token) = auth.api_key.as_deref() {
-            match crate::codex::try_codex_websocket_transport_with(
+            let codex_affinity_id = codex_responses_affinity_id(options);
+            match crate::codex::try_codex_websocket_transport_with_affinity(
                 model,
                 &body,
                 token,
                 options.transport.as_deref(),
                 options.session_id.as_deref(),
+                codex_affinity_id.as_deref(),
                 options.cache_retention.as_deref(),
                 options.websocket_connect_timeout_ms,
                 options.timeout_ms,
                 options.abort_signal.as_ref(),
                 &mut |_| {},
             ) {
-                Ok(crate::codex::CodexWebsocketOutcome::Message(message)) => return Ok(*message),
+                Ok(crate::codex::CodexWebsocketOutcome::Message(message)) => {
+                    return Ok(message.message)
+                }
                 Ok(crate::codex::CodexWebsocketOutcome::FallbackToSse) => {}
                 Err(error) => return Err(error),
             }
@@ -522,6 +597,21 @@ pub fn live_complete_streaming_with_sink(
     options: &StreamOptions,
     on_event: &mut dyn FnMut(&AssistantMessageEvent),
 ) -> Result<(AssistantMessage, Vec<AssistantMessageEvent>), String> {
+    let envelope = live_complete_streaming_with_sink_envelope(
+        model, messages, auth, system, tools, options, on_event,
+    )?;
+    Ok((envelope.message, envelope.stream_events))
+}
+
+pub fn live_complete_streaming_with_sink_envelope(
+    model: &Model,
+    messages: &[ChatMessage],
+    auth: &ResolvedAuth,
+    system: Option<&str>,
+    tools: &[ToolSpec],
+    options: &StreamOptions,
+    on_event: &mut dyn FnMut(&AssistantMessageEvent),
+) -> Result<ProviderCompletionEnvelope, String> {
     let incremental = crate::stream_decoder::supports_incremental_stream(model);
     let mut body = request_body_with(model, messages, system, tools, options);
     if crate::trace::enabled() {
@@ -547,15 +637,27 @@ pub fn live_complete_streaming_with_sink(
             }
         }
     }
+    let prepared = crate::responses_request::PreparedProviderRequest::new(body);
+    let body = prepared.body();
+    if crate::trace::enabled() {
+        crate::trace::log(&format!(
+            "prepared stream request segments={} prefix={} bytes={}",
+            prepared.manifest().segments.len(),
+            prepared.manifest().ordered_prefix_fingerprint,
+            prepared.manifest().request_bytes_before_compression
+        ));
+    }
     if model.api == "openai-codex-responses" {
         if let Some(token) = auth.api_key.as_deref() {
             let mut collected = Vec::new();
-            let outcome = crate::codex::try_codex_websocket_transport_with(
+            let codex_affinity_id = codex_responses_affinity_id(options);
+            let outcome = crate::codex::try_codex_websocket_transport_with_affinity(
                 model,
                 &body,
                 token,
                 options.transport.as_deref(),
                 options.session_id.as_deref(),
+                codex_affinity_id.as_deref(),
                 options.cache_retention.as_deref(),
                 options.websocket_connect_timeout_ms,
                 options.timeout_ms,
@@ -570,13 +672,13 @@ pub fn live_complete_streaming_with_sink(
                     if crate::trace::enabled() {
                         crate::trace::log(&format!(
                             "websocket reply stop={:?} blocks={} error={:?}",
-                            message.stop_reason,
-                            message.content.len(),
-                            message.error_message
+                            message.message.stop_reason,
+                            message.message.content.len(),
+                            message.message.error_message
                         ));
                     }
                     let events = if collected.is_empty() {
-                        let synthesized = events_from_complete(&message);
+                        let synthesized = events_from_complete(&message.message);
                         for event in &synthesized {
                             on_event(event);
                         }
@@ -584,7 +686,16 @@ pub fn live_complete_streaming_with_sink(
                     } else {
                         collected
                     };
-                    return Ok((*message, events));
+                    let native_responses = message.native_responses.and_then(|output| {
+                        crate::responses_ledger::NativeResponsesTurn::from_prepared(
+                            &prepared, output,
+                        )
+                    });
+                    return Ok(ProviderCompletionEnvelope {
+                        message: message.message,
+                        stream_events: events,
+                        native_responses,
+                    });
                 }
                 Ok(crate::codex::CodexWebsocketOutcome::FallbackToSse) => {
                     crate::trace::log("websocket fell back to sse");
@@ -621,13 +732,23 @@ pub fn live_complete_streaming_with_sink(
     })?;
     crate::trace::log(&format!("sse status {}", response.status()));
     match crate::stream_decoder::decoder_for(model).filter(|_| incremental) {
-        Some(mut decoder) => read_provider_stream(
-            response,
-            model,
-            decoder.as_mut(),
-            options.abort_signal.as_ref(),
-            on_event,
-        ),
+        Some(mut decoder) => {
+            let (message, stream_events, native_output) = read_provider_stream(
+                response,
+                model,
+                decoder.as_mut(),
+                options.abort_signal.as_ref(),
+                on_event,
+            )?;
+            let native_responses = native_output.and_then(|output| {
+                crate::responses_ledger::NativeResponsesTurn::from_prepared(&prepared, output)
+            });
+            Ok(ProviderCompletionEnvelope {
+                message,
+                stream_events,
+                native_responses,
+            })
+        }
         None => {
             let text = response
                 .into_string()
@@ -646,7 +767,29 @@ pub fn live_complete_streaming_with_sink(
             for event in &events {
                 on_event(event);
             }
-            Ok((message, events))
+            let native_output = if native_responses_api(model) {
+                if text.contains("data:") {
+                    let raw_events = crate::stream_decoder::frames_of(&text)
+                        .into_iter()
+                        .map(|frame| frame.data)
+                        .collect::<Vec<_>>();
+                    crate::responses_ledger::NativeResponsesOutput::from_events(&raw_events)
+                } else {
+                    serde_json::from_str::<Value>(&text).ok().and_then(|value| {
+                        crate::responses_ledger::NativeResponsesOutput::from_response_value(&value)
+                    })
+                }
+            } else {
+                None
+            };
+            let native_responses = native_output.and_then(|output| {
+                crate::responses_ledger::NativeResponsesTurn::from_prepared(&prepared, output)
+            });
+            Ok(ProviderCompletionEnvelope {
+                message,
+                stream_events: events,
+                native_responses,
+            })
         }
     }
 }
@@ -657,6 +800,7 @@ fn collect_request_headers(
     options: &StreamOptions,
 ) -> Vec<(String, String)> {
     let session_id = options.session_id.as_deref().filter(|id| !id.is_empty());
+    let codex_affinity_id = codex_responses_affinity_id(options);
     if model.api == "openai-codex-responses" {
         if let Some(token) = &auth.api_key {
             if let Ok(account_id) = crate::codex::extract_account_id(token) {
@@ -670,7 +814,7 @@ fn collect_request_headers(
                     &extra,
                     &account_id,
                     token,
-                    session_id,
+                    codex_affinity_id.as_deref(),
                 );
             }
         }
@@ -862,6 +1006,7 @@ pub fn request_body_with(
         _ => openai_body(model, messages, system, tools, options),
     };
     apply_max_tokens_override(&mut body, options);
+    apply_native_responses_resume(&mut body, model, messages, options);
     body
 }
 
@@ -920,8 +1065,14 @@ pub fn openai_responses_input(messages: &[ChatMessage]) -> Vec<Value> {
         if text.is_empty() {
             continue;
         }
+        let role = match message.role.as_str() {
+            "developer" => "developer",
+            "system" => "system",
+            _ => "user",
+        };
         input.push(serde_json::json!({
-            "role": "user",
+            "type": "message",
+            "role": role,
             "content": [{"type": "input_text", "text": text}],
         }));
     }
@@ -936,24 +1087,61 @@ fn openai_responses_body(
     options: &StreamOptions,
 ) -> Value {
     let codex = model.api == "openai-codex-responses";
-    let input = openai_responses_input(messages);
-    let instructions = system
-        .filter(|value| !value.is_empty())
-        .unwrap_or("You are a helpful assistant.");
+    let retention = crate::cache::cache_retention_from_options(options);
+    let cache_capabilities = if model.api == "openai-responses" {
+        crate::openai_cache_policy::OpenAiCacheCapabilities::resolve(
+            model,
+            model.base_url.as_deref(),
+            false,
+        )
+    } else {
+        crate::openai_cache_policy::OpenAiCacheCapabilities::unknown()
+    };
+    let cache_capabilities = crate::openai_cache_policy::apply_runtime_features(
+        cache_capabilities,
+        retention,
+        crate::openai_cache_policy::runtime_features(),
+    );
+    let trusted_system = system.filter(|value| !value.is_empty());
+    let cache_plan = crate::openai_cache_policy::PromptCacheWirePlan::resolve(
+        &cache_capabilities,
+        retention,
+        trusted_system.is_some(),
+    );
+
+    let mut input = openai_responses_input(messages);
+    if cache_plan.use_stable_bootstrap_breakpoint {
+        let text = trusted_system.expect("checked above");
+        input.insert(
+            0,
+            serde_json::json!({
+                "type": "message",
+                "role": "developer",
+                "content": [{
+                    "type": "input_text",
+                    "text": text,
+                    "prompt_cache_breakpoint": {"mode": "explicit"}
+                }],
+            }),
+        );
+    }
+
+    let instructions = trusted_system.unwrap_or("You are a helpful assistant.");
     let mut body = serde_json::json!({
         "model": model.id,
         "store": false,
         "stream": false,
-        "instructions": instructions,
         "input": input,
     });
+    if !cache_plan.use_stable_bootstrap_breakpoint {
+        body["instructions"] = Value::String(instructions.to_string());
+    }
     if codex {
         body["text"] = serde_json::json!({"verbosity": "low"});
         body["include"] = serde_json::json!(["reasoning.encrypted_content"]);
         body["tool_choice"] = Value::String("auto".into());
         body["parallel_tool_calls"] = Value::Bool(true);
     }
-    let retention = crate::cache::cache_retention_from_options(options);
     let session_key = crate::cache::effective_prompt_cache_key(options)
         .filter(|id| !id.is_empty())
         .map(crate::cache::clamp_openai_prompt_cache_key);
@@ -972,25 +1160,36 @@ fn openai_responses_body(
                 }
             }
         }
-        // openai-responses.ts:288-296.
+        // Public Responses cache dialect is capability-scoped. The pure
+        // wire planner is the sole authority for new cache fields.
         _ => {
-            if retention != crate::cache::CacheRetention::None {
+            if cache_plan.emit_cache_key {
                 if let Some(key) = session_key {
                     body["prompt_cache_key"] = Value::String(key);
                 }
             }
-            if retention == crate::cache::CacheRetention::Long
-                && crate::cache::supports_long_cache_retention(&model.compat)
-            {
-                body["prompt_cache_retention"] = Value::String("24h".into());
+
+            if let Some(retention) = cache_plan.legacy_retention {
+                if crate::cache::supports_long_cache_retention(&model.compat) {
+                    body["prompt_cache_retention"] = Value::String(retention.into());
+                }
             }
-            let explicit_mode = model
-                .compat
-                .get("supportsExplicitPromptCacheMode")
-                .and_then(Value::as_bool)
-                .unwrap_or(false);
-            if retention == crate::cache::CacheRetention::None && explicit_mode {
-                body["prompt_cache_options"] = serde_json::json!({"mode": "explicit"});
+
+            if let Some(mode) = cache_plan.prompt_cache_mode {
+                let mut prompt_cache_options = serde_json::json!({"mode": mode});
+                if let Some(ttl) = cache_plan.prompt_cache_ttl {
+                    prompt_cache_options["ttl"] = Value::String(ttl.into());
+                }
+                body["prompt_cache_options"] = prompt_cache_options;
+            }
+            if let Some(comparison_response_id) =
+                crate::openai_cache_diagnostics::configured_comparison_response_id(model, options)
+            {
+                if !body["prompt_cache_options"].is_object() {
+                    body["prompt_cache_options"] = serde_json::json!({});
+                }
+                body["prompt_cache_options"]["comparison_response_id"] =
+                    Value::String(comparison_response_id);
             }
         }
     }
@@ -1037,6 +1236,52 @@ fn openai_responses_body(
     body
 }
 
+fn apply_native_responses_resume(
+    body: &mut Value,
+    model: &Model,
+    messages: &[ChatMessage],
+    options: &StreamOptions,
+) {
+    if !native_responses_api(model)
+        || !crate::openai_cache_policy::runtime_features().native_responses_replay
+    {
+        return;
+    }
+    let Some(resume) = options.native_responses_resume.as_ref() else {
+        return;
+    };
+    if !resume.matches_provider_prefix(messages) {
+        if crate::trace::enabled() {
+            crate::trace::log("native responses replay skipped: provider prefix changed");
+        }
+        return;
+    }
+
+    let current = crate::responses_request::PreparedProviderRequest::new(body.clone());
+    if !current
+        .manifest()
+        .stable_contract_compatible_with(&resume.turn.wire_manifest)
+    {
+        if crate::trace::enabled() {
+            crate::trace::log("native responses replay skipped: stable request contract changed");
+        }
+        return;
+    }
+
+    let mut input = resume.turn.full_native_replay_prefix();
+    input.extend(openai_responses_input(
+        &messages[resume.resume_provider_message_count..],
+    ));
+    body["input"] = Value::Array(input);
+    if crate::trace::enabled() {
+        crate::trace::log(&format!(
+            "native responses replay applied baseline_messages={} replay_items={}",
+            resume.resume_provider_message_count,
+            body["input"].as_array().map(Vec::len).unwrap_or(0)
+        ));
+    }
+}
+
 fn apply_max_tokens_override(body: &mut Value, options: &StreamOptions) {
     let Some(max_tokens) = options.max_tokens.filter(|value| *value > 0) else {
         return;
@@ -1067,6 +1312,8 @@ pub fn live_stream(
     if let Value::Object(map) = &mut body {
         map.insert("stream".into(), Value::Bool(true));
     }
+    let prepared = crate::responses_request::PreparedProviderRequest::new(body);
+    let body = prepared.body();
     let url = request_url(model, auth);
     let mut request = ureq::post(&url);
     for (key, value) in &auth.headers {
@@ -3161,5 +3408,261 @@ mod tests {
         assert!(body.get("top_p").is_none());
         assert!(body.get("top_logprobs").is_none());
         assert_ne!(body["reasoning"]["effort"], "none");
+    }
+}
+
+#[cfg(test)]
+mod openai_cache_wire_tests {
+    use super::*;
+    use crate::catalog::ModelCost;
+    use serde_json::json;
+
+    fn public_model(explicit: bool, base_url: &str) -> Model {
+        Model {
+            id: if explicit { "gpt-5.6-sol" } else { "gpt-5" }.into(),
+            name: "cache-test".into(),
+            api: "openai-responses".into(),
+            provider: "openai".into(),
+            base_url: Some(base_url.into()),
+            reasoning: true,
+            input: vec!["text".into()],
+            cost: ModelCost {
+                input: 1.0,
+                output: 1.0,
+                cache_read: 0.1,
+                cache_write: 0.2,
+            },
+            context_window: 272_000,
+            max_tokens: 128_000,
+            compat: if explicit {
+                json!({"supportsExplicitPromptCacheMode": true})
+            } else {
+                json!({})
+            },
+            headers: Default::default(),
+            thinking_level_map: Default::default(),
+        }
+    }
+
+    #[test]
+    fn codex_affinity_uses_cache_partition_only_for_session_owned_root() {
+        let root = StreamOptions {
+            session_id: Some("conversation-1".into()),
+            cache_key: Some("shared-root-partition".into()),
+            ..StreamOptions::default()
+        };
+        assert_eq!(
+            codex_responses_affinity_id(&root).as_deref(),
+            Some("shared-root-partition")
+        );
+
+        let worker = StreamOptions {
+            session_id: None,
+            cache_key: Some("shared-worker-bootstrap".into()),
+            ..StreamOptions::default()
+        };
+        assert_eq!(codex_responses_affinity_id(&worker), None);
+
+        let disabled = StreamOptions {
+            session_id: Some("conversation-1".into()),
+            cache_key: Some("partition".into()),
+            cache_retention: Some("none".into()),
+            ..StreamOptions::default()
+        };
+        assert_eq!(codex_responses_affinity_id(&disabled), None);
+    }
+
+    #[test]
+    fn responses_input_preserves_developer_and_system_authority() {
+        let input = openai_responses_input(&[
+            ChatMessage::text("developer", "developer rules"),
+            ChatMessage::text("system", "system rules"),
+            ChatMessage::text("user", "question"),
+        ]);
+        assert_eq!(input[0]["role"], "developer");
+        assert_eq!(input[1]["role"], "system");
+        assert_eq!(input[2]["role"], "user");
+    }
+
+    #[test]
+    fn verified_gpt56_moves_stable_system_to_developer_breakpoint() {
+        let model = public_model(true, "https://api.openai.com/v1");
+        let body = openai_responses_body(
+            &model,
+            &[ChatMessage::text("user", "variable tail")],
+            Some("stable trusted bootstrap"),
+            &[],
+            &StreamOptions {
+                cache_key: Some("partition".into()),
+                cache_retention: Some("short".into()),
+                ..StreamOptions::default()
+            },
+        );
+
+        assert!(body.get("instructions").is_none());
+        assert_eq!(body["input"][0]["role"], "developer");
+        assert_eq!(
+            body["input"][0]["content"][0]["prompt_cache_breakpoint"]["mode"],
+            "explicit"
+        );
+        assert_eq!(body["prompt_cache_options"]["mode"], "implicit");
+        assert_eq!(body["prompt_cache_options"]["ttl"], "30m");
+        assert_eq!(body["prompt_cache_key"], "partition");
+    }
+
+    #[test]
+    fn verified_gpt56_none_uses_explicit_mode_without_marker() {
+        let model = public_model(true, "https://api.openai.com/v1");
+        let body = openai_responses_body(
+            &model,
+            &[ChatMessage::text("user", "tail")],
+            Some("trusted bootstrap"),
+            &[],
+            &StreamOptions {
+                cache_key: Some("must-not-be-sent".into()),
+                cache_retention: Some("none".into()),
+                ..StreamOptions::default()
+            },
+        );
+
+        assert_eq!(body["instructions"], "trusted bootstrap");
+        assert!(body.get("prompt_cache_key").is_none());
+        assert_eq!(body["prompt_cache_options"]["mode"], "explicit");
+        assert_eq!(body["prompt_cache_options"]["ttl"], "30m");
+        assert!(body["input"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|item| item.pointer("/content/0/prompt_cache_breakpoint").is_none()));
+    }
+
+    #[test]
+    fn deceptive_proxy_never_receives_gpt56_cache_dialect() {
+        let model = public_model(true, "https://api.openai.com.evil.test/v1");
+        let body = openai_responses_body(
+            &model,
+            &[ChatMessage::text("user", "tail")],
+            Some("trusted bootstrap"),
+            &[],
+            &StreamOptions {
+                cache_key: Some("legacy-key".into()),
+                cache_retention: Some("none".into()),
+                ..StreamOptions::default()
+            },
+        );
+
+        assert_eq!(body["instructions"], "trusted bootstrap");
+        assert!(body.get("prompt_cache_options").is_none());
+        assert!(body["input"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|item| item.pointer("/content/0/prompt_cache_breakpoint").is_none()));
+    }
+
+    #[test]
+    fn durable_native_replay_replaces_generic_assistant_with_exact_provider_items() {
+        let model = public_model(true, "https://api.openai.com/v1");
+        let prior_messages = vec![ChatMessage::text("user", "first")];
+        let prior_body = openai_responses_body(
+            &model,
+            &prior_messages,
+            Some("stable bootstrap"),
+            &[],
+            &StreamOptions {
+                cache_key: Some("partition".into()),
+                cache_retention: Some("short".into()),
+                ..StreamOptions::default()
+            },
+        );
+        let prior_prepared = crate::responses_request::PreparedProviderRequest::new(prior_body);
+        let turn = crate::responses_ledger::NativeResponsesTurn::from_prepared(
+            &prior_prepared,
+            crate::responses_ledger::NativeResponsesOutput {
+                response_id: Some("resp_1".into()),
+                output_items: vec![
+                    serde_json::json!({
+                        "type":"reasoning",
+                        "id":"rs_1",
+                        "encrypted_content":"opaque"
+                    }),
+                    serde_json::json!({
+                        "type":"message",
+                        "id":"msg_1",
+                        "role":"assistant",
+                        "content":[{"type":"output_text","text":"answer"}]
+                    }),
+                ],
+                final_response: None,
+                terminal_event_type: "response.completed".into(),
+            },
+        )
+        .unwrap();
+
+        let assistant = ChatMessage::text("assistant", "answer");
+        let mut resume_projection = prior_messages.clone();
+        resume_projection.push(assistant.clone());
+        let record = crate::responses_ledger::NativeResponsesResumeRecord {
+            turn,
+            resume_provider_message_count: resume_projection.len(),
+            resume_provider_messages_fingerprint:
+                crate::responses_ledger::provider_messages_fingerprint(&resume_projection),
+        };
+
+        let mut current = resume_projection;
+        current.push(ChatMessage::tool_result("call_1", "read", "result", false));
+        let body = request_body_with(
+            &model,
+            &current,
+            Some("stable bootstrap"),
+            &[],
+            &StreamOptions {
+                cache_key: Some("partition".into()),
+                cache_retention: Some("short".into()),
+                native_responses_resume: Some(record),
+                ..StreamOptions::default()
+            },
+        );
+        let input = body["input"].as_array().unwrap();
+        assert!(input.iter().any(|item| item["id"] == "rs_1"));
+        assert!(input.iter().any(|item| item["id"] == "msg_1"));
+        assert_eq!(
+            input
+                .iter()
+                .filter(|item| {
+                    item["role"] == "assistant"
+                        && item.get("id").is_none()
+                        && item.get("type").is_none()
+                })
+                .count(),
+            0,
+            "generic assistant projection must not duplicate the exact native output"
+        );
+        assert_eq!(
+            input.last().unwrap()["type"],
+            "function_call_output",
+            "only the new tail follows the exact native replay prefix"
+        );
+    }
+
+    #[test]
+    fn older_public_responses_keeps_legacy_retention_fields() {
+        let model = public_model(false, "https://api.openai.com/v1");
+        let body = openai_responses_body(
+            &model,
+            &[ChatMessage::text("user", "tail")],
+            Some("trusted bootstrap"),
+            &[],
+            &StreamOptions {
+                cache_key: Some("legacy-key".into()),
+                cache_retention: Some("long".into()),
+                ..StreamOptions::default()
+            },
+        );
+
+        assert_eq!(body["instructions"], "trusted bootstrap");
+        assert_eq!(body["prompt_cache_key"], "legacy-key");
+        assert_eq!(body["prompt_cache_retention"], "24h");
+        assert!(body.get("prompt_cache_options").is_none());
     }
 }

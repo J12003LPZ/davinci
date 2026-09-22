@@ -1,0 +1,11 @@
+{
+  "name": "unsupported-proxy-conservative",
+  "backend": "openai-responses",
+  "origin": "https://proxy.example.test/v1",
+  "model": "gpt-5.6-sol",
+  "expected": {
+    "explicit_breakpoints": false,
+    "cache_diagnostics": false,
+    "new_cache_fields": false
+  }
+}

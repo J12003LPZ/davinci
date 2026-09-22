@@ -100,7 +100,16 @@ impl ContextVmRuntime {
             .clone()
     }
 
-    pub fn install_root(&self, root: ContextRoot, last_source_seq: u64) {
+    pub fn install_root(&self, mut root: ContextRoot, last_source_seq: u64) {
+        if root.cache_namespace.is_empty() {
+            let checkpoint = root
+                .checkpoint
+                .as_ref()
+                .map(|page| page.content_hash.as_str())
+                .unwrap_or("uninitialized");
+            root.cache_namespace =
+                digest(format!("ctxvm_cache_namespace_v2:{}:{checkpoint}", root.epoch).as_bytes());
+        }
         let mut state = self
             .state
             .write()
@@ -175,6 +184,7 @@ impl ContextVmRuntime {
             epoch: previous
                 .epoch
                 .saturating_add(u64::from(previous.checkpoint.is_some())),
+            cache_namespace: String::new(),
             checkpoint: Some(checkpoint),
             deltas: Vec::new(),
             episodes: Vec::new(),
@@ -374,6 +384,7 @@ impl ContextVmRuntime {
         }
         let root = ContextRoot {
             epoch: old.epoch.saturating_add(1),
+            cache_namespace: String::new(),
             checkpoint: Some(checkpoint),
             deltas: Vec::new(),
             episodes,
@@ -437,21 +448,33 @@ impl ContextVmRuntime {
 
     pub fn cache_affinity(&self) -> String {
         let root = self.root();
-        format!(
-            "ctxvm:{}:{}:{}:{}",
-            root.epoch,
-            root.checkpoint.map(|page| page.id).unwrap_or_default(),
-            root.deltas
-                .iter()
-                .map(|page| page.id.as_str())
-                .collect::<Vec<_>>()
-                .join(","),
-            self.state
-                .read()
-                .unwrap_or_else(|error| error.into_inner())
-                .stable_context_digest
-                .clone()
-                .unwrap_or_default()
+        format!("ctxvm:v2:{}:{}", root.epoch, root.cache_namespace)
+    }
+
+    /// Ordered content fingerprint for diagnostics and prefix-change analysis.
+    /// Unlike cache_affinity(), this is expected to change as stable provider
+    /// content evolves within one routing/accounting namespace.
+    pub fn content_fingerprint(&self) -> String {
+        let state = self.state.read().unwrap_or_else(|error| error.into_inner());
+        let root = &state.root;
+        let checkpoint = root
+            .checkpoint
+            .as_ref()
+            .map(|page| page.content_hash.as_str())
+            .unwrap_or_default();
+        let deltas = root
+            .deltas
+            .iter()
+            .map(|page| page.content_hash.as_str())
+            .collect::<Vec<_>>()
+            .join(",");
+        let stable = state.stable_context_digest.as_deref().unwrap_or_default();
+        digest(
+            format!(
+                "ctxvm_content_fingerprint_v1:{}:{checkpoint}:{deltas}:{stable}",
+                root.epoch
+            )
+            .as_bytes(),
         )
     }
 

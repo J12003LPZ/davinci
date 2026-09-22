@@ -8,6 +8,7 @@ pub mod decision_intelligence;
 pub mod engineering;
 pub mod harness_eval;
 pub mod harness_table;
+pub mod openai_cache_eval;
 pub mod optimization;
 pub mod promotion;
 pub mod reporter;

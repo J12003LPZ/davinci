@@ -1065,6 +1065,56 @@ pub fn session_stats_for_agent(agent: &Agent, model: Option<&Model>) -> Value {
         "cost": stats.cost,
         "contextUsage": context_usage,
         "runtime": agent.run_stats(),
+        "openaiCache": openai_cache_status(agent, &stats),
+    })
+}
+
+fn openai_cache_status(agent: &Agent, stats: &davinci_session::SessionUsageStats) -> Value {
+    let raw_input = stats
+        .input
+        .saturating_add(stats.cache_read)
+        .saturating_add(stats.cache_write);
+    let resume = agent.native_responses_resume_record();
+    let diagnostic = davinci_ai::latest_diagnostic(resume.as_ref());
+    let applied_policy = davinci_ai::latest_applied_policy(resume.as_ref());
+    let local_prefix_fingerprint = resume
+        .as_ref()
+        .map(|record| record.turn.wire_manifest.ordered_prefix_fingerprint.clone());
+    let transport = agent
+        .session
+        .as_ref()
+        .and_then(|session| davinci_ai::get_openai_codex_websocket_debug_stats(&session.header.id))
+        .map(|stats| {
+            serde_json::json!({
+                "requests": stats.requests,
+                "connectionsCreated": stats.connections_created,
+                "connectionsReused": stats.connections_reused,
+                "cachedContextRequests": stats.cached_context_requests,
+                "fullContextRequests": stats.full_context_requests,
+                "deltaRequests": stats.delta_requests,
+                "websocketFailures": stats.websocket_failures,
+                "fallbackToSse": stats.websocket_fallback_active,
+            })
+        });
+
+    serde_json::json!({
+        "providerUsage": {
+            "ordinaryInputTokens": stats.input,
+            "cacheReadTokens": stats.cache_read,
+            "cacheWriteTokens": stats.cache_write,
+            "rawInputTokens": raw_input,
+            "cacheReadRatio": if raw_input > 0 {
+                Value::from(stats.cache_read as f64 / raw_input as f64)
+            } else {
+                Value::Null
+            },
+        },
+        "sameLocalPrefixFingerprint": local_prefix_fingerprint,
+        "providerDiagnostic": diagnostic,
+        "appliedPolicy": applied_policy,
+        "nativeReplayAvailable": resume.is_some(),
+        "transportContinuation": transport,
+        "localEvidenceCache": "reported separately by /cache-status",
     })
 }
 

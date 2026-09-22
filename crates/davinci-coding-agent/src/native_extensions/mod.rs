@@ -180,7 +180,7 @@ pub fn command_specs() -> Vec<(&'static str, &'static str, Option<&'static str>)
         ),
         (
             "cache-status",
-            "Show local cache usage and separate provider token counters.",
+            "Show local cache hits separately from provider read/write usage and transport reuse.",
             None,
         ),
         (
@@ -760,12 +760,35 @@ impl NativeExtensionHost {
             "memory-search" => Ok(Some(self.memory.search_text(args))),
             "memory-reindex" => Ok(Some(self.memory.reindex().map_err(|err| err.to_string())?)),
             "memory-clear" => Ok(Some(self.memory.clear().map_err(|err| err.to_string())?)),
-            "cache-status" => Ok(Some(json!({
-                "enabled":self.cache.config().enabled, "summary":self.cache.stats().summary(),
-                "namespaces":self.cache.stats().namespaces,
-                "diskUsage":"last observed on write or explicit sweep; no startup scan",
-                "providerSource":"provider-reported usage only"
-            }))),
+            "cache-status" => {
+                let stats = self.cache.stats();
+                let raw_input = stats
+                    .provider
+                    .input_tokens
+                    .saturating_add(stats.provider.cache_read_tokens)
+                    .saturating_add(stats.provider.cache_write_tokens);
+                Ok(Some(json!({
+                    "enabled": self.cache.config().enabled,
+                    "runtimeFeatures": davinci_ai::openai_cache_policy::runtime_features(),
+                    "summary": stats.summary(),
+                    "namespaces": stats.namespaces,
+                    "diskUsage":"last observed on write or explicit sweep; no startup scan",
+                    "providerSource":"provider-reported usage only; not local cache hits or websocket reuse",
+                    "provider":{
+                        "ordinaryInputTokens":stats.provider.input_tokens,
+                        "cacheReadTokens":stats.provider.cache_read_tokens,
+                        "cacheWriteTokens":stats.provider.cache_write_tokens,
+                        "rawInputTokens":raw_input,
+                        "cacheReadRatio":if raw_input > 0 {
+                            Value::from(stats.provider.cache_read_tokens as f64 / raw_input as f64)
+                        } else {
+                            Value::Null
+                        }
+                    },
+                    "localEvidenceSource":"memory/persistent namespace counters above",
+                    "transportContinuationSource":"separate Codex websocket/session diagnostics"
+                })))
+            }
             "governor-status" => Ok(Some(self.governor.status())),
             "governor-reset" => {
                 self.governor.reset();

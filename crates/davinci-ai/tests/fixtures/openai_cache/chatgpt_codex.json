@@ -1,0 +1,12 @@
+{
+  "name": "chatgpt-codex-affinity-is-not-conversation",
+  "backend": "openai-codex-responses",
+  "origin": "https://chatgpt.com/backend-api",
+  "model": "gpt-5-codex",
+  "cache_partition": "cache-partition-example",
+  "conversation_id": "conversation-private-example",
+  "expected": {
+    "conversation_owns_continuation": true,
+    "cache_partition_owns_continuation": false
+  }
+}

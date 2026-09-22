@@ -196,7 +196,7 @@ use davinci_ai::{
     apply_config_auth_with_shell, apply_models_config, check_auth, complete_simple, content_text,
     find_model, format_no_api_key_found_message, format_no_model_selected_message,
     format_no_models_available_message, format_oauth_auth_failed_message, fuzzy_models,
-    get_supported_thinking_levels, live_complete_streaming_with_sink, load_builtin_models,
+    get_supported_thinking_levels, live_complete_streaming_with_sink_envelope, load_builtin_models,
     models_json_path, resolve_provider_auth, snapshot_availability, AssistantMessage, AuthStorage,
     ContentBlock, Credential, CredentialKind, ModelConfig, ModelRuntimeSnapshot, ResolvedAuth,
     StopReason, StreamOptions, ToolSpec, NO_MODELS_AVAILABLE, PROVIDER_SPECS,
@@ -1067,6 +1067,7 @@ fn complete_simple_summarization(
         session_id: None,
         cache_key: None,
         cache_retention: Some("none".into()),
+        native_responses_resume: None,
         install_telemetry: Some(load_settings(&default_agent_dir()).install_telemetry_enabled()),
         abort_signal: None,
     };
@@ -2260,9 +2261,10 @@ fn complete_prompt_with_host(
                             assistant_message_event: event.clone(),
                         });
                     };
-                    let result = live_complete_streaming_with_sink(
+                    let provider_messages = current.messages_for_provider();
+                    let result = live_complete_streaming_with_sink_envelope(
                         model,
-                        &current.messages_for_provider(),
+                        &provider_messages,
                         auth,
                         Some(&system),
                         &provider_tools(current),
@@ -2298,15 +2300,33 @@ fn complete_prompt_with_host(
                                     role: Some("root".into()),
                                 }.cache_key())),
                             cache_retention: None,
+                            native_responses_resume:
+                                current.native_responses_resume_record(),
                             install_telemetry: Some(current.install_telemetry),
                             abort_signal: current.abort_signal.clone(),
                         },
                         &mut sink,
                     );
-                    result.map(|(message, stream_events)| CompleteOutput {
-                        message,
-                        stream_events: Some(stream_events),
-                        streamed_live: started,
+                    result.map(|envelope| {
+                        let native_responses_resume = envelope.native_responses.map(|turn| {
+                            let mut resume_projection = provider_messages.clone();
+                            resume_projection
+                                .push(davinci_ai::assistant_to_chat(&envelope.message));
+                            davinci_ai::NativeResponsesResumeRecord {
+                                turn,
+                                resume_provider_message_count: resume_projection.len(),
+                                resume_provider_messages_fingerprint:
+                                    davinci_ai::provider_messages_fingerprint(
+                                        &resume_projection,
+                                    ),
+                            }
+                        });
+                        CompleteOutput {
+                            message: envelope.message,
+                            stream_events: Some(envelope.stream_events),
+                            native_responses_resume,
+                            streamed_live: started,
+                        }
                     })
                 }
                 // Nothing was asked of a provider. Say which of the three

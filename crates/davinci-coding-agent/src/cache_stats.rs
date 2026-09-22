@@ -3,12 +3,9 @@
 use davinci_session::SessionEntry;
 use serde_json::Value;
 
-/// Prompt-cache TTL: idle gaps longer than this are worth mentioning.
-/// Anthropic's default cache TTL is 5 minutes.
-pub const CACHE_TTL_MS: u64 = 5 * 60 * 1000;
-
-/// Per-turn misses at or below this are cache breakpoint granularity noise.
-const NOISE_FLOOR_TOKENS: i64 = 1024;
+/// Local estimator noise guard. This is not a provider eligibility threshold
+/// and must not be presented as evidence about OpenAI cache lifetime/behavior.
+const ESTIMATED_MISS_NOISE_TOKENS: i64 = 1024;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct CacheMiss {
@@ -72,7 +69,7 @@ fn detect_miss(
 
     let missed_tokens =
         (prev.prompt_tokens.min(prompt_tokens) as i64) - (message.cache_read as i64);
-    if missed_tokens <= NOISE_FLOOR_TOKENS {
+    if missed_tokens <= ESTIMATED_MISS_NOISE_TOKENS {
         return None;
     }
 
@@ -250,14 +247,14 @@ pub fn format_cache_miss_notice(miss: &CacheMiss) -> Option<String> {
         format_tokens(miss.missed_tokens)
     );
     let label = if miss.model_changed {
-        "Cache miss after model switch".into()
-    } else if miss.idle_ms >= CACHE_TTL_MS {
+        "Estimated cache miss after model switch".into()
+    } else if miss.idle_ms > 0 {
         format!(
-            "Cache miss after {}m idle",
+            "Estimated cache miss after {}m idle (expiry/routing/eligibility uncertain)",
             (miss.idle_ms as f64 / 60_000.0).round() as u64
         )
     } else {
-        "Cache miss".into()
+        "Estimated cache miss".into()
     };
     Some(format!("{label}: {re_billed}"))
 }
@@ -435,7 +432,9 @@ mod tests {
         };
         assert_eq!(
             format_cache_miss_notice(&miss).as_deref(),
-            Some("Cache miss after 9m idle: 105k tokens re-billed (~$0.36)")
+            Some(
+                "Estimated cache miss after 9m idle (expiry/routing/eligibility uncertain): 105k tokens re-billed (~$0.36)"
+            )
         );
         let switched = CacheMiss {
             model_changed: true,
@@ -444,7 +443,7 @@ mod tests {
         };
         assert!(format_cache_miss_notice(&switched)
             .unwrap()
-            .starts_with("Cache miss after model switch:"));
+            .starts_with("Estimated cache miss after model switch:"));
         let small = CacheMiss {
             missed_tokens: 5_000,
             missed_cost: 0.01,

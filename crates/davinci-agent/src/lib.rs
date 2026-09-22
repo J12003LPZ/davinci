@@ -1401,6 +1401,24 @@ impl Agent {
         }
     }
 
+    pub fn native_responses_resume_record(
+        &self,
+    ) -> Option<davinci_ai::NativeResponsesResumeRecord> {
+        let session = self.session.as_ref()?;
+        session.entries.iter().rev().find_map(|entry| {
+            if entry.entry_type != "custom"
+                || entry.custom_type.as_deref()
+                    != Some(davinci_ai::NATIVE_RESPONSES_TURN_ENTRY_TYPE)
+            {
+                return None;
+            }
+            entry.extra.get("data").and_then(|value| {
+                serde_json::from_value::<davinci_ai::NativeResponsesResumeRecord>(value.clone())
+                    .ok()
+            })
+        })
+    }
+
     pub fn messages_for_provider(&self) -> Vec<ChatMessage> {
         match self.context_vm_mode() {
             ContextVmMode::Off => self.legacy_messages_for_provider(),
@@ -3002,6 +3020,7 @@ fn first_kept_entry_id(
 pub struct CompleteOutput {
     pub message: AssistantMessage,
     pub stream_events: Option<Vec<AssistantMessageEvent>>,
+    pub native_responses_resume: Option<davinci_ai::NativeResponsesResumeRecord>,
     /// The closure already sent `MessageStart` and one `MessageUpdate` per
     /// stream event through `Agent::emit_live` while the provider was
     /// answering. The loop then only records them.
@@ -3013,6 +3032,7 @@ impl From<AssistantMessage> for CompleteOutput {
         Self {
             message,
             stream_events: None,
+            native_responses_resume: None,
             streamed_live: false,
         }
     }
@@ -3968,6 +3988,7 @@ mod tests {
                 Ok(CompleteOutput {
                     message,
                     stream_events: Some(stream_events),
+                    native_responses_resume: None,
                     streamed_live: true,
                 })
             })
