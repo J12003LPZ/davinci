@@ -73,51 +73,31 @@ impl ResponsesItem {
 
     pub fn from_json_value(value: &Value) -> Self {
         let item_type = value.get("type").and_then(Value::as_str).unwrap_or("");
-        match item_type {
-            "message" => serde_json::from_value(value.clone()).unwrap_or_else(|_| Self::Raw {
-                item_type: item_type.to_string(),
-                payload: value.clone(),
-            }),
-            "function_call" => {
-                serde_json::from_value(value.clone()).unwrap_or_else(|_| Self::Raw {
-                    item_type: item_type.to_string(),
-                    payload: value.clone(),
-                })
+
+        let parsed = match item_type {
+            "message"
+            | "function_call"
+            | "custom_tool_call"
+            | "function_call_output"
+            | "custom_tool_call_output"
+            | "reasoning_summary"
+            | "encrypted_reasoning" => serde_json::from_value::<Self>(value.clone()).ok(),
+            _ => None,
+        };
+
+        // Serde normally ignores unknown object fields. Native Responses replay
+        // must not silently discard provider fields, so retain the original
+        // object whenever the typed representation is not byte-structure
+        // equivalent after a JSON round-trip.
+        if let Some(item) = parsed {
+            if item.to_json_value() == *value {
+                return item;
             }
-            "custom_tool_call" => {
-                serde_json::from_value(value.clone()).unwrap_or_else(|_| Self::Raw {
-                    item_type: item_type.to_string(),
-                    payload: value.clone(),
-                })
-            }
-            "function_call_output" => {
-                serde_json::from_value(value.clone()).unwrap_or_else(|_| Self::Raw {
-                    item_type: item_type.to_string(),
-                    payload: value.clone(),
-                })
-            }
-            "custom_tool_call_output" => {
-                serde_json::from_value(value.clone()).unwrap_or_else(|_| Self::Raw {
-                    item_type: item_type.to_string(),
-                    payload: value.clone(),
-                })
-            }
-            "reasoning_summary" => {
-                serde_json::from_value(value.clone()).unwrap_or_else(|_| Self::Raw {
-                    item_type: item_type.to_string(),
-                    payload: value.clone(),
-                })
-            }
-            "encrypted_reasoning" => {
-                serde_json::from_value(value.clone()).unwrap_or_else(|_| Self::Raw {
-                    item_type: item_type.to_string(),
-                    payload: value.clone(),
-                })
-            }
-            _ => Self::Raw {
-                item_type: item_type.to_string(),
-                payload: value.clone(),
-            },
+        }
+
+        Self::Raw {
+            item_type: item_type.to_string(),
+            payload: value.clone(),
         }
     }
 }
@@ -331,6 +311,35 @@ mod tests {
         assert_eq!(delta_1[0]["call_id"], "call_abc");
 
         assert!(ledger.delta_since_response_id("resp_missing").is_none());
+    }
+
+    #[test]
+    fn preserves_unknown_fields_on_known_native_items() {
+        let original = serde_json::json!({
+            "type": "function_call",
+            "id": "fc_1",
+            "call_id": "call_1",
+            "name": "read",
+            "arguments": "{\"path\":\"Cargo.toml\"}",
+            "provider_future_field": {"revision": 2}
+        });
+        let item = ResponsesItem::from_json_value(&original);
+        assert!(matches!(item, ResponsesItem::Raw { .. }));
+        assert_eq!(item.to_json_value(), original);
+    }
+
+    #[test]
+    fn keeps_exact_known_native_items_typed() {
+        let original = serde_json::json!({
+            "type": "function_call",
+            "id": "fc_1",
+            "call_id": "call_1",
+            "name": "read",
+            "arguments": "{}"
+        });
+        let item = ResponsesItem::from_json_value(&original);
+        assert!(matches!(item, ResponsesItem::FunctionCall { .. }));
+        assert_eq!(item.to_json_value(), original);
     }
 
     #[test]
