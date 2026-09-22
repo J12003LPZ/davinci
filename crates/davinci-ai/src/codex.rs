@@ -1199,7 +1199,7 @@ data: {"type":"response.completed","response":{"status":"completed"}}
         match outcome {
             CodexWebsocketOutcome::Message(message) => {
                 assert_eq!(
-                    match &message.content[0] {
+                    match &message.message.content[0] {
                         ContentBlock::Text { text } => text.as_str(),
                         _ => "",
                     },
