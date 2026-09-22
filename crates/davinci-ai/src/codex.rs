@@ -10,6 +10,7 @@ use serde_json::Value;
 use uuid::Uuid;
 
 use crate::catalog::Model;
+use crate::responses_ledger::NativeResponsesOutput;
 use crate::stream::{AssistantMessage, AssistantMessageEvent};
 
 pub const DEFAULT_CODEX_BASE_URL: &str = "https://chatgpt.com/backend-api";
@@ -670,8 +671,14 @@ pub fn use_cached_websocket_context(transport: Option<&str>) -> bool {
 }
 
 #[derive(Debug)]
+pub struct CodexWebsocketMessage {
+    pub message: AssistantMessage,
+    pub native_responses: Option<NativeResponsesOutput>,
+}
+
+#[derive(Debug)]
 pub enum CodexWebsocketOutcome {
-    Message(Box<AssistantMessage>),
+    Message(Box<CodexWebsocketMessage>),
     FallbackToSse,
 }
 
@@ -996,7 +1003,7 @@ data: {"type":"response.completed","response":{"status":"completed"}}
         match done {
             AssistantMessageEvent::Done { message, .. } => {
                 assert_eq!(
-                    match &message.content[0] {
+                    match &message.message.content[0] {
                         ContentBlock::Text { text } => text.as_str(),
                         _ => "",
                     },
@@ -1192,7 +1199,7 @@ data: {"type":"response.completed","response":{"status":"completed"}}
         match outcome {
             CodexWebsocketOutcome::Message(message) => {
                 assert_eq!(
-                    match &message.content[0] {
+                    match &message.message.content[0] {
                         ContentBlock::Text { text } => text.as_str(),
                         _ => "",
                     },
@@ -1302,7 +1309,7 @@ data: {"type":"response.completed","response":{"status":"completed"}}
         match outcome {
             CodexWebsocketOutcome::Message(message) => {
                 assert_eq!(
-                    match &message.content[0] {
+                    match &message.message.content[0] {
                         ContentBlock::Text { text } => text.as_str(),
                         _ => "",
                     },
@@ -1419,7 +1426,7 @@ data: {"type":"response.completed","response":{"status":"completed"}}
         match second {
             CodexWebsocketOutcome::Message(message) => {
                 assert_eq!(
-                    match &message.content[0] {
+                    match &message.message.content[0] {
                         ContentBlock::Text { text } => text.as_str(),
                         _ => "",
                     },

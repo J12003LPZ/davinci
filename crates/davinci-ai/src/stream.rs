@@ -198,6 +198,20 @@ impl AssistantMessageEvent {
 
 pub type StreamEvent = AssistantMessageEvent;
 
+#[derive(Debug, Clone)]
+pub struct ProviderCompletionEnvelope {
+    pub message: AssistantMessage,
+    pub stream_events: Vec<AssistantMessageEvent>,
+    pub native_responses: Option<crate::responses_ledger::NativeResponsesTurn>,
+}
+
+fn native_responses_api(model: &Model) -> bool {
+    matches!(
+        model.api.as_str(),
+        "openai-responses" | "azure-openai-responses" | "openai-codex-responses"
+    )
+}
+
 pub fn parse_sse_block(block: &str) -> Option<Value> {
     let mut data = String::new();
     for line in block.lines() {
@@ -270,7 +284,14 @@ fn read_provider_stream(
     decoder: &mut dyn crate::stream_decoder::StreamDecoder,
     abort: Option<&std::sync::Arc<std::sync::atomic::AtomicBool>>,
     on_event: &mut dyn FnMut(&AssistantMessageEvent),
-) -> Result<(AssistantMessage, Vec<AssistantMessageEvent>), String> {
+) -> Result<
+    (
+        AssistantMessage,
+        Vec<AssistantMessageEvent>,
+        Option<crate::responses_ledger::NativeResponsesOutput>,
+    ),
+    String,
+> {
     use std::sync::atomic::Ordering;
 
     // The body is read on its own thread and handed over line by line, so the
@@ -281,6 +302,7 @@ fn read_provider_stream(
     let line_rx = crate::stream_reader::response_lines(response.into_reader());
     let mut framer = crate::stream_decoder::SseFramer::default();
     let mut events = Vec::new();
+    let mut raw_events = Vec::new();
     let mut raw = String::new();
     let mut frames = 0usize;
     let mut aborted = false;
@@ -329,6 +351,7 @@ fn read_provider_stream(
                     crate::trace::describe_event(&frame.data)
                 ));
             }
+            raw_events.push(frame.data.clone());
             feed(&frame.data, decoder, &mut events, on_event);
             if decoder.is_done() {
                 break;
@@ -348,6 +371,7 @@ fn read_provider_stream(
         if let Some(frame) = framer.flush() {
             frames += 1;
             raw.clear();
+            raw_events.push(frame.data.clone());
             feed(&frame.data, decoder, &mut events, on_event);
         }
     }
@@ -368,7 +392,11 @@ fn read_provider_stream(
         for event in &synthesized {
             on_event(event);
         }
-        return Ok((message, synthesized));
+        let native = native_responses_api(model)
+            .then(|| serde_json::from_str::<Value>(&raw).ok())
+            .flatten()
+            .and_then(|value| crate::responses_ledger::NativeResponsesOutput::from_response_value(&value));
+        return Ok((message, synthesized, native));
     }
 
     if aborted {
@@ -382,7 +410,7 @@ fn read_provider_stream(
         };
         on_event(&event);
         events.push(event);
-        return Ok((message, events));
+        return Ok((message, events, None));
     }
 
     let start = events.len();
@@ -401,7 +429,15 @@ fn read_provider_stream(
     for event in &events[start..] {
         on_event(event);
     }
-    Ok((message, events))
+    let native = if native_responses_api(model)
+        && message.stop_reason != Some(StopReason::Error)
+        && message.stop_reason != Some(StopReason::Aborted)
+    {
+        crate::responses_ledger::NativeResponsesOutput::from_events(&raw_events)
+    } else {
+        None
+    };
+    Ok((message, events, native))
 }
 
 pub fn complete_from_events(events: &[AssistantMessageEvent]) -> Option<AssistantMessage> {
@@ -499,7 +535,9 @@ pub fn live_complete_with(
                 options.abort_signal.as_ref(),
                 &mut |_| {},
             ) {
-                Ok(crate::codex::CodexWebsocketOutcome::Message(message)) => return Ok(*message),
+                Ok(crate::codex::CodexWebsocketOutcome::Message(message)) => {
+                    return Ok(message.message)
+                },
                 Ok(crate::codex::CodexWebsocketOutcome::FallbackToSse) => {}
                 Err(error) => return Err(error),
             }
@@ -555,6 +593,21 @@ pub fn live_complete_streaming_with_sink(
     options: &StreamOptions,
     on_event: &mut dyn FnMut(&AssistantMessageEvent),
 ) -> Result<(AssistantMessage, Vec<AssistantMessageEvent>), String> {
+    let envelope = live_complete_streaming_with_sink_envelope(
+        model, messages, auth, system, tools, options, on_event,
+    )?;
+    Ok((envelope.message, envelope.stream_events))
+}
+
+pub fn live_complete_streaming_with_sink_envelope(
+    model: &Model,
+    messages: &[ChatMessage],
+    auth: &ResolvedAuth,
+    system: Option<&str>,
+    tools: &[ToolSpec],
+    options: &StreamOptions,
+    on_event: &mut dyn FnMut(&AssistantMessageEvent),
+) -> Result<ProviderCompletionEnvelope, String> {
     let incremental = crate::stream_decoder::supports_incremental_stream(model);
     let mut body = request_body_with(model, messages, system, tools, options);
     if crate::trace::enabled() {
@@ -615,13 +668,13 @@ pub fn live_complete_streaming_with_sink(
                     if crate::trace::enabled() {
                         crate::trace::log(&format!(
                             "websocket reply stop={:?} blocks={} error={:?}",
-                            message.stop_reason,
-                            message.content.len(),
-                            message.error_message
+                            message.message.stop_reason,
+                            message.message.content.len(),
+                            message.message.error_message
                         ));
                     }
                     let events = if collected.is_empty() {
-                        let synthesized = events_from_complete(&message);
+                        let synthesized = events_from_complete(&message.message);
                         for event in &synthesized {
                             on_event(event);
                         }
@@ -629,7 +682,19 @@ pub fn live_complete_streaming_with_sink(
                     } else {
                         collected
                     };
-                    return Ok((*message, events));
+                    let native_responses = message
+                        .native_responses
+                        .and_then(|output| {
+                            crate::responses_ledger::NativeResponsesTurn::from_prepared(
+                                &prepared,
+                                output,
+                            )
+                        });
+                    return Ok(ProviderCompletionEnvelope {
+                        message: message.message,
+                        stream_events: events,
+                        native_responses,
+                    });
                 }
                 Ok(crate::codex::CodexWebsocketOutcome::FallbackToSse) => {
                     crate::trace::log("websocket fell back to sse");
@@ -666,13 +731,23 @@ pub fn live_complete_streaming_with_sink(
     })?;
     crate::trace::log(&format!("sse status {}", response.status()));
     match crate::stream_decoder::decoder_for(model).filter(|_| incremental) {
-        Some(mut decoder) => read_provider_stream(
-            response,
-            model,
-            decoder.as_mut(),
-            options.abort_signal.as_ref(),
-            on_event,
-        ),
+        Some(mut decoder) => {
+            let (message, stream_events, native_output) = read_provider_stream(
+                response,
+                model,
+                decoder.as_mut(),
+                options.abort_signal.as_ref(),
+                on_event,
+            )?;
+            let native_responses = native_output.and_then(|output| {
+                crate::responses_ledger::NativeResponsesTurn::from_prepared(&prepared, output)
+            });
+            Ok(ProviderCompletionEnvelope {
+                message,
+                stream_events,
+                native_responses,
+            })
+        }
         None => {
             let text = response
                 .into_string()
@@ -691,7 +766,33 @@ pub fn live_complete_streaming_with_sink(
             for event in &events {
                 on_event(event);
             }
-            Ok((message, events))
+            let native_output = if native_responses_api(model) {
+                if text.contains("data:") {
+                    let raw_events = crate::stream_decoder::frames_of(&text)
+                        .into_iter()
+                        .map(|frame| frame.data)
+                        .collect::<Vec<_>>();
+                    crate::responses_ledger::NativeResponsesOutput::from_events(&raw_events)
+                } else {
+                    serde_json::from_str::<Value>(&text)
+                        .ok()
+                        .and_then(|value| {
+                            crate::responses_ledger::NativeResponsesOutput::from_response_value(
+                                &value,
+                            )
+                        })
+                }
+            } else {
+                None
+            };
+            let native_responses = native_output.and_then(|output| {
+                crate::responses_ledger::NativeResponsesTurn::from_prepared(&prepared, output)
+            });
+            Ok(ProviderCompletionEnvelope {
+                message,
+                stream_events: events,
+                native_responses,
+            })
         }
     }
 }

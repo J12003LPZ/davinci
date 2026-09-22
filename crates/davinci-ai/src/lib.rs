@@ -61,7 +61,8 @@ pub use codex::{
     resolve_websocket_connect_timeout_ms, should_fallback_to_sse,
     should_retry_missing_previous_response, should_retry_websocket_connection_limit,
     try_codex_websocket_transport, websocket_connect_timeout_error, websocket_idle_timeout_error,
-    CachedWebSocketContinuation, CodexWebsocketOutcome, OpenAICodexWebSocketDebugStats,
+    CachedWebSocketContinuation, CodexWebsocketMessage, CodexWebsocketOutcome,
+    OpenAICodexWebSocketDebugStats,
     DEFAULT_CODEX_BASE_URL, DEFAULT_WEBSOCKET_CONNECT_TIMEOUT_MS,
     OPENAI_BETA_RESPONSES_EXPERIMENTAL, OPENAI_BETA_RESPONSES_WEBSOCKETS,
     PREVIOUS_RESPONSE_NOT_FOUND, REQUEST_COMPRESSION_ZSTD_LEVEL, SESSION_WEBSOCKET_CACHE_TTL_MS,
@@ -130,10 +131,11 @@ pub use shell::{
 pub use stream::{
     assistant_to_chat, complete_from_events, complete_simple, events_from_complete,
     fixture_complete, live_complete, live_complete_streaming_with,
-    live_complete_streaming_with_sink, live_complete_with, live_stream, parse_sse_block,
+    live_complete_streaming_with_sink, live_complete_streaming_with_sink_envelope,
+    live_complete_with, live_stream, parse_sse_block,
     replay_sse_events, request_body, request_body_with, request_url,
     resolve_json_schema_strict_sampling, AssistantMessage, AssistantMessageEvent, ContentBlock,
-    StopReason, StreamEvent, StreamOptions,
+    ProviderCompletionEnvelope, StopReason, StreamEvent, StreamOptions,
 };
 pub use stream_decoder::{
     decoder_for, frames_of, new_message, supports_incremental_stream, ResponsesDecoder, SseFrame,

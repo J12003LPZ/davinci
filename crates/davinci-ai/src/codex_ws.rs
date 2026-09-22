@@ -18,9 +18,10 @@ use crate::codex::{
     acquire_cached_continuation, build_cached_websocket_request_body,
     record_websocket_request_stats, replay_codex_events, store_cached_continuation,
     websocket_connect_timeout_error, websocket_handshake_headers, websocket_idle_timeout_error,
-    CachedWebSocketContinuation, SESSION_WEBSOCKET_CACHE_TTL_MS, SESSION_WEBSOCKET_MAX_AGE_MS,
-    WEBSOCKET_CLOSED_BEFORE_COMPLETED,
+    CachedWebSocketContinuation, CodexWebsocketMessage, SESSION_WEBSOCKET_CACHE_TTL_MS,
+    SESSION_WEBSOCKET_MAX_AGE_MS, WEBSOCKET_CLOSED_BEFORE_COMPLETED,
 };
+use crate::responses_ledger::NativeResponsesOutput;
 use crate::stream::{AssistantMessage, AssistantMessageEvent, StopReason};
 use crate::stream_decoder::{ResponsesDecoder, StreamDecoder};
 
@@ -46,7 +47,7 @@ pub fn process_codex_websocket(
     started: &mut bool,
     abort: AbortFlag<'_>,
     on_event: &mut dyn FnMut(&AssistantMessageEvent),
-) -> Result<AssistantMessage, String> {
+) -> Result<CodexWebsocketMessage, String> {
     if let Ok(reply) = std::env::var("PI_CODEX_WS_REPLY") {
         return process_fixture(
             &reply,
@@ -117,8 +118,12 @@ pub fn process_codex_websocket(
     if aborted {
         // The socket is mid-response; nothing later can reuse it.
         release_live_socket(acquired.key, stream, false);
-        return Ok(message);
+        return Ok(CodexWebsocketMessage {
+            message,
+            native_responses: None,
+        });
     }
+    let native_responses = NativeResponsesOutput::from_events(&events);
     let mut keep = acquired.key.is_some();
     if use_cached_context {
         if let Some(response_id) = events.iter().rev().find_map(|event| {
@@ -143,7 +148,10 @@ pub fn process_codex_websocket(
         }
     }
     release_live_socket(acquired.key, stream, keep);
-    Ok(message)
+    Ok(CodexWebsocketMessage {
+        message,
+        native_responses,
+    })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -158,7 +166,7 @@ fn process_fixture(
     use_cached_context: bool,
     started: &mut bool,
     on_event: &mut dyn FnMut(&AssistantMessageEvent),
-) -> Result<AssistantMessage, String> {
+) -> Result<CodexWebsocketMessage, String> {
     match reply {
         "timeout" => Err(websocket_connect_timeout_error(connect_timeout_ms)),
         "limit" => Err(crate::codex::WEBSOCKET_CONNECTION_LIMIT_REACHED.into()),
@@ -204,7 +212,12 @@ fn process_fixture(
                     Instant::now(),
                 );
             }
-            Ok(message)
+            let native_responses =
+                NativeResponsesOutput::from_events(&fixture_raw_events(corpus));
+            Ok(CodexWebsocketMessage {
+                message,
+                native_responses,
+            })
         }
     }
 }
