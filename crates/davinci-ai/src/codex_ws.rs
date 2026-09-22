@@ -133,7 +133,7 @@ pub fn process_codex_websocket(
                 CachedWebSocketContinuation {
                     last_request_body: body.clone(),
                     last_response_id: response_id,
-                    last_response_items: cached_response_items(&message),
+                    last_response_items: native_response_items_from_events(&events),
                 },
                 socket_reused,
                 Instant::now(),
@@ -184,13 +184,21 @@ fn process_fixture(
             }
             let message = done_message(&events)?;
             if use_cached_context {
+                let raw_events = fixture_raw_events(corpus);
+                let mut response_items = native_response_items_from_events(&raw_events);
+                if response_items.as_array().is_some_and(Vec::is_empty) {
+                    // Old minimal fixtures predate native output-item events.
+                    // Keep this fallback fixture-only; the live path never
+                    // reconstructs native provider state from UI messages.
+                    response_items = reconstructed_response_items_for_fixture(&message);
+                }
                 store_cached_continuation(
                     cache_session_id,
                     account_id,
                     CachedWebSocketContinuation {
                         last_request_body: body.clone(),
                         last_response_id: "resp_fixture".into(),
-                        last_response_items: cached_response_items(&message),
+                        last_response_items: response_items,
                     },
                     reused,
                     Instant::now(),
@@ -212,7 +220,51 @@ fn is_loopback(url: &str) -> bool {
     url.contains("127.0.0.1") || url.contains("localhost") || url.contains("[::1]")
 }
 
-fn cached_response_items(message: &AssistantMessage) -> Value {
+fn native_response_items_from_events(events: &[Value]) -> Value {
+    // Prefer the terminal response envelope when it contains the final native
+    // output array. It is authoritative and can carry opaque/future fields.
+    if let Some(output) = events.iter().rev().find_map(|event| {
+        event
+            .pointer("/response/output")
+            .and_then(Value::as_array)
+            .filter(|items| !items.is_empty())
+    }) {
+        return Value::Array(output.clone());
+    }
+
+    // Streaming transports also emit completed native items individually.
+    // Preserve each raw item verbatim and restore provider output order.
+    let mut completed = events
+        .iter()
+        .filter(|event| event.get("type").and_then(Value::as_str) == Some("response.output_item.done"))
+        .filter_map(|event| {
+            let item = event.get("item")?.clone();
+            let index = event
+                .get("output_index")
+                .and_then(Value::as_u64)
+                .unwrap_or(u64::MAX);
+            Some((index, item))
+        })
+        .collect::<Vec<_>>();
+    completed.sort_by_key(|(index, _)| *index);
+    Value::Array(completed.into_iter().map(|(_, item)| item).collect())
+}
+
+fn fixture_raw_events(corpus: &str) -> Vec<Value> {
+    corpus
+        .lines()
+        .filter_map(|line| {
+            let line = line.trim();
+            let payload = line.strip_prefix("data:").map(str::trim).unwrap_or(line);
+            if payload.is_empty() || payload == "[DONE]" || payload.starts_with(':') {
+                return None;
+            }
+            serde_json::from_str::<Value>(payload).ok()
+        })
+        .collect()
+}
+
+fn reconstructed_response_items_for_fixture(message: &AssistantMessage) -> Value {
     let chat = crate::assistant_to_chat(message);
     let items = crate::stream::openai_responses_input(std::slice::from_ref(&chat))
         .into_iter()
@@ -961,5 +1013,70 @@ mod tests {
             ])
         );
         crate::codex::close_openai_codex_websocket_sessions(Some(SESSION));
+    }
+}
+
+
+#[cfg(test)]
+mod native_replay_cache_tests {
+    use super::*;
+
+    #[test]
+    fn native_output_items_preserve_unknown_fields_and_provider_order() {
+        let events = vec![
+            serde_json::json!({
+                "type": "response.output_item.done",
+                "output_index": 1,
+                "item": {
+                    "type": "message",
+                    "id": "msg_1",
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": "done"}],
+                    "future_field": {"v": 2}
+                }
+            }),
+            serde_json::json!({
+                "type": "response.output_item.done",
+                "output_index": 0,
+                "item": {
+                    "type": "reasoning",
+                    "id": "rs_1",
+                    "encrypted_content": "opaque-fixture",
+                    "provider_private_field": true
+                }
+            }),
+        ];
+        let items = native_response_items_from_events(&events);
+        let items = items.as_array().unwrap();
+        assert_eq!(items[0]["id"], "rs_1");
+        assert_eq!(items[0]["provider_private_field"], true);
+        assert_eq!(items[1]["id"], "msg_1");
+        assert_eq!(items[1]["future_field"]["v"], 2);
+    }
+
+    #[test]
+    fn terminal_output_array_is_authoritative_for_replay() {
+        let events = vec![
+            serde_json::json!({
+                "type": "response.output_item.done",
+                "output_index": 0,
+                "item": {"type": "message", "id": "streamed"}
+            }),
+            serde_json::json!({
+                "type": "response.completed",
+                "response": {
+                    "id": "resp_1",
+                    "output": [{
+                        "type": "reasoning",
+                        "id": "final",
+                        "encrypted_content": "opaque",
+                        "future": 7
+                    }]
+                }
+            }),
+        ];
+        let items = native_response_items_from_events(&events);
+        assert_eq!(items[0]["id"], "final");
+        assert_eq!(items[0]["future"], 7);
     }
 }
