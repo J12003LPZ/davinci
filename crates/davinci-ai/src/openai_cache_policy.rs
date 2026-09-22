@@ -10,8 +10,7 @@ use crate::catalog::Model;
 use crate::codex_capabilities::CodexCapabilities;
 
 pub const OPENAI_CACHE_CONTRACT_REVISION: &str = "openai-cache-2026-09-21-v1";
-pub const OPENAI_CACHE_EXPLICIT_BOUNDARIES_ENV: &str =
-    "PI_OPENAI_CACHE_EXPLICIT_BOUNDARIES";
+pub const OPENAI_CACHE_EXPLICIT_BOUNDARIES_ENV: &str = "PI_OPENAI_CACHE_EXPLICIT_BOUNDARIES";
 pub const OPENAI_CACHE_NATIVE_REPLAY_ENV: &str = "PI_OPENAI_CACHE_NATIVE_REPLAY";
 pub const OPENAI_CACHE_WORKER_AFFINITY_ENV: &str = "PI_OPENAI_CACHE_WORKER_AFFINITY";
 
@@ -40,10 +39,7 @@ impl OpenAiCacheRuntimeFeatures {
                 OPENAI_CACHE_EXPLICIT_BOUNDARIES_ENV,
                 true,
             ),
-            native_responses_replay: feature_enabled_from_env(
-                OPENAI_CACHE_NATIVE_REPLAY_ENV,
-                true,
-            ),
+            native_responses_replay: feature_enabled_from_env(OPENAI_CACHE_NATIVE_REPLAY_ENV, true),
             worker_bootstrap_affinity: feature_enabled_from_env(
                 OPENAI_CACHE_WORKER_AFFINITY_ENV,
                 true,
