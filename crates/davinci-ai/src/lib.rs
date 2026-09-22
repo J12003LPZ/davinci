@@ -19,6 +19,7 @@ mod models_store;
 mod oauth;
 mod oauth_callback;
 mod oauth_providers;
+pub mod openai_cache_policy;
 mod provider_retry;
 mod providers;
 pub mod request_shape;
