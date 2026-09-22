@@ -96,6 +96,25 @@ pub fn effective_model_cost_rates(model: &Model, raw_input_tokens: u64) -> Model
             if entry.get("id").and_then(serde_json::Value::as_str) != Some(model.id.as_str()) {
                 continue;
             }
+
+            // A user/provider override can intentionally reuse a built-in
+            // provider/model id with different pricing. In that case the
+            // built-in long-context tiers are no longer authoritative and
+            // must not be mixed with the override's base rates.
+            let catalog_cost = |name: &str| {
+                entry
+                    .pointer(&format!("/cost/{name}"))
+                    .and_then(serde_json::Value::as_f64)
+                    .unwrap_or(0.0)
+            };
+            let base_rates_match = catalog_cost("input") == model.cost.input
+                && catalog_cost("output") == model.cost.output
+                && catalog_cost("cacheRead") == model.cost.cache_read
+                && catalog_cost("cacheWrite") == model.cost.cache_write;
+            if !base_rates_match {
+                return rates;
+            }
+
             let Some(tiers) = entry.pointer("/cost/tiers").and_then(serde_json::Value::as_array) else {
                 return rates;
             };
@@ -350,6 +369,27 @@ mod tests {
         assert_eq!(high.cache_read, 0.8);
         assert_eq!(high.cache_write, 10.0);
         assert_eq!(high.tier_input_tokens_above, Some(272_000));
+    }
+
+    #[test]
+    fn custom_price_override_does_not_inherit_builtin_long_input_tier() {
+        let mut custom = load_builtin_models()
+            .into_iter()
+            .find(|model| model.provider == "openai" && model.id == "gpt-5.6-sol")
+            .expect("gpt-5.6-sol");
+        custom.cost = ModelCost {
+            input: 123.0,
+            output: 456.0,
+            cache_read: 7.0,
+            cache_write: 8.0,
+        };
+
+        let rates = effective_model_cost_rates(&custom, 300_000);
+        assert_eq!(rates.input, 123.0);
+        assert_eq!(rates.output, 456.0);
+        assert_eq!(rates.cache_read, 7.0);
+        assert_eq!(rates.cache_write, 8.0);
+        assert_eq!(rates.tier_input_tokens_above, None);
     }
 
     #[test]
