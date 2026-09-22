@@ -59,6 +59,82 @@ pub struct ModelCost {
     pub cache_write: f64,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ModelCostRates {
+    pub input: f64,
+    pub output: f64,
+    pub cache_read: f64,
+    pub cache_write: f64,
+    pub tier_input_tokens_above: Option<u64>,
+}
+
+/// Resolve model rates using the raw provider input total. Built-in catalog
+/// tiers are read from the authoritative catalog JSON so the public `Model`
+/// shape stays source-compatible with existing providers and plugins.
+pub fn effective_model_cost_rates(model: &Model, raw_input_tokens: u64) -> ModelCostRates {
+    let mut rates = ModelCostRates {
+        input: model.cost.input,
+        output: model.cost.output,
+        cache_read: model.cost.cache_read,
+        cache_write: model.cost.cache_write,
+        tier_input_tokens_above: None,
+    };
+
+    let Some(json) = builtin_catalog_json(&model.provider) else {
+        return rates;
+    };
+    let Ok(root) = serde_json::from_str::<serde_json::Value>(json) else {
+        return rates;
+    };
+    let Some(groups) = root.as_object() else {
+        return rates;
+    };
+
+    let mut selected: Option<(u64, &serde_json::Value)> = None;
+    for group in groups.values().filter_map(serde_json::Value::as_object) {
+        for entry in group.values() {
+            if entry.get("id").and_then(serde_json::Value::as_str) != Some(model.id.as_str()) {
+                continue;
+            }
+            let Some(tiers) = entry.pointer("/cost/tiers").and_then(serde_json::Value::as_array) else {
+                return rates;
+            };
+            for tier in tiers {
+                let Some(threshold) = tier
+                    .get("inputTokensAbove")
+                    .and_then(serde_json::Value::as_u64)
+                else {
+                    continue;
+                };
+                if raw_input_tokens > threshold
+                    && selected
+                        .as_ref()
+                        .map(|(current, _)| threshold > *current)
+                        .unwrap_or(true)
+                {
+                    selected = Some((threshold, tier));
+                }
+            }
+        }
+    }
+
+    let Some((threshold, tier)) = selected else {
+        return rates;
+    };
+    rates.input = tier.get("input").and_then(serde_json::Value::as_f64).unwrap_or(rates.input);
+    rates.output = tier.get("output").and_then(serde_json::Value::as_f64).unwrap_or(rates.output);
+    rates.cache_read = tier
+        .get("cacheRead")
+        .and_then(serde_json::Value::as_f64)
+        .unwrap_or(rates.cache_read);
+    rates.cache_write = tier
+        .get("cacheWrite")
+        .and_then(serde_json::Value::as_f64)
+        .unwrap_or(rates.cache_write);
+    rates.tier_input_tokens_above = Some(threshold);
+    rates
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Model {
     pub id: String,
@@ -256,6 +332,25 @@ pub fn builtin_provider_ids() -> Vec<&'static str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn resolves_long_input_pricing_tier_from_builtin_catalog() {
+        let sol = load_builtin_models()
+            .into_iter()
+            .find(|model| model.provider == "openai" && model.id == "gpt-5.6-sol")
+            .expect("gpt-5.6-sol");
+
+        let base = effective_model_cost_rates(&sol, 272_000);
+        assert_eq!(base.input, 4.0);
+        assert_eq!(base.tier_input_tokens_above, None);
+
+        let high = effective_model_cost_rates(&sol, 272_001);
+        assert_eq!(high.input, 8.0);
+        assert_eq!(high.output, 30.0);
+        assert_eq!(high.cache_read, 0.8);
+        assert_eq!(high.cache_write, 10.0);
+        assert_eq!(high.tier_input_tokens_above, Some(272_000));
+    }
 
     #[test]
     fn radius_and_registered_providers_flatten_models() {

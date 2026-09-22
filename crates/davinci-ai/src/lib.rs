@@ -47,7 +47,8 @@ pub use auth::{
 pub use catalog::{
     builtin_catalog_json, builtin_provider_ids, flatten_catalog, load_builtin_models,
     load_radius_models, models_from_provider_config, openrouter_image_models,
-    radius_models_from_config, Model, ModelCost, KNOWN_PROVIDERS,
+    effective_model_cost_rates, radius_models_from_config, Model, ModelCost, ModelCostRates,
+    KNOWN_PROVIDERS,
 };
 pub use codex::{
     build_cached_websocket_request_body, build_sse_headers, build_websocket_headers,
@@ -258,16 +259,20 @@ pub fn calculate_usage(
     cache_read: u64,
     cache_write: u64,
 ) -> Usage {
+    let raw_input = input
+        .saturating_add(cache_read)
+        .saturating_add(cache_write);
+    let rates = effective_model_cost_rates(model, raw_input);
     Usage::from_tokens(
         input,
         output,
         cache_read,
         cache_write,
         &davinci_protocol::ModelCost {
-            input: model.cost.input,
-            output: model.cost.output,
-            cache_read: model.cost.cache_read,
-            cache_write: model.cost.cache_write,
+            input: rates.input,
+            output: rates.output,
+            cache_read: rates.cache_read,
+            cache_write: rates.cache_write,
         },
     )
 }
