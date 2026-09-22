@@ -1,12 +1,16 @@
+mod coordinator;
+mod coordinator_api;
 mod failure;
 mod identity;
 mod migrations;
 mod model;
+mod retry_safety;
 mod store;
 mod store_api;
 mod store_support;
 mod transitions;
 
+pub use coordinator_api::{AdmittedOperation, DispatchPermit, EffectPermit, OperationAdmission};
 pub use failure::{FailureReasonCode, FailureSubsystem, OperationFailure};
 pub use identity::{
     AttemptId, ExecutionOwnerId, IdempotencyScope, IdentityError, JournalId, OperationId,

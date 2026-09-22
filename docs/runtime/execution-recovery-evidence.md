@@ -40,6 +40,29 @@ power-loss behavior were not injected. The backup test checks that the closed
 export has no WAL sidecar before opening it as a journal. All checks were local;
 CI and non-Windows platform behavior were not run.
 
+## Task 03 - idempotent admission, attempts, and owner fencing
+
+Checks ran on Windows in the isolated task worktree. The red runs exposed the
+missing admission/dispatch/owner APIs, the missing safe-recovery API, and a v2
+schema path that accepted a cleared SQLite application ID; each regression
+passed after its implementation fix.
+
+| Check | Result |
+|---|---|
+| `cargo test -p davinci-agent --test operation_idempotency --offline --locked` | Passed: 4 tests, exit 0. Covers concurrent duplicate delivery, digest collisions, distinct operation kinds with identical arguments, and durable result replay. |
+| `cargo test -p davinci-agent --test operation_ownership --offline --locked` | Passed: 8 tests, exit 0. Covers stale revisions/owners, claim and latch gating, quiescence, unstarted recovery, durable effect-latch recheck before retry, safe retry, and uncertain-effect blocking. |
+| `cargo test -p davinci-agent --test operation_journal --test operation_model --offline --locked` | Passed: 21 tests across both integration targets, exit 0. |
+| `cargo test -p davinci-agent --test operation_idempotency --test operation_ownership --test operation_journal --test operation_model --offline --locked` | Passed: 33 tests across four integration targets, exit 0. |
+| `cargo test -p davinci-agent v1_upgrade_backfills_intent_owner_and_call_mapping_for_existing_operations --lib --offline --locked` | Passed: 1 test, exit 0. Verifies populated v1 backfill and rejection after clearing the v2 SQLite application ID. |
+| `cargo test -p davinci-agent operations::transitions::tests --lib --offline --locked` | Passed: 1 test, 994 filtered out, exit 0. |
+| Targeted `rustfmt --check` on changed Rust files | Passed, exit 0. |
+| `git diff --check` | Passed, exit 0. |
+
+The journal returns the complete stored result for a matching intent. This
+lower-level API does not make a live user permission decision; the current
+caller facade will enforce that when Task 05 routes tool admission through it.
+All checks were local; CI and non-Windows behavior were not run.
+
 ## Ignored and platform-specific cases
 
 The four ignored tests reported by the workspace run were:

@@ -36,6 +36,9 @@ pub enum OperationEvent {
     Interrupt {
         at: Timestamp,
     },
+    RecoverUnstartedDispatch {
+        evidence: EvidenceId,
+    },
     RequireRecovery,
     FinalizeRecoveredSuccess {
         result: ResultRef,
@@ -184,6 +187,18 @@ pub fn transition_attempt(
             }
             next.state = OperationState::Interrupted;
             next.finished_at = Some(at);
+        }
+        OperationEvent::RecoverUnstartedDispatch { evidence } => {
+            require_state(
+                current,
+                OperationState::Queued,
+                "recover_unstarted_dispatch",
+            )?;
+            if current.effect_status != EffectStatus::NotStarted {
+                return Err(invalid(current, "recover_dispatch_with_possible_effect"));
+            }
+            next.state = OperationState::RecoveryRequired;
+            next.recovery_evidence = Some(evidence);
         }
         OperationEvent::RequireRecovery => {
             require_state(current, OperationState::Interrupted, "require_recovery")?;

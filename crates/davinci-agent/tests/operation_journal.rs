@@ -81,6 +81,7 @@ fn apply_event(
     outbox: Vec<OutboxDraft>,
 ) -> Result<OperationAttempt, JournalError> {
     journal.transition(
+        attempt.owner(),
         attempt.attempt_id(),
         attempt.revision(),
         event,
@@ -92,12 +93,13 @@ fn apply_event(
 fn running_with_possible_effect(
     journal: &OperationJournal,
     attempt: OperationAttempt,
+    spec: &OperationSpec,
 ) -> OperationAttempt {
     let attempt = apply_event(
         journal,
         &attempt,
         OperationEvent::Authorize(AuthorizationReceipt::new(
-            PayloadDigest::of_bytes(b"approved operation"),
+            spec.intent_digest().unwrap(),
             "test-policy-v1".to_owned(),
             Timestamp::from_unix_millis(10),
         )),
@@ -106,24 +108,14 @@ fn running_with_possible_effect(
     )
     .unwrap();
     let attempt = apply_event(journal, &attempt, OperationEvent::Queue, None, vec![]).unwrap();
-    let attempt = apply_event(
-        journal,
-        &attempt,
-        OperationEvent::Start {
-            at: Timestamp::from_unix_millis(20),
-        },
-        None,
-        vec![],
-    )
-    .unwrap();
-    apply_event(
-        journal,
-        &attempt,
-        OperationEvent::MarkEffectPossible,
-        None,
-        vec![],
-    )
-    .unwrap()
+    let claim = journal
+        .claim_dispatch(attempt.owner(), attempt.attempt_id(), attempt.revision())
+        .unwrap();
+    let permit = journal
+        .latch_effect_start(claim, Timestamp::from_unix_millis(20))
+        .unwrap();
+    permit.dispatch(journal, || ()).unwrap();
+    journal.load_attempt(attempt.attempt_id()).unwrap()
 }
 
 const CHILD_DIRECTORY: &str = "DAVINCI_OPERATION_JOURNAL_CHILD_DIRECTORY";
@@ -221,7 +213,7 @@ fn transition_result_event_and_outbox_commit_together() {
     let spec = fixture.spec("call-atomic", json!({"action": "publish"}));
     let initial = OperationAttempt::new(spec.operation_id(), 1, owner()).unwrap();
     let attempt = journal.persist_intent(&spec, &initial).unwrap();
-    let attempt = running_with_possible_effect(&journal, attempt);
+    let attempt = running_with_possible_effect(&journal, attempt, &spec);
 
     let payload = json!({"receipt": "remote-42", "accepted": true});
     let reference = ResultRef::new(PayloadDigest::of_json(&payload).unwrap());
@@ -260,7 +252,7 @@ fn failed_durable_write_rolls_back_and_poisons_until_reopen() {
     let spec = fixture.spec("call-failure", json!({"action": "publish"}));
     let initial = OperationAttempt::new(spec.operation_id(), 1, owner()).unwrap();
     let attempt = journal.persist_intent(&spec, &initial).unwrap();
-    let attempt = running_with_possible_effect(&journal, attempt);
+    let attempt = running_with_possible_effect(&journal, attempt, &spec);
     Connection::open(fixture.directory.join(JOURNAL_DATABASE_FILE_NAME))
         .unwrap()
         .execute_batch(
@@ -406,7 +398,7 @@ fn oversized_records_and_outbox_batches_are_rejected_without_partial_writes() {
     let spec = fixture.spec("call-bounded-outbox", json!({"action": "publish"}));
     let initial = OperationAttempt::new(spec.operation_id(), 1, owner()).unwrap();
     let attempt = journal.persist_intent(&spec, &initial).unwrap();
-    let attempt = running_with_possible_effect(&journal, attempt);
+    let attempt = running_with_possible_effect(&journal, attempt, &spec);
     let payload = json!({"receipt": "remote-44"});
     let reference = ResultRef::new(PayloadDigest::of_json(&payload).unwrap());
     let batch = vec![
@@ -473,7 +465,7 @@ fn pending_outbox_reads_enforce_the_batch_bound_and_acknowledgements_are_durable
     let spec = fixture.spec("call-ack", json!({"action": "publish"}));
     let initial = OperationAttempt::new(spec.operation_id(), 1, owner()).unwrap();
     let attempt = journal.persist_intent(&spec, &initial).unwrap();
-    let attempt = running_with_possible_effect(&journal, attempt);
+    let attempt = running_with_possible_effect(&journal, attempt, &spec);
     let payload = json!({"receipt": "remote-45"});
     let reference = ResultRef::new(PayloadDigest::of_json(&payload).unwrap());
     apply_event(

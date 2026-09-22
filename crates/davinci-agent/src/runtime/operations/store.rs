@@ -3,8 +3,8 @@ use super::store_api::*;
 use super::store_support::*;
 use super::transitions::{transition_attempt, OperationEvent, TransitionError};
 use super::{
-    AttemptId, OperationAttempt, OperationSpec, OperationState, PayloadDigest, RootNamespaceId,
-    Timestamp,
+    AttemptId, ExecutionOwner, OperationAdmission, OperationAttempt, OperationSpec, PayloadDigest,
+    RootNamespaceId, Timestamp,
 };
 use crate::runtime::cache::directory::{Directory, DirectoryLease};
 use rusqlite::{
@@ -21,7 +21,7 @@ use uuid::Uuid;
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 const LEASE_DIRECTORY: &str = ".operation-journal-leases";
 const MIGRATION_LEASE_DIRECTORY: &str = "migration";
-struct JournalState {
+pub(super) struct JournalState {
     connection: Connection,
 }
 
@@ -29,8 +29,8 @@ struct JournalState {
 /// nonblocking lane: contention returns `WriterBusy`, so no unbounded queue can
 /// accumulate before a durable intent acknowledgement.
 pub struct OperationJournal {
-    identity: JournalIdentity,
-    root_namespace_id: RootNamespaceId,
+    pub(super) identity: JournalIdentity,
+    pub(super) root_namespace_id: RootNamespaceId,
     directory: Directory,
     _root_lease_directory: Directory,
     _root_lease: DirectoryLease,
@@ -131,118 +131,19 @@ impl OperationJournal {
         spec: &OperationSpec,
         initial_attempt: &OperationAttempt,
     ) -> Result<OperationAttempt, JournalError> {
-        spec.validate()
-            .map_err(|error| JournalError::Serialization(error.to_string()))?;
-        self.validate_spec_binding(spec)?;
-        if initial_attempt.operation_id() != spec.operation_id()
-            || initial_attempt.revision() != 0
-            || initial_attempt.state() != OperationState::Created
-        {
-            return Err(JournalError::RootBindingMismatch);
+        match self.admit(spec, initial_attempt)? {
+            OperationAdmission::New(admitted) => Ok(admitted.attempt),
+            OperationAdmission::ExistingInFlight(admitted)
+            | OperationAdmission::ExistingResult(admitted) => Err(JournalError::DuplicateIntent(
+                admitted.attempt.operation_id(),
+            )),
+            OperationAdmission::Collision => Err(JournalError::IdempotencyCollision),
         }
-        initial_attempt
-            .validate()
-            .map_err(|error| JournalError::Serialization(error.to_string()))?;
-        let spec_json = encode_bounded(spec, MAX_SPEC_BYTES, "operation specification")?;
-        let event = OperationEvent::Persist;
-        let event_json = encode_bounded(&event, MAX_EVENT_BYTES, "operation event")?;
-        let attempt = transition_attempt(initial_attempt, 0, event.clone())?;
-        let attempt_json = encode_bounded(&attempt, MAX_ATTEMPT_BYTES, "operation attempt")?;
-        let scope = serde_json::to_value(spec.caller_key().scope)
-            .map_err(|error| JournalError::Serialization(error.to_string()))?
-            .as_str()
-            .ok_or_else(|| JournalError::Serialization("invalid idempotency scope".into()))?
-            .to_owned();
-        let payload_digest = spec.payload_digest().to_string();
-        let operation_id = spec.operation_id().to_string();
-        let attempt_id = attempt.attempt_id().to_string();
-        let owner = attempt.owner();
-
-        self.write(|transaction| {
-            let existing: Option<(String, String)> = transaction
-                .query_row(
-                    "SELECT operation_id, payload_digest FROM operations
-                     WHERE root_namespace_id = ?1 AND caller_scope = ?2 AND caller_key = ?3",
-                    params![self.root_namespace_id.to_string(), scope, spec.caller_key().key],
-                    |row| Ok((row.get(0)?, row.get(1)?)),
-                )
-                .optional()
-                .map_err(sqlite_error)?;
-            if let Some((existing_id, digest)) = existing {
-                if digest != payload_digest {
-                    return Err(JournalError::IdempotencyCollision);
-                }
-                return Err(JournalError::DuplicateIntent(parse_id(&existing_id)?));
-            }
-            let operations: i64 = transaction
-                .query_row(
-                    "SELECT count(*) FROM operations WHERE root_namespace_id = ?1",
-                    [self.root_namespace_id.to_string()],
-                    |row| row.get(0),
-                )
-                .map_err(sqlite_error)?;
-            if operations >= MAX_OPERATIONS_PER_ROOT {
-                return Err(JournalError::Capacity("operation count per root"));
-            }
-            let duplicate_id: bool = transaction
-                .query_row(
-                    "SELECT EXISTS(SELECT 1 FROM operations WHERE operation_id = ?1)",
-                    [&operation_id],
-                    |row| row.get(0),
-                )
-                .map_err(sqlite_error)?;
-            if duplicate_id {
-                return Err(JournalError::DuplicateOperation);
-            }
-            transaction
-                .execute(
-                    "INSERT INTO operations
-                     (operation_id, root_namespace_id, caller_scope, caller_key, payload_digest, spec_json, created_at_ms)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-                    params![
-                        operation_id,
-                        self.root_namespace_id.to_string(),
-                        scope,
-                        spec.caller_key().key,
-                        payload_digest,
-                        spec_json,
-                        now_unix_millis()
-                    ],
-                )
-                .map_err(sqlite_error)?;
-            transaction
-                .execute(
-                    "INSERT INTO attempts
-                     (attempt_id, operation_id, attempt_number, revision, owner_id, owner_generation, state, attempt_json, updated_at_ms)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
-                    params![
-                        attempt_id,
-                        operation_id,
-                        i64::from(attempt.attempt_number()),
-                        to_sql_integer(attempt.revision())?,
-                        owner.id.to_string(),
-                        to_sql_integer(owner.generation)?,
-                        state_name(attempt.state())?,
-                        attempt_json,
-                        now_unix_millis()
-                    ],
-                )
-                .map_err(sqlite_error)?;
-            insert_event(
-                transaction,
-                self.root_namespace_id,
-                spec.operation_id(),
-                attempt.attempt_id(),
-                0,
-                attempt.revision(),
-                &event_json,
-            )?;
-            Ok(attempt.clone())
-        })
     }
 
     pub fn transition(
         &self,
+        owner: ExecutionOwner,
         attempt_id: AttemptId,
         expected_revision: u64,
         event: OperationEvent,
@@ -271,18 +172,56 @@ impl OperationJournal {
             .transpose()?;
 
         self.write(|transaction| {
-            let current_json: Option<String> = transaction
+            let row: Option<(String, String, i64, String)> = transaction
                 .query_row(
-                    "SELECT a.attempt_json FROM attempts a
+                    "SELECT a.attempt_json, oo.owner_id, oo.generation, o.spec_json
+                     FROM attempts a
                      JOIN operations o ON o.operation_id = a.operation_id
+                     JOIN operation_owners oo ON oo.operation_id = o.operation_id
                      WHERE a.attempt_id = ?1 AND o.root_namespace_id = ?2",
                     params![attempt_id.to_string(), self.root_namespace_id.to_string()],
-                    |row| row.get(0),
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
                 )
                 .optional()
                 .map_err(sqlite_error)?;
-            let current_json = current_json.ok_or(JournalError::NotFound)?;
+            let (current_json, owner_id, owner_generation, spec_json) =
+                row.ok_or(JournalError::NotFound)?;
+            let active_owner = ExecutionOwner::new(
+                parse_id(&owner_id)?,
+                from_sql_integer(owner_generation)?,
+            )
+            .map_err(|error| JournalError::Integrity(error.to_string()))?;
+            if owner != active_owner {
+                return Err(JournalError::OwnerFenced {
+                    expected: owner,
+                    actual: active_owner,
+                });
+            }
             let current: OperationAttempt = decode_json(&current_json)?;
+            if current.owner() != owner {
+                return Err(JournalError::OwnerFenced {
+                    expected: owner,
+                    actual: current.owner(),
+                });
+            }
+            if let OperationEvent::Authorize(receipt) = &event {
+                let spec: OperationSpec = decode_json(&spec_json)?;
+                let intent_digest = spec
+                    .intent_digest()
+                    .map_err(|error| JournalError::Serialization(error.to_string()))?;
+                if receipt.approved_payload_digest != intent_digest {
+                    return Err(JournalError::AuthorizationDigestMismatch);
+                }
+            }
+            if matches!(
+                &event,
+                OperationEvent::Start { .. } | OperationEvent::MarkEffectPossible
+            ) {
+                return Err(JournalError::DispatchPermitRequired);
+            }
+            if matches!(&event, OperationEvent::RecoverUnstartedDispatch { .. }) {
+                return Err(JournalError::CoordinatorTransitionRequired);
+            }
             let next = transition_attempt(&current, expected_revision, event.clone())?;
             let new_result = current.result().is_none() && next.result().is_some();
             let result_record = match (new_result, result_payload.as_ref(), encoded_payload.as_ref()) {
@@ -560,7 +499,7 @@ impl OperationJournal {
         result
     }
 
-    fn validate_spec_binding(&self, spec: &OperationSpec) -> Result<(), JournalError> {
+    pub(super) fn validate_spec_binding(&self, spec: &OperationSpec) -> Result<(), JournalError> {
         let context = spec.context();
         if context.journal_id != self.identity.journal_id
             || context.workspace.id != self.identity.workspace.id
@@ -585,7 +524,7 @@ impl OperationJournal {
         }
     }
 
-    fn write<R>(
+    pub(super) fn write<R>(
         &self,
         action: impl FnOnce(&Transaction<'_>) -> Result<R, JournalError>,
     ) -> Result<R, JournalError> {
@@ -621,7 +560,7 @@ impl OperationJournal {
         }
     }
 
-    fn read<R>(
+    pub(super) fn read<R>(
         &self,
         action: impl FnOnce(&Transaction<'_>) -> Result<R, JournalError>,
     ) -> Result<R, JournalError> {

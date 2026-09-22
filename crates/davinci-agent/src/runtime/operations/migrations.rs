@@ -1,7 +1,9 @@
 use super::store_api::{JournalError, JournalIdentity};
+use super::OperationSpec;
 use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 
-pub(super) const SCHEMA_VERSION: u32 = 1;
+const INITIAL_SCHEMA_VERSION: u32 = 1;
+pub(super) const SCHEMA_VERSION: u32 = 2;
 const APPLICATION_ID: i64 = 0x4456_4F50; // "DVOP"
 
 const SCHEMA_V1: &str = r#"
@@ -130,6 +132,67 @@ CREATE TRIGGER operation_outbox_no_delete BEFORE DELETE ON operation_outbox
 BEGIN SELECT RAISE(ABORT, 'outbox history is retained'); END;
 "#;
 
+const SCHEMA_V2: &str = r#"
+ALTER TABLE operations ADD COLUMN intent_digest TEXT
+    CHECK (intent_digest IS NULL OR length(intent_digest) = 64);
+DROP TRIGGER operations_immutable_update;
+CREATE TABLE operation_owners (
+    operation_id TEXT PRIMARY KEY REFERENCES operations(operation_id),
+    owner_id TEXT NOT NULL,
+    generation INTEGER NOT NULL CHECK (generation > 0),
+    updated_at_ms INTEGER NOT NULL
+);
+CREATE TABLE dispatch_claims (
+    attempt_id TEXT PRIMARY KEY REFERENCES attempts(attempt_id),
+    operation_id TEXT NOT NULL REFERENCES operations(operation_id),
+    owner_id TEXT NOT NULL,
+    owner_generation INTEGER NOT NULL CHECK (owner_generation > 0),
+    permit_nonce TEXT NOT NULL UNIQUE,
+    claimed_at_ms INTEGER NOT NULL,
+    effect_started INTEGER NOT NULL CHECK (effect_started IN (0, 1))
+);
+CREATE TABLE operation_call_mappings (
+    operation_id TEXT PRIMARY KEY REFERENCES operations(operation_id),
+    root_namespace_id TEXT NOT NULL REFERENCES journal_roots(root_namespace_id),
+    session_id TEXT NOT NULL,
+    caller_scope TEXT NOT NULL,
+    caller_key TEXT NOT NULL,
+    wire_tool_call_id TEXT,
+    parent_operation_id TEXT,
+    UNIQUE (root_namespace_id, caller_scope, caller_key),
+    UNIQUE (root_namespace_id, session_id, wire_tool_call_id)
+);
+"#;
+
+const SCHEMA_V2_GUARDS: &str = r#"
+CREATE TRIGGER operations_intent_guard BEFORE INSERT ON operations
+WHEN NEW.intent_digest IS NULL OR length(NEW.intent_digest) != 64
+BEGIN SELECT RAISE(ABORT, 'operation intent digest is required'); END;
+CREATE TRIGGER operations_immutable_update BEFORE UPDATE ON operations
+BEGIN SELECT RAISE(ABORT, 'operation specifications are immutable'); END;
+CREATE TRIGGER operation_owners_generation_guard BEFORE UPDATE ON operation_owners
+WHEN NEW.operation_id != OLD.operation_id OR NEW.generation <= OLD.generation
+BEGIN SELECT RAISE(ABORT, 'owner generation must increase'); END;
+CREATE TRIGGER operation_owners_no_delete BEFORE DELETE ON operation_owners
+BEGIN SELECT RAISE(ABORT, 'operation owner history is retained'); END;
+CREATE TRIGGER dispatch_claims_effect_guard BEFORE UPDATE ON dispatch_claims
+WHEN NEW.attempt_id != OLD.attempt_id
+  OR NEW.operation_id != OLD.operation_id
+  OR NEW.owner_id != OLD.owner_id
+  OR NEW.owner_generation != OLD.owner_generation
+  OR NEW.permit_nonce != OLD.permit_nonce
+  OR NEW.claimed_at_ms != OLD.claimed_at_ms
+  OR OLD.effect_started != 0
+  OR NEW.effect_started != 1
+BEGIN SELECT RAISE(ABORT, 'invalid dispatch effect latch'); END;
+CREATE TRIGGER dispatch_claims_no_delete BEFORE DELETE ON dispatch_claims
+BEGIN SELECT RAISE(ABORT, 'dispatch claims are retained'); END;
+CREATE TRIGGER operation_call_mappings_no_update BEFORE UPDATE ON operation_call_mappings
+BEGIN SELECT RAISE(ABORT, 'operation call mappings are immutable'); END;
+CREATE TRIGGER operation_call_mappings_no_delete BEFORE DELETE ON operation_call_mappings
+BEGIN SELECT RAISE(ABORT, 'operation call mappings are immutable'); END;
+"#;
+
 pub(super) fn initialize(
     connection: &mut Connection,
     identity: &JournalIdentity,
@@ -141,8 +204,18 @@ pub(super) fn initialize(
     }
     let version: u32 = connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
     match version {
-        0 => initialize_v1(connection, identity, application_id)?,
-        SCHEMA_VERSION => validate_v1(connection, identity, application_id)?,
+        0 => {
+            initialize_v1(connection, identity, application_id)?;
+            migrate_v2(connection)?;
+        }
+        INITIAL_SCHEMA_VERSION => {
+            validate_v1(connection, identity, application_id)?;
+            migrate_v2(connection)?;
+        }
+        SCHEMA_VERSION => {
+            validate_v1(connection, identity, application_id)?;
+            validate_v2(connection)?;
+        }
         other => return Err(JournalError::UnsupportedSchema(other)),
     }
     integrity_check(connection)
@@ -170,7 +243,7 @@ fn initialize_v1(
          (singleton, schema_version, journal_id, workspace_id, workspace_binding_version, created_at_ms)
          VALUES (1, ?1, ?2, ?3, ?4, ?5)",
         params![
-            SCHEMA_VERSION,
+            INITIAL_SCHEMA_VERSION,
             identity.journal_id.to_string(),
             identity.workspace.id.to_string(),
             identity.workspace.binding_version,
@@ -179,10 +252,13 @@ fn initialize_v1(
     )?;
     transaction.execute(
         "INSERT INTO journal_migrations (version, applied_at_ms) VALUES (?1, ?2)",
-        params![SCHEMA_VERSION, super::store_support::now_unix_millis()],
+        params![
+            INITIAL_SCHEMA_VERSION,
+            super::store_support::now_unix_millis()
+        ],
     )?;
     transaction.pragma_update(None, "application_id", APPLICATION_ID)?;
-    transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+    transaction.pragma_update(None, "user_version", INITIAL_SCHEMA_VERSION)?;
     transaction.commit()?;
     validate_v1(connection, identity, APPLICATION_ID)
 }
@@ -208,7 +284,7 @@ fn validate_v1(
             "journal metadata is missing".into(),
         ));
     };
-    if schema != SCHEMA_VERSION {
+    if schema != INITIAL_SCHEMA_VERSION {
         return Err(JournalError::UnsupportedSchema(schema));
     }
     if journal_id != identity.journal_id.to_string() {
@@ -231,6 +307,101 @@ fn validate_v1(
     let migration: Option<u32> = connection
         .query_row(
             "SELECT version FROM journal_migrations WHERE version = ?1",
+            [INITIAL_SCHEMA_VERSION],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if migration != Some(INITIAL_SCHEMA_VERSION) {
+        return Err(JournalError::Integrity(
+            "schema migration record is missing".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn migrate_v2(connection: &mut Connection) -> Result<(), JournalError> {
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Exclusive)?;
+    transaction.execute_batch(SCHEMA_V2)?;
+
+    let operations = {
+        let mut statement = transaction.prepare(
+            "SELECT operation_id, root_namespace_id, spec_json FROM operations
+             ORDER BY operation_id",
+        )?;
+        let rows = statement.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })?;
+        rows.collect::<Result<Vec<_>, _>>()?
+    };
+
+    for (operation_id, root_namespace_id, spec_json) in operations {
+        let spec: OperationSpec = super::store_support::decode_json(&spec_json)?;
+        let intent_digest = spec
+            .intent_digest()
+            .map_err(|error| JournalError::Serialization(error.to_string()))?
+            .to_string();
+        let scope = serde_json::to_value(spec.caller_key().scope)
+            .map_err(|error| JournalError::Serialization(error.to_string()))?
+            .as_str()
+            .ok_or_else(|| JournalError::Serialization("invalid idempotency scope".into()))?
+            .to_owned();
+        transaction.execute(
+            "UPDATE operations SET intent_digest = ?1 WHERE operation_id = ?2",
+            params![intent_digest, operation_id],
+        )?;
+        let attempt_owner: (String, i64) = transaction.query_row(
+            "SELECT owner_id, owner_generation FROM attempts
+             WHERE operation_id = ?1 ORDER BY attempt_number DESC LIMIT 1",
+            [&operation_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        transaction.execute(
+            "INSERT INTO operation_owners (operation_id, owner_id, generation, updated_at_ms)
+             VALUES (?1, ?2, ?3, ?4)",
+            params![
+                operation_id,
+                attempt_owner.0,
+                attempt_owner.1,
+                super::store_support::now_unix_millis()
+            ],
+        )?;
+        let parent_id = spec.context().parent_operation_id.map(|id| id.to_string());
+        let wire_call_id = spec.context().wire_tool_call_id.as_deref();
+        transaction.execute(
+            "INSERT INTO operation_call_mappings
+             (operation_id, root_namespace_id, session_id, caller_scope, caller_key,
+              wire_tool_call_id, parent_operation_id)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![
+                operation_id,
+                root_namespace_id,
+                spec.context().session_id,
+                scope,
+                spec.caller_key().key,
+                wire_call_id,
+                parent_id
+            ],
+        )?;
+    }
+
+    transaction.execute_batch(SCHEMA_V2_GUARDS)?;
+    transaction.execute(
+        "INSERT INTO journal_migrations (version, applied_at_ms) VALUES (?1, ?2)",
+        params![SCHEMA_VERSION, super::store_support::now_unix_millis()],
+    )?;
+    transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+    transaction.commit()?;
+    validate_v2(connection)
+}
+
+fn validate_v2(connection: &Connection) -> Result<(), JournalError> {
+    let migration: Option<u32> = connection
+        .query_row(
+            "SELECT version FROM journal_migrations WHERE version = ?1",
             [SCHEMA_VERSION],
             |row| row.get(0),
         )
@@ -238,6 +409,19 @@ fn validate_v1(
     if migration != Some(SCHEMA_VERSION) {
         return Err(JournalError::Integrity(
             "schema migration record is missing".into(),
+        ));
+    }
+    let invalid_records: i64 = connection.query_row(
+        "SELECT
+           (SELECT count(*) FROM operations WHERE intent_digest IS NULL OR length(intent_digest) != 64)
+         + (SELECT abs((SELECT count(*) FROM operations) - (SELECT count(*) FROM operation_owners)))
+         + (SELECT abs((SELECT count(*) FROM operations) - (SELECT count(*) FROM operation_call_mappings)))",
+        [],
+        |row| row.get(0),
+    )?;
+    if invalid_records != 0 {
+        return Err(JournalError::Integrity(
+            "operation coordinator metadata is incomplete".into(),
         ));
     }
     Ok(())
@@ -258,4 +442,187 @@ fn integrity_check(connection: &Connection) -> Result<(), JournalError> {
         )));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::runtime::operations::{
+        transition_attempt, CallerType, EffectClass, EffectProfile, ExecutionOwner,
+        ExecutionOwnerId, IdempotencyScope, JournalId, OperationAttempt, OperationContext,
+        OperationEvent, OperationKind, RootNamespaceId, ScopedIdempotencyKey, WorkspaceId,
+        WorkspaceIdentity,
+    };
+    use crate::runtime::{AgentId, RunId, TaskId};
+    use serde_json::json;
+
+    #[test]
+    fn v1_upgrade_backfills_intent_owner_and_call_mapping_for_existing_operations() {
+        let identity = JournalIdentity::new(
+            JournalId::new(),
+            WorkspaceIdentity {
+                id: WorkspaceId::new(),
+                binding_version: 1,
+            },
+        )
+        .unwrap();
+        let root = RootNamespaceId::new();
+        let spec = OperationSpec::new(
+            OperationContext {
+                journal_id: identity.journal_id,
+                root_namespace_id: root,
+                session_id: "migration-session".to_owned(),
+                runtime_run_id: RunId::new(),
+                parent_operation_id: None,
+                agent_id: AgentId::new(),
+                worker_id: None,
+                task_id: Some(TaskId::new()),
+                graph: None,
+                workspace: identity.workspace.clone(),
+                caller: CallerType::HostControl,
+                wire_tool_call_id: Some("migration-call".to_owned()),
+            },
+            ScopedIdempotencyKey::new(IdempotencyScope::HostControl, "migration-key").unwrap(),
+            OperationKind::CustomExternalAction,
+            EffectProfile {
+                classification: EffectClass::ExternalMutation,
+                supports_idempotency_key: true,
+                supports_postcondition_probe: false,
+                supports_compensation: false,
+                requires_live_owner: true,
+            },
+            json!({"action": "migrate"}),
+            vec![],
+        )
+        .unwrap();
+        let owner = ExecutionOwner::new(ExecutionOwnerId::new(), 7).unwrap();
+        let created = OperationAttempt::new(spec.operation_id(), 1, owner).unwrap();
+        let event = OperationEvent::Persist;
+        let attempt = transition_attempt(&created, 0, event.clone()).unwrap();
+        let spec_json = serde_json::to_string(&spec).unwrap();
+        let attempt_json = serde_json::to_string(&attempt).unwrap();
+        let event_json = serde_json::to_string(&event).unwrap();
+        let scope = serde_json::to_value(spec.caller_key().scope)
+            .unwrap()
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let mut connection = Connection::open_in_memory().unwrap();
+        connection.execute_batch(SCHEMA_V1).unwrap();
+        connection
+            .execute(
+                "INSERT INTO journal_metadata
+                 (singleton, schema_version, journal_id, workspace_id, workspace_binding_version, created_at_ms)
+                 VALUES (1, 1, ?1, ?2, 1, 1)",
+                params![identity.journal_id.to_string(), identity.workspace.id.to_string()],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO journal_migrations (version, applied_at_ms) VALUES (1, 1)",
+                [],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO journal_roots
+                 (root_namespace_id, journal_id, workspace_id, workspace_binding_version, created_at_ms)
+                 VALUES (?1, ?2, ?3, 1, 1)",
+                params![
+                    root.to_string(),
+                    identity.journal_id.to_string(),
+                    identity.workspace.id.to_string()
+                ],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO operations
+                 (operation_id, root_namespace_id, caller_scope, caller_key, payload_digest, spec_json, created_at_ms)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, 1)",
+                params![
+                    spec.operation_id().to_string(),
+                    root.to_string(),
+                    scope,
+                    spec.caller_key().key,
+                    spec.payload_digest().to_string(),
+                    spec_json
+                ],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO attempts
+                 (attempt_id, operation_id, attempt_number, revision, owner_id, owner_generation, state, attempt_json, updated_at_ms)
+                 VALUES (?1, ?2, 1, 1, ?3, 7, 'persisted', ?4, 1)",
+                params![
+                    attempt.attempt_id().to_string(),
+                    spec.operation_id().to_string(),
+                    owner.id.to_string(),
+                    attempt_json
+                ],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO operation_events
+                 (root_namespace_id, operation_id, attempt_id, prior_revision, revision, event_json, created_at_ms)
+                 VALUES (?1, ?2, ?3, 0, 1, ?4, 1)",
+                params![
+                    root.to_string(),
+                    spec.operation_id().to_string(),
+                    attempt.attempt_id().to_string(),
+                    event_json
+                ],
+            )
+            .unwrap();
+        connection
+            .pragma_update(None, "application_id", APPLICATION_ID)
+            .unwrap();
+        connection
+            .pragma_update(None, "user_version", INITIAL_SCHEMA_VERSION)
+            .unwrap();
+
+        initialize(&mut connection, &identity).unwrap();
+
+        let stored_intent: String = connection
+            .query_row(
+                "SELECT intent_digest FROM operations WHERE operation_id = ?1",
+                [spec.operation_id().to_string()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let stored_owner: (String, i64) = connection
+            .query_row(
+                "SELECT owner_id, generation FROM operation_owners WHERE operation_id = ?1",
+                [spec.operation_id().to_string()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        let mapping_count: i64 = connection
+            .query_row(
+                "SELECT count(*) FROM operation_call_mappings
+                 WHERE operation_id = ?1 AND session_id = 'migration-session'
+                   AND wire_tool_call_id = 'migration-call'",
+                [spec.operation_id().to_string()],
+                |row| row.get(0),
+            )
+            .unwrap();
+
+        assert_eq!(stored_intent, spec.intent_digest().unwrap().to_string());
+        assert_eq!(stored_owner, (owner.id.to_string(), 7));
+        assert_eq!(mapping_count, 1);
+        assert_eq!(
+            connection
+                .pragma_query_value(None, "user_version", |row| row.get::<_, u32>(0))
+                .unwrap(),
+            SCHEMA_VERSION
+        );
+
+        connection.pragma_update(None, "application_id", 0).unwrap();
+        assert!(matches!(
+            initialize(&mut connection, &identity),
+            Err(JournalError::UnsupportedDatabase(0))
+        ));
+    }
 }

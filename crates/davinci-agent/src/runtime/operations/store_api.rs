@@ -1,7 +1,7 @@
 use super::transitions::{OperationEvent, TransitionError};
 use super::{
-    AttemptId, JournalId, OperationAttempt, OperationId, OperationSpec, ResultRef, RootNamespaceId,
-    WorkspaceIdentity,
+    AttemptId, ExecutionOwner, JournalId, OperationAttempt, OperationId, OperationSpec, ResultRef,
+    RootNamespaceId, WorkspaceIdentity,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -90,6 +90,29 @@ pub enum JournalError {
     DuplicateIntent(OperationId),
     #[error("same scoped idempotency key was used with a different payload")]
     IdempotencyCollision,
+    #[error("current owner {actual:?} does not match caller owner {expected:?}")]
+    OwnerFenced {
+        expected: ExecutionOwner,
+        actual: ExecutionOwner,
+    },
+    #[error("host did not confirm that the prior operation owner is quiescent")]
+    OwnerQuiescenceNotConfirmed,
+    #[error("attempt already has a dispatch claim")]
+    AttemptAlreadyClaimed,
+    #[error("dispatch permit is invalid, stale, or belongs to another journal")]
+    InvalidDispatchPermit,
+    #[error("attempt is not authorized and queued for dispatch")]
+    DispatchNotReady,
+    #[error("dispatch start and effect latch require a host-owned dispatch permit")]
+    DispatchPermitRequired,
+    #[error("operation transition can only be written through the coordinator")]
+    CoordinatorTransitionRequired,
+    #[error("retry is unsafe because the previous effect may have started")]
+    RetryEffectUncertain,
+    #[error("replacement owner generation must be greater than the current generation")]
+    OwnerGenerationNotAdvanced,
+    #[error("authorization receipt does not approve this operation intent")]
+    AuthorizationDigestMismatch,
     #[error("operation identity already exists")]
     DuplicateOperation,
     #[error("operation or attempt was not found in this root namespace")]

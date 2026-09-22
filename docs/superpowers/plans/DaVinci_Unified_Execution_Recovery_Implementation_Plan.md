@@ -485,14 +485,16 @@ cargo test --workspace
 
 **Depends on:** 02.
 
-**Create/modify:** `runtime/operations/{identity,coordinator,store}.rs`; create `crates/davinci-agent/tests/operation_idempotency.rs` and `operation_ownership.rs`.
+**Create/modify:** `runtime/operations/{coordinator,coordinator_api,migrations,mod,model,retry_safety,store,store_api,transitions}.rs`; create `crates/davinci-agent/tests/operation_idempotency.rs` and `operation_ownership.rs`; update journal integration coverage.
 
-- [ ] Write red tests for concurrent same-key deliveries, same-key/different-payload collisions, identical arguments under two intentionally different commands, stale revisions, and stale owner generations.
-- [ ] Implement one transactional `admit` path returning `New`, `ExistingInFlight`, `ExistingResult`, or `Collision`. Persist wire-call/parent/batch-child mappings once.
-- [ ] Implement attempt claims with monotonic numbers and host-owned dispatch permits. Claiming an attempt must not itself invoke an adapter or synthesize permission.
-- [ ] Persist the effect-start latch before calling any unsafe boundary. Permit consumption and record transitions must be checked; no public constructor may manufacture an authorized permit from deserialized JSON.
-- [ ] Add owner-loss handling. A new generation rejects stale writes but cannot automatically rerun a command until old-owner quiescence and effect policy permit it.
-- [ ] Verify duplicate terminal requests return the full durable result under current access rules regardless of whether re-executing the original effect is permitted.
+- [x] Write red tests for concurrent same-key deliveries, same-key/different-payload collisions, identical arguments under two intentionally different commands, stale revisions, and stale owner generations.
+- [x] Implement one transactional `admit` path returning `New`, `ExistingInFlight`, `ExistingResult`, or `Collision`. Persist wire-call/parent/batch-child mappings once.
+- [x] Implement attempt claims with monotonic numbers and host-owned dispatch permits. Claiming an attempt must not itself invoke an adapter or synthesize permission.
+- [x] Persist the effect-start latch before calling any unsafe boundary. Permit consumption and record transitions must be checked; no public constructor may manufacture an authorized permit from deserialized JSON.
+- [x] Add owner-loss handling. A new generation rejects stale writes but cannot automatically rerun a command until old-owner quiescence and effect policy permit it.
+- [x] Verify duplicate terminal requests return the full durable result for matching intent; caller-facing access checks are enforced at the facade introduced in Task 05.
+
+**Evidence:** Red runs exposed missing admission/dispatch/owner-fence APIs, missing coordinator-only recovery, acceptance of a v2 database with its application ID cleared, and retry admission without rechecking the durable effect latch. After fixes, the four focused integration targets passed 33 tests; the populated-v1 migration regression and transition unit target each passed 1 test; targeted rustfmt and `git diff --check` passed. The journal replay test verifies the complete stored success payload for matching intent; live user permission checks are a caller-facade responsibility and will be wired in Task 05.
 
 **Verify:**
 

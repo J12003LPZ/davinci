@@ -271,6 +271,27 @@ impl OperationSpec {
         self.payload_digest
     }
 
+    /// Digest of the caller's complete operation intent, including its command
+    /// kind and stable session/call lineage as well as arguments.
+    pub fn intent_digest(&self) -> Result<PayloadDigest, ModelError> {
+        let bytes = serde_json::to_vec(&(
+            self.context.journal_id,
+            self.context.root_namespace_id,
+            &self.context.session_id,
+            self.context.parent_operation_id,
+            self.context.caller,
+            &self.context.wire_tool_call_id,
+            self.caller_key.scope,
+            &self.caller_key.key,
+            self.kind,
+            self.effects,
+            &self.preconditions,
+            &self.payload,
+        ))
+        .map_err(|error| ModelError::PayloadEncoding(error.to_string()))?;
+        Ok(PayloadDigest::of_bytes(&bytes))
+    }
+
     pub fn kind(&self) -> OperationKind {
         self.kind
     }
