@@ -27,6 +27,17 @@ The compatibility `cache_retention` setting behaves as follows:
 
 The pure `PromptCacheWirePlan` is the request-shape authority for these choices.
 
+### Rollback switches
+
+The cache optimizations are independently switchable and default to enabled on this branch:
+
+- `PI_OPENAI_CACHE_EXPLICIT_BOUNDARIES=0` rolls verified public Responses requests back to the legacy/provider-default cache shape for normal cache-enabled requests. It does **not** weaken `cache_retention=none`; strict disable still uses the verified explicit-mode contract.
+- `PI_OPENAI_CACHE_NATIVE_REPLAY=0` disables reuse of durable native Responses replay state and falls back to normal full request construction.
+- `PI_OPENAI_CACHE_WORKER_AFFINITY=0` stops installing worker bootstrap cache partitions. Worker conversation/session isolation is unchanged.
+- Provider comparison diagnostics remain separately sampled by `PI_OPENAI_CACHE_DIAGNOSTICS_EVERY_N`; `0` disables comparison sampling.
+
+`/cache-status` reports the effective runtime feature-switch state. These switches change optimization only; they do not widen permissions, merge conversation ownership, or discard acknowledged tool state.
+
 ## Identity and ownership
 
 DaVinci deliberately keeps these identities separate:

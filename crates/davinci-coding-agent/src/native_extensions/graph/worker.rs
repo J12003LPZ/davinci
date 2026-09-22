@@ -387,17 +387,23 @@ pub fn worker_cache_profile(spec: &WorkerSpec) -> WorkerCacheProfile {
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(str::to_string);
-    let cache_key = resolved_model.as_deref().map(|model| {
-        crate::native_extensions::ecosystem::cache_affinity::derive_worker_cache_key(
-            &spec.cwd.to_string_lossy(),
-            1,
-            spec.role,
-            Some(model),
-            &spec.initially_exposed_tools,
-            &stable_bootstrap,
-            spec.expect,
-        )
-    });
+    let cache_key = if davinci_ai::openai_cache_policy::runtime_features()
+        .worker_bootstrap_affinity
+    {
+        resolved_model.as_deref().map(|model| {
+            crate::native_extensions::ecosystem::cache_affinity::derive_worker_cache_key(
+                &spec.cwd.to_string_lossy(),
+                1,
+                spec.role,
+                Some(model),
+                &spec.initially_exposed_tools,
+                &stable_bootstrap,
+                spec.expect,
+            )
+        })
+    } else {
+        None
+    };
 
     WorkerCacheProfile {
         resolved_model,

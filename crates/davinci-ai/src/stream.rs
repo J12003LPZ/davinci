@@ -1097,6 +1097,11 @@ fn openai_responses_body(
     } else {
         crate::openai_cache_policy::OpenAiCacheCapabilities::unknown()
     };
+    let cache_capabilities = crate::openai_cache_policy::apply_runtime_features(
+        cache_capabilities,
+        retention,
+        crate::openai_cache_policy::runtime_features(),
+    );
     let trusted_system = system.filter(|value| !value.is_empty());
     let cache_plan = crate::openai_cache_policy::PromptCacheWirePlan::resolve(
         &cache_capabilities,
@@ -1237,7 +1242,9 @@ fn apply_native_responses_resume(
     messages: &[ChatMessage],
     options: &StreamOptions,
 ) {
-    if !native_responses_api(model) {
+    if !native_responses_api(model)
+        || !crate::openai_cache_policy::runtime_features().native_responses_replay
+    {
         return;
     }
     let Some(resume) = options.native_responses_resume.as_ref() else {

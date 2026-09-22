@@ -10,6 +10,86 @@ use crate::catalog::Model;
 use crate::codex_capabilities::CodexCapabilities;
 
 pub const OPENAI_CACHE_CONTRACT_REVISION: &str = "openai-cache-2026-09-21-v1";
+pub const OPENAI_CACHE_EXPLICIT_BOUNDARIES_ENV: &str =
+    "PI_OPENAI_CACHE_EXPLICIT_BOUNDARIES";
+pub const OPENAI_CACHE_NATIVE_REPLAY_ENV: &str = "PI_OPENAI_CACHE_NATIVE_REPLAY";
+pub const OPENAI_CACHE_WORKER_AFFINITY_ENV: &str = "PI_OPENAI_CACHE_WORKER_AFFINITY";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OpenAiCacheRuntimeFeatures {
+    pub explicit_stable_boundary: bool,
+    pub native_responses_replay: bool,
+    pub worker_bootstrap_affinity: bool,
+}
+
+impl Default for OpenAiCacheRuntimeFeatures {
+    fn default() -> Self {
+        Self {
+            explicit_stable_boundary: true,
+            native_responses_replay: true,
+            worker_bootstrap_affinity: true,
+        }
+    }
+}
+
+impl OpenAiCacheRuntimeFeatures {
+    pub fn from_env() -> Self {
+        Self {
+            explicit_stable_boundary: feature_enabled_from_env(
+                OPENAI_CACHE_EXPLICIT_BOUNDARIES_ENV,
+                true,
+            ),
+            native_responses_replay: feature_enabled_from_env(
+                OPENAI_CACHE_NATIVE_REPLAY_ENV,
+                true,
+            ),
+            worker_bootstrap_affinity: feature_enabled_from_env(
+                OPENAI_CACHE_WORKER_AFFINITY_ENV,
+                true,
+            ),
+        }
+    }
+}
+
+pub fn runtime_features() -> OpenAiCacheRuntimeFeatures {
+    OpenAiCacheRuntimeFeatures::from_env()
+}
+
+fn feature_enabled_from_env(name: &str, default: bool) -> bool {
+    feature_enabled_from_value(std::env::var(name).ok().as_deref(), default)
+}
+
+fn feature_enabled_from_value(value: Option<&str>, default: bool) -> bool {
+    let Some(value) = value.map(str::trim).filter(|value| !value.is_empty()) else {
+        return default;
+    };
+    match value.to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" | "on" => true,
+        "0" | "false" | "no" | "off" => false,
+        _ => default,
+    }
+}
+
+/// Roll back only the explicit-boundary optimization. A strict cache disable
+/// still uses the verified explicit contract so the rollback cannot weaken a
+/// privacy request.
+pub fn apply_runtime_features(
+    mut capabilities: OpenAiCacheCapabilities,
+    retention: CacheRetention,
+    features: OpenAiCacheRuntimeFeatures,
+) -> OpenAiCacheCapabilities {
+    if retention != CacheRetention::None
+        && !features.explicit_stable_boundary
+        && capabilities.cache_control_family == CacheControlFamily::ExplicitBoundaries
+    {
+        capabilities.cache_control_family = CacheControlFamily::LegacyImplicit;
+        capabilities.cache_partition_semantics = CachePartitionSemantics::RoutingHint;
+        capabilities.supports_breakpoint_content_types = false;
+        capabilities.supports_ttl_30m = false;
+    }
+    capabilities
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -374,6 +454,40 @@ mod tests {
             headers: Default::default(),
             thinking_level_map: Default::default(),
         }
+    }
+
+    #[test]
+    fn runtime_switch_parser_is_conservative_and_explicit() {
+        assert!(!feature_enabled_from_value(Some("0"), true));
+        assert!(!feature_enabled_from_value(Some("off"), true));
+        assert!(feature_enabled_from_value(Some("1"), false));
+        assert!(feature_enabled_from_value(Some("yes"), false));
+        assert!(feature_enabled_from_value(Some("garbage"), true));
+        assert!(!feature_enabled_from_value(Some("garbage"), false));
+    }
+
+    #[test]
+    fn explicit_boundary_rollback_keeps_strict_disable_semantics() {
+        let model = model("openai", "openai-responses", true);
+        let caps =
+            OpenAiCacheCapabilities::resolve(&model, Some("https://api.openai.com/v1"), false);
+        let off = OpenAiCacheRuntimeFeatures {
+            explicit_stable_boundary: false,
+            ..OpenAiCacheRuntimeFeatures::default()
+        };
+        let rolled_back = apply_runtime_features(caps.clone(), CacheRetention::Short, off);
+        assert_eq!(
+            rolled_back.cache_control_family,
+            CacheControlFamily::LegacyImplicit
+        );
+        assert!(!rolled_back.supports_breakpoint_content_types);
+        assert!(!rolled_back.supports_ttl_30m);
+
+        let strict_disable = apply_runtime_features(caps, CacheRetention::None, off);
+        assert_eq!(
+            strict_disable.cache_control_family,
+            CacheControlFamily::ExplicitBoundaries
+        );
     }
 
     #[test]
