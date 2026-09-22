@@ -385,10 +385,11 @@ fn read_provider_stream(
             return Err(err);
         }
         if crate::trace::enabled() {
+            // Response bodies can contain user-visible output, provider prompt
+            // fragments in errors, or opaque reasoning. Trace only the size.
             crate::trace::log(&format!(
-                "body was not an event stream ({} bytes): {}",
-                raw.len(),
-                raw.chars().take(300).collect::<String>()
+                "body was not an event stream ({} bytes)",
+                raw.len()
             ));
         }
         let message = parse_provider_response(model, &raw);

@@ -57,19 +57,31 @@ pub fn describe_event(event: &serde_json::Value) -> String {
             .unwrap_or("")
             .to_string(),
         "response.completed" | "response.incomplete" | "response.done" | "response.failed" => {
+            let error_type = event
+                .pointer("/response/error/type")
+                .and_then(serde_json::Value::as_str)
+                .or_else(|| {
+                    event
+                        .pointer("/response/error/code")
+                        .and_then(serde_json::Value::as_str)
+                })
+                .unwrap_or("-");
             format!(
-                "status={} error={}",
+                "status={} error_type={error_type}",
                 event
                     .pointer("/response/status")
                     .and_then(serde_json::Value::as_str)
                     .unwrap_or("-"),
-                event
-                    .pointer("/response/error")
-                    .map(|error| error.to_string())
-                    .unwrap_or_else(|| "-".into())
             )
         }
-        "error" => event.to_string(),
+        "error" => {
+            let error_type = event
+                .pointer("/error/type")
+                .and_then(serde_json::Value::as_str)
+                .or_else(|| event.get("code").and_then(serde_json::Value::as_str))
+                .unwrap_or("-");
+            format!("error_type={error_type}")
+        }
         _ if event.get("choices").is_some() => event
             .pointer("/choices/0/finish_reason")
             .and_then(serde_json::Value::as_str)
@@ -81,5 +93,50 @@ pub fn describe_event(event: &serde_json::Value) -> String {
         kind.to_string()
     } else {
         format!("{kind} {detail}")
+    }
+}
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn provider_trace_never_stringifies_prompt_or_opaque_error_content() {
+        let event = serde_json::json!({
+            "type": "error",
+            "code": "invalid_request",
+            "message": "RAW-PROMPT-SECRET",
+            "encrypted_content": "OPAQUE-REASONING-SECRET"
+        });
+        let rendered = describe_event(&event);
+        assert_eq!(rendered, "error error_type=invalid_request");
+        assert!(!rendered.contains("RAW-PROMPT-SECRET"));
+        assert!(!rendered.contains("OPAQUE-REASONING-SECRET"));
+    }
+
+    #[test]
+    fn terminal_failure_trace_keeps_only_status_and_error_class() {
+        let event = serde_json::json!({
+            "type": "response.failed",
+            "response": {
+                "status": "failed",
+                "error": {
+                    "type": "invalid_request_error",
+                    "message": "prompt fragment should stay private"
+                },
+                "output": [{
+                    "type":"reasoning",
+                    "encrypted_content":"OPAQUE"
+                }]
+            }
+        });
+        let rendered = describe_event(&event);
+        assert_eq!(
+            rendered,
+            "response.failed status=failed error_type=invalid_request_error"
+        );
+        assert!(!rendered.contains("prompt fragment"));
+        assert!(!rendered.contains("OPAQUE"));
     }
 }
