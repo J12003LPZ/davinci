@@ -23,6 +23,7 @@ pub mod openai_cache_policy;
 mod provider_retry;
 mod providers;
 pub mod request_shape;
+pub mod responses_request;
 pub mod responses_ledger;
 mod retry;
 mod shell;
@@ -74,6 +75,10 @@ pub use deferred::{
 pub use http_proxy::{
     resolve_http_proxy_url_for_target, tcp_connect_via_http_proxy,
     UNSUPPORTED_PROXY_PROTOCOL_MESSAGE,
+};
+pub use responses_request::{
+    PreparedProviderRequest, WireManifest, WireSegmentCategory, WireSegmentManifest,
+    WireTrustClass, WIRE_MANIFEST_VERSION,
 };
 pub use images::{
     generate_images, image_content, images_request_body, AssistantImages, GenerateImagesOptions,

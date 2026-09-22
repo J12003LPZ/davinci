@@ -473,6 +473,16 @@ pub fn live_complete_with(
     options: &StreamOptions,
 ) -> Result<AssistantMessage, String> {
     let body = request_body_with(model, messages, system, tools, options);
+    let prepared = crate::responses_request::PreparedProviderRequest::new(body);
+    let body = prepared.body();
+    if crate::trace::enabled() {
+        crate::trace::log(&format!(
+            "prepared request segments={} prefix={} bytes={}",
+            prepared.manifest().segments.len(),
+            prepared.manifest().ordered_prefix_fingerprint,
+            prepared.manifest().request_bytes_before_compression
+        ));
+    }
     if model.api == "openai-codex-responses" {
         if let Some(token) = auth.api_key.as_deref() {
             let codex_affinity_id = codex_responses_affinity_id(options);
@@ -569,6 +579,16 @@ pub fn live_complete_streaming_with_sink(
                 );
             }
         }
+    }
+    let prepared = crate::responses_request::PreparedProviderRequest::new(body);
+    let body = prepared.body();
+    if crate::trace::enabled() {
+        crate::trace::log(&format!(
+            "prepared stream request segments={} prefix={} bytes={}",
+            prepared.manifest().segments.len(),
+            prepared.manifest().ordered_prefix_fingerprint,
+            prepared.manifest().request_bytes_before_compression
+        ));
     }
     if model.api == "openai-codex-responses" {
         if let Some(token) = auth.api_key.as_deref() {
@@ -1133,6 +1153,8 @@ pub fn live_stream(
     if let Value::Object(map) = &mut body {
         map.insert("stream".into(), Value::Bool(true));
     }
+    let prepared = crate::responses_request::PreparedProviderRequest::new(body);
+    let body = prepared.body();
     let url = request_url(model, auth);
     let mut request = ureq::post(&url);
     for (key, value) in &auth.headers {
