@@ -1068,6 +1068,7 @@ fn complete_simple_summarization(
         session_id: None,
         cache_key: None,
         cache_retention: Some("none".into()),
+        native_responses_resume: None,
         install_telemetry: Some(load_settings(&default_agent_dir()).install_telemetry_enabled()),
         abort_signal: None,
     };

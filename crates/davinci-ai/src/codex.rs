@@ -1003,7 +1003,7 @@ data: {"type":"response.completed","response":{"status":"completed"}}
         match done {
             AssistantMessageEvent::Done { message, .. } => {
                 assert_eq!(
-                    match &message.message.content[0] {
+                    match &message.content[0] {
                         ContentBlock::Text { text } => text.as_str(),
                         _ => "",
                     },

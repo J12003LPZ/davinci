@@ -3993,6 +3993,7 @@ mod tests {
                 Ok(CompleteOutput {
                     message,
                     stream_events: Some(stream_events),
+                    native_responses_resume: None,
                     streamed_live: true,
                 })
             })
