@@ -1069,10 +1069,7 @@ pub fn session_stats_for_agent(agent: &Agent, model: Option<&Model>) -> Value {
     })
 }
 
-fn openai_cache_status(
-    agent: &Agent,
-    stats: &davinci_session::SessionUsageStats,
-) -> Value {
+fn openai_cache_status(agent: &Agent, stats: &davinci_session::SessionUsageStats) -> Value {
     let raw_input = stats
         .input
         .saturating_add(stats.cache_read)
@@ -1086,19 +1083,19 @@ fn openai_cache_status(
     let transport = agent
         .session
         .as_ref()
-        .and_then(|session| {
-            davinci_ai::get_openai_codex_websocket_debug_stats(&session.header.id)
-        })
-        .map(|stats| serde_json::json!({
-            "requests": stats.requests,
-            "connectionsCreated": stats.connections_created,
-            "connectionsReused": stats.connections_reused,
-            "cachedContextRequests": stats.cached_context_requests,
-            "fullContextRequests": stats.full_context_requests,
-            "deltaRequests": stats.delta_requests,
-            "websocketFailures": stats.websocket_failures,
-            "fallbackToSse": stats.websocket_fallback_active,
-        }));
+        .and_then(|session| davinci_ai::get_openai_codex_websocket_debug_stats(&session.header.id))
+        .map(|stats| {
+            serde_json::json!({
+                "requests": stats.requests,
+                "connectionsCreated": stats.connections_created,
+                "connectionsReused": stats.connections_reused,
+                "cachedContextRequests": stats.cached_context_requests,
+                "fullContextRequests": stats.full_context_requests,
+                "deltaRequests": stats.delta_requests,
+                "websocketFailures": stats.websocket_failures,
+                "fallbackToSse": stats.websocket_fallback_active,
+            })
+        });
 
     serde_json::json!({
         "providerUsage": {

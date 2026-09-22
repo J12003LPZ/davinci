@@ -42,11 +42,7 @@ fn spec(cwd: &Path, model: Option<&str>) -> WorkerSpec {
 }
 
 fn create_run_dirs(cwd: &Path, run_id: &str) {
-    let root = cwd
-        .join(".davinci")
-        .join("graph")
-        .join("runs")
-        .join(run_id);
+    let root = cwd.join(".davinci").join("graph").join("runs").join(run_id);
     std::fs::create_dir_all(root.join("artifacts")).unwrap();
     std::fs::create_dir_all(root.join("logs")).unwrap();
 }
@@ -54,11 +50,8 @@ fn create_run_dirs(cwd: &Path, run_id: &str) {
 #[test]
 fn worker_model_resolution_never_invents_default_identity() {
     assert_eq!(
-        resolve_worker_model_identity(
-            Some("openai/gpt-5.6-sol"),
-            Some("openai/gpt-5.6-luna")
-        )
-        .as_deref(),
+        resolve_worker_model_identity(Some("openai/gpt-5.6-sol"), Some("openai/gpt-5.6-luna"))
+            .as_deref(),
         Some("openai/gpt-5.6-sol")
     );
     assert_eq!(
@@ -189,8 +182,7 @@ fn valid_retry_reuses_private_worker_conversation_and_uncertain_mutation_blocks(
         .unwrap();
 
     spec.briefing.push_str("\nretry delta");
-    let second =
-        WorkerSessionBinding::create(&spec, run_id, 2, 2, None, Some(&first)).unwrap();
+    let second = WorkerSessionBinding::create(&spec, run_id, 2, 2, None, Some(&first)).unwrap();
     assert_eq!(second.session_id, first.session_id);
     assert_eq!(second.session_path, first.session_path);
     assert_eq!(second.agent, first.agent);
