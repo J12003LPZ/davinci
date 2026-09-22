@@ -513,12 +513,12 @@ cargo test -p davinci-agent --test operation_ownership
 
 **Create:** `runtime/operations/{recovery,fault}.rs`; `crates/davinci-agent/tests/{operation_recovery,operation_crash}.rs`; `crates/davinci-agent/tests/support/operation_harness.rs`.
 
-- [ ] Write table-driven red tests for each recovery classification and every row in the crash-window matrix. Inputs are durable records plus typed observations, not human-readable error substrings.
-- [ ] Implement a pure reducer and a separate authorized action runner. Persist each decision and its evidence/policy version before scheduling a retry/probe. Persist unresolved-effect resource claims and check them during admission regardless of tool-call ID, wrapper, or root namespace; known scope allows narrow barriers, while opaque workspace effects require conservative conflict blocking.
-- [ ] Implement a test-only injected fault interface. Initial points: before/after intent commit, after attempt claim, after effect latch, after side effect, before/after result commit, before publication, after sink commit, and before outbox acknowledgement.
-- [ ] Build a child-process test harness that opens a real temporary journal, performs a counted durable effect, signals the chosen fault boundary, and is forcibly terminated. A fresh process then loads the journal and recovers. Do not substitute a returned Rust error for every crash test.
-- [ ] Add a separately stored mutation counter and probeable fake endpoint. Assert mutation count, number of attempts, preserved result, recovery decision, and projection count after restart and duplicate delivery.
-- [ ] Keep production builds free of model-controlled environment fault switches. Where an environment variable is used by a test helper, scope it to the helper process, not process-global parallel tests.
+- [x] Write table-driven red tests for each recovery classification and every row in the crash-window matrix. Inputs are durable records plus typed observations, not human-readable error substrings.
+- [x] Implement a pure reducer and a separate authorized action runner. Persist each decision and its evidence/policy version before scheduling a retry/probe. Persist unresolved-effect resource claims and check them during admission regardless of tool-call ID, wrapper, or root namespace; known scope allows narrow barriers, while opaque workspace effects require conservative conflict blocking.
+- [x] Implement a test-only injected fault interface. Initial points: before/after intent commit, after attempt claim, after effect latch, after side effect, before/after result commit, before publication, after sink commit, and before outbox acknowledgement.
+- [x] Build a child-process test harness that opens a real temporary journal, performs a counted durable effect, signals the chosen fault boundary, and is forcibly terminated. A fresh process then loads the journal and recovers. Do not substitute a returned Rust error for every crash test.
+- [x] Add a separately stored mutation counter and probeable fake endpoint. Assert mutation count, number of attempts, preserved result, recovery decision, and projection count after restart and duplicate delivery.
+- [x] Keep production builds free of model-controlled environment fault switches. Where an environment variable is used by a test helper, scope it to the helper process, not process-global parallel tests.
 
 **Canonical red/green scenario:**
 

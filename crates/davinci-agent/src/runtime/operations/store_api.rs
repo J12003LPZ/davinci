@@ -115,6 +115,11 @@ pub enum JournalError {
     AuthorizationDigestMismatch,
     #[error("operation identity already exists")]
     DuplicateOperation,
+    #[error("unresolved effect for operation {operation_id} holds resource claim {resource}")]
+    UnresolvedEffectConflict {
+        operation_id: String,
+        resource: String,
+    },
     #[error("operation or attempt was not found in this root namespace")]
     NotFound,
     #[error("attempt transition requires a new result payload")]

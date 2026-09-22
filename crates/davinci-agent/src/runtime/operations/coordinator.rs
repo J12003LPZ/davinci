@@ -2,8 +2,9 @@ use super::coordinator_api::{AdmittedOperation, DispatchPermit, EffectPermit, Op
 use super::retry_safety::ensure_retry_dispatch_is_unstarted;
 use super::store_api::*;
 use super::store_support::{
-    decode_json, encode_bounded, from_sql_integer, insert_event, now_unix_millis, parse_id,
-    state_name, to_sql_integer,
+    decode_json, encode_bounded, ensure_no_resource_claim_conflict, from_sql_integer, insert_event,
+    insert_resource_claims, now_unix_millis, parse_id, resource_claim_keys, state_name,
+    to_sql_integer,
 };
 use super::transitions::{admit_retry, transition_attempt, OperationEvent, TransitionError};
 use super::{
@@ -127,6 +128,13 @@ impl OperationJournal {
             if duplicate_id {
                 return Err(JournalError::DuplicateOperation);
             }
+
+            let resource_keys = resource_claim_keys(spec);
+            ensure_no_resource_claim_conflict(
+                transaction,
+                self.identity.workspace.id,
+                &resource_keys,
+            )?;
 
             transaction
                 .execute(
@@ -347,6 +355,7 @@ impl OperationJournal {
                 &recovered,
                 &event,
             )?;
+            super::store_support::resolve_resource_claims(transaction, attempt_id)?;
             Ok(recovered)
         })
     }
@@ -454,9 +463,10 @@ impl OperationJournal {
                     "SELECT spec_json FROM operations WHERE operation_id = ?1 AND root_namespace_id = ?2",
                     params![attempt.operation_id().to_string(), self.root_namespace_id.to_string()],
                     |row| row.get(0),
-                )
-                .map_err(super::store_support::sqlite_error)?;
+            )
+            .map_err(super::store_support::sqlite_error)?;
             let spec: OperationSpec = decode_json(&spec_json)?;
+            let resource_keys = resource_claim_keys(&spec);
             let intent_digest = spec
                 .intent_digest()
                 .map_err(|error| JournalError::Serialization(error.to_string()))?;
@@ -476,6 +486,11 @@ impl OperationJournal {
             if already_claimed {
                 return Err(JournalError::AttemptAlreadyClaimed);
             }
+            ensure_no_resource_claim_conflict(
+                transaction,
+                self.identity.workspace.id,
+                &resource_keys,
+            )?;
             let nonce = Uuid::now_v7();
             transaction
                 .execute(
@@ -492,6 +507,14 @@ impl OperationJournal {
                     ],
                 )
                 .map_err(super::store_support::sqlite_error)?;
+            insert_resource_claims(
+                transaction,
+                self.identity.workspace.id,
+                self.root_namespace_id,
+                attempt.operation_id(),
+                attempt_id,
+                &resource_keys,
+            )?;
             Ok(DispatchPermit {
                 journal_id: self.identity.journal_id,
                 root_namespace_id: self.root_namespace_id,

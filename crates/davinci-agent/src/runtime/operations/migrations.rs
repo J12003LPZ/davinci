@@ -3,7 +3,8 @@ use super::OperationSpec;
 use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 
 const INITIAL_SCHEMA_VERSION: u32 = 1;
-pub(super) const SCHEMA_VERSION: u32 = 2;
+const SCHEMA_V2_VERSION: u32 = 2;
+pub(super) const SCHEMA_VERSION: u32 = 3;
 const APPLICATION_ID: i64 = 0x4456_4F50; // "DVOP"
 
 const SCHEMA_V1: &str = r#"
@@ -193,6 +194,52 @@ CREATE TRIGGER operation_call_mappings_no_delete BEFORE DELETE ON operation_call
 BEGIN SELECT RAISE(ABORT, 'operation call mappings are immutable'); END;
 "#;
 
+const SCHEMA_V3: &str = r#"
+CREATE TABLE operation_recovery_decisions (
+    decision_sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+    decision_id TEXT NOT NULL UNIQUE,
+    root_namespace_id TEXT NOT NULL REFERENCES journal_roots(root_namespace_id),
+    operation_id TEXT NOT NULL REFERENCES operations(operation_id),
+    evidence_id TEXT NOT NULL,
+    policy_version TEXT NOT NULL CHECK (length(policy_version) BETWEEN 1 AND 128),
+    decision_json TEXT NOT NULL CHECK (length(decision_json) <= 262144),
+    created_at_ms INTEGER NOT NULL
+);
+CREATE INDEX operation_recovery_latest
+    ON operation_recovery_decisions(root_namespace_id, operation_id, decision_sequence DESC);
+CREATE TABLE operation_effect_claims (
+    claim_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    workspace_id TEXT NOT NULL,
+    root_namespace_id TEXT NOT NULL REFERENCES journal_roots(root_namespace_id),
+    operation_id TEXT NOT NULL REFERENCES operations(operation_id),
+    attempt_id TEXT NOT NULL REFERENCES attempts(attempt_id),
+    resource_key TEXT NOT NULL CHECK (length(resource_key) BETWEEN 1 AND 4096),
+    created_at_ms INTEGER NOT NULL,
+    resolved_at_ms INTEGER,
+    UNIQUE (attempt_id, resource_key),
+    CHECK (resolved_at_ms IS NULL OR resolved_at_ms >= created_at_ms)
+);
+CREATE INDEX operation_effect_claims_active
+    ON operation_effect_claims(workspace_id, resource_key, resolved_at_ms);
+CREATE TRIGGER recovery_decisions_no_update BEFORE UPDATE ON operation_recovery_decisions
+BEGIN SELECT RAISE(ABORT, 'recovery decisions are append only'); END;
+CREATE TRIGGER recovery_decisions_no_delete BEFORE DELETE ON operation_recovery_decisions
+BEGIN SELECT RAISE(ABORT, 'recovery decisions are append only'); END;
+CREATE TRIGGER effect_claims_guard_update BEFORE UPDATE ON operation_effect_claims
+WHEN NEW.claim_id != OLD.claim_id
+  OR NEW.workspace_id != OLD.workspace_id
+  OR NEW.root_namespace_id != OLD.root_namespace_id
+  OR NEW.operation_id != OLD.operation_id
+  OR NEW.attempt_id != OLD.attempt_id
+  OR NEW.resource_key != OLD.resource_key
+  OR NEW.created_at_ms != OLD.created_at_ms
+  OR OLD.resolved_at_ms IS NOT NULL
+  OR NEW.resolved_at_ms IS NULL
+BEGIN SELECT RAISE(ABORT, 'invalid effect claim resolution'); END;
+CREATE TRIGGER effect_claims_no_delete BEFORE DELETE ON operation_effect_claims
+BEGIN SELECT RAISE(ABORT, 'effect claim history is retained'); END;
+"#;
+
 pub(super) fn initialize(
     connection: &mut Connection,
     identity: &JournalIdentity,
@@ -207,14 +254,22 @@ pub(super) fn initialize(
         0 => {
             initialize_v1(connection, identity, application_id)?;
             migrate_v2(connection)?;
+            migrate_v3(connection)?;
         }
         INITIAL_SCHEMA_VERSION => {
             validate_v1(connection, identity, application_id)?;
             migrate_v2(connection)?;
+            migrate_v3(connection)?;
+        }
+        SCHEMA_V2_VERSION => {
+            validate_v1(connection, identity, application_id)?;
+            validate_v2(connection)?;
+            migrate_v3(connection)?;
         }
         SCHEMA_VERSION => {
             validate_v1(connection, identity, application_id)?;
             validate_v2(connection)?;
+            validate_v3(connection)?;
         }
         other => return Err(JournalError::UnsupportedSchema(other)),
     }
@@ -391,22 +446,83 @@ fn migrate_v2(connection: &mut Connection) -> Result<(), JournalError> {
     transaction.execute_batch(SCHEMA_V2_GUARDS)?;
     transaction.execute(
         "INSERT INTO journal_migrations (version, applied_at_ms) VALUES (?1, ?2)",
-        params![SCHEMA_VERSION, super::store_support::now_unix_millis()],
+        params![SCHEMA_V2_VERSION, super::store_support::now_unix_millis()],
+    )?;
+    transaction.pragma_update(None, "user_version", SCHEMA_V2_VERSION)?;
+    transaction.commit()?;
+    validate_v2(connection)
+}
+
+fn migrate_v3(connection: &mut Connection) -> Result<(), JournalError> {
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Exclusive)?;
+    transaction.execute_batch(SCHEMA_V3)?;
+    let workspace_id: String = transaction.query_row(
+        "SELECT workspace_id FROM journal_metadata WHERE singleton = 1",
+        [],
+        |row| row.get(0),
+    )?;
+    let unresolved = {
+        let mut statement = transaction.prepare(
+            "SELECT o.root_namespace_id, o.operation_id, a.attempt_id, a.attempt_json
+             FROM dispatch_claims d
+             JOIN operations o ON o.operation_id = d.operation_id
+             JOIN attempts a ON a.attempt_id = d.attempt_id
+             WHERE d.effect_started = 1 ORDER BY a.attempt_id",
+        )?;
+        let rows = statement.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+            ))
+        })?;
+        rows.collect::<Result<Vec<_>, _>>()?
+    };
+    for (root_namespace_id, operation_id, attempt_id, attempt_json) in unresolved {
+        let attempt: super::OperationAttempt = super::store_support::decode_json(&attempt_json)?;
+        let resolved = attempt.state() == super::OperationState::Succeeded
+            || (attempt.state() == super::OperationState::Failed
+                && matches!(
+                    attempt.effect_status(),
+                    super::EffectStatus::KnownNoEffect | super::EffectStatus::Compensated
+                ));
+        if !resolved {
+            // v2 did not durably retain resource scope at the effect latch. A
+            // wildcard is the only safe backfill for those unresolved effects.
+            transaction.execute(
+                "INSERT INTO operation_effect_claims
+                 (workspace_id, root_namespace_id, operation_id, attempt_id,
+                  resource_key, created_at_ms, resolved_at_ms)
+                 VALUES (?1, ?2, ?3, ?4, '*', ?5, NULL)",
+                rusqlite::params![
+                    workspace_id,
+                    root_namespace_id,
+                    operation_id,
+                    attempt_id,
+                    super::store_support::now_unix_millis()
+                ],
+            )?;
+        }
+    }
+    transaction.execute(
+        "INSERT INTO journal_migrations (version, applied_at_ms) VALUES (?1, ?2)",
+        rusqlite::params![SCHEMA_VERSION, super::store_support::now_unix_millis()],
     )?;
     transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
     transaction.commit()?;
-    validate_v2(connection)
+    validate_v3(connection)
 }
 
 fn validate_v2(connection: &Connection) -> Result<(), JournalError> {
     let migration: Option<u32> = connection
         .query_row(
             "SELECT version FROM journal_migrations WHERE version = ?1",
-            [SCHEMA_VERSION],
+            [SCHEMA_V2_VERSION],
             |row| row.get(0),
         )
         .optional()?;
-    if migration != Some(SCHEMA_VERSION) {
+    if migration != Some(SCHEMA_V2_VERSION) {
         return Err(JournalError::Integrity(
             "schema migration record is missing".into(),
         ));
@@ -422,6 +538,36 @@ fn validate_v2(connection: &Connection) -> Result<(), JournalError> {
     if invalid_records != 0 {
         return Err(JournalError::Integrity(
             "operation coordinator metadata is incomplete".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_v3(connection: &Connection) -> Result<(), JournalError> {
+    let migration: Option<u32> = connection
+        .query_row(
+            "SELECT version FROM journal_migrations WHERE version = ?1",
+            [SCHEMA_VERSION],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if migration != Some(SCHEMA_VERSION) {
+        return Err(JournalError::Integrity(
+            "recovery/resource claim migration record is missing".into(),
+        ));
+    }
+    let invalid_claims: i64 = connection.query_row(
+        "SELECT count(*) FROM operation_effect_claims c
+         JOIN operations o ON o.operation_id = c.operation_id
+         JOIN attempts a ON a.attempt_id = c.attempt_id
+         WHERE o.root_namespace_id != c.root_namespace_id
+            OR a.operation_id != c.operation_id",
+        [],
+        |row| row.get(0),
+    )?;
+    if invalid_claims != 0 {
+        return Err(JournalError::Integrity(
+            "resource effect claim binding is invalid".into(),
         ));
     }
     Ok(())

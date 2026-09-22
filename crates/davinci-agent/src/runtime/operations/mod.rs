@@ -1,9 +1,12 @@
 mod coordinator;
 mod coordinator_api;
 mod failure;
+mod fault;
 mod identity;
 mod migrations;
 mod model;
+mod recovery;
+mod recovery_types;
 mod retry_safety;
 mod store;
 mod store_api;
@@ -12,6 +15,7 @@ mod transitions;
 
 pub use coordinator_api::{AdmittedOperation, DispatchPermit, EffectPermit, OperationAdmission};
 pub use failure::{FailureReasonCode, FailureSubsystem, OperationFailure};
+pub use fault::{FaultInjector, FaultPoint};
 pub use identity::{
     AttemptId, ExecutionOwnerId, IdempotencyScope, IdentityError, JournalId, OperationId,
     PayloadDigest, ResultId, RootNamespaceId, ScopedIdempotencyKey, WorkspaceId,
@@ -22,6 +26,15 @@ pub use model::{
     OperationLink, OperationLinkKind, OperationPayload, OperationSpec, OperationState,
     Precondition, PreconditionKind, PublicationState, ResultRef, Timestamp, VerificationState,
     WorkspaceIdentity, OPERATION_SCHEMA_VERSION,
+};
+pub use recovery::{
+    AuthorizationObservation, DispatchObservation, JournalIntegrityObservation,
+    MigrationObservation, OperationRecoveryDecision, OwnerObservation, PostconditionObservation,
+    ProcessObservation, PublicationObservation, RecoveryAction, RecoveryClassification,
+    RecoveryDecision, RecoveryEngine, RecoveryInput, RecoveryObservations, RecoveryPhase,
+    RecoveryReasonCode, RecoveryRunError, RecoveryRunResult, RemoteObservation,
+    SessionProjectionObservation, TransactionObservation, VerificationObservation,
+    WorkerObservation,
 };
 pub use store::OperationJournal;
 pub use store_api::{

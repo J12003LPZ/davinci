@@ -1,7 +1,10 @@
 use super::store_api::*;
-use super::{AttemptId, OperationId, OperationState, RootNamespaceId};
+use super::{
+    AttemptId, EffectClass, OperationId, OperationKind, OperationSpec, OperationState,
+    PreconditionKind, RootNamespaceId, WorkspaceId,
+};
 use crate::runtime::cache::directory::{Directory, DirectoryLease};
-use rusqlite::{params, Connection, Transaction, TransactionBehavior};
+use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBehavior};
 use serde::{de::DeserializeOwned, Serialize};
 use std::io::{self, Write};
 use std::str::FromStr;
@@ -18,6 +21,152 @@ pub(super) fn collect_json<T: DeserializeOwned>(
         .map_err(sqlite_error)?;
     rows.map(|row| decode_json(&row.map_err(sqlite_error)?))
         .collect()
+}
+
+pub(super) fn resource_claim_keys(spec: &OperationSpec) -> Vec<String> {
+    if spec.effects().classification == EffectClass::ReadOnly {
+        return Vec::new();
+    }
+    if spec
+        .preconditions()
+        .iter()
+        .any(|condition| condition.kind == PreconditionKind::Custom)
+    {
+        return vec!["*".to_owned()];
+    }
+    let expected_kind = match spec.kind() {
+        OperationKind::FileWrite
+        | OperationKind::FileEdit
+        | OperationKind::FileDelete
+        | OperationKind::FileMove
+        | OperationKind::TransactionApply
+        | OperationKind::TransactionRollback => Some(PreconditionKind::ResourceVersion),
+        OperationKind::ProcessSpawn
+        | OperationKind::ProcessStdin
+        | OperationKind::ProcessSignal
+        | OperationKind::ProcessTermination => Some(PreconditionKind::ProcessIdentity),
+        _ => None,
+    };
+    let Some(expected_kind) = expected_kind else {
+        return vec!["*".to_owned()];
+    };
+
+    let mut keys = spec
+        .preconditions()
+        .iter()
+        .filter(|condition| condition.kind == expected_kind)
+        .map(|condition| {
+            let resource = condition.resource.trim();
+            if resource.is_empty() {
+                return "*".to_owned();
+            }
+            match expected_kind {
+                PreconditionKind::ResourceVersion => {
+                    format!("resource:{}", canonical_resource_path(resource))
+                }
+                PreconditionKind::ProcessIdentity => format!("process:{resource}"),
+                _ => "*".to_owned(),
+            }
+        })
+        .collect::<std::collections::BTreeSet<_>>();
+    if keys.is_empty() {
+        keys.insert("*".to_owned());
+    }
+    keys.into_iter().collect()
+}
+
+fn canonical_resource_path(resource: &str) -> String {
+    let normalized_separators = resource.replace('\\', "/");
+    let mut components: Vec<String> = Vec::new();
+    for component in normalized_separators.split('/') {
+        match component {
+            "" | "." => {}
+            ".." => {
+                if components.last().is_some_and(|last| last.as_str() != "..") {
+                    components.pop();
+                } else {
+                    components.push("..".to_owned());
+                }
+            }
+            value => components.push(value.to_owned()),
+        }
+    }
+    let value = components.join("/");
+    if cfg!(windows) {
+        value.to_lowercase()
+    } else {
+        value
+    }
+}
+
+pub(super) fn ensure_no_resource_claim_conflict(
+    transaction: &Transaction<'_>,
+    workspace_id: WorkspaceId,
+    resources: &[String],
+) -> Result<(), JournalError> {
+    for resource in resources {
+        let conflict: Option<(String, String)> = transaction
+            .query_row(
+                "SELECT operation_id, resource_key FROM operation_effect_claims
+                 WHERE workspace_id = ?1 AND resolved_at_ms IS NULL
+                   AND (resource_key = '*' OR ?2 = '*' OR resource_key = ?2)
+                 ORDER BY claim_id LIMIT 1",
+                params![workspace_id.to_string(), resource],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()
+            .map_err(sqlite_error)?;
+        if let Some((operation_id, claimed_resource)) = conflict {
+            return Err(JournalError::UnresolvedEffectConflict {
+                operation_id,
+                resource: claimed_resource,
+            });
+        }
+    }
+    Ok(())
+}
+
+pub(super) fn insert_resource_claims(
+    transaction: &Transaction<'_>,
+    workspace_id: WorkspaceId,
+    root_namespace_id: RootNamespaceId,
+    operation_id: OperationId,
+    attempt_id: AttemptId,
+    resources: &[String],
+) -> Result<(), JournalError> {
+    for resource in resources {
+        transaction
+            .execute(
+                "INSERT INTO operation_effect_claims
+                 (workspace_id, root_namespace_id, operation_id, attempt_id,
+                  resource_key, created_at_ms, resolved_at_ms)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL)",
+                params![
+                    workspace_id.to_string(),
+                    root_namespace_id.to_string(),
+                    operation_id.to_string(),
+                    attempt_id.to_string(),
+                    resource,
+                    now_unix_millis()
+                ],
+            )
+            .map_err(sqlite_error)?;
+    }
+    Ok(())
+}
+
+pub(super) fn resolve_resource_claims(
+    transaction: &Transaction<'_>,
+    attempt_id: AttemptId,
+) -> Result<(), JournalError> {
+    transaction
+        .execute(
+            "UPDATE operation_effect_claims SET resolved_at_ms = ?1
+             WHERE attempt_id = ?2 AND resolved_at_ms IS NULL",
+            params![now_unix_millis(), attempt_id.to_string()],
+        )
+        .map_err(sqlite_error)?;
+    Ok(())
 }
 
 pub(super) fn collect_events(

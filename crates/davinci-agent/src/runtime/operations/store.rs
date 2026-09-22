@@ -3,8 +3,8 @@ use super::store_api::*;
 use super::store_support::*;
 use super::transitions::{transition_attempt, OperationEvent, TransitionError};
 use super::{
-    AttemptId, ExecutionOwner, OperationAdmission, OperationAttempt, OperationSpec, PayloadDigest,
-    RootNamespaceId, Timestamp,
+    AttemptId, ExecutionOwner, OperationAdmission, OperationAttempt, OperationSpec, OperationState,
+    PayloadDigest, RootNamespaceId, Timestamp,
 };
 use crate::runtime::cache::directory::{Directory, DirectoryLease};
 use rusqlite::{
@@ -326,6 +326,17 @@ impl OperationJournal {
                         ],
                     )
                     .map_err(sqlite_error)?;
+            }
+            if next.state() == OperationState::Succeeded
+                || (next.state() == OperationState::Failed
+                    && matches!(
+                        next.effect_status(),
+                        super::EffectStatus::KnownNoEffect | super::EffectStatus::Compensated
+                    ))
+                || (next.state() == OperationState::Cancelled
+                    && next.effect_status() == super::EffectStatus::NotStarted)
+            {
+                resolve_resource_claims(transaction, next.attempt_id())?;
             }
             Ok(next)
         })
