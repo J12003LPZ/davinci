@@ -1,8 +1,7 @@
 use davinci_ai::{
     sampled_comparison_response_id, AppliedPromptCachePolicy, Model, ModelCost,
     NativeResponsesOutput, NativeResponsesResumeRecord, NativeResponsesTurn,
-    OpenAiCacheCapabilities, ProviderPromptCacheDiagnostics,
-    StreamOptions, WireManifest,
+    OpenAiCacheCapabilities, ProviderPromptCacheDiagnostics, StreamOptions, WireManifest,
 };
 use serde_json::json;
 
