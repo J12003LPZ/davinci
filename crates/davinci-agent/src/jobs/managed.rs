@@ -490,11 +490,14 @@ impl ManagedOwner {
             supports_stdin: true,
             supervisor: Mutex::new(None),
         });
-        let supervisor = Arc::new(Supervisor::spawn(
-            &self.0.scope.host,
-            config.clone(),
-            restarts::callback(Arc::downgrade(&shared), options.restart.max_restarts > 0),
-        )?);
+        let supervisor = Arc::new(
+            Supervisor::spawn(
+                &self.0.scope.host,
+                config.clone(),
+                restarts::callback(Arc::downgrade(&shared), options.restart.max_restarts > 0),
+            )
+            .map_err(|error| error.to_string())?,
+        );
         crate::SharedCounters::add(&options.counters.process_startups, 1);
         // Unpublished ownership is dropped (and stopped) on every failure path.
         validate()?;
@@ -623,7 +626,7 @@ impl ManagedOwner {
             environment_digest: record.environment_digest.clone(),
             environment_names: record.command.environment.keys().cloned().collect(),
             pid: supervisor.child_pid(),
-            lifetime: supervisor.identity(),
+            lifetime: supervisor.identity().lifetime,
             started_ms: record.started_ms,
             state,
             exit_code: exit.as_ref().and_then(|exit| exit.code),

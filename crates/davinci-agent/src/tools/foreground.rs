@@ -34,7 +34,16 @@ pub(super) fn config(
     cwd: &std::path::Path,
     executable: std::path::PathBuf,
     argv: Vec<String>,
+    context: &ToolContext,
 ) -> Result<ProcessConfig, ToolError> {
+    let cwd = cwd
+        .canonicalize()
+        .map_err(|error| ToolError::Failed(format!("command cwd is unavailable: {error}")))?;
+    let executable = executable
+        .to_str()
+        .ok_or_else(|| ToolError::Failed("command executable path is not UTF-8".into()))?;
+    let executable = crate::process_manager::resolve_native_executable(executable, &cwd)
+        .map_err(ToolError::Failed)?;
     let environment = std::env::vars_os()
         .map(|(key, value)| {
             Ok((
@@ -47,12 +56,13 @@ pub(super) fn config(
             ))
         })
         .collect::<Result<_, ToolError>>()?;
-    Ok(ProcessConfig {
-        executable,
-        argv,
-        cwd: cwd.into(),
-        environment,
-    })
+    let config = ProcessConfig::new(executable, argv, cwd, environment);
+    Ok(context
+        .command_receipt
+        .as_ref()
+        .and_then(|capture| capture.process_operation_binding())
+        .map(|binding| config.clone().with_operation_binding(binding))
+        .unwrap_or(config))
 }
 
 pub(super) fn run(
@@ -64,6 +74,7 @@ pub(super) fn run(
     context: &ToolContext,
 ) -> Result<Output, ToolError> {
     let start = Instant::now();
+    let started_at_ms = crate::command_receipt::now();
     let interrupted = || {
         if context.is_aborted() {
             Some("Command aborted".to_owned())
@@ -94,7 +105,7 @@ pub(super) fn run(
     let capture = Arc::new(Mutex::new(Capture::default()));
     let stdout = capture.clone();
     let stderr = capture.clone();
-    let process = Supervisor::spawn_with_stderr(
+    let process = match Supervisor::spawn_with_stderr(
         host,
         config.clone(),
         Arc::new(move |event| {
@@ -111,22 +122,41 @@ pub(super) fn run(
                 .unwrap_or_else(|e| e.into_inner())
                 .append(&bytes, true);
         }),
-    )
-    .map_err(ToolError::Failed)?;
+    ) {
+        Ok(process) => process,
+        Err(error) => {
+            if let Some(receipt) = &context.command_receipt {
+                receipt.process_observed(error.evidence().clone(), started_at_ms, &[], &[]);
+            }
+            return Err(ToolError::Failed(error.to_string()));
+        }
+    };
     let stop = |reason: String| {
         process.stop();
-        let cleaned = process.wait(Duration::from_secs(2)).is_some();
+        let exit = process.wait(Duration::from_secs(2));
         let capture = capture.lock().unwrap_or_else(|e| e.into_inner());
         let output = format!(
             "{}{}",
             String::from_utf8_lossy(&capture.stdout),
             String::from_utf8_lossy(&capture.stderr)
         );
-        let cleanup = if cleaned {
+        let cleanup = if exit.is_some() {
             ""
         } else {
             "; process cleanup did not finish within deadline"
         };
+        let evidence = config.execution_evidence(
+            process.identity().clone(),
+            exit.as_ref()
+                .map(|exit| exit.launch_state)
+                .unwrap_or(crate::jobs::supervisor::ProcessLaunchState::Unknown),
+            exit.as_ref().and_then(|exit| exit.code),
+            exit.as_ref()
+                .map(|exit| exit.output_complete && !capture.overflow),
+        );
+        if let Some(receipt) = &context.command_receipt {
+            receipt.process_observed(evidence, started_at_ms, &capture.stdout, &capture.stderr);
+        }
         ToolError::Failed(format!("{output}\n{reason}{cleanup}"))
     };
     for chunk in input.chunks(16 * 1024) {
@@ -150,27 +180,52 @@ pub(super) fn run(
             break exit;
         }
     };
+    let mut captured = capture.lock().unwrap_or_else(|e| e.into_inner());
+    let output_complete = exit.output_complete && !captured.overflow;
+    let evidence = config.execution_evidence(
+        exit.identity.clone(),
+        exit.launch_state,
+        exit.code,
+        Some(output_complete),
+    );
+    if let Some(receipt) = &context.command_receipt {
+        receipt.process_observed(evidence, started_at_ms, &captured.stdout, &captured.stderr);
+    }
     if let Some(runtime) = &context.runtime {
         runtime.emit_observe(crate::runtime::RuntimeEvent::AfterProcessExit {
             executable: config.executable.to_string_lossy().into_owned(),
             argv: config.argv.clone(),
             exit_code: exit.code,
-            is_error: !exit.output_complete
+            is_error: !output_complete
                 || exit.error.is_some()
                 || exit.stopped
                 || exit.code != Some(0),
         });
     }
-    if exit.stopped || exit.error.is_some() || !exit.output_complete {
-        return Err(ToolError::Failed(exit.error.unwrap_or_else(|| {
-            "command output capture incomplete or process stopped".into()
-        })));
+    if exit.stopped || exit.error.is_some() || !output_complete {
+        let output = format!(
+            "{}{}",
+            String::from_utf8_lossy(&captured.stdout),
+            String::from_utf8_lossy(&captured.stderr)
+        );
+        let reason = exit
+            .error
+            .unwrap_or_else(|| "command output capture incomplete or process stopped".into());
+        return Err(ToolError::Failed(if output.is_empty() {
+            reason
+        } else {
+            format!("{output}\n{reason}")
+        }));
     }
-    let mut capture = capture.lock().unwrap_or_else(|e| e.into_inner());
-    if capture.overflow {
-        return Err(ToolError::Failed(
-            "command output exceeded stream byte limit".into(),
-        ));
+    if captured.overflow {
+        let output = format!(
+            "{}{}",
+            String::from_utf8_lossy(&captured.stdout),
+            String::from_utf8_lossy(&captured.stderr)
+        );
+        return Err(ToolError::Failed(format!(
+            "{output}\ncommand output exceeded stream byte limit"
+        )));
     }
     let code = exit
         .code
@@ -187,8 +242,8 @@ pub(super) fn run(
     };
     Ok(Output {
         status,
-        stdout: std::mem::take(&mut capture.stdout),
-        stderr: std::mem::take(&mut capture.stderr),
+        stdout: std::mem::take(&mut captured.stdout),
+        stderr: std::mem::take(&mut captured.stderr),
     })
 }
 
@@ -237,14 +292,16 @@ mod tests {
                 "--nocapture".into(),
             ],
         };
-        let config = |script: &str| ProcessConfig {
-            executable: "node".into(),
-            argv: vec!["-e".into(), script.into()],
-            cwd: root.path().into(),
-            environment: ["PATH", "SystemRoot", "TEMP", "TMP"]
-                .into_iter()
-                .filter_map(|key| std::env::var(key).ok().map(|value| (key.into(), value)))
-                .collect(),
+        let config = |script: &str| {
+            ProcessConfig::new(
+                "node".into(),
+                vec!["-e".into(), script.into()],
+                root.path().into(),
+                ["PATH", "SystemRoot", "TEMP", "TMP"]
+                    .into_iter()
+                    .filter_map(|key| std::env::var(key).ok().map(|value| (key.into(), value)))
+                    .collect(),
+            )
         };
         let output = run(&host, config("let b='';process.stdin.on('data',s=>b+=s);process.stdin.on('end',()=>{process.stdout.write(b);process.stderr.write('err');process.exitCode=7})"), b"literal input", Some(5_000), Some("5"), &ToolContext::default()).unwrap();
         assert_eq!(output.status.code(), Some(7));
@@ -301,6 +358,15 @@ mod tests {
             "DAVINCI_FOREGROUND_PIPE_FIXTURE".into(),
             ready.to_string_lossy().into_owned(),
         );
+        let incomplete_receipt = crate::command_receipt::CommandReceiptCapture::new(
+            "incomplete-output",
+            "exec_command",
+            None,
+        );
+        let incomplete_context = ToolContext {
+            command_receipt: Some(incomplete_receipt.clone()),
+            ..Default::default()
+        };
         let start = std::time::Instant::now();
         let error = run(
             &host,
@@ -308,10 +374,20 @@ mod tests {
             b"",
             Some(5_000),
             Some("5"),
-            &ToolContext::default(),
+            &incomplete_context,
         )
         .unwrap_err();
         assert!(error.to_string().contains("incomplete"), "{error}");
+        let receipt = incomplete_receipt
+            .take()
+            .expect("incomplete process output still leaves a receipt");
+        let evidence = receipt.process_evidence.unwrap();
+        assert_eq!(
+            evidence.launch_state,
+            crate::jobs::supervisor::ProcessLaunchState::Exited
+        );
+        assert_eq!(evidence.output_complete, Some(false));
+        assert!(receipt.stdout_hash.is_some() && receipt.stderr_hash.is_some());
         assert!(start.elapsed() < Duration::from_secs(5));
         let port: u16 = serde_json::from_slice(&std::fs::read(ready).unwrap()).unwrap();
         // Group termination requests precede helper reaping, but the kernel may

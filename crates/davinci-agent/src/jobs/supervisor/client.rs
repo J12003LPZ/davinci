@@ -1,7 +1,8 @@
 use super::{
     platform,
     wire::{self, Event, Request, MAX_INPUT, POLL},
-    ProcessConfig, ProcessEvent, ProcessExit, SupervisorCommand,
+    ProcessConfig, ProcessEvent, ProcessExit, ProcessIdentity, ProcessLaunchError,
+    ProcessLaunchState, SupervisorCommand,
 };
 use std::{
     process::{Child, Command, Stdio},
@@ -33,7 +34,7 @@ struct Control {
 /// retains the unreaped helper until its group/job has been terminated.
 pub struct Supervisor {
     control: Arc<Control>,
-    identity: uuid::Uuid,
+    identity: ProcessIdentity,
     host_pid: u32,
 }
 
@@ -51,7 +52,7 @@ impl Supervisor {
         host: &SupervisorCommand,
         config: ProcessConfig,
         event: Arc<dyn Fn(ProcessEvent) + Send + Sync>,
-    ) -> Result<Self, String> {
+    ) -> Result<Self, ProcessLaunchError> {
         let stderr_event = event.clone();
         Self::spawn_with_stderr(
             host,
@@ -70,13 +71,25 @@ impl Supervisor {
         config: ProcessConfig,
         event: Arc<dyn Fn(ProcessEvent) + Send + Sync>,
         stderr: Arc<dyn Fn(Vec<u8>) + Send + Sync>,
-    ) -> Result<Self, String> {
-        if serde_json::to_vec(&config)
-            .map_err(|_| "invalid process configuration")?
-            .len()
-            > 64 * 1024
-        {
-            return Err("process configuration exceeds 64 KiB".into());
+    ) -> Result<Self, ProcessLaunchError> {
+        let identity = ProcessIdentity::new(config.operation.clone());
+        let config_size = serde_json::to_vec(&config)
+            .map_err(|_| {
+                ProcessLaunchError::new(
+                    ProcessLaunchState::FailedBeforeChild,
+                    identity.clone(),
+                    &config,
+                    "invalid process configuration",
+                )
+            })?
+            .len();
+        if config_size > 64 * 1024 {
+            return Err(ProcessLaunchError::new(
+                ProcessLaunchState::FailedBeforeChild,
+                identity,
+                &config,
+                "process configuration exceeds 64 KiB",
+            ));
         }
         let mut command = Command::new(&host.executable);
         command.args(&host.argv).env_clear();
@@ -97,9 +110,14 @@ impl Supervisor {
             use std::os::windows::process::CommandExt;
             command.creation_flags(0x08000000);
         }
-        let mut child = command
-            .spawn()
-            .map_err(|error| format!("supervisor launch failed: {error}"))?;
+        let mut child = command.spawn().map_err(|error| {
+            ProcessLaunchError::new(
+                ProcessLaunchState::FailedBeforeChild,
+                identity.clone(),
+                &config,
+                format!("supervisor launch failed: {error}"),
+            )
+        })?;
         let mut stdout = child.stdout.take().expect("piped stdout");
         let mut stdin = child.stdin.take().expect("piped stdin");
         let (events, event_rx) = mpsc::sync_channel(64);
@@ -119,7 +137,12 @@ impl Supervisor {
         {
             platform::terminate_owned(&mut child);
             let _ = child.wait();
-            return Err("supervisor ownership handshake failed".into());
+            return Err(ProcessLaunchError::new(
+                ProcessLaunchState::FailedBeforeChild,
+                identity,
+                &config,
+                "supervisor ownership handshake failed",
+            ));
         }
         let (input, input_rx) = mpsc::sync_channel(2);
         let control = Arc::new(Control {
@@ -131,7 +154,7 @@ impl Supervisor {
         });
         let owner = Self {
             control: control.clone(),
-            identity: uuid::Uuid::new_v4(),
+            identity: identity.clone(),
             host_pid: child.id(),
         };
         let writer_control = Arc::downgrade(&control);
@@ -151,12 +174,23 @@ impl Supervisor {
                 Err(_) => break,
             }
         });
-        thread::spawn(move || monitor(child, event_rx, control, event, stderr));
+        let monitor_identity = identity.clone();
+        thread::spawn(move || monitor(child, event_rx, control, event, stderr, monitor_identity));
         owner
             .control
             .input
-            .try_send(Request::Configure(config))
-            .map_err(|_| "supervisor stopped during startup")?;
+            .try_send(Request::Configure {
+                identity: identity.clone(),
+                config: config.clone(),
+            })
+            .map_err(|_| {
+                ProcessLaunchError::new(
+                    ProcessLaunchState::Unknown,
+                    identity.clone(),
+                    &config,
+                    "supervisor stopped during startup; command launch is unknown",
+                )
+            })?;
         let state = owner
             .control
             .state
@@ -170,11 +204,25 @@ impl Supervisor {
             })
             .unwrap_or_else(|e| e.into_inner());
         if state.pid.is_none() {
-            return Err(state
+            let launch_state = state
+                .exit
+                .as_ref()
+                .map(|exit| exit.launch_state)
+                .filter(|state| *state == ProcessLaunchState::FailedBeforeChild)
+                .unwrap_or(ProcessLaunchState::Unknown);
+            let message = state
                 .exit
                 .as_ref()
                 .and_then(|exit| exit.error.clone())
-                .unwrap_or_else(|| "supervised command startup timed out".into()));
+                .unwrap_or_else(|| {
+                    "supervised command startup timed out; command launch is unknown".into()
+                });
+            return Err(ProcessLaunchError::new(
+                launch_state,
+                owner.identity.clone(),
+                &config,
+                message,
+            ));
         }
         drop(state);
         Ok(owner)
@@ -214,10 +262,14 @@ impl Supervisor {
             .input
             .try_send(match bytes {
                 Some(bytes) => Request::Write {
+                    identity: self.identity.clone(),
                     id,
                     bytes: bytes.to_vec(),
                 },
-                None => Request::CloseStdin { id },
+                None => Request::CloseStdin {
+                    identity: self.identity.clone(),
+                    id,
+                },
             })
             .map_err(|_| "stdin queue is unavailable")?;
         let (mut state, _) = self
@@ -263,8 +315,8 @@ impl Supervisor {
     }
 
     /// Correlation only. Termination always uses the owned, unreaped OS lifetime.
-    pub fn identity(&self) -> uuid::Uuid {
-        self.identity
+    pub fn identity(&self) -> &ProcessIdentity {
+        &self.identity
     }
 }
 
@@ -280,18 +332,28 @@ fn monitor(
     control: Arc<Control>,
     callback: Arc<dyn Fn(ProcessEvent) + Send + Sync>,
     stderr_callback: Arc<dyn Fn(Vec<u8>) + Send + Sync>,
+    identity: ProcessIdentity,
 ) {
     let mut code = None;
     let mut exit_reported = false;
     let mut output_complete = false;
     let mut error = None;
+    let mut launch_state = ProcessLaunchState::Unknown;
     while !control.stop.load(Ordering::SeqCst) {
         match events.recv_timeout(POLL) {
-            Ok(Event::Started { pid }) => {
+            Ok(Event::Started {
+                identity: observed,
+                pid,
+            }) if observed == identity => {
+                launch_state = ProcessLaunchState::Started;
                 control.state.lock().unwrap_or_else(|e| e.into_inner()).pid = Some(pid);
                 control.changed.notify_all();
             }
-            Ok(Event::Output { bytes, stderr }) => {
+            Ok(Event::Output {
+                identity: observed,
+                bytes,
+                stderr,
+            }) if observed == identity => {
                 if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     if stderr {
                         stderr_callback(bytes)
@@ -305,7 +367,12 @@ fn monitor(
                     break;
                 }
             }
-            Ok(Event::Written { id, count, failed }) => {
+            Ok(Event::Written {
+                identity: observed,
+                id,
+                count,
+                failed,
+            }) if observed == identity => {
                 let mut state = control.state.lock().unwrap_or_else(|e| e.into_inner());
                 if state.sequence == id {
                     state.ack = Some((
@@ -320,15 +387,30 @@ fn monitor(
                 }
             }
             Ok(Event::Exit {
+                identity: observed,
                 code: value,
                 output_complete: complete,
-            }) => {
+            }) if observed == identity => {
+                launch_state = ProcessLaunchState::Exited;
                 code = value;
                 exit_reported = true;
                 output_complete = complete;
             }
-            Ok(Event::Failed | Event::Hello { .. }) => {
+            Ok(Event::LaunchFailed {
+                identity: observed,
+                message,
+            }) if observed == identity => {
+                launch_state = ProcessLaunchState::FailedBeforeChild;
+                error = Some(message);
+                exit_reported = true;
+                break;
+            }
+            Ok(Event::Failed { identity: observed }) if observed == identity => {
                 error = Some("supervised command failed".into());
+                break;
+            }
+            Ok(_) => {
+                error = Some("supervisor event identity mismatch; command state is unknown".into());
                 break;
             }
             Err(mpsc::RecvTimeoutError::Timeout) => {}
@@ -345,7 +427,12 @@ fn monitor(
     if !stopped && !exit_reported && error.is_none() {
         error = Some("supervisor exited without command status".into());
     }
+    if stopped && launch_state == ProcessLaunchState::Started && !exit_reported {
+        launch_state = ProcessLaunchState::Stopped;
+    }
     let exit = ProcessExit {
+        identity,
+        launch_state,
         code,
         stopped,
         error,

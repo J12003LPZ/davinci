@@ -1540,12 +1540,7 @@ impl Agent {
                 }
                 crate::runtime::operations::OperationAdmission::ExistingResult(admitted) => {
                     return match operation_runtime.dispatcher().replay_result(&admitted) {
-                        Ok(mut result) => {
-                            result.details = Some(
-                                serde_json::json!({ "replayed_from_operation_journal": true }),
-                            );
-                            Preparation::Immediate(result)
-                        }
+                        Ok(result) => Preparation::Immediate(result),
                         Err(error) => {
                             immediate(format!("Operation replay blocked: {error}"), false)
                         }
@@ -1810,11 +1805,21 @@ impl Agent {
                 let mut context = self.tool_context.clone();
                 context.command_receipt = matches!(name, "bash" | "powershell" | "exec_command")
                     .then(|| {
-                        crate::command_receipt::CommandReceiptCapture::new(
+                        let capture = crate::command_receipt::CommandReceiptCapture::new(
                             id,
                             name,
                             self.active_contract().map(|contract| contract.task_id),
-                        )
+                        );
+                        pending_operation
+                            .as_ref()
+                            .map(|pending| {
+                                capture.clone().with_process_operation_binding(
+                                    crate::runtime::operations::ProcessOperationBinding::from_admitted(
+                                        &pending.admitted,
+                                    ),
+                                )
+                            })
+                            .unwrap_or(capture)
                     });
                 context.dispatch_permit = dispatch_permit;
                 context.mutation_attempted =
@@ -1880,6 +1885,30 @@ impl Agent {
                     .as_ref()
                     .and_then(|capture| capture.take())
                 {
+                    if let Some(pending) = pending_operation.as_ref() {
+                        let expected =
+                            crate::runtime::operations::ProcessOperationBinding::from_admitted(
+                                &pending.admitted,
+                            );
+                        let observed = receipt
+                            .process_evidence
+                            .as_ref()
+                            .and_then(|evidence| evidence.identity.operation.as_ref());
+                        if observed == Some(&expected) {
+                            if let Err(error) = crate::command_receipt::attach_to_tool_result(
+                                &mut executed,
+                                &receipt,
+                            ) {
+                                executed.is_error = true;
+                                executed.content = format!(
+                                    "Command result could not retain its process receipt: {error}. The command may have completed."
+                                );
+                            }
+                        } else if observed.is_some() {
+                            executed.is_error = true;
+                            executed.content = "Command process receipt did not match the admitted operation attempt. The command may have completed.".into();
+                        }
+                    }
                     if let Ok(mut receipts) = self.command_receipts.lock() {
                         receipts.retain(|previous| previous.operation_id != id);
                         if receipts.len() >= 128 {
@@ -5714,6 +5743,66 @@ mod operation_dispatch_tests {
         assert_eq!(
             attempt.effect_status(),
             crate::runtime::operations::EffectStatus::NotStarted
+        );
+    }
+
+    #[test]
+    fn supervised_shell_receipt_is_committed_and_replayed_with_operation_result() {
+        let (mut agent, workspace, journal) = configured_agent();
+        agent.tools = vec!["exec_command".into()];
+        agent.permissions.lock().unwrap().mode = crate::PermissionMode::AlwaysApprove;
+        agent.tool_context.foreground_supervisor = Some(crate::command_receipt::test_supervisor());
+        let command = if cfg!(windows) {
+            "Write-Output process-receipt"
+        } else {
+            "printf process-receipt"
+        };
+        let args = json!({"command": command});
+        assert!(matches!(
+            agent.prepare_tool_call(workspace.path(), "receipt-call", "exec_command", &args, 0),
+            Preparation::Ready { .. }
+        ));
+        let result =
+            agent.run_prepared_call(workspace.path(), "receipt-call", "exec_command", &args, 0);
+        assert!(!result.is_error, "{}", result.content);
+
+        let stored = journal.snapshot().unwrap();
+        let operation_id = stored.operations[0].operation_id();
+        let attempt = stored
+            .attempts
+            .iter()
+            .find(|attempt| attempt.operation_id() == operation_id)
+            .unwrap();
+        assert_eq!(attempt.state(), OperationState::Succeeded);
+        let details = result.details.as_ref().unwrap();
+        let receipt = &details["_command_receipt"];
+        assert_eq!(
+            receipt["process_evidence"]["identity"]["operation"]["operation_id"],
+            operation_id.to_string()
+        );
+        assert_eq!(
+            receipt["process_evidence"]["identity"]["operation"]["attempt_id"],
+            attempt.attempt_id().to_string()
+        );
+        assert_eq!(
+            receipt["process_evidence"]["identity"]["operation"]["owner_generation"],
+            attempt.owner().generation
+        );
+
+        let replay = match agent.prepare_tool_call(
+            workspace.path(),
+            "receipt-call",
+            "exec_command",
+            &args,
+            0,
+        ) {
+            Preparation::Immediate(result) => result,
+            _ => panic!("expected journal replay"),
+        };
+        assert!(replay.details.as_ref().unwrap()["replayed_from_operation_journal"] == true);
+        assert_eq!(
+            replay.details.as_ref().unwrap()["_command_receipt"],
+            receipt.clone()
         );
     }
 }

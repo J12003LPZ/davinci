@@ -110,12 +110,7 @@ pub(super) fn resolve(
         environment.insert(name, value);
     }
     let (executable, argv) = executable(&request.executable, request.argv, &cwd)?;
-    Ok(ProcessConfig {
-        executable,
-        argv,
-        cwd,
-        environment,
-    })
+    Ok(ProcessConfig::new(executable, argv, cwd, environment))
 }
 
 fn candidates(name: &str, cwd: &Path) -> Vec<PathBuf> {

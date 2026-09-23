@@ -7,6 +7,7 @@ pub struct CommandReceiptCapture {
     operation_id: String,
     tool_name: String,
     task_id: Option<TaskId>,
+    process_operation_binding: Option<crate::runtime::operations::ProcessOperationBinding>,
     receipt: Arc<Mutex<Option<ExecutionReceipt>>>,
 }
 
@@ -16,8 +17,23 @@ impl CommandReceiptCapture {
             operation_id: operation_id.into(),
             tool_name: tool_name.into(),
             task_id,
+            process_operation_binding: None,
             receipt: Arc::new(Mutex::new(None)),
         }
+    }
+
+    pub(crate) fn with_process_operation_binding(
+        mut self,
+        binding: crate::runtime::operations::ProcessOperationBinding,
+    ) -> Self {
+        self.process_operation_binding = Some(binding);
+        self
+    }
+
+    pub(crate) fn process_operation_binding(
+        &self,
+    ) -> Option<crate::runtime::operations::ProcessOperationBinding> {
+        self.process_operation_binding.clone()
     }
 
     pub(crate) fn take(&self) -> Option<ExecutionReceipt> {
@@ -40,9 +56,9 @@ impl CommandReceiptCapture {
         let Ok(mut slot) = self.receipt.lock() else {
             return;
         };
-        if slot.is_some() {
-            return;
-        }
+        let process_evidence = slot
+            .as_ref()
+            .and_then(|receipt| receipt.process_evidence.clone());
         *slot = Some(ExecutionReceipt {
             operation_id: self.operation_id.clone(),
             tool_name: self.tool_name.clone(),
@@ -56,9 +72,66 @@ impl CommandReceiptCapture {
             finished_at_ms: now(),
             stdout_hash: Some(crate::runtime::checkpoints::compute_sha256(&output.stdout)),
             stderr_hash: Some(crate::runtime::checkpoints::compute_sha256(&output.stderr)),
+            process_evidence,
             ..Default::default()
         });
     }
+
+    pub(crate) fn process_observed(
+        &self,
+        evidence: crate::jobs::supervisor::ProcessExecutionEvidence,
+        started_at_ms: i64,
+        stdout: &[u8],
+        stderr: &[u8],
+    ) {
+        if self.process_operation_binding.as_ref() != evidence.identity.operation.as_ref() {
+            return;
+        }
+        let Ok(mut slot) = self.receipt.lock() else {
+            return;
+        };
+        let started = matches!(
+            evidence.launch_state,
+            crate::jobs::supervisor::ProcessLaunchState::Started
+                | crate::jobs::supervisor::ProcessLaunchState::Exited
+                | crate::jobs::supervisor::ProcessLaunchState::Stopped
+        );
+        let mut receipt = slot.take().unwrap_or_else(|| ExecutionReceipt {
+            operation_id: self.operation_id.clone(),
+            task_id: self.task_id,
+            tool_name: self.tool_name.clone(),
+            argv: evidence.argv.clone(),
+            cwd: evidence.cwd.clone(),
+            started,
+            started_at_ms,
+            ..Default::default()
+        });
+        receipt.started |= started;
+        receipt.exit_code = evidence.exit_code;
+        receipt.started_at_ms = if receipt.started_at_ms == 0 {
+            started_at_ms
+        } else {
+            receipt.started_at_ms.min(started_at_ms)
+        };
+        receipt.finished_at_ms = now();
+        receipt.stdout_hash = Some(crate::runtime::checkpoints::compute_sha256(stdout));
+        receipt.stderr_hash = Some(crate::runtime::checkpoints::compute_sha256(stderr));
+        receipt.process_evidence = Some(evidence);
+        *slot = Some(receipt);
+    }
+}
+
+pub(crate) fn attach_to_tool_result(
+    result: &mut crate::ToolResult,
+    receipt: &ExecutionReceipt,
+) -> Result<(), String> {
+    let details = result.details.get_or_insert_with(|| serde_json::json!({}));
+    if !details.is_object() {
+        *details = serde_json::json!({});
+    }
+    details["_command_receipt"] = serde_json::to_value(receipt)
+        .map_err(|error| format!("command receipt encoding failed: {error}"))?;
+    Ok(())
 }
 
 pub(crate) fn now() -> i64 {

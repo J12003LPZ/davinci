@@ -71,12 +71,7 @@ fn config(directory: &Path, argv: Vec<String>) -> ProcessConfig {
             environment.insert(name.into(), value);
         }
     }
-    ProcessConfig {
-        executable: "node".into(),
-        argv,
-        cwd: directory.into(),
-        environment,
-    }
+    ProcessConfig::new("node".into(), argv, directory.into(), environment)
 }
 
 fn fixture(directory: &Path) -> (Supervisor, Arc<Mutex<Vec<u8>>>) {

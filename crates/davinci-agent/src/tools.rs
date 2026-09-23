@@ -1818,7 +1818,7 @@ fn shell_tool(
         };
         let output = foreground::run(
             host,
-            foreground::config(cwd, shell.shell.into(), argv)?,
+            foreground::config(cwd, shell.shell.into(), argv, context)?,
             stdin,
             timeout_ms,
             timeout_label.as_deref(),
@@ -1992,6 +1992,7 @@ fn powershell_tool(
                     "-Command".into(),
                     wrapped,
                 ],
+                context,
             )?;
             let output = foreground::run(
                 host,

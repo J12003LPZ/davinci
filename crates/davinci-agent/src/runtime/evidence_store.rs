@@ -58,6 +58,8 @@ pub struct ExecutionReceipt {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stderr_artifact: Option<ArtifactRef>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub process_evidence: Option<crate::jobs::supervisor::ProcessExecutionEvidence>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub assertion_counts: Option<AssertionCounts>,
     #[serde(default)]
     pub runtime_versions: HashMap<String, String>,
@@ -89,6 +91,7 @@ impl Default for ExecutionReceipt {
             stderr_hash: None,
             stdout_artifact: None,
             stderr_artifact: None,
+            process_evidence: None,
             assertion_counts: None,
             runtime_versions: HashMap::new(),
             started_at_ms: 0,

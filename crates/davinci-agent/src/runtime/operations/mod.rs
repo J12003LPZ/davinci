@@ -16,7 +16,10 @@ mod store_api;
 mod store_support;
 mod transitions;
 
-pub use adapters::{ToolOperationDispatchError, ToolOperationDispatcher, ToolOperationRuntime};
+pub use adapters::{
+    ProcessOperationBinding, ToolOperationDispatchError, ToolOperationDispatcher,
+    ToolOperationRuntime,
+};
 pub use coordinator_api::{AdmittedOperation, DispatchPermit, EffectPermit, OperationAdmission};
 pub use failure::{FailureReasonCode, FailureSubsystem, OperationFailure};
 pub use fault::{FaultInjector, FaultPoint};

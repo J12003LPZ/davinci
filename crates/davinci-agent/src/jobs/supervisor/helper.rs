@@ -35,11 +35,39 @@ fn run_owned() -> std::io::Result<()> {
         },
     )?;
     let mut input = std::io::stdin();
-    let Request::Configure(config) = wire::read(&mut input)? else {
+    let Request::Configure { identity, config } = wire::read(&mut input)? else {
         return Ok(());
     };
-    let mut child = spawn(config)?;
-    wire::write(&mut output, &Event::Started { pid: child.id() })?;
+    if identity.operation != config.operation {
+        wire::write(
+            &mut output,
+            &Event::LaunchFailed {
+                identity,
+                message: "process operation binding does not match its lifetime identity".into(),
+            },
+        )?;
+        return Ok(());
+    }
+    let mut child = match spawn(config) {
+        Ok(child) => child,
+        Err(error) => {
+            wire::write(
+                &mut output,
+                &Event::LaunchFailed {
+                    identity,
+                    message: format!("command launch failed before child start: {error}"),
+                },
+            )?;
+            return Ok(());
+        }
+    };
+    wire::write(
+        &mut output,
+        &Event::Started {
+            identity: identity.clone(),
+            pid: child.id(),
+        },
+    )?;
 
     let stopped = Arc::new(AtomicBool::new(false));
     let (events, event_rx) = mpsc::sync_channel::<Message>(64);
@@ -71,11 +99,13 @@ fn run_owned() -> std::io::Result<()> {
     .filter_map(|(index, pipe)| pipe.map(|pipe| (index == 1, pipe)))
     .map(|(stderr, pipe)| {
         let events = events.clone();
-        thread::spawn(move || forward_output(pipe, &events, stderr))
+        let identity = identity.clone();
+        thread::spawn(move || forward_output(pipe, &events, &identity, stderr))
     })
     .collect();
     let (writes, write_rx) = mpsc::sync_channel::<(u64, Option<Vec<u8>>)>(1);
     let write_events = events.clone();
+    let write_identity = identity.clone();
     let mut stdin = child.stdin.take();
     thread::spawn(move || {
         while let Ok((id, bytes)) = write_rx.recv() {
@@ -93,7 +123,15 @@ fn run_owned() -> std::io::Result<()> {
             let failed = result.is_err();
             let count = result.unwrap_or(0);
             if write_events
-                .send((Event::Written { id, count, failed }, None))
+                .send((
+                    Event::Written {
+                        identity: write_identity.clone(),
+                        id,
+                        count,
+                        failed,
+                    },
+                    None,
+                ))
                 .is_err()
             {
                 break;
@@ -102,17 +140,26 @@ fn run_owned() -> std::io::Result<()> {
     });
     let input_stop = stopped.clone();
     let input_events = events.clone();
+    let input_identity = identity.clone();
     thread::spawn(move || {
         while let Ok(request) = wire::read(&mut input) {
-            let (id, bytes) = match request {
-                Request::Write { id, bytes } if bytes.len() <= MAX_INPUT => (id, Some(bytes)),
-                Request::CloseStdin { id } => (id, None),
+            let (request_identity, id, bytes) = match request {
+                Request::Write {
+                    identity,
+                    id,
+                    bytes,
+                } if bytes.len() <= MAX_INPUT => (identity, id, Some(bytes)),
+                Request::CloseStdin { identity, id } => (identity, id, None),
                 _ => break,
             };
+            if request_identity != input_identity {
+                break;
+            }
             if writes.try_send((id, bytes)).is_err()
                 && input_events
                     .send((
                         Event::Written {
+                            identity: input_identity.clone(),
                             id,
                             count: 0,
                             failed: true,
@@ -136,7 +183,7 @@ fn run_owned() -> std::io::Result<()> {
             while readers.iter().any(|reader| !reader.is_finished()) && Instant::now() < deadline {
                 thread::sleep(POLL);
             }
-            flush_exit(&events, status.code(), readers_complete(readers));
+            flush_exit(&events, &identity, status.code(), readers_complete(readers));
             return Ok(());
         }
         thread::sleep(POLL);
@@ -147,6 +194,7 @@ fn run_owned() -> std::io::Result<()> {
 fn forward_output(
     mut pipe: impl Read,
     events: &mpsc::SyncSender<Message>,
+    identity: &super::ProcessIdentity,
     stderr: bool,
 ) -> std::io::Result<()> {
     let mut bytes = [0; 8192];
@@ -160,6 +208,7 @@ fn forward_output(
         if events
             .send((
                 Event::Output {
+                    identity: identity.clone(),
                     bytes: bytes[..count].to_vec(),
                     stderr,
                 },
@@ -213,10 +262,16 @@ fn spawn(config: ProcessConfig) -> std::io::Result<std::process::Child> {
     command.spawn()
 }
 
-fn flush_exit(events: &mpsc::SyncSender<Message>, code: Option<i32>, output_complete: bool) {
+fn flush_exit(
+    events: &mpsc::SyncSender<Message>,
+    identity: &super::ProcessIdentity,
+    code: Option<i32>,
+    output_complete: bool,
+) {
     let (ack, ack_rx) = mpsc::sync_channel(1);
     let mut message = (
         Event::Exit {
+            identity: identity.clone(),
             code,
             output_complete,
         },
@@ -256,9 +311,11 @@ mod tests {
     #[test]
     fn supervisor_exit_waits_for_saturated_output_queue() {
         let (events, receiver) = mpsc::sync_channel::<Message>(1);
+        let identity = super::super::ProcessIdentity::new(None);
         events
             .send((
                 Event::Output {
+                    identity: identity.clone(),
                     bytes: vec![b'x'],
                     stderr: false,
                 },
@@ -278,21 +335,23 @@ mod tests {
                 event,
                 Event::Exit {
                     code: Some(0),
-                    output_complete: true
+                    output_complete: true,
+                    ..
                 }
             ));
             ack.expect("exit event carries delivery acknowledgement")
                 .send(())
                 .unwrap();
         });
-        flush_exit(&events, Some(0), true);
+        flush_exit(&events, &identity, Some(0), true);
         drained.join().unwrap();
     }
 
     #[test]
     fn supervisor_capture_does_not_report_read_failure_as_eof() {
         let (events, _receiver) = mpsc::sync_channel(2);
-        let result = forward_output(InterruptedThenData(false), &events, false);
+        let identity = super::super::ProcessIdentity::new(None);
+        let result = forward_output(InterruptedThenData(false), &events, &identity, false);
         assert_eq!(result.unwrap_err().kind(), std::io::ErrorKind::Other);
     }
 
@@ -300,7 +359,8 @@ mod tests {
     fn supervisor_capture_requires_output_delivery() {
         let (events, receiver) = mpsc::sync_channel(2);
         drop(receiver);
-        assert!(forward_output(&b"output"[..], &events, false).is_err());
+        let identity = super::super::ProcessIdentity::new(None);
+        assert!(forward_output(&b"output"[..], &events, &identity, false).is_err());
     }
 
     #[test]

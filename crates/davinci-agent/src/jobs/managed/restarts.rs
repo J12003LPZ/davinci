@@ -177,7 +177,7 @@ pub(super) fn supervise(
                     .restart
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())
-                    .error = Some(error);
+                    .error = Some(error.to_string());
                 finish(&shared, &record, exit);
                 return;
             }
@@ -202,7 +202,7 @@ pub(super) fn supervise(
                     .restart
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())
-                    .error = Some(error);
+                    .error = Some(error.to_string());
                 finish(&shared, &record, exit);
                 return;
             }

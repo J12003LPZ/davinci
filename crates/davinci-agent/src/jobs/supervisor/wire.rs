@@ -1,8 +1,8 @@
-use super::ProcessConfig;
+use super::{ProcessConfig, ProcessIdentity};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use std::io::{self, Read, Write};
 
-pub(super) const MAGIC: &[u8] = b"DAVINCI_PROCESS_V1\n";
+pub(super) const MAGIC: &[u8] = b"DAVINCI_PROCESS_V2\n";
 pub(super) const MAX_FRAME: usize = 128 * 1024;
 pub(super) const MAX_INPUT: usize = 16 * 1024;
 pub(super) const POLL: std::time::Duration = std::time::Duration::from_millis(20);
@@ -10,9 +10,19 @@ pub(super) const POLL: std::time::Duration = std::time::Duration::from_millis(20
 #[derive(Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub(super) enum Request {
-    Configure(ProcessConfig),
-    Write { id: u64, bytes: Vec<u8> },
-    CloseStdin { id: u64 },
+    Configure {
+        identity: ProcessIdentity,
+        config: ProcessConfig,
+    },
+    Write {
+        identity: ProcessIdentity,
+        id: u64,
+        bytes: Vec<u8>,
+    },
+    CloseStdin {
+        identity: ProcessIdentity,
+        id: u64,
+    },
 }
 
 #[derive(Serialize, Deserialize)]
@@ -22,22 +32,32 @@ pub(super) enum Event {
         pid: u32,
     },
     Started {
+        identity: ProcessIdentity,
         pid: u32,
     },
     Output {
+        identity: ProcessIdentity,
         bytes: Vec<u8>,
         stderr: bool,
     },
     Written {
+        identity: ProcessIdentity,
         id: u64,
         count: usize,
         failed: bool,
     },
     Exit {
+        identity: ProcessIdentity,
         code: Option<i32>,
         output_complete: bool,
     },
-    Failed,
+    LaunchFailed {
+        identity: ProcessIdentity,
+        message: String,
+    },
+    Failed {
+        identity: ProcessIdentity,
+    },
 }
 
 pub(super) fn read<T: DeserializeOwned>(input: &mut impl Read) -> io::Result<T> {
