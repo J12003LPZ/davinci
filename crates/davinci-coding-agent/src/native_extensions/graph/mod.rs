@@ -94,8 +94,10 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 pub use roles::GRAPH_SUBMIT_TOOL;
+#[allow(unused_imports)]
 pub use worker::{build_worker_args, worker_cache_profile, WorkerCacheProfile};
 pub use worker_hooks::GraphWorkerContext;
+#[allow(unused_imports)]
 pub use worker_sessions::WorkerSessionBinding;
 
 /// Resolve the concrete worker model identity used by both the launch and
