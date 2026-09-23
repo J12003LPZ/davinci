@@ -1394,6 +1394,120 @@ impl Agent {
                 }
             }
         }
+        // Journal-authoritative tools persist immutable intent before any
+        // runtime decision hook, task-contract policy, capability-effect gate,
+        // or permission/approval decision. Validation that the tool is known
+        // and enabled still happens first.
+        let mut journal_pending: Option<crate::PendingToolOperation> = None;
+        if route == crate::tool_ledger::ToolCallExecutionAuthority::OperationJournal {
+            if !self.tools.iter().any(|tool| tool == name) {
+                return immediate(format!("Unknown tool: {name}"), false);
+            }
+            let Some(operation_runtime) = operation_runtime.clone() else {
+                return immediate("Operation journal runtime is unavailable.".into(), true);
+            };
+            let Some(capability) = self
+                .runtime
+                .as_ref()
+                .and_then(|runtime| runtime.capability_registry.get(name))
+                .filter(|capability| {
+                    matches!(
+                        capability.source,
+                        crate::runtime::CapabilitySource::Builtin
+                            | crate::runtime::CapabilitySource::JsExtension
+                            | crate::runtime::CapabilitySource::NativeExtension
+                            | crate::runtime::CapabilitySource::Mcp
+                    )
+                })
+            else {
+                return immediate(
+                    "Operation denied: registered capability changed during preparation.".into(),
+                    true,
+                );
+            };
+            let contract_digest = self.active_contract().map(|contract| contract.digest);
+            let Some(runtime) = self.runtime.as_ref() else {
+                return immediate("Operation journal runtime is unavailable.".into(), true);
+            };
+            let session_id = runtime.session_id.as_deref();
+            let (run_id, agent_id) = (runtime.run_id, runtime.agent_id);
+            let planned = match origin {
+                crate::ToolOperationOrigin::ProviderCall => operation_runtime.plan_provider_call(
+                    run_id,
+                    agent_id,
+                    session_id,
+                    id,
+                    name,
+                    args,
+                    Some(&capability),
+                    contract_digest.as_deref(),
+                ),
+                crate::ToolOperationOrigin::BatchChild {
+                    parent,
+                    child_index,
+                } => operation_runtime.plan_batch_child(
+                    run_id,
+                    agent_id,
+                    session_id,
+                    parent,
+                    child_index,
+                    name,
+                    args,
+                    Some(&capability),
+                    contract_digest.as_deref(),
+                ),
+            };
+            let plan = match planned {
+                Ok(plan) => plan,
+                Err(error) => {
+                    return immediate(format!("Operation planning failed: {error}"), true)
+                }
+            };
+            let admission = match operation_runtime
+                .dispatcher()
+                .persist_intent(plan.clone())
+            {
+                Ok(admission) => admission,
+                Err(error) => {
+                    return Preparation::Immediate(crate::ToolResult {
+                        content: format!(
+                            "Operation intent could not be persisted before policy evaluation: {error}"
+                        ),
+                        is_error: true,
+                        details: Some(serde_json::json!({ "operation_persistence": true })),
+                    });
+                }
+            };
+            match admission {
+                crate::runtime::operations::OperationAdmission::New(admitted) => {
+                    journal_pending = Some(crate::PendingToolOperation {
+                        runtime: operation_runtime,
+                        plan,
+                        admitted,
+                        origin,
+                    });
+                }
+                crate::runtime::operations::OperationAdmission::ExistingResult(admitted) => {
+                    return match operation_runtime.dispatcher().replay_result(&admitted) {
+                        Ok(result) => Preparation::Immediate(result),
+                        Err(error) => {
+                            immediate(format!("Operation replay blocked: {error}"), false)
+                        }
+                    };
+                }
+                crate::runtime::operations::OperationAdmission::ExistingInFlight(_) => {
+                    return immediate("Operation is already admitted or in flight; automatic redispatch is blocked.".into(), false);
+                }
+                crate::runtime::operations::OperationAdmission::Collision => {
+                    return Preparation::Immediate(crate::ToolResult {
+                        content: "Operation idempotency key collided with different intent.".into(),
+                        is_error: true,
+                        details: Some(serde_json::json!({ "collision": true })),
+                    });
+                }
+            }
+        }
+
         if let Some(runtime) = &self.runtime {
             let event = crate::runtime::RuntimeEvent::PreToolUse {
                 call_id: id.to_string(),
