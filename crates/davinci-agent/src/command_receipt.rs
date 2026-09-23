@@ -61,6 +61,10 @@ impl CommandReceiptCapture {
             .and_then(|receipt| receipt.process_evidence.clone());
         *slot = Some(ExecutionReceipt {
             operation_id: self.operation_id.clone(),
+            attempt_id: self
+                .process_operation_binding
+                .as_ref()
+                .map(|binding| binding.attempt_id.to_string()),
             tool_name: self.tool_name.clone(),
             task_id: self.task_id,
             argv: vec![command.into()],
@@ -98,6 +102,10 @@ impl CommandReceiptCapture {
         );
         let mut receipt = slot.take().unwrap_or_else(|| ExecutionReceipt {
             operation_id: self.operation_id.clone(),
+            attempt_id: self
+                .process_operation_binding
+                .as_ref()
+                .map(|binding| binding.attempt_id.to_string()),
             task_id: self.task_id,
             tool_name: self.tool_name.clone(),
             argv: evidence.argv.clone(),
@@ -106,6 +114,11 @@ impl CommandReceiptCapture {
             started_at_ms,
             ..Default::default()
         });
+        receipt.attempt_id = self
+            .process_operation_binding
+            .as_ref()
+            .map(|binding| binding.attempt_id.to_string())
+            .or(receipt.attempt_id);
         receipt.started |= started;
         receipt.exit_code = evidence.exit_code;
         receipt.started_at_ms = if receipt.started_at_ms == 0 {

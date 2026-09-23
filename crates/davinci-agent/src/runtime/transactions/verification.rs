@@ -11,6 +11,8 @@ use std::collections::BTreeMap;
 pub struct VerificationObservation {
     id: String,
     sequence: u64,
+    operation_id: Option<String>,
+    attempt_id: Option<String>,
     workspace_identity: String,
     owner: TransactionOwner,
     source_digest: String,
@@ -59,6 +61,16 @@ pub struct TransactionVerification {
     /// Fingerprint of the transaction's affected files, including deletions and modes.
     /// This is not a claim that every repository dependency was tested.
     pub source_digest: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub operation_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attempt_id: Option<String>,
+    #[serde(default)]
+    pub evidence_schema_version: u32,
+    #[serde(default)]
+    pub output_complete: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub artifact_digests: Vec<String>,
 }
 
 impl TransactionCoordinator {
@@ -81,6 +93,8 @@ impl TransactionCoordinator {
             Ok(SourceObservation(VerificationObservation {
                 id: id.into(),
                 sequence: record.summary.sequence,
+                operation_id: record.summary.operation_id.clone(),
+                attempt_id: record.summary.attempt_id.clone(),
                 workspace_identity: record.summary.workspace_identity.clone(),
                 owner: self.owner.clone(),
                 source_digest: source_digest(&record),
@@ -146,6 +160,8 @@ impl TransactionCoordinator {
             Ok(VerificationObservation {
                 id: id.into(),
                 sequence: record.summary.sequence,
+                operation_id: record.summary.operation_id.clone(),
+                attempt_id: record.summary.attempt_id.clone(),
                 workspace_identity: record.summary.workspace_identity.clone(),
                 owner: self.owner.clone(),
                 source_digest: source_digest(&record),
@@ -164,6 +180,17 @@ impl TransactionCoordinator {
         authority: Authority<'_>,
     ) -> Result<TransactionSummary, String> {
         validate_receipt(&receipt)?;
+        if observation
+            .operation_id
+            .as_deref()
+            .is_some_and(|operation_id| operation_id != receipt.operation_id)
+            || observation
+                .attempt_id
+                .as_deref()
+                .is_some_and(|attempt_id| receipt.attempt_id.as_deref() != Some(attempt_id))
+        {
+            return Err("verification receipt does not match its operation observation".into());
+        }
         if files::root(std::path::Path::new(&receipt.cwd))? != self.root
             || receipt.started_at_ms < observation.observed_at_ms
             || receipt.task_id != self.owner.task_id
@@ -192,9 +219,19 @@ impl TransactionCoordinator {
                 return Err("transaction changed during verification".into());
             }
             self.check_verification_images(&record, authority)?;
+            let evidence = crate::runtime::operations::bind_verification_evidence(
+                &record.summary,
+                &receipt,
+                observation.source_digest.clone(),
+            )?;
             record.summary.verification = Some(TransactionVerification {
                 receipt,
                 source_digest: observation.source_digest,
+                operation_id: Some(evidence.link.verification_operation_id),
+                attempt_id: evidence.link.verification_attempt_id,
+                evidence_schema_version: evidence.schema_version,
+                output_complete: evidence.output_complete,
+                artifact_digests: evidence.artifact_digests,
             });
             record.summary.verification_state = "verified for affected-file scope".into();
             transition(&mut record, TransactionState::Verified);
@@ -246,6 +283,20 @@ pub(super) fn validate(record: &Record) -> Result<(), String> {
             || evidence.receipt.task_id != record.summary.owner.task_id
         {
             return Err("invalid transaction verification source binding".into());
+        }
+        if (evidence.evidence_schema_version > 0
+            && evidence.evidence_schema_version
+                != crate::runtime::operations::VERIFICATION_EVIDENCE_SCHEMA_VERSION)
+            || (evidence.operation_id.is_some()
+                && evidence.operation_id.as_deref() != Some(evidence.receipt.operation_id.as_str()))
+            || (evidence.attempt_id.is_some()
+                && evidence.attempt_id.as_deref() != evidence.receipt.attempt_id.as_deref())
+            || (evidence.output_complete
+                && !crate::runtime::operations::output_is_complete(&evidence.receipt))
+            || evidence.artifact_digests
+                != crate::runtime::operations::artifact_digests(&evidence.receipt)
+        {
+            return Err("invalid transaction verification operation evidence".into());
         }
     } else if record.summary.state == TransactionState::Verified {
         return Err("verified transaction has no execution evidence".into());

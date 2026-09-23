@@ -26,6 +26,8 @@ pub struct ExecutionReceipt {
     pub receipt_id: EvidenceId,
     pub operation_id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attempt_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub task_id: Option<TaskId>,
     #[serde(default)]
     pub attempt: u32,
@@ -72,6 +74,7 @@ impl Default for ExecutionReceipt {
         Self {
             receipt_id: EvidenceId::new(),
             operation_id: String::new(),
+            attempt_id: None,
             task_id: None,
             attempt: 0,
             requirement_id: None,

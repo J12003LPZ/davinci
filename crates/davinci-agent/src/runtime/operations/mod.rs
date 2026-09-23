@@ -17,11 +17,13 @@ mod store_support;
 mod transitions;
 
 pub use adapters::{
-    classify_file_observation, phase_map, phase_receipt_for_attempt, phase_receipts_match_summary,
-    reconcile_transaction_phase, FilesystemEffectObservation, FilesystemOperationLink,
-    ProcessOperationBinding, ToolOperationDispatchError, ToolOperationDispatcher,
-    ToolOperationRuntime, TransactionOperationLink, TransactionPhaseReceipt,
-    TransactionProjectionLedger, TransactionRecovery,
+    artifact_digests, bind_verification_evidence, classify_file_observation, output_is_complete,
+    phase_map, phase_receipt_for_attempt, phase_receipts_match_summary,
+    reconcile_transaction_phase, transaction_link_for_verification, FilesystemEffectObservation,
+    FilesystemOperationLink, ProcessOperationBinding, ToolOperationDispatchError,
+    ToolOperationDispatcher, ToolOperationRuntime, TransactionOperationLink,
+    TransactionPhaseReceipt, TransactionProjectionLedger, TransactionRecovery,
+    VerificationEvidenceBinding, VerificationOperationLink, VERIFICATION_EVIDENCE_SCHEMA_VERSION,
 };
 pub use coordinator_api::{AdmittedOperation, DispatchPermit, EffectPermit, OperationAdmission};
 pub use failure::{FailureReasonCode, FailureSubsystem, OperationFailure};
