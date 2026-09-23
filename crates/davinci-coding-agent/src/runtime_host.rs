@@ -29,6 +29,18 @@ pub fn configure_session_workflow(
     )
 }
 
+/// Inspect child executions from the product host boundary.  This delegates
+/// to the runtime's existing operation journal rather than creating a second
+/// coordinator, so a reopened UI/server/native host sees the same unresolved
+/// subagent, workflow, and background-job ownership.
+pub fn child_operation_status(
+    runtime: &davinci_agent::RuntimeHandle,
+) -> Result<Vec<davinci_agent::UnresolvedChild>, String> {
+    runtime
+        .unresolved_child_operations()
+        .map_err(|error| format!("child operation status unavailable: {error}"))
+}
+
 /// Configure a session with an explicit host-authored mapping for record-less
 /// legacy task creations. Existing journals remain authoritative and ignore
 /// the mapping, while missing or unused entries fail closed during migration.

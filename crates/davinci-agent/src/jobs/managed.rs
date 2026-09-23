@@ -549,6 +549,7 @@ impl ManagedOwner {
             task_id: None,
             agent_id: None,
             generation: None,
+            operation: None,
             shared: shared.clone(),
             managed: Some(record.clone()),
             announced: false,

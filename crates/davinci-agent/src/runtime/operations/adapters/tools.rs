@@ -338,6 +338,10 @@ impl ToolOperationRuntime {
         &self.dispatcher
     }
 
+    pub fn operation_context(&self) -> &OperationContext {
+        &self.context
+    }
+
     pub fn shares_dispatch_authority(&self, other: &Self) -> bool {
         self.dispatcher.shares_dispatch_authority(&other.dispatcher)
             && self.workspace_root == other.workspace_root

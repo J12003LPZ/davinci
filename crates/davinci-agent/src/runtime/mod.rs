@@ -97,7 +97,11 @@ pub use evidence::{
 };
 pub use ids::{AgentId, EvidenceId, RunId, TaskId, WorkflowId};
 pub use mailbox::{steering_state, AgentMailbox, AgentMessage, MailboxError, SteeringReceipt};
-pub use operations::{OperationAttempt, OperationSpec, OperationState};
+pub use operations::{
+    AgentLaunchDisposition, AgentOperationAdapter, AgentOperationError, AgentOperationHandle,
+    ChildExecutionContext, ChildExecutionKind, OperationAttempt, OperationSpec, OperationState,
+    UnresolvedChild,
+};
 pub use progress_watchdog::*;
 pub use registry::{is_valid_transition, RegistryError, RuntimeRegistry};
 pub use rewind::{
@@ -107,8 +111,12 @@ pub use rewind::{
 pub use source_manifest::{
     compute_manifest_digest, FileKind, ManifestEntry, SourceManifest, SourceManifestBuilder,
 };
-pub use tasks::{is_valid_task_transition, TaskError, TaskOwner, TaskRecord, TaskRegistry, TaskState};
-pub use task_store::{StatusRequest, TaskCreateRequest, TaskOperationReceipt, TaskOperationRequest};
+pub use task_store::{
+    StatusRequest, TaskCreateRequest, TaskOperationReceipt, TaskOperationRequest,
+};
+pub use tasks::{
+    is_valid_task_transition, TaskError, TaskOwner, TaskRecord, TaskRegistry, TaskState,
+};
 pub use team::{TeamConfig, TeamError, TeamManager, TeammateHandle};
 pub use tools_agent::{agent_message_tool, agent_status_tool, agent_stop_tool, agent_tool_specs};
 pub use tools_task::{
@@ -229,6 +237,24 @@ impl RuntimeHandle {
     pub fn with_operation_runtime(mut self, operations: operations::ToolOperationRuntime) -> Self {
         self.operations = Some(operations);
         self
+    }
+
+    /// Return the journal-backed adapter shared by subagents, workflow
+    /// workers, and background jobs. It never creates a second coordinator.
+    pub fn child_operation_adapter(&self) -> Option<operations::AgentOperationAdapter> {
+        operations::AgentOperationAdapter::from_runtime(self)
+    }
+
+    pub fn unresolved_child_operations(
+        &self,
+    ) -> Result<Vec<operations::UnresolvedChild>, operations::AgentOperationError> {
+        self.child_operation_adapter()
+            .ok_or_else(|| {
+                operations::AgentOperationError::InvalidContext(
+                    "operation journal is not configured".into(),
+                )
+            })?
+            .unresolved_children()
     }
 
     pub fn with_project_trusted(mut self, trusted: bool) -> Self {

@@ -15,6 +15,8 @@ use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
 
+use crate::runtime::operations::AgentOperationHandle;
+
 pub mod managed;
 pub mod supervisor;
 
@@ -105,6 +107,10 @@ pub struct Job {
     pub task_id: Option<crate::runtime::ids::TaskId>,
     pub agent_id: Option<crate::runtime::ids::AgentId>,
     pub generation: Option<u64>,
+    /// Durable child launch whose result is completed by the terminal job
+    /// notice. Keeping the handle with the job prevents a notice from being
+    /// lost between process exit and the next model turn.
+    operation: Option<AgentOperationHandle>,
     shared: Arc<Shared>,
     managed: Option<Arc<managed::Record>>,
     /// The model has been told this job finished.
@@ -407,10 +413,26 @@ impl JobBook {
     pub fn register_with_provenance(
         &mut self,
         command: &str,
+        child: Child,
+        task_id: Option<crate::runtime::ids::TaskId>,
+        agent_id: Option<crate::runtime::ids::AgentId>,
+        generation: Option<u64>,
+    ) -> u32 {
+        self.register_with_provenance_and_operation(
+            command, child, task_id, agent_id, generation, None,
+        )
+    }
+
+    /// Register a spawned child and retain its durable launch operation until
+    /// the process reaches a terminal state.
+    pub fn register_with_provenance_and_operation(
+        &mut self,
+        command: &str,
         mut child: Child,
         task_id: Option<crate::runtime::ids::TaskId>,
         agent_id: Option<crate::runtime::ids::AgentId>,
         generation: Option<u64>,
+        operation: Option<AgentOperationHandle>,
     ) -> u32 {
         self.next_id += 1;
         let id = self.next_id;
@@ -504,6 +526,7 @@ impl JobBook {
             task_id,
             agent_id,
             generation,
+            operation,
             shared,
             managed: None,
             announced: false,
@@ -637,11 +660,35 @@ impl JobBook {
         let mut out = Vec::new();
         for job in self.jobs.iter_mut() {
             if !job.announced && !job.status().is_running() {
+                let notice = Self::notice_of(job);
+                if let Some(operation) = job.operation.as_ref() {
+                    let result = crate::ToolResult {
+                        content: notice.message_text(),
+                        is_error: !notice.status.succeeded(),
+                        details: Some(json!({
+                            "jobId": notice.id,
+                            "command": notice.command,
+                            "status": notice.status.describe(),
+                            "elapsedMs": notice.elapsed.as_millis(),
+                            "tail": notice.tail,
+                        })),
+                    };
+                    if let Err(error) = operation.complete(&result) {
+                        if davinci_ai::trace::enabled() {
+                            davinci_ai::trace::log(&format!(
+                                "job {} operation completion deferred: {error}",
+                                job.id
+                            ));
+                        }
+                        continue;
+                    }
+                    job.operation = None;
+                }
                 job.announced = true;
                 if davinci_ai::trace::enabled() {
                     davinci_ai::trace::log(&format!("job {} {}", job.id, job.status().describe()));
                 }
-                out.push(Self::notice_of(job));
+                out.push(notice);
             }
         }
         out

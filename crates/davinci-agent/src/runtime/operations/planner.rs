@@ -44,6 +44,28 @@ impl PlannedToolOperation {
 pub struct ToolOperationPlanner;
 
 impl ToolOperationPlanner {
+    /// Plan a durable child execution. The payload contains the stable logical
+    /// identity and child context, while the actual prompt or command remains
+    /// owned by the host adapter.
+    pub fn managed_execution(
+        mut context: OperationContext,
+        caller: CallerType,
+        scope: IdempotencyScope,
+        logical_id: &str,
+        kind: OperationKind,
+        effects: EffectProfile,
+        payload: Value,
+    ) -> Result<PlannedToolOperation, ToolOperationPlanError> {
+        let key = ScopedIdempotencyKey::new(scope, logical_id.to_owned())?;
+        context.caller = caller;
+        context.wire_tool_call_id = Some(logical_id.to_owned());
+        let spec = OperationSpec::new(context, key, kind, effects, payload, Vec::new())?;
+        Ok(PlannedToolOperation {
+            spec,
+            replay_policy: ReplayPolicy::NeverAutoReplay,
+        })
+    }
+
     pub fn provider_call(
         mut context: OperationContext,
         call_id: &str,

@@ -16,7 +16,7 @@ use super::validate::{validate_workflow_with_capabilities, WorkflowValidationErr
 use crate::runtime::cancellation::CancellationToken;
 use crate::runtime::events::{AgentKind, AgentRecord, AgentState, RuntimeEvent};
 use crate::runtime::ids::{AgentId, TaskId, WorkflowId};
-use crate::runtime::RuntimeHandle;
+use crate::runtime::{ChildExecutionContext, ChildExecutionKind, RuntimeHandle};
 use crate::subagent::{SubagentRequest, SubagentRunner};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -558,6 +558,7 @@ impl WorkflowExecutor {
         // Execute workers using scheduler or runner
         let mut successful_workers: Vec<AgentId> = Vec::new();
         let mut failed_workers: Vec<AgentId> = Vec::new();
+        let operation_adapter = self.runtime.child_operation_adapter();
 
         for (aid, tid, worker) in worker_tasks {
             if wf_token.is_cancelled() {
@@ -607,14 +608,74 @@ impl WorkflowExecutor {
             let mut outcome: Result<String, String> = Err("no runner configured".into());
 
             while attempt <= retry_limit {
-                if let Some(r) = &self.runner {
-                    outcome = r.run(&req);
-                    if outcome.is_ok() {
-                        break;
+                let operation = operation_adapter.as_ref().map(|adapter| {
+                    let mut child = ChildExecutionContext::new(
+                        format!(
+                            "workflow:{wf_id}:{}:{}:attempt-{}",
+                            phase.id,
+                            worker.id,
+                            attempt + 1
+                        ),
+                        &self.runtime,
+                        Some(aid),
+                    );
+                    child.task_id = Some(tid);
+                    child.workflow_id = Some(*wf_id);
+                    child.host = "workflow_executor".to_owned();
+                    let payload = serde_json::json!({
+                        "workflow_id": wf_id,
+                        "phase_id": phase.id,
+                        "worker_id": worker.id,
+                        "attempt": attempt + 1,
+                        "tools": worker.tools,
+                        "model": worker.model,
+                        "prompt_digest": crate::runtime::operations::PayloadDigest::of_bytes(req.prompt.as_bytes()),
+                    });
+                    adapter
+                        .start(ChildExecutionKind::WorkflowPhase, child, payload)
+                });
+                let operation = match operation {
+                    Some(Ok(operation)) => Some(operation),
+                    Some(Err(error)) => {
+                        return Err(WorkflowExecutionError::ExecutionError(format!(
+                            "workflow child launch was not durably admitted: {error}"
+                        )))
                     }
-                } else {
-                    // Default fallback if runner is not provided in test: canned success
-                    outcome = Ok(format!("completed {}", worker.id));
+                    None => None,
+                };
+                let run = || match &self.runner {
+                    Some(r) => match r.run(&req) {
+                        Ok(result) => crate::tools::ToolResult {
+                            content: result,
+                            is_error: false,
+                            details: None,
+                        },
+                        Err(error) => crate::tools::ToolResult {
+                            content: error,
+                            is_error: true,
+                            details: None,
+                        },
+                    },
+                    None => crate::tools::ToolResult {
+                        content: format!("completed {}", worker.id),
+                        is_error: false,
+                        details: None,
+                    },
+                };
+                let result = match operation.as_ref() {
+                    Some(operation) => operation
+                        .execute(wf_token.is_cancelled(), || Ok(()), run)
+                        .map_err(|error| error.to_string()),
+                    None => Ok(run()),
+                };
+                outcome = result.and_then(|result| {
+                    if result.is_error {
+                        Err(result.content)
+                    } else {
+                        Ok(result.content)
+                    }
+                });
+                if outcome.is_ok() {
                     break;
                 }
                 attempt += 1;

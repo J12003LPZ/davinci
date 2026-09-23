@@ -10,8 +10,9 @@ use serde_json::Value;
 
 use crate::permission::{tool_class, PermissionMode, ToolClass};
 use crate::runtime::{
-    AgentId, AgentKind, AgentRecord, AgentState, CancellationToken, RuntimeCapabilityRegistry,
-    RuntimeHandle, WorktreeLease, WorktreeManager,
+    AgentId, AgentKind, AgentOperationHandle, AgentRecord, AgentState, CancellationToken,
+    ChildExecutionContext, ChildExecutionKind, RuntimeCapabilityRegistry, RuntimeHandle,
+    WorktreeLease, WorktreeManager,
 };
 use crate::tools::{ToolError, ToolResult};
 
@@ -524,10 +525,53 @@ pub fn run_tool(
         leases.push(lease_opt);
     }
 
+    // Admit every child before any runner or worker thread starts.  The
+    // admission uses the parent's dispatcher, so duplicate provider delivery
+    // observes the durable child instead of creating a second owner.
+    let child_operations: Vec<Option<AgentOperationHandle>> = if let Some(runtime) = &parent.runtime
+    {
+        if let Some(adapter) = runtime.child_operation_adapter() {
+            requests
+                .iter()
+                .map(|request| {
+                    let child_id = request.runtime_agent_id.unwrap_or_default();
+                    let mut child = ChildExecutionContext::new(
+                        format!("subagent:{child_id}"),
+                        runtime,
+                        Some(child_id),
+                    );
+                    child.host = "agent_tool".to_owned();
+                    let payload = serde_json::json!({
+                        "mode": request.mode,
+                        "description": request.description,
+                        "tools": request.tools,
+                        "model": request.model_override,
+                        "isolation": request.isolation,
+                        "prompt_digest": crate::runtime::operations::PayloadDigest::of_bytes(request.prompt.as_bytes()),
+                    });
+                    adapter
+                        .start(ChildExecutionKind::Subagent, child, payload)
+                        .map(Some)
+                        .map_err(|error| ToolError::Failed(format!(
+                            "subagent launch was not durably admitted: {error}"
+                        )))
+                })
+                .collect::<Result<Vec<_>, _>>()?
+        } else {
+            vec![None; requests.len()]
+        }
+    } else {
+        vec![None; requests.len()]
+    };
+
     let any_async = requests.iter().any(|r| r.mode != AgentSpawnMode::Oneshot);
     if any_async {
         let mut launched_ids = Vec::new();
-        for (req, lease_opt) in requests.iter().zip(leases.into_iter()) {
+        for ((req, lease_opt), operation) in requests
+            .iter()
+            .zip(leases.into_iter())
+            .zip(child_operations.iter().cloned())
+        {
             let req_clone = req.clone();
             let runner_clone = runner.clone();
             let rt_clone = parent.runtime.clone();
@@ -536,7 +580,8 @@ pub fn run_tool(
             std::thread::Builder::new()
                 .name(format!("agent-worker-{cid}"))
                 .spawn(move || {
-                    let outcome = runner_clone.run(&req_clone);
+                    let outcome =
+                        run_journaled_subagent(&req_clone, &runner_clone, operation.as_ref());
                     if let Some(rt) = &rt_clone {
                         let next_state = match &outcome {
                             Ok(_) => AgentState::Completed,
@@ -600,7 +645,7 @@ pub fn run_tool(
 
     if requests.len() == 1 {
         let aid = requests[0].runtime_agent_id.unwrap_or_default();
-        let outcome = runner.run(&requests[0]);
+        let outcome = run_journaled_subagent(&requests[0], runner, child_operations[0].as_ref());
         if let Some(rt) = &parent.runtime {
             let next = match &outcome {
                 Ok(_) => AgentState::Completed,
@@ -629,12 +674,14 @@ pub fn run_tool(
     // in task order. One failed worker does not hide the others' answers.
     let calls = requests
         .iter()
-        .map(|request| {
+        .zip(child_operations.iter())
+        .map(|(request, operation)| {
             let req = request.clone();
             let r = runner.clone();
+            let operation = operation.clone();
             crate::scheduler::ScheduledCall {
                 lane: crate::scheduler::ToolLane::Parallel,
-                run: Box::new(move || r.run(&req)),
+                run: Box::new(move || run_journaled_subagent(&req, &r, operation.as_ref())),
             }
         })
         .collect();
@@ -706,6 +753,44 @@ pub fn run_tool(
             "failed": failures,
         })),
     })
+}
+
+fn run_journaled_subagent(
+    request: &SubagentRequest,
+    runner: &SubagentRunner,
+    operation: Option<&AgentOperationHandle>,
+) -> Result<String, String> {
+    let run = || match runner.run(request) {
+        Ok(content) => ToolResult {
+            content,
+            is_error: false,
+            details: None,
+        },
+        Err(error) => ToolResult {
+            content: error,
+            is_error: true,
+            details: None,
+        },
+    };
+    let result = if let Some(operation) = operation {
+        operation
+            .execute(
+                request
+                    .cancellation_token
+                    .as_ref()
+                    .is_some_and(CancellationToken::is_cancelled),
+                || Ok(()),
+                run,
+            )
+            .map_err(|error| error.to_string())?
+    } else {
+        run()
+    };
+    if result.is_error {
+        Err(result.content)
+    } else {
+        Ok(result.content)
+    }
 }
 
 #[cfg(test)]

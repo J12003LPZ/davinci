@@ -1731,6 +1731,66 @@ fn wants_background(input: &serde_json::Value) -> bool {
         .unwrap_or(false)
 }
 
+fn admit_background_operation(
+    context: &ToolContext,
+    shell: &str,
+    command: &str,
+) -> Result<Option<crate::runtime::operations::AgentOperationHandle>, ToolError> {
+    let Some(runtime) = context.runtime.as_ref() else {
+        return Ok(None);
+    };
+    let Some(adapter) = runtime.child_operation_adapter() else {
+        return Ok(None);
+    };
+    let logical_id = context
+        .process_operation_binding
+        .as_ref()
+        .map(|binding| format!("background:{}", binding.operation_id))
+        .or_else(|| {
+            runtime
+                .operations
+                .as_ref()
+                .and_then(|operations| operations.operation_context().wire_tool_call_id.clone())
+                .map(|call_id| format!("background:{call_id}"))
+        })
+        .unwrap_or_else(|| format!("background:{}", uuid::Uuid::now_v7()));
+    let mut child =
+        crate::runtime::operations::ChildExecutionContext::new(logical_id, runtime, None);
+    child.host = "background_job".to_owned();
+    let payload = serde_json::json!({
+        "shell": shell,
+        "command_digest": crate::runtime::operations::PayloadDigest::of_bytes(command.as_bytes()),
+    });
+    adapter
+        .start(
+            crate::runtime::operations::ChildExecutionKind::BackgroundJob,
+            child,
+            payload,
+        )
+        .map(Some)
+        .map_err(|error| {
+            ToolError::Failed(format!("background job was not durably admitted: {error}"))
+        })
+}
+
+fn reject_existing_background_operation(
+    operation: &crate::runtime::operations::AgentOperationHandle,
+) -> Result<Option<ToolResult>, ToolError> {
+    match operation.disposition() {
+        crate::runtime::operations::AgentLaunchDisposition::New => Ok(None),
+        crate::runtime::operations::AgentLaunchDisposition::ExistingResult => operation
+            .replay_result()
+            .map(Some)
+            .map_err(|error| ToolError::Failed(format!("background job replay blocked: {error}"))),
+        crate::runtime::operations::AgentLaunchDisposition::ExistingInFlight => {
+            Err(ToolError::Failed(format!(
+                "background job is already active under operation {}",
+                operation.operation_id()
+            )))
+        }
+    }
+}
+
 /// Spawn the shell with the command, stdout and stderr piped, exactly as a
 /// foreground call would — a background job is the same process, only
 /// nobody waits for it.
@@ -1798,14 +1858,34 @@ fn shell_tool(
     let background = wants_background(input);
     let started_at_ms = crate::command_receipt::now();
     if background {
-        let child = spawn_shell(cwd, &command, true)?;
+        let operation = admit_background_operation(context, "shell", &command)?;
+        if let Some(operation) = operation.as_ref() {
+            if let Some(result) = reject_existing_background_operation(operation)? {
+                return Ok(result);
+            }
+        }
+        let child = match operation.as_ref() {
+            Some(operation) => operation
+                .begin(false, || Ok(()), || spawn_shell(cwd, &command, true))
+                .map_err(|error| {
+                    ToolError::Failed(format!("background job dispatch failed: {error}"))
+                })??,
+            None => spawn_shell(cwd, &command, true)?,
+        };
         let shown = required_str(input, "command")?;
         let pid = child.id();
         let id = context
             .jobs
             .lock()
             .unwrap_or_else(|err| err.into_inner())
-            .register(shown, child);
+            .register_with_provenance_and_operation(
+                shown,
+                child,
+                None,
+                context.runtime.as_ref().map(|runtime| runtime.agent_id),
+                None,
+                operation,
+            );
         return Ok(crate::jobs::started_result(id, pid, shown));
     }
     let timeout_label = input.get("timeout").map(|value| match value {
@@ -2029,22 +2109,50 @@ fn powershell_tool(
             });
         }
     }
+    let operation = if background {
+        admit_background_operation(context, "powershell", command)?
+    } else {
+        None
+    };
+    if let Some(operation) = operation.as_ref() {
+        if let Some(result) = reject_existing_background_operation(operation)? {
+            return Ok(result);
+        }
+    }
     for program in ["pwsh", "powershell"] {
+        let executable = if operation.is_some() {
+            crate::process_manager::resolve_native_executable(program, cwd).ok()
+        } else {
+            None
+        };
+        if operation.is_some() && executable.is_none() {
+            continue;
+        }
+        let program_path = executable.as_deref().unwrap_or_else(|| Path::new(program));
         let stdin = if background {
             std::process::Stdio::piped()
         } else {
             std::process::Stdio::null()
         };
-        let spawned = Command::new(program)
-            .args(["-NoProfile", "-NonInteractive", "-Command", &wrapped])
-            .current_dir(cwd)
-            .stdin(stdin)
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .spawn();
-        let child = match spawned {
-            Ok(child) => child,
-            Err(_) => continue,
+        let spawn = || {
+            Command::new(program_path)
+                .args(["-NoProfile", "-NonInteractive", "-Command", &wrapped])
+                .current_dir(cwd)
+                .stdin(stdin)
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .spawn()
+                .map_err(|error| ToolError::Failed(error.to_string()))
+        };
+        let child = if let Some(operation) = operation.as_ref() {
+            operation.begin(false, || Ok(()), spawn).map_err(|error| {
+                ToolError::Failed(format!("background job dispatch failed: {error}"))
+            })??
+        } else {
+            match spawn() {
+                Ok(child) => child,
+                Err(_) => continue,
+            }
         };
         if background {
             let pid = child.id();
@@ -2052,7 +2160,14 @@ fn powershell_tool(
                 .jobs
                 .lock()
                 .unwrap_or_else(|err| err.into_inner())
-                .register(command, child);
+                .register_with_provenance_and_operation(
+                    command,
+                    child,
+                    None,
+                    context.runtime.as_ref().map(|runtime| runtime.agent_id),
+                    None,
+                    operation,
+                );
             return Ok(crate::jobs::started_result(id, pid, command));
         }
         let output = wait_shell_output(child, timeout_ms, timeout_label.as_deref(), context)?;

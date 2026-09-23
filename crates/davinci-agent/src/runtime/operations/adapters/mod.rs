@@ -1,9 +1,14 @@
+mod agents;
 mod control;
 mod filesystem;
 mod process;
 mod tools;
 mod transactions;
 mod verification;
+pub use agents::{
+    AgentLaunchDisposition, AgentOperationAdapter, AgentOperationError, AgentOperationHandle,
+    ChildExecutionContext, ChildExecutionKind, UnresolvedChild,
+};
 pub use control::{
     ControlOperationAdapter, ControlOperationError, ControlOperationReceipt, ControlReceiptValue,
     CONTROL_OPERATION_SCHEMA_VERSION,
