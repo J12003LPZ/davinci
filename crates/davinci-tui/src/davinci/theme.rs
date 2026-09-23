@@ -155,16 +155,16 @@ const TRUECOLOR: Ramp = Ramp {
 /// Aged paper with dark printed ink. Yellow is reserved for headline labels;
 /// crimson is the readable focus color on light surfaces.
 const LIGHT: Ramp = Ramp {
-    background: Color::Reset,
-    surface: Color::Reset,
-    surface_alt: Color::Reset,
+    background: rgb(0xFAFAFA),
+    surface: rgb(0xFFFFFF),
+    surface_alt: rgb(0xF2F2F2),
     border: rgb(0x999999),
-    text: Color::Reset,
+    text: rgb(0x1C1C1C),
     muted: rgb(0x666666),
-    primary: rgb(0x5769F7),
-    secondary: rgb(0xD77757),
+    primary: rgb(0x4657D9),
+    secondary: rgb(0x7A3628),
     success: rgb(0x2C7A39),
-    warning: rgb(0xB25B00),
+    warning: rgb(0x8A4B00),
     error: rgb(0xB42318),
 };
 
