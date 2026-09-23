@@ -298,7 +298,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(
             dir.path().join("relative.cjs"),
-            "console.log('RELATIVE_SCRIPT_OK')",
+            "require('fs').writeFileSync('relative-script.ok', 'RELATIVE_SCRIPT_OK')",
         )
         .unwrap();
         let jobs = Arc::new(Mutex::new(JobBook::default()));
@@ -318,20 +318,20 @@ mod tests {
             .details
             .unwrap();
         let id = &started["process"]["id"];
+        let marker = dir.path().join("relative-script.ok");
         let until = Instant::now() + Duration::from_secs(5);
         loop {
-            let output = worker
-                .client()
-                .call("process_output", &json!({"id":id}))
-                .unwrap();
-            if output.content.contains("RELATIVE_SCRIPT_OK") {
+            if marker.is_file() {
+                assert_eq!(
+                    std::fs::read_to_string(&marker).unwrap(),
+                    "RELATIVE_SCRIPT_OK"
+                );
                 break;
             }
             if Instant::now() >= until {
                 let status = worker.client().call("process_status", &json!({"id":id}));
                 panic!(
-                    "relative script failed: {}; process status: {status:?}",
-                    output.content
+                    "relative script did not run from canonical workspace; process status: {status:?}"
                 );
             }
             std::thread::sleep(Duration::from_millis(10));
