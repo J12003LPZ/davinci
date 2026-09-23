@@ -46,6 +46,7 @@ pub enum ControlOperationError {
     InvalidReceipt,
 }
 
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum ControlReceiptValue {
@@ -412,6 +413,7 @@ impl ControlOperationAdapter {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn admit(
         &self,
         run_id: RunId,

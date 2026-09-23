@@ -48,6 +48,7 @@ impl std::fmt::Debug for Supervisor {
 }
 
 impl Supervisor {
+    #[allow(clippy::result_large_err)]
     pub fn spawn(
         host: &SupervisorCommand,
         config: ProcessConfig,
@@ -66,6 +67,7 @@ impl Supervisor {
 
     /// Retains stream identity for foreground capture. `spawn` continues to
     /// merge both streams for existing managed-process consumers.
+    #[allow(clippy::result_large_err)]
     pub fn spawn_with_stderr(
         host: &SupervisorCommand,
         config: ProcessConfig,

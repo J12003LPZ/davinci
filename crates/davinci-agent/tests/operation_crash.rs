@@ -488,6 +488,11 @@ fn run_recovery_child(temp: &TempDir, config: &RecoveryConfig) {
 fn child_process_crashes_recover_without_duplicate_mutations_or_projections() {
     for (index, case) in CASES.into_iter().enumerate() {
         let temp = tempfile::tempdir().unwrap();
+        // macOS exposes the default temporary root through /var -> /private/var.
+        // The production journal intentionally rejects symlinked ancestors, so
+        // make the test fixture use the canonical temporary root instead of
+        // weakening the journal's no-follow policy.
+        let temp_root = fs::canonicalize(temp.path()).unwrap();
         let identity = SerializedIdentity {
             journal_id: JournalId::new(),
             workspace: WorkspaceIdentity {
@@ -499,10 +504,10 @@ fn child_process_crashes_recover_without_duplicate_mutations_or_projections() {
         let owner = ExecutionOwner::new(ExecutionOwnerId::new(), 1).unwrap();
         let spec = operation_harness::standard_spec(&identity, root, &format!("crash-{index}"));
         let config = ChildConfig {
-            journal_directory: temp.path().join("journal"),
-            endpoint_path: temp.path().join("endpoint.sqlite3"),
-            sink_path: temp.path().join("sink.sqlite3"),
-            marker_path: temp.path().join("fault-reached"),
+            journal_directory: temp_root.join("journal"),
+            endpoint_path: temp_root.join("endpoint.sqlite3"),
+            sink_path: temp_root.join("sink.sqlite3"),
+            marker_path: temp_root.join("fault-reached"),
             identity,
             root,
             owner,

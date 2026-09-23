@@ -366,6 +366,7 @@ impl ExternalOperationAdapter {
         &self.runtime
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn start(
         &self,
         call_id: &str,
@@ -575,7 +576,7 @@ fn redacted_scalar(value: &Value) -> Value {
     let digest = Sha256::digest(&bytes);
     json!({
         "redacted": true,
-        "sha256": digest.iter().map(|byte| format!("{byte:02x}")).collect::<String>(),
+        "sha256": format!("{digest:x}"),
         "length": bytes.len(),
     })
 }

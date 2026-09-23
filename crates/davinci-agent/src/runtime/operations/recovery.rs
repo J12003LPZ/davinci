@@ -37,6 +37,7 @@ impl RecoveryEngine {
 
     /// The decision is committed first, then current authorization is checked,
     /// and only then can retry/probe work be scheduled.
+    #[allow(clippy::too_many_arguments)]
     pub fn run_authorized<T>(
         journal: &OperationJournal,
         owner: ExecutionOwner,
@@ -336,15 +337,7 @@ fn classify(input: &RecoveryInput) -> (RecoveryClassification, RecoveryAction, R
             ),
         },
         P::DuringVerification => {
-            if input.observations.verification == VerificationObservation::Incomplete
-                && input.observations.probe_authorized
-            {
-                (
-                    C::NeedsVerification,
-                    X::RunVerification,
-                    R::VerificationIncomplete,
-                )
-            } else if input.observations.probe_authorized {
+            if input.observations.probe_authorized {
                 (
                     C::NeedsVerification,
                     X::RunVerification,

@@ -177,8 +177,8 @@ pub fn reconcile_interrupted_attempts(
         binding.validate_retry_safety().map_err(|error| {
             format!("Interrupted worker '{id}' requires reconciliation: {error}")
         })?;
-        let effects = super::store::artifact_path(cwd, &run.run_id, &id)
-            .with_extension("effects.jsonl");
+        let effects =
+            super::store::artifact_path(cwd, &run.run_id, &id).with_extension("effects.jsonl");
         if effects.exists() {
             davinci_agent::runtime::effects::read_effect_report(&effects).map_err(|error| {
                 format!("Interrupted worker '{id}' has an invalid effect report: {error}")

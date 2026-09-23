@@ -1977,7 +1977,8 @@ mod tests {
             .as_bool()
             .unwrap());
 
-        // 3. Control stop (completed action)
+        // 3. Control stop. Signal delivery is accepted first; terminal
+        // completion requires an observed worker exit and must not be invented.
         let stop_res = handle_rpc(
             &mut runtime,
             RpcCommand {
@@ -1992,8 +1993,8 @@ mod tests {
         assert!(stop_res.success);
         let stop_data = stop_res.data.as_ref().unwrap();
         assert_eq!(stop_data["operationId"], "op-123");
-        assert_eq!(stop_data["status"], "stopped");
-        assert!(stop_data["completed"].as_bool().unwrap());
+        assert_eq!(stop_data["status"], "stopping");
+        assert!(!stop_data["completed"].as_bool().unwrap());
 
         // 4. Poll operation by ID
         let poll_res = handle_rpc(
@@ -2007,7 +2008,8 @@ mod tests {
         assert!(poll_res.success);
         let polled_data = poll_res.data.as_ref().unwrap();
         assert_eq!(polled_data["operationId"], "op-123");
-        assert_eq!(polled_data["status"], "stopped");
+        assert_eq!(polled_data["status"], "stopping");
+        assert!(!polled_data["completed"].as_bool().unwrap());
 
         // 5. Control retry on active worker (accepted command, not yet terminal/completed)
         let worker_id2 = davinci_agent::AgentId::new();

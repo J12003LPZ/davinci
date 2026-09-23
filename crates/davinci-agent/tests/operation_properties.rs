@@ -15,7 +15,13 @@ struct Fixture {
 
 impl Fixture {
     fn new() -> Self {
-        let temp = tempfile::tempdir().unwrap();
+        let workspace = std::env::current_dir().unwrap();
+        let temp = tempfile::tempdir_in(&workspace).unwrap();
+        // Keep the journal under the checked-out workspace rather than the OS
+        // temp root. macOS maps parts of its temp hierarchy through filesystem
+        // indirection that intentionally conflicts with the journal's no-follow
+        // ancestor policy.
+        let temp_root = fs::canonicalize(temp.path()).unwrap();
         let identity = JournalIdentity::new(
             JournalId::new(),
             WorkspaceIdentity {
@@ -25,7 +31,7 @@ impl Fixture {
         )
         .unwrap();
         Self {
-            directory: temp.path().join("operations"),
+            directory: temp_root.join("operations"),
             _temp: temp,
             identity,
             root: RootNamespaceId::new(),

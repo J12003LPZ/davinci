@@ -1026,7 +1026,7 @@ mod tests {
     }
 
     #[test]
-    fn test_repeated_control_id_creates_one_attempt() {
+    fn test_repeated_control_id_creates_one_retry_transition_without_allocating_attempt() {
         let mut run = sample_test_run();
         let mut task = GraphTaskState::new(
             "research-1",
@@ -1056,13 +1056,17 @@ mod tests {
 
         let receipt1 = reduce_control(&mut run, &ctrl, &mut tracker, 0, true);
         assert_eq!(receipt1.state, ControlReceiptState::Applied);
-        assert_eq!(run.tasks[0].attempts, 1);
+        // The control reducer invalidates the failed task but does not allocate
+        // a physical worker attempt. The controller owns that allocation after
+        // recovery/authority checks pass.
+        assert_eq!(run.tasks[0].attempts, 0);
         assert_eq!(run.revision, 1);
 
-        // Second call with same operation_id returns cached receipt without bumping revision or attempts
+        // Second delivery returns the durable receipt without another state
+        // transition or prematurely allocating a worker attempt.
         let receipt2 = reduce_control(&mut run, &ctrl, &mut tracker, 0, true);
         assert_eq!(receipt2.state, ControlReceiptState::Applied);
-        assert_eq!(run.tasks[0].attempts, 1);
+        assert_eq!(run.tasks[0].attempts, 0);
         assert_eq!(run.revision, 1);
     }
 }

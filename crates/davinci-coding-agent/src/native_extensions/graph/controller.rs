@@ -37,9 +37,7 @@ use super::types::{
     GraphLifecycle, GraphRun, GraphTaskState, ImplementationPlan, Phase, ResearchKind, ReviewIssue,
     Role, Severity, TaskStatus, Verdict, VerificationResult, WorkerResult, WorkerSpec, WorkerUsage,
 };
-use super::verify::{
-    collect_verify_commands, nothing_ran, CollectInput, VerifyExec,
-};
+use super::verify::{collect_verify_commands, nothing_ran, CollectInput, VerifyExec};
 use super::worker::WorkerRunner;
 use crate::native_extensions::ecosystem::risk::ChangeRisk;
 use crate::native_extensions::ecosystem::verification::{SecurityPolicyMode, SecurityVerification};
@@ -1036,10 +1034,12 @@ impl GraphExecution {
                     .as_deref()
                     .and_then(|model| model.split_once('/'))
                     .map(|(provider, model_id)| (provider.to_string(), model_id.to_string()))
-                    .unwrap_or_else(|| (
-                        "unresolved".to_string(),
-                        spec.model.clone().unwrap_or_default(),
-                    ));
+                    .unwrap_or_else(|| {
+                        (
+                            "unresolved".to_string(),
+                            spec.model.clone().unwrap_or_default(),
+                        )
+                    });
                 let record = davinci_agent::AgentRecord {
                     id: worker_agent_id,
                     run_id: runtime.run_id,
@@ -3058,7 +3058,9 @@ fn deliver_goal(
         let verification_inputs = match execution.verification_inputs(&commands) {
             Ok(inputs) => inputs,
             Err(error) => {
-                execution.blocked(format!("Cannot bind verification to current inputs: {error}"));
+                execution.blocked(format!(
+                    "Cannot bind verification to current inputs: {error}"
+                ));
                 return Delivery::Stop;
             }
         };

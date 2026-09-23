@@ -528,7 +528,7 @@ pub fn live_complete_with(
             let codex_affinity_id = codex_responses_affinity_id(options);
             match crate::codex::try_codex_websocket_transport_with_affinity(
                 model,
-                &body,
+                body,
                 token,
                 options.transport.as_deref(),
                 options.session_id.as_deref(),
@@ -557,7 +557,7 @@ pub fn live_complete_with(
     let timeout_ms = options.timeout_ms.filter(|ms| *ms > 0);
     let compress_zstd = model.api == "openai-codex-responses";
     let text = crate::provider_retry::retry_provider_request_controlled(
-        || send_provider_body(&url, &headers, &body, timeout_ms, compress_zstd),
+        || send_provider_body(&url, &headers, body, timeout_ms, compress_zstd),
         crate::provider_retry::ProviderRetryOptions {
             max_retries: options.max_retries.unwrap_or(0),
             max_retry_delay_ms: options.max_retry_delay_ms,
@@ -653,7 +653,7 @@ pub fn live_complete_streaming_with_sink_envelope(
             let codex_affinity_id = codex_responses_affinity_id(options);
             let outcome = crate::codex::try_codex_websocket_transport_with_affinity(
                 model,
-                &body,
+                body,
                 token,
                 options.transport.as_deref(),
                 options.session_id.as_deref(),
@@ -718,7 +718,7 @@ pub fn live_complete_streaming_with_sink_envelope(
     let compress_zstd = model.api == "openai-codex-responses";
     crate::trace::log(&format!("sse post {url}"));
     let response = crate::provider_retry::retry_provider_request_controlled(
-        || send_provider_request(&url, &headers, &body, timeout_ms, compress_zstd),
+        || send_provider_request(&url, &headers, body, timeout_ms, compress_zstd),
         crate::provider_retry::ProviderRetryOptions {
             max_retries: options.max_retries.unwrap_or(0),
             max_retry_delay_ms: options.max_retry_delay_ms,
@@ -1334,7 +1334,7 @@ pub fn live_stream(
     }
     request = request.set("content-type", "application/json");
     let response = if model.api == "openai-codex-responses" {
-        let (bytes, compressed) = crate::codex::encode_codex_sse_body(&body);
+        let (bytes, compressed) = crate::codex::encode_codex_sse_body(body);
         if compressed {
             request = request.set("content-encoding", "zstd");
         }

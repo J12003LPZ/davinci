@@ -55,41 +55,71 @@ impl ToolOperationDispatcher {
         self.owner == other.owner && Arc::ptr_eq(&self.journal, &other.journal)
     }
 
+    /// Persist immutable operation intent without granting execution authority.
+    /// Policy/permission evaluation happens after this boundary.
+    pub fn persist_intent(
+        &self,
+        plan: PlannedToolOperation,
+    ) -> Result<OperationAdmission, ToolOperationDispatchError> {
+        let spec = plan.into_spec();
+        let attempt = OperationAttempt::new(spec.operation_id(), 1, self.owner)
+            .map_err(|error| JournalError::Serialization(error.to_string()))?;
+        self.journal.admit(&spec, &attempt).map_err(Into::into)
+    }
+
+    /// Attach the current authorization receipt and queue a previously
+    /// persisted operation. This is the first point at which the operation can
+    /// become eligible for dispatch.
+    pub fn authorize_and_queue(
+        &self,
+        admitted: &AdmittedOperation,
+        permission_revision: u64,
+    ) -> Result<AdmittedOperation, ToolOperationDispatchError> {
+        let mut attempt = self.journal.load_attempt(admitted.attempt.attempt_id())?;
+        if attempt.state() != OperationState::Persisted {
+            return Err(ToolOperationDispatchError::AlreadyInFlight);
+        }
+        attempt = self.journal.transition(
+            self.owner,
+            attempt.attempt_id(),
+            attempt.revision(),
+            OperationEvent::Authorize(AuthorizationReceipt::new(
+                admitted
+                    .spec
+                    .intent_digest()
+                    .map_err(|error| JournalError::Serialization(error.to_string()))?,
+                permission_revision.to_string(),
+                now(),
+            )),
+            None,
+            vec![],
+        )?;
+        attempt = self.journal.transition(
+            self.owner,
+            attempt.attempt_id(),
+            attempt.revision(),
+            OperationEvent::Queue,
+            None,
+            vec![],
+        )?;
+        Ok(AdmittedOperation {
+            spec: admitted.spec.clone(),
+            attempt,
+            result: admitted.result.clone(),
+        })
+    }
+
+    /// Backward-compatible convenience for callers that already completed
+    /// permission evaluation before entering the dispatcher.
     pub fn admit(
         &self,
         plan: PlannedToolOperation,
         permission_revision: u64,
     ) -> Result<OperationAdmission, ToolOperationDispatchError> {
-        let spec = plan.into_spec();
-        let attempt = OperationAttempt::new(spec.operation_id(), 1, self.owner)
-            .map_err(|error| JournalError::Serialization(error.to_string()))?;
-        match self.journal.admit(&spec, &attempt)? {
-            OperationAdmission::New(mut admitted) => {
-                admitted.attempt = self.journal.transition(
-                    self.owner,
-                    admitted.attempt.attempt_id(),
-                    admitted.attempt.revision(),
-                    OperationEvent::Authorize(AuthorizationReceipt::new(
-                        admitted
-                            .spec
-                            .intent_digest()
-                            .map_err(|error| JournalError::Serialization(error.to_string()))?,
-                        permission_revision.to_string(),
-                        now(),
-                    )),
-                    None,
-                    vec![],
-                )?;
-                admitted.attempt = self.journal.transition(
-                    self.owner,
-                    admitted.attempt.attempt_id(),
-                    admitted.attempt.revision(),
-                    OperationEvent::Queue,
-                    None,
-                    vec![],
-                )?;
-                Ok(OperationAdmission::New(admitted))
-            }
+        match self.persist_intent(plan)? {
+            OperationAdmission::New(admitted) => Ok(OperationAdmission::New(
+                self.authorize_and_queue(&admitted, permission_revision)?,
+            )),
             existing => Ok(existing),
         }
     }
@@ -183,13 +213,17 @@ impl ToolOperationDispatcher {
         admitted: &AdmittedOperation,
         _reason: &str,
     ) -> Result<(), ToolOperationDispatchError> {
-        if admitted.attempt.state() != OperationState::Queued {
+        let attempt = self.journal.load_attempt(admitted.attempt.attempt_id())?;
+        if !matches!(
+            attempt.state(),
+            OperationState::Persisted | OperationState::Authorized | OperationState::Queued
+        ) {
             return Err(ToolOperationDispatchError::AlreadyInFlight);
         }
         self.journal.transition(
             self.owner,
-            admitted.attempt.attempt_id(),
-            admitted.attempt.revision(),
+            attempt.attempt_id(),
+            attempt.revision(),
             OperationEvent::CancelBeforeStart { finished_at: now() },
             None,
             vec![],
@@ -388,6 +422,7 @@ impl ToolOperationRuntime {
         child
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn plan_provider_call(
         &self,
         run_id: RunId,
@@ -409,6 +444,7 @@ impl ToolOperationRuntime {
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn plan_batch_child(
         &self,
         run_id: RunId,

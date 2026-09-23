@@ -85,7 +85,7 @@ impl JsonlSession {
         cwd: &str,
         name: Option<&str>,
     ) -> Result<Self, SessionError> {
-        fs::create_dir_all(&dir).map_err(|err| {
+        fs::create_dir_all(dir).map_err(|err| {
             SessionError::storage(format!("Unable to create cwd session directory: {err}"))
         })?;
         let id = Uuid::new_v4().to_string();

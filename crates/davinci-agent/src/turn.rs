@@ -670,6 +670,7 @@ impl Agent {
         }
     }
 
+    #[allow(clippy::type_complexity)]
     fn complete_with_retry<F, T>(
         &mut self,
         complete: &mut F,
@@ -1325,6 +1326,17 @@ impl Agent {
                 details: denied.then(|| serde_json::json!({ "denied": true })),
             })
         };
+        fn cancel_persisted_intent(
+            pending: Option<&crate::PendingToolOperation>,
+            reason: &str,
+        ) {
+            if let Some(pending) = pending {
+                let _ = pending
+                    .runtime
+                    .dispatcher()
+                    .cancel_before_start(&pending.admitted, reason);
+            }
+        }
         if depth > 0
             && matches!(
                 name,
@@ -1394,81 +1406,17 @@ impl Agent {
                 }
             }
         }
-        if let Some(runtime) = &self.runtime {
-            let event = crate::runtime::RuntimeEvent::PreToolUse {
-                call_id: id.to_string(),
-                tool: name.to_string(),
-                args: args.clone(),
-            };
-            if let Err(reason) = runtime.emit_decision(event) {
-                if let Ok(mut ledger) = self.tool_ledger.lock() {
-                    ledger.cancel_reservation(id);
-                }
-                return immediate(reason, false);
-            }
-        }
-        if let Some(reason) = self.pre_tool.as_ref().and_then(|hook| (hook.0)(name, args)) {
-            if let Ok(mut ledger) = self.tool_ledger.lock() {
-                ledger.cancel_reservation(id);
-            }
-            return immediate(reason, false);
-        }
-        if !self.tools.iter().any(|tool| tool == name) {
-            if let Ok(mut ledger) = self.tool_ledger.lock() {
-                ledger.cancel_reservation(id);
-            }
-            return immediate(format!("Unknown tool: {name}"), false);
-        }
-        if let Err(violation) = self.check_contract_gate(cwd, id, name, args) {
-            if let Ok(mut ledger) = self.tool_ledger.lock() {
-                ledger.record_blocked(id, &violation.to_string());
-            }
-            return Preparation::Immediate(crate::ToolResult {
-                content: violation.to_string(),
-                is_error: true,
-                details: Some(serde_json::json!({
-                    "denied": true,
-                    "scope_violation": violation,
-                })),
-            });
-        }
-        if let Some(reason) = self.capability_effect_denial(cwd, name, args) {
-            if let Ok(mut ledger) = self.tool_ledger.lock() {
-                ledger.record_blocked(id, &reason);
-            }
-            return immediate(reason, true);
-        }
-        if let Some(reason) = self.permission_denial(cwd, id, name, args) {
-            // `denied` marks a call that never ran, for the hosts' rows
-            // and the post-tool hooks, without sniffing the text.
-            if let Ok(mut ledger) = self.tool_ledger.lock() {
-                ledger.record_blocked(id, &reason);
-            }
-            return immediate(reason, true);
-        }
-        let class = self
-            .permissions
-            .lock()
-            .unwrap_or_else(|err| err.into_inner())
-            .class_of(name);
-        // Runtime metadata is authoritative when installed; unknown tools fail
-        // closed inside `lane_for_capability`. Without a runtime, the legacy
-        // class-based resolver still keeps unrecognized extensions serial.
-        let lane = self.lane_for_tool(name, class);
+        // Journal-authoritative tools persist immutable intent before any
+        // runtime decision hook, task-contract policy, capability-effect gate,
+        // or permission/approval decision. Validation that the tool is known
+        // and enabled still happens first.
+        let mut journal_pending: Option<crate::PendingToolOperation> = None;
         if route == crate::tool_ledger::ToolCallExecutionAuthority::OperationJournal {
-            let Some(operation_runtime) = operation_runtime else {
+            if !self.tools.iter().any(|tool| tool == name) {
+                return immediate(format!("Unknown tool: {name}"), false);
+            }
+            let Some(operation_runtime) = operation_runtime.clone() else {
                 return immediate("Operation journal runtime is unavailable.".into(), true);
-            };
-            let permission_revision = self
-                .permissions
-                .lock()
-                .ok()
-                .and_then(|permissions| permissions.revision());
-            let Some(permission_revision) = permission_revision else {
-                return immediate(
-                    "Operation denied: permission policy revision is unavailable.".into(),
-                    true,
-                );
             };
             let Some(capability) = self
                 .runtime
@@ -1529,13 +1477,13 @@ impl Agent {
             };
             let admission = match operation_runtime
                 .dispatcher()
-                .admit(plan.clone(), permission_revision)
+                .persist_intent(plan.clone())
             {
                 Ok(admission) => admission,
                 Err(error) => {
                     return Preparation::Immediate(crate::ToolResult {
                         content: format!(
-                            "Operation intent could not be persisted before dispatch: {error}"
+                            "Operation intent could not be persisted before policy evaluation: {error}"
                         ),
                         is_error: true,
                         details: Some(serde_json::json!({ "operation_persistence": true })),
@@ -1544,29 +1492,12 @@ impl Agent {
             };
             match admission {
                 crate::runtime::operations::OperationAdmission::New(admitted) => {
-                    let mut pending_calls = match self.pending_tool_operations.lock() {
-                        Ok(pending_calls) => pending_calls,
-                        Err(_) => {
-                            let _ = operation_runtime.dispatcher().cancel_before_start(
-                                &admitted,
-                                "pending operation state unavailable",
-                            );
-                            return immediate(
-                                "Operation dispatch state is unavailable; no adapter was run."
-                                    .into(),
-                                true,
-                            );
-                        }
-                    };
-                    pending_calls.insert(
-                        id.to_owned(),
-                        crate::PendingToolOperation {
-                            runtime: operation_runtime.clone(),
-                            plan,
-                            admitted,
-                            origin,
-                        },
-                    );
+                    journal_pending = Some(crate::PendingToolOperation {
+                        runtime: operation_runtime,
+                        plan,
+                        admitted,
+                        origin,
+                    });
                 }
                 crate::runtime::operations::OperationAdmission::ExistingResult(admitted) => {
                     return match operation_runtime.dispatcher().replay_result(&admitted) {
@@ -1587,6 +1518,135 @@ impl Agent {
                     });
                 }
             }
+        }
+
+        if let Some(runtime) = &self.runtime {
+            let event = crate::runtime::RuntimeEvent::PreToolUse {
+                call_id: id.to_string(),
+                tool: name.to_string(),
+                args: args.clone(),
+            };
+            if let Err(reason) = runtime.emit_decision(event) {
+                cancel_persisted_intent(journal_pending.as_ref(), &reason);
+                if let Ok(mut ledger) = self.tool_ledger.lock() {
+                    ledger.cancel_reservation(id);
+                }
+                return immediate(reason, false);
+            }
+        }
+        if let Some(reason) = self.pre_tool.as_ref().and_then(|hook| (hook.0)(name, args)) {
+            cancel_persisted_intent(journal_pending.as_ref(), &reason);
+            if let Ok(mut ledger) = self.tool_ledger.lock() {
+                ledger.cancel_reservation(id);
+            }
+            return immediate(reason, false);
+        }
+        if !self.tools.iter().any(|tool| tool == name) {
+            let reason = format!("Unknown tool: {name}");
+            cancel_persisted_intent(journal_pending.as_ref(), &reason);
+            if let Ok(mut ledger) = self.tool_ledger.lock() {
+                ledger.cancel_reservation(id);
+            }
+            return immediate(reason, false);
+        }
+        if let Err(violation) = self.check_contract_gate(cwd, id, name, args) {
+            cancel_persisted_intent(journal_pending.as_ref(), &violation.to_string());
+            if let Ok(mut ledger) = self.tool_ledger.lock() {
+                ledger.record_blocked(id, &violation.to_string());
+            }
+            return Preparation::Immediate(crate::ToolResult {
+                content: violation.to_string(),
+                is_error: true,
+                details: Some(serde_json::json!({
+                    "denied": true,
+                    "scope_violation": violation,
+                })),
+            });
+        }
+        if let Some(reason) = self.capability_effect_denial(cwd, name, args) {
+            cancel_persisted_intent(journal_pending.as_ref(), &reason);
+            if let Ok(mut ledger) = self.tool_ledger.lock() {
+                ledger.record_blocked(id, &reason);
+            }
+            return immediate(reason, true);
+        }
+        if let Some(reason) = self.permission_denial(cwd, id, name, args) {
+            // `denied` marks a call that never ran, for the hosts' rows
+            // and the post-tool hooks, without sniffing the text.
+            cancel_persisted_intent(journal_pending.as_ref(), &reason);
+            if let Ok(mut ledger) = self.tool_ledger.lock() {
+                ledger.record_blocked(id, &reason);
+            }
+            return immediate(reason, true);
+        }
+        let class = self
+            .permissions
+            .lock()
+            .unwrap_or_else(|err| err.into_inner())
+            .class_of(name);
+        // Runtime metadata is authoritative when installed; unknown tools fail
+        // closed inside `lane_for_capability`. Without a runtime, the legacy
+        // class-based resolver still keeps unrecognized extensions serial.
+        let lane = self.lane_for_tool(name, class);
+        if route == crate::tool_ledger::ToolCallExecutionAuthority::OperationJournal {
+            let Some(mut pending) = journal_pending else {
+                return immediate(
+                    "Operation intent was not durably admitted before authorization.".into(),
+                    true,
+                );
+            };
+            let permission_revision = self
+                .permissions
+                .lock()
+                .ok()
+                .and_then(|permissions| permissions.revision());
+            let Some(permission_revision) = permission_revision else {
+                cancel_persisted_intent(
+                    Some(&pending),
+                    "permission policy revision is unavailable",
+                );
+                self.approval_registry.take_dispatch(id);
+                return immediate(
+                    "Operation denied: permission policy revision is unavailable.".into(),
+                    true,
+                );
+            };
+            pending.admitted = match pending
+                .runtime
+                .dispatcher()
+                .authorize_and_queue(&pending.admitted, permission_revision)
+            {
+                Ok(admitted) => admitted,
+                Err(error) => {
+                    cancel_persisted_intent(
+                        Some(&pending),
+                        "authorization could not be committed",
+                    );
+                    self.approval_registry.take_dispatch(id);
+                    return Preparation::Immediate(crate::ToolResult {
+                        content: format!(
+                            "Operation authorization could not be persisted before dispatch: {error}"
+                        ),
+                        is_error: true,
+                        details: Some(serde_json::json!({ "operation_persistence": true })),
+                    });
+                }
+            };
+            let mut pending_calls = match self.pending_tool_operations.lock() {
+                Ok(pending_calls) => pending_calls,
+                Err(_) => {
+                    let _ = pending.runtime.dispatcher().cancel_before_start(
+                        &pending.admitted,
+                        "pending operation state unavailable",
+                    );
+                    self.approval_registry.take_dispatch(id);
+                    return immediate(
+                        "Operation dispatch state is unavailable; no adapter was run.".into(),
+                        true,
+                    );
+                }
+            };
+            pending_calls.insert(id.to_owned(), pending);
         }
         Preparation::Ready { lane }
     }
@@ -5737,6 +5797,40 @@ mod operation_dispatch_tests {
             crate::runtime::operations::IdempotencyScope::BatchChild
         );
         assert!(agent.tool_ledger.lock().unwrap().records().is_empty());
+    }
+
+    #[test]
+    fn permission_denial_is_durable_before_authorization_and_never_starts_effects() {
+        let (mut agent, workspace, journal) = configured_agent();
+        agent.tools = vec!["write".into()];
+        agent.permissions.lock().unwrap().mode = crate::PermissionMode::ReadOnly;
+        let args = json!({"path": "denied.txt", "content": "must not be written"});
+
+        let result = agent.prepare_tool_call(workspace.path(), "denied-write", "write", &args, 0);
+        let Preparation::Immediate(result) = result else {
+            panic!("read-only write should be denied during preparation");
+        };
+        assert!(result.is_error);
+        assert_eq!(
+            result
+                .details
+                .as_ref()
+                .and_then(|details| details.get("denied"))
+                .and_then(serde_json::Value::as_bool),
+            Some(true)
+        );
+        assert!(!workspace.path().join("denied.txt").exists());
+
+        let snapshot = journal.snapshot().unwrap();
+        assert_eq!(snapshot.operations.len(), 1);
+        assert_eq!(snapshot.attempts.len(), 1);
+        let attempt = &snapshot.attempts[0];
+        assert_eq!(attempt.state(), OperationState::Cancelled);
+        assert!(attempt.authorization().is_none());
+        assert_eq!(
+            attempt.effect_status(),
+            crate::runtime::operations::EffectStatus::NotStarted
+        );
     }
 
     #[test]

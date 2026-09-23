@@ -33,13 +33,18 @@ ownership or effect is unknown.
 
 ## Admission and idempotency
 
-Migrated callers first create an immutable OperationSpec with root/workspace and
-session lineage, operation kind, effect profile, preconditions, normalized
-payload, and digest. Admission is unique by root, caller scope, and caller key.
-A matching digest reuses the operation; a changed payload is a collision. A
-duplicate delivery can replay a stored result or outbox publication and cannot
-silently execute a second mutation. Unresolved resource claims block fresh keys.
-Owner fencing, revisions, and dispatch permits reject stale commands.
+Migrated callers first validate the known/enabled capability and create an
+immutable OperationSpec with root/workspace and session lineage, operation kind,
+effect profile, preconditions, normalized payload, and digest. The immutable
+intent is durably persisted before runtime decision hooks, contract/effect
+policy, or permission/approval evaluation. A denied operation transitions from
+Persisted/Authorized/Queued to Cancelled with EffectStatus::NotStarted; only an
+approved intent receives an AuthorizationReceipt and advances to Queued.
+Admission is unique by root, caller scope, and caller key. A matching digest
+reuses the operation; a changed payload is a collision. A duplicate delivery
+can replay a stored result or outbox publication and cannot silently execute a
+second mutation. Unresolved resource claims block fresh keys. Owner fencing,
+revisions, and dispatch permits reject stale commands.
 
 The coordinator is used by direct and batch tools, host controls,
 process/browser lifetimes, external providers, verification, graph workers, and

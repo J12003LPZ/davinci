@@ -323,9 +323,10 @@ pub fn run_verification_with_progress_from(
 ) -> VerificationResult {
     let mut completed = prior.map_or_else(Vec::new, |result| result.commands.clone());
     if completed.len() > commands.len()
-        || completed.iter().zip(commands).any(|(result, spec)| {
-            result.name != spec.name || result.command != spec.command
-        })
+        || completed
+            .iter()
+            .zip(commands)
+            .any(|(result, spec)| result.name != spec.name || result.command != spec.command)
     {
         completed.clear();
     }
@@ -333,8 +334,14 @@ pub fn run_verification_with_progress_from(
     if start == commands.len() {
         let ran = completed.iter().filter(|result| !result.skipped).count();
         let passed = ran > 0
-            && completed.iter().all(|result| result.skipped || result.exit_code == 0);
-        return VerificationResult { commands: completed, passed, progress: None };
+            && completed
+                .iter()
+                .all(|result| result.skipped || result.exit_code == 0);
+        return VerificationResult {
+            commands: completed,
+            passed,
+            progress: None,
+        };
     }
     let result = run_verification_with_progress(
         &commands[start..],
@@ -367,8 +374,14 @@ pub fn run_verification_with_progress_from(
     let ran = merged.iter().filter(|item| !item.skipped).count();
     let passed = !abort.load(Ordering::Relaxed)
         && ran > 0
-        && merged.iter().all(|item| item.skipped || item.exit_code == 0);
-    VerificationResult { commands: merged, passed, progress: None }
+        && merged
+            .iter()
+            .all(|item| item.skipped || item.exit_code == 0);
+    VerificationResult {
+        commands: merged,
+        passed,
+        progress: None,
+    }
 }
 pub fn run_verification_with_progress(
     commands: &[VerifyCommandSpec],

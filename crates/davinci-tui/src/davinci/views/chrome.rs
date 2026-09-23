@@ -132,10 +132,12 @@ fn conversation_status(model: &Model) -> Line<'static> {
     } else {
         {
             let label = model.permission_label().to_lowercase();
-            vec![
-                span("  ⏸ ", th.muted),
-                span(format!("{label} mode on"), th.muted),
-            ]
+            let state = if label.ends_with(" mode") {
+                format!("{label} on")
+            } else {
+                format!("{label} mode on")
+            };
+            vec![span("  ⏸ ", th.muted), span(state, th.muted)]
         }
     };
     if model.width >= 40 {
@@ -415,10 +417,13 @@ pub fn effort_rule(model: &Model) -> Line<'static> {
     let label = format!(" ● {} · /effort ▔", model.thinking_level.to_lowercase());
     let label_width = UnicodeWidthStr::width(label.as_str()).min(model.width as usize);
     let left = "▔".repeat((model.width as usize).saturating_sub(label_width));
-    Line::from(vec![
-        span(left, model.theme.border),
-        span(label, model.theme.muted),
-    ])
+    Line::from(crate::davinci::ui::truncate_run(
+        vec![
+            span(left, model.theme.border),
+            span(label, model.theme.muted),
+        ],
+        model.width,
+    ))
 }
 /// Rows for the composer plus its hint row. Grows with content. The box takes
 /// two neutral rules and no side borders. The prompt and caret carry
@@ -462,8 +467,13 @@ pub fn composer(model: &Model, lines: Option<&[String]>, hint: Hint) -> Vec<Line
         })
         .or_else(|| screen_placeholder(model.screen).map(str::to_string));
     let lit = model.blink();
+    let caret_color = if th.text == ratatui::style::Color::Reset {
+        th.primary
+    } else {
+        th.text
+    };
     let caret_style = if lit {
-        Style::default().bg(th.text).fg(th.background)
+        Style::default().bg(caret_color).fg(th.background)
     } else {
         Style::default().bg(th.background).fg(th.background)
     };
@@ -537,7 +547,16 @@ pub fn composer(model: &Model, lines: Option<&[String]>, hint: Hint) -> Vec<Line
         // owns it, so the composer's goes with it (`1d`, `1f`). At end of line
         // it has no character to sit on, so it takes a cell of its own.
         if index == caret_row && !overlaid && !caret_here {
-            row.push(Span::styled(" ", caret_style));
+            if lit {
+                row.push(Span::styled(" ", caret_style));
+            } else {
+                // With terminal-default foreground/background both represented
+                // as Color::Reset, an explicitly Reset background is
+                // indistinguishable from the lit caret in tests and some
+                // backends. An unlit end-of-line caret is simply an unstyled
+                // blank cell.
+                row.push(Span::raw(" "));
+            }
         }
         let mut run = Vec::new();
         run.extend(row);
@@ -852,8 +871,9 @@ pub fn suggestions_height(model: &Model) -> u16 {
 /// How many rows [`composer`] will occupy, known before it is built.
 pub fn composer_height(lines: Option<&[String]>, hinted: bool) -> u16 {
     let entries = lines.map(<[String]>::len).unwrap_or(1).max(1);
-    // surface top + entries + surface bottom, then the hint row if any.
-    entries as u16 + 2 + u16::from(hinted)
+    // Conversation composer: effort row + top rule + entries + bottom rule,
+    // then the optional hint row. Command sheets use their actual row count.
+    entries as u16 + 3 + u16::from(hinted)
 }
 
 /// The keybind row under the composer: hints left, the closing act right,
@@ -1145,10 +1165,10 @@ mod tests {
     #[test]
     fn permission_status_uses_all_five_exact_labels() {
         for (id, label) in [
-            ("ask", "Manual"),
-            ("edits", "Accept Edits"),
-            ("read-only", "Plan Mode"),
-            ("auto", "Auto Mode"),
+            ("ask", "manual mode on"),
+            ("edits", "accept edits mode on"),
+            ("read-only", "plan mode on"),
+            ("auto", "auto mode on"),
             ("always-approve", "Always Approve"),
         ] {
             let mut m = model(100);
@@ -1184,7 +1204,7 @@ mod tests {
     fn conversation_status_names_permissions_and_context_usage() {
         let mut m = model(100);
         let drawn = text(&status(&m));
-        assert!(drawn.starts_with("  Manual"));
+        assert!(drawn.starts_with("  ⏸ manual mode on"));
         assert!(drawn.contains("? for shortcuts"));
         assert!(!drawn.contains("23% context"));
         m.context = (180_000, 200_000);
@@ -1196,14 +1216,14 @@ mod tests {
         for width in [72u16, 90] {
             let drawn = text(&status(&model(width)));
             assert!(drawn.contains("? for shortcuts"), "{drawn}");
-            assert!(drawn.contains("Manual"), "{drawn}");
+            assert!(drawn.contains("manual mode on"), "{drawn}");
         }
     }
 
     #[test]
     fn the_status_bar_left_names_the_screen_in_hand() {
         let mut m = model(120);
-        assert!(text(&status(&m)).starts_with("  Manual · ? for shortcuts"));
+        assert!(text(&status(&m)).starts_with("  ⏸ manual mode on · ? for shortcuts"));
         m.toggle_screen(Screen::Grafo);
         let drawn = text(&status(&m));
         assert!(drawn.contains("Code graph"), "{drawn}");
@@ -1216,18 +1236,18 @@ mod tests {
         let m = model(100);
         let rows = composer(&m, None, Hint::Default);
         assert_eq!(rows.len() as u16, composer_height(None, true));
-        assert_eq!(rows.len(), 4);
-        assert_eq!(rows[0].spans[0].style.fg, Some(m.theme.border));
-        assert_eq!(rows[1].style.bg, None);
-        assert!(text(&rows[0]).chars().all(|ch| ch == '─'));
-        let prompt_row = text(&rows[1]);
+        assert_eq!(rows.len(), 5);
+        assert_eq!(rows[1].spans[0].style.fg, Some(m.theme.border));
+        assert_eq!(rows[2].style.bg, None);
+        assert!(text(&rows[1]).chars().all(|ch| ch == '─'));
+        let prompt_row = text(&rows[2]);
         assert!(prompt_row.contains("❯"), "{prompt_row}");
         assert!(
             !prompt_row.contains("…"),
             "an empty composer carries no placeholder prose: {prompt_row}"
         );
-        assert!(text(&rows[3]).contains("/help for shortcuts · ctrl+alt+p commands"));
-        assert!(text(&rows[3])
+        assert!(text(&rows[4]).contains("/help for shortcuts · ctrl+alt+p commands"));
+        assert!(text(&rows[4])
             .trim_end()
             .ends_with("shift+enter for newline"));
     }
@@ -1237,8 +1257,8 @@ mod tests {
         let mut m = model(100);
         m.transcript.clear();
         let rows = composer(&m, None, Hint::None);
-        assert_eq!(rows[0].spans[0].style.fg, Some(m.theme.border));
-        let prompt_row = text(&rows[1]);
+        assert_eq!(rows[1].spans[0].style.fg, Some(m.theme.border));
+        let prompt_row = text(&rows[2]);
         assert!(prompt_row.contains("❯"), "{prompt_row}");
         assert!(!prompt_row.contains("…"), "{prompt_row}");
     }
@@ -1275,11 +1295,11 @@ mod tests {
             "existing TS golden files under tests\\golden\\".to_string(),
         ];
         let rows = composer(&m, Some(&entered), Hint::Multiline);
-        assert_eq!(rows.len(), 5);
-        assert_eq!(composer_height(Some(&entered), true), 5);
-        assert!(text(&rows[1]).contains("keep step IV"));
-        assert!(text(&rows[2]).contains("existing TS golden files"));
-        let hint = text(&rows[4]);
+        assert_eq!(rows.len(), 6);
+        assert_eq!(composer_height(Some(&entered), true), 6);
+        assert!(text(&rows[2]).contains("keep step IV"));
+        assert!(text(&rows[3]).contains("existing TS golden files"));
+        let hint = text(&rows[5]);
         assert!(hint.contains("shift+enter newline · 2 lines"), "{hint}");
         assert!(hint.trim_end().ends_with("enter send"), "{hint}");
     }
@@ -1290,23 +1310,24 @@ mod tests {
         let entered = vec!["one".to_string(), "two".to_string()];
         let rows = composer(&m, Some(&entered), Hint::Multiline);
         let caret = |line: &Line<'_>| {
-            line.spans
-                .iter()
-                .any(|span| span.style.bg == Some(m.theme.text))
+            line.spans.iter().any(|span| {
+                span.style.bg.is_some()
+                    && span.style.bg != Some(m.theme.background)
+            })
         };
-        assert!(!caret(&rows[1]), "no caret on the first row");
-        assert!(caret(&rows[2]), "caret on the last row");
+        assert!(!caret(&rows[2]), "no caret on the first row");
+        assert!(caret(&rows[3]), "caret on the last row");
 
         m.tick = 4;
         let off = composer(&m, Some(&entered), Hint::Multiline);
-        assert!(!caret(&off[2]), "the caret blinks off");
+        assert!(!caret(&off[3]), "the caret blinks off");
     }
 
     #[test]
     fn the_hint_row_abbreviates_below_eighty_columns() {
         let mut m = model(72);
         m.running = true;
-        let drawn = text(&composer(&m, None, Hint::Default)[3]);
+        let drawn = text(&composer(&m, None, Hint::Default)[4]);
         assert!(drawn.contains("enter send"), "{drawn}");
         assert!(drawn.contains("esc cancel"), "{drawn}");
         assert!(!drawn.contains("tab complete"), "{drawn}");
@@ -1343,7 +1364,7 @@ mod tests {
 
     /// Find the caret after the four-cell prompt/continuation gutter.
     fn caret_column(model: &Model, row: usize) -> Option<usize> {
-        let line = composer(model, None, Hint::Default).remove(row);
+        let line = composer(model, None, Hint::Default).remove(row + 1);
         let mut column = 0usize;
         let mut caret = None;
         for span in &line.spans {

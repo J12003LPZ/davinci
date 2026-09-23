@@ -45,7 +45,7 @@ impl OperationJournal {
     }
 
     pub fn root_namespace_id(&self) -> RootNamespaceId {
-        self.root_namespace_id.clone()
+        self.root_namespace_id
     }
     pub fn open(
         directory_path: &Path,
@@ -276,7 +276,7 @@ impl OperationJournal {
                 (false, None, None) => None,
                 (false, None, Some(_)) => return Err(JournalError::UnexpectedResultPayload),
             };
-            if outbox.len() > 0 {
+            if !outbox.is_empty() {
                 let pending: i64 = transaction
                     .query_row(
                         "SELECT count(*) FROM operation_outbox
@@ -746,7 +746,7 @@ impl OperationJournal {
         };
         let result = (|| {
             let mut target = Connection::open_with_flags(
-                &destination.path.join(JOURNAL_DATABASE_FILE_NAME),
+                destination.path.join(JOURNAL_DATABASE_FILE_NAME),
                 OpenFlags::SQLITE_OPEN_READ_WRITE
                     | OpenFlags::SQLITE_OPEN_CREATE
                     | OpenFlags::SQLITE_OPEN_NOFOLLOW

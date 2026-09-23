@@ -2322,7 +2322,11 @@ mod tests {
         let task = run.task("survey").unwrap();
         let previous_attempts = task.attempts;
         assert_eq!(task.status, TaskStatus::Succeeded);
-        let survey = run.tasks.iter_mut().find(|task| task.id == "survey").unwrap();
+        let survey = run
+            .tasks
+            .iter_mut()
+            .find(|task| task.id == "survey")
+            .unwrap();
         survey.status = TaskStatus::Failed;
         survey.error = Some("fixture retry".into());
         run.phase = Phase::Blocked;

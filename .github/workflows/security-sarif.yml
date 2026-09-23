@@ -2,6 +2,10 @@ name: Security SARIF interoperability
 on:
   push:
   pull_request:
+concurrency:
+  group: security-sarif-${{ github.event_name }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
 jobs:
   schema:
     runs-on: ubuntu-latest

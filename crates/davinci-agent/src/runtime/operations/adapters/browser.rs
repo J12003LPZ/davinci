@@ -195,6 +195,7 @@ impl BrowserOperationAdapter {
         &self.runtime
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn start(
         &self,
         call_id: &str,
@@ -310,10 +311,7 @@ fn redacted_scalar(value: &Value) -> Value {
         _ => serde_json::to_vec(value).unwrap_or_default(),
     };
     let digest = Sha256::digest(&bytes);
-    let hash = digest
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect::<String>();
+    let hash = format!("{digest:x}");
     json!({"redacted": true, "sha256": hash, "length": bytes.len()})
 }
 

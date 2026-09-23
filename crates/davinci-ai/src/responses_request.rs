@@ -119,8 +119,7 @@ impl PreparedProviderRequest {
             .iter()
             .filter(|segment| segment.cache_sensitive);
         let mut index = 0usize;
-        let mut pairs = left.zip(right);
-        while let Some((a, b)) = pairs.next() {
+        for (a, b) in left.zip(right) {
             if a.category != b.category
                 || a.trust != b.trust
                 || a.digest != b.digest

@@ -204,66 +204,68 @@ impl BrowserProcess {
             let event_state = state.clone();
             let owner: Arc<Mutex<Option<Weak<Supervisor>>>> = Arc::new(Mutex::new(None));
             let event_owner = owner.clone();
-            let supervisor = Arc::new(Supervisor::spawn_with_stderr(
-                host,
-                ProcessConfig {
-                    executable: node,
-                    argv: vec![
-                        directory
-                            .join("browser_host.js")
-                            .to_string_lossy()
-                            .into_owned(),
-                        directory.join("config.json").to_string_lossy().into_owned(),
-                    ],
-                    cwd: directory.clone(),
-                    environment,
-                    operation: None,
-                },
-                Arc::new(move |event| {
-                    let mut state = event_state.0.lock().unwrap_or_else(|e| e.into_inner());
-                    let failure = match event {
-                        ProcessEvent::Output(bytes) => state.receive(&bytes).err(),
-                        ProcessEvent::Finished(exit) => {
-                            state.closed = true;
-                            if exit.code != Some(0)
-                                || exit.error.is_some()
-                                || !exit.output_complete
-                                || !state.frame.is_empty()
+            let supervisor = Arc::new(
+                Supervisor::spawn_with_stderr(
+                    host,
+                    ProcessConfig {
+                        executable: node,
+                        argv: vec![
+                            directory
+                                .join("browser_host.js")
+                                .to_string_lossy()
+                                .into_owned(),
+                            directory.join("config.json").to_string_lossy().into_owned(),
+                        ],
+                        cwd: directory.clone(),
+                        environment,
+                        operation: None,
+                    },
+                    Arc::new(move |event| {
+                        let mut state = event_state.0.lock().unwrap_or_else(|e| e.into_inner());
+                        let failure = match event {
+                            ProcessEvent::Output(bytes) => state.receive(&bytes).err(),
+                            ProcessEvent::Finished(exit) => {
+                                state.closed = true;
+                                if exit.code != Some(0)
+                                    || exit.error.is_some()
+                                    || !exit.output_complete
+                                    || !state.frame.is_empty()
+                                {
+                                    Some("browser host exited without complete output".into())
+                                } else {
+                                    None
+                                }
+                            }
+                        };
+                        if let Some(failure) = failure {
+                            state.failure = Some(failure);
+                        }
+                        let failed = state.failure.is_some();
+                        event_state.1.notify_all();
+                        drop(state);
+                        if failed {
+                            if let Some(owner) = event_owner
+                                .lock()
+                                .unwrap_or_else(|e| e.into_inner())
+                                .as_ref()
+                                .and_then(Weak::upgrade)
                             {
-                                Some("browser host exited without complete output".into())
-                            } else {
-                                None
+                                owner.stop();
                             }
                         }
-                    };
-                    if let Some(failure) = failure {
-                        state.failure = Some(failure);
-                    }
-                    let failed = state.failure.is_some();
-                    event_state.1.notify_all();
-                    drop(state);
-                    if failed {
-                        if let Some(owner) = event_owner
-                            .lock()
-                            .unwrap_or_else(|e| e.into_inner())
-                            .as_ref()
-                            .and_then(Weak::upgrade)
-                        {
-                            owner.stop();
+                    }),
+                    Arc::new(move |bytes| {
+                        if diagnostics {
+                            let detail = String::from_utf8_lossy(&bytes);
+                            eprint!(
+                                "browser host stderr: {}",
+                                detail.chars().take(1024).collect::<String>()
+                            );
                         }
-                    }
-                }),
-                Arc::new(move |bytes| {
-                    if diagnostics {
-                        let detail = String::from_utf8_lossy(&bytes);
-                        eprint!(
-                            "browser host stderr: {}",
-                            detail.chars().take(1024).collect::<String>()
-                        );
-                    }
-                }),
-            )
-            .map_err(|error| error.to_string())?);
+                    }),
+                )
+                .map_err(|error| error.to_string())?,
+            );
             *owner.lock().unwrap_or_else(|e| e.into_inner()) = Some(Arc::downgrade(&supervisor));
             if state
                 .0
