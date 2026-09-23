@@ -422,6 +422,7 @@ impl ToolOperationRuntime {
         child
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn plan_provider_call(
         &self,
         run_id: RunId,
@@ -443,6 +444,7 @@ impl ToolOperationRuntime {
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn plan_batch_child(
         &self,
         run_id: RunId,
