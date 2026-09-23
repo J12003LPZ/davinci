@@ -37,14 +37,14 @@ impl Fixture {
     }
 
     fn open(&self) -> OperationJournal {
-        OperationJournal::open(&self.directory, self.identity.clone(), self.root.clone()).unwrap()
+        OperationJournal::open(&self.directory, self.identity.clone(), self.root).unwrap()
     }
 
     fn spec(&self, key: &str, payload: Value) -> OperationSpec {
         OperationSpec::new(
             OperationContext {
                 journal_id: self.identity.journal_id,
-                root_namespace_id: self.root.clone(),
+                root_namespace_id: self.root,
                 session_id: "operation-capacity-test".to_owned(),
                 runtime_run_id: RunId::new(),
                 parent_operation_id: None,
