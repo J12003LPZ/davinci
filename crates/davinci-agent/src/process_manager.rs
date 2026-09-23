@@ -156,14 +156,30 @@ impl BrowserDevServerLease {
         let birth = self
             .pid_birth
             .ok_or("managed process identity unavailable")?;
-        if socket_owner::identity(self.pid)? != birth {
-            return Err("managed process identity changed".into());
+        let mut last_error = None;
+        for attempt in 0..4 {
+            if socket_owner::identity(self.pid)? != birth {
+                return Err("managed process identity changed".into());
+            }
+            match socket_owner::verify_for(self.pid, self.port, self.ipv6) {
+                Ok(()) => {
+                    if socket_owner::identity(self.pid)? != birth {
+                        return Err("managed process identity changed".into());
+                    }
+                    return Ok(());
+                }
+                Err(error) => last_error = Some(error),
+            }
+            if attempt < 3 {
+                // Darwin's global PCB snapshot and per-process descriptor
+                // snapshot are collected separately. A listener that is being
+                // actively used can transiently move between those snapshots.
+                // Retry the proof briefly, but never accept it without a
+                // successful ownership match for the same process lifetime.
+                std::thread::sleep(std::time::Duration::from_millis(15));
+            }
         }
-        socket_owner::verify_for(self.pid, self.port, self.ipv6)?;
-        if socket_owner::identity(self.pid)? != birth {
-            return Err("managed process identity changed".into());
-        }
-        Ok(())
+        Err(last_error.unwrap_or_else(|| "managed listener ownership could not be proven".into()))
     }
 }
 
