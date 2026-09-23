@@ -83,6 +83,44 @@ impl SessionEntry {
     }
 }
 
+pub(crate) fn prepare_operation_entry(
+    event_id: &str,
+    entry: &mut SessionEntry,
+) -> Result<(), crate::SessionError> {
+    if event_id.trim().is_empty() {
+        return Err(crate::SessionError::invalid_entry(
+            "Operation event ID must not be empty",
+        ));
+    }
+    if !entry.id.is_empty() && entry.id != event_id {
+        return Err(crate::SessionError::invalid_entry(format!(
+            "Operation event ID {event_id} does not match entry ID {}",
+            entry.id
+        )));
+    }
+    if let Some(existing) = entry.extra.get("operationEventId") {
+        if existing.as_str() != Some(event_id) {
+            return Err(crate::SessionError::invalid_entry(
+                "Entry is already tagged with a different operation event ID",
+            ));
+        }
+    } else {
+        entry.extra.insert(
+            "operationEventId".into(),
+            Value::String(event_id.to_owned()),
+        );
+    }
+    entry.id = event_id.to_owned();
+    Ok(())
+}
+
+pub(crate) fn operation_entry_matches(existing: &SessionEntry, expected: &SessionEntry) -> bool {
+    existing.entry_type == expected.entry_type
+        && existing.message == expected.message
+        && existing.custom_type == expected.custom_type
+        && existing.extra == expected.extra
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct LaneRecord {
     pub id: String,

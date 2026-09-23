@@ -244,30 +244,39 @@ pub(super) fn collect_outbox(
     root: RootNamespaceId,
     pending_only: bool,
     limit: usize,
+    consumer: Option<&str>,
+    session_id: Option<&str>,
 ) -> Result<Vec<StoredOutbox>, JournalError> {
     let sql = if pending_only {
         "SELECT outbox_id, operation_id, attempt_id, consumer, payload_json, state, created_at_ms, acknowledged_at_ms
          FROM operation_outbox WHERE root_namespace_id = ?1 AND state = 'pending'
+         AND (?3 IS NULL OR consumer = ?3)
+         AND (?4 IS NULL OR json_extract(payload_json, '$.session_id') = ?4)
          ORDER BY created_at_ms, outbox_id LIMIT ?2"
     } else {
         "SELECT outbox_id, operation_id, attempt_id, consumer, payload_json, state, created_at_ms, acknowledged_at_ms
          FROM operation_outbox WHERE root_namespace_id = ?1
+         AND (?3 IS NULL OR consumer = ?3)
+         AND (?4 IS NULL OR json_extract(payload_json, '$.session_id') = ?4)
          ORDER BY created_at_ms, outbox_id LIMIT ?2"
     };
     let mut statement = transaction.prepare(sql).map_err(sqlite_error)?;
     let rows = statement
-        .query_map(params![root.to_string(), limit as i64], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, String>(2)?,
-                row.get::<_, String>(3)?,
-                row.get::<_, String>(4)?,
-                row.get::<_, String>(5)?,
-                row.get::<_, i64>(6)?,
-                row.get::<_, Option<i64>>(7)?,
-            ))
-        })
+        .query_map(
+            params![root.to_string(), limit as i64, consumer, session_id],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, String>(5)?,
+                    row.get::<_, i64>(6)?,
+                    row.get::<_, Option<i64>>(7)?,
+                ))
+            },
+        )
         .map_err(sqlite_error)?;
     rows.map(|row| {
         let (id, operation, attempt, consumer, payload, state, created, acknowledged) =

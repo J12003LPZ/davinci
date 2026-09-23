@@ -245,9 +245,32 @@ impl OperationJournal {
                         MAX_RESULT_REF_BYTES,
                         "result reference",
                     )?;
-                    Some((reference.result_id.to_string(), reference_json, payload_json.clone()))
+                    Some((
+                        reference.result_id.to_string(),
+                        reference_json,
+                        payload_json.clone(),
+                        reference.payload_digest,
+                    ))
                 }
                 (true, _, _) => return Err(JournalError::MissingResultPayload),
+                (false, Some(payload), Some(payload_json))
+                    if matches!(&event, OperationEvent::CompleteFailure { .. }) =>
+                {
+                    let digest = PayloadDigest::of_json(payload)
+                        .map_err(|error| JournalError::Serialization(error.to_string()))?;
+                    let reference = super::ResultRef::new(digest);
+                    let reference_json = encode_bounded(
+                        &reference,
+                        MAX_RESULT_REF_BYTES,
+                        "result reference",
+                    )?;
+                    Some((
+                        reference.result_id.to_string(),
+                        reference_json,
+                        payload_json.clone(),
+                        digest,
+                    ))
+                }
                 (false, Some(_), _) => return Err(JournalError::UnexpectedResultPayload),
                 (false, None, None) => None,
                 (false, None, Some(_)) => return Err(JournalError::UnexpectedResultPayload),
@@ -296,7 +319,7 @@ impl OperationJournal {
                 next.revision(),
                 &event_json,
             )?;
-            if let Some((result_id, reference_json, payload_json)) = result_record {
+            if let Some((result_id, reference_json, payload_json, payload_digest)) = result_record {
                 transaction
                     .execute(
                         "INSERT INTO operation_results
@@ -306,7 +329,7 @@ impl OperationJournal {
                             result_id,
                             next.operation_id().to_string(),
                             next.attempt_id().to_string(),
-                            next.result().expect("new result is present").payload_digest.to_string(),
+                            payload_digest.to_string(),
                             reference_json,
                             payload_json,
                             now_unix_millis()
@@ -365,6 +388,59 @@ impl OperationJournal {
         })
     }
 
+    pub fn load_spec(
+        &self,
+        operation_id: super::OperationId,
+    ) -> Result<OperationSpec, JournalError> {
+        self.read(|transaction| {
+            let json: Option<String> = transaction
+                .query_row(
+                    "SELECT spec_json FROM operations
+                     WHERE operation_id = ?1 AND root_namespace_id = ?2",
+                    params![operation_id.to_string(), self.root_namespace_id.to_string()],
+                    |row| row.get(0),
+                )
+                .optional()
+                .map_err(sqlite_error)?;
+            decode_json(&json.ok_or(JournalError::NotFound)?)
+        })
+    }
+
+    /// Load the durable raw result for an attempt, including failed results
+    /// retained for presentation and recovery.
+    pub fn load_result_for_attempt(
+        &self,
+        attempt_id: AttemptId,
+    ) -> Result<Option<StoredResult>, JournalError> {
+        self.read(|transaction| {
+            let row: Option<(String, String, String, i64)> = transaction
+                .query_row(
+                    "SELECT r.payload_digest, r.result_ref_json, r.payload_json, r.created_at_ms
+                     FROM operation_results r JOIN operations o USING(operation_id)
+                     WHERE r.attempt_id = ?1 AND o.root_namespace_id = ?2",
+                    params![attempt_id.to_string(), self.root_namespace_id.to_string()],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                )
+                .optional()
+                .map_err(sqlite_error)?;
+            row.map(|(stored_digest, reference, payload, created_at_ms)| {
+                let reference: super::ResultRef = decode_json(&reference)?;
+                let payload: Value = decode_json(&payload)?;
+                let digest = PayloadDigest::of_json(&payload)
+                    .map_err(|error| JournalError::Serialization(error.to_string()))?;
+                if digest != reference.payload_digest || digest.to_string() != stored_digest {
+                    return Err(JournalError::ResultDigestMismatch);
+                }
+                Ok(StoredResult {
+                    reference,
+                    payload,
+                    created_at_ms: from_sql_integer(created_at_ms)?,
+                })
+            })
+            .transpose()
+        })
+    }
+
     pub fn snapshot(&self) -> Result<OperationJournalSnapshot, JournalError> {
         self.read(|transaction| {
             let counts: (i64, i64, i64, i64, i64) = transaction
@@ -404,6 +480,8 @@ impl OperationJournal {
                 self.root_namespace_id,
                 false,
                 MAX_SNAPSHOT_RECORDS as usize,
+                None,
+                None,
             )?;
             Ok(OperationJournalSnapshot {
                 journal_id: self.identity.journal_id,
@@ -425,7 +503,56 @@ impl OperationJournal {
                 limit: MAX_OUTBOX_BATCH_SIZE,
             });
         }
-        self.read(|transaction| collect_outbox(transaction, self.root_namespace_id, true, limit))
+        self.read(|transaction| {
+            collect_outbox(transaction, self.root_namespace_id, true, limit, None, None)
+        })
+    }
+
+    pub fn pending_outbox_for_consumer(
+        &self,
+        consumer: &str,
+        limit: usize,
+    ) -> Result<Vec<StoredOutbox>, JournalError> {
+        if limit > MAX_OUTBOX_BATCH_SIZE {
+            return Err(JournalError::OutboxBatchTooLarge {
+                actual: limit,
+                limit: MAX_OUTBOX_BATCH_SIZE,
+            });
+        }
+        self.read(|transaction| {
+            collect_outbox(
+                transaction,
+                self.root_namespace_id,
+                true,
+                limit,
+                Some(consumer),
+                None,
+            )
+        })
+    }
+
+    pub fn pending_outbox_for_consumer_and_session(
+        &self,
+        consumer: &str,
+        session_id: &str,
+        limit: usize,
+    ) -> Result<Vec<StoredOutbox>, JournalError> {
+        if limit > MAX_OUTBOX_BATCH_SIZE {
+            return Err(JournalError::OutboxBatchTooLarge {
+                actual: limit,
+                limit: MAX_OUTBOX_BATCH_SIZE,
+            });
+        }
+        self.read(|transaction| {
+            collect_outbox(
+                transaction,
+                self.root_namespace_id,
+                true,
+                limit,
+                Some(consumer),
+                Some(session_id),
+            )
+        })
     }
 
     pub fn acknowledge_outbox(

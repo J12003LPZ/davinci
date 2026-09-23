@@ -203,8 +203,19 @@ impl ToolOperationDispatcher {
         admitted: &AdmittedOperation,
         result: &crate::tools::ToolResult,
     ) -> Result<(), ToolOperationDispatchError> {
+        self.complete_for_session(admitted, result, true)
+    }
+
+    pub fn complete_for_session(
+        &self,
+        admitted: &AdmittedOperation,
+        result: &crate::tools::ToolResult,
+        publish_to_session: bool,
+    ) -> Result<(), ToolOperationDispatchError> {
         let attempt = self.journal.load_attempt(admitted.attempt.attempt_id())?;
         let payload = serde_json::to_value(result)
+            .map_err(|error| ToolOperationDispatchError::ResultEncoding(error.to_string()))?;
+        let payload_digest = PayloadDigest::of_json(&payload)
             .map_err(|error| ToolOperationDispatchError::ResultEncoding(error.to_string()))?;
         let finished_at = now();
         let event = if result.is_error {
@@ -222,22 +233,33 @@ impl ToolOperationDispatcher {
             } else {
                 EffectStatus::Possible
             };
-            let payload_digest = PayloadDigest::of_json(&payload)
-                .map_err(|error| ToolOperationDispatchError::ResultEncoding(error.to_string()))?;
             OperationEvent::CompleteSuccess {
                 result: ResultRef::new(payload_digest),
                 effect_status,
                 finished_at,
             }
         };
-        let result_payload = (!result.is_error).then_some(payload);
+        let mut outbox = Vec::new();
+        if publish_to_session && admitted.spec.context().wire_tool_call_id.is_some() {
+            let ready = super::super::OperationResultReady::new(
+                &admitted.spec,
+                attempt.attempt_id(),
+                payload_digest,
+            )
+            .map_err(ToolOperationDispatchError::ResultEncoding)?;
+            outbox.push(
+                ready
+                    .into_draft()
+                    .map_err(ToolOperationDispatchError::Journal)?,
+            );
+        }
         self.journal.transition(
             self.owner,
             attempt.attempt_id(),
             attempt.revision(),
             event,
-            result_payload,
-            vec![],
+            Some(payload),
+            outbox,
         )?;
         Ok(())
     }
@@ -254,8 +276,24 @@ impl ToolOperationDispatcher {
             .as_ref()
             .map(|result| &result.payload)
             .ok_or(ToolOperationDispatchError::NoReplayableResult)?;
-        serde_json::from_value(payload.clone())
-            .map_err(|error| ToolOperationDispatchError::ResultEncoding(error.to_string()))
+        let mut result: crate::tools::ToolResult = serde_json::from_value(payload.clone())
+            .map_err(|error| ToolOperationDispatchError::ResultEncoding(error.to_string()))?;
+        let digest = PayloadDigest::of_json(payload)
+            .map_err(|error| ToolOperationDispatchError::ResultEncoding(error.to_string()))?;
+        let ready = super::super::OperationResultReady::new(
+            &admitted.spec,
+            admitted.attempt.attempt_id(),
+            digest,
+        )
+        .map_err(ToolOperationDispatchError::ResultEncoding)?;
+        let details = result.details.get_or_insert_with(|| serde_json::json!({}));
+        if !details.is_object() {
+            *details = serde_json::json!({});
+        }
+        details["replayed_from_operation_journal"] = serde_json::Value::Bool(true);
+        details["_operation_publication"] = serde_json::to_value(ready)
+            .map_err(|error| ToolOperationDispatchError::ResultEncoding(error.to_string()))?;
+        Ok(result)
     }
 }
 

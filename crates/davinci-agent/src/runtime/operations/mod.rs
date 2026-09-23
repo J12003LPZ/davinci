@@ -6,6 +6,7 @@ mod fault;
 mod identity;
 mod migrations;
 mod model;
+mod outbox;
 mod planner;
 mod recovery;
 mod recovery_types;
@@ -30,6 +31,7 @@ pub use model::{
     Precondition, PreconditionKind, PublicationState, ResultRef, Timestamp, VerificationState,
     WorkspaceIdentity, OPERATION_SCHEMA_VERSION,
 };
+pub use outbox::{OperationResultReady, SESSION_RESULT_CONSUMER};
 pub use planner::{PlannedToolOperation, ToolOperationPlanError, ToolOperationPlanner};
 pub use recovery::{
     AuthorizationObservation, DispatchObservation, JournalIntegrityObservation,

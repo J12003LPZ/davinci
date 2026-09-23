@@ -405,6 +405,7 @@ pub struct Agent {
     pub tool_ledger: Arc<std::sync::Mutex<ToolCallLedger>>,
     pub(crate) pending_tool_operations:
         Arc<Mutex<std::collections::HashMap<String, PendingToolOperation>>>,
+    pub(crate) operation_presentations: Arc<Mutex<std::collections::HashMap<String, ToolResult>>>,
     /// Tool-call ids whose results are pruned from the provider view. Only
     /// grows; the session file keeps every body.
     pruned_tool_results: std::collections::HashSet<String>,
@@ -530,6 +531,7 @@ impl Agent {
             evidence: None,
             tool_ledger: Arc::new(std::sync::Mutex::new(ToolCallLedger::default())),
             pending_tool_operations: Arc::new(Mutex::new(std::collections::HashMap::new())),
+            operation_presentations: Arc::new(Mutex::new(std::collections::HashMap::new())),
             pruned_tool_results: std::collections::HashSet::new(),
             pruned_evidence: std::collections::HashMap::new(),
             base_system_prompt: system_prompt,
@@ -1835,6 +1837,28 @@ impl Agent {
             Some(error) => Err(format!("Session recovery required: {error}")),
             None => Ok(()),
         }
+    }
+
+    pub(crate) fn cache_operation_presentation(&self, call_id: &str, result: ToolResult) {
+        self.operation_presentations
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .insert(call_id.to_owned(), result);
+    }
+
+    pub(crate) fn operation_presentation(&self, call_id: &str) -> Option<ToolResult> {
+        self.operation_presentations
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .get(call_id)
+            .cloned()
+    }
+
+    pub(crate) fn clear_operation_presentation(&self, call_id: &str) {
+        self.operation_presentations
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .remove(call_id);
     }
 
     fn persist_full_message(&mut self, message: &ChatMessage) {

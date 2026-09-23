@@ -5,6 +5,7 @@ use std::collections::{HashMap, HashSet};
 use serde_json::Value;
 use uuid::Uuid;
 
+use crate::types::{operation_entry_matches, prepare_operation_entry};
 use crate::{now_ms, LaneRecord, SessionEntry, SessionError};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -250,6 +251,23 @@ impl SessionState {
             .ok_or_else(|| SessionError::invalid_lane(format!("Lane not found: {lane}")))
     }
 
+    fn entry_is_on_lane_lineage(&self, lane: &str, entry_id: &str) -> Result<bool, SessionError> {
+        let mut current = self.require_lane(lane)?;
+        let mut seen = HashSet::new();
+        while let Some(id) = current {
+            if id == entry_id {
+                return Ok(true);
+            }
+            if !seen.insert(id.clone()) {
+                return Ok(false);
+            }
+            current = self
+                .get_entry(&id)
+                .and_then(|entry| entry.parent_id.clone());
+        }
+        Ok(false)
+    }
+
     pub fn validate_new_lane(&self, lane: &str) -> Result<(), SessionError> {
         if self.lanes.contains_key(lane) {
             return Err(SessionError::already_exists(format!(
@@ -296,6 +314,33 @@ impl SessionState {
         }
         self.validate_unused_id(&entry.id)?;
         self.apply_entry_mutation(lane, entry)
+    }
+
+    pub fn append_entry_once(
+        &mut self,
+        lane: &str,
+        event_id: &str,
+        expected_parent_id: Option<&str>,
+        mut entry: SessionEntry,
+    ) -> Result<SessionEntry, SessionError> {
+        prepare_operation_entry(event_id, &mut entry)?;
+        if let Some(existing) = self.get_entry(event_id) {
+            if operation_entry_matches(existing, &entry)
+                && self.entry_is_on_lane_lineage(lane, event_id)?
+            {
+                return Ok(existing.clone());
+            }
+            return Err(SessionError::invalid_entry(format!(
+                "Operation event {event_id} is outside the current lineage or has a different payload"
+            )));
+        }
+        if self.require_lane(lane)?.as_deref() != expected_parent_id {
+            return Err(SessionError::invalid_entry(format!(
+                "Operation event {event_id} session lineage changed before append"
+            )));
+        }
+        entry.parent_id = expected_parent_id.map(str::to_owned);
+        self.apply_entry(Some(lane), entry)
     }
 
     fn apply_entry_mutation(
@@ -937,6 +982,17 @@ impl Session {
         self.state.apply_entry(Some(lane), entry)
     }
 
+    pub fn append_entry_once(
+        &mut self,
+        event_id: &str,
+        expected_parent_id: Option<&str>,
+        entry: SessionEntry,
+        lane: &str,
+    ) -> Result<SessionEntry, SessionError> {
+        self.state
+            .append_entry_once(lane, event_id, expected_parent_id, entry)
+    }
+
     pub fn append_record(&mut self, record: LaneRecord) -> Result<LaneRecord, SessionError> {
         self.state.apply_record(record)
     }
@@ -1293,6 +1349,34 @@ mod tests {
                 },
             ]
         );
+    }
+
+    #[test]
+    fn operation_projection_duplicate_must_be_on_the_current_lane_lineage() {
+        let mut session = Session::new("session");
+        let root = session
+            .append_entry(user_message_entry("root", "root"), "main")
+            .unwrap();
+        let mut event = SessionEntry::message("toolResult", serde_json::json!({"text": "done"}));
+        event.extra.insert(
+            "operationEventId".into(),
+            Value::String("operation-event".into()),
+        );
+        session
+            .append_entry_once("operation-event", Some(&root.id), event.clone(), "main")
+            .unwrap();
+        session
+            .append_entry(user_message_entry("after", "after"), "main")
+            .unwrap();
+
+        assert!(session
+            .append_entry_once("operation-event", Some("root"), event.clone(), "main")
+            .is_ok());
+
+        session.create_lane("other", Some(&root.id)).unwrap();
+        assert!(session
+            .append_entry_once("operation-event", Some("root"), event, "other")
+            .is_err());
     }
 
     #[test]

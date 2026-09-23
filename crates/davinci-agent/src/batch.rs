@@ -209,13 +209,28 @@ impl Agent {
                         }
                     };
                     let pre_hook_error = pre_hook_result.is_error;
+                    let operation_result_committed = pre_hook_result
+                        .details
+                        .as_ref()
+                        .and_then(|details| details.get("_operation_result_committed"))
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false);
+                    let mut result = pre_hook_result.clone();
+                    if let Some(Value::Object(details)) = result.details.as_mut() {
+                        details.remove("_operation_result_committed");
+                    }
                     let replayed = pre_hook_result
                         .details
                         .as_ref()
                         .and_then(|details| details.get("replayed_from_ledger"))
                         .and_then(Value::as_bool)
-                        .unwrap_or(false);
-                    let mut result = pre_hook_result.clone();
+                        .unwrap_or(false)
+                        || pre_hook_result
+                            .details
+                            .as_ref()
+                            .and_then(|details| details.get("replayed_from_operation_journal"))
+                            .and_then(Value::as_bool)
+                            .unwrap_or(false);
                     if let Some(hook) = &agent.post_tool {
                         result = (hook.0)(&op_id, cwd, &tool, &args, result);
                     }
@@ -253,6 +268,9 @@ impl Agent {
                         &result,
                         hook_vetoed,
                     );
+                    if operation_result_committed {
+                        agent.cache_operation_presentation(&op_id, result.clone());
+                    }
                     result
                 }),
             });

@@ -524,6 +524,18 @@ impl JsonlStoredSession {
         self.commit_change(|session| session.append_entry(entry, lane))
     }
 
+    pub fn append_entry_once(
+        &mut self,
+        event_id: &str,
+        expected_parent_id: Option<&str>,
+        entry: SessionEntry,
+        lane: &str,
+    ) -> Result<SessionEntry, SessionError> {
+        self.commit_change(|session| {
+            session.append_entry_once(event_id, expected_parent_id, entry, lane)
+        })
+    }
+
     pub fn append_custom_entry(
         &mut self,
         custom_type: &str,

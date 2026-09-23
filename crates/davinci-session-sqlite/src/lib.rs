@@ -29,6 +29,90 @@ pub struct SqliteSessionStore {
     conn: Connection,
 }
 
+fn prepare_operation_entry(event_id: &str, entry: &mut SessionEntry) -> Result<(), SessionError> {
+    if event_id.trim().is_empty() {
+        return Err(SessionError::invalid_entry(
+            "Operation event ID must not be empty",
+        ));
+    }
+    if !entry.id.is_empty() && entry.id != event_id {
+        return Err(SessionError::invalid_entry(format!(
+            "Operation event ID {event_id} does not match entry ID {}",
+            entry.id
+        )));
+    }
+    if let Some(existing) = entry.extra.get("operationEventId") {
+        if existing.as_str() != Some(event_id) {
+            return Err(SessionError::invalid_entry(
+                "Entry is already tagged with a different operation event ID",
+            ));
+        }
+    } else {
+        entry.extra.insert(
+            "operationEventId".into(),
+            Value::String(event_id.to_owned()),
+        );
+    }
+    entry.id = event_id.to_owned();
+    Ok(())
+}
+
+fn operation_entry_matches(existing: &SessionEntry, expected: &SessionEntry) -> bool {
+    existing.entry_type == expected.entry_type
+        && existing.message == expected.message
+        && existing.custom_type == expected.custom_type
+        && existing.extra == expected.extra
+}
+
+fn operation_entry_on_main_lineage(
+    conn: &Connection,
+    session_id: &str,
+    event_id: &str,
+) -> Result<bool, SessionError> {
+    let lane_leaf: Option<Option<String>> = conn
+        .query_row(
+            "SELECT leaf_id FROM lanes WHERE session_id = ?1 AND lane = 'main'",
+            [session_id],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|err| SessionError::storage(format!("Unable to read session lane: {err}")))?;
+    let mut current = match lane_leaf {
+        Some(leaf) => leaf,
+        None => conn
+            .query_row(
+                "SELECT id FROM entries WHERE session_id = ?1 ORDER BY seq DESC LIMIT 1",
+                [session_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|err| {
+                SessionError::storage(format!("Unable to read session lineage: {err}"))
+            })?,
+    };
+    let mut seen = std::collections::HashSet::new();
+    while let Some(id) = current {
+        if id == event_id {
+            return Ok(true);
+        }
+        if !seen.insert(id.clone()) {
+            return Ok(false);
+        }
+        current = conn
+            .query_row(
+                "SELECT parent_id FROM entries WHERE session_id = ?1 AND id = ?2",
+                params![session_id, id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|err| {
+                SessionError::storage(format!("Unable to read session ancestry: {err}"))
+            })?
+            .flatten();
+    }
+    Ok(false)
+}
+
 impl SqliteSessionStore {
     pub fn open(path: &Path) -> Result<Self, SessionError> {
         if let Some(parent) = path.parent() {
@@ -155,6 +239,168 @@ impl SqliteSessionStore {
                 entry.custom_type.as_deref(),
                 entry.parent_id.as_deref(),
             )
+        })
+    }
+
+    /// Append a main-lane operation projection once, rejecting stale lineage
+    /// and event-ID reuse with different content.
+    pub fn append_entry_once(
+        &self,
+        session_id: &str,
+        event_id: &str,
+        expected_parent_id: Option<&str>,
+        mut entry: SessionEntry,
+    ) -> Result<SessionEntry, SessionError> {
+        prepare_operation_entry(event_id, &mut entry)?;
+        transaction::atomic(&self.conn, || {
+            let existing: Option<String> = self
+                .conn
+                .query_row(
+                    "SELECT payload FROM entries WHERE session_id = ?1 AND id = ?2",
+                    params![session_id, event_id],
+                    |row| row.get(0),
+                )
+                .optional()
+                .map_err(|err| {
+                    SessionError::storage(format!("Unable to read operation entry: {err}"))
+                })?;
+            if let Some(payload) = existing {
+                let existing: SessionEntry = serde_json::from_str(&payload).map_err(|err| {
+                    SessionError::storage(format!("Unable to decode operation entry: {err}"))
+                })?;
+                if operation_entry_matches(&existing, &entry)
+                    && operation_entry_on_main_lineage(&self.conn, session_id, event_id)?
+                {
+                    return Ok(existing);
+                }
+                return Err(SessionError::invalid_entry(format!(
+                    "Operation event {event_id} is outside the current lineage or has a different payload"
+                )));
+            }
+
+            let session_exists: bool = self
+                .conn
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM sessions WHERE id = ?1)",
+                    [session_id],
+                    |row| row.get(0),
+                )
+                .map_err(|err| SessionError::storage(format!("Unable to read session: {err}")))?;
+            if !session_exists {
+                return Err(SessionError::not_found(format!(
+                    "Session not found: {session_id}"
+                )));
+            }
+
+            let lane_leaf: Option<Option<String>> = self
+                .conn
+                .query_row(
+                    "SELECT leaf_id FROM lanes WHERE session_id = ?1 AND lane = 'main'",
+                    [session_id],
+                    |row| row.get(0),
+                )
+                .optional()
+                .map_err(|err| {
+                    SessionError::storage(format!("Unable to read session lane: {err}"))
+                })?;
+            let current_parent = match lane_leaf {
+                Some(leaf) => leaf,
+                None => self
+                    .conn
+                    .query_row(
+                        "SELECT id FROM entries WHERE session_id = ?1 ORDER BY seq DESC LIMIT 1",
+                        [session_id],
+                        |row| row.get(0),
+                    )
+                    .optional()
+                    .map_err(|err| {
+                        SessionError::storage(format!("Unable to read session lineage: {err}"))
+                    })?,
+            };
+            if current_parent.as_deref() != expected_parent_id {
+                return Err(SessionError::invalid_entry(format!(
+                    "Operation event {event_id} session lineage changed before append"
+                )));
+            }
+
+            let next_seq: Option<i64> = self
+                .conn
+                .query_row(
+                    "SELECT next_seq FROM session_sequences WHERE session_id = ?1",
+                    [session_id],
+                    |row| row.get(0),
+                )
+                .optional()
+                .map_err(|err| {
+                    SessionError::storage(format!("Unable to read session sequence: {err}"))
+                })?;
+            let seq = match next_seq {
+                Some(seq) => seq,
+                None => self
+                    .conn
+                    .query_row(
+                        "SELECT COALESCE(MAX(seq), 0) + 1 FROM entries WHERE session_id = ?1",
+                        [session_id],
+                        |row| row.get(0),
+                    )
+                    .map_err(|err| {
+                        SessionError::storage(format!("Unable to derive session sequence: {err}"))
+                    })?,
+            };
+            entry.seq = u64::try_from(seq)
+                .map_err(|_| SessionError::storage("Invalid session sequence"))?;
+            if entry.timestamp == 0 {
+                entry.timestamp = now_ms();
+            }
+            entry.parent_id = expected_parent_id.map(str::to_owned);
+            let payload = serde_json::to_string(&entry)
+                .map_err(|err| SessionError::storage(format!("Unable to encode entry: {err}")))?;
+            self.conn
+                .execute(
+                    "INSERT INTO entries (session_id, seq, id, parent_id, type, timestamp, payload)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                    params![
+                        session_id,
+                        seq,
+                        entry.id,
+                        entry.parent_id,
+                        entry.entry_type,
+                        entry.timestamp as i64,
+                        payload
+                    ],
+                )
+                .map_err(|err| {
+                    SessionError::storage(format!("Unable to insert operation entry: {err}"))
+                })?;
+            append_entry_to_branch_cache(
+                &self.conn,
+                session_id,
+                &entry.id,
+                seq,
+                &entry.entry_type,
+                entry.custom_type.as_deref(),
+                entry.parent_id.as_deref(),
+            )?;
+            self.conn
+                .execute(
+                    "INSERT INTO lanes (session_id, lane, leaf_id, open_operation_id)
+                     VALUES (?1, 'main', ?2, NULL)
+                     ON CONFLICT(session_id, lane) DO UPDATE SET leaf_id = excluded.leaf_id",
+                    params![session_id, event_id],
+                )
+                .map_err(|err| {
+                    SessionError::storage(format!("Unable to update session lineage: {err}"))
+                })?;
+            self.conn
+                .execute(
+                    "INSERT INTO session_sequences (session_id, next_seq) VALUES (?1, ?2)
+                     ON CONFLICT(session_id) DO UPDATE SET next_seq = excluded.next_seq",
+                    params![session_id, seq + 1],
+                )
+                .map_err(|err| {
+                    SessionError::storage(format!("Unable to update session sequence: {err}"))
+                })?;
+            Ok(entry)
         })
     }
 

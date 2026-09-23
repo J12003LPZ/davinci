@@ -45,6 +45,7 @@ use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use crate::types::{operation_entry_matches, prepare_operation_entry};
 use uuid::Uuid;
 
 pub fn now_ms() -> u64 {
@@ -213,6 +214,57 @@ impl JsonlSession {
         self.leaf_id = Some(entry.id.clone());
         self.entries.push(entry);
         Ok(())
+    }
+
+    /// Append an operation projection once. The stable event ID is also the
+    /// session entry ID, so a retry after a crash can find the durable append.
+    /// Existing IDs must carry the same payload; a different payload is an
+    /// integrity error rather than a successful duplicate.
+    pub fn append_entry_once(
+        &mut self,
+        event_id: &str,
+        expected_parent_id: Option<&str>,
+        mut entry: SessionEntry,
+    ) -> Result<SessionEntry, SessionError> {
+        prepare_operation_entry(event_id, &mut entry)?;
+        if let Some(existing) = self.entries.iter().find(|existing| existing.id == event_id) {
+            if operation_entry_matches(existing, &entry)
+                && self.entry_is_on_current_lineage(event_id)
+            {
+                return Ok(existing.clone());
+            }
+            return Err(SessionError::invalid_entry(format!(
+                "Operation event {event_id} is outside the current lineage or has a different payload"
+            )));
+        }
+        if self.leaf_id.as_deref() != expected_parent_id {
+            return Err(SessionError::invalid_entry(format!(
+                "Operation event {event_id} session lineage changed before append"
+            )));
+        }
+        entry.parent_id = expected_parent_id.map(str::to_owned);
+        self.append_entry(entry.clone())?;
+        Ok(self.entries.last().cloned().unwrap_or(entry))
+    }
+
+    fn entry_is_on_current_lineage(&self, event_id: &str) -> bool {
+        let by_id: std::collections::HashMap<_, _> = self
+            .entries
+            .iter()
+            .map(|entry| (entry.id.as_str(), entry.parent_id.as_deref()))
+            .collect();
+        let mut current = self.leaf_id.as_deref();
+        let mut seen = std::collections::HashSet::new();
+        while let Some(id) = current {
+            if id == event_id {
+                return true;
+            }
+            if !seen.insert(id) {
+                return false;
+            }
+            current = by_id.get(id).copied().flatten();
+        }
+        false
     }
 
     pub fn set_leaf(&mut self, leaf_id: Option<String>) {

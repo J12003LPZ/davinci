@@ -86,6 +86,7 @@ impl Agent {
         T: Into<crate::CompleteOutput>,
     {
         self.ensure_session_persistence()?;
+        self.recover_pending_operation_publications()?;
         let result = self.run_loop_body(emit_prompt_messages, complete);
         if let Err(error) = self.ensure_session_persistence() {
             self.is_streaming = false;
@@ -170,7 +171,7 @@ impl Agent {
             }
 
             self.inject_queued(&mut events, &mut new_messages, true);
-            self.inject_job_notices(&mut events, &mut new_messages);
+            self.inject_job_notices(&mut events, &mut new_messages)?;
 
             let active_context_vm = self.context_vm_mode() == crate::runtime::ContextVmMode::Active;
             // The legacy path prunes tool output before deciding whether to
@@ -453,8 +454,7 @@ impl Agent {
                             },
                         );
                         self.messages.push(result.clone());
-                        self.persist_chat(&result);
-                        self.ensure_session_persistence()?;
+                        self.persist_chat(&result)?;
                         new_messages.push(result.clone());
                         self.push_event(
                             &mut events,
@@ -477,8 +477,7 @@ impl Agent {
                         let name = result.tool_name.clone().unwrap_or_default();
                         self.after_tool(&name, &mut result);
                         self.messages.push(result.clone());
-                        self.persist_chat(&result);
-                        self.ensure_session_persistence()?;
+                        self.persist_chat(&result)?;
                         new_messages.push(result.clone());
                         self.push_event(
                             &mut events,
@@ -580,10 +579,10 @@ impl Agent {
         &mut self,
         events: &mut Vec<AgentEvent>,
         new_messages: &mut Vec<ChatMessage>,
-    ) {
+    ) -> Result<(), String> {
         for notice in self.job_notice_messages() {
             self.messages.push(notice.clone());
-            self.persist_chat(&notice);
+            self.persist_chat(&notice)?;
             new_messages.push(notice.clone());
             self.push_event(
                 events,
@@ -593,6 +592,7 @@ impl Agent {
             );
             self.push_event(events, AgentEvent::MessageEnd { message: notice });
         }
+        Ok(())
     }
 
     /// What a finished tool owes the session beyond its result: the `todo`
@@ -2074,19 +2074,27 @@ impl Agent {
                 },
             };
             if dispatch_succeeded {
-                if let Err(error) = pending
-                    .runtime
-                    .dispatcher()
-                    .complete(&pending.admitted, &result)
-                {
+                if let Err(error) = pending.runtime.dispatcher().complete_for_session(
+                    &pending.admitted,
+                    &result,
+                    self.session.is_some(),
+                ) {
                     let details = result.details.get_or_insert_with(|| serde_json::json!({}));
                     if !details.is_object() {
                         *details = serde_json::json!({});
                     }
+                    result.is_error = true;
+                    result.content = "Tool effect may have occurred, but its complete result could not be durably recorded. Conversation continuation is blocked pending recovery.".into();
                     details["operation_persistence"] = Value::Bool(true);
                     details["ledger_persistence"] = Value::Bool(true);
                     details["operation_result_persistence_error"] =
                         Value::String(error.to_string());
+                } else if self.session.is_some() {
+                    let details = result.details.get_or_insert_with(|| serde_json::json!({}));
+                    if !details.is_object() {
+                        *details = serde_json::json!({});
+                    }
+                    details["_operation_result_committed"] = Value::Bool(true);
                 }
             }
             result
@@ -2177,6 +2185,7 @@ impl Agent {
         });
         let storage_failure = [
             "plan_storage_error",
+            "operation_persistence",
             "ledger_persistence",
             "ledger_wait_error",
             "replay_blocked",
@@ -2191,12 +2200,27 @@ impl Agent {
                 .and_then(Value::as_bool)
                 == Some(true)
         });
+        let operation_result_committed = result
+            .details
+            .as_ref()
+            .and_then(|details| details.get("_operation_result_committed"))
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        if let Some(Value::Object(details)) = result.details.as_mut() {
+            details.remove("_operation_result_committed");
+        }
         let replayed = result
             .details
             .as_ref()
             .and_then(|details| details.get("replayed_from_ledger"))
             .and_then(Value::as_bool)
-            .unwrap_or(false);
+            .unwrap_or(false)
+            || result
+                .details
+                .as_ref()
+                .and_then(|details| details.get("replayed_from_operation_journal"))
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
         let pre_hook_error = result.is_error;
         let pre_hook_result = result.clone();
         if !storage_failure {
@@ -2253,6 +2277,9 @@ impl Agent {
                     );
                 }
             }
+        }
+        if operation_result_committed {
+            self.cache_operation_presentation(id, result.clone());
         }
         self.emit_tool_result(id, name, args, result)
     }
@@ -2893,8 +2920,499 @@ impl Agent {
             })
     }
 
-    fn persist_chat(&mut self, message: &ChatMessage) {
+    fn operation_journal(
+        &self,
+    ) -> Option<std::sync::Arc<crate::runtime::operations::OperationJournal>> {
+        self.runtime
+            .as_ref()?
+            .operations
+            .as_ref()
+            .map(|runtime| runtime.dispatcher().journal().clone())
+    }
+
+    fn decode_operation_outbox(
+        outbox: &crate::runtime::operations::StoredOutbox,
+    ) -> Result<crate::runtime::operations::OperationResultReady, String> {
+        use crate::runtime::operations::{OperationResultReady, SESSION_RESULT_CONSUMER};
+        if outbox.consumer != SESSION_RESULT_CONSUMER {
+            return Err(format!(
+                "unexpected operation outbox consumer: {}",
+                outbox.consumer
+            ));
+        }
+        let ready: OperationResultReady = serde_json::from_value(outbox.payload.clone())
+            .map_err(|error| format!("operation result outbox is corrupt: {error}"))?;
+        if ready.version != 1
+            || ready.event_id != OperationResultReady::event_id(outbox.attempt_id)
+            || ready.attempt_id != outbox.attempt_id
+            || ready.operation_id != outbox.operation_id
+        {
+            return Err(format!(
+                "operation result outbox {} has inconsistent identity",
+                outbox.id
+            ));
+        }
+        Ok(ready)
+    }
+
+    fn validate_existing_operation_projection(
+        session: &davinci_session::JsonlSession,
+        entry: &davinci_session::SessionEntry,
+        ready: &crate::runtime::operations::OperationResultReady,
+    ) -> Result<(), String> {
+        let same = |key: &str, expected: &str| {
+            entry.extra.get(key).and_then(Value::as_str) == Some(expected)
+        };
+        if !same("operationEventId", &ready.event_id)
+            || !same("operationId", &ready.operation_id.to_string())
+            || !same("attemptId", &ready.attempt_id.to_string())
+            || !same("rawResultDigest", &ready.result_digest.to_string())
+            || !same("toolCallId", &ready.tool_call_id)
+            || !Self::session_entry_on_current_lineage(session, &ready.event_id)
+        {
+            return Err(format!(
+                "operation result projection {} has corrupt identity or lineage",
+                ready.event_id
+            ));
+        }
+        let message = entry.message.as_ref().ok_or_else(|| {
+            format!(
+                "operation result projection {} has no message",
+                ready.event_id
+            )
+        })?;
+        let digest = crate::runtime::operations::PayloadDigest::of_json(message)
+            .map_err(|error| format!("operation presentation digest failed: {error}"))?;
+        if !same("presentationDigest", &digest.to_string()) {
+            return Err(format!(
+                "operation result projection {} has a corrupt presentation digest",
+                ready.event_id
+            ));
+        }
+        Ok(())
+    }
+
+    fn session_entry_on_current_lineage(
+        session: &davinci_session::JsonlSession,
+        event_id: &str,
+    ) -> bool {
+        let by_id: std::collections::HashMap<_, _> = session
+            .entries
+            .iter()
+            .map(|entry| (entry.id.as_str(), entry.parent_id.as_deref()))
+            .collect();
+        let mut current = session.leaf_id.as_deref();
+        let mut seen = std::collections::HashSet::new();
+        while let Some(id) = current {
+            if id == event_id {
+                return true;
+            }
+            if !seen.insert(id) {
+                return false;
+            }
+            current = by_id.get(id).copied().flatten();
+        }
+        false
+    }
+
+    fn project_operation_result(
+        &mut self,
+        ready: &crate::runtime::operations::OperationResultReady,
+        outbox: Option<&crate::runtime::operations::StoredOutbox>,
+        current_message: Option<&ChatMessage>,
+        cached_presentation: Option<crate::ToolResult>,
+        journal: &crate::runtime::operations::OperationJournal,
+    ) -> Result<Option<ChatMessage>, String> {
+        use crate::runtime::operations::{CallerType, PayloadDigest, Timestamp};
+        let session = self
+            .session
+            .as_ref()
+            .ok_or_else(|| "operation result publication has no active session".to_owned())?;
+        if ready.session_id != session.header.id {
+            return Err(format!(
+                "operation result {} belongs to a different session; publication is blocked",
+                ready.event_id
+            ));
+        }
+        let spec = journal
+            .load_spec(ready.operation_id)
+            .map_err(|error| format!("operation specification is unavailable: {error}"))?;
+        if spec.context().session_id != ready.session_id
+            || spec.context().wire_tool_call_id.as_deref() != Some(&ready.tool_call_id)
+            || spec.context().parent_operation_id != ready.parent_operation_id
+            || spec.context().caller != ready.caller
+        {
+            return Err(format!(
+                "operation result {} does not match its durable operation lineage",
+                ready.event_id
+            ));
+        }
+        let stored = journal
+            .load_result_for_attempt(ready.attempt_id)
+            .map_err(|error| format!("durable operation result is corrupt: {error}"))?
+            .ok_or_else(|| {
+                format!(
+                    "operation result publication blocked: result artifact for {} is missing",
+                    ready.event_id
+                )
+            })?;
+        if stored.reference.payload_digest != ready.result_digest {
+            return Err(format!(
+                "operation result publication blocked: result digest does not match {}",
+                ready.event_id
+            ));
+        }
+        let mut raw: crate::ToolResult = serde_json::from_value(stored.payload.clone())
+            .map_err(|error| format!("durable ToolResult is corrupt: {error}"))?;
+        let tool_name = spec
+            .payload()
+            .get("tool")
+            .and_then(Value::as_str)
+            .ok_or_else(|| "durable operation has no tool name".to_owned())?;
+
+        if let Some(existing) = self.session.as_ref().and_then(|session| {
+            session
+                .entries
+                .iter()
+                .find(|entry| entry.id == ready.event_id)
+        }) {
+            Self::validate_existing_operation_projection(
+                self.session.as_ref().expect("session was checked"),
+                existing,
+                ready,
+            )?;
+            if let Some(outbox) = outbox {
+                journal
+                    .acknowledge_outbox(
+                        outbox.id,
+                        Timestamp::from_unix_millis(davinci_session::now_ms()),
+                    )
+                    .map_err(|error| format!("operation result acknowledgement failed: {error}"))?;
+            }
+            self.clear_operation_presentation(&ready.tool_call_id);
+            return Ok(None);
+        }
+
+        let is_batch_child = ready.caller == CallerType::BatchToolCall;
+        let presentation = if is_batch_child {
+            if let Some(presentation) = cached_presentation {
+                presentation
+            } else {
+                let details = raw.details.get_or_insert_with(|| serde_json::json!({}));
+                if !details.is_object() {
+                    *details = serde_json::json!({});
+                }
+                details["operation_recovered_from_raw"] = Value::Bool(true);
+                raw
+            }
+        } else if let Some(message) = current_message {
+            if message.role != "toolResult"
+                || message.tool_call_id.as_deref() != Some(&ready.tool_call_id)
+                || message.tool_name.as_deref() != Some(tool_name)
+            {
+                return Err(format!(
+                    "operation result {} does not match the presented tool message",
+                    ready.event_id
+                ));
+            }
+            let message_value = serde_json::to_value(message)
+                .map_err(|error| format!("tool message could not be encoded: {error}"))?;
+            let presentation_digest = PayloadDigest::of_json(&message_value)
+                .map_err(|error| format!("tool message digest failed: {error}"))?;
+            let mut entry = davinci_session::SessionEntry::message("toolResult", Value::Null);
+            entry.message = Some(message_value);
+            entry.extra.insert(
+                "presentationDigest".into(),
+                Value::String(presentation_digest.to_string()),
+            );
+            entry.extra.insert(
+                "operationId".into(),
+                Value::String(ready.operation_id.to_string()),
+            );
+            entry.extra.insert(
+                "attemptId".into(),
+                Value::String(ready.attempt_id.to_string()),
+            );
+            entry.extra.insert(
+                "rawResultDigest".into(),
+                Value::String(ready.result_digest.to_string()),
+            );
+            entry.extra.insert(
+                "toolCallId".into(),
+                Value::String(ready.tool_call_id.clone()),
+            );
+            let expected_parent = self
+                .session
+                .as_ref()
+                .and_then(|session| session.leaf_id.clone());
+            let appended = self
+                .session
+                .as_mut()
+                .expect("session was checked")
+                .append_entry_once(&ready.event_id, expected_parent.as_deref(), entry)
+                .map_err(|error| format!("operation result session append failed: {error}"))?;
+            Self::validate_existing_operation_projection(
+                self.session.as_ref().expect("session was checked"),
+                &appended,
+                ready,
+            )?;
+            if let Some(outbox) = outbox {
+                journal
+                    .acknowledge_outbox(
+                        outbox.id,
+                        Timestamp::from_unix_millis(davinci_session::now_ms()),
+                    )
+                    .map_err(|error| format!("operation result acknowledgement failed: {error}"))?;
+            }
+            self.clear_operation_presentation(&ready.tool_call_id);
+            return Ok(None);
+        } else {
+            let details = raw.details.get_or_insert_with(|| serde_json::json!({}));
+            if !details.is_object() {
+                *details = serde_json::json!({});
+            }
+            details["operation_recovered_from_raw"] = Value::Bool(true);
+            raw
+        };
+
+        let recovered_message = (!is_batch_child && current_message.is_none()).then(|| {
+            tool_result_message(
+                &ready.tool_call_id,
+                tool_name,
+                presentation.clone(),
+                self.auto_resize_images,
+            )
+        });
+        let presentation_value = match &recovered_message {
+            Some(message) => serde_json::to_value(message),
+            None => serde_json::to_value(&presentation),
+        }
+        .map_err(|error| format!("operation presentation could not be encoded: {error}"))?;
+        let presentation_digest = PayloadDigest::of_json(&presentation_value)
+            .map_err(|error| format!("operation presentation digest failed: {error}"))?;
+        let mut entry = davinci_session::SessionEntry::message(
+            if is_batch_child {
+                "operation_result"
+            } else {
+                "toolResult"
+            },
+            Value::Null,
+        );
+        entry.message = Some(presentation_value.clone());
+        if is_batch_child {
+            entry.entry_type = "custom".into();
+            entry.custom_type = Some("operation_result".into());
+        }
+        entry.extra.insert(
+            "presentationDigest".into(),
+            Value::String(presentation_digest.to_string()),
+        );
+        entry.extra.insert(
+            "operationId".into(),
+            Value::String(ready.operation_id.to_string()),
+        );
+        entry.extra.insert(
+            "attemptId".into(),
+            Value::String(ready.attempt_id.to_string()),
+        );
+        entry.extra.insert(
+            "rawResultDigest".into(),
+            Value::String(ready.result_digest.to_string()),
+        );
+        entry.extra.insert(
+            "toolCallId".into(),
+            Value::String(ready.tool_call_id.clone()),
+        );
+        let expected_parent = self
+            .session
+            .as_ref()
+            .and_then(|session| session.leaf_id.clone());
+        let appended = self
+            .session
+            .as_mut()
+            .expect("session was checked")
+            .append_entry_once(&ready.event_id, expected_parent.as_deref(), entry)
+            .map_err(|error| format!("operation result session append failed: {error}"))?;
+        Self::validate_existing_operation_projection(
+            self.session.as_ref().expect("session was checked"),
+            &appended,
+            ready,
+        )?;
+        if let Some(outbox) = outbox {
+            journal
+                .acknowledge_outbox(
+                    outbox.id,
+                    Timestamp::from_unix_millis(davinci_session::now_ms()),
+                )
+                .map_err(|error| format!("operation result acknowledgement failed: {error}"))?;
+        }
+        self.clear_operation_presentation(&ready.tool_call_id);
+
+        if let Some(message) = recovered_message {
+            return Ok(Some(message));
+        }
+        Ok(None)
+    }
+
+    fn persist_operation_chat_result(&mut self, message: &ChatMessage) -> Result<bool, String> {
+        use crate::runtime::operations::{
+            OperationResultReady, MAX_OUTBOX_BATCH_SIZE, SESSION_RESULT_CONSUMER,
+        };
+        let Some(journal) = self.operation_journal() else {
+            return Ok(false);
+        };
+        let session_id = self
+            .session
+            .as_ref()
+            .map(|session| session.header.id.clone())
+            .ok_or_else(|| "operation result publication has no active session".to_owned())?;
+        let message_call_id = message.tool_call_id.as_deref();
+        let replay_ready = message
+            .extra
+            .get("details")
+            .and_then(|details| details.get("_operation_publication"))
+            .cloned()
+            .map(|value| {
+                serde_json::from_value::<OperationResultReady>(value)
+                    .map_err(|error| format!("replayed operation publication is corrupt: {error}"))
+            })
+            .transpose()?;
+        let pending = journal
+            .pending_outbox_for_consumer_and_session(
+                SESSION_RESULT_CONSUMER,
+                &session_id,
+                MAX_OUTBOX_BATCH_SIZE,
+            )
+            .map_err(|error| format!("pending operation results could not be read: {error}"))?;
+        let (outbox, ready) = if let Some(ready) = replay_ready {
+            if ready.session_id != session_id
+                || Some(ready.tool_call_id.as_str()) != message_call_id
+            {
+                return Err(
+                    "replayed operation result does not match the active session message".into(),
+                );
+            }
+            (None, ready)
+        } else {
+            let mut matches = pending
+                .iter()
+                .filter_map(|outbox| match Self::decode_operation_outbox(outbox) {
+                    Ok(ready)
+                        if ready.session_id == session_id
+                            && Some(ready.tool_call_id.as_str()) == message_call_id =>
+                    {
+                        Some(Ok((outbox, ready)))
+                    }
+                    Ok(_) => None,
+                    Err(error) => Some(Err(error)),
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            if matches.len() > 1 {
+                return Err("multiple pending operation results match one tool call".into());
+            }
+            match matches.pop() {
+                Some((outbox, ready)) => (Some(outbox.clone()), ready),
+                None => return Ok(false),
+            }
+        };
+
+        if ready.caller == crate::runtime::operations::CallerType::ProviderToolCall
+            && message.tool_name.as_deref() == Some("batch")
+        {
+            let mut children = Vec::new();
+            for candidate in &pending {
+                let child = Self::decode_operation_outbox(candidate)?;
+                if child.session_id == session_id
+                    && child.parent_operation_id == Some(ready.operation_id)
+                    && child.caller == crate::runtime::operations::CallerType::BatchToolCall
+                {
+                    children.push((candidate.clone(), child));
+                }
+            }
+            for (child_outbox, child) in children {
+                let presentation = self.operation_presentation(&child.tool_call_id);
+                self.project_operation_result(
+                    &child,
+                    Some(&child_outbox),
+                    None,
+                    presentation,
+                    &journal,
+                )?;
+            }
+        }
+        self.project_operation_result(&ready, outbox.as_ref(), Some(message), None, &journal)?;
+        Ok(true)
+    }
+
+    fn recover_pending_operation_publications(&mut self) -> Result<(), String> {
+        use crate::runtime::operations::{MAX_OUTBOX_BATCH_SIZE, SESSION_RESULT_CONSUMER};
+        if self.session.is_none() {
+            return Ok(());
+        }
+        let session_id = self
+            .session
+            .as_ref()
+            .map(|session| session.header.id.clone())
+            .expect("session presence was checked");
+        let Some(journal) = self.operation_journal() else {
+            return Ok(());
+        };
+        loop {
+            let pending = journal
+                .pending_outbox_for_consumer_and_session(
+                    SESSION_RESULT_CONSUMER,
+                    &session_id,
+                    MAX_OUTBOX_BATCH_SIZE,
+                )
+                .map_err(|error| format!("pending operation results could not be read: {error}"))?;
+            if pending.is_empty() {
+                return Ok(());
+            }
+            for outbox in pending {
+                let ready = Self::decode_operation_outbox(&outbox)?;
+                let presentation =
+                    if ready.caller == crate::runtime::operations::CallerType::BatchToolCall {
+                        self.operation_presentation(&ready.tool_call_id)
+                    } else {
+                        None
+                    };
+                if let Some(message) = self.project_operation_result(
+                    &ready,
+                    Some(&outbox),
+                    None,
+                    presentation,
+                    &journal,
+                )? {
+                    if !self.messages.iter().any(|existing| {
+                        existing.role == "toolResult"
+                            && existing.tool_call_id.as_deref() == message.tool_call_id.as_deref()
+                    }) {
+                        self.messages.push(message);
+                    }
+                }
+            }
+        }
+    }
+
+    fn persist_chat(&mut self, message: &ChatMessage) -> Result<(), String> {
+        if message.role == "toolResult" {
+            if message
+                .extra
+                .get("details")
+                .and_then(|details| details.get("operation_persistence"))
+                .and_then(Value::as_bool)
+                == Some(true)
+            {
+                return Err(
+                    "Operation result durability failed; provider continuation is blocked.".into(),
+                );
+            }
+            if self.session.is_some() && self.persist_operation_chat_result(message)? {
+                return self.ensure_session_persistence();
+            }
+        }
         self.persist_full_message(message);
+        self.ensure_session_persistence()
     }
 
     fn persist_assistant(
@@ -3055,6 +3573,9 @@ fn tool_result_message(
     let mut extra = serde_json::Map::new();
     if let Some(governor_details) = governor_details {
         extra.insert("tokenGovernor".into(), governor_details);
+    }
+    if let Some(details) = &result.details {
+        extra.insert("details".into(), details.clone());
     }
     ChatMessage {
         role: "toolResult".into(),

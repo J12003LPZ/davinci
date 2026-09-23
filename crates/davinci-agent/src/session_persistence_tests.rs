@@ -85,7 +85,7 @@ fn session_persistence_preserves_tool_result_identity() {
     message
         .extra
         .insert("fixture".into(), serde_json::json!(true));
-    agent.persist_chat(&message);
+    agent.persist_chat(&message).unwrap();
     let reopened = JsonlSession::open(&path).unwrap();
     let messages = crate::messages_from_session(&reopened);
     assert_eq!(messages.len(), 1);
