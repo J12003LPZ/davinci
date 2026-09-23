@@ -669,6 +669,7 @@ impl GraphOperationBinding {
         binding_path(cwd, self)
     }
 
+    #[allow(dead_code)]
     pub fn result_path(&self, cwd: &Path) -> PathBuf {
         result_path(cwd, self)
     }
