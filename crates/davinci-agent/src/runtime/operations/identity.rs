@@ -13,6 +13,12 @@ macro_rules! uuid_identity {
         #[serde(transparent)]
         pub struct $name(Uuid);
 
+        impl Default for $name {
+            fn default() -> Self {
+                Self::new()
+            }
+        }
+
         impl $name {
             pub fn new() -> Self {
                 Self(Uuid::now_v7())
