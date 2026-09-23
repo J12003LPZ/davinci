@@ -1352,12 +1352,13 @@ mod tests {
         };
         assert_eq!(fixture, expected);
         let dir = tempfile::tempdir().unwrap();
-        fs::write(dir.path().join("a.txt"), b"before").unwrap();
+        let workspace = fs::canonicalize(dir.path()).unwrap();
+        fs::write(workspace.join("a.txt"), b"before").unwrap();
         let mut spec = spec();
         spec.task_id = "transaction-writer-1".into();
         spec.role = Role::Writer;
         spec.expect = ArtifactKind::PatchReport;
-        spec.cwd = dir.path().to_path_buf();
+        spec.cwd = workspace.clone();
         spec.transcript_path = Some(dir.path().join("live.log"));
         spec.model = None;
         spec.thinking_level = None;
@@ -1369,9 +1370,9 @@ mod tests {
         let worker_id = davinci_agent::AgentId::new();
         spec.runtime_agent_id = Some(worker_id);
         let run_id = crate::native_extensions::graph::store::new_run_id();
-        crate::native_extensions::graph::store::create_run_dir(dir.path(), &run_id).unwrap();
+        crate::native_extensions::graph::store::create_run_dir(&workspace, &run_id).unwrap();
         spec.artifact_path = crate::native_extensions::graph::store::artifact_path(
-            dir.path(),
+            &workspace,
             &run_id,
             &spec.task_id,
         );
