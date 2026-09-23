@@ -1411,6 +1411,183 @@ impl Agent {
         // and enabled still happens first.
         let mut journal_pending: Option<crate::PendingToolOperation> = None;
         if route == crate::tool_ledger::ToolCallExecutionAuthority::OperationJournal {
+            if !self.tools.iter().any(|tool| tool == name) {
+                return immediate(format!("Unknown tool: {name}"), false);
+            }
+            let Some(operation_runtime) = operation_runtime.clone() else {
+                return immediate("Operation journal runtime is unavailable.".into(), true);
+            };
+            let Some(capability) = self
+                .runtime
+                .as_ref()
+                .and_then(|runtime| runtime.capability_registry.get(name))
+                .filter(|capability| {
+                    matches!(
+                        capability.source,
+                        crate::runtime::CapabilitySource::Builtin
+                            | crate::runtime::CapabilitySource::JsExtension
+                            | crate::runtime::CapabilitySource::NativeExtension
+                            | crate::runtime::CapabilitySource::Mcp
+                    )
+                })
+            else {
+                return immediate(
+                    "Operation denied: registered capability changed during preparation.".into(),
+                    true,
+                );
+            };
+            let contract_digest = self.active_contract().map(|contract| contract.digest);
+            let Some(runtime) = self.runtime.as_ref() else {
+                return immediate("Operation journal runtime is unavailable.".into(), true);
+            };
+            let session_id = runtime.session_id.as_deref();
+            let (run_id, agent_id) = (runtime.run_id, runtime.agent_id);
+            let planned = match origin {
+                crate::ToolOperationOrigin::ProviderCall => operation_runtime.plan_provider_call(
+                    run_id,
+                    agent_id,
+                    session_id,
+                    id,
+                    name,
+                    args,
+                    Some(&capability),
+                    contract_digest.as_deref(),
+                ),
+                crate::ToolOperationOrigin::BatchChild {
+                    parent,
+                    child_index,
+                } => operation_runtime.plan_batch_child(
+                    run_id,
+                    agent_id,
+                    session_id,
+                    parent,
+                    child_index,
+                    name,
+                    args,
+                    Some(&capability),
+                    contract_digest.as_deref(),
+                ),
+            };
+            let plan = match planned {
+                Ok(plan) => plan,
+                Err(error) => {
+                    return immediate(format!("Operation planning failed: {error}"), true)
+                }
+            };
+            let admission = match operation_runtime
+                .dispatcher()
+                .persist_intent(plan.clone())
+            {
+                Ok(admission) => admission,
+                Err(error) => {
+                    return Preparation::Immediate(crate::ToolResult {
+                        content: format!(
+                            "Operation intent could not be persisted before policy evaluation: {error}"
+                        ),
+                        is_error: true,
+                        details: Some(serde_json::json!({ "operation_persistence": true })),
+                    });
+                }
+            };
+            match admission {
+                crate::runtime::operations::OperationAdmission::New(admitted) => {
+                    journal_pending = Some(crate::PendingToolOperation {
+                        runtime: operation_runtime,
+                        plan,
+                        admitted,
+                        origin,
+                    });
+                }
+                crate::runtime::operations::OperationAdmission::ExistingResult(admitted) => {
+                    return match operation_runtime.dispatcher().replay_result(&admitted) {
+                        Ok(result) => Preparation::Immediate(result),
+                        Err(error) => {
+                            immediate(format!("Operation replay blocked: {error}"), false)
+                        }
+                    };
+                }
+                crate::runtime::operations::OperationAdmission::ExistingInFlight(_) => {
+                    return immediate("Operation is already admitted or in flight; automatic redispatch is blocked.".into(), false);
+                }
+                crate::runtime::operations::OperationAdmission::Collision => {
+                    return Preparation::Immediate(crate::ToolResult {
+                        content: "Operation idempotency key collided with different intent.".into(),
+                        is_error: true,
+                        details: Some(serde_json::json!({ "collision": true })),
+                    });
+                }
+            }
+        }
+
+        if let Some(runtime) = &self.runtime {
+            let event = crate::runtime::RuntimeEvent::PreToolUse {
+                call_id: id.to_string(),
+                tool: name.to_string(),
+                args: args.clone(),
+            };
+            if let Err(reason) = runtime.emit_decision(event) {
+                cancel_persisted_intent(journal_pending.as_ref(), &reason);
+                if let Ok(mut ledger) = self.tool_ledger.lock() {
+                    ledger.cancel_reservation(id);
+                }
+                return immediate(reason, false);
+            }
+        }
+        if let Some(reason) = self.pre_tool.as_ref().and_then(|hook| (hook.0)(name, args)) {
+            cancel_persisted_intent(journal_pending.as_ref(), &reason);
+            if let Ok(mut ledger) = self.tool_ledger.lock() {
+                ledger.cancel_reservation(id);
+            }
+            return immediate(reason, false);
+        }
+        if !self.tools.iter().any(|tool| tool == name) {
+            let reason = format!("Unknown tool: {name}");
+            cancel_persisted_intent(journal_pending.as_ref(), &reason);
+            if let Ok(mut ledger) = self.tool_ledger.lock() {
+                ledger.cancel_reservation(id);
+            }
+            return immediate(reason, false);
+        }
+        if let Err(violation) = self.check_contract_gate(cwd, id, name, args) {
+            cancel_persisted_intent(journal_pending.as_ref(), &violation.to_string());
+            if let Ok(mut ledger) = self.tool_ledger.lock() {
+                ledger.record_blocked(id, &violation.to_string());
+            }
+            return Preparation::Immediate(crate::ToolResult {
+                content: violation.to_string(),
+                is_error: true,
+                details: Some(serde_json::json!({
+                    "denied": true,
+                    "scope_violation": violation,
+                })),
+            });
+        }
+        if let Some(reason) = self.capability_effect_denial(cwd, name, args) {
+            cancel_persisted_intent(journal_pending.as_ref(), &reason);
+            if let Ok(mut ledger) = self.tool_ledger.lock() {
+                ledger.record_blocked(id, &reason);
+            }
+            return immediate(reason, true);
+        }
+        if let Some(reason) = self.permission_denial(cwd, id, name, args) {
+            // `denied` marks a call that never ran, for the hosts' rows
+            // and the post-tool hooks, without sniffing the text.
+            cancel_persisted_intent(journal_pending.as_ref(), &reason);
+            if let Ok(mut ledger) = self.tool_ledger.lock() {
+                ledger.record_blocked(id, &reason);
+            }
+            return immediate(reason, true);
+        }
+        let class = self
+            .permissions
+            .lock()
+            .unwrap_or_else(|err| err.into_inner())
+            .class_of(name);
+        // Runtime metadata is authoritative when installed; unknown tools fail
+        // closed inside `lane_for_capability`. Without a runtime, the legacy
+        // class-based resolver still keeps unrecognized extensions serial.
+        let lane = self.lane_for_tool(name, class);
+        if route == crate::tool_ledger::ToolCallExecutionAuthority::OperationJournal {
             let Some(mut pending) = journal_pending else {
                 return immediate(
                     "Operation intent was not durably admitted before authorization.".into(),
