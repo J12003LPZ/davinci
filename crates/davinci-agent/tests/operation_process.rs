@@ -26,7 +26,8 @@ struct Fixture {
 impl Fixture {
     fn new() -> Self {
         let temp = tempfile::tempdir().unwrap();
-        let workspace = temp.path().join("workspace");
+        let temp_root = std::fs::canonicalize(temp.path()).unwrap();
+        let workspace = temp_root.join("workspace");
         std::fs::create_dir_all(&workspace).unwrap();
         let root = RootNamespaceId::new();
         let identity = JournalIdentity::new(
@@ -39,7 +40,7 @@ impl Fixture {
         .unwrap();
         let owner = ExecutionOwner::new(ExecutionOwnerId::new(), 1).unwrap();
         let journal = Arc::new(
-            OperationJournal::open(&temp.path().join("journal"), identity.clone(), root).unwrap(),
+            OperationJournal::open(&temp_root.join("journal"), identity.clone(), root).unwrap(),
         );
         let context = OperationContext {
             journal_id: identity.journal_id,
