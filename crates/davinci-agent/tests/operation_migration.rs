@@ -13,6 +13,7 @@ struct Fixture {
 impl Fixture {
     fn new() -> Self {
         let temp = tempfile::tempdir().unwrap();
+        let temp_root = std::fs::canonicalize(temp.path()).unwrap();
         let identity = JournalIdentity::new(
             JournalId::new(),
             WorkspaceIdentity {
@@ -22,7 +23,7 @@ impl Fixture {
         )
         .unwrap();
         let journal = OperationJournal::open(
-            &temp.path().join("operations"),
+            &temp_root.join("operations"),
             identity,
             RootNamespaceId::new(),
         )
