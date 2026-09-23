@@ -212,3 +212,16 @@ pub struct OperationJournalSnapshot {
     pub results: Vec<StoredResult>,
     pub outbox: Vec<StoredOutbox>,
 }
+
+/// Observable occupancy for callers that need to apply their own bounded
+/// admission or draining policy. Counts are scoped to one journal root and do
+/// not authorize evicting recovery evidence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct JournalCapacity {
+    pub operation_count: u64,
+    pub pending_outbox_count: u64,
+    pub snapshot_record_count: u64,
+    pub max_operations: u64,
+    pub max_pending_outbox: u64,
+    pub max_snapshot_records: u64,
+}

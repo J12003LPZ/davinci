@@ -13,6 +13,7 @@ use super::validate::validate_artifact;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::fs;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -136,6 +137,7 @@ pub fn new_run_id() -> String {
 /// Runs kept when a new one starts; everything is on disk, so the cap only
 /// bounds growth, it is not a history feature.
 const RETAINED_RUNS: usize = 20;
+const MAX_OPERATION_REFERENCE_SCAN_BYTES: u64 = 256 * 1024;
 
 pub fn create_run_dir(cwd: &Path, run_id: &str) -> std::io::Result<()> {
     let root = run_dir(cwd, run_id);
@@ -210,10 +212,77 @@ fn prune_finished_runs(cwd: &Path) {
 
     for run in runs.iter().skip(RETAINED_RUNS) {
         let terminal = matches!(run.phase.as_str(), "done" | "blocked" | "cancelled");
-        let is_pinned = is_run_pinned(cwd, &run.run_id) || pinned_ancestors.contains(&run.run_id);
+        let is_pinned = is_run_pinned(cwd, &run.run_id)
+            || pinned_ancestors.contains(&run.run_id)
+            || run_has_operation_references(cwd, &run.run_id);
         if terminal && !is_pinned && is_safe_run_id(&run.run_id) {
             let _ = fs::remove_dir_all(run_dir(cwd, &run.run_id));
         }
+    }
+}
+
+/// A graph checkpoint can outlive the in-memory projection when an operation
+/// is still unresolved or its result has not been acknowledged.  Retention is
+/// therefore conservative: any persisted operation binding keeps the run
+/// directory until an explicit archive removes the evidence.  An unreadable
+/// candidate is retained too, because pruning through an unknown checkpoint
+/// would turn uncertainty into data loss.
+fn run_has_operation_references(cwd: &Path, run_id: &str) -> bool {
+    let root = run_dir(cwd, run_id);
+    let mut candidates = vec![root.join("state.json")];
+    let artifacts = root.join("artifacts");
+    let entries = match fs::read_dir(&artifacts) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return false,
+        Err(_) => return true,
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path
+            .extension()
+            .is_some_and(|extension| extension == "json")
+        {
+            candidates.push(path);
+        }
+    }
+
+    candidates.into_iter().any(|path| {
+        let mut file = match fs::File::open(&path) {
+            Ok(file) => file,
+            Err(_) => return true,
+        };
+        let mut bytes = Vec::new();
+        let mut bounded = (&mut file).take(MAX_OPERATION_REFERENCE_SCAN_BYTES + 1);
+        if bounded.read_to_end(&mut bytes).is_err()
+            || bytes.len() as u64 > MAX_OPERATION_REFERENCE_SCAN_BYTES
+        {
+            return true;
+        }
+        match serde_json::from_slice::<Value>(&bytes) {
+            Ok(value) => json_contains_operation_reference(&value),
+            Err(_) => true,
+        }
+    })
+}
+
+fn json_contains_operation_reference(value: &Value) -> bool {
+    match value {
+        Value::Array(values) => values.iter().any(json_contains_operation_reference),
+        Value::Object(fields) => fields.iter().any(|(key, value)| {
+            matches!(
+                key.as_str(),
+                "operationBinding"
+                    | "operation_binding"
+                    | "operationReference"
+                    | "operation_reference"
+                    | "launchOperationId"
+                    | "launch_operation_id"
+                    | "launchAttemptId"
+                    | "launch_attempt_id"
+            ) && !value.is_null()
+                || json_contains_operation_reference(value)
+        }),
+        _ => false,
     }
 }
 
@@ -1118,6 +1187,46 @@ mod tests {
         assert!(
             !run_dir(dir.path(), "run-child-001").exists(),
             "unreferenced old run should be pruned"
+        );
+    }
+
+    #[test]
+    fn operation_referenced_terminal_run_is_retained_until_archived() {
+        let dir = tempdir().unwrap();
+        let operation_run_id = "run-operation-000";
+        create_run_dir(dir.path(), operation_run_id).unwrap();
+        let mut operation_run = sample_run(dir.path(), operation_run_id, "operation evidence");
+        operation_run.phase = Phase::Done;
+        operation_run.lifecycle =
+            Some(crate::native_extensions::graph::types::GraphLifecycle::Stopped);
+        save_run(&mut operation_run).unwrap();
+        let operation_attempt = run_dir(dir.path(), operation_run_id)
+            .join("artifacts")
+            .join("research-1.attempt_1.json");
+        fs::write(
+            operation_attempt,
+            br#"{"operationBinding":{"launchOperationId":"op-retain"}}"#,
+        )
+        .unwrap();
+
+        for i in 1..=25 {
+            let id = format!("run-old-{i:03}");
+            create_run_dir(dir.path(), &id).unwrap();
+            let mut run = sample_run(dir.path(), &id, &format!("old run {i}"));
+            run.phase = Phase::Done;
+            run.lifecycle = Some(crate::native_extensions::graph::types::GraphLifecycle::Stopped);
+            save_run(&mut run).unwrap();
+        }
+
+        create_run_dir(dir.path(), "run-latest").unwrap();
+
+        assert!(
+            run_dir(dir.path(), operation_run_id).exists(),
+            "operation-bound graph evidence must not be pruned"
+        );
+        assert!(
+            !run_dir(dir.path(), "run-old-001").exists(),
+            "unreferenced terminal runs remain eligible for pruning"
         );
     }
 

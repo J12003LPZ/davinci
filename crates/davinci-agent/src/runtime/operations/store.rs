@@ -442,6 +442,45 @@ impl OperationJournal {
         })
     }
 
+    /// Return bounded occupancy without materializing journal records. This is
+    /// an observation only: callers must drain or archive through an explicit
+    /// correctness-preserving contract rather than evicting rows at capacity.
+    pub fn capacity(&self) -> Result<JournalCapacity, JournalError> {
+        self.read(|transaction| {
+            let counts: (i64, i64, i64) = transaction
+                .query_row(
+                    "SELECT
+                       (SELECT count(*) FROM operations WHERE root_namespace_id = ?1),
+                       (SELECT count(*) FROM operation_outbox
+                        WHERE root_namespace_id = ?1 AND state = 'pending'),
+                       (SELECT count(*) FROM operations WHERE root_namespace_id = ?1)
+                       + (SELECT count(*) FROM attempts a JOIN operations o USING(operation_id)
+                          WHERE o.root_namespace_id = ?1)
+                       + (SELECT count(*) FROM operation_events WHERE root_namespace_id = ?1)
+                       + (SELECT count(*) FROM operation_results r JOIN operations o USING(operation_id)
+                          WHERE o.root_namespace_id = ?1)
+                       + (SELECT count(*) FROM operation_outbox WHERE root_namespace_id = ?1)",
+                    [self.root_namespace_id.to_string()],
+                    |row| {
+                        Ok((
+                            row.get(0)?,
+                            row.get(1)?,
+                            row.get(2)?,
+                        ))
+                    },
+                )
+                .map_err(sqlite_error)?;
+            Ok(JournalCapacity {
+                operation_count: from_sql_integer(counts.0)?,
+                pending_outbox_count: from_sql_integer(counts.1)?,
+                snapshot_record_count: from_sql_integer(counts.2)?,
+                max_operations: MAX_OPERATIONS_PER_ROOT as u64,
+                max_pending_outbox: MAX_PENDING_OUTBOX as u64,
+                max_snapshot_records: MAX_SNAPSHOT_RECORDS as u64,
+            })
+        })
+    }
+
     pub fn snapshot(&self) -> Result<OperationJournalSnapshot, JournalError> {
         self.read(|transaction| {
             let counts: (i64, i64, i64, i64, i64) = transaction

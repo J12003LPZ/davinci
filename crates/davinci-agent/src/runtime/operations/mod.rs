@@ -72,7 +72,8 @@ pub use recovery::{
 };
 pub use store::OperationJournal;
 pub use store_api::{
-    JournalError, JournalIdentity, OperationJournalSnapshot, OutboxDraft, OutboxState, StoredEvent,
-    StoredOutbox, StoredResult, JOURNAL_DATABASE_FILE_NAME, MAX_OUTBOX_BATCH_SIZE,
+    JournalCapacity, JournalError, JournalIdentity, OperationJournalSnapshot, OutboxDraft,
+    OutboxState, StoredEvent, StoredOutbox, StoredResult, JOURNAL_DATABASE_FILE_NAME,
+    MAX_OUTBOX_BATCH_SIZE,
 };
 pub use transitions::{admit_retry, transition_attempt, OperationEvent, TransitionError};
