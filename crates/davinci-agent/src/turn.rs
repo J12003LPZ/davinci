@@ -1325,6 +1325,17 @@ impl Agent {
                 details: denied.then(|| serde_json::json!({ "denied": true })),
             })
         };
+        fn cancel_persisted_intent(
+            pending: Option<&crate::PendingToolOperation>,
+            reason: &str,
+        ) {
+            if let Some(pending) = pending {
+                let _ = pending
+                    .runtime
+                    .dispatcher()
+                    .cancel_before_start(&pending.admitted, reason);
+            }
+        }
         if depth > 0
             && matches!(
                 name,
@@ -1515,6 +1526,7 @@ impl Agent {
                 args: args.clone(),
             };
             if let Err(reason) = runtime.emit_decision(event) {
+                cancel_persisted_intent(journal_pending.as_ref(), &reason);
                 if let Ok(mut ledger) = self.tool_ledger.lock() {
                     ledger.cancel_reservation(id);
                 }
@@ -1522,18 +1534,22 @@ impl Agent {
             }
         }
         if let Some(reason) = self.pre_tool.as_ref().and_then(|hook| (hook.0)(name, args)) {
+            cancel_persisted_intent(journal_pending.as_ref(), &reason);
             if let Ok(mut ledger) = self.tool_ledger.lock() {
                 ledger.cancel_reservation(id);
             }
             return immediate(reason, false);
         }
         if !self.tools.iter().any(|tool| tool == name) {
+            let reason = format!("Unknown tool: {name}");
+            cancel_persisted_intent(journal_pending.as_ref(), &reason);
             if let Ok(mut ledger) = self.tool_ledger.lock() {
                 ledger.cancel_reservation(id);
             }
-            return immediate(format!("Unknown tool: {name}"), false);
+            return immediate(reason, false);
         }
         if let Err(violation) = self.check_contract_gate(cwd, id, name, args) {
+            cancel_persisted_intent(journal_pending.as_ref(), &violation.to_string());
             if let Ok(mut ledger) = self.tool_ledger.lock() {
                 ledger.record_blocked(id, &violation.to_string());
             }
@@ -1547,6 +1563,7 @@ impl Agent {
             });
         }
         if let Some(reason) = self.capability_effect_denial(cwd, name, args) {
+            cancel_persisted_intent(journal_pending.as_ref(), &reason);
             if let Ok(mut ledger) = self.tool_ledger.lock() {
                 ledger.record_blocked(id, &reason);
             }
@@ -1555,6 +1572,7 @@ impl Agent {
         if let Some(reason) = self.permission_denial(cwd, id, name, args) {
             // `denied` marks a call that never ran, for the hosts' rows
             // and the post-tool hooks, without sniffing the text.
+            cancel_persisted_intent(journal_pending.as_ref(), &reason);
             if let Ok(mut ledger) = self.tool_ledger.lock() {
                 ledger.record_blocked(id, &reason);
             }
