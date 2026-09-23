@@ -224,6 +224,53 @@ fn validate(record: &Record, root: &Path) -> Result<(), String> {
     {
         return Err("invalid transaction provenance".into());
     }
+    let operation_fields = [
+        record.summary.operation_id.is_some(),
+        record.summary.attempt_id.is_some(),
+        record.summary.operation_owner_id.is_some(),
+        record.summary.operation_owner_generation.is_some(),
+        record.summary.operation_workspace_identity.is_some(),
+    ];
+    if operation_fields.iter().any(|present| *present)
+        && operation_fields.iter().any(|present| !present)
+    {
+        return Err("incomplete transaction operation link".into());
+    }
+    if record.summary.operation_workspace_identity.as_deref()
+        != record
+            .summary
+            .operation_id
+            .as_ref()
+            .map(|_| record.summary.workspace_identity.as_str())
+    {
+        return Err("transaction operation workspace binding mismatch".into());
+    }
+    if record
+        .summary
+        .operation_id
+        .as_ref()
+        .is_some_and(|id| id.is_empty())
+        || record
+            .summary
+            .attempt_id
+            .as_ref()
+            .is_some_and(|id| id.is_empty())
+        || record
+            .summary
+            .operation_owner_id
+            .as_ref()
+            .is_some_and(|id| id.is_empty())
+        || record
+            .summary
+            .operation_workspace_identity
+            .as_ref()
+            .is_some_and(|id| id.is_empty())
+    {
+        return Err("empty transaction operation binding".into());
+    }
+    if !crate::runtime::operations::phase_receipts_match_summary(&record.summary) {
+        return Err("invalid transaction phase receipts".into());
+    }
     let mut paths = std::collections::BTreeSet::new();
     let mut bytes = 0usize;
     for change in &record.changes {
@@ -315,6 +362,32 @@ fn validate(record: &Record, root: &Path) -> Result<(), String> {
                 .and_then(|s| s.strip_suffix(".tmp"))
                 .ok_or("invalid transaction staging name")?;
             valid_id(id)?;
+        }
+    }
+    if !record.summary.path_receipts.is_empty() {
+        if record.summary.path_receipts.len() != record.changes.len()
+            || record
+                .summary
+                .path_receipts
+                .keys()
+                .any(|path| !record.summary.affected_files.contains(path))
+        {
+            return Err("transaction path receipt summary mismatch".into());
+        }
+        for change in &record.changes {
+            let Some(receipt) = record.summary.path_receipts.get(&change.path) else {
+                return Err("transaction path receipt is missing".into());
+            };
+            if receipt.before_hash != change.before.hash
+                || receipt.proposed_hash != change.proposed.hash
+                || (receipt.applied_hash.is_some() && receipt.applied_hash != change.proposed.hash)
+                || receipt.state.is_empty()
+                || receipt.state.len() > 64
+                || receipt.sequence == 0
+                || receipt.sequence > record.summary.sequence
+            {
+                return Err("invalid transaction path receipt".into());
+            }
         }
     }
     if bytes > MAX_TRANSACTION_BYTES {

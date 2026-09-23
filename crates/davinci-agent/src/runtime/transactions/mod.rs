@@ -38,6 +38,7 @@ pub struct TransactionCoordinator {
     allow_session_recovery: bool,
     operation_id: Option<String>,
     attempt_id: Option<String>,
+    operation_owner_id: Option<String>,
     operation_owner_generation: Option<u64>,
 }
 
@@ -54,6 +55,7 @@ impl TransactionCoordinator {
             allow_session_recovery: false,
             operation_id: None,
             attempt_id: None,
+            operation_owner_id: None,
             operation_owner_generation: None,
         })
     }
@@ -73,6 +75,7 @@ impl TransactionCoordinator {
     ) -> Self {
         self.operation_id = Some(link.operation_id.to_string());
         self.attempt_id = Some(link.attempt_id.to_string());
+        self.operation_owner_id = Some(link.owner_id.to_string());
         self.operation_owner_generation = Some(link.owner_generation);
         self
     }
@@ -162,11 +165,18 @@ impl TransactionCoordinator {
                 restore_alias_pending: false,
             });
         }
+        let workspace_identity = self.root_pin.identity().map_err(|e| e.to_string())?;
+        let phase_receipt = TransactionPhaseReceipt {
+            phase: "previewed".into(),
+            sequence: 1,
+            operation_id: self.operation_id.clone(),
+            attempt_id: self.attempt_id.clone(),
+        };
         let summary = TransactionSummary {
             id: uuid::Uuid::new_v4().to_string(),
             owner: self.owner.clone(),
             workspace: self.root.to_string_lossy().into_owned(),
-            workspace_identity: self.root_pin.identity().map_err(|e| e.to_string())?,
+            workspace_identity: workspace_identity.clone(),
             base_revision: self.base_revision.clone(),
             affected_files: changes.iter().map(|c| c.path.clone()).collect(),
             before_hashes: changes
@@ -191,7 +201,10 @@ impl TransactionCoordinator {
             warnings: Vec::new(),
             operation_id: self.operation_id.clone(),
             attempt_id: self.attempt_id.clone(),
+            operation_owner_id: self.operation_owner_id.clone(),
             operation_owner_generation: self.operation_owner_generation,
+            operation_workspace_identity: self.operation_id.as_ref().map(|_| workspace_identity),
+            phase_receipts: crate::runtime::operations::phase_map(phase_receipt),
             path_receipts: changes
                 .iter()
                 .map(|change| {
@@ -744,6 +757,26 @@ impl TransactionCoordinator {
 fn transition(record: &mut Record, state: TransactionState) {
     record.summary.state = state;
     record.summary.sequence = record.summary.sequence.saturating_add(1);
+    let phase = match state {
+        TransactionState::Draft => "draft",
+        TransactionState::Previewed => "previewed",
+        TransactionState::Applying => "applying",
+        TransactionState::Applied => "applied",
+        TransactionState::Verified => "verified",
+        TransactionState::Committed => "committed",
+        TransactionState::RollingBack => "rolling_back",
+        TransactionState::RolledBack => "rolled_back",
+        TransactionState::Conflicted => "conflicted",
+    };
+    record.summary.phase_receipts.insert(
+        phase.to_owned(),
+        TransactionPhaseReceipt {
+            phase: phase.to_owned(),
+            sequence: record.summary.sequence,
+            operation_id: record.summary.operation_id.clone(),
+            attempt_id: record.summary.attempt_id.clone(),
+        },
+    );
 }
 fn cancelled(abort: Option<&AtomicBool>) -> Result<(), String> {
     if abort.is_some_and(|flag| flag.load(Ordering::Acquire)) {

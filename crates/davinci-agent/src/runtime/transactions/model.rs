@@ -77,7 +77,13 @@ pub struct TransactionSummary {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub attempt_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub operation_owner_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub operation_owner_generation: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub operation_workspace_identity: Option<String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub phase_receipts: BTreeMap<String, TransactionPhaseReceipt>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub path_receipts: BTreeMap<String, TransactionPathReceipt>,
 }
@@ -94,6 +100,8 @@ pub struct TransactionPathReceipt {
     pub state: String,
     pub sequence: u64,
 }
+
+pub type TransactionPhaseReceipt = crate::runtime::operations::TransactionPhaseReceipt;
 
 #[derive(Debug, Clone)]
 pub struct ProposedChange {

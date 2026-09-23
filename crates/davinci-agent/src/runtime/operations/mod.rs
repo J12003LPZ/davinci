@@ -17,9 +17,11 @@ mod store_support;
 mod transitions;
 
 pub use adapters::{
-    classify_file_observation, FilesystemEffectObservation, FilesystemOperationLink,
+    classify_file_observation, phase_map, phase_receipt_for_attempt, phase_receipts_match_summary,
+    reconcile_transaction_phase, FilesystemEffectObservation, FilesystemOperationLink,
     ProcessOperationBinding, ToolOperationDispatchError, ToolOperationDispatcher,
-    ToolOperationRuntime,
+    ToolOperationRuntime, TransactionOperationLink, TransactionPhaseReceipt,
+    TransactionProjectionLedger, TransactionRecovery,
 };
 pub use coordinator_api::{AdmittedOperation, DispatchPermit, EffectPermit, OperationAdmission};
 pub use failure::{FailureReasonCode, FailureSubsystem, OperationFailure};
