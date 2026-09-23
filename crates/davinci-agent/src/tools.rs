@@ -151,6 +151,9 @@ pub struct ToolContext {
     pub processes: Option<crate::process_manager::ProcessManager>,
     /// Engine-issued consent for this exact dispatch; never model input.
     pub dispatch_permit: Option<Arc<crate::approval::DispatchPermit>>,
+    /// Operation identity admitted by the runtime journal for managed-process
+    /// controls.  This is host-installed and never read from model JSON.
+    pub process_operation_binding: Option<crate::runtime::operations::ProcessOperationBinding>,
     pub cache: crate::runtime::cache::CacheRuntime,
     pub jobs: Arc<Mutex<JobBook>>,
     pub todos: Arc<Mutex<TodoList>>,
@@ -617,7 +620,14 @@ pub fn execute_tool_with(
             };
             drop(contract);
             manager.clone().with_provenance(provenance)
-                .execute(cwd, process, input, context.abort.as_deref(), context.dispatch_permit.as_deref())
+                .execute_with_operation(
+                    cwd,
+                    process,
+                    input,
+                    context.abort.as_deref(),
+                    context.dispatch_permit.as_deref(),
+                    context.process_operation_binding.as_ref(),
+                )
                 .map_err(ToolError::Failed)
         }
         "read" => read_tool_cached(cwd, input, context),

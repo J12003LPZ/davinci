@@ -1822,6 +1822,11 @@ impl Agent {
                             .unwrap_or(capture)
                     });
                 context.dispatch_permit = dispatch_permit;
+                context.process_operation_binding = pending_operation.as_ref().map(|pending| {
+                    crate::runtime::operations::ProcessOperationBinding::from_admitted(
+                        &pending.admitted,
+                    )
+                });
                 context.mutation_attempted =
                     std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
                 if coordinated || crate::runtime::transactions::is_tool(name) {

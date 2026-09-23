@@ -22,6 +22,7 @@ use std::{
         Arc, Mutex,
     },
 };
+use uuid::Uuid;
 
 #[derive(Clone, Debug)]
 pub struct ProcessManager {
@@ -37,6 +38,8 @@ pub struct ProcessManager {
 #[serde(deny_unknown_fields)]
 struct Id {
     id: u32,
+    #[serde(default)]
+    lifetime: Option<Uuid>,
 }
 
 #[derive(Deserialize)]
@@ -52,6 +55,8 @@ struct Output {
 struct Write {
     id: u32,
     text: String,
+    #[serde(default)]
+    lifetime: Option<Uuid>,
 }
 
 #[derive(Deserialize)]
@@ -438,6 +443,21 @@ impl ProcessManager {
         abort: Option<&AtomicBool>,
         permit: Option<&DispatchPermit>,
     ) -> Result<ToolResult, String> {
+        self.execute_with_operation(cwd, name, args, abort, permit, None)
+    }
+
+    /// Execute a managed-process request under the already-admitted operation
+    /// identity.  The ordinary `execute` entry point remains available for
+    /// trusted embedders that do not install the operation journal.
+    pub fn execute_with_operation(
+        &self,
+        cwd: &Path,
+        name: &str,
+        args: &Value,
+        abort: Option<&AtomicBool>,
+        permit: Option<&DispatchPermit>,
+        operation: Option<&crate::runtime::operations::ProcessOperationBinding>,
+    ) -> Result<ToolResult, String> {
         let fallback_abort = AtomicBool::new(false);
         self.owner.ensure_open()?;
         let abort = abort.unwrap_or(&fallback_abort);
@@ -481,6 +501,10 @@ impl ProcessManager {
                     }
                 }
                 let config = command::resolve(&self.workspace, cwd, request)?;
+                let config = operation
+                    .cloned()
+                    .map(|binding| config.clone().with_operation_binding(binding))
+                    .unwrap_or(config);
                 let permissions = self.permissions.clone();
                 let restart_cwd = cwd.to_owned();
                 let restart_args = args.clone();
@@ -504,7 +528,14 @@ impl ProcessManager {
                     || self.recheck(cwd, name, args, &authority),
                     restart_check,
                 )?;
-                json!({"process":self.owner.snapshot(id)?,"reused":reused})
+                let snapshot = self.owner.snapshot(id)?;
+                let receipt = crate::runtime::control::ProcessControlReceipt::accepted(
+                    operation_id(operation),
+                    operation.cloned(),
+                    "start",
+                    &snapshot,
+                );
+                json!({"process":snapshot,"reused":reused,"control":receipt})
             }
             "process_status" => {
                 let request: Id = parse(args)?;
@@ -543,13 +574,104 @@ impl ProcessManager {
                     return Err("process stdin is limited to 16 KiB per call".into());
                 }
                 self.recheck(cwd, name, args, &authority)?;
-                json!({"id":request.id, "written_bytes":self.owner.write(request.id, request.text.as_bytes())?})
+                let snapshot = match self.owner.control_snapshot(request.id, request.lifetime) {
+                    Ok(snapshot) => snapshot,
+                    Err(error) => {
+                        let current = self.owner.snapshot(request.id).ok();
+                        let receipt = crate::runtime::control::ProcessControlReceipt::rejected(
+                            operation_id(operation),
+                            operation.cloned(),
+                            "write",
+                            current.as_ref(),
+                            if error.contains("stale") {
+                                crate::runtime::control::ControlStatus::Stale
+                            } else {
+                                crate::runtime::control::ControlStatus::Rejected
+                            },
+                            error.clone(),
+                        );
+                        return Ok(ToolResult {
+                            content: error,
+                            is_error: true,
+                            details: Some(json!({"control":receipt})),
+                        });
+                    }
+                };
+                let command_id = operation_id(operation);
+                match self.owner.write_with_lifetime(
+                    request.id,
+                    request.lifetime,
+                    request.text.as_bytes(),
+                ) {
+                    Ok(written) => {
+                        let mut receipt = crate::runtime::control::ProcessControlReceipt::accepted(
+                            command_id,
+                            operation.cloned(),
+                            "write",
+                            &snapshot,
+                        );
+                        receipt.effect = crate::runtime::control::ProcessControlEffect::Observed;
+                        json!({"id":request.id, "written_bytes":written, "control":receipt})
+                    }
+                    Err(error) => {
+                        let receipt = crate::runtime::control::ProcessControlReceipt::accepted(
+                            command_id,
+                            operation.cloned(),
+                            "write",
+                            &snapshot,
+                        )
+                        .mark_unknown(error.clone());
+                        return Ok(ToolResult {
+                            content: error,
+                            is_error: true,
+                            details: Some(json!({"control":receipt})),
+                        });
+                    }
+                }
             }
             "process_stop" => {
                 let request: Id = parse(args)?;
                 self.recheck(cwd, name, args, &authority)?;
-                self.owner.release(request.id)?;
-                json!({"process":self.owner.snapshot(request.id)?,"lease_released":true})
+                let snapshot = match self.owner.control_snapshot(request.id, request.lifetime) {
+                    Ok(snapshot) => snapshot,
+                    Err(error) => {
+                        let current = self.owner.snapshot(request.id).ok();
+                        let receipt = crate::runtime::control::ProcessControlReceipt::rejected(
+                            operation_id(operation),
+                            operation.cloned(),
+                            "stop",
+                            current.as_ref(),
+                            if error.contains("stale") {
+                                crate::runtime::control::ControlStatus::Stale
+                            } else {
+                                crate::runtime::control::ControlStatus::Rejected
+                            },
+                            error.clone(),
+                        );
+                        return Ok(ToolResult {
+                            content: error,
+                            is_error: true,
+                            details: Some(json!({"control":receipt})),
+                        });
+                    }
+                };
+                self.owner
+                    .release_with_lifetime(request.id, request.lifetime)?;
+                let current = self.owner.snapshot(request.id)?;
+                let receipt = crate::runtime::control::ProcessControlReceipt::accepted(
+                    operation_id(operation),
+                    operation.cloned(),
+                    "stop",
+                    &snapshot,
+                );
+                let receipt = if current.state == "exited" {
+                    receipt.mark_stopped()
+                } else {
+                    receipt.mark_stopping(Some(
+                        "stop accepted; waiting for supervisor termination evidence".into(),
+                    ))
+                };
+                json!({"process":current,"lease_released":true,"control":receipt})
             }
             _ => return Err("unknown managed process tool".into()),
         };
@@ -612,6 +734,12 @@ impl ProcessManager {
             }
         }
     }
+}
+
+fn operation_id(operation: Option<&crate::runtime::operations::ProcessOperationBinding>) -> Uuid {
+    operation
+        .map(|binding| binding.operation_id.uuid())
+        .unwrap_or_else(Uuid::new_v4)
 }
 
 fn parse<T: serde::de::DeserializeOwned>(args: &Value) -> Result<T, String> {

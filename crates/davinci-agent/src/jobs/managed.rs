@@ -169,6 +169,10 @@ pub struct ProcessSnapshot {
     pub environment_names: Vec<String>,
     pub pid: u32,
     pub lifetime: Uuid,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub operation: Option<crate::runtime::operations::ProcessOperationBinding>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub generation: Option<u64>,
     pub started_ms: u64,
     pub state: String,
     pub exit_code: Option<i32>,
@@ -627,6 +631,12 @@ impl ManagedOwner {
             environment_names: record.command.environment.keys().cloned().collect(),
             pid: supervisor.child_pid(),
             lifetime: supervisor.identity().lifetime,
+            generation: supervisor
+                .identity()
+                .operation
+                .as_ref()
+                .map(|operation| operation.owner_generation),
+            operation: supervisor.identity().operation.clone(),
             started_ms: record.started_ms,
             state,
             exit_code: exit.as_ref().and_then(|exit| exit.code),
@@ -671,6 +681,21 @@ impl ManagedOwner {
             lifetime: snapshot.lifetime,
         };
         Ok((snapshot, lease))
+    }
+
+    /// Return the current record only when the caller still holds the exact
+    /// supervised lifetime. Numeric process IDs are deliberately insufficient
+    /// because the operating system may reuse them.
+    pub fn control_snapshot(
+        &self,
+        id: u32,
+        expected_lifetime: Option<Uuid>,
+    ) -> Result<ProcessSnapshot, String> {
+        let snapshot = self.snapshot(id)?;
+        if expected_lifetime.is_some_and(|expected| expected != snapshot.lifetime) {
+            return Err("stale managed process lifetime".into());
+        }
+        Ok(snapshot)
     }
 
     pub fn ids(&self) -> Vec<u32> {
@@ -734,7 +759,29 @@ impl ManagedOwner {
         supervisor.write(bytes)
     }
 
+    pub fn write_with_lifetime(
+        &self,
+        id: u32,
+        expected_lifetime: Option<Uuid>,
+        bytes: &[u8],
+    ) -> Result<usize, String> {
+        let snapshot = self.control_snapshot(id, expected_lifetime)?;
+        if snapshot.state != "running" {
+            return Err("managed process is not running".into());
+        }
+        self.write(id, bytes)
+    }
+
     pub fn release(&self, id: u32) -> Result<(), String> {
+        self.release_with_lifetime(id, None)
+    }
+
+    pub fn release_with_lifetime(
+        &self,
+        id: u32,
+        expected_lifetime: Option<Uuid>,
+    ) -> Result<(), String> {
+        let _ = self.control_snapshot(id, expected_lifetime)?;
         let (shared, record) = self.owned(id)?;
         let mut owners = record.owners.lock().unwrap_or_else(|e| e.into_inner());
         owners.active.remove(&self.0.id);

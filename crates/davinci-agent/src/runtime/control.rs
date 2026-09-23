@@ -93,6 +93,143 @@ pub enum ControlStatus {
     Unknown,
 }
 
+/// Effect certainty for a managed-process control.  An accepted control is
+/// durable intent; it becomes observed only after the supervisor reports the
+/// corresponding OS event.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProcessControlEffect {
+    NotStarted,
+    Accepted,
+    Observed,
+    Unknown,
+}
+
+/// Durable receipt for a managed-process command.  The process ID is only a
+/// locator; the owner/session/lifetime tuple is the authority boundary.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProcessControlReceipt {
+    pub command_id: Uuid,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub operation: Option<crate::runtime::operations::ProcessOperationBinding>,
+    pub action: String,
+    pub owner: Uuid,
+    pub session: Uuid,
+    pub workspace: PathBuf,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub generation: Option<u64>,
+    pub process_id: u32,
+    pub pid: u32,
+    pub lifetime: Uuid,
+    pub status: ControlStatus,
+    pub effect: ProcessControlEffect,
+    pub terminated: bool,
+    /// Root/descendant PIDs still owned by the supervisor when proof is absent.
+    pub unresolved_descendants: Vec<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
+impl ProcessControlReceipt {
+    pub fn accepted(
+        command_id: Uuid,
+        operation: Option<crate::runtime::operations::ProcessOperationBinding>,
+        action: impl Into<String>,
+        snapshot: &crate::jobs::managed::ProcessSnapshot,
+    ) -> Self {
+        Self {
+            command_id,
+            generation: operation.as_ref().map(|value| value.owner_generation),
+            operation,
+            action: action.into(),
+            owner: snapshot.owner,
+            session: snapshot.session,
+            workspace: snapshot.workspace.clone(),
+            process_id: snapshot.id,
+            pid: snapshot.pid,
+            lifetime: snapshot.lifetime,
+            status: ControlStatus::Accepted,
+            effect: ProcessControlEffect::Accepted,
+            terminated: snapshot.state == "exited",
+            unresolved_descendants: if snapshot.state == "exited" || snapshot.pid == 0 {
+                Vec::new()
+            } else {
+                vec![snapshot.pid]
+            },
+            reason: None,
+        }
+    }
+
+    pub fn rejected(
+        command_id: Uuid,
+        operation: Option<crate::runtime::operations::ProcessOperationBinding>,
+        action: impl Into<String>,
+        snapshot: Option<&crate::jobs::managed::ProcessSnapshot>,
+        status: ControlStatus,
+        reason: impl Into<String>,
+    ) -> Self {
+        let (owner, session, workspace, process_id, pid, lifetime) = snapshot
+            .map(|value| {
+                (
+                    value.owner,
+                    value.session,
+                    value.workspace.clone(),
+                    value.id,
+                    value.pid,
+                    value.lifetime,
+                )
+            })
+            .unwrap_or_else(|| (Uuid::nil(), Uuid::nil(), PathBuf::new(), 0, 0, Uuid::nil()));
+        Self {
+            command_id,
+            generation: operation.as_ref().map(|value| value.owner_generation),
+            operation,
+            action: action.into(),
+            owner,
+            session,
+            workspace,
+            process_id,
+            pid,
+            lifetime,
+            status,
+            effect: ProcessControlEffect::NotStarted,
+            terminated: false,
+            unresolved_descendants: Vec::new(),
+            reason: Some(reason.into()),
+        }
+    }
+
+    pub fn mark_stopping(mut self, reason: Option<String>) -> Self {
+        self.status = ControlStatus::Stopping;
+        self.effect = ProcessControlEffect::Accepted;
+        self.terminated = false;
+        self.unresolved_descendants = if self.pid == 0 {
+            Vec::new()
+        } else {
+            vec![self.pid]
+        };
+        self.reason = reason;
+        self
+    }
+
+    pub fn mark_stopped(mut self) -> Self {
+        self.status = ControlStatus::Stopped;
+        self.effect = ProcessControlEffect::Observed;
+        self.terminated = true;
+        self.unresolved_descendants.clear();
+        self
+    }
+
+    pub fn mark_unknown(mut self, reason: impl Into<String>) -> Self {
+        self.status = ControlStatus::Unknown;
+        self.effect = ProcessControlEffect::Unknown;
+        self.terminated = false;
+        self.reason = Some(reason.into());
+        self
+    }
+}
+
 impl ControlStatus {
     pub fn as_str(&self) -> &'static str {
         match self {
@@ -420,10 +557,10 @@ impl WorkerController {
                         crate::jobs::kill_tree(*child_pid);
                     }
                 }
-                let _ = self
-                    .registry
-                    .transition(cmd.agent_id, AgentState::Cancelled);
-                (ControlStatus::Stopped, reason.clone())
+                // Signal delivery is only an accepted stop request.  The
+                // worker remains stopping until its host reports a terminal
+                // state; a bounded wait cannot manufacture termination proof.
+                (ControlStatus::Stopping, reason.clone())
             }
             WorkerControlAction::Retry { reason } => {
                 self.registry.advance_generation(&cmd.agent_id);
