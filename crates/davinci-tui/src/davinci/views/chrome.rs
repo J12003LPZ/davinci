@@ -1202,7 +1202,7 @@ mod tests {
         for width in [72u16, 90] {
             let drawn = text(&status(&model(width)));
             assert!(drawn.contains("? for shortcuts"), "{drawn}");
-            assert!(drawn.contains("Manual"), "{drawn}");
+            assert!(drawn.contains("manual mode on"), "{drawn}");
         }
     }
 
