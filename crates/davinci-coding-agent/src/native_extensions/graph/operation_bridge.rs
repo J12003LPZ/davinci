@@ -89,6 +89,7 @@ pub struct GraphOperationRecoveryEvidence {
     pub reason: String,
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct GraphOperationLaunch {
     pub binding: GraphOperationBinding,
@@ -517,6 +518,7 @@ pub fn complete_worker(
 /// Read the child operation result after a graph projection failure.  This
 /// path is intentionally observational: it never starts a process or creates
 /// another operation.
+#[allow(dead_code)]
 pub fn replay_projection(
     runtime: &RuntimeHandle,
     cwd: &Path,
@@ -621,6 +623,7 @@ pub fn inspect_retry_recovery(
 /// Check that a worker runtime retains the parent journal and dispatch owner.
 /// A child must use the parent-issued runtime transport; a separately opened
 /// journal is never accepted as an equivalent authority.
+#[allow(dead_code)]
 pub fn validate_child_runtime(
     parent: &RuntimeHandle,
     child: &RuntimeHandle,
