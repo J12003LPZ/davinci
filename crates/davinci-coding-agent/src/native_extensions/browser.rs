@@ -6,6 +6,9 @@ use crate::interaction_testing::{
 };
 use davinci_agent::{
     process_manager::{BrowserDevServerLease, BrowserRequest, ProcessManager},
+    runtime::operations::{
+        BrowserOperationAdapter, BrowserOperationDisposition, BrowserOperationHandle,
+    },
     runtime::transactions::{coordinator_for_context, SourceObservation, TransactionCoordinator},
     ToolContext, ToolError, ToolResult,
 };
@@ -345,6 +348,11 @@ struct Viewport {
 enum Request {
     Open(Open),
     Action { id: Uuid, command: Value },
+}
+
+enum BrowserExecution {
+    Live(Value),
+    Replay(ToolResult),
 }
 
 fn parse(name: &str, args: &Value) -> Result<Request, String> {
@@ -908,12 +916,60 @@ impl BrowserController {
                 )
             }
         };
+        let browser_id = match &request {
+            Request::Open(_) => None,
+            Request::Action { id, .. } => Some(id.to_string()),
+        };
+        let browser_operation = context
+            .runtime
+            .as_ref()
+            .and_then(BrowserOperationAdapter::from_runtime);
+        let browser_call_id = context.tool_call_id.clone();
         let mut created = None;
         let mut entered = false;
+        let mut operation: Option<BrowserOperationHandle> = None;
         let result = manager.with_verified_browser_dev_server(BrowserRequest {
             cwd, name, args, abort: context.abort.as_deref(), permit: context.dispatch_permit.as_deref(),
             process_id, port, lease: expected.as_ref(),
         }, |lease| {
+            if let Some(adapter) = &browser_operation {
+                let call_id = browser_call_id
+                    .as_deref()
+                    .ok_or("browser operation requires a trusted tool call identity")?;
+                let permission_revision = manager.permission_revision()?;
+                let handle = adapter
+                    .start(
+                        call_id,
+                        name,
+                        args,
+                        browser_id.clone(),
+                        None,
+                        lease.identity(),
+                        permission_revision,
+                    )
+                    .map_err(|error| error.to_string())?;
+                match handle.disposition() {
+                    BrowserOperationDisposition::ExistingInFlight => {
+                        return Err("browser operation is already in flight".into())
+                    }
+                    BrowserOperationDisposition::ExistingResult => {
+                        return handle
+                            .replay_result()
+                            .map(BrowserExecution::Replay)
+                            .map_err(|error| error.to_string())
+                    }
+                    BrowserOperationDisposition::New => {
+                        handle
+                            .begin(
+                                context.is_aborted(),
+                                || lease.verify_listening_socket(),
+                                || (),
+                            )
+                            .map_err(|error| error.to_string())?;
+                        operation = Some(handle);
+                    }
+                }
+            }
             entered = true;
             match request {
                 Request::Open(open) => {
@@ -965,7 +1021,7 @@ impl BrowserController {
                         if let Some(source) = &source {
                             result["source_binding"] = source.metadata();
                         }
-                        Ok(result)
+                        Ok(BrowserExecution::Live(result))
                     })();
                     self.store.lock().map_err(|_| "browser state unavailable")?.opening -= 1;
                     result
@@ -975,7 +1031,7 @@ impl BrowserController {
                     if name == "browser_close" {
                         let result = resource.engine.request(json!({"op":"close","resource":resource.backend}), Duration::from_secs(10))?;
                         self.store.lock().map_err(|_| "browser state unavailable")?.resources.remove(&id);
-                        Ok(result)
+                        Ok(BrowserExecution::Live(result))
                     } else {
                         if let Some(source) = &resource.source {
                             source.check(manager, context)?;
@@ -1002,7 +1058,7 @@ impl BrowserController {
                         if let Some(source) = &resource.source {
                             result["source_binding"] = source.metadata();
                         }
-                        Ok(json!({"status":"observed","browser_id":id,"result":result}))
+                        Ok(BrowserExecution::Live(json!({"status":"observed","browser_id":id,"result":result})))
                     }
                 }
             }
@@ -1016,13 +1072,40 @@ impl BrowserController {
                 self.close(id);
             }
         }
-        let mut result = result.map_err(ToolError::Failed)?;
-        result["verification"] = json!("observations_only");
-        Ok(ToolResult {
-            content: result.to_string(),
-            is_error: false,
-            details: Some(result),
-        })
+        let result_error = result.as_ref().err().cloned();
+        let mut tool_result = match result {
+            Ok(BrowserExecution::Replay(result)) => result,
+            Ok(BrowserExecution::Live(mut result)) => {
+                result["verification"] = json!("observations_only");
+                ToolResult {
+                    content: result.to_string(),
+                    is_error: false,
+                    details: Some(result),
+                }
+            }
+            Err(error) => ToolResult {
+                content: error,
+                is_error: true,
+                details: None,
+            },
+        };
+        if let Some(handle) = operation.take() {
+            let metadata = handle.metadata();
+            let details = tool_result.details.get_or_insert_with(|| json!({}));
+            if !details.is_object() {
+                *details = json!({});
+            }
+            details["browser_operation"] = metadata.clone();
+            if let Err(error) = handle.complete(&tool_result) {
+                return Err(ToolError::Failed(format!(
+                    "browser operation result could not be durably recorded: {error}; affected operation: {metadata}"
+                )));
+            }
+        }
+        if let Some(error) = result_error {
+            return Err(ToolError::Failed(error));
+        }
+        Ok(tool_result)
     }
 }
 

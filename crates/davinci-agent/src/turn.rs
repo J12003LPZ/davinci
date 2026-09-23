@@ -1803,6 +1803,7 @@ impl Agent {
                 // The tool sees the turn's abort flag so a long shell command
                 // or a `job_output` wait ends when the user interrupts.
                 let mut context = self.tool_context.clone();
+                context.tool_call_id = Some(id.to_owned());
                 context.command_receipt = matches!(name, "bash" | "powershell" | "exec_command")
                     .then(|| {
                         let capture = crate::command_receipt::CommandReceiptCapture::new(

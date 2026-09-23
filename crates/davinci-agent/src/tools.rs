@@ -154,6 +154,9 @@ pub struct ToolContext {
     /// Operation identity admitted by the runtime journal for managed-process
     /// controls.  This is host-installed and never read from model JSON.
     pub process_operation_binding: Option<crate::runtime::operations::ProcessOperationBinding>,
+    /// Trusted provider/host call identity for native adapters.  It is set by
+    /// the turn host and is never accepted from model-supplied arguments.
+    pub tool_call_id: Option<String>,
     pub cache: crate::runtime::cache::CacheRuntime,
     pub jobs: Arc<Mutex<JobBook>>,
     pub todos: Arc<Mutex<TodoList>>,

@@ -13,7 +13,7 @@ use crate::{
     jobs::{managed::ManagedOwner, supervisor::SupervisorCommand, JobBook},
     PermissionState, PermissionVerdict, ToolResult,
 };
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::{
     path::{Path, PathBuf},
@@ -98,6 +98,25 @@ pub struct BrowserDevServerLease {
     liveness: crate::jobs::managed::ManagedProcessLease,
 }
 
+/// Stable, credential-free identity for the managed browser server lifetime.
+///
+/// The live lease remains host-owned and is never reconstructed from model
+/// input.  This projection is safe to persist with a browser operation so a
+/// recovery pass can distinguish a replaced process or dev-server lifetime.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BrowserLeaseIdentity {
+    pub process_id: u32,
+    pub owner: Uuid,
+    pub parent_owner: Option<Uuid>,
+    pub session: Uuid,
+    pub lifetime: Uuid,
+    pub port: u16,
+    pub ipv6: bool,
+    pub pid: u32,
+    pub pid_birth: Option<u64>,
+}
+
 impl BrowserDevServerLease {
     pub fn process_id(&self) -> u32 {
         self.process_id
@@ -115,6 +134,20 @@ impl BrowserDevServerLease {
     pub fn origin(&self) -> String {
         let host = if self.ipv6 { "[::1]" } else { "127.0.0.1" };
         format!("http://{host}:{}", self.port)
+    }
+
+    pub fn identity(&self) -> BrowserLeaseIdentity {
+        BrowserLeaseIdentity {
+            process_id: self.process_id,
+            owner: self.owner,
+            parent_owner: self.parent_owner,
+            session: self.session,
+            lifetime: self.lifetime,
+            port: self.port,
+            ipv6: self.ipv6,
+            pid: self.pid,
+            pid_birth: self.pid_birth,
+        }
     }
 
     /// Requires OS evidence that the local listener belongs to the managed
@@ -135,6 +168,17 @@ impl BrowserDevServerLease {
 }
 
 impl ProcessManager {
+    /// Return the current monotonic permission revision for operation
+    /// admission.  A browser action must capture this revision after the
+    /// managed-process authority check and revalidate it before browser I/O.
+    pub fn permission_revision(&self) -> Result<u64, String> {
+        self.permissions
+            .lock()
+            .map_err(|_| "permission policy lock poisoned".to_owned())?
+            .revision()
+            .ok_or_else(|| "permission revision exhausted".to_owned())
+    }
+
     /// Host-only source read check for source-bound browser evidence.
     /// Cached observations never grant authority; callers re-run this before
     /// and after browser evidence collection.

@@ -1,4 +1,5 @@
 mod agents;
+mod browser;
 mod control;
 mod filesystem;
 mod process;
@@ -8,6 +9,11 @@ mod verification;
 pub use agents::{
     AgentLaunchDisposition, AgentOperationAdapter, AgentOperationError, AgentOperationHandle,
     ChildExecutionContext, ChildExecutionKind, UnresolvedChild,
+};
+pub use browser::{
+    redact_browser_value, redacted_browser_tool_result, BrowserActionBinding,
+    BrowserOperationAdapter, BrowserOperationDisposition, BrowserOperationError,
+    BrowserOperationHandle,
 };
 pub use control::{
     ControlOperationAdapter, ControlOperationError, ControlOperationReceipt, ControlReceiptValue,
