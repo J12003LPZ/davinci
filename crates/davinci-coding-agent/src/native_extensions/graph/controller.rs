@@ -1580,6 +1580,7 @@ pub fn run_saved_graph(
     run_graph_internal(options, deps, Some(saved_def), None)
 }
 
+#[allow(dead_code)]
 pub fn run_graph(options: RunOptions, deps: ControllerDeps) -> GraphRun {
     run_graph_internal(options, deps, None, None)
 }
