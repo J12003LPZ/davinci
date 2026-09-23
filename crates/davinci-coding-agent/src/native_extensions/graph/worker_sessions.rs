@@ -85,11 +85,11 @@ fn worker_lease_available(session_path: &Path) -> Result<bool, String> {
             return Ok(true);
         }
         let error = std::io::Error::last_os_error();
-        return if error.kind() == std::io::ErrorKind::WouldBlock {
+        if error.kind() == std::io::ErrorKind::WouldBlock {
             Ok(false)
         } else {
             Err(error.to_string())
-        };
+        }
     }
     #[cfg(windows)]
     {
