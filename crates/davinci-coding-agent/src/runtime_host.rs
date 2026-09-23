@@ -115,6 +115,7 @@ pub fn configure_session_workflow(
 /// to the runtime's existing operation journal rather than creating a second
 /// coordinator, so a reopened UI/server/native host sees the same unresolved
 /// subagent, workflow, and background-job ownership.
+#[allow(dead_code)]
 pub fn child_operation_status(
     runtime: &davinci_agent::RuntimeHandle,
 ) -> Result<Vec<davinci_agent::UnresolvedChild>, String> {
@@ -245,6 +246,7 @@ pub struct HooksRuntimeSubscriber {
 /// block or deny execution.  Decision hooks remain registered with
 /// `RuntimeBus::subscribe` so their allowlisted checks stay synchronous and
 /// fail-closed.
+#[allow(dead_code)]
 pub fn subscribe_noncritical_runtime_observer(
     runtime: &davinci_agent::RuntimeHandle,
     observer: Arc<dyn RuntimeSubscriber>,
