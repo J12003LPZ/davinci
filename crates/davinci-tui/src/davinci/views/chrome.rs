@@ -467,8 +467,13 @@ pub fn composer(model: &Model, lines: Option<&[String]>, hint: Hint) -> Vec<Line
         })
         .or_else(|| screen_placeholder(model.screen).map(str::to_string));
     let lit = model.blink();
+    let caret_color = if th.text == ratatui::style::Color::Reset {
+        th.primary
+    } else {
+        th.text
+    };
     let caret_style = if lit {
-        Style::default().bg(th.text).fg(th.background)
+        Style::default().bg(caret_color).fg(th.background)
     } else {
         Style::default().bg(th.background).fg(th.background)
     };
@@ -1305,9 +1310,10 @@ mod tests {
         let entered = vec!["one".to_string(), "two".to_string()];
         let rows = composer(&m, Some(&entered), Hint::Multiline);
         let caret = |line: &Line<'_>| {
-            line.spans
-                .iter()
-                .any(|span| span.style.bg == Some(m.theme.text))
+            line.spans.iter().any(|span| {
+                span.style.bg.is_some()
+                    && span.style.bg != Some(m.theme.background)
+            })
         };
         assert!(!caret(&rows[2]), "no caret on the first row");
         assert!(caret(&rows[3]), "caret on the last row");
