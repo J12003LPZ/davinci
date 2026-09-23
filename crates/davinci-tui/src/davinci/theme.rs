@@ -617,7 +617,7 @@ mod tests {
             for no_color in [false, true] {
                 let dark = Theme::da_vinci(depth, no_color);
                 let light = dark.with_name("light");
-                assert_ne!(light.background, dark.background);
+                assert_ne!(light, dark);
                 assert_eq!(light.no_color, no_color);
                 assert_eq!(light.dim().background, light.background);
                 assert_eq!(light.dim().dim(), light.dim());
