@@ -29,4 +29,7 @@ function request(tool, args) {
   const full = await request('retrieve_output', { id: references.details.fullResult.id });
   if (!full.content.includes('"total": 3')) throw new Error('missing retained records');
   process.stdout.write(JSON.stringify({ success: true, rss: process.memoryUsage().rss }));
-})().catch(() => { process.exitCode = 1; });
+})().catch(error => {
+  console.error(error?.stack || String(error));
+  process.exitCode = 1;
+});
