@@ -15,10 +15,12 @@ struct Fixture {
 
 impl Fixture {
     fn new() -> Self {
-        let temp = tempfile::tempdir().unwrap();
-        // macOS exposes its default temp directory through /var -> /private/var.
-        // The operation journal intentionally rejects symlinked ancestors, so
-        // use the canonical temp root in cross-platform recovery/property tests.
+        let workspace = std::env::current_dir().unwrap();
+        let temp = tempfile::tempdir_in(&workspace).unwrap();
+        // Keep the journal under the checked-out workspace rather than the OS
+        // temp root. macOS maps parts of its temp hierarchy through filesystem
+        // indirection that intentionally conflicts with the journal's no-follow
+        // ancestor policy.
         let temp_root = fs::canonicalize(temp.path()).unwrap();
         let identity = JournalIdentity::new(
             JournalId::new(),
