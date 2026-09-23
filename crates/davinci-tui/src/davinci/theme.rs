@@ -455,7 +455,7 @@ impl Theme {
     /// Build the da Vinci theme for a negotiated color depth.
     pub fn da_vinci(depth: ColorDepth, no_color: bool) -> Self {
         let ramp = match (depth, no_color) {
-            (_, true) if depth == ColorDepth::Basic => &BASIC_GREY,
+            (ColorDepth::Basic, true) => &BASIC_GREY,
             (ColorDepth::TrueColor, false) => &TRUECOLOR,
             (ColorDepth::Ansi256, false) => &ANSI256,
             (ColorDepth::Basic, false) => &BASIC,
