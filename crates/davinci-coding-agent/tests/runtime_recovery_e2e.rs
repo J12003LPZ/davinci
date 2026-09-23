@@ -28,11 +28,11 @@ fn fixture() -> Fixture {
         },
     )
     .unwrap();
-    let root = RootNamespaceId::new();
+    let root_namespace_id = RootNamespaceId::new();
     let spec = OperationSpec::new(
         OperationContext {
             journal_id: identity.journal_id,
-            root_namespace_id: root,
+            root_namespace_id,
             session_id: "runtime-recovery-e2e".to_owned(),
             runtime_run_id: RunId::new(),
             parent_operation_id: None,
@@ -58,7 +58,7 @@ fn fixture() -> Fixture {
     )
     .unwrap();
     let operation_id = spec.operation_id().to_string();
-    let journal = OperationJournal::open(&journal_dir, identity, root).unwrap();
+    let journal = OperationJournal::open(&journal_dir, identity, root_namespace_id).unwrap();
     let attempt = OperationAttempt::new(
         spec.operation_id(),
         1,
