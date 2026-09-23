@@ -513,12 +513,7 @@ mod tests {
         let global = dir.path().join("global-bin");
         std::fs::create_dir(&root).unwrap();
         std::fs::create_dir(&global).unwrap();
-        package(
-            &global,
-            "typescript",
-            "7.0.0",
-            Some(("tsc", "bin/tsc.cjs")),
-        );
+        package(&global, "typescript", "7.0.0", Some(("tsc", "bin/tsc.cjs")));
         package(
             &root,
             "typescript-language-server",
