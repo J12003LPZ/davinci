@@ -1326,10 +1326,7 @@ impl Agent {
                 details: denied.then(|| serde_json::json!({ "denied": true })),
             })
         };
-        fn cancel_persisted_intent(
-            pending: Option<&crate::PendingToolOperation>,
-            reason: &str,
-        ) {
+        fn cancel_persisted_intent(pending: Option<&crate::PendingToolOperation>, reason: &str) {
             if let Some(pending) = pending {
                 let _ = pending
                     .runtime
@@ -1475,10 +1472,7 @@ impl Agent {
                     return immediate(format!("Operation planning failed: {error}"), true)
                 }
             };
-            let admission = match operation_runtime
-                .dispatcher()
-                .persist_intent(plan.clone())
-            {
+            let admission = match operation_runtime.dispatcher().persist_intent(plan.clone()) {
                 Ok(admission) => admission,
                 Err(error) => {
                     return Preparation::Immediate(crate::ToolResult {
@@ -1627,10 +1621,7 @@ impl Agent {
             {
                 Ok(admitted) => admitted,
                 Err(error) => {
-                    cancel_persisted_intent(
-                        Some(&pending),
-                        "authorization could not be committed",
-                    );
+                    cancel_persisted_intent(Some(&pending), "authorization could not be committed");
                     self.approval_registry.take_dispatch(id);
                     return Preparation::Immediate(crate::ToolResult {
                         content: format!(
