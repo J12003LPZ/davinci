@@ -1,10 +1,13 @@
 //! Typed worker control commands, revisioned snapshots, and interventions.
 
 use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
+use std::fs::OpenOptions;
+use std::io::{BufRead, BufReader, Write};
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use super::events::{AgentKind, AgentState};
@@ -344,12 +347,50 @@ pub struct WorkerSnapshot {
     pub usage_unknown: bool,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ControlReceiptFrame {
+    command_id: Uuid,
+    command_digest: String,
+    receipt: WorkerControlReceipt,
+}
+
+fn command_digest(command: &WorkerControlCommand) -> Result<String, String> {
+    let encoded = serde_json::to_vec(command).map_err(|error| error.to_string())?;
+    Ok(format!("{:x}", Sha256::digest(encoded)))
+}
+
+fn load_control_receipts(
+    path: &Path,
+) -> Result<HashMap<Uuid, (String, WorkerControlReceipt)>, String> {
+    if !path.exists() {
+        return Ok(HashMap::new());
+    }
+    let file = std::fs::File::open(path).map_err(|error| error.to_string())?;
+    let mut receipts = HashMap::new();
+    for line in BufReader::new(file).lines() {
+        let line = line.map_err(|error| error.to_string())?;
+        if line.trim().is_empty() {
+            continue;
+        }
+        let frame: ControlReceiptFrame =
+            serde_json::from_str(&line).map_err(|error| error.to_string())?;
+        if frame.command_id != frame.receipt.command_id {
+            return Err("control receipt ledger command identity mismatch".into());
+        }
+        receipts.insert(frame.command_id, (frame.command_digest, frame.receipt));
+    }
+    Ok(receipts)
+}
+
 /// Controller responsible for querying snapshots and dispatching control commands.
 #[derive(Clone)]
 pub struct WorkerController {
     registry: RuntimeRegistry,
     leases: Arc<RwLock<HashMap<AgentId, ProcessLease>>>,
     seen_commands: Arc<RwLock<HashSet<Uuid>>>,
+    command_receipts: Arc<RwLock<HashMap<Uuid, (String, WorkerControlReceipt)>>>,
+    receipt_path: Option<Arc<PathBuf>>,
 }
 
 impl WorkerController {
@@ -358,7 +399,65 @@ impl WorkerController {
             registry,
             leases: Arc::new(RwLock::new(HashMap::new())),
             seen_commands: Arc::new(RwLock::new(HashSet::new())),
+            command_receipts: Arc::new(RwLock::new(HashMap::new())),
+            receipt_path: None,
         }
+    }
+
+    /// Attach a checksummed append-only receipt ledger.  The last frame for a
+    /// command ID is authoritative, so reopening the controller preserves
+    /// exact duplicate detection and request-digest collision checks.
+    pub fn with_receipt_store(mut self, path: impl AsRef<Path>) -> Result<Self, String> {
+        let path = path.as_ref().to_path_buf();
+        let receipts = load_control_receipts(&path)?;
+        self.command_receipts = Arc::new(RwLock::new(receipts));
+        self.receipt_path = Some(Arc::new(path));
+        Ok(self)
+    }
+
+    pub fn receipt_for(&self, command_id: &Uuid) -> Option<WorkerControlReceipt> {
+        self.command_receipts
+            .read()
+            .ok()?
+            .get(command_id)
+            .map(|(_, receipt)| receipt.clone())
+    }
+
+    fn remember_receipt(
+        &self,
+        command: &WorkerControlCommand,
+        digest: String,
+        receipt: WorkerControlReceipt,
+    ) -> bool {
+        if let Ok(mut receipts) = self.command_receipts.write() {
+            receipts.insert(command.id, (digest.clone(), receipt.clone()));
+        } else {
+            return false;
+        }
+        let Some(path) = &self.receipt_path else {
+            return true;
+        };
+        let frame = ControlReceiptFrame {
+            command_id: command.id,
+            command_digest: digest,
+            receipt,
+        };
+        let encoded = match serde_json::to_vec(&frame) {
+            Ok(encoded) => encoded,
+            Err(_) => return false,
+        };
+        let mut file = match OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path.as_ref())
+        {
+            Ok(file) => file,
+            Err(_) => return false,
+        };
+        if file.write_all(&encoded).is_err() || file.write_all(b"\n").is_err() {
+            return false;
+        }
+        file.sync_data().is_ok()
     }
 
     pub fn register_lease(&self, lease: ProcessLease) {
@@ -450,6 +549,32 @@ impl WorkerController {
         actor_authorized: bool,
     ) -> WorkerControlReceipt {
         let action_name = cmd.action.name().to_string();
+
+        let digest = command_digest(&cmd).unwrap_or_default();
+        if let Ok(receipts) = self.command_receipts.read() {
+            if let Some((prior_digest, _receipt)) = receipts.get(&cmd.id) {
+                if prior_digest == &digest {
+                    return WorkerControlReceipt {
+                        command_id: cmd.id,
+                        task_id: cmd.task_id,
+                        agent_id: cmd.agent_id,
+                        generation: cmd.generation,
+                        action: action_name,
+                        status: ControlStatus::Rejected,
+                        reason: Some("duplicate_command".to_string()),
+                    };
+                }
+                return WorkerControlReceipt {
+                    command_id: cmd.id,
+                    task_id: cmd.task_id,
+                    agent_id: cmd.agent_id,
+                    generation: cmd.generation,
+                    action: action_name,
+                    status: ControlStatus::Rejected,
+                    reason: Some("command_id_collision".to_string()),
+                };
+            }
+        }
 
         // 1. Check duplicate command ID
         if let Ok(mut seen) = self.seen_commands.write() {
@@ -571,17 +696,7 @@ impl WorkerController {
             WorkerControlAction::Diff => (ControlStatus::Accepted, None),
         };
 
-        self.registry.emit_control_ack(
-            cmd.id,
-            cmd.task_id,
-            cmd.agent_id,
-            cmd.generation,
-            action_name.clone(),
-            status.as_str().to_string(),
-            reason.clone(),
-        );
-
-        WorkerControlReceipt {
+        let mut receipt = WorkerControlReceipt {
             command_id: cmd.id,
             task_id: cmd.task_id,
             agent_id: cmd.agent_id,
@@ -589,7 +704,23 @@ impl WorkerController {
             action: action_name,
             status,
             reason,
+        };
+        if !self.remember_receipt(&cmd, digest, receipt.clone()) {
+            receipt.status = ControlStatus::Unknown;
+            receipt.reason = Some("control_receipt_persistence_failed".to_string());
         }
+
+        self.registry.emit_control_ack(
+            cmd.id,
+            cmd.task_id,
+            cmd.agent_id,
+            cmd.generation,
+            receipt.action.clone(),
+            receipt.status.as_str().to_string(),
+            receipt.reason.clone(),
+        );
+
+        receipt
     }
 }
 

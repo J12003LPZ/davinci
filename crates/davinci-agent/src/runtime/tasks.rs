@@ -411,7 +411,7 @@ fn collect_downstream_dependents(tasks: &HashMap<TaskId, TaskRecord>, root: Task
 
 /// Expected ownership supplied by a trusted host adapter, never model identity fields.
 #[derive(Clone, Copy)]
-pub(crate) struct TaskOwner {
+pub struct TaskOwner {
     pub run_id: RunId,
     pub agent_id: AgentId,
     pub revision: u64,
@@ -419,6 +419,15 @@ pub(crate) struct TaskOwner {
 }
 
 impl TaskOwner {
+    pub fn new(run_id: RunId, agent_id: AgentId, revision: u64, generation: u64) -> Self {
+        Self {
+            run_id,
+            agent_id,
+            revision,
+            generation,
+        }
+    }
+
     fn validate(self, task: &TaskRecord, lineage: Option<&TaskLineage>) -> Result<(), TaskError> {
         if !run_matches(lineage, self.run_id, task.run_id) {
             return Err(TaskError::RunMismatch(task.id));
@@ -576,6 +585,38 @@ impl TaskRegistry {
         }
     }
 
+    /// Return the durable domain receipt for an operation without reapplying
+    /// its task transition.  Recovery adapters use this after a crash between
+    /// the task journal commit and the outer operation response.
+    pub fn operation_receipt(
+        &self,
+        operation_id: uuid::Uuid,
+    ) -> Result<Option<TaskOperationReceipt>, TaskError> {
+        self.receipts
+            .read()
+            .map_err(|_| TaskError::RegistryPoisoned)
+            .map(|receipts| receipts.get(&operation_id).cloned())
+    }
+
+    /// Validate restored operation receipts before a session accepts new
+    /// commands.  A task projection without its exact command identity cannot
+    /// safely participate in idempotent recovery.
+    pub fn validate_operation_receipts(&self) -> Result<(), TaskError> {
+        let receipts = self
+            .receipts
+            .read()
+            .map_err(|_| TaskError::RegistryPoisoned)?;
+        for (operation_id, receipt) in receipts.iter() {
+            if *operation_id != receipt.operation_id {
+                return Err(TaskError::Persistence(
+                    "task operation receipt identity mismatch".into(),
+                ));
+            }
+            receipt.response.validate()?;
+        }
+        Ok(())
+    }
+
     /// Attach observers before sharing the durable registry with workers.
     pub fn with_observers(mut self, bus: RuntimeBus) -> Self {
         self.bus = Some(bus);
@@ -623,7 +664,7 @@ impl TaskRegistry {
     }
 
     /// Create from host-authenticated identity, replaying the original generated fields.
-    pub(crate) fn create_command(
+    pub fn create_command(
         &self,
         input: TaskCreateRequest,
         run_id: RunId,
@@ -810,7 +851,7 @@ impl TaskRegistry {
             .map(|_| ())
     }
 
-    pub(crate) fn claim_operation(
+    pub fn claim_operation(
         &self,
         task_id: TaskId,
         run_id: RunId,
@@ -1217,7 +1258,7 @@ impl TaskRegistry {
         self.status_operation(task_id, TaskState::Completed, result, owner, operation_id)
     }
 
-    pub(crate) fn status_operation(
+    pub fn status_operation(
         &self,
         task_id: TaskId,
         state: TaskState,

@@ -88,6 +88,9 @@ pub fn restore_session_runtime_with_legacy_recovery(
     let (tasks, run_id) =
         TaskRegistry::open_session_durable_with_legacy(&journal_path, &key, legacy_tasks)
             .map_err(|error| format!("task journal could not be opened: {error}"))?;
+    tasks
+        .validate_operation_receipts()
+        .map_err(|error| format!("task operation receipts could not be validated: {error}"))?;
     // No worker from this previous process can still own execution. Commit
     // the existing crash-recovery state before admitting new commands.
     for task in tasks.list_tasks(Some(run_id)) {

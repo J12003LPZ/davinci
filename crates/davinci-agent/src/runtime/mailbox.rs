@@ -285,6 +285,19 @@ impl AgentMailbox {
         text: String,
         redirect: bool,
     ) -> Result<SteeringReceipt, MailboxError> {
+        self.send_steer_with_id(Uuid::now_v7(), to, generation, text, redirect)
+    }
+
+    /// Enqueue steering under a caller-owned stable ID.  Operation adapters
+    /// use this to reconcile mailbox acceptance after a lost outer response.
+    pub fn send_steer_with_id(
+        &self,
+        message_id: Uuid,
+        to: AgentId,
+        generation: u64,
+        text: String,
+        redirect: bool,
+    ) -> Result<SteeringReceipt, MailboxError> {
         if text.len() > MAX_MESSAGE_SIZE {
             return Err(MailboxError::MessageTooLarge(text.len()));
         }
@@ -296,7 +309,7 @@ impl AgentMailbox {
                 AgentState::Completed | AgentState::Failed | AgentState::Cancelled
             ) {
                 let receipt = SteeringReceipt {
-                    message_id: Uuid::now_v7(),
+                    message_id,
                     agent_id: to,
                     generation,
                     state: "rejected".to_string(),
@@ -312,7 +325,7 @@ impl AgentMailbox {
             let actual_gen = reg.get_generation(&to);
             if actual_gen != generation {
                 let receipt = SteeringReceipt {
-                    message_id: Uuid::now_v7(),
+                    message_id,
                     agent_id: to,
                     generation,
                     state: "rejected".to_string(),
@@ -330,8 +343,9 @@ impl AgentMailbox {
             RunId::new()
         };
 
-        let msg = AgentMessage::new(run_id, AgentId::new(), to, text);
-        let msg_id = msg.id;
+        let mut msg = AgentMessage::new(run_id, AgentId::new(), to, text);
+        msg.id = message_id;
+        let msg_id = message_id;
 
         // Check queue capacity
         {

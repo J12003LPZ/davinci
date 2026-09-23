@@ -18,7 +18,7 @@ pub(crate) const MAX_OPERATION_RECEIPTS: usize = 4096;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct TaskOperationRequest {
+pub struct TaskOperationRequest {
     pub task_id: Option<TaskId>,
     pub run_id: RunId,
     pub actor: AgentId,
@@ -32,7 +32,7 @@ pub(crate) struct TaskOperationRequest {
 /// Caller-supplied creation fields; generated identity and timestamps are responses.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct TaskCreateRequest {
+pub struct TaskCreateRequest {
     pub title: String,
     pub description: Option<String>,
     pub dependencies: Vec<TaskId>,
@@ -46,15 +46,15 @@ pub(crate) struct TaskCreateRequest {
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct StatusRequest {
+pub struct StatusRequest {
     pub state: super::TaskState,
     pub generation: u64,
     pub result: Option<String>,
 }
 
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct TaskOperationReceipt {
+pub struct TaskOperationReceipt {
     pub operation_id: Uuid,
     pub request: TaskOperationRequest,
     pub response: TaskRecord,

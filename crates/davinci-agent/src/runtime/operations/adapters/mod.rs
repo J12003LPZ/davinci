@@ -1,8 +1,13 @@
+mod control;
 mod filesystem;
 mod process;
 mod tools;
 mod transactions;
 mod verification;
+pub use control::{
+    ControlOperationAdapter, ControlOperationError, ControlOperationReceipt, ControlReceiptValue,
+    CONTROL_OPERATION_SCHEMA_VERSION,
+};
 pub use filesystem::{
     classify_file_observation, FilesystemEffectObservation, FilesystemOperationLink,
 };

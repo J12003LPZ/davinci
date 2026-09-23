@@ -107,7 +107,8 @@ pub use rewind::{
 pub use source_manifest::{
     compute_manifest_digest, FileKind, ManifestEntry, SourceManifest, SourceManifestBuilder,
 };
-pub use tasks::{is_valid_task_transition, TaskError, TaskRecord, TaskRegistry, TaskState};
+pub use tasks::{is_valid_task_transition, TaskError, TaskOwner, TaskRecord, TaskRegistry, TaskState};
+pub use task_store::{StatusRequest, TaskCreateRequest, TaskOperationReceipt, TaskOperationRequest};
 pub use team::{TeamConfig, TeamError, TeamManager, TeammateHandle};
 pub use tools_agent::{agent_message_tool, agent_status_tool, agent_stop_tool, agent_tool_specs};
 pub use tools_task::{
