@@ -85,3 +85,26 @@ inspection, corruption diagnostics, restart stability, and provider-free
 doctor/help behavior. The stable fuzz gate is a bounded serialized-input
 mutation loop; optional nightly/libFuzzer work is intentionally isolated under
 `fuzz/README.md` and is not treated as proof by a short run.
+
+
+## Task 23 final coverage and exclusions
+
+The final integration manifest keeps the baseline capability families and gives
+the operation journal explicit authority where the adapter can supply durable
+identity and evidence.
+
+| Capability family | Final status | Evidence or boundary |
+| --- | --- | --- |
+| Direct and batch tools | Journal admission and attempt lineage; compatibility ledger remains evidence | operation dispatch, journal, property, and crash suites |
+| Providers and cache identity | Existing provider/cache contracts retained; operation IDs stay outside stable prompt/cache identity | provider/cache regression suites and runtime identity checks |
+| Permissions, approvals, and task contracts | Existing gates run before effect start and are revalidated at dispatch | dispatch, permission, approval, scheduler, and batch tests |
+| Graphs, workers, and subagents | Parent/worker bindings, attempts, artifacts, and sibling preservation retained; unresolved effects block retry | graph recovery, runtime E2E, migration, and retention tests |
+| Processes and browser/MCP lifetimes | Managed ownership and receipts are retained; remote effects remain evidence-bounded | process/browser adapter tests; unknown ownership stays non-success |
+| Transactions and verification | Transaction owner/preimage/phase and verifier verdict remain separate facts | transaction suites and verification adapters |
+| Context, sessions, alternate hosts, and TUI observations | Session lineage and operation context are durable; observers remain non-authoritative | session/continuation tests and isolated observer tests |
+| Legacy and downgrade paths | v4 append-only observations and explicit legacy graph handling; downgrade is unsupported | migration fixtures and fail-closed conflict tests |
+| Arbitrary shell/custom/remote boundaries | Explicitly opaque beyond adapter receipts | documented limitation; no invented success |
+
+The manifest preserves capability names and routes; it does not claim that an
+arbitrary child process, remote MCP endpoint, browser page, or older binary can
+be made transactional without a domain receipt.

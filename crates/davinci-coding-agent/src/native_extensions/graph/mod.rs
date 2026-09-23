@@ -644,7 +644,7 @@ impl GraphController {
                         if task.status == types::TaskStatus::Running {
                             task.status = types::TaskStatus::Failed;
                             task.error = Some(format!(
-                                "worker stopped unexpectedly; {}",
+                                "worker stopped unexpectedly; reconciliation required: {}",
                                 legacy_recovery.reason
                             ));
                         }

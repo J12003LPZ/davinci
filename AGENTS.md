@@ -405,3 +405,22 @@ STOP. Name the ambiguity in one sentence. Present 2-3 options with real trade-of
 - End responses with the next action, not a recap of what was just done.
 
 When Julien asks for something, the answer is the finished product — not a plan. Tests included. Evals included. Docs included.
+
+
+## Unified execution recovery
+
+The runtime recovery contract is documented in
+docs/runtime/unified-execution.md. Use docs/runtime/recovery-playbook.md for
+incidents and docs/runtime/operation-journal-format.md for schema/retention
+limits. The read-only maintenance commands are:
+
+    davinci inspect operation <operation-uuid> --json
+    davinci inspect run <run-uuid> --json
+    davinci inspect session <session-id> --json
+    davinci doctor runtime --json
+
+Exit code 3 means inspection is unavailable or inconsistent; it never authorizes
+destructive repair. Preserve journal, graph, transaction, artifact, and process
+evidence before recovery. Retry only when the owning adapter has a durable
+receipt, postcondition, compensation, or safe no-effect proof. The final
+coverage and platform evidence live in docs/runtime/execution-recovery-verification.md.
