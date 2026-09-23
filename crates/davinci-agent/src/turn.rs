@@ -1183,9 +1183,19 @@ impl Agent {
     ) -> Option<crate::runtime::operations::ToolOperationRuntime> {
         let runtime = self.runtime.as_ref()?;
         let capability = runtime.capability_registry.get(name)?;
-        (capability.source == crate::runtime::CapabilitySource::Builtin)
-            .then(|| runtime.operations.clone())
-            .flatten()
+        // Registered extension/MCP capabilities use the same journal facade as
+        // built-ins.  The planner applies conservative external-mutation
+        // effects for non-built-in sources; unknown tools still use the legacy
+        // compatibility ledger and cannot silently become journal operations.
+        runtime.operations.clone().filter(|_| {
+            matches!(
+                capability.source,
+                crate::runtime::CapabilitySource::Builtin
+                    | crate::runtime::CapabilitySource::JsExtension
+                    | crate::runtime::CapabilitySource::NativeExtension
+                    | crate::runtime::CapabilitySource::Mcp
+            )
+        })
     }
 
     fn current_operation_plan(
@@ -1203,7 +1213,7 @@ impl Agent {
     > {
         let operation_runtime = self
             .operation_runtime_for_tool(name)
-            .ok_or_else(|| "builtin operation runtime is unavailable".to_owned())?;
+            .ok_or_else(|| "operation runtime is unavailable".to_owned())?;
         if !pending
             .runtime
             .shares_dispatch_authority(&operation_runtime)
@@ -1217,8 +1227,16 @@ impl Agent {
         let capability = runtime
             .capability_registry
             .get(name)
-            .filter(|capability| capability.source == crate::runtime::CapabilitySource::Builtin)
-            .ok_or_else(|| "builtin capability changed after operation admission".to_owned())?;
+            .filter(|capability| {
+                matches!(
+                    capability.source,
+                    crate::runtime::CapabilitySource::Builtin
+                        | crate::runtime::CapabilitySource::JsExtension
+                        | crate::runtime::CapabilitySource::NativeExtension
+                        | crate::runtime::CapabilitySource::Mcp
+                )
+            })
+            .ok_or_else(|| "registered capability changed after operation admission".to_owned())?;
         let contract_digest = self.active_contract().map(|contract| contract.digest);
         let session_id = runtime.session_id.as_deref();
         let plan = match pending.origin {
@@ -1451,11 +1469,17 @@ impl Agent {
                 .as_ref()
                 .and_then(|runtime| runtime.capability_registry.get(name))
                 .filter(|capability| {
-                    capability.source == crate::runtime::CapabilitySource::Builtin
+                    matches!(
+                        capability.source,
+                        crate::runtime::CapabilitySource::Builtin
+                            | crate::runtime::CapabilitySource::JsExtension
+                            | crate::runtime::CapabilitySource::NativeExtension
+                            | crate::runtime::CapabilitySource::Mcp
+                    )
                 })
             else {
                 return immediate(
-                    "Operation denied: builtin capability changed during preparation.".into(),
+                    "Operation denied: registered capability changed during preparation.".into(),
                     true,
                 );
             };
@@ -2050,7 +2074,7 @@ impl Agent {
                 || {
                     let latest_runtime = self
                         .operation_runtime_for_tool(name)
-                        .ok_or_else(|| "builtin operation runtime disappeared".to_owned())?;
+                        .ok_or_else(|| "operation runtime disappeared".to_owned())?;
                     if !pending.runtime.shares_dispatch_authority(&latest_runtime)
                         || !current_runtime.shares_dispatch_authority(&latest_runtime)
                     {

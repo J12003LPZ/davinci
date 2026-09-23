@@ -1,6 +1,7 @@
 mod agents;
 mod browser;
 mod control;
+mod external;
 mod filesystem;
 mod process;
 mod tools;
@@ -18,6 +19,11 @@ pub use browser::{
 pub use control::{
     ControlOperationAdapter, ControlOperationError, ControlOperationReceipt, ControlReceiptValue,
     CONTROL_OPERATION_SCHEMA_VERSION,
+};
+pub use external::{
+    redacted_external_tool_result, ExternalEndpointContract, ExternalEndpointIdentity,
+    ExternalInvocationBinding, ExternalOperationAdapter, ExternalOperationDisposition,
+    ExternalOperationError, ExternalOperationHandle, EXTERNAL_OPERATION_SCHEMA_VERSION,
 };
 pub use filesystem::{
     classify_file_observation, FilesystemEffectObservation, FilesystemOperationLink,
