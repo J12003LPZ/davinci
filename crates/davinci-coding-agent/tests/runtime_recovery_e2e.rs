@@ -18,8 +18,8 @@ struct Fixture {
 
 fn fixture() -> Fixture {
     let temp = tempdir().unwrap();
-    let root = std::fs::canonicalize(temp.path()).unwrap();
-    let journal_dir = root.join(".davinci").join("operations");
+    let root_path = std::fs::canonicalize(temp.path()).unwrap();
+    let journal_dir = root_path.join(".davinci").join("operations");
     let identity = JournalIdentity::new(
         JournalId::new(),
         WorkspaceIdentity {
@@ -58,7 +58,8 @@ fn fixture() -> Fixture {
     )
     .unwrap();
     let operation_id = spec.operation_id().to_string();
-    let journal = OperationJournal::open(&journal_dir, identity, root_namespace_id).unwrap();
+    let journal =
+        OperationJournal::open(&journal_dir, identity, root_namespace_id).unwrap();
     let attempt = OperationAttempt::new(
         spec.operation_id(),
         1,
@@ -66,7 +67,7 @@ fn fixture() -> Fixture {
     )
     .unwrap();
     journal.persist_intent(&spec, &attempt).unwrap();
-    let snapshot_dir = root.join("snapshot");
+    let snapshot_dir = root_path.join("snapshot");
     journal.backup_to(&snapshot_dir).unwrap();
     drop(journal);
     for suffix in ["-wal", "-shm"] {
@@ -79,7 +80,7 @@ fn fixture() -> Fixture {
     .unwrap();
     Fixture {
         temp,
-        root,
+        root: root_path,
         operation_id,
     }
 }
