@@ -498,7 +498,7 @@ mod tests {
             .unwrap();
         assert!(!result.is_error, "{}", result.content);
         let details = result.details.unwrap();
-        assert_eq!(details["remaining"], 2);
+        assert_eq!(details["remaining"], 2, "unexpected semantic result: {details:#}");
         assert_eq!(details["items"].as_array().unwrap().len(), 1);
         let id = details["fullResult"]["id"]
             .as_str()
