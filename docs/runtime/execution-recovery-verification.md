@@ -1,5 +1,15 @@
 # Unified execution and recovery verification
 
+## Final review status — 2026-09-23
+
+- PR #31 (`Harden unified runtime recovery and restore green cross-platform checks`) was merged into `main` as `7be137c23e38a867298c3bf9ef724bd9c3526cb9`.
+- Post-merge hardening commit `7dda12e3e1eb3a2baac70d2f19d88ceff59b6504` added stable pre-authorization intent tracking, cross-platform operation-journal fixture portability, CLI recovery portability, and final TUI theme/caret corrections.
+- Runtime Recovery for `7dda12e3e1eb3a2baac70d2f19d88ceff59b6504` completed successfully on Linux, macOS, and Windows.
+- Follow-up `4cc5ed19770cb119767cea67f9dce167927d019d` removed the remaining graph relative-script test race by verifying the workspace side effect directly; it changes the regression test rather than the production runtime.
+- The production tool path now persists immutable operation intent before runtime decision hooks, contract/effect policy, and permission/approval evaluation. Denied operations terminate as `Cancelled` with `EffectStatus::NotStarted`; only approved intents receive an authorization receipt and advance to `Queued`.
+- The owner explicitly instructed the final review to ignore unrelated repository-wide formatting and strict-Clippy CI failures. Those failures are not treated as blockers for this review; functional runtime/recovery/product evidence remains the completion criterion.
+
+
 ## Release context
 
 - Plan: `docs/superpowers/plans/DaVinci_Unified_Execution_Recovery_Implementation_Plan.md`, Tasks 00-23.
