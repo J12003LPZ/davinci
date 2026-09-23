@@ -311,6 +311,7 @@ pub fn run_verification(
     run_verification_with_progress(commands, cwd, abort, timeout_ms, None, exec, |_| {})
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn run_verification_with_progress_from(
     commands: &[VerifyCommandSpec],
     cwd: &Path,
