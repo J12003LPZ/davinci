@@ -1310,10 +1310,9 @@ mod tests {
         let entered = vec!["one".to_string(), "two".to_string()];
         let rows = composer(&m, Some(&entered), Hint::Multiline);
         let caret = |line: &Line<'_>| {
-            line.spans.iter().any(|span| {
-                span.style.bg.is_some()
-                    && span.style.bg != Some(m.theme.background)
-            })
+            line.spans
+                .iter()
+                .any(|span| span.style.bg.is_some() && span.style.bg != Some(m.theme.background))
         };
         assert!(!caret(&rows[2]), "no caret on the first row");
         assert!(caret(&rows[3]), "caret on the last row");
