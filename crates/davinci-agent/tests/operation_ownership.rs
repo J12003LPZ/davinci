@@ -93,7 +93,7 @@ fn authorized_queued_attempt(
             vec![],
         )
         .unwrap();
-    let attempt = journal
+    journal
         .transition(
             owner,
             attempt.attempt_id(),
@@ -102,8 +102,7 @@ fn authorized_queued_attempt(
             None,
             vec![],
         )
-        .unwrap();
-    attempt
+        .unwrap()
 }
 
 fn queued_attempt(
