@@ -37,8 +37,7 @@ impl Fixture {
         )
         .unwrap();
         let journal = Arc::new(
-            OperationJournal::open(&temp_root.join("operations"), identity.clone(), root)
-                .unwrap(),
+            OperationJournal::open(&temp_root.join("operations"), identity.clone(), root).unwrap(),
         );
         let context = OperationContext {
             journal_id: identity.journal_id,
