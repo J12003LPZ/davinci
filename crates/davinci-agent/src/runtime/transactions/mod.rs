@@ -36,6 +36,9 @@ pub struct TransactionCoordinator {
     owner: TransactionOwner,
     base_revision: Option<String>,
     allow_session_recovery: bool,
+    operation_id: Option<String>,
+    attempt_id: Option<String>,
+    operation_owner_generation: Option<u64>,
 }
 
 impl TransactionCoordinator {
@@ -49,12 +52,28 @@ impl TransactionCoordinator {
             owner,
             base_revision: None,
             allow_session_recovery: false,
+            operation_id: None,
+            attempt_id: None,
+            operation_owner_generation: None,
         })
     }
 
     /// Trusted host input only, obtained from an observed Git revision.
     pub fn with_base_revision(mut self, revision: Option<String>) -> Self {
         self.base_revision = revision;
+        self
+    }
+
+    /// Bind all records produced by this coordinator to one admitted
+    /// operation attempt. The link is metadata only; operation admission and
+    /// permissions remain the authority for the write.
+    pub fn with_operation_link(
+        mut self,
+        link: crate::runtime::operations::ProcessOperationBinding,
+    ) -> Self {
+        self.operation_id = Some(link.operation_id.to_string());
+        self.attempt_id = Some(link.attempt_id.to_string());
+        self.operation_owner_generation = Some(link.owner_generation);
         self
     }
 
@@ -170,6 +189,24 @@ impl TransactionCoordinator {
             sequence: 1,
             conflict: None,
             warnings: Vec::new(),
+            operation_id: self.operation_id.clone(),
+            attempt_id: self.attempt_id.clone(),
+            operation_owner_generation: self.operation_owner_generation,
+            path_receipts: changes
+                .iter()
+                .map(|change| {
+                    (
+                        change.path.clone(),
+                        TransactionPathReceipt {
+                            before_hash: change.before.hash.clone(),
+                            proposed_hash: change.proposed.hash.clone(),
+                            applied_hash: None,
+                            state: "previewed".into(),
+                            sequence: 1,
+                        },
+                    )
+                })
+                .collect(),
         };
         let record = Record {
             schema: RECORD_SCHEMA,
@@ -364,6 +401,22 @@ impl TransactionCoordinator {
             // identify a completed rename even if the host dies before recording its result.
             if let Err(error) = store.begin(id) { self.cleanup(&record); return Err(error); }
             transition(&mut record,TransactionState::Applying);
+            let applying_sequence = record.summary.sequence;
+            for change in &record.changes {
+                let receipt = record
+                    .summary
+                    .path_receipts
+                    .entry(change.path.clone())
+                    .or_insert_with(|| TransactionPathReceipt {
+                        before_hash: change.before.hash.clone(),
+                        proposed_hash: change.proposed.hash.clone(),
+                        applied_hash: None,
+                        state: "applying".into(),
+                        sequence: applying_sequence,
+                    });
+                receipt.state = "applying".into();
+                receipt.sequence = applying_sequence;
+            }
             if let Err(error) = store.save(&record) { self.cleanup(&record); return Err(format!("journal persistence failed before mutation: {error}")); }
             for index in 0..record.changes.len() {
                 let change = &record.changes[index];
@@ -380,7 +433,26 @@ impl TransactionCoordinator {
                         Err(recovery) => Err(format!("transaction mutation failed: {error}; recovery retained: {recovery}")),
                     };
                 }
-                record.summary.applied_hashes.insert(change.path.clone(),change.proposed.hash.clone());
+                let path = change.path.clone();
+                let applied_hash = change.proposed.hash.clone();
+                record.summary.applied_hashes.insert(path.clone(), applied_hash.clone());
+                let receipt = record
+                    .summary
+                    .path_receipts
+                    .entry(path)
+                    .or_insert_with(|| TransactionPathReceipt {
+                        before_hash: change.before.hash.clone(),
+                        proposed_hash: change.proposed.hash.clone(),
+                        applied_hash: None,
+                        state: "applied".into(),
+                        sequence: record.summary.sequence,
+                    });
+                receipt.applied_hash = applied_hash;
+                receipt.state = "applied".into();
+                receipt.sequence = record.summary.sequence;
+                // Persist each path receipt immediately after its replacement so a
+                // crash cannot make a completed path look unattempted.
+                store.save(&record)?;
                 if record.changes[index].alias_pending {
                     record.changes[index].alias_pending = false;
                     store.save(&record)?;
@@ -393,6 +465,11 @@ impl TransactionCoordinator {
                 }
             }
             transition(&mut record,TransactionState::Applied);
+            let applied_sequence = record.summary.sequence;
+            for receipt in record.summary.path_receipts.values_mut() {
+                receipt.state = "applied".into();
+                receipt.sequence = applied_sequence;
+            }
             store.save(&record)?;
             store.finish(id)?;
             self.cleanup(&record);
@@ -500,6 +577,27 @@ impl TransactionCoordinator {
             return Err(error);
         }
         transition(record, TransactionState::RollingBack);
+        let rolling_back_sequence = record.summary.sequence;
+        for change in &record.changes {
+            let receipt = record
+                .summary
+                .path_receipts
+                .entry(change.path.clone())
+                .or_insert_with(|| TransactionPathReceipt {
+                    before_hash: change.before.hash.clone(),
+                    proposed_hash: change.proposed.hash.clone(),
+                    applied_hash: record
+                        .summary
+                        .applied_hashes
+                        .get(&change.path)
+                        .cloned()
+                        .flatten(),
+                    state: "rolling_back".into(),
+                    sequence: rolling_back_sequence,
+                });
+            receipt.state = "rolling_back".into();
+            receipt.sequence = rolling_back_sequence;
+        }
         if let Err(error) = store.save(record) {
             self.cleanup(record);
             return Err(error);
@@ -557,6 +655,12 @@ impl TransactionCoordinator {
                 change.restore_alias_pending = false;
                 store.save(record)?;
             }
+            let sequence = record.summary.sequence;
+            if let Some(receipt) = record.summary.path_receipts.get_mut(&path) {
+                receipt.state = "rolled_back".into();
+                receipt.sequence = sequence;
+            }
+            store.save(record)?;
         }
         for change in &record.changes {
             let current = files::capture(&self.root, &change.path)?.0;
@@ -574,6 +678,11 @@ impl TransactionCoordinator {
         }
         transition(record, TransactionState::RolledBack);
         record.summary.verification_state = "invalidated by rollback".into();
+        let rolled_back_sequence = record.summary.sequence;
+        for receipt in record.summary.path_receipts.values_mut() {
+            receipt.state = "rolled_back".into();
+            receipt.sequence = rolled_back_sequence;
+        }
         store.save(record)?;
         store.finish(&record.summary.id)?;
         self.cleanup(record);

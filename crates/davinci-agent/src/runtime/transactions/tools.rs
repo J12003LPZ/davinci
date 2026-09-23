@@ -175,6 +175,9 @@ impl<'a> ToolTransaction<'a> {
         };
         let mut coordinator =
             TransactionCoordinator::new(&root, owner).map_err(ToolError::Failed)?;
+        if let Some(binding) = context.process_operation_binding.as_ref() {
+            coordinator = coordinator.with_operation_link(binding.clone());
+        }
         // Only a trusted host-attached root session can recover across agent restarts.
         coordinator.allow_session_recovery = context.runtime.as_ref().is_some_and(|runtime| {
             runtime.parent_agent_id.is_none() && runtime.session_id.is_some()

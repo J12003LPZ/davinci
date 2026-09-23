@@ -17,6 +17,7 @@ mod store_support;
 mod transitions;
 
 pub use adapters::{
+    classify_file_observation, FilesystemEffectObservation, FilesystemOperationLink,
     ProcessOperationBinding, ToolOperationDispatchError, ToolOperationDispatcher,
     ToolOperationRuntime,
 };

@@ -70,6 +70,29 @@ pub struct TransactionSummary {
     pub conflict: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub warnings: Vec<String>,
+    /// Durable link to the operation attempt that admitted this transaction.
+    /// Legacy records omit these fields and remain read-only observations.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub operation_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attempt_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub operation_owner_generation: Option<u64>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub path_receipts: BTreeMap<String, TransactionPathReceipt>,
+}
+
+/// Per-path transaction evidence. A desired postimage can be observed after a
+/// crash, but the receipt retains whether this coordinator actually recorded
+/// the path as applied.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TransactionPathReceipt {
+    pub before_hash: Option<String>,
+    pub proposed_hash: Option<String>,
+    pub applied_hash: Option<String>,
+    pub state: String,
+    pub sequence: u64,
 }
 
 #[derive(Debug, Clone)]
