@@ -58,8 +58,7 @@ fn fixture() -> Fixture {
     )
     .unwrap();
     let operation_id = spec.operation_id().to_string();
-    let journal =
-        OperationJournal::open(&journal_dir, identity, root_namespace_id).unwrap();
+    let journal = OperationJournal::open(&journal_dir, identity, root_namespace_id).unwrap();
     let attempt = OperationAttempt::new(
         spec.operation_id(),
         1,
