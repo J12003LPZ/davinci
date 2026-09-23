@@ -1,11 +1,161 @@
 use super::store_api::{JournalError, JournalIdentity};
 use super::OperationSpec;
 use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+use sha2::{Digest, Sha256};
 
 const INITIAL_SCHEMA_VERSION: u32 = 1;
 const SCHEMA_V2_VERSION: u32 = 2;
-pub(super) const SCHEMA_VERSION: u32 = 3;
+const SCHEMA_V3_VERSION: u32 = 3;
+pub(super) const SCHEMA_VERSION: u32 = 4;
 const APPLICATION_ID: i64 = 0x4456_4F50; // "DVOP"
+
+/// A bounded, append-only observation imported from a legacy execution store.
+///
+/// These records are deliberately not operations or attempts. A legacy file
+/// can tell us what it recorded, but it cannot manufacture an owner, effect
+/// latch, start time, or retry authority that was never durably recorded.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LegacyObservation {
+    pub schema_version: u32,
+    pub source_kind: LegacySourceKind,
+    pub source_identity: String,
+    pub source_digest: String,
+    pub record_identity: String,
+    pub state: String,
+    #[serde(default)]
+    pub known_result: Option<Value>,
+    #[serde(default)]
+    pub evidence_provenance: Vec<String>,
+    #[serde(default)]
+    pub started_at_ms: Option<u64>,
+    #[serde(default)]
+    pub effect_status: Option<String>,
+    #[serde(default)]
+    pub owner_id: Option<String>,
+    #[serde(default)]
+    pub observed_at_ms: Option<u64>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LegacySourceKind {
+    ToolLedger,
+    SessionTaskJournal,
+    GraphRun,
+    Transaction,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LegacyMigrationReport {
+    pub imported: usize,
+    pub already_present: usize,
+}
+
+impl LegacyObservation {
+    pub const SCHEMA_VERSION: u32 = 1;
+
+    pub fn from_source(
+        source_kind: LegacySourceKind,
+        source_identity: impl Into<String>,
+        source_bytes: &[u8],
+        record_identity: impl Into<String>,
+        state: impl Into<String>,
+    ) -> Result<Self, JournalError> {
+        let source_digest = digest_bytes(source_bytes);
+        Self::new(
+            source_kind,
+            source_identity,
+            source_digest,
+            record_identity,
+            state,
+        )
+    }
+
+    pub fn new(
+        source_kind: LegacySourceKind,
+        source_identity: impl Into<String>,
+        source_digest: impl Into<String>,
+        record_identity: impl Into<String>,
+        state: impl Into<String>,
+    ) -> Result<Self, JournalError> {
+        let observation = Self {
+            schema_version: Self::SCHEMA_VERSION,
+            source_kind,
+            source_identity: source_identity.into(),
+            source_digest: source_digest.into(),
+            record_identity: record_identity.into(),
+            state: state.into(),
+            known_result: None,
+            evidence_provenance: Vec::new(),
+            started_at_ms: None,
+            effect_status: None,
+            owner_id: None,
+            observed_at_ms: None,
+        };
+        observation.validate()?;
+        Ok(observation)
+    }
+
+    pub fn validate(&self) -> Result<(), JournalError> {
+        if self.schema_version != Self::SCHEMA_VERSION {
+            return Err(JournalError::Serialization(format!(
+                "unsupported legacy observation schema {}",
+                self.schema_version
+            )));
+        }
+        if self.source_identity.trim().is_empty() || self.source_identity.len() > 4096 {
+            return Err(JournalError::Serialization(
+                "legacy observation source identity is invalid".into(),
+            ));
+        }
+        if self.record_identity.trim().is_empty() || self.record_identity.len() > 1024 {
+            return Err(JournalError::Serialization(
+                "legacy observation record identity is invalid".into(),
+            ));
+        }
+        if self.state.trim().is_empty() || self.state.len() > 128 {
+            return Err(JournalError::Serialization(
+                "legacy observation state is invalid".into(),
+            ));
+        }
+        if self.source_digest.len() != 64
+            || !self
+                .source_digest
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit())
+        {
+            return Err(JournalError::Serialization(
+                "legacy observation source digest is invalid".into(),
+            ));
+        }
+        if self.evidence_provenance.len() > 32
+            || self
+                .evidence_provenance
+                .iter()
+                .any(|value| value.trim().is_empty() || value.len() > 512)
+        {
+            return Err(JournalError::Serialization(
+                "legacy observation evidence provenance is invalid".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    pub fn observation_id(&self) -> String {
+        let mut hasher = Sha256::new();
+        hasher.update(self.source_digest.as_bytes());
+        hasher.update([0]);
+        hasher.update(self.record_identity.as_bytes());
+        format!("{:x}", hasher.finalize())
+    }
+}
+
+pub fn digest_bytes(bytes: &[u8]) -> String {
+    format!("{:x}", Sha256::digest(bytes))
+}
 
 const SCHEMA_V1: &str = r#"
 CREATE TABLE journal_metadata (
@@ -240,6 +390,25 @@ CREATE TRIGGER effect_claims_no_delete BEFORE DELETE ON operation_effect_claims
 BEGIN SELECT RAISE(ABORT, 'effect claim history is retained'); END;
 "#;
 
+const SCHEMA_V4: &str = r#"
+CREATE TABLE legacy_observations (
+    observation_id TEXT PRIMARY KEY,
+    source_kind TEXT NOT NULL CHECK (length(source_kind) BETWEEN 1 AND 64),
+    source_identity TEXT NOT NULL CHECK (length(source_identity) BETWEEN 1 AND 4096),
+    source_digest TEXT NOT NULL CHECK (length(source_digest) = 64),
+    record_identity TEXT NOT NULL CHECK (length(record_identity) BETWEEN 1 AND 1024),
+    observation_json TEXT NOT NULL CHECK (length(observation_json) <= 262144),
+    imported_at_ms INTEGER NOT NULL,
+    UNIQUE (source_digest, record_identity)
+);
+CREATE INDEX legacy_observations_source
+    ON legacy_observations(source_digest, source_kind, record_identity);
+CREATE TRIGGER legacy_observations_no_update BEFORE UPDATE ON legacy_observations
+BEGIN SELECT RAISE(ABORT, 'legacy observations are append only'); END;
+CREATE TRIGGER legacy_observations_no_delete BEFORE DELETE ON legacy_observations
+BEGIN SELECT RAISE(ABORT, 'legacy observations are retained'); END;
+"#;
+
 pub(super) fn initialize(
     connection: &mut Connection,
     identity: &JournalIdentity,
@@ -255,21 +424,31 @@ pub(super) fn initialize(
             initialize_v1(connection, identity, application_id)?;
             migrate_v2(connection)?;
             migrate_v3(connection)?;
+            migrate_v4(connection)?;
         }
         INITIAL_SCHEMA_VERSION => {
             validate_v1(connection, identity, application_id)?;
             migrate_v2(connection)?;
             migrate_v3(connection)?;
+            migrate_v4(connection)?;
         }
         SCHEMA_V2_VERSION => {
             validate_v1(connection, identity, application_id)?;
             validate_v2(connection)?;
             migrate_v3(connection)?;
+            migrate_v4(connection)?;
+        }
+        SCHEMA_V3_VERSION => {
+            validate_v1(connection, identity, application_id)?;
+            validate_v2(connection)?;
+            validate_v3(connection)?;
+            migrate_v4(connection)?;
         }
         SCHEMA_VERSION => {
             validate_v1(connection, identity, application_id)?;
             validate_v2(connection)?;
             validate_v3(connection)?;
+            validate_v4(connection)?;
         }
         other => return Err(JournalError::UnsupportedSchema(other)),
     }
@@ -507,11 +686,23 @@ fn migrate_v3(connection: &mut Connection) -> Result<(), JournalError> {
     }
     transaction.execute(
         "INSERT INTO journal_migrations (version, applied_at_ms) VALUES (?1, ?2)",
-        rusqlite::params![SCHEMA_VERSION, super::store_support::now_unix_millis()],
+        rusqlite::params![SCHEMA_V3_VERSION, super::store_support::now_unix_millis()],
+    )?;
+    transaction.pragma_update(None, "user_version", SCHEMA_V3_VERSION)?;
+    transaction.commit()?;
+    validate_v3(connection)
+}
+
+fn migrate_v4(connection: &mut Connection) -> Result<(), JournalError> {
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Exclusive)?;
+    transaction.execute_batch(SCHEMA_V4)?;
+    transaction.execute(
+        "INSERT INTO journal_migrations (version, applied_at_ms) VALUES (?1, ?2)",
+        params![SCHEMA_VERSION, super::store_support::now_unix_millis()],
     )?;
     transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
     transaction.commit()?;
-    validate_v3(connection)
+    validate_v4(connection)
 }
 
 fn validate_v2(connection: &Connection) -> Result<(), JournalError> {
@@ -547,11 +738,11 @@ fn validate_v3(connection: &Connection) -> Result<(), JournalError> {
     let migration: Option<u32> = connection
         .query_row(
             "SELECT version FROM journal_migrations WHERE version = ?1",
-            [SCHEMA_VERSION],
+            [SCHEMA_V3_VERSION],
             |row| row.get(0),
         )
         .optional()?;
-    if migration != Some(SCHEMA_VERSION) {
+    if migration != Some(SCHEMA_V3_VERSION) {
         return Err(JournalError::Integrity(
             "recovery/resource claim migration record is missing".into(),
         ));
@@ -568,6 +759,35 @@ fn validate_v3(connection: &Connection) -> Result<(), JournalError> {
     if invalid_claims != 0 {
         return Err(JournalError::Integrity(
             "resource effect claim binding is invalid".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_v4(connection: &Connection) -> Result<(), JournalError> {
+    let migration: Option<u32> = connection
+        .query_row(
+            "SELECT version FROM journal_migrations WHERE version = ?1",
+            [SCHEMA_VERSION],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if migration != Some(SCHEMA_VERSION) {
+        return Err(JournalError::Integrity(
+            "legacy observation migration record is missing".into(),
+        ));
+    }
+    let invalid_records: i64 = connection.query_row(
+        "SELECT count(*) FROM legacy_observations
+         WHERE length(source_digest) != 64
+            OR length(source_identity) = 0
+            OR length(record_identity) = 0",
+        [],
+        |row| row.get(0),
+    )?;
+    if invalid_records != 0 {
+        return Err(JournalError::Integrity(
+            "legacy observation binding is invalid".into(),
         ));
     }
     Ok(())
@@ -596,8 +816,8 @@ mod tests {
     use crate::runtime::operations::{
         transition_attempt, CallerType, EffectClass, EffectProfile, ExecutionOwner,
         ExecutionOwnerId, IdempotencyScope, JournalId, OperationAttempt, OperationContext,
-        OperationEvent, OperationKind, RootNamespaceId, ScopedIdempotencyKey, WorkspaceId,
-        WorkspaceIdentity,
+        OperationEvent, OperationJournal, OperationKind, RootNamespaceId, ScopedIdempotencyKey,
+        WorkspaceId, WorkspaceIdentity, JOURNAL_DATABASE_FILE_NAME,
     };
     use crate::runtime::{AgentId, RunId, TaskId};
     use serde_json::json;
@@ -770,5 +990,79 @@ mod tests {
             initialize(&mut connection, &identity),
             Err(JournalError::UnsupportedDatabase(0))
         ));
+    }
+
+    #[test]
+    fn v4_migration_rolls_back_on_interruption_and_converges_on_retry() {
+        let temp = tempfile::tempdir().unwrap();
+        let journal_dir = temp.path().join("operations");
+        let database = journal_dir.join(JOURNAL_DATABASE_FILE_NAME);
+        let identity = JournalIdentity::new(
+            JournalId::new(),
+            WorkspaceIdentity {
+                id: WorkspaceId::new(),
+                binding_version: 1,
+            },
+        )
+        .unwrap();
+        let journal =
+            OperationJournal::open(&journal_dir, identity.clone(), RootNamespaceId::new()).unwrap();
+        drop(journal);
+
+        let mut connection = Connection::open(&database).unwrap();
+        connection
+            .execute("DROP TABLE legacy_observations", [])
+            .unwrap();
+        connection
+            .execute(
+                "DELETE FROM journal_migrations WHERE version = ?1",
+                [SCHEMA_VERSION],
+            )
+            .unwrap();
+        connection
+            .pragma_update(None, "user_version", SCHEMA_V3_VERSION)
+            .unwrap();
+        connection
+            .execute_batch(
+                "CREATE TRIGGER interrupt_v4_migration
+                 BEFORE INSERT ON journal_migrations
+                 WHEN NEW.version = 4
+                 BEGIN SELECT RAISE(ABORT, 'injected migration interruption'); END;",
+            )
+            .unwrap();
+
+        let error = initialize(&mut connection, &identity).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("injected migration interruption"));
+        assert_eq!(
+            connection
+                .pragma_query_value(None, "user_version", |row| row.get::<_, u32>(0))
+                .unwrap(),
+            SCHEMA_V3_VERSION
+        );
+        assert!(connection
+            .prepare("SELECT 1 FROM legacy_observations LIMIT 1")
+            .is_err());
+
+        connection
+            .execute_batch("DROP TRIGGER interrupt_v4_migration")
+            .unwrap();
+        initialize(&mut connection, &identity).unwrap();
+        initialize(&mut connection, &identity).unwrap();
+        assert_eq!(
+            connection
+                .pragma_query_value(None, "user_version", |row| row.get::<_, u32>(0))
+                .unwrap(),
+            SCHEMA_VERSION
+        );
+        let migration_count: i64 = connection
+            .query_row(
+                "SELECT count(*) FROM journal_migrations WHERE version = ?1",
+                [SCHEMA_VERSION],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(migration_count, 1);
     }
 }

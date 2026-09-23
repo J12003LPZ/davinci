@@ -10,6 +10,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 
+use crate::runtime::operations::{digest_bytes, LegacyObservation, LegacySourceKind};
 use crate::runtime::{conservative_replay_policy, ReplayPolicy};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -213,17 +214,89 @@ impl Default for ToolCallLedger {
 pub(crate) enum ToolCallExecutionAuthority {
     CompatibilityLedger,
     OperationJournal,
+    LegacyObservationBlocked,
 }
 
 impl ToolCallLedger {
+    /// Read a legacy ledger without reconciling or rewriting it. This is the
+    /// migration boundary: the original bytes provide the source digest and
+    /// each record is imported as an observation before restart cleanup can
+    /// remove compatibility entries.
+    pub fn legacy_observations_from_path(
+        path: &Path,
+        session_id: &str,
+    ) -> Result<Vec<LegacyObservation>, String> {
+        if !path.is_file() {
+            return Ok(Vec::new());
+        }
+        let bytes = std::fs::read(path).map_err(|error| error.to_string())?;
+        let ledger: Self = serde_json::from_slice(&bytes)
+            .map_err(|error| format!("tool ledger is corrupt: {error}"))?;
+        if !ledger.session_id.is_empty() && ledger.session_id != session_id {
+            return Err("tool ledger belongs to a different session".into());
+        }
+        let source_identity = std::fs::canonicalize(path)
+            .unwrap_or_else(|_| path.to_path_buf())
+            .to_string_lossy()
+            .into_owned();
+        let source_digest = digest_bytes(&bytes);
+        let mut records = Vec::with_capacity(ledger.records.len());
+        let mut ordered_ids = ledger.record_order.clone();
+        let ordered_set: std::collections::HashSet<_> = ordered_ids.iter().cloned().collect();
+        let mut unordered_ids: Vec<_> = ledger
+            .records
+            .keys()
+            .filter(|id| !ordered_set.contains(*id))
+            .cloned()
+            .collect();
+        unordered_ids.sort();
+        ordered_ids.extend(unordered_ids);
+        for call_id in ordered_ids {
+            let Some(record) = ledger.records.get(&call_id) else {
+                return Err("tool ledger record order references a missing record".into());
+            };
+            let mut observation = LegacyObservation::new(
+                LegacySourceKind::ToolLedger,
+                source_identity.clone(),
+                source_digest.clone(),
+                record.call_id.clone(),
+                serde_json::to_value(record.status)
+                    .map_err(|error| error.to_string())?
+                    .as_str()
+                    .unwrap_or("unknown"),
+            )
+            .map_err(|error| error.to_string())?;
+            observation
+                .evidence_provenance
+                .push("tool_ledger.status".into());
+            if let Some(result_digest) = &record.result_digest {
+                observation.known_result = Some(serde_json::json!({
+                    "result_digest": result_digest,
+                    "is_error": record.is_error,
+                }));
+                observation
+                    .evidence_provenance
+                    .push("tool_ledger.result_digest".into());
+            }
+            observation.observed_at_ms = record.executed_at;
+            observation.validate().map_err(|error| error.to_string())?;
+            records.push(observation);
+        }
+        Ok(records)
+    }
+
     pub(crate) fn execution_authority(
         &self,
         call_id: &str,
         builtin_capability: bool,
         journal_configured: bool,
     ) -> ToolCallExecutionAuthority {
-        if builtin_capability && journal_configured && !self.records.contains_key(call_id) {
-            ToolCallExecutionAuthority::OperationJournal
+        if builtin_capability && journal_configured {
+            if self.records.contains_key(call_id) {
+                ToolCallExecutionAuthority::LegacyObservationBlocked
+            } else {
+                ToolCallExecutionAuthority::OperationJournal
+            }
         } else {
             ToolCallExecutionAuthority::CompatibilityLedger
         }
@@ -945,6 +1018,20 @@ mod tests {
         assert_eq!(
             classify_side_effect("exec_command"),
             ToolSideEffect::Mutating
+        );
+    }
+
+    #[test]
+    fn configured_operation_journal_blocks_legacy_record_fallback() {
+        let mut ledger = ToolCallLedger::new("session", "lineage");
+        ledger.record_start("legacy-call", "edit", &json!({"path": "file"}));
+        assert_eq!(
+            ledger.execution_authority("legacy-call", true, true),
+            ToolCallExecutionAuthority::LegacyObservationBlocked
+        );
+        assert_eq!(
+            ledger.execution_authority("new-call", true, true),
+            ToolCallExecutionAuthority::OperationJournal
         );
     }
 

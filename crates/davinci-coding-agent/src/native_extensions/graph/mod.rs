@@ -638,12 +638,15 @@ impl GraphController {
                     }));
                 }
                 Err(_) => {
+                    let legacy_recovery =
+                        recovery::legacy_retry_recovery(recovery::RetryDecision::Stop);
                     for task in &mut old_run.tasks {
                         if task.status == types::TaskStatus::Running {
                             task.status = types::TaskStatus::Failed;
-                            task.error = Some(
-                                "worker stopped unexpectedly; reconciliation required".to_string(),
-                            );
+                            task.error = Some(format!(
+                                "worker stopped unexpectedly; {}",
+                                legacy_recovery.reason
+                            ));
                         }
                     }
                     old_run.lifecycle = Some(types::GraphLifecycle::RecoveryRequired);
@@ -654,7 +657,7 @@ impl GraphController {
                         "reconciliationRequired": true,
                         "runId": old_run.run_id,
                         "status": render_now(&old_run),
-                        "message": "Run workers crashed and require reconciliation before resuming.",
+                        "message": legacy_recovery.reason,
                     }));
                 }
             };

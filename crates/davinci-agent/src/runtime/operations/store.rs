@@ -1,4 +1,5 @@
 use super::migrations;
+use super::migrations::{LegacyMigrationReport, LegacyObservation};
 use super::store_api::*;
 use super::store_support::*;
 use super::transitions::{transition_attempt, OperationEvent, TransitionError};
@@ -493,6 +494,107 @@ impl OperationJournal {
                 results,
                 outbox,
             })
+        })
+    }
+
+    /// Import observations from a legacy execution store without promoting
+    /// them to operations, attempts, owners, or retry authority. The source
+    /// digest and record identity form the idempotency key; a changed record
+    /// with the same key is an integrity error rather than an overwrite.
+    pub fn import_legacy_observations(
+        &self,
+        observations: &[LegacyObservation],
+    ) -> Result<LegacyMigrationReport, JournalError> {
+        if observations.len() > 50_000 {
+            return Err(JournalError::Capacity("legacy observation batch"));
+        }
+        let encoded = observations
+            .iter()
+            .map(|observation| {
+                observation.validate()?;
+                encode_bounded(observation, 262_144, "legacy observation")
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        self.write(|transaction| {
+            let mut imported = 0;
+            let mut already_present = 0;
+            for (observation, observation_json) in observations.iter().zip(encoded.iter()) {
+                let key = (
+                    observation.source_digest.as_str(),
+                    observation.record_identity.as_str(),
+                );
+                let existing: Option<String> = transaction
+                    .query_row(
+                        "SELECT observation_json FROM legacy_observations
+                         WHERE source_digest = ?1 AND record_identity = ?2",
+                        key,
+                        |row| row.get(0),
+                    )
+                    .optional()
+                    .map_err(sqlite_error)?;
+                if let Some(existing) = existing {
+                    if existing != *observation_json {
+                        return Err(JournalError::Serialization(format!(
+                            "legacy observation changed for source digest {} record {}",
+                            observation.source_digest, observation.record_identity
+                        )));
+                    }
+                    already_present += 1;
+                    continue;
+                }
+                transaction
+                    .execute(
+                        "INSERT INTO legacy_observations
+                         (observation_id, source_kind, source_identity, source_digest,
+                          record_identity, observation_json, imported_at_ms)
+                         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                        params![
+                            observation.observation_id(),
+                            serde_json::to_value(observation.source_kind)
+                                .map_err(|error| JournalError::Serialization(error.to_string()))?
+                                .as_str()
+                                .ok_or_else(|| {
+                                    JournalError::Serialization(
+                                        "legacy observation source kind is not a string".into(),
+                                    )
+                                })?,
+                            observation.source_identity,
+                            observation.source_digest,
+                            observation.record_identity,
+                            observation_json,
+                            now_unix_millis(),
+                        ],
+                    )
+                    .map_err(sqlite_error)?;
+                imported += 1;
+            }
+            Ok(LegacyMigrationReport {
+                imported,
+                already_present,
+            })
+        })
+    }
+
+    /// Return imported legacy observations in deterministic source/record
+    /// order for inspectors and migration tests.
+    pub fn legacy_observations(&self) -> Result<Vec<LegacyObservation>, JournalError> {
+        self.read(|transaction| {
+            let mut statement = transaction
+                .prepare(
+                    "SELECT observation_json FROM legacy_observations
+                     ORDER BY source_digest, record_identity",
+                )
+                .map_err(sqlite_error)?;
+            let rows = statement
+                .query_map([], |row| row.get::<_, String>(0))
+                .map_err(sqlite_error)?;
+            rows.map(|row| {
+                let json = row.map_err(sqlite_error)?;
+                let observation: LegacyObservation = decode_json(&json)?;
+                observation.validate()?;
+                Ok(observation)
+            })
+            .collect()
         })
     }
 

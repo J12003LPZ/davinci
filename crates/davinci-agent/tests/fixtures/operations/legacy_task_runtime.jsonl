@@ -1,0 +1,1 @@
+{"schema_version":1,"event_id":1,"run_id":"00000000-0000-0000-0000-000000000001","agent_id":null,"parent_agent_id":null,"session_id":"legacy-session","timestamp_ms":1,"payload":{"type":"task_created","task_id":"00000000-0000-0000-0000-000000000002","record":null}}

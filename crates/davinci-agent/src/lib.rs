@@ -2683,8 +2683,22 @@ impl Agent {
             .map_err(|error| format!("Runtime recovery required: {error}"))?,
         };
         let ledger_path = session.path.with_extension("tool-ledger.json");
+        let legacy_observations =
+            ToolCallLedger::legacy_observations_from_path(&ledger_path, &session.header.id)
+                .map_err(|error| format!("Runtime recovery required: {error}"))?;
         let candidate_ledger = ToolCallLedger::load_bound(&ledger_path, &session.header.id)
             .map_err(|error| format!("Runtime recovery required: {error}"))?;
+        if let Some(operations) = candidate.operations.as_ref() {
+            operations
+                .dispatcher()
+                .journal()
+                .import_legacy_observations(&legacy_observations)
+                .map_err(|error| {
+                    format!(
+                        "Runtime recovery required: legacy operation observations could not be imported: {error}"
+                    )
+                })?;
+        }
         let messages = messages_from_session(&session);
         if session_changed {
             if let Some(processes) = &self.tool_context.processes {

@@ -20,7 +20,7 @@ use std::time::Duration;
 
 pub const INSPECTOR_SCHEMA_VERSION: u32 = 1;
 pub const JOURNAL_APPLICATION_ID: i64 = 0x4456_4F50;
-pub const JOURNAL_SCHEMA_VERSION: i64 = 3;
+pub const JOURNAL_SCHEMA_VERSION: i64 = 4;
 pub const INSPECTOR_MAX_OUTPUT_BYTES: usize = 256 * 1024;
 
 const MAX_OPERATIONS: usize = 5_000;
@@ -416,6 +416,7 @@ fn validate_schema(connection: &Connection) -> Result<(), String> {
         "operation_call_mappings",
         "operation_recovery_decisions",
         "operation_effect_claims",
+        "legacy_observations",
     ];
     for table in required {
         let exists: bool = connection

@@ -72,6 +72,34 @@ recovery owners are indexed in [operation-coverage.md](operation-coverage.md).
 The planned operation journal is not implemented yet. All rows in the coverage
 manifest are therefore `legacy` or `audit_required` at this checkpoint.
 
+## Task 20 update
+
+The preceding inventory is a Task 00 snapshot. The implementation now has a
+schema-versioned operation journal (schema 4) and an append-only legacy
+observation projection. The migration deliberately preserves the Task 00
+finding that old records are evidence, not authority:
+
+- tool-ledger records are imported from their original bytes with a source
+  digest and stable record identity before compatibility cleanup; a configured
+  operation journal blocks dispatch through an existing legacy row until
+  reconciliation completes;
+- task/session runtime records are projected before orphan cleanup, and a
+  persisted `running` value remains an observation with unknown owner, start,
+  effect, and retry facts;
+- both `.davinci` and legacy `.pi` graph roots are enumerated, while conflicting
+  duplicate checkpoints fail closed instead of selecting whichever root was
+  visited first;
+- legacy graph retry recovery returns a denied, operation-journal-unavailable
+  record and cannot grant a replacement worker authority;
+- no unsupported downgrade guarantee is made. A previous reader has not been
+  modified or executed as part of this task, so compatibility with older
+  binaries remains an explicit release check.
+
+Sessionless workers continue to use the existing private ephemeral execution
+path. The migration does not turn memory-only embedding or `--no-session`
+execution into a durable crash-recovery mode; callers without a durable root
+must report recovery as unavailable.
+
 ## CI configuration and remote check policy
 
 All workflow job IDs found under `.github/workflows` are recorded below. These

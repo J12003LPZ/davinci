@@ -1343,6 +1343,12 @@ impl Agent {
             .lock()
             .map(|ledger| ledger.execution_authority(id, journal_configured, journal_configured))
             .unwrap_or(crate::tool_ledger::ToolCallExecutionAuthority::CompatibilityLedger);
+        if route == crate::tool_ledger::ToolCallExecutionAuthority::LegacyObservationBlocked {
+            return immediate(
+                "Legacy tool-ledger record was migrated as an observation; operation recovery must reconcile it before dispatch.".into(),
+                true,
+            );
+        }
         if route == crate::tool_ledger::ToolCallExecutionAuthority::CompatibilityLedger {
             let replay_policy = self.replay_policy_for_tool(name);
             let side_effect = self.side_effect_for_tool(name);

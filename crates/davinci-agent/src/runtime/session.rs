@@ -9,6 +9,7 @@ use super::{
     RuntimeDecision, RuntimeEventEnvelope, RuntimeHandle, RuntimeSubscriber, TaskRegistry,
     TaskState,
 };
+use crate::runtime::operations::{digest_bytes, LegacyObservation, LegacySourceKind};
 
 const WORKER_IDENTITY: &str = "worker_runtime_identity";
 
@@ -64,6 +65,46 @@ pub fn restore_session_runtime_with_legacy_recovery(
         TaskRegistry::legacy_snapshot_with_recovery(&events, &session.header.id, recovery)
             .map_err(|error| format!("legacy tasks could not be migrated: {error}"))?
     };
+    let legacy_task_observations = if legacy_tasks.is_empty() {
+        Vec::new()
+    } else {
+        let source_bytes = std::fs::read(&path).unwrap_or_default();
+        let source_identity = std::fs::canonicalize(&path)
+            .unwrap_or_else(|_| path.clone())
+            .to_string_lossy()
+            .into_owned();
+        let source_digest = digest_bytes(&source_bytes);
+        legacy_tasks
+            .iter()
+            .map(|task| {
+                let mut observation = LegacyObservation::new(
+                    LegacySourceKind::SessionTaskJournal,
+                    source_identity.clone(),
+                    source_digest.clone(),
+                    task.id.to_string(),
+                    serde_json::to_value(task.state)
+                        .map_err(|error| error.to_string())?
+                        .as_str()
+                        .unwrap_or("unknown"),
+                )
+                .map_err(|error| error.to_string())?;
+                observation
+                    .evidence_provenance
+                    .push("legacy_task_projection.state".into());
+                if let Some(result) = &task.result {
+                    observation.known_result = Some(serde_json::json!({
+                        "result_digest": digest_bytes(result.as_bytes()),
+                    }));
+                    observation
+                        .evidence_provenance
+                        .push("legacy_task_projection.result_digest".into());
+                }
+                observation.observed_at_ms = u64::try_from(task.updated_at_ms).ok();
+                observation.validate().map_err(|error| error.to_string())?;
+                Ok::<_, String>(observation)
+            })
+            .collect::<Result<Vec<_>, _>>()?
+    };
     runtime
         .registry
         .rehydrate_from_events(&events)
@@ -91,6 +132,15 @@ pub fn restore_session_runtime_with_legacy_recovery(
     tasks
         .validate_operation_receipts()
         .map_err(|error| format!("task operation receipts could not be validated: {error}"))?;
+    if let Some(operations) = runtime.operations.as_ref() {
+        operations
+            .dispatcher()
+            .journal()
+            .import_legacy_observations(&legacy_task_observations)
+            .map_err(|error| {
+                format!("legacy task observations could not be imported before recovery: {error}")
+            })?;
+    }
     // No worker from this previous process can still own execution. Commit
     // the existing crash-recovery state before admitting new commands.
     for task in tasks.list_tasks(Some(run_id)) {

@@ -37,3 +37,29 @@ consumes its permit, the durable intent/result/evidence IDs, its current
 recovery owner, and the regression test proving that a second entry point
 cannot bypass admission. Shell, custom extensions, hooks, browsers, and remote
 servers remain explicitly opaque outside the harness-controlled invocation.
+
+## Task 20 migration status
+
+The operation journal is now schema version 4. Legacy stores are imported as
+append-only `legacy_observations`, keyed by source digest and record identity.
+An observation retains the original source identity and evidence paths; it does
+not invent an owner, start time, effect latch, completion result, or retry
+authority. Repeating the same import is idempotent, while a changed record
+under the same source key is rejected without rewriting the prior observation.
+
+The migrated entry points have these boundaries:
+
+| Legacy source | Migration projection | Recovery authority after migration |
+|---|---|---|
+| `ToolCallLedger` | One source-bound observation per ordered record, read before compatibility reconciliation can rewrite the file. | The operation journal when configured; an existing legacy row blocks authoritative-to-legacy fallback until reconciliation. |
+| Session/task runtime log | State and result digests become observations before the durable task journal projects orphaned `running` tasks to failure. | Durable task receipts and operation reconciliation; a legacy `running` value is not a live owner or retry permit. |
+| `.pi` graph run roots | Legacy runs remain discoverable beside `.davinci`; duplicate run IDs with different checkpoint bytes fail closed. | Graph continuation and operation recovery; the legacy retry projection is observation-only. |
+| Legacy transaction records | Source kind is reserved in the observation schema; no missing effect or owner facts are synthesized. | Transaction and operation adapters must provide authoritative phase/effect evidence before retry. |
+
+The existing `--no-session` worker path remains ephemeral and is covered by
+its current worker tests. No durable sessionless transcript or durable
+memory-only embedding claim was enabled by this migration; embedding callers
+must report that crash recovery is unavailable when they do not provide a
+durable session root. Downgrade support is not claimed: the current reader
+rejects conflicting modern and legacy roots, and no assertion is made that an
+older binary understands the new markers.

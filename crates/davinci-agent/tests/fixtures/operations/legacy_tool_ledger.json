@@ -1,0 +1,23 @@
+{
+  "session_id": "legacy-session",
+  "lineage_id": "legacy-lineage",
+  "records": {
+    "call-legacy": {
+      "call_id": "call-legacy",
+      "tool_name": "edit",
+      "normalized_arguments": {"path": "README.md"},
+      "argument_digest": "fixture",
+      "side_effect": "mutating",
+      "replay_policy": "reconcile_before_replay",
+      "outcome": "started_unknown",
+      "pre_state_hash": null,
+      "post_state_hash": null,
+      "status": "executing",
+      "result_digest": null,
+      "output": null,
+      "is_error": false,
+      "executed_at": null
+    }
+  },
+  "record_order": ["call-legacy"]
+}

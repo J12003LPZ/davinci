@@ -183,6 +183,23 @@ pub fn retry_recovery_gate(input: RetryRecoveryInput) -> RetryRecoveryRecord {
     }
 }
 
+/// Convert a legacy graph retry recommendation into an observation-only
+/// recovery result. Legacy checkpoints do not carry an authoritative
+/// operation binding, so their retry branch must never grant a replacement
+/// worker authority or reinterpret a recorded `running` state as live.
+pub fn legacy_retry_recovery(recommendation: RetryDecision) -> RetryRecoveryRecord {
+    RetryRecoveryRecord {
+        recommendation,
+        status: RetryRecoveryStatus::OperationJournalUnavailable,
+        allowed: false,
+        reason:
+            "legacy recovery is an observation; operation reconciliation is required before retry"
+                .into(),
+        operation_state: None,
+        effect_status: None,
+    }
+}
+
 /// Classify a failed worker without asking a model to interpret its output.
 /// Typed process signals take precedence over compatibility text markers.
 pub fn classify_worker_failure(
@@ -593,5 +610,18 @@ mod tests {
         assert_eq!(delta.text.matches("</retry_context>").count(), 1);
         assert!(delta.text.ends_with("</retry_context>"));
         assert!(delta.estimated_tokens <= RETRY_CONTEXT_DELTA_TOKENS);
+    }
+
+    #[test]
+    fn legacy_retry_recovery_never_grants_authority() {
+        let record = legacy_retry_recovery(RetryDecision::RetrySameBudget);
+        assert!(!record.allowed);
+        assert_eq!(
+            record.status,
+            RetryRecoveryStatus::OperationJournalUnavailable
+        );
+        assert!(record.reason.contains("observation"));
+        assert!(record.operation_state.is_none());
+        assert!(record.effect_status.is_none());
     }
 }

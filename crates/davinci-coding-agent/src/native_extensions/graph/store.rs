@@ -23,6 +23,26 @@ pub use history::*;
 pub const CONFIG_DIR: &str = ".davinci";
 pub const LEGACY_CONFIG_DIR: &str = ".pi";
 
+fn modern_runs_root_dir(cwd: &Path) -> PathBuf {
+    cwd.join(CONFIG_DIR).join("graph").join("runs")
+}
+
+fn legacy_runs_root_dir(cwd: &Path) -> PathBuf {
+    cwd.join(LEGACY_CONFIG_DIR).join("graph").join("runs")
+}
+
+/// Return both graph roots in authority order. The legacy root is a migration
+/// source and is never allowed to silently shadow a conflicting modern run.
+pub fn graph_run_roots(cwd: &Path) -> Vec<PathBuf> {
+    let modern = modern_runs_root_dir(cwd);
+    let legacy = legacy_runs_root_dir(cwd);
+    if modern == legacy {
+        vec![modern]
+    } else {
+        vec![modern, legacy]
+    }
+}
+
 pub fn now_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -63,11 +83,11 @@ pub fn iso8601_utc(ms: u64) -> String {
 }
 
 pub fn runs_root_dir(cwd: &Path) -> PathBuf {
-    let davinci = cwd.join(CONFIG_DIR).join("graph").join("runs");
+    let davinci = modern_runs_root_dir(cwd);
     if davinci.exists() {
         davinci
     } else {
-        let pi = cwd.join(LEGACY_CONFIG_DIR).join("graph").join("runs");
+        let pi = legacy_runs_root_dir(cwd);
         if pi.exists() {
             pi
         } else {
@@ -77,7 +97,15 @@ pub fn runs_root_dir(cwd: &Path) -> PathBuf {
 }
 
 pub fn run_dir(cwd: &Path, run_id: &str) -> PathBuf {
-    runs_root_dir(cwd).join(run_id)
+    let modern = modern_runs_root_dir(cwd).join(run_id);
+    let legacy = legacy_runs_root_dir(cwd).join(run_id);
+    if modern.join("state.json").exists() {
+        modern
+    } else if legacy.join("state.json").exists() {
+        legacy
+    } else {
+        runs_root_dir(cwd).join(run_id)
+    }
 }
 
 pub fn is_safe_run_id(value: &str) -> bool {
@@ -437,6 +465,21 @@ pub fn load_run_checked(cwd: &Path, run_id: &str) -> Result<GraphRun, String> {
     if !is_safe_run_id(run_id) {
         return Err("Invalid graph run identity; expected a path-safe run ID.".into());
     }
+    let modern_state = modern_runs_root_dir(cwd).join(run_id).join("state.json");
+    let legacy_state = legacy_runs_root_dir(cwd).join(run_id).join("state.json");
+    if modern_state.is_file() && legacy_state.is_file() {
+        let modern = fs::read(&modern_state).map_err(|error| {
+            format!("Cannot read modern checkpoint for run '{run_id}': {error}")
+        })?;
+        let legacy = fs::read(&legacy_state).map_err(|error| {
+            format!("Cannot read legacy checkpoint for run '{run_id}': {error}")
+        })?;
+        if modern != legacy {
+            return Err(format!(
+                "conflicting .davinci and legacy .pi checkpoints exist for run '{run_id}'; explicit migration is required"
+            ));
+        }
+    }
     let raw = fs::read_to_string(run_dir(cwd, run_id).join("state.json"))
         .map_err(|error| format!("Cannot read checkpoint for run '{run_id}': {error}"))?;
     let mut run: GraphRun = serde_json::from_str(&raw)
@@ -497,12 +540,19 @@ pub struct RunSummary {
 
 /// Every persisted run in this project, newest first.
 pub fn list_runs(cwd: &Path) -> Vec<RunSummary> {
-    let Ok(entries) = fs::read_dir(runs_root_dir(cwd)) else {
-        return Vec::new();
-    };
-    let mut runs: Vec<RunSummary> = entries
-        .flatten()
-        .filter_map(|entry| entry.file_name().to_str().map(str::to_string))
+    let mut run_ids = std::collections::BTreeSet::new();
+    for root in graph_run_roots(cwd) {
+        let Ok(entries) = fs::read_dir(root) else {
+            continue;
+        };
+        run_ids.extend(
+            entries
+                .flatten()
+                .filter_map(|entry| entry.file_name().to_str().map(str::to_string)),
+        );
+    }
+    let mut runs: Vec<RunSummary> = run_ids
+        .into_iter()
         .filter_map(|run_id| load_run(cwd, &run_id))
         .map(|run| RunSummary {
             run_id: run.run_id,
@@ -859,6 +909,27 @@ mod tests {
         assert!(load_run_checked(dir.path(), "bad-run")
             .unwrap_err()
             .contains("Unsupported graph checkpoint version 2"));
+    }
+
+    #[test]
+    fn legacy_graph_root_is_visible_and_conflicts_fail_closed() {
+        let dir = tempdir().unwrap();
+        let legacy_run_id = "legacy-run";
+        fs::create_dir_all(legacy_runs_root_dir(dir.path())).unwrap();
+        let mut legacy = sample_run(dir.path(), legacy_run_id, "legacy");
+        save_run(&mut legacy).unwrap();
+        assert!(run_dir(dir.path(), legacy_run_id).starts_with(dir.path().join(LEGACY_CONFIG_DIR)));
+        assert_eq!(list_runs(dir.path()).len(), 1);
+
+        let modern = modern_runs_root_dir(dir.path()).join(legacy_run_id);
+        fs::create_dir_all(&modern).unwrap();
+        fs::write(
+            modern.join("state.json"),
+            br#"{"version":1,"runId":"legacy-run"}"#,
+        )
+        .unwrap();
+        let error = load_run_checked(dir.path(), legacy_run_id).unwrap_err();
+        assert!(error.contains("conflicting .davinci and legacy .pi checkpoints"));
     }
 
     #[test]

@@ -146,3 +146,33 @@ read-only required-status-check endpoint for repository `main` returned 404
 (`Branch not protected`), and its repository ruleset listing was empty. Thus
 there were no repository-configured required status check names to record at
 the time of this audit. This records policy discovery; it is not a CI run.
+
+## Task 20 - legacy execution record migration and recovery convergence
+
+Task 20 commit: `refactor(runtime): migrate legacy execution records and converge recovery`.
+
+The journal schema is now version 4. Legacy tool-ledger and task-runtime
+records are imported as source-bound observations. The migration is append-only,
+idempotent for the same source digest and record identity, rejects changed
+records under an existing key, and runs before compatibility cleanup or
+orphan-task failure projection. Graph storage scans both `.davinci` and legacy
+`.pi` roots and rejects conflicting duplicate checkpoints. Legacy graph retry
+recovery is explicitly denied until an authoritative operation journal can
+reconcile the effect.
+
+| Check | Result |
+|---|---|
+| `cargo test -p davinci-agent --test operation_migration --offline --locked` | Passed: 5 tests. Covers source-bound/idempotent import, unknown owner/effect facts for `running`, changed-record rejection, corrupt read-only failure, and fixture import without source rewrite. |
+| `cargo test -p davinci-agent runtime::operations::migrations::tests::v4_migration_rolls_back_on_interruption_and_converges_on_retry --lib --offline --locked` | Passed: 1 test. An injected schema interruption rolls back the v4 table/marker; removing the fault allows a repeated migration to converge exactly once. |
+| `cargo test -p davinci-agent tool_ledger::tests::configured_operation_journal_blocks_legacy_record_fallback --lib --offline --locked` | Passed: 1 test. Existing legacy rows cannot silently regain execution authority when the operation journal is configured. |
+| `cargo test -p davinci-agent v1_upgrade_backfills_intent_owner_and_call_mapping_for_existing_operations --lib --offline --locked` | Passed: 1 test. Existing schema upgrade remains valid alongside v4 migration. |
+| `cargo test -p davinci-agent --test operation_journal --offline --locked` | Passed: 12 tests. Fresh v4 journals, corruption/poisoning, bounds, reopen, and backup behavior remain green. |
+| `cargo test -p davinci-coding-agent graph::store::tests::legacy_graph_root_is_visible_and_conflicts_fail_closed --offline --locked` | Passed: 1 target test in the package run. |
+| `cargo test -p davinci-coding-agent graph::recovery::tests::legacy_retry_recovery_never_grants_authority --offline --locked` | Passed: 1 target test in the package run. |
+
+The runtime code preserves original legacy files and does not claim that an
+older binary understands modern authority markers. Sessionless and memory-only
+embedding paths were left with their existing ephemeral semantics; a durable
+crash-recovery claim still requires an explicit durable session root. These
+checks were local Windows runs; full workspace/CI coverage, older-binary
+downgrade execution, and non-Windows behavior remain release checks.

@@ -51,6 +51,7 @@ pub use inspector::{
     INSPECTOR_MAX_OUTPUT_BYTES, INSPECTOR_SCHEMA_VERSION, JOURNAL_APPLICATION_ID,
     JOURNAL_SCHEMA_VERSION,
 };
+pub use migrations::{digest_bytes, LegacyMigrationReport, LegacyObservation, LegacySourceKind};
 pub use model::{
     ArtifactReference, AuthorizationReceipt, CallerType, EffectClass, EffectProfile, EffectStatus,
     ExecutionOwner, GraphRunBinding, ModelError, OperationAttempt, OperationContext, OperationKind,
