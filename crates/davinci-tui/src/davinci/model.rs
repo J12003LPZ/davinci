@@ -1618,6 +1618,9 @@ pub struct FailedRun {
     /// `retrying in 9s`; empty draws no countdown row.
     pub retry: String,
     pub aftermath: Vec<(State, String)>,
+    /// Bounded report emitted by the runtime inspector.  The TUI only owns a
+    /// presentation copy; execution authority remains in the journal.
+    pub runtime_report: Option<serde_json::Value>,
 }
 
 /// One file of the Δ review (`6d`), carrying its own hunk.

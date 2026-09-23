@@ -7,6 +7,13 @@ pub const APP_NAME: &str = "davinci";
 pub const APP_TITLE: &str = "DaVinci";
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
+/// Return the first argument that is not the global offline switch.  The
+/// maintenance dispatcher and the normal CLI use the same definition so a
+/// literal `--` remains a prompt boundary rather than a subcommand marker.
+pub fn first_non_offline_argument(args: &[String]) -> Option<usize> {
+    args.iter().position(|argument| argument != "--offline")
+}
+
 /// TS `InteractiveMode.updateTerminalTitle`.
 pub fn format_terminal_title(session_name: Option<&str>, cwd: &std::path::Path) -> String {
     let cwd_basename = cwd

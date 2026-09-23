@@ -7,6 +7,7 @@ use crate::davinci::model::Model;
 use crate::davinci::theme::State;
 use crate::davinci::ui::{section_detail, span};
 use ratatui::text::Line;
+use serde_json::Value;
 
 pub fn lines(model: &Model) -> Vec<Line<'static>> {
     let th = &model.theme;
@@ -61,11 +62,74 @@ pub fn lines(model: &Model) -> Vec<Line<'static>> {
         let prefix = if *state == State::Attention { "! " } else { "" };
         rows.extend(section_detail(width, th, &format!("{prefix}{text}")));
     }
+    if let Some(report) = &run.runtime_report {
+        rows.extend(runtime_report_lines(model, report, false));
+    }
     rows.extend(section_detail(
         width,
         th,
         "Close this view, then send a new instruction to continue or change direction.",
     ));
+    rows
+}
+
+/// Render the shared inspector report in the compact form used by the normal
+/// recovery sheet or the expanded form used by a detail/snapshot view.
+pub fn runtime_report_lines(model: &Model, report: &Value, expanded: bool) -> Vec<Line<'static>> {
+    let th = &model.theme;
+    let width = model.width;
+    let operation_id = report
+        .pointer("/identity/operation_id")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown");
+    let state = report
+        .pointer("/attempts/0/state")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown");
+    let mut rows = section_detail(
+        width,
+        th,
+        &format!("Runtime operation: {operation_id} · state: {state}"),
+    );
+    if let Some(reason) = report
+        .pointer("/recovery_reasons/0/state")
+        .and_then(Value::as_str)
+    {
+        rows.extend(section_detail(
+            width,
+            th,
+            &format!("Recovery state: {reason}"),
+        ));
+    }
+    if expanded {
+        if let Some(run_id) = report
+            .pointer("/requester/runtime_run_id")
+            .and_then(Value::as_str)
+        {
+            rows.extend(section_detail(width, th, &format!("Runtime run: {run_id}")));
+        }
+        if let Some(session_id) = report
+            .pointer("/requester/session_id")
+            .and_then(Value::as_str)
+        {
+            rows.extend(section_detail(width, th, &format!("Session: {session_id}")));
+        }
+        let timeline = report
+            .get("timeline")
+            .and_then(Value::as_array)
+            .map_or(0, Vec::len);
+        rows.extend(section_detail(
+            width,
+            th,
+            &format!("Timeline events: {timeline}"),
+        ));
+        if let Some(evidence) = report
+            .pointer("/evidence/recovery_evidence/0")
+            .and_then(Value::as_str)
+        {
+            rows.extend(section_detail(width, th, &format!("Evidence: {evidence}")));
+        }
+    }
     rows
 }
 
@@ -140,6 +204,33 @@ mod tests {
         m.failed_run.as_mut().unwrap().aftermath =
             vec![(State::Attention, "follow-ups cleared".into())];
         assert!(text(&m).contains("retrying in 9s") && text(&m).contains("follow-ups cleared"));
+    }
+
+    #[test]
+    fn inspector_report_has_compact_and_expanded_renderings() {
+        let m = model(80);
+        let report = serde_json::json!({
+            "identity": {"operation_id": "op-1"},
+            "attempts": [{"state": "recovery_required"}],
+            "requester": {"runtime_run_id": "run-1", "session_id": "session-1"},
+            "recovery_reasons": [{"state": "recovery_required"}],
+            "timeline": [{"sequence": 1}],
+            "evidence": {"recovery_evidence": ["evidence-1"]}
+        });
+        let compact = runtime_report_lines(&m, &report, false)
+            .iter()
+            .map(Line::to_string)
+            .collect::<Vec<_>>()
+            .join("\n");
+        let expanded = runtime_report_lines(&m, &report, true)
+            .iter()
+            .map(Line::to_string)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(compact.contains("Runtime operation: op-1"));
+        assert!(!compact.contains("Runtime run: run-1"));
+        assert!(expanded.contains("Runtime run: run-1"));
+        assert!(expanded.contains("Timeline events: 1"));
     }
     #[test]
     fn empty_and_narrow_failures_do_not_overflow() {

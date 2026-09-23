@@ -1750,6 +1750,7 @@ fn run_turn(
             ),
             billed: "in the next /session stats".into(),
             aftermath: interrupted_recovery_aftermath(),
+            runtime_report: None,
         });
         open_sheet(model, Screen::Recovery);
     }

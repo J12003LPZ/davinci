@@ -14,6 +14,7 @@ pub mod native_tools;
 pub mod optimization;
 pub mod prompt_host;
 pub mod runtime_host;
+pub mod runtime_inspect;
 pub mod sdk;
 pub mod semantic;
 pub mod settings;

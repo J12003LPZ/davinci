@@ -1640,6 +1640,7 @@ pub fn workshop() -> WorkshopSheet {
 /// `6c` — the interrupt aftermath.
 pub fn failed_run() -> FailedRun {
     FailedRun {
+        runtime_report: None,
         prompt: "rewrite the provider adapter to stream".into(),
         tools: vec![
             (

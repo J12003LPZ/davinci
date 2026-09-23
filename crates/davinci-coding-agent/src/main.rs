@@ -313,7 +313,10 @@ fn main() {
 
 fn run(raw: Vec<String>) -> Result<i32, String> {
     apply_offline_mode(&raw);
-    let command_start = raw.iter().position(|arg| arg != "--offline").unwrap_or(0);
+    if let Some(result) = davinci_coding_agent::runtime_inspect::try_run(&raw) {
+        return result;
+    }
+    let command_start = args::first_non_offline_argument(&raw).unwrap_or(0);
     if raw.get(command_start).map(String::as_str) == Some("voice") {
         return voice_models::cli(&raw[command_start + 1..]);
     }

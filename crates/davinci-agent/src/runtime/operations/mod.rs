@@ -4,6 +4,7 @@ mod coordinator_api;
 mod failure;
 mod fault;
 mod identity;
+mod inspector;
 mod migrations;
 mod model;
 mod outbox;
@@ -44,6 +45,11 @@ pub use fault::{FaultInjector, FaultPoint};
 pub use identity::{
     AttemptId, ExecutionOwnerId, IdempotencyScope, IdentityError, JournalId, OperationId,
     PayloadDigest, ResultId, RootNamespaceId, ScopedIdempotencyKey, WorkspaceId,
+};
+pub use inspector::{
+    discover_journal_paths, inspect, InspectionTarget, InspectorOutput, InspectorStatus,
+    INSPECTOR_MAX_OUTPUT_BYTES, INSPECTOR_SCHEMA_VERSION, JOURNAL_APPLICATION_ID,
+    JOURNAL_SCHEMA_VERSION,
 };
 pub use model::{
     ArtifactReference, AuthorizationReceipt, CallerType, EffectClass, EffectProfile, EffectStatus,
