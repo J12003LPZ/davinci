@@ -558,7 +558,7 @@ mod conversation_identity_tests {
         let agent_id = AgentId::new();
         let context = OperationContext {
             journal_id: identity.journal_id,
-            root_namespace_id: root_namespace_id.clone(),
+            root_namespace_id,
             session_id: "runtime-context-test".into(),
             runtime_run_id: run_id,
             parent_operation_id: None,
