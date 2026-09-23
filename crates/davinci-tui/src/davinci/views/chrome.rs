@@ -1365,10 +1365,15 @@ mod tests {
     /// Find the caret after the four-cell prompt/continuation gutter.
     fn caret_column(model: &Model, row: usize) -> Option<usize> {
         let line = composer(model, None, Hint::Default).remove(row + 1);
+        let caret_color = if model.theme.text == ratatui::style::Color::Reset {
+            model.theme.primary
+        } else {
+            model.theme.text
+        };
         let mut column = 0usize;
         let mut caret = None;
         for span in &line.spans {
-            if caret.is_none() && span.style.bg == Some(model.theme.text) {
+            if caret.is_none() && span.style.bg == Some(caret_color) {
                 caret = Some(column);
             }
             column += UnicodeWidthStr::width(span.content.as_ref());
