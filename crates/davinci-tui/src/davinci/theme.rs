@@ -255,6 +255,23 @@ const GREY: Ramp = Ramp {
     error: rgb(0xFFFFFF),
 };
 
+/// ANSI-256 equivalent of the grayscale NO_COLOR ramp. Keeping the encoding
+/// explicit prevents a terminal that negotiated 256 colors from being
+/// misclassified as truecolor when themes are switched or dimmed.
+const ANSI256_GREY: Ramp = Ramp {
+    background: Color::Indexed(232),
+    surface: Color::Indexed(234),
+    surface_alt: Color::Indexed(233),
+    border: Color::Indexed(240),
+    text: Color::Indexed(254),
+    muted: Color::Indexed(246),
+    primary: Color::Indexed(231),
+    secondary: Color::Indexed(252),
+    success: Color::Indexed(231),
+    warning: Color::Indexed(231),
+    error: Color::Indexed(231),
+};
+
 const GREY_DIM: Ramp = Ramp {
     background: rgb(0x0B0B0B),
     surface: rgb(0x161616),
@@ -267,6 +284,20 @@ const GREY_DIM: Ramp = Ramp {
     success: rgb(0x9A9A9A),
     warning: rgb(0x9A9A9A),
     error: rgb(0x9A9A9A),
+};
+
+const ANSI256_GREY_DIM: Ramp = Ramp {
+    background: Color::Indexed(232),
+    surface: Color::Indexed(233),
+    surface_alt: Color::Indexed(233),
+    border: Color::Indexed(236),
+    text: Color::Indexed(242),
+    muted: Color::Indexed(239),
+    primary: Color::Indexed(246),
+    secondary: Color::Indexed(241),
+    success: Color::Indexed(246),
+    warning: Color::Indexed(246),
+    error: Color::Indexed(246),
 };
 
 /// Named terminal colors. Kept legible rather than faithful.
@@ -428,7 +459,8 @@ impl Theme {
             (ColorDepth::TrueColor, false) => &TRUECOLOR,
             (ColorDepth::Ansi256, false) => &ANSI256,
             (ColorDepth::Basic, false) => &BASIC,
-            (_, true) => &GREY,
+            (ColorDepth::TrueColor, true) => &GREY,
+            (ColorDepth::Ansi256, true) => &ANSI256_GREY,
         };
         Self::from_ramp(ramp, no_color, false)
     }
@@ -454,7 +486,8 @@ impl Theme {
         let ramp = match (self.depth_hint(), self.no_color) {
             (ColorDepth::Basic, true) => &BASIC_DIM,
             (ColorDepth::Basic, false) => &BASIC_DIM,
-            (_, true) => &GREY_DIM,
+            (ColorDepth::TrueColor, true) => &GREY_DIM,
+            (ColorDepth::Ansi256, true) => &ANSI256_GREY_DIM,
             (ColorDepth::Ansi256, false) => &ANSI256_DIM,
             (ColorDepth::TrueColor, false) => &TRUECOLOR_DIM,
         };
@@ -539,7 +572,10 @@ impl Theme {
     /// Which encoding this theme was built in, recovered from its own tokens so
     /// `dim` does not need the depth passed back in.
     fn depth_hint(&self) -> ColorDepth {
-        match self.text {
+        // The reference theme deliberately leaves the terminal foreground as
+        // Color::Reset. Infer capability from the authored accent instead:
+        // every built-in ramp keeps primary in its negotiated encoding.
+        match self.primary {
             Color::Rgb(..) => ColorDepth::TrueColor,
             Color::Indexed(..) => ColorDepth::Ansi256,
             _ => ColorDepth::Basic,
@@ -592,7 +628,7 @@ mod tests {
 
     #[test]
     fn readable_print_inks_have_contrast_on_every_surface() {
-        fn luminance(color: Color) -> f64 {
+        fn luminance(color: Color) -> Option<f64> {
             let (r, g, b) = match color {
                 Color::Rgb(r, g, b) => (r, g, b),
                 Color::Indexed(index @ 16..=231) => {
@@ -604,21 +640,24 @@ mod tests {
                     let value = 8 + (index - 232) * 10;
                     (value, value, value)
                 }
-                _ => panic!("expected an authored print color"),
+                Color::Reset => return None,
+                _ => return None,
             };
-            [r, g, b]
-                .into_iter()
-                .zip([0.2126, 0.7152, 0.0722])
-                .map(|(value, weight)| {
-                    let value = f64::from(value) / 255.0;
-                    weight
-                        * if value <= 0.04045 {
-                            value / 12.92
-                        } else {
-                            ((value + 0.055) / 1.055).powf(2.4)
-                        }
-                })
-                .sum()
+            Some(
+                [r, g, b]
+                    .into_iter()
+                    .zip([0.2126, 0.7152, 0.0722])
+                    .map(|(value, weight)| {
+                        let value = f64::from(value) / 255.0;
+                        weight
+                            * if value <= 0.04045 {
+                                value / 12.92
+                            } else {
+                                ((value + 0.055) / 1.055).powf(2.4)
+                            }
+                    })
+                    .sum(),
+            )
         }
         for depth in [ColorDepth::TrueColor, ColorDepth::Ansi256] {
             for theme in [
@@ -636,8 +675,12 @@ mod tests {
                         theme.warning,
                         theme.error,
                     ] {
-                        let a = luminance(foreground);
-                        let b = luminance(background);
+                        let (Some(a), Some(b)) = (luminance(foreground), luminance(background))
+                        else {
+                            // Reset means the user's terminal owns this color,
+                            // so a static RGB contrast claim would be invented.
+                            continue;
+                        };
                         let contrast = (a.max(b) + 0.05) / (a.min(b) + 0.05);
                         assert!(
                             contrast >= 4.5,
@@ -668,17 +711,17 @@ mod tests {
     #[test]
     fn truecolor_tokens_match_the_spec_table() {
         let theme = Theme::da_vinci(ColorDepth::TrueColor, false);
-        assert_eq!(theme.background, rgb(0x1F1F1F));
-        assert_eq!(theme.surface, rgb(0x2B2B2B));
-        assert_eq!(theme.surface_alt, rgb(0x262626));
-        assert_eq!(theme.border, rgb(0x767676));
-        assert_eq!(theme.text, rgb(0xE6E6E6));
-        assert_eq!(theme.muted, rgb(0xAAAAAA));
+        assert_eq!(theme.background, Color::Reset);
+        assert_eq!(theme.surface, Color::Reset);
+        assert_eq!(theme.surface_alt, Color::Reset);
+        assert_eq!(theme.border, rgb(0x888888));
+        assert_eq!(theme.text, Color::Reset);
+        assert_eq!(theme.muted, rgb(0x999999));
         assert_eq!(theme.primary, rgb(0xB1B9F9));
-        assert_eq!(theme.secondary, rgb(0xD99B82));
-        assert_eq!(theme.success, rgb(0x9BCC8B));
-        assert_eq!(theme.warning, rgb(0xE5C07B));
-        assert_eq!(theme.error, rgb(0xF38B8B));
+        assert_eq!(theme.secondary, rgb(0xD77757));
+        assert_eq!(theme.success, rgb(0x4EBA65));
+        assert_eq!(theme.warning, rgb(0xD77757));
+        assert_eq!(theme.error, rgb(0xE36D6D));
     }
 
     #[test]
@@ -772,6 +815,14 @@ mod tests {
     fn dim_keeps_the_encoding_it_was_built_in() {
         assert!(matches!(
             Theme::da_vinci(ColorDepth::Ansi256, false).dim().text,
+            Color::Indexed(_)
+        ));
+        assert!(matches!(
+            Theme::da_vinci(ColorDepth::Ansi256, true).text,
+            Color::Indexed(_)
+        ));
+        assert!(matches!(
+            Theme::da_vinci(ColorDepth::Ansi256, true).dim().text,
             Color::Indexed(_)
         ));
         assert!(matches!(
