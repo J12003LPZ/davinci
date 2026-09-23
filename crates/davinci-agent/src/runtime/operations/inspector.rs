@@ -1102,7 +1102,7 @@ fn bound_value(value: Value, depth: usize) -> Value {
         Value::String(mut string) => {
             if string.len() > 2048 {
                 string.truncate(2048);
-                string.push_str("…");
+                string.push('…');
             }
             Value::String(string)
         }
