@@ -434,7 +434,11 @@ fn online_backup_is_a_standalone_consistent_database() {
     let initial = OperationAttempt::new(spec.operation_id(), 1, owner()).unwrap();
     journal.persist_intent(&spec, &initial).unwrap();
 
-    let backup_directory = fixture._temp.path().join("backup");
+    let backup_directory = fixture
+        .directory
+        .parent()
+        .expect("journal fixture has a parent")
+        .join("backup");
     journal.backup_to(&backup_directory).unwrap();
     drop(journal);
 
