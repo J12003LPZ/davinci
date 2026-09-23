@@ -552,13 +552,29 @@ int main(void) {{ return 0; }}
             panic!("reuse-port child did not publish a live listener");
         }
         reader.join().unwrap();
-        // Both sockets are in this process's owned tree.
-        assert!(verify(std::process::id(), port).is_ok());
+        let eventually_owned = |root: u32| {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+            loop {
+                if verify(root, port).is_ok() {
+                    break;
+                }
+                if std::time::Instant::now() >= deadline {
+                    panic!("listener ownership did not converge for pid {root} on port {port}");
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+        };
+        // Darwin's global PCB snapshot and per-process descriptor view are
+        // separate kernel queries and can become mutually visible a few
+        // scheduler ticks apart. Positive ownership proof may therefore need a
+        // bounded retry; each individual production verification still fails
+        // closed on an inconsistent snapshot.
+        eventually_owned(std::process::id());
         // The parent socket is foreign to the child. Its distinct identity
         // cannot be hidden by the child's genuine descriptor on the same port.
         assert!(verify(child.0.id(), port).is_err());
         drop(parent_listener);
-        assert!(verify(child.0.id(), port).is_ok());
+        eventually_owned(child.0.id());
     }
 }
 
