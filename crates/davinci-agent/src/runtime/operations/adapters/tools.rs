@@ -213,7 +213,10 @@ impl ToolOperationDispatcher {
         admitted: &AdmittedOperation,
         _reason: &str,
     ) -> Result<(), ToolOperationDispatchError> {
-        if admitted.attempt.state() != OperationState::Queued {
+        if !matches!(
+            admitted.attempt.state(),
+            OperationState::Persisted | OperationState::Authorized | OperationState::Queued
+        ) {
             return Err(ToolOperationDispatchError::AlreadyInFlight);
         }
         self.journal.transition(
