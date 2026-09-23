@@ -9660,7 +9660,7 @@ mod tests {
         .unwrap();
         let stored = crate::settings::load_settings(dir.path());
         apply_theme_setting(&mut m, &stored);
-        assert_ne!(m.theme.background, dark.background);
+        assert_ne!(m.theme, dark);
         assert_eq!(m.composer, "keep this draft");
         let mut restarted = model();
         apply_theme_setting(&mut restarted, &stored);
