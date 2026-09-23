@@ -15,8 +15,8 @@ use super::continuation::{DeliveryCheckpoint, DeliveryStage, GraphContinuation, 
 use super::mutation::{capture_baseline, capture_graph_delta};
 use super::operations;
 use super::recovery::{
-    build_retry_context_delta, classify_worker_failure, retry_decision, RetryDecision,
-    WorkerFailureClass,
+    build_retry_context_delta, classify_worker_failure, retry_decision, retry_recovery_gate,
+    RetryDecision, RetryRecoveryInput, WorkerFailureClass,
 };
 use super::replay::{incompatibility_reason, replay_compatible, ReplayFingerprint};
 use super::review_coverage::{chunk_graph_mutation, coverage_complete, ReviewCoverage};
@@ -1320,17 +1320,35 @@ impl GraphExecution {
             let failure_class = classify_worker_failure(&result, Some(&error));
             let decision = retry_decision(failure_class, local_attempt as usize);
             last_failure_class = Some(failure_class);
-            if !matches!(decision, RetryDecision::Stop | RetryDecision::Replan) {
-                if let Some(binding) = spec.worker_session.as_ref() {
-                    if let Err(reason) = binding.validate_retry_safety() {
-                        let recovery = format!("reconciliation required: {reason}");
-                        self.end_task(&task_id, TaskStatus::Failed, Some(recovery));
-                        self.checkpoint(Some(
-                            "worker side effects require reconciliation; retry stopped",
-                        ));
-                        return None;
-                    }
+            let recovery = retry_recovery_gate(self.retry_recovery_input(
+                &task_id,
+                attempt,
+                local_attempt as usize,
+                decision,
+                spec.worker_session.as_ref(),
+            ));
+            if !self.record_retry_recovery(&task_id, attempt, recovery.clone()) {
+                return None;
+            }
+            if !recovery.allowed {
+                if matches!(
+                    recovery.status,
+                    super::recovery::RetryRecoveryStatus::RecommendationStop
+                        | super::recovery::RetryRecoveryStatus::BudgetExhausted
+                ) {
+                    self.checkpoint(Some(&format!(
+                        "{task_id}: retry recommendation denied ({:?})",
+                        recovery.status
+                    )));
+                    break;
                 }
+                let reason = format!(
+                    "reconciliation required: {} ({:?})",
+                    recovery.reason, recovery.status
+                );
+                self.end_task(&task_id, TaskStatus::Failed, Some(reason));
+                self.checkpoint(Some("worker retry denied by recovery evidence"));
+                return None;
             }
             self.checkpoint(Some(&format!(
                 "{task_id}: attempt {attempt} failed ({failure_class}, {decision:?})"

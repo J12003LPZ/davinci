@@ -6,6 +6,7 @@ use crate::native_extensions::ecosystem::{
     WorkerContextQuery,
 };
 use crate::native_extensions::{LearningController, VectorMemory};
+use davinci_agent::runtime::operations::{EffectStatus, OperationState};
 use serde::{Deserialize, Serialize};
 
 /// Maximum additional context allowed for a retry. The stable first-attempt
@@ -54,6 +55,132 @@ pub enum RetryDecision {
     ReviseWriter,
     Replan,
     Stop,
+}
+
+/// The durable safety result for a proposed replacement worker attempt.  A
+/// failure label is only a recommendation; this record is the gate that
+/// decides whether another process may receive authority.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RetryRecoveryStatus {
+    Allowed,
+    RecommendationStop,
+    BudgetExhausted,
+    PriorOwnerActive,
+    OriginalBindingInvalid,
+    AuthorityChanged,
+    SourceUnreconciled,
+    OperationCompleted,
+    OperationUnresolved,
+    OperationJournalUnavailable,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct RetryRecoveryRecord {
+    pub recommendation: RetryDecision,
+    pub status: RetryRecoveryStatus,
+    pub allowed: bool,
+    pub reason: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub operation_state: Option<OperationState>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effect_status: Option<EffectStatus>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RetryRecoveryInput {
+    pub recommendation: RetryDecision,
+    pub attempt: usize,
+    pub budget_available: bool,
+    pub prior_owner_quiescent: bool,
+    pub original_binding_valid: bool,
+    pub current_authority_valid: bool,
+    pub source_reconciled: bool,
+    pub operation_recovered: bool,
+    pub operation_completed: bool,
+    pub operation_state: Option<OperationState>,
+    pub effect_status: Option<EffectStatus>,
+}
+
+/// Apply the mandatory effect-recovery gate after the classifier has made its
+/// bounded orchestration recommendation.  The diagnostic text is deliberately
+/// absent from this API: it cannot establish ownership, authority, or effect
+/// recovery.
+pub fn retry_recovery_gate(input: RetryRecoveryInput) -> RetryRecoveryRecord {
+    let denied = |status: RetryRecoveryStatus, reason: &'static str| RetryRecoveryRecord {
+        recommendation: input.recommendation,
+        status,
+        allowed: false,
+        reason: reason.into(),
+        operation_state: input.operation_state,
+        effect_status: input.effect_status,
+    };
+
+    if !matches!(
+        input.recommendation,
+        RetryDecision::RetrySameBudget | RetryDecision::RetryExtendedTimeout
+    ) {
+        return denied(
+            RetryRecoveryStatus::RecommendationStop,
+            "failure recommendation does not authorize an automatic replacement",
+        );
+    }
+    if input.attempt > 1 || !input.budget_available {
+        return denied(
+            RetryRecoveryStatus::BudgetExhausted,
+            "retry budget is exhausted",
+        );
+    }
+    if !input.prior_owner_quiescent {
+        return denied(
+            RetryRecoveryStatus::PriorOwnerActive,
+            "prior worker owner is not quiescent",
+        );
+    }
+    if !input.original_binding_valid {
+        return denied(
+            RetryRecoveryStatus::OriginalBindingInvalid,
+            "original worker binding is invalid",
+        );
+    }
+    if !input.current_authority_valid {
+        return denied(
+            RetryRecoveryStatus::AuthorityChanged,
+            "current graph authority does not match the admitted operation",
+        );
+    }
+    if !input.source_reconciled {
+        return denied(
+            RetryRecoveryStatus::SourceUnreconciled,
+            "worker source and tool ledger are not reconciled",
+        );
+    }
+    if input.operation_completed {
+        return denied(
+            RetryRecoveryStatus::OperationCompleted,
+            "the original operation already has a durable successful result",
+        );
+    }
+    if !input.operation_recovered {
+        return denied(
+            if input.operation_state.is_some() {
+                RetryRecoveryStatus::OperationUnresolved
+            } else {
+                RetryRecoveryStatus::OperationJournalUnavailable
+            },
+            "operation effect recovery is unresolved",
+        );
+    }
+
+    RetryRecoveryRecord {
+        recommendation: input.recommendation,
+        status: RetryRecoveryStatus::Allowed,
+        allowed: true,
+        reason: "operation effect recovery, ownership, authority, and source reconciliation permit one replacement attempt".into(),
+        operation_state: input.operation_state,
+        effect_status: input.effect_status,
+    }
 }
 
 /// Classify a failed worker without asking a model to interpret its output.

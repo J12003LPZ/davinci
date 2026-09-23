@@ -10,7 +10,7 @@ use super::store::{atomic_write, now_ms, run_dir};
 use super::types::WorkerResult;
 use super::worker_sessions::WorkerSessionBinding;
 use davinci_agent::runtime::operations::{
-    AdmittedOperation, AuthorizationReceipt, CallerType, EffectClass, EffectProfile,
+    AdmittedOperation, AuthorizationReceipt, CallerType, EffectClass, EffectProfile, EffectStatus,
     ExecutionOwnerId, GraphRunBinding, IdempotencyScope, JournalError, OperationAttempt,
     OperationContext, OperationEvent, OperationId, OperationKind, OperationSpec, OperationState,
     PayloadDigest, ResultId, ScopedIdempotencyKey, Timestamp, ToolOperationRuntime,
@@ -74,6 +74,19 @@ pub struct GraphOperationResult {
     pub artifact_digest: Option<String>,
     pub published_to_outbox: bool,
     pub completed_at: u64,
+}
+
+/// Snapshot used by the graph retry gate.  A worker failure is not enough to
+/// start another process: the original operation must have a durable outcome
+/// proving that no effect remains possible.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct GraphOperationRecoveryEvidence {
+    pub state: OperationState,
+    pub effect_status: EffectStatus,
+    pub safe_to_retry: bool,
+    pub already_completed: bool,
+    pub reason: String,
 }
 
 #[derive(Debug, Clone)]
@@ -533,6 +546,76 @@ pub fn replay_projection(
         ));
     }
     Ok(receipt)
+}
+
+/// Inspect the admitted worker operation without dispatching or mutating it.
+/// The graph retry path may proceed only after this source of truth says the
+/// previous effect is known to have had no remaining impact.
+pub fn inspect_retry_recovery(
+    runtime: &RuntimeHandle,
+    cwd: &Path,
+    binding: &GraphOperationBinding,
+) -> Result<GraphOperationRecoveryEvidence, GraphOperationBridgeError> {
+    binding.validate()?;
+    let persisted = std::fs::read(binding.path(cwd))?;
+    let persisted: GraphOperationBinding = serde_json::from_slice(&persisted)
+        .map_err(|error| GraphOperationBridgeError::Encoding(error.to_string()))?;
+    if persisted != *binding {
+        return Err(GraphOperationBridgeError::InvalidBinding(
+            "durable graph operation binding disagrees with the attempt".into(),
+        ));
+    }
+    let operations = runtime
+        .operations
+        .as_ref()
+        .ok_or(GraphOperationBridgeError::MissingRuntime)?;
+    if runtime.run_id != binding.runtime_run_id || runtime.agent_id != binding.parent_agent_id {
+        return Err(GraphOperationBridgeError::ParentAuthorityChanged);
+    }
+    operations
+        .validate_workspace(cwd)
+        .map_err(GraphOperationBridgeError::InvalidBinding)?;
+    let journal = operations.dispatcher().journal();
+    let spec = journal.load_spec(binding.launch_operation_id)?;
+    let attempt = journal.load_attempt(binding.launch_attempt_id)?;
+    if attempt.operation_id() != binding.launch_operation_id
+        || attempt.owner().id != binding.owner_id
+        || attempt.owner().generation != binding.owner_generation
+    {
+        return Err(GraphOperationBridgeError::InvalidBinding(
+            "operation attempt binding does not match journal".into(),
+        ));
+    }
+    if attempt.owner() != operations.dispatcher().owner()
+        || spec.context().workspace != operations.dispatcher().journal().identity().workspace
+    {
+        return Err(GraphOperationBridgeError::ParentAuthorityChanged);
+    }
+
+    let state = attempt.state();
+    let effect_status = attempt.effect_status();
+    let already_completed = state == OperationState::Succeeded;
+    let safe_to_retry = matches!(state, OperationState::Failed | OperationState::Cancelled)
+        && matches!(
+            effect_status,
+            EffectStatus::KnownNoEffect | EffectStatus::Compensated
+        );
+    let reason = if already_completed {
+        "the original graph worker operation already succeeded".to_string()
+    } else if safe_to_retry {
+        "the original graph worker operation has a durable no-effect outcome".to_string()
+    } else {
+        format!(
+            "operation state {state:?} with effect status {effect_status:?} still requires recovery"
+        )
+    };
+    Ok(GraphOperationRecoveryEvidence {
+        state,
+        effect_status,
+        safe_to_retry,
+        already_completed,
+        reason,
+    })
 }
 
 /// Check that a worker runtime retains the parent journal and dispatch owner.

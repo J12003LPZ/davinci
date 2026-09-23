@@ -45,6 +45,8 @@ pub(crate) mod worker_sessions;
 
 #[cfg(test)]
 mod operation_bridge_tests;
+#[cfg(test)]
+mod operation_retry_tests;
 
 #[allow(unused_imports)]
 pub use control::*;

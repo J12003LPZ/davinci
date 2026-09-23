@@ -2,6 +2,109 @@ use super::super::store::{atomic_write, run_dir, write_task_attempt, TaskAttempt
 use super::*;
 
 impl GraphExecution {
+    pub(super) fn retry_recovery_input(
+        &self,
+        task_id: &str,
+        attempt: u32,
+        local_attempt: usize,
+        recommendation: RetryDecision,
+        binding: Option<&super::super::worker_sessions::WorkerSessionBinding>,
+    ) -> RetryRecoveryInput {
+        let budget_snapshot = self.snapshot();
+        let budget_available = Self::budget_exceeded(&budget_snapshot, now_ms()).is_none();
+        let (original_binding_valid, prior_owner_quiescent, source_reconciled) = binding
+            .map(|binding| {
+                let original = binding.validate(&self.options.cwd).is_ok();
+                let safe = original && binding.validate_retry_safety().is_ok();
+                (original, safe, safe)
+            })
+            .unwrap_or((false, false, false));
+
+        let operation_binding = self
+            .snapshot()
+            .continuation
+            .as_ref()
+            .and_then(|cursor| cursor.attempt_history.get(task_id))
+            .and_then(|history| history.iter().find(|record| record.attempt == attempt))
+            .and_then(|record| record.operation_binding.clone());
+        let mut current_authority_valid = true;
+        let mut operation_recovered = operation_binding.is_none();
+        let mut operation_completed = false;
+        let mut operation_state = None;
+        let mut effect_status = None;
+        if let Some(operation_binding) = operation_binding.as_ref() {
+            operation_recovered = false;
+            if let Some(runtime) = self.deps.runtime.as_ref() {
+                match super::super::operation_bridge::inspect_retry_recovery(
+                    runtime,
+                    &self.options.cwd,
+                    operation_binding,
+                ) {
+                    Ok(evidence) => {
+                        operation_recovered = evidence.safe_to_retry;
+                        operation_completed = evidence.already_completed;
+                        operation_state = Some(evidence.state);
+                        effect_status = Some(evidence.effect_status);
+                    }
+                    Err(error) => {
+                        current_authority_valid = !matches!(
+                            error,
+                            super::super::operation_bridge::GraphOperationBridgeError::ParentAuthorityChanged
+                        );
+                    }
+                }
+            }
+        }
+
+        RetryRecoveryInput {
+            recommendation,
+            attempt: local_attempt,
+            budget_available,
+            prior_owner_quiescent,
+            original_binding_valid,
+            current_authority_valid,
+            source_reconciled,
+            operation_recovered,
+            operation_completed,
+            operation_state,
+            effect_status,
+        }
+    }
+
+    pub(super) fn record_retry_recovery(
+        &self,
+        task_id: &str,
+        attempt: u32,
+        recovery: super::super::recovery::RetryRecoveryRecord,
+    ) -> bool {
+        self.checkpoint_with(
+            Some(&format!("{task_id}: retry recovery decision recorded")),
+            |run| {
+                let record = run
+                    .continuation
+                    .as_mut()
+                    .and_then(|cursor| cursor.attempt_history.get_mut(task_id))
+                    .and_then(|history| history.iter_mut().find(|record| record.attempt == attempt))
+                    .ok_or_else(|| {
+                        std::io::Error::new(
+                            std::io::ErrorKind::NotFound,
+                            format!("missing attempt record for {task_id} attempt {attempt}"),
+                        )
+                    })?;
+                record.retry_recovery = Some(recovery);
+                let snapshot = record.clone();
+                write_task_attempt(
+                    Path::new(&run.cwd),
+                    &run.run_id,
+                    task_id,
+                    attempt,
+                    &snapshot,
+                )?;
+                Ok(())
+            },
+        )
+    }
+
     pub(super) fn begin_attempt(&self, spec: &mut WorkerSpec, attempt: u32) -> bool {
         let mut record = {
             let run = self.run.lock().unwrap_or_else(|error| error.into_inner());
@@ -28,6 +131,7 @@ impl GraphExecution {
                 )),
                 worker_session: None,
                 operation_binding: None,
+                retry_recovery: None,
             }
         };
         self.checkpoint_with(

@@ -330,6 +330,11 @@ pub struct TaskAttemptRecord {
     pub worker_session: Option<super::worker_sessions::WorkerSessionBinding>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub operation_binding: Option<super::operation_bridge::GraphOperationBinding>,
+    /// Durable explanation for the automatic retry gate.  This is attached
+    /// to the failed attempt so a restart can replay the same decision without
+    /// reclassifying diagnostic text.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retry_recovery: Option<super::recovery::RetryRecoveryRecord>,
 }
 
 pub fn write_task_attempt(
@@ -913,6 +918,7 @@ mod tests {
             fingerprint: None,
             worker_session: None,
             operation_binding: None,
+            retry_recovery: None,
         };
 
         write_task_attempt(dir.path(), &run_id, "research-1", 1, &record).unwrap();
