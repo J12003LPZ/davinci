@@ -11,7 +11,7 @@ use std::process::Command;
 use tempfile::{tempdir, TempDir};
 
 struct Fixture {
-    temp: TempDir,
+    _temp: TempDir,
     root: std::path::PathBuf,
     operation_id: String,
 }
@@ -78,7 +78,7 @@ fn fixture() -> Fixture {
     )
     .unwrap();
     Fixture {
-        temp,
+        _temp: temp,
         root: root_path,
         operation_id,
     }
