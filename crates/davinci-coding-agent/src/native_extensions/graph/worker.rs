@@ -1369,6 +1369,14 @@ mod tests {
         spec.timeout_ms = 30_000;
         let worker_id = davinci_agent::AgentId::new();
         spec.runtime_agent_id = Some(worker_id);
+        let run_id = crate::native_extensions::graph::store::new_run_id();
+        crate::native_extensions::graph::store::create_run_dir(dir.path(), &run_id).unwrap();
+        let binding =
+            crate::native_extensions::graph::worker_sessions::WorkerSessionBinding::create(
+                &spec, &run_id, 1, 1, None, None,
+            )
+            .unwrap();
+        spec.worker_session = Some(binding);
         let result = run_worker(&spec, &Arc::new(AtomicBool::new(false)), &mut |_, _| {});
         assert!(result.child_pid.is_some(), "{result:?}");
         if submit {
