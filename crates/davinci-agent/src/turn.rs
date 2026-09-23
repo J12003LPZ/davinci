@@ -5800,6 +5800,40 @@ mod operation_dispatch_tests {
     }
 
     #[test]
+    fn permission_denial_is_durable_before_authorization_and_never_starts_effects() {
+        let (mut agent, workspace, journal) = configured_agent();
+        agent.tools = vec!["write".into()];
+        agent.permissions.lock().unwrap().mode = crate::PermissionMode::ReadOnly;
+        let args = json!({"path": "denied.txt", "content": "must not be written"});
+
+        let result = agent.prepare_tool_call(workspace.path(), "denied-write", "write", &args, 0);
+        let Preparation::Immediate(result) = result else {
+            panic!("read-only write should be denied during preparation");
+        };
+        assert!(result.is_error);
+        assert_eq!(
+            result
+                .details
+                .as_ref()
+                .and_then(|details| details.get("denied"))
+                .and_then(serde_json::Value::as_bool),
+            Some(true)
+        );
+        assert!(!workspace.path().join("denied.txt").exists());
+
+        let snapshot = journal.snapshot().unwrap();
+        assert_eq!(snapshot.operations.len(), 1);
+        assert_eq!(snapshot.attempts.len(), 1);
+        let attempt = &snapshot.attempts[0];
+        assert_eq!(attempt.state(), OperationState::Cancelled);
+        assert!(attempt.authorization().is_none());
+        assert_eq!(
+            attempt.effect_status(),
+            crate::runtime::operations::EffectStatus::NotStarted
+        );
+    }
+
+    #[test]
     fn a_scheduler_skipped_operation_is_cancelled_before_effect_start() {
         let (agent, workspace, journal) = configured_agent();
         let args = json!({"path": "input.txt"});
