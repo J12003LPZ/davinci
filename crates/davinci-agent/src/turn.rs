@@ -1833,6 +1833,14 @@ impl Agent {
                 // The tool sees the turn's abort flag so a long shell command
                 // or a `job_output` wait ends when the user interrupts.
                 let mut context = self.tool_context.clone();
+                if let (Some(parent), Some(runtime)) =
+                    (parent_operation_id, context.runtime.as_mut())
+                {
+                    runtime.operations = runtime
+                        .operations
+                        .as_ref()
+                        .map(|operations| operations.with_parent_operation(parent));
+                }
                 context.tool_call_id = Some(id.to_owned());
                 context.command_receipt = matches!(name, "bash" | "powershell" | "exec_command")
                     .then(|| {

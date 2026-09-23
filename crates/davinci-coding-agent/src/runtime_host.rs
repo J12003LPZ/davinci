@@ -1,7 +1,11 @@
 //! Host adapters connecting Davinci extensions, hooks, and persistence into the shared runtime.
 
 use std::collections::HashMap;
+use std::path::Path;
 use std::sync::{Arc, Mutex};
+
+use sha2::{Digest, Sha256};
+use uuid::Uuid;
 
 use davinci_agent::runtime::bus::is_decision_event;
 use davinci_agent::{RuntimeDecision, RuntimeEvent, RuntimeEventEnvelope, RuntimeSubscriber};
@@ -9,6 +13,84 @@ use davinci_agent::{RuntimeDecision, RuntimeEvent, RuntimeEventEnvelope, Runtime
 use crate::hooks::{self, HooksFile};
 use davinci_session::default_agent_dir;
 use serde_json::Value;
+
+/// Install the workspace journal once for a durable conversation. Continuations
+/// retain the existing writer lease through `with_session_state_from`.
+pub fn attach_operation_runtime(
+    mut runtime: davinci_agent::RuntimeHandle,
+    cwd: &Path,
+    session: Option<&davinci_session::JsonlSession>,
+) -> Result<davinci_agent::RuntimeHandle, String> {
+    let Some(session) = session else {
+        return Ok(runtime); // Explicit sessionless mode has no durable recovery.
+    };
+    if let Some(operations) = runtime.operations.as_ref() {
+        operations.validate_workspace(cwd)?;
+        if operations.operation_context().session_id != session.header.id {
+            return Err("operation journal session changed during continuation".into());
+        }
+        return Ok(runtime);
+    }
+    use davinci_agent::runtime::operations::{
+        CallerType, ExecutionOwner, ExecutionOwnerId, JournalId, JournalIdentity, OperationContext,
+        OperationJournal, RootNamespaceId, ToolOperationRuntime, WorkspaceId, WorkspaceIdentity,
+    };
+
+    fn stable_id(label: &str, value: &str) -> Uuid {
+        let mut hash = Sha256::new();
+        hash.update(label.as_bytes());
+        hash.update([0]);
+        hash.update(value.as_bytes());
+        let digest = hash.finalize();
+        let mut bytes = [0_u8; 16];
+        bytes.copy_from_slice(&digest[..16]);
+        Uuid::from_bytes(bytes)
+    }
+
+    let workspace = std::fs::canonicalize(cwd)
+        .map_err(|error| format!("operation workspace cannot be resolved: {error}"))?;
+    let binding = workspace.to_string_lossy();
+    let identity = JournalIdentity::new(
+        JournalId::from_uuid(stable_id("davinci-journal-v1", &binding)),
+        WorkspaceIdentity {
+            id: WorkspaceId::from_uuid(stable_id("davinci-workspace-v1", &binding)),
+            binding_version: 1,
+        },
+    )
+    .map_err(|error| error.to_string())?;
+    let root = RootNamespaceId::from_uuid(stable_id(
+        "davinci-session-v1",
+        &format!("{binding}\0{}", session.header.id),
+    ));
+    let journal = Arc::new(
+        OperationJournal::open(
+            &workspace.join(".davinci").join("operations"),
+            identity.clone(),
+            root,
+        )
+        .map_err(|error| format!("operation journal unavailable: {error}"))?,
+    );
+    let context = OperationContext {
+        journal_id: identity.journal_id,
+        root_namespace_id: root,
+        session_id: session.header.id.clone(),
+        runtime_run_id: runtime.run_id,
+        parent_operation_id: None,
+        agent_id: runtime.agent_id,
+        worker_id: runtime.parent_agent_id.map(|id| id.to_string()),
+        task_id: None,
+        graph: None,
+        workspace: identity.workspace,
+        caller: CallerType::ProviderToolCall,
+        wire_tool_call_id: None,
+    };
+    let owner =
+        ExecutionOwner::new(ExecutionOwnerId::new(), 1).map_err(|error| error.to_string())?;
+    let operations = ToolOperationRuntime::new(journal, context, owner, &workspace)
+        .map_err(|error| error.to_string())?;
+    runtime = runtime.with_operation_runtime(operations);
+    Ok(runtime)
+}
 
 /// Bind the session projections and workflow executor used by the product host.
 /// `previous` must come from `Agent::runtime_for_session`, which validates its source.

@@ -103,15 +103,21 @@ pub(super) fn ensure_no_resource_claim_conflict(
     transaction: &Transaction<'_>,
     workspace_id: WorkspaceId,
     resources: &[String],
+    parent_operation_id: Option<OperationId>,
 ) -> Result<(), JournalError> {
     for resource in resources {
         let conflict: Option<(String, String)> = transaction
             .query_row(
                 "SELECT operation_id, resource_key FROM operation_effect_claims
                  WHERE workspace_id = ?1 AND resolved_at_ms IS NULL
+                   AND (?3 IS NULL OR operation_id != ?3)
                    AND (resource_key = '*' OR ?2 = '*' OR resource_key = ?2)
                  ORDER BY claim_id LIMIT 1",
-                params![workspace_id.to_string(), resource],
+                params![
+                    workspace_id.to_string(),
+                    resource,
+                    parent_operation_id.map(|id| id.to_string())
+                ],
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .optional()

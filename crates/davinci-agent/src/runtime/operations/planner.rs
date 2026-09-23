@@ -134,9 +134,13 @@ impl ToolOperationPlanner {
                 expected_digest: Some(PayloadDigest::of_bytes(digest.as_bytes())),
             });
         }
+        // Bind the full invocation to the immutable intent without copying
+        // credentials, form values, or command text into journal metadata.
+        let arguments_digest = PayloadDigest::of_json(args)
+            .map_err(|error| ModelError::PayloadEncoding(error.to_string()))?;
         let payload = json!({
             "tool": tool,
-            "arguments": args,
+            "arguments_digest": arguments_digest,
         });
         let spec = OperationSpec::new(
             context,

@@ -2067,7 +2067,10 @@ fn complete_prompt_with_host(
         agent.runtime_for_session(),
         wf_store,
         agent.subagent_runner.clone(),
-    ) {
+    )
+    .and_then(|runtime| {
+        runtime_host::attach_operation_runtime(runtime, &agent.cwd, agent.session.as_ref())
+    }) {
         Ok(runtime) => runtime,
         Err(error) => {
             let reply = format!("Runtime recovery required: {error}");

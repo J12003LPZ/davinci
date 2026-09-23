@@ -130,10 +130,17 @@ impl OperationJournal {
             }
 
             let resource_keys = resource_claim_keys(spec);
+            let parent_claim = eligible_parent_claim(
+                transaction,
+                self.root_namespace_id,
+                spec,
+                initial_attempt.owner(),
+            )?;
             ensure_no_resource_claim_conflict(
                 transaction,
                 self.identity.workspace.id,
                 &resource_keys,
+                parent_claim,
             )?;
 
             transaction
@@ -467,6 +474,12 @@ impl OperationJournal {
             .map_err(super::store_support::sqlite_error)?;
             let spec: OperationSpec = decode_json(&spec_json)?;
             let resource_keys = resource_claim_keys(&spec);
+            let parent_claim = eligible_parent_claim(
+                transaction,
+                self.root_namespace_id,
+                &spec,
+                owner,
+            )?;
             let intent_digest = spec
                 .intent_digest()
                 .map_err(|error| JournalError::Serialization(error.to_string()))?;
@@ -490,6 +503,7 @@ impl OperationJournal {
                 transaction,
                 self.identity.workspace.id,
                 &resource_keys,
+                parent_claim,
             )?;
             let nonce = Uuid::now_v7();
             transaction
@@ -686,6 +700,37 @@ fn latest_attempt(
         .optional()
         .map_err(super::store_support::sqlite_error)?;
     decode_json(&value.ok_or(JournalError::NotFound)?)
+}
+
+/// A child may execute under its own active parent claim, but cannot name an
+/// unrelated or stale operation to bypass a conflicting resource barrier.
+fn eligible_parent_claim(
+    transaction: &Transaction<'_>,
+    root: RootNamespaceId,
+    child: &OperationSpec,
+    owner: ExecutionOwner,
+) -> Result<Option<super::OperationId>, JournalError> {
+    let Some(parent_id) = child.context().parent_operation_id else {
+        return Ok(None);
+    };
+    let parent_json: Option<String> = transaction
+        .query_row(
+            "SELECT spec_json FROM operations WHERE operation_id = ?1 AND root_namespace_id = ?2",
+            params![parent_id.to_string(), root.to_string()],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(super::store_support::sqlite_error)?;
+    let parent: OperationSpec = decode_json(&parent_json.ok_or(JournalError::NotFound)?)?;
+    if parent.context().session_id != child.context().session_id {
+        return Err(JournalError::RootBindingMismatch);
+    }
+    let attempt = latest_attempt(transaction, root, parent_id)?;
+    if attempt.state() == OperationState::EffectPossible && attempt.owner() == owner {
+        Ok(Some(parent_id))
+    } else {
+        Ok(None)
+    }
 }
 
 fn load_result(
