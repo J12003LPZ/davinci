@@ -214,11 +214,14 @@ pub fn compose_frame(model: &Model, height: u16) -> ComposedFrame {
     rows.extend(notice);
     rows.extend(offered);
     let mic_rect = chrome::mic_geometry(model).and_then(|(x, width)| {
-        if height >= 4 && !composer_rows.is_empty() && rows.len() + 1 < height {
-            Some(ratatui::layout::Rect::new(x, rows.len() as u16, width, 1))
-        } else {
-            None
-        }
+        // The conversation composer now starts with an effort row; the mic is
+        // rendered on the rule immediately below it. Hit testing must point at
+        // that rendered row rather than the start of the composer stack.
+        let composer_rule_offset =
+            usize::from(model.screen == Screen::Agent && model.overlay.is_none());
+        let y = rows.len().saturating_add(composer_rule_offset);
+        (height >= 4 && !composer_rows.is_empty() && y < height)
+            .then_some(ratatui::layout::Rect::new(x, y as u16, width, 1))
     });
     rows.extend(composer_rows);
     rows.extend(below);
@@ -1785,7 +1788,7 @@ mod tests {
             .position(|row| row.contains("Select model"))
             .unwrap();
         assert!(conversation < title, "{rows:?}");
-        assert!(rows.last().unwrap().contains("Enter to save default"));
+        assert!(rows.last().unwrap().contains("Enter to set as default"));
         assert!(!rows.iter().any(|row| row.contains('╰')));
     }
 
@@ -1869,7 +1872,7 @@ mod tests {
         assert!(text(&rows[21]).starts_with("❯"));
         assert!(!text(&rows[21]).contains("…"));
         assert!(text(&rows[22]).chars().all(|ch| ch == '─'));
-        assert!(text(&rows[23]).starts_with("  Manual"));
+        assert!(text(&rows[23]).starts_with("  ⏸ manual mode on"));
         assert!(text(&rows[23]).contains("? for shortcuts"));
     }
 
@@ -2775,7 +2778,7 @@ mod section_behavior_regressions {
                 .collect::<Vec<_>>()
                 .join("\n");
             assert!(rendered.contains(&format!(
-                "● {} effort  ←/→ to adjust",
+                "● {} effort (default) ←/→ to adjust",
                 model.catalog[0].reasoning_levels[expected]
             )));
         }
