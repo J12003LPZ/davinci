@@ -224,7 +224,7 @@ fn intent_persistence_failure_cannot_invoke_the_adapter() {
     let result = fixture.dispatcher.admit(plan.clone(), 7);
     if let Ok(OperationAdmission::New(operation)) = result.as_ref() {
         let _ = fixture.dispatcher.dispatch(
-            &operation,
+            operation,
             &plan,
             Some(7),
             false,
