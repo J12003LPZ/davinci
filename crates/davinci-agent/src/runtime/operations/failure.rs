@@ -179,6 +179,7 @@ impl CausalFailureReport {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn with_identity(
         mut self,
         operation_id: Option<String>,
