@@ -25,6 +25,7 @@ pub(crate) mod export;
 pub(crate) mod history;
 mod lease;
 pub(crate) mod mutation;
+pub(crate) mod operation_bridge;
 pub(crate) mod operations;
 pub(crate) mod preflight;
 pub(crate) mod process;
@@ -41,6 +42,9 @@ pub(crate) mod verify;
 pub(crate) mod worker;
 pub(crate) mod worker_hooks;
 pub(crate) mod worker_sessions;
+
+#[cfg(test)]
+mod operation_bridge_tests;
 
 #[allow(unused_imports)]
 pub use control::*;

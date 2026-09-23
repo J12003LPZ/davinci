@@ -27,6 +27,7 @@ impl GraphExecution {
                     run.dry_run,
                 )),
                 worker_session: None,
+                operation_binding: None,
             }
         };
         self.checkpoint_with(
@@ -50,8 +51,28 @@ impl GraphExecution {
                     previous.as_ref(),
                 )
                 .map_err(std::io::Error::other)?;
+                let operation_binding = self
+                    .deps
+                    .runtime
+                    .as_ref()
+                    .filter(|runtime| runtime.operations.is_some())
+                    .map(|runtime| {
+                        super::super::operation_bridge::launch_worker(
+                            runtime,
+                            &spec.cwd,
+                            &run.run_id,
+                            &spec.task_id,
+                            attempt,
+                            &binding,
+                            binding.contract_digest.as_deref(),
+                        )
+                        .map(|launch| launch.binding)
+                    })
+                    .transpose()
+                    .map_err(std::io::Error::other)?;
                 spec.worker_session = Some(binding.clone());
                 record.worker_session = Some(binding);
+                record.operation_binding = operation_binding;
                 write_task_attempt(&spec.cwd, &run.run_id, &spec.task_id, attempt, &record)?;
                 run.continuation
                     .as_mut()
@@ -122,6 +143,23 @@ impl GraphExecution {
                 .map(|_| format!("artifacts/{}.attempt_{attempt}.artifact.json", spec.task_id));
             record
         };
+        if let (Some(runtime), Some(binding)) = (
+            self.deps
+                .runtime
+                .as_ref()
+                .filter(|runtime| runtime.operations.is_some()),
+            record.operation_binding.as_ref(),
+        ) {
+            if let Err(error) =
+                super::super::operation_bridge::complete_worker(runtime, &spec.cwd, binding, result)
+            {
+                eprintln!(
+                    "graph worker operation result could not be persisted for {} attempt {}: {error}",
+                    spec.task_id, attempt
+                );
+                return false;
+            }
+        }
         self.checkpoint_with(None, |run| {
             let root = run_dir(&spec.cwd, &run.run_id);
             if let (Some(path), Some(artifact)) = (&record.artifact_file, &result.artifact) {

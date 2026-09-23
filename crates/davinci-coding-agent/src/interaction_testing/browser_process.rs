@@ -217,6 +217,7 @@ impl BrowserProcess {
                     ],
                     cwd: directory.clone(),
                     environment,
+                    operation: None,
                 },
                 Arc::new(move |event| {
                     let mut state = event_state.0.lock().unwrap_or_else(|e| e.into_inner());
@@ -261,7 +262,8 @@ impl BrowserProcess {
                         );
                     }
                 }),
-            )?);
+            )
+            .map_err(|error| error.to_string())?);
             *owner.lock().unwrap_or_else(|e| e.into_inner()) = Some(Arc::downgrade(&supervisor));
             if state
                 .0
