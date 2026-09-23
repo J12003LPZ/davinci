@@ -237,6 +237,70 @@ fn intent_persistence_failure_cannot_invoke_the_adapter() {
 }
 
 #[test]
+fn durable_intent_precedes_authorization_and_can_be_cancelled_without_effect() {
+    let fixture = Fixture::new();
+    let read = fixture.read_capability();
+    let plan = ToolOperationPlanner::provider_call(
+        fixture.context.clone(),
+        "provider-call-preauth-cancel",
+        "read",
+        &json!({"path": "README.md"}),
+        Some(&read),
+        None,
+    )
+    .unwrap();
+
+    let admitted = new_operation(fixture.dispatcher.persist_intent(plan).unwrap());
+    assert_eq!(admitted.attempt.state(), OperationState::Persisted);
+    assert!(admitted.attempt.authorization().is_none());
+
+    fixture
+        .dispatcher
+        .cancel_before_start(&admitted, "permission denied")
+        .unwrap();
+
+    let attempt = fixture
+        .journal
+        .load_attempt(admitted.attempt.attempt_id())
+        .unwrap();
+    assert_eq!(attempt.state(), OperationState::Cancelled);
+    assert_eq!(
+        attempt.effect_status(),
+        davinci_agent::runtime::operations::EffectStatus::NotStarted
+    );
+}
+
+#[test]
+fn persisted_intent_becomes_dispatchable_only_after_authorization() {
+    let fixture = Fixture::new();
+    let read = fixture.read_capability();
+    let plan = ToolOperationPlanner::provider_call(
+        fixture.context.clone(),
+        "provider-call-preauth-queue",
+        "read",
+        &json!({"path": "README.md"}),
+        Some(&read),
+        None,
+    )
+    .unwrap();
+
+    let admitted = new_operation(fixture.dispatcher.persist_intent(plan).unwrap());
+    let queued = fixture
+        .dispatcher
+        .authorize_and_queue(&admitted, 11)
+        .unwrap();
+
+    assert_eq!(queued.attempt.state(), OperationState::Queued);
+    assert_eq!(
+        queued
+            .attempt
+            .authorization()
+            .map(|receipt| receipt.policy_revision.as_str()),
+        Some("11")
+    );
+}
+
+#[test]
 fn a_post_admission_denial_records_a_not_executed_attempt() {
     let fixture = Fixture::new();
     let read = fixture.read_capability();
