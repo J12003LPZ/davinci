@@ -213,16 +213,17 @@ impl ToolOperationDispatcher {
         admitted: &AdmittedOperation,
         _reason: &str,
     ) -> Result<(), ToolOperationDispatchError> {
+        let attempt = self.journal.load_attempt(admitted.attempt.attempt_id())?;
         if !matches!(
-            admitted.attempt.state(),
+            attempt.state(),
             OperationState::Persisted | OperationState::Authorized | OperationState::Queued
         ) {
             return Err(ToolOperationDispatchError::AlreadyInFlight);
         }
         self.journal.transition(
             self.owner,
-            admitted.attempt.attempt_id(),
-            admitted.attempt.revision(),
+            attempt.attempt_id(),
+            attempt.revision(),
             OperationEvent::CancelBeforeStart { finished_at: now() },
             None,
             vec![],
