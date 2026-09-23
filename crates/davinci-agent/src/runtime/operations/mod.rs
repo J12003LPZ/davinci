@@ -35,7 +35,11 @@ pub use adapters::{
     VERIFICATION_EVIDENCE_SCHEMA_VERSION,
 };
 pub use coordinator_api::{AdmittedOperation, DispatchPermit, EffectPermit, OperationAdmission};
-pub use failure::{FailureReasonCode, FailureSubsystem, OperationFailure};
+pub use failure::{
+    AllowedRecoveryAction, CausalFailureReport, DurableResultStatus, EffectCertainty,
+    FailureReasonCode, FailureSubsystem, OperationFailure, PublicationStatus, VerificationStatus,
+    CAUSAL_FAILURE_SCHEMA_VERSION,
+};
 pub use fault::{FaultInjector, FaultPoint};
 pub use identity::{
     AttemptId, ExecutionOwnerId, IdempotencyScope, IdentityError, JournalId, OperationId,

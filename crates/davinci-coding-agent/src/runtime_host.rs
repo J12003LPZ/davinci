@@ -159,6 +159,17 @@ pub struct HooksRuntimeSubscriber {
     unmet_requirements: Mutex<Vec<String>>,
 }
 
+/// Install an observation-only host projection without giving it a path to
+/// block or deny execution.  Decision hooks remain registered with
+/// `RuntimeBus::subscribe` so their allowlisted checks stay synchronous and
+/// fail-closed.
+pub fn subscribe_noncritical_runtime_observer(
+    runtime: &davinci_agent::RuntimeHandle,
+    observer: Arc<dyn RuntimeSubscriber>,
+) {
+    runtime.bus.subscribe_noncritical(observer);
+}
+
 impl HooksRuntimeSubscriber {
     #[allow(dead_code)]
     pub fn new(hooks: HooksFile) -> Self {

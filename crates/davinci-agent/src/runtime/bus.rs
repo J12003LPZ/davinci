@@ -1,7 +1,9 @@
 //! Deterministic lifecycle event bus and subscription model.
 
 use std::panic::{catch_unwind, AssertUnwindSafe};
+use std::sync::mpsc::{sync_channel, SyncSender, TrySendError};
 use std::sync::{Arc, Mutex};
+use std::thread;
 
 use super::events::{RuntimeEvent, RuntimeEventEnvelope};
 
@@ -24,6 +26,29 @@ struct RuntimeBusInner {
 struct Subscription {
     observer: Arc<dyn RuntimeSubscriber>,
     session: bool,
+}
+
+/// Noncritical observers run behind a bounded queue so telemetry, TUI, and
+/// other projections cannot hold an execution thread hostage.  Decision hooks
+/// must use `subscribe`, which remains synchronous and fail-closed.
+struct QueuedObserver {
+    sender: SyncSender<RuntimeEventEnvelope>,
+}
+
+impl RuntimeSubscriber for QueuedObserver {
+    fn on_event(&self, event: &RuntimeEventEnvelope) -> RuntimeDecision {
+        match self.sender.try_send(event.clone()) {
+            Ok(()) => {}
+            Err(TrySendError::Full(_)) => {
+                eprintln!(
+                    "[davinci-runtime] Warning: noncritical observer queue full; dropped event sequence {}",
+                    event.sequence
+                );
+            }
+            Err(TrySendError::Disconnected(_)) => {}
+        }
+        RuntimeDecision::Continue
+    }
 }
 
 #[derive(Clone, Default)]
@@ -59,6 +84,30 @@ impl RuntimeBus {
                 observer: subscriber,
                 session: true,
             });
+    }
+
+    /// Subscribe an observation-only projection through a bounded queue.  A
+    /// slow or disconnected projection can lose observations, but it cannot
+    /// block execution or deny an allowlisted decision event.
+    pub fn subscribe_noncritical(&self, subscriber: Arc<dyn RuntimeSubscriber>) {
+        const QUEUE_CAPACITY: usize = 64;
+        let (sender, receiver) = sync_channel(QUEUE_CAPACITY);
+        let worker_name = "davinci-runtime-observer";
+        let _ = thread::Builder::new()
+            .name(worker_name.into())
+            .spawn(move || {
+                while let Ok(event) = receiver.recv() {
+                    let _ = catch_unwind(AssertUnwindSafe(|| {
+                        subscriber.on_event(&event);
+                    }));
+                }
+            });
+        if let Ok(mut subs) = self.inner.subscribers.lock() {
+            subs.push(Subscription {
+                observer: Arc::new(QueuedObserver { sender }),
+                session: false,
+            });
+        }
     }
 
     /// Atomically refresh turn observers on the bus shared with live workers.

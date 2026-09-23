@@ -99,8 +99,9 @@ pub use ids::{AgentId, EvidenceId, RunId, TaskId, WorkflowId};
 pub use mailbox::{steering_state, AgentMailbox, AgentMessage, MailboxError, SteeringReceipt};
 pub use operations::{
     AgentLaunchDisposition, AgentOperationAdapter, AgentOperationError, AgentOperationHandle,
-    ChildExecutionContext, ChildExecutionKind, OperationAttempt, OperationSpec, OperationState,
-    UnresolvedChild,
+    AllowedRecoveryAction, CausalFailureReport, ChildExecutionContext, ChildExecutionKind,
+    DurableResultStatus, EffectCertainty, FailureReasonCode, FailureSubsystem, OperationAttempt,
+    OperationSpec, OperationState, PublicationStatus, UnresolvedChild, VerificationStatus,
 };
 pub use progress_watchdog::*;
 pub use registry::{is_valid_transition, RegistryError, RuntimeRegistry};
@@ -445,6 +446,18 @@ impl RuntimeHandle {
             }
         }
         self.bus.emit_observe(envelope);
+    }
+
+    /// Emit a structured, redacted failure report as an observation.  The
+    /// operation journal remains authoritative for transitions; this event is
+    /// a derived host/UI projection and never carries execution authority.
+    pub fn emit_causal_failure(&self, report: &CausalFailureReport) {
+        let message = serde_json::to_string(report)
+            .unwrap_or_else(|_| "{\"schema_version\":1,\"serialization_error\":true}".into());
+        self.emit_observe(RuntimeEvent::RuntimeWarning {
+            code: "causal_failure".into(),
+            message,
+        });
     }
 
     pub fn emit_decision(&self, payload: RuntimeEvent) -> Result<(), String> {
