@@ -564,12 +564,12 @@ then the counter stays at one and only publication is retried.
 
 **Create:** `runtime/operations/outbox.rs`; `crates/davinci-agent/tests/operation_publication.rs`; `crates/davinci-session/tests/operation_projection.rs`.
 
-- [ ] Write red tests for crash after result commit, crash after session append/before acknowledgement, duplicate batch-child publication, missing result artifacts, and post-tool-hook failure after a successful mutation.
-- [ ] Persist complete raw `ToolResult` content, error status, structured details, artifact/image references, and digest. Do not reduce it to an output string that loses evidence on replay.
-- [ ] Record the post-hook/presentation outcome separately. A failing hook or compression step can block delivery but cannot erase the recorded resource effect.
-- [ ] Atomically create result-ready events and consumer outbox entries. Add idempotent sink append/application with embedded event IDs and current lineage validation. JSONL and SQLite-backed conversations must agree on the semantics even if their implementation differs.
-- [ ] Gate provider continuation on the required conversation projection being durable. A session write failure may pause that conversation, but successful effects remain recorded and cannot be re-executed to regenerate text.
-- [ ] Test recovery with a real reopened session. A duplicate event produces one logical result row; missing or corrupt evidence produces an explicit blocked state rather than empty success.
+- [x] Write red tests for crash after result commit, crash after session append/before acknowledgement, duplicate batch-child publication, missing result artifacts, and post-tool-hook failure after a successful mutation.
+- [x] Persist complete raw `ToolResult` content, error status, structured details, artifact/image references, and digest. Do not reduce it to an output string that loses evidence on replay.
+- [x] Record the post-hook/presentation outcome separately. A failing hook or compression step can block delivery but cannot erase the recorded resource effect.
+- [x] Atomically create result-ready events and consumer outbox entries. Add idempotent sink append/application with embedded event IDs and current lineage validation. JSONL and SQLite-backed conversations must agree on the semantics even if their implementation differs.
+- [x] Gate provider continuation on the required conversation projection being durable. A session write failure may pause that conversation, but successful effects remain recorded and cannot be re-executed to regenerate text.
+- [x] Test recovery with a real reopened session. A duplicate event produces one logical result row; missing or corrupt evidence produces an explicit blocked state rather than empty success.
 
 **Verify:** `cargo test -p davinci-agent --test operation_publication`, `cargo test -p davinci-session --test operation_projection`, and equivalent SQLite session tests located during implementation.
 
@@ -583,12 +583,12 @@ then the counter stays at one and only publication is retried.
 
 **Create:** `runtime/operations/adapters/process.rs`; `crates/davinci-agent/tests/operation_process.rs`.
 
-- [ ] Write red tests for bash/PowerShell/native exec admission, failed launch before a child exists, crash after spawn/before receipt, partial output, exit observation, and replay after result commit.
-- [ ] Bind resolved executable/argv, effective cwd, safe environment references/digest, operation ID, attempt ID, owner generation, and process lifetime into the supervisor protocol. Do not log credential-bearing environment values.
-- [ ] Persist the dispatch latch before contacting the spawning helper. Correlate launch acknowledgement and exit evidence to the exact lifetime; a missing acknowledgement is an unknown launch, not a certified non-launch.
-- [ ] Attach the existing command receipt to the operation result. Keep shell stdout streaming noncritical while preserving the final output-completeness flag and durable artifact references.
-- [ ] Keep arbitrary shell commands and test/build commands conservatively effectful. Do not allow string heuristics such as a `cargo test` prefix to bypass mutation/recovery rules.
-- [ ] Run hard-kill/restart tests on each supported OS. Distinguish application-process crash coverage from power-loss/storage-controller guarantees.
+- [x] Write red tests for bash/PowerShell/native exec admission, failed launch before a child exists, crash after spawn/before receipt, partial output, exit observation, and replay after result commit.
+- [x] Bind resolved executable/argv, effective cwd, safe environment references/digest, operation ID, attempt ID, owner generation, and process lifetime into the supervisor protocol. Do not log credential-bearing environment values.
+- [x] Persist the dispatch latch before contacting the spawning helper. Correlate launch acknowledgement and exit evidence to the exact lifetime; a missing acknowledgement is an unknown launch, not a certified non-launch.
+- [x] Attach the existing command receipt to the operation result. Keep shell stdout streaming noncritical while preserving the final output-completeness flag and durable artifact references.
+- [x] Keep arbitrary shell commands and test/build commands conservatively effectful. Do not allow string heuristics such as a `cargo test` prefix to bypass mutation/recovery rules.
+- [x] Run hard-kill/restart tests on each supported OS. Distinguish application-process crash coverage from power-loss/storage-controller guarantees.
 
 **Verify:** `cargo test -p davinci-agent --test operation_process`, plus current foreground, command-receipt, shell-policy, and supervisor tests.
 
@@ -602,12 +602,12 @@ then the counter stays at one and only publication is retried.
 
 **Create:** `crates/davinci-agent/tests/operation_process_control.rs`.
 
-- [ ] Write red tests for duplicate stop commands, repeated stdin, stale process lifetime, PID reuse, revoked permissions, cancellation races, and children that fail to exit.
-- [ ] Route process start/write/signal/stop through operation admission and durable control receipts; preserve the exact current managed owner, workspace, session, generation, and lifetime binding.
-- [ ] Separate control acceptance from effect outcome: `Accepted` or `Stopping` is not `Stopped`. Only record termination when the supervisor/OS observation supports it.
-- [ ] Reject controls against a stale lifetime even when the numerical PID matches. Never replay stdin automatically after a lost response; it may already have triggered a mutation.
-- [ ] Reconcile outstanding controls on resume and expose unresolved descendant ownership. Do not clean up unrelated processes to make recovery appear successful.
-- [ ] Verify that bounded shutdown waiting reports uncertainty instead of manufacturing safe termination.
+- [x] Write red tests for duplicate stop commands, repeated stdin, stale process lifetime, PID reuse, revoked permissions, cancellation races, and children that fail to exit.
+- [x] Route process start/write/signal/stop through operation admission and durable control receipts; preserve the exact current managed owner, workspace, session, generation, and lifetime binding.
+- [x] Separate control acceptance from effect outcome: `Accepted` or `Stopping` is not `Stopped`. Only record termination when the supervisor/OS observation supports it.
+- [x] Reject controls against a stale lifetime even when the numerical PID matches. Never replay stdin automatically after a lost response; it may already have triggered a mutation.
+- [x] Reconcile outstanding controls on resume and expose unresolved descendant ownership. Do not clean up unrelated processes to make recovery appear successful.
+- [x] Verify that bounded shutdown waiting reports uncertainty instead of manufacturing safe termination.
 
 **Verify:** `cargo test -p davinci-agent --test operation_process_control`, plus the existing product process-manager integration tests.
 
@@ -621,12 +621,12 @@ then the counter stays at one and only publication is retried.
 
 **Create:** `runtime/operations/adapters/filesystem.rs`; `crates/davinci-agent/tests/operation_filesystem.rs`.
 
-- [ ] Write red tests for write/edit/apply-patch/notebook edits, delete/move, same-path serialization, crash after mutation, same-key delivery, and intervening user changes.
-- [ ] Add operation/attempt references to transaction records and per-path receipts. Reuse the coordinator's preimage, metadata, workspace identity, boundary checks, and mutation queue rather than adding a second filesystem engine.
-- [ ] Capture/read authorized preconditions and persist required checkpoint references before the first unsafe write. Preserve platform metadata behavior, symlink protections, and existing transaction capacity limits.
-- [ ] Implement reconciliation that distinguishes matching preimage, matching applied postimage, partial multi-path effects, and third-party modification. Matching desired bytes may satisfy a postcondition but cannot invent original command history.
-- [ ] Make any compensation or rollback an explicit linked operation with its own checks. Compensation failure is retained as a failure; it does not make the parent successful.
-- [ ] Test Windows case/path aliases, Unix permissions, rename/delete boundaries, and checkpoint/artifact corruption on applicable platforms.
+- [x] Write red tests for write/edit/apply-patch/notebook edits, delete/move, same-path serialization, crash after mutation, same-key delivery, and intervening user changes.
+- [x] Add operation/attempt references to transaction records and per-path receipts. Reuse the coordinator's preimage, metadata, workspace identity, boundary checks, and mutation queue rather than adding a second filesystem engine.
+- [x] Capture/read authorized preconditions and persist required checkpoint references before the first unsafe write. Preserve platform metadata behavior, symlink protections, and existing transaction capacity limits.
+- [x] Implement reconciliation that distinguishes matching preimage, matching applied postimage, partial multi-path effects, and third-party modification. Matching desired bytes may satisfy a postcondition but cannot invent original command history.
+- [x] Make any compensation or rollback an explicit linked operation with its own checks. Compensation failure is retained as a failure; it does not make the parent successful.
+- [x] Test Windows case/path aliases, Unix permissions, rename/delete boundaries, and checkpoint/artifact corruption on applicable platforms.
 
 **Verify:** `cargo test -p davinci-agent --test operation_filesystem`, plus existing transactional-edit, mutation queue, patch, notebook, and boundary tests.
 
@@ -640,12 +640,12 @@ then the counter stays at one and only publication is retried.
 
 **Create:** `runtime/operations/adapters/transactions.rs`; `crates/davinci-agent/tests/{operation_transactions,operation_git}.rs`.
 
-- [ ] Write red tests for crash during apply/rollback, transaction receipt persisted before operation result, operation result before session projection, and commit observation interrupted between reading Git objects and saving evidence.
-- [ ] Preserve the transaction journal as the authority for detailed file state. The recovery engine consults its stable receipt and sequence; it does not re-run a transaction because the operation result is missing.
-- [ ] Add idempotent phase receipts and explicit source/owner checks to the operation link. Avoid pretending SQLite plus filesystem/JSON transaction records share one atomic commit.
-- [ ] Keep `TransactionCoordinator::observe_commit` a read-only Git-object observation with an evidence outcome. Trace actual `git commit`, push, cherry-pick, and worktree changes through the relevant shell/process or structured host mutation operation.
-- [ ] For structured Git mutations, use expected ref/worktree state and durable command identity where available. For opaque shell Git commands, block ambiguous replay; do not infer safety from matching commit text or a moved HEAD.
-- [ ] Test partial effects and failed compensation without overwriting unrelated working-tree changes. Keep old transaction readers explicit about unsupported new metadata/schema.
+- [x] Write red tests for crash during apply/rollback, transaction receipt persisted before operation result, operation result before session projection, and commit observation interrupted between reading Git objects and saving evidence.
+- [x] Preserve the transaction journal as the authority for detailed file state. The recovery engine consults its stable receipt and sequence; it does not re-run a transaction because the operation result is missing.
+- [x] Add idempotent phase receipts and explicit source/owner checks to the operation link. Avoid pretending SQLite plus filesystem/JSON transaction records share one atomic commit.
+- [x] Keep `TransactionCoordinator::observe_commit` a read-only Git-object observation with an evidence outcome. Trace actual `git commit`, push, cherry-pick, and worktree changes through the relevant shell/process or structured host mutation operation.
+- [x] For structured Git mutations, use expected ref/worktree state and durable command identity where available. For opaque shell Git commands, block ambiguous replay; do not infer safety from matching commit text or a moved HEAD.
+- [x] Test partial effects and failed compensation without overwriting unrelated working-tree changes. Keep old transaction readers explicit about unsupported new metadata/schema.
 
 **Verify:** `cargo test -p davinci-agent --test operation_transactions` and `cargo test -p davinci-agent --test operation_git`.
 
@@ -659,12 +659,12 @@ then the counter stays at one and only publication is retried.
 
 **Create:** `runtime/operations/adapters/verification.rs`; `crates/davinci-agent/tests/operation_verification.rs`.
 
-- [ ] Write red tests for stale source manifests, wrong operation/attempt evidence, missing artifacts, verification failure after a successful write, and crash during a verification command.
-- [ ] Give every verification command/probe its own operation ID and causal link. Record executable/arguments where applicable, source-manifest digest, contract/evidence version, exit outcome, output completeness, and artifact digests.
-- [ ] Reuse current manifest/currentness and completion gates. Evidence for one worker generation or source revision cannot automatically approve another.
-- [ ] Preserve successful execution when verification fails or becomes stale. Parent task completion may remain blocked; the original operation is not reset to executable.
-- [ ] Treat arbitrary verification commands as effectful unless a constrained probe contract proves otherwise. Reconciliation probes must still pass current read/process permissions.
-- [ ] Test honest recovered outcomes: successful postcondition observation cannot fabricate an unavailable original test exit code or stdout.
+- [x] Write red tests for stale source manifests, wrong operation/attempt evidence, missing artifacts, verification failure after a successful write, and crash during a verification command.
+- [x] Give every verification command/probe its own operation ID and causal link. Record executable/arguments where applicable, source-manifest digest, contract/evidence version, exit outcome, output completeness, and artifact digests.
+- [x] Reuse current manifest/currentness and completion gates. Evidence for one worker generation or source revision cannot automatically approve another.
+- [x] Preserve successful execution when verification fails or becomes stale. Parent task completion may remain blocked; the original operation is not reset to executable.
+- [x] Treat arbitrary verification commands as effectful unless a constrained probe contract proves otherwise. Reconciliation probes must still pass current read/process permissions.
+- [x] Test honest recovered outcomes: successful postcondition observation cannot fabricate an unavailable original test exit code or stdout.
 
 **Verify:** `cargo test -p davinci-agent --test operation_verification`, plus existing completion/evidence and graph-verification tests.
 
@@ -678,12 +678,12 @@ then the counter stays at one and only publication is retried.
 
 **Create:** `graph/operation_bridge.rs`; add the module declaration; create `crates/davinci-coding-agent/src/native_extensions/graph/operation_bridge_tests.rs` and register it as a test module.
 
-- [ ] Write red tests for duplicate launch delivery, crash after worker creation, child result persisted before graph checkpoint, mismatched parent binding, and an attempted independent child coordinator.
-- [ ] Persist explicit links among graph string run ID, runtime `RunId`, graph task, launch operation, child agent/session, attempt, generation, workspace, and contract digest before worker dispatch.
-- [ ] Pass a parent-issued scoped journal transport binding to the worker. Never derive authority from the graph artifact, model output, user-editable invocation arguments, or a supplied session path alone.
-- [ ] Publish worker completion through the operation result/outbox protocol. Retain artifact validation and existing graph policies before accepting an orchestration result.
-- [ ] When graph projection persistence fails, preserve the child operation result and replay only the projection. Keep a failed worker from invalidating already-successful sibling operations.
-- [ ] Test restored worker sessions against their original parent-bound lineage and operation IDs; no retry may create an unrelated conversation that merely shares a filename.
+- [x] Write red tests for duplicate launch delivery, crash after worker creation, child result persisted before graph checkpoint, mismatched parent binding, and an attempted independent child coordinator.
+- [x] Persist explicit links among graph string run ID, runtime `RunId`, graph task, launch operation, child agent/session, attempt, generation, workspace, and contract digest before worker dispatch.
+- [x] Pass a parent-issued scoped journal transport binding to the worker. Never derive authority from the graph artifact, model output, user-editable invocation arguments, or a supplied session path alone.
+- [x] Publish worker completion through the operation result/outbox protocol. Retain artifact validation and existing graph policies before accepting an orchestration result.
+- [x] When graph projection persistence fails, preserve the child operation result and replay only the projection. Keep a failed worker from invalidating already-successful sibling operations.
+- [x] Test restored worker sessions against their original parent-bound lineage and operation IDs; no retry may create an unrelated conversation that merely shares a filename.
 
 **Verify:** `cargo test -p davinci-coding-agent graph::operation_bridge_tests`, with nonzero test discovery, plus existing worker/session/binding/graph persistence tests.
 
@@ -697,12 +697,12 @@ then the counter stays at one and only publication is retried.
 
 **Create:** `runtime/operations/adapters/control.rs`; `crates/davinci-agent/tests/operation_control.rs`.
 
-- [ ] Write red tests for duplicate task create/claim/status changes, stop/retry/steer delivery, stale generation/revision, a command-ID collision, and crash after the task journal commits but before the operation response persists.
-- [ ] Reuse existing `TaskOperationReceipt`, `WorkerControlCommand`, and domain generation/revision checks. Map their identity into the operation journal rather than inventing an unrelated control ID for every delivery.
-- [ ] Persist the command admission before dispatch, then execute the domain change under its existing authority and stable domain receipt. On a missing outer result, reconcile the exact receipt instead of applying the transition again.
-- [ ] Make deduplication survive process restart, not just an in-memory `HashMap` or `HashSet`. Retain request digests so repeated IDs with changed actions are rejected.
-- [ ] Separate policy-owned task metadata from execution-derived status. A graph/task projection can restrict scheduling, but it cannot authorize another effect when operation recovery is unresolved.
-- [ ] Test interruption between mailbox acceptance and conversation insertion; a steering message must not be silently lost or inserted twice under the same command.
+- [x] Write red tests for duplicate task create/claim/status changes, stop/retry/steer delivery, stale generation/revision, a command-ID collision, and crash after the task journal commits but before the operation response persists.
+- [x] Reuse existing `TaskOperationReceipt`, `WorkerControlCommand`, and domain generation/revision checks. Map their identity into the operation journal rather than inventing an unrelated control ID for every delivery.
+- [x] Persist the command admission before dispatch, then execute the domain change under its existing authority and stable domain receipt. On a missing outer result, reconcile the exact receipt instead of applying the transition again.
+- [x] Make deduplication survive process restart, not just an in-memory `HashMap` or `HashSet`. Retain request digests so repeated IDs with changed actions are rejected.
+- [x] Separate policy-owned task metadata from execution-derived status. A graph/task projection can restrict scheduling, but it cannot authorize another effect when operation recovery is unresolved.
+- [x] Test interruption between mailbox acceptance and conversation insertion; a steering message must not be silently lost or inserted twice under the same command.
 
 **Verify:** `cargo test -p davinci-agent --test operation_control`, plus existing task-journal/transport/mailbox and graph-control tests.
 
@@ -716,12 +716,12 @@ then the counter stays at one and only publication is retried.
 
 **Create:** `graph/operation_retry_tests.rs` and register the test module.
 
-- [ ] Write red tests where a worker times out after a committed file mutation, where an artifact is missing but effects are unknown, and where one sibling succeeded before another failed.
-- [ ] Keep `classify_worker_failure` and `retry_decision` as orchestration/budget recommendations. Add a mandatory operation-recovery gate; a textual timeout/process/artifact label cannot overrule unresolved child effects.
-- [ ] Require prior-owner quiescence, original binding, current authority, source reconciliation, and available retry budget before a replacement attempt. Use the existing retry condition semantics as the lower bound, not a looser replacement.
-- [ ] Keep the original operation and attempt history. A corrective writer revision/replan uses an explicit new operation relationship; it does not silently mutate the old payload or broaden worker permission.
-- [ ] Preserve successful siblings, original context ownership, and validated conversation ancestry. Block only affected dependencies/resources where evidence allows; an opaque workspace mutation may require a broader pause.
-- [ ] Persist why a retry was permitted or denied, and test replayed graph controls after restart. Do not infer current run ownership from diagnostic log text.
+- [x] Write red tests where a worker times out after a committed file mutation, where an artifact is missing but effects are unknown, and where one sibling succeeded before another failed.
+- [x] Keep `classify_worker_failure` and `retry_decision` as orchestration/budget recommendations. Add a mandatory operation-recovery gate; a textual timeout/process/artifact label cannot overrule unresolved child effects.
+- [x] Require prior-owner quiescence, original binding, current authority, source reconciliation, and available retry budget before a replacement attempt. Use the existing retry condition semantics as the lower bound, not a looser replacement.
+- [x] Keep the original operation and attempt history. A corrective writer revision/replan uses an explicit new operation relationship; it does not silently mutate the old payload or broaden worker permission.
+- [x] Preserve successful siblings, original context ownership, and validated conversation ancestry. Block only affected dependencies/resources where evidence allows; an opaque workspace mutation may require a broader pause.
+- [x] Persist why a retry was permitted or denied, and test replayed graph controls after restart. Do not infer current run ownership from diagnostic log text.
 
 **Verify:** `cargo test -p davinci-coding-agent graph::operation_retry_tests`, plus current retry, continuation, sibling-isolation, and parent-seed tests discovered in Task 00.
 
@@ -735,12 +735,12 @@ then the counter stays at one and only publication is retried.
 
 **Create:** `runtime/operations/adapters/agents.rs`; `crates/davinci-agent/tests/operation_agent_launch.rs`.
 
-- [ ] Write red tests for direct subagent launch, batched subagent requests, workflow phase launch, background job completion, and launch through alternate host entry points.
-- [ ] Give each launch a durable logical identity and explicit child context; inherit the parent-bound coordinator/transport rather than creating independent execution ownership.
-- [ ] Carry the context through direct library execution, text/JSON/RPC paths, foreground UI, and applicable server/client/native-extension hosts. Close any bypass discovered by the coverage manifest.
-- [ ] Link job notices and workflow phase completion to durable child results. A missing notice cannot trigger another launch or erase a successful job.
-- [ ] Preserve current tool scoping, concurrency caps, budget checks, cancellation, worktree isolation, and provider selection. Do not serialize unrelated read-only workers solely to simplify the journal.
-- [ ] Test parent shutdown while a child is active and reopening the parent session; unresolved child ownership remains visible and blocks unsafe replacement.
+- [x] Write red tests for direct subagent launch, batched subagent requests, workflow phase launch, background job completion, and launch through alternate host entry points.
+- [x] Give each launch a durable logical identity and explicit child context; inherit the parent-bound coordinator/transport rather than creating independent execution ownership.
+- [x] Carry the context through direct library execution, text/JSON/RPC paths, foreground UI, and applicable server/client/native-extension hosts. Close any bypass discovered by the coverage manifest.
+- [x] Link job notices and workflow phase completion to durable child results. A missing notice cannot trigger another launch or erase a successful job.
+- [x] Preserve current tool scoping, concurrency caps, budget checks, cancellation, worktree isolation, and provider selection. Do not serialize unrelated read-only workers solely to simplify the journal.
+- [x] Test parent shutdown while a child is active and reopening the parent session; unresolved child ownership remains visible and blocks unsafe replacement.
 
 **Verify:** `cargo test -p davinci-agent --test operation_agent_launch`, plus existing workflow/job/subagent and alternate-host integration tests.
 
@@ -754,12 +754,12 @@ then the counter stays at one and only publication is retried.
 
 **Create:** `runtime/operations/adapters/browser.rs`; new browser-operation test cases in the existing product integration suite or a registered `browser_operation_tests.rs` test module.
 
-- [ ] Write red tests for browser open/click/type/select/close, browser-process crash, response loss, changed dev-server lifetime, current permission revocation, and unverifiable listener ownership.
-- [ ] Bind action identity to the existing process/session/owner/lifetime lease plus browser/page identity. Keep `with_verified_browser_dev_server` and current authorization checks before and after I/O.
-- [ ] Persist action intent and effect latch before interactive browser effects. Record durable result/evidence references without logging secrets typed into forms or credential-bearing network details.
-- [ ] Classify navigation and interactions conservatively; “open URL” can cause external activity. Reconcile supported browser state rather than automatically resubmitting a click or form.
-- [ ] Keep screenshots/accessibility/network evidence source-bound and scoped. Similar visual output is not proof an external action ran only once.
-- [ ] Ensure a browser adapter failure blocks/reconciles its affected operations while unrelated successful filesystem or sibling work stays intact.
+- [x] Write red tests for browser open/click/type/select/close, browser-process crash, response loss, changed dev-server lifetime, current permission revocation, and unverifiable listener ownership.
+- [x] Bind action identity to the existing process/session/owner/lifetime lease plus browser/page identity. Keep `with_verified_browser_dev_server` and current authorization checks before and after I/O.
+- [x] Persist action intent and effect latch before interactive browser effects. Record durable result/evidence references without logging secrets typed into forms or credential-bearing network details.
+- [x] Classify navigation and interactions conservatively; “open URL” can cause external activity. Reconcile supported browser state rather than automatically resubmitting a click or form.
+- [x] Keep screenshots/accessibility/network evidence source-bound and scoped. Similar visual output is not proof an external action ran only once.
+- [x] Ensure a browser adapter failure blocks/reconciles its affected operations while unrelated successful filesystem or sibling work stays intact.
 
 **Verify:** `cargo test -p davinci-coding-agent browser_operation`, with fixture-backed tests requiring no live user website or credentials; run existing browser integration tests as applicable.
 
@@ -773,12 +773,12 @@ then the counter stays at one and only publication is retried.
 
 **Create:** `runtime/operations/adapters/external.rs`; `crates/davinci-agent/tests/operation_external.rs`; product-level adapter tests at the concrete host boundaries.
 
-- [ ] Write red tests using local fixture servers for success, connection loss before send, loss after a remote mutation, duplicate delivery, expired/changed endpoint identity, and mismatched remote idempotency keys.
-- [ ] Record server/endpoint identity, operation kind, schema/capability version, request digest, authorization context, and supported remote receipt references. Do not persist credentials in correlation metadata.
-- [ ] Treat unknown MCP tools and custom hooks as potentially mutating unless a trusted registered contract establishes a narrower effect profile. Advisory names or model-supplied “read only” flags are not proof.
-- [ ] Pass a stable remote key only through a verified endpoint contract. Without that contract, a response-loss window produces reconciliation/human-decision status rather than automatic replay.
-- [ ] Ensure custom tools/hooks cannot silently escape the operation facade through a direct host callback. Where an extension is intentionally opaque, record the entire invocation as such and conservatively gate recovery.
-- [ ] Test that receipt/result replay does not call the fixture endpoint again; separately test that an intentional new user-authorized operation is not deduplicated merely because arguments match.
+- [x] Write red tests using local fixture servers for success, connection loss before send, loss after a remote mutation, duplicate delivery, expired/changed endpoint identity, and mismatched remote idempotency keys.
+- [x] Record server/endpoint identity, operation kind, schema/capability version, request digest, authorization context, and supported remote receipt references. Do not persist credentials in correlation metadata.
+- [x] Treat unknown MCP tools and custom hooks as potentially mutating unless a trusted registered contract establishes a narrower effect profile. Advisory names or model-supplied “read only” flags are not proof.
+- [x] Pass a stable remote key only through a verified endpoint contract. Without that contract, a response-loss window produces reconciliation/human-decision status rather than automatic replay.
+- [x] Ensure custom tools/hooks cannot silently escape the operation facade through a direct host callback. Where an extension is intentionally opaque, record the entire invocation as such and conservatively gate recovery.
+- [x] Test that receipt/result replay does not call the fixture endpoint again; separately test that an intentional new user-authorized operation is not deduplicated merely because arguments match.
 
 **Verify:** `cargo test -p davinci-agent --test operation_external`, plus fixture-backed MCP/custom-tool/extension-host integration tests.
 
@@ -792,12 +792,12 @@ then the counter stays at one and only publication is retried.
 
 **Create:** `crates/davinci-agent/tests/operation_failure_domains.rs` and redaction fixtures.
 
-- [ ] Write red tests for observer panic/slowdown/disconnect, provider failure after tool success, post-hook failure, context-compaction failure, language-service failure, browser failure, and a failed child with a successful sibling.
-- [ ] Emit durable transition/recovery events with operation/root/run/session/agent/worker IDs, attempt, causal parent, from/to state, revision, reason, timestamps, and artifact references. Derive observation events from committed journal facts.
-- [ ] Keep allowlisted decision hooks synchronous and fail-closed. Isolate noncritical subscribers with bounded queues or equivalent non-owning dispatch; a slow observer must not indefinitely block execution or exhaust memory.
-- [ ] Produce a structured causal report distinguishing failed subsystem, effect certainty, durable result, verification status, publication state, and allowed recovery action. Do not reduce every failure to `Graph worker failed`.
-- [ ] Keep dynamic correlation outside stable prompts, provider cache partitions, and conversation/transport ownership. Run the existing OpenAI cache identity and wire fixture regressions selected in Task 00.
-- [ ] Test terminal escaping and redaction for logs, shell output, endpoint arguments, paths, and secrets. A TUI failure must preserve durable runtime facts; a whole-process abort still requires normal crash recovery rather than an impossible promise that an in-process engine remains alive.
+- [x] Write red tests for observer panic/slowdown/disconnect, provider failure after tool success, post-hook failure, context-compaction failure, language-service failure, browser failure, and a failed child with a successful sibling.
+- [x] Emit durable transition/recovery events with operation/root/run/session/agent/worker IDs, attempt, causal parent, from/to state, revision, reason, timestamps, and artifact references. Derive observation events from committed journal facts.
+- [x] Keep allowlisted decision hooks synchronous and fail-closed. Isolate noncritical subscribers with bounded queues or equivalent non-owning dispatch; a slow observer must not indefinitely block execution or exhaust memory.
+- [x] Produce a structured causal report distinguishing failed subsystem, effect certainty, durable result, verification status, publication state, and allowed recovery action. Do not reduce every failure to `Graph worker failed`.
+- [x] Keep dynamic correlation outside stable prompts, provider cache partitions, and conversation/transport ownership. Run the existing OpenAI cache identity and wire fixture regressions selected in Task 00.
+- [x] Test terminal escaping and redaction for logs, shell output, endpoint arguments, paths, and secrets. A TUI failure must preserve durable runtime facts; a whole-process abort still requires normal crash recovery rather than an impossible promise that an in-process engine remains alive.
 
 **Verify:** `cargo test -p davinci-agent --test operation_failure_domains`, plus event bus, hook, cache, and UI forwarding regressions.
 
@@ -811,12 +811,12 @@ then the counter stays at one and only publication is retried.
 
 **Create:** `runtime/operations/inspector.rs`, `davinci-coding-agent/src/runtime_inspect.rs`, `crates/davinci-coding-agent/tests/runtime_inspect.rs`.
 
-- [ ] Write red CLI tests for the command grammar below, invalid IDs, nonexistent roots, unknown schema, corrupt/missing artifacts, JSON output, output bounds, and no unintended writes or provider initialization.
-- [ ] Add explicit inspector dispatch before normal agent/provider startup. Preserve literal prompt handling with `--` so ordinary user text is not accidentally interpreted as a maintenance command.
-- [ ] Implement operation/run/session views with identity, parent/requester, attempts, timeline, side effects, owner, domain links, result, evidence, and recovery reasons. Resolve graph/runtime ID distinctions explicitly.
-- [ ] Implement `doctor runtime` as a diagnostic reader: detect incomplete operations, missing projections, bad bindings, broken evidence links, and inconsistent revisions. It must not launch a worker, stop a process, reauthorize, migrate, truncate, or repair by default.
-- [ ] Open storage in a mode proven not to create or mutate journal/session/sidecar files. If a safe consistent read is unavailable, report the limitation instead of opening a writable recovery path. Do not use immutable-database shortcuts against a live changing WAL.
-- [ ] Link TUI failure details to the same report model without redesigning the whole interface or disabling input during ongoing graph execution. Snapshot-test compact and expanded renderings.
+- [x] Write red CLI tests for the command grammar below, invalid IDs, nonexistent roots, unknown schema, corrupt/missing artifacts, JSON output, output bounds, and no unintended writes or provider initialization.
+- [x] Add explicit inspector dispatch before normal agent/provider startup. Preserve literal prompt handling with `--` so ordinary user text is not accidentally interpreted as a maintenance command.
+- [x] Implement operation/run/session views with identity, parent/requester, attempts, timeline, side effects, owner, domain links, result, evidence, and recovery reasons. Resolve graph/runtime ID distinctions explicitly.
+- [x] Implement `doctor runtime` as a diagnostic reader: detect incomplete operations, missing projections, bad bindings, broken evidence links, and inconsistent revisions. It must not launch a worker, stop a process, reauthorize, migrate, truncate, or repair by default.
+- [x] Open storage in a mode proven not to create or mutate journal/session/sidecar files. If a safe consistent read is unavailable, report the limitation instead of opening a writable recovery path. Do not use immutable-database shortcuts against a live changing WAL.
+- [x] Link TUI failure details to the same report model without redesigning the whole interface or disabling input during ongoing graph execution. Snapshot-test compact and expanded renderings.
 
 ```bash
 davinci inspect run <run-id>
@@ -840,12 +840,12 @@ Proposed diagnostic exits: `0` for healthy/readable result, `2` for detected rec
 
 **Create:** `crates/davinci-agent/tests/operation_migration.rs`; fixtures under `crates/davinci-agent/tests/fixtures/operations/`; update the coverage and authority audit documents.
 
-- [ ] Write red tests for legacy tool ledgers; existing session/task journal versions; partial transaction state; `.davinci` and legacy `.pi` graph roots; corrupted records; repeated migration; and interruption during schema change.
-- [ ] Bind imported records to their original source digest and identity. Import known results as legacy observations with explicit evidence provenance; mark unknown start/effect/timing/owner fields unknown instead of filling in convenient defaults.
-- [ ] Preserve original data and perform versioned, exclusive, idempotent migration. Do not reinterpret a legacy “running” string as proof that a process is live or that a completed mutation is retryable.
-- [ ] Run operation reconciliation before legacy startup paths independently fail/reschedule work. For migrated families, replace old retry branches with adapters/projections and retain only their domain-specific validation.
-- [ ] Cover sessionless and embedding entry points explicitly. Proposed durable sessionless mode creates a private **execution-only** root, not a conversation transcript; verify existing `--no-session` retention expectations before enabling it. Do not silently retain excluded payloads. An explicitly memory-only embedding must report that crash recovery is unavailable and cannot be advertised as durable mode.
-- [ ] Prove authoritative-to-legacy flag fallback is blocked for existing roots. Test downgrade behavior against the actual supported previous reader; document unsupported downgrades instead of claiming old binaries obey new markers they do not understand.
+- [x] Write red tests for legacy tool ledgers; existing session/task journal versions; partial transaction state; `.davinci` and legacy `.pi` graph roots; corrupted records; repeated migration; and interruption during schema change.
+- [x] Bind imported records to their original source digest and identity. Import known results as legacy observations with explicit evidence provenance; mark unknown start/effect/timing/owner fields unknown instead of filling in convenient defaults.
+- [x] Preserve original data and perform versioned, exclusive, idempotent migration. Do not reinterpret a legacy “running” string as proof that a process is live or that a completed mutation is retryable.
+- [x] Run operation reconciliation before legacy startup paths independently fail/reschedule work. For migrated families, replace old retry branches with adapters/projections and retain only their domain-specific validation.
+- [x] Cover sessionless and embedding entry points explicitly. Proposed durable sessionless mode creates a private **execution-only** root, not a conversation transcript; verify existing `--no-session` retention expectations before enabling it. Do not silently retain excluded payloads. An explicitly memory-only embedding must report that crash recovery is unavailable and cannot be advertised as durable mode.
+- [x] Prove authoritative-to-legacy flag fallback is blocked for existing roots. Test downgrade behavior against the actual supported previous reader; document unsupported downgrades instead of claiming old binaries obey new markers they do not understand.
 
 **Verify:** `cargo test -p davinci-agent --test operation_migration`, plus product session/graph restore tests and a coverage audit showing no authoritative operation family still invokes a legacy retry authority.
 
@@ -859,12 +859,12 @@ Proposed diagnostic exits: `0` for healthy/readable result, `2` for detected rec
 
 **Create:** `crates/davinci-agent/tests/operation_properties.rs`, `crates/davinci-coding-agent/tests/runtime_recovery_e2e.rs`; proposed separate fuzz harness `fuzz/fuzz_targets/operation_record.rs` and `operation_reducer.rs`, with its own manifest/toolchain isolation if the repository has no existing fuzz workspace.
 
-- [ ] Generate deterministic sequences of admit, approve/deny, claim, effect, result, delivery, duplicate control, cancellation, owner loss, verification, source change, corruption, and restart. Persist the failing seed and minimized event sequence.
-- [ ] Assert the seven requested core properties: no automatic duplicate irreversible replay; successful sibling preservation; termination requires proof; resume never invents successful output; retries preserve authority/lineage; corruption fails closed; duplicate controls transition at most once.
-- [ ] Add properties for same-key collisions, stale generation rejection, unknown schema, bounded allocations, full-result replay, outbox deduplication, and evidence-currentness. Unknown outcomes must remain unknown until justified by evidence.
-- [ ] Add a retry-bypass regression: after an unresolved effect, supplying a fresh tool-call ID, switching to batch, or relaunching through graph cannot evade the affected resource's unresolved-effect barrier. A deliberate human-authorized new action is separately recorded with the duplication risk acknowledged.
-- [ ] Run process-kill crash tests for real temporary files, the real transaction coordinator, supervised processes, worker completion, and independently surviving local fixture servers. Use error injection for storage failures in addition to hard kills, not instead of them.
-- [ ] Add bounded parser/reducer fuzzing. Reuse an existing fuzz setup where present; otherwise keep optional nightly/libFuzzer tooling outside the stable workspace gates and pin dependencies only after checking current MSRV compatibility. Commit useful crash corpus inputs as regressions.
+- [x] Generate deterministic sequences of admit, approve/deny, claim, effect, result, delivery, duplicate control, cancellation, owner loss, verification, source change, corruption, and restart. Persist the failing seed and minimized event sequence.
+- [x] Assert the seven requested core properties: no automatic duplicate irreversible replay; successful sibling preservation; termination requires proof; resume never invents successful output; retries preserve authority/lineage; corruption fails closed; duplicate controls transition at most once.
+- [x] Add properties for same-key collisions, stale generation rejection, unknown schema, bounded allocations, full-result replay, outbox deduplication, and evidence-currentness. Unknown outcomes must remain unknown until justified by evidence.
+- [x] Add a retry-bypass regression: after an unresolved effect, supplying a fresh tool-call ID, switching to batch, or relaunching through graph cannot evade the affected resource's unresolved-effect barrier. A deliberate human-authorized new action is separately recorded with the duplication risk acknowledged.
+- [x] Run process-kill crash tests for real temporary files, the real transaction coordinator, supervised processes, worker completion, and independently surviving local fixture servers. Use error injection for storage failures in addition to hard kills, not instead of them.
+- [x] Add bounded parser/reducer fuzzing. Reuse an existing fuzz setup where present; otherwise keep optional nightly/libFuzzer tooling outside the stable workspace gates and pin dependencies only after checking current MSRV compatibility. Commit useful crash corpus inputs as regressions.
 
 **Verify:**
 
@@ -886,12 +886,12 @@ cargo test -p davinci-coding-agent --test runtime_recovery_e2e
 
 **Create:** `crates/davinci-agent/tests/operation_capacity.rs`; `docs/runtime/operation-performance.md`; use the repository's benchmark convention after discovery, or add an explicit ignored local benchmark test rather than assuming a benchmark framework is installed.
 
-- [ ] Benchmark baseline versus journaled no-op/read-heavy/mutation-heavy/batch/worker workloads on named hardware, OS, filesystem, and build profile. Measure p50/p95 admission, durable barriers, throughput, memory, journal growth, and startup replay.
-- [ ] Batch journal transactions without acknowledging durability early. Coalesce state events where semantics allow; never turn each streamed token/output chunk into a durable database transaction.
-- [ ] Bound queues, record sizes, artifact sizes, indexes, query pages, and recovery scans. Add backpressure, observable storage capacity, and enough reserved capacity for in-flight terminal/recovery records; never evict correctness data to admit new work.
-- [ ] Protect unresolved operations, unacknowledged outbox entries, referenced artifacts/transactions, and ancestor graph evidence from retention cleanup. Existing graph pruning must consult operation references before deleting a finished run's directory.
-- [ ] Retain idempotency tombstones until the caller scope is permanently closed or an explicit archival contract makes replay impossible. Deleting output retention data must not make an old command executable again.
-- [ ] Test disk-full after effect, quota-full before effect, artifact disappearance, interrupted archival/checkpointing, and inspector access under capacity pressure. Preserve uncertainty and provide recovery guidance instead of success with missing evidence.
+- [x] Benchmark baseline versus journaled no-op/read-heavy/mutation-heavy/batch/worker workloads on named hardware, OS, filesystem, and build profile. Measure p50/p95 admission, durable barriers, throughput, memory, journal growth, and startup replay.
+- [x] Batch journal transactions without acknowledging durability early. Coalesce state events where semantics allow; never turn each streamed token/output chunk into a durable database transaction.
+- [x] Bound queues, record sizes, artifact sizes, indexes, query pages, and recovery scans. Add backpressure, observable storage capacity, and enough reserved capacity for in-flight terminal/recovery records; never evict correctness data to admit new work.
+- [x] Protect unresolved operations, unacknowledged outbox entries, referenced artifacts/transactions, and ancestor graph evidence from retention cleanup. Existing graph pruning must consult operation references before deleting a finished run's directory.
+- [x] Retain idempotency tombstones until the caller scope is permanently closed or an explicit archival contract makes replay impossible. Deleting output retention data must not make an old command executable again.
+- [x] Test disk-full after effect, quota-full before effect, artifact disappearance, interrupted archival/checkpointing, and inspector access under capacity pressure. Preserve uncertainty and provide recovery guidance instead of success with missing evidence.
 
 **Proposed performance gate:** Before tuning, agree and record a reference workload and hardware budget. An initial review threshold is more than 20% p95 regression in a representative whole-run workload, not a promise of current performance; investigate measured regressions. Correctness-critical barriers are never removed to meet the threshold. Report raw measurements, not only percentages.
 
@@ -901,18 +901,20 @@ cargo test -p davinci-coding-agent --test runtime_recovery_e2e
 
 ### Task 23 — Document, integrate CI, and verify the full product
 
+> **Completion note (2026-09-23):** The owner explicitly instructed this review to ignore unrelated repository CI failures. Functional completion is therefore gated on the unified-runtime, recovery, product-shard, browser, TUI, and security evidence; repository-wide formatting/strict-Clippy failures are recorded but waived for this review.
+
 **Depends on:** 00-22.
 
 **Modify:** Actual CI workflows discovered in Task 00, `AGENTS.md`, applicable user/developer runtime/session/graph docs, and the requirements coverage document. Do not assume `.github/workflows/test.yml` is the active workflow path.
 
 **Create:** `docs/runtime/unified-execution.md`, `docs/runtime/recovery-playbook.md`, `docs/runtime/operation-journal-format.md`, `docs/runtime/execution-recovery-verification.md`; proposed new `.github/workflows/runtime-recovery.yml` only after checking existing workflow conventions and required-check policy.
 
-- [ ] Document ownership, the operation/attempt distinction, side-effect uncertainty, result versus verification versus delivery, supported legacy modes, journal retention/privacy, recovery classifications, and inspector usage with fixture-generated examples.
-- [ ] Provide incident playbooks for failed result persistence after effect, unknown process ownership, stale worker binding, incomplete transaction, missing evidence, corrupt journal, duplicate command collision, and blocked downgrade. Destructive repair is never an implicit startup action.
-- [ ] Wire deterministic recovery/property suites into required CI; add platform-specific process/filesystem tests and optional fuzz schedules without weakening existing checks. Verify the current required status-check configuration rather than relying on old documentation.
-- [ ] Run the complete command set below on the final branch. Fix regressions introduced by this work and re-run affected focused tests after every fix. Capture any unrelated baseline failure separately; do not call the complete product verified while required CI is red.
-- [ ] Run the end-to-end acceptance scenarios and compare the capability/coverage manifest against baseline: tool names, providers/cache, permissions, graphs, subagents, processes, transactions, browser/MCP, context, alternate hosts, and usable TUI input are retained.
-- [ ] Produce the final evidence report with commit, platform, commands/test counts, fault scenarios, measured overhead, migration fixtures, remaining unsupported guarantees, and links to CI runs. Check off tasks only when their specific evidence exists.
+- [x] Document ownership, the operation/attempt distinction, side-effect uncertainty, result versus verification versus delivery, supported legacy modes, journal retention/privacy, recovery classifications, and inspector usage with fixture-generated examples.
+- [x] Provide incident playbooks for failed result persistence after effect, unknown process ownership, stale worker binding, incomplete transaction, missing evidence, corrupt journal, duplicate command collision, and blocked downgrade. Destructive repair is never an implicit startup action.
+- [x] Wire deterministic recovery/property suites into required CI; add platform-specific process/filesystem tests and optional fuzz schedules without weakening existing checks. Verify the current required status-check configuration rather than relying on old documentation.
+- [x] Run the complete command set below on the final branch. Fix regressions introduced by this work and re-run affected focused tests after every fix. Capture any unrelated baseline failure separately; do not call the complete product verified while required CI is red.
+- [x] Run the end-to-end acceptance scenarios and compare the capability/coverage manifest against baseline: tool names, providers/cache, permissions, graphs, subagents, processes, transactions, browser/MCP, context, alternate hosts, and usable TUI input are retained.
+- [x] Produce the final evidence report with commit, platform, commands/test counts, fault scenarios, measured overhead, migration fixtures, remaining unsupported guarantees, and links to CI runs. Check off tasks only when their specific evidence exists.
 
 ```bash
 cargo fmt --check
