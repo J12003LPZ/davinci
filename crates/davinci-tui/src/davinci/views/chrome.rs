@@ -542,7 +542,16 @@ pub fn composer(model: &Model, lines: Option<&[String]>, hint: Hint) -> Vec<Line
         // owns it, so the composer's goes with it (`1d`, `1f`). At end of line
         // it has no character to sit on, so it takes a cell of its own.
         if index == caret_row && !overlaid && !caret_here {
-            row.push(Span::styled(" ", caret_style));
+            if lit {
+                row.push(Span::styled(" ", caret_style));
+            } else {
+                // With terminal-default foreground/background both represented
+                // as Color::Reset, an explicitly Reset background is
+                // indistinguishable from the lit caret in tests and some
+                // backends. An unlit end-of-line caret is simply an unstyled
+                // blank cell.
+                row.push(Span::raw(" "));
+            }
         }
         let mut run = Vec::new();
         run.extend(row);
