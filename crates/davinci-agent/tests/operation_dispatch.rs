@@ -25,7 +25,8 @@ struct Fixture {
 impl Fixture {
     fn new() -> Self {
         let temp = tempfile::tempdir().unwrap();
-        let directory = temp.path().join("operation-journal");
+        let temp_root = std::fs::canonicalize(temp.path()).unwrap();
+        let directory = temp_root.join("operation-journal");
         let root = RootNamespaceId::new();
         let identity = JournalIdentity::new(
             JournalId::new(),
