@@ -12,12 +12,14 @@ use tempfile::{tempdir, TempDir};
 
 struct Fixture {
     temp: TempDir,
+    root: std::path::PathBuf,
     operation_id: String,
 }
 
 fn fixture() -> Fixture {
     let temp = tempdir().unwrap();
-    let journal_dir = temp.path().join(".davinci").join("operations");
+    let root_path = std::fs::canonicalize(temp.path()).unwrap();
+    let journal_dir = root_path.join(".davinci").join("operations");
     let identity = JournalIdentity::new(
         JournalId::new(),
         WorkspaceIdentity {
@@ -26,11 +28,11 @@ fn fixture() -> Fixture {
         },
     )
     .unwrap();
-    let root = RootNamespaceId::new();
+    let root_namespace_id = RootNamespaceId::new();
     let spec = OperationSpec::new(
         OperationContext {
             journal_id: identity.journal_id,
-            root_namespace_id: root,
+            root_namespace_id,
             session_id: "runtime-recovery-e2e".to_owned(),
             runtime_run_id: RunId::new(),
             parent_operation_id: None,
@@ -56,7 +58,8 @@ fn fixture() -> Fixture {
     )
     .unwrap();
     let operation_id = spec.operation_id().to_string();
-    let journal = OperationJournal::open(&journal_dir, identity, root).unwrap();
+    let journal =
+        OperationJournal::open(&journal_dir, identity, root_namespace_id).unwrap();
     let attempt = OperationAttempt::new(
         spec.operation_id(),
         1,
@@ -64,7 +67,7 @@ fn fixture() -> Fixture {
     )
     .unwrap();
     journal.persist_intent(&spec, &attempt).unwrap();
-    let snapshot_dir = temp.path().join("snapshot");
+    let snapshot_dir = root_path.join("snapshot");
     journal.backup_to(&snapshot_dir).unwrap();
     drop(journal);
     for suffix in ["-wal", "-shm"] {
@@ -75,12 +78,16 @@ fn fixture() -> Fixture {
         journal_dir.join("operations.sqlite3"),
     )
     .unwrap();
-    Fixture { temp, operation_id }
+    Fixture {
+        temp,
+        root: root_path,
+        operation_id,
+    }
 }
 
 fn cli(fixture: &Fixture, arguments: &[&str]) -> std::process::Output {
     Command::new(env!("CARGO_BIN_EXE_davinci"))
-        .current_dir(fixture.temp.path())
+        .current_dir(fixture.root.as_path())
         .args(arguments)
         .output()
         .unwrap()
@@ -110,7 +117,7 @@ fn inspector_reopens_a_real_fixture_without_starting_a_provider() {
 #[test]
 fn inspector_is_restart_safe_and_does_not_mutate_journal_artifacts() {
     let fixture = fixture();
-    let journal_dir = fixture.temp.path().join(".davinci").join("operations");
+    let journal_dir = fixture.root.as_path().join(".davinci").join("operations");
     let before = std::fs::read_dir(&journal_dir)
         .unwrap()
         .map(|entry| entry.unwrap().file_name())
@@ -136,7 +143,7 @@ fn inspector_is_restart_safe_and_does_not_mutate_journal_artifacts() {
 #[test]
 fn corrupt_journal_returns_diagnostic_exit_without_repairing_files() {
     let fixture = fixture();
-    let journal_dir = fixture.temp.path().join(".davinci").join("operations");
+    let journal_dir = fixture.root.as_path().join(".davinci").join("operations");
     let database = journal_dir.join("operations.sqlite3");
     let before = std::fs::read_dir(&journal_dir)
         .unwrap()

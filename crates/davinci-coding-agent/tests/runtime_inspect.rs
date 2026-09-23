@@ -17,6 +17,7 @@ fn args(values: &[&str]) -> Vec<String> {
 
 struct Fixture {
     temp: TempDir,
+    root: std::path::PathBuf,
     operation_id: String,
     run_id: String,
     session_id: String,
@@ -24,7 +25,8 @@ struct Fixture {
 
 fn fixture() -> Fixture {
     let temp = tempdir().unwrap();
-    let journal_dir = temp.path().join(".davinci").join("operations");
+    let root_path = std::fs::canonicalize(temp.path()).unwrap();
+    let journal_dir = root_path.join(".davinci").join("operations");
     let identity = JournalIdentity::new(
         JournalId::new(),
         WorkspaceIdentity {
@@ -33,13 +35,13 @@ fn fixture() -> Fixture {
         },
     )
     .unwrap();
-    let root = RootNamespaceId::new();
+    let root_namespace_id = RootNamespaceId::new();
     let run_id = RunId::new();
     let session_id = "runtime-inspect-session".to_owned();
     let spec = OperationSpec::new(
         OperationContext {
             journal_id: identity.journal_id,
-            root_namespace_id: root,
+            root_namespace_id,
             session_id: session_id.clone(),
             runtime_run_id: run_id,
             parent_operation_id: None,
@@ -65,7 +67,8 @@ fn fixture() -> Fixture {
     )
     .unwrap();
     let operation_id = spec.operation_id().to_string();
-    let journal = OperationJournal::open(&journal_dir, identity, root).unwrap();
+    let journal =
+        OperationJournal::open(&journal_dir, identity, root_namespace_id).unwrap();
     let attempt = OperationAttempt::new(
         spec.operation_id(),
         1,
@@ -73,7 +76,7 @@ fn fixture() -> Fixture {
     )
     .unwrap();
     journal.persist_intent(&spec, &attempt).unwrap();
-    let snapshot_dir = temp.path().join("snapshot");
+    let snapshot_dir = root_path.join("snapshot");
     journal.backup_to(&snapshot_dir).unwrap();
     drop(journal);
     for suffix in ["-wal", "-shm"] {
@@ -86,6 +89,7 @@ fn fixture() -> Fixture {
     .unwrap();
     Fixture {
         temp,
+        root: root_path,
         operation_id,
         run_id: run_id.to_string(),
         session_id,
@@ -151,21 +155,21 @@ fn missing_root_returns_diagnostic_exit_without_creating_files() {
 #[test]
 fn operation_run_and_session_views_are_read_only_and_bounded() {
     let fixture = fixture();
-    let journal_path = fixture.temp.path().join(".davinci").join("operations");
+    let journal_path = fixture.root.as_path().join(".davinci").join("operations");
     let before = std::fs::read_dir(&journal_path)
         .unwrap()
         .map(|entry| entry.unwrap().file_name())
         .collect::<BTreeSet<_>>();
     let operation = inspect(
-        fixture.temp.path(),
+        fixture.root.as_path(),
         InspectionTarget::Operation(fixture.operation_id.clone()),
     );
     let run = inspect(
-        fixture.temp.path(),
+        fixture.root.as_path(),
         InspectionTarget::Run(fixture.run_id.clone()),
     );
     let session = inspect(
-        fixture.temp.path(),
+        fixture.root.as_path(),
         InspectionTarget::Session(fixture.session_id.clone()),
     );
     let after = std::fs::read_dir(&journal_path)
@@ -196,7 +200,7 @@ fn operation_run_and_session_views_are_read_only_and_bounded() {
 #[test]
 fn corrupt_artifact_returns_unavailable_without_sidecars() {
     let fixture = fixture();
-    let journal_dir = fixture.temp.path().join(".davinci").join("operations");
+    let journal_dir = fixture.root.as_path().join(".davinci").join("operations");
     let database = journal_dir.join("operations.sqlite3");
     let before = std::fs::read_dir(&journal_dir)
         .unwrap()
@@ -204,7 +208,7 @@ fn corrupt_artifact_returns_unavailable_without_sidecars() {
         .collect::<BTreeSet<_>>();
     std::fs::write(&database, b"not a sqlite database").unwrap();
     let output = inspect(
-        fixture.temp.path(),
+        fixture.root.as_path(),
         InspectionTarget::Operation(fixture.operation_id),
     );
     let after = std::fs::read_dir(&journal_dir)
@@ -229,7 +233,7 @@ fn unknown_schema_returns_unavailable_without_repairing_database() {
     bytes[60..64].copy_from_slice(&99_i32.to_be_bytes());
     std::fs::write(&database, bytes).unwrap();
     let output = inspect(
-        fixture.temp.path(),
+        fixture.root.as_path(),
         InspectionTarget::Operation(fixture.operation_id),
     );
     assert_eq!(output.status, InspectorStatus::Unavailable);
@@ -244,7 +248,7 @@ fn unknown_schema_returns_unavailable_without_repairing_database() {
 fn generated_fixture_is_available_through_the_cli_without_provider_startup() {
     let fixture = fixture();
     let output = Command::new(env!("CARGO_BIN_EXE_davinci"))
-        .current_dir(fixture.temp.path())
+        .current_dir(fixture.root.as_path())
         .args(["inspect", "operation", &fixture.operation_id, "--json"])
         .output()
         .unwrap();
@@ -258,7 +262,7 @@ fn generated_fixture_is_available_through_the_cli_without_provider_startup() {
 #[test]
 fn doctor_reports_incomplete_state_without_repair() {
     let fixture = fixture();
-    let output = inspect(fixture.temp.path(), InspectionTarget::DoctorRuntime);
+    let output = inspect(fixture.root.as_path(), InspectionTarget::DoctorRuntime);
     assert!(matches!(
         output.status,
         InspectorStatus::Healthy | InspectorStatus::Findings

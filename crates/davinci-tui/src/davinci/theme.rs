@@ -415,10 +415,11 @@ impl Theme {
     fn is_light(&self) -> bool {
         matches!(
             self.primary,
-            Color::Rgb(87, 105, 247) | Color::Indexed(60) | Color::Blue
+            Color::Rgb(70, 87, 217) | Color::Indexed(60) | Color::Blue
         ) || matches!(
             self.background,
-            Color::Rgb(255, 255, 255)
+            Color::Rgb(250, 250, 250)
+                | Color::Rgb(255, 255, 255)
                 | Color::Rgb(230, 230, 230)
                 | Color::Indexed(231)
                 | Color::Indexed(254)

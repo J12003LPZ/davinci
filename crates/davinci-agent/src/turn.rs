@@ -1570,15 +1570,29 @@ impl Agent {
             }
             return immediate(reason, true);
         }
-        if let Some(reason) = self.permission_denial(cwd, id, name, args) {
-            // `denied` marks a call that never ran, for the hosts' rows
-            // and the post-tool hooks, without sniffing the text.
-            cancel_persisted_intent(journal_pending.as_ref(), &reason);
-            if let Ok(mut ledger) = self.tool_ledger.lock() {
-                ledger.record_blocked(id, &reason);
-            }
-            return immediate(reason, true);
-        }
+        let journal_permission_revision =
+            if route == crate::tool_ledger::ToolCallExecutionAuthority::OperationJournal {
+                match self.stable_permission_revision(cwd, id, name, args) {
+                    Ok(revision) => Some(revision),
+                    Err(reason) => {
+                        // `denied` marks a call that never ran, for the hosts'
+                        // rows and post-tool hooks, without sniffing the text.
+                        cancel_persisted_intent(journal_pending.as_ref(), &reason);
+                        if let Ok(mut ledger) = self.tool_ledger.lock() {
+                            ledger.record_blocked(id, &reason);
+                        }
+                        return immediate(reason, true);
+                    }
+                }
+            } else {
+                if let Some(reason) = self.permission_denial(cwd, id, name, args) {
+                    if let Ok(mut ledger) = self.tool_ledger.lock() {
+                        ledger.record_blocked(id, &reason);
+                    }
+                    return immediate(reason, true);
+                }
+                None
+            };
         let class = self
             .permissions
             .lock()
@@ -1595,12 +1609,7 @@ impl Agent {
                     true,
                 );
             };
-            let permission_revision = self
-                .permissions
-                .lock()
-                .ok()
-                .and_then(|permissions| permissions.revision());
-            let Some(permission_revision) = permission_revision else {
+            let Some(permission_revision) = journal_permission_revision else {
                 cancel_persisted_intent(
                     Some(&pending),
                     "permission policy revision is unavailable",
@@ -2818,6 +2827,43 @@ impl Agent {
             Some(reason) => denied(reason),
             None => None,
         }
+    }
+
+    fn stable_permission_revision(
+        &self,
+        cwd: &Path,
+        id: &str,
+        name: &str,
+        args: &Value,
+    ) -> Result<u64, String> {
+        for _ in 0..3 {
+            let before = self
+                .permissions
+                .lock()
+                .unwrap_or_else(|err| err.into_inner())
+                .revision()
+                .ok_or_else(|| "Permission denied: policy revision is exhausted.".to_owned())?;
+            if let Some(reason) = self.permission_denial(cwd, id, name, args) {
+                return Err(reason);
+            }
+            let after = self
+                .permissions
+                .lock()
+                .unwrap_or_else(|err| err.into_inner())
+                .revision()
+                .ok_or_else(|| "Permission denied: policy revision is exhausted.".to_owned())?;
+            if before == after {
+                return Ok(after);
+            }
+            // A session/project grant can legitimately advance the policy
+            // revision. Any one-shot permit from the prior revision is stale;
+            // discard it and evaluate once more under the new policy.
+            self.approval_registry.take_dispatch(id);
+        }
+        Err(
+            "Permission denied: policy changed repeatedly while authorization was being evaluated."
+                .into(),
+        )
     }
 
     fn capability_effect_denial(&self, cwd: &Path, name: &str, args: &Value) -> Option<String> {

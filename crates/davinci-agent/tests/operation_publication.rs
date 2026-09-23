@@ -35,10 +35,11 @@ struct Fixture {
 impl Fixture {
     fn new() -> Self {
         let temp = tempfile::tempdir().unwrap();
-        let workspace = temp.path().join("workspace");
+        let temp_root = std::fs::canonicalize(temp.path()).unwrap();
+        let workspace = temp_root.join("workspace");
         std::fs::create_dir_all(&workspace).unwrap();
         let session = JsonlSession::create_in_directory(
-            &temp.path().join("sessions"),
+            &temp_root.join("sessions"),
             workspace.to_str().unwrap(),
             None,
         )
@@ -59,7 +60,7 @@ impl Fixture {
         let run_id = RunId::new();
         let agent_id = AgentId::new();
         let owner = ExecutionOwner::new(ExecutionOwnerId::new(), 1).unwrap();
-        let journal_dir = temp.path().join("operation-journal");
+        let journal_dir = temp_root.join("operation-journal");
         let journal =
             Arc::new(OperationJournal::open(&journal_dir, identity.clone(), root).unwrap());
         let dispatcher = ToolOperationDispatcher::new(journal.clone(), owner);
