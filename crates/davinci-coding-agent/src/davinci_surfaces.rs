@@ -1295,7 +1295,7 @@ mod tests {
             .iter()
             .flat_map(|l| l.spans.iter().map(|s| s.content.as_ref()))
             .collect();
-        assert!(joined.contains("No tasks tracked"));
+        assert!(joined.contains("No tasks currently running"));
     }
 
     #[test]
