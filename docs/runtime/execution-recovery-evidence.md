@@ -176,3 +176,28 @@ embedding paths were left with their existing ephemeral semantics; a durable
 crash-recovery claim still requires an explicit durable session root. These
 checks were local Windows runs; full workspace/CI coverage, older-binary
 downgrade execution, and non-Windows behavior remain release checks.
+
+## Task 21 - hard-crash, property, and bounded parser coverage
+
+Task 21 adds deterministic invariant coverage and a real process-boundary
+inspector harness. The existing crash matrix remains the source of truth for
+kill/restart behavior: it uses child processes, a real SQLite journal, a local
+fixture endpoint, and a local projection sink. The new property suite exercises
+same-key collisions, duplicate delivery, sibling preservation, fenced retry
+lineage, unresolved-effect retry bypass, corruption/schema refusal, bounded
+records, outbox deduplication, evidence currentness, and bounded parser/reducer
+mutation. Failures write the seed and minimized sequence to the system
+temporary directory.
+
+| Check | Result |
+|---|---|
+| `cargo test -p davinci-agent --test operation_properties --offline --locked` | Passed: 10 deterministic property and bounded-mutation tests. |
+| `cargo test -p davinci-agent --test operation_crash --offline --locked` | Passed: 3 tests, including the full child-process fault matrix and recovery replay checks. |
+| `cargo test -p davinci-coding-agent --test runtime_recovery_e2e --offline --locked` | Passed: 4 tests. The CLI inspector reopens a real fixture without provider startup, is restart/read-only stable, reports corruption with exit code 3, and keeps empty-workspace doctor/sessionless behavior explicit. |
+
+No fuzz workspace or libFuzzer dependency existed in the repository. The
+bounded mutation harness is the stable offline gate; `fuzz/README.md` records
+the isolated nightly/libFuzzer proposal and its evidence limits. No optional
+fuzz campaign or corpus regression was claimed. These checks ran on Windows;
+Linux/macOS hard-kill and filesystem-error variants remain release-platform
+checks.

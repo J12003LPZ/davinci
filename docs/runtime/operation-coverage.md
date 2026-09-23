@@ -63,3 +63,25 @@ must report that crash recovery is unavailable when they do not provide a
 durable session root. Downgrade support is not claimed: the current reader
 rejects conflicting modern and legacy roots, and no assertion is made that an
 older binary understands the new markers.
+
+## Task 21 invariant and process-boundary coverage
+
+`crates/davinci-agent/tests/operation_properties.rs` is the deterministic
+property gate for the seven safety invariants: irreversible effects are not
+replayed by duplicate delivery; sibling operations survive a terminal result;
+termination requires owner/process proof; recovery never invents a successful
+output; retries retain operation identity and advance owner generation; and
+corruption and unknown schemas fail closed. The existing `operation_control`
+suite covers duplicate control transitions, while this property gate covers
+duplicate delivery and outbox acknowledgement. It also covers same-key
+collisions, bounded records, evidence digest changes, and fresh-key retry
+bypass across roots.
+
+`crates/davinci-agent/tests/operation_crash.rs` exercises actual child-process
+kills around intent, claim, effect latch, side effect, result, and publication
+boundaries. `crates/davinci-coding-agent/tests/runtime_recovery_e2e.rs` starts
+the built CLI against real temporary journal files and verifies read-only
+inspection, corruption diagnostics, restart stability, and provider-free
+doctor/help behavior. The stable fuzz gate is a bounded serialized-input
+mutation loop; optional nightly/libFuzzer work is intentionally isolated under
+`fuzz/README.md` and is not treated as proof by a short run.
