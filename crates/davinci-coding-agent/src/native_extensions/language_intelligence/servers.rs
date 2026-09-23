@@ -190,19 +190,24 @@ pub(super) fn discover(
     search_path: &OsStr,
 ) -> Result<Vec<ServerCommand>> {
     let preview = local_package(workspace, project, "@typescript/native-preview");
-    let typescript = local_package(workspace, project, "typescript").or_else(|| {
-        // A global compatibility compiler must not displace a project-native
-        // toolchain. Explicit compatibility mode may still use that fallback.
-        (preview.is_none() || backend == Backend::TypeScriptLanguageServer)
-            .then(|| global_package(search_path, "typescript"))
-            .flatten()
-    });
-    let ts_version = typescript.as_ref().and_then(version);
+    let project_typescript = local_package(workspace, project, "typescript");
+    let global_typescript = if project_typescript.is_none()
+        && (preview.is_none() || backend == Backend::TypeScriptLanguageServer)
+    {
+        global_package(search_path, "typescript")
+    } else {
+        None
+    };
+    // A global compatibility compiler may supply tsserver for the compatibility
+    // backend, but it must never become Auto's preferred native TypeScript.
+    // Otherwise a CI/host PATH upgrade can silently replace a project-local
+    // language-server backend and change semantic results.
+    let typescript = project_typescript.as_ref().or(global_typescript.as_ref());
+    let ts_version = typescript.and_then(version);
     let tsserver = typescript
-        .as_ref()
         .map(|p| p.root.join("lib/tsserver.js"))
         .filter(|p| p.is_file());
-    let native_ts = typescript.as_ref().filter(|p| {
+    let native_ts = project_typescript.as_ref().filter(|p| {
         p.manifest["version"]
             .as_str()
             .and_then(|v| v.split('.').next()?.parse::<u32>().ok())
@@ -232,7 +237,11 @@ pub(super) fn discover(
             }
         }
     }
-    if backend != Backend::TypeScriptNative && (typescript.is_none() || tsserver.is_some()) {
+    if backend != Backend::TypeScriptNative
+        && (backend == Backend::TypeScriptLanguageServer
+            || native_ts.is_none()
+            || tsserver.is_some())
+    {
         let package = local_package(workspace, project, "typescript-language-server")
             .or_else(|| global_package(search_path, "typescript-language-server"));
         let launch = package
@@ -495,6 +504,39 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("project"));
+    }
+
+    #[test]
+    fn auto_does_not_let_global_native_typescript_displace_project_language_server() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("project");
+        let global = dir.path().join("global-bin");
+        std::fs::create_dir(&root).unwrap();
+        std::fs::create_dir(&global).unwrap();
+        package(
+            &global,
+            "typescript",
+            "7.0.0",
+            Some(("tsc", "bin/tsc.cjs")),
+        );
+        package(
+            &root,
+            "typescript-language-server",
+            "fixture",
+            Some(("typescript-language-server", "server.cjs")),
+        );
+        let paths = std::iter::once(global.clone())
+            .chain(std::env::split_paths(&std::env::var_os("PATH").unwrap()).collect::<Vec<_>>());
+        let search = std::env::join_paths(paths).unwrap();
+
+        let found = discover(&root, &root, Backend::Auto, &search).unwrap();
+
+        assert_eq!(found[0].kind, Backend::TypeScriptLanguageServer);
+        assert!(
+            found[0].args.iter().any(|arg| arg.ends_with("server.cjs")),
+            "{:?}",
+            found[0].args
+        );
     }
 
     #[test]
