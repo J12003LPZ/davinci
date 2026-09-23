@@ -1358,7 +1358,6 @@ mod tests {
         spec.role = Role::Writer;
         spec.expect = ArtifactKind::PatchReport;
         spec.cwd = dir.path().to_path_buf();
-        spec.artifact_path = dir.path().join("artifact.json");
         spec.transcript_path = Some(dir.path().join("live.log"));
         spec.model = None;
         spec.thinking_level = None;
@@ -1371,6 +1370,11 @@ mod tests {
         spec.runtime_agent_id = Some(worker_id);
         let run_id = crate::native_extensions::graph::store::new_run_id();
         crate::native_extensions::graph::store::create_run_dir(dir.path(), &run_id).unwrap();
+        spec.artifact_path = crate::native_extensions::graph::store::artifact_path(
+            dir.path(),
+            &run_id,
+            &spec.task_id,
+        );
         let binding =
             crate::native_extensions::graph::worker_sessions::WorkerSessionBinding::create(
                 &spec, &run_id, 1, 1, None, None,
