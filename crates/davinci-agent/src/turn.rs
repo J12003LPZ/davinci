@@ -670,6 +670,7 @@ impl Agent {
         }
     }
 
+    #[allow(clippy::type_complexity)]
     fn complete_with_retry<F, T>(
         &mut self,
         complete: &mut F,
