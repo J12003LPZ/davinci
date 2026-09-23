@@ -1,6 +1,6 @@
 use davinci_agent::runtime::operations::{
-    reconcile_transaction_phase, ProcessOperationBinding, TransactionProjectionLedger,
-    TransactionRecovery, AttemptId, ExecutionOwnerId, JournalId, OperationId,
+    reconcile_transaction_phase, AttemptId, ExecutionOwnerId, JournalId, OperationId,
+    ProcessOperationBinding, TransactionProjectionLedger, TransactionRecovery,
 };
 use davinci_agent::runtime::transactions::{
     ProposedChange, TransactionCoordinator, TransactionOwner, TransactionState,
@@ -33,9 +33,7 @@ fn durable_phase_receipts_reconcile_without_replaying_a_transaction() {
     );
     assert!(preview.phase_receipts.contains_key("previewed"));
 
-    let applied = coordinator
-        .apply(&preview.id, &|_| Ok(()), None)
-        .unwrap();
+    let applied = coordinator.apply(&preview.id, &|_| Ok(()), None).unwrap();
     assert_eq!(
         reconcile_transaction_phase(&applied),
         TransactionRecovery::AlreadyApplied
@@ -49,7 +47,8 @@ fn durable_phase_receipts_reconcile_without_replaying_a_transaction() {
 fn rollback_phase_is_distinct_and_compensation_is_not_parent_success() {
     let root = tempfile::tempdir().unwrap();
     fs::write(root.path().join("a.txt"), b"before").unwrap();
-    let coordinator = TransactionCoordinator::new(root.path(), TransactionOwner::default()).unwrap();
+    let coordinator =
+        TransactionCoordinator::new(root.path(), TransactionOwner::default()).unwrap();
     let preview = coordinator
         .preview(vec![ProposedChange::write("a.txt", b"after".to_vec())])
         .unwrap();
@@ -106,4 +105,3 @@ fn legacy_summary_without_new_receipts_remains_an_observation() {
     assert!(legacy.phase_receipts.is_empty());
     assert!(legacy.path_receipts.is_empty());
 }
-

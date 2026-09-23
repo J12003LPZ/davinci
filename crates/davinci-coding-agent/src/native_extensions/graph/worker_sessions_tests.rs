@@ -164,12 +164,14 @@ fn retry_safety_refuses_uncertain_or_unpersisted_mutations() {
     let dir = tempfile::tempdir().unwrap();
     let (_spec, binding) = fixture(dir.path());
     let ledger_path = binding.session_path.with_extension("tool-ledger.json");
-    let mut ledger = davinci_agent::tool_ledger::ToolCallLedger::load_bound(
-        &ledger_path,
-        &binding.session_id,
-    )
-    .unwrap();
-    ledger.record_start("write-1", "write", &serde_json::json!({"path":"changed.txt"}));
+    let mut ledger =
+        davinci_agent::tool_ledger::ToolCallLedger::load_bound(&ledger_path, &binding.session_id)
+            .unwrap();
+    ledger.record_start(
+        "write-1",
+        "write",
+        &serde_json::json!({"path":"changed.txt"}),
+    );
     let error = binding.validate_retry_safety().unwrap_err();
     assert!(error.contains("uncertain side effect"), "{error}");
 

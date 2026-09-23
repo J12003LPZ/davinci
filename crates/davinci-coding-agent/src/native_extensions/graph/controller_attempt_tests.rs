@@ -284,7 +284,11 @@ fn interrupted_private_worker_reconciles_to_a_safe_retry_boundary() {
         .clone();
     let attempt = run.task(&task_id).unwrap().attempts;
     {
-        let task = run.tasks.iter_mut().find(|task| task.id == task_id).unwrap();
+        let task = run
+            .tasks
+            .iter_mut()
+            .find(|task| task.id == task_id)
+            .unwrap();
         task.status = TaskStatus::Running;
         task.ended_at = None;
         task.error = None;

@@ -216,10 +216,13 @@ impl WorkerSessionBinding {
                     || previous.agent != agent
                     || previous.attempt.checked_add(1) != Some(attempt)
                 {
-                    return Err("worker retry does not continue the previous conversation lineage".into());
+                    return Err(
+                        "worker retry does not continue the previous conversation lineage".into(),
+                    );
                 }
                 if let Some(runtime) = parent {
-                    if previous.runtime_run != runtime.run_id || previous.parent != runtime.agent_id {
+                    if previous.runtime_run != runtime.run_id || previous.parent != runtime.agent_id
+                    {
                         return Err("worker retry parent authority changed".into());
                     }
                 }
@@ -233,8 +236,9 @@ impl WorkerSessionBinding {
                 )
             }
             None => {
-                let session = JsonlSession::create_in_directory(&root, &cwd.to_string_lossy(), None)
-                    .map_err(|error| error.to_string())?;
+                let session =
+                    JsonlSession::create_in_directory(&root, &cwd.to_string_lossy(), None)
+                        .map_err(|error| error.to_string())?;
                 (
                     session.header.id,
                     session.path,
@@ -318,8 +322,7 @@ impl WorkerSessionBinding {
             }
         }
         let saved: Self = serde_json::from_slice(
-            &std::fs::read(binding_path(&root, self.attempt))
-                .map_err(|error| error.to_string())?,
+            &std::fs::read(binding_path(&root, self.attempt)).map_err(|error| error.to_string())?,
         )
         .map_err(|error| error.to_string())?;
         if saved != *self {
@@ -368,7 +371,9 @@ impl WorkerSessionBinding {
             .entries
             .iter()
             .filter_map(|entry| entry.message.as_ref())
-            .filter(|message| message.get("role").and_then(serde_json::Value::as_str) == Some("toolResult"))
+            .filter(|message| {
+                message.get("role").and_then(serde_json::Value::as_str) == Some("toolResult")
+            })
             .filter_map(|message| {
                 message
                     .get("toolCallId")
@@ -396,7 +401,10 @@ impl WorkerSessionBinding {
                 ));
             }
             if record.side_effect == ToolSideEffect::Mutating
-                && matches!(record.outcome, AttemptOutcome::Succeeded | AttemptOutcome::Failed)
+                && matches!(
+                    record.outcome,
+                    AttemptOutcome::Succeeded | AttemptOutcome::Failed
+                )
                 && !persisted_results.contains(&record.call_id)
             {
                 return Err(format!(
