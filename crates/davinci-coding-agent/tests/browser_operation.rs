@@ -35,7 +35,7 @@ impl Fixture {
             OperationJournal::open(
                 &temp_root.join("operations"),
                 identity.clone(),
-                root_namespace_id.clone(),
+                root_namespace_id,
             )
             .unwrap(),
         );
