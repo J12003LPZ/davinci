@@ -226,7 +226,7 @@ const CASES: [CrashCase; 10] = [
     },
 ];
 
-fn stop_child_at(temp: &TempDir, config: &ChildConfig) -> Child {
+fn stop_child_at(temp: &TempDir, config: &ChildConfig) {
     let config_path = temp.path().join("child-config.json");
     fs::write(&config_path, serde_json::to_vec(config).unwrap()).unwrap();
     let executable = std::env::current_exe().unwrap();
@@ -244,7 +244,6 @@ fn stop_child_at(temp: &TempDir, config: &ChildConfig) -> Child {
         !status.success(),
         "fault-injected child unexpectedly exited normally"
     );
-    child
 }
 
 fn observations(case: CrashCase) -> RecoveryObservations {
@@ -514,7 +513,7 @@ fn child_process_crashes_recover_without_duplicate_mutations_or_projections() {
             spec,
             fault: case.point,
         };
-        let _terminated_child = stop_child_at(&temp, &config);
+        stop_child_at(&temp, &config);
         run_recovery_child(
             &temp,
             &RecoveryConfig {
