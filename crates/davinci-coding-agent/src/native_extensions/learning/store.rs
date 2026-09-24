@@ -28,10 +28,13 @@ impl LearningStore {
         let mut skills: BTreeMap<String, SkillLedgerRecord> = BTreeMap::new();
         let mut skill_versions = BTreeMap::new();
         let mut diagnostics = Vec::new();
+        let mut candidate_line_count = 0usize;
+        let mut skill_line_count = 0usize;
 
         let candidates_path = root.join("candidates.jsonl");
         if candidates_path.exists() {
             if let Ok(content) = fs::read_to_string(&candidates_path) {
+                candidate_line_count = content.lines().count();
                 for (line_no, line) in content.lines().enumerate() {
                     let trimmed = line.trim();
                     if trimmed.is_empty() {
@@ -56,6 +59,7 @@ impl LearningStore {
         let skills_path = root.join("skills.jsonl");
         if skills_path.exists() {
             if let Ok(content) = fs::read_to_string(&skills_path) {
+                skill_line_count = content.lines().count();
                 for (line_no, line) in content.lines().enumerate() {
                     let trimmed = line.trim();
                     if trimmed.is_empty() {
@@ -85,13 +89,19 @@ impl LearningStore {
             }
         }
 
-        Ok(Self {
+        let mut store = Self {
             root,
             candidates,
             skills,
             skill_versions,
             diagnostics,
-        })
+        };
+        let candidates_bloated = candidate_line_count > 2 * store.candidates.len() + 32;
+        let skills_bloated = skill_line_count > 2 * store.skill_versions.len() + 32;
+        if candidates_bloated || skills_bloated {
+            store.compact()?;
+        }
+        Ok(store)
     }
 
     pub fn root(&self) -> &Path {
@@ -252,7 +262,6 @@ impl LearningStore {
             .map_err(|err| err.to_string())
     }
 
-    #[allow(dead_code)]
     pub fn compact(&mut self) -> Result<(), String> {
         let candidates_path = self.root.join("candidates.jsonl");
         let mut candidates = String::new();
