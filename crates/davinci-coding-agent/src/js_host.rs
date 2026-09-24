@@ -165,10 +165,24 @@ pub fn node_available() -> bool {
 fn runner_path() -> Result<PathBuf, String> {
     static PATH: OnceLock<Result<PathBuf, String>> = OnceLock::new();
     PATH.get_or_init(|| {
-        let dir = std::env::temp_dir().join("pi-extension-runner");
-        std::fs::create_dir_all(&dir).map_err(|err| err.to_string())?;
-        let path = dir.join(format!("extension_runner-{}.js", std::process::id()));
-        std::fs::write(&path, RUNNER_JS).map_err(|err| err.to_string())?;
+        use sha2::{Digest, Sha256};
+        let digest = format!("{:x}", Sha256::digest(RUNNER_JS.as_bytes()));
+        let path = davinci_session::default_agent_dir()
+            .join("runtime")
+            .join(format!("extension_runner-{}.js", &digest[..16]));
+        let current = std::fs::read(&path).ok();
+        let mut needs_private_write = current.as_deref() != Some(RUNNER_JS.as_bytes());
+        #[cfg(unix)]
+        if !needs_private_write {
+            use std::os::unix::fs::PermissionsExt;
+            needs_private_write = std::fs::metadata(&path)
+                .map(|metadata| metadata.permissions().mode() & 0o777 != 0o600)
+                .unwrap_or(true);
+        }
+        if needs_private_write {
+            davinci_sys::fs::atomic_write_private(&path, RUNNER_JS.as_bytes())
+                .map_err(|err| err.to_string())?;
+        }
         Ok(path)
     })
     .clone()
