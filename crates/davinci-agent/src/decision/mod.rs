@@ -24,6 +24,72 @@ const RATE_LIMIT_COOLDOWN: Duration = Duration::from_secs(30);
 const OVERLOAD_COOLDOWN: Duration = Duration::from_secs(10);
 const NETWORK_COOLDOWN: Duration = Duration::from_secs(30);
 
+/// One finished shadow sample, reduced to metadata a host may persist and
+/// later join with what the coding model actually did.
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ShadowOutcome {
+    pub request_id: String,
+    /// `ok`, or the provider health the failure mapped to (`RateLimited`,
+    /// `Unavailable`, ...). Never an error message or payload.
+    pub outcome: String,
+    pub model: Option<String>,
+    pub latency_ms: u64,
+    pub input_tokens: Option<u64>,
+    pub output_tokens: Option<u64>,
+    pub answers: Vec<telemetry::DecisionAnswerTelemetry>,
+}
+
+impl ShadowOutcome {
+    /// Boundary marker for a turn whose sample was never admitted.
+    pub fn not_admitted(error: &DecisionError) -> Self {
+        Self {
+            request_id: String::new(),
+            outcome: match error {
+                DecisionError::Busy => "Busy".to_owned(),
+                other => format!("{:?}", other.health()),
+            },
+            model: None,
+            latency_ms: 0,
+            input_tokens: None,
+            output_tokens: None,
+            answers: Vec::new(),
+        }
+    }
+
+    fn from_result(
+        request: &DecisionRequest,
+        result: &Result<DecisionResponse, DecisionError>,
+        latency_ms: u64,
+    ) -> Self {
+        let mut outcome = Self {
+            request_id: request.request_id.clone(),
+            outcome: "ok".to_owned(),
+            model: None,
+            latency_ms,
+            input_tokens: None,
+            output_tokens: None,
+            answers: Vec::new(),
+        };
+        match result {
+            Ok(response) => {
+                outcome.model = response.model.clone();
+                outcome.input_tokens = response.input_tokens;
+                outcome.output_tokens = response.output_tokens;
+                outcome.answers = response
+                    .answers
+                    .iter()
+                    .map(|(id, answer)| telemetry::answer_metadata(id, answer, false, true))
+                    .collect();
+            }
+            Err(DecisionError::StaleResponse) => outcome.outcome = "Stale".to_owned(),
+            Err(DecisionError::Busy) => outcome.outcome = "Busy".to_owned(),
+            Err(error) => outcome.outcome = format!("{:?}", error.health()),
+        }
+        outcome
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct HealthState {
     health: DecisionProviderHealth,
@@ -186,6 +252,17 @@ impl DecisionRuntime {
         self: &Arc<Self>,
         prepare: impl FnOnce() -> DecisionRequest + Send + 'static,
     ) -> Result<(), DecisionError> {
+        self.enqueue_shadow_observed(prepare, |_| {})
+    }
+
+    /// Like `enqueue_shadow_with`, and hands the finished sample to
+    /// `observe` on the worker thread. The outcome is metadata only (no
+    /// task text, state, or payload), so the host may persist it.
+    pub fn enqueue_shadow_observed(
+        self: &Arc<Self>,
+        prepare: impl FnOnce() -> DecisionRequest + Send + 'static,
+        observe: impl FnOnce(ShadowOutcome) + Send + 'static,
+    ) -> Result<(), DecisionError> {
         if !self.is_enabled() {
             return Err(DecisionError::Disabled);
         }
@@ -210,7 +287,13 @@ impl DecisionRuntime {
                 }
                 let release = Release(runtime);
                 let request = prepare();
-                let _ = release.0.evaluate_generation(&request, generation, true);
+                let started = Instant::now();
+                let result = release.0.evaluate_generation(&request, generation, true);
+                observe(ShadowOutcome::from_result(
+                    &request,
+                    &result,
+                    started.elapsed().as_millis() as u64,
+                ));
             })
             .map_err(|_| {
                 self.shadow_busy.store(false, Ordering::Release);
@@ -474,6 +557,49 @@ mod tests {
                 DecisionQuestion::noul("browser"),
             )],
         )
+    }
+
+    fn observe_one(response: Result<Vec<u8>, DecisionError>) -> super::ShadowOutcome {
+        let runtime =
+            std::sync::Arc::new(DecisionRuntime::new(std::sync::Arc::new(FixtureProvider {
+                calls: AtomicUsize::new(0),
+                response,
+            })));
+        runtime.enable();
+        let (tx, rx) = std::sync::mpsc::channel();
+        runtime
+            .enqueue_shadow_observed(request, move |outcome| tx.send(outcome).unwrap())
+            .expect("shadow admitted");
+        rx.recv_timeout(std::time::Duration::from_secs(5))
+            .expect("observer called")
+    }
+
+    #[test]
+    fn shadow_observer_receives_answer_metadata_without_payload() {
+        let outcome = observe_one(Ok(br#"{"model":"jev-1.13.0","answers":{"browser_relevant":{"type":"noul","noul":0.9}},"usage":{"input_tokens":10,"output_tokens":2}}"#.to_vec()));
+        assert_eq!(outcome.request_id, "test-request");
+        assert_eq!(outcome.outcome, "ok");
+        assert_eq!(outcome.model.as_deref(), Some("jev-1.13.0"));
+        assert_eq!(outcome.input_tokens, Some(10));
+        assert_eq!(outcome.answers.len(), 1);
+        assert_eq!(outcome.answers[0].question_id, "browser_relevant");
+        assert!(outcome.answers[0].shadow_only);
+        let wire = serde_json::to_string(&outcome).unwrap();
+        assert!(!wire.contains("redacted"), "state leaked: {wire}");
+    }
+
+    #[test]
+    fn shadow_observer_reports_failures_as_health_labels_only() {
+        let outcome = observe_one(Err(DecisionError::RateLimited));
+        assert_eq!(outcome.outcome, "RateLimited");
+        assert!(outcome.answers.is_empty());
+        let outcome = observe_one(Err(DecisionError::Unavailable(
+            "secret-bearing detail".into(),
+        )));
+        assert_eq!(outcome.outcome, "Unavailable");
+        assert!(!serde_json::to_string(&outcome)
+            .unwrap()
+            .contains("secret-bearing"));
     }
 
     #[test]

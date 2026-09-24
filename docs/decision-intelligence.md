@@ -213,6 +213,34 @@ credential material.
 There is no durable decision cache. Only bounded in-process state is retained
 for health, audit, and telemetry.
 
+### Shadow outcome log
+
+Each submitted turn with decision intelligence enabled appends one `jev` row
+to the session's `<session>.events.jsonl`, next to the existing `tool` rows:
+
+```json
+{"ts":1727190000512,"kind":"jev","turnTs":1727190000100,"requestId":"...",
+ "outcome":"ok","model":"jev-1.13.0","latencyMs":140,"inputTokens":1500,
+ "outputTokens":185,"answers":[{"question_id":"browser_relevant",
+ "answer_type":"noul","value":0.88,...}]}
+```
+
+`turnTs` is the submit time. The `tool` rows from `turnTs` up to the next
+`jev` row's `turnTs` are what the coding model ran for that turn. A turn whose
+sample was not admitted (busy slot) still writes a row with `outcome` set to
+`Busy` and no answers, so its tools are not credited to the previous sample.
+Failures record only the health label (`RateLimited`, `Unavailable`, ...).
+The row carries the same metadata as in-process telemetry: no task text,
+state, payload, or credential.
+
+`scripts/jev-shadow-report.py` joins the two and prints, per capability
+question, how often Jev's answer (Noul at or above `--threshold`, default
+0.85) agreed with actual tool use. With no arguments it scans the session
+directories under `~/.davinci/agent` and `~/.pi/agent`. Tool use is a proxy
+label: a model that skipped a tool does not prove the tool would not have
+helped, so treat the counts as the disagreement signal the rollout gate asks
+for, not as accuracy.
+
 ## Rollout gate
 
 Phase 1 is shadow-only and records no behavior changes. A future guarded

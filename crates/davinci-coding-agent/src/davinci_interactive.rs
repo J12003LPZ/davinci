@@ -7949,28 +7949,49 @@ fn submit_prompt(shell: &mut Shell<'_>, text: &str, images: &[davinci_ai::Messag
     if let Some(runtime) = shell.agent.decision_runtime() {
         let cwd = shell.cwd.to_path_buf();
         let task = expanded.clone();
-        let _ = runtime.enqueue_shadow_with(move || {
-            // A prior turn's observation is reusable only after freshness/root
-            // validation. New-turn invalidation or a concurrent scan yields
-            // unknown facts; neither causes work on the submit thread.
-            if let Some(snapshot) = snapshots.and_then(|facts| facts.peek_current(&cwd)) {
-                metadata.apply_snapshot(
-                    snapshot.workspace_dirty,
-                    snapshot.index.files.keys().map(String::as_str),
-                    snapshot
-                        .metadata
-                        .packages
-                        .iter()
-                        .flat_map(|p| p.dependencies.iter().map(String::as_str)),
-                );
-            }
-            davinci_coding_agent::decision_state::build_request_with_metadata(
-                davinci_agent::new_message_id(),
-                &task,
-                davinci_agent::decision::risk::DecisionRisk::Planning,
-                metadata,
-            )
-        });
+        // The sample is logged against the turn's start time so offline
+        // analysis can join it with the `tool` rows this turn produces.
+        let session_path = shell.agent.session.as_ref().map(|store| store.path.clone());
+        let turn_ts = davinci_session::now_ms();
+        let observed_path = session_path.clone();
+        let observe = move |outcome: davinci_agent::decision::ShadowOutcome| {
+            crate::hooks::append_decision_event(observed_path.as_ref(), turn_ts, &outcome);
+        };
+        let admitted = runtime.enqueue_shadow_observed(
+            move || {
+                // A prior turn's observation is reusable only after freshness/root
+                // validation. New-turn invalidation or a concurrent scan yields
+                // unknown facts; neither causes work on the submit thread.
+                if let Some(snapshot) = snapshots.and_then(|facts| facts.peek_current(&cwd)) {
+                    metadata.apply_snapshot(
+                        snapshot.workspace_dirty,
+                        snapshot.index.files.keys().map(String::as_str),
+                        snapshot
+                            .metadata
+                            .packages
+                            .iter()
+                            .flat_map(|p| p.dependencies.iter().map(String::as_str)),
+                    );
+                }
+                davinci_coding_agent::decision_state::build_request_with_metadata(
+                    davinci_agent::new_message_id(),
+                    &task,
+                    davinci_agent::decision::risk::DecisionRisk::Planning,
+                    metadata,
+                )
+            },
+            observe,
+        );
+        // A turn whose sample was never admitted (busy slot, disabled)
+        // still marks its boundary, so its tool rows are not credited to
+        // the previous turn's sample.
+        if let Err(error) = admitted {
+            crate::hooks::append_decision_event(
+                session_path.as_ref(),
+                turn_ts,
+                &davinci_agent::decision::ShadowOutcome::not_admitted(&error),
+            );
+        }
     }
     if let Some(runtime) = shell.agent.decision_runtime() {
         if let Some(health) = runtime.take_health_transition() {
