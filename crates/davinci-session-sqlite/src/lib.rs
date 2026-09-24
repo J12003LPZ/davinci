@@ -17,6 +17,7 @@ pub use branch_cache::{
 };
 
 pub const INITIAL_MIGRATION_SQL: &str = include_str!("migrations/001_initial.sql");
+pub const FTS_REBUILD_MIGRATION_SQL: &str = include_str!("migrations/002_fts_rebuild.sql");
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WriterLease {
@@ -123,54 +124,89 @@ impl SqliteSessionStore {
         let conn = Connection::open(path).map_err(|err| {
             SessionError::storage(format!("Unable to open sqlite database: {err}"))
         })?;
+        conn.busy_timeout(std::time::Duration::from_millis(5000))
+            .map_err(|err| SessionError::storage(format!("Unable to set busy timeout: {err}")))?;
         conn.pragma_update(None, "journal_mode", "WAL")
             .map_err(|err| SessionError::storage(format!("Unable to set WAL: {err}")))?;
         conn.pragma_update(None, "synchronous", "FULL")
             .map_err(|err| SessionError::storage(format!("Unable to set synchronous: {err}")))?;
-        conn.busy_timeout(std::time::Duration::from_millis(5000))
-            .map_err(|err| SessionError::storage(format!("Unable to set busy timeout: {err}")))?;
         let store = Self { conn };
         store.apply_migrations()?;
-        store.ensure_search_schema()?;
         Ok(store)
     }
 
     pub fn apply_migrations(&self) -> Result<(), SessionError> {
-        self.conn
-            .execute_batch(
-                "CREATE TABLE IF NOT EXISTS migrations (
-                    id TEXT PRIMARY KEY,
-                    applied_at TEXT NOT NULL
-                );",
-            )
-            .map_err(|err| {
-                SessionError::storage(format!("Unable to create migrations table: {err}"))
-            })?;
-        let applied: Option<String> = self
-            .conn
-            .query_row(
-                "SELECT id FROM migrations WHERE id = ?1",
-                ["001_initial.sql"],
-                |row| row.get(0),
-            )
-            .optional()
-            .map_err(|err| SessionError::storage(format!("Unable to read migrations: {err}")))?;
-        if applied.is_none() {
-            self.conn
-                .execute_batch(INITIAL_MIGRATION_SQL)
-                .map_err(|err| {
-                    SessionError::storage(format!("Unable to apply 001_initial.sql: {err}"))
-                })?;
-            self.conn
-                .execute(
-                    "INSERT INTO migrations (id, applied_at) VALUES (?1, ?2)",
-                    params!["001_initial.sql", chrono_now()],
-                )
-                .map_err(|err| {
-                    SessionError::storage(format!("Unable to record migration: {err}"))
-                })?;
+        fn storage(what: &'static str) -> impl Fn(rusqlite::Error) -> SessionError {
+            move |err| SessionError::storage(format!("{what}: {err}"))
         }
-        Ok(())
+
+        self.conn
+            .execute_batch("BEGIN IMMEDIATE")
+            .map_err(storage("Unable to start migration"))?;
+        let result = (|| {
+            self.conn
+                .execute_batch(
+                    "CREATE TABLE IF NOT EXISTS migrations (
+                        id TEXT PRIMARY KEY,
+                        applied_at TEXT NOT NULL
+                    );",
+                )
+                .map_err(storage("Unable to create migrations table"))?;
+
+            let initial_applied: Option<String> = self
+                .conn
+                .query_row(
+                    "SELECT id FROM migrations WHERE id = ?1",
+                    ["001_initial.sql"],
+                    |row| row.get(0),
+                )
+                .optional()
+                .map_err(storage("Unable to read migrations"))?;
+            if initial_applied.is_none() {
+                self.conn
+                    .execute_batch(INITIAL_MIGRATION_SQL)
+                    .map_err(storage("Unable to apply 001_initial.sql"))?;
+                self.conn
+                    .execute(
+                        "INSERT INTO migrations (id, applied_at) VALUES (?1, ?2)",
+                        params!["001_initial.sql", chrono_now()],
+                    )
+                    .map_err(storage("Unable to record 001_initial.sql"))?;
+            }
+
+            self.ensure_search_schema()?;
+
+            let fts_applied: Option<String> = self
+                .conn
+                .query_row(
+                    "SELECT id FROM migrations WHERE id = ?1",
+                    ["002_fts_rebuild.sql"],
+                    |row| row.get(0),
+                )
+                .optional()
+                .map_err(storage("Unable to read migrations"))?;
+            if fts_applied.is_none() {
+                self.conn
+                    .execute_batch(FTS_REBUILD_MIGRATION_SQL)
+                    .map_err(storage("Unable to apply 002_fts_rebuild.sql"))?;
+                self.conn
+                    .execute(
+                        "INSERT INTO migrations (id, applied_at) VALUES (?1, ?2)",
+                        params!["002_fts_rebuild.sql", chrono_now()],
+                    )
+                    .map_err(storage("Unable to record 002_fts_rebuild.sql"))?;
+            }
+            Ok(())
+        })();
+
+        if result.is_ok() {
+            self.conn
+                .execute_batch("COMMIT")
+                .map_err(storage("Unable to commit migration"))?;
+        } else {
+            let _ = self.conn.execute_batch("ROLLBACK");
+        }
+        result
     }
 
     pub fn ensure_search_schema(&self) -> Result<(), SessionError> {
@@ -409,8 +445,14 @@ impl SqliteSessionStore {
             .map_err(|err| SessionError::storage(format!("Unable to encode entry: {err}")))?;
         self.conn
             .execute(
-                "INSERT OR REPLACE INTO entries (session_id, seq, id, parent_id, type, timestamp, payload)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                "INSERT INTO entries (session_id, seq, id, parent_id, type, timestamp, payload)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+                 ON CONFLICT(session_id, id) DO UPDATE SET
+                    seq = excluded.seq,
+                    parent_id = excluded.parent_id,
+                    type = excluded.type,
+                    timestamp = excluded.timestamp,
+                    payload = excluded.payload",
                 params![
                     session_id,
                     entry.seq as i64,
@@ -701,6 +743,10 @@ impl SqliteSessionStore {
                     [&session.id],
                     |row| row.get(0),
                 )
+                .optional()
+                .map_err(|err| {
+                    SessionError::storage(format!("Unable to read next sequence: {err}"))
+                })?
                 .unwrap_or(1);
             for item in session.get_log(&davinci_session::LogOptions::default())? {
                 if item.seq() as i64 >= next {
@@ -940,6 +986,48 @@ pub fn now_ms_i64() -> i64 {
 mod tests {
     use super::*;
     use tempfile::tempdir;
+
+    #[test]
+    fn two_threads_opening_a_fresh_database_both_succeed() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("concurrent.db");
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(4));
+        let handles = (0..4)
+            .map(|_| {
+                let path = path.clone();
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    SqliteSessionStore::open(&path).map(|_| ())
+                })
+            })
+            .collect::<Vec<_>>();
+        for handle in handles {
+            handle.join().unwrap().unwrap();
+        }
+    }
+
+    #[test]
+    fn reimporting_a_session_keeps_the_fts_index_consistent() {
+        let dir = tempdir().unwrap();
+        let store = SqliteSessionStore::open(&dir.path().join("fts.db")).unwrap();
+        let mut session = JsonlSession::create(dir.path(), "/work", None).unwrap();
+        for text in ["alpha one", "beta two", "gamma three"] {
+            session
+                .append_entry(SessionEntry::message("user", serde_json::json!(text)))
+                .unwrap();
+        }
+        store.upsert_session(&session).unwrap();
+        store.upsert_session(&session).unwrap();
+        store
+            .conn
+            .execute_batch(
+                "INSERT INTO session_search_fts(session_search_fts, rank)
+                 VALUES('integrity-check', 1);",
+            )
+            .unwrap();
+        assert_eq!(store.search("alpha").unwrap().len(), 1);
+    }
 
     #[test]
     fn audit_regression_create_rolls_back_after_lane_failure() {
