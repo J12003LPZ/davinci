@@ -20,6 +20,10 @@ use std::time::Duration;
 use uuid::Uuid;
 
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
+/// How long an in-process caller waits for the journal writer before
+/// `WriterBusy`, and how often it checks.
+const WRITER_WAIT: Duration = Duration::from_secs(2);
+const WRITER_WAIT_STEP: Duration = Duration::from_millis(1);
 const LEASE_DIRECTORY: &str = ".operation-journal-leases";
 const MIGRATION_LEASE_DIRECTORY: &str = "migration";
 pub(super) struct JournalState {
@@ -27,8 +31,8 @@ pub(super) struct JournalState {
 }
 
 /// A synchronous durable boundary for one root namespace. Writes use a single
-/// nonblocking lane: contention returns `WriterBusy`, so no unbounded queue can
-/// accumulate before a durable intent acknowledgement.
+/// lane: contention waits at most `WRITER_WAIT`, then returns `WriterBusy`, so
+/// no unbounded queue can accumulate before a durable intent acknowledgement.
 pub struct OperationJournal {
     pub(super) identity: JournalIdentity,
     pub(super) root_namespace_id: RootNamespaceId,
@@ -366,6 +370,11 @@ impl OperationJournal {
                     ))
                 || (next.state() == OperationState::Cancelled
                     && next.effect_status() == super::EffectStatus::NotStarted)
+                // The adapter returned an error: the effect is finished, even
+                // if unknown. `Unknown` still forbids automatic replay; only an
+                // attempt that never completed (a crash mid-effect) keeps its
+                // claim for the recovery path.
+                || matches!(&event, OperationEvent::CompleteFailure { .. })
             {
                 resolve_resource_claims(transaction, next.attempt_id())?;
             }
@@ -802,11 +811,22 @@ impl OperationJournal {
         Ok(())
     }
 
+    /// Waits a bounded time for the in-process writer. The tool scheduler
+    /// runs up to eight read-class calls on parallel threads and each one
+    /// writes a few short transactions, so contention is routine and brief;
+    /// failing it at once turned parallel reads into tool errors. The wait
+    /// is bounded, so no unbounded queue can form behind a stuck writer.
     fn try_state(&self) -> Result<MutexGuard<'_, JournalState>, JournalError> {
-        match self.state.try_lock() {
-            Ok(state) => Ok(state),
-            Err(TryLockError::WouldBlock) => Err(JournalError::WriterBusy),
-            Err(TryLockError::Poisoned(_)) => Err(JournalError::Poisoned),
+        let deadline = std::time::Instant::now() + WRITER_WAIT;
+        loop {
+            match self.state.try_lock() {
+                Ok(state) => return Ok(state),
+                Err(TryLockError::Poisoned(_)) => return Err(JournalError::Poisoned),
+                Err(TryLockError::WouldBlock) if std::time::Instant::now() < deadline => {
+                    std::thread::sleep(WRITER_WAIT_STEP);
+                }
+                Err(TryLockError::WouldBlock) => return Err(JournalError::WriterBusy),
+            }
         }
     }
 

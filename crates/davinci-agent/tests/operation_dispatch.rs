@@ -337,3 +337,137 @@ fn a_post_admission_denial_records_a_not_executed_attempt() {
         davinci_agent::runtime::operations::EffectStatus::NotStarted
     );
 }
+
+fn edit_plan(
+    fixture: &Fixture,
+    call_id: &str,
+    path: &str,
+) -> davinci_agent::runtime::operations::PlannedToolOperation {
+    let edit = RuntimeCapabilityRegistry::with_builtins()
+        .get("edit")
+        .unwrap();
+    ToolOperationPlanner::provider_call(
+        fixture.context.clone(),
+        call_id,
+        "edit",
+        &json!({"path": path, "edits": [{"oldText": "a", "newText": "b"}]}),
+        Some(&edit),
+        None,
+    )
+    .unwrap()
+}
+
+/// A mutating tool that returns an error (a rejected edit, a missing
+/// `oldText`) has finished running. Its effect stays `Unknown`, so it is
+/// never replayed, but it must not keep the workspace claim: before this
+/// fix one rejected edit blocked every later edit in the workspace, from
+/// every session, until the journal was deleted.
+#[test]
+fn a_returned_tool_error_releases_its_claim_for_the_next_mutation() {
+    let fixture = Fixture::new();
+    let plan = edit_plan(&fixture, "provider-edit-rejected", "math.js");
+    let admitted = new_operation(fixture.dispatcher.admit(plan.clone(), 7).unwrap());
+    let result = fixture
+        .dispatcher
+        .dispatch(
+            &admitted,
+            &plan,
+            Some(7),
+            false,
+            || Ok(()),
+            || davinci_agent::ToolResult {
+                content: "edits[1].oldText must not be empty in math.js.".into(),
+                is_error: true,
+                details: None,
+            },
+        )
+        .unwrap();
+    fixture
+        .dispatcher
+        .complete_for_session(&admitted, &result, false)
+        .unwrap();
+    let attempt = fixture
+        .journal
+        .load_attempt(admitted.attempt.attempt_id())
+        .unwrap();
+    assert_eq!(attempt.state(), OperationState::Failed);
+    assert_eq!(
+        attempt.effect_status(),
+        davinci_agent::runtime::operations::EffectStatus::Unknown
+    );
+
+    let next = edit_plan(&fixture, "provider-edit-retry", "math.js");
+    let admitted = fixture.dispatcher.admit(next, 7);
+    assert!(
+        matches!(admitted, Ok(OperationAdmission::New(_))),
+        "the next edit must be admitted, got {admitted:?}"
+    );
+}
+
+/// The scheduler runs up to eight read-class calls on parallel threads. Each
+/// writes the journal briefly (admit, claim, latch, complete); contention
+/// must wait for the writer rather than fail the tool call.
+#[test]
+fn parallel_read_dispatch_waits_for_the_journal_writer() {
+    let fixture = Fixture::new();
+    let read = fixture.read_capability();
+    let threads = 8;
+    let rounds = 12;
+    let barrier = std::sync::Barrier::new(threads);
+    let failures = std::sync::Mutex::new(Vec::new());
+    std::thread::scope(|scope| {
+        for thread in 0..threads {
+            let (fixture, read, barrier, failures) = (&fixture, &read, &barrier, &failures);
+            scope.spawn(move || {
+                for round in 0..rounds {
+                    barrier.wait();
+                    let outcome = (|| -> Result<(), String> {
+                        let plan = ToolOperationPlanner::provider_call(
+                            fixture.context.clone(),
+                            &format!("provider-read-{thread}-{round}"),
+                            "read",
+                            &json!({"path": format!("src/{thread}.rs")}),
+                            Some(read),
+                            None,
+                        )
+                        .map_err(|error| format!("{error:?}"))?;
+                        let admitted = new_operation(
+                            fixture
+                                .dispatcher
+                                .admit(plan.clone(), 7)
+                                .map_err(|error| error.to_string())?,
+                        );
+                        let result = fixture
+                            .dispatcher
+                            .dispatch(
+                                &admitted,
+                                &plan,
+                                Some(7),
+                                false,
+                                || Ok(()),
+                                || davinci_agent::ToolResult {
+                                    content: "ok".into(),
+                                    is_error: false,
+                                    details: None,
+                                },
+                            )
+                            .map_err(|error| error.to_string())?;
+                        fixture
+                            .dispatcher
+                            .complete_for_session(&admitted, &result, false)
+                            .map_err(|error| error.to_string())
+                    })();
+                    if let Err(error) = outcome {
+                        failures.lock().unwrap().push(error);
+                    }
+                }
+            });
+        }
+    });
+    let failures = failures.into_inner().unwrap();
+    assert!(
+        failures.is_empty(),
+        "{} failed: {failures:?}",
+        failures.len()
+    );
+}
