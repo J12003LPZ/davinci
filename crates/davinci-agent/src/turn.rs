@@ -751,7 +751,8 @@ impl Agent {
         } else {
             0
         };
-        let attempts = max_retries.max(1);
+        // `retry_attempts` is the number of retries after the first request.
+        let attempts = max_retries.saturating_add(1);
         let mut last_error = None;
         let mut scheduled_attempt = 0_u32;
         for attempt in 0..attempts {
@@ -3941,6 +3942,25 @@ mod session_persistence_tests;
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn max_retries_counts_retries_not_total_attempts() {
+        use davinci_ai::AssistantMessage;
+
+        for (max_retries, expected_calls) in [(0, 1), (1, 2), (3, 4)] {
+            let mut agent = Agent::new("retry count fixture");
+            agent.auto_retry = true;
+            agent.retry_attempts = max_retries;
+            agent.retry_base_delay_ms = 0;
+            agent.prompt("retry count");
+            let calls = std::cell::Cell::new(0);
+            let _ = agent.run_loop(|_| {
+                calls.set(calls.get() + 1);
+                Err::<AssistantMessage, String>("overloaded_error".into())
+            });
+            assert_eq!(calls.get(), expected_calls, "maxRetries={max_retries}");
+        }
+    }
+
     #[test]
     fn writable_shared_agent_calls_are_serial() {
         let mut agent = Agent::new("agent lane fixture");
