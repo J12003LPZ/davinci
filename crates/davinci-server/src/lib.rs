@@ -19,7 +19,7 @@ use davinci_protocol::{
     ServerEvent, ServerMessage, ServerSnapshot, SessionPhase, SessionSnapshot, TextOrImage,
     ThinkingLevel, TranscriptItem, TranscriptProgress, PROTOCOL_VERSION,
 };
-use davinci_session::{discover_sessions, JsonlSession};
+use davinci_session::{discover_session_headers, JsonlSession};
 use serde_json::Value;
 use thiserror::Error;
 use uuid::Uuid;
@@ -215,7 +215,7 @@ impl PiServer {
     }
 
     pub fn snapshot(&self) -> ServerSnapshot {
-        let sessions = discover_sessions(&self.sessions_dir, None)
+        let sessions = discover_session_headers(&self.sessions_dir, None)
             .unwrap_or_default()
             .into_iter()
             .map(|s| davinci_protocol::SessionMetadata {
