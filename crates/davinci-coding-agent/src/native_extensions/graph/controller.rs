@@ -52,6 +52,7 @@ use std::time::{Duration, Instant};
 const EVIDENCE_DIGEST_MAX_CHARS: usize = 24_000;
 const DIFF_MAX_CHARS: usize = 60_000;
 const NODE_ATTEMPTS: u32 = 2;
+const PROGRESS_CHECKPOINT_EVERY: Duration = Duration::from_secs(2);
 
 pub type UpdateSink = dyn Fn(&GraphRun, Option<&str>) + Send + Sync;
 
@@ -229,6 +230,8 @@ pub struct GraphExecution {
     exec_abort: Arc<AtomicBool>,
     budget_abort_reason: Mutex<Option<String>>,
     persistence_error: Mutex<Option<String>>,
+    last_progress_checkpoint: Mutex<Option<Instant>>,
+    checkpoint_io: Mutex<()>,
     run_deadline: Option<std::time::Instant>,
     pub active_workers: Arc<AtomicUsize>,
     pub node_aborts: Arc<Mutex<HashMap<String, Arc<AtomicBool>>>>,
@@ -327,25 +330,40 @@ impl GraphExecution {
         self.checkpoint_with(note, |_| Ok(()))
     }
 
+    fn checkpoint_progress(&self, note: &str) {
+        let due = {
+            let mut last = self
+                .last_progress_checkpoint
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            let due = last.map_or(true, |at| at.elapsed() >= PROGRESS_CHECKPOINT_EVERY);
+            if due {
+                *last = Some(Instant::now());
+            }
+            due
+        };
+        if due {
+            self.checkpoint(Some(note));
+        }
+    }
+
     fn checkpoint_with(
         &self,
         note: Option<&str>,
         persist_companions: impl FnOnce(&mut GraphRun) -> std::io::Result<()>,
     ) -> bool {
-        // Persist under the lock, but report on a clone with the guard dropped:
-        // a slow `on_update` must not serialize every worker thread, and an
-        // implementation that re-locks the run must not deadlock.
-        let (snapshot, failure) = {
+        // Serialize checkpoint publication without holding the run mutex. The
+        // I/O lock preserves snapshot order while workers keep updating memory.
+        let _checkpoint_io = self
+            .checkpoint_io
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if self.persistence_failure().is_some() {
+            return false;
+        }
+
+        let mut snapshot = {
             let mut run = self.run.lock().unwrap_or_else(|error| error.into_inner());
-            let mut failure = self
-                .persistence_error
-                .lock()
-                .unwrap_or_else(|error| error.into_inner());
-            // A failed save is terminal for this execution. Retrying implicitly
-            // could overwrite the last durable checkpoint with partial state.
-            if failure.is_some() {
-                return false;
-            }
             if matches!(run.phase, Phase::Done | Phase::Blocked | Phase::Cancelled) {
                 run.lifecycle = Some(GraphLifecycle::Stopped);
             }
@@ -362,26 +380,43 @@ impl GraphExecution {
                     gov_stats.as_ref(),
                 ),
             );
-            if let Err(error) = persist_companions(&mut run).and_then(|()| save_run(&mut run)) {
-                let reason = format!("checkpoint persistence failed: {error}");
-                *failure = Some(reason.clone());
-                self.exec_abort.store(true, Ordering::SeqCst);
+            run.clone()
+        };
+
+        if let Err(error) = persist_companions(&mut snapshot).and_then(|()| save_run(&mut snapshot))
+        {
+            let reason = format!("checkpoint persistence failed: {error}");
+            *self
+                .persistence_error
+                .lock()
+                .unwrap_or_else(|error| error.into_inner()) = Some(reason.clone());
+            self.exec_abort.store(true, Ordering::SeqCst);
+            let failed = {
+                let mut run = self.run.lock().unwrap_or_else(|error| error.into_inner());
                 run.phase = Phase::Blocked;
                 run.lifecycle = Some(GraphLifecycle::Stopped);
-                run.blocked_reason = Some(reason);
-            }
-            (run.clone(), failure.clone())
-        };
-        if let Some(reason) = failure {
+                run.blocked_reason = Some(reason.clone());
+                run.clone()
+            };
             (self.deps.on_update)(
-                &snapshot,
+                &failed,
                 Some(&format!("{reason}; stopped state not saved")),
             );
-            false
-        } else {
-            (self.deps.on_update)(&snapshot, note);
-            true
+            return false;
         }
+
+        {
+            let mut run = self.run.lock().unwrap_or_else(|error| error.into_inner());
+            run.updated_at = run.updated_at.max(snapshot.updated_at);
+            // A successful state-transition checkpoint starts a fresh progress
+            // debounce window as well.
+            *self
+                .last_progress_checkpoint
+                .lock()
+                .unwrap_or_else(|error| error.into_inner()) = Some(Instant::now());
+        }
+        (self.deps.on_update)(&snapshot, note);
+        true
     }
 
     fn snapshot(&self) -> GraphRun {
@@ -1125,7 +1160,7 @@ impl GraphExecution {
                             record.usage = *usage;
                         }
                     }
-                    self.checkpoint(Some(&format!("{task_id}: {line}")));
+                    self.checkpoint_progress(&format!("{task_id}: {line}"));
                 };
                 let node_abort = self.register_node_abort(&task_id);
                 spec.node_abort = Some(Arc::clone(&node_abort));
@@ -1771,6 +1806,8 @@ fn run_graph_internal(
         exec_abort,
         budget_abort_reason: Mutex::new(None),
         persistence_error: Mutex::new(None),
+        last_progress_checkpoint: Mutex::new(None),
+        checkpoint_io: Mutex::new(()),
         run_deadline,
         active_workers: Arc::new(AtomicUsize::new(0)),
         node_aborts: Arc::new(Mutex::new(HashMap::new())),
@@ -4674,6 +4711,8 @@ mod tests {
             exec_abort: Arc::new(AtomicBool::new(false)),
             budget_abort_reason: Mutex::new(None),
             persistence_error: Mutex::new(None),
+            last_progress_checkpoint: Mutex::new(None),
+            checkpoint_io: Mutex::new(()),
             run_deadline: None,
             active_workers: Arc::new(AtomicUsize::new(0)),
             node_aborts: Arc::new(Mutex::new(HashMap::new())),
@@ -5949,6 +5988,8 @@ mod tests {
             exec_abort: Arc::new(AtomicBool::new(false)),
             budget_abort_reason: Mutex::new(None),
             persistence_error: Mutex::new(None),
+            last_progress_checkpoint: Mutex::new(None),
+            checkpoint_io: Mutex::new(()),
             run_deadline: None,
             active_workers: Arc::new(AtomicUsize::new(1)),
             node_aborts: Arc::new(Mutex::new(HashMap::new())),
@@ -6062,6 +6103,8 @@ mod tests {
             exec_abort: Arc::new(AtomicBool::new(false)),
             budget_abort_reason: Mutex::new(None),
             persistence_error: Mutex::new(None),
+            last_progress_checkpoint: Mutex::new(None),
+            checkpoint_io: Mutex::new(()),
             run_deadline: None,
             active_workers: Arc::new(AtomicUsize::new(0)),
             node_aborts: Arc::new(Mutex::new(HashMap::new())),
@@ -6154,6 +6197,8 @@ mod tests {
             exec_abort: Arc::new(AtomicBool::new(false)),
             budget_abort_reason: Mutex::new(None),
             persistence_error: Mutex::new(None),
+            last_progress_checkpoint: Mutex::new(None),
+            checkpoint_io: Mutex::new(()),
             run_deadline: Some(past_deadline),
             active_workers: Arc::new(AtomicUsize::new(0)),
             node_aborts: Arc::new(Mutex::new(HashMap::new())),
@@ -6185,6 +6230,90 @@ mod tests {
         let active = ActiveRun::default();
         // A run whose thread hasn't finished is still running
         assert!(!active.is_finished());
+    }
+
+    #[test]
+    fn progress_checkpoint_burst_is_debounced() {
+        let dir = tempdir().unwrap();
+        let updates = Arc::new(AtomicUsize::new(0));
+        let seen = Arc::clone(&updates);
+        let deps = ControllerDeps {
+            runner: Arc::new(|_, _, _| WorkerResult::default()),
+            on_update: Arc::new(move |_, _| {
+                seen.fetch_add(1, Ordering::SeqCst);
+            }),
+            config: GraphConfig::default(),
+            learning: None,
+            memory: None,
+            governor: None,
+            security: None,
+            language_intelligence: None,
+            processes: None,
+            browser: None,
+            runtime: None,
+            permissions: None,
+            task_contract: None,
+        };
+        let options = RunOptions {
+            goal: "test".into(),
+            cwd: dir.path().to_path_buf(),
+            forced: None,
+            dry_run: true,
+            abort: Arc::new(AtomicBool::new(false)),
+            resume_artifacts: HashMap::new(),
+            resume_run: None,
+        };
+        create_run_dir(dir.path(), "progress-test").unwrap();
+        let execution = GraphExecution {
+            run: Mutex::new(GraphRun {
+                version: 1,
+                run_id: "progress-test".into(),
+                goal: options.goal.clone(),
+                cwd: options.cwd.to_string_lossy().into_owned(),
+                phase: Phase::Investigate,
+                forced: None,
+                dry_run: true,
+                execution_origin: None,
+                definition_digest: None,
+                saved_definition: None,
+                definition: None,
+                classification: None,
+                milestones: None,
+                current_milestone: None,
+                tasks: vec![],
+                verification: None,
+                verification_bundle: None,
+                review_coverage: None,
+                budgets: GraphBudgets::default(),
+                counters: GraphCounters::default(),
+                blocked_reason: None,
+                resource_snapshot: None,
+                ecosystem_stats: Default::default(),
+                updated_at: 0,
+                lifecycle: Some(GraphLifecycle::Running),
+                revision: 0,
+                control_history: Vec::new(),
+                continuation: None,
+            }),
+            deps,
+            learning: Mutex::new(None),
+            options,
+            exec_abort: Arc::new(AtomicBool::new(false)),
+            budget_abort_reason: Mutex::new(None),
+            persistence_error: Mutex::new(None),
+            last_progress_checkpoint: Mutex::new(None),
+            checkpoint_io: Mutex::new(()),
+            run_deadline: None,
+            active_workers: Arc::new(AtomicUsize::new(0)),
+            node_aborts: Arc::new(Mutex::new(HashMap::new())),
+        };
+
+        assert!(execution.checkpoint(Some("start")));
+        let after_start = updates.load(Ordering::SeqCst);
+        for i in 0..200 {
+            execution.checkpoint_progress(&format!("line {i}"));
+        }
+        assert_eq!(updates.load(Ordering::SeqCst), after_start);
     }
 
     #[test]
@@ -6265,6 +6394,8 @@ mod tests {
             exec_abort: Arc::new(AtomicBool::new(false)),
             budget_abort_reason: Mutex::new(None),
             persistence_error: Mutex::new(None),
+            last_progress_checkpoint: Mutex::new(None),
+            checkpoint_io: Mutex::new(()),
             run_deadline: None,
             active_workers: Arc::new(AtomicUsize::new(0)),
             node_aborts: Arc::new(Mutex::new(HashMap::new())),
