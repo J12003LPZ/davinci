@@ -615,16 +615,18 @@ fn get_param_value<'a>(args: &'a Value, param: &str) -> Option<&'a Value> {
             }
         }
     }
-    if let Some(tasks) = args.get("tasks").and_then(Value::as_array) {
-        if let Some(first_task) = tasks.first() {
-            if let Some(val) = first_task.get(param) {
-                if !val.is_null() {
-                    return Some(val);
-                }
-            }
-        }
-    }
     None
+}
+
+/// `Some(tasks)` when `args` contains a non-empty batch and no ambiguous
+/// top-level fields. Callers deny malformed batches that still carry `tasks`.
+fn split_agent_tasks(args: &Value) -> Option<Vec<Value>> {
+    let object = args.as_object()?;
+    let tasks = object.get("tasks")?.as_array()?;
+    if object.len() != 1 || tasks.is_empty() {
+        return None;
+    }
+    Some(tasks.clone())
 }
 
 fn resolve_json_path<'a>(mut current: &'a Value, path: &str) -> Option<&'a Value> {
@@ -928,6 +930,16 @@ impl PermissionPolicy {
         args: &Value,
         cwd: &Path,
     ) -> PermissionVerdict {
+        if tool == "agent" {
+            if let Some(tasks) = split_agent_tasks(args) {
+                return self.decide_agent_batch(tool_call_id, &tasks, cwd);
+            }
+            if args.get("tasks").is_some() {
+                return PermissionVerdict::Deny {
+                    reason: "agent: pass per-task fields inside `tasks`, not beside it".into(),
+                };
+            }
+        }
         // Capturing evidence is a compound read. It must obey the same rules
         // as the read tool, including named denies, even when propose_plan is
         // generally permitted or Always Approve is selected.
@@ -1265,6 +1277,30 @@ impl PermissionPolicy {
         })
     }
 
+    /// Deny if any task is denied, ask if at least one task needs approval,
+    /// and allow only when every task is allowed.
+    fn decide_agent_batch(
+        &self,
+        tool_call_id: &str,
+        tasks: &[Value],
+        cwd: &Path,
+    ) -> PermissionVerdict {
+        let mut first_ask = None;
+        for task in tasks {
+            match self.decide(tool_call_id, "agent", task, cwd) {
+                PermissionVerdict::Allow => {}
+                deny @ PermissionVerdict::Deny { .. } => return deny,
+                PermissionVerdict::Ask(request) => {
+                    first_ask.get_or_insert(request);
+                }
+            }
+        }
+        match first_ask {
+            Some(request) => PermissionVerdict::Ask(request),
+            None => PermissionVerdict::Allow,
+        }
+    }
+
     pub fn class_of(&self, tool: &str) -> ToolClass {
         if tool.starts_with("mcp__") && self.mcp_read_only.contains(tool) {
             ToolClass::Read
@@ -1395,13 +1431,6 @@ pub fn subject_of_with_boundary(
             let isolation = args
                 .get("isolation")
                 .and_then(Value::as_str)
-                .or_else(|| {
-                    args.get("tasks")
-                        .and_then(Value::as_array)
-                        .and_then(|arr| arr.first())
-                        .and_then(|t| t.get("isolation"))
-                        .and_then(Value::as_str)
-                })
                 .unwrap_or("shared");
             (format!("isolation:{isolation}"), false)
         }
@@ -2865,6 +2894,44 @@ mod tests {
     }
 
     #[test]
+    fn agent_deny_rule_matches_any_task_in_a_batch() {
+        let mut policy = PermissionPolicy::new(PermissionMode::AlwaysApprove);
+        policy.deny = vec![PermissionRule::parse("agent(isolation:worktree)").unwrap()];
+        let batch = json!({"tasks":[
+            {"prompt":"a","isolation":"shared"},
+            {"prompt":"b","isolation":"worktree"}
+        ]});
+        assert!(is_deny(&verdict(&policy, "agent", batch)));
+    }
+
+    #[test]
+    fn agent_allow_rule_must_match_every_task() {
+        let mut policy = PermissionPolicy::new(PermissionMode::Ask);
+        policy.allow = vec![PermissionRule::parse("agent(isolation:shared)").unwrap()];
+        let mixed = json!({"tasks":[
+            {"prompt":"a","isolation":"shared"},
+            {"prompt":"b","isolation":"worktree"}
+        ]});
+        assert!(is_ask(&verdict(&policy, "agent", mixed)));
+        let uniform = json!({"tasks":[
+            {"prompt":"a","isolation":"shared"},
+            {"prompt":"b"}
+        ]});
+        assert!(matches!(
+            verdict(&policy, "agent", uniform),
+            PermissionVerdict::Allow
+        ));
+    }
+
+    #[test]
+    fn agent_top_level_fields_beside_tasks_are_refused() {
+        let policy = PermissionPolicy::new(PermissionMode::AlwaysApprove);
+        let ambiguous =
+            json!({"isolation":"shared","tasks":[{"prompt":"a","isolation":"worktree"}]});
+        assert!(is_deny(&verdict(&policy, "agent", ambiguous)));
+    }
+
+    #[test]
     fn deny_parent_checkout_blocks_parent_edits() {
         let parent_dir = cwd();
         let mut policy = PermissionPolicy::new(PermissionMode::Edits);
@@ -3145,16 +3212,6 @@ mod tests {
         });
         assert_eq!(
             policy.decide("c1", "agent", &call_with_tasks, &root),
-            PermissionVerdict::Allow
-        );
-
-        // Direct indexed parameter
-        let mut policy2 = PermissionPolicy::new(PermissionMode::Ask);
-        policy2
-            .allow
-            .push(PermissionRule::parse("Agent(tasks[0].model:anthropic/*)").unwrap());
-        assert_eq!(
-            policy2.decide("c2", "agent", &call_with_tasks, &root),
             PermissionVerdict::Allow
         );
     }
