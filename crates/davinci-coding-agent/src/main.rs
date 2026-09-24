@@ -9005,10 +9005,17 @@ fn apply_session_calls(
                 }
             }
             Some("reload") => {
-                agent.skills = discover_skills(&[agent.cwd.join(".pi").join("skills")]);
-                agent.templates =
-                    discover_prompt_templates(&[agent.cwd.join(".pi").join("prompts")]);
-                agent.context_files = load_context_files(&agent.cwd, true);
+                // Match startup's trust-gated root assembly so reload neither
+                // loads untrusted project resources nor drops user and CLI roots.
+                let fallback;
+                let args = match parsed {
+                    Some(args) => args,
+                    None => {
+                        fallback = Args::default();
+                        &fallback
+                    }
+                };
+                apply_discovered_resources(args, agent);
                 ui.status(
                     "Reloaded keybindings, extensions, skills, prompts, themes, and context files",
                 );
@@ -13110,6 +13117,39 @@ mod tests {
                 .map(|skill| &skill.name)
                 .collect::<Vec<_>>()
         );
+    }
+
+    #[test]
+    fn extension_reload_does_not_load_untrusted_project_skills() {
+        let _env_lock = PROCESS_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        let _agent_dir = EnvRestore::set(
+            "PI_CODING_AGENT_DIR",
+            &dir.path().join("agent").to_string_lossy(),
+        );
+        let _davinci_agent_dir = EnvRestore::set(
+            "DAVINCI_CODING_AGENT_DIR",
+            &dir.path().join("agent").to_string_lossy(),
+        );
+        let skill_dir = dir.path().join(".pi").join("skills").join("planted");
+        std::fs::create_dir_all(&skill_dir).unwrap();
+        std::fs::write(
+            skill_dir.join("SKILL.md"),
+            "---\nname: planted\ndescription: planted skill\n---\n# Planted\n",
+        )
+        .unwrap();
+        let mut agent = Agent::new("x");
+        agent.cwd = dir.path().to_path_buf();
+        apply_session_calls(
+            None,
+            &mut agent,
+            SessionCallUi::Silent,
+            &[serde_json::json!({"op":"reload"})],
+            false,
+        );
+        assert!(agent.skills.iter().all(|skill| skill.name != "planted"));
     }
 
     #[test]
