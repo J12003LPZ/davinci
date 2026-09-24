@@ -542,6 +542,38 @@ pub fn append_event(
     }
 }
 
+/// One `jev` row of `<session>.events.jsonl`: the shadow sample for the
+/// turn submitted at `turn_ts`. The `tool` rows written after `turn_ts`,
+/// up to the next `jev` row's `turnTs`, are what the coding model actually
+/// did that turn. The outcome carries metadata only: no task, no payload.
+pub fn append_decision_event(
+    session_path: Option<&PathBuf>,
+    turn_ts: u64,
+    outcome: &davinci_agent::decision::ShadowOutcome,
+) {
+    let Some(path) = session_path else {
+        return;
+    };
+    let Ok(Value::Object(fields)) = serde_json::to_value(outcome) else {
+        return;
+    };
+    let mut row = serde_json::json!({
+        "ts": davinci_session::now_ms(),
+        "kind": "jev",
+        "turnTs": turn_ts,
+    });
+    row.as_object_mut()
+        .expect("row is an object")
+        .extend(fields);
+    if let Ok(mut out) = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path.with_extension("events.jsonl"))
+    {
+        let _ = writeln!(out, "{row}");
+    }
+}
+
 pub fn run_stop(hooks: &HooksFile) {
     for argv in &hooks.stop {
         let _ = run_one(argv, "stop", "", &Value::Null, None);
@@ -1012,6 +1044,54 @@ mod tests {
         assert_eq!(rows[0]["ok"], true);
         assert_eq!(rows[1]["kind"], "denied");
         assert_eq!(rows[1]["ok"], false);
+    }
+
+    #[test]
+    fn decision_rows_join_the_tool_rows_by_turn() {
+        let dir = tempfile::tempdir().unwrap();
+        let session = dir.path().join("s.jsonl");
+        append_decision_event(
+            Some(&session),
+            1_700_000_000_000,
+            &davinci_agent::decision::ShadowOutcome {
+                request_id: "req-1".into(),
+                outcome: "ok".into(),
+                model: Some("jev-1.13.0".into()),
+                latency_ms: 140,
+                input_tokens: Some(1500),
+                output_tokens: Some(185),
+                answers: vec![
+                    davinci_agent::decision::telemetry::DecisionAnswerTelemetry {
+                        question_id: "browser_relevant".into(),
+                        answer_type: "noul".into(),
+                        value: Some(0.88),
+                        choice: None,
+                        confidence: None,
+                        probability_margin: None,
+                        behavior_affecting: false,
+                        shadow_only: true,
+                    },
+                ],
+            },
+        );
+        append_event(
+            Some(&session),
+            "tool",
+            "browser_open",
+            Some("c1"),
+            Some(true),
+        );
+        let rows: Vec<Value> = std::fs::read_to_string(session.with_extension("events.jsonl"))
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(rows[0]["kind"], "jev");
+        assert_eq!(rows[0]["turnTs"], 1_700_000_000_000_u64);
+        assert_eq!(rows[0]["requestId"], "req-1");
+        assert_eq!(rows[0]["model"], "jev-1.13.0");
+        assert_eq!(rows[0]["answers"][0]["question_id"], "browser_relevant");
+        assert_eq!(rows[1]["tool"], "browser_open");
     }
 
     #[test]

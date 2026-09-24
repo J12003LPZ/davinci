@@ -171,7 +171,7 @@ impl DecisionTelemetry {
     }
 }
 
-fn answer_metadata(
+pub fn answer_metadata(
     question_id: &str,
     answer: &DecisionAnswer,
     behavior_affecting: bool,
