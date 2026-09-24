@@ -755,6 +755,9 @@ impl Agent {
                             usage.cache_read,
                             usage.cache_write,
                         );
+                        self.tool_context
+                            .cache
+                            .record_provider_cost(usage.cost.total);
                     }
                     if let Some(runtime) = &self.runtime {
                         if let Some(ledger) = &runtime.budget_ledger {
