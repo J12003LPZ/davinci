@@ -1506,7 +1506,7 @@ fn run_turn(
                     approval_project_allowed = trusted;
                     let request = &pending.request;
                     turn.await_approval(model, request);
-                    model.ask = permission_ask(request, trusted);
+                    model.ask = permission_ask_at(request, trusted, &cwd);
                     open_ask_overlay(model);
                     voice.cancel(model);
                     approval = Some(pending);
@@ -2739,6 +2739,14 @@ impl Question {
 /// decide on its own (spec: trust-and-control, *davinci*). The policy supplies
 /// legal choices; an untrusted host additionally removes project persistence.
 pub fn permission_ask(request: &ToolApprovalRequest, trusted: bool) -> Ask {
+    permission_ask_at(request, trusted, std::path::Path::new("."))
+}
+
+fn permission_ask_at(
+    request: &ToolApprovalRequest,
+    trusted: bool,
+    cwd: &std::path::Path,
+) -> Ask {
     let rule = &request.session_rule;
     let mut items: Vec<_> = request
         .host_choices(trusted)
@@ -2761,35 +2769,49 @@ pub fn permission_ask(request: &ToolApprovalRequest, trusted: bool) -> Ask {
             "",
         ));
     }
+
     let file_tool = matches!(
         request.tool.as_str(),
         "edit" | "write" | "notebook_edit" | "apply_patch"
     );
     let shell_tool = matches!(request.tool.as_str(), "bash" | "powershell");
-    let subject = if request.outside_project {
-        format!("{} · outside the project", request.subject)
+    let (preview, exists) = if file_tool {
+        approval_preview(request, cwd)
     } else {
-        request.subject.clone()
+        (Vec::new(), false)
     };
-    let name = std::path::Path::new(&request.subject)
+    let raw_subject = if file_tool {
+        request
+            .args
+            .get("path")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or(&request.subject)
+    } else {
+        request.subject.as_str()
+    };
+    let subject = if request.outside_project {
+        format!("{raw_subject} · outside the project")
+    } else {
+        raw_subject.to_string()
+    };
+    let name = std::path::Path::new(raw_subject)
         .file_name()
         .map(|name| name.to_string_lossy().to_string())
-        .unwrap_or_else(|| request.subject.clone());
-    let question = if request.tool == "write" {
-        format!("Do you want to create {name}?")
-    } else if file_tool {
-        format!("Do you want to make this edit to {name}?")
-    } else {
-        "Do you want to proceed?".to_string()
+        .unwrap_or_else(|| raw_subject.to_string());
+    let question = match request.tool.as_str() {
+        "write" if !exists => format!("Do you want to create {name}?"),
+        _ if file_tool => format!("Do you want to make this edit to {name}?"),
+        _ => "Do you want to proceed?".to_string(),
     };
+
     Ask {
-        title: permission_title(&request.tool, false),
+        title: permission_title(&request.tool, exists),
         name: "PERMISSION".into(),
         key: "/permissions".into(),
         note: request.summary.clone(),
         subject,
         question,
-        preview: Vec::new(),
+        preview,
         kind: if shell_tool {
             AskKind::Shell
         } else if file_tool {
@@ -2799,6 +2821,82 @@ pub fn permission_ask(request: &ToolApprovalRequest, trusted: bool) -> Ask {
         },
         items,
     }
+}
+
+fn approval_preview(
+    request: &ToolApprovalRequest,
+    cwd: &std::path::Path,
+) -> (Vec<Hunk>, bool) {
+    let path = request
+        .args
+        .get("path")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or(&request.subject);
+    let path = std::path::Path::new(path);
+    let full = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        cwd.join(path)
+    };
+    let exists = full.exists();
+
+    if request.tool == "write" {
+        let preview = request
+            .args
+            .get("content")
+            .and_then(serde_json::Value::as_str)
+            .map(|content| {
+                content
+                    .lines()
+                    .take(20)
+                    .enumerate()
+                    .map(|(index, line)| Hunk::at(HunkKind::Add, index as u32 + 1, line))
+                    .collect()
+            })
+            .unwrap_or_default();
+        return (preview, exists);
+    }
+
+    if !matches!(
+        request.tool.as_str(),
+        "edit" | "notebook_edit" | "apply_patch"
+    ) {
+        return (Vec::new(), exists);
+    }
+
+    let edit = request
+        .args
+        .get("edits")
+        .and_then(serde_json::Value::as_array)
+        .and_then(|edits| edits.first());
+    let old_text = request
+        .args
+        .get("oldText")
+        .or_else(|| edit.and_then(|edit| edit.get("oldText")))
+        .and_then(serde_json::Value::as_str);
+    let new_text = request
+        .args
+        .get("newText")
+        .or_else(|| edit.and_then(|edit| edit.get("newText")))
+        .and_then(serde_json::Value::as_str);
+    let (Some(old_text), Some(new_text)) = (old_text, new_text) else {
+        return (Vec::new(), exists);
+    };
+    let Ok(current) = std::fs::read_to_string(&full) else {
+        return (Vec::new(), exists);
+    };
+    let Some(offset) = current.find(old_text) else {
+        return (Vec::new(), exists);
+    };
+    let first_line = current[..offset].bytes().filter(|byte| *byte == b'\n').count() as u32 + 1;
+    let mut preview = Vec::new();
+    for (index, line) in old_text.lines().take(20).enumerate() {
+        preview.push(Hunk::at(HunkKind::Del, first_line + index as u32, line));
+    }
+    for (index, line) in new_text.lines().take(20).enumerate() {
+        preview.push(Hunk::at(HunkKind::Add, first_line + index as u32, line));
+    }
+    (preview, exists)
 }
 
 pub fn permission_title(tool: &str, exists: bool) -> String {
@@ -3336,7 +3434,7 @@ fn persist_permission_choice(
         return Some(decision);
     }
     *project_allowed = false;
-    model.ask = permission_ask(request, false);
+    model.ask = permission_ask_at(request, false, cwd);
     model.ask.note = format!(
         "Project permission could not be saved. Choose another scope. {}",
         model.ask.note
