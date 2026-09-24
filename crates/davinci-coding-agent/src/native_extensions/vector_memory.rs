@@ -32,6 +32,7 @@ const REINDEX_EMBED_LIMIT: usize = 256;
 /// the documented break-even gate.
 pub const MEMORY_PROJECTION_PROFILE: &str = "local";
 const EMBEDDING_PREFIX_REVISION: u32 = 1;
+const MAX_LOCAL_RECORDS: usize = 20_000;
 
 /// EmbeddingGemma uses different task prefixes for documents and queries.
 /// Keep these constants alongside the client so callers cannot accidentally
@@ -798,6 +799,7 @@ pub struct VectorMemory {
     pub cwd: PathBuf,
     pub repo_id: String,
     records: Vec<MemoryRecord>,
+    foreign_lines: Vec<String>,
     pub tombstones: HashSet<String>,
     pub supersessions: std::collections::HashMap<String, String>,
     #[allow(dead_code)]
@@ -839,6 +841,7 @@ impl VectorMemory {
             cwd,
             repo_id,
             records: Vec::new(),
+            foreign_lines: Vec::new(),
             tombstones: HashSet::new(),
             supersessions: std::collections::HashMap::new(),
             provenances: std::collections::HashMap::new(),
@@ -875,11 +878,16 @@ impl VectorMemory {
         let Ok(content) = fs::read_to_string(self.local_path()) else {
             return;
         };
-        self.records = content
-            .lines()
-            .filter_map(|line| serde_json::from_str::<MemoryRecord>(line).ok())
-            .filter(|record| record.repo_id == self.repo_id || record.repo_id == "*")
-            .collect();
+        self.records.clear();
+        self.foreign_lines.clear();
+        for line in content.lines().filter(|line| !line.trim().is_empty()) {
+            match serde_json::from_str::<MemoryRecord>(line) {
+                Ok(record) if record.repo_id == self.repo_id || record.repo_id == "*" => {
+                    self.records.push(record);
+                }
+                Ok(_) | Err(_) => self.foreign_lines.push(line.to_string()),
+            }
+        }
         self.known = self
             .records
             .iter()
@@ -897,13 +905,26 @@ impl VectorMemory {
         let path = self.local_path();
         fs::create_dir_all(path.parent().unwrap_or_else(|| Path::new(".")))
             .map_err(|err| ToolError::Failed(err.to_string()))?;
-        let content = self
-            .records
-            .iter()
-            .filter_map(|record| serde_json::to_string(record).ok())
-            .collect::<Vec<_>>()
-            .join("\n");
-        fs::write(path, content).map_err(|err| ToolError::Failed(err.to_string()))
+
+        let mut records = self.records.iter().collect::<Vec<_>>();
+        records.sort_by_key(|record| record.created_at);
+        let keep_from = records.len().saturating_sub(MAX_LOCAL_RECORDS);
+
+        let mut content = self.foreign_lines.join("\n");
+        for record in records.into_iter().skip(keep_from) {
+            let Ok(line) = serde_json::to_string(record) else {
+                continue;
+            };
+            if !content.is_empty() {
+                content.push('\n');
+            }
+            content.push_str(&line);
+        }
+        if !content.is_empty() {
+            content.push('\n');
+        }
+        davinci_sys::fs::atomic_write(&path, content.as_bytes())
+            .map_err(|err| ToolError::Failed(err.to_string()))
     }
 
     pub fn session_start(&mut self) {
@@ -2157,6 +2178,48 @@ pub(crate) mod tests {
         assert_eq!(record.source_turn, Some(4));
         assert_eq!(record.verification, Some("graph_pass".to_string()));
         assert_eq!(record.use_count, 0);
+    }
+
+    #[test]
+    fn records_of_another_repo_id_survive_a_persist() {
+        let directory = tempfile::tempdir().unwrap();
+        let cwd = directory.path().to_path_buf();
+
+        let mut first = VectorMemory::new(cwd.clone());
+        first.repo_id = "repo-a".into();
+        first.load_local();
+        first.mark_dense_offline();
+        first
+            .index_learning_memory(
+                "remember the rust edition",
+                MemoryKind::Fact,
+                0.8,
+                0.9,
+                "session-a",
+                1,
+                None,
+            )
+            .unwrap();
+
+        let mut second = VectorMemory::new(cwd.clone());
+        second.repo_id = "repo-b".into();
+        second.load_local();
+        second.mark_dense_offline();
+        second
+            .index_learning_memory(
+                "unrelated",
+                MemoryKind::Fact,
+                0.8,
+                0.9,
+                "session-b",
+                1,
+                None,
+            )
+            .unwrap();
+
+        let raw = fs::read_to_string(second.local_path()).unwrap();
+        assert!(raw.contains("repo-a"), "{raw}");
+        assert!(raw.contains("repo-b"), "{raw}");
     }
 
     #[test]
