@@ -18,6 +18,11 @@ use uuid::Uuid;
 use crate::catalog::Model;
 use crate::stream::{AssistantMessage, AssistantMessageEvent, ContentBlock, StopReason};
 
+/// Recorded when a stream closes before the provider's terminal event. The
+/// received content is kept, but the turn is not complete; `retry.rs` matches
+/// this wording.
+pub(crate) const TRUNCATED_STREAM: &str = "stream ended before a terminal response event";
+
 /// A decoder for one provider wire format.
 pub trait StreamDecoder {
     /// Fold one provider event into the message, pushing the stream events it
@@ -874,9 +879,8 @@ impl StreamDecoder for ResponsesDecoder {
 
     fn finish(&mut self, out: &mut Vec<AssistantMessageEvent>) -> AssistantMessage {
         if !self.done {
-            // The connection closed before the terminal event. Text already
-            // received is worth keeping; a tool call cut off mid-arguments is
-            // not, because executing it would guess at what the model meant.
+            // The connection closed before the terminal event: keep what
+            // arrived, but the turn did not finish.
             let cut_tool_call = self
                 .slots
                 .values()
@@ -884,7 +888,7 @@ impl StreamDecoder for ResponsesDecoder {
             if cut_tool_call {
                 self.fail("Stream ended before the tool call was complete".into(), out);
             } else {
-                self.finalize(None, out);
+                self.fail(TRUNCATED_STREAM.into(), out);
             }
         }
         self.message.clone()
@@ -1159,16 +1163,21 @@ data: {"type":"response.completed","response":{"status":"completed"}}
     }
 
     #[test]
-    fn a_stream_cut_mid_text_keeps_the_text_but_cut_mid_tool_call_is_an_error() {
+    fn eof_before_response_completed_is_an_error_that_keeps_text() {
         let (message, events) = run(
             r#"data: {"type":"response.output_item.added","output_index":0,"item":{"type":"message"}}
 
 data: {"type":"response.output_text.delta","output_index":0,"delta":"half"}
 "#,
         );
-        assert_eq!(message.stop_reason, Some(StopReason::Stop));
+        assert_eq!(message.stop_reason, Some(StopReason::Error));
+        assert_eq!(
+            message.error_message.as_deref(),
+            Some("stream ended before a terminal response event")
+        );
         assert!(matches!(&message.content[0], ContentBlock::Text { text } if text == "half"));
-        assert_eq!(names(&events).last(), Some(&"done"));
+        assert!(crate::is_retryable_assistant_error(&message));
+        assert_eq!(names(&events).last(), Some(&"error"));
 
         let (message, _) = run(
             r#"data: {"type":"response.output_item.added","output_index":0,"item":{"type":"function_call","id":"fc","call_id":"c","name":"bash","arguments":""}}

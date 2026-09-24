@@ -9,9 +9,8 @@
 //! name duplicates it and is ignored.
 //!
 //! Deliberate departures from the TypeScript, each noted at the site:
-//! - a stream that ends before `message_stop` keeps the text it received (TS
-//!   throws "Anthropic stream ended before message_stop") and errors only
-//!   when a tool call was cut off, the rule `ResponsesDecoder::finish` uses;
+//! - a stream that ends before `message_stop` keeps the text it received but
+//!   marks the turn as errored;
 //! - streamed tool arguments are re-parsed only once the buffer is a complete
 //!   JSON object (TS repairs and partially parses the fragment);
 //! - thinking signatures and redacted-thinking payloads are retained for
@@ -393,10 +392,7 @@ impl AnthropicDecoder {
             .any(|block| matches!(block, ContentBlock::ToolCall { .. }))
     }
 
-    /// `message_stop`, or the connection closing on a message whose blocks
-    /// were all complete: the stop reason seen in `message_delta`, else
-    /// `Stop`. TS raises "Anthropic stream ended without a stop reason" for
-    /// the latter; the text received is worth more than the complaint.
+    /// `message_stop`: the stop reason seen in `message_delta`, else `Stop`.
     fn finalize(&mut self, out: &mut Vec<AssistantMessageEvent>) {
         if self.done {
             return;
@@ -474,9 +470,8 @@ impl StreamDecoder for AnthropicDecoder {
 
     fn finish(&mut self, out: &mut Vec<AssistantMessageEvent>) -> AssistantMessage {
         if !self.done {
-            // The connection closed before message_stop. Text already
-            // received is worth keeping; a tool call cut off mid-arguments is
-            // not, because executing it would guess at what the model meant.
+            // The connection closed before the terminal event: keep what
+            // arrived, but the turn did not finish.
             let cut_tool_call = self
                 .blocks
                 .values()
@@ -484,7 +479,7 @@ impl StreamDecoder for AnthropicDecoder {
             if cut_tool_call {
                 self.fail("Stream ended before the tool call was complete".into(), out);
             } else {
-                self.finalize(out);
+                self.fail(crate::stream_decoder::TRUNCATED_STREAM.into(), out);
             }
         }
         self.message.clone()
@@ -1033,21 +1028,27 @@ data: {"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta"
     }
 
     #[test]
-    fn a_stream_cut_mid_text_keeps_the_text() {
+    fn eof_before_message_stop_is_an_error_that_keeps_text() {
         let (message, events) = run(
-            r#"data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}
+            r#"data: {"type":"message_start","message":{"id":"m","model":"claude","usage":{}}}
 
-data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"half"}}
+data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}
+
+data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"half an ans"}}
 "#,
         );
+        assert_eq!(message.stop_reason, Some(StopReason::Error));
         assert_eq!(
-            names(&events),
-            ["start", "text_start", "text_delta", "text_end", "done"]
+            message.error_message.as_deref(),
+            Some("stream ended before a terminal response event")
         );
-        assert_eq!(message.stop_reason, Some(StopReason::Stop));
-        assert!(matches!(&message.content[0], ContentBlock::Text { text } if text == "half"));
+        assert!(
+            matches!(&message.content[0], ContentBlock::Text { text } if text == "half an ans")
+        );
+        assert!(crate::is_retryable_assistant_error(&message));
+        assert_eq!(names(&events).last(), Some(&"error"));
 
-        // With a stop reason already seen, the cut stream keeps it.
+        // A message_delta stop reason is not the terminal message_stop event.
         let (message, events) = run(
             r#"data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}
 
@@ -1058,8 +1059,13 @@ data: {"type":"content_block_stop","index":0}
 data: {"type":"message_delta","delta":{"stop_reason":"max_tokens","stop_sequence":null},"usage":{"output_tokens":3}}
 "#,
         );
-        assert_eq!(message.stop_reason, Some(StopReason::Length));
-        assert_eq!(names(&events).last(), Some(&"done"));
+        assert_eq!(message.stop_reason, Some(StopReason::Error));
+        assert_eq!(
+            message.error_message.as_deref(),
+            Some("stream ended before a terminal response event")
+        );
+        assert!(matches!(&message.content[0], ContentBlock::Text { text } if text == "cut"));
+        assert_eq!(names(&events).last(), Some(&"error"));
     }
 
     #[test]
@@ -1452,10 +1458,14 @@ data: {"type":"message_stop"}
     }
 
     #[test]
-    fn finishing_an_empty_stream_emits_start_and_done() {
+    fn finishing_an_empty_stream_emits_start_and_error() {
         let (message, events) = run("");
-        assert_eq!(names(&events), ["start", "done"]);
-        assert_eq!(message.stop_reason, Some(StopReason::Stop));
+        assert_eq!(names(&events), ["start", "error"]);
+        assert_eq!(message.stop_reason, Some(StopReason::Error));
+        assert_eq!(
+            message.error_message.as_deref(),
+            Some("stream ended before a terminal response event")
+        );
         assert!(message.content.is_empty());
         assert_eq!(message.usage, None);
     }

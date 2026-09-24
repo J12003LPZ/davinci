@@ -2613,7 +2613,7 @@ mod tests {
             .into_iter()
             .find(|m| m.provider == "openai")
             .expect("openai model");
-        let corpus = "data: {\"choices\":[{\"delta\":{\"content\":\"Hi\"}}]}\n\ndata: {\"usage\":{\"prompt_tokens\":3,\"completion_tokens\":1,\"total_tokens\":4}}\n\ndata: [DONE]\n";
+        let corpus = "data: {\"choices\":[{\"delta\":{\"content\":\"Hi\"},\"finish_reason\":\"stop\"}]}\n\ndata: {\"usage\":{\"prompt_tokens\":3,\"completion_tokens\":1,\"total_tokens\":4}}\n\ndata: [DONE]\n";
         let events = replay_sse_events(&model, corpus);
         let types: Vec<_> = events
             .iter()

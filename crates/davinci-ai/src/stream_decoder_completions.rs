@@ -463,17 +463,19 @@ impl StreamDecoder for CompletionsDecoder {
         if !self.done {
             self.start(out);
             if !self.finish_reason_seen {
-                // The connection closed before finish_reason. Text already
-                // received is worth keeping; a tool call cut off mid-arguments
-                // is not, because executing it would guess at what the model
-                // meant. A provider flagged as never sending finish_reason
-                // ends every stream this way, so its tool calls are complete.
-                if !self.tool_calls.is_empty() && self.expects_finish_reason() {
+                // The connection closed before the terminal event: keep what
+                // arrived, but the turn did not finish. Some providers never
+                // send finish_reason, so EOF remains valid for those models.
+                if !self.expects_finish_reason() {
+                    self.message.stop_reason = Some(StopReason::Stop);
+                } else if !self.tool_calls.is_empty() {
                     self.message.stop_reason = Some(StopReason::Error);
                     self.message.error_message =
                         Some("Stream ended before the tool call was complete".into());
                 } else {
-                    self.message.stop_reason = Some(StopReason::Stop);
+                    self.message.stop_reason = Some(StopReason::Error);
+                    self.message.error_message =
+                        Some(crate::stream_decoder::TRUNCATED_STREAM.into());
                 }
             }
             self.close_open(out);
@@ -1068,24 +1070,47 @@ data: {{"choices":[{{"index":0,"delta":{{"tool_calls":[{{"index":0,"function":{{
     }
 
     #[test]
-    fn a_stream_cut_mid_text_keeps_the_text() {
+    fn eof_before_finish_reason_is_an_error_that_keeps_text() {
         let (message, events) = run(
             r#"data: {"choices":[{"index":0,"delta":{"role":"assistant","content":"half"},"finish_reason":null}]}
+"#,
+        );
+        assert_eq!(message.stop_reason, Some(StopReason::Error));
+        assert_eq!(
+            message.error_message.as_deref(),
+            Some("stream ended before a terminal response event")
+        );
+        assert!(matches!(&message.content[0], ContentBlock::Text { text } if text == "half"));
+        assert!(crate::is_retryable_assistant_error(&message));
+        assert_eq!(
+            names(&events),
+            ["start", "text_start", "text_delta", "text_end", "error"]
+        );
+
+        // A provider that expects finish_reason must reject an empty EOF too.
+        let (message, events) = run("");
+        assert!(message.content.is_empty());
+        assert_eq!(message.stop_reason, Some(StopReason::Error));
+        assert_eq!(
+            message.error_message.as_deref(),
+            Some("stream ended before a terminal response event")
+        );
+        assert_eq!(names(&events), ["start", "error"]);
+    }
+
+    #[test]
+    fn providers_that_do_not_expect_finish_reason_accept_text_at_eof() {
+        let mut lenient = model();
+        lenient.compat = serde_json::json!({"supportsFinishReason": false});
+        let (message, events) = run_with(
+            &lenient,
+            r#"data: {"choices":[{"index":0,"delta":{"content":"half"},"finish_reason":null}]}
 "#,
         );
         assert_eq!(message.stop_reason, Some(StopReason::Stop));
         assert_eq!(message.error_message, None);
         assert!(matches!(&message.content[0], ContentBlock::Text { text } if text == "half"));
-        assert_eq!(
-            names(&events),
-            ["start", "text_start", "text_delta", "text_end", "done"]
-        );
-
-        // Nothing at all still concludes cleanly.
-        let (message, events) = run("");
-        assert!(message.content.is_empty());
-        assert_eq!(message.stop_reason, Some(StopReason::Stop));
-        assert_eq!(names(&events), ["start", "done"]);
+        assert_eq!(names(&events).last(), Some(&"done"));
     }
 
     #[test]
