@@ -823,11 +823,6 @@ impl Agent {
             }
             if attempt > 0 {
                 self.stats.provider_retries += 1;
-                if let Some(runtime) = &self.runtime {
-                    if let Some(ledger) = &runtime.budget_ledger {
-                        let _ = ledger.record_retry();
-                    }
-                }
             }
             let result = complete(self);
             drop(permit);
@@ -845,42 +840,20 @@ impl Agent {
                         self.tool_context
                             .cache
                             .record_provider_cost(usage.cost.total);
-                    }
-                    if let Some(runtime) = &self.runtime {
-                        if let Some(ledger) = &runtime.budget_ledger {
-                            let total_tokens =
-                                message.usage.as_ref().map(|u| u.total_tokens).unwrap_or(0);
-                            let cache_read =
-                                message.usage.as_ref().map(|u| u.cache_read).unwrap_or(0);
-                            let cache_write =
-                                message.usage.as_ref().map(|u| u.cache_write).unwrap_or(0);
-                            let cost = if let Some(usage) = &message.usage {
-                                if usage.cost.total > 0.0 {
-                                    crate::runtime::CostAmount::Known(
-                                        (usage.cost.total * 10_000.0) as u64,
-                                    )
-                                } else {
-                                    crate::runtime::CostAmount::Unknown
-                                }
-                            } else {
-                                crate::runtime::CostAmount::Unknown
-                            };
-                            let receipt = crate::runtime::UsageReceipt {
-                                attempt_id: format!("provider_attempt_{}_{}", message.id, attempt),
-                                provider_usage: total_tokens,
-                                estimated_usage: self.estimated_context_tokens(),
-                                cache_read_tokens: cache_read,
-                                cache_write_tokens: cache_write,
-                                cost,
-                                finished_at: std::time::SystemTime::now()
-                                    .duration_since(std::time::UNIX_EPOCH)
-                                    .map(|d| d.as_millis() as u64)
-                                    .unwrap_or(0),
-                            };
-                            let _ = ledger.settle_receipt(None, receipt);
-                            self.stats.apply_budget_snapshot(&ledger.snapshot());
+                        self.stats.budget_tokens_charged = self
+                            .stats
+                            .budget_tokens_charged
+                            .saturating_add(usage.total_tokens);
+                        if usage.cost.total > 0.0 {
+                            let minor = (usage.cost.total * 10_000.0) as u64;
+                            self.stats.cost_minor_units = Some(
+                                self.stats.cost_minor_units.unwrap_or(0).saturating_add(minor),
+                            );
+                        } else {
+                            self.stats.has_unknown_cost = true;
                         }
                     }
+
                     if message.stop_reason == Some(StopReason::Error)
                         && davinci_ai::is_retryable_assistant_error(&message)
                         && attempt + 1 < attempts
