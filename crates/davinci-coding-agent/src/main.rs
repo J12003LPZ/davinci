@@ -1979,6 +1979,8 @@ fn complete_prompt_with_host(
             // An extension's prompt replaces the base, not the mode: plan
             // mode keeps its appendix.
             if agent.is_plan_mode()
+                && agent.turn_context_placement()
+                    == davinci_agent::turn_context::TurnContextPlacement::SystemPrompt
                 && !agent
                     .system_prompt
                     .contains(davinci_agent::PLAN_MODE_APPENDIX)
@@ -1995,9 +1997,22 @@ fn complete_prompt_with_host(
         }
         let suppress_memory = std::env::var_os("PI_GRAPH_SUPPRESS_MEMORY_INJECT").is_some()
             || std::env::var_os("PI_GRAPH_ROLE").is_some();
-        if !suppress_memory {
-            if let Some(memory) = host.native_memory_inject(&prompt) {
-                agent.set_ephemeral_context(vec![davinci_ai::ChatMessage::text("custom", memory)]);
+        let memory = if suppress_memory {
+            None
+        } else {
+            host.native_memory_inject(&prompt)
+        };
+        match agent.turn_context_placement() {
+            davinci_agent::turn_context::TurnContextPlacement::Appended => {
+                agent.freeze_tools_for_cache();
+                agent.commit_turn_context(memory);
+            }
+            davinci_agent::turn_context::TurnContextPlacement::SystemPrompt => {
+                if let Some(memory) = memory {
+                    agent.set_ephemeral_context(vec![davinci_ai::ChatMessage::text(
+                        "custom", memory,
+                    )]);
+                }
             }
         }
         host.native_cancel_learning_review();
