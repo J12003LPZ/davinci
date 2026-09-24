@@ -155,3 +155,34 @@ Cache-sensitive routes also:
 Run `node scripts/measure-codex-cache.mjs <session.jsonl>` after a repeated multi-turn Codex session. From request 2 onward, a cache-stable run should report cache reads covering the unchanged prefix instead of falling back to only the stable bootstrap after mode/capability changes.
 
 The repository does not commit fabricated before/after numbers. Live measurements require an authenticated ChatGPT Codex session and should be recorded only from an actual run.
+
+
+## Subscription-efficiency implementation status
+
+Prepared on 2026-09-24 from the current `main` branch.
+
+### Implemented
+
+- Stable OpenAI reasoning instructions with appended per-turn runtime state, plan-mode state, living-plan revisions, and memory.
+- Cache-aware pruning and a fixed authorized provider-tool prefix on cache-sensitive routes.
+- Configurable OpenAI verbosity and reasoning summaries.
+- Per-assistant native Responses item persistence and replay for the same provider/model.
+- A hidden `--codex-probe` maintainer command and sanitized evidence document.
+- Capability-ready Codex cache-policy plumbing. New explicit cache options remain disabled unless model compatibility data is backed by a successful probe.
+- ChatGPT Codex usage-window parsing, threshold warnings, `usage_limit_reached` retry suppression, and `/cache-status` visibility.
+- Economy-model routing for read-only graph roles during `openai-codex/*` sessions. Set `graphEconomyModel` or `DAVINCI_GRAPH_ECONOMY_MODEL`; use `off` to disable it.
+- Accumulated provider USD cost in cache telemetry and an explicitly labeled ChatGPT-plan credit estimate in `/cache-status`.
+- Cache measurement and Codex CLI comparison scripts.
+
+### Awaiting live backend evidence
+
+The following plan items are intentionally not enabled until the explicit authenticated backend probe records support:
+
+- prompt-cache TTL and explicit bootstrap breakpoints in the model catalog;
+- freeform grammar `apply_patch` request wiring;
+- `additional_tools` late-tool delivery;
+- cache-sharing compaction using `tool_choice: "none"`;
+- the remote `/responses/compact` decision;
+- final Codex usage-header names if the live backend differs from the conservative parser names.
+
+Live before/after cache measurements and Codex CLI comparison results are also pending. The implementation does not commit synthetic benchmark numbers or claim probe acceptance without an authenticated run.
