@@ -782,11 +782,16 @@ pub fn check_for_available_updates(
     settings: &Settings,
     agent_dir: &Path,
     cwd: &Path,
+    project_trusted: bool,
 ) -> Vec<String> {
     let mut sources = Vec::new();
-    let project = load_settings(&cwd.join(".pi"));
-    for pkg in &project.packages {
-        sources.push((pkg.source().to_string(), true));
+    if project_trusted {
+        if let Some(path) = crate::project_config::resolve(cwd, "settings.json") {
+            let project = crate::settings::load_settings_file(&path);
+            for pkg in &project.packages {
+                sources.push((pkg.source().to_string(), true));
+            }
+        }
     }
     for pkg in &settings.packages {
         sources.push((pkg.source().to_string(), false));
@@ -1012,15 +1017,7 @@ fn git_rev_parse(installed: &Path, rev: &str) -> Option<String> {
     if cfg!(test) {
         return None;
     }
-    let output = std::process::Command::new("git")
-        .args(["rev-parse", rev])
-        .current_dir(installed)
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    Some(String::from_utf8_lossy(&output.stdout).trim().to_string())
+    update_check_git(installed, &["rev-parse", rev])
 }
 
 fn remote_git_head(installed: &Path) -> Option<String> {
@@ -1036,16 +1033,49 @@ fn remote_git_head(installed: &Path) -> Option<String> {
     if cfg!(test) {
         return None;
     }
+    let raw = update_check_git(installed, &["ls-remote", "origin", "HEAD"])?;
+    parse_ls_remote_head(&raw)
+}
+
+/// Git for update checks. Command-line `-c` overrides repository config, so a
+/// cloned package cannot select an ssh program, upload-pack program, fsmonitor
+/// hook, or the `ext::` transport.
+fn update_check_git(dir: &Path, args: &[&str]) -> Option<String> {
     let git = std::env::var("PI_GIT_CMD").unwrap_or_else(|_| "git".into());
-    let output = std::process::Command::new(git)
-        .args(["ls-remote", "origin", "HEAD"])
-        .current_dir(installed)
-        .output()
-        .ok()?;
-    if !output.status.success() {
+    let mut command = std::process::Command::new(davinci_sys::process::resolve_program(&git));
+    command
+        .current_dir(dir)
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .args([
+            "-c",
+            "core.fsmonitor=false",
+            "-c",
+            "core.hooksPath=",
+            "-c",
+            "core.sshCommand=ssh",
+            "-c",
+            "protocol.ext.allow=never",
+            "-c",
+            "remote.origin.uploadpack=git-upload-pack",
+            "-c",
+            "safe.bareRepository=explicit",
+        ])
+        .args(args);
+    let output = davinci_sys::process::run_bounded(
+        command,
+        None,
+        davinci_sys::process::RunLimits {
+            timeout: std::time::Duration::from_secs(15),
+            output_cap: 64 * 1024,
+        },
+        &|| false,
+    )
+    .ok()?;
+    if !output.status.is_some_and(|status| status.success()) {
         return None;
     }
-    parse_ls_remote_head(&String::from_utf8_lossy(&output.stdout))
+    Some(String::from_utf8_lossy(&output.stdout).trim().to_string())
 }
 
 fn parse_ls_remote_head(raw: &str) -> Option<String> {

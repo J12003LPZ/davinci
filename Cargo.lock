@@ -514,6 +514,7 @@ dependencies = [
  "davinci-server",
  "davinci-session",
  "davinci-session-sqlite",
+ "davinci-sys",
  "davinci-telemetry",
  "davinci-tui",
  "davinci-voice",

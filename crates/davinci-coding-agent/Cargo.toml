@@ -24,6 +24,7 @@ davinci-protocol = { path = "../davinci-protocol" }
 davinci-server = { path = "../davinci-server" }
 davinci-session = { path = "../davinci-session" }
 davinci-session-sqlite = { path = "../davinci-session-sqlite" }
+davinci-sys = { path = "../davinci-sys" }
 davinci-telemetry = { path = "../davinci-telemetry" }
 davinci-tui = { path = "../davinci-tui" }
 crossterm.workspace = true

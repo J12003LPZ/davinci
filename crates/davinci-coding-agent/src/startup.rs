@@ -93,7 +93,8 @@ pub fn check_for_package_updates(settings: &Settings) -> Vec<String> {
     }
     let agent_dir = davinci_session::default_agent_dir();
     let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
-    crate::packages::check_for_available_updates(settings, &agent_dir, &cwd)
+    let trusted = crate::settings::is_trusted(settings, &cwd, None);
+    crate::packages::check_for_available_updates(settings, &agent_dir, &cwd, trusted)
 }
 
 pub fn check_tmux_keyboard_setup() -> Option<String> {
@@ -150,6 +151,8 @@ fn tmux_show(option: &str) -> Option<String> {
 mod tests {
     use super::*;
 
+    static UPDATE_CHECK_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[test]
     fn package_and_tmux_fixtures() {
         // Parsing a fixture must not depend on (or disable) the offline guard.
@@ -185,6 +188,9 @@ mod tests {
 
     #[test]
     fn live_npm_view_fixture_detects_update() {
+        let _env_lock = UPDATE_CHECK_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
         let dir = tempfile::tempdir().unwrap();
         let npm = dir
             .path()
@@ -210,6 +216,7 @@ mod tests {
             &settings,
             &dir.path().join("agent"),
             dir.path(),
+            true,
         );
         assert_eq!(updates, vec!["todo".to_string()]);
         std::env::set_var("PI_NPM_VIEW_REPLY", "\"1.0.0\"");
@@ -217,11 +224,53 @@ mod tests {
             &settings,
             &dir.path().join("agent"),
             dir.path(),
+            true,
         );
         assert!(none.is_empty());
         match old_npm_reply {
             Some(value) => std::env::set_var("PI_NPM_VIEW_REPLY", value),
             None => std::env::remove_var("PI_NPM_VIEW_REPLY"),
         }
+    }
+
+    #[test]
+    fn untrusted_project_packages_are_not_checked_for_updates() {
+        let _env_lock = UPDATE_CHECK_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        let project_settings = dir.path().join(".pi");
+        std::fs::create_dir_all(&project_settings).unwrap();
+        std::fs::write(
+            project_settings.join("settings.json"),
+            r#"{"packages":["npm:evil"]}"#,
+        )
+        .unwrap();
+        let installed = dir
+            .path()
+            .join(".pi")
+            .join("npm")
+            .join("node_modules")
+            .join("evil");
+        std::fs::create_dir_all(&installed).unwrap();
+        std::fs::write(
+            installed.join("package.json"),
+            r#"{"name":"evil","version":"1.0.0"}"#,
+        )
+        .unwrap();
+        let old = std::env::var_os("PI_NPM_VIEW_REPLY");
+        std::env::set_var("PI_NPM_VIEW_REPLY", "\"2.0.0\"");
+        let settings = Settings::default();
+        let agent = dir.path().join("agent");
+        let untrusted =
+            crate::packages::check_for_available_updates(&settings, &agent, dir.path(), false);
+        let trusted =
+            crate::packages::check_for_available_updates(&settings, &agent, dir.path(), true);
+        match old {
+            Some(value) => std::env::set_var("PI_NPM_VIEW_REPLY", value),
+            None => std::env::remove_var("PI_NPM_VIEW_REPLY"),
+        }
+        assert!(untrusted.is_empty());
+        assert_eq!(trusted, vec!["evil".to_string()]);
     }
 }
