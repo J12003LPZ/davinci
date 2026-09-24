@@ -4967,6 +4967,13 @@ fn run_interactive(
         .unwrap_or(TuiMode::Regular);
     let fullscreen = tui_mode == TuiMode::Fullscreen;
     let use_tui_host = io::stdin().is_terminal();
+    let prepared = prepare_initial_message(
+        &parsed.messages,
+        &parsed.file_args,
+        None,
+        &agent.cwd,
+        stored.image_auto_resize(),
+    )?;
     let mut tui_host = if use_tui_host {
         if let Ok((cols, _rows)) = crossterm::terminal::size() {
             session.width = cols as usize;
@@ -4998,13 +5005,6 @@ fn run_interactive(
         apply_terminal_title(&mut session, agent, None);
         None
     };
-    let prepared = prepare_initial_message(
-        &parsed.messages,
-        &parsed.file_args,
-        None,
-        &agent.cwd,
-        stored.image_auto_resize(),
-    )?;
     if let Some(prompt) = &prepared.text {
         if !submit_user_message(
             parsed,
