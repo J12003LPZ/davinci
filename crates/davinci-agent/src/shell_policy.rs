@@ -204,6 +204,9 @@ const TEST_PATTERNS: &[&str] = &[
     r"(?i)^\s*pnpm\s+(test|check|typecheck|lint)\b",
     r"(?i)^\s*node\s+.*vitest[/\\]dist[/\\]cli\.js\b",
     r"(?i)^\s*node\s+--test\b",
+    r"(?i)^\s*ctest\b",
+    r"(?i)^\s*mvn\s+test\b",
+    r"(?i)^\s*gradle\s+test\b",
     r"(?i)^\s*(?:python|python3|pytest|cargo(?:\.exe)?(?:\s+\+[a-z0-9_.-]+)?(?:\s+--(?:offline|locked|frozen))*\s+(?:test|check|clippy|fmt|build|nextest)|go\s+(?:test|vet|build)|dotnet\s+(?:test|build))\b",
     r"(?i)^\s*make\s+(test|check|lint|fmt|clippy|build)\b",
     r"(?i)^\s*\.[/\\]test\.sh\b",
@@ -781,6 +784,18 @@ pub fn analyze_command(command: &str) -> ShellAnalysisReport {
     }
 }
 
+/// Classifies whether a command runs a verification program and whether its
+/// exit status can be trusted as the verification result.
+pub fn verification_outcome(command: &str) -> Option<bool> {
+    let report = analyze_command(command);
+    let test_position = report
+        .segments
+        .iter()
+        .position(|segment| test_regex().is_match(segment) && !segment.contains("--no-run"))?;
+    let status_masked = command.contains("||") || test_position + 1 != report.segments.len();
+    Some(!status_masked)
+}
+
 impl ShellAnalysisReport {
     /// Classifies the declared effects of this shell command based on static analysis.
     ///
@@ -918,6 +933,29 @@ pub fn evaluate(profile: ShellPolicyProfile, command: &str) -> ShellCommandDecis
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn verification_commands_are_recognised_by_their_program() {
+        for (command, expected) in [
+            ("cargo test", Some(true)),
+            ("cargo test --workspace -- --nocapture", Some(true)),
+            ("cargo nextest run", Some(true)),
+            ("npx vitest run", Some(true)),
+            ("npx jest", Some(true)),
+            ("tsc --noEmit", Some(true)),
+            ("pytest -q", Some(true)),
+            ("ctest --output-on-failure", Some(true)),
+            ("mvn test", Some(true)),
+            ("gradle test", Some(true)),
+            ("cargo test 2>&1 | tail-20", Some(false)),
+            ("cargo test || true", Some(false)),
+            ("echo cargo test", None),
+            ("cargo test --no-run", None),
+            ("ls", None),
+        ] {
+            assert_eq!(verification_outcome(command), expected, "{command}");
+        }
+    }
 
     #[test]
     fn cargo_global_flags_are_test_policy_compatible_without_granting_other_commands() {

@@ -2494,8 +2494,11 @@ impl Agent {
                     .get("command")
                     .and_then(Value::as_str)
                     .unwrap_or_default();
-                if is_verification_command(cmd) {
-                    self.record_verification_command(cmd, !pre_hook_error && !result.is_error);
+                if let Some(trustworthy) = crate::shell_policy::verification_outcome(cmd) {
+                    self.record_verification_command(
+                        cmd,
+                        trustworthy && !pre_hook_error && !result.is_error,
+                    );
                 }
             }
         }
@@ -3948,20 +3951,7 @@ pub(crate) fn mutation_paths_from_tool(name: &str, args: &Value) -> Vec<PathBuf>
 }
 
 pub(crate) fn is_verification_command(cmd: &str) -> bool {
-    let lower = cmd.to_ascii_lowercase();
-    lower.contains("cargo test")
-        || lower.contains("cargo check")
-        || lower.contains("cargo clippy")
-        || lower.contains("pytest")
-        || lower.contains("npm test")
-        || lower.contains("pnpm test")
-        || lower.contains("yarn test")
-        || lower.contains("go test")
-        || lower.contains("make test")
-        || lower.contains("make check")
-        || lower.contains("ctest")
-        || lower.contains("mvn test")
-        || lower.contains("gradle test")
+    crate::shell_policy::verification_outcome(cmd).is_some()
 }
 
 #[cfg(test)]

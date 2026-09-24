@@ -250,10 +250,12 @@ impl Agent {
                                 .get("command")
                                 .and_then(Value::as_str)
                                 .unwrap_or_default();
-                            if crate::turn::is_verification_command(command) {
+                            if let Some(trustworthy) =
+                                crate::shell_policy::verification_outcome(command)
+                            {
                                 agent.record_verification_command(
                                     command,
-                                    !pre_hook_error && !result.is_error,
+                                    trustworthy && !pre_hook_error && !result.is_error,
                                 );
                             }
                         }
