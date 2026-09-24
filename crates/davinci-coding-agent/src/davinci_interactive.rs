@@ -3897,6 +3897,7 @@ pub fn perform(
             crate::apply_discovered_resources(parsed, agent);
             let resources_ms = resources_started.elapsed().as_millis();
             let host_started = Instant::now();
+            crate::clear_model_runtime_cache();
             let mut host = crate::loaded_extension_host(parsed);
             let host_ms = host_started.elapsed().as_millis();
             host.runtime_flag_values = crate::flag_values_json(parsed);
@@ -4284,6 +4285,7 @@ pub fn run(
         .collect();
     // What the composer completes: the same slash corpus, extension providers
     // and `/login` list the legacy chrome offers, through the same engine.
+    crate::startup_mark("shell: models listed");
     model.slash_commands = crate::interactive_slash_commands(agent, parsed);
     // The palette lists what the composer completes, so it is built from the
     // same command list rather than from the built-ins alone.
@@ -4291,6 +4293,7 @@ pub fn run(
     model.corpus_total = model.corpus.len();
     model.extra_autocomplete = crate::interactive_extra_autocomplete(parsed);
     model.login_providers = crate::interactive_login_providers(parsed);
+    crate::startup_mark("shell: commands and completions");
     model.model_names = model.models.iter().map(|item| item.name.clone()).collect();
     sync_thinking_state(agent, &mut model);
     sync_permission_state(agent, &mut model);
@@ -4314,6 +4317,7 @@ pub fn run(
         .position(|item| item.name.ends_with(&agent.model_id))
         .unwrap_or(0);
     refresh_context(&mut model, agent);
+    crate::startup_mark("shell: state synced");
 
     // Everything the old chrome printed before the first prompt: extension
     // startup events, notices, the trust warning, the changelog, the resource
@@ -4336,6 +4340,7 @@ pub fn run(
         model.transcript.push(entry);
     }
     model.startup.found = opening_found(parsed, agent);
+    crate::startup_mark("shell: opening block");
 
     // The user's own bindings, which davinci was rendering the defaults of
     // however `~/.pi/agent/keybindings.json` read.
@@ -4401,6 +4406,8 @@ pub fn run(
     let mut attached_images: Vec<davinci_ai::MessageContent> = Vec::new();
 
     let mut terminal = Session::open().map_err(|err| err.to_string())?;
+    crate::startup_mark("shell: terminal open");
+    let mut first_frame = true;
     // From here the alternate screen is ours, so a `println!` from shared code
     // is queued for the transcript instead of painted over the frame.
     crate::set_hosted_tui_active(true);
@@ -4551,6 +4558,9 @@ pub fn run(
         voice.tick(&mut model, terminal.input_pending());
         if let Err(err) = terminal.draw(&model) {
             break Err(err.to_string());
+        }
+        if std::mem::take(&mut first_frame) {
+            crate::startup_mark("shell: first frame");
         }
         voice.drawn();
         if model.voice.active && !terminal.mic_visible() {
@@ -5174,6 +5184,7 @@ fn apply_host_effects(shell: &mut Shell<'_>) -> Next {
         .collect();
 
     if calls.iter().any(|call| op_of(call) == "reload") {
+        crate::clear_model_runtime_cache();
         crate::apply_discovered_resources(shell.parsed, shell.agent);
         shell.model.slash_commands = crate::interactive_slash_commands(shell.agent, shell.parsed);
     }
