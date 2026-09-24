@@ -1,7 +1,6 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use crate::args::APP_NAME;
 use crate::self_update::{current_install_method, InstallMethod};
 use crate::settings::{load_settings, save_settings, update_settings, PackageSource, Settings};
 use davinci_tui::{Component, ConfigResource, ConfigResourceKind, ConfigScope, ConfigSelector};
@@ -1004,14 +1003,6 @@ pub fn config_selector_from_settings(
 
 pub fn ensure_agent_dir(path: &Path) -> Result<(), String> {
     fs::create_dir_all(path).map_err(|err| err.to_string())
-}
-
-pub fn managed_bin_dir(agent_dir: &Path) -> PathBuf {
-    agent_dir
-        .parent()
-        .map(Path::to_path_buf)
-        .unwrap_or_else(|| agent_dir.to_path_buf())
-        .join("bin")
 }
 
 #[cfg(test)]
