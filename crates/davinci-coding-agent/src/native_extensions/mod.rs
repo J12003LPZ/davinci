@@ -360,13 +360,13 @@ impl NativeExtensionHost {
         agent_dir: Option<&Path>,
     ) -> Self {
         let session_key = session_key.into();
-        let cache_settings = agent_dir.map(|dir| crate::settings::load_merged_settings(dir, cwd));
+        let repo_agent_dir = agent_dir
+            .map(Path::to_path_buf)
+            .unwrap_or_else(davinci_session::default_agent_dir);
+        let merged_settings = crate::settings::load_merged_settings(&repo_agent_dir, cwd);
         let cache = match agent_dir {
             Some(dir) => davinci_agent::runtime::cache::CacheRuntime::shared(
-                cache_settings
-                    .as_ref()
-                    .and_then(|s| s.cache.clone())
-                    .unwrap_or_default(),
+                merged_settings.cache.clone().unwrap_or_default(),
                 dir.into(),
             ),
             None => davinci_agent::runtime::cache::CacheRuntime::default(),
@@ -378,12 +378,14 @@ impl NativeExtensionHost {
             .map(|dir| VectorMemoryConfig::from_file(&dir.join("vector-memory.json")))
             .unwrap_or_else(VectorMemoryConfig::from_env);
         let governor_value = TokenGovernor::new(session_key.clone(), governor_config);
-        // Only the product host sweeps: other sessions' stored outputs past
-        // the retention window go, never the live session's.
         let _ = governor_value.sweep_stale_outputs();
         let language_governor = governor_value.clone();
         let governor = Arc::new(Mutex::new(governor_value));
-        let learning_config = cache_settings.and_then(|settings| settings.learning);
+        let learning_config = if agent_dir.is_some() {
+            merged_settings.learning.clone()
+        } else {
+            None
+        };
         let learning = LearningController::new(cwd, agent_dir, learning_config);
         let memory = Arc::new(Mutex::new(VectorMemory::with_config(
             cwd.to_path_buf(),
@@ -394,12 +396,8 @@ impl NativeExtensionHost {
         graph.learning = Some(learning.clone());
         graph.governor = Some(Arc::clone(&governor));
         let visual_snapshot = VisualSnapshotHost::discover(cwd);
-        let repo_agent_dir = agent_dir
-            .map(Path::to_path_buf)
-            .unwrap_or_else(davinci_session::default_agent_dir);
-        let repo_config = crate::settings::load_merged_settings(&repo_agent_dir, cwd)
-            .repo_intelligence
-            .unwrap_or_default();
+
+        let repo_config = merged_settings.repo_intelligence.clone().unwrap_or_default();
         let repo_intelligence =
             repo_intelligence::RepoIntelligence::new(cwd, &repo_agent_dir, repo_config);
         let engineering = engineering_snapshot::EngineeringSnapshots::default();
@@ -407,37 +405,32 @@ impl NativeExtensionHost {
             cwd,
             repo_intelligence.clone(),
             cache.clone(),
-            crate::settings::load_merged_settings(&repo_agent_dir, cwd)
-                .test_impact
-                .unwrap_or_default(),
+            merged_settings.test_impact.clone().unwrap_or_default(),
         )
         .with_snapshots(engineering.clone());
-        let package_config = crate::settings::load_merged_settings(&repo_agent_dir, cwd)
-            .package_intelligence
-            .unwrap_or_default();
+        let package_config = merged_settings.package_intelligence.clone().unwrap_or_default();
         let package_intelligence =
             package_intelligence::PackageIntelligence::new(cwd, cache.clone(), package_config);
-        let build_config = crate::settings::load_merged_settings(&repo_agent_dir, cwd)
-            .build_intelligence
-            .unwrap_or_default();
+        let build_config = merged_settings.build_intelligence.clone().unwrap_or_default();
         let build_intelligence =
             build_intelligence::BuildIntelligence::new(cwd, cache.clone(), build_config)
                 .with_snapshots(engineering.clone());
-        let git_config = crate::settings::load_merged_settings(&repo_agent_dir, cwd)
-            .git_intelligence
-            .unwrap_or_default();
+        let git_config = merged_settings.git_intelligence.clone().unwrap_or_default();
         let git_intelligence =
             git_intelligence::GitIntelligence::new(cwd, cache.clone(), git_config);
-        let language_config = agent_dir
-            .and_then(|dir| crate::settings::load_merged_settings(dir, cwd).language_intelligence)
-            .unwrap_or_default();
+        let language_config = if agent_dir.is_some() {
+            merged_settings
+                .language_intelligence
+                .clone()
+                .unwrap_or_default()
+        } else {
+            Default::default()
+        };
         let language_intelligence =
             language_intelligence::LanguageIntelligence::new(cwd, language_config);
         language_intelligence.set_governor(language_governor);
         graph.language_intelligence = Some(language_intelligence.clone());
-        let change_config = crate::settings::load_merged_settings(&repo_agent_dir, cwd)
-            .change_impact
-            .unwrap_or_default();
+        let change_config = merged_settings.change_impact.clone().unwrap_or_default();
         let change_impact = change_impact::ChangeImpact::new(
             cwd,
             cache.clone(),
@@ -452,37 +445,36 @@ impl NativeExtensionHost {
         let repo_intelligence = repo_intelligence.with_semantic_provider(Arc::new(
             change_impact::LanguageIntelligenceAdapter::new(language_intelligence.clone()),
         ));
-        let verification_planner_config =
-            crate::settings::load_merged_settings(&repo_agent_dir, cwd)
-                .verification_planner
-                .unwrap_or_default();
+        let verification_planner_config = merged_settings
+            .verification_planner
+            .clone()
+            .unwrap_or_default();
         let verification_planner =
             verification_planner::VerificationPlanner::new(cwd, verification_planner_config)
                 .with_snapshots(engineering.clone());
-        let workspace_snapshot_config = crate::settings::load_merged_settings(&repo_agent_dir, cwd)
-            .workspace_snapshots
-            .unwrap_or_default();
+        let workspace_snapshot_config =
+            merged_settings.workspace_snapshots.clone().unwrap_or_default();
         let workspace_snapshot =
             workspace_snapshot::WorkspaceSnapshot::new(cwd, workspace_snapshot_config);
+
+        let browser_config = agent_dir
+            .map(|dir| {
+                let mut config = crate::settings::load_settings(dir)
+                    .browser_verification
+                    .unwrap_or_default();
+                if merged_settings
+                    .browser_verification
+                    .as_ref()
+                    .is_some_and(|settings| !settings.enabled)
+                {
+                    config.enabled = false;
+                }
+                config
+            })
+            .unwrap_or_default();
+
         Self {
-            browser: browser::BrowserController::new(
-                cwd,
-                agent_dir
-                    .map(|dir| {
-                        let mut config = crate::settings::load_settings(dir)
-                            .browser_verification
-                            .unwrap_or_default();
-                        // Project settings may disable the feature, never select executable/package pins.
-                        if crate::settings::load_merged_settings(dir, cwd)
-                            .browser_verification
-                            .is_some_and(|settings| !settings.enabled)
-                        {
-                            config.enabled = false;
-                        }
-                        config
-                    })
-                    .unwrap_or_default(),
-            ),
+            browser: browser::BrowserController::new(cwd, browser_config),
             test_impact,
             engineering,
             package_intelligence,
