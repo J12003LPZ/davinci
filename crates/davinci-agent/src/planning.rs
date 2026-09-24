@@ -439,6 +439,16 @@ impl Agent {
         }
         Some(text)
     }
+
+    pub(crate) fn plan_turn_context(&self) -> Option<(u64, String)> {
+        let revision = self
+            .tool_context
+            .living_plan
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .revision;
+        self.plan_provider_context().map(|text| (revision, text))
+    }
 }
 
 fn decode_plan(value: &Value, cwd: &std::path::Path) -> Result<LivingPlan, String> {
