@@ -244,6 +244,52 @@ impl ExtensionHost {
                     }),
                 ) {
                     Ok(loaded) if loaded.ok => {
+                        let path = module.display().to_string();
+                        for custom_type in &loaded.message_renderers {
+                            host.message_renderers
+                                .insert(custom_type.clone(), path.clone());
+                        }
+                        for custom_type in &loaded.entry_renderers {
+                            host.entry_renderers
+                                .insert(custom_type.clone(), path.clone());
+                        }
+                        if loaded.markdown_transformers > 0 {
+                            host.markdown_modules.push(path.clone());
+                        }
+                        host.ui_calls.extend(loaded.ui_calls.clone());
+                        host.session_calls.extend(loaded.session_calls.clone());
+                        host.unregistered_providers
+                            .extend(loaded.unregistered_providers.clone());
+                        let has_editor = loaded.has_editor
+                            || loaded.handlers.iter().any(|name| name == "session_start");
+                        if has_editor {
+                            host.editor_modules.push(path.clone());
+                        }
+                        host.js.push(LoadedJsExtension {
+                            path,
+                            handlers: loaded.handlers,
+                            tools: loaded.tools.iter().map(|tool| tool.name.clone()).collect(),
+                            tool_defs: loaded.tools,
+                            commands: loaded
+                                .commands
+                                .iter()
+                                .map(|command| command.name.clone())
+                                .collect(),
+                            command_details: loaded.commands,
+                            autocomplete_providers: loaded.autocomplete_providers,
+                            message_renderers: loaded.message_renderers,
+                            entry_renderers: loaded.entry_renderers,
+                            markdown_transformers: loaded.markdown_transformers,
+                            shortcuts: loaded.shortcuts,
+                            has_editor,
+                            providers: loaded.providers,
+                            flags: loaded.flags,
+                            terminal_input: loaded.terminal_input_handlers > 0
+                                || loaded.ui_calls.iter().any(|call| {
+                                    call.get("op").and_then(Value::as_str)
+                                        == Some("onTerminalInput")
+                                }),
+                        });
                     }
                     Ok(loaded) => {
                         let error = loaded
