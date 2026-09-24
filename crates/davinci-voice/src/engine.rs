@@ -11,6 +11,7 @@ use zeroize::Zeroizing;
 
 extern "C" {
     fn dv_load(bytes: *mut c_void, size: usize) -> *mut c_void;
+    fn dv_load_file(path: *const c_char) -> *mut c_void;
     fn dv_free(context: *mut c_void);
     fn dv_decode(
         context: *mut c_void,
@@ -38,15 +39,23 @@ extern "C" fn cancelled(user: *mut c_void) -> bool {
 impl Engine {
     pub fn load(id: &str, path: &Path) -> Result<Self, VoiceError> {
         let model = catalog::find(id).ok_or(VoiceError::ModelMissing)?;
-        let mut data = model.read_verified(path).map_err(|e| {
+        let verified = model.verify_file(path).map_err(|e| {
             if e.kind() == std::io::ErrorKind::NotFound {
                 VoiceError::ModelMissing
             } else {
                 VoiceError::ModelCorrupt
             }
         })?;
-        // The loader consumes these verified bytes synchronously, with no pathname reopen.
-        let context = unsafe { dv_load(data.as_mut_ptr().cast(), data.len()) };
+        // Models live in the user-owned agent directory. Re-check size and
+        // modification time immediately before whisper reopens the path so a
+        // changed model is refused without keeping a second copy in memory.
+        let metadata = std::fs::metadata(path).map_err(|_| VoiceError::ModelMissing)?;
+        if !verified.matches(&metadata) {
+            return Err(VoiceError::ModelCorrupt);
+        }
+        let path = CString::new(path.to_string_lossy().as_bytes())
+            .map_err(|_| VoiceError::ModelCorrupt)?;
+        let context = unsafe { dv_load_file(path.as_ptr()) };
         if context.is_null() {
             return Err(VoiceError::ModelCorrupt);
         }

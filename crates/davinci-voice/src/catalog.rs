@@ -1,9 +1,10 @@
 //! Immutable upstream GGML model identities; runtime recognition has no HTTP client.
 use sha2::{Digest, Sha256};
 use std::{
-    fs::File,
+    fs::{self, File, Metadata},
     io::{self, Read},
     path::Path,
+    time::SystemTime,
 };
 
 pub const REVISION: &str = "5359861c739e955e79d9a303bcbc70fb988958b1";
@@ -41,6 +42,18 @@ pub fn find(id: &str) -> Option<&'static Model> {
     MODELS.iter().find(|m| m.id == id)
 }
 
+#[derive(Debug, Clone, Copy)]
+pub struct VerifiedFile {
+    pub len: u64,
+    pub modified: Option<SystemTime>,
+}
+
+impl VerifiedFile {
+    pub fn matches(&self, metadata: &Metadata) -> bool {
+        metadata.len() == self.len && metadata.modified().ok() == self.modified
+    }
+}
+
 impl Model {
     pub fn url(&self) -> String {
         format!(
@@ -49,19 +62,41 @@ impl Model {
         )
     }
 
-    /// Read and verify exactly the bytes subsequently passed to the native loader.
+    /// Verify a model by streaming it so loading does not briefly hold a
+    /// second model-sized allocation in memory.
+    pub fn verify_file(&self, path: &Path) -> io::Result<VerifiedFile> {
+        let metadata = fs::metadata(path)?;
+        if metadata.len() != self.bytes {
+            return Err(corrupt());
+        }
+        let mut file = File::open(path)?;
+        let mut hasher = Sha256::new();
+        let mut buffer = vec![0u8; 1024 * 1024];
+        let mut read = 0u64;
+        loop {
+            let count = file.read(&mut buffer)?;
+            if count == 0 {
+                break;
+            }
+            read = read.saturating_add(count as u64);
+            if read > self.bytes {
+                return Err(corrupt());
+            }
+            hasher.update(&buffer[..count]);
+        }
+        if read != self.bytes || format!("{:x}", hasher.finalize()) != self.sha256 {
+            return Err(corrupt());
+        }
+        Ok(VerifiedFile {
+            len: metadata.len(),
+            modified: metadata.modified().ok(),
+        })
+    }
+
+    /// Compatibility helper for tests and tooling that need the verified bytes.
     pub fn read_verified(&self, path: &Path) -> io::Result<Vec<u8>> {
-        let file = File::open(path)?;
-        if file.metadata()?.len() != self.bytes {
-            return Err(corrupt());
-        }
-        let mut data = Vec::new();
-        file.take(self.bytes + 1).read_to_end(&mut data)?;
-        if data.len() as u64 != self.bytes || format!("{:x}", Sha256::digest(&data)) != self.sha256
-        {
-            return Err(corrupt());
-        }
-        Ok(data)
+        self.verify_file(path)?;
+        fs::read(path)
     }
 }
 

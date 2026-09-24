@@ -15,6 +15,16 @@ extern "C" void *dv_load(void *bytes, size_t size) {
     } catch (...) { return nullptr; }
 }
 
+extern "C" void *dv_load_file(const char *path) {
+    if (!path || !*path) return nullptr;
+    try {
+        whisper_log_set(quiet, nullptr);
+        auto params = whisper_context_default_params();
+        params.use_gpu = false;
+        return whisper_init_from_file_with_params_no_state(path, params);
+    } catch (...) { return nullptr; }
+}
+
 extern "C" void dv_free(void *context) {
     try { if (context) whisper_free(static_cast<whisper_context *>(context)); }
     catch (...) {}
