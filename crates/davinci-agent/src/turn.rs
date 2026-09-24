@@ -697,6 +697,13 @@ impl Agent {
         new_messages: &mut Vec<ChatMessage>,
         steer: bool,
     ) {
+        for (kind, message) in self.remote.drain() {
+            match kind {
+                crate::QueueKind::Steer => self.queues.steer.push(message),
+                crate::QueueKind::FollowUp => self.queues.follow_up.push(message),
+            }
+        }
+
         let drained = if steer {
             let mode = self.queues.steer_mode;
             self.queues.drain_steer(mode)
