@@ -3,34 +3,47 @@
 //! Keeps startup discovery from the native shell; upstream interaction lives in
 //! vendor/davinci/packages/coding-agent/src/modes/interactive/interactive-mode.ts.
 
+use ratatui::style::Modifier;
 use ratatui::text::Line;
 
 use crate::davinci::model::{Model, Startup};
-use crate::davinci::ui::{blank, paper_label, span, truncate_run};
+use crate::davinci::ui::{blank, clip_ellipsis, span, truncate_run};
 
 /// Compact identity block, also kept above a short conversation. The path and
 /// selected model come from the running session, never from sample copy.
 pub fn banner(model: &Model, info: &Startup) -> Vec<Line<'static>> {
     let th = &model.theme;
-    // Preserve DaVinci's identity in the reference's eleven-cell logo column.
-    let facts = [
+    let cc = th.cc();
+    let mut name = span("DaVinci", th.text);
+    name.style = name.style.add_modifier(Modifier::BOLD);
+    let home = std::env::var("USERPROFILE")
+        .or_else(|_| std::env::var("HOME"))
+        .unwrap_or_default();
+    let cwd = if !home.is_empty() && info.cwd.starts_with(&home) {
+        format!("~{}", &info.cwd[home.len()..])
+    } else {
+        info.cwd.clone()
+    };
+    let rows = [
+        vec![span(" ██████╗   ", cc.claude), name, span(format!(" v{}", env!("CARGO_PKG_VERSION")), cc.inactive)],
         vec![
-            span(" ██████╗   ", th.text),
-            paper_label("DaVinci", th, false),
-            span(format!(" v{}", env!("CARGO_PKG_VERSION")), th.muted),
+            span(" ██   ██║  ", cc.claude),
+            span(format!("{} with {} effort", model.model_name, model.thinking_level), cc.inactive),
         ],
         vec![
-            span(" ██   ██║  ", th.text),
-            span(model.model_name.clone(), th.text),
-            span(format!(" · {}", model.thinking_level), th.muted),
+            span(" ██████╔╝  ", cc.claude),
+            span(clip_ellipsis(&cwd, model.width.saturating_sub(12)), cc.inactive),
         ],
+        vec![],
         vec![
-            span(" ██████╔╝  ", th.text),
-            span(info.cwd.clone(), th.muted),
+            span("  Switch models anytime with ", th.text),
+            span("/model", cc.permission),
+            span(". Type ", th.text),
+            span("?", cc.permission),
+            span(" for shortcuts.", th.text),
         ],
     ];
-    facts
-        .into_iter()
+    rows.into_iter()
         .map(|row| Line::from(truncate_run(row, model.width)))
         .collect()
 }

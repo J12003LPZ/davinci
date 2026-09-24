@@ -4,26 +4,27 @@
 //!
 //! Mirrors `docs/ui/davinci_tui/lib/davinci/views/transcript.ex`.
 
-use ratatui::text::Line;
+use ratatui::style::{Color, Modifier, Style};
+use ratatui::text::{Line, Span};
 
 use super::{markdown, studio};
 use crate::davinci::model::{Entry, HunkKind, Model};
 use crate::davinci::theme::{glyph, State, Theme};
 use crate::davinci::ui::{
-    blank, clip_ellipsis, detail_line, failure_line, indent, span, tool_line, truncate_run, wrap,
-    MEASURE,
+    blank, clip_ellipsis, detail_line, failure_line, indent, run_width, span, tool_line,
+    truncate_run, wrap, MEASURE,
 };
 
 /// How many rows of live reasoning are shown while it streams.
 const THINKING_TAIL: usize = 3;
 
+/// Tool and shell result elbow, including the non-breaking spacer.
+pub const ELBOW: &str = "  ⎿ \u{a0}";
+
 /// Render a whole transcript, at a width that may be narrower than the window
 /// when the Codex sidebar is open.
 pub fn lines(model: &Model, entries: &[Entry], width: u16) -> Vec<Line<'static>> {
-    entries
-        .iter()
-        .flat_map(|entry| entry_lines(model, entry, width))
-        .collect()
+    rendered_blocks(model, entries, width).into_iter().flatten().collect()
 }
 
 /// The last `height` rows of the transcript, rendered from the end.
@@ -37,10 +38,10 @@ pub fn tail_lines(
     width: u16,
     height: usize,
 ) -> Vec<Line<'static>> {
+    let blocks = rendered_blocks(model, entries, width);
     let mut chunks: Vec<Vec<Line<'static>>> = Vec::new();
     let mut total = 0usize;
-    for entry in entries.iter().rev() {
-        let rows = entry_lines(model, entry, width);
+    for rows in blocks.into_iter().rev() {
         total += rows.len();
         chunks.push(rows);
         if total >= height {
@@ -54,24 +55,144 @@ pub fn tail_lines(
     out
 }
 
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Explore {
+    Read,
+    Search,
+    List,
+    Shell,
+}
+
+fn explore_kind(instrument: &str, target: &str) -> Option<Explore> {
+    if instrument == "manus" {
+        return Some(Explore::Shell);
+    }
+    match target.split_once(' ').map_or(target, |(verb, _)| verb) {
+        "read" => Some(Explore::Read),
+        "search" | "grep" | "find" => Some(Explore::Search),
+        "list" | "ls" => Some(Explore::List),
+        _ => None,
+    }
+}
+
+fn rendered_blocks(model: &Model, entries: &[Entry], width: u16) -> Vec<Vec<Line<'static>>> {
+    let mut out = Vec::new();
+    let mut index = 0usize;
+    while index < entries.len() {
+        if !model.show_tool_output {
+            let mut calls: Vec<(Explore, &str, bool)> = Vec::new();
+            let mut cursor = index;
+            let mut consumed = index;
+            while cursor < entries.len() {
+                match &entries[cursor] {
+                    Entry::Gap if !calls.is_empty() => {
+                        let next_groupable = matches!(
+                            entries.get(cursor + 1),
+                            Some(Entry::Tool {
+                                state,
+                                instrument,
+                                target,
+                                ..
+                            }) if !matches!(state, State::Failed | State::Attention)
+                                && explore_kind(instrument, target).is_some()
+                        );
+                        if !next_groupable {
+                            break;
+                        }
+                        cursor += 1;
+                        consumed = cursor;
+                    }
+                    Entry::Tool { state, instrument, target, duration, .. }
+                        if !matches!(state, State::Failed | State::Attention) =>
+                    {
+                        if let Some(kind) = explore_kind(instrument, target) {
+                            calls.push((kind, target.as_str(), duration.is_some()));
+                            cursor += 1;
+                            consumed = cursor;
+                        } else {
+                            break;
+                        }
+                    }
+                    _ => break,
+                }
+            }
+            if !calls.is_empty() {
+                out.push(group_rows(model, &calls, width));
+                index = consumed;
+                continue;
+            }
+        }
+        out.push(entry_lines(model, &entries[index], width));
+        index += 1;
+    }
+    out
+}
+
+fn group_rows(model: &Model, calls: &[(Explore, &str, bool)], width: u16) -> Vec<Line<'static>> {
+    let th = &model.theme;
+    let cc = th.cc();
+    let running = model.running && calls.iter().any(|(_, _, done)| !done);
+    let mut order: Vec<Explore> = Vec::new();
+    for (kind, _, _) in calls {
+        if !order.contains(kind) {
+            order.push(*kind);
+        }
+    }
+    let clause = |kind: Explore, n: usize| -> String {
+        let noun = |one: &str, many: &str| if n == 1 { one } else { many };
+        match (kind, running) {
+            (Explore::Read, false) => format!("read {n} {}", noun("file", "files")),
+            (Explore::Read, true) => format!("reading {n} {}", noun("file", "files")),
+            (Explore::Search, false) => format!("searched for {n} {}", noun("pattern", "patterns")),
+            (Explore::Search, true) => format!("searching for {n} {}", noun("pattern", "patterns")),
+            (Explore::List, false) => format!("listed {n} {}", noun("directory", "directories")),
+            (Explore::List, true) => format!("listing {n} {}", noun("directory", "directories")),
+            (Explore::Shell, false) => format!("ran {n} shell {}", noun("command", "commands")),
+            (Explore::Shell, true) => format!("running {n} shell {}", noun("command", "commands")),
+        }
+    };
+    let mut sentence = order
+        .iter()
+        .map(|kind| clause(*kind, calls.iter().filter(|(candidate, _, _)| candidate == kind).count()))
+        .collect::<Vec<_>>()
+        .join(", ");
+    if let Some(first) = sentence.get(0..1) {
+        sentence = format!("{}{}", first.to_uppercase(), &sentence[1..]);
+    }
+    if !running {
+        let mut spans = vec![span("  ", cc.inactive)];
+        spans.extend(bold_numbers(&sentence, cc.inactive));
+        return vec![Line::from(truncate_run(spans, width))];
+    }
+    let bullet = if model.tick % 2 == 1 { "  " } else { "● " };
+    let mut spans = vec![span(bullet, cc.inactive)];
+    spans.extend(bold_numbers(&format!("{sentence}…"), th.text));
+    let (kind, target, _) = calls.last().expect("a group has a call");
+    let newest = match kind {
+        Explore::Shell => format!("$ {target}"),
+        _ => target.split_once(' ').map_or(*target, |(_, rest)| rest).to_string(),
+    };
+    vec![
+        Line::from(truncate_run(spans, width)),
+        Line::from(truncate_run(
+            vec![span(
+                format!("{ELBOW}{}", clip_ellipsis(&newest, width.saturating_sub(5))),
+                cc.inactive,
+            )],
+            width,
+        )),
+    ]
+}
+
 fn entry_lines(model: &Model, entry: &Entry, width: u16) -> Vec<Line<'static>> {
     let th = &model.theme;
     match entry {
         Entry::Gap => vec![blank()],
 
-        Entry::User(text) => {
-            crate::wrap_text_with_ansi(text, width.saturating_sub(2).max(1) as usize)
-                .into_iter()
-                .enumerate()
-                .map(|(row, text)| {
-                    let prompt = if row == 0 { "❯ " } else { "  " };
-                    Line::from(truncate_run(
-                        vec![span(format!("{prompt}{text}"), th.text)],
-                        width,
-                    ))
-                })
-                .collect()
-        }
+        Entry::User(text) => user_lines(th, text, width),
+
+        Entry::Shell { command, output, .. } => shell_lines(th, command, output, width),
 
         // The agent's turn is not announced: the reply follows the prompt
         // after a gap, as in claude code. The entry stays in the transcript
@@ -93,7 +214,8 @@ fn entry_lines(model: &Model, entry: &Entry, width: u16) -> Vec<Line<'static>> {
                 instrument,
                 target,
                 duration.as_deref(),
-                None,
+                model.tick,
+                model.running,
             )];
             if let Some(summary) = summary.as_deref().filter(|s| !s.is_empty()) {
                 rows.push(tool_result(th, summary, width));
@@ -130,7 +252,13 @@ fn entry_lines(model: &Model, entry: &Entry, width: u16) -> Vec<Line<'static>> {
             text,
             live,
             seconds,
-        } => thinking_lines(th, text, *live, *seconds, width),
+        } => {
+            if model.show_tool_output {
+                thinking_lines(th, text, *live, *seconds, width)
+            } else {
+                Vec::new()
+            }
+        },
 
         Entry::Studio(steps) => studio::lines(model, steps),
 
@@ -140,48 +268,162 @@ fn entry_lines(model: &Model, entry: &Entry, width: u16) -> Vec<Line<'static>> {
             dels,
             hunks,
         } => {
-            let mut rows = vec![Line::from(vec![
-                span(format!("{} ", glyph::DELTA), th.primary),
-                span(clip_ellipsis(path, width.saturating_sub(20)), th.text),
-                span(format!("  +{adds}"), th.success),
-                span(format!(" -{dels}"), th.error),
-            ])];
-            // A block from a live edit is capped like tool output: enough
-            // rows to see the shape, the rest counted (phase 3).
-            let cap = if model.show_tool_output {
-                DELTA_ROWS_EXPANDED
-            } else {
-                DELTA_ROWS_COLLAPSED
-            };
+            let mut rows = vec![tool_result(th, &change_summary(*adds, *dels), width)];
+            let cap = if model.show_tool_output { DELTA_ROWS_EXPANDED } else { DELTA_ROWS_COLLAPSED };
             let language = super::highlight::language_of(path);
+            let number_width = hunks
+                .iter()
+                .filter_map(|hunk| hunk.line)
+                .max()
+                .map_or(1, |line| line.to_string().len());
             rows.extend(
-                hunks
-                    .iter()
-                    .take(cap)
-                    .map(|hunk| hunk_line(th, language, hunk, width)),
+                hunks.iter().take(cap)
+                    .map(|hunk| hunk_line(th, language, hunk, number_width, width)),
             );
             if hunks.len() > cap {
-                rows.push(indent(
-                    2,
-                    vec![
-                        span("│ ", th.border),
-                        span(format!("… {} more rows", hunks.len() - cap), th.border),
-                    ],
-                ));
+                rows.push(Line::from(span(
+                    format!("      … {} more rows", hunks.len() - cap),
+                    th.cc().inactive,
+                )));
             }
             rows
+        }
+
+        Entry::Done { verb, seconds } => {
+            let cc = th.cc();
+            vec![Line::from(vec![
+                span("✻ ", cc.inactive),
+                span(format!("{verb} for {}", duration_words(*seconds)), cc.inactive),
+            ])]
         }
     }
 }
 
 fn tool_result(theme: &Theme, text: &str, width: u16) -> Line<'static> {
-    Line::from(truncate_run(
+    let cc = theme.cc();
+    let mut spans = vec![span(ELBOW, cc.inactive)];
+    spans.extend(bold_numbers(&clip_ellipsis(text, width.saturating_sub(5)), theme.text));
+    Line::from(truncate_run(spans, width))
+}
+
+
+fn user_lines(theme: &Theme, text: &str, width: u16) -> Vec<Line<'static>> {
+    let cc = theme.cc();
+    let plain = text.replace('`', "");
+    let code = code_ranges(text);
+    let wrapped = crate::wrap_text_with_ansi(&plain, width.saturating_sub(3).max(1) as usize);
+    let mut offset = 0usize;
+    wrapped.into_iter().enumerate().map(|(row, content)| {
+        let lead = if row == 0 { "❯ " } else { "  " };
+        let mut spans = vec![Span::styled(
+            lead,
+            Style::default().fg(if row == 0 { cc.subtle } else { cc.text }).bg(cc.user_bg),
+        )];
+        for (index, ch) in content.chars().enumerate() {
+            let at = offset + index;
+            let foreground = if code.iter().any(|(start, end)| at >= *start && at < *end) {
+                cc.permission
+            } else {
+                cc.text
+            };
+            spans.push(Span::styled(ch.to_string(), Style::default().fg(foreground).bg(cc.user_bg)));
+        }
+        offset += content.chars().count() + 1;
+        spans.push(Span::styled(" ", Style::default().bg(cc.user_bg)));
+        Line::from(truncate_run(merge_same_style(spans), width))
+    }).collect()
+}
+
+fn code_ranges(text: &str) -> Vec<(usize, usize)> {
+    let mut ranges = Vec::new();
+    let mut plain_index = 0;
+    let mut open = None;
+    for ch in text.chars() {
+        if ch == '`' {
+            match open.take() {
+                Some(start) => ranges.push((start, plain_index)),
+                None => open = Some(plain_index),
+            }
+        } else {
+            plain_index += 1;
+        }
+    }
+    ranges
+}
+
+fn merge_same_style(spans: Vec<Span<'static>>) -> Vec<Span<'static>> {
+    let mut out: Vec<Span<'static>> = Vec::new();
+    for item in spans {
+        match out.last_mut() {
+            Some(last) if last.style == item.style => {
+                last.content = format!("{}{}", last.content, item.content).into();
+            }
+            _ => out.push(item),
+        }
+    }
+    out
+}
+
+fn shell_lines(theme: &Theme, command: &str, output: &[String], width: u16) -> Vec<Line<'static>> {
+    let cc = theme.cc();
+    let mut rows = vec![Line::from(truncate_run(
         vec![
-            span(format!("  {} ", glyph::BRANCH), theme.muted),
-            span(clip_ellipsis(text, width.saturating_sub(4)), theme.muted),
+            Span::styled("! ", Style::default().fg(cc.bash).bg(cc.bash_bg)),
+            Span::styled(format!("{command} "), Style::default().fg(cc.text).bg(cc.bash_bg)),
         ],
         width,
-    ))
+    ))];
+    if output.is_empty() {
+        rows.push(Line::from(span(format!("{ELBOW}(No output)"), cc.inactive)));
+        return rows;
+    }
+    for (index, row) in output.iter().enumerate() {
+        let lead = if index == 0 { ELBOW } else { "     " };
+        rows.push(Line::from(truncate_run(
+            vec![span(lead, cc.inactive), span(row.clone(), theme.text)],
+            width,
+        )));
+    }
+    rows
+}
+
+fn bold_numbers(text: &str, color: Color) -> Vec<Span<'static>> {
+    let mut out = Vec::new();
+    let mut current = String::new();
+    let mut digits = false;
+    for ch in text.chars() {
+        if ch.is_ascii_digit() != digits && !current.is_empty() {
+            let mut piece = span(std::mem::take(&mut current), color);
+            if digits { piece.style = piece.style.add_modifier(Modifier::BOLD); }
+            out.push(piece);
+        }
+        digits = ch.is_ascii_digit();
+        current.push(ch);
+    }
+    if !current.is_empty() {
+        let mut piece = span(current, color);
+        if digits { piece.style = piece.style.add_modifier(Modifier::BOLD); }
+        out.push(piece);
+    }
+    out
+}
+
+fn change_summary(adds: u32, dels: u32) -> String {
+    let lines = |n| if n == 1 { "line" } else { "lines" };
+    match (adds, dels) {
+        (0, 0) => "No changes".into(),
+        (adds, 0) => format!("Added {adds} {}", lines(adds)),
+        (0, dels) => format!("Removed {dels} {}", lines(dels)),
+        (adds, dels) => format!("Added {adds} {}, removed {dels} {}", lines(adds), lines(dels)),
+    }
+}
+
+fn duration_words(seconds: u64) -> String {
+    match seconds {
+        seconds if seconds < 60 => format!("{seconds}s"),
+        seconds if seconds < 3600 => format!("{}m {}s", seconds / 60, seconds % 60),
+        seconds => format!("{}h {}m", seconds / 3600, seconds % 3600 / 60),
+    }
 }
 
 /// Rows of a tool's result shown under its line when expanded (`ctrl+t`).
@@ -300,21 +542,47 @@ fn hunk_line(
     theme: &Theme,
     language: Option<super::highlight::Lang>,
     hunk: &crate::davinci::model::Hunk,
+    number_width: usize,
     width: u16,
 ) -> Line<'static> {
-    let (sign, color) = match hunk.kind {
-        HunkKind::Add => ("+", theme.success),
-        HunkKind::Del => ("-", theme.error),
-        HunkKind::Context => (" ", theme.muted),
+    let cc = theme.cc();
+    let number = hunk.line.map_or(String::new(), |line| line.to_string());
+    let gutter = format!(" {number:>number_width$} ");
+    let (sign, sign_color, background) = match hunk.kind {
+        HunkKind::Add => ("+", cc.diff_add, Some(cc.diff_add_bg)),
+        HunkKind::Del => ("-", cc.diff_del, Some(cc.diff_del_bg)),
+        HunkKind::Context => (" ", cc.diff_text, None),
     };
-    let text = clip_ellipsis(&hunk.text, width.saturating_sub(10));
-    let mut spans = vec![span("│ ", theme.border), span(format!("{sign} "), color)];
-    if hunk.kind == HunkKind::Context {
-        spans.push(span(text, color));
-    } else {
-        spans.extend(super::highlight::spans(theme, language, &text, color));
+    let paint = |foreground: Color| {
+        let style = Style::default().fg(foreground);
+        match background {
+            Some(background) => style.bg(background),
+            None => style,
+        }
+    };
+    let mut gutter_style = paint(if background.is_some() { sign_color } else { cc.diff_text });
+    if background.is_none() {
+        gutter_style = gutter_style.add_modifier(Modifier::DIM);
     }
-    indent(2, spans)
+    let room = width.saturating_sub(5 + gutter.chars().count() as u16 + 1);
+    let text = clip_ellipsis(&hunk.text, room);
+    let mut spans = vec![
+        Span::raw("     "),
+        Span::styled(gutter, gutter_style),
+        Span::styled(sign.to_string(), paint(sign_color)),
+    ];
+    for piece in super::highlight::spans(theme, language, &text, cc.diff_text) {
+        let foreground = piece.style.fg.unwrap_or(cc.diff_text);
+        spans.push(Span::styled(piece.content.to_string(), paint(foreground)));
+    }
+    let used = run_width(&spans);
+    if let Some(background) = background {
+        spans.push(Span::styled(
+            " ".repeat(width.saturating_sub(used) as usize),
+            Style::default().bg(background),
+        ));
+    }
+    Line::from(spans)
 }
 
 /// A tool failure expands to at most four indented lines and keeps the exit

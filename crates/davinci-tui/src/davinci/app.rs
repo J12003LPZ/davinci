@@ -189,7 +189,7 @@ pub fn compose_frame(model: &Model, height: u16) -> ComposedFrame {
         + offered.len()
         + composer_rows.len()
         + below.len()
-        + 1;
+        + chrome::footer(chrome_model).len();
     let body_height = height.saturating_sub(reserved);
 
     let mut rows = Vec::with_capacity(height);
@@ -225,7 +225,7 @@ pub fn compose_frame(model: &Model, height: u16) -> ComposedFrame {
     });
     rows.extend(composer_rows);
     rows.extend(below);
-    rows.push(chrome::status(chrome_model));
+    rows.extend(chrome::footer(chrome_model));
     rows.truncate(height);
     if !conversation {
         rows = rows
@@ -248,6 +248,7 @@ fn command_panel_frame(
     height: usize,
 ) -> Vec<Line<'static>> {
     let th = &model.theme;
+    let cc = th.cc();
     let chrome = sheet::chrome(model);
     let notices: Vec<Line<'static>> = model
         .section_notice
@@ -296,15 +297,15 @@ fn command_panel_frame(
     ) {
         rows.push(Line::from(ui::span(
             "▔".repeat(usize::from(model.width)),
-            th.border,
+            cc.permission,
         )));
     } else {
         rows.push(chrome::effort_rule(model));
     }
     rows.push(Line::from(ui::truncate_run(
         vec![
-            ui::span("   ", th.text),
-            ui::span_strong(sheet::title(model.screen), th.primary, th),
+            ui::span("   ", cc.inactive),
+            ui::span_strong(sheet::title(model.screen), cc.permission, th),
         ],
         model.width,
     )));
@@ -317,7 +318,7 @@ fn command_panel_frame(
     let hint = chrome
         .as_ref()
         .and_then(|chrome| sheet::hint_row(model, chrome))
-        .unwrap_or_else(|| Line::from(ui::span("   Esc to close", th.muted)));
+        .unwrap_or_else(|| Line::from(ui::span("   Esc to close", cc.inactive)));
     rows.push(hint);
     pad_to(
         rows.into_iter()
@@ -654,6 +655,22 @@ pub fn handle_key(model: &mut Model, key: KeyEvent) -> Flow {
     if key.kind == KeyEventKind::Release {
         return Flow::Continue;
     }
+    // ? in an empty conversation composer opens the shortcuts panel. Any
+    // other key closes it and is then handled normally.
+    if model.shortcuts_open {
+        model.shortcuts_open = false;
+        if key.code == KeyCode::Char('?') && (key.modifiers - KeyModifiers::SHIFT).is_empty() {
+            return Flow::Continue;
+        }
+    } else if key.code == KeyCode::Char('?')
+        && (key.modifiers - KeyModifiers::SHIFT).is_empty()
+        && model.composer.is_empty()
+        && model.screen == Screen::Agent
+        && model.overlay.is_none()
+    {
+        model.shortcuts_open = true;
+        return Flow::Continue;
+    }
     if model.screen == Screen::GraphRun
         && model.overlay.is_none()
         && key.code == KeyCode::Tab
@@ -791,31 +808,18 @@ fn handle_suggestion_key(model: &mut Model, data: Option<&str>) -> Option<Flow> 
         model.suggestion_move(1);
         return Some(Flow::Continue);
     }
-    // Tab and enter both take the marked row: tab because that is what the
-    // hint row promises, enter because a list in hand means the user is
-    // choosing a command, not sending one.
     let tab = bindings.matches(data, "tui.input.tab");
-    let model_command = model.suggestions.as_ref().is_some_and(|found| {
-        found.prefix.starts_with('/')
-            && found
-                .items
-                .get(model.suggestion_index)
-                .is_some_and(|item| item.value == "model")
-    });
-    // Choosing the `/model` command itself opens the full picker for both
-    // advertised acceptance keys. Letting Tab merely expand to `/model `
-    // dropped into argument autocomplete, whose compact list cannot own the
-    // selected model's reasoning level.
-    if (tab || bindings.matches(data, "tui.input.submit")) && model_command {
-        model.composer.set_text("/model");
-        model.submit();
-        return Some(Flow::Submit("/model".into()));
-    }
     if tab || bindings.matches(data, "tui.input.submit") {
+        let run = !tab && runs_on_enter(model);
         if model.accept_suggestion() || tab {
+            if run {
+                let sent = model.composer.editor().get_expanded_text().trim_end().to_string();
+                model.dismiss_suggestions();
+                model.submit();
+                return Some(Flow::Submit(sent));
+            }
             return Some(Flow::Continue);
         }
-        // Enter on a row the composer already holds sends it instead.
         return None;
     }
     if bindings.matches(data, "tui.select.cancel") {
@@ -823,6 +827,14 @@ fn handle_suggestion_key(model: &mut Model, data: Option<&str>) -> Option<Flow> 
         return Some(Flow::Continue);
     }
     None
+}
+
+fn runs_on_enter(model: &Model) -> bool {
+    model.composer.trim_start().starts_with('/')
+        && model
+            .suggestions
+            .as_ref()
+            .is_some_and(|found| !found.prefix.starts_with(['@', '#']))
 }
 
 fn action_matches(model: &Model, data: Option<&str>, action: &str) -> bool {

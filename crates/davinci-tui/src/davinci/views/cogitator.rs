@@ -225,6 +225,7 @@ pub fn suggestions(model: &Model) -> Option<Vec<Line<'static>>> {
 
 fn picker_panel(model: &Model, height: usize, echo: bool) -> Vec<Line<'static>> {
     let th = &model.theme;
+    let cc = th.cc();
     let entries = catalog(model);
     let anchor = model
         .section_offset
@@ -236,12 +237,12 @@ fn picker_panel(model: &Model, height: usize, echo: bool) -> Vec<Line<'static>> 
             .collect();
     }
     let bounded = |spans| Line::from(ui::truncate_run(spans, model.width));
-    let detail = |text: String, color| bounded(vec![span("   ", th.text), span(text, color)]);
+    let detail = |text: String, color| bounded(vec![span("   ", cc.inactive), span(text, color)]);
     let mut out = vec![
         super::chrome::effort_rule(model),
         bounded(vec![
-            span("   ", th.text),
-            ui::span_strong("Select model", th.text, th),
+            span("   ", cc.inactive),
+            ui::span_strong("Select model", cc.permission, th),
         ]),
     ];
     for text in ui::wrap(
@@ -251,11 +252,11 @@ fn picker_panel(model: &Model, height: usize, echo: bool) -> Vec<Line<'static>> 
     .into_iter()
     .take(2)
     {
-        out.push(detail(text, th.text));
+        out.push(detail(text, cc.inactive));
     }
     out.push(ui::blank());
     if !model.catalog_query.is_empty() {
-        out.push(detail(format!("Search: {}", model.catalog_query), th.muted));
+        out.push(detail(format!("Search: {}", model.catalog_query), cc.inactive));
     }
     let selected = visible_indices(model)
         .contains(&model.catalog_index)
@@ -269,10 +270,19 @@ fn picker_panel(model: &Model, height: usize, echo: bool) -> Vec<Line<'static>> 
             .map(String::as_str)
             .unwrap_or(&model.thinking_level);
         if !level.is_empty() {
-            footer.push(detail(
-                format!("● {level} effort (default) ←/→ to adjust"),
-                th.primary,
-            ));
+            let display_level = {
+                let mut chars = level.chars();
+                match chars.next() {
+                    Some(first) => format!("{}{}", first.to_uppercase(), chars.as_str()),
+                    None => String::new(),
+                }
+            };
+            footer.push(bounded(vec![
+                span("   ", cc.inactive),
+                span("● ", cc.claude),
+                span(format!("{display_level} effort"), cc.inactive),
+                span(" ←/→ to adjust", cc.subtle),
+            ]));
         }
         if matches!(entry.credential, Credential::Absent | Credential::Expired) {
             footer.push(detail(
@@ -293,14 +303,12 @@ fn picker_panel(model: &Model, height: usize, echo: bool) -> Vec<Line<'static>> 
     }
     footer.push(ui::blank());
     footer.push(detail(
-        if echo && model.width < 60 {
-            "Enter save · s session · Esc cancel".into()
-        } else if echo {
-            "Enter to set as default · s to use this session only · Esc to cancel".into()
+        if echo {
+            "Enter to confirm · ←/→ effort · Esc to cancel".into()
         } else {
             "↑↓ move · tab/↵ take · esc close".into()
         },
-        th.muted,
+        cc.inactive,
     ));
     // On short terminals preserve selection and action guidance before decoration.
     let footer_room = height.saturating_sub(out.len() + 1);
@@ -380,25 +388,39 @@ fn catalog_row(
     ordinal: usize,
 ) -> Line<'static> {
     let th = &model.theme;
-    let color = if focused { th.primary } else { th.text };
+    let cc = th.cc();
     let name = if entry.id.is_empty() {
         &entry.name
     } else {
         &entry.id
     };
-    let label = format!("{ordinal}. {name}{}", if current { " ✔" } else { "" });
-    let clipped = ui::clip_ellipsis(&label, name_width);
+    let number = format!("{ordinal}. ");
+    let check = if current { " ✔" } else { "" };
+    let fixed = text_width(&number).saturating_add(text_width(check));
+    let clipped_name = ui::clip_ellipsis(name, name_width.saturating_sub(fixed));
+    let label_color = if current {
+        cc.success
+    } else if focused {
+        cc.permission
+    } else {
+        th.text
+    };
     let mut spans = vec![
-        span(if focused { "   ❯ " } else { "     " }, color),
-        span(clipped.clone(), color),
+        span(
+            if focused { "   ❯ " } else { "     " },
+            if focused { cc.permission } else { cc.inactive },
+        ),
+        span(number, cc.inactive),
+        span(clipped_name.clone(), label_color),
     ];
+    if current {
+        spans.push(span(check, cc.success));
+    }
     if model.width >= 60 {
-        let padding = name_width.saturating_sub(text_width(&clipped)) + 2;
-        spans.push(span(" ".repeat(usize::from(padding)), color));
-        spans.push(span(
-            model_description(entry),
-            if focused { color } else { th.muted },
-        ));
+        let used_name = fixed.saturating_add(text_width(&clipped_name));
+        let padding = name_width.saturating_sub(used_name) + 2;
+        spans.push(span(" ".repeat(usize::from(padding)), cc.inactive));
+        spans.push(span(model_description(entry), cc.inactive));
     }
     Line::from(ui::truncate_run(spans, model.width))
 }
@@ -529,10 +551,13 @@ mod tests {
         assert!(rows[0].to_string().contains("✔"));
         assert!(!rows[1].to_string().contains("✔"));
         assert_eq!(ui::focused_row(&rows), Some(1));
+        let cc = m.theme.cc();
+        assert_eq!(rows[1].spans[0].style.fg, Some(cc.permission));
         assert!(rows[1]
             .spans
             .iter()
-            .all(|s| s.style.fg == Some(m.theme.model_picker_colors().0)));
+            .any(|span| span.content.contains("gpt-5.6-luna")
+                && span.style.fg == Some(cc.permission)));
     }
 
     #[test]
