@@ -36,7 +36,6 @@ Running the binary:
 ./target/debug/davinci --help
 ./target/debug/davinci -p "List files in src/"   # print mode
 ./target/debug/davinci --mode rpc                # JSON-RPC over stdio
-cargo run -p davinci-parity                      # golden-fixture parity corpora
 ```
 
 Toolchain is pinned to Rust 1.83.0 (`rust-toolchain.toml`). Every workspace dependency is pinned with `=` exact versions; keep that convention when adding one.
@@ -114,7 +113,6 @@ davinci-coding-agent (bin `davinci`) — CLI, TUI wiring, extensions, slash comm
   ├── davinci-protocol   — length-prefixed CBOR wire format
   ├── davinci-client / davinci-server — protocol client/server over Unix socket or TCP
   ├── davinci-evals, davinci-telemetry
-  └── davinci-parity     — golden fixtures, optional diff against the TS binary
 ```
 
 **Ecosystem integration plan**: The roadmap coordinates four bounded workstreams: graph execution hardening, runtime integration with the token governor and vector memory, learning/security feedback, and proof plus CI hygiene. Treat the design document as the contract and the A–D plans as the execution order. Preserve worker isolation, deterministic/offline verification, explicit provenance, bounded context and resource budgets, and fail-closed security approval as cross-cutting acceptance criteria.

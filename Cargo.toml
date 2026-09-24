@@ -14,7 +14,6 @@ members = [
     "crates/davinci-telemetry",
     "crates/davinci-evals",
     "crates/davinci-coding-agent",
-    "crates/davinci-parity",
     "crates/davinci-voice",
 ]
 

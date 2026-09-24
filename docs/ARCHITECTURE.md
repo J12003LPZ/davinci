@@ -41,7 +41,6 @@ form a directed graph with shared contracts and supporting libraries.
 | `davinci-server` | Session controller/dispatcher and Unix transport for the typed client/server API |
 | `davinci-telemetry` | Telemetry contracts and local aggregate run reports |
 | `davinci-evals` | Evaluation harnesses, engineering scenarios and benchmark artifacts |
-| `davinci-parity` | Golden fixtures and differential checks against the pinned reference |
 
 ## Main flows
 

@@ -13,7 +13,7 @@ checkout had unrelated dirty and untracked work; it was left untouched.
 `davinci-coding-agent` version `1.0.71` and these 14 workspace packages:
 
 `davinci-agent`, `davinci-ai`, `davinci-client`, `davinci-coding-agent`,
-`davinci-evals`, `davinci-mcp`, `davinci-parity`, `davinci-protocol`,
+`davinci-evals`, `davinci-mcp`, `davinci-protocol`, `davinci-sys`,
 `davinci-server`, `davinci-session`, `davinci-session-sqlite`,
 `davinci-telemetry`, `davinci-tui`, and `davinci-voice`.
 

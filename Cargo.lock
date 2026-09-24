@@ -572,23 +572,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "davinci-parity"
-version = "1.0.71"
-dependencies = [
- "clap",
- "davinci-agent",
- "davinci-ai",
- "davinci-client",
- "davinci-protocol",
- "davinci-server",
- "davinci-session",
- "davinci-session-sqlite",
- "serde",
- "serde_json",
- "tempfile",
-]
-
-[[package]]
 name = "davinci-protocol"
 version = "1.0.71"
 dependencies = [
