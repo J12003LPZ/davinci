@@ -97,7 +97,7 @@ fn worker_lease_available(session_path: &Path) -> Result<bool, String> {
         if metadata.file_attributes() & 0x400 != 0 {
             return Err("worker conversation lease is a reparse point".into());
         }
-        return match std::fs::OpenOptions::new()
+        match std::fs::OpenOptions::new()
             .read(true)
             .write(true)
             .share_mode(0)
@@ -107,7 +107,7 @@ fn worker_lease_available(session_path: &Path) -> Result<bool, String> {
             Ok(_) => Ok(true),
             Err(error) if error.raw_os_error() == Some(32) => Ok(false),
             Err(error) => Err(error.to_string()),
-        };
+        }
     }
     #[cfg(not(any(unix, windows)))]
     {

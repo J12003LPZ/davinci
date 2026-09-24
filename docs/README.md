@@ -50,6 +50,8 @@ Comprehensive specifications detailing the design contracts and algorithms:
 | [`2026-09-03-davinci-self-improving-learning-design.md`](superpowers/specs/2026-09-03-davinci-self-improving-learning-design.md) | Self-improving learning system: settled turn review, durable memory, and skills ledger. |
 | [`learning.md`](learning.md) | User and operator guide to Davinci self-improving learning, commands, and policy. |
 | [`ecosystem.md`](ecosystem.md) | Closed ecosystem integration architecture connecting Graph, Token Governor, Vector Memory, Learning, and Security. |
+| [`vector-memory.md`](vector-memory.md) | Vector memory storage, commands, and the `/memory-page` connection report. |
+| [`ecosystem-verification-2026-09-23.md`](ecosystem-verification-2026-09-23.md) | Live end-to-end verification of graph, token governor, vector memory, and language intelligence, with the defects it found. |
 
 ---
 

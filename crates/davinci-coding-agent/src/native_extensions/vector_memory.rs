@@ -24,6 +24,8 @@ const DENSE_BACKOFF: Duration = Duration::from_secs(120);
 /// `memory_search` never answers more than this many hits whatever `limit`
 /// says; the tool schema states the same cap.
 pub const SEARCH_LIMIT_CAP: usize = 20;
+/// Records `/memory-reindex` embeds per run; run it again for the rest.
+const REINDEX_EMBED_LIMIT: usize = 256;
 /// Phase 3 chooses the bounded local index as the production projection.
 /// Qdrant configuration remains readable for rollback/experiments but normal
 /// indexing does not perform remote writes until a remote query path clears
@@ -849,7 +851,7 @@ impl VectorMemory {
         memory
     }
 
-    fn local_path(&self) -> PathBuf {
+    pub fn local_path(&self) -> PathBuf {
         let davinci_path = self
             .cwd
             .join(".davinci")
@@ -955,10 +957,14 @@ impl VectorMemory {
                 break;
             }
             self.known.insert(tag);
+            // The kind is part of the identity: a promoted chunk has the
+            // same text (and hash) as its source, and sharing an id made the
+            // embedding step find the source twice and skip the promotion.
             let id_seed = format!(
-                "{}\0{}\0{}",
+                "{}\0{}\0{:?}\0{}",
                 target_repo,
                 profile_str.as_deref().unwrap_or(""),
+                chunk.kind,
                 hash
             );
             let record = MemoryRecord {
@@ -1420,7 +1426,7 @@ impl VectorMemory {
             .and_then(Value::as_u64)
             .map(|value| (value as usize).clamp(1, SEARCH_LIMIT_CAP))
             .unwrap_or(self.config.result_limit);
-        let hits = self.search(query, limit);
+        let hits = without_embeddings(self.search(query, limit));
         let content = hits
             .iter()
             .map(|hit| format!("[{:.2}] {}", hit.score, hit.record.text))
@@ -1436,7 +1442,7 @@ impl VectorMemory {
     }
 
     pub fn search_text(&self, query: &str) -> Value {
-        let hits = self.search(query, self.config.result_limit);
+        let hits = without_embeddings(self.search(query, self.config.result_limit));
         json!({"query": query, "count": hits.len(), "hits": hits})
     }
 
@@ -1450,9 +1456,53 @@ impl VectorMemory {
         (!hits.is_empty()).then(|| format_memory_block(&hits, self.config.max_injected_tokens))
     }
 
+    /// Reload the store, give records that share an id their own, and embed
+    /// a bounded batch of records that have no current vector. Embedding
+    /// failures leave the records lexical-only and are reported, not raised.
     pub fn reindex(&mut self) -> Result<Value, ToolError> {
         self.load_local();
-        Ok(self.status())
+        let repaired_ids = self.repair_duplicate_ids();
+        if repaired_ids > 0 {
+            self.persist_local()?;
+        }
+        let (embedded, embedding_error) = if self.config.enabled {
+            match self.rebuild_local_embeddings(REINDEX_EMBED_LIMIT) {
+                Ok(count) => (count, None),
+                Err(error) => (0, Some(error.to_string())),
+            }
+        } else {
+            (0, None)
+        };
+        let mut status = self.status();
+        status["repairedIds"] = json!(repaired_ids);
+        status["reembedded"] = json!(embedded);
+        status["embeddingError"] = json!(embedding_error);
+        Ok(status)
+    }
+
+    /// Records written before the kind joined the id seed can share an id
+    /// with their promoted twin. The later twin gets the id it would get now.
+    fn repair_duplicate_ids(&mut self) -> usize {
+        let mut seen = HashSet::new();
+        let mut repaired = 0;
+        for record in &mut self.records {
+            if seen.insert(record.id.clone()) {
+                continue;
+            }
+            let seed = format!(
+                "{}\0{}\0{:?}\0{}",
+                record.repo_id,
+                record.agent_profile_name.as_deref().unwrap_or(""),
+                record.kind,
+                record.content_hash
+            );
+            record.id = hash_to_uuid(&sha256_hex(seed));
+            record.embedding = None;
+            record.embedding_identity = None;
+            seen.insert(record.id.clone());
+            repaired += 1;
+        }
+        repaired
     }
 
     pub fn clear(&mut self) -> Result<Value, ToolError> {
@@ -1511,7 +1561,6 @@ impl VectorMemory {
     /// Authoritative records remain readable through lexical retrieval if the
     /// embedding service is unavailable. Tombstoned/superseded records are
     /// never projected.
-    #[allow(dead_code)]
     pub fn rebuild_local_embeddings(&mut self, limit: usize) -> Result<usize, ToolError> {
         self.drop_incompatible_embeddings();
         let pending = self
@@ -1720,8 +1769,21 @@ impl VectorMemory {
     ) -> Result<String, ToolError> {
         let text_redacted = redact_secrets(text);
         let hash = content_hash(&text_redacted);
-        let id = hash_to_uuid(&sha256_hex(format!("{}\0{}", self.repo_id, hash)));
         if !self.known.insert(known_key(kind, &hash)) {
+            let existing = self.records.iter().find(|record| {
+                record.kind == kind
+                    && record.content_hash == hash
+                    && record.agent_profile_name.is_none()
+            });
+            if let Some(existing) = existing {
+                return Ok(existing.id.clone());
+            }
+        }
+        let id = hash_to_uuid(&sha256_hex(format!(
+            "{}\0{:?}\0{}",
+            self.repo_id, kind, hash
+        )));
+        if self.records.iter().any(|record| record.id == id) {
             return Ok(id);
         }
         let record = MemoryRecord {
@@ -1785,6 +1847,15 @@ impl VectorMemory {
     pub fn embed_query_text(&self, text: &str) -> Result<Vec<f32>, ToolError> {
         self.embed_query(text)
     }
+}
+
+/// Hits for a surface a person or tool reads. The 768-float vector is an
+/// index detail; left in, one `/memory-search` printed about 50 KB.
+fn without_embeddings(mut hits: Vec<MemoryHit>) -> Vec<MemoryHit> {
+    for hit in &mut hits {
+        hit.record.embedding = None;
+    }
+    hits
 }
 
 fn parse_embedding_response(
@@ -1895,7 +1966,7 @@ fn promote_chunk(chunk: &MemoryChunk) -> Option<MemoryChunk> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use std::io::{Read, Write};
     use std::net::{TcpListener, TcpStream};
@@ -1934,6 +2005,116 @@ mod tests {
             bytes.extend_from_slice(&chunk[..size]);
         }
         String::from_utf8_lossy(&bytes).into_owned()
+    }
+
+    /// A local stand-in for Ollama: `/api/embed` answers one vector of
+    /// `dimensions` per input, `/api/tags` lists `embeddinggemma:latest`.
+    pub(crate) fn fake_ollama(dimensions: usize) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { continue };
+                let request = read_http_request(&mut stream);
+                let body = request.split("\r\n\r\n").nth(1).unwrap_or_default();
+                let reply = if request.starts_with("GET /api/tags") {
+                    json!({"models": [{"name": "embeddinggemma:latest"}]})
+                } else {
+                    let inputs = serde_json::from_str::<Value>(body)
+                        .ok()
+                        .and_then(|value| value["input"].as_array().map(Vec::len))
+                        .unwrap_or(1);
+                    let vector = (0..dimensions)
+                        .map(|index| (index % 7) as f32 / 7.0 + 0.01)
+                        .collect::<Vec<_>>();
+                    json!({"embeddings": vec![vector; inputs]})
+                };
+                let reply = reply.to_string();
+                let _ = write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    reply.len(),
+                    reply
+                );
+            }
+        });
+        format!("http://{address}")
+    }
+
+    fn memory_with_fake_ollama(directory: &Path) -> VectorMemory {
+        let config = VectorMemoryConfig {
+            ollama_url: fake_ollama(8),
+            embedding_dimensions: 8,
+            ..VectorMemoryConfig::default()
+        };
+        VectorMemory::with_config(directory.to_path_buf(), config)
+    }
+
+    #[test]
+    fn a_promoted_chunk_gets_its_own_id_and_its_own_embedding() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut memory = memory_with_fake_ollama(directory.path());
+        let inserted = memory
+            .index_messages(&[MemoryMessage {
+                role: "user".into(),
+                content: "The deploy script must run with -Region eu-west-3.".into(),
+            }])
+            .unwrap();
+        assert_eq!(inserted, 2, "the task and its promoted constraint");
+        let records = memory.records();
+        assert_ne!(records[0].id, records[1].id);
+        assert!(
+            records.iter().all(|record| record.embedding.is_some()),
+            "every record is embedded"
+        );
+        assert_eq!(memory.status()["projectionLag"], 0);
+    }
+
+    #[test]
+    fn reindex_repairs_shared_ids_and_embeds_missing_vectors() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = directory.path().join(".davinci").join("vector-memory");
+        fs::create_dir_all(&store).unwrap();
+        let repo_id = resolve_repo_id(directory.path());
+        let record = |kind: &str| {
+            json!({"id": "same-id", "repoId": repo_id, "kind": kind,
+                   "text": "deploy must use eu-west-3", "source": "message-0-0",
+                   "contentHash": "h", "importance": 0.8, "createdAt": 1})
+            .to_string()
+        };
+        fs::write(
+            store.join("records.jsonl"),
+            format!("{}\n{}", record("task"), record("constraint")),
+        )
+        .unwrap();
+        let mut memory = memory_with_fake_ollama(directory.path());
+        let status = memory.reindex().unwrap();
+        assert_eq!(status["repairedIds"], 1);
+        assert_eq!(status["reembedded"], 2);
+        assert_eq!(status["projectionLag"], 0);
+        let records = memory.records();
+        assert_ne!(records[0].id, records[1].id);
+        let reloaded = VectorMemory::with_config(directory.path().into(), memory.config.clone());
+        assert_eq!(reloaded.status()["embedded"], 2);
+    }
+
+    #[test]
+    fn memory_search_output_never_carries_embedding_vectors() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut memory = memory_with_fake_ollama(directory.path());
+        memory
+            .index_messages(&[MemoryMessage {
+                role: "user".into(),
+                content: "graph scheduler uses a ready frontier".into(),
+            }])
+            .unwrap();
+        let text = memory.search_text("graph scheduler");
+        assert!(text["count"].as_u64().unwrap() > 0);
+        assert!(!text.to_string().contains("\"embedding\""), "{text}");
+        let tool = memory
+            .search_tool(&json!({"query": "graph scheduler"}))
+            .unwrap();
+        assert!(!tool.details.unwrap().to_string().contains("\"embedding\""));
     }
 
     #[test]

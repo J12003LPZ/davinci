@@ -10,6 +10,7 @@ pub mod git_intelligence;
 pub mod graph;
 pub mod language_intelligence;
 pub mod learning;
+pub mod memory_page;
 pub mod package_intelligence;
 pub mod repo_intelligence;
 pub mod security_scan;
@@ -145,6 +146,7 @@ pub const NATIVE_COMMANDS: &[&str] = &[
     "memory-search",
     "memory-reindex",
     "memory-clear",
+    "memory-page",
     "governor-status",
     "governor-reset",
     "graph",
@@ -230,10 +232,15 @@ pub fn command_specs() -> Vec<(&'static str, &'static str, Option<&'static str>)
         ),
         (
             "memory-reindex",
-            "Reload the local vector-memory index.",
+            "Reload vector memory, repair record ids and embed records missing a vector.",
             None,
         ),
         ("memory-clear", "Clear local vector-memory records.", None),
+        (
+            "memory-page",
+            "Build and open a page showing vector-memory connection, records and a live retrieval check.",
+            Some("[--no-open] [query]"),
+        ),
         (
             "governor-status",
             "Show token-governor compression and deduplication counters.",
@@ -760,6 +767,7 @@ impl NativeExtensionHost {
             "memory-search" => Ok(Some(self.memory.search_text(args))),
             "memory-reindex" => Ok(Some(self.memory.reindex().map_err(|err| err.to_string())?)),
             "memory-clear" => Ok(Some(self.memory.clear().map_err(|err| err.to_string())?)),
+            "memory-page" => Ok(Some(memory_page::command(&self.memory, args)?)),
             "cache-status" => {
                 let stats = self.cache.stats();
                 let raw_input = stats

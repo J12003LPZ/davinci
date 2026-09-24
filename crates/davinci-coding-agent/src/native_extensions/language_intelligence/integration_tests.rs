@@ -112,11 +112,14 @@ fn real_typescript_semantics_and_edit_synchronization() {
         "lsp_diagnostics",
         json!({"path":"src/b.ts","severity":"error"}),
     );
-    assert!(diagnostics["items"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .any(|r| r["code"] == 2322));
+    assert!(
+        diagnostics["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|r| r["code"] == 2322),
+        "{diagnostics}"
+    );
     std::fs::write(root.join("src/b.ts"), good).unwrap();
     let diagnostics = call("lsp_diagnostics", json!({"path":"src/b.ts"}));
     assert_eq!(diagnostics["total"], 0, "{diagnostics}");

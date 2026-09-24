@@ -88,11 +88,22 @@ pub fn normalize_rel_path(path: &str) -> String {
 }
 
 // Recovery state must not capture itself inside the next mutation baseline.
+// Neither may other harness runtime state: the operation journal is a SQLite
+// file that changes on every tool call, and inlining it made one failed run's
+// state.json 14 MB and put the database into the graph's own diff.
 fn is_transaction_journal(path: &str) -> bool {
     let path = normalize_rel_path(path);
-    [".davinci-transactions/", ".davinci/graph/", ".pi/graph/"]
-        .iter()
-        .any(|prefix| path.starts_with(prefix))
+    [
+        ".davinci-transactions/",
+        ".davinci/graph/",
+        ".pi/graph/",
+        ".davinci/operations/",
+        ".pi/operations/",
+        ".davinci/vector-memory/",
+        ".pi/vector-memory/",
+    ]
+    .iter()
+    .any(|prefix| path.starts_with(prefix))
 }
 
 fn list_workspace_files(cwd: &Path) -> Vec<String> {
@@ -443,6 +454,18 @@ mod tests {
         for root in [".davinci/graph/run", ".pi/graph/run"] {
             std::fs::create_dir_all(dir.path().join(root)).unwrap();
             std::fs::write(dir.path().join(root).join("state.json"), "checkpoint").unwrap();
+        }
+        // Harness runtime state beside the checkpoints: the operation
+        // journal (a growing SQLite file) and the vector-memory store.
+        for (root, file) in [
+            (".davinci/operations", "operations.sqlite3"),
+            (".davinci/operations", "operations.sqlite3-wal"),
+            (".pi/operations", "operations.sqlite3"),
+            (".davinci/vector-memory", "records.jsonl"),
+            (".pi/vector-memory", "records.jsonl"),
+        ] {
+            std::fs::create_dir_all(dir.path().join(root)).unwrap();
+            std::fs::write(dir.path().join(root).join(file), "runtime state").unwrap();
         }
         let baseline = capture_baseline(dir.path()).unwrap();
         assert_eq!(
