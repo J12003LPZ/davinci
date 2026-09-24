@@ -731,6 +731,20 @@ pub fn live_complete_streaming_with_sink_envelope(
         err.message
     })?;
     crate::trace::log(&format!("sse status {}", response.status()));
+    if model.api == "openai-codex-responses" {
+        let response_headers: Vec<(String, String)> = response
+            .headers_names()
+            .into_iter()
+            .filter_map(|name| {
+                response
+                    .header(&name)
+                    .map(|value| (name.clone(), value.to_string()))
+            })
+            .collect();
+        if let Some(snapshot) = crate::codex_usage::parse_usage_headers(&response_headers) {
+            crate::codex_usage::record(snapshot);
+        }
+    }
     match crate::stream_decoder::decoder_for(model).filter(|_| incremental) {
         Some(mut decoder) => {
             let (message, stream_events, native_output) = read_provider_stream(
