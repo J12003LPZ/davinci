@@ -400,12 +400,16 @@ pub fn save_run(run: &mut GraphRun) -> std::io::Result<()> {
             atomic_write(&saved_path, yaml_str.as_bytes())?;
         }
     }
+    // Migrate legacy inline bytes before cloning so a resumed old run does
+    // not keep a second repository-sized copy in memory. Blob writes are
+    // content-addressed and atomic, so clearing the inline copy is safe once
+    // this step succeeds even if publishing state.json later fails.
+    let blob_dir = super::blobs::dir(&cwd);
+    migrate_inline_baselines(run, &blob_dir)?;
     // The self-contained run state is the commit record. Publish it only after
     // all companion writes succeed, and retain the previous timestamp on error.
     let mut snapshot = run.clone();
     snapshot.updated_at = now_ms();
-    let blob_dir = super::blobs::dir(&cwd);
-    migrate_inline_baselines(&mut snapshot, &blob_dir)?;
     let content = serde_json::to_vec(&snapshot)
         .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
     atomic_write(&state_path, &content)?;
@@ -828,6 +832,18 @@ mod tests {
         assert_eq!(loaded.goal, "goal text");
         assert_eq!(loaded.budgets, GraphBudgets::default());
         assert!(loaded.updated_at > 0);
+    }
+
+    #[test]
+    fn saved_state_is_compact_and_has_no_inline_contents() {
+        let dir = tempdir().unwrap();
+        let run_id = new_run_id();
+        create_run_dir(dir.path(), &run_id).unwrap();
+        let mut run = sample_run(dir.path(), &run_id, "goal");
+        save_run(&mut run).unwrap();
+        let raw = fs::read_to_string(run_dir(dir.path(), &run_id).join("state.json")).unwrap();
+        assert!(!raw.contains("\n  "), "state.json must be compact");
+        assert!(!raw.contains("\"contents\""));
     }
 
     #[test]
