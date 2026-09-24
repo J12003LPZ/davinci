@@ -499,10 +499,14 @@ impl ExtensionHost {
 
     /// Agent-level pruning/auto-compaction removed output from the model view.
     pub fn native_context_pruned(&self) {
-        self.native
+        let native = self
+            .native
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        native
+            .governor
             .lock()
             .unwrap_or_else(|error| error.into_inner())
-            .governor
             .record_pruning();
     }
 
@@ -1703,7 +1707,16 @@ mod tests {
                 .content,
             output.content
         );
-        assert_eq!(host.native.lock().unwrap().governor.prunings(), 1);
+        assert_eq!(
+            host.native
+                .lock()
+                .unwrap()
+                .governor
+                .lock()
+                .unwrap()
+                .prunings(),
+            1
+        );
     }
 
     #[test]
