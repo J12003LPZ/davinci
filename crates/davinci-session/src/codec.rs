@@ -419,6 +419,7 @@ pub fn migrate_v3_to_v4<'a>(
         metadata: None,
     };
     let leaf_id = entries.last().map(|e| e.id.clone());
+    let max_seq = entries.iter().map(|entry| entry.seq).max().unwrap_or(0);
     Ok(JsonlSession {
         persistence_error: None,
         path: path.to_path_buf(),
@@ -426,6 +427,7 @@ pub fn migrate_v3_to_v4<'a>(
         entries,
         records: Vec::new(),
         leaf_id,
+        max_seq,
         writer: WriterState {
             rewrite_as_v4: true,
             ..WriterState::default()

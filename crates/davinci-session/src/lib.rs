@@ -69,6 +69,7 @@ pub struct JsonlSession {
     pub entries: Vec<SessionEntry>,
     pub records: Vec<LaneRecord>,
     pub leaf_id: Option<String>,
+    max_seq: u64,
     persistence_error: Option<String>,
     pub(crate) writer: WriterState,
 }
@@ -131,6 +132,7 @@ impl JsonlSession {
             entries: Vec::new(),
             records: Vec::new(),
             leaf_id: None,
+            max_seq: 0,
             persistence_error: None,
             writer: WriterState::default(),
         })
@@ -183,6 +185,7 @@ impl JsonlSession {
             entries: Vec::new(),
             records: Vec::new(),
             leaf_id: None,
+            max_seq: 0,
             persistence_error: None,
             writer: WriterState::default(),
         };
@@ -193,10 +196,14 @@ impl JsonlSession {
             }
             match parse_mutation(line) {
                 Ok(SessionMutation::Entry { entry, .. }) => {
+                    session.max_seq = session.max_seq.max(entry.seq);
                     session.leaf_id = Some(entry.id.clone());
                     session.entries.push(entry);
                 }
-                Ok(SessionMutation::Record { record, .. }) => session.records.push(record),
+                Ok(SessionMutation::Record { record, .. }) => {
+                    session.max_seq = session.max_seq.max(record.seq);
+                    session.records.push(record);
+                }
                 Ok(
                     SessionMutation::Lane { .. }
                     | SessionMutation::FactName { .. }
@@ -216,7 +223,7 @@ impl JsonlSession {
     }
 
     pub fn append_entry(&mut self, mut entry: SessionEntry) -> Result<(), SessionError> {
-        entry.seq = self.next_seq();
+        entry.seq = self.max_seq.saturating_add(1);
         if entry.timestamp == 0 {
             entry.timestamp = now_ms();
         }
@@ -228,6 +235,7 @@ impl JsonlSession {
             lane: None,
             entry: entry.clone(),
         }))?;
+        self.max_seq = entry.seq;
         self.leaf_id = Some(entry.id.clone());
         self.entries.push(entry);
         Ok(())
@@ -392,16 +400,6 @@ impl JsonlSession {
             .and_then(|value| value.get("name"))
             .and_then(|value| value.as_str())
             .map(str::to_string)
-    }
-
-    fn next_seq(&self) -> u64 {
-        self.entries
-            .iter()
-            .map(|e| e.seq)
-            .chain(self.records.iter().map(|r| r.seq))
-            .max()
-            .unwrap_or(0)
-            + 1
     }
 
     pub fn persistence_error(&self) -> Option<&str> {
@@ -581,6 +579,29 @@ mod tests {
             assert_eq!(reopened.entries.len(), 2);
             assert_eq!(reopened.entries[1].parent_id, original_leaf_id);
         }
+    }
+
+    #[test]
+    fn append_sequence_is_cached_across_open() {
+        let dir = tempdir().unwrap();
+        let mut session = JsonlSession::create(dir.path(), "/work", None).unwrap();
+        for index in 0..100 {
+            session
+                .append_entry(SessionEntry::message(
+                    "user",
+                    serde_json::json!(format!("{index}")),
+                ))
+                .unwrap();
+        }
+        assert_eq!(session.entries.last().unwrap().seq, 100);
+        let path = session.path.clone();
+        drop(session);
+
+        let mut reopened = JsonlSession::open(&path).unwrap();
+        reopened
+            .append_entry(SessionEntry::message("user", serde_json::json!("next")))
+            .unwrap();
+        assert_eq!(reopened.entries.last().unwrap().seq, 101);
     }
 
     #[test]
