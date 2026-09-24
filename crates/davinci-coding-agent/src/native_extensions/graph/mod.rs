@@ -14,6 +14,7 @@
 //! it finishes, blocks, or the operator aborts it. See [`types::GraphBudgets`].
 
 pub(crate) mod bindings;
+pub(crate) mod blobs;
 pub(crate) mod briefings;
 pub(crate) mod config;
 pub(crate) mod continuation;

@@ -343,14 +343,53 @@ pub fn load_graph_definition(cwd: &Path, run_id: &str) -> Option<super::topology
     serde_json::from_str(&raw).ok()
 }
 
+fn migrate_baseline(
+    baseline: &mut super::mutation::MutationBaseline,
+    blob_dir: &Path,
+) -> std::io::Result<()> {
+    for (path, bytes) in std::mem::take(&mut baseline.contents) {
+        if let Some(fingerprint) = baseline.files.get(&path) {
+            super::blobs::put(blob_dir, &fingerprint.hash, &bytes)?;
+        }
+    }
+    Ok(())
+}
+
+fn migrate_inline_baselines(run: &mut GraphRun, blob_dir: &Path) -> std::io::Result<()> {
+    let Some(cursor) = run.continuation.as_mut() else {
+        return Ok(());
+    };
+    if let Some(delivery) = cursor.delivery.as_mut() {
+        migrate_baseline(&mut delivery.baseline, blob_dir)?;
+        if let Some(baseline) = delivery.attempt_baseline.as_mut() {
+            migrate_baseline(baseline, blob_dir)?;
+        }
+    }
+    if let Some(delivery) = cursor.completed_delivery.as_mut() {
+        migrate_baseline(&mut delivery.baseline, blob_dir)?;
+        if let Some(baseline) = delivery.attempt_baseline.as_mut() {
+            migrate_baseline(baseline, blob_dir)?;
+        }
+    }
+    if let Some(baseline) = cursor.saved_baseline.as_mut() {
+        migrate_baseline(baseline, blob_dir)?;
+    }
+    for baseline in cursor.saved_attempt_baselines.values_mut() {
+        migrate_baseline(baseline, blob_dir)?;
+    }
+    Ok(())
+}
+
 pub fn save_run(run: &mut GraphRun) -> std::io::Result<()> {
     let cwd = PathBuf::from(&run.cwd);
     let state_path = run_dir(&cwd, &run.run_id).join("state.json");
 
     if let Some(definition) = &run.definition {
         let graph_path = run_dir(&cwd, &run.run_id).join("graph.json");
-        if run.saved_definition.is_none() || !graph_path.exists() {
-            write_graph_definition(&cwd, &run.run_id, definition)?;
+        let bytes = serde_json::to_vec_pretty(definition)
+            .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+        if fs::read(&graph_path).ok().as_deref() != Some(bytes.as_slice()) {
+            atomic_write(&graph_path, &bytes)?;
         }
     }
 
@@ -365,7 +404,9 @@ pub fn save_run(run: &mut GraphRun) -> std::io::Result<()> {
     // all companion writes succeed, and retain the previous timestamp on error.
     let mut snapshot = run.clone();
     snapshot.updated_at = now_ms();
-    let content = serde_json::to_vec_pretty(&snapshot)
+    let blob_dir = super::blobs::dir(&cwd);
+    migrate_inline_baselines(&mut snapshot, &blob_dir)?;
+    let content = serde_json::to_vec(&snapshot)
         .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
     atomic_write(&state_path, &content)?;
     run.updated_at = snapshot.updated_at;
