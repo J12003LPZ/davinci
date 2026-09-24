@@ -1,0 +1,40 @@
+
+❯ In README.md replace the line Edited. with the two lines Changed. and Second line. Then create notes.txt containing
+  the two lines alpha and beta.
+
+  Read 1 file
+
+● Update(README.md)
+  ⎿  Added 2 lines, removed 1 line
+      1  # Sandbox
+      2
+      3  A tiny project used to capture reference screens.
+      4 -Edited.
+      4 +Changed.
+      5 +Second line.
+
+● Write(notes.txt)
+  ⎿  Wrote 2 lines to notes.txt
+      1 alpha
+      2 beta
+
+● I made both changes:
+
+  - README.md:4: the line Edited. is now two lines, Changed. and Second line.
+  - notes.txt: new file with two lines, alpha and beta.
+
+✻ Worked for 7s · done 2:24 AM
+
+❯ Run these shell commands one at a time: cargo --version, then git status --short, then exit 3. Then answer in one
+  word.
+
+  Ran 3 shell commands
+
+● Done.
+
+✻ Worked for 7s · done 2:25 AM
+                                                                                                      ● high · /effort
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  ⏸ manual mode on · ? for shortcuts · ← 1 agent

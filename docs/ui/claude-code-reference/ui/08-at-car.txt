@@ -1,0 +1,40 @@
+
+           Claude Code v2.1.281
+           Opus 5.5 with high effort · <plan>
+           ~\project
+
+  Get to finished work sooner with Opus 5.5. Switch anytime with /model.
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+  + Cargo.lock
+  * ecc:healthcare-reviewer (agent) – Reviews healthcare application code for clinical safety, CD…
+  + Cargo.toml
+  + C:\Users\<user>\…
+  + C:\Users\<user>\…
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯ @Car
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  ⏵⏵ auto mode on (shift+tab to cycle)
