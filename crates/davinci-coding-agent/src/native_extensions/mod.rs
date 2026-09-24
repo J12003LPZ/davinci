@@ -343,6 +343,12 @@ pub struct NativeExtensionHost {
     pub cwd: std::path::PathBuf,
 }
 
+const CODEX_CREDITS_PER_USD: f64 = 25.0;
+
+fn codex_credits_estimate(usd: f64) -> f64 {
+    usd.max(0.0) * CODEX_CREDITS_PER_USD
+}
+
 impl NativeExtensionHost {
     pub fn new_with_agent_dir(
         session_key: impl Into<String>,
@@ -752,12 +758,6 @@ impl NativeExtensionHost {
         }
     }
 
-const CODEX_CREDITS_PER_USD: f64 = 25.0;
-
-fn codex_credits_estimate(usd: f64) -> f64 {
-    usd.max(0.0) * Self::CODEX_CREDITS_PER_USD
-}
-
     pub fn command(&mut self, name: &str, args: &str) -> Result<Option<Value>, String> {
         match name {
             "repo-index-status" => Ok(Some(self.repo_intelligence.status())),
@@ -785,7 +785,7 @@ fn codex_credits_estimate(usd: f64) -> f64 {
                     "enabled": self.cache.config().enabled,
                     "runtimeFeatures": davinci_ai::openai_cache_policy::runtime_features(),
                     "codexUsage": davinci_ai::codex_usage::latest(),
-                    "codexCreditsEstimate": Self::codex_credits_estimate(stats.provider.total_cost_usd),
+                    "codexCreditsEstimate": codex_credits_estimate(stats.provider.total_cost_usd),
                     "creditsSource": "estimate: session USD cost x 25, Codex rate card 2026-09",
                     "summary": stats.summary(),
                     "namespaces": stats.namespaces,
