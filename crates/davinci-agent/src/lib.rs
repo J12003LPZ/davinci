@@ -92,7 +92,7 @@ pub use prompt::{
 };
 pub use prompt::{PreparedTurnPrompt, PromptProfile};
 pub use pruning::PruneSettings;
-pub use queues::{QueueMode, QueuedMessage, SteerFollowUpQueues};
+pub use queues::{QueueKind, QueueMode, QueuedMessage, RemoteQueue, SteerFollowUpQueues};
 pub use scheduler::{lane_for, lane_for_capability, ToolLane, MAX_TOOL_PARALLELISM};
 pub use skills::{
     describe_skill, discover_skills, expand_skill_command, expand_user_text,
@@ -356,6 +356,7 @@ pub struct Agent {
     pub context_window: u64,
     pub context_vm_mode: ContextVmMode,
     pub queues: SteerFollowUpQueues,
+    remote: RemoteQueue,
     pub tools: Vec<String>,
     pub tool_registry: Vec<String>,
     pub skills: Vec<Skill>,
@@ -505,6 +506,7 @@ impl Agent {
                 std::env::var("DAVINCI_CONTEXT_VM").ok().as_deref(),
             ),
             queues: SteerFollowUpQueues::default(),
+            remote: RemoteQueue::default(),
             tools: BUILTIN_TOOLS.iter().map(|t| t.to_string()).collect(),
             tool_registry: BUILTIN_TOOLS.iter().map(|t| t.to_string()).collect(),
             skills: Vec::new(),
@@ -590,6 +592,10 @@ impl Agent {
         ]);
         agent.sync_tool_authorization();
         agent
+    }
+
+    pub fn remote_queue(&self) -> RemoteQueue {
+        self.remote.clone()
     }
 
     pub fn new_builtin(profile: prompt::PromptProfile) -> Self {
