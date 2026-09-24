@@ -1,5 +1,6 @@
 //! Unified multi-provider LLM API matching `@earendil-works/pi-ai`.
 
+mod apply_patch_grammar;
 mod attribution;
 mod auth;
 pub mod cache;
@@ -38,6 +39,7 @@ mod stream_reader;
 mod thinking;
 pub mod trace;
 
+pub use apply_patch_grammar::APPLY_PATCH_LARK;
 pub use attribution::{is_install_telemetry_enabled, merge_provider_attribution_headers};
 pub use auth::{
     bedrock_ambient_source, cloudflare_auth, copilot_available_model_ids,
@@ -143,9 +145,9 @@ pub use stream::{
     fixture_complete, live_complete, live_complete_streaming_with,
     live_complete_streaming_with_sink, live_complete_streaming_with_sink_envelope,
     live_complete_with, live_stream, parse_sse_block, replay_sse_events, request_body,
-    request_body_with, request_url, resolve_json_schema_strict_sampling, AssistantMessage,
-    AssistantMessageEvent, ContentBlock, ProviderCompletionEnvelope, StopReason, StreamEvent,
-    StreamOptions,
+    raw_provider_post, request_body_with, request_url, resolve_json_schema_strict_sampling,
+    AssistantMessage, AssistantMessageEvent, ContentBlock, ProviderCompletionEnvelope,
+    RawProviderReply, StopReason, StreamEvent, StreamOptions,
 };
 pub use stream_decoder::{
     decoder_for, frames_of, new_message, supports_incremental_stream, ResponsesDecoder, SseFrame,
