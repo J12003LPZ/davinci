@@ -752,6 +752,12 @@ impl NativeExtensionHost {
         }
     }
 
+const CODEX_CREDITS_PER_USD: f64 = 25.0;
+
+fn codex_credits_estimate(usd: f64) -> f64 {
+    usd.max(0.0) * CODEX_CREDITS_PER_USD
+}
+
     pub fn command(&mut self, name: &str, args: &str) -> Result<Option<Value>, String> {
         match name {
             "repo-index-status" => Ok(Some(self.repo_intelligence.status())),
@@ -779,6 +785,8 @@ impl NativeExtensionHost {
                     "enabled": self.cache.config().enabled,
                     "runtimeFeatures": davinci_ai::openai_cache_policy::runtime_features(),
                     "codexUsage": davinci_ai::codex_usage::latest(),
+                    "codexCreditsEstimate": codex_credits_estimate(stats.provider.total_cost_usd),
+                    "creditsSource": "estimate: session USD cost x 25, Codex rate card 2026-09",
                     "summary": stats.summary(),
                     "namespaces": stats.namespaces,
                     "diskUsage":"last observed on write or explicit sweep; no startup scan",
