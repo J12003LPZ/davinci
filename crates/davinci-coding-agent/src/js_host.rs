@@ -220,6 +220,10 @@ pub fn resolve_extension_module(dir: &Path) -> Option<PathBuf> {
     None
 }
 
+#[cfg(test)]
+static JS_SESSION_SPAWNS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
 struct PersistentJsSession {
     child: Child,
     stdin: ChildStdin,
@@ -310,6 +314,8 @@ fn extension_timeout_for_op(op: &str) -> Duration {
 
 impl PersistentJsSession {
     fn start(module: &Path) -> Result<Self, String> {
+        #[cfg(test)]
+        JS_SESSION_SPAWNS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let node =
             find_node().ok_or_else(|| "Node.js is not available for JS extensions".to_string())?;
         let runner = runner_path()?;
@@ -1053,9 +1059,8 @@ mod tests {
     use super::*;
     use tempfile::tempdir;
 
-    /// PERSISTENT_JS is one process-wide slot keyed by module path; parallel
-    /// tests with different modules evict each other's live session mid-test.
-    /// Every test that touches the persistent host must hold this lock.
+    /// Persistent JS sessions are process-wide. Tests that inspect spawn counts
+    /// or clear the shared pool serialize through this lock.
     static PERSISTENT_HOST_TEST_LOCK: Mutex<()> = Mutex::new(());
 
     fn persistent_host_guard() -> std::sync::MutexGuard<'static, ()> {
@@ -1076,6 +1081,45 @@ mod tests {
         )
         .unwrap();
         assert!(out.contains("\"path\""), "{out}");
+    }
+
+    #[test]
+    fn alternating_modules_reuse_exactly_two_persistent_runners() {
+        let _persistent = persistent_host_guard();
+        let Some(_) = find_node() else {
+            return;
+        };
+        shutdown_js_pool();
+        JS_SESSION_SPAWNS.store(0, std::sync::atomic::Ordering::SeqCst);
+
+        let first = tempdir().unwrap();
+        let second = tempdir().unwrap();
+        for dir in [&first, &second] {
+            std::fs::write(
+                dir.path().join("index.js"),
+                "module.exports = () => {};\n",
+            )
+            .unwrap();
+        }
+        let first_module = resolve_extension_module(first.path()).unwrap();
+        let second_module = resolve_extension_module(second.path()).unwrap();
+        for _ in 0..10 {
+            let _ = run_persistent_js_extension(
+                &first_module,
+                "load",
+                &serde_json::json!({}),
+            );
+            let _ = run_persistent_js_extension(
+                &second_module,
+                "load",
+                &serde_json::json!({}),
+            );
+        }
+        assert_eq!(
+            JS_SESSION_SPAWNS.load(std::sync::atomic::Ordering::SeqCst),
+            2
+        );
+        shutdown_js_pool();
     }
 
     #[test]
