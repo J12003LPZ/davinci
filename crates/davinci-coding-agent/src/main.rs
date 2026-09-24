@@ -6,8 +6,8 @@ mod browser_integration_tests;
 mod cache_stats;
 mod catalog_refresh;
 mod changelog;
-mod completion_delivery;
 mod codex_probe;
+mod completion_delivery;
 mod davinci_interactive;
 mod davinci_sources;
 mod davinci_surfaces;
@@ -312,7 +312,26 @@ fn main() {
     }
 }
 
+/// Appends `<ms since run start>  <stage>` to the file named by
+/// `DAVINCI_STARTUP_TRACE`, so a slow start can be split into stages without a
+/// profiler. Off, it costs one environment lookup per stage.
+pub(crate) fn startup_mark(stage: &str) {
+    static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    let start = *START.get_or_init(std::time::Instant::now);
+    let Some(path) = std::env::var_os("DAVINCI_STARTUP_TRACE") else {
+        return;
+    };
+    if let Ok(mut file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+    {
+        let _ = writeln!(file, "{:>7} ms  {stage}", start.elapsed().as_millis());
+    }
+}
+
 fn run(raw: Vec<String>) -> Result<i32, String> {
+    startup_mark("start");
     apply_offline_mode(&raw);
     if let Some(result) = davinci_coding_agent::runtime_inspect::try_run(&raw) {
         return result;
@@ -434,6 +453,7 @@ fn run(raw: Vec<String>) -> Result<i32, String> {
         Err(err) if err == NO_SESSION_SELECTED => return Ok(0),
         other => other?,
     };
+    startup_mark("agent built");
     // Evidence older than a week is nobody's: a `read` of its path would
     // have happened in the session that wrote it.
     if let Some(store) = &agent.evidence {
@@ -824,6 +844,7 @@ fn build_agent(parsed: &Args, session_dir: &Path, cwd: &Path) -> Result<Agent, S
         // mode; davinci re-reads it to draw the rows.
         agent.restore_todos();
     }
+    startup_mark("session opened");
     agent.auto_compaction = settings.compaction_enabled();
     agent.compaction = settings.compaction_settings();
     agent.auto_retry = settings.retry_enabled();
@@ -880,6 +901,7 @@ fn build_agent(parsed: &Args, session_dir: &Path, cwd: &Path) -> Result<Agent, S
         }
     }
     let mut host = ExtensionHost::load_with_cwd(&default_agent_dir(), &extensions, cwd);
+    startup_mark("extensions loaded");
     let native_names = host.native_tool_names();
     let mut names = native_names.clone();
     // The extension *paths* are not tool names — TS registers only what an
@@ -958,6 +980,7 @@ fn build_agent(parsed: &Args, session_dir: &Path, cwd: &Path) -> Result<Agent, S
     host.emit(ExtensionEvent::SessionStart);
     let _ = host.describe_js();
     apply_resolved_models(parsed, &mut agent)?;
+    startup_mark("models resolved");
     let ctx = davinci_agent::prompt::PromptContext {
         provider: &agent.provider,
         model_id: &agent.model_id,
@@ -1033,13 +1056,7 @@ pub(crate) fn resolve_model_and_auth(
         storage.set_runtime_override(provider, key);
     }
     if let Some(storage) = storage.as_mut() {
-        maybe_refresh_auth(
-            storage,
-            provider,
-            now_ms(),
-            OAUTH_MIN_VALIDITY_MS,
-            false,
-        );
+        maybe_refresh_auth(storage, provider, now_ms(), OAUTH_MIN_VALIDITY_MS, false);
     }
 
     let env = std::env::vars().collect();
@@ -1412,7 +1429,105 @@ fn load_available_models(parsed: &Args) -> (Vec<davinci_ai::Model>, Option<Strin
     (snapshot.available, error)
 }
 
+/// Everything `build_model_runtime` reads, reduced to a comparable value. The
+/// environment is kept only as a hash so no credential is held in the cache.
+#[derive(Debug, Clone, PartialEq)]
+struct ModelRuntimeKey {
+    args: String,
+    cwd: PathBuf,
+    env_hash: u64,
+    files: Vec<(PathBuf, Option<(std::time::SystemTime, u64)>)>,
+}
+
+impl ModelRuntimeKey {
+    fn current(parsed: &Args) -> Self {
+        use std::hash::{Hash, Hasher};
+        let agent_dir = default_agent_dir();
+        let mut env: Vec<(String, String)> = std::env::vars().collect();
+        env.sort();
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        env.hash(&mut hasher);
+        let stamp = |path: PathBuf| {
+            let meta = std::fs::metadata(&path).ok();
+            let stamp = meta.and_then(|meta| Some((meta.modified().ok()?, meta.len())));
+            (path, stamp)
+        };
+        Self {
+            args: format!(
+                "{:?}|{:?}|{:?}|{}|{:?}",
+                parsed.api_key,
+                parsed.provider,
+                parsed.model,
+                parsed.no_extensions,
+                parsed.extensions
+            ),
+            cwd: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+            env_hash: hasher.finish(),
+            files: vec![
+                stamp(davinci_ai::models_store_path(&agent_dir)),
+                stamp(models_json_path(&agent_dir)),
+                stamp(crate::settings::settings_path(&agent_dir)),
+                stamp(davinci_ai::default_auth_path()),
+                stamp(agent_dir.join("extensions")),
+            ],
+        }
+    }
+
+    /// The same question asked of possibly different file contents: an entry
+    /// for these inputs is stale once any stamp or the environment moves.
+    fn same_inputs(&self, other: &Self) -> bool {
+        self.args == other.args
+            && self.cwd == other.cwd
+            && self
+                .files
+                .iter()
+                .map(|(path, _)| path)
+                .eq(other.files.iter().map(|(path, _)| path))
+    }
+}
+
+/// Recent model runtime snapshots and the inputs each was built from.
+///
+/// Building one loads a throwaway extension host (the native extensions plus a
+/// Node process per JavaScript extension) and re-parses the model catalog, and
+/// one interactive start asked for it several times. A snapshot is reused only
+/// while every input it read is unchanged; `/reload` clears the cache so edited
+/// extension sources are read again, as they are at startup. A rebuild replaces
+/// the stale entry for the same inputs, so an ordinary session keeps one entry.
+static MODEL_RUNTIME_CACHE: Mutex<Vec<(ModelRuntimeKey, ModelRuntimeSnapshot)>> =
+    Mutex::new(Vec::new());
+const MODEL_RUNTIME_CACHE_ENTRIES: usize = 4;
+
+pub(crate) fn clear_model_runtime_cache() {
+    MODEL_RUNTIME_CACHE
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clear();
+}
+
 fn load_model_runtime(parsed: &Args) -> ModelRuntimeSnapshot {
+    let key = ModelRuntimeKey::current(parsed);
+    if let Some((_, snapshot)) = MODEL_RUNTIME_CACHE
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .iter()
+        .find(|(cached, _)| *cached == key)
+    {
+        return snapshot.clone();
+    }
+    let snapshot = build_model_runtime(parsed);
+    let mut cache = MODEL_RUNTIME_CACHE
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    cache.retain(|(cached, _)| !cached.same_inputs(&key));
+    if cache.len() >= MODEL_RUNTIME_CACHE_ENTRIES {
+        cache.remove(0);
+    }
+    cache.push((key, snapshot.clone()));
+    snapshot
+}
+
+fn build_model_runtime(parsed: &Args) -> ModelRuntimeSnapshot {
     let mut models = load_builtin_models();
     let agent_dir = default_agent_dir();
     let store = davinci_ai::load_models_store(&agent_dir);
@@ -4663,6 +4778,7 @@ fn run_interactive(
     // `--legacy-tui` opt back out.
     if !parsed.legacy_tui && std::env::var("PI_DAVINCI").as_deref() != Ok("0") {
         let host = Arc::new(Mutex::new(loaded_extension_host(parsed)));
+        startup_mark("interactive extensions loaded");
         let raw: Vec<String> = std::env::args().skip(1).collect();
         return davinci_interactive::run(parsed, agent, &raw, host, migrated_auth_providers);
     }
@@ -6205,6 +6321,7 @@ fn reload_interactive_resources(
 ) {
     session.keybindings = Keybindings::load(&default_agent_dir());
     apply_discovered_resources(parsed, agent);
+    clear_model_runtime_cache();
     let mut host = loaded_extension_host(parsed);
     host.runtime_flag_values = flag_values_json(parsed);
     host.emit(ExtensionEvent::SessionStart);
@@ -11343,6 +11460,81 @@ mod tests {
         apply_resolved_models(&parsed, &mut agent).unwrap();
         assert_eq!(agent.provider, "openai-codex");
         assert!(!agent.model_id.is_empty());
+    }
+
+    #[test]
+    fn model_runtime_snapshot_is_reused_until_an_input_changes() {
+        let _lock = PROCESS_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        let _config = EnvRestore::set("PI_CODING_AGENT_DIR", &dir.path().to_string_lossy());
+        let _current = EnvRestore::set("DAVINCI_CODING_AGENT_DIR", &dir.path().to_string_lossy());
+        let parsed = Args {
+            no_extensions: true,
+            ..Args::default()
+        };
+        clear_model_runtime_cache();
+        let first = load_model_runtime(&parsed);
+        assert!(!first.stored_providers.contains(&"anthropic".to_string()));
+
+        // Unchanged inputs are served from the cache, not rebuilt: a marker
+        // planted in the cached snapshot comes back.
+        {
+            let key = ModelRuntimeKey::current(&parsed);
+            let mut cache = MODEL_RUNTIME_CACHE
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let (_, snapshot) = cache
+                .iter_mut()
+                .find(|(cached, _)| *cached == key)
+                .expect("first load fills the cache");
+            snapshot
+                .composition_errors
+                .insert("cache-marker".into(), "reused".into());
+        }
+        assert!(load_model_runtime(&parsed)
+            .composition_errors
+            .contains_key("cache-marker"));
+
+        // A login rewrites auth.json, so the next load is rebuilt from disk.
+        let mut storage = AuthStorage::create().unwrap();
+        storage.login_api_key("anthropic", "sk-test").unwrap();
+        let after_login = load_model_runtime(&parsed);
+        assert!(!after_login.composition_errors.contains_key("cache-marker"));
+        assert!(after_login
+            .stored_providers
+            .contains(&"anthropic".to_string()));
+        // The rebuild replaced the stale entry for the same inputs.
+        let login_key = ModelRuntimeKey::current(&parsed);
+        assert_eq!(
+            MODEL_RUNTIME_CACHE
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .iter()
+                .filter(|(cached, _)| cached.same_inputs(&login_key))
+                .count(),
+            1
+        );
+
+        // Environment and argument changes are part of the key too.
+        let key = ModelRuntimeKey::current(&parsed);
+        {
+            let _env = EnvRestore::set("DAVINCI_MODEL_RUNTIME_KEY_PROBE", "1");
+            assert_ne!(ModelRuntimeKey::current(&parsed), key);
+        }
+        let other_model = Args {
+            model: Some("openai/gpt-test".into()),
+            ..parsed.clone()
+        };
+        assert_ne!(ModelRuntimeKey::current(&other_model), key);
+
+        clear_model_runtime_cache();
+        assert!(!MODEL_RUNTIME_CACHE
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .iter()
+            .any(|(cached, _)| cached.same_inputs(&login_key)));
     }
 
     #[test]
