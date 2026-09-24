@@ -43,6 +43,15 @@ process.stdin.on('data', chunk => {
       const doc = message.params.textDocument;
       if (message.method.endsWith('didOpen')) { opens++; texts[doc.uri] = doc.text; }
       else { changes++; texts[doc.uri] = message.params.contentChanges[0].text; }
+      if (mode === 'push-two-phase') {
+        // typescript-language-server publishes syntax diagnostics first and
+        // the semantic pass (type errors) in a later publication.
+        send({ method: 'textDocument/publishDiagnostics', params: { uri: doc.uri, version: doc.version, diagnostics: [] } });
+        setTimeout(() => send({ method: 'textDocument/publishDiagnostics', params: {
+          uri: doc.uri, version: doc.version, diagnostics: texts[doc.uri].trim() === 'bad' ? [{ range, severity: 1, message: 'bad type' }] : []
+        } }), 120);
+        continue;
+      }
       if (mode === 'push-stale-diagnostics') send({ method: 'textDocument/publishDiagnostics', params: {
         uri: doc.uri, version: doc.version - 1, diagnostics: [{ range, severity: 1, message: 'stale error' }]
       } });

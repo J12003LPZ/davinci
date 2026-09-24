@@ -6,7 +6,11 @@ use super::transport::Transport;
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
-use std::time::Instant;
+use std::time::{Duration, Instant};
+
+/// How long a push-diagnostics server must stay quiet before its latest
+/// publication for a document version is taken as complete.
+const DIAGNOSTIC_SETTLE: Duration = Duration::from_millis(400);
 
 #[derive(Debug)]
 pub(super) struct Session {
@@ -226,7 +230,7 @@ impl Session {
             let document = &self.documents[path];
             let mut floor = *self.diagnostic_floor.get(&document.uri).unwrap_or(&0);
             loop {
-                let snapshot =
+                let mut snapshot =
                     self.transport
                         .wait_diagnostics(&document.uri, floor, remaining(deadline)?)?;
                 if snapshot
@@ -235,6 +239,34 @@ impl Session {
                 {
                     floor = snapshot.sequence;
                     continue;
+                }
+                // A push server may publish one version more than once:
+                // typescript-language-server sends syntax diagnostics first
+                // and type errors later. Keep the newest publication until
+                // the server has been quiet for the settle window, so a
+                // file with type errors is not reported clean.
+                loop {
+                    let window = remaining(deadline)
+                        .map(|left| left.min(DIAGNOSTIC_SETTLE))
+                        .unwrap_or_default();
+                    if window.is_zero() {
+                        break;
+                    }
+                    match self
+                        .transport
+                        .wait_diagnostics(&document.uri, snapshot.sequence, window)
+                    {
+                        Ok(newer)
+                            if newer
+                                .version
+                                .is_none_or(|version| version == document.version) =>
+                        {
+                            snapshot = newer
+                        }
+                        Ok(_) => break,
+                        Err(error) if error.code == "diagnostics_pending" => break,
+                        Err(error) => return Err(error),
+                    }
                 }
                 return Ok(json!({"items":snapshot.items,"omitted":snapshot.omitted,
                     "freshness":if snapshot.version.is_some() {"versioned-publication"} else {"unversioned-publication"},
@@ -394,6 +426,26 @@ mod tests {
             )
             .unwrap();
         assert!(session.documents.is_empty());
+    }
+
+    #[test]
+    fn push_diagnostics_wait_for_the_semantic_publication() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let path = root.join("a.ts");
+        std::fs::write(&path, "bad").unwrap();
+        let mut session = Session::start(fixture(&root, "push-two-phase"), deadline()).unwrap();
+        let result = session
+            .execute(
+                "textDocument/diagnostic",
+                "diagnosticProvider",
+                Some(&path),
+                json!({}),
+                &TypeScriptAdapter,
+                deadline(),
+            )
+            .unwrap();
+        assert_eq!(result["items"].as_array().unwrap().len(), 1, "{result}");
     }
 
     #[test]
