@@ -229,18 +229,59 @@ pub struct SecurityArtifactStore {
     root: PathBuf,
 }
 
+fn ensure_private_dir(path: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut permissions = fs::metadata(path)?.permissions();
+        permissions.set_mode(0o700);
+        fs::set_permissions(path, permissions)?;
+    }
+    #[cfg(not(unix))]
+    let _ = path;
+    Ok(())
+}
+
+fn atomic_report_write(path: &Path, bytes: &[u8]) -> Result<(), ToolError> {
+    davinci_sys::fs::atomic_write(path, bytes).map_err(|err| ToolError::Failed(err.to_string()))
+}
+
+fn prune_scan_reports(root: &Path, keep: usize) {
+    let Ok(entries) = fs::read_dir(root) else {
+        return;
+    };
+    let mut entries = entries
+        .flatten()
+        .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_dir()))
+        .map(|entry| {
+            let modified = entry
+                .metadata()
+                .and_then(|metadata| metadata.modified())
+                .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+            (modified, entry.path())
+        })
+        .collect::<Vec<_>>();
+    entries.sort_by_key(|(modified, _)| *modified);
+    let remove = entries.len().saturating_sub(keep);
+    for (_, path) in entries.into_iter().take(remove) {
+        let _ = fs::remove_dir_all(path);
+    }
+}
+
 impl SecurityArtifactStore {
-    pub fn new(repo_id: &str, scan_id: &str) -> Result<Self, ToolError> {
+    pub fn new(agent_dir: &Path, repo_id: &str, scan_id: &str) -> Result<Self, ToolError> {
         if !safe_component(repo_id) || !safe_component(scan_id) {
             return Err(ToolError::Failed(
                 "invalid security artifact identity".into(),
             ));
         }
-        let root = std::env::temp_dir()
-            .join("pi-security-scans")
-            .join(repo_id)
-            .join(scan_id);
+        let reports = agent_dir.join("security-scans");
+        let repo_root = reports.join(repo_id);
+        let root = repo_root.join(scan_id);
         fs::create_dir_all(&root).map_err(|err| ToolError::Failed(err.to_string()))?;
+        ensure_private_dir(&reports).map_err(|err| ToolError::Failed(err.to_string()))?;
+        ensure_private_dir(&repo_root).map_err(|err| ToolError::Failed(err.to_string()))?;
+        ensure_private_dir(&root).map_err(|err| ToolError::Failed(err.to_string()))?;
         Ok(Self { root })
     }
 
@@ -264,26 +305,22 @@ impl SecurityArtifactStore {
             .map_err(|err| ToolError::Failed(err.to_string()))?;
         let coverage = serde_json::to_vec_pretty(&scan.coverage)
             .map_err(|err| ToolError::Failed(err.to_string()))?;
-        fs::write(self.root.join("findings.json"), &findings)
-            .map_err(|err| ToolError::Failed(err.to_string()))?;
-        fs::write(self.root.join("candidates.json"), &candidates)
-            .map_err(|err| ToolError::Failed(err.to_string()))?;
-        fs::write(self.root.join("coverage.json"), &coverage)
-            .map_err(|err| ToolError::Failed(err.to_string()))?;
+        atomic_report_write(&self.root.join("findings.json"), &findings)?;
+        atomic_report_write(&self.root.join("candidates.json"), &candidates)?;
+        atomic_report_write(&self.root.join("coverage.json"), &coverage)?;
         let report = render_report(scan);
-        fs::write(self.root.join("report.md"), &report)
-            .map_err(|err| ToolError::Failed(err.to_string()))?;
+        atomic_report_write(&self.root.join("report.md"), report.as_bytes())?;
         let sarif = render_sarif(scan);
         let sarif_bytes =
             serde_json::to_vec_pretty(&sarif).map_err(|err| ToolError::Failed(err.to_string()))?;
-        fs::write(self.root.join("report.sarif"), &sarif_bytes)
-            .map_err(|err| ToolError::Failed(err.to_string()))?;
-        fs::write(self.root.join("results.sarif"), &sarif_bytes)
-            .map_err(|err| ToolError::Failed(err.to_string()))?;
+        atomic_report_write(&self.root.join("report.sarif"), &sarif_bytes)?;
+        atomic_report_write(&self.root.join("results.sarif"), &sarif_bytes)?;
         let digest = self.combined_digest()?;
-        fs::write(self.root.join("artifact.sha256"), &digest)
-            .map_err(|err| ToolError::Failed(err.to_string()))?;
+        atomic_report_write(&self.root.join("artifact.sha256"), digest.as_bytes())?;
         self.write_manifest(scan)?;
+        if let Some(repo_root) = self.root.parent() {
+            prune_scan_reports(repo_root, 10);
+        }
         Ok(digest)
     }
 
@@ -390,8 +427,7 @@ impl SecurityArtifactStore {
         }
         let content = serde_json::to_vec_pretty(&manifest)
             .map_err(|err| ToolError::Failed(err.to_string()))?;
-        fs::write(self.root.join("scan-manifest.json"), content)
-            .map_err(|err| ToolError::Failed(err.to_string()))
+        atomic_report_write(&self.root.join("scan-manifest.json"), &content)
     }
 
     pub fn read_report(&self) -> Result<String, ToolError> {
@@ -436,6 +472,12 @@ impl SecurityScanController {
             incremental_cache: IncrementalSecurityCache::new(),
             incremental_cache_repo: None,
         }
+    }
+
+    fn artifact_agent_dir(&self) -> PathBuf {
+        self.review_agent_dir
+            .clone()
+            .unwrap_or_else(|| self.cwd.join(".davinci"))
     }
 
     fn prepare_incremental_cache(&mut self, repo_id: &str) {
@@ -583,7 +625,7 @@ impl SecurityScanController {
         scan.coverage.candidate_count = scan.candidates.len();
         scan.coverage.finding_count = scan.findings.len();
         scan.manifest.status = ScanStatus::Draft;
-        let artifact = SecurityArtifactStore::new(&repo_id, &scan_id)?;
+        let artifact = SecurityArtifactStore::new(&self.artifact_agent_dir(), &repo_id, &scan_id)?;
         let digest = artifact.write_scan(&scan)?;
         scan.manifest.artifact_digest = Some(digest);
         artifact.write_manifest(&scan)?;
@@ -1127,7 +1169,7 @@ impl SecurityScanController {
         scan.coverage.candidate_count = scan.candidates.len();
         scan.coverage.finding_count = scan.findings.len();
 
-        let artifact = SecurityArtifactStore::new(&repo_id, &scan_id)
+        let artifact = SecurityArtifactStore::new(&self.artifact_agent_dir(), &repo_id, &scan_id)
             .map_err(|e| format!("failed to initialize security store: {e}"))?;
         scan.manifest.status = ScanStatus::Completed;
         scan.manifest.completed_at = Some(now_ms());
