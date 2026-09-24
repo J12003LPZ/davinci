@@ -1460,8 +1460,15 @@ fn run_turn(
 
         loop {
             let _ = session.reacquire();
+            if last_tick.elapsed() >= davinci_tui::davinci::runtime::TICK {
+                model.tick = model.tick.wrapping_add(1);
+                model.dirty = true;
+                last_tick = Instant::now();
+                poll_jobs(&jobs, model);
+            }
             while let Ok(event) = event_rx.try_recv() {
                 apply(model, &mut turn, &event);
+                model.dirty = true;
             }
             if approval.as_ref().is_some_and(|pending| !pending.is_live()) {
                 approval = None;
@@ -1502,16 +1509,23 @@ fn run_turn(
                 working.seconds = started.elapsed().as_secs();
             }
             voice.tick(model, session.input_pending());
-            session.draw(model)?;
-            voice.drawn();
-            if model.voice.active && !session.mic_visible() {
-                voice.cancel(model);
+            if voice.polling() {
+                model.dirty = true;
+            }
+            if model.dirty {
+                session.draw(model)?;
+                model.dirty = false;
+                voice.drawn();
+                if model.voice.active && !session.mic_visible() {
+                    voice.cancel(model);
+                }
             }
 
             if worker.is_finished() {
                 break;
             }
             if let Some(event) = session.poll_event(Duration::from_millis(40))? {
+                model.dirty = true;
                 if let crossterm::event::Event::Key(key) = event {
                     if voice.key(model, key) {
                         continue;
@@ -1655,11 +1669,6 @@ fn run_turn(
                     }
                     _ => {}
                 }
-            }
-            if last_tick.elapsed() >= davinci_tui::davinci::runtime::TICK {
-                model.tick = model.tick.wrapping_add(1);
-                last_tick = Instant::now();
-                poll_jobs(&jobs, model);
             }
         }
 
@@ -3072,13 +3081,27 @@ fn resolve_scope_expansion_modal(
     model.approval_instructions = None;
     open_ask_overlay(model);
     voice.cancel(model);
+    let mut last_tick = Instant::now();
     loop {
         let _ = session.reacquire();
-        session.draw(model)?;
-        voice.drawn();
+        if last_tick.elapsed() >= davinci_tui::davinci::runtime::TICK {
+            model.tick = model.tick.wrapping_add(1);
+            model.dirty = true;
+            last_tick = Instant::now();
+        }
+        voice.tick(model, session.input_pending());
+        if voice.polling() {
+            model.dirty = true;
+        }
+        if model.dirty {
+            session.draw(model)?;
+            model.dirty = false;
+            voice.drawn();
+        }
         let Some(event) = session.poll_event(Duration::from_millis(40))? else {
             continue;
         };
+        model.dirty = true;
         match event {
             crossterm::event::Event::Key(key) => {
                 if let Some((decision, instructions)) = scope_expansion_answer_key(model, key) {
@@ -3097,6 +3120,9 @@ fn resolve_scope_expansion_modal(
             crossterm::event::Event::Resize(width, height) => {
                 model.width = width.max(20);
                 model.height = height.max(4);
+            }
+            crossterm::event::Event::Paste(text) => {
+                model.paste(&text);
             }
             crossterm::event::Event::Mouse(mouse) => {
                 if session.handle_model_mouse(model, mouse) {
@@ -4340,6 +4366,12 @@ pub fn run(
 
     let result = loop {
         let _ = terminal.reacquire();
+        if last_tick.elapsed() >= davinci_tui::davinci::runtime::TICK {
+            model.tick = model.tick.wrapping_add(1);
+            model.dirty = true;
+            last_tick = Instant::now();
+            poll_jobs(&agent.tool_context.jobs, &mut model);
+        }
         // Lines shared code printed while the screen was ours belong in the
         // transcript, which is the only place a davinci shell can say anything
         // (design.md §6).
@@ -4356,6 +4388,7 @@ pub fn run(
             } else {
                 model.transcript.push(Entry::prose(&line));
             }
+            model.dirty = true;
         }
         // Between turns only: a live turn holds indices into the transcript,
         // and trimming under it would repoint its open tool lines.
@@ -4364,9 +4397,11 @@ pub fn run(
         if dresser.apply_ready(&mut model) {
             model.corpus = corpus(agent, &model.slash_commands, &model.sessions);
             model.corpus_total = model.corpus.len();
+            model.dirty = true;
         }
         for notices in startup_checks.try_iter() {
             model.transcript.extend(startup_notice_entries(&notices));
+            model.dirty = true;
         }
         if last_graph_refresh.elapsed() >= Duration::from_secs(1) {
             last_graph_refresh = Instant::now();
@@ -4377,21 +4412,29 @@ pub fn run(
                     .is_some_and(|run| run.outcome().is_none())
             {
                 refresh_graph_sheet(&mut model, &host);
+                model.dirty = true;
             }
             if model.screen == Screen::Securitas {
                 let locked = host.lock().unwrap_or_else(|e| e.into_inner());
                 if let Ok(Some(value)) = locked.execute_native_command("sec-report", "") {
                     model.security = Some(security_sheet(&value));
+                    model.dirty = true;
                 }
             }
         }
         voice.tick(&mut model, terminal.input_pending());
-        if let Err(err) = terminal.draw(&model) {
-            break Err(err.to_string());
+        if voice.polling() {
+            model.dirty = true;
         }
-        voice.drawn();
-        if model.voice.active && !terminal.mic_visible() {
-            voice.cancel(&mut model);
+        if model.dirty {
+            if let Err(err) = terminal.draw(&model) {
+                break Err(err.to_string());
+            }
+            model.dirty = false;
+            voice.drawn();
+            if model.voice.active && !terminal.mic_visible() {
+                voice.cancel(&mut model);
+            }
         }
 
         let timeout = davinci_tui::davinci::runtime::TICK.saturating_sub(last_tick.elapsed());
@@ -4401,7 +4444,9 @@ pub fn run(
             timeout
         };
         match terminal.poll_event(timeout) {
-            Ok(Some(event)) => match event {
+            Ok(Some(event)) => {
+                model.dirty = true;
+                match event {
                 crossterm::event::Event::Key(key)
                     if key.kind != crossterm::event::KeyEventKind::Release =>
                 {
@@ -4760,18 +4805,12 @@ pub fn run(
                     }
                 }
                 _ => {}
-            },
+                }
+            }
             Ok(None) => {}
             Err(err) => break Err(err.to_string()),
         }
 
-        if last_tick.elapsed() >= davinci_tui::davinci::runtime::TICK {
-            model.tick = model.tick.wrapping_add(1);
-            last_tick = Instant::now();
-            // A job that finishes between turns is news at once, not at
-            // the next prompt.
-            poll_jobs(&agent.tool_context.jobs, &mut model);
-        }
     };
 
     {
