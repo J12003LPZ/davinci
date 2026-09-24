@@ -714,7 +714,8 @@ fn ensure_npm_project(root: &Path) -> Result<(), String> {
 }
 
 fn run_install_command(program: &str, args: &[String], cwd: Option<&Path>) -> Result<(), String> {
-    let mut command = std::process::Command::new(program);
+    let resolved = davinci_sys::process::resolve_program(program);
+    let mut command = std::process::Command::new(resolved);
     command.args(args);
     if let Some(cwd) = cwd {
         command.current_dir(cwd);
@@ -740,42 +741,78 @@ fn install_npm_live(agent_dir: &Path, local: bool, cwd: &Path, spec: &str) -> Re
     run_install_command(&command[0], &args, None)
 }
 
+fn validate_git_arg(value: &str) -> Result<(), String> {
+    if value.starts_with('-') {
+        Err(format!(
+            "refusing git argument that looks like an option: {value}"
+        ))
+    } else {
+        Ok(())
+    }
+}
+
 fn install_git_live(agent_dir: &Path, local: bool, cwd: &Path, spec: &str) -> Result<(), String> {
     let (url, git_ref) = parse_git_source(spec);
+    validate_git_arg(&url)?;
+    if let Some(git_ref) = &git_ref {
+        validate_git_arg(git_ref)?;
+    }
+
     let dest = git_checkout_path(agent_dir, local, cwd, spec)?;
-    if dest.exists() {
-        fs::remove_dir_all(&dest).map_err(|error| error.to_string())?;
-    }
-    if let Some(parent) = dest.parent() {
-        fs::create_dir_all(parent).map_err(|err| err.to_string())?;
-    }
-    let git = std::env::var("PI_GIT_CMD").unwrap_or_else(|_| "git".into());
-    if let Err(err) = run_install_command(
-        &git,
-        &["clone".into(), url.clone(), dest.display().to_string()],
-        None,
-    ) {
-        let _ = fs::remove_dir_all(&dest);
+    let parent = dest.parent().ok_or("git checkout path has no parent")?;
+    fs::create_dir_all(parent).map_err(|err| err.to_string())?;
+    let name = dest
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("pkg");
+    let staging = parent.join(format!(".{name}.staging-{}", uuid::Uuid::new_v4()));
+
+    let result = (|| {
+        let git = std::env::var("PI_GIT_CMD").unwrap_or_else(|_| "git".into());
+        run_install_command(
+            &git,
+            &[
+                "clone".into(),
+                "--".into(),
+                url.clone(),
+                staging.display().to_string(),
+            ],
+            None,
+        )?;
+        if let Some(git_ref) = &git_ref {
+            run_install_command(
+                &git,
+                &["checkout".into(), git_ref.clone(), "--".into()],
+                Some(&staging),
+            )?;
+        }
+        if staging.join("package.json").exists() {
+            let command = npm_command(agent_dir)?;
+            let mut args = command[1..].to_vec();
+            args.push("install".into());
+            if command.last().map(String::as_str) == Some("npm") && command.len() == 1 {
+                args.push("--omit=dev".into());
+            }
+            run_install_command(&command[0], &args, Some(&staging))?;
+        }
+        Ok::<(), String>(())
+    })();
+
+    if let Err(err) = result {
+        let _ = fs::remove_dir_all(&staging);
         return Err(err);
     }
-    if let Some(git_ref) = git_ref {
-        if let Err(err) = run_install_command(&git, &["checkout".into(), git_ref], Some(&dest)) {
-            let _ = fs::remove_dir_all(&dest);
-            return Err(err);
-        }
+
+    let previous = parent.join(format!(".{name}.previous-{}", uuid::Uuid::new_v4()));
+    if dest.exists() {
+        fs::rename(&dest, &previous).map_err(|err| err.to_string())?;
     }
-    if dest.join("package.json").exists() {
-        let command = npm_command(agent_dir)?;
-        let mut args = command[1..].to_vec();
-        args.push("install".into());
-        if command.last().map(String::as_str) == Some("npm") && command.len() == 1 {
-            args.push("--omit=dev".into());
-        }
-        if let Err(err) = run_install_command(&command[0], &args, Some(&dest)) {
-            let _ = fs::remove_dir_all(&dest);
-            return Err(err);
-        }
+    if let Err(err) = fs::rename(&staging, &dest) {
+        let _ = fs::rename(&previous, &dest);
+        let _ = fs::remove_dir_all(&staging);
+        return Err(err.to_string());
     }
+    let _ = fs::remove_dir_all(&previous);
     Ok(())
 }
 
@@ -1234,6 +1271,33 @@ mod tests {
                 "untouched"
             );
         }
+    }
+
+    #[test]
+    fn option_shaped_git_sources_and_refs_are_refused() {
+        assert!(validate_git_arg("--upload-pack=touch /tmp/x").is_err());
+        assert!(validate_git_arg("-c").is_err());
+        assert!(validate_git_arg("https://github.com/a/b.git").is_ok());
+        assert!(validate_git_arg("v1.2.3").is_ok());
+    }
+
+    #[test]
+    fn failed_git_update_keeps_the_existing_checkout() {
+        let dir = tempdir().unwrap();
+        let agent = dir.path().join("agent");
+        let source = "git:example.invalid/x/y";
+        let dest = git_checkout_path(&agent, false, dir.path(), source).unwrap();
+        fs::create_dir_all(&dest).unwrap();
+        fs::write(dest.join("marker"), "keep me").unwrap();
+        let prior = std::env::var_os("PI_GIT_CMD");
+        std::env::set_var("PI_GIT_CMD", "davinci-no-such-git-binary");
+        let result = install_git_live(&agent, false, dir.path(), source);
+        match prior {
+            Some(value) => std::env::set_var("PI_GIT_CMD", value),
+            None => std::env::remove_var("PI_GIT_CMD"),
+        }
+        assert!(result.is_err());
+        assert_eq!(fs::read_to_string(dest.join("marker")).unwrap(), "keep me");
     }
 
     #[test]
