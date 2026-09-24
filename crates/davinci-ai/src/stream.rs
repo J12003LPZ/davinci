@@ -1106,8 +1106,48 @@ fn reasoning_summary() -> Option<&'static str> {
     summary_from(std::env::var("DAVINCI_REASONING_SUMMARY").ok().as_deref())
 }
 
+pub const NATIVE_ITEMS_KEY: &str = "responsesOutputItems";
+pub const NATIVE_MODEL_KEY: &str = "responsesOutputModel";
+
+#[derive(Debug, Default, Clone, Copy)]
+pub struct ResponsesInputOptions<'a> {
+    /// `provider/model` whose saved output items may be replayed verbatim.
+    pub native_items_model: Option<&'a str>,
+    /// Tools represented as Responses custom/freeform tools.
+    pub custom_tools: &'a [&'a str],
+}
+
+pub fn attach_native_items(chat: &mut ChatMessage, items: &[Value], model_key: &str) {
+    if items.is_empty() {
+        return;
+    }
+    chat.extra
+        .insert(NATIVE_ITEMS_KEY.into(), Value::Array(items.to_vec()));
+    chat.extra
+        .insert(NATIVE_MODEL_KEY.into(), Value::String(model_key.into()));
+}
+
+fn native_items<'m>(
+    message: &'m ChatMessage,
+    model_key: Option<&str>,
+) -> Option<&'m Vec<Value>> {
+    let model_key = model_key?;
+    if message.extra.get(NATIVE_MODEL_KEY).and_then(Value::as_str) != Some(model_key) {
+        return None;
+    }
+    message.extra.get(NATIVE_ITEMS_KEY).and_then(Value::as_array)
+}
+
 #[doc(hidden)]
 pub fn openai_responses_input(messages: &[ChatMessage]) -> Vec<Value> {
+    openai_responses_input_with(messages, &ResponsesInputOptions::default())
+}
+
+#[doc(hidden)]
+pub fn openai_responses_input_with(
+    messages: &[ChatMessage],
+    options: &ResponsesInputOptions<'_>,
+) -> Vec<Value> {
     let mut input = Vec::new();
     for message in messages {
         if message.role == "toolResult" {
@@ -1119,6 +1159,10 @@ pub fn openai_responses_input(messages: &[ChatMessage]) -> Vec<Value> {
             continue;
         }
         if message.role == "assistant" {
+            if let Some(items) = native_items(message, options.native_items_model) {
+                input.extend(items.iter().cloned());
+                continue;
+            }
             let text = content_text(&message.content);
             if !text.is_empty() {
                 input.push(serde_json::json!({
@@ -1197,7 +1241,12 @@ fn openai_responses_body(
         trusted_system.is_some(),
     );
 
-    let mut input = openai_responses_input(messages);
+    let model_key = format!("{}/{}", model.provider, model.id);
+    let input_options = ResponsesInputOptions {
+        native_items_model: Some(&model_key),
+        custom_tools: &[],
+    };
+    let mut input = openai_responses_input_with(messages, &input_options);
     if cache_plan.use_stable_bootstrap_breakpoint {
         let text = trusted_system.expect("checked above");
         input.insert(
@@ -1365,8 +1414,13 @@ fn apply_native_responses_resume(
     }
 
     let mut input = resume.turn.full_native_replay_prefix();
-    input.extend(openai_responses_input(
+    let model_key = format!("{}/{}", model.provider, model.id);
+    input.extend(openai_responses_input_with(
         &messages[resume.resume_provider_message_count..],
+        &ResponsesInputOptions {
+            native_items_model: Some(&model_key),
+            custom_tools: &[],
+        },
     ));
     body["input"] = Value::Array(input);
     if crate::trace::enabled() {
