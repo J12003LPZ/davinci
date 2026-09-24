@@ -7,6 +7,7 @@ mod cache_stats;
 mod catalog_refresh;
 mod changelog;
 mod completion_delivery;
+mod codex_probe;
 mod davinci_interactive;
 mod davinci_sources;
 mod davinci_surfaces;
@@ -421,6 +422,10 @@ fn run(raw: Vec<String>) -> Result<i32, String> {
     }
     if let Some(export) = &parsed.export {
         return export_session(&parsed, export);
+    }
+    if let Some(path) = parsed.codex_probe.as_deref() {
+        codex_probe::run(&parsed, std::path::Path::new(path))?;
+        return Ok(0);
     }
 
     let session_dir = resolved_session_dir(&parsed, &cwd);
@@ -993,6 +998,70 @@ fn live_compaction_summarizer(parsed: &Args, agent: &Agent) -> Summarizer {
             thinking_budgets.clone(),
         )
     })
+}
+
+pub(crate) fn resolve_model_and_auth(
+    parsed: &Args,
+    provider: &str,
+    model_id: &str,
+) -> Result<(davinci_ai::Model, ResolvedAuth), String> {
+    let offline = parsed.offline
+        || matches!(
+            std::env::var("PI_OFFLINE").as_deref(),
+            Ok("1") | Ok("true") | Ok("yes")
+        );
+    if offline {
+        return Err("Provider request failed: offline".into());
+    }
+
+    let models = available_models(parsed);
+    let model = find_model(&models, provider, model_id)
+        .cloned()
+        .or_else(|| {
+            models
+                .iter()
+                .find(|item| item.provider == provider && item.id == model_id)
+                .cloned()
+        })
+        .ok_or_else(|| format!("No model available for {provider}/{model_id}"))?;
+
+    let mut storage = AuthStorage::create().ok();
+    if let (Some(storage), Some(key)) = (storage.as_mut(), parsed.api_key.as_deref()) {
+        storage.set_runtime_override(provider, key);
+    }
+    if let Some(storage) = storage.as_mut() {
+        maybe_refresh_auth(
+            storage,
+            provider,
+            now_ms(),
+            OAUTH_MIN_VALIDITY_MS,
+            false,
+        );
+    }
+
+    let env = std::env::vars().collect();
+    let mut auth = storage
+        .as_ref()
+        .and_then(|storage| resolve_provider_auth(provider, storage, &env, true))
+        .unwrap_or(ResolvedAuth {
+            api_key: None,
+            headers: Default::default(),
+            source: "none".into(),
+        });
+    let config = ModelConfig::load(&models_json_path(&default_agent_dir()));
+    let shell_path = load_settings(&default_agent_dir()).shell_path;
+    apply_config_auth_with_shell(
+        &mut auth,
+        &config,
+        provider,
+        Some(&model),
+        &env,
+        shell_path.as_deref(),
+    );
+    if auth.api_key.is_none() && auth.headers.is_empty() && auth.source == "none" {
+        return Err(format!("No credentials available for {provider}"));
+    }
+    Ok((model, auth))
 }
 
 fn complete_simple_summarization(
