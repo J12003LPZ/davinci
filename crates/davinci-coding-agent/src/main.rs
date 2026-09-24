@@ -611,6 +611,8 @@ fn build_agent(parsed: &Args, session_dir: &Path, cwd: &Path) -> Result<Agent, S
     // set_var is only sound before other threads exist. These values are
     // resolved from trust-aware merged settings before MCP or extension
     // runners can spawn any background work.
+    apply_http_proxy_settings(settings.http_proxy.as_deref());
+    crate::settings::apply_web_search_settings(settings.web_search.as_ref());
     if let Some(ms) = settings.websocket_connect_timeout_ms {
         std::env::set_var("PI_WEBSOCKET_CONNECT_TIMEOUT_MS", ms.to_string());
     }
@@ -697,8 +699,6 @@ fn build_agent(parsed: &Args, session_dir: &Path, cwd: &Path) -> Result<Agent, S
         agent.prompt_session = session;
         agent
     };
-    apply_http_proxy_settings(settings.http_proxy.as_deref());
-    crate::settings::apply_web_search_settings(settings.web_search.as_ref());
     if let Some(level) = parsed.thinking {
         agent.thinking_level = level;
     } else if let Some(level) = settings
