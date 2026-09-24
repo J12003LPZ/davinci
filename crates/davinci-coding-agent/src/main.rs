@@ -3561,9 +3561,39 @@ fn run_rpc_with_host(
                 no_extensions: parsed.no_extensions,
                 ..Args::default()
             };
-            let (_reply, events) = rpc_with_ui_abort(&mut runtime.agent, &ui_abort, |agent| {
-                complete_prompt_with_host(&prompt_args, agent, Some(host.clone()), false)
+            let signal = Arc::new(std::sync::atomic::AtomicBool::new(
+                runtime.agent.abort_requested(),
+            ));
+            let previous_abort = runtime.agent.abort_signal.replace(signal.clone());
+            *ui_abort.lock().unwrap_or_else(|err| err.into_inner()) = Some(signal);
+            let remote = runtime.agent.remote_queue();
+            let skills = runtime.agent.skills.clone();
+            let templates = runtime.agent.templates.clone();
+            let (_reply, events) = std::thread::scope(|scope| {
+                let stop = std::sync::atomic::AtomicBool::new(false);
+                let watcher = scope.spawn(|| {
+                    rpc_watch_during_turn(
+                        &leftover,
+                        &rx,
+                        &ui_abort,
+                        &remote,
+                        &skills,
+                        &templates,
+                        &stop,
+                    )
+                });
+                let result = complete_prompt_with_host(
+                    &prompt_args,
+                    &mut runtime.agent,
+                    Some(host.clone()),
+                    false,
+                );
+                stop.store(true, std::sync::atomic::Ordering::Relaxed);
+                let _ = watcher.join();
+                result
             });
+            *ui_abort.lock().unwrap_or_else(|err| err.into_inner()) = None;
+            runtime.agent.abort_signal = previous_abort;
             if let Some(preview) = scope_expansion_preview_from_events(&runtime.agent, &events) {
                 let (report, failed) = rpc_scope_expansion_result(command.id.clone(), &preview);
                 output::write_raw_stdout_line(
@@ -3791,6 +3821,80 @@ fn rpc_next_line(
         }
     }
     rx.lock().ok()?.recv().ok()
+}
+
+fn rpc_write_ok(id: Option<String>, kind: &str) {
+    if let Ok(encoded) = serde_json::to_string(&rpc::ok_response(id, kind, None)) {
+        let _ = output::write_raw_stdout_line(&encoded);
+    }
+}
+
+fn rpc_watch_during_turn(
+    leftover: &Mutex<std::collections::VecDeque<String>>,
+    rx: &Mutex<std::sync::mpsc::Receiver<String>>,
+    active: &RpcUiAbort,
+    remote: &davinci_agent::RemoteQueue,
+    skills: &[davinci_agent::Skill],
+    templates: &[davinci_agent::PromptTemplate],
+    stop: &std::sync::atomic::AtomicBool,
+) {
+    while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+        let line = match rx.lock() {
+            Ok(receiver) => match receiver.recv_timeout(std::time::Duration::from_millis(50)) {
+                Ok(line) => line,
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return,
+            },
+            Err(_) => return,
+        };
+        let parsed = serde_json::from_str::<RpcCommand>(&line).ok();
+        let handled = match parsed {
+            Some(command) if command.kind == "abort" => {
+                if let Some(signal) = active
+                    .lock()
+                    .unwrap_or_else(|err| err.into_inner())
+                    .as_ref()
+                {
+                    signal.store(true, std::sync::atomic::Ordering::Relaxed);
+                }
+                rpc_write_ok(command.id, "abort");
+                true
+            }
+            Some(command) if command.kind == "prompt" => {
+                if let (Some(behavior), Some(message)) = (
+                    command.streaming_behavior.as_deref(),
+                    command.message.as_deref(),
+                ) {
+                    if matches!(behavior, "steer" | "followUp") {
+                        let text = davinci_agent::expand_user_text(message, skills, templates);
+                        let images = command
+                            .images
+                            .as_deref()
+                            .map(davinci_agent::parse_rpc_images)
+                            .unwrap_or_default();
+                        if behavior == "steer" {
+                            remote.push_steer(text, images);
+                        } else {
+                            remote.push_follow_up(text, images);
+                        }
+                        rpc_write_ok(command.id, "prompt");
+                        true
+                    } else {
+                        false
+                    }
+                } else {
+                    false
+                }
+            }
+            _ => false,
+        };
+        if !handled {
+            leftover
+                .lock()
+                .unwrap_or_else(|err| err.into_inner())
+                .push_back(line);
+        }
+    }
 }
 
 type RpcUiAbort = Mutex<Option<Arc<std::sync::atomic::AtomicBool>>>;
