@@ -14,7 +14,6 @@ use std::cmp::Ordering;
 use std::collections::{BTreeMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -442,21 +441,16 @@ pub fn hash_to_uuid(hash: &str) -> String {
 pub use resolve_repo_id as repo_id;
 
 pub fn resolve_repo_id(cwd: &Path) -> String {
-    let remote = Command::new("git")
-        .args(["config", "--get", "remote.origin.url"])
-        .current_dir(cwd)
-        .output()
+    let remote = crate::native_extensions::graph::git::run(
+        cwd,
+        &["config", "--get", "remote.origin.url"],
+    )
+    .ok()
+    .map(|output| String::from_utf8_lossy(&output).trim().to_string())
+    .filter(|value| !value.is_empty());
+    let root = crate::native_extensions::graph::git::run(cwd, &["rev-parse", "--show-toplevel"])
         .ok()
-        .filter(|output| output.status.success())
-        .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_string())
-        .filter(|value| !value.is_empty());
-    let root = Command::new("git")
-        .args(["rev-parse", "--show-toplevel"])
-        .current_dir(cwd)
-        .output()
-        .ok()
-        .filter(|output| output.status.success())
-        .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_string())
+        .map(|output| String::from_utf8_lossy(&output).trim().to_string())
         .filter(|value| !value.is_empty());
     let identity = remote
         .or(root)
