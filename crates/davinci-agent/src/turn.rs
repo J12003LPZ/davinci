@@ -1737,7 +1737,7 @@ impl Agent {
                 details: Some(serde_json::json!({ "denied": true })),
             };
         }
-        if let Err(violation) = self.check_contract_dispatch_boundary(cwd, name) {
+        if let Err(violation) = self.check_contract_dispatch_boundary(cwd, name, args) {
             if let Ok(mut ledger) = self.tool_ledger.lock() {
                 ledger.cancel_reservation(id);
             }
@@ -2195,7 +2195,7 @@ impl Agent {
                     }
                     self.check_contract_gate(cwd, id, name, args)
                         .map_err(|error| error.to_string())?;
-                    self.check_contract_dispatch_boundary(cwd, name)
+                    self.check_contract_dispatch_boundary(cwd, name, args)
                         .map_err(|error| error.to_string())?;
                     if let Some(reason) = self.capability_effect_denial(cwd, name, args) {
                         return Err(reason);
@@ -3074,6 +3074,7 @@ impl Agent {
         &self,
         cwd: &Path,
         name: &str,
+        args: &Value,
     ) -> Result<(), crate::runtime::ScopeViolation> {
         let Some(contract) = self.active_contract() else {
             return Ok(());
@@ -3089,6 +3090,21 @@ impl Agent {
             .any(|effect| matches!(effect, crate::runtime::DeclaredEffect::FileSystemWrite))
         {
             return Ok(());
+        }
+
+        // Host-native file tools write only after `check_call` has verified
+        // every target against the contract's writable scope. That path check
+        // is the filesystem enforcement; external tools still need a sandbox.
+        let host_native_file_tool = crate::tools::BUILTIN_TOOLS.contains(&name)
+            && effects
+                .iter()
+                .all(|effect| matches!(effect, crate::runtime::DeclaredEffect::FileSystemWrite));
+        if host_native_file_tool {
+            let targets = crate::runtime::contracts::extract_tool_targets(name, args);
+            if !targets.is_empty() {
+                contract.check_call(cwd, name, args)?;
+                return Ok(());
+            }
         }
 
         let action = crate::runtime::PreparedAction::new(name, Vec::new(), effects)
@@ -4934,7 +4950,7 @@ mod tests {
     }
 
     #[test]
-    fn f05_hard_contract_refuses_native_write_without_race_safe_boundary() {
+    fn f05_hard_contract_allows_in_scope_native_write_after_path_check() {
         let temp = tempfile::tempdir().unwrap();
         let mut agent = Agent::new("native write containment fixture");
         agent.tools = vec!["write".into()];
@@ -4955,12 +4971,72 @@ mod tests {
         )
         .unwrap();
         agent.set_active_contract(contract);
-        let args = serde_json::json!({"path": "src/ok.rs", "content": "must not land"});
+        let args = serde_json::json!({"path": "src/ok.rs", "content": "allowed"});
+
+        let result = agent.run_prepared_call(temp.path(), "native_write", "write", &args, 0);
+        assert!(!result.is_error, "{}", result.content);
+        assert_eq!(
+            std::fs::read_to_string(temp.path().join("src/ok.rs")).unwrap(),
+            "allowed"
+        );
+    }
+
+    #[test]
+    fn f05_hard_contract_still_refuses_out_of_scope_native_writes() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut agent = Agent::new("out-of-scope native write fixture");
+        agent.tools = vec!["write".into()];
+        agent.permissions = std::sync::Arc::new(crate::PermissionState::new(
+            crate::PermissionPolicy::new(crate::PermissionMode::AlwaysApprove),
+        ));
+        let contract = crate::runtime::TaskContract::new(
+            "contract-native-write-scope",
+            1,
+            crate::TaskId::new(),
+            1,
+            vec!["src/".into()],
+            vec![],
+            false,
+            vec![],
+            vec![],
+            vec![],
+        )
+        .unwrap();
+        agent.set_active_contract(contract);
+        let args = serde_json::json!({"path": "docs/x.md", "content": "out of scope"});
 
         let result = agent.run_prepared_call(temp.path(), "native_write", "write", &args, 0);
         assert!(result.is_error);
-        assert!(result.content.contains("execution_contract_unenforceable"));
-        assert!(!temp.path().join("src/ok.rs").exists());
+        assert!(result.content.contains("scope"), "{}", result.content);
+        assert!(!temp.path().join("docs/x.md").exists());
+    }
+
+    #[test]
+    fn f05_hard_contract_refuses_native_file_tools_without_checked_targets() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut agent = Agent::new("missing native write target fixture");
+        let contract = crate::runtime::TaskContract::new(
+            "contract-native-write-missing-target",
+            1,
+            crate::TaskId::new(),
+            1,
+            vec!["src/".into()],
+            vec![],
+            false,
+            vec![],
+            vec![],
+            vec![],
+        )
+        .unwrap();
+        agent.set_active_contract(contract);
+
+        let result =
+            agent.check_contract_dispatch_boundary(temp.path(), "write", &serde_json::json!({}));
+
+        let violation = result.unwrap_err();
+        assert!(violation
+            .reason
+            .contains("execution_contract_unenforceable"));
     }
 
     #[test]
