@@ -48,6 +48,9 @@ impl std::fmt::Display for ProviderError {
 
 /// TS `isRetryableProviderError`.
 pub fn is_retryable_provider_error(error: &ProviderError) -> bool {
+    if crate::codex_usage::is_usage_limit_error(&error.message) {
+        return false;
+    }
     match error.header("x-should-retry") {
         Some("true") => return true,
         Some("false") => return false,
