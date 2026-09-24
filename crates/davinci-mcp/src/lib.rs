@@ -543,6 +543,27 @@ mod tests {
     }
 
     #[test]
+    fn ping_is_answered_with_an_empty_result() {
+        let mut client = fixture_client(&["--ping"]);
+        let ok = client.call_tool("echo", json!({"text": "x"})).unwrap();
+        assert_eq!(ok.text(), "x ping:0");
+    }
+
+    #[test]
+    fn chatty_stdio_server_does_not_deadlock_the_client() {
+        let mut client = fixture_client(&["--chatty"]);
+        let ok = client.call_tool("echo", json!({"text": "still responsive"})).unwrap();
+        assert_eq!(ok.text(), "still responsive");
+    }
+
+    #[test]
+    fn malformed_correlated_reply_is_a_protocol_error() {
+        let mut client = fixture_client(&["--malformed-reply"]);
+        let error = client.call_tool("echo", json!({"text": "x"})).unwrap_err();
+        assert!(matches!(error, Error::Protocol(_)), "{error}");
+    }
+
+    #[test]
     fn a_hung_call_times_out_with_the_stderr_tail() {
         let mut client = Client::connect_with_timeout(
             "memory",
@@ -558,7 +579,10 @@ mod tests {
         let text = err.to_string();
         assert!(text.contains("timed out"), "{text}");
         assert!(text.contains("hanging on purpose"), "{text}");
-        assert!(client.stderr_tail().unwrap().contains("hanging on purpose"));
+        std::thread::sleep(Duration::from_millis(50));
+        let tail = client.stderr_tail().unwrap();
+        assert!(tail.contains("hanging on purpose"), "{tail}");
+        assert!(tail.contains("cancelled request"), "{tail}");
     }
 
     #[test]

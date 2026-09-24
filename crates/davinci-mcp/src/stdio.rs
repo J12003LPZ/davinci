@@ -60,7 +60,7 @@ struct StderrTail {
 }
 
 pub struct StdioTransport {
-    stdin: ChildStdin,
+    stdin: Arc<Mutex<ChildStdin>>,
     lines: Receiver<std::io::Result<String>>,
     stderr: Arc<(Mutex<StderrTail>, Condvar)>,
     next_id: u64,
@@ -88,10 +88,12 @@ impl StdioTransport {
         let mut child = cmd
             .spawn()
             .map_err(|err| Error::Transport(format!("spawn `{command}`: {err}")))?;
-        let stdin = child
-            .stdin
-            .take()
-            .ok_or_else(|| Error::Transport("stdio server has no stdin".into()))?;
+        let stdin = Arc::new(Mutex::new(
+            child
+                .stdin
+                .take()
+                .ok_or_else(|| Error::Transport("stdio server has no stdin".into()))?,
+        ));
         let stdout = child
             .stdout
             .take()
@@ -130,18 +132,37 @@ impl StdioTransport {
             }
         }
         let (sender, lines) = stdout_channel();
+        let response_writer = Arc::clone(&stdin);
         std::thread::spawn(move || {
             let mut reader = BufReader::new(stdout);
             loop {
                 let line = match read_stdout_line(&mut reader, MAX_STDOUT_LINE_BYTES) {
-                    Ok(Some(line)) => Ok(line),
+                    Ok(Some(line)) => line,
                     Ok(None) => break,
                     Err(error) => {
                         let _ = sender.send(Err(error));
                         break;
                     }
                 };
-                if sender.send(line).is_err() {
+                let Ok(Value::Object(message)) = serde_json::from_str::<Value>(line.trim()) else {
+                    continue;
+                };
+                if let Some(method) = message.get("method").and_then(Value::as_str) {
+                    if let Some(id) = message.get("id").cloned() {
+                        let reply = server_request_reply(id, method);
+                        if let Err(error) = write_shared_line(&response_writer, &reply) {
+                            let _ = sender.send(Err(error));
+                            break;
+                        }
+                    }
+                    continue;
+                }
+                if message.get("id").is_none()
+                    || (!message.contains_key("result") && !message.contains_key("error"))
+                {
+                    continue;
+                }
+                if sender.send(Ok(line)).is_err() {
                     break;
                 }
             }
@@ -202,13 +223,16 @@ impl StdioTransport {
     }
 
     fn write_line(&mut self, value: &Value) -> Result<()> {
-        let mut line =
-            serde_json::to_vec(value).map_err(|err| Error::Protocol(format!("encode: {err}")))?;
-        line.push(b'\n');
-        if let Err(err) = self.stdin.write_all(&line).and_then(|_| self.stdin.flush()) {
-            return Err(self.closed_error(&format!("mcp server stdin: {err}")));
-        }
-        Ok(())
+        write_shared_line(&self.stdin, value)
+            .map_err(|err| self.closed_error(&format!("mcp server stdin: {err}")))
+    }
+
+    fn cancel_request(&mut self, id: &Value) {
+        let _ = self.write_line(&json!({
+            "jsonrpc": "2.0",
+            "method": "notifications/cancelled",
+            "params": { "requestId": id, "reason": "timeout" }
+        }));
     }
 
     /// Wait for the reply to `id`, answering server-to-client requests and
@@ -218,6 +242,7 @@ impl StdioTransport {
         loop {
             let now = Instant::now();
             if now >= deadline {
+                self.cancel_request(id);
                 return Err(self.transport_error(&timeout_message(self.call_timeout)));
             }
             let line = match self.lines.recv_timeout(deadline - now) {
@@ -226,6 +251,7 @@ impl StdioTransport {
                     return Err(self.transport_error(&format!("mcp stdout: {error}")));
                 }
                 Err(RecvTimeoutError::Timeout) => {
+                    self.cancel_request(id);
                     return Err(self.transport_error(&timeout_message(self.call_timeout)));
                 }
                 Err(RecvTimeoutError::Disconnected) => {
@@ -236,23 +262,24 @@ impl StdioTransport {
             if trimmed.is_empty() {
                 continue;
             }
-            // Servers that log to stdout do not fail the call.
             let Ok(Value::Object(message)) = serde_json::from_str::<Value>(trimmed) else {
                 continue;
             };
-            if message.contains_key("method") {
-                // A server-to-client request or notification, never our reply
-                // — even if its id collides with ours.
-                if let Some(request_id) = message.get("id") {
-                    self.refuse_request(request_id.clone())?;
-                }
+            if message.get("id") != Some(id) {
                 continue;
+            }
+            let has_result = message.contains_key("result");
+            let has_error = message.contains_key("error");
+            if message.get("jsonrpc").and_then(Value::as_str) != Some("2.0")
+                || message.contains_key("method")
+                || has_result == has_error
+            {
+                return Err(Error::Protocol(format!(
+                    "invalid MCP response envelope `{trimmed}`"
+                )));
             }
             let parsed: Response = serde_json::from_value(Value::Object(message))
                 .map_err(|err| Error::Protocol(format!("decode `{trimmed}`: {err}")))?;
-            if parsed.id != *id {
-                continue;
-            }
             if let Some(error) = parsed.error {
                 return Err(Error::Rpc {
                     code: error.code,
@@ -263,15 +290,27 @@ impl StdioTransport {
         }
     }
 
-    /// The host is not a nested model: every server request (sampling,
-    /// elicitation, roots) is refused with `-32601`.
-    fn refuse_request(&mut self, id: Value) -> Result<()> {
-        self.write_line(&json!({
+}
+
+fn server_request_reply(id: Value, method: &str) -> Value {
+    if method == "ping" {
+        json!({ "jsonrpc": "2.0", "id": id, "result": {} })
+    } else {
+        json!({
             "jsonrpc": "2.0",
             "id": id,
             "error": { "code": -32601, "message": "method not supported" }
-        }))
+        })
     }
+}
+
+fn write_shared_line(stdin: &Arc<Mutex<ChildStdin>>, value: &Value) -> std::io::Result<()> {
+    let mut line = serde_json::to_vec(value)
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+    line.push(b'\n');
+    let mut writer = stdin.lock().unwrap_or_else(|error| error.into_inner());
+    writer.write_all(&line)?;
+    writer.flush()
 }
 
 const MAX_STDOUT_LINE_BYTES: usize = 16 * 1024 * 1024;

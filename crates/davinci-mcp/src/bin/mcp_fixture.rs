@@ -5,6 +5,9 @@
 //! `--sampling` sends a notification and a `sampling/createMessage` request
 //! (with the caller's own id) before answering `tools/call` and echoes the
 //! error code the client refused it with,
+//! `--ping` sends a server ping and verifies the client answers with `{}`,
+//! `--chatty` emits 10,000 notifications after initialize,
+//! `--malformed-reply` sends a response containing both result and error,
 //! `--hang` never answers `tools/call` (and says so on stderr),
 //! `--die` writes to stderr and exits on `tools/call`,
 //! `--rpc-error` answers `tools/call` without `text` with `-32602`,
@@ -18,6 +21,9 @@ use std::io::{self, BufRead, Write};
 struct Flags {
     log_stdout: bool,
     sampling: bool,
+    ping: bool,
+    chatty: bool,
+    malformed_reply: bool,
     hang: bool,
     die: bool,
     rpc_error: bool,
@@ -31,6 +37,9 @@ fn main() {
     let flags = Flags {
         log_stdout: has("--log-stdout"),
         sampling: has("--sampling"),
+        ping: has("--ping"),
+        chatty: has("--chatty"),
+        malformed_reply: has("--malformed-reply"),
         hang: has("--hang"),
         die: has("--die"),
         rpc_error: has("--rpc-error"),
@@ -55,7 +64,11 @@ fn main() {
         let id = msg.get("id").cloned().unwrap_or(Value::Null);
         let method = msg.get("method").and_then(Value::as_str).unwrap_or("");
         if flags.log_stdout {
-            let _ = writeln!(stdout, "fixture: handling {method}");
+            let _ = writeln!(
+                stdout,
+                "{}",
+                json!({"level":30,"time":1,"msg":format!("handling {method}")})
+            );
             let _ = stdout.flush();
         }
         let cursor = msg
@@ -75,12 +88,30 @@ fn main() {
             "tools/list" => ok(&id, tools_page(&flags, cursor.as_deref())),
             "tools/call" if flags.hang => {
                 eprintln!("hanging on purpose");
+                for line in lines.by_ref() {
+                    let Ok(line) = line else { break };
+                    let Ok(message) = serde_json::from_str::<Value>(line.trim()) else {
+                        continue;
+                    };
+                    if message.get("method").and_then(Value::as_str)
+                        == Some("notifications/cancelled")
+                    {
+                        eprintln!("cancelled request");
+                        break;
+                    }
+                }
                 continue;
             }
             "tools/call" if flags.die => {
                 eprintln!("fatal: boom");
                 std::process::exit(1);
             }
+            "tools/call" if flags.malformed_reply => json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "result": {},
+                "error": { "code": -32603, "message": "both are invalid" }
+            }),
             "tools/call" => {
                 let text = msg
                     .pointer("/params/arguments/text")
@@ -92,6 +123,10 @@ fn main() {
                         if flags.sampling {
                             let code = sample(&mut stdout, &mut lines, &id);
                             text = format!("{text} refused:{code}");
+                        }
+                        if flags.ping {
+                            let code = ping(&mut stdout, &mut lines);
+                            text = format!("{text} ping:{code}");
                         }
                         ok(
                             &id,
@@ -109,6 +144,17 @@ fn main() {
         };
         let _ = writeln!(stdout, "{reply}");
         let _ = stdout.flush();
+        if flags.chatty && method == "initialize" {
+            for i in 0..10_000 {
+                let note = json!({
+                    "jsonrpc":"2.0",
+                    "method":"notifications/message",
+                    "params":{"level":"debug","data":i}
+                });
+                let _ = writeln!(stdout, "{note}");
+            }
+            let _ = stdout.flush();
+        }
     }
 }
 
@@ -190,6 +236,26 @@ fn sample(stdout: &mut io::Stdout, lines: &mut io::Lines<io::StdinLock<'_>>, id:
             .pointer("/error/code")
             .and_then(Value::as_i64)
             .unwrap_or(0);
+    }
+    -1
+}
+
+
+/// Send a basic MCP ping and return 0 when the client answers with a result.
+fn ping(stdout: &mut io::Stdout, lines: &mut io::Lines<io::StdinLock<'_>>) -> i64 {
+    let id = json!("server-ping");
+    let request = json!({ "jsonrpc": "2.0", "id": id, "method": "ping" });
+    let _ = writeln!(stdout, "{request}");
+    let _ = stdout.flush();
+    for line in lines.by_ref() {
+        let Ok(line) = line else { break };
+        let Ok(reply) = serde_json::from_str::<Value>(line.trim()) else {
+            continue;
+        };
+        if reply.get("method").is_some() || reply.get("id") != Some(&id) {
+            continue;
+        }
+        return reply.pointer("/error/code").and_then(Value::as_i64).unwrap_or(0);
     }
     -1
 }
