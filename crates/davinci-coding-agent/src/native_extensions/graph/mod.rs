@@ -1595,6 +1595,26 @@ mod tests {
             .unwrap_or_else(|error| error.into_inner())
     }
 
+    #[test]
+    fn codex_sessions_use_economy_model_for_read_only_roles() {
+        let models = economy_role_models_with(Some("openai-codex/gpt-5.6-sol"), None);
+        assert_eq!(
+            models.get(&Role::Researcher).map(String::as_str),
+            Some("openai-codex/gpt-5.6-luna")
+        );
+        assert_eq!(
+            models.get(&Role::Classifier).map(String::as_str),
+            Some("openai-codex/gpt-5.6-luna")
+        );
+        assert!(!models.contains_key(&Role::Writer));
+        assert!(!models.contains_key(&Role::Reviewer));
+
+        assert!(economy_role_models_with(Some("anthropic/claude-opus-4-5"), None).is_empty());
+        assert!(
+            economy_role_models_with(Some("openai-codex/gpt-5.6-sol"), Some("off")).is_empty()
+        );
+    }
+
     fn controller(cwd: &Path) -> GraphController {
         let mut controller = GraphController::new(cwd.to_path_buf());
         controller.set_session_context(None, None, false);
