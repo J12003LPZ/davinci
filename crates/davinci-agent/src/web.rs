@@ -11,8 +11,9 @@
 //!
 //! The model chooses the URL, so `web_fetch` guards against server-side
 //! request forgery: local hostnames and loopback, private, link-local,
-//! unspecified, multicast and broadcast addresses (literal, DNS-resolved, or
-//! IPv4-mapped IPv6) are refused before any connection, and again on every
+//! unspecified, multicast, broadcast, and `0.0.0.0/8` addresses (literal,
+//! DNS-resolved, or carried by IPv4-mapped, NAT64, 6to4, or Teredo IPv6) are
+//! refused before any connection, and again on every
 //! redirect hop, which the tool follows by hand. Set
 //! `PI_WEB_FETCH_ALLOW_PRIVATE=1` to fetch from a development server on such
 //! an address.
@@ -64,7 +65,8 @@ fn ip_refusal(ip: IpAddr) -> Option<&'static str> {
 
 fn ipv4_refusal(ip: Ipv4Addr) -> Option<&'static str> {
     let octets = ip.octets();
-    if ip.is_unspecified() {
+    if octets[0] == 0 {
+        // 0.0.0.0/8 is "this network"; some stacks route it to localhost.
         Some("unspecified address")
     } else if ip.is_loopback() {
         Some("loopback address")
@@ -101,7 +103,13 @@ fn ipv6_refusal(ip: Ipv6Addr) -> Option<&'static str> {
     if let Some(v4) = ip.to_ipv4() {
         return ipv4_refusal(v4);
     }
-    let first = ip.segments()[0];
+    let segments = ip.segments();
+    if let Some(embedded) = embedded_ipv4(segments) {
+        if let Some(reason) = ipv4_refusal(embedded) {
+            return Some(reason);
+        }
+    }
+    let first = segments[0];
     if first & 0xfe00 == 0xfc00 {
         // fc00::/7, unique local.
         return Some("private address");
@@ -109,6 +117,25 @@ fn ipv6_refusal(ip: Ipv6Addr) -> Option<&'static str> {
     if first & 0xffc0 == 0xfe80 {
         // fe80::/10.
         return Some("link-local address");
+    }
+    None
+}
+
+/// IPv4 carried inside NAT64 (64:ff9b::/96), 6to4 (2002::/16), and Teredo
+/// (2001::/32) addresses. Judge the embedded destination like a direct IPv4
+/// literal before allowing the outer IPv6 address.
+fn embedded_ipv4(segments: [u16; 8]) -> Option<Ipv4Addr> {
+    let from = |high: u16, low: u16| {
+        Ipv4Addr::new((high >> 8) as u8, high as u8, (low >> 8) as u8, low as u8)
+    };
+    if segments[..6] == [0x64, 0xff9b, 0, 0, 0, 0] {
+        return Some(from(segments[6], segments[7]));
+    }
+    if segments[0] == 0x2002 {
+        return Some(from(segments[1], segments[2]));
+    }
+    if segments[0] == 0x2001 && segments[1] == 0 {
+        return Some(from(!segments[6], !segments[7]));
     }
     None
 }
@@ -1530,6 +1557,32 @@ and <a href="https://example.com/x">https://example.com/x</a>.</p>
         assert!(err.ends_with("loopback address"), "{err}");
         let err = judge("ftp://example.com/").unwrap_err();
         assert!(err.contains("only http and https"), "{err}");
+    }
+
+    #[test]
+    fn ipv6_prefixes_that_embed_private_ipv4_are_refused() {
+        use std::net::{IpAddr, Ipv6Addr};
+        let cases = [
+            // NAT64 64:ff9b::/96 -> 169.254.169.254
+            Ipv6Addr::new(0x64, 0xff9b, 0, 0, 0, 0, 0xa9fe, 0xa9fe),
+            // 6to4 2002::/16 -> 10.0.0.1
+            Ipv6Addr::new(0x2002, 0x0a00, 0x0001, 0, 0, 0, 0, 0),
+            // Teredo 2001:0::/32, with the client IPv4 address inverted.
+            Ipv6Addr::new(0x2001, 0, 0, 0, 0, 0, !0x7f00u16, !0x0001u16),
+        ];
+        for ip in cases {
+            assert!(ip_refusal(IpAddr::V6(ip)).is_some(), "{ip}");
+        }
+        assert!(ip_refusal(IpAddr::V6(Ipv6Addr::new(
+            0x2606, 0x4700, 0, 0, 0, 0, 0, 0x1111
+        )))
+        .is_none());
+    }
+
+    #[test]
+    fn whole_zero_network_is_refused() {
+        use std::net::{IpAddr, Ipv4Addr};
+        assert!(ip_refusal(IpAddr::V4(Ipv4Addr::new(0, 1, 2, 3))).is_some());
     }
 
     #[test]
