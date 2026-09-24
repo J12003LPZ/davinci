@@ -4066,6 +4066,21 @@ fn adopt_model(parsed: &crate::args::Args, agent: &mut Agent, model: &mut Model)
     sync_thinking_state(agent, model);
 }
 
+struct HostedTuiGuard;
+
+impl HostedTuiGuard {
+    fn activate() -> Self {
+        let _hosted = HostedTuiGuard::activate();
+        Self
+    }
+}
+
+impl Drop for HostedTuiGuard {
+    fn drop(&mut self) {
+        crate::set_hosted_tui_active(false);
+    }
+}
+
 /// Run the davinci TUI against a live agent until the user leaves.
 pub fn run(
     parsed: &crate::args::Args,
@@ -4309,7 +4324,6 @@ pub fn run(
             // The terminal has to be given back on the way out, whatever the
             // opening turn came to.
             Next::Leave | Next::Fail(_) => {
-                crate::set_hosted_tui_active(false);
                 terminal.close().map_err(|err| err.to_string())?;
                 for (_, line) in crate::take_hosted_lines() {
                     if !line.trim().is_empty() {
@@ -4760,7 +4774,6 @@ pub fn run(
         }
     };
 
-    crate::set_hosted_tui_active(false);
     {
         let locked = host.lock().unwrap_or_else(|e| e.into_inner());
         let _ = locked.execute_native_command("sec-abort", "");
