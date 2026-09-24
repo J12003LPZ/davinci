@@ -976,6 +976,13 @@ mod tests {
     use std::sync::Arc;
 
     #[test]
+    fn codex_credit_estimate_follows_rate_card_ratio() {
+        assert_eq!(codex_credits_estimate(5.0), 125.0);
+        assert_eq!(codex_credits_estimate(0.2), 5.0);
+        assert_eq!(codex_credits_estimate(-1.0), 0.0);
+    }
+
+    #[test]
     fn repository_language_and_cache_surfaces_coexist() {
         let _guard = graph::worker_hooks::submit_test_guard();
         let mut host = NativeExtensionHost::default();
