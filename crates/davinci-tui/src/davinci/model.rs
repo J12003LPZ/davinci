@@ -2594,10 +2594,11 @@ impl Model {
         if self.transcript.len() <= TRANSCRIPT_CAP {
             return;
         }
-        let mut cut = self.transcript.len() - TRANSCRIPT_CAP;
-        while cut < self.transcript.len() && !matches!(self.transcript[cut], Entry::Gap) {
-            cut += 1;
-        }
+        let len = self.transcript.len();
+        let minimum = len - TRANSCRIPT_CAP;
+        let cut = (minimum..len)
+            .find(|&index| matches!(self.transcript[index], Entry::Gap))
+            .unwrap_or(minimum);
         self.transcript.drain(..cut);
     }
 
