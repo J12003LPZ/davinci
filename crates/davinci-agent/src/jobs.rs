@@ -24,6 +24,8 @@ pub mod supervisor;
 const OUTPUT_CAP: usize = 4 * 1024 * 1024;
 /// How much is kept once the cap is passed.
 const OUTPUT_KEEP: usize = 3 * 1024 * 1024;
+/// Full output retained for the newest finished and announced jobs.
+const KEEP_FINISHED_OUTPUT: usize = 16;
 /// Lines of output a finished-job notice carries.
 pub const NOTICE_LINES: usize = 20;
 /// The longest `job_output` will wait for an exit.
@@ -60,10 +62,14 @@ struct OutputBuffer {
     bytes: Vec<u8>,
     dropped: bool,
     total_bytes: u64,
+    released: bool,
 }
 
 impl OutputBuffer {
     fn append(&mut self, chunk: &[u8]) {
+        if self.released {
+            return;
+        }
         self.total_bytes = self.total_bytes.saturating_add(chunk.len() as u64);
         self.bytes.extend_from_slice(chunk);
         if self.bytes.len() > OUTPUT_CAP {
@@ -86,6 +92,12 @@ impl OutputBuffer {
         } else {
             text
         }
+    }
+
+    fn release(&mut self) {
+        self.bytes.clear();
+        self.bytes.shrink_to_fit();
+        self.released = true;
     }
 }
 
@@ -142,12 +154,16 @@ impl Job {
 
     /// Everything the job has printed so far, or its last `tail` lines.
     pub fn output(&self, tail: Option<usize>) -> String {
-        let text = self
+        let output = self
             .shared
             .output
             .lock()
-            .unwrap_or_else(|err| err.into_inner())
-            .text();
+            .unwrap_or_else(|err| err.into_inner());
+        let text = if output.released {
+            released_output_message(self.id)
+        } else {
+            output.text()
+        };
         match tail {
             Some(n) => {
                 let lines: Vec<&str> = text.lines().collect();
@@ -156,6 +172,22 @@ impl Job {
             }
             None => text,
         }
+    }
+
+    fn output_released(&self) -> bool {
+        self.shared
+            .output
+            .lock()
+            .unwrap_or_else(|err| err.into_inner())
+            .released
+    }
+
+    fn release_output(&self) {
+        self.shared
+            .output
+            .lock()
+            .unwrap_or_else(|err| err.into_inner())
+            .release();
     }
 
     pub fn write_stdin(&self, text: &str) -> Result<usize, String> {
@@ -691,7 +723,25 @@ impl JobBook {
                 out.push(notice);
             }
         }
+        self.release_old_output();
         out
+    }
+
+    fn release_old_output(&mut self) {
+        let mut finished: Vec<usize> = self
+            .jobs
+            .iter()
+            .enumerate()
+            .filter(|(_, job)| job.announced && !job.status().is_running())
+            .map(|(index, _)| index)
+            .collect();
+        if finished.len() <= KEEP_FINISHED_OUTPUT {
+            return;
+        }
+        finished.truncate(finished.len() - KEEP_FINISHED_OUTPUT);
+        for index in finished {
+            self.jobs[index].release_output();
+        }
     }
 
     /// Finished jobs the user has not seen finish, marked seen.
@@ -769,6 +819,10 @@ fn unknown_job(book: &JobBook, id: u32) -> String {
     }
 }
 
+fn released_output_message(id: u32) -> String {
+    format!("Output of job {id} was released; rerun the command to see it again.")
+}
+
 /// The reply to a background `bash`: which job, and how to reach it.
 pub fn started_result(id: u32, pid: u32, command: &str) -> crate::ToolResult {
     crate::ToolResult {
@@ -821,6 +875,9 @@ pub fn output_tool(
     }
     let book = book.lock().unwrap_or_else(|err| err.into_inner());
     let job = book.get(id).ok_or_else(|| unknown_job(&book, id))?;
+    if job.output_released() {
+        return Err(released_output_message(id));
+    }
     let status = job.status();
     let output = job.output(tail);
     let elapsed = format_elapsed(job.elapsed());
@@ -1062,6 +1119,60 @@ mod tests {
         // The user's view is a separate ledger.
         assert_eq!(book.lock().unwrap().take_unseen().len(), 1);
         assert!(book.lock().unwrap().take_unseen().is_empty());
+    }
+
+    #[test]
+    fn old_announced_jobs_release_their_output() {
+        let book = Arc::new(Mutex::new(JobBook::default()));
+        let payload = "x".repeat(1024);
+        for i in 0..20 {
+            let command = format!("echo {payload}");
+            let id = book
+                .lock()
+                .unwrap()
+                .register(&format!("echo {i}"), spawn(&command));
+            wait_for_exit(&book, id);
+            let deadline = Instant::now() + Duration::from_secs(5);
+            loop {
+                let total_bytes = book
+                    .lock()
+                    .unwrap()
+                    .get(id)
+                    .unwrap()
+                    .shared
+                    .output
+                    .lock()
+                    .unwrap()
+                    .total_bytes;
+                if total_bytes >= payload.len() as u64 {
+                    break;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "job {id} output was not captured"
+                );
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
+
+        let notices = book.lock().unwrap().take_unannounced();
+        assert_eq!(notices.len(), 20);
+        let kept = book
+            .lock()
+            .unwrap()
+            .jobs
+            .iter()
+            .filter(|job| !job.shared.output.lock().unwrap().bytes.is_empty())
+            .count();
+        assert_eq!(kept, 16);
+        assert_eq!(
+            output_tool(&book, &json!({"jobId": 1}), None).unwrap_err(),
+            "Output of job 1 was released; rerun the command to see it again."
+        );
+        assert!(output_tool(&book, &json!({"jobId": 20}), None)
+            .unwrap()
+            .content
+            .contains(&payload));
     }
 
     #[test]
