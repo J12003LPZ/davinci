@@ -1459,6 +1459,7 @@ fn run_turn(
             .spawn(|| crate::complete_prompt_with_host(parsed, agent, Some(host.clone()), false));
 
         loop {
+            let _ = session.reacquire();
             while let Ok(event) = event_rx.try_recv() {
                 apply(model, &mut turn, &event);
             }
@@ -3072,6 +3073,7 @@ fn resolve_scope_expansion_modal(
     open_ask_overlay(model);
     voice.cancel(model);
     loop {
+        let _ = session.reacquire();
         session.draw(model)?;
         voice.drawn();
         let Some(event) = session.poll_event(Duration::from_millis(40))? else {
@@ -4323,6 +4325,7 @@ pub fn run(
     }
 
     let result = loop {
+        let _ = terminal.reacquire();
         // Lines shared code printed while the screen was ours belong in the
         // transcript, which is the only place a davinci shell can say anything
         // (design.md §6).
@@ -7591,9 +7594,8 @@ impl Shell<'_> {
                 }
             }
         };
-        match davinci_tui::davinci::runtime::Session::open() {
-            Ok(session) => *self.terminal = session,
-            Err(err) => return Next::Fail(err.to_string()),
+        if let Err(err) = self.terminal.reacquire() {
+            return Next::Fail(err.to_string());
         }
         crate::set_hosted_tui_active(true);
         if let Ok((width, height)) = self.terminal.size() {
