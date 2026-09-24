@@ -6791,10 +6791,30 @@ fn login_provider_with_wait(
     }
     if let Some(key) = key {
         if looks_like_oauth_input(key) {
-            let (code, _) = davinci_ai::parse_authorization_input(key);
+            let (code, pasted_state) = davinci_ai::parse_authorization_input(key);
             let code = code.ok_or_else(|| "Missing authorization code.".to_string())?;
-            let pkce = davinci_ai::generate_pkce(uuid::Uuid::new_v4().as_bytes());
-            let tokens = davinci_ai::exchange_authorization_code(provider, &code, Some(&pkce))?;
+            let pending = davinci_ai::take_pending_login(&default_agent_dir(), provider)
+                .ok_or_else(|| {
+                    format!(
+                        "No login in progress for {provider}. Run /login {provider} first, then paste the redirect URL."
+                    )
+                })?;
+            if let (Some(expected), Some(got)) =
+                (pending.state.as_deref(), pasted_state.as_deref())
+            {
+                if expected != got {
+                    return Err(
+                        "The pasted login does not match the one started here (state mismatch)."
+                            .into(),
+                    );
+                }
+            }
+            let tokens = davinci_ai::exchange_authorization_code(
+                provider,
+                &code,
+                pending.pkce.as_ref(),
+                pending.state.as_deref(),
+            )?;
             return store_oauth_tokens(&mut storage, provider, tokens);
         }
         storage
@@ -6809,8 +6829,12 @@ fn login_provider_with_wait(
     }
     if let Some(request) = davinci_ai::fresh_authorize_request(provider) {
         if let Ok(code) = std::env::var("PI_OAUTH_CODE") {
-            let tokens =
-                davinci_ai::exchange_authorization_code(provider, &code, request.pkce.as_ref())?;
+            let tokens = davinci_ai::exchange_authorization_code(
+                provider,
+                &code,
+                request.pkce.as_ref(),
+                request.state.as_deref(),
+            )?;
             return store_oauth_tokens(&mut storage, provider, tokens);
         }
         let should_wait = wait_for_oauth_callback || std::env::var("PI_OAUTH_WAIT").is_ok();
@@ -6830,18 +6854,22 @@ fn login_provider_with_wait(
                 println!("{}", request.url);
                 println!("{}", request.instructions);
                 println!("Waiting for browser callback on {}", server.redirect_uri()?);
-                let response = server.accept_one()?;
+                let response = server.accept_until(
+                    std::time::Instant::now() + std::time::Duration::from_secs(300),
+                )?;
                 if let Some(code) = response.code {
                     let tokens = davinci_ai::exchange_authorization_code(
                         provider,
                         &code,
                         request.pkce.as_ref(),
+                        request.state.as_deref(),
                     )?;
                     return store_oauth_tokens(&mut storage, provider, tokens);
                 }
                 return Err("OAuth callback did not include an authorization code.".into());
             }
         }
+        davinci_ai::save_pending_login(&default_agent_dir(), provider, &request)?;
         println!("{}", request.url);
         println!("{}", request.instructions);
         return Ok(false);

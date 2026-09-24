@@ -34,13 +34,13 @@ const GITHUB_DEVICE_CODE_URL: &str = "https://github.com/login/device/code";
 const RADIUS_CLIENT_ID: &str = "pi-gateway";
 const RADIUS_REDIRECT: &str = "http://127.0.0.1:1456/oauth/callback";
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Pkce {
     pub verifier: String,
     pub challenge: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct AuthorizeRequest {
     pub provider: String,
     pub url: String,
@@ -70,6 +70,48 @@ pub fn fresh_authorize_request(provider: &str) -> Option<AuthorizeRequest> {
     let pkce = generate_pkce(&verifier_bytes);
     let state = uuid::Uuid::new_v4().simple().to_string();
     authorize_request(provider, &pkce, &state)
+}
+
+const PENDING_LOGIN_TTL_MS: u64 = 10 * 60 * 1000;
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct PendingLogin {
+    created_ms: u64,
+    request: AuthorizeRequest,
+}
+
+fn pending_path(agent_dir: &std::path::Path, provider: &str) -> std::path::PathBuf {
+    agent_dir
+        .join("oauth-pending")
+        .join(format!("{provider}.json"))
+}
+
+/// Keep the PKCE verifier and state of the URL we printed so a code pasted in
+/// a later invocation is exchanged with the matching verifier.
+pub fn save_pending_login(
+    agent_dir: &std::path::Path,
+    provider: &str,
+    request: &AuthorizeRequest,
+) -> Result<(), String> {
+    let pending = PendingLogin {
+        created_ms: crate::models_store::now_ms(),
+        request: request.clone(),
+    };
+    let bytes = serde_json::to_vec(&pending).map_err(|err| err.to_string())?;
+    davinci_sys::fs::atomic_write_private(&pending_path(agent_dir, provider), &bytes)
+        .map_err(|err| err.to_string())
+}
+
+pub fn take_pending_login(
+    agent_dir: &std::path::Path,
+    provider: &str,
+) -> Option<AuthorizeRequest> {
+    let path = pending_path(agent_dir, provider);
+    let raw = std::fs::read(&path).ok()?;
+    let _ = std::fs::remove_file(&path);
+    let pending: PendingLogin = serde_json::from_slice(&raw).ok()?;
+    let age = crate::models_store::now_ms().saturating_sub(pending.created_ms);
+    (age <= PENDING_LOGIN_TTL_MS).then_some(pending.request)
 }
 
 fn base64url(bytes: &[u8]) -> String {
@@ -141,14 +183,14 @@ pub fn authorize_request(provider: &str, pkce: &Pkce, state: &str) -> Option<Aut
                 .append_pair("scope", ANTHROPIC_SCOPES)
                 .append_pair("code_challenge", &pkce.challenge)
                 .append_pair("code_challenge_method", "S256")
-                .append_pair("state", &pkce.verifier);
+                .append_pair("state", state);
             Some(AuthorizeRequest {
                 provider: provider.into(),
                 url: url.to_string(),
                 token_url: ANTHROPIC_TOKEN_URL.into(),
                 instructions: "Complete login in your browser. If the browser is on another machine, paste the final redirect URL here.".into(),
                 pkce: Some(pkce.clone()),
-                state: Some(pkce.verifier.clone()),
+                state: Some(state.to_string()),
             })
         }
         "openai-codex" => {
@@ -406,6 +448,7 @@ pub fn exchange_authorization_code(
     provider: &str,
     code: &str,
     pkce: Option<&Pkce>,
+    state: Option<&str>,
 ) -> Result<OauthTokens, String> {
     if code.starts_with("pi-fixture-") || std::env::var("PI_OAUTH_FIXTURE").is_ok() {
         return Ok(OauthTokens {
@@ -414,9 +457,9 @@ pub fn exchange_authorization_code(
             expires: Some(crate::models_store::now_ms().saturating_add(3_600_000)),
         });
     }
-    let request =
-        token_exchange_request(provider, code, pkce, pkce.map(|p| p.verifier.as_str()))
-            .ok_or_else(|| format!("OAuth token exchange is not configured for {provider}"))?;
+    let exchange_state = state.or_else(|| pkce.map(|p| p.verifier.as_str()));
+    let request = token_exchange_request(provider, code, pkce, exchange_state)
+        .ok_or_else(|| format!("OAuth token exchange is not configured for {provider}"))?;
     post_token_exchange(&request)
 }
 
@@ -589,13 +632,21 @@ mod tests {
         // credential nothing ever renews.
         let pkce = generate_pkce(&[7u8; 32]);
         let exchanged =
-            exchange_authorization_code("openai-codex", "pi-fixture-code", Some(&pkce)).unwrap();
+            exchange_authorization_code("openai-codex", "pi-fixture-code", Some(&pkce), None).unwrap();
         assert!(exchanged.expires.is_some());
         assert!(exchanged.refresh.is_some());
 
         let refreshed = refresh_oauth_token("openai-codex", "pi-fixture-refresh").unwrap();
         assert!(refreshed.expires.is_some());
         assert_eq!(refreshed.refresh.as_deref(), Some("pi-fixture-refresh"));
+    }
+
+    #[test]
+    fn anthropic_state_is_not_the_pkce_verifier() {
+        let pkce = generate_pkce(b"0123456789abcdef0123456789abcdef");
+        let request = authorize_request("anthropic", &pkce, "random-state").unwrap();
+        assert_eq!(request.state.as_deref(), Some("random-state"));
+        assert!(!request.url.contains(&pkce.verifier));
     }
 
     #[test]
@@ -626,7 +677,7 @@ mod tests {
             );
         }
         let exchanged =
-            exchange_authorization_code("anthropic", "pi-fixture-code", Some(&pkce)).unwrap();
+            exchange_authorization_code("anthropic", "pi-fixture-code", Some(&pkce), None).unwrap();
         assert!(exchanged.access.contains("anthropic"));
         let anthropic_token =
             token_exchange_request("anthropic", "abc", Some(&pkce), Some("st")).unwrap();

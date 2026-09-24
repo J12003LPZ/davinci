@@ -469,6 +469,7 @@ version = "1.0.71"
 dependencies = [
  "base64",
  "davinci-protocol",
+ "davinci-sys",
  "davinci-telemetry",
  "regex",
  "rustls",

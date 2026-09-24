@@ -134,7 +134,8 @@ pub use oauth_callback::{
 pub use oauth_providers::{
     authorize_request, device_status_from_error, exchange_authorization_code,
     fresh_authorize_request, generate_pkce, oauth_providers, parse_authorization_input,
-    refresh_oauth_token, token_exchange_request, token_refresh_request, AuthorizeRequest,
+    refresh_oauth_token, save_pending_login, take_pending_login, token_exchange_request,
+    token_refresh_request, AuthorizeRequest,
     OauthTokens, Pkce, TokenExchangeRequest,
 };
 pub use openai_cache_diagnostics::{

@@ -335,6 +335,12 @@ impl CallbackServer {
         provider: CallbackProvider,
         expected_state: impl Into<String>,
     ) -> Result<Self, String> {
+        let ip: std::net::IpAddr = host
+            .parse()
+            .map_err(|_| format!("OAuth callback host must be an IP address, got {host}"))?;
+        if !ip.is_loopback() {
+            return Err(format!("OAuth callback host must be loopback, got {host}"));
+        }
         let listener =
             TcpListener::bind((host, port)).map_err(|err| format!("OAuth callback bind: {err}"))?;
         listener
@@ -368,6 +374,38 @@ impl CallbackServer {
             .accept()
             .map_err(|err| format!("OAuth callback accept: {err}"))?;
         self.serve(stream)
+    }
+
+    /// Serve requests until one carries an authorization code or the deadline
+    /// passes. Browser preconnects, favicon fetches, and wrong paths do not
+    /// consume the callback.
+    pub fn accept_until(
+        &mut self,
+        deadline: std::time::Instant,
+    ) -> Result<CallbackResponse, String> {
+        self.listener
+            .set_nonblocking(true)
+            .map_err(|err| err.to_string())?;
+        loop {
+            match self.listener.accept() {
+                Ok((stream, _)) => {
+                    stream
+                        .set_nonblocking(false)
+                        .map_err(|err| err.to_string())?;
+                    let response = self.serve(stream)?;
+                    if response.code.is_some() {
+                        return Ok(response);
+                    }
+                }
+                Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                    if std::time::Instant::now() >= deadline {
+                        return Err("Timed out waiting for the browser login callback.".into());
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                }
+                Err(err) => return Err(format!("OAuth callback accept: {err}")),
+            }
+        }
     }
 
     fn serve(&mut self, mut stream: TcpStream) -> Result<CallbackResponse, String> {
@@ -564,4 +602,42 @@ mod tests {
         assert_eq!(response.code.as_deref(), Some("pi-fixture-loop"));
         assert!(response.body.contains(TITLE_SUCCESS));
     }
+    #[test]
+    fn stray_requests_do_not_consume_the_callback() {
+        let mut server =
+            CallbackServer::bind("127.0.0.1", 0, CallbackProvider::OpenAiCodex, "state-1")
+                .unwrap();
+        let addr = server.local_addr().unwrap();
+        let client = std::thread::spawn(move || {
+            for target in ["/favicon.ico", "/auth/callback?code=real&state=state-1"] {
+                let mut stream = std::net::TcpStream::connect(addr).unwrap();
+                use std::io::{Read, Write};
+                write!(
+                    stream,
+                    "GET {target} HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n"
+                )
+                .unwrap();
+                let mut sink = Vec::new();
+                let _ = stream.read_to_end(&mut sink);
+            }
+        });
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let response = server.accept_until(deadline).unwrap();
+        client.join().unwrap();
+        assert_eq!(response.code.as_deref(), Some("real"));
+    }
+
+    #[test]
+    fn accept_until_times_out() {
+        let mut server =
+            CallbackServer::bind("127.0.0.1", 0, CallbackProvider::OpenAiCodex, "s").unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(200);
+        assert!(server.accept_until(deadline).is_err());
+    }
+
+    #[test]
+    fn non_loopback_bind_is_refused() {
+        assert!(CallbackServer::bind("0.0.0.0", 0, CallbackProvider::OpenAiCodex, "s").is_err());
+    }
+
 }
