@@ -102,7 +102,7 @@ pub fn git_install_root(agent_dir: &Path, local: bool, cwd: &Path) -> PathBuf {
 }
 
 
-fn git_checkout_path(
+pub fn git_checkout_path(
     agent_dir: &Path,
     local: bool,
     cwd: &Path,
