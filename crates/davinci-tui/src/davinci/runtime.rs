@@ -468,7 +468,8 @@ impl Session {
     /// the tab strip, where they are legible with the terminal in the
     /// background.
     pub fn set_title(&mut self, title: &str) -> io::Result<()> {
-        execute!(io::stdout(), SetTitle(title))
+        let title = super::sanitize::terminal_safe(title);
+        execute!(io::stdout(), SetTitle(title.as_ref()))
     }
 
     pub fn size(&self) -> io::Result<(u16, u16)> {
