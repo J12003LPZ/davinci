@@ -294,7 +294,7 @@ fn write_trust_file(path: &Path, data: &BTreeMap<String, Value>) -> Result<(), S
         "{}\n",
         serde_json::to_string_pretty(&Value::Object(sorted)).map_err(|err| err.to_string())?
     );
-    fs::write(path, body).map_err(|err| err.to_string())
+    davinci_sys::fs::atomic_write(path, body.as_bytes()).map_err(|err| err.to_string())
 }
 
 fn find_nearest_trust_entry(

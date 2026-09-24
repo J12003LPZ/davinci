@@ -1357,18 +1357,45 @@ fn prune_nulls(value: &mut serde_json::Value) {
     }
 }
 
+const SETTINGS_LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
+
 pub fn save_settings(agent_dir: &Path, settings: &Settings) -> Result<(), String> {
     fs::create_dir_all(agent_dir).map_err(|err| err.to_string())?;
     let path = settings_path(agent_dir);
+    with_settings_lock(&path, || write_settings_locked(&path, settings))
+}
+
+pub fn update_settings(
+    agent_dir: &Path,
+    change: impl FnOnce(&mut Settings),
+) -> Result<Settings, String> {
+    fs::create_dir_all(agent_dir).map_err(|err| err.to_string())?;
+    let path = settings_path(agent_dir);
     with_settings_lock(&path, || {
-        let mut value = serde_json::to_value(settings).map_err(|e| e.to_string())?;
-        prune_nulls(&mut value);
-        fs::write(
-            &path,
-            serde_json::to_string_pretty(&value).map_err(|e| e.to_string())?,
-        )
-        .map_err(|err| err.to_string())
+        refuse_unparseable(&path)?;
+        let mut settings = load_settings_file(&path);
+        change(&mut settings);
+        write_settings_locked(&path, &settings)?;
+        Ok(settings)
     })
+}
+
+fn refuse_unparseable(path: &Path) -> Result<(), String> {
+    match fs::read_to_string(path) {
+        Ok(raw) if !raw.trim().is_empty() && parse_settings_value(&raw).is_none() => Err(format!(
+            "{} is not valid JSON; fix or remove it before davinci changes it (nothing was written)",
+            path.display()
+        )),
+        _ => Ok(()),
+    }
+}
+
+fn write_settings_locked(path: &Path, settings: &Settings) -> Result<(), String> {
+    refuse_unparseable(path)?;
+    let mut value = serde_json::to_value(settings).map_err(|err| err.to_string())?;
+    prune_nulls(&mut value);
+    let text = serde_json::to_string_pretty(&value).map_err(|err| err.to_string())?;
+    davinci_sys::fs::atomic_write(path, text.as_bytes()).map_err(|err| err.to_string())
 }
 
 /// TS `proper-lockfile` / `lockfile.lockSync` sibling lock (`settings.json.lock`).
@@ -1382,46 +1409,13 @@ pub fn with_settings_lock<T>(
     path: &Path,
     write: impl FnOnce() -> Result<T, String>,
 ) -> Result<T, String> {
-    let lock_path = settings_lock_path(path);
-    let _guard = acquire_settings_lock(&lock_path)?;
+    let _guard = davinci_sys::lock::LockFile::acquire(
+        &settings_lock_path(path),
+        SETTINGS_LOCK_WAIT,
+        davinci_sys::lock::DEFAULT_STALE_AFTER,
+    )
+    .map_err(|err| format!("Failed to acquire settings lock: {err}"))?;
     write()
-}
-
-struct SettingsLock(PathBuf);
-
-impl Drop for SettingsLock {
-    fn drop(&mut self) {
-        let _ = fs::remove_file(&self.0);
-    }
-}
-
-fn acquire_settings_lock(lock_path: &Path) -> Result<SettingsLock, String> {
-    const MAX_ATTEMPTS: u32 = 10;
-    const DELAY_MS: u64 = 20;
-    let mut last_error = None;
-    for attempt in 1..=MAX_ATTEMPTS {
-        match fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(lock_path)
-        {
-            Ok(_) => return Ok(SettingsLock(lock_path.to_path_buf())),
-            Err(err)
-                if err.kind() == std::io::ErrorKind::AlreadyExists && attempt < MAX_ATTEMPTS =>
-            {
-                last_error = Some(err.to_string());
-                std::thread::sleep(std::time::Duration::from_millis(DELAY_MS));
-            }
-            Err(err) => {
-                return Err(if err.kind() == std::io::ErrorKind::AlreadyExists {
-                    "Failed to acquire settings lock".into()
-                } else {
-                    err.to_string()
-                });
-            }
-        }
-    }
-    Err(last_error.unwrap_or_else(|| "Failed to acquire settings lock".into()))
 }
 
 pub fn should_run_first_time_setup(settings_path: &Path) -> bool {
@@ -1546,6 +1540,53 @@ pub fn is_trusted(settings: &Settings, cwd: &Path, override_trust: Option<bool>)
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn saving_never_overwrites_a_file_that_does_not_parse() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = settings_path(dir.path());
+        fs::write(&path, "{ \"theme\": \"dark\", // my comment\n }").unwrap();
+        let err = save_settings(dir.path(), &Settings::default()).unwrap_err();
+        assert!(err.contains("not valid JSON"), "{err}");
+        assert!(fs::read_to_string(&path).unwrap().contains("my comment"));
+        assert!(update_settings(dir.path(), |settings| {
+            settings.packages.push("npm:x".into());
+        })
+        .is_err());
+    }
+
+    #[test]
+    fn stale_settings_lock_is_taken_over() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = settings_path(dir.path());
+        let lock = settings_lock_path(&path);
+        fs::write(&lock, "999999\n").unwrap();
+        let old = std::time::SystemTime::now() - std::time::Duration::from_secs(60);
+        fs::File::options()
+            .write(true)
+            .open(&lock)
+            .unwrap()
+            .set_modified(old)
+            .unwrap();
+        save_settings(dir.path(), &Settings::default()).unwrap();
+    }
+
+    #[test]
+    fn update_settings_changes_packages_without_losing_other_fields() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            settings_path(dir.path()),
+            r#"{"theme":"dark","packages":[]}"#,
+        )
+        .unwrap();
+        update_settings(dir.path(), |settings| {
+            settings.packages.push("npm:x".into());
+        })
+        .unwrap();
+        let raw = fs::read_to_string(settings_path(dir.path())).unwrap();
+        assert!(raw.contains("\"theme\": \"dark\""));
+        assert!(raw.contains("npm:x"));
+    }
 
     #[test]
     fn max_model_turns_is_optional_and_zero_can_be_configured() {

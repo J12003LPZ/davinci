@@ -7,7 +7,7 @@ use crate::self_update::{
     self_update_command_for_method, self_update_unavailable_instruction, update_instruction,
     InstallMethod, PackageTarget, PACKAGE_NAME,
 };
-use crate::settings::{load_settings, save_settings, PackageSource, Settings};
+use crate::settings::{load_settings, save_settings, update_settings, PackageSource, Settings};
 use davinci_tui::{Component, ConfigResource, ConfigResourceKind, ConfigScope, ConfigSelector};
 
 const CANNOT_SELF_UPDATE: &str = "error: pi cannot self-update this installation.";
@@ -47,9 +47,10 @@ pub fn handle_package_command(
         }
         "remove" | "uninstall" => {
             let source = source.ok_or("remove <source> [-l]")?;
-            settings.extensions.retain(|item| item != &source);
-            settings.packages.retain(|item| item.source() != source);
-            save_settings(agent_dir, &settings)?;
+            update_settings(agent_dir, |settings| {
+                settings.extensions.retain(|item| item != &source);
+                settings.packages.retain(|item| item.source() != source);
+            })?;
             Ok(format!("Removed {source}{}", scope(local)))
         }
         "update" => handle_update(args, agent_dir),
@@ -520,7 +521,6 @@ pub fn git_install_root(agent_dir: &Path, local: bool, cwd: &Path) -> PathBuf {
 }
 
 fn install_and_persist(source: &str, local: bool, agent_dir: &Path) -> Result<String, String> {
-    let mut settings = load_settings(agent_dir);
     let parsed = parse_package_source(source);
     match &parsed {
         ParsedSource::Local(path) => {
@@ -537,13 +537,14 @@ fn install_and_persist(source: &str, local: bool, agent_dir: &Path) -> Result<St
             install_remote_package(agent_dir, "git", &name, url, local)?;
         }
     }
-    if !settings.extensions.contains(&source.to_string()) {
-        settings.extensions.push(source.to_string());
-    }
-    if !settings.packages.iter().any(|item| item.source() == source) {
-        settings.packages.push(source.into());
-    }
-    save_settings(agent_dir, &settings)?;
+    update_settings(agent_dir, |settings| {
+        if !settings.extensions.contains(&source.to_string()) {
+            settings.extensions.push(source.to_string());
+        }
+        if !settings.packages.iter().any(|item| item.source() == source) {
+            settings.packages.push(source.into());
+        }
+    })?;
     Ok(source.to_string())
 }
 
