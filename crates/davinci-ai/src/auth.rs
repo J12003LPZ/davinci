@@ -722,14 +722,13 @@ pub fn parse_copilot_available_model_ids(raw: &str) -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+    use tempfile::tempdir;
+
     #[test]
     fn fixture_hooks_are_on_in_test_builds() {
         assert!(crate::fixtures::enabled());
     }
-
-
-    use super::*;
-    use tempfile::tempdir;
 
     #[test]
     fn auth_path_keeps_legacy_logins_when_current_catalog_directory_exists() {

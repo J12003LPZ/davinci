@@ -8005,20 +8005,20 @@ fn configure_security_review(
         if fixtures_enabled() {
             if let Ok(path) = std::env::var("PI_SECURITY_SCAN_FIXTURE") {
                 let runner = SecurityWorkerRunner::from_offline_fixture(Path::new(&path))?;
-            let config = crate::settings::load_security_scan_config(
-                &default_agent_dir(),
-                &agent.cwd,
-                false,
-            )?;
-            let mut native = host
-                .native
-                .lock()
-                .map_err(|_| "native host lock poisoned")?;
-            native.security.configure_review(runner, config);
-            native.security.set_review_storage(default_agent_dir());
-            davinci_agent::runtime::capacity::bind_shared_directory(
-                default_agent_dir().join("capacity"),
-            );
+                let config = crate::settings::load_security_scan_config(
+                    &default_agent_dir(),
+                    &agent.cwd,
+                    false,
+                )?;
+                let mut native = host
+                    .native
+                    .lock()
+                    .map_err(|_| "native host lock poisoned")?;
+                native.security.configure_review(runner, config);
+                native.security.set_review_storage(default_agent_dir());
+                davinci_agent::runtime::capacity::bind_shared_directory(
+                    default_agent_dir().join("capacity"),
+                );
                 return Ok(());
             }
         }

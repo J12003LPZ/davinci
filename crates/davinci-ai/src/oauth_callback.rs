@@ -602,6 +602,7 @@ mod tests {
         assert_eq!(response.code.as_deref(), Some("pi-fixture-loop"));
         assert!(response.body.contains(TITLE_SUCCESS));
     }
+
     #[test]
     fn stray_requests_do_not_consume_the_callback() {
         let mut server =
@@ -639,5 +640,4 @@ mod tests {
     fn non_loopback_bind_is_refused() {
         assert!(CallbackServer::bind("0.0.0.0", 0, CallbackProvider::OpenAiCodex, "s").is_err());
     }
-
 }
