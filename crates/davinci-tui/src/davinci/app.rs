@@ -248,6 +248,7 @@ fn command_panel_frame(
     height: usize,
 ) -> Vec<Line<'static>> {
     let th = &model.theme;
+    let cc = th.cc();
     let chrome = sheet::chrome(model);
     let notices: Vec<Line<'static>> = model
         .section_notice
@@ -296,15 +297,15 @@ fn command_panel_frame(
     ) {
         rows.push(Line::from(ui::span(
             "▔".repeat(usize::from(model.width)),
-            th.border,
+            cc.permission,
         )));
     } else {
         rows.push(chrome::effort_rule(model));
     }
     rows.push(Line::from(ui::truncate_run(
         vec![
-            ui::span("   ", th.text),
-            ui::span_strong(sheet::title(model.screen), th.primary, th),
+            ui::span("   ", cc.inactive),
+            ui::span_strong(sheet::title(model.screen), cc.permission, th),
         ],
         model.width,
     )));
@@ -317,7 +318,7 @@ fn command_panel_frame(
     let hint = chrome
         .as_ref()
         .and_then(|chrome| sheet::hint_row(model, chrome))
-        .unwrap_or_else(|| Line::from(ui::span("   Esc to close", th.muted)));
+        .unwrap_or_else(|| Line::from(ui::span("   Esc to close", cc.inactive)));
     rows.push(hint);
     pad_to(
         rows.into_iter()
