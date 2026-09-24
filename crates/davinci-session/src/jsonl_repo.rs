@@ -11,7 +11,7 @@ use uuid::Uuid;
 use crate::codec::{encode_header, encode_mutation, parse_header, parse_mutation};
 use crate::repo::{
     custom_entry, user_message_entry, BranchBounds, EntryQuery, ForkOptions, LogItem, LogOptions,
-    RecordQuery, Session, SessionStats,
+    PlannedEntryAppend, RecordQuery, Session, SessionStats,
 };
 use crate::types::{JsonlV4Header, LaneRecord, SessionEntry};
 use crate::{now_ms, LanePointer, SessionError, SessionMutation};
@@ -521,7 +521,10 @@ impl JsonlStoredSession {
         entry: SessionEntry,
         lane: &str,
     ) -> Result<SessionEntry, SessionError> {
-        self.commit_change(|session| session.append_entry(entry, lane))
+        self.require_writable()?;
+        let (mutation, entry) = self.session.plan_entry(entry, lane)?;
+        self.commit_mutation(mutation)?;
+        Ok(entry)
     }
 
     pub fn append_entry_once(
@@ -531,9 +534,17 @@ impl JsonlStoredSession {
         entry: SessionEntry,
         lane: &str,
     ) -> Result<SessionEntry, SessionError> {
-        self.commit_change(|session| {
-            session.append_entry_once(event_id, expected_parent_id, entry, lane)
-        })
+        self.require_writable()?;
+        match self
+            .session
+            .plan_entry_once(lane, event_id, expected_parent_id, entry)?
+        {
+            PlannedEntryAppend::Existing(entry) => Ok(entry),
+            PlannedEntryAppend::Mutation { mutation, entry } => {
+                self.commit_mutation(mutation)?;
+                Ok(entry)
+            }
+        }
     }
 
     pub fn append_custom_entry(
@@ -557,50 +568,56 @@ impl JsonlStoredSession {
     }
 
     pub fn append_record(&mut self, record: LaneRecord) -> Result<LaneRecord, SessionError> {
-        self.commit_change(|session| session.append_record(record))
+        self.require_writable()?;
+        let (mutation, record) = self.session.plan_record(record)?;
+        self.commit_mutation(mutation)?;
+        Ok(record)
     }
 
     pub fn create_lane(&mut self, lane: &str, at: Option<&str>) -> Result<(), SessionError> {
-        self.commit_change(|session| session.create_lane(lane, at))
+        self.require_writable()?;
+        let mutation = self.session.plan_create_lane(lane, at)?;
+        self.commit_mutation(mutation)
     }
 
     pub fn move_lane(&mut self, lane: &str, to: Option<&str>) -> Result<(), SessionError> {
-        self.commit_change(|session| session.move_lane(lane, to))
+        self.require_writable()?;
+        let mutation = self.session.plan_move_lane(lane, to)?;
+        self.commit_mutation(mutation)
     }
 
     pub fn set_name(&mut self, name: Option<&str>) -> Result<(), SessionError> {
-        self.commit_change(|session| {
-            session.set_name(name);
-            Ok(())
-        })
+        self.require_writable()?;
+        let mutation = self.session.plan_name(name);
+        self.commit_mutation(mutation)
     }
 
     pub fn set_label(&mut self, id: &str, label: Option<&str>) -> Result<(), SessionError> {
-        self.commit_change(|session| session.set_label(id, label))
+        self.require_writable()?;
+        let mutation = self.session.plan_label(id, label)?;
+        self.commit_mutation(mutation)
     }
 
-    fn commit_change<T>(
-        &mut self,
-        change: impl FnOnce(&mut Session) -> Result<T, SessionError>,
-    ) -> Result<T, SessionError> {
+    fn require_writable(&self) -> Result<(), SessionError> {
         if let Some(error) = &self.persistence_error {
             return Err(SessionError::storage(format!(
                 "Session recovery required: {error}"
             )));
         }
-        let mut candidate = self.session.clone();
-        let value = change(&mut candidate)?;
-        let item = candidate
-            .get_log(&LogOptions::default())?
-            .into_iter()
-            .last()
-            .ok_or_else(|| SessionError::storage("Session log is empty after mutation"))?;
-        self.append_mutation(item.into_mutation())
-            .inspect_err(|error| {
-                self.persistence_error = Some(error.to_string());
-            })?;
-        self.session = candidate;
-        Ok(value)
+        Ok(())
+    }
+
+    fn commit_mutation(&mut self, mutation: SessionMutation) -> Result<(), SessionError> {
+        self.append_mutation(mutation.clone()).inspect_err(|error| {
+            self.persistence_error = Some(error.to_string());
+        })?;
+        if let Err(error) = self.session.apply_mutation(mutation) {
+            self.persistence_error = Some(error.to_string());
+            return Err(SessionError::storage(format!(
+                "Session mutation was persisted but could not be applied in memory; reopen the session: {error}"
+            )));
+        }
+        Ok(())
     }
 
     fn append_mutation(&mut self, mutation: SessionMutation) -> Result<(), SessionError> {
@@ -674,6 +691,27 @@ mod tests {
             reopened.append_message("recovered").unwrap();
             assert_eq!(reopened.get_stats().message_count, 2);
         }
+    }
+
+    #[test]
+    fn repeated_appends_do_not_require_session_clones() {
+        let dir = tempdir().unwrap();
+        let repo = JsonlSessionRepo::new(dir.path());
+        let mut session = repo
+            .create(JsonlCreateOptions {
+                id: Some("many".into()),
+                cwd: "/fixture".into(),
+                parent_session_id: None,
+                metadata: None,
+            })
+            .unwrap();
+        for index in 0..2_000 {
+            session.append_message(&format!("message-{index}")).unwrap();
+        }
+        assert_eq!(session.get_stats().message_count, 2_000);
+        let log = session.get_log(&LogOptions::default()).unwrap();
+        assert_eq!(log.len(), 2_000);
+        assert_eq!(log.last().map(LogItem::seq), Some(2_000));
     }
 
     #[test]
