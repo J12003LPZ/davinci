@@ -23,4 +23,5 @@ default = []
 test-fixtures = []
 
 [dev-dependencies]
+davinci-mcp = { path = ".", features = ["test-fixtures"] }
 tempfile.workspace = true
