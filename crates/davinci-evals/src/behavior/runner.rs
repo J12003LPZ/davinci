@@ -59,6 +59,28 @@ pub fn scheduled_infrastructure_gate(summary: &RunDispositionSummary) -> Result<
     }
 }
 
+pub fn require_scored_runs(
+    summary: &RunDispositionSummary,
+    minimum: usize,
+    max_timeout_rate: f64,
+) -> Result<(), String> {
+    if !summary.minimum_behavioral_runs_met(minimum) {
+        return Err(format!(
+            "only {} scored runs; need at least {minimum}",
+            summary.behavioral_runs
+        ));
+    }
+    let timeout_rate = rate(summary.timed_out_runs, summary.total_runs);
+    if timeout_rate > max_timeout_rate {
+        return Err(format!(
+            "timeout rate {:.2}% exceeds limit of {:.2}%",
+            timeout_rate * 100.0,
+            max_timeout_rate * 100.0
+        ));
+    }
+    Ok(())
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct DispositionedSuiteSummary {
     pub dispositions: RunDispositionSummary,
@@ -413,6 +435,41 @@ mod tests {
         assert_eq!(summary.infrastructure_failure_rate(), 1.0 / 5.0);
         assert!(summary.minimum_behavioral_runs_met(1));
         assert!(summary.minimum_behavioral_runs_met(2));
+    }
+
+    #[test]
+    fn scored_run_gate_rejects_too_few_runs_and_excess_timeouts() {
+        let too_few = RunDispositionSummary {
+            total_runs: 40,
+            behavioral_runs: 0,
+            infrastructure_failures: 0,
+            configuration_failures: 0,
+            verification_failures: 0,
+            timed_out_runs: 40,
+        };
+        let error = require_scored_runs(&too_few, 10, 0.20).unwrap_err();
+        assert!(error.contains("scored runs"), "{error}");
+
+        let timeout_heavy = RunDispositionSummary {
+            total_runs: 40,
+            behavioral_runs: 30,
+            infrastructure_failures: 0,
+            configuration_failures: 0,
+            verification_failures: 0,
+            timed_out_runs: 10,
+        };
+        let error = require_scored_runs(&timeout_heavy, 10, 0.20).unwrap_err();
+        assert!(error.contains("timeout rate"), "{error}");
+
+        let healthy = RunDispositionSummary {
+            total_runs: 40,
+            behavioral_runs: 36,
+            infrastructure_failures: 2,
+            configuration_failures: 0,
+            verification_failures: 0,
+            timed_out_runs: 2,
+        };
+        require_scored_runs(&healthy, 10, 0.20).unwrap();
     }
 
     #[test]

@@ -32,8 +32,9 @@ pub use mutation::{audit_dead_prompt_modules, evaluate_ablation, AblationResult,
 pub use process::{run_davinci_process, DavinciProcessConfig, DavinciProcessRun};
 pub use runner::{
     aggregate_scenario_results, aggregate_suite_scores, classify_failure_signal,
-    classify_process_result, evaluate_scenario_trace, scheduled_infrastructure_gate,
-    summarize_dispositions, BehaviorSuiteSummary, DispositionedSuiteSummary, RunDisposition,
+    classify_process_result, evaluate_scenario_trace, require_scored_runs,
+    scheduled_infrastructure_gate, summarize_dispositions, BehaviorSuiteSummary,
+    DispositionedSuiteSummary, RunDisposition,
     RunDispositionSummary, MAX_SCHEDULED_INFRASTRUCTURE_FAILURE_RATE,
 };
 pub use scenario::{
