@@ -1,8 +1,7 @@
 use std::{
-    io::Read,
     path::{Path, PathBuf},
-    process::{Command, Stdio},
-    time::{Duration, Instant},
+    process::Command,
+    time::Duration,
 };
 
 pub fn executable() -> Result<PathBuf, String> {
@@ -179,13 +178,8 @@ pub fn run_status_interruptible(
         return Err("repository-owned Git executable denied".into());
     }
     let mut command = Command::new(exe);
-    command
-        .current_dir(root)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
+    command.current_dir(root);
 
-    // Sanitize environment
     for (name, _) in std::env::vars_os() {
         if name.to_string_lossy().starts_with("GIT_") {
             command.env_remove(name);
@@ -211,110 +205,33 @@ pub fn run_status_interruptible(
         ])
         .args(args);
 
-    #[cfg(unix)]
-    {
-        use std::os::unix::process::CommandExt;
-        command.process_group(0);
+    let output = davinci_sys::process::run_bounded(
+        command,
+        None,
+        davinci_sys::process::RunLimits {
+            timeout,
+            output_cap: 16 * 1024 * 1024,
+        },
+        cancelled,
+    )
+    .map_err(|e| format!("cannot run Git process: {e}"))?;
+
+    if output.cancelled {
+        return Err("git execution cancelled".into());
     }
-
-    let mut child = command
-        .spawn()
-        .map_err(|e| format!("cannot start Git process: {e}"))?;
-    let stdout = child.stdout.take().ok_or("git stdout unavailable")?;
-    let stderr = child.stderr.take().ok_or("git stderr unavailable")?;
-
-    let (tx, rx) = std::sync::mpsc::sync_channel(1);
-    std::thread::spawn(move || {
-        let res = bounded_read_combined(stdout, stderr, 16 * 1024 * 1024);
-        let _ = tx.send(res);
-    });
-
-    let deadline = Instant::now() + timeout;
-    loop {
-        if cancelled() {
-            terminate_child(&mut child);
-            return Err("git execution cancelled".into());
-        }
-        if Instant::now() >= deadline {
-            terminate_child(&mut child);
-            return Err("git execution timed out".into());
-        }
-        match rx.recv_timeout(Duration::from_millis(25)) {
-            Ok(Ok(bytes)) => loop {
-                if cancelled() {
-                    terminate_child(&mut child);
-                    return Err("git execution cancelled".into());
-                }
-                if let Some(status) = child
-                    .try_wait()
-                    .map_err(|e| format!("cannot inspect child: {e}"))?
-                {
-                    return Ok((bytes, status));
-                }
-                if Instant::now() >= deadline {
-                    terminate_child(&mut child);
-                    return Err("git execution timed out".into());
-                }
-                std::thread::sleep(Duration::from_millis(10));
-            },
-            Ok(Err(error)) => {
-                terminate_child(&mut child);
-                return Err(error);
-            }
-            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => (),
-            Err(_) => {
-                terminate_child(&mut child);
-                return Err("git process reader failed".into());
-            }
-        }
+    if output.timed_out {
+        return Err("git execution timed out".into());
     }
-}
-
-fn terminate_child(child: &mut std::process::Child) {
-    #[cfg(windows)]
-    {
-        let _ = Command::new("taskkill")
-            .args(["/PID", &child.id().to_string(), "/T", "/F"])
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status();
-    }
-    #[cfg(unix)]
-    {
-        let _ = Command::new("kill")
-            .args(["-TERM", "--", &format!("-{}", child.id())])
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status();
-    }
-    let _ = child.kill();
-    let _ = child.wait();
-}
-
-fn bounded_read_combined(
-    stdout: impl Read,
-    stderr: impl Read,
-    limit: u64,
-) -> Result<Vec<u8>, String> {
-    let mut bytes = Vec::new();
-    let mut out_reader = stdout.take(limit + 1);
-    out_reader
-        .read_to_end(&mut bytes)
-        .map_err(|e| format!("cannot read git stdout: {e}"))?;
-    if bytes.len() as u64 > limit {
+    if output.stdout_truncated {
         return Err("git process stdout exceeded byte limit".into());
     }
-
-    if bytes.is_empty() {
-        let mut err_bytes = Vec::new();
-        let mut err_reader = stderr.take(4096);
-        let _ = err_reader.read_to_end(&mut err_bytes);
-        if !err_bytes.is_empty() {
-            return Ok(err_bytes);
-        }
-    }
-
-    Ok(bytes)
+    let status = output
+        .status
+        .ok_or_else(|| "git process ended without an exit status".to_string())?;
+    let bytes = if output.stdout.is_empty() {
+        output.stderr.into_iter().take(4096).collect()
+    } else {
+        output.stdout
+    };
+    Ok((bytes, status))
 }
