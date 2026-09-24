@@ -567,6 +567,7 @@ pub fn live_complete_with(
     tools: &[ToolSpec],
     options: &StreamOptions,
 ) -> Result<AssistantMessage, String> {
+    refuse_unsupported_tools(&model.api, tools.len())?;
     let body = request_body_with(model, messages, system, tools, options);
     let prepared = crate::responses_request::PreparedProviderRequest::new(body);
     let body = prepared.body();
@@ -602,7 +603,7 @@ pub fn live_complete_with(
             }
         }
     }
-    let url = request_url(model, auth);
+    let url = request_url_checked(model, auth)?;
     let headers = crate::merge_provider_attribution_headers(
         model,
         options.session_id.as_deref(),
@@ -667,6 +668,7 @@ pub fn live_complete_streaming_with_sink_envelope(
     options: &StreamOptions,
     on_event: &mut dyn FnMut(&AssistantMessageEvent),
 ) -> Result<ProviderCompletionEnvelope, String> {
+    refuse_unsupported_tools(&model.api, tools.len())?;
     let incremental = crate::stream_decoder::supports_incremental_stream(model);
     let mut body = request_body_with(model, messages, system, tools, options);
     if crate::trace::enabled() {
@@ -762,7 +764,7 @@ pub fn live_complete_streaming_with_sink_envelope(
             }
         }
     }
-    let url = request_url(model, auth);
+    let url = request_url_checked(model, auth)?;
     let headers = crate::merge_provider_attribution_headers(
         model,
         options.session_id.as_deref(),
@@ -1533,13 +1535,14 @@ pub fn live_stream(
     system: Option<&str>,
     tools: &[ToolSpec],
 ) -> Result<Vec<AssistantMessageEvent>, String> {
+    refuse_unsupported_tools(&model.api, tools.len())?;
     let mut body = request_body(model, messages, system, tools);
     if let Value::Object(map) = &mut body {
         map.insert("stream".into(), Value::Bool(true));
     }
     let prepared = crate::responses_request::PreparedProviderRequest::new(body);
     let body = prepared.body();
-    let url = request_url(model, auth);
+    let url = request_url_checked(model, auth)?;
     let mut request = crate::http::agent(crate::http::PROVIDER_IDLE_TIMEOUT).post(&url);
     for (key, value) in &auth.headers {
         request = request.set(key, value);
@@ -1723,6 +1726,54 @@ fn mistral_body(
     body
 }
 
+fn vertex_url(
+    model: &Model,
+    project: Option<&str>,
+    location: Option<&str>,
+) -> Result<String, String> {
+    let project = project
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| {
+            "google-vertex needs GOOGLE_CLOUD_PROJECT (and optionally GOOGLE_CLOUD_LOCATION)"
+                .to_string()
+        })?;
+    let location = location
+        .filter(|value| !value.is_empty())
+        .unwrap_or("us-central1");
+    let base = model
+        .base_url
+        .as_deref()
+        .unwrap_or("https://aiplatform.googleapis.com")
+        .trim_end_matches('/');
+    Ok(format!(
+        "{base}/v1/projects/{project}/locations/{location}/publishers/google/models/{}:generateContent",
+        model.id
+    ))
+}
+
+fn refuse_unsupported_tools(api: &str, tool_count: usize) -> Result<(), String> {
+    const STUBS: &[&str] = &[
+        "google-generative-ai",
+        "google-vertex",
+        "bedrock-converse-stream",
+    ];
+    if tool_count > 0 && STUBS.contains(&api) {
+        return Err(format!(
+            "{api} does not support tool use in davinci yet; pick a model from another provider for agent work"
+        ));
+    }
+    Ok(())
+}
+
+fn request_url_checked(model: &Model, auth: &ResolvedAuth) -> Result<String, String> {
+    if model.api == "google-vertex" {
+        let project = std::env::var("GOOGLE_CLOUD_PROJECT").ok();
+        let location = std::env::var("GOOGLE_CLOUD_LOCATION").ok();
+        return vertex_url(model, project.as_deref(), location.as_deref());
+    }
+    Ok(request_url(model, auth))
+}
+
 pub fn request_url(model: &Model, _auth: &ResolvedAuth) -> String {
     let base = model
         .base_url
@@ -1732,10 +1783,12 @@ pub fn request_url(model: &Model, _auth: &ResolvedAuth) -> String {
     match model.api.as_str() {
         "anthropic-messages" | "pi-messages" => format!("{base}/v1/messages"),
         "google-generative-ai" => format!("{base}/models/{}:generateContent", model.id),
-        "google-vertex" => format!(
-            "{base}/v1/projects/default/locations/us-central1/publishers/google/models/{}:generateContent",
-            model.id
-        ),
+        "google-vertex" => vertex_url(
+            model,
+            std::env::var("GOOGLE_CLOUD_PROJECT").ok().as_deref(),
+            std::env::var("GOOGLE_CLOUD_LOCATION").ok().as_deref(),
+        )
+        .unwrap_or_else(|_| format!("{base}/v1/projects/default/locations/us-central1/publishers/google/models/{}:generateContent", model.id)),
         "openai-codex-responses" => crate::codex::resolve_codex_url(model.base_url.as_deref()),
         "openai-responses" | "azure-openai-responses" => {
             format!("{base}/responses")
@@ -2073,7 +2126,7 @@ fn anthropic_body(
     }
     let mut body = serde_json::json!({
         "model": model.id,
-        "max_tokens": model.max_tokens.min(8192),
+        "max_tokens": model.max_tokens,
         "messages": converted,
         "stream": false,
     });
@@ -2187,8 +2240,14 @@ pub(crate) fn usage_from_value(model: &Model, usage: &Value) -> Usage {
     let anthropic_read = get("cache_read_input_tokens").or_else(|| get("cacheReadInputTokens"));
     let anthropic_write =
         get("cache_creation_input_tokens").or_else(|| get("cacheWriteInputTokens"));
-    let (input, cache_read, cache_write) = if anthropic_read.is_some() || anthropic_write.is_some()
+    let has_openai_prompt_total = get("prompt_tokens").is_some();
+    let (input, cache_read, cache_write) = if has_openai_prompt_total
+        && (anthropic_read.is_some() || anthropic_write.is_some())
     {
+        let read = anthropic_read.unwrap_or(0);
+        let write = anthropic_write.unwrap_or(0);
+        (base_input.saturating_sub(read).saturating_sub(write), read, write)
+    } else if anthropic_read.is_some() || anthropic_write.is_some() {
         (
             base_input,
             anthropic_read.unwrap_or(0),
@@ -2427,6 +2486,67 @@ fn parse_provider_response(model: &Model, raw: &str) -> AssistantMessage {
 mod tests {
     use super::*;
     use crate::catalog::load_builtin_models;
+
+    #[test]
+    fn anthropic_max_tokens_follows_the_model() {
+        let mut model = load_builtin_models()
+            .into_iter()
+            .find(|model| model.api == "anthropic-messages")
+            .unwrap();
+        model.max_tokens = 64_000;
+        let body = anthropic_body(
+            &model,
+            &[ChatMessage::text("user", "hi")],
+            None,
+            &[],
+            &StreamOptions::default(),
+        );
+        assert_eq!(body["max_tokens"], 64_000);
+    }
+
+    #[test]
+    fn vertex_url_uses_the_configured_project_and_location() {
+        let mut model = load_builtin_models()
+            .into_iter()
+            .find(|model| model.api == "google-generative-ai")
+            .unwrap();
+        model.api = "google-vertex".into();
+        model.base_url = Some("https://us-east5-aiplatform.googleapis.com".into());
+        let url = vertex_url(&model, Some("my-proj"), Some("us-east5")).unwrap();
+        assert!(url.contains("/projects/my-proj/locations/us-east5/"), "{url}");
+        assert!(vertex_url(&model, None, None).is_err());
+    }
+
+    #[test]
+    fn stub_providers_refuse_tool_use() {
+        for api in [
+            "google-generative-ai",
+            "google-vertex",
+            "bedrock-converse-stream",
+        ] {
+            assert!(refuse_unsupported_tools(api, 1).is_err(), "{api}");
+            assert!(refuse_unsupported_tools(api, 0).is_ok(), "{api}");
+        }
+        assert!(refuse_unsupported_tools("anthropic-messages", 3).is_ok());
+    }
+
+    #[test]
+    fn prompt_tokens_already_include_cache_reads() {
+        let model = load_builtin_models()
+            .into_iter()
+            .find(|model| model.api == "openai-completions")
+            .unwrap();
+        let usage = usage_from_value(
+            &model,
+            &serde_json::json!({
+                "prompt_tokens": 1000,
+                "completion_tokens": 10,
+                "cache_read_input_tokens": 800
+            }),
+        );
+        assert_eq!(usage.input, 200);
+        assert_eq!(usage.cache_read, 800);
+    }
 
     #[test]
     fn oauth_bearer_credentials_never_become_x_api_key() {
