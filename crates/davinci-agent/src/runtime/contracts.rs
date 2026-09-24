@@ -143,8 +143,9 @@ pub fn path_scope_allows_case(
         if case_insensitive {
             normalized.eq_ignore_ascii_case(s)
                 || (scope.ends_with('/')
-                    && normalized.len() >= scope.len()
-                    && normalized[..scope.len()].eq_ignore_ascii_case(scope))
+                    && normalized
+                        .get(..scope.len())
+                        .is_some_and(|prefix| prefix.eq_ignore_ascii_case(scope)))
         } else {
             normalized == s || (scope.ends_with('/') && normalized.starts_with(*scope))
         }
@@ -717,7 +718,7 @@ impl TaskContract {
 
     /// Evaluates if a given path is permitted by this contract's scopes.
     pub fn allows_path(&self, raw_path: &str) -> Result<bool, ContractError> {
-        self.allows_path_case(raw_path, false)
+        self.allows_path_case(raw_path, cfg!(any(windows, target_os = "macos")))
     }
 
     /// Evaluates if a given path is permitted by this contract's scopes with optional case-insensitivity.
@@ -966,6 +967,35 @@ mod tests {
     use super::*;
     use crate::runtime::{AgentId, RunId, TaskRecord, TaskRegistry};
     use serde_json::json;
+
+    fn contract_with_scopes(writable: &[&str], protected: &[&str]) -> TaskContract {
+        TaskContract::new(
+            "test-contract",
+            1,
+            TaskId::new(),
+            1,
+            writable.iter().map(|path| (*path).to_string()).collect(),
+            protected.iter().map(|path| (*path).to_string()).collect(),
+            false,
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn case_insensitive_prefix_check_does_not_split_characters() {
+        let contract = contract_with_scopes(&["src/abc/"], &[]);
+        assert!(!contract.allows_path_case("src/é/éx/a.rs", true).unwrap());
+    }
+
+    #[cfg(any(windows, target_os = "macos"))]
+    #[test]
+    fn scope_matching_ignores_case_on_case_insensitive_filesystems() {
+        let contract = contract_with_scopes(&["src/"], &[]);
+        assert!(contract.allows_path("SRC/lib.rs").unwrap());
+    }
 
     #[test]
     fn f05_protected_wins() {
