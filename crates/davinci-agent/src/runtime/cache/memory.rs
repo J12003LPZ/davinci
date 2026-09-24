@@ -476,6 +476,14 @@ impl CacheRuntime {
         provider.cache_read_tokens = provider.cache_read_tokens.saturating_add(read);
         provider.cache_write_tokens = provider.cache_write_tokens.saturating_add(write);
     }
+
+    pub fn record_provider_cost(&self, cost_usd: f64) {
+        if !cost_usd.is_finite() || cost_usd <= 0.0 {
+            return;
+        }
+        let mut state = self.inner.state.lock().unwrap_or_else(|e| e.into_inner());
+        state.stats.provider.total_cost_usd += cost_usd;
+    }
     /// The resource owner retains and closes handles; the cache records only counters.
     pub fn record_resource(&self, started: bool, live: usize) {
         let mut state = self.inner.state.lock().unwrap_or_else(|e| e.into_inner());

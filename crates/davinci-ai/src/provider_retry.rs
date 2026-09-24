@@ -48,6 +48,9 @@ impl std::fmt::Display for ProviderError {
 
 /// TS `isRetryableProviderError`.
 pub fn is_retryable_provider_error(error: &ProviderError) -> bool {
+    if crate::codex_usage::is_usage_limit_error(&error.message) {
+        return false;
+    }
     match error.header("x-should-retry") {
         Some("true") => return true,
         Some("false") => return false,
@@ -309,6 +312,27 @@ mod tests {
         assert!(result.unwrap_err().message.contains("aborted"));
         assert_eq!(calls, 1);
         assert_eq!(waited, 25);
+    }
+
+    #[test]
+    fn usage_limit_reached_is_not_retried() {
+        let mut calls = 0;
+        let error = retry_provider_request::<(), _>(
+            || {
+                calls += 1;
+                Err(ProviderError::new(
+                    Some(429),
+                    "{\"error\":{\"type\":\"usage_limit_reached\"}}",
+                ))
+            },
+            ProviderRetryOptions {
+                max_retries: 3,
+                max_retry_delay_ms: None,
+            },
+        )
+        .unwrap_err();
+        assert!(error.message.contains("usage_limit_reached"));
+        assert_eq!(calls, 1);
     }
 
     #[test]

@@ -1,5 +1,6 @@
 //! Unified multi-provider LLM API matching `@earendil-works/pi-ai`.
 
+mod apply_patch_grammar;
 mod attribution;
 mod auth;
 pub mod cache;
@@ -9,6 +10,7 @@ pub mod codex_capabilities;
 pub mod codex_flags;
 pub mod codex_telemetry;
 pub mod codex_transport;
+pub mod codex_usage;
 mod codex_ws;
 mod deferred;
 mod http_proxy;
@@ -30,7 +32,7 @@ mod retry;
 mod shell;
 mod stream;
 #[doc(hidden)]
-pub use stream::openai_responses_input;
+pub use stream::{openai_responses_input, openai_responses_input_with};
 mod stream_decoder;
 mod stream_decoder_anthropic;
 mod stream_decoder_completions;
@@ -38,6 +40,7 @@ mod stream_reader;
 mod thinking;
 pub mod trace;
 
+pub use apply_patch_grammar::APPLY_PATCH_LARK;
 pub use attribution::{is_install_telemetry_enabled, merge_provider_attribution_headers};
 pub use auth::{
     bedrock_ambient_source, cloudflare_auth, copilot_available_model_ids,
@@ -143,9 +146,10 @@ pub use stream::{
     fixture_complete, live_complete, live_complete_streaming_with,
     live_complete_streaming_with_sink, live_complete_streaming_with_sink_envelope,
     live_complete_with, live_stream, parse_sse_block, replay_sse_events, request_body,
-    request_body_with, request_url, resolve_json_schema_strict_sampling, AssistantMessage,
-    AssistantMessageEvent, ContentBlock, ProviderCompletionEnvelope, StopReason, StreamEvent,
-    StreamOptions,
+    attach_native_items, raw_provider_post, request_body_with, request_url,
+    resolve_json_schema_strict_sampling, AssistantMessage, AssistantMessageEvent, ContentBlock,
+    ProviderCompletionEnvelope, RawProviderReply, ResponsesInputOptions, StopReason, StreamEvent,
+    StreamOptions, NATIVE_ITEMS_KEY, NATIVE_MODEL_KEY,
 };
 pub use stream_decoder::{
     decoder_for, frames_of, new_message, supports_incremental_stream, ResponsesDecoder, SseFrame,

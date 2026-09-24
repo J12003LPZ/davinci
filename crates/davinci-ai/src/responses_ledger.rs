@@ -253,10 +253,19 @@ impl NativeResponsesResumeRecord {
 }
 
 pub fn provider_messages_fingerprint(messages: &[ChatMessage]) -> String {
-    let bytes = serde_json::to_vec(messages).unwrap_or_default();
+    let stripped: Vec<ChatMessage> = messages
+        .iter()
+        .map(|message| {
+            let mut message = message.clone();
+            message.extra.remove(crate::NATIVE_ITEMS_KEY);
+            message.extra.remove(crate::NATIVE_MODEL_KEY);
+            message
+        })
+        .collect();
+    let bytes = serde_json::to_vec(&stripped).unwrap_or_default();
     let mut hasher = Sha256::new();
     hasher.update(b"davinci.responses-provider-projection.v1\0");
-    hasher.update((messages.len() as u64).to_le_bytes());
+    hasher.update((stripped.len() as u64).to_le_bytes());
     hasher.update(bytes);
     format!("{:x}", hasher.finalize())
 }

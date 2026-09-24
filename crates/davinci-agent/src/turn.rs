@@ -278,7 +278,14 @@ impl Agent {
                         return Err(err);
                     }
                 };
-            let chat = assistant_to_chat(&assistant);
+            let mut chat = assistant_to_chat(&assistant);
+            if let Some(record) = &native_responses_resume {
+                davinci_ai::attach_native_items(
+                    &mut chat,
+                    &record.turn.output.output_items,
+                    &format!("{}/{}", self.provider, self.model_id),
+                );
+            }
             self.messages.push(chat.clone());
             self.persist_assistant(&assistant, &chat, native_responses_resume.as_ref());
             self.ensure_session_persistence()?;
@@ -748,6 +755,9 @@ impl Agent {
                             usage.cache_read,
                             usage.cache_write,
                         );
+                        self.tool_context
+                            .cache
+                            .record_provider_cost(usage.cost.total);
                     }
                     if let Some(runtime) = &self.runtime {
                         if let Some(ledger) = &runtime.budget_ledger {
@@ -3608,6 +3618,11 @@ impl Agent {
             if let Some(stop) = &assistant.stop_reason {
                 if let Ok(value) = serde_json::to_value(stop) {
                     message["stopReason"] = value;
+                }
+            }
+            for key in [davinci_ai::NATIVE_ITEMS_KEY, davinci_ai::NATIVE_MODEL_KEY] {
+                if let Some(value) = chat.extra.get(key) {
+                    message[key] = value.clone();
                 }
             }
             let _ = session.append_entry(davinci_session::SessionEntry {

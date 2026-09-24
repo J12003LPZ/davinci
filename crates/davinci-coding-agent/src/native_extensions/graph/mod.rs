@@ -358,6 +358,46 @@ impl Default for GraphController {
     }
 }
 
+const DEFAULT_ECONOMY_MODEL: &str = "openai-codex/gpt-5.6-luna";
+
+fn economy_role_models_with(
+    session_model: Option<&str>,
+    setting: Option<&str>,
+) -> std::collections::BTreeMap<Role, String> {
+    let mut models = std::collections::BTreeMap::new();
+    let Some(session_model) = session_model.map(str::trim).filter(|value| !value.is_empty()) else {
+        return models;
+    };
+    if !session_model.starts_with("openai-codex/") || setting == Some("off") {
+        return models;
+    }
+    let economy = setting
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or(DEFAULT_ECONOMY_MODEL);
+    if economy == session_model {
+        return models;
+    }
+    for role in [
+        Role::Classifier,
+        Role::Researcher,
+        Role::TestAnalyzer,
+        Role::Historian,
+    ] {
+        models.insert(role, economy.to_string());
+    }
+    models
+}
+
+fn economy_role_models(
+    session_model: Option<&str>,
+) -> std::collections::BTreeMap<Role, String> {
+    economy_role_models_with(
+        session_model,
+        std::env::var("DAVINCI_GRAPH_ECONOMY_MODEL").ok().as_deref(),
+    )
+}
+
 impl GraphController {
     pub fn new(cwd: PathBuf) -> Self {
         Self {
@@ -421,13 +461,18 @@ impl GraphController {
     }
 
     pub fn role_models(&self) -> std::collections::BTreeMap<Role, String> {
-        self.session_role_models.clone().unwrap_or_else(|| {
+        let configured = self.session_role_models.clone().unwrap_or_else(|| {
             if self.project_trusted {
                 load_config(&self.cwd).config.models
             } else {
                 Default::default()
             }
-        })
+        });
+        if configured.is_empty() {
+            economy_role_models(self.session_model.as_deref())
+        } else {
+            configured
+        }
     }
 
     /// Explicit interactive choices override project defaults for this session.
@@ -1548,6 +1593,26 @@ mod tests {
         REGISTRY_LOCK
             .lock()
             .unwrap_or_else(|error| error.into_inner())
+    }
+
+    #[test]
+    fn codex_sessions_use_economy_model_for_read_only_roles() {
+        let models = economy_role_models_with(Some("openai-codex/gpt-5.6-sol"), None);
+        assert_eq!(
+            models.get(&Role::Researcher).map(String::as_str),
+            Some("openai-codex/gpt-5.6-luna")
+        );
+        assert_eq!(
+            models.get(&Role::Classifier).map(String::as_str),
+            Some("openai-codex/gpt-5.6-luna")
+        );
+        assert!(!models.contains_key(&Role::Writer));
+        assert!(!models.contains_key(&Role::Reviewer));
+
+        assert!(economy_role_models_with(Some("anthropic/claude-opus-4-5"), None).is_empty());
+        assert!(
+            economy_role_models_with(Some("openai-codex/gpt-5.6-sol"), Some("off")).is_empty()
+        );
     }
 
     fn controller(cwd: &Path) -> GraphController {

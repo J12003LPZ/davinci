@@ -15,6 +15,51 @@ pub struct PreparedTurnPrompt {
     pub runtime_state: RuntimePromptState,
 }
 
+/// User `--append-system-prompt` text. Stable for the session.
+pub(crate) fn session_appends(session: &PromptSessionState) -> String {
+    session
+        .append_text
+        .iter()
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n\n")
+}
+
+/// The stable provider instructions and the per-turn state of a composed prompt.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TurnPromptParts {
+    pub instructions: String,
+    pub turn_state: String,
+}
+
+/// Split a composed prompt so cache-sensitive routes keep changing state out of
+/// the provider `instructions` prefix.
+pub fn split_turn_prompt(
+    session: &PromptSessionState,
+    composed: &ComposedPrompt,
+) -> TurnPromptParts {
+    let appends = session_appends(session);
+    let turn_state = if appends.is_empty() {
+        composed.dynamic_text.clone()
+    } else {
+        composed
+            .dynamic_text
+            .strip_suffix(appends.as_str())
+            .map(|rest| rest.trim_end().to_string())
+            .unwrap_or_else(|| composed.dynamic_text.clone())
+    };
+    let instructions = match (composed.stable_text.is_empty(), appends.is_empty()) {
+        (_, true) => composed.stable_text.clone(),
+        (true, false) => appends,
+        (false, false) => format!("{}\n\n{}", composed.stable_text, appends),
+    };
+    TurnPromptParts {
+        instructions,
+        turn_state,
+    }
+}
+
 /// Compose a full turn prompt for a built-in session with active capabilities and runtime state.
 pub fn compose_turn_prompt(
     session: &PromptSessionState,
@@ -52,13 +97,7 @@ pub fn compose_turn_prompt(
     composed.manifest.model_policy_version = policy.version();
 
     // 4. Dynamic user appends
-    let appends = session
-        .append_text
-        .iter()
-        .map(|s| s.trim())
-        .filter(|s| !s.is_empty())
-        .collect::<Vec<_>>()
-        .join("\n\n");
+    let appends = session_appends(session);
 
     if !appends.is_empty() {
         let dynamic_text = if composed.dynamic_text.is_empty() {

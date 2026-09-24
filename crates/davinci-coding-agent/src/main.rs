@@ -7,6 +7,7 @@ mod cache_stats;
 mod catalog_refresh;
 mod changelog;
 mod completion_delivery;
+mod codex_probe;
 mod davinci_interactive;
 mod davinci_sources;
 mod davinci_surfaces;
@@ -422,6 +423,10 @@ fn run(raw: Vec<String>) -> Result<i32, String> {
     if let Some(export) = &parsed.export {
         return export_session(&parsed, export);
     }
+    if let Some(path) = parsed.codex_probe.as_deref() {
+        codex_probe::run(&parsed, std::path::Path::new(path))?;
+        return Ok(0);
+    }
 
     let session_dir = resolved_session_dir(&parsed, &cwd);
     let migrations = migrations::maybe_run_startup_migrations(&cwd);
@@ -835,6 +840,15 @@ fn build_agent(parsed: &Args, session_dir: &Path, cwd: &Path) -> Result<Agent, S
     if let Some(ms) = settings.websocket_connect_timeout_ms {
         std::env::set_var("PI_WEBSOCKET_CONNECT_TIMEOUT_MS", ms.to_string());
     }
+    if let Some(value) = settings.openai_verbosity.as_deref() {
+        std::env::set_var("DAVINCI_OPENAI_VERBOSITY", value);
+    }
+    if let Some(value) = settings.reasoning_summary.as_deref() {
+        std::env::set_var("DAVINCI_REASONING_SUMMARY", value);
+    }
+    if let Some(value) = settings.graph_economy_model.as_deref() {
+        std::env::set_var("DAVINCI_GRAPH_ECONOMY_MODEL", value);
+    }
     let (images, true_color, hyperlinks) = settings.terminal_capability_overrides();
     if let Some(kind) = images {
         std::env::set_var("PI_TERMINAL_IMAGES", kind);
@@ -987,6 +1001,70 @@ fn live_compaction_summarizer(parsed: &Args, agent: &Agent) -> Summarizer {
             thinking_budgets.clone(),
         )
     })
+}
+
+pub(crate) fn resolve_model_and_auth(
+    parsed: &Args,
+    provider: &str,
+    model_id: &str,
+) -> Result<(davinci_ai::Model, ResolvedAuth), String> {
+    let offline = parsed.offline
+        || matches!(
+            std::env::var("PI_OFFLINE").as_deref(),
+            Ok("1") | Ok("true") | Ok("yes")
+        );
+    if offline {
+        return Err("Provider request failed: offline".into());
+    }
+
+    let models = available_models(parsed);
+    let model = find_model(&models, provider, model_id)
+        .cloned()
+        .or_else(|| {
+            models
+                .iter()
+                .find(|item| item.provider == provider && item.id == model_id)
+                .cloned()
+        })
+        .ok_or_else(|| format!("No model available for {provider}/{model_id}"))?;
+
+    let mut storage = AuthStorage::create().ok();
+    if let (Some(storage), Some(key)) = (storage.as_mut(), parsed.api_key.as_deref()) {
+        storage.set_runtime_override(provider, key);
+    }
+    if let Some(storage) = storage.as_mut() {
+        maybe_refresh_auth(
+            storage,
+            provider,
+            now_ms(),
+            OAUTH_MIN_VALIDITY_MS,
+            false,
+        );
+    }
+
+    let env = std::env::vars().collect();
+    let mut auth = storage
+        .as_ref()
+        .and_then(|storage| resolve_provider_auth(provider, storage, &env, true))
+        .unwrap_or(ResolvedAuth {
+            api_key: None,
+            headers: Default::default(),
+            source: "none".into(),
+        });
+    let config = ModelConfig::load(&models_json_path(&default_agent_dir()));
+    let shell_path = load_settings(&default_agent_dir()).shell_path;
+    apply_config_auth_with_shell(
+        &mut auth,
+        &config,
+        provider,
+        Some(&model),
+        &env,
+        shell_path.as_deref(),
+    );
+    if auth.api_key.is_none() && auth.headers.is_empty() && auth.source == "none" {
+        return Err(format!("No credentials available for {provider}"));
+    }
+    Ok((model, auth))
 }
 
 fn complete_simple_summarization(
@@ -1979,6 +2057,8 @@ fn complete_prompt_with_host(
             // An extension's prompt replaces the base, not the mode: plan
             // mode keeps its appendix.
             if agent.is_plan_mode()
+                && agent.turn_context_placement()
+                    == davinci_agent::turn_context::TurnContextPlacement::SystemPrompt
                 && !agent
                     .system_prompt
                     .contains(davinci_agent::PLAN_MODE_APPENDIX)
@@ -1995,9 +2075,22 @@ fn complete_prompt_with_host(
         }
         let suppress_memory = std::env::var_os("PI_GRAPH_SUPPRESS_MEMORY_INJECT").is_some()
             || std::env::var_os("PI_GRAPH_ROLE").is_some();
-        if !suppress_memory {
-            if let Some(memory) = host.native_memory_inject(&prompt) {
-                agent.set_ephemeral_context(vec![davinci_ai::ChatMessage::text("custom", memory)]);
+        let memory = if suppress_memory {
+            None
+        } else {
+            host.native_memory_inject(&prompt)
+        };
+        match agent.turn_context_placement() {
+            davinci_agent::turn_context::TurnContextPlacement::Appended => {
+                agent.freeze_tools_for_cache();
+                agent.commit_turn_context(memory);
+            }
+            davinci_agent::turn_context::TurnContextPlacement::SystemPrompt => {
+                if let Some(memory) = memory {
+                    agent.set_ephemeral_context(vec![davinci_ai::ChatMessage::text(
+                        "custom", memory,
+                    )]);
+                }
             }
         }
         host.native_cancel_learning_review();

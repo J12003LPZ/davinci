@@ -1719,6 +1719,12 @@ fn run_turn(
     ) {
         model.transcript.push(entry);
     }
+    if let Some(warning) = davinci_ai::codex_usage::take_warning() {
+        model.transcript.push(Entry::Gap);
+        model
+            .transcript
+            .push(Entry::tool(State::Attention, "usage", &warning, None));
+    }
 
     if interrupted {
         // The `6c` sheet: what the interrupted turn came to — what ran, what

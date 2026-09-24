@@ -313,6 +313,12 @@ pub struct Settings {
     pub follow_up_mode: Option<String>,
     #[serde(default)]
     pub transport: Option<String>,
+    #[serde(default, rename = "openaiVerbosity")]
+    pub openai_verbosity: Option<String>,
+    #[serde(default, rename = "reasoningSummary")]
+    pub reasoning_summary: Option<String>,
+    #[serde(default, rename = "graphEconomyModel")]
+    pub graph_economy_model: Option<String>,
     #[serde(default, rename = "httpIdleTimeoutMs")]
     pub http_idle_timeout_ms: Option<u64>,
     #[serde(default, rename = "hideThinkingBlock")]

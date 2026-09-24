@@ -129,3 +129,60 @@ Do not claim provider cache-hit rates, latency improvement, or monetary savings 
 The implementation is covered across the existing workspace package tests, including focused OpenAI cache tests in `davinci-ai`, worker/recovery tests in `davinci-coding-agent`, and the paired benchmark contract in `davinci-evals`.
 
 For local validation with the repository-pinned toolchain and cached dependencies, use the repository's normal offline/locked Cargo workflow. Live provider calls are a separate, explicitly authorized activity.
+
+
+## Cache-stable turns
+
+On `OpenAiReasoning` routes, DaVinci now keeps provider `instructions` stable across ordinary user turns. Stable prompt modules and user session appends remain in `instructions`; runtime permission state, capability state, plan-mode state, living-plan revisions, and injected memory are persisted as hidden `davinci.turn_context` messages after the active user turn. Non-OpenAI prompt families retain the previous system-prompt behavior.
+
+This is intentionally append-only. A new turn may add new provider input, but it should not rewrite earlier input merely because permission state, the active capability set, memory, or the living plan changed.
+
+Cache-sensitive routes also:
+
+- use the cached pruning profile, starting at 65% of the context window and targeting 35%;
+- freeze the authorized provider tool schema before dispatch so later `tool_search` activation does not mutate the leading `tools` array;
+- support configurable OpenAI text verbosity and reasoning-summary output.
+
+### Cache-stability controls
+
+- `DAVINCI_TURN_CONTEXT=system` restores per-turn state to the system prompt. `appended` forces the cache-stable path.
+- `DAVINCI_PRUNE_PROFILE=default|cached|off` selects legacy pruning, cache-aware pruning, or disables pruning.
+- `DAVINCI_OPENAI_VERBOSITY=low|medium|high` controls Responses `text.verbosity`.
+- `DAVINCI_REASONING_SUMMARY=auto|concise|detailed|none` controls `reasoning.summary`; `none` omits the field.
+
+### Measuring the effect
+
+Run `node scripts/measure-codex-cache.mjs <session.jsonl>` after a repeated multi-turn Codex session. From request 2 onward, a cache-stable run should report cache reads covering the unchanged prefix instead of falling back to only the stable bootstrap after mode/capability changes.
+
+The repository does not commit fabricated before/after numbers. Live measurements require an authenticated ChatGPT Codex session and should be recorded only from an actual run.
+
+
+## Subscription-efficiency implementation status
+
+Prepared on 2026-09-24 from the current `main` branch.
+
+### Implemented
+
+- Stable OpenAI reasoning instructions with appended per-turn runtime state, plan-mode state, living-plan revisions, and memory.
+- Cache-aware pruning and a fixed authorized provider-tool prefix on cache-sensitive routes.
+- Configurable OpenAI verbosity and reasoning summaries.
+- Per-assistant native Responses item persistence and replay for the same provider/model.
+- A hidden `--codex-probe` maintainer command and sanitized evidence document.
+- Capability-ready Codex cache-policy plumbing. New explicit cache options remain disabled unless model compatibility data is backed by a successful probe.
+- ChatGPT Codex usage-window parsing, threshold warnings, `usage_limit_reached` retry suppression, and `/cache-status` visibility.
+- Economy-model routing for read-only graph roles during `openai-codex/*` sessions. Set `graphEconomyModel` or `DAVINCI_GRAPH_ECONOMY_MODEL`; use `off` to disable it.
+- Accumulated provider USD cost in cache telemetry and an explicitly labeled ChatGPT-plan credit estimate in `/cache-status`.
+- Cache measurement and Codex CLI comparison scripts.
+
+### Awaiting live backend evidence
+
+The following plan items are intentionally not enabled until the explicit authenticated backend probe records support:
+
+- prompt-cache TTL and explicit bootstrap breakpoints in the model catalog;
+- freeform grammar `apply_patch` request wiring;
+- `additional_tools` late-tool delivery;
+- cache-sharing compaction using `tool_choice: "none"`;
+- the remote `/responses/compact` decision;
+- final Codex usage-header names if the live backend differs from the conservative parser names.
+
+Live before/after cache measurements and Codex CLI comparison results are also pending. The implementation does not commit synthetic benchmark numbers or claim probe acceptance without an authenticated run.

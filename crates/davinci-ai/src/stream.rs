@@ -731,6 +731,20 @@ pub fn live_complete_streaming_with_sink_envelope(
         err.message
     })?;
     crate::trace::log(&format!("sse status {}", response.status()));
+    if model.api == "openai-codex-responses" {
+        let response_headers: Vec<(String, String)> = response
+            .headers_names()
+            .into_iter()
+            .filter_map(|name| {
+                response
+                    .header(&name)
+                    .map(|value| (name.clone(), value.to_string()))
+            })
+            .collect();
+        if let Some(snapshot) = crate::codex_usage::parse_usage_headers(&response_headers) {
+            crate::codex_usage::record(snapshot);
+        }
+    }
     match crate::stream_decoder::decoder_for(model).filter(|_| incremental) {
         Some(mut decoder) => {
             let (message, stream_events, native_output) = read_provider_stream(
@@ -792,6 +806,63 @@ pub fn live_complete_streaming_with_sink_envelope(
             })
         }
     }
+}
+
+/// One raw provider exchange used by the explicit maintainer Codex probe.
+#[derive(Debug, Clone)]
+pub struct RawProviderReply {
+    pub status: u16,
+    pub headers: Vec<(String, String)>,
+    pub body: String,
+}
+
+/// Perform one direct provider POST without retries or response decoding.
+/// Normal product traffic continues to use the standard retry/stream path.
+pub fn raw_provider_post(
+    model: &Model,
+    auth: &ResolvedAuth,
+    url: &str,
+    body: &Value,
+) -> Result<RawProviderReply, String> {
+    let headers = collect_request_headers(model, auth, &StreamOptions::default());
+    let mut request = ureq::post(url).timeout(Duration::from_secs(120));
+    for (key, value) in &headers {
+        request = request.set(key, value);
+    }
+
+    let result = if model.api == "openai-codex-responses" {
+        let (bytes, compressed) = crate::codex::encode_codex_sse_body(body);
+        if compressed {
+            request = request.set("content-encoding", "zstd");
+        }
+        request.send_bytes(&bytes)
+    } else {
+        request.send_string(&body.to_string())
+    };
+
+    let response = match result {
+        Ok(response) => response,
+        Err(ureq::Error::Status(_, response)) => response,
+        Err(error) => return Err(error.to_string()),
+    };
+    let status = response.status();
+    let headers = response
+        .headers_names()
+        .into_iter()
+        .filter_map(|name| {
+            response
+                .header(&name)
+                .map(|value| (name.clone(), value.to_string()))
+        })
+        .collect();
+    let body = response
+        .into_string()
+        .map_err(|error| error.to_string())?;
+    Ok(RawProviderReply {
+        status,
+        headers,
+        body,
+    })
 }
 
 fn collect_request_headers(
@@ -1024,8 +1095,73 @@ pub(crate) fn responses_call_id(id: &str) -> &str {
     id.split_once('|').map(|(call_id, _)| call_id).unwrap_or(id)
 }
 
+fn verbosity_from(value: Option<&str>) -> &'static str {
+    match value {
+        Some("medium") => "medium",
+        Some("high") => "high",
+        _ => "low",
+    }
+}
+
+fn summary_from(value: Option<&str>) -> Option<&'static str> {
+    match value {
+        Some("none") => None,
+        Some("concise") => Some("concise"),
+        Some("detailed") => Some("detailed"),
+        _ => Some("auto"),
+    }
+}
+
+fn openai_verbosity() -> &'static str {
+    verbosity_from(std::env::var("DAVINCI_OPENAI_VERBOSITY").ok().as_deref())
+}
+
+fn reasoning_summary() -> Option<&'static str> {
+    summary_from(std::env::var("DAVINCI_REASONING_SUMMARY").ok().as_deref())
+}
+
+pub const NATIVE_ITEMS_KEY: &str = "responsesOutputItems";
+pub const NATIVE_MODEL_KEY: &str = "responsesOutputModel";
+
+#[derive(Debug, Default, Clone, Copy)]
+pub struct ResponsesInputOptions<'a> {
+    /// `provider/model` whose saved output items may be replayed verbatim.
+    pub native_items_model: Option<&'a str>,
+    /// Tools represented as Responses custom/freeform tools.
+    pub custom_tools: &'a [&'a str],
+}
+
+pub fn attach_native_items(chat: &mut ChatMessage, items: &[Value], model_key: &str) {
+    if items.is_empty() {
+        return;
+    }
+    chat.extra
+        .insert(NATIVE_ITEMS_KEY.into(), Value::Array(items.to_vec()));
+    chat.extra
+        .insert(NATIVE_MODEL_KEY.into(), Value::String(model_key.into()));
+}
+
+fn native_items<'m>(
+    message: &'m ChatMessage,
+    model_key: Option<&str>,
+) -> Option<&'m Vec<Value>> {
+    let model_key = model_key?;
+    if message.extra.get(NATIVE_MODEL_KEY).and_then(Value::as_str) != Some(model_key) {
+        return None;
+    }
+    message.extra.get(NATIVE_ITEMS_KEY).and_then(Value::as_array)
+}
+
 #[doc(hidden)]
 pub fn openai_responses_input(messages: &[ChatMessage]) -> Vec<Value> {
+    openai_responses_input_with(messages, &ResponsesInputOptions::default())
+}
+
+#[doc(hidden)]
+pub fn openai_responses_input_with(
+    messages: &[ChatMessage],
+    options: &ResponsesInputOptions<'_>,
+) -> Vec<Value> {
     let mut input = Vec::new();
     for message in messages {
         if message.role == "toolResult" {
@@ -1037,6 +1173,10 @@ pub fn openai_responses_input(messages: &[ChatMessage]) -> Vec<Value> {
             continue;
         }
         if message.role == "assistant" {
+            if let Some(items) = native_items(message, options.native_items_model) {
+                input.extend(items.iter().cloned());
+                continue;
+            }
             let text = content_text(&message.content);
             if !text.is_empty() {
                 input.push(serde_json::json!({
@@ -1088,14 +1228,20 @@ fn openai_responses_body(
 ) -> Value {
     let codex = model.api == "openai-codex-responses";
     let retention = crate::cache::cache_retention_from_options(options);
-    let cache_capabilities = if model.api == "openai-responses" {
-        crate::openai_cache_policy::OpenAiCacheCapabilities::resolve(
+    let cache_capabilities = match model.api.as_str() {
+        "openai-responses" => crate::openai_cache_policy::OpenAiCacheCapabilities::resolve(
             model,
             model.base_url.as_deref(),
             false,
-        )
-    } else {
-        crate::openai_cache_policy::OpenAiCacheCapabilities::unknown()
+        ),
+        "openai-codex-responses" => {
+            crate::openai_cache_policy::OpenAiCacheCapabilities::resolve(
+                model,
+                model.base_url.as_deref(),
+                true,
+            )
+        }
+        _ => crate::openai_cache_policy::OpenAiCacheCapabilities::unknown(),
     };
     let cache_capabilities = crate::openai_cache_policy::apply_runtime_features(
         cache_capabilities,
@@ -1109,7 +1255,12 @@ fn openai_responses_body(
         trusted_system.is_some(),
     );
 
-    let mut input = openai_responses_input(messages);
+    let model_key = format!("{}/{}", model.provider, model.id);
+    let input_options = ResponsesInputOptions {
+        native_items_model: Some(&model_key),
+        custom_tools: &[],
+    };
+    let mut input = openai_responses_input_with(messages, &input_options);
     if cache_plan.use_stable_bootstrap_breakpoint {
         let text = trusted_system.expect("checked above");
         input.insert(
@@ -1137,7 +1288,7 @@ fn openai_responses_body(
         body["instructions"] = Value::String(instructions.to_string());
     }
     if codex {
-        body["text"] = serde_json::json!({"verbosity": "low"});
+        body["text"] = serde_json::json!({"verbosity": openai_verbosity()});
         body["include"] = serde_json::json!(["reasoning.encrypted_content"]);
         body["tool_choice"] = Value::String("auto".into());
         body["parallel_tool_calls"] = Value::Bool(true);
@@ -1158,6 +1309,13 @@ fn openai_responses_body(
                 if let Some(key) = session_key {
                     body["prompt_cache_key"] = Value::String(key);
                 }
+            }
+            if let Some(mode) = cache_plan.prompt_cache_mode {
+                let mut prompt_cache_options = serde_json::json!({"mode": mode});
+                if let Some(ttl) = cache_plan.prompt_cache_ttl {
+                    prompt_cache_options["ttl"] = Value::String(ttl.into());
+                }
+                body["prompt_cache_options"] = prompt_cache_options;
             }
         }
         // Public Responses cache dialect is capability-scoped. The pure
@@ -1226,10 +1384,11 @@ fn openai_responses_body(
                 None => Some(level.as_str().to_string()),
             };
             if let Some(effort) = mapped {
-                body["reasoning"] = serde_json::json!({
-                    "effort": effort,
-                    "summary": "auto",
-                });
+                let mut reasoning = serde_json::json!({ "effort": effort });
+                if let Some(summary) = reasoning_summary() {
+                    reasoning["summary"] = Value::String(summary.into());
+                }
+                body["reasoning"] = reasoning;
             }
         }
     }
@@ -1269,8 +1428,13 @@ fn apply_native_responses_resume(
     }
 
     let mut input = resume.turn.full_native_replay_prefix();
-    input.extend(openai_responses_input(
+    let model_key = format!("{}/{}", model.provider, model.id);
+    input.extend(openai_responses_input_with(
         &messages[resume.resume_provider_message_count..],
+        &ResponsesInputOptions {
+            native_items_model: Some(&model_key),
+            custom_tools: &[],
+        },
     ));
     body["input"] = Value::Array(input);
     if crate::trace::enabled() {
@@ -2186,6 +2350,50 @@ fn parse_provider_response(model: &Model, raw: &str) -> AssistantMessage {
 mod tests {
     use super::*;
     use crate::catalog::load_builtin_models;
+
+    #[test]
+    fn openai_response_control_values_are_conservative() {
+        assert_eq!(verbosity_from(Some("medium")), "medium");
+        assert_eq!(verbosity_from(Some("loud")), "low");
+        assert_eq!(verbosity_from(None), "low");
+        assert_eq!(summary_from(Some("none")), None);
+        assert_eq!(summary_from(Some("concise")), Some("concise"));
+        assert_eq!(summary_from(None), Some("auto"));
+    }
+
+    #[test]
+    fn assistant_message_replays_its_native_items_for_same_model() {
+        let items = vec![
+            serde_json::json!({
+                "type": "reasoning",
+                "id": "rs_1",
+                "encrypted_content": "enc",
+                "summary": []
+            }),
+            serde_json::json!({
+                "type": "message",
+                "role": "assistant",
+                "phase": "final_answer",
+                "content": [{"type": "output_text", "text": "Done."}]
+            }),
+        ];
+        let mut assistant = ChatMessage::text("assistant", "Done.");
+        attach_native_items(&mut assistant, &items, "openai-codex/gpt-5.6-luna");
+        let input = openai_responses_input_with(
+            &[
+                ChatMessage::text("user", "go"),
+                assistant,
+                ChatMessage::text("user", "next"),
+            ],
+            &ResponsesInputOptions {
+                native_items_model: Some("openai-codex/gpt-5.6-luna"),
+                custom_tools: &[],
+            },
+        );
+        assert_eq!(input[1]["type"], "reasoning");
+        assert_eq!(input[2]["phase"], "final_answer");
+        assert_eq!(input.len(), 4);
+    }
 
     /// A loopback HTTP server that answers one POST with an SSE body in two
     /// halves, the second only once `release` fires (or after `patience`).

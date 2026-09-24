@@ -343,6 +343,12 @@ pub struct NativeExtensionHost {
     pub cwd: std::path::PathBuf,
 }
 
+const CODEX_CREDITS_PER_USD: f64 = 25.0;
+
+fn codex_credits_estimate(usd: f64) -> f64 {
+    usd.max(0.0) * CODEX_CREDITS_PER_USD
+}
+
 impl NativeExtensionHost {
     pub fn new_with_agent_dir(
         session_key: impl Into<String>,
@@ -778,6 +784,9 @@ impl NativeExtensionHost {
                 Ok(Some(json!({
                     "enabled": self.cache.config().enabled,
                     "runtimeFeatures": davinci_ai::openai_cache_policy::runtime_features(),
+                    "codexUsage": davinci_ai::codex_usage::latest(),
+                    "codexCreditsEstimate": codex_credits_estimate(stats.provider.total_cost_usd),
+                    "creditsSource": "estimate: session USD cost x 25, Codex rate card 2026-09",
                     "summary": stats.summary(),
                     "namespaces": stats.namespaces,
                     "diskUsage":"last observed on write or explicit sweep; no startup scan",
@@ -965,6 +974,13 @@ impl NativeExtensionHost {
 mod tests {
     use super::*;
     use std::sync::Arc;
+
+    #[test]
+    fn codex_credit_estimate_follows_rate_card_ratio() {
+        assert_eq!(codex_credits_estimate(5.0), 125.0);
+        assert_eq!(codex_credits_estimate(0.2), 5.0);
+        assert_eq!(codex_credits_estimate(-1.0), 0.0);
+    }
 
     #[test]
     fn repository_language_and_cache_surfaces_coexist() {

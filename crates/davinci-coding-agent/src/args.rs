@@ -69,6 +69,8 @@ pub struct Args {
     pub no_mcp: bool,
     pub print: bool,
     pub export: Option<String>,
+    /// Hidden maintainer command: write a live Codex backend capability report.
+    pub codex_probe: Option<String>,
     pub no_skills: bool,
     pub skills: Vec<String>,
     pub prompt_templates: Vec<String>,
@@ -250,6 +252,9 @@ pub fn parse_args(args: &[String]) -> Args {
         } else if arg == "--export" && i + 1 < args.len() {
             i += 1;
             result.export = Some(args[i].clone());
+        } else if arg == "--codex-probe" && i + 1 < args.len() {
+            i += 1;
+            result.codex_probe = Some(args[i].clone());
         } else if (arg == "--extension" || arg == "-e") && i + 1 < args.len() {
             i += 1;
             result.extensions.push(args[i].clone());
