@@ -31,4 +31,5 @@ default = []
 test-fixtures = []
 
 [dev-dependencies]
+davinci-ai = { path = ".", features = ["test-fixtures"] }
 tempfile.workspace = true
