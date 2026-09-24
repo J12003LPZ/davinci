@@ -3308,26 +3308,34 @@ fn glob_match(pattern: &str, name: &str) -> bool {
 fn match_glob_chars(pattern: &str, name: &str) -> bool {
     let p: Vec<char> = pattern.chars().collect();
     let n: Vec<char> = name.chars().collect();
-    fn rec(p: &[char], n: &[char]) -> bool {
-        match (p.first(), n.first()) {
-            (None, None) => true,
-            (Some('*'), _) if p.get(1) == Some(&'*') => {
-                let rest = if p.get(2) == Some(&'/') {
-                    &p[3..]
-                } else {
-                    &p[2..]
-                };
-                rec(rest, n)
-                    || (!n.is_empty() && rec(p, &n[1..]))
-                    || (p.get(2) == Some(&'/') && n.first() == Some(&'/') && rec(&p[3..], &n[1..]))
-            }
-            (Some('*'), _) => rec(&p[1..], n) || (!n.is_empty() && rec(p, &n[1..])),
-            (Some('?'), Some(_)) => rec(&p[1..], &n[1..]),
-            (Some(a), Some(b)) if a == b => rec(&p[1..], &n[1..]),
-            _ => false,
+    // memo[i * (n.len() + 1) + j]: does p[i..] match n[j..]? Each cell is
+    // computed once, so matching takes O(|p| * |n|) work regardless of stars.
+    let mut memo = vec![None; (p.len() + 1) * (n.len() + 1)];
+    fn rec(p: &[char], n: &[char], i: usize, j: usize, memo: &mut [Option<bool>]) -> bool {
+        let key = i * (n.len() + 1) + j;
+        if let Some(known) = memo[key] {
+            return known;
         }
+        let result = match (p.get(i), n.get(j)) {
+            (None, None) => true,
+            (Some('*'), _) if p.get(i + 1) == Some(&'*') => {
+                let slash = p.get(i + 2) == Some(&'/');
+                let rest = if slash { i + 3 } else { i + 2 };
+                rec(p, n, rest, j, memo)
+                    || (j < n.len() && rec(p, n, i, j + 1, memo))
+                    || (slash && n.get(j) == Some(&'/') && rec(p, n, i + 3, j + 1, memo))
+            }
+            (Some('*'), _) => {
+                rec(p, n, i + 1, j, memo) || (j < n.len() && rec(p, n, i, j + 1, memo))
+            }
+            (Some('?'), Some(_)) => rec(p, n, i + 1, j + 1, memo),
+            (Some(a), Some(b)) if a == b => rec(p, n, i + 1, j + 1, memo),
+            _ => false,
+        };
+        memo[key] = Some(result);
+        result
     }
-    rec(&p, &n)
+    rec(&p, &n, 0, 0, &mut memo)
 }
 
 fn code_definition_tool(
@@ -3588,6 +3596,33 @@ fn code_rename_preview_tool(
 mod tests {
     use super::*;
     use tempfile::tempdir;
+
+    #[test]
+    fn pathological_glob_finishes_quickly() {
+        let name = "a".repeat(40);
+        let started = std::time::Instant::now();
+        assert!(!match_glob_chars("*a*a*a*a*a*a*a*a*a*b", &name));
+        assert!(started.elapsed() < std::time::Duration::from_millis(100));
+    }
+
+    #[test]
+    fn glob_semantics_are_unchanged() {
+        for (pattern, name, expected) in [
+            ("*.rs", "src/lib.rs", true),
+            ("src/**/*.rs", "src/a/b/c.rs", true),
+            ("src/**/*.rs", "src/c.rs", true),
+            ("?.md", "a.md", true),
+            ("?.md", "ab.md", false),
+            ("**", "anything/at/all", true),
+            ("a*b", "a/x/b", true),
+        ] {
+            assert_eq!(
+                match_glob_chars(pattern, name),
+                expected,
+                "{pattern} {name}"
+            );
+        }
+    }
 
     #[test]
     fn shell_capture_rejects_partial_reads_and_drains_overflow() {
