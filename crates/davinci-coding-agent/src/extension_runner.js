@@ -1,5 +1,12 @@
 "use strict";
 
+const util = require("node:util");
+// stdout carries one JSON reply per line to davinci. Extension diagnostics
+// belong on stderr so console output cannot corrupt the protocol.
+for (const name of ["log", "info", "debug", "warn", "error", "trace", "dir"]) {
+	console[name] = (...args) => process.stderr.write(util.format(...args) + "\n");
+}
+
 const fs = require("fs");
 const os = require("os");
 const path = require("path");
