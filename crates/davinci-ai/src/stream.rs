@@ -952,7 +952,11 @@ fn collect_request_headers(
     for (key, value) in &model.headers {
         headers.push((key.clone(), value.clone()));
     }
-    if let Some(key) = &auth.api_key {
+    let has_authorization = auth
+        .headers
+        .keys()
+        .any(|name| name.eq_ignore_ascii_case("authorization"));
+    if let Some(key) = auth.api_key.as_ref().filter(|_| !has_authorization) {
         if model.api == "google-generative-ai" {
             headers.push(("x-goog-api-key".into(), key.clone()));
         } else if model.api == "anthropic-messages" {
@@ -2423,6 +2427,28 @@ fn parse_provider_response(model: &Model, raw: &str) -> AssistantMessage {
 mod tests {
     use super::*;
     use crate::catalog::load_builtin_models;
+
+    #[test]
+    fn oauth_bearer_credentials_never_become_x_api_key() {
+        let model = load_builtin_models()
+            .into_iter()
+            .find(|model| model.api == "anthropic-messages")
+            .unwrap();
+        let mut headers = std::collections::HashMap::new();
+        headers.insert(
+            "Authorization".to_string(),
+            "Bearer sk-ant-oat01-x".to_string(),
+        );
+        let auth = ResolvedAuth {
+            api_key: Some("sk-ant-oat01-x".into()),
+            headers,
+            source: "OAuth".into(),
+        };
+        let sent = collect_request_headers(&model, &auth, &StreamOptions::default());
+        assert!(!sent
+            .iter()
+            .any(|(name, _)| name.eq_ignore_ascii_case("x-api-key")));
+    }
 
     #[test]
     fn openai_response_control_values_are_conservative() {

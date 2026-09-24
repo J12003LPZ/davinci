@@ -1034,6 +1034,7 @@ pub(crate) fn resolve_model_and_auth(
     if let (Some(storage), Some(key)) = (storage.as_mut(), parsed.api_key.as_deref()) {
         storage.set_runtime_override(provider, key);
     }
+    ensure_supported_stored_oauth(storage.as_ref(), provider, parsed.api_key.as_deref())?;
     if let Some(storage) = storage.as_mut() {
         maybe_refresh_auth(
             storage,
@@ -1101,6 +1102,12 @@ fn complete_simple_summarization(
     if let (Some(storage), Some(key)) = (storage.as_mut(), parsed.api_key.as_deref()) {
         storage.set_runtime_override(&request.provider, key);
     }
+    ensure_supported_stored_oauth(
+        storage.as_ref(),
+        &request.provider,
+        parsed.api_key.as_deref(),
+    )
+    .map_err(|error| format!("Summarization failed: {error}"))?;
     if let Some(storage) = storage.as_mut() {
         maybe_refresh_auth(
             storage,
@@ -6671,6 +6678,9 @@ fn maybe_refresh_auth(
     min_expiry_ms: u64,
     no_refresh: bool,
 ) {
+    if provider == "anthropic" {
+        return;
+    }
     if storage
         .maybe_refresh(provider, now, min_expiry_ms, no_refresh)
         .unwrap_or(false)
@@ -6706,6 +6716,9 @@ fn apply_js_oauth_api_key(
     storage: Option<&AuthStorage>,
     auth: &mut Option<ResolvedAuth>,
 ) {
+    if provider == "anthropic" {
+        return;
+    }
     let Some(storage) = storage else {
         return;
     };
@@ -6732,6 +6745,22 @@ fn apply_js_oauth_api_key(
     }
 }
 
+fn ensure_supported_stored_oauth(
+    storage: Option<&AuthStorage>,
+    provider: &str,
+    explicit_api_key: Option<&str>,
+) -> Result<(), String> {
+    if explicit_api_key.is_none()
+        && provider == "anthropic"
+        && storage
+            .and_then(|storage| storage.get(provider))
+            .is_some_and(|credential| credential.kind == CredentialKind::Oauth)
+    {
+        return Err(davinci_ai::ANTHROPIC_OAUTH_UNSUPPORTED_MESSAGE.into());
+    }
+    Ok(())
+}
+
 fn login_provider(provider: &str, key: Option<&str>) -> Result<(), String> {
     login_provider_with_wait(provider, key, false).map(|_| ())
 }
@@ -6746,6 +6775,10 @@ fn login_provider_with_wait(
     wait_for_oauth_callback: bool,
 ) -> Result<bool, String> {
     let mut storage = AuthStorage::create().map_err(|err| err.to_string())?;
+    if provider == "anthropic" && key.is_none() {
+        println!("Anthropic login uses an API key: /login anthropic sk-ant-...");
+        return Ok(false);
+    }
     if key.is_none() {
         if let Some((path, name)) = login_js_oauth_provider(provider) {
             let (access, refresh, expires) =
@@ -6794,6 +6827,9 @@ fn login_provider_with_wait(
         return Ok(true);
     }
     if let Some(key) = key {
+        if provider == "anthropic" && looks_like_oauth_input(key) {
+            return Err(davinci_ai::ANTHROPIC_OAUTH_UNSUPPORTED_MESSAGE.into());
+        }
         if looks_like_oauth_input(key) {
             let (code, pasted_state) = davinci_ai::parse_authorization_input(key);
             let code = code.ok_or_else(|| "Missing authorization code.".to_string())?;

@@ -25,6 +25,9 @@ pub enum CredentialKind {
     Oauth,
 }
 
+pub const ANTHROPIC_OAUTH_UNSUPPORTED_MESSAGE: &str =
+    "Anthropic OAuth credentials are not supported by davinci; run `/login anthropic <api-key>`";
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Credential {
     #[serde(rename = "type")]
@@ -198,6 +201,11 @@ impl AuthStorage {
         if cred.kind != CredentialKind::Oauth {
             return Ok(false);
         }
+        if provider == "anthropic" {
+            return Err(AuthStorageError::Invalid(
+                ANTHROPIC_OAUTH_UNSUPPORTED_MESSAGE.into(),
+            ));
+        }
         if !credential_expires_by(&cred, now_ms.saturating_add(min_expiry_ms)) {
             return Ok(false);
         }
@@ -334,6 +342,9 @@ pub fn env_api_key(spec: &ProviderSpec, env: &HashMap<String, String>) -> Option
 }
 
 pub(crate) fn oauth_credential_usable(provider: &str, credential: &Credential) -> bool {
+    if provider == "anthropic" {
+        return false;
+    }
     provider != "openai-codex"
         || credential
             .access
@@ -792,25 +803,43 @@ mod tests {
     }
 
     #[test]
+    fn stored_anthropic_oauth_credential_is_refused_with_clear_guidance() {
+        let mut storage = AuthStorage::in_memory();
+        storage
+            .login_oauth("anthropic", "sk-ant-oat01-x", None, Some(u64::MAX))
+            .unwrap();
+        assert!(resolve_provider_auth(
+            "anthropic",
+            &storage,
+            &Default::default(),
+            true,
+        )
+        .is_none());
+        let error = storage
+            .maybe_refresh("anthropic", 10_000, u64::MAX, false)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("/login anthropic <api-key>"), "{error}");
+    }
+
+    #[test]
     fn fixture_oauth_refresh_extends_expiry() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("auth.json");
         let mut storage = AuthStorage::open(&path).unwrap();
         storage
             .login_oauth(
-                "anthropic",
+                "xai",
                 "expired",
                 Some("pi-fixture-refresh".into()),
                 Some(1),
             )
             .unwrap();
-        assert!(storage
-            .maybe_refresh("anthropic", 10_000, 0, false)
-            .unwrap());
-        let cred = storage.get("anthropic").unwrap();
+        assert!(storage.maybe_refresh("xai", 10_000, 0, false).unwrap());
+        let cred = storage.get("xai").unwrap();
         assert_eq!(cred.access.as_deref(), Some("pi-fixture-refresh-access"));
         assert!(cred.expires.unwrap() > 10_000);
-        assert!(!storage.maybe_refresh("anthropic", 10_000, 0, true).unwrap());
+        assert!(!storage.maybe_refresh("xai", 10_000, 0, true).unwrap());
     }
 
     /// A JWT with the given `exp` (seconds) and nothing else that matters.

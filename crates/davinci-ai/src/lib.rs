@@ -73,7 +73,7 @@ pub use auth::{
     copilot_base_url_from_token, credential_expires_by, default_auth_path,
     fetch_github_copilot_available_model_ids, parse_copilot_available_model_ids,
     resolve_provider_auth, vertex_ambient_auth, AuthStorage, AuthStorageError, Credential,
-    CredentialKind, ResolvedAuth,
+    CredentialKind, ResolvedAuth, ANTHROPIC_OAUTH_UNSUPPORTED_MESSAGE,
 };
 pub use catalog::{
     builtin_catalog_json, builtin_provider_ids, effective_model_cost_rates, flatten_catalog,
