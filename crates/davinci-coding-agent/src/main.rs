@@ -3323,7 +3323,18 @@ fn run_rpc_with_host(
         if line.trim().is_empty() {
             continue;
         }
-        let mut command: RpcCommand = serde_json::from_str(&line).map_err(|err| err.to_string())?;
+        let mut command: RpcCommand = match serde_json::from_str(&line) {
+            Ok(command) => command,
+            Err(err) => {
+                let response =
+                    rpc::fail_response(None, "parse", format!("parse error: {err}"));
+                output::write_raw_stdout_line(
+                    &serde_json::to_string(&response).map_err(|err| err.to_string())?,
+                )
+                .map_err(|err| err.to_string())?;
+                continue;
+            }
+        };
         if command.kind == "verify_browser" {
             #[derive(serde::Deserialize)]
             #[serde(deny_unknown_fields)]
