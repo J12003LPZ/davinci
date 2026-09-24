@@ -4366,6 +4366,8 @@ mod tests {
     fn parallel_workers_in_one_message_overlap_and_answer_in_order() {
         use std::time::{Duration, Instant};
         let mut agent = Agent::new(default_system_prompt());
+        agent.set_permission_mode(PermissionMode::Ask);
+        agent.approver = Some(ToolApprover(Arc::new(|_| ToolApprovalDecision::AllowOnce)));
         agent.subagent_runner = Some(SubagentRunner::new(|req| {
             std::thread::sleep(Duration::from_millis(80));
             Ok(format!("answer:{}", req.prompt))

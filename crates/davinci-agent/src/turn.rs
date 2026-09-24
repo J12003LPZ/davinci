@@ -51,6 +51,24 @@ impl Drop for PendingToolOperationGuard {
     }
 }
 
+fn agent_call_may_write_shared(args: &Value, mode: crate::PermissionMode) -> bool {
+    if !matches!(
+        mode,
+        crate::PermissionMode::Edits
+            | crate::PermissionMode::Auto
+            | crate::PermissionMode::AlwaysApprove
+    ) {
+        return false;
+    }
+
+    let task_may_write_shared =
+        |task: &Value| task.get("isolation").and_then(Value::as_str) != Some("worktree");
+    match args.get("tasks").and_then(Value::as_array) {
+        Some(tasks) if !tasks.is_empty() => tasks.iter().any(task_may_write_shared),
+        _ => task_may_write_shared(args),
+    }
+}
+
 impl Agent {
     /// Start a loop after user prompts have already been appended.
     pub fn run_loop<F, T>(&mut self, complete: F) -> Result<Vec<AgentEvent>, String>
@@ -1199,6 +1217,19 @@ impl Agent {
         }
     }
 
+    /// Resolve the lane for a call whose arguments can affect its write scope.
+    fn lane_for_call(
+        &self,
+        name: &str,
+        class: crate::permission::ToolClass,
+        args: &Value,
+    ) -> crate::scheduler::ToolLane {
+        if name == "agent" && agent_call_may_write_shared(args, self.permission_mode()) {
+            return crate::scheduler::ToolLane::Serial;
+        }
+        self.lane_for_tool(name, class)
+    }
+
     fn replay_policy_for_tool(&self, name: &str) -> crate::runtime::ReplayPolicy {
         self.runtime
             .as_ref()
@@ -1444,7 +1475,7 @@ impl Agent {
                             .lock()
                             .unwrap_or_else(|err| err.into_inner())
                             .class_of(name);
-                        let lane = self.lane_for_tool(name, class);
+                        let lane = self.lane_for_call(name, class, args);
                         return Preparation::Wait {
                             call_id: id.to_string(),
                             lane,
@@ -1648,7 +1679,7 @@ impl Agent {
         // Runtime metadata is authoritative when installed; unknown tools fail
         // closed inside `lane_for_capability`. Without a runtime, the legacy
         // class-based resolver still keeps unrecognized extensions serial.
-        let lane = self.lane_for_tool(name, class);
+        let lane = self.lane_for_call(name, class, args);
         if route == crate::tool_ledger::ToolCallExecutionAuthority::OperationJournal {
             let Some(mut pending) = journal_pending else {
                 return immediate(
@@ -3910,6 +3941,74 @@ mod session_persistence_tests;
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn writable_shared_agent_calls_are_serial() {
+        let mut agent = Agent::new("agent lane fixture");
+        agent.set_permission_mode(crate::PermissionMode::Auto);
+        let shared = serde_json::json!({"prompt": "edit things"});
+        let worktree = serde_json::json!({"prompt": "edit things", "isolation": "worktree"});
+        let empty_tasks = serde_json::json!({"tasks": [], "prompt": "edit things"});
+        let empty_tasks_worktree =
+            serde_json::json!({"tasks": [], "prompt": "edit things", "isolation": "worktree"});
+        let mixed_tasks = serde_json::json!({"tasks": [
+            {"prompt": "isolated", "isolation": "worktree"},
+            {"prompt": "shared"}
+        ]});
+        let isolated_tasks = serde_json::json!({"tasks": [
+            {"prompt": "isolated one", "isolation": "worktree"},
+            {"prompt": "isolated two", "isolation": "worktree"}
+        ]});
+        for mode in [
+            crate::PermissionMode::Edits,
+            crate::PermissionMode::Auto,
+            crate::PermissionMode::AlwaysApprove,
+        ] {
+            agent.set_permission_mode(mode);
+            assert_eq!(
+                agent.lane_for_call("agent", crate::permission::ToolClass::Other, &shared),
+                crate::scheduler::ToolLane::Serial
+            );
+            assert_eq!(
+                agent.lane_for_call("agent", crate::permission::ToolClass::Other, &mixed_tasks),
+                crate::scheduler::ToolLane::Serial
+            );
+            assert_eq!(
+                agent.lane_for_call("agent", crate::permission::ToolClass::Other, &worktree),
+                crate::scheduler::ToolLane::Parallel
+            );
+            assert_eq!(
+                agent.lane_for_call("agent", crate::permission::ToolClass::Other, &empty_tasks),
+                crate::scheduler::ToolLane::Serial
+            );
+            assert_eq!(
+                agent.lane_for_call(
+                    "agent",
+                    crate::permission::ToolClass::Other,
+                    &empty_tasks_worktree
+                ),
+                crate::scheduler::ToolLane::Parallel
+            );
+            assert_eq!(
+                agent.lane_for_call(
+                    "agent",
+                    crate::permission::ToolClass::Other,
+                    &isolated_tasks
+                ),
+                crate::scheduler::ToolLane::Parallel
+            );
+        }
+        agent.set_permission_mode(crate::PermissionMode::Ask);
+        assert_eq!(
+            agent.lane_for_call("agent", crate::permission::ToolClass::Other, &shared),
+            crate::scheduler::ToolLane::Parallel
+        );
+        agent.set_permission_mode(crate::PermissionMode::ReadOnly);
+        assert_eq!(
+            agent.lane_for_call("agent", crate::permission::ToolClass::Other, &shared),
+            crate::scheduler::ToolLane::Parallel
+        );
+    }
+
     #[test]
     fn graph_effect_handoff_failure_stops_worker_after_mutation() {
         const CHILD: &str = "DAVINCI_EFFECT_HANDOFF_FIXTURE";
