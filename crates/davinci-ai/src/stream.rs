@@ -2351,6 +2351,50 @@ mod tests {
     use super::*;
     use crate::catalog::load_builtin_models;
 
+    #[test]
+    fn openai_response_control_values_are_conservative() {
+        assert_eq!(verbosity_from(Some("medium")), "medium");
+        assert_eq!(verbosity_from(Some("loud")), "low");
+        assert_eq!(verbosity_from(None), "low");
+        assert_eq!(summary_from(Some("none")), None);
+        assert_eq!(summary_from(Some("concise")), Some("concise"));
+        assert_eq!(summary_from(None), Some("auto"));
+    }
+
+    #[test]
+    fn assistant_message_replays_its_native_items_for_same_model() {
+        let items = vec![
+            serde_json::json!({
+                "type": "reasoning",
+                "id": "rs_1",
+                "encrypted_content": "enc",
+                "summary": []
+            }),
+            serde_json::json!({
+                "type": "message",
+                "role": "assistant",
+                "phase": "final_answer",
+                "content": [{"type": "output_text", "text": "Done."}]
+            }),
+        ];
+        let mut assistant = ChatMessage::text("assistant", "Done.");
+        attach_native_items(&mut assistant, &items, "openai-codex/gpt-5.6-luna");
+        let input = openai_responses_input_with(
+            &[
+                ChatMessage::text("user", "go"),
+                assistant,
+                ChatMessage::text("user", "next"),
+            ],
+            &ResponsesInputOptions {
+                native_items_model: Some("openai-codex/gpt-5.6-luna"),
+                custom_tools: &[],
+            },
+        );
+        assert_eq!(input[1]["type"], "reasoning");
+        assert_eq!(input[2]["phase"], "final_answer");
+        assert_eq!(input.len(), 4);
+    }
+
     /// A loopback HTTP server that answers one POST with an SSE body in two
     /// halves, the second only once `release` fires (or after `patience`).
     /// Returns whether the release arrived in time.
