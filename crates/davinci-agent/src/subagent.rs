@@ -12,7 +12,7 @@ use crate::permission::{tool_class, PermissionMode, ToolClass};
 use crate::runtime::{
     AgentId, AgentKind, AgentOperationHandle, AgentRecord, AgentState, CancellationToken,
     ChildExecutionContext, ChildExecutionKind, RuntimeCapabilityRegistry, RuntimeHandle,
-    WorktreeLease, WorktreeManager,
+    RuntimeRegistry, WorktreeLease, WorktreeManager,
 };
 use crate::tools::{ToolError, ToolResult};
 
@@ -263,6 +263,72 @@ struct TaskSpec {
     name: Option<String>,
 }
 
+/// Rolls back workers that have not begun execution if preparing a batch fails.
+struct LaunchRollback<'a> {
+    registry: Option<&'a RuntimeRegistry>,
+    agents: Vec<AgentId>,
+    leases: Vec<(WorktreeManager, WorktreeLease)>,
+    operations: Vec<(AgentId, AgentOperationHandle)>,
+    committed: bool,
+}
+
+impl<'a> LaunchRollback<'a> {
+    fn new(registry: Option<&'a RuntimeRegistry>) -> Self {
+        Self {
+            registry,
+            agents: Vec::new(),
+            leases: Vec::new(),
+            operations: Vec::new(),
+            committed: false,
+        }
+    }
+
+    fn track_agent(&mut self, agent_id: AgentId) {
+        self.agents.push(agent_id);
+    }
+
+    fn track_lease(&mut self, manager: WorktreeManager, lease: WorktreeLease) {
+        self.leases.push((manager, lease));
+    }
+
+    fn track_operation(&mut self, agent_id: AgentId, operation: AgentOperationHandle) {
+        if operation.should_execute() {
+            self.operations.push((agent_id, operation));
+        }
+    }
+
+    /// A successfully spawned worker owns its lifecycle and worktree now.
+    fn mark_started(&mut self, agent_id: AgentId) {
+        self.agents.retain(|tracked| *tracked != agent_id);
+        self.leases.retain(|(_, lease)| lease.agent_id != agent_id);
+        self.operations.retain(|(tracked, _)| *tracked != agent_id);
+    }
+
+    fn commit(mut self) {
+        self.committed = true;
+    }
+}
+
+impl Drop for LaunchRollback<'_> {
+    fn drop(&mut self) {
+        if self.committed {
+            return;
+        }
+        for (_, operation) in &self.operations {
+            let _ = operation.cancel_before_start("subagent batch failed before worker start");
+        }
+        if let Some(registry) = self.registry {
+            for agent_id in &self.agents {
+                let _ = registry.transition(*agent_id, AgentState::Failed);
+            }
+        }
+        for (manager, lease) in &self.leases {
+            // These workers never ran, so their worktrees contain no worker output.
+            let _ = manager.release_lease(lease, false);
+        }
+    }
+}
+
 fn task_spec(input: &Value) -> Result<TaskSpec, ToolError> {
     let prompt = input
         .get("prompt")
@@ -352,6 +418,16 @@ pub fn run_tool(
         _ => vec![task_spec(input)?],
     };
 
+    let async_count = specs
+        .iter()
+        .filter(|spec| spec.mode != AgentSpawnMode::Oneshot)
+        .count();
+    if async_count > 0 && async_count < specs.len() {
+        return Err(ToolError::Failed(
+            "This batch mixes oneshot tasks with background/teammate tasks. Send them as separate agent calls: oneshot results are returned, background ones are only spawned.".into(),
+        ));
+    }
+
     let is_parent_readonly = parent.permission_mode == Some(PermissionMode::ReadOnly);
     for spec in &specs {
         if is_parent_readonly {
@@ -410,6 +486,8 @@ pub fn run_tool(
         None
     };
 
+    let mut rollback =
+        LaunchRollback::new(parent.runtime.as_ref().map(|runtime| &runtime.registry));
     let mut requests: Vec<SubagentRequest> = Vec::with_capacity(specs.len());
     let mut leases: Vec<Option<WorktreeLease>> = Vec::with_capacity(specs.len());
     for spec in &specs {
@@ -446,6 +524,7 @@ pub fn run_tool(
             let lease = mgr
                 .create_lease(run_id, child_agent_id, None)
                 .map_err(|e| ToolError::Failed(format!("Worktree isolation failed: {e}")))?;
+            rollback.track_lease(mgr.clone(), lease.clone());
             lease_opt = Some(lease);
         }
         let wt_path = lease_opt.as_ref().map(|l| l.path.clone());
@@ -492,8 +571,13 @@ pub fn run_tool(
                 updated_ms: now,
                 failure_reason: None,
             };
-            let _ = rt.registry.register_agent(record);
-            let _ = rt.registry.transition(child_agent_id, AgentState::Running);
+            rt.registry.register_agent(record).map_err(|error| {
+                ToolError::Failed(format!("failed to register subagent: {error}"))
+            })?;
+            rollback.track_agent(child_agent_id);
+            rt.registry
+                .transition(child_agent_id, AgentState::Running)
+                .map_err(|error| ToolError::Failed(format!("failed to start subagent: {error}")))?;
         }
 
         let runtime = parent
@@ -531,32 +615,34 @@ pub fn run_tool(
     let child_operations: Vec<Option<AgentOperationHandle>> = if let Some(runtime) = &parent.runtime
     {
         if let Some(adapter) = runtime.child_operation_adapter() {
-            requests
-                .iter()
-                .map(|request| {
-                    let child_id = request.runtime_agent_id.unwrap_or_default();
-                    let mut child = ChildExecutionContext::new(
-                        format!("subagent:{child_id}"),
-                        runtime,
-                        Some(child_id),
-                    );
-                    child.host = "agent_tool".to_owned();
-                    let payload = serde_json::json!({
-                        "mode": request.mode,
-                        "description": request.description,
-                        "tools": request.tools,
-                        "model": request.model_override,
-                        "isolation": request.isolation,
-                        "prompt_digest": crate::runtime::operations::PayloadDigest::of_bytes(request.prompt.as_bytes()),
-                    });
-                    adapter
-                        .start(ChildExecutionKind::Subagent, child, payload)
-                        .map(Some)
-                        .map_err(|error| ToolError::Failed(format!(
+            let mut operations = Vec::with_capacity(requests.len());
+            for request in &requests {
+                let child_id = request.runtime_agent_id.unwrap_or_default();
+                let mut child = ChildExecutionContext::new(
+                    format!("subagent:{child_id}"),
+                    runtime,
+                    Some(child_id),
+                );
+                child.host = "agent_tool".to_owned();
+                let payload = serde_json::json!({
+                    "mode": request.mode,
+                    "description": request.description,
+                    "tools": request.tools,
+                    "model": request.model_override,
+                    "isolation": request.isolation,
+                    "prompt_digest": crate::runtime::operations::PayloadDigest::of_bytes(request.prompt.as_bytes()),
+                });
+                let operation = adapter
+                    .start(ChildExecutionKind::Subagent, child, payload)
+                    .map_err(|error| {
+                        ToolError::Failed(format!(
                             "subagent launch was not durably admitted: {error}"
-                        )))
-                })
-                .collect::<Result<Vec<_>, _>>()?
+                        ))
+                    })?;
+                rollback.track_operation(child_id, operation.clone());
+                operations.push(Some(operation));
+            }
+            operations
         } else {
             vec![None; requests.len()]
         }
@@ -567,19 +653,24 @@ pub fn run_tool(
     let any_async = requests.iter().any(|r| r.mode != AgentSpawnMode::Oneshot);
     if any_async {
         let mut launched_ids = Vec::new();
-        for ((req, lease_opt), operation) in requests
-            .iter()
-            .zip(leases.into_iter())
-            .zip(child_operations.iter().cloned())
-        {
+        for (index, (req, operation)) in requests.iter().zip(&child_operations).enumerate() {
             let req_clone = req.clone();
             let runner_clone = runner.clone();
+            let operation = operation.clone();
             let rt_clone = parent.runtime.clone();
             let cid = req.runtime_agent_id.unwrap_or_default();
+            let lease_opt = leases.get(index).cloned().flatten();
             let wt_mgr_clone = wt_manager.clone();
+            let cleanup_lease = lease_opt.clone();
+            let cleanup_manager = wt_manager.clone();
+            let cleanup_operation = operation.clone();
+            let (start_tx, start_rx) = std::sync::mpsc::channel();
             std::thread::Builder::new()
                 .name(format!("agent-worker-{cid}"))
                 .spawn(move || {
+                    if start_rx.recv().is_err() {
+                        return;
+                    }
                     let outcome =
                         run_journaled_subagent(&req_clone, &runner_clone, operation.as_ref());
                     if let Some(rt) = &rt_clone {
@@ -598,6 +689,24 @@ pub fn run_tool(
                 .map_err(|e| {
                     ToolError::Failed(format!("failed to spawn background agent thread: {e}"))
                 })?;
+            rollback.mark_started(cid);
+            if start_tx.send(()).is_err() {
+                if let Some(operation) = &cleanup_operation {
+                    if operation.should_execute() {
+                        let _ = operation
+                            .cancel_before_start("subagent worker exited before it could start");
+                    }
+                }
+                if let Some(runtime) = &parent.runtime {
+                    let _ = runtime.registry.transition(cid, AgentState::Failed);
+                }
+                if let (Some(manager), Some(lease)) = (&cleanup_manager, &cleanup_lease) {
+                    let _ = manager.release_lease(lease, false);
+                }
+                return Err(ToolError::Failed(
+                    "background agent thread exited before launch".into(),
+                ));
+            }
             launched_ids.push(cid);
         }
 
@@ -644,6 +753,7 @@ pub fn run_tool(
     }
 
     if requests.len() == 1 {
+        rollback.commit();
         let aid = requests[0].runtime_agent_id.unwrap_or_default();
         let outcome = run_journaled_subagent(&requests[0], runner, child_operations[0].as_ref());
         if let Some(rt) = &parent.runtime {
@@ -690,6 +800,7 @@ pub fn run_tool(
         .as_ref()
         .map(|t| t.as_atomic_bool())
         .or_else(|| parent.abort.clone());
+    rollback.commit();
     let (outcomes, _) = crate::scheduler::run_lanes(
         calls,
         false,
@@ -1412,6 +1523,236 @@ mod tests {
     }
 
     #[test]
+    fn mixed_oneshot_and_background_batch_is_refused_before_launch() {
+        let runtime = RuntimeHandle::new(
+            crate::runtime::RunId::new(),
+            AgentId::new(),
+            crate::RuntimeBus::new(),
+        );
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let runner_calls = Arc::clone(&calls);
+        let runner = SubagentRunner::new(move |_| {
+            runner_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok("done".into())
+        });
+        let parent = SubagentParent {
+            runtime: Some(runtime.clone()),
+            ..SubagentParent::default()
+        };
+
+        let err = run_tool(
+            &json!({"tasks": [
+                {"prompt": "oneshot result", "mode": "oneshot"},
+                {"prompt": "background task", "mode": "background"}
+            ]}),
+            &["read".into()],
+            Some(&runner),
+            &parent,
+        )
+        .unwrap_err()
+        .to_string();
+
+        assert!(err.contains("separate agent calls"), "{err}");
+        assert!(runtime.registry.snapshot().is_empty());
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn partial_launch_failure_marks_prior_workers_failed() {
+        let invalid_repo = tempfile::tempdir().unwrap();
+        let worktree_root = tempfile::tempdir().unwrap();
+        let manager = WorktreeManager::new(
+            invalid_repo.path().join("not-a-git-repository"),
+            worktree_root.path(),
+        );
+        let runtime = RuntimeHandle::new(
+            crate::runtime::RunId::new(),
+            AgentId::new(),
+            crate::RuntimeBus::new(),
+        )
+        .with_worktree_manager(manager.clone());
+        let runner = SubagentRunner::new(|_| Err("runner must not start".into()));
+        let parent = SubagentParent {
+            runtime: Some(runtime.clone()),
+            permission_mode: Some(PermissionMode::Edits),
+            worktree_manager: Some(manager.clone()),
+            ..SubagentParent::default()
+        };
+
+        let err = run_tool(
+            &json!({"tasks": [
+                {"prompt": "shared worker"},
+                {"prompt": "worktree worker", "isolation": "worktree"}
+            ]}),
+            &["read".into()],
+            Some(&runner),
+            &parent,
+        )
+        .unwrap_err()
+        .to_string();
+
+        assert!(err.contains("Worktree isolation failed"), "{err}");
+        let records = runtime.registry.snapshot();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].state, AgentState::Failed);
+        assert!(manager.list_leases().is_empty());
+    }
+
+    #[test]
+    fn launch_rollback_preserves_started_workers_and_releases_unstarted_worktrees() {
+        let repo_dir = init_subagent_temp_git_repo();
+        let started_worktree_root = tempfile::tempdir().unwrap();
+        let unstarted_worktree_root = tempfile::tempdir().unwrap();
+        let started_manager = WorktreeManager::new(repo_dir.path(), started_worktree_root.path());
+        let unstarted_manager =
+            WorktreeManager::new(repo_dir.path(), unstarted_worktree_root.path());
+        let runtime = RuntimeHandle::new(
+            crate::runtime::RunId::new(),
+            AgentId::new(),
+            crate::RuntimeBus::new(),
+        );
+        let started_id = AgentId::new();
+        let started_lease = started_manager
+            .create_lease(
+                runtime.run_id,
+                started_id,
+                Some("davinci/agent/rollback-started"),
+            )
+            .unwrap();
+        let unstarted_id = AgentId::new();
+        let unstarted_lease = unstarted_manager
+            .create_lease(
+                runtime.run_id,
+                unstarted_id,
+                Some("davinci/agent/rollback-unstarted"),
+            )
+            .unwrap();
+
+        for (agent_id, lease, name) in [
+            (started_id, &started_lease, "started-worker"),
+            (unstarted_id, &unstarted_lease, "unstarted-worker"),
+        ] {
+            runtime
+                .registry
+                .register_agent(AgentRecord {
+                    id: agent_id,
+                    run_id: runtime.run_id,
+                    parent: Some(runtime.agent_id),
+                    kind: AgentKind::Subagent,
+                    name: name.into(),
+                    provider: String::new(),
+                    model_id: String::new(),
+                    cwd: lease.path.clone(),
+                    state: AgentState::Starting,
+                    task_id: None,
+                    worktree: Some(lease.path.clone()),
+                    started_ms: 0,
+                    updated_ms: 0,
+                    failure_reason: None,
+                })
+                .unwrap();
+            runtime
+                .registry
+                .transition(agent_id, AgentState::Running)
+                .unwrap();
+        }
+
+        {
+            let mut rollback = LaunchRollback::new(Some(&runtime.registry));
+            rollback.track_agent(started_id);
+            rollback.track_lease(started_manager.clone(), started_lease.clone());
+            rollback.track_agent(unstarted_id);
+            rollback.track_lease(unstarted_manager.clone(), unstarted_lease.clone());
+            rollback.mark_started(started_id);
+        }
+
+        assert_eq!(
+            runtime.registry.get(&started_id).unwrap().state,
+            AgentState::Running
+        );
+        assert_eq!(
+            runtime.registry.get(&unstarted_id).unwrap().state,
+            AgentState::Failed
+        );
+        assert_eq!(started_manager.list_leases(), vec![started_lease.clone()]);
+        assert!(unstarted_manager.list_leases().is_empty());
+        assert!(started_lease.path.exists());
+        assert!(!unstarted_lease.path.exists());
+    }
+
+    #[test]
+    fn launch_rollback_cancels_durably_admitted_children_that_never_started() {
+        use crate::runtime::operations::{
+            CallerType, ChildExecutionContext, ExecutionOwner, ExecutionOwnerId, JournalId,
+            JournalIdentity, OperationContext, OperationJournal, RootNamespaceId,
+            ToolOperationRuntime, WorkspaceId, WorkspaceIdentity,
+        };
+
+        let temp = tempfile::tempdir().unwrap();
+        let temp_root = std::fs::canonicalize(temp.path()).unwrap();
+        let runtime = RuntimeHandle::new(
+            crate::runtime::RunId::new(),
+            AgentId::new(),
+            crate::RuntimeBus::new(),
+        );
+        let root = RootNamespaceId::new();
+        let identity = JournalIdentity::new(
+            JournalId::new(),
+            WorkspaceIdentity {
+                id: WorkspaceId::new(),
+                binding_version: 1,
+            },
+        )
+        .unwrap();
+        let journal = Arc::new(
+            OperationJournal::open(&temp_root.join("operations"), identity.clone(), root).unwrap(),
+        );
+        let context = OperationContext {
+            journal_id: identity.journal_id,
+            root_namespace_id: root,
+            session_id: "subagent-rollback".into(),
+            runtime_run_id: runtime.run_id,
+            parent_operation_id: None,
+            agent_id: runtime.agent_id,
+            worker_id: None,
+            task_id: None,
+            graph: None,
+            workspace: identity.workspace,
+            caller: CallerType::HostControl,
+            wire_tool_call_id: None,
+        };
+        let operations = ToolOperationRuntime::new(
+            journal,
+            context,
+            ExecutionOwner::new(ExecutionOwnerId::new(), 1).unwrap(),
+            &temp_root,
+        )
+        .unwrap();
+        let runtime = runtime.with_operation_runtime(operations);
+        let child_id = AgentId::new();
+        let mut child =
+            ChildExecutionContext::new(format!("subagent:{child_id}"), &runtime, Some(child_id));
+        child.host = "agent_tool".into();
+        let operation = runtime
+            .child_operation_adapter()
+            .unwrap()
+            .start(
+                ChildExecutionKind::Subagent,
+                child,
+                json!({"prompt_digest": "fixture"}),
+            )
+            .unwrap();
+        assert_eq!(runtime.unresolved_child_operations().unwrap().len(), 1);
+
+        {
+            let mut rollback = LaunchRollback::new(Some(&runtime.registry));
+            rollback.track_operation(child_id, operation);
+        }
+
+        assert!(runtime.unresolved_child_operations().unwrap().is_empty());
+    }
+
+    #[test]
     fn test_worktree_isolation_creates_lease_and_updates_record() {
         let repo_dir = init_subagent_temp_git_repo();
         let wt_dir = tempfile::tempdir().unwrap();
@@ -1463,6 +1804,57 @@ mod tests {
         assert_eq!(record.worktree, Some(captured.clone()));
         assert_eq!(record.cwd, captured);
         assert_eq!(record.state, AgentState::Completed);
+    }
+
+    #[test]
+    fn multiple_worktree_subagents_get_distinct_leases() {
+        let repo_dir = init_subagent_temp_git_repo();
+        let wt_dir = tempfile::tempdir().unwrap();
+        let manager = WorktreeManager::new(repo_dir.path(), wt_dir.path());
+        let runtime = RuntimeHandle::new(
+            crate::runtime::RunId::new(),
+            AgentId::new(),
+            crate::RuntimeBus::new(),
+        )
+        .with_worktree_manager(manager.clone());
+        let paths = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let runner_paths = Arc::clone(&paths);
+        let runner = SubagentRunner::new(move |request| {
+            let path = request
+                .worktree_path
+                .clone()
+                .ok_or_else(|| "worktree path missing".to_string())?;
+            runner_paths.lock().unwrap().push(path);
+            Ok("done".into())
+        });
+        let parent = SubagentParent {
+            runtime: Some(runtime.clone()),
+            permission_mode: Some(PermissionMode::Edits),
+            worktree_manager: Some(manager.clone()),
+            ..SubagentParent::default()
+        };
+
+        run_tool(
+            &json!({"tasks": [
+                {"prompt": "first isolated task", "isolation": "worktree"},
+                {"prompt": "second isolated task", "isolation": "worktree"}
+            ]}),
+            &["read".into(), "write".into()],
+            Some(&runner),
+            &parent,
+        )
+        .unwrap();
+
+        let paths = paths.lock().unwrap();
+        assert_eq!(paths.len(), 2);
+        assert_ne!(paths[0], paths[1]);
+        assert!(paths.iter().all(|path| !path.exists()));
+        assert!(manager.list_leases().is_empty());
+        assert!(runtime
+            .registry
+            .snapshot()
+            .iter()
+            .all(|record| record.state == AgentState::Completed));
     }
 
     #[test]

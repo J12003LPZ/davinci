@@ -131,10 +131,13 @@ impl WorktreeManager {
     ) -> Result<WorktreeLease, WorktreeError> {
         self.validate_git_repo()?;
 
-        let short_agent = &agent_id.to_string()[..8];
+        // UUIDv7's leading characters encode time, so the first eight characters
+        // collide for agents created near one another. Keep the full ID in both
+        // the branch and path to make concurrent leases distinct.
+        let agent_key = agent_id.to_string();
         let branch = explicit_branch
             .map(str::to_string)
-            .unwrap_or_else(|| format!("davinci/agent/{short_agent}"));
+            .unwrap_or_else(|| format!("davinci/agent/{agent_key}"));
 
         // 1. Validate branch is not held by another active lease
         {
@@ -152,9 +155,9 @@ impl WorktreeManager {
         let base_head = run_git(&self.repo_root, &["rev-parse", "HEAD"])?;
 
         // 3. Determine deterministic worktree path outside tracked paths
-        let wt_path =
-            self.worktree_root
-                .join(format!("wt-{}-{}", &run_id.to_string()[..8], short_agent));
+        let wt_path = self
+            .worktree_root
+            .join(format!("wt-{}-{agent_key}", &run_id.to_string()[..8]));
 
         if wt_path.exists() {
             return Err(WorktreeError::PathAlreadyExists(wt_path));
@@ -456,6 +459,30 @@ mod tests {
         assert!(captured_remove
             .iter()
             .any(|e| matches!(e, RuntimeEvent::WorktreeRemoved { path } if path == &lease.path)));
+    }
+
+    #[test]
+    fn uuid_v7_agents_with_the_same_timestamp_get_distinct_worktrees() {
+        let repo_dir = init_temp_git_repo();
+        let wt_dir = tempdir().unwrap();
+        let manager = WorktreeManager::new(repo_dir.path(), wt_dir.path());
+        let run_id = RunId::from_uuid(
+            uuid::Uuid::parse_str("01901234-3333-7333-8333-333333333333").unwrap(),
+        );
+        let agent1 = AgentId::from_uuid(
+            uuid::Uuid::parse_str("01901234-1111-7111-8111-111111111111").unwrap(),
+        );
+        let agent2 = AgentId::from_uuid(
+            uuid::Uuid::parse_str("01901234-2222-7222-8222-222222222222").unwrap(),
+        );
+
+        let lease1 = manager.create_lease(run_id, agent1, None).unwrap();
+        let lease2 = manager.create_lease(run_id, agent2, None).unwrap();
+
+        assert_ne!(lease1.branch, lease2.branch);
+        assert_ne!(lease1.path, lease2.path);
+        manager.release_lease(&lease1, false).unwrap();
+        manager.release_lease(&lease2, false).unwrap();
     }
 
     #[test]
