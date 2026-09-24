@@ -70,6 +70,23 @@ impl ProjectTrustStore {
         .flatten()
     }
 
+    /// `Err` means a decision may exist but cannot be read. Callers that
+    /// grant trust must treat that as "not trusted".
+    pub fn try_get(&self, cwd: &Path) -> Result<Option<bool>, String> {
+        if let Some(parent) = self.trust_path.parent() {
+            fs::create_dir_all(parent).map_err(|err| {
+                format!(
+                    "Failed to create trust store directory {}: {err}",
+                    parent.display()
+                )
+            })?;
+        }
+        with_settings_lock(&self.trust_path, || {
+            let data = read_trust_file(&self.trust_path)?;
+            Ok(find_nearest_trust_entry(&data, cwd).map(|entry| entry.decision))
+        })
+    }
+
     #[allow(dead_code)]
     pub fn set(&self, cwd: &Path, decision: Option<bool>) -> Result<(), String> {
         self.set_many(&[ProjectTrustUpdate {
@@ -114,9 +131,12 @@ pub fn resolve_project_trusted(
     if !has_trust_requiring_project_resources(cwd) {
         return true;
     }
-    let store = ProjectTrustStore::open(agent_dir);
-    if let Some(decision) = store.get(cwd) {
-        return decision;
+    match ProjectTrustStore::open(agent_dir).try_get(cwd) {
+        Ok(Some(decision)) => return decision,
+        Ok(None) => {}
+        // A stored "Do not trust" we cannot read must not be overridden by
+        // `defaultProjectTrust` or `trustedProjects`.
+        Err(_) => return false,
     }
     let canonical = canonicalize_trust_path(cwd);
     let display = cwd.to_string_lossy();
@@ -449,6 +469,42 @@ mod tests {
             &cwd,
             None,
             Some("ask"),
+            &[]
+        ));
+    }
+
+    #[test]
+    fn unreadable_trust_store_is_not_trusted_even_with_default_always() {
+        let dir = tempdir().unwrap();
+        let agent = dir.path().join("agent");
+        let project = dir.path().join("project");
+        fs::create_dir_all(project.join(".pi")).unwrap();
+        fs::write(project.join(".pi").join("settings.json"), "{}").unwrap();
+        fs::create_dir_all(&agent).unwrap();
+        fs::write(agent.join("trust.json"), "{ not json").unwrap();
+        assert!(!resolve_project_trusted(
+            &agent,
+            &project,
+            None,
+            Some("always"),
+            &[]
+        ));
+    }
+
+    #[test]
+    fn held_trust_lock_is_not_trusted_even_with_default_always() {
+        let dir = tempdir().unwrap();
+        let agent = dir.path().join("agent");
+        let project = dir.path().join("project");
+        fs::create_dir_all(project.join(".pi")).unwrap();
+        fs::write(project.join(".pi").join("settings.json"), "{}").unwrap();
+        fs::create_dir_all(&agent).unwrap();
+        fs::write(agent.join("trust.json.lock"), "1\n").unwrap();
+        assert!(!resolve_project_trusted(
+            &agent,
+            &project,
+            None,
+            Some("always"),
             &[]
         ));
     }
