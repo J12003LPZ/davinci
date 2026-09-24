@@ -835,6 +835,12 @@ fn build_agent(parsed: &Args, session_dir: &Path, cwd: &Path) -> Result<Agent, S
     if let Some(ms) = settings.websocket_connect_timeout_ms {
         std::env::set_var("PI_WEBSOCKET_CONNECT_TIMEOUT_MS", ms.to_string());
     }
+    if let Some(value) = settings.openai_verbosity.as_deref() {
+        std::env::set_var("DAVINCI_OPENAI_VERBOSITY", value);
+    }
+    if let Some(value) = settings.reasoning_summary.as_deref() {
+        std::env::set_var("DAVINCI_REASONING_SUMMARY", value);
+    }
     let (images, true_color, hyperlinks) = settings.terminal_capability_overrides();
     if let Some(kind) = images {
         std::env::set_var("PI_TERMINAL_IMAGES", kind);
