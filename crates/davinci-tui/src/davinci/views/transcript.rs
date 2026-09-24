@@ -87,6 +87,19 @@ fn rendered_blocks(model: &Model, entries: &[Entry], width: u16) -> Vec<Vec<Line
             while cursor < entries.len() {
                 match &entries[cursor] {
                     Entry::Gap if !calls.is_empty() => {
+                        let next_groupable = matches!(
+                            entries.get(cursor + 1),
+                            Some(Entry::Tool {
+                                state,
+                                instrument,
+                                target,
+                                ..
+                            }) if !matches!(state, State::Failed | State::Attention)
+                                && explore_kind(instrument, target).is_some()
+                        );
+                        if !next_groupable {
+                            break;
+                        }
                         cursor += 1;
                         consumed = cursor;
                     }
