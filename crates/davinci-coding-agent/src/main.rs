@@ -13280,7 +13280,7 @@ mod tests {
             message: std::sync::Arc::new(davinci_ai::ChatMessage::text("assistant", "")),
             assistant_message_event: davinci_ai::AssistantMessageEvent::ToolcallStart {
                 content_index: 0,
-                partial: message,
+                partial: std::sync::Arc::new(message),
             },
         })
         .unwrap();
@@ -13294,7 +13294,7 @@ mod tests {
     #[test]
     fn print_json_fast_path_matches_full_serialization_minus_partial() {
         use davinci_ai::AssistantMessageEvent as Ev;
-        let partial = AssistantMessage {
+        let partial = std::sync::Arc::new(AssistantMessage {
             id: "m1".into(),
             role: "assistant".into(),
             content: vec![ContentBlock::Text { text: "big".into() }],
@@ -13302,7 +13302,7 @@ mod tests {
             usage: None,
             stop_reason: None,
             error_message: None,
-        };
+        });
         let tool_call = ContentBlock::ToolCall {
             id: "call-1".into(),
             name: "read".into(),

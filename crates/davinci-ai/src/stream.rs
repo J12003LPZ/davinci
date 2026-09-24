@@ -11,8 +11,8 @@ use crate::thinking::{
 };
 use crate::{ChatMessage, MessageContent, ToolSpec};
 use davinci_protocol::{ThinkingLevel, Usage};
-use std::sync::mpsc;
-use std::time::Duration;
+use std::sync::{mpsc, Arc};
+use std::time::{Duration, Instant};
 
 #[derive(Debug, Clone, Default)]
 pub struct StreamOptions {
@@ -107,63 +107,106 @@ pub struct AssistantMessage {
     pub error_message: Option<String>,
 }
 
+/// Shares message snapshots across stream events and refreshes them at a
+/// bounded rate while content is arriving.
+pub(crate) struct PartialMessageSnapshot {
+    current: Arc<AssistantMessage>,
+    last_refresh: Instant,
+    bytes_since_refresh: usize,
+}
+
+impl PartialMessageSnapshot {
+    pub(crate) fn new(message: &AssistantMessage) -> Self {
+        Self {
+            current: Arc::new(message.clone()),
+            last_refresh: Instant::now(),
+            bytes_since_refresh: 0,
+        }
+    }
+
+    pub(crate) fn update(
+        &mut self,
+        message: &AssistantMessage,
+        appended_bytes: usize,
+    ) -> Arc<AssistantMessage> {
+        self.bytes_since_refresh = self.bytes_since_refresh.saturating_add(appended_bytes);
+        if self.bytes_since_refresh >= 4 * 1024
+            || self.last_refresh.elapsed() >= Duration::from_millis(50)
+        {
+            self.refresh(message);
+        }
+        Arc::clone(&self.current)
+    }
+
+    pub(crate) fn force(&mut self, message: &AssistantMessage) -> Arc<AssistantMessage> {
+        self.refresh(message);
+        Arc::clone(&self.current)
+    }
+
+    fn refresh(&mut self, message: &AssistantMessage) {
+        self.current = Arc::new(message.clone());
+        self.last_refresh = Instant::now();
+        self.bytes_since_refresh = 0;
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub enum AssistantMessageEvent {
     #[serde(rename = "start")]
-    Start { partial: AssistantMessage },
+    Start { partial: Arc<AssistantMessage> },
     #[serde(rename = "text_start")]
     TextStart {
         #[serde(rename = "contentIndex")]
         content_index: usize,
-        partial: AssistantMessage,
+        partial: Arc<AssistantMessage>,
     },
     #[serde(rename = "text_delta")]
     TextDelta {
         #[serde(rename = "contentIndex")]
         content_index: usize,
         delta: String,
-        partial: AssistantMessage,
+        partial: Arc<AssistantMessage>,
     },
     #[serde(rename = "text_end")]
     TextEnd {
         #[serde(rename = "contentIndex")]
         content_index: usize,
         content: String,
-        partial: AssistantMessage,
+        partial: Arc<AssistantMessage>,
     },
     #[serde(rename = "thinking_start")]
     ThinkingStart {
         #[serde(rename = "contentIndex")]
         content_index: usize,
-        partial: AssistantMessage,
+        partial: Arc<AssistantMessage>,
     },
     #[serde(rename = "thinking_delta")]
     ThinkingDelta {
         #[serde(rename = "contentIndex")]
         content_index: usize,
         delta: String,
-        partial: AssistantMessage,
+        partial: Arc<AssistantMessage>,
     },
     #[serde(rename = "thinking_end")]
     ThinkingEnd {
         #[serde(rename = "contentIndex")]
         content_index: usize,
         content: String,
-        partial: AssistantMessage,
+        partial: Arc<AssistantMessage>,
     },
     #[serde(rename = "toolcall_start")]
     ToolcallStart {
         #[serde(rename = "contentIndex")]
         content_index: usize,
-        partial: AssistantMessage,
+        partial: Arc<AssistantMessage>,
     },
     #[serde(rename = "toolcall_delta")]
     ToolcallDelta {
         #[serde(rename = "contentIndex")]
         content_index: usize,
         delta: String,
-        partial: AssistantMessage,
+        partial: Arc<AssistantMessage>,
     },
     #[serde(rename = "toolcall_end")]
     ToolcallEnd {
@@ -171,7 +214,7 @@ pub enum AssistantMessageEvent {
         content_index: usize,
         #[serde(rename = "toolCall")]
         tool_call: ContentBlock,
-        partial: AssistantMessage,
+        partial: Arc<AssistantMessage>,
     },
     #[serde(rename = "done")]
     Done {
@@ -197,7 +240,7 @@ impl AssistantMessageEvent {
             | Self::ThinkingEnd { partial, .. }
             | Self::ToolcallStart { partial, .. }
             | Self::ToolcallDelta { partial, .. }
-            | Self::ToolcallEnd { partial, .. } => partial,
+            | Self::ToolcallEnd { partial, .. } => partial.as_ref(),
             Self::Done { message, .. } => message,
             Self::Error { error, .. } => error,
         }
@@ -1535,52 +1578,53 @@ pub fn live_stream(
 }
 
 pub fn events_from_complete(message: &AssistantMessage) -> Vec<AssistantMessageEvent> {
+    let partial = Arc::new(message.clone());
     let mut events = vec![AssistantMessageEvent::Start {
-        partial: message.clone(),
+        partial: Arc::clone(&partial),
     }];
     for (index, block) in message.content.iter().enumerate() {
         match block {
             ContentBlock::Text { text } => {
                 events.push(AssistantMessageEvent::TextStart {
                     content_index: index,
-                    partial: message.clone(),
+                    partial: Arc::clone(&partial),
                 });
                 events.push(AssistantMessageEvent::TextDelta {
                     content_index: index,
                     delta: text.clone(),
-                    partial: message.clone(),
+                    partial: Arc::clone(&partial),
                 });
                 events.push(AssistantMessageEvent::TextEnd {
                     content_index: index,
                     content: text.clone(),
-                    partial: message.clone(),
+                    partial: Arc::clone(&partial),
                 });
             }
             ContentBlock::Thinking { thinking, .. } => {
                 events.push(AssistantMessageEvent::ThinkingStart {
                     content_index: index,
-                    partial: message.clone(),
+                    partial: Arc::clone(&partial),
                 });
                 events.push(AssistantMessageEvent::ThinkingDelta {
                     content_index: index,
                     delta: thinking.clone(),
-                    partial: message.clone(),
+                    partial: Arc::clone(&partial),
                 });
                 events.push(AssistantMessageEvent::ThinkingEnd {
                     content_index: index,
                     content: thinking.clone(),
-                    partial: message.clone(),
+                    partial: Arc::clone(&partial),
                 });
             }
             ContentBlock::ToolCall { .. } => {
                 events.push(AssistantMessageEvent::ToolcallStart {
                     content_index: index,
-                    partial: message.clone(),
+                    partial: Arc::clone(&partial),
                 });
                 events.push(AssistantMessageEvent::ToolcallEnd {
                     content_index: index,
                     tool_call: block.clone(),
-                    partial: message.clone(),
+                    partial: Arc::clone(&partial),
                 });
             }
         }

@@ -9880,8 +9880,8 @@ mod tests {
         assert_eq!(m.permission_label(), "Plan Mode");
     }
 
-    fn partial(text: &str) -> davinci_ai::AssistantMessage {
-        davinci_ai::AssistantMessage {
+    fn partial(text: &str) -> std::sync::Arc<davinci_ai::AssistantMessage> {
+        std::sync::Arc::new(davinci_ai::AssistantMessage {
             id: "m".into(),
             role: "assistant".into(),
             content: vec![davinci_ai::ContentBlock::Text { text: text.into() }],
@@ -9889,7 +9889,7 @@ mod tests {
             usage: None,
             stop_reason: None,
             error_message: None,
-        }
+        })
     }
 
     fn update(event: davinci_ai::AssistantMessageEvent) -> AgentEvent {

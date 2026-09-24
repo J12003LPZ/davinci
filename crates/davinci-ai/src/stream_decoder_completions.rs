@@ -43,7 +43,8 @@ use uuid::Uuid;
 
 use crate::catalog::Model;
 use crate::stream::{
-    usage_from_value, AssistantMessage, AssistantMessageEvent, ContentBlock, StopReason,
+    usage_from_value, AssistantMessage, AssistantMessageEvent, ContentBlock,
+    PartialMessageSnapshot, StopReason,
 };
 use crate::stream_decoder::{new_message, StreamDecoder};
 
@@ -74,6 +75,7 @@ struct ToolSlot {
 pub struct CompletionsDecoder {
     model: Model,
     message: AssistantMessage,
+    partial_snapshot: PartialMessageSnapshot,
     open: Option<Open>,
     tool_calls: Vec<ToolSlot>,
     started: bool,
@@ -83,9 +85,11 @@ pub struct CompletionsDecoder {
 
 impl CompletionsDecoder {
     pub fn new(model: &Model) -> Self {
+        let message = new_message(model);
         Self {
             model: model.clone(),
-            message: new_message(model),
+            partial_snapshot: PartialMessageSnapshot::new(&message),
+            message,
             open: None,
             tool_calls: Vec::new(),
             started: false,
@@ -98,7 +102,7 @@ impl CompletionsDecoder {
         if !self.started {
             self.started = true;
             out.push(AssistantMessageEvent::Start {
-                partial: self.message.clone(),
+                partial: self.partial_snapshot.force(&self.message),
             });
         }
     }
@@ -114,7 +118,7 @@ impl CompletionsDecoder {
                 out.push(AssistantMessageEvent::TextEnd {
                     content_index,
                     content,
-                    partial: self.message.clone(),
+                    partial: self.partial_snapshot.force(&self.message),
                 });
             }
             Some(Open::Thinking(content_index)) => {
@@ -125,7 +129,7 @@ impl CompletionsDecoder {
                 out.push(AssistantMessageEvent::ThinkingEnd {
                     content_index,
                     content,
-                    partial: self.message.clone(),
+                    partial: self.partial_snapshot.force(&self.message),
                 });
             }
             None => {}
@@ -146,7 +150,7 @@ impl CompletionsDecoder {
         self.open = Some(Open::Text(content_index));
         out.push(AssistantMessageEvent::TextStart {
             content_index,
-            partial: self.message.clone(),
+            partial: self.partial_snapshot.force(&self.message),
         });
         content_index
     }
@@ -166,7 +170,7 @@ impl CompletionsDecoder {
         self.open = Some(Open::Thinking(content_index));
         out.push(AssistantMessageEvent::ThinkingStart {
             content_index,
-            partial: self.message.clone(),
+            partial: self.partial_snapshot.force(&self.message),
         });
         content_index
     }
@@ -179,7 +183,7 @@ impl CompletionsDecoder {
         out.push(AssistantMessageEvent::TextDelta {
             content_index,
             delta: delta.to_string(),
-            partial: self.message.clone(),
+            partial: self.partial_snapshot.update(&self.message, delta.len()),
         });
     }
 
@@ -193,7 +197,7 @@ impl CompletionsDecoder {
         out.push(AssistantMessageEvent::ThinkingDelta {
             content_index,
             delta: delta.to_string(),
-            partial: self.message.clone(),
+            partial: self.partial_snapshot.update(&self.message, delta.len()),
         });
     }
 
@@ -269,12 +273,13 @@ impl CompletionsDecoder {
                 });
                 out.push(AssistantMessageEvent::ToolcallStart {
                     content_index,
-                    partial: self.message.clone(),
+                    partial: self.partial_snapshot.force(&self.message),
                 });
                 self.tool_calls.len() - 1
             }
         };
 
+        let appended_bytes = arguments.len();
         let slot = &mut self.tool_calls[position];
         if slot.stream_index.is_none() {
             slot.stream_index = stream_index;
@@ -286,7 +291,7 @@ impl CompletionsDecoder {
         if let Some(ContentBlock::ToolCall {
             id: block_id,
             name: block_name,
-            arguments: block_arguments,
+            arguments: _,
         }) = self.message.content.get_mut(content_index)
         {
             if block_id.is_empty() {
@@ -297,15 +302,12 @@ impl CompletionsDecoder {
             if block_name.is_empty() && !name.is_empty() {
                 *block_name = name.to_string();
             }
-            if !arguments.is_empty() {
-                *block_arguments = parse_streaming_arguments(&slot.partial, block_arguments);
-            }
         }
         if !arguments.is_empty() {
             out.push(AssistantMessageEvent::ToolcallDelta {
                 content_index,
                 delta: arguments.to_string(),
-                partial: self.message.clone(),
+                partial: self.partial_snapshot.update(&self.message, appended_bytes),
             });
         }
     }
@@ -329,7 +331,7 @@ impl CompletionsDecoder {
             out.push(AssistantMessageEvent::ToolcallEnd {
                 content_index: slot.content_index,
                 tool_call,
-                partial: self.message.clone(),
+                partial: self.partial_snapshot.force(&self.message),
             });
         }
     }
@@ -515,16 +517,6 @@ fn map_stop_reason(reason: &str) -> (StopReason, Option<String>) {
             StopReason::Error,
             Some(format!("Provider finish_reason: {other}")),
         ),
-    }
-}
-
-/// TS `parseStreamingJson` while the arguments stream, without its repair
-/// pass: the buffer if it parses as an object, else the last value that did.
-fn parse_streaming_arguments(buffer: &str, previous: &Value) -> Value {
-    match serde_json::from_str::<Value>(buffer) {
-        Ok(value @ Value::Object(_)) => value,
-        _ if previous.is_object() => previous.clone(),
-        _ => Value::Object(Map::new()),
     }
 }
 
@@ -817,8 +809,8 @@ data: [DONE]
         assert_eq!(name, "read");
         assert_eq!(arguments, &serde_json::json!({"path": "Cargo.toml"}));
 
-        // While the buffer does not parse the arguments stay at the last
-        // parsed value, `{}`; the last fragment completes them.
+        // The original fragments remain available for live rendering while
+        // parsed arguments are only finalized at the tool-call boundary.
         let deltas: Vec<(&str, &Value)> = events
             .iter()
             .filter_map(|event| match event {
@@ -833,16 +825,35 @@ data: [DONE]
         assert_eq!(deltas[1].0, ": \"Cargo");
         assert_eq!(deltas[1].1, &serde_json::json!({}));
         assert_eq!(deltas[2].0, ".toml\"}");
-        assert_eq!(deltas[2].1, &serde_json::json!({"path": "Cargo.toml"}));
+        assert_eq!(deltas[2].1, &serde_json::json!({}));
+        let delta_snapshots: Vec<_> = events
+            .iter()
+            .filter_map(|event| match event {
+                AssistantMessageEvent::ToolcallDelta { partial, .. } => Some(partial),
+                _ => None,
+            })
+            .collect();
+        assert!(delta_snapshots
+            .iter()
+            .all(|snapshot| std::sync::Arc::ptr_eq(delta_snapshots[0], snapshot)));
 
         match &events[5] {
             AssistantMessageEvent::ToolcallEnd {
                 content_index,
                 tool_call,
+                partial,
                 ..
             } => {
                 assert_eq!(*content_index, 0);
                 assert_eq!(tool_call, &message.content[0]);
+                assert_eq!(
+                    &partial.content[0],
+                    &ContentBlock::ToolCall {
+                        id: "call_abc".into(),
+                        name: "read".into(),
+                        arguments: serde_json::json!({"path": "Cargo.toml"}),
+                    }
+                );
             }
             other => panic!("expected toolcall_end, got {other:?}"),
         }

@@ -23,7 +23,9 @@ use std::collections::HashMap;
 use serde_json::{Map, Value};
 
 use crate::catalog::{Model, ModelCost};
-use crate::stream::{AssistantMessage, AssistantMessageEvent, ContentBlock, StopReason};
+use crate::stream::{
+    AssistantMessage, AssistantMessageEvent, ContentBlock, PartialMessageSnapshot, StopReason,
+};
 use crate::stream_decoder::{new_message, StreamDecoder};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -64,6 +66,7 @@ pub struct AnthropicDecoder {
     /// the allowed fallback the response says it was served by.
     usage_model: Model,
     message: AssistantMessage,
+    partial_snapshot: PartialMessageSnapshot,
     blocks: HashMap<u64, Block>,
     counts: TokenCounts,
     started: bool,
@@ -72,10 +75,12 @@ pub struct AnthropicDecoder {
 
 impl AnthropicDecoder {
     pub fn new(model: &Model) -> Self {
+        let message = new_message(model);
         Self {
             model: model.clone(),
             usage_model: model.clone(),
-            message: new_message(model),
+            partial_snapshot: PartialMessageSnapshot::new(&message),
+            message,
             blocks: HashMap::new(),
             counts: TokenCounts::default(),
             started: false,
@@ -87,7 +92,7 @@ impl AnthropicDecoder {
         if !self.started {
             self.started = true;
             out.push(AssistantMessageEvent::Start {
-                partial: self.message.clone(),
+                partial: self.partial_snapshot.force(&self.message),
             });
         }
     }
@@ -153,7 +158,7 @@ impl AnthropicDecoder {
                 });
                 out.push(AssistantMessageEvent::TextStart {
                     content_index,
-                    partial: self.message.clone(),
+                    partial: self.partial_snapshot.force(&self.message),
                 });
                 BlockKind::Text
             }
@@ -165,7 +170,7 @@ impl AnthropicDecoder {
                 });
                 out.push(AssistantMessageEvent::ThinkingStart {
                     content_index,
-                    partial: self.message.clone(),
+                    partial: self.partial_snapshot.force(&self.message),
                 });
                 BlockKind::Thinking
             }
@@ -177,7 +182,7 @@ impl AnthropicDecoder {
                 });
                 out.push(AssistantMessageEvent::ThinkingStart {
                     content_index,
-                    partial: self.message.clone(),
+                    partial: self.partial_snapshot.force(&self.message),
                 });
                 BlockKind::Thinking
             }
@@ -193,7 +198,7 @@ impl AnthropicDecoder {
                 });
                 out.push(AssistantMessageEvent::ToolcallStart {
                     content_index,
-                    partial: self.message.clone(),
+                    partial: self.partial_snapshot.force(&self.message),
                 });
                 BlockKind::ToolCall
             }
@@ -218,72 +223,67 @@ impl AnthropicDecoder {
         };
         // A delta for an index no content_block_start opened is dropped, as
         // in TS.
-        let Some(block) = self.blocks.get(&index).cloned() else {
+        let Some((kind, content_index)) = self
+            .blocks
+            .get(&index)
+            .map(|block| (block.kind, block.content_index))
+        else {
             return;
         };
         let delta_type = delta.get("type").and_then(Value::as_str).unwrap_or("");
-        match (delta_type, block.kind) {
+        match (delta_type, kind) {
             ("text_delta", BlockKind::Text) => {
                 let text = string_field(delta, "text");
+                let appended_bytes = text.len();
                 if let Some(ContentBlock::Text { text: existing }) =
-                    self.message.content.get_mut(block.content_index)
+                    self.message.content.get_mut(content_index)
                 {
                     existing.push_str(&text);
                 }
                 out.push(AssistantMessageEvent::TextDelta {
-                    content_index: block.content_index,
+                    content_index,
                     delta: text,
-                    partial: self.message.clone(),
+                    partial: self.partial_snapshot.update(&self.message, appended_bytes),
                 });
             }
             ("thinking_delta", BlockKind::Thinking) => {
                 let thinking = string_field(delta, "thinking");
+                let appended_bytes = thinking.len();
                 if let Some(ContentBlock::Thinking {
                     thinking: existing, ..
-                }) = self.message.content.get_mut(block.content_index)
+                }) = self.message.content.get_mut(content_index)
                 {
                     existing.push_str(&thinking);
                 }
                 out.push(AssistantMessageEvent::ThinkingDelta {
-                    content_index: block.content_index,
+                    content_index,
                     delta: thinking,
-                    partial: self.message.clone(),
+                    partial: self.partial_snapshot.update(&self.message, appended_bytes),
                 });
             }
             ("input_json_delta", BlockKind::ToolCall) => {
                 let fragment = string_field(delta, "partial_json");
-                let partial_json = match self.blocks.get_mut(&index) {
-                    Some(stored) => {
-                        stored.partial_json.push_str(&fragment);
-                        stored.partial_json.clone()
-                    }
-                    None => return,
+                let appended_bytes = fragment.len();
+                let Some(stored) = self.blocks.get_mut(&index) else {
+                    return;
                 };
-                self.set_arguments(block.content_index, &partial_json);
+                stored.partial_json.push_str(&fragment);
                 out.push(AssistantMessageEvent::ToolcallDelta {
-                    content_index: block.content_index,
+                    content_index,
                     delta: fragment,
-                    partial: self.message.clone(),
+                    partial: self.partial_snapshot.update(&self.message, appended_bytes),
                 });
             }
             ("signature_delta", _) => {
                 let signature = string_field(delta, "signature");
                 if let Some(ContentBlock::Thinking {
                     signature: stored, ..
-                }) = self.message.content.get_mut(block.content_index)
+                }) = self.message.content.get_mut(content_index)
                 {
                     stored.get_or_insert_with(String::new).push_str(&signature);
                 }
             }
             _ => {}
-        }
-    }
-
-    fn set_arguments(&mut self, content_index: usize, partial_json: &str) {
-        if let Some(ContentBlock::ToolCall { arguments, .. }) =
-            self.message.content.get_mut(content_index)
-        {
-            *arguments = parse_streaming_json(partial_json, arguments);
         }
     }
 
@@ -300,7 +300,7 @@ impl AnthropicDecoder {
                 out.push(AssistantMessageEvent::TextEnd {
                     content_index: block.content_index,
                     content,
-                    partial: self.message.clone(),
+                    partial: self.partial_snapshot.force(&self.message),
                 });
             }
             BlockKind::Thinking => {
@@ -311,7 +311,7 @@ impl AnthropicDecoder {
                 out.push(AssistantMessageEvent::ThinkingEnd {
                     content_index: block.content_index,
                     content,
-                    partial: self.message.clone(),
+                    partial: self.partial_snapshot.force(&self.message),
                 });
             }
             BlockKind::ToolCall => {
@@ -338,7 +338,7 @@ impl AnthropicDecoder {
                 out.push(AssistantMessageEvent::ToolcallEnd {
                     content_index: block.content_index,
                     tool_call,
-                    partial: self.message.clone(),
+                    partial: self.partial_snapshot.force(&self.message),
                 });
             }
         }
@@ -552,24 +552,6 @@ fn usage_model_for(model: &Model, served_by: &str) -> Model {
             ..model.clone()
         },
         None => model.clone(),
-    }
-}
-
-/// Lenient JSON for streamed tool arguments: the text so far if it parses as
-/// an object, otherwise the last value that did. TS `parseStreamingJson`
-/// additionally repairs and partially parses the fragment, so its arguments
-/// track the stream more closely; only the complete object matters to
-/// callers.
-fn parse_streaming_json(text: &str, previous: &Value) -> Value {
-    match serde_json::from_str::<Value>(text) {
-        Ok(Value::Object(map)) => Value::Object(map),
-        Ok(_) | Err(_) => {
-            if previous.is_object() {
-                previous.clone()
-            } else {
-                Value::Object(Map::new())
-            }
-        }
     }
 }
 
@@ -904,8 +886,8 @@ data: {"type":"message_stop"}
             }
             other => panic!("expected a tool call, got {other:?}"),
         }
-        // While the JSON is incomplete the arguments stay at the last object
-        // that parsed; each delta still carries its fragment.
+        // Deltas carry each raw fragment while the parsed arguments are
+        // finalized once, at the block boundary.
         let deltas: Vec<(&str, &Value)> = events
             .iter()
             .filter_map(|event| match event {
@@ -924,15 +906,34 @@ data: {"type":"message_stop"}
         assert_eq!(deltas[1].1, &serde_json::json!({}));
         assert_eq!(deltas[2].1, &serde_json::json!({}));
         assert_eq!(deltas[3].0, "}");
-        assert_eq!(deltas[3].1, &serde_json::json!({"path": "Cargo.toml"}));
+        assert_eq!(deltas[3].1, &serde_json::json!({}));
+        let delta_snapshots: Vec<_> = events
+            .iter()
+            .filter_map(|event| match event {
+                AssistantMessageEvent::ToolcallDelta { partial, .. } => Some(partial),
+                _ => None,
+            })
+            .collect();
+        assert!(delta_snapshots
+            .iter()
+            .all(|snapshot| std::sync::Arc::ptr_eq(delta_snapshots[0], snapshot)));
         match &events[6] {
             AssistantMessageEvent::ToolcallEnd {
                 content_index,
                 tool_call,
+                partial,
                 ..
             } => {
                 assert_eq!(*content_index, 0);
                 assert_eq!(tool_call, &message.content[0]);
+                assert_eq!(
+                    &partial.content[0],
+                    &ContentBlock::ToolCall {
+                        id: "toolu_01".into(),
+                        name: "read".into(),
+                        arguments: serde_json::json!({"path": "Cargo.toml"}),
+                    }
+                );
             }
             other => panic!("expected toolcall_end, got {other:?}"),
         }
