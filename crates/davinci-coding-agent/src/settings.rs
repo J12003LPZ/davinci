@@ -764,19 +764,26 @@ fn is_override_pattern(value: &str) -> bool {
     value.starts_with('!') || value.starts_with('+') || value.starts_with('-')
 }
 
-pub fn collect_package_resources(pkg: &PackageSource, kind: &str) -> Vec<PathBuf> {
-    let root = Path::new(pkg.source());
+pub fn collect_package_resources(
+    pkg: &PackageSource,
+    kind: &str,
+    agent_dir: &Path,
+    cwd: &Path,
+) -> Vec<PathBuf> {
+    let Some(root) = crate::package_source::installed_root(pkg.source(), agent_dir, cwd) else {
+        return Vec::new();
+    };
     if let Some(manifest) = read_pi_manifest(&root.join("package.json")) {
         if let Some(entries) = manifest_entries(&manifest, kind) {
-            return collect_manifest_resources(root, kind, entries, pkg);
+            return collect_manifest_resources(&root, kind, entries, pkg);
         }
     }
     let dir = if root.join(kind).is_dir() {
         root.join(kind)
     } else {
-        root.to_path_buf()
+        root.clone()
     };
-    collect_dir_resources(root, &dir, pkg, kind)
+    collect_dir_resources(&root, &dir, pkg, kind)
 }
 
 fn collect_manifest_resources(
@@ -802,22 +809,14 @@ fn collect_manifest_resources(
 }
 
 fn collect_glob_files(root: &Path, pattern: &str, out: &mut Vec<PathBuf>) {
-    collect_glob_files_from(root, root, pattern, out);
-}
-
-fn collect_glob_files_from(root: &Path, dir: &Path, pattern: &str, out: &mut Vec<PathBuf>) {
-    let Ok(entries) = fs::read_dir(dir) else {
-        return;
-    };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.is_dir() {
-            collect_glob_files_from(root, &path, pattern, out);
-            continue;
-        }
-        if !path.is_file() {
-            continue;
-        }
+    for entry in walkdir::WalkDir::new(root)
+        .follow_links(false)
+        .max_depth(16)
+        .into_iter()
+        .filter_map(Result::ok)
+        .filter(|entry| entry.file_type().is_file())
+    {
+        let path = entry.into_path();
         let relative = path
             .strip_prefix(root)
             .unwrap_or(&path)
@@ -831,21 +830,18 @@ fn collect_glob_files_from(root: &Path, dir: &Path, pattern: &str, out: &mut Vec
 
 fn collect_dir_resources(root: &Path, dir: &Path, pkg: &PackageSource, kind: &str) -> Vec<PathBuf> {
     let mut out = Vec::new();
-    if !dir.exists() {
-        return out;
-    }
-    if let Ok(entries) = fs::read_dir(dir) {
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.is_dir() {
-                out.extend(collect_dir_resources(root, &path, pkg, kind));
-            } else if path.is_file() {
-                push_if_allowed(root, path, pkg, kind, &mut out);
-            }
-        }
+    for entry in walkdir::WalkDir::new(dir)
+        .follow_links(false)
+        .max_depth(16)
+        .into_iter()
+        .filter_map(Result::ok)
+        .filter(|entry| entry.file_type().is_file())
+    {
+        push_if_allowed(root, entry.into_path(), pkg, kind, &mut out);
     }
     out
 }
+
 
 fn push_if_allowed(
     root: &Path,
@@ -1542,6 +1538,32 @@ mod tests {
     use super::*;
 
     #[test]
+    fn npm_package_skills_are_collected_from_node_modules() {
+        let dir = tempfile::tempdir().unwrap();
+        let agent = dir.path().join("agent");
+        let root = agent.join("npm").join("node_modules").join("skills-pack");
+        std::fs::create_dir_all(root.join("skills").join("demo")).unwrap();
+        std::fs::write(
+            root.join("skills").join("demo").join("SKILL.md"),
+            "---\nname: demo\n---\n",
+        )
+        .unwrap();
+        let pkg: PackageSource = "npm:skills-pack".into();
+        let found = collect_package_resources(&pkg, "skills", &agent, dir.path());
+        assert!(found.iter().any(|path| path.ends_with("SKILL.md")), "{found:?}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn package_resource_walk_does_not_follow_symlink_loops() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("a")).unwrap();
+        std::os::unix::fs::symlink(dir.path(), dir.path().join("a").join("loop")).unwrap();
+        let pkg: PackageSource = dir.path().display().to_string().as_str().into();
+        let _ = collect_package_resources(&pkg, "skills", dir.path(), dir.path());
+    }
+
+    #[test]
     fn saving_never_overwrites_a_file_that_does_not_parse() {
         let dir = tempfile::tempdir().unwrap();
         let path = settings_path(dir.path());
@@ -1934,11 +1956,11 @@ mod tests {
         std::fs::write(pkg_dir.join("skills").join("review.md"), "# review").ok();
         std::fs::write(pkg_dir.join("skills").join("skip.txt"), "no").ok();
         let manifest_pkg = PackageSource::from_spec(pkg_dir.display().to_string());
-        let extensions = collect_package_resources(&manifest_pkg, "extensions");
+        let extensions = collect_package_resources(&manifest_pkg, "extensions", dir.path(), dir.path());
         assert!(extensions
             .iter()
             .any(|path| path.ends_with("src/index.js") || path.ends_with("src\\index.js")));
-        let skills = collect_package_resources(&manifest_pkg, "skills");
+        let skills = collect_package_resources(&manifest_pkg, "skills", dir.path(), dir.path());
         assert!(skills.iter().any(|path| path.ends_with("review.md")));
         assert!(!skills.iter().any(|path| path.ends_with("skip.txt")));
         assert!(read_pi_manifest(&pkg_dir.join("package.json"))

@@ -100,6 +100,7 @@ mod model_resolver;
 mod native_extensions;
 mod native_tools;
 mod output;
+mod package_source;
 mod packages;
 mod permissions;
 mod project_config;
@@ -876,7 +877,7 @@ fn build_agent(parsed: &Args, session_dir: &Path, cwd: &Path) -> Result<Agent, S
     };
     for pkg in &settings.packages {
         if !parsed.no_extensions {
-            for path in settings::collect_package_resources(pkg, "extensions") {
+            for path in settings::collect_package_resources(pkg, "extensions", &default_agent_dir(), cwd) {
                 extensions.push(path.to_string_lossy().into_owned());
             }
         }
@@ -6264,7 +6265,12 @@ fn available_themes_with(parsed: Option<&Args>) -> Vec<Theme> {
         }
     }
     for pkg in &settings.packages {
-        for path in settings::collect_package_resources(pkg, "themes") {
+        for path in settings::collect_package_resources(
+            pkg,
+            "themes",
+            &default_agent_dir(),
+            &std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+        ) {
             if path.is_dir() {
                 themes.extend(load_themes_from_dir(&path));
             } else if let Some(parent) = path.parent() {
@@ -7743,7 +7749,7 @@ fn apply_discovered_resources(parsed: &Args, agent: &mut Agent) {
             roots.extend(extra.iter().map(PathBuf::from));
         }
         for pkg in &settings.packages {
-            roots.extend(settings::collect_package_resources(pkg, "skills"));
+            roots.extend(settings::collect_package_resources(pkg, "skills", &default_agent_dir(), &agent.cwd));
         }
         agent.skills = discover_skills(&roots);
     }
@@ -7757,7 +7763,7 @@ fn apply_discovered_resources(parsed: &Args, agent: &mut Agent) {
             roots.extend(extra.iter().map(PathBuf::from));
         }
         for pkg in &settings.packages {
-            roots.extend(settings::collect_package_resources(pkg, "prompts"));
+            roots.extend(settings::collect_package_resources(pkg, "prompts", &default_agent_dir(), &agent.cwd));
         }
         agent.templates = discover_prompt_templates(&roots);
     }
@@ -7974,7 +7980,12 @@ fn collect_custom_theme_files(parsed: &Args) -> Vec<(String, PathBuf)> {
         }
     }
     for pkg in &settings.packages {
-        for path in settings::collect_package_resources(pkg, "themes") {
+        for path in settings::collect_package_resources(
+            pkg,
+            "themes",
+            &default_agent_dir(),
+            &std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+        ) {
             if path.is_dir() {
                 files.extend(theme_files_from_dir(&path));
             } else if let Some(parent) = path.parent() {

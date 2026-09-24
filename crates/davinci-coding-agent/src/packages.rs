@@ -47,11 +47,18 @@ pub fn handle_package_command(
         }
         "remove" | "uninstall" => {
             let source = source.ok_or("remove <source> [-l]")?;
-            update_settings(agent_dir, |settings| {
-                settings.extensions.retain(|item| item != &source);
-                settings.packages.retain(|item| item.source() != source);
+            let cwd = std::env::current_dir().map_err(|err| err.to_string())?;
+            let normalized = match parse_package_source(&source) {
+                ParsedSource::Local(path) => normalize_local_source(&path, &cwd)?,
+                _ => source.clone(),
+            };
+            let settings_dir = settings_dir_for(local, agent_dir, &cwd);
+            update_settings(&settings_dir, |settings| {
+                settings.extensions.retain(|item| item != &normalized);
+                settings.packages.retain(|item| item.source() != normalized);
             })?;
-            Ok(format!("Removed {source}{}", scope(local)))
+            remove_installed_package(&source, local, agent_dir, &cwd)?;
+            Ok(format!("Removed {normalized}{}", scope(local)))
         }
         "update" => handle_update(args, agent_dir),
         "list" => Ok(render_list(&settings)),
@@ -357,7 +364,7 @@ fn run_self_update_command(command: &crate::self_update::SelfUpdateCommand) -> R
         }]
     });
     for step in steps {
-        let status = std::process::Command::new(&step.command)
+        let status = std::process::Command::new(davinci_sys::process::resolve_program(&step.command))
             .args(&step.args)
             .status()
             .map_err(|err| err.to_string())?;
@@ -419,147 +426,62 @@ fn render_list(settings: &Settings) -> String {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ParsedSource {
-    Local(String),
-    Npm { spec: String, name: String },
-    Git(String),
-}
+pub use crate::package_source::{
+    git_checkout_path, git_install_root, npm_install_root, parse_git_source,
+    parse_package_source, ParsedSource,
+};
 
-pub fn parse_package_source(source: &str) -> ParsedSource {
-    if let Some(spec) = source.strip_prefix("npm:") {
-        let spec = spec.trim();
-        let name = spec
-            .split_once('@')
-            .filter(|(head, _)| !head.is_empty() || spec.starts_with('@'))
-            .map(|(head, _)| {
-                if spec.starts_with('@') {
-                    let rest = spec.trim_start_matches('@');
-                    rest.split_once('@')
-                        .map(|(pkg, _)| format!("@{pkg}"))
-                        .unwrap_or_else(|| spec.to_string())
-                } else {
-                    head.to_string()
-                }
-            })
-            .unwrap_or_else(|| spec.to_string());
-        return ParsedSource::Npm {
-            spec: spec.to_string(),
-            name,
-        };
-    }
-    if source.starts_with("git:")
-        || source.starts_with("git@")
-        || source.ends_with(".git")
-        || source.contains("github.com")
-        || source.starts_with("https://")
-        || source.starts_with("ssh://")
-    {
-        return ParsedSource::Git(source.to_string());
-    }
-    ParsedSource::Local(source.to_string())
-}
 
-pub fn parse_git_source(source: &str) -> (String, Option<String>) {
-    let raw = source.strip_prefix("git:").unwrap_or(source);
-    if raw.starts_with("git@") {
-        if let Some(idx) = raw.rfind('@') {
-            if idx > 3 {
-                return (raw[..idx].to_string(), Some(raw[idx + 1..].to_string()));
-            }
-        }
-        return (raw.to_string(), None);
+fn settings_dir_for(local: bool, agent_dir: &Path, cwd: &Path) -> PathBuf {
+    if !local {
+        return agent_dir.to_path_buf();
     }
-    if let Some(idx) = raw.rfind('@') {
-        let spec = &raw[idx + 1..];
-        if !spec.contains('/') && !spec.contains(':') {
-            return (raw[..idx].to_string(), Some(spec.to_string()));
-        }
-    }
-    (raw.to_string(), None)
-}
-
-pub fn npm_install_args(manager: &str, specs: &[String], install_root: &Path) -> Vec<String> {
-    let mut args = vec!["install".into()];
-    args.extend(specs.iter().cloned());
-    match manager {
-        "pnpm" => {
-            args.push("--prefix".into());
-            args.push(install_root.display().to_string());
-            args.push("--config.auto-install-peers=false".into());
-            args.push("--config.strict-peer-dependencies=false".into());
-            args.push("--config.strict-dep-builds=false".into());
-        }
-        "bun" => {
-            args.push("--cwd".into());
-            args.push(install_root.display().to_string());
-            args.push("--omit=peer".into());
-        }
-        _ => {
-            args.push("--prefix".into());
-            args.push(install_root.display().to_string());
-            args.push("--legacy-peer-deps".into());
-        }
-    }
-    args
-}
-
-pub fn npm_install_root(agent_dir: &Path, local: bool, cwd: &Path) -> PathBuf {
-    if local {
-        cwd.join(".pi").join("npm")
+    if cwd.join(crate::settings::CONFIG_DIR_NAME).is_dir() {
+        cwd.join(crate::settings::CONFIG_DIR_NAME)
     } else {
-        agent_dir.join("npm")
+        cwd.join(crate::settings::LEGACY_CONFIG_DIR_NAME)
     }
 }
 
-pub fn git_install_root(agent_dir: &Path, local: bool, cwd: &Path) -> PathBuf {
-    if local {
-        cwd.join(".pi").join("git")
-    } else {
-        agent_dir.join("git")
-    }
+fn normalize_local_source(path: &str, cwd: &Path) -> Result<String, String> {
+    let expanded = crate::package_source::expand_local(path, cwd);
+    let canonical = expanded
+        .canonicalize()
+        .map_err(|err| format!("Unable to resolve local package {}: {err}", expanded.display()))?;
+    Ok(crate::trust::display_path(&canonical))
 }
 
 fn install_and_persist(source: &str, local: bool, agent_dir: &Path) -> Result<String, String> {
+    let cwd = std::env::current_dir().map_err(|err| err.to_string())?;
     let parsed = parse_package_source(source);
-    match &parsed {
-        ParsedSource::Local(path) => {
-            let resolved = resolve_local_path(path);
-            if !resolved.exists() {
-                return Err(format!("Path does not exist: {}", resolved.display()));
-            }
-        }
+    let stored_source = match &parsed {
+        ParsedSource::Local(path) => normalize_local_source(path, &cwd)?,
         ParsedSource::Npm { name, spec } => {
             install_remote_package(agent_dir, "npm", name, spec, local)?;
+            source.to_string()
         }
         ParsedSource::Git(url) => {
             let name = git_package_name(url);
             install_remote_package(agent_dir, "git", &name, url, local)?;
+            source.to_string()
         }
-    }
-    update_settings(agent_dir, |settings| {
-        if !settings.extensions.contains(&source.to_string()) {
-            settings.extensions.push(source.to_string());
+    };
+    let settings_dir = settings_dir_for(local, agent_dir, &cwd);
+    update_settings(&settings_dir, |settings| {
+        if !settings.extensions.contains(&stored_source) {
+            settings.extensions.push(stored_source.clone());
         }
-        if !settings.packages.iter().any(|item| item.source() == source) {
-            settings.packages.push(source.into());
+        if !settings
+            .packages
+            .iter()
+            .any(|item| item.source() == stored_source)
+        {
+            settings.packages.push(stored_source.clone().into());
         }
     })?;
-    Ok(source.to_string())
+    Ok(stored_source)
 }
 
-fn resolve_local_path(path: &str) -> PathBuf {
-    if let Some(rest) = path.strip_prefix("~/") {
-        if let Some(home) = dirs_home() {
-            return home.join(rest);
-        }
-    }
-    PathBuf::from(path)
-}
-
-fn dirs_home() -> Option<PathBuf> {
-    std::env::var_os("HOME").map(PathBuf::from)
-}
 
 fn git_package_name(url: &str) -> String {
     url.rsplit('/')
@@ -567,6 +489,46 @@ fn git_package_name(url: &str) -> String {
         .unwrap_or("package")
         .trim_end_matches(".git")
         .to_string()
+}
+
+fn remove_installed_package(
+    source: &str,
+    local: bool,
+    agent_dir: &Path,
+    cwd: &Path,
+) -> Result<(), String> {
+    match parse_package_source(source) {
+        ParsedSource::Local(_) => Ok(()),
+        ParsedSource::Git(_) => {
+            let path = git_checkout_path(agent_dir, local, cwd, source)?;
+            if path.exists() {
+                fs::remove_dir_all(path).map_err(|err| err.to_string())?;
+            }
+            Ok(())
+        }
+        ParsedSource::Npm { name, .. } => {
+            let root = npm_install_root(agent_dir, local, cwd);
+            if !root.exists() {
+                return Ok(());
+            }
+            if cfg!(test) || std::env::var("PI_INSTALL_DRY_RUN").is_ok() {
+                let path = root.join("node_modules").join(name);
+                if path.exists() {
+                    fs::remove_dir_all(path).map_err(|err| err.to_string())?;
+                }
+                return Ok(());
+            }
+            let command = npm_command(agent_dir)?;
+            let mut args = command[1..].to_vec();
+            args.extend([
+                "uninstall".into(),
+                name,
+                "--prefix".into(),
+                root.display().to_string(),
+            ]);
+            run_install_command(&command[0], &args, Some(cwd))
+        }
+    }
 }
 
 fn install_remote_package(
@@ -608,74 +570,6 @@ fn install_remote_package(
         return install_npm_live(agent_dir, local, &cwd, spec);
     }
     install_git_live(agent_dir, local, &cwd, spec)
-}
-
-fn git_checkout_path(
-    agent_dir: &Path,
-    local: bool,
-    cwd: &Path,
-    spec: &str,
-) -> Result<PathBuf, String> {
-    let (url, _) = parse_git_source(spec);
-    // Inspect the raw path before URL or filesystem normalization can erase
-    // parent components. A checkout may subsequently be recursively replaced.
-    let raw = url
-        .strip_prefix("https://")
-        .or_else(|| url.strip_prefix("http://"))
-        .or_else(|| url.strip_prefix("ssh://"))
-        .unwrap_or(&url);
-    let (host, path) = if let Some(scp) = raw.strip_prefix("git@") {
-        if !url.contains("://") {
-            scp.split_once(':')
-        } else {
-            raw.split_once('/')
-        }
-    } else {
-        raw.split_once('/')
-    }
-    .ok_or("Invalid Git checkout path")?;
-    if host.is_empty() || path.contains(':') {
-        return Err("Invalid Git checkout path".into());
-    }
-    let host_path = url
-        .trim_start_matches("https://")
-        .trim_start_matches("http://")
-        .trim_start_matches("ssh://")
-        .trim_start_matches("git@")
-        .replace(':', "/");
-    let relative = host_path.trim_end_matches(".git");
-    for part in relative.split('/') {
-        let device = part
-            .split('.')
-            .next()
-            .unwrap_or_default()
-            .to_ascii_uppercase();
-        if part.is_empty()
-            || part == "."
-            || part == ".."
-            || part.ends_with(['.', ' '])
-            || part
-                .chars()
-                .any(|c| c.is_control() || "<>:\"\\|?*".contains(c))
-            || matches!(
-                device.as_str(),
-                "CON" | "PRN" | "AUX" | "NUL" | "CONIN$" | "CONOUT$"
-            )
-            || ["COM", "LPT"].iter().any(|prefix| {
-                device.strip_prefix(prefix).is_some_and(|number| {
-                    matches!(number, "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9")
-                })
-            })
-        {
-            return Err("Invalid Git checkout path".into());
-        }
-    }
-    let root = git_install_root(agent_dir, local, cwd);
-    let destination = root.join(relative);
-    if davinci_agent::check_path_boundary(&root, &destination) != (false, false) {
-        return Err("Git checkout escapes the package directory".into());
-    }
-    Ok(destination)
 }
 
 fn npm_command(agent_dir: &Path) -> Result<Vec<String>, String> {
@@ -1013,7 +907,7 @@ fn latest_npm_version(spec: &str, agent_dir: &Path, cwd: &Path) -> Option<String
             "version".into(),
             "--json".into(),
         ]);
-        let output = std::process::Command::new(&command[0])
+        let output = std::process::Command::new(davinci_sys::process::resolve_program(&command[0]))
             .args(&args)
             .current_dir(cwd)
             .output()
@@ -1244,6 +1138,32 @@ mod tests {
     use tempfile::tempdir;
 
     #[test]
+    fn local_sources_are_stored_absolute() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("ext")).unwrap();
+        assert_eq!(
+            normalize_local_source("./ext", dir.path()).unwrap(),
+            crate::trust::display_path(&dir.path().join("ext").canonicalize().unwrap())
+        );
+    }
+
+    #[test]
+    fn every_command_in_packages_goes_through_resolve_program() {
+        let source = include_str!("packages.rs");
+        for (number, line) in source.lines().enumerate() {
+            if line.contains("Command::new(")
+                && !line.contains("resolve_program")
+                && !line.trim_start().starts_with("//")
+            {
+                panic!(
+                    "packages.rs:{} spawns without resolve_program: {line}",
+                    number + 1
+                );
+            }
+        }
+    }
+
+    #[test]
     fn audit_regression_git_install_rejects_escaping_checkout() {
         let dir = tempdir().unwrap();
         let agent = dir.path().join("agent");
@@ -1341,7 +1261,7 @@ mod tests {
         #[cfg(windows)]
         assert!(
             std::os::windows::fs::symlink_dir(outside.path(), &link).is_ok()
-                || std::process::Command::new("cmd")
+                || std::process::Command::new(davinci_sys::process::resolve_program("cmd"))
                     .args(["/C", "mklink", "/J"])
                     .arg(&link)
                     .arg(outside.path())
