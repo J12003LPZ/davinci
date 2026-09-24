@@ -237,3 +237,14 @@ measurement fields needed for a guarded decision.
 
 Live TypeSafe API validation is intentionally not part of the offline test
 pass; it requires a user-provided credential and external service access.
+The ignored live acceptance test uses the stored credential (never printed)
+and the production provider, probe, request builder, and parser:
+
+```sh
+cargo test -p davinci-coding-agent --test typesafe_live -- --ignored --nocapture --test-threads=1
+```
+
+First run, 2026-09-24, `jev-latest` resolving to `jev-1.13.0`: the probe and
+all five routing requests parsed. Latency was 132 to 305 ms, under the
+800 ms soft budget. Each request was about 5.1 KB and about 1,500 input and
+185 output tokens; the question text, not the task, dominates the size.
