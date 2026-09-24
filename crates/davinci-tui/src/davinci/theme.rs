@@ -343,7 +343,137 @@ const BASIC_GREY: Ramp = Ramp {
     error: Color::White,
 };
 
+
+/// Claude Code conversation colors, measured on the reference frames in
+/// docs/ui/claude-code-reference. Views access these only through Theme::cc().
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Cc {
+    pub claude: Color,
+    pub claude_shimmer: Color,
+    pub permission: Color,
+    pub inactive: Color,
+    pub inactive_shimmer: Color,
+    pub subtle: Color,
+    pub prompt_border: Color,
+    pub text: Color,
+    pub user_bg: Color,
+    pub bash: Color,
+    pub bash_bg: Color,
+    pub success: Color,
+    pub error: Color,
+    pub auto_mode: Color,
+    pub plan_mode: Color,
+    pub accept_edits: Color,
+    pub diff_text: Color,
+    pub diff_add: Color,
+    pub diff_add_bg: Color,
+    pub diff_del: Color,
+    pub diff_del_bg: Color,
+    pub code_keyword: Color,
+    pub code_string: Color,
+    pub code_macro: Color,
+}
+
+const CC_DARK: Cc = Cc {
+    claude: rgb(0xD77757), claude_shimmer: rgb(0xEB9F7F),
+    permission: rgb(0xB1B9F9), inactive: rgb(0x999999),
+    inactive_shimmer: rgb(0xB9B9B9), subtle: rgb(0x505050),
+    prompt_border: rgb(0x888888), text: rgb(0xFFFFFF),
+    user_bg: rgb(0x373737), bash: rgb(0xFD5DB1), bash_bg: rgb(0x413C41),
+    success: rgb(0x4EBA65), error: rgb(0xFF6B80), auto_mode: rgb(0xFFC107),
+    plan_mode: rgb(0x48968C), accept_edits: rgb(0xAF87FF), diff_text: rgb(0xF8F8F2),
+    diff_add: rgb(0x50C850), diff_add_bg: rgb(0x022800),
+    diff_del: rgb(0xDC5A5A), diff_del_bg: rgb(0x3D0100),
+    code_keyword: Color::Blue, code_string: Color::Red, code_macro: Color::Cyan,
+};
+
+const CC_DARK_256: Cc = Cc {
+    claude: Color::Indexed(173), claude_shimmer: Color::Indexed(216),
+    permission: Color::Indexed(147), inactive: Color::Indexed(246),
+    inactive_shimmer: Color::Indexed(250), subtle: Color::Indexed(239),
+    prompt_border: Color::Indexed(244), text: Color::Indexed(231),
+    user_bg: Color::Indexed(237), bash: Color::Indexed(205), bash_bg: Color::Indexed(237),
+    success: Color::Indexed(71), error: Color::Indexed(204), auto_mode: Color::Indexed(214),
+    plan_mode: Color::Indexed(72), accept_edits: Color::Indexed(141),
+    diff_text: Color::Indexed(255), diff_add: Color::Indexed(77), diff_add_bg: Color::Indexed(22),
+    diff_del: Color::Indexed(167), diff_del_bg: Color::Indexed(52),
+    code_keyword: Color::Blue, code_string: Color::Red, code_macro: Color::Cyan,
+};
+
+const CC_LIGHT: Cc = Cc {
+    claude: rgb(0xD77757), claude_shimmer: rgb(0xF5A788),
+    permission: rgb(0x5769F7), inactive: rgb(0x666666), inactive_shimmer: rgb(0x8A8A8A),
+    subtle: rgb(0xAFAFAF), prompt_border: rgb(0x999999), text: rgb(0x000000),
+    user_bg: rgb(0xF0F0F0), bash: rgb(0xFF0087), bash_bg: rgb(0xFCE4EC),
+    success: rgb(0x2C7A39), error: rgb(0xAB2B3F), auto_mode: rgb(0x966C1E),
+    plan_mode: rgb(0x006666), accept_edits: rgb(0x8700FF), diff_text: rgb(0x1C1C1C),
+    diff_add: rgb(0x2C7A39), diff_add_bg: rgb(0xDAFBE1), diff_del: rgb(0xAB2B3F),
+    diff_del_bg: rgb(0xFFEBE9), code_keyword: Color::Blue, code_string: Color::Red,
+    code_macro: Color::Cyan,
+};
+
+const CC_LIGHT_256: Cc = Cc {
+    claude: Color::Indexed(173), claude_shimmer: Color::Indexed(216),
+    permission: Color::Indexed(63), inactive: Color::Indexed(241),
+    inactive_shimmer: Color::Indexed(245), subtle: Color::Indexed(145),
+    prompt_border: Color::Indexed(246), text: Color::Indexed(16), user_bg: Color::Indexed(255),
+    bash: Color::Indexed(198), bash_bg: Color::Indexed(225), success: Color::Indexed(28),
+    error: Color::Indexed(124), auto_mode: Color::Indexed(136), plan_mode: Color::Indexed(23),
+    accept_edits: Color::Indexed(93), diff_text: Color::Indexed(234),
+    diff_add: Color::Indexed(28), diff_add_bg: Color::Indexed(194),
+    diff_del: Color::Indexed(124), diff_del_bg: Color::Indexed(224),
+    code_keyword: Color::Blue, code_string: Color::Red, code_macro: Color::Cyan,
+};
+
+const CC_BASIC: Cc = Cc {
+    claude: Color::LightRed, claude_shimmer: Color::LightRed, permission: Color::LightBlue,
+    inactive: Color::Gray, inactive_shimmer: Color::Gray, subtle: Color::DarkGray,
+    prompt_border: Color::DarkGray, text: Color::White, user_bg: Color::Reset,
+    bash: Color::LightMagenta, bash_bg: Color::Reset, success: Color::Green, error: Color::Red,
+    auto_mode: Color::Yellow, plan_mode: Color::Cyan, accept_edits: Color::Magenta,
+    diff_text: Color::White, diff_add: Color::Green, diff_add_bg: Color::Reset,
+    diff_del: Color::Red, diff_del_bg: Color::Reset, code_keyword: Color::Blue,
+    code_string: Color::Red, code_macro: Color::Cyan,
+};
+
+const CC_NONE: Cc = Cc {
+    claude: Color::Reset, claude_shimmer: Color::Reset, permission: Color::Reset,
+    inactive: Color::Reset, inactive_shimmer: Color::Reset, subtle: Color::Reset,
+    prompt_border: Color::Reset, text: Color::Reset, user_bg: Color::Reset,
+    bash: Color::Reset, bash_bg: Color::Reset, success: Color::Reset, error: Color::Reset,
+    auto_mode: Color::Reset, plan_mode: Color::Reset, accept_edits: Color::Reset,
+    diff_text: Color::Reset, diff_add: Color::Reset, diff_add_bg: Color::Reset,
+    diff_del: Color::Reset, diff_del_bg: Color::Reset, code_keyword: Color::Reset,
+    code_string: Color::Reset, code_macro: Color::Reset,
+};
+
 impl Theme {
+
+    /// Claude Code palette in this theme's negotiated color encoding.
+    pub fn cc(&self) -> Cc {
+        if self.no_color {
+            return CC_NONE;
+        }
+        let base = match (self.depth_hint(), self.is_light()) {
+            (ColorDepth::TrueColor, false) => CC_DARK,
+            (ColorDepth::TrueColor, true) => CC_LIGHT,
+            (ColorDepth::Ansi256, false) => CC_DARK_256,
+            (ColorDepth::Ansi256, true) => CC_LIGHT_256,
+            (ColorDepth::Basic, _) => CC_BASIC,
+        };
+        if !self.dimmed {
+            return base;
+        }
+        let quiet = base.inactive;
+        Cc {
+            claude: quiet, claude_shimmer: quiet, permission: quiet,
+            inactive_shimmer: quiet, text: quiet, bash: quiet, success: quiet,
+            error: quiet, auto_mode: quiet, plan_mode: quiet, accept_edits: quiet,
+            diff_add: quiet, diff_del: quiet, user_bg: Color::Reset, bash_bg: Color::Reset,
+            diff_add_bg: Color::Reset, diff_del_bg: Color::Reset, ..base
+        }
+    }
+
     /// Saturated crimson identifies the optional editorial collage palette.
     pub fn is_vox(&self) -> bool {
         matches!(
