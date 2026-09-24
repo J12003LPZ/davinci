@@ -1115,7 +1115,7 @@ impl ExtensionHost {
             for tool in &manifest.tools {
                 if tool.name == name {
                     if let Some(command) = &tool.command {
-                        return Some(execute_command_tool(command, cwd));
+                        return Some(execute_command_tool(command, &Value::Object(Default::default()), cwd, tool.timeout_ms));
                     }
                 }
             }
@@ -1194,7 +1194,7 @@ impl ExtensionHost {
             for tool in &manifest.tools {
                 if tool.name == name {
                     if let Some(command) = &tool.command {
-                        return execute_command_tool(command, cwd)
+                        return execute_command_tool(command, &Value::Object(Default::default()), cwd, tool.timeout_ms)
                             .map(|content| davinci_agent::ToolResult {
                                 content,
                                 is_error: false,

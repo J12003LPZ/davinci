@@ -876,22 +876,39 @@ fn render_js_tool(module: &Path, op: &str, name: &str, args: &Value, width: usiz
         .unwrap_or_default()
 }
 
-pub fn execute_command_tool(command: &str, cwd: &Path) -> Result<String, String> {
-    let output = if cfg!(windows) {
-        Command::new("cmd")
-            .args(["/C", command])
-            .current_dir(cwd)
-            .output()
+pub fn execute_command_tool(
+    command: &str,
+    args: &Value,
+    cwd: &Path,
+    timeout_ms: Option<u64>,
+) -> Result<String, String> {
+    let args_json = serde_json::to_string(args).map_err(|err| err.to_string())?;
+    let mut process = if cfg!(windows) {
+        let mut process = Command::new(davinci_sys::process::resolve_program("cmd"));
+        process.args(["/C", command]);
+        process
     } else {
-        Command::new("sh")
-            .args(["-c", command])
-            .current_dir(cwd)
-            .output()
-    }
+        let mut process = Command::new(davinci_sys::process::resolve_program("sh"));
+        process.args(["-c", command]);
+        process
+    };
+    process.current_dir(cwd).env("DAVINCI_TOOL_ARGS", &args_json);
+    let output = davinci_sys::process::run_bounded(
+        process,
+        Some(args_json.into_bytes()),
+        davinci_sys::process::RunLimits {
+            timeout: Duration::from_millis(timeout_ms.unwrap_or(120_000)),
+            output_cap: 1024 * 1024,
+        },
+        &|| false,
+    )
     .map_err(|err| err.to_string())?;
+    if output.timed_out {
+        return Err("manifest command tool timed out".into());
+    }
     let stdout = String::from_utf8_lossy(&output.stdout).to_string();
     let stderr = String::from_utf8_lossy(&output.stderr).to_string();
-    if output.status.success() {
+    if output.status.is_some_and(|status| status.success()) {
         Ok(stdout)
     } else {
         Err(if stderr.is_empty() { stdout } else { stderr })
@@ -912,6 +929,20 @@ mod tests {
         PERSISTENT_HOST_TEST_LOCK
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    #[test]
+    fn command_tool_receives_model_arguments() {
+        let dir = tempdir().unwrap();
+        let command = if cfg!(windows) { "more" } else { "cat" };
+        let out = execute_command_tool(
+            command,
+            &serde_json::json!({"path":"a.txt"}),
+            dir.path(),
+            Some(5_000),
+        )
+        .unwrap();
+        assert!(out.contains("\"path\""), "{out}");
     }
 
     #[test]
@@ -1653,7 +1684,8 @@ module.exports = (pi) => {
         } else {
             "printf fixture-ok"
         };
-        let out = execute_command_tool(command, dir.path()).unwrap();
+        let out =
+            execute_command_tool(command, &serde_json::json!({}), dir.path(), None).unwrap();
         assert_eq!(out.trim_end_matches(['\r', '\n']), "fixture-ok");
     }
 
