@@ -800,7 +800,6 @@ davinci/
 ├── docs/                       # Architecture and capability documentation
 ├── scripts/                    # Installation and validation scripts
 ├── vendor/davinci/             # Pinned TypeScript behavioral reference
-├── packages/                   # Retained migration/compatibility material
 ├── .github/workflows/          # CI, behavior, security, lint, evaluation workflows
 ├── Cargo.toml                  # Rust workspace
 ├── Cargo.lock                  # Locked dependency graph
@@ -808,7 +807,6 @@ davinci/
 └── README.md
 ~~~
 
-crates/davinci-core is retained as an archived early port and is not an active workspace member.
 
 ---
 

@@ -115,9 +115,6 @@ fixtures and source control.
   Plans describe intent; code and fresh verification establish current behavior.
 - `vendor/davinci/`: pinned TypeScript behavioral reference; preserve it during
   Rust feature work.
-- `packages/`: retained migration stubs. Root `package.json` / Bun metadata
-  describe that workspace, not the Rust product build.
-- `crates/davinci-core/`: archived early protocol port, excluded from Cargo.
 - `crates/davinci-coding-agent/export-html/`: standalone session HTML template,
   browser assets and viewer tests, included by the exporter.
 
