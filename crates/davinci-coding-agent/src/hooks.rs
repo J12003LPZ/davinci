@@ -14,9 +14,9 @@
 use std::fs::OpenOptions;
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Command;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -682,141 +682,50 @@ pub fn run_supervised_hook(
         cmd.current_dir(c);
     }
 
-    cmd.stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        cmd.creation_flags(0x08000000);
-    }
-
-    let mut child = match cmd.spawn() {
-        Ok(child) => child,
-        Err(err) => {
-            GLOBAL_HOOK_TELEMETRY
-                .blocked
-                .fetch_add(1, Ordering::Relaxed);
-            return Err(format!("hook `{program}` failed: {err}"));
-        }
-    };
-
-    let child_pid = child.id();
-
-    if let Some(mut stdin) = child.stdin.take() {
-        let _ = stdin.write_all(payload_str.as_bytes());
-        let _ = stdin.flush();
-        drop(stdin);
-    }
-
-    let stdout = child.stdout.take().map(|mut pipe| {
-        std::thread::spawn(move || {
-            let mut buf = Vec::new();
-            let mut chunk = [0u8; 8192];
-            while let Ok(n) = std::io::Read::read(&mut pipe, &mut chunk) {
-                if n == 0 {
-                    break;
-                }
-                let remaining = MAX_HOOK_STREAM_BYTES.saturating_sub(buf.len());
-                let take = n.min(remaining);
-                buf.extend_from_slice(&chunk[..take]);
-                if buf.len() >= MAX_HOOK_STREAM_BYTES {
-                    break;
-                }
-            }
-            buf
-        })
-    });
-
-    let stderr = child.stderr.take().map(|mut pipe| {
-        std::thread::spawn(move || {
-            let mut buf = Vec::new();
-            let mut chunk = [0u8; 8192];
-            while let Ok(n) = std::io::Read::read(&mut pipe, &mut chunk) {
-                if n == 0 {
-                    break;
-                }
-                let remaining = MAX_HOOK_STREAM_BYTES.saturating_sub(buf.len());
-                let take = n.min(remaining);
-                buf.extend_from_slice(&chunk[..take]);
-                if buf.len() >= MAX_HOOK_STREAM_BYTES {
-                    break;
-                }
-            }
-            buf
-        })
-    });
-
     let timeout = timeout_ms
         .map(Duration::from_millis)
         .unwrap_or(HOOK_TIMEOUT);
-    let started = Instant::now();
+    let output = davinci_sys::process::run_bounded(
+        cmd,
+        Some(payload_str.into_bytes()),
+        davinci_sys::process::RunLimits {
+            timeout,
+            output_cap: MAX_HOOK_STREAM_BYTES,
+        },
+        &|| false,
+    )
+    .map_err(|err| {
+        GLOBAL_HOOK_TELEMETRY
+            .blocked
+            .fetch_add(1, Ordering::Relaxed);
+        format!("hook `{program}` failed: {err}")
+    })?;
 
-    let status = loop {
-        match child.try_wait() {
-            Ok(Some(status)) => break status,
-            Ok(None) if started.elapsed() >= timeout => {
-                kill_process_tree(child_pid);
-                let _ = child.kill();
-                let _ = child.wait();
-                GLOBAL_HOOK_TELEMETRY
-                    .timed_out
-                    .fetch_add(1, Ordering::Relaxed);
-                GLOBAL_HOOK_TELEMETRY
-                    .blocked
-                    .fetch_add(1, Ordering::Relaxed);
-                return Err(format!(
-                    "hook `{program}` timed out after {}s",
-                    timeout.as_secs()
-                ));
-            }
-            Ok(None) => std::thread::sleep(Duration::from_millis(10)),
-            Err(err) => {
-                GLOBAL_HOOK_TELEMETRY
-                    .blocked
-                    .fetch_add(1, Ordering::Relaxed);
-                return Err(format!("hook `{program}` failed: {err}"));
-            }
-        }
-    };
+    if output.timed_out {
+        GLOBAL_HOOK_TELEMETRY
+            .timed_out
+            .fetch_add(1, Ordering::Relaxed);
+        GLOBAL_HOOK_TELEMETRY
+            .blocked
+            .fetch_add(1, Ordering::Relaxed);
+        return Err(format!(
+            "hook `{program}` timed out after {}s",
+            timeout.as_secs()
+        ));
+    }
 
-    let stdout_bytes = stdout
-        .map(|handle| handle.join().unwrap_or_default())
-        .unwrap_or_default();
-    let stderr_bytes = stderr
-        .map(|handle| handle.join().unwrap_or_default())
-        .unwrap_or_default();
-
-    if status.success() {
+    if output.status.is_some_and(|status| status.success()) {
         return Ok(());
     }
 
     GLOBAL_HOOK_TELEMETRY
         .blocked
         .fetch_add(1, Ordering::Relaxed);
-
-    let mut text = String::from_utf8_lossy(&stderr_bytes).into_owned();
+    let mut text = String::from_utf8_lossy(&output.stderr).into_owned();
     if text.trim().is_empty() {
-        text = String::from_utf8_lossy(&stdout_bytes).into_owned();
+        text = String::from_utf8_lossy(&output.stdout).into_owned();
     }
     Err(format!("hook `{program}` blocked {tool}: {}", text.trim()))
-}
-
-fn kill_process_tree(pid: u32) {
-    if cfg!(windows) {
-        let _ = Command::new("taskkill")
-            .args(["/F", "/T", "/PID", &pid.to_string()])
-            .output();
-    } else {
-        #[cfg(unix)]
-        {
-            unsafe {
-                libc::kill(-(pid as i32), libc::SIGKILL);
-                libc::kill(pid as i32, libc::SIGKILL);
-            }
-        }
-    }
 }
 
 pub fn status_report(cwd: &Path) -> Value {
@@ -938,6 +847,36 @@ mod tests {
         std::fs::write(&path, "{ not json").unwrap();
         let loaded = load_path(&path);
         assert!(loaded.pre_tool.is_empty() && loaded.stop.is_empty());
+    }
+
+    #[test]
+    fn a_hook_that_ignores_large_stdin_still_times_out() {
+        let command = if cfg!(windows) {
+            vec![
+                "powershell".to_string(),
+                "-NoProfile".to_string(),
+                "-Command".to_string(),
+                "Start-Sleep -Seconds 30".to_string(),
+            ]
+        } else {
+            vec!["sh".to_string(), "-c".to_string(), "sleep 30".to_string()]
+        };
+        let payload = serde_json::json!({"output": "x".repeat(4 * 1024 * 1024)});
+        let started = std::time::Instant::now();
+        let result = run_supervised_hook(
+            &command,
+            "preTool",
+            "read",
+            None,
+            &payload,
+            None,
+            None,
+            Some(250),
+            None,
+            3,
+        );
+        assert!(result.unwrap_err().contains("timed out"));
+        assert!(started.elapsed() < Duration::from_secs(5));
     }
 
     #[test]
