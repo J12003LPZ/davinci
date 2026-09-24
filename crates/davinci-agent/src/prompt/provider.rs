@@ -48,13 +48,22 @@ pub fn prompt_model_family(provider: &str, model_id: &str) -> PromptModelFamily 
     }
 }
 
+const OPENAI_REASONING_ADAPTER: &str = "\
+OpenAI model guidance:
+- When several independent reads or searches are known up front, request them as parallel tool calls instead of serializing work unnecessarily.
+- Use apply_patch for multi-hunk or multi-file edits and keep patches minimal with enough context to match once.
+- After a change, report what changed and how it was verified without repeating whole files or the plan.
+- Stop when the requested task is complete and verified; do not start unrelated work.";
+
 pub fn provider_adapter(family: PromptModelFamily) -> Option<PromptModule> {
     match family {
-        PromptModelFamily::OpenAiReasoning => None,
-        PromptModelFamily::Anthropic => None,
-        PromptModelFamily::Gemini => None,
-        PromptModelFamily::Mistral => None,
-        PromptModelFamily::Generic => None,
+        PromptModelFamily::OpenAiReasoning => {
+            Some(create_family_adapter(family, OPENAI_REASONING_ADAPTER))
+        }
+        PromptModelFamily::Anthropic
+        | PromptModelFamily::Gemini
+        | PromptModelFamily::Mistral
+        | PromptModelFamily::Generic => None,
     }
 }
 
