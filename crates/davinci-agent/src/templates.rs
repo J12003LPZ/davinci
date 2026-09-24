@@ -212,8 +212,8 @@ pub fn expand_prompt_template(text: &str, templates: &[PromptTemplate]) -> Strin
         return text.to_string();
     }
     let rest = &text[1..];
-    let (name, args_string) = match rest.find(|c: char| c.is_whitespace()) {
-        Some(index) => (&rest[..index], rest[index + 1..].to_string()),
+    let (name, args_string) = match rest.split_once(char::is_whitespace) {
+        Some((name, args)) => (name, args.to_string()),
         None => (rest, String::new()),
     };
     let Some(template) = templates.iter().find(|item| item.name == name) else {
@@ -385,6 +385,28 @@ mod tests {
             parse_command_args("\"quoted \\\"text\\\"\""),
             args(&["quoted \\text\\"])
         );
+    }
+
+    #[test]
+    fn multibyte_whitespace_after_the_command_does_not_panic() {
+        let templates = vec![PromptTemplate {
+            name: "review".into(),
+            path: PathBuf::from("/virtual/review.md"),
+            body: "Review: $ARGUMENTS".into(),
+            description: "Review template".into(),
+            argument_hint: None,
+        }];
+        for text in [
+            "/review\u{3000}foo",
+            "/review\u{a0}foo",
+            "/review\u{2003}foo",
+        ] {
+            assert_eq!(
+                expand_prompt_template(text, &templates),
+                "Review: foo",
+                "{text:?}"
+            );
+        }
     }
 
     #[test]
