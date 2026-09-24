@@ -619,6 +619,7 @@ name = "davinci-session"
 version = "1.0.71"
 dependencies = [
  "davinci-protocol",
+ "davinci-sys",
  "serde",
  "serde_json",
  "tempfile",
