@@ -9,7 +9,9 @@
 //! job outlives the session.
 
 use std::io::Read;
-use std::process::{Child, ChildStdin, Command, Stdio};
+use std::process::{Child, ChildStdin};
+#[cfg(test)]
+use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -290,20 +292,7 @@ pub fn stop_status(requested: bool, exited: bool, failed: bool) -> &'static str 
 /// `taskkill /T` on Windows, the process group elsewhere; `Child::kill`
 /// alone would leave a shell's children running.
 pub fn kill_tree(pid: u32) {
-    if cfg!(windows) {
-        let _ = Command::new("taskkill")
-            .args(["/PID", &pid.to_string(), "/T", "/F"])
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status();
-    } else {
-        let _ = Command::new("kill")
-            // A negative PID is a process group, not another signal option.
-            .args(["-TERM", "--", &format!("-{pid}")])
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status();
-    }
+    davinci_sys::process::kill_tree(pid);
 }
 
 /// A job that finished and has not been announced yet.

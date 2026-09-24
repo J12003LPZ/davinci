@@ -446,6 +446,7 @@ dependencies = [
  "davinci-mcp",
  "davinci-protocol",
  "davinci-session",
+ "davinci-sys",
  "davinci-telemetry",
  "image",
  "libc",
@@ -633,6 +634,15 @@ dependencies = [
  "serde_json",
  "tempfile",
  "thiserror",
+ "uuid",
+]
+
+[[package]]
+name = "davinci-sys"
+version = "1.0.71"
+dependencies = [
+ "libc",
+ "tempfile",
  "uuid",
 ]
 

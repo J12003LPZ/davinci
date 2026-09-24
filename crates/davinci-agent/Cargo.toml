@@ -11,6 +11,7 @@ davinci-ai = { path = "../davinci-ai" }
 davinci-mcp = { path = "../davinci-mcp" }
 davinci-protocol = { path = "../davinci-protocol" }
 davinci-session = { path = "../davinci-session" }
+davinci-sys = { path = "../davinci-sys" }
 davinci-telemetry = { path = "../davinci-telemetry" }
 base64.workspace = true
 image.workspace = true

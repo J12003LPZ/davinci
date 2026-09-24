@@ -102,6 +102,7 @@ mod native_tools;
 mod output;
 mod packages;
 mod permissions;
+mod project_config;
 mod rpc;
 mod runtime_host;
 mod self_update;
@@ -7657,7 +7658,7 @@ fn apply_discovered_resources(parsed: &Args, agent: &mut Agent) {
         let mut roots: Vec<PathBuf> = parsed.skills.iter().map(PathBuf::from).collect();
         roots.push(default_agent_dir().join("skills"));
         if trusted {
-            roots.push(agent.cwd.join(".pi").join("skills"));
+            roots.extend(project_config::all(&agent.cwd, "skills"));
         }
         if let Some(extra) = &settings.skills {
             roots.extend(extra.iter().map(PathBuf::from));
@@ -7671,7 +7672,7 @@ fn apply_discovered_resources(parsed: &Args, agent: &mut Agent) {
         let mut roots: Vec<PathBuf> = parsed.prompt_templates.iter().map(PathBuf::from).collect();
         roots.push(default_agent_dir().join("prompts"));
         if trusted {
-            roots.push(agent.cwd.join(".pi").join("prompts"));
+            roots.extend(project_config::all(&agent.cwd, "prompts"));
         }
         if let Some(extra) = &settings.prompts {
             roots.extend(extra.iter().map(PathBuf::from));

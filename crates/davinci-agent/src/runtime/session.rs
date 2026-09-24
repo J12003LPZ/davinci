@@ -272,68 +272,26 @@ impl RuntimeLogSubscriber {
     }
 }
 
-struct WorkerSessionLease(std::fs::File);
+struct WorkerSessionLease(#[allow(dead_code)] davinci_sys::lock::ExclusiveFileLock);
 
 impl WorkerSessionLease {
     fn acquire(path: &std::path::Path) -> Result<Self, String> {
-        if let Ok(metadata) = std::fs::symlink_metadata(path) {
-            if !metadata.is_file() || metadata.file_type().is_symlink() {
-                return Err("worker conversation lease is not an ordinary file".into());
-            }
-        }
-        let mut options = std::fs::OpenOptions::new();
-        options.create(true).truncate(false).read(true).write(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            options
-                .mode(0o600)
-                .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
-        }
-        #[cfg(windows)]
-        {
-            use std::os::windows::fs::OpenOptionsExt;
-            options.share_mode(0).custom_flags(0x00200000); // FILE_FLAG_OPEN_REPARSE_POINT
-        }
-        let unavailable = |error| format!("worker conversation ownership unavailable: {error}");
-        let file = options.open(path).map_err(unavailable)?;
-        let metadata = file.metadata().map_err(unavailable)?;
-        if !metadata.is_file() {
-            return Err("worker conversation lease is not an ordinary file".into());
-        }
-        #[cfg(windows)]
-        {
-            use std::os::windows::fs::MetadataExt;
-            if metadata.file_attributes() & 0x400 != 0 {
-                return Err("worker conversation lease is a reparse point".into());
-            }
-        }
-        #[cfg(unix)]
-        {
-            use std::os::fd::AsRawFd;
-            // SAFETY: file retains ownership of this live descriptor.
-            if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
-                return Err(unavailable(std::io::Error::last_os_error()));
-            }
-        }
-        #[cfg(not(any(unix, windows)))]
-        return Err("worker conversation ownership is unsupported on this platform".into());
-        #[cfg(any(unix, windows))]
-        Ok(Self(file))
-    }
-}
-
-impl Drop for WorkerSessionLease {
-    fn drop(&mut self) {
-        #[cfg(unix)]
-        {
-            use std::os::fd::AsRawFd;
-            // Closing alone may leave a concurrent fork holding the description.
-            // SAFETY: this guard still owns the descriptor while unlocking it.
-            unsafe { libc::flock(self.0.as_raw_fd(), libc::LOCK_UN) };
-        }
-        #[cfg(not(unix))]
-        let _ = &self.0;
+        davinci_sys::lock::ExclusiveFileLock::try_acquire(path)
+            .map(Self)
+            .map_err(|error| match error.kind() {
+                std::io::ErrorKind::InvalidInput
+                    if error.to_string().ends_with("is a reparse point") =>
+                {
+                    "worker conversation lease is a reparse point".into()
+                }
+                std::io::ErrorKind::InvalidInput => {
+                    "worker conversation lease is not an ordinary file".into()
+                }
+                std::io::ErrorKind::Unsupported => {
+                    "worker conversation ownership is unsupported on this platform".into()
+                }
+                _ => format!("worker conversation ownership unavailable: {error}"),
+            })
     }
 }
 
@@ -347,5 +305,31 @@ impl RuntimeSubscriber for RuntimeLogSubscriber {
             eprintln!("[davinci-runtime] runtime sidecar lock failed");
         }
         RuntimeDecision::Continue
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::WorkerSessionLease;
+    use tempfile::tempdir;
+
+    #[test]
+    fn worker_session_lease_blocks_a_second_owner_until_dropped() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("worker.session.lock");
+        let first = WorkerSessionLease::acquire(&path).unwrap();
+
+        let error = match WorkerSessionLease::acquire(&path) {
+            Ok(_) => panic!("a second worker acquired the same session lease"),
+            Err(error) => error,
+        };
+        assert!(
+            error.starts_with("worker conversation ownership unavailable:"),
+            "{error}"
+        );
+
+        drop(first);
+        assert!(path.is_file(), "OS-held lock files remain in place");
+        assert!(WorkerSessionLease::acquire(&path).is_ok());
     }
 }
