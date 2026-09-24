@@ -566,6 +566,7 @@ pub fn run_worker(
             spec.initially_exposed_tools.join(","),
         )
         .env("PI_GRAPH_SUPPRESS_MEMORY_INJECT", "1");
+    davinci_sys::process::set_own_process_group(&mut command);
     if let Err(error) = configure_task_contract_env(&mut command, spec) {
         let _ = fs::remove_dir_all(&temp_dir);
         return WorkerResult {
