@@ -358,6 +358,46 @@ impl Default for GraphController {
     }
 }
 
+const DEFAULT_ECONOMY_MODEL: &str = "openai-codex/gpt-5.6-luna";
+
+fn economy_role_models_with(
+    session_model: Option<&str>,
+    setting: Option<&str>,
+) -> std::collections::BTreeMap<Role, String> {
+    let mut models = std::collections::BTreeMap::new();
+    let Some(session_model) = session_model.map(str::trim).filter(|value| !value.is_empty()) else {
+        return models;
+    };
+    if !session_model.starts_with("openai-codex/") || setting == Some("off") {
+        return models;
+    }
+    let economy = setting
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or(DEFAULT_ECONOMY_MODEL);
+    if economy == session_model {
+        return models;
+    }
+    for role in [
+        Role::Classifier,
+        Role::Researcher,
+        Role::TestAnalyzer,
+        Role::Historian,
+    ] {
+        models.insert(role, economy.to_string());
+    }
+    models
+}
+
+fn economy_role_models(
+    session_model: Option<&str>,
+) -> std::collections::BTreeMap<Role, String> {
+    economy_role_models_with(
+        session_model,
+        std::env::var("DAVINCI_GRAPH_ECONOMY_MODEL").ok().as_deref(),
+    )
+}
+
 impl GraphController {
     pub fn new(cwd: PathBuf) -> Self {
         Self {
@@ -420,46 +460,6 @@ impl GraphController {
         self.project_trusted = project_trusted;
     }
 
-const DEFAULT_ECONOMY_MODEL: &str = "openai-codex/gpt-5.6-luna";
-
-fn economy_role_models_with(
-    session_model: Option<&str>,
-    setting: Option<&str>,
-) -> std::collections::BTreeMap<Role, String> {
-    let mut models = std::collections::BTreeMap::new();
-    let Some(session_model) = session_model.map(str::trim).filter(|value| !value.is_empty()) else {
-        return models;
-    };
-    if !session_model.starts_with("openai-codex/") || setting == Some("off") {
-        return models;
-    }
-    let economy = setting
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .unwrap_or(Self::DEFAULT_ECONOMY_MODEL);
-    if economy == session_model {
-        return models;
-    }
-    for role in [
-        Role::Classifier,
-        Role::Researcher,
-        Role::TestAnalyzer,
-        Role::Historian,
-    ] {
-        models.insert(role, economy.to_string());
-    }
-    models
-}
-
-fn economy_role_models(
-    session_model: Option<&str>,
-) -> std::collections::BTreeMap<Role, String> {
-    Self::economy_role_models_with(
-        session_model,
-        std::env::var("DAVINCI_GRAPH_ECONOMY_MODEL").ok().as_deref(),
-    )
-}
-
     pub fn role_models(&self) -> std::collections::BTreeMap<Role, String> {
         let configured = self.session_role_models.clone().unwrap_or_else(|| {
             if self.project_trusted {
@@ -469,7 +469,7 @@ fn economy_role_models(
             }
         });
         if configured.is_empty() {
-            Self::economy_role_models(self.session_model.as_deref())
+            economy_role_models(self.session_model.as_deref())
         } else {
             configured
         }
