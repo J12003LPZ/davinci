@@ -2710,6 +2710,7 @@ impl Question {
                         )
                     })
                     .collect(),
+                ..Default::default()
             },
             Question::FirstRun => Ask {
                 title: "Welcome".into(),
@@ -2720,6 +2721,7 @@ impl Question {
                     PickerItem::new("share anonymous usage data", "recommended"),
                     PickerItem::new("keep it to this machine", ""),
                 ],
+                ..Default::default()
             },
             Question::Logout { providers } => Ask {
                 title: "Credentials".into(),
@@ -2730,6 +2732,7 @@ impl Question {
                     .iter()
                     .map(|provider| PickerItem::new(provider, "stored by /login"))
                     .collect(),
+                ..Default::default()
             },
         }
     }
@@ -3302,6 +3305,7 @@ pub fn watchdog_ask(signal: &davinci_agent::runtime::progress_watchdog::LoopSign
                 "terminate task and persist available checkpoint",
             ),
         ],
+        ..Default::default()
     }
 }
 
