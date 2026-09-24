@@ -1,8 +1,7 @@
 //! Embed API matching TypeScript `createAgentSession`.
 
 pub mod agent_profiles;
-#[allow(dead_code)]
-mod args;
+pub mod args;
 pub mod completion_delivery;
 pub mod decision_providers;
 pub mod decision_state;
