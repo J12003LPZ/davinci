@@ -1,5 +1,29 @@
 //! Unified multi-provider LLM API matching `@earendil-works/pi-ai`.
 
+/// Set on a finished tool call whose arguments were not valid JSON. The agent
+/// answers such a call with an error and never executes it.
+pub const INVALID_ARGUMENTS_KEY: &str = "__davinci_invalid_arguments";
+
+pub(crate) fn invalid_arguments(raw: &str) -> serde_json::Value {
+    let mut arguments = serde_json::Map::new();
+    arguments.insert(
+        INVALID_ARGUMENTS_KEY.to_owned(),
+        serde_json::Value::String(raw.chars().take(2_000).collect()),
+    );
+    serde_json::Value::Object(arguments)
+}
+
+pub(crate) fn final_tool_arguments(raw: &str) -> serde_json::Value {
+    if raw.trim().is_empty() {
+        return serde_json::Value::Object(serde_json::Map::new());
+    }
+
+    match serde_json::from_str::<serde_json::Value>(raw) {
+        Ok(value @ serde_json::Value::Object(_)) => value,
+        _ => invalid_arguments(raw),
+    }
+}
+
 mod apply_patch_grammar;
 mod attribution;
 mod auth;

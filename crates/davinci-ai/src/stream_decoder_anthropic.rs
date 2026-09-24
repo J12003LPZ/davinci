@@ -315,12 +315,16 @@ impl AnthropicDecoder {
                 });
             }
             BlockKind::ToolCall => {
-                // TS re-parses the buffer here, which yields `{}` when nothing
-                // streamed. An empty buffer keeps whatever the block already
-                // holds (`{}` unless the input arrived whole in
-                // content_block_start), so a proxy that sends the input up
-                // front is not silently emptied.
-                self.set_arguments(block.content_index, &block.partial_json);
+                // Keep input supplied whole in content_block_start when no
+                // JSON deltas arrived; otherwise validate only the completed
+                // buffer, leaving streaming partial events unchanged.
+                if !block.partial_json.is_empty() {
+                    if let Some(ContentBlock::ToolCall { arguments, .. }) =
+                        self.message.content.get_mut(block.content_index)
+                    {
+                        *arguments = crate::final_tool_arguments(&block.partial_json);
+                    }
+                }
                 let tool_call = self
                     .message
                     .content
@@ -665,6 +669,58 @@ mod tests {
 data: {"type":"message_start","message":{"id":"msg_01","type":"message","role":"assistant","model":"claude-sonnet-4-5","content":[],"stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":25,"cache_creation_input_tokens":0,"cache_read_input_tokens":10,"output_tokens":1}}}
 
 "#;
+
+    #[test]
+    fn malformed_final_tool_input_is_preserved_for_rejection() {
+        let raw = r#"{"command":"rm"#;
+        let body = [
+            format!(
+                "event: content_block_start\ndata: {}",
+                serde_json::json!({
+                    "type": "content_block_start",
+                    "index": 0,
+                    "content_block": {
+                        "type": "tool_use",
+                        "id": "toolu_bad",
+                        "name": "exec_command",
+                        "input": {}
+                    }
+                })
+            ),
+            format!(
+                "event: content_block_delta\ndata: {}",
+                serde_json::json!({
+                    "type": "content_block_delta",
+                    "index": 0,
+                    "delta": {"type": "input_json_delta", "partial_json": raw}
+                })
+            ),
+            format!(
+                "event: content_block_stop\ndata: {}",
+                serde_json::json!({"type": "content_block_stop", "index": 0})
+            ),
+            format!(
+                "event: message_delta\ndata: {}",
+                serde_json::json!({
+                    "type": "message_delta",
+                    "delta": {"stop_reason": "max_tokens"}
+                })
+            ),
+            format!(
+                "event: message_stop\ndata: {}",
+                serde_json::json!({"type": "message_stop"})
+            ),
+        ]
+        .join("\n\n");
+        let corpus = format!("{MESSAGE_START}{body}");
+        let (message, _) = run(&corpus);
+
+        assert!(matches!(
+            &message.content[0],
+            ContentBlock::ToolCall { arguments, .. }
+                if arguments == &serde_json::json!({"__davinci_invalid_arguments": raw})
+        ));
+    }
 
     #[test]
     fn text_only_stream_keeps_message_start_usage_and_prices_it() {
@@ -1020,10 +1076,13 @@ data: {"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta"
             message.error_message.as_deref(),
             Some("Stream ended before the tool call was complete")
         );
-        // The half-received JSON never became arguments.
+        // The half-received JSON is marked invalid for the agent to reject.
         assert!(matches!(
             &message.content[0],
-            ContentBlock::ToolCall { arguments, .. } if arguments == &serde_json::json!({})
+            ContentBlock::ToolCall { arguments, .. }
+                if arguments == &serde_json::json!({
+                    "__davinci_invalid_arguments": "{\"command\":\"rm"
+                })
         ));
     }
 
@@ -1412,7 +1471,11 @@ data: {"type":"message_stop"}
         assert!(matches!(
             &message.content[0],
             ContentBlock::ToolCall { id, name, arguments }
-                if id.is_empty() && name.is_empty() && arguments == &serde_json::json!({})
+                if id.is_empty()
+                    && name.is_empty()
+                    && arguments == &serde_json::json!({
+                        "__davinci_invalid_arguments": "not json"
+                    })
         ));
         // The refusal delta was malformed but its stop reason still counts.
         assert_eq!(message.stop_reason, Some(StopReason::Error));

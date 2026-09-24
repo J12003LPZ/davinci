@@ -528,12 +528,9 @@ fn parse_streaming_arguments(buffer: &str, previous: &Value) -> Value {
     }
 }
 
-/// The finished arguments: the parsed buffer, `{}` when empty or unparseable.
+/// The finished arguments: the parsed object, or a sentinel when malformed.
 fn final_arguments(buffer: &str) -> Value {
-    match serde_json::from_str::<Value>(buffer) {
-        Ok(value @ Value::Object(_)) => value,
-        _ => Value::Object(Map::new()),
-    }
+    crate::final_tool_arguments(buffer)
 }
 
 /// The message of an `error` payload, else its code, else the raw JSON.
@@ -741,6 +738,50 @@ data: {"choices":[{"index":0,"delta":{"content":"Hi"},"finish_reason":"stop","us
         let (message, _) = run(corpus);
         let usage = message.usage.expect("usage");
         assert_eq!((usage.input, usage.output), (7, 3));
+    }
+
+    #[test]
+    fn invalid_final_arguments_are_marked_not_emptied() {
+        let raw = r#"{"path":"#;
+        let encoded_raw = serde_json::to_string(raw).unwrap();
+        let corpus = format!(
+            r#"data: {{"choices":[{{"index":0,"delta":{{"role":"assistant","tool_calls":[{{"index":0,"id":"call_bad","type":"function","function":{{"name":"read","arguments":{encoded_raw}}}}}]}},"finish_reason":null}}]}}
+
+data: {{"choices":[{{"index":0,"delta":{{}},"finish_reason":"length"}}]}}
+
+data: [DONE]
+"#
+        );
+        let (message, _) = run(&corpus);
+
+        assert_eq!(message.stop_reason, Some(StopReason::Length));
+        assert_eq!(
+            tool_call(&message.content[0]).2,
+            &serde_json::json!({"__davinci_invalid_arguments": raw})
+        );
+    }
+
+    #[test]
+    fn invalid_argument_diagnostics_are_limited_by_unicode_characters() {
+        let raw = "💡".repeat(2_001);
+        let value = final_arguments(&raw);
+        assert_eq!(
+            value["__davinci_invalid_arguments"],
+            Value::String("💡".repeat(2_000))
+        );
+    }
+
+    #[test]
+    fn final_arguments_keep_objects_and_treat_empty_input_as_an_empty_object() {
+        assert_eq!(final_arguments(" \n\t"), serde_json::json!({}));
+        assert_eq!(
+            final_arguments(r#"{"ok":true}"#),
+            serde_json::json!({"ok": true})
+        );
+        assert_eq!(
+            final_arguments("[1,2]"),
+            serde_json::json!({"__davinci_invalid_arguments": "[1,2]"})
+        );
     }
 
     #[test]
@@ -1065,8 +1106,11 @@ data: {{"choices":[{{"index":0,"delta":{{"tool_calls":[{{"index":0,"function":{{
                 "error"
             ]
         );
-        // The half-received arguments are not guessed at.
-        assert_eq!(tool_call(&message.content[0]).2, &serde_json::json!({}));
+        // The half-received arguments are marked invalid for the agent to reject.
+        assert_eq!(
+            tool_call(&message.content[0]).2,
+            &serde_json::json!({"__davinci_invalid_arguments": "{\"path\""})
+        );
     }
 
     #[test]

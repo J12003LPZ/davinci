@@ -1322,6 +1322,16 @@ impl Agent {
         depth: usize,
         origin: crate::ToolOperationOrigin,
     ) -> Preparation {
+        if let Some(raw) = args.get(davinci_ai::INVALID_ARGUMENTS_KEY) {
+            let raw = raw.as_str().unwrap_or("<unavailable>");
+            return Preparation::Immediate(crate::ToolResult {
+                content: format!(
+                    "The arguments for `{name}` were not valid JSON, so the tool was not run. Send the call again with complete JSON arguments. Received: {raw}"
+                ),
+                is_error: true,
+                details: Some(serde_json::json!({"invalidArguments": true})),
+            });
+        }
         if let Err(error) = self.ensure_session_persistence() {
             return Preparation::Immediate(crate::ToolResult {
                 content: error,
@@ -4516,6 +4526,46 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
     use tempfile::tempdir;
+
+    #[test]
+    fn a_call_with_invalid_arguments_is_answered_with_an_error_and_not_run() {
+        let root = tempdir().unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let executor_calls = calls.clone();
+        let mut agent = Agent::new("invalid argument fixture");
+        agent.tools = vec!["fixture".into()];
+        agent.permissions = Arc::new(crate::PermissionState::new(crate::PermissionPolicy::new(
+            crate::PermissionMode::AlwaysApprove,
+        )));
+        agent.custom_tool_executor = Some(crate::CustomToolExecutor::new(move |_, _, _| {
+            executor_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(crate::ToolResult {
+                content: "tool ran".into(),
+                is_error: false,
+                details: None,
+            })
+        }));
+        let raw = r#"{"path":"#;
+        let args = json!({"__davinci_invalid_arguments": raw});
+
+        let result = match agent.prepare_tool_call(root.path(), "invalid-1", "fixture", &args, 0) {
+            Preparation::Immediate(result) => result,
+            Preparation::Ready { .. } => {
+                agent.run_prepared_call(root.path(), "invalid-1", "fixture", &args, 0)
+            }
+            Preparation::Wait { .. } => panic!("a new invalid call cannot be waiting"),
+        };
+
+        assert!(result.is_error);
+        assert_eq!(
+            result.content,
+            format!(
+                "The arguments for `fixture` were not valid JSON, so the tool was not run. Send the call again with complete JSON arguments. Received: {raw}"
+            )
+        );
+        assert_eq!(result.details, Some(json!({"invalidArguments": true})));
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+    }
 
     #[test]
     fn existing_serialized_agent_event_json_is_unchanged() {

@@ -514,32 +514,23 @@ impl ResponsesDecoder {
                 });
             }
             SlotKind::ToolCall => {
-                if let Some(item) = item {
-                    if slot.custom_input {
+                if slot.custom_input {
+                    if let Some(item) = item {
                         if let Some(input) = item.get("input").and_then(Value::as_str) {
                             self.set_arguments(&slot, input);
                         }
-                    } else {
-                        let raw = item
-                            .get("arguments")
-                            .and_then(Value::as_str)
-                            .filter(|raw| !raw.is_empty())
-                            .map(str::to_string)
-                            .unwrap_or_else(|| slot.partial.clone());
-                        let raw = if raw.is_empty() {
-                            "{}".to_string()
-                        } else {
-                            raw
-                        };
-                        self.set_arguments(&slot, &raw);
                     }
-                } else if !slot.custom_input {
-                    let raw = if slot.partial.is_empty() {
-                        "{}".to_string()
-                    } else {
-                        slot.partial.clone()
-                    };
-                    self.set_arguments(&slot, &raw);
+                } else {
+                    let raw = item
+                        .and_then(|item| item.get("arguments"))
+                        .and_then(Value::as_str)
+                        .filter(|raw| !raw.is_empty())
+                        .unwrap_or(&slot.partial);
+                    if let Some(ContentBlock::ToolCall { arguments, .. }) =
+                        self.message.content.get_mut(slot.content_index)
+                    {
+                        *arguments = crate::final_tool_arguments(raw);
+                    }
                 }
                 let block = self
                     .message
@@ -1096,6 +1087,27 @@ data: {"type":"response.completed","response":{"status":"completed"}}
         assert_eq!(ends, [2, 3]);
         // The summary_part.done newline is replaced by the item's own summary.
         assert!(names(&events).contains(&"thinking_end"));
+    }
+
+    #[test]
+    fn malformed_final_function_arguments_are_preserved_for_rejection() {
+        let raw = r#"{"path":"#;
+        let encoded_raw = serde_json::to_string(raw).unwrap();
+        let corpus = format!(
+            r#"data: {{"type":"response.output_item.added","output_index":0,"item":{{"type":"function_call","id":"fc_bad","call_id":"call_bad","name":"read","arguments":{encoded_raw}}}}}
+
+data: {{"type":"response.output_item.done","output_index":0,"item":{{"type":"function_call","id":"fc_bad","call_id":"call_bad","name":"read","arguments":{encoded_raw}}}}}
+
+data: {{"type":"response.completed","response":{{"status":"completed"}}}}
+"#
+        );
+        let (message, _) = run(&corpus);
+
+        assert!(matches!(
+            &message.content[0],
+            ContentBlock::ToolCall { arguments, .. }
+                if arguments == &serde_json::json!({"__davinci_invalid_arguments": raw})
+        ));
     }
 
     #[test]
