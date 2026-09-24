@@ -617,6 +617,7 @@ impl NativeExtensionHost {
         }
         self.language_intelligence.shutdown();
         graph::abort_all_runs();
+        self.security.abort_review();
         self.learning.cancel_active_review();
     }
 
