@@ -397,11 +397,7 @@ impl Editor {
             self.cursor = start;
             return;
         }
-        self.cursor -= self.buffer[..self.cursor]
-            .chars()
-            .next_back()
-            .map(|c| c.len_utf8())
-            .unwrap_or(0);
+        self.cursor -= prev_grapheme_len(&self.buffer[..self.cursor]);
     }
 
     pub fn move_right(&mut self) {
@@ -414,11 +410,7 @@ impl Editor {
             self.cursor = end;
             return;
         }
-        self.cursor += self.buffer[self.cursor..]
-            .chars()
-            .next()
-            .map(|c| c.len_utf8())
-            .unwrap_or(0);
+        self.cursor += next_grapheme_len(&self.buffer[self.cursor..]);
     }
 
     pub fn move_line_start(&mut self) {
