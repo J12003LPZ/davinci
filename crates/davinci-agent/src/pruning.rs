@@ -133,6 +133,23 @@ mod tests {
     use super::*;
 
     #[test]
+    fn cached_routes_prune_later_and_deeper() {
+        let settings = PruneSettings::cached_route();
+        assert!(settings.enabled);
+        assert_eq!(settings.start_fraction, 0.65);
+        assert_eq!(settings.target_fraction, 0.35);
+    }
+
+    #[test]
+    fn custom_pruning_is_not_overridden_by_route() {
+        let custom = PruneSettings {
+            keep_recent: 2,
+            ..PruneSettings::default()
+        };
+        assert_eq!(PruneSettings::for_route(&custom, true), custom);
+    }
+
+    #[test]
     fn pruned_mutation_does_not_request_reexecution() {
         let body = placeholder("bash", 7_000);
         assert!(!body.contains("Re-run"));
