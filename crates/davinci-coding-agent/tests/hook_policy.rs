@@ -673,13 +673,8 @@ fn test_hook_status_diagnostics() {
     });
     env.write_project_hooks(&hooks_json.to_string());
 
-    let report = hooks::status_report(&env.project_dir);
-    assert_eq!(report["rulesCount"], 1);
-    assert_eq!(report["trusted"], true);
-    assert!(report["contentHash"].as_str().is_some());
-    assert!(report["telemetry"]["executed"].as_u64().is_some());
-
-    // NativeExtensionHost command dispatch
+    // NativeExtensionHost command dispatch must use its configured agent root
+    // and must not treat project hooks as trusted without a trust decision.
     let mut host = NativeExtensionHost::new_with_agent_dir(
         "test-session",
         &env.project_dir,
@@ -689,6 +684,7 @@ fn test_hook_status_diagnostics() {
         .command("hook-status", "")
         .expect("command should succeed");
     let cmd_val = cmd_result.expect("should return json value");
-    assert_eq!(cmd_val["rulesCount"], 1);
-    assert_eq!(cmd_val["trusted"], true);
+    assert_eq!(cmd_val["rulesCount"], 0);
+    assert_eq!(cmd_val["trusted"], false);
+    assert!(cmd_val["telemetry"]["executed"].as_u64().is_some());
 }

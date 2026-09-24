@@ -733,7 +733,7 @@ pub fn status_report(cwd: &Path) -> Value {
     status_report_with_agent_dir(&agent_dir, cwd)
 }
 
-fn status_report_with_agent_dir(agent_dir: &Path, cwd: &Path) -> Value {
+pub(crate) fn status_report_with_agent_dir(agent_dir: &Path, cwd: &Path) -> Value {
     let settings = crate::settings::load_merged_settings(agent_dir, cwd);
     let trusted = crate::trust::resolve_project_trusted(
         agent_dir,

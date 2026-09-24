@@ -344,6 +344,7 @@ pub struct NativeExtensionHost {
     /// Set by the native visual backend registration path when one exists.
     pub visual_verification_available: bool,
     pub cwd: std::path::PathBuf,
+    agent_dir: std::path::PathBuf,
 }
 
 const CODEX_CREDITS_PER_USD: f64 = 25.0;
@@ -501,6 +502,7 @@ impl NativeExtensionHost {
             visual_verification_available: visual_snapshot.is_available(),
             visual_snapshot,
             cwd: cwd.to_path_buf(),
+            agent_dir: repo_agent_dir,
         }
     }
 
@@ -878,7 +880,10 @@ impl NativeExtensionHost {
                 } else {
                     self.cwd.clone()
                 };
-                Ok(Some(crate::hooks::status_report(&cwd)))
+                Ok(Some(crate::hooks::status_report_with_agent_dir(
+                    &self.agent_dir,
+                    &cwd,
+                )))
             }
             name if name.starts_with("graph") => self.graph.command(name, args),
             name if name == "security-scan" || name.starts_with("sec-") => {
