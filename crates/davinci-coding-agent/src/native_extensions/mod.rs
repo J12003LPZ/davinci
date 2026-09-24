@@ -191,6 +191,16 @@ pub fn command_specs() -> Vec<(&'static str, &'static str, Option<&'static str>)
             None,
         ),
         (
+            "git-status",
+            "Show bounded Git intelligence status and repository history availability.",
+            None,
+        ),
+        (
+            "impact-status",
+            "Show change-impact analysis status and dependency coverage.",
+            None,
+        ),
+        (
             "verification-status",
             "Show bounded verification-planner limits and planning telemetry.",
             None,
@@ -219,6 +229,26 @@ pub fn command_specs() -> Vec<(&'static str, &'static str, Option<&'static str>)
             "security-scan",
             "Start an experimental source-grounded security review.",
             Some("[path] [--mode quick|standard|deep] [--format terminal|json|sarif]"),
+        ),
+        (
+            "sec-resume",
+            "Resume an interrupted security review.",
+            Some("<scanId>"),
+        ),
+        (
+            "sec-status",
+            "Show the active security review status.",
+            Some("[scanId]"),
+        ),
+        (
+            "sec-report",
+            "Show the current security review report.",
+            Some("[scanId]"),
+        ),
+        (
+            "sec-abort",
+            "Cancel the active security review.",
+            Some("[scanId]"),
         ),
         (
             "memory-status",
@@ -1022,6 +1052,19 @@ impl NativeExtensionHost {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn every_external_native_command_is_listed() {
+        let listed: std::collections::BTreeSet<_> =
+            command_specs().into_iter().map(|(name, _, _)| name).collect();
+        let internal_graph = ["graph-resume", "graph-status", "graph-view", "graph-abort"];
+        for name in NATIVE_COMMANDS {
+            if internal_graph.contains(name) {
+                continue;
+            }
+            assert!(listed.contains(name), "{name} is dispatched but not listed");
+        }
+    }
     use std::sync::Arc;
 
     #[test]
