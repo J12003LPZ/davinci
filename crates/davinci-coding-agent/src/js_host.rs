@@ -424,7 +424,6 @@ impl Drop for PersistentJsSession {
     }
 }
 
-static PERSISTENT_JS: Mutex<Option<PersistentJsSession>> = Mutex::new(None);
 static NODE_LOCK: Mutex<()> = Mutex::new(());
 
 type UiWaiter = Box<dyn FnMut(&Value) -> Value>;
@@ -488,32 +487,11 @@ pub fn run_persistent_js_extension(
     payload: &Value,
 ) -> Result<JsExtensionResult, String> {
     let _guard = NODE_LOCK.lock().map_err(|err| err.to_string())?;
-    let mut slot = PERSISTENT_JS.lock().map_err(|err| err.to_string())?;
-    if slot
-        .as_ref()
-        .is_some_and(|session| session.module != module)
-    {
-        *slot = None;
-    }
-    if slot.is_none() {
-        *slot = Some(PersistentJsSession::start(module)?);
-    }
-    let result = slot
-        .as_mut()
-        .ok_or_else(|| "persistent JS session missing".to_string())?
-        .send(op, payload);
-    // A dead or hung runner must not linger in the slot: the next call should
-    // start a fresh one rather than write into a closed pipe.
-    if result.is_err() {
-        *slot = None;
-    }
-    result
+    run_pooled_js_extension(module, op, payload)
 }
 
 pub fn stop_persistent_js_extension() {
-    if let Ok(mut slot) = PERSISTENT_JS.lock() {
-        *slot = None;
-    }
+    shutdown_js_pool();
 }
 
 /// One long-lived `--persistent` runner per extension module. A fresh node
@@ -521,8 +499,36 @@ pub fn stop_persistent_js_extension() {
 /// (worse with TypeScript extensions that load a transpiler); the runner
 /// already speaks line-delimited `{op, payload}` in persistent mode, and the
 /// TS reference keeps extensions loaded for the whole session anyway.
-static JS_POOL: Mutex<Option<std::collections::HashMap<PathBuf, PersistentJsSession>>> =
-    Mutex::new(None);
+const MAX_PERSISTENT_JS_SESSIONS: usize = 8;
+
+#[derive(Default)]
+struct PersistentJsPool {
+    sessions: std::collections::HashMap<PathBuf, PersistentJsSession>,
+    lru: std::collections::VecDeque<PathBuf>,
+}
+
+impl PersistentJsPool {
+    fn touch(&mut self, module: &Path) {
+        self.lru.retain(|path| path != module);
+        self.lru.push_back(module.to_path_buf());
+    }
+
+    fn remove(&mut self, module: &Path) {
+        self.sessions.remove(module);
+        self.lru.retain(|path| path != module);
+    }
+
+    fn ensure_capacity(&mut self) {
+        while self.sessions.len() >= MAX_PERSISTENT_JS_SESSIONS {
+            let Some(oldest) = self.lru.pop_front() else {
+                break;
+            };
+            self.sessions.remove(&oldest);
+        }
+    }
+}
+
+static JS_POOL: Mutex<Option<PersistentJsPool>> = Mutex::new(None);
 
 fn js_pool_enabled() -> bool {
     !matches!(
@@ -537,11 +543,14 @@ fn run_pooled_js_extension(
     payload: &Value,
 ) -> Result<JsExtensionResult, String> {
     let mut pool = JS_POOL.lock().map_err(|err| err.to_string())?;
-    let pool = pool.get_or_insert_with(std::collections::HashMap::new);
-    if !pool.contains_key(module) {
-        pool.insert(module.to_path_buf(), PersistentJsSession::start(module)?);
+    let pool = pool.get_or_insert_with(PersistentJsPool::default);
+    if !pool.sessions.contains_key(module) {
+        pool.ensure_capacity();
+        pool.sessions
+            .insert(module.to_path_buf(), PersistentJsSession::start(module)?);
     }
-    let session = pool.get_mut(module).expect("pooled session");
+    pool.touch(module);
+    let session = pool.sessions.get_mut(module).expect("pooled session");
     if op == "load" {
         if let Some(initial) = session.initial_load.take() {
             return Ok(initial);
@@ -558,9 +567,11 @@ fn run_pooled_js_extension(
         Err(_) => {
             // The runner died (crash, stdin closed): respawn once and retry.
             pool.remove(module);
+            pool.ensure_capacity();
             let mut fresh = PersistentJsSession::start(module)?;
             let result = fresh.send(op, payload);
-            pool.insert(module.to_path_buf(), fresh);
+            pool.sessions.insert(module.to_path_buf(), fresh);
+            pool.touch(module);
             result
         }
     }
