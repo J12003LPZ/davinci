@@ -778,6 +778,7 @@ impl NativeExtensionHost {
                 Ok(Some(json!({
                     "enabled": self.cache.config().enabled,
                     "runtimeFeatures": davinci_ai::openai_cache_policy::runtime_features(),
+                    "codexUsage": davinci_ai::codex_usage::latest(),
                     "summary": stats.summary(),
                     "namespaces": stats.namespaces,
                     "diskUsage":"last observed on write or explicit sweep; no startup scan",
