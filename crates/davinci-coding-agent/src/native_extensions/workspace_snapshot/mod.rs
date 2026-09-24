@@ -284,10 +284,7 @@ impl WorkspaceSnapshot {
                 .ok_or_else(|| format!("current capture omitted {}", expected.path))?;
             let mut change = compare_entry(expected, actual);
             change.safe_to_restore = safe_restore(actual, expected, transaction.as_ref());
-            if !change.safe_to_restore
-                && change.status != "already_restored"
-                && change.status != "unchanged"
-            {
+            if !change.safe_to_restore && change.status != "unchanged" {
                 conflicts.push(json!({
                     "path": change.path,
                     "reason": "current postimage is not owned by the supplied transaction",
@@ -322,7 +319,7 @@ impl WorkspaceSnapshot {
         }
         let restore_paths = changes
             .iter()
-            .filter(|change| change.status != "already_restored" && change.status != "unchanged")
+            .filter(|change| change.status != "unchanged")
             .map(|change| change.path.clone())
             .collect::<Vec<_>>();
         if restore_paths.is_empty() {
@@ -342,7 +339,7 @@ impl WorkspaceSnapshot {
                 .iter()
                 .find(|change| change.path == entry.path)
                 .expect("change created for every checkpoint entry");
-            if change.status != "already_restored" && change.status != "unchanged" {
+            if change.status != "unchanged" {
                 self.apply_entry(cwd, entry)?;
             }
         }
