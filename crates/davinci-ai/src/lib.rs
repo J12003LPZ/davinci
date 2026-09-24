@@ -13,6 +13,7 @@ pub mod codex_transport;
 pub mod codex_usage;
 mod codex_ws;
 mod deferred;
+mod http;
 mod http_proxy;
 mod images;
 mod model_config;

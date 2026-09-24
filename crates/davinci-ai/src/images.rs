@@ -152,10 +152,12 @@ fn post_images(
         .unwrap_or("https://openrouter.ai/api/v1")
         .trim_end_matches('/');
     let url = format!("{base}/chat/completions");
-    let mut request = ureq::post(&url);
-    if let Some(timeout_ms) = options.timeout_ms {
-        request = request.timeout(std::time::Duration::from_millis(timeout_ms));
-    }
+    let idle = options
+        .timeout_ms
+        .filter(|timeout_ms| *timeout_ms > 0)
+        .map(std::time::Duration::from_millis)
+        .unwrap_or(crate::http::PROVIDER_IDLE_TIMEOUT);
+    let mut request = crate::http::agent(idle).post(&url);
     if let Some(key) = &options.api_key {
         request = request.set("Authorization", &format!("Bearer {key}"));
     }

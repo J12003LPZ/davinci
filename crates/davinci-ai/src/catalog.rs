@@ -325,7 +325,9 @@ fn fetch_radius_config() -> Option<String> {
         std::env::var("PI_RADIUS_GATEWAY").unwrap_or_else(|_| "https://radius.pi.dev".into());
     let gateway = gateway.trim_end_matches('/');
     let url = format!("{gateway}/v1/config");
-    let mut request = ureq::get(&url).set("accept", "application/json");
+    let mut request = crate::http::agent(crate::http::CONTROL_IDLE_TIMEOUT)
+        .get(&url)
+        .set("accept", "application/json");
     if let Ok(key) = std::env::var("RADIUS_API_KEY") {
         request = request.set("Authorization", &format!("Bearer {key}"));
     } else if let Ok(key) = std::env::var("PI_RADIUS_TOKEN") {

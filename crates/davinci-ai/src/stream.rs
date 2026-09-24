@@ -18,6 +18,7 @@ use std::time::Duration;
 pub struct StreamOptions {
     pub thinking_level: Option<ThinkingLevel>,
     pub thinking_budgets: Option<ThinkingBudgets>,
+    /// Provider HTTP idle timeout per socket read, in milliseconds. Defaults to 300 seconds.
     pub timeout_ms: Option<u64>,
     pub max_retries: Option<u32>,
     pub max_retry_delay_ms: Option<u64>,
@@ -836,7 +837,7 @@ pub fn raw_provider_post(
     body: &Value,
 ) -> Result<RawProviderReply, String> {
     let headers = collect_request_headers(model, auth, &StreamOptions::default());
-    let mut request = ureq::post(url).timeout(Duration::from_secs(120));
+    let mut request = crate::http::agent(crate::http::PROVIDER_IDLE_TIMEOUT).post(url);
     for (key, value) in &headers {
         request = request.set(key, value);
     }
@@ -1001,10 +1002,11 @@ fn send_provider_request(
     timeout_ms: Option<u64>,
     compress_zstd: bool,
 ) -> Result<ureq::Response, crate::provider_retry::ProviderError> {
-    let mut request = ureq::post(url);
-    if let Some(timeout_ms) = timeout_ms {
-        request = request.timeout(std::time::Duration::from_millis(timeout_ms));
-    }
+    let idle = timeout_ms
+        .filter(|timeout_ms| *timeout_ms > 0)
+        .map(std::time::Duration::from_millis)
+        .unwrap_or(crate::http::PROVIDER_IDLE_TIMEOUT);
+    let mut request = crate::http::agent(idle).post(url);
     for (key, value) in headers {
         request = request.set(key, value);
     }
@@ -1490,7 +1492,7 @@ pub fn live_stream(
     let prepared = crate::responses_request::PreparedProviderRequest::new(body);
     let body = prepared.body();
     let url = request_url(model, auth);
-    let mut request = ureq::post(&url);
+    let mut request = crate::http::agent(crate::http::PROVIDER_IDLE_TIMEOUT).post(&url);
     for (key, value) in &auth.headers {
         request = request.set(key, value);
     }

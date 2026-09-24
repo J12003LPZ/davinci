@@ -422,7 +422,8 @@ pub fn exchange_authorization_code(
 
 fn post_token_exchange(request: &TokenExchangeRequest) -> Result<OauthTokens, String> {
     let url = std::env::var("PI_OAUTH_TOKEN_URL").unwrap_or_else(|_| request.url.clone());
-    let response = ureq::post(&url)
+    let response = crate::http::agent(crate::http::CONTROL_IDLE_TIMEOUT)
+        .post(&url)
         .set("content-type", &request.content_type)
         .set("accept", "application/json")
         .send_string(&request.body)

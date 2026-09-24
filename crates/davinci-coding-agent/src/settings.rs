@@ -608,6 +608,7 @@ impl CompactionSettings {
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct ProviderRetrySettings {
+    /// Provider HTTP idle timeout per socket read, in milliseconds (default: 300 seconds).
     #[serde(default, rename = "timeoutMs")]
     pub timeout_ms: Option<u64>,
     #[serde(default, rename = "maxRetries")]

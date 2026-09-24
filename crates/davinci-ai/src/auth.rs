@@ -222,7 +222,8 @@ impl AuthStorage {
                 "provider": provider,
                 "refresh": refresh,
             });
-            let response = ureq::post(&url)
+            let response = crate::http::agent(crate::http::CONTROL_IDLE_TIMEOUT)
+                .post(&url)
                 .set("content-type", "application/json")
                 .send_string(&body.to_string())
                 .map_err(|err| AuthStorageError::Read(err.to_string()))?;
@@ -647,7 +648,8 @@ pub fn fetch_github_copilot_available_model_ids(access: &str) -> Vec<String> {
     if url.is_empty() {
         return Vec::new();
     }
-    let response = match ureq::get(&url)
+    let response = match crate::http::agent(crate::http::CONTROL_IDLE_TIMEOUT)
+        .get(&url)
         .set("accept", "application/json")
         .set("authorization", &format!("Bearer {access}"))
         .set("user-agent", COPILOT_USER_AGENT)
@@ -655,7 +657,6 @@ pub fn fetch_github_copilot_available_model_ids(access: &str) -> Vec<String> {
         .set("editor-plugin-version", COPILOT_PLUGIN_VERSION)
         .set("copilot-integration-id", COPILOT_INTEGRATION_ID)
         .set("x-github-api-version", COPILOT_API_VERSION)
-        .timeout(std::time::Duration::from_secs(10))
         .call()
     {
         Ok(response) => response,
