@@ -3,6 +3,7 @@
 // Usage: node scripts/compare-codex.mjs <fixture-repo> <model> <tasks.json>
 import { spawnSync } from "node:child_process";
 import { cpSync, mkdtempSync, readFileSync } from "node:fs";
+import { fileURLToPath } from "node:url";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -14,6 +15,45 @@ if (!fixture || !model || !tasksFile) {
   process.exit(2);
 }
 const tasks = JSON.parse(readFileSync(tasksFile, "utf8"));
+const runsPerHarness = Number.parseInt(process.env.DAVINCI_COMPARE_RUNS ?? "3", 10);
+if (!Number.isInteger(runsPerHarness) || runsPerHarness < 1) {
+  throw new Error("DAVINCI_COMPARE_RUNS must be a positive integer");
+}
+
+const catalogPath = fileURLToPath(
+  new URL("../crates/davinci-ai/src/catalogs.json", import.meta.url),
+);
+const catalog = JSON.parse(readFileSync(catalogPath, "utf8"));
+
+function findModelCost(value) {
+  if (!value || typeof value !== "object") return null;
+  if (
+    !Array.isArray(value) &&
+    value.provider === "openai-codex" &&
+    value.id === model &&
+    value.cost
+  ) {
+    return value.cost;
+  }
+  for (const child of Object.values(value)) {
+    const found = findModelCost(child);
+    if (found) return found;
+  }
+  return null;
+}
+
+const modelCost = findModelCost(catalog);
+if (!modelCost) {
+  throw new Error(`no openai-codex catalog cost found for ${model}`);
+}
+
+function creditsFor(usage) {
+  const usd =
+    ((usage.input ?? 0) / 1_000_000) * (modelCost.input ?? 0) +
+    ((usage.cached ?? 0) / 1_000_000) * (modelCost.cacheRead ?? modelCost.cache_read ?? 0) +
+    ((usage.output ?? 0) / 1_000_000) * (modelCost.output ?? 0);
+  return usd * 25;
+}
 
 function freshCopy() {
   const dir = mkdtempSync(join(tmpdir(), "davinci-codex-cmp-"));
@@ -99,6 +139,7 @@ function run(harness, task) {
     task: task.name,
     wallMs,
     ...usage,
+    credits: creditsFor(usage),
     passed: check.status === 0,
     exitCode: result.status,
   };
@@ -107,9 +148,36 @@ function run(harness, task) {
 const rows = [];
 for (const task of tasks) {
   for (const harness of ["codex", "davinci"]) {
-    const row = run(harness, task);
-    console.log(JSON.stringify(row));
-    rows.push(row);
+    for (let runIndex = 1; runIndex <= runsPerHarness; runIndex += 1) {
+      const row = { run: runIndex, ...run(harness, task) };
+      console.log(JSON.stringify(row));
+      rows.push(row);
+    }
   }
 }
 console.table(rows);
+
+const groups = new Map();
+for (const row of rows) {
+  const key = `${row.harness}\0${row.task}`;
+  const group = groups.get(key) ?? [];
+  group.push(row);
+  groups.set(key, group);
+}
+const means = [...groups.entries()].map(([key, group]) => {
+  const [harness, task] = key.split("\0");
+  const mean = (field) =>
+    group.reduce((sum, row) => sum + Number(row[field] ?? 0), 0) / group.length;
+  return {
+    harness,
+    task,
+    runs: group.length,
+    input: mean("input"),
+    cached: mean("cached"),
+    output: mean("output"),
+    credits: mean("credits"),
+    wallMs: mean("wallMs"),
+    passRate: group.filter((row) => row.passed).length / group.length,
+  };
+});
+console.table(means);
