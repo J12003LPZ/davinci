@@ -281,6 +281,8 @@ pub struct Settings {
     pub compaction: Option<CompactionSettings>,
     #[serde(default)]
     pub retry: Option<RetrySettings>,
+    #[serde(default, rename = "maxModelTurns")]
+    pub max_model_turns: Option<u32>,
     #[serde(default, rename = "thinkingBudgets")]
     pub thinking_budgets: Option<davinci_ai::ThinkingBudgets>,
     #[serde(default, rename = "branchSummary")]
@@ -1206,6 +1208,10 @@ impl Settings {
             .unwrap_or(DEFAULT_RETRY_BASE_DELAY_MS)
     }
 
+    pub fn max_model_turns(&self) -> Option<u32> {
+        self.max_model_turns
+    }
+
     pub fn provider_timeout_ms(&self) -> Option<u64> {
         self.retry
             .as_ref()
@@ -1548,6 +1554,17 @@ pub fn is_trusted(settings: &Settings, cwd: &Path, override_trust: Option<bool>)
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn max_model_turns_is_optional_and_zero_can_be_configured() {
+        assert_eq!(Settings::default().max_model_turns(), None);
+
+        for (value, expected) in [(7, Some(7)), (0, Some(0))] {
+            let settings: Settings =
+                serde_json::from_value(serde_json::json!({"maxModelTurns": value})).unwrap();
+            assert_eq!(settings.max_model_turns(), expected);
+        }
+    }
 
     #[test]
     fn browser_settings_fail_closed_and_preserve_unrelated_settings() {

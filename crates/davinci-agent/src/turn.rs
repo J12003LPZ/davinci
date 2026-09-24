@@ -165,6 +165,22 @@ impl Agent {
         }
     }
 
+    fn finish_run(&mut self, events: &mut Vec<AgentEvent>, new_messages: Vec<ChatMessage>) {
+        if let Some(runtime) = &self.runtime {
+            runtime.emit_turn_end(false);
+        }
+        self.push_event(
+            events,
+            AgentEvent::AgentEnd {
+                messages: new_messages,
+                will_retry: false,
+            },
+        );
+        self.is_streaming = false;
+        self.flush_pending_bash_messages();
+        self.emit_behavior_telemetry();
+    }
+
     fn run_loop_body<F, T>(
         &mut self,
         emit_prompt_messages: bool,
@@ -195,6 +211,7 @@ impl Agent {
         let mut new_messages = prompt_messages.clone();
         let mut capability_completion_reminders = 0_u32;
         let mut verification_reminded_generation = None;
+        let mut turns_this_run = 0_u32;
         self.push_event(&mut events, AgentEvent::AgentStart);
         self.push_event(&mut events, AgentEvent::TurnStart);
         if let Some(runtime) = &self.runtime {
@@ -220,20 +237,30 @@ impl Agent {
         loop {
             self.ensure_session_persistence()?;
             if self.abort_requested() {
-                if let Some(runtime) = &self.runtime {
-                    runtime.emit_turn_end(false);
-                }
-                self.push_event(
-                    &mut events,
-                    AgentEvent::AgentEnd {
-                        messages: new_messages,
-                        will_retry: false,
-                    },
-                );
-                self.is_streaming = false;
-                self.flush_pending_bash_messages();
-                self.emit_behavior_telemetry();
+                self.finish_run(&mut events, new_messages);
                 return Ok(events);
+            }
+            if let Some(max_model_turns) = self.max_model_turns.filter(|limit| *limit > 0) {
+                if turns_this_run >= max_model_turns {
+                    let notice = ChatMessage::text(
+                        "assistant",
+                        format!(
+                            "Stopped after {max_model_turns} model turns (maxModelTurns). Send a message to continue."
+                        ),
+                    );
+                    self.messages.push(notice.clone());
+                    self.persist_chat(&notice)?;
+                    new_messages.push(notice.clone());
+                    self.push_event(
+                        &mut events,
+                        AgentEvent::MessageStart {
+                            message: notice.clone(),
+                        },
+                    );
+                    self.push_event(&mut events, AgentEvent::MessageEnd { message: notice });
+                    self.finish_run(&mut events, new_messages);
+                    return Ok(events);
+                }
             }
 
             self.inject_queued(&mut events, &mut new_messages, true);
@@ -321,6 +348,7 @@ impl Agent {
 
             self.ensure_session_persistence()?;
             self.stats.model_turns += 1;
+            turns_this_run += 1;
             let model_started = std::time::Instant::now();
             let completion = self.complete_with_retry(&mut complete, &mut events);
             self.stats.model_wall_ms += model_started.elapsed().as_millis() as u64;
@@ -3959,6 +3987,111 @@ mod tests {
             });
             assert_eq!(calls.get(), expected_calls, "maxRetries={max_retries}");
         }
+    }
+
+    fn model_turn_read_call(turn: usize) -> davinci_ai::AssistantMessage {
+        davinci_ai::AssistantMessage {
+            id: format!("assistant-{turn}"),
+            role: "assistant".into(),
+            content: vec![davinci_ai::ContentBlock::ToolCall {
+                id: format!("call-{turn}"),
+                name: "read".into(),
+                arguments: serde_json::json!({"path": format!("missing-{turn}.txt")}),
+            }],
+            model: "fixture".into(),
+            usage: None,
+            stop_reason: Some(davinci_ai::StopReason::ToolUse),
+            error_message: None,
+        }
+    }
+
+    #[test]
+    fn the_loop_stops_at_max_model_turns() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut agent = Agent::new("model turn limit fixture");
+        agent.cwd = dir.path().to_path_buf();
+        agent.set_permission_mode(crate::PermissionMode::ReadOnly);
+        assert_eq!(agent.max_model_turns, Some(200));
+        agent.max_model_turns = Some(3);
+        agent.stats.model_turns = 7;
+        agent.prompt("go");
+        let calls = std::cell::Cell::new(0);
+
+        let events = agent
+            .run_loop(|_| {
+                let turn = calls.get();
+                calls.set(turn + 1);
+                Ok(model_turn_read_call(turn))
+            })
+            .unwrap();
+
+        assert_eq!(calls.get(), 3);
+        assert_eq!(agent.stats.model_turns, 10);
+        let notice = "Stopped after 3 model turns (maxModelTurns). Send a message to continue.";
+        assert!(events.iter().any(|event| matches!(
+            event,
+            crate::AgentEvent::MessageEnd { message }
+                if message.role == "assistant"
+                    && message.content.iter().any(|content| matches!(
+                        content,
+                        davinci_ai::MessageContent::Text { text } if text == notice
+                    ))
+        )));
+        assert!(!agent.is_streaming);
+    }
+
+    #[test]
+    fn zero_max_model_turns_does_not_limit_a_run() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut agent = Agent::new("unlimited model turn fixture");
+        agent.cwd = dir.path().to_path_buf();
+        agent.set_permission_mode(crate::PermissionMode::ReadOnly);
+        agent.max_model_turns = Some(0);
+        agent.prompt("go");
+        let calls = std::cell::Cell::new(0);
+
+        let events = agent
+            .run_loop(|_| {
+                let turn = calls.get();
+                calls.set(turn + 1);
+                let content = if turn == 0 {
+                    davinci_ai::ContentBlock::ToolCall {
+                        id: "call-first".into(),
+                        name: "read".into(),
+                        arguments: serde_json::json!({"path": "missing.txt"}),
+                    }
+                } else {
+                    davinci_ai::ContentBlock::Text {
+                        text: "done".into(),
+                    }
+                };
+                Ok(davinci_ai::AssistantMessage {
+                    id: format!("assistant-{turn}"),
+                    role: "assistant".into(),
+                    content: vec![content],
+                    model: "fixture".into(),
+                    usage: None,
+                    stop_reason: Some(if turn == 0 {
+                        davinci_ai::StopReason::ToolUse
+                    } else {
+                        davinci_ai::StopReason::Stop
+                    }),
+                    error_message: None,
+                })
+            })
+            .unwrap();
+
+        assert_eq!(calls.get(), 2);
+        assert_eq!(agent.stats.model_turns, 2);
+        assert!(!events.iter().any(|event| matches!(
+            event,
+            crate::AgentEvent::MessageEnd { message }
+                if message.content.iter().any(|content| matches!(
+                    content,
+                    davinci_ai::MessageContent::Text { text }
+                        if text.contains("maxModelTurns")
+                ))
+        )));
     }
 
     #[test]

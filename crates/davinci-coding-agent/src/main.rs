@@ -829,6 +829,7 @@ fn build_agent(parsed: &Args, session_dir: &Path, cwd: &Path) -> Result<Agent, S
     agent.auto_retry = settings.retry_enabled();
     agent.retry_attempts = settings.retry_max_retries();
     agent.retry_base_delay_ms = settings.retry_base_delay_ms();
+    apply_max_model_turns(&mut agent, &settings);
     agent.provider_timeout_ms = settings.provider_timeout_ms();
     agent.provider_max_retries = settings.provider_max_retries();
     agent.provider_max_retry_delay_ms = settings.provider_max_retry_delay_ms();
@@ -1792,6 +1793,18 @@ fn agent_memory_messages(agent: &Agent) -> Vec<crate::native_extensions::MemoryM
         .collect()
 }
 
+fn apply_max_model_turns(agent: &mut Agent, settings: &settings::Settings) {
+    if let Some(max_model_turns) = settings.max_model_turns() {
+        agent.max_model_turns = Some(max_model_turns);
+    }
+}
+
+fn new_worker_agent(system_prompt: impl Into<String>) -> Agent {
+    let mut agent = Agent::new(system_prompt);
+    agent.max_model_turns = Some(60);
+    agent
+}
+
 fn run_nested_subagent(
     parsed: &Args,
     cwd: &Path,
@@ -1831,7 +1844,7 @@ fn run_nested_subagent(
             davinci_agent::TOOL_USE_STRATEGY
         )
     };
-    let mut child = Agent::new(system_prompt);
+    let mut child = new_worker_agent(system_prompt);
     let effective_cwd = if let Some(wt) = &req.worktree_path {
         wt.as_path()
     } else {
@@ -10567,6 +10580,26 @@ mod tests {
     use super::*;
 
     static PROCESS_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn main_model_turn_setting_overrides_the_default_and_keeps_zero() {
+        let mut agent = Agent::new("main turn limit fixture");
+        super::apply_max_model_turns(&mut agent, &super::settings::Settings::default());
+        assert_eq!(agent.max_model_turns, Some(200));
+
+        let settings = super::settings::Settings {
+            max_model_turns: Some(0),
+            ..super::settings::Settings::default()
+        };
+        super::apply_max_model_turns(&mut agent, &settings);
+        assert_eq!(agent.max_model_turns, Some(0));
+    }
+
+    #[test]
+    fn worker_agents_use_the_lower_model_turn_default() {
+        let worker = super::new_worker_agent("worker turn limit fixture");
+        assert_eq!(worker.max_model_turns, Some(60));
+    }
 
     #[test]
     fn provider_context_accounting_includes_runtime_identity() {

@@ -346,6 +346,8 @@ pub struct Agent {
     pub auto_retry: bool,
     pub retry_attempts: u32,
     pub retry_base_delay_ms: u64,
+    /// Maximum provider model turns in one run; `Some(0)` disables the limit.
+    pub max_model_turns: Option<u32>,
     pub provider_timeout_ms: Option<u64>,
     pub provider_max_retries: Option<u32>,
     pub provider_max_retry_delay_ms: u64,
@@ -492,6 +494,7 @@ impl Agent {
             auto_retry: true,
             retry_attempts: 3,
             retry_base_delay_ms: 2_000,
+            max_model_turns: Some(200),
             provider_timeout_ms: None,
             provider_max_retries: None,
             provider_max_retry_delay_ms: 60_000,
