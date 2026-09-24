@@ -4,7 +4,7 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Condvar, Mutex};
@@ -12,6 +12,10 @@ use std::time::Duration;
 
 use crate::runtime::operations::{digest_bytes, LegacyObservation, LegacySourceKind};
 use crate::runtime::{conservative_replay_policy, ReplayPolicy};
+
+const MAX_STORED_OUTPUT: usize = 64 * 1024;
+const MAX_TERMINAL_RECORDS: usize = 256;
+const OUTPUT_TRUNCATED_MARKER: &str = "\n[output truncated in ledger; digest covers the full text]";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -116,6 +120,21 @@ fn compute_digest(content: &str) -> String {
     let mut hasher = Sha256::new();
     hasher.update(content.as_bytes());
     format!("{:x}", hasher.finalize())
+}
+
+fn bounded_output(output: &str) -> String {
+    if output.len() <= MAX_STORED_OUTPUT {
+        return output.to_string();
+    }
+
+    let mut prefix_end = MAX_STORED_OUTPUT - OUTPUT_TRUNCATED_MARKER.len();
+    while !output.is_char_boundary(prefix_end) {
+        prefix_end -= 1;
+    }
+    let mut stored = String::with_capacity(MAX_STORED_OUTPUT);
+    stored.push_str(&output[..prefix_end]);
+    stored.push_str(OUTPUT_TRUNCATED_MARKER);
+    stored
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -371,7 +390,7 @@ impl ToolCallLedger {
         let Some(path) = &self.persistence_path else {
             return Ok(());
         };
-        let result = serde_json::to_vec_pretty(self)
+        let result = serde_json::to_vec(self)
             .map_err(|err| err.to_string())
             .and_then(|bytes| atomic_write_json(path, &bytes));
         if let Err(error) = &result {
@@ -394,6 +413,54 @@ impl ToolCallLedger {
             Some(error) => Err(error.clone()),
             None => Ok(()),
         }
+    }
+
+    fn ordered_record_ids(&self) -> Vec<String> {
+        let mut seen = HashSet::with_capacity(self.records.len());
+        let mut ordered = Vec::with_capacity(self.records.len());
+        for id in &self.record_order {
+            if self.records.contains_key(id) && seen.insert(id.as_str()) {
+                ordered.push(id.clone());
+            }
+        }
+
+        let mut untracked: Vec<_> = self
+            .records
+            .values()
+            .filter(|record| !seen.contains(record.call_id.as_str()))
+            .collect();
+        untracked.sort_by(|left, right| {
+            left.executed_at
+                .cmp(&right.executed_at)
+                .then_with(|| left.call_id.cmp(&right.call_id))
+        });
+        ordered.extend(untracked.into_iter().map(|record| record.call_id.clone()));
+        ordered
+    }
+
+    fn prune_terminal_records(&mut self) {
+        let terminal: Vec<_> = self
+            .ordered_record_ids()
+            .into_iter()
+            .filter(|id| {
+                self.records.get(id).is_some_and(|record| {
+                    matches!(
+                        record.status,
+                        ToolExecutionStatus::Completed
+                            | ToolExecutionStatus::Failed
+                            | ToolExecutionStatus::Blocked
+                    )
+                })
+            })
+            .collect();
+        let excess = terminal.len().saturating_sub(MAX_TERMINAL_RECORDS);
+        for id in terminal.into_iter().take(excess) {
+            self.records.remove(&id);
+        }
+        let records = &self.records;
+        let mut seen = HashSet::with_capacity(self.record_order.len());
+        self.record_order
+            .retain(|id| records.contains_key(id) && seen.insert(id.clone()));
     }
 
     pub fn records(&self) -> &HashMap<String, ToolCallRecord> {
@@ -865,7 +932,7 @@ impl ToolCallLedger {
         if let Some(entry) = self.records.get_mut(call_id) {
             entry.status = ToolExecutionStatus::Completed;
             entry.outcome = AttemptOutcome::Succeeded;
-            entry.output = Some(output.to_string());
+            entry.output = Some(bounded_output(output));
             entry.result_digest = Some(compute_digest(output));
             entry.is_error = is_error;
             entry.executed_at = Some(
@@ -875,6 +942,7 @@ impl ToolCallLedger {
                     .as_millis() as u64,
             );
         }
+        self.prune_terminal_records();
         self.condvar.notify_all();
     }
 
@@ -882,19 +950,21 @@ impl ToolCallLedger {
         if let Some(entry) = self.records.get_mut(call_id) {
             entry.status = ToolExecutionStatus::Failed;
             entry.outcome = AttemptOutcome::Failed;
-            entry.output = Some(error.to_string());
+            entry.output = Some(bounded_output(error));
             entry.result_digest = Some(compute_digest(error));
             entry.is_error = true;
         }
+        self.prune_terminal_records();
         self.condvar.notify_all();
     }
 
     pub fn record_blocked(&mut self, call_id: &str, reason: &str) {
         if let Some(entry) = self.records.get_mut(call_id) {
             entry.status = ToolExecutionStatus::Blocked;
-            entry.output = Some(reason.to_string());
+            entry.output = Some(bounded_output(reason));
             entry.is_error = true;
         }
+        self.prune_terminal_records();
         self.condvar.notify_all();
     }
 }
@@ -1130,6 +1200,55 @@ mod tests {
         let (result, is_err) = ledger.get_completed_result(call_id).unwrap();
         assert_eq!(result, "file.txt\n");
         assert!(!is_err);
+    }
+
+    #[test]
+    fn completion_output_is_bounded_without_splitting_utf8() {
+        let mut ledger = ToolCallLedger::new("sess_output", "lin_output");
+        let call_id = "call_large_output";
+        let output = "🙂".repeat(20_000);
+        ledger.record_start(call_id, "read", &json!({"path": "large.txt"}));
+        ledger.record_completion(call_id, &output, false);
+
+        let record = ledger.records().get(call_id).unwrap();
+        let stored = record.output.as_deref().unwrap();
+        let marker = "\n[output truncated in ledger; digest covers the full text]";
+        assert!(stored.len() <= 64 * 1024, "{} bytes", stored.len());
+        assert!(stored.ends_with(marker));
+        assert!(stored.is_char_boundary(stored.len() - marker.len()));
+        assert_eq!(
+            record.result_digest.as_deref(),
+            Some(compute_digest(&output).as_str())
+        );
+    }
+
+    #[test]
+    fn ledger_size_stays_bounded_over_a_long_session() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ledger.json");
+        let mut ledger = ToolCallLedger::load_bound(&path, "session-bounded").unwrap();
+        let output = "y".repeat(20_000);
+
+        ledger.record_start("reserved", "write", &json!({"path": "pending.txt"}));
+        for i in 0..2_000 {
+            let id = format!("call-{i}");
+            ledger.record_start(&id, "read", &json!({"path": i}));
+            ledger.record_completion(&id, &output, false);
+        }
+        ledger.persist().unwrap();
+
+        let bytes = std::fs::read(&path).unwrap();
+        assert!(bytes.len() < 8 * 1024 * 1024, "{} bytes", bytes.len());
+        assert!(!bytes.contains(&b'\n'), "ledger JSON should be compact");
+        assert_eq!(ledger.records().len(), 257);
+        assert!(ledger.records().contains_key("reserved"));
+        assert!(!ledger.records().contains_key("call-1743"));
+        assert!(ledger.records().contains_key("call-1744"));
+        assert!(!ledger.records().contains_key("call-0"));
+        assert!(matches!(
+            ledger.begin_execution("call-0", "read", &json!({"path": 0})),
+            BeginOutcome::Execute
+        ));
     }
 
     #[test]
