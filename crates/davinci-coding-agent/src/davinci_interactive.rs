@@ -2958,8 +2958,8 @@ pub fn scope_expansion_ask(
                 "keep the current contract and provide host-authored guidance",
             ),
         ],
-,
-        ..Default::default()    }
+        ..Default::default()
+    }
 }
 
 /// Map only the three scope-expansion rows to trusted-host decisions.
