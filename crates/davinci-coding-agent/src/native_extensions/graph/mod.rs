@@ -15,6 +15,8 @@
 
 pub(crate) mod bindings;
 pub(crate) mod blobs;
+pub(crate) mod git;
+pub(crate) mod tail;
 pub(crate) mod briefings;
 pub(crate) mod config;
 pub(crate) mod continuation;

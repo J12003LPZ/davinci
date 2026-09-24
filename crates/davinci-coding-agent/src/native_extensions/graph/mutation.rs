@@ -123,31 +123,21 @@ fn is_transaction_journal(path: &str) -> bool {
 fn list_workspace_files(cwd: &Path) -> Vec<String> {
     if cwd.join(".git").exists() {
         let mut list = Vec::new();
-        if let Ok(output) = Command::new("git")
-            .args(["ls-files"])
-            .current_dir(cwd)
-            .output()
-        {
-            if output.status.success() {
-                for line in String::from_utf8_lossy(&output.stdout).lines() {
-                    let trimmed = line.trim();
-                    if !trimmed.is_empty() {
-                        list.push(normalize_rel_path(trimmed));
-                    }
+        if let Ok(output) = super::git::run(cwd, &["ls-files"]) {
+            for line in String::from_utf8_lossy(&output).lines() {
+                let trimmed = line.trim();
+                if !trimmed.is_empty() {
+                    list.push(normalize_rel_path(trimmed));
                 }
             }
         }
-        if let Ok(output) = Command::new("git")
-            .args(["ls-files", "--others", "--exclude-standard"])
-            .current_dir(cwd)
-            .output()
+        if let Ok(output) =
+            super::git::run(cwd, &["ls-files", "--others", "--exclude-standard"])
         {
-            if output.status.success() {
-                for line in String::from_utf8_lossy(&output.stdout).lines() {
-                    let trimmed = line.trim();
-                    if !trimmed.is_empty() {
-                        list.push(normalize_rel_path(trimmed));
-                    }
+            for line in String::from_utf8_lossy(&output).lines() {
+                let trimmed = line.trim();
+                if !trimmed.is_empty() {
+                    list.push(normalize_rel_path(trimmed));
                 }
             }
         }

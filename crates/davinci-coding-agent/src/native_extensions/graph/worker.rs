@@ -609,7 +609,7 @@ pub fn run_worker(
     }
 
     let mut state = WorkerEventState::default();
-    let mut stderr = String::new();
+    let mut stderr = super::tail::TailBuffer::new(64 * 1024);
     let mut reported_seq = 0;
     let transcript = spec.transcript_path.clone();
 
@@ -642,8 +642,8 @@ pub fn run_worker(
                 }
             },
             |line| {
-                stderr.push_str(line);
-                stderr.push('\n');
+                stderr.push(line.as_bytes());
+                stderr.push(b"\n");
             },
         )
     };
@@ -674,6 +674,7 @@ pub fn run_worker(
         append_transcript(path, &format!("══ exited {}{suffix}", outcome.exit_code));
     }
 
+    let stderr = stderr.text();
     finish_worker(spec, outcome, state, &stderr)
 }
 

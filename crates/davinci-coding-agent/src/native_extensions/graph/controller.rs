@@ -42,6 +42,7 @@ use super::worker::WorkerRunner;
 use crate::native_extensions::ecosystem::risk::ChangeRisk;
 use crate::native_extensions::ecosystem::verification::{SecurityPolicyMode, SecurityVerification};
 use std::collections::HashMap;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -153,13 +154,9 @@ const UNTRACKED_FILE_MAX_BYTES: usize = 64 * 1024;
 /// showed new files and the reviewer approved changes it had not seen.
 pub fn default_get_diff(cwd: &Path) -> String {
     let git = |args: &[&str]| {
-        Command::new("git")
-            .args(args)
-            .current_dir(cwd)
-            .output()
+        super::git::run(cwd, args)
             .ok()
-            .filter(|output| output.status.success())
-            .map(|output| String::from_utf8_lossy(&output.stdout).into_owned())
+            .map(|output| String::from_utf8_lossy(&output).into_owned())
     };
     // `HEAD` includes staged changes; a repository without a commit has none.
     let mut diff = git(&["diff", "HEAD"])
@@ -171,7 +168,8 @@ pub fn default_get_diff(cwd: &Path) -> String {
         .map(str::trim)
         .filter(|file| !file.is_empty())
     {
-        let Ok(bytes) = std::fs::read(cwd.join(file)) else {
+        let path = cwd.join(file);
+        let Ok(metadata) = std::fs::metadata(&path) else {
             continue;
         };
         if !diff.is_empty() && !diff.ends_with('\n') {
@@ -180,10 +178,28 @@ pub fn default_get_diff(cwd: &Path) -> String {
         diff.push_str(&format!(
             "diff --git a/{file} b/{file}\nnew file (untracked)\n--- /dev/null\n+++ b/{file}\n"
         ));
+        if metadata.len() > UNTRACKED_FILE_MAX_BYTES as u64 {
+            diff.push_str(&format!(
+                "@@ new file, {} bytes, contents not shown @@\n",
+                metadata.len()
+            ));
+            continue;
+        }
+        let mut bytes = Vec::with_capacity(metadata.len() as usize);
+        let Ok(mut input) = std::fs::File::open(&path) else {
+            continue;
+        };
+        if input
+            .take(UNTRACKED_FILE_MAX_BYTES as u64 + 1)
+            .read_to_end(&mut bytes)
+            .is_err()
+        {
+            continue;
+        }
         if bytes.len() > UNTRACKED_FILE_MAX_BYTES || bytes.contains(&0) {
             diff.push_str(&format!(
                 "@@ new file, {} bytes, contents not shown @@\n",
-                bytes.len()
+                metadata.len()
             ));
             continue;
         }
