@@ -31,7 +31,7 @@ mod retry;
 mod shell;
 mod stream;
 #[doc(hidden)]
-pub use stream::openai_responses_input;
+pub use stream::{openai_responses_input, openai_responses_input_with};
 mod stream_decoder;
 mod stream_decoder_anthropic;
 mod stream_decoder_completions;
@@ -145,9 +145,10 @@ pub use stream::{
     fixture_complete, live_complete, live_complete_streaming_with,
     live_complete_streaming_with_sink, live_complete_streaming_with_sink_envelope,
     live_complete_with, live_stream, parse_sse_block, replay_sse_events, request_body,
-    raw_provider_post, request_body_with, request_url, resolve_json_schema_strict_sampling,
-    AssistantMessage, AssistantMessageEvent, ContentBlock, ProviderCompletionEnvelope,
-    RawProviderReply, StopReason, StreamEvent, StreamOptions,
+    attach_native_items, raw_provider_post, request_body_with, request_url,
+    resolve_json_schema_strict_sampling, AssistantMessage, AssistantMessageEvent, ContentBlock,
+    ProviderCompletionEnvelope, RawProviderReply, ResponsesInputOptions, StopReason, StreamEvent,
+    StreamOptions, NATIVE_ITEMS_KEY, NATIVE_MODEL_KEY,
 };
 pub use stream_decoder::{
     decoder_for, frames_of, new_message, supports_incremental_stream, ResponsesDecoder, SseFrame,
