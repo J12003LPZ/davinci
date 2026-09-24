@@ -235,6 +235,65 @@ fn extension_reply_timeout() -> Duration {
 /// from a crashed one and skip the respawn-and-retry that would hang again.
 pub(crate) const EXTENSION_TIMEOUT_MARK: &str = "extension reply timed out";
 
+fn spawn_capped_drain<R>(
+    mut reader: R,
+    cap: usize,
+) -> (
+    std::sync::Arc<Mutex<Vec<u8>>>,
+    std::sync::Arc<std::sync::atomic::AtomicBool>,
+)
+where
+    R: Read + Send + 'static,
+{
+    let data = std::sync::Arc::new(Mutex::new(Vec::new()));
+    let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let thread_data = data.clone();
+    let thread_done = done.clone();
+    std::thread::spawn(move || {
+        let mut chunk = [0_u8; 8192];
+        loop {
+            match reader.read(&mut chunk) {
+                Ok(0) | Err(_) => break,
+                Ok(read) => {
+                    let mut out = thread_data.lock().unwrap_or_else(|err| err.into_inner());
+                    let remaining = cap.saturating_sub(out.len());
+                    if remaining > 0 {
+                        out.extend_from_slice(&chunk[..read.min(remaining)]);
+                    }
+                }
+            }
+        }
+        thread_done.store(true, std::sync::atomic::Ordering::Release);
+    });
+    (data, done)
+}
+
+fn drain_snapshot(
+    data: &std::sync::Arc<Mutex<Vec<u8>>>,
+    done: &std::sync::Arc<std::sync::atomic::AtomicBool>,
+) -> Vec<u8> {
+    let deadline = std::time::Instant::now() + Duration::from_millis(500);
+    while !done.load(std::sync::atomic::Ordering::Acquire)
+        && std::time::Instant::now() < deadline
+    {
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    data.lock()
+        .unwrap_or_else(|err| err.into_inner())
+        .clone()
+}
+
+fn extension_timeout_for_op(op: &str) -> Duration {
+    if op == "streamSimple" {
+        // Provider streams may legitimately outlive the ordinary extension
+        // reply budget. Keep an idle bound rather than the 120 s total cap.
+        Duration::from_secs(300)
+    } else {
+        extension_reply_timeout()
+    }
+}
+
+
 impl PersistentJsSession {
     fn start(module: &Path) -> Result<Self, String> {
         let node =
@@ -257,6 +316,22 @@ impl PersistentJsSession {
             .stdout
             .take()
             .ok_or_else(|| "persistent stdout".to_string())?;
+        let stderr = child.stderr.take();
+        if let Some(stderr) = stderr {
+            let module_name = module.display().to_string();
+            std::thread::spawn(move || {
+                let reader = BufReader::new(stderr);
+                for line in reader.lines().map_while(Result::ok) {
+                    if davinci_ai::trace::enabled() {
+                        davinci_ai::trace::log(&format!(
+                            "extension {module_name}: {}",
+                            line.chars().take(500).collect::<String>()
+                        ));
+                    }
+                }
+            });
+        }
+        let module_name = module.display().to_string();
         let (tx, lines) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
             let mut reader = BufReader::new(stdout);
@@ -265,6 +340,15 @@ impl PersistentJsSession {
                 match reader.read_line(&mut line) {
                     Ok(0) => break,
                     Ok(_) => {
+                        if !line.trim_start().starts_with('{') {
+                            if davinci_ai::trace::enabled() {
+                                davinci_ai::trace::log(&format!(
+                                    "extension {module_name} wrote non-protocol stdout: {}",
+                                    line.chars().take(500).collect::<String>()
+                                ));
+                            }
+                            continue;
+                        }
                         if tx.send(Ok(line)).is_err() {
                             break;
                         }
@@ -283,7 +367,7 @@ impl PersistentJsSession {
             module: module.to_path_buf(),
             initial_load: None,
         };
-        session.initial_load = session.read_line().ok();
+        session.initial_load = session.read_line(extension_reply_timeout()).ok();
         Ok(session)
     }
 
@@ -293,11 +377,11 @@ impl PersistentJsSession {
             .write_all(format!("{line}\n").as_bytes())
             .map_err(|err| err.to_string())?;
         self.stdin.flush().map_err(|err| err.to_string())?;
-        self.read_line()
+        self.read_line(extension_timeout_for_op(op))
     }
 
-    fn read_line(&mut self) -> Result<JsExtensionResult, String> {
-        match self.lines.recv_timeout(extension_reply_timeout()) {
+    fn read_line(&mut self, timeout: Duration) -> Result<JsExtensionResult, String> {
+        match self.lines.recv_timeout(timeout) {
             Ok(Ok(line)) => serde_json::from_str(line.trim())
                 .map_err(|err| format!("extension runner: {err}: {line}")),
             Ok(Err(err)) => Err(err.to_string()),
@@ -308,7 +392,7 @@ impl PersistentJsSession {
                 let _ = self.child.wait();
                 Err(format!(
                     "{EXTENSION_TIMEOUT_MARK} after {}s ({})",
-                    extension_reply_timeout().as_secs(),
+                    timeout.as_secs(),
                     self.module.display()
                 ))
             }
@@ -550,21 +634,45 @@ pub fn run_js_extension(
             .map_err(|err| err.to_string())?;
     }
     if let Some(dir) = &channel {
+        let stdout_drain = child
+            .stdout
+            .take()
+            .map(|pipe| spawn_capped_drain(pipe, 16 * 1024 * 1024));
+        let stderr_drain = child
+            .stderr
+            .take()
+            .map(|pipe| spawn_capped_drain(pipe, 64 * 1024));
+        let mut deadline = std::time::Instant::now() + extension_reply_timeout();
         while child.try_wait().map_err(|err| err.to_string())?.is_none() {
+            let ui_started = std::time::Instant::now();
             poll_ui_channel(dir);
+            deadline = deadline
+                .checked_add(ui_started.elapsed())
+                .unwrap_or(deadline);
+            if std::time::Instant::now() >= deadline {
+                davinci_sys::process::kill_tree(child.id());
+                let _ = child.kill();
+                let _ = child.wait();
+                let _ = std::fs::remove_dir_all(dir);
+                return Err(format!(
+                    "{EXTENSION_TIMEOUT_MARK} after {}s",
+                    extension_reply_timeout().as_secs()
+                ));
+            }
             std::thread::sleep(Duration::from_millis(20));
         }
         poll_ui_channel(dir);
-        let mut stdout = String::new();
-        if let Some(mut pipe) = child.stdout.take() {
-            pipe.read_to_string(&mut stdout)
-                .map_err(|err| err.to_string())?;
-        }
-        let mut stderr = String::new();
-        if let Some(mut pipe) = child.stderr.take() {
-            let _ = pipe.read_to_string(&mut stderr);
-        }
+        let stdout = stdout_drain
+            .as_ref()
+            .map(|(data, done)| drain_snapshot(data, done))
+            .unwrap_or_default();
+        let stderr = stderr_drain
+            .as_ref()
+            .map(|(data, done)| drain_snapshot(data, done))
+            .unwrap_or_default();
         let _ = std::fs::remove_dir_all(dir);
+        let stdout = String::from_utf8_lossy(&stdout);
+        let stderr = String::from_utf8_lossy(&stderr);
         return serde_json::from_str(&stdout)
             .map_err(|err| format!("extension runner: {err}: {} {stderr}", stdout.trim()));
     }
