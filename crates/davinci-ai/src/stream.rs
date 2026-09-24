@@ -1170,14 +1170,20 @@ fn openai_responses_body(
 ) -> Value {
     let codex = model.api == "openai-codex-responses";
     let retention = crate::cache::cache_retention_from_options(options);
-    let cache_capabilities = if model.api == "openai-responses" {
-        crate::openai_cache_policy::OpenAiCacheCapabilities::resolve(
+    let cache_capabilities = match model.api.as_str() {
+        "openai-responses" => crate::openai_cache_policy::OpenAiCacheCapabilities::resolve(
             model,
             model.base_url.as_deref(),
             false,
-        )
-    } else {
-        crate::openai_cache_policy::OpenAiCacheCapabilities::unknown()
+        ),
+        "openai-codex-responses" => {
+            crate::openai_cache_policy::OpenAiCacheCapabilities::resolve(
+                model,
+                model.base_url.as_deref(),
+                true,
+            )
+        }
+        _ => crate::openai_cache_policy::OpenAiCacheCapabilities::unknown(),
     };
     let cache_capabilities = crate::openai_cache_policy::apply_runtime_features(
         cache_capabilities,
@@ -1240,6 +1246,13 @@ fn openai_responses_body(
                 if let Some(key) = session_key {
                     body["prompt_cache_key"] = Value::String(key);
                 }
+            }
+            if let Some(mode) = cache_plan.prompt_cache_mode {
+                let mut prompt_cache_options = serde_json::json!({"mode": mode});
+                if let Some(ttl) = cache_plan.prompt_cache_ttl {
+                    prompt_cache_options["ttl"] = Value::String(ttl.into());
+                }
+                body["prompt_cache_options"] = prompt_cache_options;
             }
         }
         // Public Responses cache dialect is capability-scoped. The pure
