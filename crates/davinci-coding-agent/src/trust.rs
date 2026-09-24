@@ -150,8 +150,12 @@ pub fn resolve_project_trusted(
 }
 
 pub fn canonicalize_trust_path(path: &Path) -> String {
-    fs::canonicalize(path)
-        .unwrap_or_else(|_| path.to_path_buf())
+    let canonical = fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    display_path(&canonical)
+}
+
+pub fn display_path(path: &Path) -> String {
+    davinci_agent::strip_verbatim_prefix(path)
         .to_string_lossy()
         .into_owned()
 }
@@ -304,7 +308,8 @@ fn find_nearest_trust_entry(
     let mut current = PathBuf::from(canonicalize_trust_path(cwd));
     loop {
         let key = current.to_string_lossy().into_owned();
-        if let Some(Value::Bool(decision)) = data.get(&key) {
+        let legacy = format!(r"\\?\{key}");
+        if let Some(Value::Bool(decision)) = data.get(&key).or_else(|| data.get(&legacy)) {
             return Some(ProjectTrustStoreEntry {
                 path: key,
                 decision: *decision,
@@ -322,6 +327,12 @@ fn find_nearest_trust_entry(
 mod tests {
     use super::*;
     use tempfile::tempdir;
+
+    #[test]
+    fn display_path_never_exposes_a_windows_verbatim_prefix() {
+        let path = Path::new(r"\\?\C:\work\repo");
+        assert_eq!(display_path(path), r"C:\work\repo");
+    }
 
     #[test]
     fn stores_decisions_and_inherits_from_parent_directories() {
