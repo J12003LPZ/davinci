@@ -771,7 +771,7 @@ pub fn live_complete_streaming_with_sink_envelope(
     );
     let timeout_ms = options.timeout_ms.filter(|ms| *ms > 0);
     let compress_zstd = model.api == "openai-codex-responses";
-    crate::trace::log(&format!("sse post {url}"));
+    crate::trace::log(&format!("sse post {}", crate::trace::redact_url(&url)));
     let response = crate::provider_retry::retry_provider_request_controlled(
         || send_provider_request(&url, &headers, body, timeout_ms, compress_zstd),
         crate::provider_retry::ProviderRetryOptions {
@@ -953,7 +953,8 @@ fn collect_request_headers(
         headers.push((key.clone(), value.clone()));
     }
     if let Some(key) = &auth.api_key {
-        if model.api.starts_with("google") {
+        if model.api == "google-generative-ai" {
+            headers.push(("x-goog-api-key".into(), key.clone()));
         } else if model.api == "anthropic-messages" {
             headers.push(("x-api-key".into(), key.clone()));
             headers.push(("anthropic-version".into(), "2023-06-01".into()));
@@ -1543,7 +1544,8 @@ pub fn live_stream(
         request = request.set(key, value);
     }
     if let Some(key) = &auth.api_key {
-        if model.api.starts_with("google") {
+        if model.api == "google-generative-ai" {
+            request = request.set("x-goog-api-key", key);
         } else if model.api == "anthropic-messages" || model.api == "pi-messages" {
             request = request
                 .set("x-api-key", key)
@@ -1717,7 +1719,7 @@ fn mistral_body(
     body
 }
 
-pub fn request_url(model: &Model, auth: &ResolvedAuth) -> String {
+pub fn request_url(model: &Model, _auth: &ResolvedAuth) -> String {
     let base = model
         .base_url
         .clone()
@@ -1725,10 +1727,7 @@ pub fn request_url(model: &Model, auth: &ResolvedAuth) -> String {
     let base = base.trim_end_matches('/');
     match model.api.as_str() {
         "anthropic-messages" | "pi-messages" => format!("{base}/v1/messages"),
-        "google-generative-ai" => {
-            let key = auth.api_key.clone().unwrap_or_default();
-            format!("{base}/models/{}:generateContent?key={key}", model.id)
-        }
+        "google-generative-ai" => format!("{base}/models/{}:generateContent", model.id),
         "google-vertex" => format!(
             "{base}/v1/projects/default/locations/us-central1/publishers/google/models/{}:generateContent",
             model.id
@@ -3544,6 +3543,112 @@ mod tests {
         assert_eq!(usage.cache_read, 800);
         assert_eq!(usage.output, 30);
         assert_eq!(usage.total_tokens, 1030);
+    }
+
+    #[test]
+    fn google_api_key_is_a_header_not_a_query_parameter() {
+        let model = load_builtin_models()
+            .into_iter()
+            .find(|m| m.api == "google-generative-ai")
+            .expect("a built-in Gemini model");
+        let auth = ResolvedAuth {
+            api_key: Some("AIzaSECRET".into()),
+            headers: Default::default(),
+            source: "test".into(),
+        };
+        let url = request_url(&model, &auth);
+        assert!(!url.contains("AIzaSECRET"), "{url}");
+        assert!(!url.contains("key="), "{url}");
+        let headers = collect_request_headers(&model, &auth, &StreamOptions::default());
+        assert!(headers
+            .iter()
+            .any(|(name, value)| name == "x-goog-api-key" && value == "AIzaSECRET"));
+
+        let vertex = load_builtin_models()
+            .into_iter()
+            .find(|m| m.api == "google-vertex")
+            .expect("a built-in Vertex model");
+        let vertex_auth = ResolvedAuth {
+            api_key: Some("ya29.ACCESS_TOKEN".into()),
+            headers: Default::default(),
+            source: "test".into(),
+        };
+        let headers = collect_request_headers(&vertex, &vertex_auth, &StreamOptions::default());
+        assert!(headers.iter().any(|(name, value)| {
+            name.eq_ignore_ascii_case("authorization") && value == "Bearer ya29.ACCESS_TOKEN"
+        }));
+    }
+
+    #[test]
+    fn google_live_stream_sends_the_api_key_header() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (request_tx, request_rx) = std::sync::mpsc::channel();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = Vec::new();
+            let mut buf = [0u8; 4096];
+            let header_end = loop {
+                let n = stream.read(&mut buf).unwrap();
+                request.extend_from_slice(&buf[..n]);
+                if let Some(pos) = request.windows(4).position(|window| window == b"\r\n\r\n") {
+                    break pos + 4;
+                }
+            };
+            let content_length = String::from_utf8_lossy(&request[..header_end])
+                .lines()
+                .find_map(|line| {
+                    line.to_ascii_lowercase()
+                        .strip_prefix("content-length:")
+                        .and_then(|length| length.trim().parse::<usize>().ok())
+                })
+                .unwrap_or(0);
+            while request.len() < header_end + content_length {
+                let n = stream.read(&mut buf).unwrap();
+                request.extend_from_slice(&buf[..n]);
+            }
+            request_tx
+                .send(String::from_utf8_lossy(&request[..header_end]).into_owned())
+                .unwrap();
+            let body = r#"{"candidates":[{"content":{"parts":[{"text":"ok"}]}}]}"#;
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            )
+            .unwrap();
+        });
+
+        let mut model = load_builtin_models()
+            .into_iter()
+            .find(|model| model.api == "google-generative-ai")
+            .expect("a built-in Gemini model");
+        model.base_url = Some(format!("http://{addr}"));
+        let auth = ResolvedAuth {
+            api_key: Some("AIzaSECRET".into()),
+            headers: Default::default(),
+            source: "test".into(),
+        };
+        let events = live_stream(
+            &model,
+            &[ChatMessage::text("user", "hello")],
+            &auth,
+            None,
+            &[],
+        )
+        .unwrap();
+        let request = request_rx.recv().unwrap().to_ascii_lowercase();
+        server.join().unwrap();
+
+        assert!(
+            request.contains("x-goog-api-key: aizasecret\r\n"),
+            "{request}"
+        );
+        assert!(!request.lines().next().unwrap_or_default().contains("key="));
+        assert!(!events.is_empty());
     }
 
     #[test]

@@ -43,6 +43,15 @@ pub fn log(line: &str) {
     }
 }
 
+/// Strip query parameters from traced URLs because providers and proxies may
+/// put API keys, signatures, or other secrets there.
+pub fn redact_url(url: &str) -> String {
+    match url.split_once('?') {
+        Some((base, _)) => format!("{base}?<redacted>"),
+        None => url.to_string(),
+    }
+}
+
 /// A compact description of one provider event for the trace: its type and,
 /// for a few shapes, the field that says what it did.
 pub fn describe_event(event: &serde_json::Value) -> String {
@@ -99,6 +108,15 @@ pub fn describe_event(event: &serde_json::Value) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn redact_url_drops_the_query() {
+        assert_eq!(
+            redact_url("https://h/models/x:generateContent?key=SECRET&alt=sse"),
+            "https://h/models/x:generateContent?<redacted>"
+        );
+        assert_eq!(redact_url("https://h/v1/messages"), "https://h/v1/messages");
+    }
 
     #[test]
     fn provider_trace_never_stringifies_prompt_or_opaque_error_content() {
