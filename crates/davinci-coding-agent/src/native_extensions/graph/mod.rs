@@ -1235,18 +1235,13 @@ impl GraphController {
             .ok_or_else(|| "No graph run found in this project to diff.".to_string())?;
         let current = load_run(&self.cwd, &latest.run_id)
             .ok_or_else(|| format!("Could not load run {}", latest.run_id))?;
-        let prior = if let Some(rev) = revision {
-            list_runs(&self.cwd)
-                .iter()
-                .filter_map(|s| load_run(&self.cwd, &s.run_id))
-                .find(|r| r.revision == rev)
-        } else if current.revision > 1 {
-            list_runs(&self.cwd)
-                .iter()
-                .filter_map(|s| load_run(&self.cwd, &s.run_id))
-                .find(|r| r.revision == current.revision - 1)
-        } else {
-            None
+        let prior = match revision {
+            Some(rev) if rev == current.revision => Some(current.clone()),
+            Some(rev) => history::load_revision(&self.cwd, &current.run_id, rev),
+            None if current.revision > 0 => {
+                history::load_revision(&self.cwd, &current.run_id, current.revision - 1)
+            }
+            None => None,
         };
         Ok(operations::generate_graph_diff(
             &current,

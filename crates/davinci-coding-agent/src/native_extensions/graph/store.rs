@@ -437,6 +437,17 @@ pub fn save_run(run: &mut GraphRun) -> std::io::Result<()> {
     snapshot.updated_at = now_ms();
     let content = serde_json::to_vec(&snapshot)
         .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+    if let Ok(previous_bytes) = fs::read(&state_path) {
+        if let Ok(previous) = serde_json::from_slice::<GraphRun>(&previous_bytes) {
+            if previous.run_id == snapshot.run_id && previous.revision < snapshot.revision {
+                let history_path = super::history::history_dir(&cwd, &run.run_id)
+                    .join(format!("revision-{}.state.json", previous.revision));
+                if !history_path.exists() {
+                    atomic_write(&history_path, &previous_bytes)?;
+                }
+            }
+        }
+    }
     atomic_write(&state_path, &content)?;
     run.updated_at = snapshot.updated_at;
     Ok(())

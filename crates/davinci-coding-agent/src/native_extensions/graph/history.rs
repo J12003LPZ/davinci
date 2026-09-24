@@ -69,6 +69,16 @@ pub fn load_history_entry(cwd: &Path, run_id: &str, entry_id: &str) -> Option<Gr
 }
 
 #[allow(dead_code)]
+pub fn load_revision(cwd: &Path, run_id: &str, revision: u64) -> Option<super::types::GraphRun> {
+    if !is_safe_run_id(run_id) {
+        return None;
+    }
+    let path = history_dir(cwd, run_id).join(format!("revision-{revision}.state.json"));
+    let raw = fs::read_to_string(path).ok()?;
+    let run: super::types::GraphRun = serde_json::from_str(&raw).ok()?;
+    (run.run_id == run_id && run.revision == revision).then_some(run)
+}
+
 pub fn list_history_entries(cwd: &Path, run_id: &str) -> Vec<GraphHistoryEntry> {
     if !is_safe_run_id(run_id) {
         return Vec::new();
@@ -216,6 +226,30 @@ mod tests {
             simulated: None,
             model_id: None,
         }
+    }
+
+    #[test]
+    fn saved_revisions_are_loaded_only_from_the_same_run() {
+        let dir = tempdir().unwrap();
+        let run_id = "same-run-history";
+        create_run_dir(dir.path(), run_id).unwrap();
+        let mut run = sample_run(dir.path(), run_id, "same");
+        run.revision = 1;
+        save_run(&mut run).unwrap();
+        run.revision = 2;
+        run.goal = "same revision two".into();
+        save_run(&mut run).unwrap();
+
+        let other_id = "other-run-history";
+        create_run_dir(dir.path(), other_id).unwrap();
+        let mut other = sample_run(dir.path(), other_id, "other");
+        other.revision = 1;
+        save_run(&mut other).unwrap();
+
+        let prior = load_revision(dir.path(), run_id, 1).unwrap();
+        assert_eq!(prior.run_id, run_id);
+        assert_eq!(prior.goal, "same");
+        assert!(load_revision(dir.path(), other_id, 2).is_none());
     }
 
     #[test]
