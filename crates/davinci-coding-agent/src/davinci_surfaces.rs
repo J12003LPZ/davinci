@@ -618,9 +618,13 @@ pub fn redact_evidence_output(raw: &str, max_len: usize) -> String {
     }
 
     if sanitized.len() > max_len {
-        let truncated_bytes = sanitized.len() - max_len;
-        sanitized.truncate(max_len);
-        sanitized.push_str(&format!("\n... [truncated {} bytes]", truncated_bytes));
+        let mut cut = max_len;
+        while cut > 0 && !sanitized.is_char_boundary(cut) {
+            cut -= 1;
+        }
+        let truncated_bytes = sanitized.len() - cut;
+        sanitized.truncate(cut);
+        sanitized.push_str(&format!("\n... [truncated {truncated_bytes} bytes]"));
     }
 
     sanitized
@@ -826,6 +830,14 @@ mod tests {
         );
         task.status = status;
         task
+    }
+
+    #[test]
+    fn evidence_truncation_respects_utf8_boundaries() {
+        let text = "é".repeat(3000);
+        let out = redact_evidence_output(&text, 4095);
+        assert!(out.contains("[truncated"));
+        assert!(!out.contains('�'));
     }
 
     #[test]
