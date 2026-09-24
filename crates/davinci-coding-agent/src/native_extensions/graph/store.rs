@@ -660,11 +660,19 @@ pub fn load_run_checked(cwd: &Path, run_id: &str) -> Result<GraphRun, String> {
     if run.saved_definition.is_none() {
         let saved_path = run_dir(cwd, run_id).join("saved_definition.yaml");
         if saved_path.exists() {
-            if let Ok(raw_yaml) = fs::read_to_string(&saved_path) {
-                if let Ok(def) = super::definitions::parse_saved_definition(&raw_yaml) {
-                    run.saved_definition = Some(def);
-                }
-            }
+            let raw_yaml = fs::read_to_string(&saved_path).map_err(|error| {
+                format!(
+                    "Cannot read saved graph definition '{}': {error}",
+                    saved_path.display()
+                )
+            })?;
+            let def = super::definitions::parse_saved_definition(&raw_yaml).map_err(|error| {
+                format!(
+                    "Cannot parse saved graph definition '{}': {error}",
+                    saved_path.display()
+                )
+            })?;
+            run.saved_definition = Some(def);
         }
     }
     for task in &mut run.tasks {
