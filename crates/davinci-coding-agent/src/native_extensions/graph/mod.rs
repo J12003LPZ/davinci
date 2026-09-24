@@ -797,7 +797,7 @@ impl GraphController {
             .collect();
         json!({
             "active": active.is_some() && is_running(&self.cwd),
-            "run": current,
+            "run": current.as_ref().map(run_for_display),
             "status": current.as_ref().map(render_now).unwrap_or_default(),
             "summary": current.as_ref().map(render_run_summary),
             "recent": recent,
@@ -894,7 +894,7 @@ impl GraphController {
                 Ok(ToolResult {
                     content: render_run_summary(&run),
                     is_error: run.phase != types::Phase::Done,
-                    details: Some(json!({"graph": run})),
+                    details: Some(json!({"graph": run_for_display(&run)})),
                 })
             }
             "graph_status" => {
@@ -1578,11 +1578,40 @@ impl GraphController {
     }
 }
 
+/// A run as tools and the session may see it. The continuation field holds full
+/// file baselines for resume and rollback; it stays on disk only.
+fn run_for_display(run: &types::GraphRun) -> Value {
+    strip_continuation(serde_json::to_value(run).unwrap_or(Value::Null))
+}
+
+fn strip_continuation(mut value: Value) -> Value {
+    if let Some(object) = value.as_object_mut() {
+        object.remove("continuation");
+    }
+    value
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use tempfile::tempdir;
     use types::{ArtifactKind, Phase, TaskStatus};
+
+    #[test]
+    fn displayed_run_has_no_baseline_contents() {
+        let secret: Vec<u8> = b"OPENAI_API_KEY=sk-secret".to_vec();
+        let run = json!({
+            "runId": "r1",
+            "phase": "running",
+            "continuation": {
+                "savedBaseline": { "files": {}, "contents": { ".env": secret } }
+            }
+        });
+        let shown = strip_continuation(run);
+        assert!(shown.get("continuation").is_none());
+        assert_eq!(shown["runId"], "r1");
+        assert!(!shown.to_string().contains("115,107,45")); // "sk-" as bytes
+    }
 
     /// The active-run registry and `abort_all_runs` are process-wide by
     /// design (one process is one session), so tests that touch them run one
