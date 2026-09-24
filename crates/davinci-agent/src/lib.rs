@@ -2,6 +2,7 @@
 
 pub mod apply_patch;
 pub mod approval;
+pub mod cache_stability;
 pub mod decision;
 pub mod decisions;
 mod permission_state;
@@ -40,6 +41,7 @@ pub mod tool_ledger;
 pub mod tools;
 mod transaction_verification;
 mod turn;
+pub mod turn_context;
 pub mod web;
 
 pub use batch::{BATCH_MAX_OPERATIONS, VISIBLE_PER_OPERATION, VISIBLE_TOTAL};
@@ -434,6 +436,10 @@ pub struct Agent {
     /// Context supplied by extensions for the next provider request only.
     /// These messages never enter the persisted session history.
     ephemeral_context: Vec<ChatMessage>,
+    /// Tests and hosts may force a placement; `None` follows the route family.
+    pub turn_context_placement_override: Option<turn_context::TurnContextPlacement>,
+    /// Per-turn prompt state prepared for the next `commit_turn_context`.
+    turn_state_pending: Option<String>,
     /// Host-supplied schema estimate, excluding the system prompt and messages.
     provider_context_overhead_tokens: Option<u64>,
     provider_output_limit: Option<u64>,
@@ -550,6 +556,8 @@ impl Agent {
             pending_bash_messages: Vec::new(),
             pending_prompt_messages: Vec::new(),
             ephemeral_context: Vec::new(),
+            turn_context_placement_override: None,
+            turn_state_pending: None,
             provider_context_overhead_tokens: None,
             provider_output_limit: None,
             prepared_context_image: Arc::new(Mutex::new(None)),
@@ -711,7 +719,9 @@ impl Agent {
     /// Restore the base prompt before each extension-aware prompt turn.
     pub fn reset_system_prompt_to_base(&mut self) {
         self.system_prompt = self.base_system_prompt.clone();
-        if self.plan_mode() {
+        if self.plan_mode()
+            && self.turn_context_placement() == turn_context::TurnContextPlacement::SystemPrompt
+        {
             self.system_prompt.push_str("\n\n");
             self.system_prompt.push_str(crate::PLAN_MODE_APPENDIX);
         }
@@ -944,6 +954,42 @@ impl Agent {
         self.ephemeral_context = messages;
     }
 
+    pub fn turn_context_placement(&self) -> turn_context::TurnContextPlacement {
+        self.turn_context_placement_override
+            .unwrap_or_else(|| turn_context::default_placement(&self.provider, &self.model_id))
+    }
+
+    /// Append changing harness state after the current user message on
+    /// cache-sensitive routes so prior provider input remains an exact prefix.
+    pub fn commit_turn_context(&mut self, memory: Option<String>) {
+        if self.turn_context_placement() != turn_context::TurnContextPlacement::Appended {
+            return;
+        }
+        if self.messages.last().map(|message| message.role.as_str()) != Some("user") {
+            return;
+        }
+
+        let previous = turn_context::TurnContextState::from_messages(&self.messages);
+        let runtime_state = self.turn_state_pending.clone().unwrap_or_default();
+        let plan = self.plan_turn_context();
+        let input = turn_context::TurnContextInput {
+            runtime_state: &runtime_state,
+            plan_mode_appendix: self.is_plan_mode().then_some(crate::PLAN_MODE_APPENDIX),
+            living_plan: plan
+                .as_ref()
+                .map(|(revision, text)| (*revision, text.as_str())),
+            memory: memory.as_deref(),
+        };
+        if let Some((text, state)) = turn_context::render_turn_context(&previous, &input) {
+            self.record_custom_message(&serde_json::json!({
+                "customType": turn_context::TURN_CONTEXT_CUSTOM_TYPE,
+                "content": text,
+                "display": false,
+                "details": state,
+            }));
+        }
+    }
+
     /// Remove extension context after a prompt turn (or when a session is
     /// switched) without touching persisted conversation messages.
     pub fn clear_ephemeral_context(&mut self) {
@@ -974,6 +1020,22 @@ impl Agent {
     pub fn reload(&mut self) {
         self.reload_count = self.reload_count.saturating_add(1);
         self.aborted = false;
+    }
+
+    fn apply_composed_turn_prompt(&mut self, composed: &prompt::composer::ComposedPrompt) {
+        match self.turn_context_placement() {
+            turn_context::TurnContextPlacement::SystemPrompt => {
+                self.system_prompt = composed.text.clone();
+                self.base_system_prompt = composed.text.clone();
+                self.turn_state_pending = None;
+            }
+            turn_context::TurnContextPlacement::Appended => {
+                let parts = prompt::turn::split_turn_prompt(&self.prompt_session, composed);
+                self.system_prompt = parts.instructions.clone();
+                self.base_system_prompt = parts.instructions;
+                self.turn_state_pending = Some(parts.turn_state);
+            }
+        }
     }
 
     pub fn prepare_builtin_prompt_for_user_turn(
@@ -1026,8 +1088,7 @@ impl Agent {
         )?;
         self.reset_capability_run_state(&capabilities, runtime_state.visual_verification_available);
 
-        self.system_prompt = composed.text.clone();
-        self.base_system_prompt = composed.text.clone();
+        self.apply_composed_turn_prompt(&composed);
         self.prompt_manifest = Some(composed.manifest.clone());
         self.prompt_session.last_manifest = Some(composed.manifest.clone());
         self.prompt_session.stable_bundle_hash = Some(composed.manifest.stable_sha256.clone());
@@ -1093,8 +1154,7 @@ impl Agent {
         let composed =
             prompt::turn::compose_turn_prompt(&self.prompt_session, &ctx, &union, &runtime_state)?;
         self.reset_capability_run_state(&union, runtime_state.visual_verification_available);
-        self.system_prompt = composed.text.clone();
-        self.base_system_prompt = composed.text.clone();
+        self.apply_composed_turn_prompt(&composed);
         self.prompt_manifest = Some(composed.manifest.clone());
         self.prompt_session.last_manifest = Some(composed.manifest.clone());
         self.prompt_session.stable_bundle_hash = Some(composed.manifest.stable_sha256.clone());
@@ -1198,8 +1258,10 @@ impl Agent {
     }
 
     fn legacy_messages_for_provider(&self) -> Vec<ChatMessage> {
-        let plan_context = self
-            .plan_provider_context()
+        let plan_context = (self.turn_context_placement()
+            == turn_context::TurnContextPlacement::SystemPrompt)
+            .then(|| self.plan_provider_context())
+            .flatten()
             .map(|text| ChatMessage::text("custom", text));
         let selected = self.select_root_context(self.context_window);
         let ephemeral_context = selected.ephemeral_messages;
@@ -1733,7 +1795,10 @@ impl Agent {
             &self.pruned_tool_results,
             tokens,
             self.context_window,
-            &self.prune_settings,
+            &pruning::PruneSettings::for_route(
+                &self.prune_settings,
+                turn_context::is_cache_sensitive_route(&self.provider, &self.model_id),
+            ),
         );
         if plan.is_empty() {
             return;
@@ -2198,6 +2263,36 @@ impl Agent {
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         for name in &self.tools {
             exposure.activate_authorized(name, authorized.contains(name));
+        }
+    }
+
+    /// On cache-sensitive routes, expose the full authorized schema set before
+    /// the first request so `tool_search` cannot mutate the provider tool list.
+    pub fn freeze_tools_for_cache(&self) {
+        if self.turn_context_placement() != turn_context::TurnContextPlacement::Appended {
+            return;
+        }
+        self.expose_active_tools();
+        let authorized = self
+            .tool_context
+            .authorized_tools
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        if let Some(runtime) = &self.runtime {
+            let mut exposure = self
+                .tool_context
+                .tool_exposure
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            for capability in runtime.capability_registry.list() {
+                if capability.schema.is_some() {
+                    exposure.activate_authorized(
+                        &capability.name,
+                        authorized.contains(&capability.name),
+                    );
+                }
+            }
         }
     }
 
