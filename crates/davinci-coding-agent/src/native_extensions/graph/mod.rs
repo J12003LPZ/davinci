@@ -436,7 +436,7 @@ fn economy_role_models_with(
     let economy = setting
         .map(str::trim)
         .filter(|value| !value.is_empty())
-        .unwrap_or(DEFAULT_ECONOMY_MODEL);
+        .unwrap_or(Self::DEFAULT_ECONOMY_MODEL);
     if economy == session_model {
         return models;
     }
@@ -454,7 +454,7 @@ fn economy_role_models_with(
 fn economy_role_models(
     session_model: Option<&str>,
 ) -> std::collections::BTreeMap<Role, String> {
-    economy_role_models_with(
+    Self::economy_role_models_with(
         session_model,
         std::env::var("DAVINCI_GRAPH_ECONOMY_MODEL").ok().as_deref(),
     )
@@ -469,7 +469,7 @@ fn economy_role_models(
             }
         });
         if configured.is_empty() {
-            economy_role_models(self.session_model.as_deref())
+            Self::economy_role_models(self.session_model.as_deref())
         } else {
             configured
         }
