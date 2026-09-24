@@ -1188,6 +1188,15 @@ impl ExtensionHost {
                 .clone();
             return snapshots.execute_with_context(cwd, name, args, Some(context));
         }
+        if name == "graph_run" {
+            let graph = self
+                .native
+                .lock()
+                .map_err(|_| davinci_agent::ToolError::Failed("native host unavailable".into()))?
+                .graph
+                .clone();
+            return graph.execute_tool_with_abort(name, args, context.abort.clone());
+        }
         self.execute_js_or_manifest_tool(cwd, name, args)
     }
 

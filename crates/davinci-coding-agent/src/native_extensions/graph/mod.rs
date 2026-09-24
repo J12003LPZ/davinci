@@ -610,26 +610,73 @@ impl GraphController {
         }))
     }
 
+    fn apply_tool_budget_defaults(config: &mut GraphConfig) {
+        const WORKER_TIMEOUT_MS: u64 = 20 * 60 * 1000;
+        const VERIFY_TIMEOUT_MS: u64 = 10 * 60 * 1000;
+        const RUN_DEADLINE_MS: u64 = 2 * 60 * 60 * 1000;
+        const MAX_COST_USD: f64 = 5.0;
+
+        if config.budgets.max_cost_usd <= 0.0 {
+            config.budgets.max_cost_usd = MAX_COST_USD;
+        }
+        if config.budgets.run_deadline_ms == 0 {
+            config.budgets.run_deadline_ms = RUN_DEADLINE_MS;
+        }
+        if config.budgets.verify_command_timeout_ms == 0 {
+            config.budgets.verify_command_timeout_ms = VERIFY_TIMEOUT_MS;
+        }
+        for role in Role::ALL {
+            if config.budgets.worker_timeout_ms.get(*role) == 0 {
+                config.budgets.worker_timeout_ms.set(*role, WORKER_TIMEOUT_MS);
+            }
+        }
+    }
+
     /// Run to completion on the calling thread and return the full summary.
     /// Used by the `graph_run` tool, where the caller wants the outcome, not a
     /// handle to poll.
-    fn run_to_completion(&self, parsed: ParsedGraphArgs) -> Result<GraphRun, String> {
+    fn run_to_completion(
+        &self,
+        parsed: ParsedGraphArgs,
+        tool_abort: Option<Arc<AtomicBool>>,
+    ) -> Result<GraphRun, String> {
         if parsed.goal.trim().is_empty() {
             return Err("graph goal cannot be empty".into());
         }
         refuse_if_active(&self.cwd)?;
         let workspace_lease = lease::WorkspaceLease::acquire(&self.cwd)?;
         let active = Arc::new(ActiveRun::default());
-        let (deps, _config_errors) = self.deps(parsed.dry_run, &active);
+        let (mut deps, _config_errors) = self.deps(parsed.dry_run, &active);
+        Self::apply_tool_budget_defaults(&mut deps.config);
         let options = self.options(&parsed, Arc::clone(&active.abort), HashMap::new(), None);
         register_run(&self.cwd, Arc::clone(&active));
-        let _guard = FinishedOnDrop(Arc::clone(&active));
-        Ok(controller::run_graph_owned(
-            options,
-            deps,
-            None,
-            workspace_lease,
-        ))
+
+        if tool_abort
+            .as_ref()
+            .is_some_and(|abort| abort.load(Ordering::Relaxed))
+        {
+            active.abort.store(true, Ordering::SeqCst);
+        }
+        let watcher = tool_abort.map(|tool_abort| {
+            let active = Arc::clone(&active);
+            thread::spawn(move || {
+                while !active.finished.load(Ordering::Relaxed) {
+                    if tool_abort.load(Ordering::Relaxed) {
+                        active.abort.store(true, Ordering::SeqCst);
+                        break;
+                    }
+                    thread::sleep(Duration::from_millis(50));
+                }
+            })
+        });
+
+        let guard = FinishedOnDrop(Arc::clone(&active));
+        let result = controller::run_graph_owned(options, deps, None, workspace_lease);
+        drop(guard);
+        if let Some(watcher) = watcher {
+            let _ = watcher.join();
+        }
+        Ok(result)
     }
 
     fn resume(&self, wanted: &str) -> Result<Value, String> {
@@ -880,6 +927,15 @@ impl GraphController {
     }
 
     pub fn execute_tool(&self, name: &str, args: &Value) -> Result<ToolResult, ToolError> {
+        self.execute_tool_with_abort(name, args, None)
+    }
+
+    pub fn execute_tool_with_abort(
+        &self,
+        name: &str,
+        args: &Value,
+        abort: Option<Arc<AtomicBool>>,
+    ) -> Result<ToolResult, ToolError> {
         match name {
             "graph_run" => {
                 let goal = args.get("goal").and_then(Value::as_str).unwrap_or_default();
@@ -891,7 +947,9 @@ impl GraphController {
                         .and_then(types::Complexity::parse),
                     dry_run: args.get("dryRun").and_then(Value::as_bool).unwrap_or(false),
                 };
-                let run = self.run_to_completion(parsed).map_err(ToolError::Failed)?;
+                let run = self
+                    .run_to_completion(parsed, abort)
+                    .map_err(ToolError::Failed)?;
                 Ok(ToolResult {
                     content: render_run_summary(&run),
                     is_error: run.phase != types::Phase::Done,
