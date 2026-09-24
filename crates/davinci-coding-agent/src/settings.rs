@@ -291,8 +291,6 @@ pub struct Settings {
     pub http_proxy: Option<String>,
     #[serde(default, rename = "sessionDir")]
     pub session_dir: Option<String>,
-    #[serde(default, rename = "sessionBackend")]
-    pub session_backend: Option<String>,
     #[serde(default, rename = "defaultThinkingLevel")]
     pub default_thinking_level: Option<String>,
     #[serde(default, rename = "websocketConnectTimeoutMs")]
@@ -959,6 +957,9 @@ pub fn load_settings_file(path: &Path) -> Settings {
     let Ok(raw) = fs::read_to_string(path) else {
         return Settings::default();
     };
+    if let Some(value) = parse_settings_value(&raw) {
+        warn_removed_sqlite_backend(path, &value);
+    }
     match parse_settings_json(&raw) {
         Some(settings) => settings,
         None => {
@@ -1031,10 +1032,28 @@ fn enforce_decision_intelligence_user_boundary(
 }
 
 fn load_settings_value(path: &Path) -> serde_json::Value {
-    fs::read_to_string(path)
+    let value = fs::read_to_string(path)
         .ok()
         .and_then(|raw| parse_settings_value(&raw))
-        .unwrap_or(serde_json::Value::Object(Default::default()))
+        .unwrap_or(serde_json::Value::Object(Default::default()));
+    warn_removed_sqlite_backend(path, &value);
+    value
+}
+
+fn warn_removed_sqlite_backend(path: &Path, value: &serde_json::Value) {
+    if value.get("sessionBackend").and_then(serde_json::Value::as_str) != Some("sqlite") {
+        return;
+    }
+    static WARNED: std::sync::Mutex<Vec<PathBuf>> = std::sync::Mutex::new(Vec::new());
+    let mut warned = WARNED.lock().unwrap_or_else(|error| error.into_inner());
+    if warned.iter().any(|seen| seen == path) {
+        return;
+    }
+    warned.push(path.to_path_buf());
+    eprintln!(
+        "pi: the SQLite session backend was removed; sessions are stored as JSONL ({}).",
+        path.display()
+    );
 }
 
 fn parse_settings_json(raw: &str) -> Option<Settings> {
@@ -1324,13 +1343,6 @@ impl Settings {
         })
     }
 
-    /// `jsonl` (default, TS coding-agent) or `sqlite`.
-    pub fn session_backend(&self) -> &str {
-        match self.session_backend.as_deref() {
-            Some(value) if !value.is_empty() => value,
-            _ => "jsonl",
-        }
-    }
 }
 
 /// Drop `null` members so a rewrite does not expand every unset field into an
@@ -1907,15 +1919,6 @@ mod tests {
         .expect("write");
         let merged = load_merged_settings(&agent_dir, &project);
         assert_eq!(merged.session_dir.as_deref(), Some("./sessions"));
-        assert_eq!(Settings::default().session_backend(), "jsonl");
-        assert_eq!(
-            Settings {
-                session_backend: Some("sqlite".into()),
-                ..Settings::default()
-            }
-            .session_backend(),
-            "sqlite"
-        );
         assert_eq!(
             Settings {
                 session_dir: Some("~/sessions".into()),

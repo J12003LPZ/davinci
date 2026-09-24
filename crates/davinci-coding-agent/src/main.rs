@@ -1254,24 +1254,7 @@ fn resolve_or_create_session(
             .as_deref(),
     )
     .map_err(|err| err.to_string())?;
-    persist_selected_backend(&session, session_dir);
     Ok(session)
-}
-
-fn persist_selected_backend(session: &JsonlSession, session_dir: &Path) {
-    let backend = std::env::var("PI_SESSION_BACKEND").unwrap_or_else(|_| {
-        load_settings(&default_agent_dir())
-            .session_backend()
-            .to_string()
-    });
-    if backend != "sqlite" {
-        return;
-    }
-    if let Ok(store) =
-        davinci_session_sqlite::SqliteSessionStore::open(&session_dir.join("sessions.db"))
-    {
-        let _ = store.upsert_session(session);
-    }
 }
 
 fn available_models(parsed: &Args) -> Vec<davinci_ai::Model> {
@@ -13368,23 +13351,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn sqlite_session_backend_upserts_created_session() {
-        let _env_lock = PROCESS_ENV_LOCK
-            .lock()
-            .unwrap_or_else(|error| error.into_inner());
-        let dir = tempfile::tempdir().unwrap();
-        let session_dir = dir.path().join("sessions");
-        std::env::set_var("PI_SESSION_BACKEND", "sqlite");
-        let session = JsonlSession::create(&session_dir, "/tmp/work", Some("sqlite-demo")).unwrap();
-        persist_selected_backend(&session, &session_dir);
-        std::env::remove_var("PI_SESSION_BACKEND");
-        let store =
-            davinci_session_sqlite::SqliteSessionStore::open(&session_dir.join("sessions.db"))
-                .unwrap();
-        let listed = store.list_sessions(None).unwrap();
-        assert!(listed.iter().any(|item| item.id == session.header.id));
-    }
 
     fn test_session() -> (Args, Agent, InteractiveSession) {
         let theme = builtin_themes().into_iter().next().expect("theme");
