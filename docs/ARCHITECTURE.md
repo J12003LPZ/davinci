@@ -41,7 +41,6 @@ form a directed graph with shared contracts and supporting libraries.
 | `davinci-server` | Session controller/dispatcher and Unix transport for the typed client/server API |
 | `davinci-telemetry` | Telemetry contracts and local aggregate run reports |
 | `davinci-evals` | Evaluation harnesses, engineering scenarios and benchmark artifacts |
-| `davinci-parity` | Golden fixtures and differential checks against the pinned reference |
 
 ## Main flows
 
@@ -116,9 +115,6 @@ fixtures and source control.
   Plans describe intent; code and fresh verification establish current behavior.
 - `vendor/davinci/`: pinned TypeScript behavioral reference; preserve it during
   Rust feature work.
-- `packages/`: retained migration stubs. Root `package.json` / Bun metadata
-  describe that workspace, not the Rust product build.
-- `crates/davinci-core/`: archived early protocol port, excluded from Cargo.
 - `crates/davinci-coding-agent/export-html/`: standalone session HTML template,
   browser assets and viewer tests, included by the exporter.
 

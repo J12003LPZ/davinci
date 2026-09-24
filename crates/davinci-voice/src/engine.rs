@@ -11,6 +11,7 @@ use zeroize::Zeroizing;
 
 extern "C" {
     fn dv_load(bytes: *mut c_void, size: usize) -> *mut c_void;
+    fn dv_load_file(path: *const c_char) -> *mut c_void;
     fn dv_free(context: *mut c_void);
     fn dv_decode(
         context: *mut c_void,
@@ -38,15 +39,23 @@ extern "C" fn cancelled(user: *mut c_void) -> bool {
 impl Engine {
     pub fn load(id: &str, path: &Path) -> Result<Self, VoiceError> {
         let model = catalog::find(id).ok_or(VoiceError::ModelMissing)?;
-        let mut data = model.read_verified(path).map_err(|e| {
+        let verified = model.verify_file(path).map_err(|e| {
             if e.kind() == std::io::ErrorKind::NotFound {
                 VoiceError::ModelMissing
             } else {
                 VoiceError::ModelCorrupt
             }
         })?;
-        // The loader consumes these verified bytes synchronously, with no pathname reopen.
-        let context = unsafe { dv_load(data.as_mut_ptr().cast(), data.len()) };
+        // Models live in the user-owned agent directory. Re-check size and
+        // modification time immediately before whisper reopens the path so a
+        // changed model is refused without keeping a second copy in memory.
+        let metadata = std::fs::metadata(path).map_err(|_| VoiceError::ModelMissing)?;
+        if !verified.matches(&metadata) {
+            return Err(VoiceError::ModelCorrupt);
+        }
+        let path = CString::new(path.to_string_lossy().as_bytes())
+            .map_err(|_| VoiceError::ModelCorrupt)?;
+        let context = unsafe { dv_load_file(path.as_ptr()) };
         if context.is_null() {
             return Err(VoiceError::ModelCorrupt);
         }
@@ -92,13 +101,17 @@ impl Engine {
                 VoiceError::InferenceFailed
             });
         }
-        let end = text
-            .iter()
-            .position(|b| *b == 0)
-            .ok_or(VoiceError::InferenceFailed)?;
-        let raw = std::str::from_utf8(&text[..end]).map_err(|_| VoiceError::InferenceFailed)?;
-        normalize::normalize(raw).map_err(|_| VoiceError::TextTooLong)
+        text_from_decoder(&text)
     }
+}
+
+fn text_from_decoder(buffer: &[u8]) -> Result<String, VoiceError> {
+    let end = buffer
+        .iter()
+        .position(|b| *b == 0)
+        .ok_or(VoiceError::InferenceFailed)?;
+    let raw = String::from_utf8_lossy(&buffer[..end]);
+    normalize::normalize(&raw).map_err(|_| VoiceError::TextTooLong)
 }
 
 impl Drop for Engine {
@@ -138,6 +151,12 @@ mod tests {
         assert!(crate::audio::no_speech(&vec![0.0; 16000]));
         cancel.store(true, Ordering::Release);
         assert!(engine.decode(&pcm, "en", &cancel).is_err());
+    }
+
+    #[test]
+    fn invalid_utf8_from_the_decoder_is_decoded_lossily() {
+        let bytes = b"caf\xc3 ok\0".to_vec();
+        assert_eq!(text_from_decoder(&bytes).unwrap(), "caf\u{fffd} ok");
     }
 
     #[test]

@@ -121,18 +121,22 @@ pub fn truncate_run(spans: Vec<Span<'static>>, width: u16) -> Vec<Span<'static>>
     if run_width(&spans) <= width {
         return spans;
     }
+    let width = usize::from(width);
     let mut out = Vec::with_capacity(spans.len());
-    let mut used = 0u16;
+    let mut used = 0usize;
     for span in spans {
-        let span_width = UnicodeWidthStr::width(span.content.as_ref()) as u16;
-        if used + span_width <= width {
-            used += span_width;
+        let span_width = UnicodeWidthStr::width(span.content.as_ref());
+        if used.saturating_add(span_width) <= width {
+            used = used.saturating_add(span_width);
             out.push(span);
             continue;
         }
         let room = width.saturating_sub(used);
         if room > 0 {
-            let clipped = clip_ellipsis(span.content.as_ref(), room);
+            let clipped = clip_ellipsis(
+                span.content.as_ref(),
+                u16::try_from(room).unwrap_or(u16::MAX),
+            );
             out.push(Span::styled(clipped, span.style));
         }
         break;
@@ -535,7 +539,11 @@ pub fn tool_line(
         span(
             clip_ellipsis(
                 argument,
-                width.saturating_sub(UnicodeWidthStr::width(label) as u16 + 6),
+                width.saturating_sub(
+                    u16::try_from(UnicodeWidthStr::width(label))
+                        .unwrap_or(u16::MAX)
+                        .saturating_add(6),
+                ),
             ),
             theme.text,
         ),

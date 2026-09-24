@@ -19,6 +19,33 @@ use crate::{Error, Result, Rpc, CALL_TIMEOUT_SECS};
 /// How much of the child's stderr is kept for the error row.
 pub const STDERR_TAIL_BYTES: usize = 64 * 1024;
 
+/// Variables a stdio server inherits, matching the MCP TypeScript SDK's
+/// `getDefaultEnvironment`. Everything else must be passed explicitly in the
+/// server's `env` configuration.
+pub const INHERITED_ENV: &[&str] = if cfg!(windows) {
+    &[
+        "APPDATA",
+        "HOMEDRIVE",
+        "HOMEPATH",
+        "LOCALAPPDATA",
+        "PATH",
+        "PATHEXT",
+        "PROCESSOR_ARCHITECTURE",
+        "SYSTEMDRIVE",
+        "SYSTEMROOT",
+        "TEMP",
+        "TMP",
+        "USERNAME",
+        "USERPROFILE",
+        "PROGRAMFILES",
+        "COMSPEC",
+    ]
+} else {
+    &[
+        "HOME", "LOGNAME", "PATH", "SHELL", "TERM", "USER", "LANG", "TMPDIR",
+    ]
+};
+
 /// How many trailing stderr lines a transport error quotes.
 const STDERR_QUOTE_LINES: usize = 5;
 
@@ -33,7 +60,7 @@ struct StderrTail {
 }
 
 pub struct StdioTransport {
-    stdin: ChildStdin,
+    stdin: Arc<Mutex<ChildStdin>>,
     lines: Receiver<std::io::Result<String>>,
     stderr: Arc<(Mutex<StderrTail>, Condvar)>,
     next_id: u64,
@@ -54,16 +81,19 @@ impl StdioTransport {
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
-        for (key, value) in env {
+        cmd.env_clear();
+        for (key, value) in child_environment(std::env::vars(), env) {
             cmd.env(key, value);
         }
         let mut child = cmd
             .spawn()
             .map_err(|err| Error::Transport(format!("spawn `{command}`: {err}")))?;
-        let stdin = child
-            .stdin
-            .take()
-            .ok_or_else(|| Error::Transport("stdio server has no stdin".into()))?;
+        let stdin = Arc::new(Mutex::new(
+            child
+                .stdin
+                .take()
+                .ok_or_else(|| Error::Transport("stdio server has no stdin".into()))?,
+        ));
         let stdout = child
             .stdout
             .take()
@@ -102,18 +132,37 @@ impl StdioTransport {
             }
         }
         let (sender, lines) = stdout_channel();
+        let response_writer = Arc::clone(&stdin);
         std::thread::spawn(move || {
             let mut reader = BufReader::new(stdout);
             loop {
                 let line = match read_stdout_line(&mut reader, MAX_STDOUT_LINE_BYTES) {
-                    Ok(Some(line)) => Ok(line),
+                    Ok(Some(line)) => line,
                     Ok(None) => break,
                     Err(error) => {
                         let _ = sender.send(Err(error));
                         break;
                     }
                 };
-                if sender.send(line).is_err() {
+                let Ok(Value::Object(message)) = serde_json::from_str::<Value>(line.trim()) else {
+                    continue;
+                };
+                if let Some(method) = message.get("method").and_then(Value::as_str) {
+                    if let Some(id) = message.get("id").cloned() {
+                        let reply = server_request_reply(id, method);
+                        if let Err(error) = write_shared_line(&response_writer, &reply) {
+                            let _ = sender.send(Err(error));
+                            break;
+                        }
+                    }
+                    continue;
+                }
+                if message.get("id").is_none()
+                    || (!message.contains_key("result") && !message.contains_key("error"))
+                {
+                    continue;
+                }
+                if sender.send(Ok(line)).is_err() {
                     break;
                 }
             }
@@ -174,13 +223,16 @@ impl StdioTransport {
     }
 
     fn write_line(&mut self, value: &Value) -> Result<()> {
-        let mut line =
-            serde_json::to_vec(value).map_err(|err| Error::Protocol(format!("encode: {err}")))?;
-        line.push(b'\n');
-        if let Err(err) = self.stdin.write_all(&line).and_then(|_| self.stdin.flush()) {
-            return Err(self.closed_error(&format!("mcp server stdin: {err}")));
-        }
-        Ok(())
+        write_shared_line(&self.stdin, value)
+            .map_err(|err| self.closed_error(&format!("mcp server stdin: {err}")))
+    }
+
+    fn cancel_request(&mut self, id: &Value) {
+        let _ = self.write_line(&json!({
+            "jsonrpc": "2.0",
+            "method": "notifications/cancelled",
+            "params": { "requestId": id, "reason": "timeout" }
+        }));
     }
 
     /// Wait for the reply to `id`, answering server-to-client requests and
@@ -190,6 +242,7 @@ impl StdioTransport {
         loop {
             let now = Instant::now();
             if now >= deadline {
+                self.cancel_request(id);
                 return Err(self.transport_error(&timeout_message(self.call_timeout)));
             }
             let line = match self.lines.recv_timeout(deadline - now) {
@@ -198,6 +251,7 @@ impl StdioTransport {
                     return Err(self.transport_error(&format!("mcp stdout: {error}")));
                 }
                 Err(RecvTimeoutError::Timeout) => {
+                    self.cancel_request(id);
                     return Err(self.transport_error(&timeout_message(self.call_timeout)));
                 }
                 Err(RecvTimeoutError::Disconnected) => {
@@ -208,23 +262,24 @@ impl StdioTransport {
             if trimmed.is_empty() {
                 continue;
             }
-            // Servers that log to stdout do not fail the call.
             let Ok(Value::Object(message)) = serde_json::from_str::<Value>(trimmed) else {
                 continue;
             };
-            if message.contains_key("method") {
-                // A server-to-client request or notification, never our reply
-                // — even if its id collides with ours.
-                if let Some(request_id) = message.get("id") {
-                    self.refuse_request(request_id.clone())?;
-                }
+            if message.get("id") != Some(id) {
                 continue;
+            }
+            let has_result = message.contains_key("result");
+            let has_error = message.contains_key("error");
+            if message.get("jsonrpc").and_then(Value::as_str) != Some("2.0")
+                || message.contains_key("method")
+                || has_result == has_error
+            {
+                return Err(Error::Protocol(format!(
+                    "invalid MCP response envelope `{trimmed}`"
+                )));
             }
             let parsed: Response = serde_json::from_value(Value::Object(message))
                 .map_err(|err| Error::Protocol(format!("decode `{trimmed}`: {err}")))?;
-            if parsed.id != *id {
-                continue;
-            }
             if let Some(error) = parsed.error {
                 return Err(Error::Rpc {
                     code: error.code,
@@ -235,15 +290,27 @@ impl StdioTransport {
         }
     }
 
-    /// The host is not a nested model: every server request (sampling,
-    /// elicitation, roots) is refused with `-32601`.
-    fn refuse_request(&mut self, id: Value) -> Result<()> {
-        self.write_line(&json!({
+}
+
+fn server_request_reply(id: Value, method: &str) -> Value {
+    if method == "ping" {
+        json!({ "jsonrpc": "2.0", "id": id, "result": {} })
+    } else {
+        json!({
             "jsonrpc": "2.0",
             "id": id,
             "error": { "code": -32601, "message": "method not supported" }
-        }))
+        })
     }
+}
+
+fn write_shared_line(stdin: &Arc<Mutex<ChildStdin>>, value: &Value) -> std::io::Result<()> {
+    let mut line = serde_json::to_vec(value)
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+    line.push(b'\n');
+    let mut writer = stdin.lock().unwrap_or_else(|error| error.into_inner());
+    writer.write_all(&line)?;
+    writer.flush()
 }
 
 const MAX_STDOUT_LINE_BYTES: usize = 16 * 1024 * 1024;
@@ -307,6 +374,25 @@ impl Rpc for StdioTransport {
     }
 }
 
+fn child_environment(
+    parent: impl Iterator<Item = (String, String)>,
+    config: &BTreeMap<String, String>,
+) -> BTreeMap<String, String> {
+    let mut env: BTreeMap<String, String> = parent
+        .filter(|(key, _)| {
+            INHERITED_ENV
+                .iter()
+                .any(|name| name.eq_ignore_ascii_case(key))
+        })
+        .collect();
+    env.extend(
+        config
+            .iter()
+            .map(|(key, value)| (key.clone(), value.clone())),
+    );
+    env
+}
+
 /// On Windows `CreateProcess` does not consult `PATHEXT`, so `npx` from
 /// `mcp.json` would not find `npx.cmd`. Resolve it ourselves; the standard
 /// library then runs a `.cmd`/`.bat` through `cmd.exe` with safe quoting.
@@ -362,6 +448,21 @@ pub fn resolve_command_in(command: &str, dirs: &[PathBuf], exts: &[String]) -> O
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn child_environment_is_allowlisted_plus_config() {
+        let parent = vec![
+            ("PATH".to_string(), "/bin".to_string()),
+            ("OPENAI_API_KEY".to_string(), "sk-x".to_string()),
+            ("HOME".to_string(), "/home/u".to_string()),
+        ];
+        let mut config = BTreeMap::new();
+        config.insert("FOO".to_string(), "bar".to_string());
+        let env = child_environment(parent.into_iter(), &config);
+        assert_eq!(env.get("PATH").map(String::as_str), Some("/bin"));
+        assert_eq!(env.get("FOO").map(String::as_str), Some("bar"));
+        assert!(!env.contains_key("OPENAI_API_KEY"));
+    }
 
     #[test]
     fn security_stdout_line_is_bounded_before_buffering() {

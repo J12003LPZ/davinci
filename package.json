@@ -1,9 +1,0 @@
-{
-  "name": "davinci",
-  "private": true,
-  "description": "Davinci Rust agent harness; this workspace retains legacy TypeScript migration packages.",
-  "workspaces": [
-    "packages/*"
-  ],
-  "packageManager": "bun@1.3.14"
-}

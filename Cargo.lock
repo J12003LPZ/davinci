@@ -446,6 +446,7 @@ dependencies = [
  "davinci-mcp",
  "davinci-protocol",
  "davinci-session",
+ "davinci-sys",
  "davinci-telemetry",
  "image",
  "libc",
@@ -468,6 +469,7 @@ version = "1.0.71"
 dependencies = [
  "base64",
  "davinci-protocol",
+ "davinci-sys",
  "davinci-telemetry",
  "regex",
  "rustls",
@@ -512,7 +514,7 @@ dependencies = [
  "davinci-protocol",
  "davinci-server",
  "davinci-session",
- "davinci-session-sqlite",
+ "davinci-sys",
  "davinci-telemetry",
  "davinci-tui",
  "davinci-voice",
@@ -562,27 +564,11 @@ version = "1.0.71"
 dependencies = [
  "serde",
  "serde_json",
+ "sha2",
  "tempfile",
  "thiserror",
  "ureq",
  "url",
-]
-
-[[package]]
-name = "davinci-parity"
-version = "1.0.71"
-dependencies = [
- "clap",
- "davinci-agent",
- "davinci-ai",
- "davinci-client",
- "davinci-protocol",
- "davinci-server",
- "davinci-session",
- "davinci-session-sqlite",
- "serde",
- "serde_json",
- "tempfile",
 ]
 
 [[package]]
@@ -616,6 +602,7 @@ name = "davinci-session"
 version = "1.0.71"
 dependencies = [
  "davinci-protocol",
+ "davinci-sys",
  "serde",
  "serde_json",
  "tempfile",
@@ -633,6 +620,15 @@ dependencies = [
  "serde_json",
  "tempfile",
  "thiserror",
+ "uuid",
+]
+
+[[package]]
+name = "davinci-sys"
+version = "1.0.71"
+dependencies = [
+ "libc",
+ "tempfile",
  "uuid",
 ]
 

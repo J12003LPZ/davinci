@@ -431,6 +431,20 @@ pub fn build_rewind_preview(
             .as_deref()
             .and_then(|h| blob_store.get_blob(h));
 
+        let missing_before = first.before_blob.is_some() && before_bytes.is_none();
+        let missing_after = last.after_blob.is_some() && after_bytes.is_none();
+        if missing_before || missing_after {
+            conflict_count += 1;
+            files.push(FileRewindPlan::new(
+                path,
+                "conflict",
+                None,
+                true,
+                Some("The recorded file content is no longer available".into()),
+            ));
+            continue;
+        }
+
         let current_path = base_dir.join(&path);
         let current_bytes = std::fs::read(&current_path).ok();
         let pre_rewind_hash = current_bytes
@@ -988,6 +1002,38 @@ mod tests {
             let conflict = check_rename_conflict("file.txt", "File.txt", dir.path());
             assert!(conflict.is_none());
         }
+    }
+
+    #[test]
+    fn a_missing_before_blob_is_a_conflict() {
+        let dir = tempfile::tempdir().unwrap();
+        let current = b"task-created content";
+        std::fs::write(dir.path().join("a.txt"), current).unwrap();
+
+        let blob_store = BlobStore::new();
+        let task_id = crate::runtime::ids::TaskId::new();
+        let after_blob = blob_store.store_blob_for_task(task_id, current).unwrap();
+        let mut effect = OwnedFileEffect::new(
+            "op_missing_before",
+            crate::runtime::ids::AgentId::new(),
+            1,
+            "a.txt",
+            crate::runtime::effects::FileEffectKind::Modified,
+            task_id,
+        );
+        effect.before_blob = Some("missing-before-blob".into());
+        effect.after_blob = Some(after_blob);
+
+        let preview = build_rewind_preview(
+            "cp_missing_before",
+            &[effect],
+            &blob_store,
+            dir.path(),
+            Vec::new(),
+        );
+        assert_eq!(preview.files[0].classification, "conflict");
+        assert!(preview.files[0].is_conflict);
+        assert_eq!(preview.conflict_count, 1);
     }
 
     #[test]

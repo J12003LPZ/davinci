@@ -778,17 +778,58 @@ fn run_behavior_ab(args: BehaviorAbArgs) -> Result<String, String> {
     ))
 }
 
+const MINIMUM_SCORED_RUNS: usize = 10;
+const MAXIMUM_TIMEOUT_RATE: f64 = 0.20;
+
 fn validate_behavior_gate(artifacts: PathBuf) -> Result<String, String> {
     let root = ArtifactRoot::new(&artifacts);
     let manifest = root.validate_complete()?;
-    let bytes = fs::read(artifacts.join("disposition-summary.json"))
+    let disposition_bytes = fs::read(artifacts.join("disposition-summary.json"))
         .map_err(|error| format!("failed to read disposition summary: {error}"))?;
-    let summary: DispositionSummaryArtifact = serde_json::from_slice(&bytes)
+    let dispositions: DispositionSummaryArtifact = serde_json::from_slice(&disposition_bytes)
         .map_err(|error| format!("failed to decode disposition summary: {error}"))?;
-    davinci_evals::behavior::scheduled_infrastructure_gate(&summary.baseline)?;
-    if let Some(candidate) = &summary.candidate {
-        davinci_evals::behavior::scheduled_infrastructure_gate(candidate)?;
+    for side in std::iter::once(&dispositions.baseline).chain(dispositions.candidate.as_ref()) {
+        davinci_evals::behavior::scheduled_infrastructure_gate(side)?;
+        davinci_evals::behavior::require_scored_runs(
+            side,
+            MINIMUM_SCORED_RUNS,
+            MAXIMUM_TIMEOUT_RATE,
+        )?;
     }
+
+    let report_bytes = fs::read(artifacts.join("summary.json"))
+        .map_err(|error| format!("failed to read behavior summary: {error}"))?;
+    let report: BehaviorExecutionReport = serde_json::from_slice(&report_bytes)
+        .map_err(|error| format!("failed to decode behavior summary: {error}"))?;
+    let baseline = report
+        .baseline
+        .as_ref()
+        .ok_or_else(|| "behavior summary is missing the baseline result".to_string())?;
+    if let Some(candidate_dispositions) = &dispositions.candidate {
+        let candidate = report
+            .candidate
+            .as_ref()
+            .ok_or_else(|| "behavior summary is missing the candidate result".to_string())?;
+        if baseline.dispositions != dispositions.baseline
+            || candidate.dispositions != *candidate_dispositions
+        {
+            return Err("behavior summary and disposition summary disagree".into());
+        }
+        let result = davinci_evals::behavior::evaluate_gate(
+            &baseline.behavioral,
+            &candidate.behavioral,
+            &davinci_evals::behavior::RegressionBudget::default(),
+        );
+        if !result.passed {
+            return Err(format!(
+                "behavior regression: {}",
+                result.violations.join("; ")
+            ));
+        }
+    } else if baseline.dispositions != dispositions.baseline {
+        return Err("behavior summary and disposition summary disagree".into());
+    }
+
     Ok(format!(
         "behavior gate passed for run {} ({})",
         manifest.run_id,

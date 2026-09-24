@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
     "crates/davinci-protocol",
+    "crates/davinci-sys",
     "crates/davinci-mcp",
     "crates/davinci-session",
     "crates/davinci-session-sqlite",
@@ -13,7 +14,6 @@ members = [
     "crates/davinci-telemetry",
     "crates/davinci-evals",
     "crates/davinci-coding-agent",
-    "crates/davinci-parity",
     "crates/davinci-voice",
 ]
 

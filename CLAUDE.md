@@ -36,7 +36,6 @@ Running the binary:
 ./target/debug/davinci --help
 ./target/debug/davinci -p "List files in src/"   # print mode
 ./target/debug/davinci --mode rpc                # JSON-RPC over stdio
-cargo run -p davinci-parity                      # golden-fixture parity corpora
 ```
 
 Toolchain is pinned to Rust 1.83.0 (`rust-toolchain.toml`). Every workspace dependency is pinned with `=` exact versions; keep that convention when adding one.
@@ -114,7 +113,6 @@ davinci-coding-agent (bin `davinci`) — CLI, TUI wiring, extensions, slash comm
   ├── davinci-protocol   — length-prefixed CBOR wire format
   ├── davinci-client / davinci-server — protocol client/server over Unix socket or TCP
   ├── davinci-evals, davinci-telemetry
-  └── davinci-parity     — golden fixtures, optional diff against the TS binary
 ```
 
 **Ecosystem integration plan**: The roadmap coordinates four bounded workstreams: graph execution hardening, runtime integration with the token governor and vector memory, learning/security feedback, and proof plus CI hygiene. Treat the design document as the contract and the A–D plans as the execution order. Preserve worker isolation, deterministic/offline verification, explicit provenance, bounded context and resource budgets, and fail-closed security approval as cross-cutting acceptance criteria.
@@ -177,7 +175,6 @@ The historical HTML mockups and Elixir reference under `docs/ui/` document earli
 
 ## Gotchas
 
-- **Legacy crates and dead code cleanup**: Uncompiled legacy source islands in `davinci-session`, `davinci-agent`, and `davinci-session-sqlite` were audited and removed in release Gate D (see `docs/archive/dead-code-audit-2026-09-04.md`). The standalone crate `crates/davinci-core` remains as an explicit historical archive crate that is not a workspace member and has no dependents. Before editing something a grep turned up, check that its module is actually declared in the active workspace.
 - **`home_dir()` mirrors Node `os.homedir()`** (`davinci-session/src/discovery.rs`): `USERPROFILE` first on Windows, `HOME` otherwise. Session dirs use the TS `--…--` cwd encoding (every `/`, `\`, `:` becomes `-`); the older Rust `--a--b` encoding is still scanned read-only for pre-existing stores. Tests that create sessions should still set `PI_CODING_AGENT_DIR` or `PI_CODING_AGENT_SESSION_DIR` so they never touch the real `~/.pi`; if `--Users--…/` directories ever reappear in the repo, they are test/session strays — delete, never commit.
 - **Git pre-commit hook on Windows**: Environments where `core.hooksPath` points to Unix shell scripts (e.g. `~/.codex/git-hooks`) may fail on Windows with `execvpe(/bin/bash) failed: No such file or directory`. Use `git commit --no-verify` to bypass this hook when committing on Windows.
 - `davinci-coding-agent` (~47k lines) and `davinci-tui` (~39k lines) are large; prefer targeted `grep` over reading whole files.

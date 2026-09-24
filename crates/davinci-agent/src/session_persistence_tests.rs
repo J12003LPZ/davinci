@@ -67,6 +67,24 @@ fn session_persistence_failure_blocks_provider_and_mutation_boundaries() {
         assert_eq!(calls, usize::from(boundary != "prompt"), "{boundary}");
         assert_eq!(dir.path().join("result.txt").exists(), boundary == "result");
         assert!(!agent.is_streaming);
+        let call_ids: Vec<_> = agent
+            .messages
+            .iter()
+            .filter(|message| message.role == "assistant")
+            .flat_map(|message| message.content.iter())
+            .filter_map(|content| match content {
+                davinci_ai::MessageContent::ToolCall { id, .. } => Some(id.clone()),
+                _ => None,
+            })
+            .collect();
+        for id in call_ids {
+            assert!(
+                agent.messages.iter().any(|message| {
+                    message.role == "toolResult" && message.tool_call_id.as_deref() == Some(&id)
+                }),
+                "{boundary}: dangling tool call {id}"
+            );
+        }
         let result = agent.run_loop(|_| -> Result<AssistantMessage, String> {
             panic!("a failed session must be reopened before another request")
         });

@@ -6,7 +6,7 @@
 
 ## Key Capabilities
 
-- **Evaluation Harness (`harness.rs`)**:
+- **Evaluation Harness (`src/lib.rs`, `harness_eval.rs`)**:
   - Executes standardized benchmark tasks against candidate models and configurations.
   - Measures task pass rates, tool selection precision, edit patch accuracy, and token efficiency.
 - **Behavioral Reliability & Core-200 Benchmark (`behavior/`)**:

@@ -1,6 +1,5 @@
 use std::collections::HashMap;
-use std::fs::{self, File};
-use std::io::Write;
+use std::fs;
 use std::path::{Component, Path, PathBuf};
 
 use davinci_agent::{ToolError, ToolResult};
@@ -116,33 +115,8 @@ fn now_ms() -> u64 {
 }
 
 fn atomic_write_file(path: &Path, content: &str) -> Result<(), String> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).map_err(|e| e.to_string())?;
-    }
-    let tmp_path = path.with_extension(format!("tmp.{}", now_ms()));
-    let mut file = File::create(&tmp_path).map_err(|e| e.to_string())?;
-    file.write_all(content.as_bytes())
-        .map_err(|e| e.to_string())?;
-    file.sync_all().map_err(|e| e.to_string())?;
-    drop(file);
+    davinci_sys::fs::atomic_write(path, content.as_bytes()).map_err(|err| err.to_string())
 
-    let had_dest = path.exists();
-    let bak_path = path.with_extension(format!("bak.{}", now_ms()));
-    if had_dest {
-        fs::rename(path, &bak_path)
-            .map_err(|e| format!("failed to backup existing file: {}", e))?;
-    }
-    if let Err(e) = fs::rename(&tmp_path, path) {
-        if had_dest {
-            let _ = fs::rename(&bak_path, path);
-        }
-        let _ = fs::remove_file(&tmp_path);
-        return Err(format!("failed to replace file: {}", e));
-    }
-    if had_dest {
-        let _ = fs::remove_file(&bak_path);
-    }
-    Ok(())
 }
 
 pub struct SkillManagerContext<'a> {

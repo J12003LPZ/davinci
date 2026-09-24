@@ -6,8 +6,8 @@
 
 use std::collections::VecDeque;
 use std::io::{self, Stdout, Write};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Once;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Once, OnceLock};
 use std::time::{Duration, Instant};
 
 use crossterm::cursor::Show;
@@ -85,7 +85,37 @@ fn supports_keyboard_enhancement() -> bool {
 static DISAMBIGUATED: AtomicBool = AtomicBool::new(false);
 /// Whether the alternate screen is currently ours.
 static HELD: AtomicBool = AtomicBool::new(false);
+static GENERATION: AtomicU64 = AtomicU64::new(0);
+static MAIN_THREAD: OnceLock<std::thread::ThreadId> = OnceLock::new();
+
+#[derive(Debug, Clone, Copy)]
+struct Generation(u64);
+
+impl Generation {
+    fn begin() -> Self {
+        Self(GENERATION.fetch_add(1, Ordering::SeqCst) + 1)
+    }
+
+    fn is_current(self) -> bool {
+        GENERATION.load(Ordering::SeqCst) == self.0
+    }
+}
+
+fn panic_restores_terminal() -> bool {
+    MAIN_THREAD
+        .get()
+        .is_some_and(|main| *main == std::thread::current().id())
+}
 static MOUSE: AtomicBool = AtomicBool::new(false);
+
+#[cfg(unix)]
+const MOUSE_ON: &str = "\x1b[?1000h\x1b[?1002h\x1b[?1006h";
+#[cfg(unix)]
+const MOUSE_OFF: &str = "\x1b[?1006l\x1b[?1002l\x1b[?1000l";
+
+fn event_marks_dirty(event: &Event) -> bool {
+    !matches!(event, Event::Mouse(mouse) if mouse.kind == event::MouseEventKind::Moved)
+}
 
 /// Undo everything [`Session::open`] did, from anywhere, at most once.
 ///
@@ -98,7 +128,16 @@ pub fn restore() -> io::Result<()> {
         let _ = execute!(io::stdout(), PopKeyboardEnhancementFlags);
     }
     if MOUSE.swap(false, Ordering::SeqCst) {
-        let _ = execute!(io::stdout(), event::DisableMouseCapture);
+        #[cfg(unix)]
+        {
+            let mut out = io::stdout();
+            let _ = out.write_all(MOUSE_OFF.as_bytes());
+            let _ = out.flush();
+        }
+        #[cfg(windows)]
+        {
+            let _ = execute!(io::stdout(), event::DisableMouseCapture);
+        }
     }
     let _ = execute!(io::stdout(), DisableBracketedPaste);
     let _ = execute!(io::stdout(), LeaveAlternateScreen, Show);
@@ -115,10 +154,13 @@ pub fn restore() -> io::Result<()> {
 /// printed as usual — onto the real screen.
 pub fn install_panic_hook() {
     static ONCE: Once = Once::new();
+    MAIN_THREAD.get_or_init(|| std::thread::current().id());
     ONCE.call_once(|| {
         let previous = std::panic::take_hook();
         std::panic::set_hook(Box::new(move |info| {
-            let _ = restore();
+            if panic_restores_terminal() {
+                let _ = restore();
+            }
             previous(info);
         }));
     });
@@ -311,6 +353,7 @@ impl PasteFilter {
 /// The terminal, for as long as the TUI owns it.
 pub struct Session {
     terminal: Terminal<CrosstermBackend<Stdout>>,
+    generation: Generation,
     keyboard: Keyboard,
     paste: PasteFilter,
     mic_rect: Option<Rect>,
@@ -324,30 +367,36 @@ impl Session {
     /// protocol when the terminal supports it.
     pub fn open() -> io::Result<Self> {
         install_panic_hook();
-        enable_raw_mode()?;
-        // Held from here, not after the screen is taken: if entering the
-        // alternate screen fails, `restore()` still has to turn raw mode back
-        // off, and it short-circuits on `HELD`.
-        HELD.store(true, Ordering::SeqCst);
-        let mut out = io::stdout();
-        execute!(out, EnterAlternateScreen)?;
-        // A multi-line paste arrives as one `Event::Paste` rather than as a
-        // burst of keys with newlines in it, which the composer would have
-        // read as one submit per line.
-        let _ = execute!(out, EnableBracketedPaste);
-
-        let disambiguated = supports_keyboard_enhancement();
-        if disambiguated {
-            execute!(
-                out,
-                PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
-            )?;
-            DISAMBIGUATED.store(true, Ordering::SeqCst);
-        }
-
-        let terminal = Terminal::new(CrosstermBackend::new(out))?;
+        let generation = Generation::begin();
+        let opened = (|| {
+            enable_raw_mode()?;
+            HELD.store(true, Ordering::SeqCst);
+            let mut out = io::stdout();
+            execute!(out, EnterAlternateScreen)?;
+            let _ = execute!(out, EnableBracketedPaste);
+            let disambiguated = supports_keyboard_enhancement();
+            if disambiguated {
+                execute!(
+                    out,
+                    PushKeyboardEnhancementFlags(
+                        KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
+                    )
+                )?;
+                DISAMBIGUATED.store(true, Ordering::SeqCst);
+            }
+            let terminal = Terminal::new(CrosstermBackend::new(out))?;
+            Ok::<_, io::Error>((terminal, disambiguated))
+        })();
+        let (terminal, disambiguated) = match opened {
+            Ok(parts) => parts,
+            Err(err) => {
+                let _ = restore();
+                return Err(err);
+            }
+        };
         Ok(Self {
             terminal,
+            generation,
             keyboard: Keyboard { disambiguated },
             paste: PasteFilter {
                 burst: cfg!(windows).then(super::paste_burst::PasteBurst::default),
@@ -395,6 +444,9 @@ impl Session {
                 if matches!(ready, Event::Resize(..)) {
                     self.mic_rect = None;
                 }
+                if matches!(ready, Event::Mouse(mouse) if mouse.kind == event::MouseEventKind::Moved) {
+                    continue;
+                }
                 return Ok(Some(ready));
             }
             // While a partial marker is held, wait only briefly: the rest of
@@ -419,6 +471,9 @@ impl Session {
                 if matches!(ready, Event::Resize(..)) {
                     self.mic_rect = None;
                 }
+                if matches!(ready, Event::Mouse(mouse) if mouse.kind == event::MouseEventKind::Moved) {
+                    continue;
+                }
                 return Ok(Some(ready));
             }
             // Everything read so far is inside a marker or a paste; poll
@@ -437,7 +492,8 @@ impl Session {
     /// the tab strip, where they are legible with the terminal in the
     /// background.
     pub fn set_title(&mut self, title: &str) -> io::Result<()> {
-        execute!(io::stdout(), SetTitle(title))
+        let title = super::sanitize::terminal_safe(title);
+        execute!(io::stdout(), SetTitle(title.as_ref()))
     }
 
     pub fn size(&self) -> io::Result<(u16, u16)> {
@@ -447,13 +503,25 @@ impl Session {
 
     /// Paint one frame.
     pub fn draw(&mut self, model: &Model) -> io::Result<()> {
+        if !HELD.load(Ordering::SeqCst) {
+            return Ok(());
+        }
         self.mic_rect = None;
         let mouse = true;
         if mouse != MOUSE.load(Ordering::SeqCst) {
-            if mouse {
-                execute!(io::stdout(), event::EnableMouseCapture)?;
-            } else {
-                execute!(io::stdout(), event::DisableMouseCapture)?;
+            #[cfg(unix)]
+            {
+                let mut out = io::stdout();
+                out.write_all(if mouse { MOUSE_ON } else { MOUSE_OFF }.as_bytes())?;
+                out.flush()?;
+            }
+            #[cfg(windows)]
+            {
+                if mouse {
+                    execute!(io::stdout(), event::EnableMouseCapture)?;
+                } else {
+                    execute!(io::stdout(), event::DisableMouseCapture)?;
+                }
             }
             MOUSE.store(mouse, Ordering::SeqCst);
         }
@@ -606,7 +674,11 @@ impl Session {
 
     /// Give the terminal back. Safe to call twice.
     pub fn close(&mut self) -> io::Result<()> {
-        restore()
+        if self.generation.is_current() {
+            restore()
+        } else {
+            Ok(())
+        }
     }
 }
 
@@ -639,10 +711,14 @@ pub fn run(model: &mut Model, mut on_submit: impl FnMut(&mut Model, String)) -> 
 
     let mut last_tick = Instant::now();
     loop {
-        session.draw(model)?;
+        if model.dirty {
+            session.draw(model)?;
+            model.dirty = false;
+        }
 
         let timeout = TICK.saturating_sub(last_tick.elapsed());
         if let Some(event) = session.poll_event(timeout)? {
+            model.dirty |= event_marks_dirty(&event);
             match event {
                 Event::Key(key) if key.kind != KeyEventKind::Release => {
                     match app::handle_key(model, key) {
@@ -672,6 +748,7 @@ pub fn run(model: &mut Model, mut on_submit: impl FnMut(&mut Model, String)) -> 
 
         if last_tick.elapsed() >= TICK {
             model.tick = model.tick.wrapping_add(1);
+            model.dirty = true;
             last_tick = Instant::now();
         }
     }
@@ -682,6 +759,21 @@ pub fn run(model: &mut Model, mut on_submit: impl FnMut(&mut Model, String)) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mouse_motion_does_not_mark_the_frame_dirty() {
+        let moved = Event::Mouse(event::MouseEvent {
+            kind: event::MouseEventKind::Moved,
+            column: 3,
+            row: 3,
+            modifiers: KeyModifiers::NONE,
+        });
+        assert!(!event_marks_dirty(&moved));
+        assert!(event_marks_dirty(&Event::Key(KeyEvent::new(
+            KeyCode::Char('a'),
+            KeyModifiers::NONE,
+        ))));
+    }
 
     #[test]
     fn graph_mouse_preserves_microphone_and_other_surfaces() {

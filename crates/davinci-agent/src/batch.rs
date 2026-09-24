@@ -250,10 +250,12 @@ impl Agent {
                                 .get("command")
                                 .and_then(Value::as_str)
                                 .unwrap_or_default();
-                            if crate::turn::is_verification_command(command) {
+                            if let Some(trustworthy) =
+                                crate::shell_policy::verification_outcome(command)
+                            {
                                 agent.record_verification_command(
                                     command,
-                                    !pre_hook_error && !result.is_error,
+                                    trustworthy && !pre_hook_error && !result.is_error,
                                 );
                             }
                         }
@@ -541,17 +543,19 @@ mod tests {
             }),
         );
 
-        // Hard-contracted native writes have no race-safe filesystem backend yet, so even the
-        // in-scope member must fail closed before mutation; the forbidden member remains denied.
+        // The host checks each native write against contract scope before dispatch,
+        // so the in-scope member succeeds and the protected member remains denied.
         let details = result.details.as_ref().unwrap();
         let ops = details["operations"].as_array().unwrap();
         assert_eq!(ops.len(), 2);
-        assert_eq!(ops[0]["status"], "error");
+        assert_eq!(ops[0]["status"], "ok");
         assert_eq!(ops[1]["status"], "error");
 
-        assert!(!dir.path().join("src/allowed.rs").exists());
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("src/allowed.rs")).unwrap(),
+            "pub fn ok() {}"
+        );
         assert!(!dir.path().join("secret.env").exists());
         assert!(result.content.contains("Scope violation"));
-        assert!(result.content.contains("execution_contract_unenforceable"));
     }
 }

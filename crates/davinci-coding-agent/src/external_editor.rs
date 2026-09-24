@@ -49,16 +49,18 @@ impl ExternalEditor {
             }
             return Ok(normalize(&text));
         }
-        let mut parts = self.command.split_whitespace();
-        let program = parts
-            .next()
+        let parts = split_command_line(&self.command)?;
+        let (program, args) = parts
+            .split_first()
             .ok_or_else(|| "empty editor command".to_string())?;
-        let mut cmd = Command::new(program);
-        for arg in parts {
-            cmd.arg(arg);
+        let mut cmd = Command::new(davinci_sys::process::resolve_program(program));
+        cmd.args(args).arg(&self.file_path);
+        let status = cmd.status().map_err(|e| e.to_string())?;
+        if !status.success() {
+            return Err(format!(
+                "editor exited with {status}; the edit was discarded"
+            ));
         }
-        cmd.arg(&self.file_path);
-        cmd.status().map_err(|e| e.to_string())?;
         let text = fs::read_to_string(&self.file_path).map_err(|e| e.to_string())?;
         Ok(normalize(&text))
     }
@@ -71,9 +73,62 @@ impl Drop for ExternalEditor {
     }
 }
 
+pub fn split_command_line(line: &str) -> Result<Vec<String>, String> {
+    let mut parts = Vec::new();
+    let mut current = String::new();
+    let mut chars = line.chars().peekable();
+    let mut quote: Option<char> = None;
+
+    while let Some(ch) = chars.next() {
+        match quote {
+            Some('\'') => {
+                if ch == '\'' {
+                    quote = None;
+                } else {
+                    current.push(ch);
+                }
+            }
+            Some('"') => {
+                if ch == '"' {
+                    quote = None;
+                } else if ch == '\\' && chars.peek() == Some(&'"') {
+                    current.push(chars.next().unwrap());
+                } else {
+                    current.push(ch);
+                }
+            }
+            None => match ch {
+                '\'' | '"' => quote = Some(ch),
+                '\\' => {
+                    if let Some(next) = chars.next() {
+                        current.push(next);
+                    }
+                }
+                ch if ch.is_whitespace() => {
+                    if !current.is_empty() {
+                        parts.push(std::mem::take(&mut current));
+                    }
+                }
+                _ => current.push(ch),
+            },
+            _ => unreachable!(),
+        }
+    }
+    if quote.is_some() {
+        return Err("unterminated quote in editor command".into());
+    }
+    if !current.is_empty() {
+        parts.push(current);
+    }
+    Ok(parts)
+}
+
 fn normalize(text: &str) -> String {
     let stripped = text.strip_prefix('\u{feff}').unwrap_or(text);
-    stripped.trim_end_matches('\n').to_string()
+    stripped
+        .replace("\r\n", "\n")
+        .trim_end_matches('\n')
+        .to_string()
 }
 
 pub fn clipboard_text() -> Option<String> {
@@ -376,6 +431,29 @@ fn command_stdout(program: &str, args: &[&str], timeout_ms: u64) -> Option<Vec<u
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn editor_command_lines_split_like_a_shell() {
+        assert_eq!(
+            split_command_line("code --wait").unwrap(),
+            ["code", "--wait"]
+        );
+        assert_eq!(
+            split_command_line(r#""C:\Program Files\Sublime\subl.exe" -w"#).unwrap(),
+            [r"C:\Program Files\Sublime\subl.exe", "-w"]
+        );
+        assert_eq!(
+            split_command_line("vim -c 'set tw=72'").unwrap(),
+            ["vim", "-c", "set tw=72"]
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn non_zero_editor_exit_cancels_the_edit() {
+        let editor = ExternalEditor::new(Some("false"), "draft").unwrap();
+        assert!(editor.edit().is_err());
+    }
 
     #[test]
     fn dry_run_appends_fixture_and_strips_bom() {

@@ -10,11 +10,9 @@ configuration, and the boundaries between them.
 | Execution and provider access | [davinci-agent](davinci-agent/), [davinci-ai](davinci-ai/), [davinci-mcp](davinci-mcp/) |
 | Persistence | [davinci-session](davinci-session/), [davinci-session-sqlite](davinci-session-sqlite/) |
 | Typed IPC | [davinci-protocol](davinci-protocol/), [davinci-client](davinci-client/), [davinci-server](davinci-server/) |
-| Measurement and compatibility | [davinci-telemetry](davinci-telemetry/), [davinci-evals](davinci-evals/), [davinci-parity](davinci-parity/) |
+| Measurement and compatibility | [davinci-telemetry](davinci-telemetry/), [davinci-evals](davinci-evals/) |
 
-`davinci-core/` is an archived early port, excluded from the workspace.
 The pinned TypeScript reference lives in [vendor/davinci](../vendor/davinci/);
-the directories in [packages](../packages/) are legacy migration stubs.
 
 Use the root `Cargo.toml` and each crate's `src/lib.rs` / `src/main.rs` to
 establish what is compiled. A Rust source file's presence alone does not make

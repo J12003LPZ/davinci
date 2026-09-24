@@ -18,12 +18,12 @@ path = "src/main.rs"
 davinci-voice = { path = "../davinci-voice" }
 davinci-agent = { path = "../davinci-agent" }
 davinci-ai = { path = "../davinci-ai" }
-davinci-client = { path = "../davinci-client" }
+davinci-client = { path = "../davinci-client", optional = true }
 davinci-mcp = { path = "../davinci-mcp" }
 davinci-protocol = { path = "../davinci-protocol" }
-davinci-server = { path = "../davinci-server" }
+davinci-server = { path = "../davinci-server", optional = true }
 davinci-session = { path = "../davinci-session" }
-davinci-session-sqlite = { path = "../davinci-session-sqlite" }
+davinci-sys = { path = "../davinci-sys" }
 davinci-telemetry = { path = "../davinci-telemetry" }
 davinci-tui = { path = "../davinci-tui" }
 crossterm.workspace = true
@@ -50,8 +50,13 @@ globset.workspace = true
 notify.workspace = true
 
 [dev-dependencies]
+davinci-coding-agent = { path = ".", features = ["test-fixtures"] }
+davinci-ai = { path = "../davinci-ai", features = ["test-fixtures"] }
+davinci-mcp = { path = "../davinci-mcp", features = ["test-fixtures"] }
 tempfile.workspace = true
 
 [features]
 default = []
+experimental-ipc = ["dep:davinci-server", "dep:davinci-client"]
 interaction-testing = []
+test-fixtures = ["davinci-ai/test-fixtures", "davinci-mcp/test-fixtures"]

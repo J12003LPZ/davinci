@@ -4,13 +4,6 @@ use sha2::{Digest, Sha256};
 
 use crate::oauth::DevicePollStatus;
 
-const ANTHROPIC_CLIENT_ID: &str = "9d1c250a-e61b-44d9-88ed-5944d1962f5e";
-const ANTHROPIC_AUTHORIZE_URL: &str = "https://claude.ai/oauth/authorize";
-const ANTHROPIC_TOKEN_URL: &str = "https://platform.claude.com/v1/oauth/token";
-const ANTHROPIC_REDIRECT: &str = "http://localhost:53692/callback";
-const ANTHROPIC_SCOPES: &str =
-    "org:create_api_key user:profile user:inference user:sessions:claude_code user:mcp_servers user:file_upload";
-
 const CODEX_CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
 const CODEX_AUTHORIZE_URL: &str = "https://auth.openai.com/oauth/authorize";
 const CODEX_TOKEN_URL: &str = "https://auth.openai.com/oauth/token";
@@ -34,13 +27,13 @@ const GITHUB_DEVICE_CODE_URL: &str = "https://github.com/login/device/code";
 const RADIUS_CLIENT_ID: &str = "pi-gateway";
 const RADIUS_REDIRECT: &str = "http://127.0.0.1:1456/oauth/callback";
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Pkce {
     pub verifier: String,
     pub challenge: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct AuthorizeRequest {
     pub provider: String,
     pub url: String,
@@ -70,6 +63,48 @@ pub fn fresh_authorize_request(provider: &str) -> Option<AuthorizeRequest> {
     let pkce = generate_pkce(&verifier_bytes);
     let state = uuid::Uuid::new_v4().simple().to_string();
     authorize_request(provider, &pkce, &state)
+}
+
+const PENDING_LOGIN_TTL_MS: u64 = 10 * 60 * 1000;
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct PendingLogin {
+    created_ms: u64,
+    request: AuthorizeRequest,
+}
+
+fn pending_path(agent_dir: &std::path::Path, provider: &str) -> std::path::PathBuf {
+    agent_dir
+        .join("oauth-pending")
+        .join(format!("{provider}.json"))
+}
+
+/// Keep the PKCE verifier and state of the URL we printed so a code pasted in
+/// a later invocation is exchanged with the matching verifier.
+pub fn save_pending_login(
+    agent_dir: &std::path::Path,
+    provider: &str,
+    request: &AuthorizeRequest,
+) -> Result<(), String> {
+    let pending = PendingLogin {
+        created_ms: crate::models_store::now_ms(),
+        request: request.clone(),
+    };
+    let bytes = serde_json::to_vec(&pending).map_err(|err| err.to_string())?;
+    davinci_sys::fs::atomic_write_private(&pending_path(agent_dir, provider), &bytes)
+        .map_err(|err| err.to_string())
+}
+
+pub fn take_pending_login(
+    agent_dir: &std::path::Path,
+    provider: &str,
+) -> Option<AuthorizeRequest> {
+    let path = pending_path(agent_dir, provider);
+    let raw = std::fs::read(&path).ok()?;
+    let _ = std::fs::remove_file(&path);
+    let pending: PendingLogin = serde_json::from_slice(&raw).ok()?;
+    let age = crate::models_store::now_ms().saturating_sub(pending.created_ms);
+    (age <= PENDING_LOGIN_TTL_MS).then_some(pending.request)
 }
 
 fn base64url(bytes: &[u8]) -> String {
@@ -131,26 +166,6 @@ pub fn parse_authorization_input(input: &str) -> (Option<String>, Option<String>
 
 pub fn authorize_request(provider: &str, pkce: &Pkce, state: &str) -> Option<AuthorizeRequest> {
     match provider {
-        "anthropic" => {
-            let mut url = url::Url::parse(ANTHROPIC_AUTHORIZE_URL).ok()?;
-            url.query_pairs_mut()
-                .append_pair("code", "true")
-                .append_pair("client_id", ANTHROPIC_CLIENT_ID)
-                .append_pair("response_type", "code")
-                .append_pair("redirect_uri", ANTHROPIC_REDIRECT)
-                .append_pair("scope", ANTHROPIC_SCOPES)
-                .append_pair("code_challenge", &pkce.challenge)
-                .append_pair("code_challenge_method", "S256")
-                .append_pair("state", &pkce.verifier);
-            Some(AuthorizeRequest {
-                provider: provider.into(),
-                url: url.to_string(),
-                token_url: ANTHROPIC_TOKEN_URL.into(),
-                instructions: "Complete login in your browser. If the browser is on another machine, paste the final redirect URL here.".into(),
-                pkce: Some(pkce.clone()),
-                state: Some(pkce.verifier.clone()),
-            })
-        }
         "openai-codex" => {
             let mut url = url::Url::parse(CODEX_AUTHORIZE_URL).ok()?;
             url.query_pairs_mut()
@@ -242,7 +257,7 @@ pub struct TokenExchangeRequest {
     pub redirect_uri: String,
 }
 
-/// TS token POST bodies: Anthropic JSON, Codex/Radius form-urlencoded, OpenRouter JSON.
+/// OAuth token POST bodies for providers supported by davinci.
 pub fn token_exchange_request(
     provider: &str,
     code: &str,
@@ -251,23 +266,6 @@ pub fn token_exchange_request(
 ) -> Option<TokenExchangeRequest> {
     let verifier = pkce.map(|p| p.verifier.as_str()).unwrap_or("");
     match provider {
-        "anthropic" => {
-            let state = state.unwrap_or(verifier);
-            let body = serde_json::json!({
-                "grant_type": "authorization_code",
-                "client_id": ANTHROPIC_CLIENT_ID,
-                "code": code,
-                "state": state,
-                "redirect_uri": ANTHROPIC_REDIRECT,
-                "code_verifier": verifier,
-            });
-            Some(TokenExchangeRequest {
-                url: ANTHROPIC_TOKEN_URL.into(),
-                content_type: "application/json".into(),
-                body: body.to_string(),
-                redirect_uri: ANTHROPIC_REDIRECT.into(),
-            })
-        }
         "openai-codex" => {
             let body = url::form_urlencoded::Serializer::new(String::new())
                 .append_pair("grant_type", "authorization_code")
@@ -339,10 +337,8 @@ pub struct OauthTokens {
     pub expires: Option<u64>,
 }
 
-/// TS refresh bodies (`refreshAnthropicToken`, `refreshAccessToken`,
-/// `refreshXaiToken`, Kimi's `/api/oauth/token`): every provider posts
-/// `grant_type=refresh_token` with its client id, Anthropic as JSON and the
-/// rest form-encoded.
+/// Refresh bodies for supported OAuth providers use `grant_type=refresh_token`
+/// with the provider client id.
 pub fn token_refresh_request(provider: &str, refresh: &str) -> Option<TokenExchangeRequest> {
     let form = |url: String, client_id: &str| TokenExchangeRequest {
         url,
@@ -355,17 +351,6 @@ pub fn token_refresh_request(provider: &str, refresh: &str) -> Option<TokenExcha
         redirect_uri: String::new(),
     };
     match provider {
-        "anthropic" => Some(TokenExchangeRequest {
-            url: ANTHROPIC_TOKEN_URL.into(),
-            content_type: "application/json".into(),
-            body: serde_json::json!({
-                "grant_type": "refresh_token",
-                "client_id": ANTHROPIC_CLIENT_ID,
-                "refresh_token": refresh,
-            })
-            .to_string(),
-            redirect_uri: String::new(),
-        }),
         "openai-codex" => Some(form(CODEX_TOKEN_URL.into(), CODEX_CLIENT_ID)),
         "xai" => Some(form(XAI_TOKEN_URL.into(), XAI_CLIENT_ID)),
         "kimi-coding" => Some(form(
@@ -381,7 +366,12 @@ pub fn token_refresh_request(provider: &str, refresh: &str) -> Option<TokenExcha
 /// Trade a refresh token for a fresh access token. Fixture refresh (a
 /// `pi-fixture-` token or `PI_OAUTH_FIXTURE`) never hits the network.
 pub fn refresh_oauth_token(provider: &str, refresh: &str) -> Result<OauthTokens, String> {
-    if refresh.starts_with("pi-fixture-") || std::env::var("PI_OAUTH_FIXTURE").is_ok() {
+    if provider == "anthropic" {
+        return Err(crate::auth::ANTHROPIC_OAUTH_UNSUPPORTED_MESSAGE.into());
+    }
+    if crate::fixtures::enabled()
+        && (refresh.starts_with("pi-fixture-") || std::env::var("PI_OAUTH_FIXTURE").is_ok())
+    {
         return Ok(OauthTokens {
             access: format!("{refresh}-access"),
             refresh: Some(refresh.to_string()),
@@ -406,23 +396,33 @@ pub fn exchange_authorization_code(
     provider: &str,
     code: &str,
     pkce: Option<&Pkce>,
+    state: Option<&str>,
 ) -> Result<OauthTokens, String> {
-    if code.starts_with("pi-fixture-") || std::env::var("PI_OAUTH_FIXTURE").is_ok() {
+    if provider == "anthropic" {
+        return Err(crate::auth::ANTHROPIC_OAUTH_UNSUPPORTED_MESSAGE.into());
+    }
+    if crate::fixtures::enabled()
+        && (code.starts_with("pi-fixture-") || std::env::var("PI_OAUTH_FIXTURE").is_ok())
+    {
         return Ok(OauthTokens {
             access: format!("{provider}-{code}-access"),
             refresh: pkce.map(|p| format!("pi-fixture-{}", p.verifier)),
             expires: Some(crate::models_store::now_ms().saturating_add(3_600_000)),
         });
     }
-    let request =
-        token_exchange_request(provider, code, pkce, pkce.map(|p| p.verifier.as_str()))
-            .ok_or_else(|| format!("OAuth token exchange is not configured for {provider}"))?;
+    let exchange_state = state.or_else(|| pkce.map(|p| p.verifier.as_str()));
+    let request = token_exchange_request(provider, code, pkce, exchange_state)
+        .ok_or_else(|| format!("OAuth token exchange is not configured for {provider}"))?;
     post_token_exchange(&request)
 }
 
 fn post_token_exchange(request: &TokenExchangeRequest) -> Result<OauthTokens, String> {
-    let url = std::env::var("PI_OAUTH_TOKEN_URL").unwrap_or_else(|_| request.url.clone());
-    let response = ureq::post(&url)
+    let url = crate::fixtures::enabled()
+        .then(|| std::env::var("PI_OAUTH_TOKEN_URL").ok())
+        .flatten()
+        .unwrap_or_else(|| request.url.clone());
+    let response = crate::http::agent(crate::http::CONTROL_IDLE_TIMEOUT)
+        .post(&url)
         .set("content-type", &request.content_type)
         .set("accept", "application/json")
         .send_string(&request.body)
@@ -441,14 +441,20 @@ fn post_token_exchange(request: &TokenExchangeRequest) -> Result<OauthTokens, St
         )
     })?;
     let value: serde_json::Value = serde_json::from_str(&body).map_err(|err| {
-        format!("Token exchange returned invalid JSON. url={url}; body={body}; details={err}")
+        format!(
+            "Token exchange returned invalid JSON. url={url}; {}; details={err}",
+            describe_token_body(&body)
+        )
     })?;
     let access = value
         .get("access_token")
         .or_else(|| value.get("access"))
         .and_then(|v| v.as_str())
         .ok_or_else(|| {
-            format!("Token exchange returned invalid JSON. url={url}; body={body}; details=missing access_token")
+            format!(
+                "Token exchange returned invalid JSON. url={url}; {}; details=missing access_token",
+                describe_token_body(&body)
+            )
         })?;
     let refresh = value
         .get("refresh_token")
@@ -474,9 +480,25 @@ fn post_token_exchange(request: &TokenExchangeRequest) -> Result<OauthTokens, St
     })
 }
 
+/// What an error message may say about a token endpoint reply: the OAuth
+/// `error` / `error_description` strings (RFC 6749 5.2, never secret) and
+/// the key names, never any other value.
+fn describe_token_body(body: &str) -> String {
+    let Ok(serde_json::Value::Object(map)) = serde_json::from_str::<serde_json::Value>(body) else {
+        return format!("non-JSON body, {} bytes", body.len());
+    };
+    let text = |key: &str| map.get(key).and_then(|v| v.as_str()).unwrap_or("");
+    let keys: Vec<&str> = map.keys().map(String::as_str).collect();
+    format!(
+        "error={:?}; error_description={:?}; keys=[{}]",
+        text("error"),
+        text("error_description"),
+        keys.join(",")
+    )
+}
+
 pub fn oauth_providers() -> &'static [&'static str] {
     &[
-        "anthropic",
         "openai-codex",
         "openrouter",
         "xai",
@@ -500,6 +522,20 @@ pub fn device_status_from_error(error: &str) -> DevicePollStatus<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn token_error_description_never_includes_values() {
+        let body =
+            r#"{"weird_token":"sk-SECRET","error":"invalid_grant","error_description":"expired"}"#;
+        let described = describe_token_body(body);
+        assert!(!described.contains("sk-SECRET"), "{described}");
+        assert!(described.contains("invalid_grant"));
+        assert!(described.contains("expired"));
+        assert!(described.contains("weird_token"));
+        let not_json = describe_token_body("<html>proxy error sk-SECRET</html>");
+        assert!(!not_json.contains("sk-SECRET"));
+        assert!(not_json.contains("bytes"));
+    }
 
     #[test]
     fn fresh_codex_authorize_request_uses_ts_sized_secrets() {
@@ -530,15 +566,7 @@ mod tests {
         assert!(codex.body.contains(&format!("client_id={CODEX_CLIENT_ID}")));
         assert!(codex.body.contains("refresh_token=rt.1.abc"));
 
-        // `refreshAnthropicToken` posts the same three fields as JSON.
-        let anthropic = token_refresh_request("anthropic", "rt-2").unwrap();
-        assert_eq!(anthropic.url, ANTHROPIC_TOKEN_URL);
-        assert_eq!(anthropic.content_type, "application/json");
-        let body: serde_json::Value = serde_json::from_str(&anthropic.body).unwrap();
-        assert_eq!(body["grant_type"], "refresh_token");
-        assert_eq!(body["client_id"], ANTHROPIC_CLIENT_ID);
-        assert_eq!(body["refresh_token"], "rt-2");
-
+        assert!(token_refresh_request("anthropic", "rt-2").is_none());
         assert!(token_refresh_request("xai", "rt-3").is_some());
         assert!(token_refresh_request("kimi-coding", "rt-4").is_some());
         // OpenRouter hands back a durable key and has no refresh grant.
@@ -551,7 +579,7 @@ mod tests {
         // credential nothing ever renews.
         let pkce = generate_pkce(&[7u8; 32]);
         let exchanged =
-            exchange_authorization_code("openai-codex", "pi-fixture-code", Some(&pkce)).unwrap();
+            exchange_authorization_code("openai-codex", "pi-fixture-code", Some(&pkce), None).unwrap();
         assert!(exchanged.expires.is_some());
         assert!(exchanged.refresh.is_some());
 
@@ -561,16 +589,26 @@ mod tests {
     }
 
     #[test]
-    fn anthropic_and_codex_authorize_urls_match_ts() {
+    fn anthropic_has_no_browser_login() {
+        let pkce = generate_pkce(b"0123456789abcdef0123456789abcdef");
+        assert!(authorize_request("anthropic", &pkce, "random-state").is_none());
+        assert!(fresh_authorize_request("anthropic").is_none());
+        assert!(exchange_authorization_code(
+            "anthropic",
+            "pi-fixture-code",
+            Some(&pkce),
+            None,
+        )
+        .unwrap_err()
+        .contains("/login anthropic <api-key>"));
+        assert!(refresh_oauth_token("anthropic", "pi-fixture-refresh")
+            .unwrap_err()
+            .contains("/login anthropic <api-key>"));
+    }
+
+    #[test]
+    fn codex_authorize_url_and_parsing_match_ts() {
         let pkce = generate_pkce(&[1u8; 32]);
-        let anthropic = authorize_request("anthropic", &pkce, "state").unwrap();
-        assert!(anthropic.url.starts_with(ANTHROPIC_AUTHORIZE_URL));
-        assert!(anthropic.url.contains("code_challenge_method=S256"));
-        assert!(anthropic.url.contains(ANTHROPIC_CLIENT_ID));
-        assert_eq!(anthropic.token_url, ANTHROPIC_TOKEN_URL);
-        assert!(anthropic
-            .instructions
-            .contains("paste the final redirect URL"));
         let codex = authorize_request("openai-codex", &pkce, "abc").unwrap();
         assert!(codex.url.contains("codex_cli_simplified_flow=true"));
         assert!(codex.url.contains(CODEX_CLIENT_ID));
@@ -587,17 +625,6 @@ mod tests {
                 "{provider}"
             );
         }
-        let exchanged =
-            exchange_authorization_code("anthropic", "pi-fixture-code", Some(&pkce)).unwrap();
-        assert!(exchanged.access.contains("anthropic"));
-        let anthropic_token =
-            token_exchange_request("anthropic", "abc", Some(&pkce), Some("st")).unwrap();
-        assert_eq!(anthropic_token.content_type, "application/json");
-        assert!(anthropic_token
-            .body
-            .contains("\"grant_type\":\"authorization_code\""));
-        assert!(anthropic_token.body.contains(ANTHROPIC_CLIENT_ID));
-        assert!(anthropic_token.body.contains(ANTHROPIC_REDIRECT));
         let codex_token = token_exchange_request("openai-codex", "abc", Some(&pkce), None).unwrap();
         assert_eq!(
             codex_token.content_type,
@@ -610,12 +637,12 @@ mod tests {
         assert!(openrouter_token.body.contains("code_challenge_method"));
         let failed = format!(
             "Token exchange request failed. url={}; redirect_uri={}; response_type=authorization_code; details=fixture",
-            anthropic_token.url, anthropic_token.redirect_uri
+            codex_token.url, anthropic_token.redirect_uri
         );
         assert!(failed.contains("response_type=authorization_code"));
         let invalid = format!(
             "Token exchange returned invalid JSON. url={}; body={{}}; details=fixture",
-            anthropic_token.url
+            codex_token.url
         );
         assert!(invalid.contains("invalid JSON"));
         assert!(matches!(

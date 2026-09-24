@@ -79,6 +79,9 @@ jobs:
           if [[ -z "${EVAL_MODEL}" ]]; then
             echo "available=false" >> "$GITHUB_OUTPUT"
             echo "CONFIGURATION_FAILURE: no model configured for ${EVAL_PROVIDER}" | tee "target/behavior-evals/live-${EVAL_PROVIDER}/configuration-failure.txt"
+            if [[ "${GITHUB_EVENT_NAME}" == "schedule" ]]; then
+              exit 1
+            fi
             exit 0
           fi
           case "${EVAL_PROVIDER}" in
@@ -90,6 +93,9 @@ jobs:
           if [[ -z "${key}" ]]; then
             echo "available=false" >> "$GITHUB_OUTPUT"
             echo "CONFIGURATION_FAILURE: credential unavailable for ${EVAL_PROVIDER}" | tee "target/behavior-evals/live-${EVAL_PROVIDER}/configuration-failure.txt"
+            if [[ "${GITHUB_EVENT_NAME}" == "schedule" ]]; then
+              exit 1
+            fi
             exit 0
           fi
           echo "available=true" >> "$GITHUB_OUTPUT"

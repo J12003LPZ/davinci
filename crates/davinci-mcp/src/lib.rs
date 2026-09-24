@@ -4,6 +4,7 @@
 //! `docs/superpowers/specs/2026-09-01-native-mcp-design.md`.
 
 mod config;
+pub mod fixtures;
 mod http;
 mod jsonrpc;
 mod stdio;
@@ -206,7 +207,7 @@ impl Client {
     }
 
     pub fn agent_tool_name(&self, tool: &str) -> String {
-        format!("mcp__{}__{tool}", self.name)
+        agent_tool_name(&self.name, tool)
     }
 }
 
@@ -382,7 +383,10 @@ fn contents_text(result: &Value) -> Result<String> {
     Ok(out)
 }
 
-/// Server and tool names are `mcp__<server>__<tool>`.
+/// Provider-facing MCP function names must fit the strictest supported
+/// function-name limit.
+const MAX_AGENT_TOOL_NAME: usize = 64;
+
 pub fn is_ident(name: &str) -> bool {
     !name.is_empty()
         && name
@@ -390,14 +394,34 @@ pub fn is_ident(name: &str) -> bool {
             .all(|ch| ch.is_ascii_alphanumeric() || ch == '_' || ch == '-')
 }
 
-pub fn split_agent_tool_name(name: &str) -> Option<(&str, &str)> {
-    let rest = name.strip_prefix("mcp__")?;
-    let (server, tool) = rest.split_once("__")?;
-    if is_ident(server) && is_ident(tool) {
-        Some((server, tool))
-    } else {
-        None
+/// Server names are embedded in an exposed MCP tool prefix. Double underscores
+/// and edge underscores would make delimiter parsing ambiguous in older
+/// clients, so refuse them even though tool routing no longer parses names.
+pub fn validate_server_name(name: &str) -> std::result::Result<(), String> {
+    if !is_ident(name)
+        || name.contains("__")
+        || name.starts_with('_')
+        || name.ends_with('_')
+    {
+        return Err(format!(
+            "MCP server name `{name}` must use letters, digits, `-` and single `_`, and not start or end with `_`"
+        ));
     }
+    Ok(())
+}
+
+/// Build the provider-visible name for one MCP tool. Long names retain a
+/// readable prefix plus a stable digest, while the registry keeps the original
+/// server/tool pair for dispatch.
+pub fn agent_tool_name(server: &str, tool: &str) -> String {
+    let full = format!("mcp__{server}__{tool}");
+    if full.len() <= MAX_AGENT_TOOL_NAME {
+        return full;
+    }
+    use sha2::{Digest, Sha256};
+    let digest = format!("{:x}", Sha256::digest(full.as_bytes()));
+    let keep = MAX_AGENT_TOOL_NAME - 9;
+    format!("{}_{}", &full[..keep], &digest[..8])
 }
 
 pub const CALL_TIMEOUT_SECS: u64 = CALL_TIMEOUT.as_secs();
@@ -472,14 +496,18 @@ mod tests {
     }
 
     #[test]
-    fn names_round_trip() {
-        assert!(is_ident("server-memory"));
-        assert!(!is_ident("has space"));
-        assert_eq!(
-            split_agent_tool_name("mcp__memory__echo"),
-            Some(("memory", "echo"))
-        );
-        assert_eq!(split_agent_tool_name("echo"), None);
+    fn server_names_are_unambiguous_and_long_tools_are_bounded() {
+        assert!(validate_server_name("server-memory").is_ok());
+        for invalid in ["has space", "my__srv", "a_", "_a"] {
+            assert!(validate_server_name(invalid).is_err(), "{invalid}");
+        }
+
+        let long = "t".repeat(80);
+        let exposed = agent_tool_name("server", &long);
+        assert!(exposed.len() <= 64, "{exposed}");
+        assert!(exposed.starts_with("mcp__server__"));
+        assert_eq!(exposed, agent_tool_name("server", &long));
+        assert_eq!(agent_tool_name("memory", "echo"), "mcp__memory__echo");
     }
 
     #[test]
@@ -542,6 +570,27 @@ mod tests {
     }
 
     #[test]
+    fn ping_is_answered_with_an_empty_result() {
+        let mut client = fixture_client(&["--ping"]);
+        let ok = client.call_tool("echo", json!({"text": "x"})).unwrap();
+        assert_eq!(ok.text(), "x ping:0");
+    }
+
+    #[test]
+    fn chatty_stdio_server_does_not_deadlock_the_client() {
+        let mut client = fixture_client(&["--chatty"]);
+        let ok = client.call_tool("echo", json!({"text": "still responsive"})).unwrap();
+        assert_eq!(ok.text(), "still responsive");
+    }
+
+    #[test]
+    fn malformed_correlated_reply_is_a_protocol_error() {
+        let mut client = fixture_client(&["--malformed-reply"]);
+        let error = client.call_tool("echo", json!({"text": "x"})).unwrap_err();
+        assert!(matches!(error, Error::Protocol(_)), "{error}");
+    }
+
+    #[test]
     fn a_hung_call_times_out_with_the_stderr_tail() {
         let mut client = Client::connect_with_timeout(
             "memory",
@@ -557,7 +606,10 @@ mod tests {
         let text = err.to_string();
         assert!(text.contains("timed out"), "{text}");
         assert!(text.contains("hanging on purpose"), "{text}");
-        assert!(client.stderr_tail().unwrap().contains("hanging on purpose"));
+        std::thread::sleep(Duration::from_millis(50));
+        let tail = client.stderr_tail().unwrap();
+        assert!(tail.contains("hanging on purpose"), "{tail}");
+        assert!(tail.contains("cancelled request"), "{tail}");
     }
 
     #[test]

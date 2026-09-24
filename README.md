@@ -781,7 +781,6 @@ Primary crate responsibilities:
 | davinci-server | Background session/controller server |
 | davinci-telemetry | Runtime telemetry contracts |
 | davinci-evals | Behavioral and engineering evaluation harnesses |
-| davinci-parity | Golden and differential compatibility fixtures |
 
 For entry points and control flow, start with [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 
@@ -801,7 +800,6 @@ davinci/
 ├── docs/                       # Architecture and capability documentation
 ├── scripts/                    # Installation and validation scripts
 ├── vendor/davinci/             # Pinned TypeScript behavioral reference
-├── packages/                   # Retained migration/compatibility material
 ├── .github/workflows/          # CI, behavior, security, lint, evaluation workflows
 ├── Cargo.toml                  # Rust workspace
 ├── Cargo.lock                  # Locked dependency graph
@@ -809,7 +807,6 @@ davinci/
 └── README.md
 ~~~
 
-crates/davinci-core is retained as an archived early port and is not an active workspace member.
 
 ---
 
@@ -875,7 +872,6 @@ Examples:
 cargo test -p davinci-evals behavior::
 cargo test -p davinci-coding-agent ecosystem_loop_ -- --nocapture
 cargo test -p davinci-coding-agent ecosystem_invariants_ -- --nocapture
-cargo run -p davinci-parity
 ~~~
 
 Some tests intentionally require external software, a browser, language server, audio stack, or live provider credentials. Offline fixture tests do not prove those external integrations.

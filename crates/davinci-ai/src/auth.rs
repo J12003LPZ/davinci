@@ -25,6 +25,9 @@ pub enum CredentialKind {
     Oauth,
 }
 
+pub const ANTHROPIC_OAUTH_UNSUPPORTED_MESSAGE: &str =
+    "Anthropic OAuth credentials are not supported by davinci; run `/login anthropic <api-key>`";
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Credential {
     #[serde(rename = "type")]
@@ -119,13 +122,11 @@ impl AuthStorage {
     }
 
     pub fn set(&mut self, provider: &str, credential: Credential) -> Result<(), AuthStorageError> {
-        self.data.insert(provider.to_string(), credential);
-        self.persist()
+        self.write_change(provider, Some(credential))
     }
 
     pub fn remove(&mut self, provider: &str) -> Result<(), AuthStorageError> {
-        self.data.remove(provider);
-        self.persist()
+        self.write_change(provider, None)
     }
 
     pub fn get(&self, provider: &str) -> Option<&Credential> {
@@ -162,24 +163,32 @@ impl AuthStorage {
         refresh: Option<String>,
         expires: Option<u64>,
     ) -> Result<(), AuthStorageError> {
-        let access = access.into();
+        self.set(
+            provider,
+            Self::oauth_credential(provider, access.into(), refresh, expires),
+        )
+    }
+
+    fn oauth_credential(
+        provider: &str,
+        access: String,
+        refresh: Option<String>,
+        expires: Option<u64>,
+    ) -> Credential {
         let available_model_ids = if provider == "github-copilot" {
             fetch_github_copilot_available_model_ids(&access)
         } else {
             Vec::new()
         };
-        self.set(
-            provider,
-            Credential {
-                kind: CredentialKind::Oauth,
-                key: None,
-                access: Some(access),
-                refresh,
-                expires,
-                env: HashMap::new(),
-                available_model_ids,
-            },
-        )
+        Credential {
+            kind: CredentialKind::Oauth,
+            key: None,
+            access: Some(access),
+            refresh,
+            expires,
+            env: HashMap::new(),
+            available_model_ids,
+        }
     }
 
     pub fn maybe_refresh(
@@ -192,6 +201,23 @@ impl AuthStorage {
         if no_refresh {
             return Ok(false);
         }
+        let Some(snapshot) = self.get(provider).cloned() else {
+            return Ok(false);
+        };
+        if snapshot.kind != CredentialKind::Oauth {
+            return Ok(false);
+        }
+        if provider == "anthropic" {
+            return Err(AuthStorageError::Invalid(
+                ANTHROPIC_OAUTH_UNSUPPORTED_MESSAGE.into(),
+            ));
+        }
+        if !credential_expires_by(&snapshot, now_ms.saturating_add(min_expiry_ms)) {
+            return Ok(false);
+        }
+
+        let _lock = self.lock()?;
+        self.data = self.read_disk()?;
         let Some(cred) = self.get(provider).cloned() else {
             return Ok(false);
         };
@@ -199,30 +225,36 @@ impl AuthStorage {
             return Ok(false);
         }
         if !credential_expires_by(&cred, now_ms.saturating_add(min_expiry_ms)) {
-            return Ok(false);
+            return Ok(true);
         }
+
         let refresh = cred.refresh.clone().unwrap_or_default();
-        let fixture = refresh.starts_with("pi-fixture-")
-            || matches!(
-                std::env::var("PI_OAUTH_FIXTURE").as_deref(),
-                Ok("1") | Ok("true")
-            );
+        let fixture = crate::fixtures::enabled()
+            && (refresh.starts_with("pi-fixture-")
+                || matches!(
+                    std::env::var("PI_OAUTH_FIXTURE").as_deref(),
+                    Ok("1") | Ok("true")
+                ));
         if fixture {
-            return self
-                .login_oauth(
-                    provider,
-                    format!("{refresh}-access"),
-                    Some(refresh),
-                    Some(now_ms.saturating_add(3_600_000)),
-                )
-                .map(|_| true);
+            let credential = Self::oauth_credential(
+                provider,
+                format!("{refresh}-access"),
+                Some(refresh),
+                Some(now_ms.saturating_add(3_600_000)),
+            );
+            self.store_locked(provider, Some(credential))?;
+            return Ok(true);
         }
-        if let Ok(url) = std::env::var("PI_OAUTH_REFRESH_URL") {
+        let refresh_url = crate::fixtures::enabled()
+            .then(|| std::env::var("PI_OAUTH_REFRESH_URL").ok())
+            .flatten();
+        if let Some(url) = refresh_url {
             let body = serde_json::json!({
                 "provider": provider,
                 "refresh": refresh,
             });
-            let response = ureq::post(&url)
+            let response = crate::http::agent(crate::http::CONTROL_IDLE_TIMEOUT)
+                .post(&url)
                 .set("content-type", "application/json")
                 .send_string(&body.to_string())
                 .map_err(|err| AuthStorageError::Read(err.to_string()))?;
@@ -234,28 +266,27 @@ impl AuthStorage {
             let access = value
                 .get("access")
                 .or_else(|| value.get("access_token"))
-                .and_then(|v| v.as_str())
+                .and_then(|value| value.as_str())
                 .ok_or_else(|| {
                     AuthStorageError::Invalid("refresh response missing access".into())
-                })?;
+                })?
+                .to_string();
             let next_refresh = value
                 .get("refresh")
                 .or_else(|| value.get("refresh_token"))
-                .and_then(|v| v.as_str())
+                .and_then(|value| value.as_str())
                 .map(str::to_string)
                 .or(Some(refresh));
             let expires = value
                 .get("expires")
                 .or_else(|| value.get("expires_at"))
-                .and_then(|v| v.as_u64())
+                .and_then(|value| value.as_u64())
                 .or(Some(now_ms.saturating_add(3_600_000)));
-            return self
-                .login_oauth(provider, access, next_refresh, expires)
-                .map(|_| true);
+            let credential =
+                Self::oauth_credential(provider, access, next_refresh, expires);
+            self.store_locked(provider, Some(credential))?;
+            return Ok(true);
         }
-        // The provider's own refresh grant. Without this a stored OAuth login
-        // was good until its token died and then needed a fresh `/login`,
-        // which is what "no credential" looked like from the outside.
         if refresh.is_empty() {
             return Ok(false);
         }
@@ -264,18 +295,65 @@ impl AuthStorage {
         let expires = tokens
             .expires
             .or_else(|| crate::codex::jwt_expiry_ms(&tokens.access));
-        self.login_oauth(provider, tokens.access, tokens.refresh, expires)
-            .map(|_| true)
+        let credential =
+            Self::oauth_credential(provider, tokens.access, tokens.refresh, expires);
+        self.store_locked(provider, Some(credential))?;
+        Ok(true)
     }
 
-    fn persist(&self) -> Result<(), AuthStorageError> {
-        if let Some(parent) = self.path.parent() {
-            fs::create_dir_all(parent).map_err(|err| AuthStorageError::Write(err.to_string()))?;
-        }
-        let raw = serde_json::to_string_pretty(&self.data)
-            .map_err(|err| AuthStorageError::Write(err.to_string()))?;
-        fs::write(&self.path, raw).map_err(|err| AuthStorageError::Write(err.to_string()))
+    fn lock_path(&self) -> PathBuf {
+        let mut name = self.path.as_os_str().to_owned();
+        name.push(".lock");
+        PathBuf::from(name)
     }
+
+    fn lock(&self) -> Result<davinci_sys::lock::ExclusiveFileLock, AuthStorageError> {
+        const AUTH_LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
+        davinci_sys::lock::ExclusiveFileLock::acquire(&self.lock_path(), AUTH_LOCK_WAIT)
+            .map_err(|err| AuthStorageError::Write(format!("auth.json is busy: {err}")))
+    }
+
+    fn read_disk(&self) -> Result<HashMap<String, Credential>, AuthStorageError> {
+        match fs::read_to_string(&self.path) {
+            Ok(raw) => serde_json::from_str(&raw)
+                .map_err(|err| AuthStorageError::Invalid(err.to_string())),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(HashMap::new()),
+            Err(err) => Err(AuthStorageError::Read(err.to_string())),
+        }
+    }
+
+    fn write_change(
+        &mut self,
+        provider: &str,
+        credential: Option<Credential>,
+    ) -> Result<(), AuthStorageError> {
+        let _lock = self.lock()?;
+        self.store_locked(provider, credential)
+    }
+
+    fn store_locked(
+        &mut self,
+        provider: &str,
+        credential: Option<Credential>,
+    ) -> Result<(), AuthStorageError> {
+        let mut data = self.read_disk()?;
+        match credential {
+            Some(credential) => {
+                data.insert(provider.to_string(), credential);
+            }
+            None => {
+                data.remove(provider);
+            }
+        }
+        let raw = serde_json::to_string_pretty(&data)
+            .map_err(|err| AuthStorageError::Write(err.to_string()))?;
+        davinci_sys::fs::atomic_write_private(&self.path, raw.as_bytes())
+            .map_err(|err| AuthStorageError::Write(err.to_string()))?;
+        self.data = data;
+        Ok(())
+    }
+
+
 }
 
 /// TS `os.homedir()`: `USERPROFILE` on Windows, `HOME` on POSIX (kept as a
@@ -329,6 +407,9 @@ pub fn env_api_key(spec: &ProviderSpec, env: &HashMap<String, String>) -> Option
 }
 
 pub(crate) fn oauth_credential_usable(provider: &str, credential: &Credential) -> bool {
+    if provider == "anthropic" {
+        return false;
+    }
     provider != "openai-codex"
         || credential
             .access
@@ -647,7 +728,8 @@ pub fn fetch_github_copilot_available_model_ids(access: &str) -> Vec<String> {
     if url.is_empty() {
         return Vec::new();
     }
-    let response = match ureq::get(&url)
+    let response = match crate::http::agent(crate::http::CONTROL_IDLE_TIMEOUT)
+        .get(&url)
         .set("accept", "application/json")
         .set("authorization", &format!("Bearer {access}"))
         .set("user-agent", COPILOT_USER_AGENT)
@@ -655,7 +737,6 @@ pub fn fetch_github_copilot_available_model_ids(access: &str) -> Vec<String> {
         .set("editor-plugin-version", COPILOT_PLUGIN_VERSION)
         .set("copilot-integration-id", COPILOT_INTEGRATION_ID)
         .set("x-github-api-version", COPILOT_API_VERSION)
-        .timeout(std::time::Duration::from_secs(10))
         .call()
     {
         Ok(response) => response,
@@ -721,6 +802,68 @@ mod tests {
     use tempfile::tempdir;
 
     #[test]
+    fn two_handles_do_not_lose_each_others_logins() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("auth.json");
+        let mut first = AuthStorage::open(&path).unwrap();
+        let mut second = AuthStorage::open(&path).unwrap();
+        first.login_api_key("openai", "sk-a").unwrap();
+        second.login_api_key("anthropic", "sk-b").unwrap();
+        let fresh = AuthStorage::open(&path).unwrap();
+        assert!(fresh.get("openai").is_some());
+        assert!(fresh.get("anthropic").is_some());
+    }
+
+    #[test]
+    fn refresh_adopts_a_token_another_process_already_refreshed() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("auth.json");
+        let now = 1_000_000;
+        let mut stale = AuthStorage::open(&path).unwrap();
+        stale
+            .login_oauth(
+                "openai-codex",
+                "old-access",
+                Some("pi-fixture-r1".into()),
+                Some(now),
+            )
+            .unwrap();
+        let mut other = AuthStorage::open(&path).unwrap();
+        other
+            .login_oauth(
+                "openai-codex",
+                "new-access",
+                Some("pi-fixture-r2".into()),
+                Some(now + 3_600_000),
+            )
+            .unwrap();
+        assert!(stale
+            .maybe_refresh("openai-codex", now, 60_000, false)
+            .unwrap());
+        assert_eq!(
+            stale.get("openai-codex").unwrap().access.as_deref(),
+            Some("new-access")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn auth_file_is_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("auth.json");
+        let mut storage = AuthStorage::open(&path).unwrap();
+        storage.login_api_key("openai", "sk").unwrap();
+        let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+    }
+
+    #[test]
+    fn fixture_hooks_are_on_in_test_builds() {
+        assert!(crate::fixtures::enabled());
+    }
+
+    #[test]
     fn auth_path_keeps_legacy_logins_when_current_catalog_directory_exists() {
         let home = tempdir().unwrap();
         let current = home.path().join(".davinci/agent/auth.json");
@@ -782,25 +925,43 @@ mod tests {
     }
 
     #[test]
+    fn stored_anthropic_oauth_credential_is_refused_with_clear_guidance() {
+        let mut storage = AuthStorage::in_memory();
+        storage
+            .login_oauth("anthropic", "sk-ant-oat01-x", None, Some(u64::MAX))
+            .unwrap();
+        assert!(resolve_provider_auth(
+            "anthropic",
+            &storage,
+            &Default::default(),
+            true,
+        )
+        .is_none());
+        let error = storage
+            .maybe_refresh("anthropic", 10_000, u64::MAX, false)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("/login anthropic <api-key>"), "{error}");
+    }
+
+    #[test]
     fn fixture_oauth_refresh_extends_expiry() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("auth.json");
         let mut storage = AuthStorage::open(&path).unwrap();
         storage
             .login_oauth(
-                "anthropic",
+                "xai",
                 "expired",
                 Some("pi-fixture-refresh".into()),
                 Some(1),
             )
             .unwrap();
-        assert!(storage
-            .maybe_refresh("anthropic", 10_000, 0, false)
-            .unwrap());
-        let cred = storage.get("anthropic").unwrap();
+        assert!(storage.maybe_refresh("xai", 10_000, 0, false).unwrap());
+        let cred = storage.get("xai").unwrap();
         assert_eq!(cred.access.as_deref(), Some("pi-fixture-refresh-access"));
         assert!(cred.expires.unwrap() > 10_000);
-        assert!(!storage.maybe_refresh("anthropic", 10_000, 0, true).unwrap());
+        assert!(!storage.maybe_refresh("xai", 10_000, 0, true).unwrap());
     }
 
     /// A JWT with the given `exp` (seconds) and nothing else that matters.

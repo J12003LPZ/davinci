@@ -48,7 +48,12 @@ fn owner(
     let mut language = String::from("auto");
     let mut warm_until = Instant::now() + Duration::from_secs(300);
     loop {
-        let command = match rx.recv_timeout(Duration::from_millis(10)) {
+        let wait = if capture.is_some() {
+            Duration::from_millis(10)
+        } else {
+            warm_until.saturating_duration_since(Instant::now())
+        };
+        let command = match rx.recv_timeout(wait) {
             Ok(command) => Some(command),
             Err(mpsc::RecvTimeoutError::Timeout) => None,
             Err(_) => break,
@@ -109,7 +114,8 @@ fn owner(
             if let Some(id) = identity.take() {
                 emit(&tx, Event::Cancelled { id })?;
             }
-            continue;
+            cancel.store(false, Ordering::Release);
+            warm_until = Instant::now() + Duration::from_secs(300);
         }
         if let Some(stream) = capture.as_mut() {
             match stream.drain() {
@@ -196,7 +202,7 @@ fn run() -> Result<(), VoiceError> {
     });
     thread::spawn(move || {
         while !parent_lost.load(Ordering::Acquire) {
-            thread::sleep(Duration::from_millis(25));
+            thread::sleep(Duration::from_millis(250));
         }
         thread::sleep(Duration::from_millis(750));
         std::process::exit(1);

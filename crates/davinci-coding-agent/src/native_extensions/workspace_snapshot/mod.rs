@@ -284,10 +284,7 @@ impl WorkspaceSnapshot {
                 .ok_or_else(|| format!("current capture omitted {}", expected.path))?;
             let mut change = compare_entry(expected, actual);
             change.safe_to_restore = safe_restore(actual, expected, transaction.as_ref());
-            if !change.safe_to_restore
-                && change.status != "already_restored"
-                && change.status != "unchanged"
-            {
+            if !change.safe_to_restore && change.status != "unchanged" {
                 conflicts.push(json!({
                     "path": change.path,
                     "reason": "current postimage is not owned by the supplied transaction",
@@ -322,7 +319,7 @@ impl WorkspaceSnapshot {
         }
         let restore_paths = changes
             .iter()
-            .filter(|change| change.status != "already_restored" && change.status != "unchanged")
+            .filter(|change| change.status != "unchanged")
             .map(|change| change.path.clone())
             .collect::<Vec<_>>();
         if restore_paths.is_empty() {
@@ -342,7 +339,7 @@ impl WorkspaceSnapshot {
                 .iter()
                 .find(|change| change.path == entry.path)
                 .expect("change created for every checkpoint entry");
-            if change.status != "already_restored" && change.status != "unchanged" {
+            if change.status != "unchanged" {
                 self.apply_entry(cwd, entry)?;
             }
         }
@@ -910,22 +907,8 @@ fn remove_path(path: &Path) -> Result<(), String> {
 }
 
 fn atomic_write(path: &Path, bytes: &[u8]) -> Result<(), String> {
-    let temp = path.with_extension(format!("tmp-{}", std::process::id()));
-    let _ = fs::remove_file(&temp);
-    {
-        let mut file = OpenOptions::new()
-            .create_new(true)
-            .truncate(true)
-            .write(true)
-            .open(&temp)
-            .map_err(|error| format!("create atomic file: {error}"))?;
-        file.write_all(bytes)
-            .map_err(|error| format!("write atomic file: {error}"))?;
-        file.sync_all()
-            .map_err(|error| format!("sync atomic file: {error}"))?;
-    }
-    let _ = fs::remove_file(path);
-    fs::rename(&temp, path).map_err(|error| format!("publish atomic file: {error}"))
+    davinci_sys::fs::atomic_write(path, bytes)
+        .map_err(|error| format!("publish atomic file: {error}"))
 }
 
 fn digest(bytes: &[u8]) -> String {

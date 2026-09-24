@@ -191,6 +191,16 @@ pub fn command_specs() -> Vec<(&'static str, &'static str, Option<&'static str>)
             None,
         ),
         (
+            "git-status",
+            "Show bounded Git intelligence status and repository history availability.",
+            None,
+        ),
+        (
+            "impact-status",
+            "Show change-impact analysis status and dependency coverage.",
+            None,
+        ),
+        (
             "verification-status",
             "Show bounded verification-planner limits and planning telemetry.",
             None,
@@ -219,6 +229,26 @@ pub fn command_specs() -> Vec<(&'static str, &'static str, Option<&'static str>)
             "security-scan",
             "Start an experimental source-grounded security review.",
             Some("[path] [--mode quick|standard|deep] [--format terminal|json|sarif]"),
+        ),
+        (
+            "sec-resume",
+            "Resume an interrupted security review.",
+            Some("<scanId>"),
+        ),
+        (
+            "sec-status",
+            "Show the active security review status.",
+            Some("[scanId]"),
+        ),
+        (
+            "sec-report",
+            "Show the current security review report.",
+            Some("[scanId]"),
+        ),
+        (
+            "sec-abort",
+            "Cancel the active security review.",
+            Some("[scanId]"),
         ),
         (
             "memory-status",
@@ -318,6 +348,9 @@ pub fn graph_worker_context() -> Option<GraphWorkerContext> {
     GraphWorkerContext::from_env()
 }
 
+pub type SharedVectorMemory = Arc<Mutex<VectorMemory>>;
+pub type SharedTokenGovernor = Arc<Mutex<TokenGovernor>>;
+
 #[derive(Debug, Clone, Default)]
 pub struct NativeExtensionHost {
     pub browser: browser::BrowserController,
@@ -332,8 +365,8 @@ pub struct NativeExtensionHost {
     pub repo_intelligence: repo_intelligence::RepoIntelligence,
     pub cache: davinci_agent::runtime::cache::CacheRuntime,
     pub language_intelligence: language_intelligence::LanguageIntelligence,
-    pub governor: TokenGovernor,
-    pub memory: VectorMemory,
+    pub governor: SharedTokenGovernor,
+    pub memory: SharedVectorMemory,
     pub graph: GraphController,
     pub security: SecurityScanController,
     pub learning: LearningController,
@@ -341,6 +374,7 @@ pub struct NativeExtensionHost {
     /// Set by the native visual backend registration path when one exists.
     pub visual_verification_available: bool,
     pub cwd: std::path::PathBuf,
+    agent_dir: std::path::PathBuf,
 }
 
 const CODEX_CREDITS_PER_USD: f64 = 25.0;
@@ -356,13 +390,13 @@ impl NativeExtensionHost {
         agent_dir: Option<&Path>,
     ) -> Self {
         let session_key = session_key.into();
-        let cache_settings = agent_dir.map(|dir| crate::settings::load_merged_settings(dir, cwd));
+        let repo_agent_dir = agent_dir
+            .map(Path::to_path_buf)
+            .unwrap_or_else(davinci_session::default_agent_dir);
+        let merged_settings = crate::settings::load_merged_settings(&repo_agent_dir, cwd);
         let cache = match agent_dir {
             Some(dir) => davinci_agent::runtime::cache::CacheRuntime::shared(
-                cache_settings
-                    .as_ref()
-                    .and_then(|s| s.cache.clone())
-                    .unwrap_or_default(),
+                merged_settings.cache.clone().unwrap_or_default(),
                 dir.into(),
             ),
             None => davinci_agent::runtime::cache::CacheRuntime::default(),
@@ -373,24 +407,27 @@ impl NativeExtensionHost {
         let memory_config = agent_dir
             .map(|dir| VectorMemoryConfig::from_file(&dir.join("vector-memory.json")))
             .unwrap_or_else(VectorMemoryConfig::from_env);
-        let governor = TokenGovernor::new(session_key.clone(), governor_config);
-        // Only the product host sweeps: other sessions' stored outputs past
-        // the retention window go, never the live session's.
-        let _ = governor.sweep_stale_outputs();
-        let learning_config = cache_settings.and_then(|settings| settings.learning);
+        let governor_value = TokenGovernor::new(session_key.clone(), governor_config);
+        let _ = governor_value.sweep_stale_outputs();
+        let language_governor = governor_value.clone();
+        let governor = Arc::new(Mutex::new(governor_value));
+        let learning_config = if agent_dir.is_some() {
+            merged_settings.learning.clone()
+        } else {
+            None
+        };
         let learning = LearningController::new(cwd, agent_dir, learning_config);
-        let memory = VectorMemory::with_config(cwd.to_path_buf(), memory_config);
+        let memory = Arc::new(Mutex::new(VectorMemory::with_config(
+            cwd.to_path_buf(),
+            memory_config,
+        )));
         let mut graph = GraphController::new(cwd.to_path_buf());
-        graph.memory = Some(memory.clone());
+        graph.memory = Some(Arc::clone(&memory));
         graph.learning = Some(learning.clone());
-        graph.governor = Some(governor.clone());
+        graph.governor = Some(Arc::clone(&governor));
         let visual_snapshot = VisualSnapshotHost::discover(cwd);
-        let repo_agent_dir = agent_dir
-            .map(Path::to_path_buf)
-            .unwrap_or_else(davinci_session::default_agent_dir);
-        let repo_config = crate::settings::load_merged_settings(&repo_agent_dir, cwd)
-            .repo_intelligence
-            .unwrap_or_default();
+
+        let repo_config = merged_settings.repo_intelligence.clone().unwrap_or_default();
         let repo_intelligence =
             repo_intelligence::RepoIntelligence::new(cwd, &repo_agent_dir, repo_config);
         let engineering = engineering_snapshot::EngineeringSnapshots::default();
@@ -398,37 +435,32 @@ impl NativeExtensionHost {
             cwd,
             repo_intelligence.clone(),
             cache.clone(),
-            crate::settings::load_merged_settings(&repo_agent_dir, cwd)
-                .test_impact
-                .unwrap_or_default(),
+            merged_settings.test_impact.clone().unwrap_or_default(),
         )
         .with_snapshots(engineering.clone());
-        let package_config = crate::settings::load_merged_settings(&repo_agent_dir, cwd)
-            .package_intelligence
-            .unwrap_or_default();
+        let package_config = merged_settings.package_intelligence.clone().unwrap_or_default();
         let package_intelligence =
             package_intelligence::PackageIntelligence::new(cwd, cache.clone(), package_config);
-        let build_config = crate::settings::load_merged_settings(&repo_agent_dir, cwd)
-            .build_intelligence
-            .unwrap_or_default();
+        let build_config = merged_settings.build_intelligence.clone().unwrap_or_default();
         let build_intelligence =
             build_intelligence::BuildIntelligence::new(cwd, cache.clone(), build_config)
                 .with_snapshots(engineering.clone());
-        let git_config = crate::settings::load_merged_settings(&repo_agent_dir, cwd)
-            .git_intelligence
-            .unwrap_or_default();
+        let git_config = merged_settings.git_intelligence.clone().unwrap_or_default();
         let git_intelligence =
             git_intelligence::GitIntelligence::new(cwd, cache.clone(), git_config);
-        let language_config = agent_dir
-            .and_then(|dir| crate::settings::load_merged_settings(dir, cwd).language_intelligence)
-            .unwrap_or_default();
+        let language_config = if agent_dir.is_some() {
+            merged_settings
+                .language_intelligence
+                .clone()
+                .unwrap_or_default()
+        } else {
+            Default::default()
+        };
         let language_intelligence =
             language_intelligence::LanguageIntelligence::new(cwd, language_config);
-        language_intelligence.set_governor(governor.clone());
+        language_intelligence.set_governor(language_governor);
         graph.language_intelligence = Some(language_intelligence.clone());
-        let change_config = crate::settings::load_merged_settings(&repo_agent_dir, cwd)
-            .change_impact
-            .unwrap_or_default();
+        let change_config = merged_settings.change_impact.clone().unwrap_or_default();
         let change_impact = change_impact::ChangeImpact::new(
             cwd,
             cache.clone(),
@@ -443,37 +475,36 @@ impl NativeExtensionHost {
         let repo_intelligence = repo_intelligence.with_semantic_provider(Arc::new(
             change_impact::LanguageIntelligenceAdapter::new(language_intelligence.clone()),
         ));
-        let verification_planner_config =
-            crate::settings::load_merged_settings(&repo_agent_dir, cwd)
-                .verification_planner
-                .unwrap_or_default();
+        let verification_planner_config = merged_settings
+            .verification_planner
+            .clone()
+            .unwrap_or_default();
         let verification_planner =
             verification_planner::VerificationPlanner::new(cwd, verification_planner_config)
                 .with_snapshots(engineering.clone());
-        let workspace_snapshot_config = crate::settings::load_merged_settings(&repo_agent_dir, cwd)
-            .workspace_snapshots
-            .unwrap_or_default();
+        let workspace_snapshot_config =
+            merged_settings.workspace_snapshots.clone().unwrap_or_default();
         let workspace_snapshot =
             workspace_snapshot::WorkspaceSnapshot::new(cwd, workspace_snapshot_config);
+
+        let browser_config = agent_dir
+            .map(|dir| {
+                let mut config = crate::settings::load_settings(dir)
+                    .browser_verification
+                    .unwrap_or_default();
+                if merged_settings
+                    .browser_verification
+                    .as_ref()
+                    .is_some_and(|settings| !settings.enabled)
+                {
+                    config.enabled = false;
+                }
+                config
+            })
+            .unwrap_or_default();
+
         Self {
-            browser: browser::BrowserController::new(
-                cwd,
-                agent_dir
-                    .map(|dir| {
-                        let mut config = crate::settings::load_settings(dir)
-                            .browser_verification
-                            .unwrap_or_default();
-                        // Project settings may disable the feature, never select executable/package pins.
-                        if crate::settings::load_merged_settings(dir, cwd)
-                            .browser_verification
-                            .is_some_and(|settings| !settings.enabled)
-                        {
-                            config.enabled = false;
-                        }
-                        config
-                    })
-                    .unwrap_or_default(),
-            ),
+            browser: browser::BrowserController::new(cwd, browser_config),
             test_impact,
             engineering,
             package_intelligence,
@@ -493,6 +524,7 @@ impl NativeExtensionHost {
             visual_verification_available: visual_snapshot.is_available(),
             visual_snapshot,
             cwd: cwd.to_path_buf(),
+            agent_dir: repo_agent_dir,
         }
     }
 
@@ -546,7 +578,10 @@ impl NativeExtensionHost {
                 return Some(reason);
             }
         }
-        self.governor.before_tool(name, args, state_hash)
+        self.governor
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .before_tool(name, args, state_hash)
     }
 
     pub fn after_tool(&mut self, name: &str, args: &Value, result: ToolResult) -> ToolResult {
@@ -560,28 +595,49 @@ impl NativeExtensionHost {
         {
             self.engineering.invalidate();
         }
-        self.governor.after_tool(name, args, result)
+        self.governor
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .after_tool(name, args, result)
     }
 
     pub fn memory_inject(&self, query: &str) -> Option<String> {
-        self.memory.inject(query)
+        self.memory
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .inject(query)
     }
 
     pub fn memory_index_messages(
         &mut self,
         messages: &[MemoryMessage],
     ) -> Result<usize, ToolError> {
-        self.memory.index_messages(messages)
+        self.memory
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .index_messages(messages)
     }
 
     pub fn session_start(&mut self) {
-        self.governor.session_start();
-        self.memory.session_start();
+        self.governor
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .session_start();
+        self.memory
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .session_start();
     }
 
     pub fn session_compact(&mut self) {
-        self.governor.session_compact();
-        self.memory.session_compact();
+        self.governor
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .session_compact();
+        self.memory
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .session_compact();
     }
 
     /// A background graph run must not outlive the session that started it.
@@ -591,6 +647,7 @@ impl NativeExtensionHost {
         }
         self.language_intelligence.shutdown();
         graph::abort_all_runs();
+        self.security.abort_review();
         self.learning.cancel_active_review();
     }
 
@@ -607,6 +664,10 @@ impl NativeExtensionHost {
             }
         }
 
+        let mut memory = self
+            .memory
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
         for candidate in to_sync {
             match &candidate.artifact {
                 LearningArtifact::Memory {
@@ -629,7 +690,7 @@ impl NativeExtensionHost {
                         "conversation" => vector_memory::MemoryKind::Conversation,
                         _ => vector_memory::MemoryKind::Fact,
                     };
-                    let _ = self.memory.index_learning_memory(
+                    let _ = memory.index_learning_memory(
                         text,
                         kind,
                         *importance,
@@ -640,7 +701,7 @@ impl NativeExtensionHost {
                     );
                 }
                 LearningArtifact::FailureLesson { text, importance } => {
-                    let _ = self.memory.index_learning_memory(
+                    let _ = memory.index_learning_memory(
                         text,
                         vector_memory::MemoryKind::Bug,
                         *importance,
@@ -726,8 +787,17 @@ impl NativeExtensionHost {
                 }
             }
             VISUAL_SNAPSHOT_TOOL => self.visual_snapshot.execute_tool(_cwd, args),
-            "memory_search" => self.memory.search_tool(args),
-            "retrieve_output" => self.governor.retrieve(args).or_else(|error| {
+            "memory_search" => self
+                .memory
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .search_tool(args),
+            "retrieve_output" => self
+                .governor
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .retrieve(args)
+                .or_else(|error| {
                 if std::env::var_os("PI_GRAPH_ROLE").is_some() {
                     if let Some(client) =
                         davinci_agent::runtime::task_transport::TaskCoordinatorClient::from_env()
@@ -739,10 +809,16 @@ impl NativeExtensionHost {
             }),
             "skill_list" => {
                 let query = args.get("query").and_then(Value::as_str).unwrap_or("");
-                let query_embedding = if !query.trim().is_empty() && self.memory.dense_available() {
-                    self.memory.embed_query_text(query).ok()
-                } else {
-                    None
+                let query_embedding = {
+                    let memory = self
+                        .memory
+                        .lock()
+                        .unwrap_or_else(|error| error.into_inner());
+                    if !query.trim().is_empty() && memory.dense_available() {
+                        memory.embed_query_text(query).ok()
+                    } else {
+                        None
+                    }
                 };
                 self.learning.skill_list_tool_with_query_embedding(
                     _cwd,
@@ -827,7 +903,10 @@ impl NativeExtensionHost {
                 } else {
                     self.cwd.clone()
                 };
-                Ok(Some(crate::hooks::status_report(&cwd)))
+                Ok(Some(crate::hooks::status_report_with_agent_dir(
+                    &self.agent_dir,
+                    &cwd,
+                )))
             }
             name if name.starts_with("graph") => self.graph.command(name, args),
             name if name == "security-scan" || name.starts_with("sec-") => {
@@ -973,6 +1052,19 @@ impl NativeExtensionHost {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn every_external_native_command_is_listed() {
+        let listed: std::collections::BTreeSet<_> =
+            command_specs().into_iter().map(|(name, _, _)| name).collect();
+        let internal_graph = ["graph-resume", "graph-status", "graph-view", "graph-abort"];
+        for name in NATIVE_COMMANDS {
+            if internal_graph.contains(name) {
+                continue;
+            }
+            assert!(listed.contains(name), "{name} is dispatched but not listed");
+        }
+    }
     use std::sync::Arc;
 
     #[test]

@@ -19,7 +19,7 @@ use davinci_protocol::{
     ServerEvent, ServerMessage, ServerSnapshot, SessionPhase, SessionSnapshot, TextOrImage,
     ThinkingLevel, TranscriptItem, TranscriptProgress, PROTOCOL_VERSION,
 };
-use davinci_session::{discover_sessions, JsonlSession};
+use davinci_session::{discover_session_headers, JsonlSession};
 use serde_json::Value;
 use thiserror::Error;
 use uuid::Uuid;
@@ -215,7 +215,7 @@ impl PiServer {
     }
 
     pub fn snapshot(&self) -> ServerSnapshot {
-        let sessions = discover_sessions(&self.sessions_dir, None)
+        let sessions = discover_session_headers(&self.sessions_dir, None)
             .unwrap_or_default()
             .into_iter()
             .map(|s| davinci_protocol::SessionMetadata {
@@ -911,6 +911,8 @@ pub fn serve_stream<S: Read + Write>(
     let mut decoder =
         ClientMessageDecoder::new(None).map_err(|err| ServerError::Protocol(err.to_string()))?;
     let mut buf = [0u8; 8192];
+    let mut greeted = false;
+    let mut connection_id = None;
     loop {
         let n = stream
             .read(&mut buf)
@@ -922,7 +924,29 @@ pub fn serve_stream<S: Read + Write>(
             .push(&buf[..n])
             .map_err(|err| ServerError::Protocol(err.to_string()))?
         {
-            let response = server.handle(message);
+            let response = match message {
+                ClientMessage::Request { id, .. } if !greeted => ServerMessage::Response {
+                    id,
+                    ok: false,
+                    result: None,
+                    error: Some(ProtocolError {
+                        code: ProtocolErrorCode::InvalidRequest,
+                        message: "Hello must be the first protocol message".into(),
+                        details: None,
+                    }),
+                },
+                message => {
+                    let response = server.handle(message);
+                    if let ServerMessage::Hello {
+                        connection_id: id, ..
+                    } = &response
+                    {
+                        greeted = true;
+                        connection_id = Some(id.clone());
+                    }
+                    response
+                }
+            };
             let mut outgoing = vec![response];
             outgoing.extend(
                 server
@@ -938,6 +962,12 @@ pub fn serve_stream<S: Read + Write>(
                     .map_err(|err| ServerError::Io(err.to_string()))?;
             }
         }
+    }
+    decoder
+        .end()
+        .map_err(|err| ServerError::Protocol(err.to_string()))?;
+    if let Some(connection_id) = connection_id {
+        server.disconnect(&connection_id);
     }
     Ok(())
 }
@@ -973,6 +1003,46 @@ mod tests {
                 ..
             } => session,
             other => panic!("expected create: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn stream_rejects_request_before_hello() {
+        let dir = tempdir().unwrap();
+        let mut server = PiServer::new(dir.path().to_path_buf());
+        let request = ClientMessage::Request {
+            id: "early".into(),
+            request: Command::List,
+        };
+        let input = encode_client_message(&request, None).unwrap();
+        let mut stream = std::io::Cursor::new(input);
+        let mut output = Vec::new();
+        struct Duplex<'a> {
+            input: std::io::Cursor<Vec<u8>>,
+            output: &'a mut Vec<u8>,
+        }
+        impl Read for Duplex<'_> {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                self.input.read(buf)
+            }
+        }
+        impl Write for Duplex<'_> {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.output.extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
+        }
+        let duplex = Duplex { input: stream, output: &mut output };
+        serve_stream(&mut server, duplex).unwrap();
+        let mut decoder = davinci_protocol::create_server_message_decoder(None).unwrap();
+        let decoded = decoder.push(&output).unwrap();
+        decoder.end().unwrap();
+        match &decoded[0] {
+            ServerMessage::Response { ok: false, error: Some(error), .. } => {
+                assert_eq!(error.code, ProtocolErrorCode::InvalidRequest);
+            }
+            other => panic!("expected pre-hello rejection: {other:?}"),
         }
     }
 

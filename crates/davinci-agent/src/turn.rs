@@ -51,6 +51,24 @@ impl Drop for PendingToolOperationGuard {
     }
 }
 
+fn agent_call_may_write_shared(args: &Value, mode: crate::PermissionMode) -> bool {
+    if !matches!(
+        mode,
+        crate::PermissionMode::Edits
+            | crate::PermissionMode::Auto
+            | crate::PermissionMode::AlwaysApprove
+    ) {
+        return false;
+    }
+
+    let task_may_write_shared =
+        |task: &Value| task.get("isolation").and_then(Value::as_str) != Some("worktree");
+    match args.get("tasks").and_then(Value::as_array) {
+        Some(tasks) if !tasks.is_empty() => tasks.iter().any(task_may_write_shared),
+        _ => task_may_write_shared(args),
+    }
+}
+
 impl Agent {
     /// Start a loop after user prompts have already been appended.
     pub fn run_loop<F, T>(&mut self, complete: F) -> Result<Vec<AgentEvent>, String>
@@ -88,15 +106,79 @@ impl Agent {
         self.ensure_session_persistence()?;
         self.recover_pending_operation_publications()?;
         let result = self.run_loop_body(emit_prompt_messages, complete);
-        if let Err(error) = self.ensure_session_persistence() {
-            self.is_streaming = false;
-            if let Some(runtime) = &self.runtime {
-                runtime.mark_turn_failed();
-                runtime.emit_turn_end(false);
+        let persistence = self.ensure_session_persistence();
+        match (&result, persistence) {
+            (_, Err(error)) => {
+                self.fail_turn(&error);
+                Err(error)
             }
-            return Err(error);
+            (Err(error), Ok(())) => {
+                if self.is_streaming {
+                    self.fail_turn(error);
+                }
+                result
+            }
+            (Ok(_), Ok(())) => result,
         }
-        result
+    }
+
+    /// Leave the agent idle after a failed turn and close every dangling tool call.
+    fn fail_turn(&mut self, error: &str) {
+        let answered: std::collections::HashSet<String> = self
+            .messages
+            .iter()
+            .filter(|message| message.role == "toolResult")
+            .filter_map(|message| message.tool_call_id.clone())
+            .collect();
+        let dangling: Vec<(String, String)> = self
+            .messages
+            .iter()
+            .filter(|message| message.role == "assistant")
+            .flat_map(|message| message.content.iter())
+            .filter_map(|content| match content {
+                davinci_ai::MessageContent::ToolCall { id, name, .. } if !answered.contains(id) => {
+                    Some((id.clone(), name.clone()))
+                }
+                _ => None,
+            })
+            .collect();
+        for (id, name) in dangling {
+            // Keep this repair in memory; persistence is the failed boundary.
+            self.messages.push(tool_result_message(
+                &id,
+                &name,
+                crate::ToolResult {
+                    content: format!(
+                        "The turn stopped before this tool result was recorded: {error}"
+                    ),
+                    is_error: true,
+                    details: None,
+                },
+                self.auto_resize_images,
+            ));
+        }
+        self.is_streaming = false;
+        self.flush_pending_bash_messages();
+        if let Some(runtime) = &self.runtime {
+            runtime.mark_turn_failed();
+            runtime.emit_turn_end(false);
+        }
+    }
+
+    fn finish_run(&mut self, events: &mut Vec<AgentEvent>, new_messages: Vec<ChatMessage>) {
+        if let Some(runtime) = &self.runtime {
+            runtime.emit_turn_end(false);
+        }
+        self.push_event(
+            events,
+            AgentEvent::AgentEnd {
+                messages: new_messages,
+                will_retry: false,
+            },
+        );
+        self.is_streaming = false;
+        self.flush_pending_bash_messages();
+        self.emit_behavior_telemetry();
     }
 
     fn run_loop_body<F, T>(
@@ -129,6 +211,7 @@ impl Agent {
         let mut new_messages = prompt_messages.clone();
         let mut capability_completion_reminders = 0_u32;
         let mut verification_reminded_generation = None;
+        let mut turns_this_run = 0_u32;
         self.push_event(&mut events, AgentEvent::AgentStart);
         self.push_event(&mut events, AgentEvent::TurnStart);
         if let Some(runtime) = &self.runtime {
@@ -154,20 +237,30 @@ impl Agent {
         loop {
             self.ensure_session_persistence()?;
             if self.abort_requested() {
-                if let Some(runtime) = &self.runtime {
-                    runtime.emit_turn_end(false);
-                }
-                self.push_event(
-                    &mut events,
-                    AgentEvent::AgentEnd {
-                        messages: new_messages,
-                        will_retry: false,
-                    },
-                );
-                self.is_streaming = false;
-                self.flush_pending_bash_messages();
-                self.emit_behavior_telemetry();
+                self.finish_run(&mut events, new_messages);
                 return Ok(events);
+            }
+            if let Some(max_model_turns) = self.max_model_turns.filter(|limit| *limit > 0) {
+                if turns_this_run >= max_model_turns {
+                    let notice = ChatMessage::text(
+                        "assistant",
+                        format!(
+                            "Stopped after {max_model_turns} model turns (maxModelTurns). Send a message to continue."
+                        ),
+                    );
+                    self.messages.push(notice.clone());
+                    self.persist_chat(&notice)?;
+                    new_messages.push(notice.clone());
+                    self.push_event(
+                        &mut events,
+                        AgentEvent::MessageStart {
+                            message: notice.clone(),
+                        },
+                    );
+                    self.push_event(&mut events, AgentEvent::MessageEnd { message: notice });
+                    self.finish_run(&mut events, new_messages);
+                    return Ok(events);
+                }
             }
 
             self.inject_queued(&mut events, &mut new_messages, true);
@@ -237,11 +330,6 @@ impl Agent {
             // must not bypass the budget through the legacy accessor fallback.
             if active_context_vm {
                 if let Err(error) = self.prepared_context_image() {
-                    if let Some(runtime) = &self.runtime {
-                        runtime.emit_turn_end(false);
-                    }
-                    self.is_streaming = false;
-                    self.flush_pending_bash_messages();
                     return Err(format!(
                         "Request blocked: context compilation failed: {error}"
                     ));
@@ -253,8 +341,6 @@ impl Agent {
                 .as_ref()
                 .is_some_and(|m| m.is_mandatory_violated())
             {
-                self.is_streaming = false;
-                self.flush_pending_bash_messages();
                 return Err(
                     "Request blocked: mandatory context policy is violated or unavailable".into(),
                 );
@@ -262,21 +348,14 @@ impl Agent {
 
             self.ensure_session_persistence()?;
             self.stats.model_turns += 1;
+            turns_this_run += 1;
             let model_started = std::time::Instant::now();
             let completion = self.complete_with_retry(&mut complete, &mut events);
             self.stats.model_wall_ms += model_started.elapsed().as_millis() as u64;
             let (assistant, stream_events, streamed_live, native_responses_resume) =
                 match completion {
                     Ok(output) => output,
-                    Err(err) => {
-                        if let Some(runtime) = &self.runtime {
-                            runtime.mark_turn_failed();
-                            runtime.emit_turn_end(false);
-                        }
-                        self.is_streaming = false;
-                        self.flush_pending_bash_messages();
-                        return Err(err);
-                    }
+                    Err(err) => return Err(err),
                 };
             let mut chat = assistant_to_chat(&assistant);
             if let Some(record) = &native_responses_resume {
@@ -618,6 +697,13 @@ impl Agent {
         new_messages: &mut Vec<ChatMessage>,
         steer: bool,
     ) {
+        for (kind, message) in self.remote.drain() {
+            match kind {
+                crate::QueueKind::Steer => self.queues.steer.push(message),
+                crate::QueueKind::FollowUp => self.queues.follow_up.push(message),
+            }
+        }
+
         let drained = if steer {
             let mode = self.queues.steer_mode;
             self.queues.drain_steer(mode)
@@ -700,7 +786,8 @@ impl Agent {
         } else {
             0
         };
-        let attempts = max_retries.max(1);
+        // `retry_attempts` is the number of retries after the first request.
+        let attempts = max_retries.saturating_add(1);
         let mut last_error = None;
         let mut scheduled_attempt = 0_u32;
         for attempt in 0..attempts {
@@ -736,11 +823,6 @@ impl Agent {
             }
             if attempt > 0 {
                 self.stats.provider_retries += 1;
-                if let Some(runtime) = &self.runtime {
-                    if let Some(ledger) = &runtime.budget_ledger {
-                        let _ = ledger.record_retry();
-                    }
-                }
             }
             let result = complete(self);
             drop(permit);
@@ -758,42 +840,20 @@ impl Agent {
                         self.tool_context
                             .cache
                             .record_provider_cost(usage.cost.total);
-                    }
-                    if let Some(runtime) = &self.runtime {
-                        if let Some(ledger) = &runtime.budget_ledger {
-                            let total_tokens =
-                                message.usage.as_ref().map(|u| u.total_tokens).unwrap_or(0);
-                            let cache_read =
-                                message.usage.as_ref().map(|u| u.cache_read).unwrap_or(0);
-                            let cache_write =
-                                message.usage.as_ref().map(|u| u.cache_write).unwrap_or(0);
-                            let cost = if let Some(usage) = &message.usage {
-                                if usage.cost.total > 0.0 {
-                                    crate::runtime::CostAmount::Known(
-                                        (usage.cost.total * 10_000.0) as u64,
-                                    )
-                                } else {
-                                    crate::runtime::CostAmount::Unknown
-                                }
-                            } else {
-                                crate::runtime::CostAmount::Unknown
-                            };
-                            let receipt = crate::runtime::UsageReceipt {
-                                attempt_id: format!("provider_attempt_{}_{}", message.id, attempt),
-                                provider_usage: total_tokens,
-                                estimated_usage: self.estimated_context_tokens(),
-                                cache_read_tokens: cache_read,
-                                cache_write_tokens: cache_write,
-                                cost,
-                                finished_at: std::time::SystemTime::now()
-                                    .duration_since(std::time::UNIX_EPOCH)
-                                    .map(|d| d.as_millis() as u64)
-                                    .unwrap_or(0),
-                            };
-                            let _ = ledger.settle_receipt(None, receipt);
-                            self.stats.apply_budget_snapshot(&ledger.snapshot());
+                        self.stats.budget_tokens_charged = self
+                            .stats
+                            .budget_tokens_charged
+                            .saturating_add(usage.total_tokens);
+                        if usage.cost.total > 0.0 {
+                            let minor = (usage.cost.total * 10_000.0) as u64;
+                            self.stats.cost_minor_units = Some(
+                                self.stats.cost_minor_units.unwrap_or(0).saturating_add(minor),
+                            );
+                        } else {
+                            self.stats.has_unknown_cost = true;
                         }
                     }
+
                     if message.stop_reason == Some(StopReason::Error)
                         && davinci_ai::is_retryable_assistant_error(&message)
                         && attempt + 1 < attempts
@@ -1166,6 +1226,19 @@ impl Agent {
         }
     }
 
+    /// Resolve the lane for a call whose arguments can affect its write scope.
+    fn lane_for_call(
+        &self,
+        name: &str,
+        class: crate::permission::ToolClass,
+        args: &Value,
+    ) -> crate::scheduler::ToolLane {
+        if name == "agent" && agent_call_may_write_shared(args, self.permission_mode()) {
+            return crate::scheduler::ToolLane::Serial;
+        }
+        self.lane_for_tool(name, class)
+    }
+
     fn replay_policy_for_tool(&self, name: &str) -> crate::runtime::ReplayPolicy {
         self.runtime
             .as_ref()
@@ -1322,6 +1395,16 @@ impl Agent {
         depth: usize,
         origin: crate::ToolOperationOrigin,
     ) -> Preparation {
+        if let Some(raw) = args.get(davinci_ai::INVALID_ARGUMENTS_KEY) {
+            let raw = raw.as_str().unwrap_or("<unavailable>");
+            return Preparation::Immediate(crate::ToolResult {
+                content: format!(
+                    "The arguments for `{name}` were not valid JSON, so the tool was not run. Send the call again with complete JSON arguments. Received: {raw}"
+                ),
+                is_error: true,
+                details: Some(serde_json::json!({"invalidArguments": true})),
+            });
+        }
         if let Err(error) = self.ensure_session_persistence() {
             return Preparation::Immediate(crate::ToolResult {
                 content: error,
@@ -1401,7 +1484,7 @@ impl Agent {
                             .lock()
                             .unwrap_or_else(|err| err.into_inner())
                             .class_of(name);
-                        let lane = self.lane_for_tool(name, class);
+                        let lane = self.lane_for_call(name, class, args);
                         return Preparation::Wait {
                             call_id: id.to_string(),
                             lane,
@@ -1605,7 +1688,7 @@ impl Agent {
         // Runtime metadata is authoritative when installed; unknown tools fail
         // closed inside `lane_for_capability`. Without a runtime, the legacy
         // class-based resolver still keeps unrecognized extensions serial.
-        let lane = self.lane_for_tool(name, class);
+        let lane = self.lane_for_call(name, class, args);
         if route == crate::tool_ledger::ToolCallExecutionAuthority::OperationJournal {
             let Some(mut pending) = journal_pending else {
                 return immediate(
@@ -1727,7 +1810,7 @@ impl Agent {
                 details: Some(serde_json::json!({ "denied": true })),
             };
         }
-        if let Err(violation) = self.check_contract_dispatch_boundary(cwd, name) {
+        if let Err(violation) = self.check_contract_dispatch_boundary(cwd, name, args) {
             if let Ok(mut ledger) = self.tool_ledger.lock() {
                 ledger.cancel_reservation(id);
             }
@@ -2185,7 +2268,7 @@ impl Agent {
                     }
                     self.check_contract_gate(cwd, id, name, args)
                         .map_err(|error| error.to_string())?;
-                    self.check_contract_dispatch_boundary(cwd, name)
+                    self.check_contract_dispatch_boundary(cwd, name, args)
                         .map_err(|error| error.to_string())?;
                     if let Some(reason) = self.capability_effect_denial(cwd, name, args) {
                         return Err(reason);
@@ -2391,8 +2474,11 @@ impl Agent {
                     .get("command")
                     .and_then(Value::as_str)
                     .unwrap_or_default();
-                if is_verification_command(cmd) {
-                    self.record_verification_command(cmd, !pre_hook_error && !result.is_error);
+                if let Some(trustworthy) = crate::shell_policy::verification_outcome(cmd) {
+                    self.record_verification_command(
+                        cmd,
+                        trustworthy && !pre_hook_error && !result.is_error,
+                    );
                 }
             }
         }
@@ -3064,6 +3150,7 @@ impl Agent {
         &self,
         cwd: &Path,
         name: &str,
+        args: &Value,
     ) -> Result<(), crate::runtime::ScopeViolation> {
         let Some(contract) = self.active_contract() else {
             return Ok(());
@@ -3079,6 +3166,21 @@ impl Agent {
             .any(|effect| matches!(effect, crate::runtime::DeclaredEffect::FileSystemWrite))
         {
             return Ok(());
+        }
+
+        // Host-native file tools write only after `check_call` has verified
+        // every target against the contract's writable scope. That path check
+        // is the filesystem enforcement; external tools still need a sandbox.
+        let host_native_file_tool = crate::tools::BUILTIN_TOOLS.contains(&name)
+            && effects
+                .iter()
+                .all(|effect| matches!(effect, crate::runtime::DeclaredEffect::FileSystemWrite));
+        if host_native_file_tool {
+            let targets = crate::runtime::contracts::extract_tool_targets(name, args);
+            if !targets.is_empty() {
+                contract.check_call(cwd, name, args)?;
+                return Ok(());
+            }
         }
 
         let action = crate::runtime::PreparedAction::new(name, Vec::new(), effects)
@@ -3829,20 +3931,7 @@ pub(crate) fn mutation_paths_from_tool(name: &str, args: &Value) -> Vec<PathBuf>
 }
 
 pub(crate) fn is_verification_command(cmd: &str) -> bool {
-    let lower = cmd.to_ascii_lowercase();
-    lower.contains("cargo test")
-        || lower.contains("cargo check")
-        || lower.contains("cargo clippy")
-        || lower.contains("pytest")
-        || lower.contains("npm test")
-        || lower.contains("pnpm test")
-        || lower.contains("yarn test")
-        || lower.contains("go test")
-        || lower.contains("make test")
-        || lower.contains("make check")
-        || lower.contains("ctest")
-        || lower.contains("mvn test")
-        || lower.contains("gradle test")
+    crate::shell_policy::verification_outcome(cmd).is_some()
 }
 
 #[cfg(test)]
@@ -3851,6 +3940,198 @@ mod session_persistence_tests;
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn max_retries_counts_retries_not_total_attempts() {
+        use davinci_ai::AssistantMessage;
+
+        for (max_retries, expected_calls) in [(0, 1), (1, 2), (3, 4)] {
+            let mut agent = Agent::new("retry count fixture");
+            agent.auto_retry = true;
+            agent.retry_attempts = max_retries;
+            agent.retry_base_delay_ms = 0;
+            agent.prompt("retry count");
+            let calls = std::cell::Cell::new(0);
+            let _ = agent.run_loop(|_| {
+                calls.set(calls.get() + 1);
+                Err::<AssistantMessage, String>("overloaded_error".into())
+            });
+            assert_eq!(calls.get(), expected_calls, "maxRetries={max_retries}");
+        }
+    }
+
+    fn model_turn_read_call(turn: usize) -> davinci_ai::AssistantMessage {
+        davinci_ai::AssistantMessage {
+            id: format!("assistant-{turn}"),
+            role: "assistant".into(),
+            content: vec![davinci_ai::ContentBlock::ToolCall {
+                id: format!("call-{turn}"),
+                name: "read".into(),
+                arguments: serde_json::json!({"path": format!("missing-{turn}.txt")}),
+            }],
+            model: "fixture".into(),
+            usage: None,
+            stop_reason: Some(davinci_ai::StopReason::ToolUse),
+            error_message: None,
+        }
+    }
+
+    #[test]
+    fn the_loop_stops_at_max_model_turns() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut agent = Agent::new("model turn limit fixture");
+        agent.cwd = dir.path().to_path_buf();
+        agent.set_permission_mode(crate::PermissionMode::ReadOnly);
+        assert_eq!(agent.max_model_turns, Some(200));
+        agent.max_model_turns = Some(3);
+        agent.stats.model_turns = 7;
+        agent.prompt("go");
+        let calls = std::cell::Cell::new(0);
+
+        let events = agent
+            .run_loop(|_| {
+                let turn = calls.get();
+                calls.set(turn + 1);
+                Ok(model_turn_read_call(turn))
+            })
+            .unwrap();
+
+        assert_eq!(calls.get(), 3);
+        assert_eq!(agent.stats.model_turns, 10);
+        let notice = "Stopped after 3 model turns (maxModelTurns). Send a message to continue.";
+        assert!(events.iter().any(|event| matches!(
+            event,
+            crate::AgentEvent::MessageEnd { message }
+                if message.role == "assistant"
+                    && message.content.iter().any(|content| matches!(
+                        content,
+                        davinci_ai::MessageContent::Text { text } if text == notice
+                    ))
+        )));
+        assert!(!agent.is_streaming);
+    }
+
+    #[test]
+    fn zero_max_model_turns_does_not_limit_a_run() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut agent = Agent::new("unlimited model turn fixture");
+        agent.cwd = dir.path().to_path_buf();
+        agent.set_permission_mode(crate::PermissionMode::ReadOnly);
+        agent.max_model_turns = Some(0);
+        agent.prompt("go");
+        let calls = std::cell::Cell::new(0);
+
+        let events = agent
+            .run_loop(|_| {
+                let turn = calls.get();
+                calls.set(turn + 1);
+                let content = if turn == 0 {
+                    davinci_ai::ContentBlock::ToolCall {
+                        id: "call-first".into(),
+                        name: "read".into(),
+                        arguments: serde_json::json!({"path": "missing.txt"}),
+                    }
+                } else {
+                    davinci_ai::ContentBlock::Text {
+                        text: "done".into(),
+                    }
+                };
+                Ok(davinci_ai::AssistantMessage {
+                    id: format!("assistant-{turn}"),
+                    role: "assistant".into(),
+                    content: vec![content],
+                    model: "fixture".into(),
+                    usage: None,
+                    stop_reason: Some(if turn == 0 {
+                        davinci_ai::StopReason::ToolUse
+                    } else {
+                        davinci_ai::StopReason::Stop
+                    }),
+                    error_message: None,
+                })
+            })
+            .unwrap();
+
+        assert_eq!(calls.get(), 2);
+        assert_eq!(agent.stats.model_turns, 2);
+        assert!(!events.iter().any(|event| matches!(
+            event,
+            crate::AgentEvent::MessageEnd { message }
+                if message.content.iter().any(|content| matches!(
+                    content,
+                    davinci_ai::MessageContent::Text { text }
+                        if text.contains("maxModelTurns")
+                ))
+        )));
+    }
+
+    #[test]
+    fn writable_shared_agent_calls_are_serial() {
+        let mut agent = Agent::new("agent lane fixture");
+        agent.set_permission_mode(crate::PermissionMode::Auto);
+        let shared = serde_json::json!({"prompt": "edit things"});
+        let worktree = serde_json::json!({"prompt": "edit things", "isolation": "worktree"});
+        let empty_tasks = serde_json::json!({"tasks": [], "prompt": "edit things"});
+        let empty_tasks_worktree =
+            serde_json::json!({"tasks": [], "prompt": "edit things", "isolation": "worktree"});
+        let mixed_tasks = serde_json::json!({"tasks": [
+            {"prompt": "isolated", "isolation": "worktree"},
+            {"prompt": "shared"}
+        ]});
+        let isolated_tasks = serde_json::json!({"tasks": [
+            {"prompt": "isolated one", "isolation": "worktree"},
+            {"prompt": "isolated two", "isolation": "worktree"}
+        ]});
+        for mode in [
+            crate::PermissionMode::Edits,
+            crate::PermissionMode::Auto,
+            crate::PermissionMode::AlwaysApprove,
+        ] {
+            agent.set_permission_mode(mode);
+            assert_eq!(
+                agent.lane_for_call("agent", crate::permission::ToolClass::Other, &shared),
+                crate::scheduler::ToolLane::Serial
+            );
+            assert_eq!(
+                agent.lane_for_call("agent", crate::permission::ToolClass::Other, &mixed_tasks),
+                crate::scheduler::ToolLane::Serial
+            );
+            assert_eq!(
+                agent.lane_for_call("agent", crate::permission::ToolClass::Other, &worktree),
+                crate::scheduler::ToolLane::Parallel
+            );
+            assert_eq!(
+                agent.lane_for_call("agent", crate::permission::ToolClass::Other, &empty_tasks),
+                crate::scheduler::ToolLane::Serial
+            );
+            assert_eq!(
+                agent.lane_for_call(
+                    "agent",
+                    crate::permission::ToolClass::Other,
+                    &empty_tasks_worktree
+                ),
+                crate::scheduler::ToolLane::Parallel
+            );
+            assert_eq!(
+                agent.lane_for_call(
+                    "agent",
+                    crate::permission::ToolClass::Other,
+                    &isolated_tasks
+                ),
+                crate::scheduler::ToolLane::Parallel
+            );
+        }
+        agent.set_permission_mode(crate::PermissionMode::Ask);
+        assert_eq!(
+            agent.lane_for_call("agent", crate::permission::ToolClass::Other, &shared),
+            crate::scheduler::ToolLane::Parallel
+        );
+        agent.set_permission_mode(crate::PermissionMode::ReadOnly);
+        assert_eq!(
+            agent.lane_for_call("agent", crate::permission::ToolClass::Other, &shared),
+            crate::scheduler::ToolLane::Parallel
+        );
+    }
+
     #[test]
     fn graph_effect_handoff_failure_stops_worker_after_mutation() {
         const CHILD: &str = "DAVINCI_EFFECT_HANDOFF_FIXTURE";
@@ -4518,6 +4799,46 @@ mod tests {
     use tempfile::tempdir;
 
     #[test]
+    fn a_call_with_invalid_arguments_is_answered_with_an_error_and_not_run() {
+        let root = tempdir().unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let executor_calls = calls.clone();
+        let mut agent = Agent::new("invalid argument fixture");
+        agent.tools = vec!["fixture".into()];
+        agent.permissions = Arc::new(crate::PermissionState::new(crate::PermissionPolicy::new(
+            crate::PermissionMode::AlwaysApprove,
+        )));
+        agent.custom_tool_executor = Some(crate::CustomToolExecutor::new(move |_, _, _| {
+            executor_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(crate::ToolResult {
+                content: "tool ran".into(),
+                is_error: false,
+                details: None,
+            })
+        }));
+        let raw = r#"{"path":"#;
+        let args = json!({"__davinci_invalid_arguments": raw});
+
+        let result = match agent.prepare_tool_call(root.path(), "invalid-1", "fixture", &args, 0) {
+            Preparation::Immediate(result) => result,
+            Preparation::Ready { .. } => {
+                agent.run_prepared_call(root.path(), "invalid-1", "fixture", &args, 0)
+            }
+            Preparation::Wait { .. } => panic!("a new invalid call cannot be waiting"),
+        };
+
+        assert!(result.is_error);
+        assert_eq!(
+            result.content,
+            format!(
+                "The arguments for `fixture` were not valid JSON, so the tool was not run. Send the call again with complete JSON arguments. Received: {raw}"
+            )
+        );
+        assert_eq!(result.details, Some(json!({"invalidArguments": true})));
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
     fn existing_serialized_agent_event_json_is_unchanged() {
         let event = AgentEvent::ToolExecutionStart {
             tool_call_id: "call_1".into(),
@@ -4884,7 +5205,7 @@ mod tests {
     }
 
     #[test]
-    fn f05_hard_contract_refuses_native_write_without_race_safe_boundary() {
+    fn f05_hard_contract_allows_in_scope_native_write_after_path_check() {
         let temp = tempfile::tempdir().unwrap();
         let mut agent = Agent::new("native write containment fixture");
         agent.tools = vec!["write".into()];
@@ -4905,12 +5226,72 @@ mod tests {
         )
         .unwrap();
         agent.set_active_contract(contract);
-        let args = serde_json::json!({"path": "src/ok.rs", "content": "must not land"});
+        let args = serde_json::json!({"path": "src/ok.rs", "content": "allowed"});
+
+        let result = agent.run_prepared_call(temp.path(), "native_write", "write", &args, 0);
+        assert!(!result.is_error, "{}", result.content);
+        assert_eq!(
+            std::fs::read_to_string(temp.path().join("src/ok.rs")).unwrap(),
+            "allowed"
+        );
+    }
+
+    #[test]
+    fn f05_hard_contract_still_refuses_out_of_scope_native_writes() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut agent = Agent::new("out-of-scope native write fixture");
+        agent.tools = vec!["write".into()];
+        agent.permissions = std::sync::Arc::new(crate::PermissionState::new(
+            crate::PermissionPolicy::new(crate::PermissionMode::AlwaysApprove),
+        ));
+        let contract = crate::runtime::TaskContract::new(
+            "contract-native-write-scope",
+            1,
+            crate::TaskId::new(),
+            1,
+            vec!["src/".into()],
+            vec![],
+            false,
+            vec![],
+            vec![],
+            vec![],
+        )
+        .unwrap();
+        agent.set_active_contract(contract);
+        let args = serde_json::json!({"path": "docs/x.md", "content": "out of scope"});
 
         let result = agent.run_prepared_call(temp.path(), "native_write", "write", &args, 0);
         assert!(result.is_error);
-        assert!(result.content.contains("execution_contract_unenforceable"));
-        assert!(!temp.path().join("src/ok.rs").exists());
+        assert!(result.content.contains("scope"), "{}", result.content);
+        assert!(!temp.path().join("docs/x.md").exists());
+    }
+
+    #[test]
+    fn f05_hard_contract_refuses_native_file_tools_without_checked_targets() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut agent = Agent::new("missing native write target fixture");
+        let contract = crate::runtime::TaskContract::new(
+            "contract-native-write-missing-target",
+            1,
+            crate::TaskId::new(),
+            1,
+            vec!["src/".into()],
+            vec![],
+            false,
+            vec![],
+            vec![],
+            vec![],
+        )
+        .unwrap();
+        agent.set_active_contract(contract);
+
+        let result =
+            agent.check_contract_dispatch_boundary(temp.path(), "write", &serde_json::json!({}));
+
+        let violation = result.unwrap_err();
+        assert!(violation
+            .reason
+            .contains("execution_contract_unenforceable"));
     }
 
     #[test]

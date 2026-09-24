@@ -181,19 +181,13 @@ pub fn compute_config_hash(cwd: &Path) -> String {
 
 pub fn compute_repo_state_hash(cwd: &Path) -> String {
     if cwd.join(".git").exists() {
-        let head = Command::new("git")
-            .args(["rev-parse", "HEAD"])
-            .current_dir(cwd)
-            .output()
+        let head = super::git::run(cwd, &["rev-parse", "HEAD"])
             .ok()
-            .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_string())
+            .map(|output| String::from_utf8_lossy(&output).trim().to_string())
             .unwrap_or_default();
-        let status = Command::new("git")
-            .args(["status", "--porcelain"])
-            .current_dir(cwd)
-            .output()
+        let status = super::git::run(cwd, &["status", "--porcelain"])
             .ok()
-            .map(|output| String::from_utf8_lossy(&output.stdout).to_string())
+            .map(|output| String::from_utf8_lossy(&output).to_string())
             .unwrap_or_default();
         let mut dirty_manifest = Vec::new();
         for line in status.lines() {

@@ -49,6 +49,7 @@ impl RuntimeLogWriter {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
         }
+        davinci_sys::fs::truncate_torn_tail(&path)?;
         let file = OpenOptions::new().create(true).append(true).open(&path)?;
         Ok(Self { path, file })
     }
@@ -60,7 +61,7 @@ impl RuntimeLogWriter {
     pub fn append<T: serde::Serialize>(&mut self, record: &T) -> Result<(), RuntimeLogError> {
         let line = serde_json::to_string(record)?;
         writeln!(self.file, "{line}")?;
-        self.file.flush()?;
+        self.file.sync_data()?;
         Ok(())
     }
 }
@@ -106,9 +107,9 @@ pub fn read_runtime_log<T: serde::de::DeserializeOwned>(
 
         // Schema version check
         if let Some(ver) = value.get("schema_version").and_then(|v| v.as_u64()) {
-            if ver as u16 > CURRENT_RUNTIME_SCHEMA_VERSION {
+            if ver > u64::from(CURRENT_RUNTIME_SCHEMA_VERSION) {
                 return Err(RuntimeLogError::UnsupportedSchemaVersion {
-                    found: ver as u16,
+                    found: u16::try_from(ver).unwrap_or(u16::MAX),
                     supported: CURRENT_RUNTIME_SCHEMA_VERSION,
                 });
             }
@@ -180,6 +181,35 @@ mod tests {
         assert_eq!(read.len(), 2);
         assert_eq!(read[0], r1);
         assert_eq!(read[1], r2);
+    }
+
+    #[test]
+    fn writer_repairs_a_torn_tail_before_appending() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("s.runtime.jsonl");
+        fs::write(
+            &path,
+            "{\"schema_version\":1,\"a\":1}\n{\"schema_version\":1,\"a\":",
+        )
+        .unwrap();
+        let mut writer = RuntimeLogWriter::open(&path).unwrap();
+        writer
+            .append(&serde_json::json!({"schema_version": 1, "a": 2}))
+            .unwrap();
+        let rows: Vec<serde_json::Value> = read_runtime_log(&path).unwrap();
+        assert_eq!(rows.len(), 2);
+    }
+
+    #[test]
+    fn huge_schema_version_is_unsupported_not_truncated() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("s.runtime.jsonl");
+        fs::write(&path, "{\"schema_version\":65537}\n").unwrap();
+        let err = read_runtime_log::<serde_json::Value>(&path).unwrap_err();
+        assert!(matches!(
+            err,
+            RuntimeLogError::UnsupportedSchemaVersion { .. }
+        ));
     }
 
     #[test]

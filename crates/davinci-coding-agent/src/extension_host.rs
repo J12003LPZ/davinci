@@ -175,6 +175,7 @@ pub struct ExtensionHost {
     pub editor_text: String,
     pub runtime_system_prompt: String,
     pub unregistered_providers: Vec<String>,
+    pub load_errors: Vec<(String, String)>,
     pub native: Arc<Mutex<NativeExtensionHost>>,
     before_agent_start_messages: Vec<Value>,
     before_agent_start_system_prompt: Option<String>,
@@ -207,6 +208,7 @@ impl ExtensionHost {
             editor_text: String::new(),
             runtime_system_prompt: String::new(),
             unregistered_providers: Vec::new(),
+            load_errors: Vec::new(),
             native: Arc::new(Mutex::new(NativeExtensionHost::new_with_agent_dir(
                 "runtime",
                 cwd,
@@ -232,7 +234,7 @@ impl ExtensionHost {
                         })
                     })
                     .collect();
-                if let Ok(loaded) = run_js_extension(
+                match run_js_extension(
                     &module,
                     "load",
                     &serde_json::json!({
@@ -241,7 +243,7 @@ impl ExtensionHost {
                         "toolsExpanded": false,
                     }),
                 ) {
-                    if loaded.ok {
+                    Ok(loaded) if loaded.ok => {
                         let path = module.display().to_string();
                         for custom_type in &loaded.message_renderers {
                             host.message_renderers
@@ -288,6 +290,19 @@ impl ExtensionHost {
                                         == Some("onTerminalInput")
                                 }),
                         });
+                    }
+                    Ok(loaded) => {
+                        let error = loaded
+                            .error
+                            .unwrap_or_else(|| "extension load returned ok=false".into());
+                        eprintln!("davinci: extension {} failed to load: {error}", module.display());
+                        host.load_errors
+                            .push((module.display().to_string(), error));
+                    }
+                    Err(error) => {
+                        eprintln!("davinci: extension {} failed to load: {error}", module.display());
+                        host.load_errors
+                            .push((module.display().to_string(), error));
                     }
                 }
             }
@@ -484,10 +499,14 @@ impl ExtensionHost {
 
     /// Agent-level pruning/auto-compaction removed output from the model view.
     pub fn native_context_pruned(&self) {
-        self.native
+        let native = self
+            .native
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        native
+            .governor
             .lock()
             .unwrap_or_else(|error| error.into_inner())
-            .governor
             .record_pruning();
     }
 
@@ -1115,7 +1134,7 @@ impl ExtensionHost {
             for tool in &manifest.tools {
                 if tool.name == name {
                     if let Some(command) = &tool.command {
-                        return Some(execute_command_tool(command, cwd));
+                        return Some(execute_command_tool(command, &Value::Object(Default::default()), cwd, tool.timeout_ms));
                     }
                 }
             }
@@ -1173,6 +1192,15 @@ impl ExtensionHost {
                 .clone();
             return snapshots.execute_with_context(cwd, name, args, Some(context));
         }
+        if name == "graph_run" {
+            let graph = self
+                .native
+                .lock()
+                .map_err(|_| davinci_agent::ToolError::Failed("native host unavailable".into()))?
+                .graph
+                .clone();
+            return graph.execute_tool_with_abort(name, args, context.abort.clone());
+        }
         self.execute_js_or_manifest_tool(cwd, name, args)
     }
 
@@ -1194,7 +1222,7 @@ impl ExtensionHost {
             for tool in &manifest.tools {
                 if tool.name == name {
                     if let Some(command) = &tool.command {
-                        return execute_command_tool(command, cwd)
+                        return execute_command_tool(command, args, cwd, tool.timeout_ms)
                             .map(|content| davinci_agent::ToolResult {
                                 content,
                                 is_error: false,
@@ -1550,6 +1578,30 @@ mod tests {
     use crate::js_host::JsRegisteredProvider;
 
     #[test]
+    fn malformed_js_extension_is_reported() {
+        if !node_available() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let ext = dir.path().join("extensions").join("broken");
+        std::fs::create_dir_all(&ext).unwrap();
+        std::fs::write(
+            ext.join("pi.extension.json"),
+            r#"{"name":"broken","tools":[]}"#,
+        )
+        .unwrap();
+        std::fs::write(ext.join("index.js"), "module.exports = (pi) => {").unwrap();
+        let host = ExtensionHost::load_with_cwd(
+            dir.path(),
+            &["broken".into()],
+            dir.path(),
+        );
+        assert_eq!(host.js.len(), 0);
+        assert_eq!(host.load_errors.len(), 1);
+        assert!(host.load_errors[0].0.contains("broken"));
+    }
+
+    #[test]
     fn browser_worker_dispatch_does_not_fall_back_when_parent_transport_is_unavailable() {
         let host = ExtensionHost::default();
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -1655,7 +1707,16 @@ mod tests {
                 .content,
             output.content
         );
-        assert_eq!(host.native.lock().unwrap().governor.prunings(), 1);
+        assert_eq!(
+            host.native
+                .lock()
+                .unwrap()
+                .governor
+                .lock()
+                .unwrap()
+                .prunings(),
+            1
+        );
     }
 
     #[test]

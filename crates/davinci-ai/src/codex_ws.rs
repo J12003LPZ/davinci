@@ -32,6 +32,7 @@ const OPCODE_TEXT: u8 = 0x1;
 const OPCODE_CLOSE: u8 = 0x8;
 const OPCODE_PING: u8 = 0x9;
 const OPCODE_PONG: u8 = 0xA;
+const DEFAULT_WEBSOCKET_IDLE_TIMEOUT_MS: u64 = 300_000;
 
 #[allow(clippy::too_many_arguments)]
 pub fn process_codex_websocket(
@@ -65,12 +66,9 @@ pub fn process_codex_websocket(
     if !allows_live_websocket(url) {
         return Err("WebSocket transport is not available in this runtime".into());
     }
-    let (continuation_hit, continuation) =
+    let (_, continuation) =
         acquire_cached_continuation(cache_session_id, account_id, Instant::now());
-    let _ = continuation_hit;
-    let (request_body, used_delta) =
-        build_cached_websocket_request_body(body, continuation.as_ref());
-    let _ = used_delta;
+    let (request_body, _) = build_cached_websocket_request_body(body, continuation.as_ref());
     let acquired = acquire_live_socket(
         url,
         headers,
@@ -86,11 +84,12 @@ pub fn process_codex_websocket(
         use_cached_context,
         &request_body,
     );
-    if let Some(idle_ms) = idle_timeout_ms.filter(|ms| *ms > 0) {
-        stream
-            .set_read_timeout(Some(Duration::from_millis(idle_ms)))
-            .map_err(|err| format!("WebSocket timeout: {err}"))?;
-    }
+    let idle_timeout_ms = idle_timeout_ms
+        .filter(|ms| *ms > 0)
+        .unwrap_or(DEFAULT_WEBSOCKET_IDLE_TIMEOUT_MS);
+    stream
+        .set_read_timeout(Some(Duration::from_millis(idle_timeout_ms)))
+        .map_err(|err| format!("WebSocket timeout: {err}"))?;
     let mut outgoing = request_body.clone();
     if let Value::Object(map) = &mut outgoing {
         map.insert("type".into(), Value::String("response.create".into()));
@@ -103,7 +102,7 @@ pub fn process_codex_websocket(
     let mut decoder = ResponsesDecoder::new(model);
     let (events, message, aborted) = match read_codex_events(
         &mut stream,
-        idle_timeout_ms,
+        Some(idle_timeout_ms),
         started,
         &mut decoder,
         abort,
@@ -356,6 +355,8 @@ fn stream_is_open(stream: &WsStream) -> bool {
     match &stream.inner {
         WsInner::Plain(inner) => inner.peer_addr().is_ok(),
         WsInner::Tls(inner) => inner.sock.peer_addr().is_ok(),
+        #[cfg(test)]
+        WsInner::Memory { .. } => true,
     }
 }
 
@@ -467,6 +468,11 @@ struct WsStream {
 enum WsInner {
     Plain(TcpStream),
     Tls(Box<rustls::StreamOwned<rustls::ClientConnection, TcpStream>>),
+    #[cfg(test)]
+    Memory {
+        reader: std::io::Cursor<Vec<u8>>,
+        written: Vec<u8>,
+    },
 }
 
 impl WsStream {
@@ -474,6 +480,26 @@ impl WsStream {
         match &self.inner {
             WsInner::Plain(stream) => stream.set_read_timeout(timeout),
             WsInner::Tls(stream) => stream.sock.set_read_timeout(timeout),
+            #[cfg(test)]
+            WsInner::Memory { .. } => Ok(()),
+        }
+    }
+
+    #[cfg(test)]
+    fn for_test(bytes: Vec<u8>) -> Self {
+        Self {
+            inner: WsInner::Memory {
+                reader: std::io::Cursor::new(bytes),
+                written: Vec::new(),
+            },
+        }
+    }
+
+    #[cfg(test)]
+    fn written(&self) -> &[u8] {
+        match &self.inner {
+            WsInner::Memory { written, .. } => written,
+            _ => panic!("test stream is not in memory"),
         }
     }
 }
@@ -483,6 +509,8 @@ impl Read for WsStream {
         match &mut self.inner {
             WsInner::Plain(stream) => stream.read(buf),
             WsInner::Tls(stream) => stream.read(buf),
+            #[cfg(test)]
+            WsInner::Memory { reader, .. } => reader.read(buf),
         }
     }
 }
@@ -492,6 +520,11 @@ impl Write for WsStream {
         match &mut self.inner {
             WsInner::Plain(stream) => stream.write(buf),
             WsInner::Tls(stream) => stream.write(buf),
+            #[cfg(test)]
+            WsInner::Memory { written, .. } => {
+                written.extend_from_slice(buf);
+                Ok(buf.len())
+            }
         }
     }
 
@@ -499,6 +532,8 @@ impl Write for WsStream {
         match &mut self.inner {
             WsInner::Plain(stream) => stream.flush(),
             WsInner::Tls(stream) => stream.flush(),
+            #[cfg(test)]
+            WsInner::Memory { .. } => Ok(()),
         }
     }
 }
@@ -753,7 +788,7 @@ fn read_codex_events(
             });
             return Ok((events, message, true));
         }
-        let (opcode, payload) = match read_frame(stream, idle_timeout_ms) {
+        let (opcode, payload) = match read_message(stream, idle_timeout_ms) {
             Ok(frame) => frame,
             Err(_) if saw_completion => break,
             Err(err) => return Err(err),
@@ -814,7 +849,6 @@ fn read_codex_events(
                 }
                 events.push(parsed);
             }
-            OPCODE_PING => write_frame(stream, OPCODE_PONG, &payload, true)?,
             OPCODE_CLOSE => {
                 if !saw_completion {
                     return Err(WEBSOCKET_CLOSED_BEFORE_COMPLETED.into());
@@ -835,12 +869,60 @@ fn read_codex_events(
     Ok((events, message, false))
 }
 
-fn read_frame(
+/// Reads a complete WebSocket message and handles interleaved control frames.
+fn read_message(
     stream: &mut WsStream,
     idle_timeout_ms: Option<u64>,
 ) -> Result<(u8, Vec<u8>), String> {
+    let mut opcode = None;
+    let mut payload = Vec::new();
+    loop {
+        let (fin, frame_opcode, data) = read_frame(stream, idle_timeout_ms)?;
+        match frame_opcode {
+            OPCODE_PING => {
+                if !fin {
+                    return Err("Fragmented WebSocket control frame".into());
+                }
+                write_frame(stream, OPCODE_PONG, &data, true)?;
+                continue;
+            }
+            OPCODE_PONG => {
+                if !fin {
+                    return Err("Fragmented WebSocket control frame".into());
+                }
+                continue;
+            }
+            OPCODE_CLOSE => return Ok((OPCODE_CLOSE, data)),
+            0x0 if opcode.is_none() => {
+                return Err("WebSocket continuation without a start frame".into());
+            }
+            0x0 => {}
+            start => {
+                if opcode.is_some() {
+                    return Err("WebSocket data frame inside a fragmented message".into());
+                }
+                opcode = Some(start);
+            }
+        }
+        if payload.len().saturating_add(data.len()) > 8 * 1024 * 1024 {
+            return Err("WebSocket message too big".into());
+        }
+        payload.extend_from_slice(&data);
+        if fin {
+            let opcode =
+                opcode.ok_or_else(|| "WebSocket message has no start frame".to_string())?;
+            return Ok((opcode, payload));
+        }
+    }
+}
+
+fn read_frame(
+    stream: &mut WsStream,
+    idle_timeout_ms: Option<u64>,
+) -> Result<(bool, u8, Vec<u8>), String> {
     let mut header = [0u8; 2];
     read_exact(stream, &mut header, idle_timeout_ms)?;
+    let fin = header[0] & 0x80 != 0;
     let opcode = header[0] & 0x0f;
     let masked = header[1] & 0x80 != 0;
     let mut len = (header[1] & 0x7f) as u64;
@@ -870,7 +952,7 @@ fn read_frame(
             *byte ^= key[index % 4];
         }
     }
-    Ok((opcode, payload))
+    Ok((fin, opcode, payload))
 }
 
 fn read_exact(
@@ -891,10 +973,9 @@ fn read_exact(
 
 fn map_io_error(err: std::io::Error, idle_timeout_ms: Option<u64>) -> String {
     if err.kind() == std::io::ErrorKind::TimedOut || err.kind() == std::io::ErrorKind::WouldBlock {
-        if let Some(ms) = idle_timeout_ms {
-            return websocket_idle_timeout_error(ms);
-        }
-        return websocket_connect_timeout_error(0);
+        return websocket_idle_timeout_error(
+            idle_timeout_ms.unwrap_or(DEFAULT_WEBSOCKET_IDLE_TIMEOUT_MS),
+        );
     }
     format!("WebSocket error: {err}")
 }
@@ -966,6 +1047,42 @@ mod tests {
             headers: Default::default(),
             thinking_level_map: Default::default(),
         }
+    }
+
+    fn frame(fin: bool, opcode: u8, payload: &[u8]) -> Vec<u8> {
+        let mut out = vec![(if fin { 0x80 } else { 0 }) | opcode, payload.len() as u8];
+        out.extend_from_slice(payload);
+        out
+    }
+
+    #[test]
+    fn fragmented_text_message_is_reassembled() {
+        let text = br#"{"type":"response.completed","response":{"id":"r"}}"#;
+        let (a, b) = text.split_at(10);
+        let mut wire = Vec::new();
+        wire.extend(frame(false, OPCODE_TEXT, a));
+        wire.extend(frame(true, OPCODE_PING, b""));
+        wire.extend(frame(true, 0x0, b));
+
+        let mut stream = WsStream::for_test(wire);
+        let (opcode, payload) = read_message(&mut stream, Some(1000)).unwrap();
+
+        assert_eq!(opcode, OPCODE_TEXT);
+        assert_eq!(payload, text);
+        assert_eq!(&stream.written()[..2], &[0x80 | OPCODE_PONG, 0x80]);
+    }
+
+    #[test]
+    fn missing_idle_timeout_reports_the_default_idle_timeout() {
+        let error = map_io_error(
+            std::io::Error::new(std::io::ErrorKind::TimedOut, "timed out"),
+            None,
+        );
+
+        assert_eq!(
+            error,
+            websocket_idle_timeout_error(DEFAULT_WEBSOCKET_IDLE_TIMEOUT_MS)
+        );
     }
 
     #[test]

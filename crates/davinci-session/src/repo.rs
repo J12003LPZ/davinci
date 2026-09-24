@@ -84,6 +84,15 @@ impl LogItem {
     }
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum PlannedEntryAppend {
+    Existing(SessionEntry),
+    Mutation {
+        mutation: crate::SessionMutation,
+        entry: SessionEntry,
+    },
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct EntryQuery {
     pub entry_type: Option<String>,
@@ -933,6 +942,154 @@ impl Session {
 
     pub fn state_mut(&mut self) -> &mut SessionState {
         &mut self.state
+    }
+
+    pub(crate) fn plan_entry(
+        &self,
+        mut entry: SessionEntry,
+        lane: &str,
+    ) -> Result<(crate::SessionMutation, SessionEntry), SessionError> {
+        let leaf = self.state.require_lane(lane)?;
+        if entry.seq == 0 {
+            entry.seq = self.state.next_sequence();
+        }
+        if entry.timestamp == 0 {
+            entry.timestamp = now_ms();
+        }
+        if entry.parent_id.is_none() {
+            entry.parent_id = leaf.clone();
+        }
+        self.state.validate_unused_id(&entry.id)?;
+        if entry.seq != self.state.next_sequence() {
+            return Err(SessionError::invalid_entry(format!(
+                "Invalid session mutation: has non-consecutive seq {}",
+                entry.seq
+            )));
+        }
+        if entry.parent_id != leaf {
+            return Err(SessionError::invalid_entry(
+                "Invalid session mutation: does not chain to the lane leaf",
+            ));
+        }
+        self.state.validate_target(entry.parent_id.as_deref())?;
+        let mutation = crate::SessionMutation::Entry {
+            lane: Some(lane.to_string()),
+            entry: entry.clone(),
+        };
+        Ok((mutation, entry))
+    }
+
+    pub(crate) fn plan_entry_once(
+        &self,
+        lane: &str,
+        event_id: &str,
+        expected_parent_id: Option<&str>,
+        mut entry: SessionEntry,
+    ) -> Result<PlannedEntryAppend, SessionError> {
+        prepare_operation_entry(event_id, &mut entry)?;
+        if let Some(existing) = self.state.get_entry(event_id) {
+            if operation_entry_matches(existing, &entry)
+                && self.state.entry_is_on_lane_lineage(lane, event_id)?
+            {
+                return Ok(PlannedEntryAppend::Existing(existing.clone()));
+            }
+            return Err(SessionError::invalid_entry(format!(
+                "Operation event {event_id} is outside the current lineage or has a different payload"
+            )));
+        }
+        if self.state.require_lane(lane)?.as_deref() != expected_parent_id {
+            return Err(SessionError::invalid_entry(format!(
+                "Operation event {event_id} session lineage changed before append"
+            )));
+        }
+        entry.parent_id = expected_parent_id.map(str::to_owned);
+        let (mutation, entry) = self.plan_entry(entry, lane)?;
+        Ok(PlannedEntryAppend::Mutation { mutation, entry })
+    }
+
+    pub(crate) fn plan_record(
+        &self,
+        mut record: LaneRecord,
+    ) -> Result<(crate::SessionMutation, LaneRecord), SessionError> {
+        if record.seq == 0 {
+            record.seq = self.state.next_sequence();
+        }
+        if record.timestamp == 0 {
+            record.timestamp = now_ms();
+        }
+        let lane = record
+            .lane
+            .clone()
+            .ok_or_else(|| SessionError::invalid_lane("Lane not found: ".to_string()))?;
+        self.state.require_lane(&lane)?;
+        self.state.validate_unused_id(&record.id)?;
+        if record.record_type == "operation_started" {
+            if let Some(open) = self.state.find_open_operations(&lane, Some(1))?.first() {
+                return Err(SessionError::storage(format!(
+                    "Lane {lane} already has an open operation {}",
+                    open.id
+                )));
+            }
+        }
+        if record.seq != self.state.next_sequence() {
+            return Err(SessionError::invalid_entry(format!(
+                "Invalid session mutation: has non-consecutive seq {}",
+                record.seq
+            )));
+        }
+        let mutation = crate::SessionMutation::Record {
+            lane: Some(lane),
+            record: record.clone(),
+        };
+        Ok((mutation, record))
+    }
+
+    pub(crate) fn plan_create_lane(
+        &self,
+        lane: &str,
+        at: Option<&str>,
+    ) -> Result<crate::SessionMutation, SessionError> {
+        self.state.validate_new_lane(lane)?;
+        self.state.validate_target(at)?;
+        Ok(crate::SessionMutation::Lane {
+            seq: self.state.next_sequence(),
+            lane: lane.to_string(),
+            leaf_id: at.map(str::to_string),
+        })
+    }
+
+    pub(crate) fn plan_move_lane(
+        &self,
+        lane: &str,
+        to: Option<&str>,
+    ) -> Result<crate::SessionMutation, SessionError> {
+        self.state.require_lane(lane)?;
+        self.state.validate_target(to)?;
+        Ok(crate::SessionMutation::Lane {
+            seq: self.state.next_sequence(),
+            lane: lane.to_string(),
+            leaf_id: to.map(str::to_string),
+        })
+    }
+
+    pub(crate) fn plan_name(&self, name: Option<&str>) -> crate::SessionMutation {
+        crate::SessionMutation::FactName {
+            seq: self.state.next_sequence(),
+            name: name.map(str::to_string),
+        }
+    }
+
+    pub(crate) fn plan_label(
+        &self,
+        id: &str,
+        label: Option<&str>,
+    ) -> Result<crate::SessionMutation, SessionError> {
+        self.state.validate_target(Some(id))?;
+        Ok(crate::SessionMutation::FactLabel {
+            seq: self.state.next_sequence(),
+            target_id: id.to_string(),
+            label: label.map(str::to_string),
+        })
     }
 
     pub fn apply_log_item(&mut self, item: LogItem) -> Result<(), SessionError> {

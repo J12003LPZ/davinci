@@ -76,26 +76,7 @@ pub fn terminate(child: &mut Child) {
 }
 
 pub fn terminate_process_tree(pid: u32) {
-    #[cfg(windows)]
-    {
-        let _ = Command::new("taskkill")
-            .args(["/PID", &pid.to_string(), "/T", "/F"])
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status();
-    }
-    #[cfg(not(windows))]
-    {
-        let ipid = pid as i32;
-        unsafe {
-            let _ = libc::kill(-ipid, libc::SIGTERM);
-            let _ = libc::kill(ipid, libc::SIGTERM);
-            thread::sleep(Duration::from_millis(50));
-            let _ = libc::kill(-ipid, libc::SIGKILL);
-            let _ = libc::kill(ipid, libc::SIGKILL);
-        }
-    }
+    davinci_sys::process::kill_tree(pid);
 }
 
 #[allow(dead_code)]
@@ -250,7 +231,13 @@ pub fn run_child(
 pub fn shell_command(command: &str, cwd: &std::path::Path) -> Command {
     let mut process = if cfg!(windows) {
         let mut process = Command::new("cmd");
-        process.arg("/C").arg(command);
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            // cmd.exe owns parsing of the command line. Avoid MSVC argv
+            // escaping, which changes nested quotes before cmd sees them.
+            process.raw_arg("/C").raw_arg(command);
+        }
         process
     } else {
         let mut process = Command::new("sh");
@@ -258,6 +245,7 @@ pub fn shell_command(command: &str, cwd: &std::path::Path) -> Command {
         process
     };
     process.current_dir(cwd);
+    davinci_sys::process::set_own_process_group(&mut process);
     process
 }
 
@@ -389,6 +377,27 @@ mod tests {
             started.elapsed() < Duration::from_secs(2),
             "waited for descendant pipe handles"
         );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn cmd_receives_quoted_arguments_intact() {
+        let dir = tempfile::tempdir().unwrap();
+        let output = shell_command(r#"echo "a b""#, dir.path()).output().unwrap();
+        assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), r#""a b""#);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn timeout_kills_the_shells_children() {
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("still-running");
+        let script = format!("(sleep 2; touch {}) & wait", marker.display());
+        let abort = Arc::new(AtomicBool::new(false));
+        let _ = run_child(shell_command(&script, dir.path()), &abort, 300, |_| {}, |_| {})
+            .unwrap();
+        thread::sleep(Duration::from_secs(3));
+        assert!(!marker.exists(), "the backgrounded child survived the timeout");
     }
 
     #[test]

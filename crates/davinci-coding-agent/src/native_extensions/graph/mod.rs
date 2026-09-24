@@ -14,6 +14,9 @@
 //! it finishes, blocks, or the operator aborts it. See [`types::GraphBudgets`].
 
 pub(crate) mod bindings;
+pub(crate) mod blobs;
+pub(crate) mod git;
+pub(crate) mod tail;
 pub(crate) mod briefings;
 pub(crate) mod config;
 pub(crate) mod continuation;
@@ -340,9 +343,9 @@ pub struct GraphController {
     session_thinking: Option<String>,
     session_role_models: Option<std::collections::BTreeMap<Role, String>>,
     project_trusted: bool,
-    pub memory: Option<crate::native_extensions::VectorMemory>,
+    pub memory: Option<crate::native_extensions::SharedVectorMemory>,
     pub learning: Option<crate::native_extensions::LearningController>,
-    pub governor: Option<crate::native_extensions::TokenGovernor>,
+    pub governor: Option<crate::native_extensions::SharedTokenGovernor>,
     pub language_intelligence:
         Option<crate::native_extensions::language_intelligence::LanguageIntelligence>,
     pub processes: Option<davinci_agent::process_manager::ProcessManager>,
@@ -609,26 +612,73 @@ impl GraphController {
         }))
     }
 
+    fn apply_tool_budget_defaults(config: &mut GraphConfig) {
+        const WORKER_TIMEOUT_MS: u64 = 20 * 60 * 1000;
+        const VERIFY_TIMEOUT_MS: u64 = 10 * 60 * 1000;
+        const RUN_DEADLINE_MS: u64 = 2 * 60 * 60 * 1000;
+        const MAX_COST_USD: f64 = 5.0;
+
+        if config.budgets.max_cost_usd <= 0.0 {
+            config.budgets.max_cost_usd = MAX_COST_USD;
+        }
+        if config.budgets.run_deadline_ms == 0 {
+            config.budgets.run_deadline_ms = RUN_DEADLINE_MS;
+        }
+        if config.budgets.verify_command_timeout_ms == 0 {
+            config.budgets.verify_command_timeout_ms = VERIFY_TIMEOUT_MS;
+        }
+        for role in Role::ALL {
+            if config.budgets.worker_timeout_ms.get(*role) == 0 {
+                config.budgets.worker_timeout_ms.set(*role, WORKER_TIMEOUT_MS);
+            }
+        }
+    }
+
     /// Run to completion on the calling thread and return the full summary.
     /// Used by the `graph_run` tool, where the caller wants the outcome, not a
     /// handle to poll.
-    fn run_to_completion(&self, parsed: ParsedGraphArgs) -> Result<GraphRun, String> {
+    fn run_to_completion(
+        &self,
+        parsed: ParsedGraphArgs,
+        tool_abort: Option<Arc<AtomicBool>>,
+    ) -> Result<GraphRun, String> {
         if parsed.goal.trim().is_empty() {
             return Err("graph goal cannot be empty".into());
         }
         refuse_if_active(&self.cwd)?;
         let workspace_lease = lease::WorkspaceLease::acquire(&self.cwd)?;
         let active = Arc::new(ActiveRun::default());
-        let (deps, _config_errors) = self.deps(parsed.dry_run, &active);
+        let (mut deps, _config_errors) = self.deps(parsed.dry_run, &active);
+        Self::apply_tool_budget_defaults(&mut deps.config);
         let options = self.options(&parsed, Arc::clone(&active.abort), HashMap::new(), None);
         register_run(&self.cwd, Arc::clone(&active));
-        let _guard = FinishedOnDrop(Arc::clone(&active));
-        Ok(controller::run_graph_owned(
-            options,
-            deps,
-            None,
-            workspace_lease,
-        ))
+
+        if tool_abort
+            .as_ref()
+            .is_some_and(|abort| abort.load(Ordering::Relaxed))
+        {
+            active.abort.store(true, Ordering::SeqCst);
+        }
+        let watcher = tool_abort.map(|tool_abort| {
+            let active = Arc::clone(&active);
+            thread::spawn(move || {
+                while !active.finished.load(Ordering::Relaxed) {
+                    if tool_abort.load(Ordering::Relaxed) {
+                        active.abort.store(true, Ordering::SeqCst);
+                        break;
+                    }
+                    thread::sleep(Duration::from_millis(50));
+                }
+            })
+        });
+
+        let guard = FinishedOnDrop(Arc::clone(&active));
+        let result = controller::run_graph_owned(options, deps, None, workspace_lease);
+        drop(guard);
+        if let Some(watcher) = watcher {
+            let _ = watcher.join();
+        }
+        Ok(result)
     }
 
     fn resume(&self, wanted: &str) -> Result<Value, String> {
@@ -797,7 +847,7 @@ impl GraphController {
             .collect();
         json!({
             "active": active.is_some() && is_running(&self.cwd),
-            "run": current,
+            "run": current.as_ref().map(run_for_display),
             "status": current.as_ref().map(render_now).unwrap_or_default(),
             "summary": current.as_ref().map(render_run_summary),
             "recent": recent,
@@ -879,6 +929,15 @@ impl GraphController {
     }
 
     pub fn execute_tool(&self, name: &str, args: &Value) -> Result<ToolResult, ToolError> {
+        self.execute_tool_with_abort(name, args, None)
+    }
+
+    pub fn execute_tool_with_abort(
+        &self,
+        name: &str,
+        args: &Value,
+        abort: Option<Arc<AtomicBool>>,
+    ) -> Result<ToolResult, ToolError> {
         match name {
             "graph_run" => {
                 let goal = args.get("goal").and_then(Value::as_str).unwrap_or_default();
@@ -890,11 +949,13 @@ impl GraphController {
                         .and_then(types::Complexity::parse),
                     dry_run: args.get("dryRun").and_then(Value::as_bool).unwrap_or(false),
                 };
-                let run = self.run_to_completion(parsed).map_err(ToolError::Failed)?;
+                let run = self
+                    .run_to_completion(parsed, abort)
+                    .map_err(ToolError::Failed)?;
                 Ok(ToolResult {
                     content: render_run_summary(&run),
                     is_error: run.phase != types::Phase::Done,
-                    details: Some(json!({"graph": run})),
+                    details: Some(json!({"graph": run_for_display(&run)})),
                 })
             }
             "graph_status" => {
@@ -1174,18 +1235,13 @@ impl GraphController {
             .ok_or_else(|| "No graph run found in this project to diff.".to_string())?;
         let current = load_run(&self.cwd, &latest.run_id)
             .ok_or_else(|| format!("Could not load run {}", latest.run_id))?;
-        let prior = if let Some(rev) = revision {
-            list_runs(&self.cwd)
-                .iter()
-                .filter_map(|s| load_run(&self.cwd, &s.run_id))
-                .find(|r| r.revision == rev)
-        } else if current.revision > 1 {
-            list_runs(&self.cwd)
-                .iter()
-                .filter_map(|s| load_run(&self.cwd, &s.run_id))
-                .find(|r| r.revision == current.revision - 1)
-        } else {
-            None
+        let prior = match revision {
+            Some(rev) if rev == current.revision => Some(current.clone()),
+            Some(rev) => history::load_revision(&self.cwd, &current.run_id, rev),
+            None if current.revision > 0 => {
+                history::load_revision(&self.cwd, &current.run_id, current.revision - 1)
+            }
+            None => None,
         };
         Ok(operations::generate_graph_diff(
             &current,
@@ -1476,12 +1532,18 @@ impl GraphController {
                                     latest.run_id
                                 ));
                             };
-                            if run.phase == types::Phase::Done
-                                || run.current_lifecycle() == types::GraphLifecycle::Paused
-                            {
-                                self.status(Some(&run.run_id))
-                            } else {
+                            let resumable =
+                                run.current_lifecycle() == types::GraphLifecycle::Running
+                                    && !matches!(
+                                        run.phase,
+                                        types::Phase::Done
+                                            | types::Phase::Blocked
+                                            | types::Phase::Cancelled
+                                    );
+                            if resumable {
                                 self.resume(&run.run_id)?
+                            } else {
+                                self.status(Some(&run.run_id))
                             }
                         }
                     }
@@ -1578,11 +1640,40 @@ impl GraphController {
     }
 }
 
+/// A run as tools and the session may see it. The continuation field holds full
+/// file baselines for resume and rollback; it stays on disk only.
+fn run_for_display(run: &types::GraphRun) -> Value {
+    strip_continuation(serde_json::to_value(run).unwrap_or(Value::Null))
+}
+
+fn strip_continuation(mut value: Value) -> Value {
+    if let Some(object) = value.as_object_mut() {
+        object.remove("continuation");
+    }
+    value
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use tempfile::tempdir;
     use types::{ArtifactKind, Phase, TaskStatus};
+
+    #[test]
+    fn displayed_run_has_no_baseline_contents() {
+        let secret: Vec<u8> = b"OPENAI_API_KEY=sk-secret".to_vec();
+        let run = json!({
+            "runId": "r1",
+            "phase": "running",
+            "continuation": {
+                "savedBaseline": { "files": {}, "contents": { ".env": secret } }
+            }
+        });
+        let shown = strip_continuation(run);
+        assert!(shown.get("continuation").is_none());
+        assert_eq!(shown["runId"], "r1");
+        assert!(!shown.to_string().contains("115,107,45")); // "sk-" as bytes
+    }
 
     /// The active-run registry and `abort_all_runs` are process-wide by
     /// design (one process is one session), so tests that touch them run one
@@ -2460,6 +2551,22 @@ mod tests {
         assert!(resumed.blocked_reason.is_none());
         assert!(resumed.counters.cost_usd >= 6.83);
         assert!(resumed.counters.revision_cycles >= 3);
+    }
+
+    #[test]
+    fn bare_graph_command_shows_cancelled_run_without_resuming() {
+        let _guard = registry_guard();
+        let dir = tempdir().unwrap();
+        let controller = controller(dir.path());
+        let mut run = controller
+            .run_to_completion(parse_graph_args("--dry-run --simple cancelled fixture"))
+            .unwrap();
+        run.phase = Phase::Cancelled;
+        run.lifecycle = Some(types::GraphLifecycle::Stopped);
+        store::save_run(&mut run).unwrap();
+        let response = controller.command("graph", "").unwrap().unwrap();
+        assert_eq!(response["phase"], "cancelled");
+        assert!(!is_running(dir.path()));
     }
 
     #[test]

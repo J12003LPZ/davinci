@@ -8,6 +8,7 @@ description = "JSONL session store matching pi-agent-core session harness"
 
 [dependencies]
 davinci-protocol = { path = "../davinci-protocol" }
+davinci-sys = { path = "../davinci-sys" }
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true

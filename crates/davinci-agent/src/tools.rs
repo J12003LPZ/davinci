@@ -1025,10 +1025,7 @@ fn mcp_call_tool(
     input: &serde_json::Value,
     context: &ToolContext,
 ) -> Result<ToolResult, ToolError> {
-    let Some((server, tool)) = davinci_mcp::split_agent_tool_name(name) else {
-        return Err(ToolError::Unknown(name.to_string()));
-    };
-    context.mcp.call(server, tool, input)
+    context.mcp.call_exposed(name, input)
 }
 
 fn update_plan_parameters() -> Value {
@@ -1895,7 +1892,7 @@ fn shell_tool(
         serde_json::Value::Number(number) => number.to_string(),
         other => other.to_string(),
     });
-    let output = if let Some(host) = &context.foreground_supervisor {
+    let (output, pipe_truncated) = if let Some(host) = &context.foreground_supervisor {
         let custom = std::env::var("PI_SHELL")
             .ok()
             .filter(|value| !value.is_empty());
@@ -1920,7 +1917,7 @@ fn shell_tool(
         if let Some(capture) = &context.command_receipt {
             capture.completed(cwd, &command, started_at_ms, &output);
         }
-        output
+        (output, false)
     } else {
         wait_shell_output(
             spawn_shell(cwd, &command, false)?,
@@ -1938,17 +1935,26 @@ fn shell_tool(
     }
     Ok(ToolResult {
         content,
-        is_error: !output.status.success(),
+        is_error: !output.status.success() || pipe_truncated,
         details: Some(serde_json::json!({"exitCode": output.status.code()})),
     })
 }
 
 const MAX_SHELL_STREAM_BYTES: usize = 16 * 1024 * 1024;
+const PIPE_TRUNCATED_NOTE: &str = "(output truncated: a background process kept the pipe open)";
 
-fn read_shell_stream(mut pipe: impl std::io::Read, limit: usize) -> std::io::Result<Vec<u8>> {
-    let mut bytes = Vec::new();
+#[derive(Default)]
+struct ShellStreamCapture {
+    bytes: Vec<u8>,
+    overflow: bool,
+}
+
+fn read_shell_stream_into(
+    mut pipe: impl std::io::Read,
+    limit: usize,
+    capture: &Arc<Mutex<ShellStreamCapture>>,
+) -> std::io::Result<()> {
     let mut buffer = [0u8; 8192];
-    let mut overflow = false;
     loop {
         let count = match pipe.read(&mut buffer) {
             Ok(0) => break,
@@ -1956,20 +1962,38 @@ fn read_shell_stream(mut pipe: impl std::io::Read, limit: usize) -> std::io::Res
             Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
             Err(error) => return Err(error),
         };
-        let retained = count.min(limit.saturating_sub(bytes.len()));
-        bytes.extend_from_slice(&buffer[..retained]);
-        overflow |= retained != count;
+        let mut capture = capture.lock().unwrap_or_else(|err| err.into_inner());
+        let retained = count.min(limit.saturating_sub(capture.bytes.len()));
+        capture.bytes.extend_from_slice(&buffer[..retained]);
+        capture.overflow |= retained != count;
         // Keep draining after the cap: stopping here could block the child on
         // a full pipe. Incomplete output must never become verification evidence.
     }
-    if overflow {
+    if capture
+        .lock()
+        .unwrap_or_else(|err| err.into_inner())
+        .overflow
+    {
         return Err(std::io::Error::other(
             "command output exceeded stream byte limit",
         ));
     }
+    Ok(())
+}
+
+#[cfg(test)]
+fn read_shell_stream(pipe: impl std::io::Read, limit: usize) -> std::io::Result<Vec<u8>> {
+    let capture = Arc::new(Mutex::new(ShellStreamCapture::default()));
+    read_shell_stream_into(pipe, limit, &capture)?;
+    let bytes = capture
+        .lock()
+        .unwrap_or_else(|err| err.into_inner())
+        .bytes
+        .clone();
     Ok(bytes)
 }
 
+#[cfg(test)]
 fn join_shell_stream(
     handle: Option<std::thread::JoinHandle<std::io::Result<Vec<u8>>>>,
 ) -> Result<Vec<u8>, ToolError> {
@@ -1982,18 +2006,91 @@ fn join_shell_stream(
     }
 }
 
+fn shell_readers_finished(
+    stdout: &Option<std::thread::JoinHandle<std::io::Result<()>>>,
+    stderr: &Option<std::thread::JoinHandle<std::io::Result<()>>>,
+) -> bool {
+    stdout.as_ref().map_or(true, |handle| handle.is_finished())
+        && stderr.as_ref().map_or(true, |handle| handle.is_finished())
+}
+
+fn join_finished_shell_stream(
+    handle: Option<std::thread::JoinHandle<std::io::Result<()>>>,
+) -> Result<bool, ToolError> {
+    match handle {
+        None => Ok(true),
+        Some(handle) if handle.is_finished() => handle
+            .join()
+            .map_err(|_| ToolError::Failed("command output reader panicked".into()))?
+            .map_err(|error| ToolError::Failed(format!("command output capture failed: {error}")))
+            .map(|()| true),
+        Some(_) => Ok(false),
+    }
+}
+
+fn finish_shell_capture(
+    child_pid: u32,
+    stdout_handle: Option<std::thread::JoinHandle<std::io::Result<()>>>,
+    stderr_handle: Option<std::thread::JoinHandle<std::io::Result<()>>>,
+    stdout_capture: &Arc<Mutex<ShellStreamCapture>>,
+    stderr_capture: &Arc<Mutex<ShellStreamCapture>>,
+) -> Result<(Vec<u8>, Vec<u8>, bool), ToolError> {
+    const READER_GRACE: std::time::Duration = std::time::Duration::from_millis(500);
+    let started = std::time::Instant::now();
+    while !shell_readers_finished(&stdout_handle, &stderr_handle)
+        && started.elapsed() < READER_GRACE
+    {
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    let pending = !shell_readers_finished(&stdout_handle, &stderr_handle);
+    if pending {
+        crate::jobs::kill_tree(child_pid);
+    }
+
+    let stdout_done = join_finished_shell_stream(stdout_handle)?;
+    let stderr_done = join_finished_shell_stream(stderr_handle)?;
+    let stdout = stdout_capture.lock().unwrap_or_else(|err| err.into_inner());
+    let stderr = stderr_capture.lock().unwrap_or_else(|err| err.into_inner());
+    if stdout.overflow || stderr.overflow {
+        return Err(ToolError::Failed(
+            "command output capture failed: command output exceeded stream byte limit".into(),
+        ));
+    }
+    Ok((
+        stdout.bytes.clone(),
+        stderr.bytes.clone(),
+        pending || !stdout_done || !stderr_done,
+    ))
+}
+
+fn append_pipe_truncated_note(stderr: &mut Vec<u8>, truncated: bool) {
+    if !truncated {
+        return;
+    }
+    if !stderr.is_empty() {
+        stderr.push(b'\n');
+    }
+    stderr.extend_from_slice(PIPE_TRUNCATED_NOTE.as_bytes());
+}
+
 fn wait_shell_output(
     mut child: std::process::Child,
     timeout_ms: Option<u64>,
     timeout_label: Option<&str>,
     context: &ToolContext,
-) -> Result<std::process::Output, ToolError> {
+) -> Result<(std::process::Output, bool), ToolError> {
     let stdout = child.stdout.take();
     let stderr = child.stderr.take();
-    let stdout_handle = stdout
-        .map(|pipe| std::thread::spawn(move || read_shell_stream(pipe, MAX_SHELL_STREAM_BYTES)));
-    let stderr_handle = stderr
-        .map(|pipe| std::thread::spawn(move || read_shell_stream(pipe, MAX_SHELL_STREAM_BYTES)));
+    let stdout_capture = Arc::new(Mutex::new(ShellStreamCapture::default()));
+    let stderr_capture = Arc::new(Mutex::new(ShellStreamCapture::default()));
+    let stdout_handle = stdout.map(|pipe| {
+        let capture = Arc::clone(&stdout_capture);
+        std::thread::spawn(move || read_shell_stream_into(pipe, MAX_SHELL_STREAM_BYTES, &capture))
+    });
+    let stderr_handle = stderr.map(|pipe| {
+        let capture = Arc::clone(&stderr_capture);
+        std::thread::spawn(move || read_shell_stream_into(pipe, MAX_SHELL_STREAM_BYTES, &capture))
+    });
     // Poll rather than block in `wait`: the turn's abort flag has to be able
     // to end the command, timeout or not.
     let start = std::time::Instant::now();
@@ -2008,12 +2105,17 @@ fn wait_shell_output(
                     std::thread::sleep(std::time::Duration::from_millis(10));
                     continue;
                 }
+                crate::jobs::kill_tree(child.id());
                 let _ = child.kill();
                 let _ = child.wait();
-                let stdout = join_shell_stream(stdout_handle);
-                let stderr = join_shell_stream(stderr_handle);
-                let stdout = stdout?;
-                let stderr = stderr?;
+                let (stdout, mut stderr, truncated) = finish_shell_capture(
+                    child.id(),
+                    stdout_handle,
+                    stderr_handle,
+                    &stdout_capture,
+                    &stderr_capture,
+                )?;
+                append_pipe_truncated_note(&mut stderr, truncated);
                 let mut content = String::from_utf8_lossy(&stdout).into_owned();
                 if !stderr.is_empty() {
                     if !content.is_empty() {
@@ -2033,17 +2135,37 @@ fn wait_shell_output(
                     format!("{content}\n\n{status}")
                 }));
             }
-            Err(err) => return Err(ToolError::Failed(err.to_string())),
+            Err(err) => {
+                crate::jobs::kill_tree(child.id());
+                let _ = child.kill();
+                let _ = child.wait();
+                let _ = finish_shell_capture(
+                    child.id(),
+                    stdout_handle,
+                    stderr_handle,
+                    &stdout_capture,
+                    &stderr_capture,
+                );
+                return Err(ToolError::Failed(err.to_string()));
+            }
         }
     };
-    // Join both even when one failed, so no reader is detached on this path.
-    let stdout = join_shell_stream(stdout_handle);
-    let stderr = join_shell_stream(stderr_handle);
-    Ok(std::process::Output {
-        status,
-        stdout: stdout?,
-        stderr: stderr?,
-    })
+    let (stdout, mut stderr, truncated) = finish_shell_capture(
+        child.id(),
+        stdout_handle,
+        stderr_handle,
+        &stdout_capture,
+        &stderr_capture,
+    )?;
+    append_pipe_truncated_note(&mut stderr, truncated);
+    Ok((
+        std::process::Output {
+            status,
+            stdout,
+            stderr,
+        },
+        truncated,
+    ))
 }
 
 fn powershell_tool(
@@ -2138,12 +2260,19 @@ fn powershell_tool(
             std::process::Stdio::null()
         };
         let spawn = || {
-            Command::new(program_path)
+            let mut process = Command::new(program_path);
+            process
                 .args(["-NoProfile", "-NonInteractive", "-Command", &wrapped])
                 .current_dir(cwd)
                 .stdin(stdin)
                 .stdout(std::process::Stdio::piped())
-                .stderr(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped());
+            #[cfg(unix)]
+            {
+                use std::os::unix::process::CommandExt;
+                process.process_group(0);
+            }
+            process
                 .spawn()
                 .map_err(|error| ToolError::Failed(error.to_string()))
         };
@@ -2173,7 +2302,8 @@ fn powershell_tool(
                 );
             return Ok(crate::jobs::started_result(id, pid, command));
         }
-        let output = wait_shell_output(child, timeout_ms, timeout_label.as_deref(), context)?;
+        let (output, pipe_truncated) =
+            wait_shell_output(child, timeout_ms, timeout_label.as_deref(), context)?;
         let mut content = String::from_utf8_lossy(&output.stdout).into_owned();
         if !output.stderr.is_empty() {
             if !content.is_empty() {
@@ -2183,7 +2313,7 @@ fn powershell_tool(
         }
         return Ok(ToolResult {
             content,
-            is_error: !output.status.success(),
+            is_error: !output.status.success() || pipe_truncated,
             details: Some(serde_json::json!({"exitCode": output.status.code()})),
         });
     }
@@ -3308,26 +3438,34 @@ fn glob_match(pattern: &str, name: &str) -> bool {
 fn match_glob_chars(pattern: &str, name: &str) -> bool {
     let p: Vec<char> = pattern.chars().collect();
     let n: Vec<char> = name.chars().collect();
-    fn rec(p: &[char], n: &[char]) -> bool {
-        match (p.first(), n.first()) {
-            (None, None) => true,
-            (Some('*'), _) if p.get(1) == Some(&'*') => {
-                let rest = if p.get(2) == Some(&'/') {
-                    &p[3..]
-                } else {
-                    &p[2..]
-                };
-                rec(rest, n)
-                    || (!n.is_empty() && rec(p, &n[1..]))
-                    || (p.get(2) == Some(&'/') && n.first() == Some(&'/') && rec(&p[3..], &n[1..]))
-            }
-            (Some('*'), _) => rec(&p[1..], n) || (!n.is_empty() && rec(p, &n[1..])),
-            (Some('?'), Some(_)) => rec(&p[1..], &n[1..]),
-            (Some(a), Some(b)) if a == b => rec(&p[1..], &n[1..]),
-            _ => false,
+    // memo[i * (n.len() + 1) + j]: does p[i..] match n[j..]? Each cell is
+    // computed once, so matching takes O(|p| * |n|) work regardless of stars.
+    let mut memo = vec![None; (p.len() + 1) * (n.len() + 1)];
+    fn rec(p: &[char], n: &[char], i: usize, j: usize, memo: &mut [Option<bool>]) -> bool {
+        let key = i * (n.len() + 1) + j;
+        if let Some(known) = memo[key] {
+            return known;
         }
+        let result = match (p.get(i), n.get(j)) {
+            (None, None) => true,
+            (Some('*'), _) if p.get(i + 1) == Some(&'*') => {
+                let slash = p.get(i + 2) == Some(&'/');
+                let rest = if slash { i + 3 } else { i + 2 };
+                rec(p, n, rest, j, memo)
+                    || (j < n.len() && rec(p, n, i, j + 1, memo))
+                    || (slash && n.get(j) == Some(&'/') && rec(p, n, i + 3, j + 1, memo))
+            }
+            (Some('*'), _) => {
+                rec(p, n, i + 1, j, memo) || (j < n.len() && rec(p, n, i, j + 1, memo))
+            }
+            (Some('?'), Some(_)) => rec(p, n, i + 1, j + 1, memo),
+            (Some(a), Some(b)) if a == b => rec(p, n, i + 1, j + 1, memo),
+            _ => false,
+        };
+        memo[key] = Some(result);
+        result
     }
-    rec(&p, &n)
+    rec(&p, &n, 0, 0, &mut memo)
 }
 
 fn code_definition_tool(
@@ -3590,6 +3728,33 @@ mod tests {
     use tempfile::tempdir;
 
     #[test]
+    fn pathological_glob_finishes_quickly() {
+        let name = "a".repeat(40);
+        let started = std::time::Instant::now();
+        assert!(!match_glob_chars("*a*a*a*a*a*a*a*a*a*b", &name));
+        assert!(started.elapsed() < std::time::Duration::from_millis(100));
+    }
+
+    #[test]
+    fn glob_semantics_are_unchanged() {
+        for (pattern, name, expected) in [
+            ("*.rs", "src/lib.rs", true),
+            ("src/**/*.rs", "src/a/b/c.rs", true),
+            ("src/**/*.rs", "src/c.rs", true),
+            ("?.md", "a.md", true),
+            ("?.md", "ab.md", false),
+            ("**", "anything/at/all", true),
+            ("a*b", "a/x/b", true),
+        ] {
+            assert_eq!(
+                match_glob_chars(pattern, name),
+                expected,
+                "{pattern} {name}"
+            );
+        }
+    }
+
+    #[test]
     fn shell_capture_rejects_partial_reads_and_drains_overflow() {
         use std::io::{self, Read};
         struct Broken;
@@ -3662,6 +3827,25 @@ mod tests {
                 "{stream}: {error}"
             );
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn fallback_shell_returns_when_a_grandchild_keeps_the_pipe() {
+        let dir = tempfile::tempdir().unwrap();
+        let context = ToolContext::default();
+        let started = std::time::Instant::now();
+        let result = execute_tool_with(
+            dir.path(),
+            "bash",
+            &serde_json::json!({"command": "sleep 30 & echo started", "timeout": 5}),
+            &context,
+        );
+        assert!(started.elapsed() < std::time::Duration::from_secs(8));
+        let result = result.unwrap();
+        assert!(result.content.contains("started"));
+        assert!(result.content.contains("output truncated"));
+        assert!(result.is_error, "partial output cannot verify success");
     }
 
     #[test]

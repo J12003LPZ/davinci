@@ -43,7 +43,8 @@ use uuid::Uuid;
 
 use crate::catalog::Model;
 use crate::stream::{
-    usage_from_value, AssistantMessage, AssistantMessageEvent, ContentBlock, StopReason,
+    usage_from_value, AssistantMessage, AssistantMessageEvent, ContentBlock,
+    PartialMessageSnapshot, StopReason,
 };
 use crate::stream_decoder::{new_message, StreamDecoder};
 
@@ -74,6 +75,7 @@ struct ToolSlot {
 pub struct CompletionsDecoder {
     model: Model,
     message: AssistantMessage,
+    partial_snapshot: PartialMessageSnapshot,
     open: Option<Open>,
     tool_calls: Vec<ToolSlot>,
     started: bool,
@@ -83,9 +85,11 @@ pub struct CompletionsDecoder {
 
 impl CompletionsDecoder {
     pub fn new(model: &Model) -> Self {
+        let message = new_message(model);
         Self {
             model: model.clone(),
-            message: new_message(model),
+            partial_snapshot: PartialMessageSnapshot::new(&message),
+            message,
             open: None,
             tool_calls: Vec::new(),
             started: false,
@@ -98,7 +102,7 @@ impl CompletionsDecoder {
         if !self.started {
             self.started = true;
             out.push(AssistantMessageEvent::Start {
-                partial: self.message.clone(),
+                partial: self.partial_snapshot.force(&self.message),
             });
         }
     }
@@ -114,18 +118,18 @@ impl CompletionsDecoder {
                 out.push(AssistantMessageEvent::TextEnd {
                     content_index,
                     content,
-                    partial: self.message.clone(),
+                    partial: self.partial_snapshot.force(&self.message),
                 });
             }
             Some(Open::Thinking(content_index)) => {
                 let content = match self.message.content.get(content_index) {
-                    Some(ContentBlock::Thinking { thinking }) => thinking.clone(),
+                    Some(ContentBlock::Thinking { thinking, .. }) => thinking.clone(),
                     _ => String::new(),
                 };
                 out.push(AssistantMessageEvent::ThinkingEnd {
                     content_index,
                     content,
-                    partial: self.message.clone(),
+                    partial: self.partial_snapshot.force(&self.message),
                 });
             }
             None => {}
@@ -146,7 +150,7 @@ impl CompletionsDecoder {
         self.open = Some(Open::Text(content_index));
         out.push(AssistantMessageEvent::TextStart {
             content_index,
-            partial: self.message.clone(),
+            partial: self.partial_snapshot.force(&self.message),
         });
         content_index
     }
@@ -160,11 +164,13 @@ impl CompletionsDecoder {
         let content_index = self.message.content.len();
         self.message.content.push(ContentBlock::Thinking {
             thinking: String::new(),
+            signature: None,
+            redacted: false,
         });
         self.open = Some(Open::Thinking(content_index));
         out.push(AssistantMessageEvent::ThinkingStart {
             content_index,
-            partial: self.message.clone(),
+            partial: self.partial_snapshot.force(&self.message),
         });
         content_index
     }
@@ -177,13 +183,13 @@ impl CompletionsDecoder {
         out.push(AssistantMessageEvent::TextDelta {
             content_index,
             delta: delta.to_string(),
-            partial: self.message.clone(),
+            partial: self.partial_snapshot.update(&self.message, delta.len()),
         });
     }
 
     fn append_thinking(&mut self, delta: &str, out: &mut Vec<AssistantMessageEvent>) {
         let content_index = self.ensure_thinking(out);
-        if let Some(ContentBlock::Thinking { thinking }) =
+        if let Some(ContentBlock::Thinking { thinking, .. }) =
             self.message.content.get_mut(content_index)
         {
             thinking.push_str(delta);
@@ -191,7 +197,7 @@ impl CompletionsDecoder {
         out.push(AssistantMessageEvent::ThinkingDelta {
             content_index,
             delta: delta.to_string(),
-            partial: self.message.clone(),
+            partial: self.partial_snapshot.update(&self.message, delta.len()),
         });
     }
 
@@ -228,19 +234,28 @@ impl CompletionsDecoder {
             .and_then(Value::as_str)
             .unwrap_or("");
 
-        let found = stream_index
-            .and_then(|index| {
+        let by_index = stream_index.and_then(|index| {
+            self.tool_calls
+                .iter()
+                .rposition(|slot| slot.stream_index == Some(index))
+        });
+        // Some providers reuse an index for parallel calls. A distinct id
+        // means this fragment starts another call, while id-less fragments
+        // continue the latest call using that index.
+        let by_index = by_index.filter(|position| match id {
+            Some(id) => {
+                let slot_id = self.block_id(self.tool_calls[*position].content_index);
+                slot_id.is_empty() || slot_id == id
+            }
+            None => true,
+        });
+        let found = by_index.or_else(|| {
+            id.and_then(|id| {
                 self.tool_calls
                     .iter()
-                    .position(|slot| slot.stream_index == Some(index))
+                    .position(|slot| self.block_id(slot.content_index) == id)
             })
-            .or_else(|| {
-                id.and_then(|id| {
-                    self.tool_calls
-                        .iter()
-                        .position(|slot| self.block_id(slot.content_index) == id)
-                })
-            });
+        });
         let position = match found {
             Some(position) => position,
             None => {
@@ -258,12 +273,13 @@ impl CompletionsDecoder {
                 });
                 out.push(AssistantMessageEvent::ToolcallStart {
                     content_index,
-                    partial: self.message.clone(),
+                    partial: self.partial_snapshot.force(&self.message),
                 });
                 self.tool_calls.len() - 1
             }
         };
 
+        let appended_bytes = arguments.len();
         let slot = &mut self.tool_calls[position];
         if slot.stream_index.is_none() {
             slot.stream_index = stream_index;
@@ -275,7 +291,7 @@ impl CompletionsDecoder {
         if let Some(ContentBlock::ToolCall {
             id: block_id,
             name: block_name,
-            arguments: block_arguments,
+            arguments: _,
         }) = self.message.content.get_mut(content_index)
         {
             if block_id.is_empty() {
@@ -286,15 +302,12 @@ impl CompletionsDecoder {
             if block_name.is_empty() && !name.is_empty() {
                 *block_name = name.to_string();
             }
-            if !arguments.is_empty() {
-                *block_arguments = parse_streaming_arguments(&slot.partial, block_arguments);
-            }
         }
         if !arguments.is_empty() {
             out.push(AssistantMessageEvent::ToolcallDelta {
                 content_index,
                 delta: arguments.to_string(),
-                partial: self.message.clone(),
+                partial: self.partial_snapshot.update(&self.message, appended_bytes),
             });
         }
     }
@@ -318,7 +331,7 @@ impl CompletionsDecoder {
             out.push(AssistantMessageEvent::ToolcallEnd {
                 content_index: slot.content_index,
                 tool_call,
-                partial: self.message.clone(),
+                partial: self.partial_snapshot.force(&self.message),
             });
         }
     }
@@ -452,17 +465,19 @@ impl StreamDecoder for CompletionsDecoder {
         if !self.done {
             self.start(out);
             if !self.finish_reason_seen {
-                // The connection closed before finish_reason. Text already
-                // received is worth keeping; a tool call cut off mid-arguments
-                // is not, because executing it would guess at what the model
-                // meant. A provider flagged as never sending finish_reason
-                // ends every stream this way, so its tool calls are complete.
-                if !self.tool_calls.is_empty() && self.expects_finish_reason() {
+                // The connection closed before the terminal event: keep what
+                // arrived, but the turn did not finish. Some providers never
+                // send finish_reason, so EOF remains valid for those models.
+                if !self.expects_finish_reason() {
+                    self.message.stop_reason = Some(StopReason::Stop);
+                } else if !self.tool_calls.is_empty() {
                     self.message.stop_reason = Some(StopReason::Error);
                     self.message.error_message =
                         Some("Stream ended before the tool call was complete".into());
                 } else {
-                    self.message.stop_reason = Some(StopReason::Stop);
+                    self.message.stop_reason = Some(StopReason::Error);
+                    self.message.error_message =
+                        Some(crate::stream_decoder::TRUNCATED_STREAM.into());
                 }
             }
             self.close_open(out);
@@ -505,22 +520,9 @@ fn map_stop_reason(reason: &str) -> (StopReason, Option<String>) {
     }
 }
 
-/// TS `parseStreamingJson` while the arguments stream, without its repair
-/// pass: the buffer if it parses as an object, else the last value that did.
-fn parse_streaming_arguments(buffer: &str, previous: &Value) -> Value {
-    match serde_json::from_str::<Value>(buffer) {
-        Ok(value @ Value::Object(_)) => value,
-        _ if previous.is_object() => previous.clone(),
-        _ => Value::Object(Map::new()),
-    }
-}
-
-/// The finished arguments: the parsed buffer, `{}` when empty or unparseable.
+/// The finished arguments: the parsed object, or a sentinel when malformed.
 fn final_arguments(buffer: &str) -> Value {
-    match serde_json::from_str::<Value>(buffer) {
-        Ok(value @ Value::Object(_)) => value,
-        _ => Value::Object(Map::new()),
-    }
+    crate::final_tool_arguments(buffer)
 }
 
 /// The message of an `error` payload, else its code, else the raw JSON.
@@ -731,6 +733,50 @@ data: {"choices":[{"index":0,"delta":{"content":"Hi"},"finish_reason":"stop","us
     }
 
     #[test]
+    fn invalid_final_arguments_are_marked_not_emptied() {
+        let raw = r#"{"path":"#;
+        let encoded_raw = serde_json::to_string(raw).unwrap();
+        let corpus = format!(
+            r#"data: {{"choices":[{{"index":0,"delta":{{"role":"assistant","tool_calls":[{{"index":0,"id":"call_bad","type":"function","function":{{"name":"read","arguments":{encoded_raw}}}}}]}},"finish_reason":null}}]}}
+
+data: {{"choices":[{{"index":0,"delta":{{}},"finish_reason":"length"}}]}}
+
+data: [DONE]
+"#
+        );
+        let (message, _) = run(&corpus);
+
+        assert_eq!(message.stop_reason, Some(StopReason::Length));
+        assert_eq!(
+            tool_call(&message.content[0]).2,
+            &serde_json::json!({"__davinci_invalid_arguments": raw})
+        );
+    }
+
+    #[test]
+    fn invalid_argument_diagnostics_are_limited_by_unicode_characters() {
+        let raw = "💡".repeat(2_001);
+        let value = final_arguments(&raw);
+        assert_eq!(
+            value["__davinci_invalid_arguments"],
+            Value::String("💡".repeat(2_000))
+        );
+    }
+
+    #[test]
+    fn final_arguments_keep_objects_and_treat_empty_input_as_an_empty_object() {
+        assert_eq!(final_arguments(" \n\t"), serde_json::json!({}));
+        assert_eq!(
+            final_arguments(r#"{"ok":true}"#),
+            serde_json::json!({"ok": true})
+        );
+        assert_eq!(
+            final_arguments("[1,2]"),
+            serde_json::json!({"__davinci_invalid_arguments": "[1,2]"})
+        );
+    }
+
+    #[test]
     fn one_tool_call_streamed_in_three_argument_fragments() {
         let corpus = format!(
             r#"{ONE_TOOL_CALL_OPENING}
@@ -763,8 +809,8 @@ data: [DONE]
         assert_eq!(name, "read");
         assert_eq!(arguments, &serde_json::json!({"path": "Cargo.toml"}));
 
-        // While the buffer does not parse the arguments stay at the last
-        // parsed value, `{}`; the last fragment completes them.
+        // The original fragments remain available for live rendering while
+        // parsed arguments are only finalized at the tool-call boundary.
         let deltas: Vec<(&str, &Value)> = events
             .iter()
             .filter_map(|event| match event {
@@ -779,16 +825,35 @@ data: [DONE]
         assert_eq!(deltas[1].0, ": \"Cargo");
         assert_eq!(deltas[1].1, &serde_json::json!({}));
         assert_eq!(deltas[2].0, ".toml\"}");
-        assert_eq!(deltas[2].1, &serde_json::json!({"path": "Cargo.toml"}));
+        assert_eq!(deltas[2].1, &serde_json::json!({}));
+        let delta_snapshots: Vec<_> = events
+            .iter()
+            .filter_map(|event| match event {
+                AssistantMessageEvent::ToolcallDelta { partial, .. } => Some(partial),
+                _ => None,
+            })
+            .collect();
+        assert!(delta_snapshots
+            .iter()
+            .all(|snapshot| std::sync::Arc::ptr_eq(delta_snapshots[0], snapshot)));
 
         match &events[5] {
             AssistantMessageEvent::ToolcallEnd {
                 content_index,
                 tool_call,
+                partial,
                 ..
             } => {
                 assert_eq!(*content_index, 0);
                 assert_eq!(tool_call, &message.content[0]);
+                assert_eq!(
+                    &partial.content[0],
+                    &ContentBlock::ToolCall {
+                        id: "call_abc".into(),
+                        name: "read".into(),
+                        arguments: serde_json::json!({"path": "Cargo.toml"}),
+                    }
+                );
             }
             other => panic!("expected toolcall_end, got {other:?}"),
         }
@@ -841,6 +906,32 @@ data: [DONE]
     }
 
     #[test]
+    fn same_index_different_ids_are_two_tool_calls() {
+        let corpus = r#"
+data: {"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"a","function":{"name":"read","arguments":"{\"path\":\"x\"}"}}]},"finish_reason":null}]}
+
+data: {"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"b","function":{"name":"read","arguments":"{\"path\":\"y\"}"}}]},"finish_reason":null}]}
+
+data: {"choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}
+
+data: [DONE]
+"#;
+        let (message, _) = run(corpus);
+        let calls: Vec<_> = message
+            .content
+            .iter()
+            .filter_map(|block| match block {
+                ContentBlock::ToolCall { id, arguments, .. } => Some((id.as_str(), arguments)),
+                _ => None,
+            })
+            .collect();
+
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0], ("a", &serde_json::json!({"path": "x"})));
+        assert_eq!(calls[1], ("b", &serde_json::json!({"path": "y"})));
+    }
+
+    #[test]
     fn reasoning_content_then_content_closes_the_thinking_block_first() {
         let corpus = r#"
 data: {"choices":[{"index":0,"delta":{"role":"assistant","reasoning_content":"Think"},"finish_reason":null}]}
@@ -870,7 +961,7 @@ data: [DONE]
         );
         assert_eq!(message.content.len(), 2);
         assert!(
-            matches!(&message.content[0], ContentBlock::Thinking { thinking } if thinking == "Think hard")
+            matches!(&message.content[0], ContentBlock::Thinking { thinking, .. } if thinking == "Think hard")
         );
         assert!(matches!(&message.content[1], ContentBlock::Text { text } if text == "Answer"));
         match &events[4] {
@@ -896,7 +987,7 @@ data: {"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}
         let (message, events) = run(corpus);
         assert_eq!(message.content.len(), 1);
         assert!(
-            matches!(&message.content[0], ContentBlock::Thinking { thinking } if thinking == "same more!")
+            matches!(&message.content[0], ContentBlock::Thinking { thinking, .. } if thinking == "same more!")
         );
         assert_eq!(
             names(&events)
@@ -1026,29 +1117,55 @@ data: {{"choices":[{{"index":0,"delta":{{"tool_calls":[{{"index":0,"function":{{
                 "error"
             ]
         );
-        // The half-received arguments are not guessed at.
-        assert_eq!(tool_call(&message.content[0]).2, &serde_json::json!({}));
+        // The half-received arguments are marked invalid for the agent to reject.
+        assert_eq!(
+            tool_call(&message.content[0]).2,
+            &serde_json::json!({"__davinci_invalid_arguments": "{\"path\""})
+        );
     }
 
     #[test]
-    fn a_stream_cut_mid_text_keeps_the_text() {
+    fn eof_before_finish_reason_is_an_error_that_keeps_text() {
         let (message, events) = run(
             r#"data: {"choices":[{"index":0,"delta":{"role":"assistant","content":"half"},"finish_reason":null}]}
+"#,
+        );
+        assert_eq!(message.stop_reason, Some(StopReason::Error));
+        assert_eq!(
+            message.error_message.as_deref(),
+            Some("stream ended before a terminal response event")
+        );
+        assert!(matches!(&message.content[0], ContentBlock::Text { text } if text == "half"));
+        assert!(crate::is_retryable_assistant_error(&message));
+        assert_eq!(
+            names(&events),
+            ["start", "text_start", "text_delta", "text_end", "error"]
+        );
+
+        // A provider that expects finish_reason must reject an empty EOF too.
+        let (message, events) = run("");
+        assert!(message.content.is_empty());
+        assert_eq!(message.stop_reason, Some(StopReason::Error));
+        assert_eq!(
+            message.error_message.as_deref(),
+            Some("stream ended before a terminal response event")
+        );
+        assert_eq!(names(&events), ["start", "error"]);
+    }
+
+    #[test]
+    fn providers_that_do_not_expect_finish_reason_accept_text_at_eof() {
+        let mut lenient = model();
+        lenient.compat = serde_json::json!({"supportsFinishReason": false});
+        let (message, events) = run_with(
+            &lenient,
+            r#"data: {"choices":[{"index":0,"delta":{"content":"half"},"finish_reason":null}]}
 "#,
         );
         assert_eq!(message.stop_reason, Some(StopReason::Stop));
         assert_eq!(message.error_message, None);
         assert!(matches!(&message.content[0], ContentBlock::Text { text } if text == "half"));
-        assert_eq!(
-            names(&events),
-            ["start", "text_start", "text_delta", "text_end", "done"]
-        );
-
-        // Nothing at all still concludes cleanly.
-        let (message, events) = run("");
-        assert!(message.content.is_empty());
-        assert_eq!(message.stop_reason, Some(StopReason::Stop));
-        assert_eq!(names(&events), ["start", "done"]);
+        assert_eq!(names(&events).last(), Some(&"done"));
     }
 
     #[test]

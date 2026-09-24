@@ -2,10 +2,9 @@
 
 use serde_json::Value;
 use std::ffi::OsString;
-use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
-use std::time::{Duration, Instant, SystemTime};
+use std::process::Command;
+use std::time::{Duration, SystemTime};
 
 #[cfg_attr(not(test), allow(dead_code))]
 pub const SUPPORTED_CARGO_AUDIT: &str = "0.22";
@@ -260,9 +259,6 @@ fn run_bounded(
     let mut command = Command::new(executable);
     command
         .current_dir(cwd)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
         .env_clear()
         .env("CARGO_NET_OFFLINE", "true")
         .env("CARGO_TERM_COLOR", "never")
@@ -274,140 +270,33 @@ fn run_bounded(
     if let Some(value) = std::env::var_os("WINDIR") {
         command.env("WINDIR", value);
     }
-    #[cfg(unix)]
-    {
-        use std::os::unix::process::CommandExt;
-        command.process_group(0);
+    let output = davinci_sys::process::run_bounded(
+        command,
+        None,
+        davinci_sys::process::RunLimits {
+            timeout,
+            output_cap: max_output as usize,
+        },
+        cancelled,
+    )
+    .map_err(|_| "cannot start provisioned cargo-audit".to_string())?;
+    if output.cancelled {
+        return Err("cargo-audit cancelled".into());
     }
-    let mut child = command
-        .spawn()
-        .map_err(|_| "cannot start provisioned cargo-audit")?;
-    let stdout = child
-        .stdout
-        .take()
-        .ok_or("cargo-audit output unavailable")?;
-    let (tx, rx) = std::sync::mpsc::sync_channel(1);
-    std::thread::spawn(move || {
-        let mut bytes = Vec::new();
-        let result = stdout.take(max_output + 1).read_to_end(&mut bytes);
-        let _ = tx.send(result.map(|_| bytes));
-    });
-    let deadline = Instant::now() + timeout;
-    loop {
-        if cancelled() {
-            terminate_child(&mut child);
-            return Err("cargo-audit cancelled".into());
-        }
-        if Instant::now() >= deadline {
-            terminate_child(&mut child);
-            return Err("cargo-audit timed out".into());
-        }
-        match rx.recv_timeout(Duration::from_millis(20)) {
-            Ok(Ok(bytes)) if bytes.len() as u64 <= max_output => {
-                let status = loop {
-                    if cancelled() {
-                        terminate_child(&mut child);
-                        return Err("cargo-audit cancelled".into());
-                    }
-                    if let Some(status) = child
-                        .try_wait()
-                        .map_err(|_| "cannot inspect cargo-audit process")?
-                    {
-                        break status;
-                    }
-                    if Instant::now() >= deadline {
-                        terminate_child(&mut child);
-                        return Err("cargo-audit timed out".into());
-                    }
-                    std::thread::sleep(Duration::from_millis(10));
-                };
-                if status.code() == Some(2) || !status.success() && status.code() != Some(1) {
-                    return Err("cargo-audit failed".into());
-                }
-                return Ok(bytes);
-            }
-            Ok(Ok(_)) => {
-                terminate_child(&mut child);
-                return Err("cargo-audit output exceeded bound".into());
-            }
-            Ok(Err(_)) => {
-                terminate_child(&mut child);
-                return Err("cargo-audit output unavailable".into());
-            }
-            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
-            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-                terminate_child(&mut child);
-                return Err("cargo-audit output unavailable".into());
-            }
-        }
+    if output.timed_out {
+        return Err("cargo-audit timed out".into());
     }
+    if output.stdout_truncated {
+        return Err("cargo-audit output exceeded bound".into());
+    }
+    let status = output
+        .status
+        .ok_or_else(|| "cargo-audit failed".to_string())?;
+    if status.code() == Some(2) || (!status.success() && status.code() != Some(1)) {
+        return Err("cargo-audit failed".into());
+    }
+    Ok(output.stdout)
 }
-
-fn terminate_child(child: &mut std::process::Child) {
-    #[cfg(windows)]
-    {
-        let _ = Command::new("taskkill")
-            .args(["/PID", &child.id().to_string(), "/T", "/F"])
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status();
-    }
-    #[cfg(unix)]
-    {
-        let _ = Command::new("kill")
-            .args(["-TERM", "--", &format!("-{}", child.id())])
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status();
-    }
-    let _ = child.kill();
-    let _ = child.wait();
-}
-
-fn parse_signals(bytes: &[u8]) -> Result<Vec<AdvisorySignal>, String> {
-    let value: Value =
-        serde_json::from_slice(bytes).map_err(|_| "cargo-audit returned invalid JSON")?;
-    let list = value
-        .pointer("/vulnerabilities/list")
-        .and_then(Value::as_array)
-        .ok_or("cargo-audit returned invalid JSON")?;
-    let mut signals = Vec::new();
-    for item in list {
-        let id = item
-            .pointer("/advisory/id")
-            .and_then(Value::as_str)
-            .unwrap_or("")
-            .to_string();
-        let title = item
-            .pointer("/advisory/title")
-            .and_then(Value::as_str)
-            .unwrap_or("")
-            .to_string();
-        let package = item
-            .pointer("/package/name")
-            .and_then(Value::as_str)
-            .unwrap_or("")
-            .to_string();
-        let version = item
-            .pointer("/package/version")
-            .and_then(Value::as_str)
-            .unwrap_or("")
-            .to_string();
-        if id.is_empty() || package.is_empty() {
-            return Err("cargo-audit returned invalid JSON".into());
-        }
-        signals.push(AdvisorySignal {
-            id,
-            package,
-            version,
-            title,
-        });
-    }
-    Ok(signals)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

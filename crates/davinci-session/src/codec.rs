@@ -1,4 +1,3 @@
-use std::io::BufRead;
 use std::path::Path;
 
 use serde_json::Value;
@@ -8,7 +7,7 @@ use crate::errors::{JsonlDecodeError, SessionError};
 use crate::types::{
     JsonlV4Header, LaneRecord, SessionEntry, SessionMutation, ENTRY_TYPES, RECORD_TYPES,
 };
-use crate::JsonlSession;
+use crate::{JsonlSession, WriterState};
 
 fn parse_object(line: &str) -> Result<serde_json::Map<String, Value>, JsonlDecodeError> {
     let value: Value =
@@ -351,10 +350,12 @@ pub fn encode_mutation(mutation: &SessionMutation) -> String {
     }
 }
 
-pub fn migrate_v3_to_v4<R: BufRead>(
+pub fn migrate_v3_to_v4<'a>(
     path: &Path,
     first_line: &str,
-    rest: std::io::Lines<R>,
+    rest: impl Iterator<Item = (usize, &'a str)>,
+    terminated: bool,
+    last_line_no: usize,
 ) -> Result<JsonlSession, SessionError> {
     // TS v3 files begin with a `{"type":"session",...}` header carrying the
     // authoritative id, ISO timestamp, cwd, and optional parent session path.
@@ -366,13 +367,15 @@ pub fn migrate_v3_to_v4<R: BufRead>(
     if v3_header.is_none() {
         entries.push(parse_v3_line(first_line, 1)?);
     }
-    for (index, line) in rest.enumerate() {
-        let line = line
-            .map_err(|err| SessionError::storage(format!("Unable to read session file: {err}")))?;
+    for (line_no, line) in rest {
         if line.trim().is_empty() {
             continue;
         }
-        entries.push(parse_v3_line(&line, index + 2)?);
+        match parse_v3_line(line, line_no) {
+            Ok(entry) => entries.push(entry),
+            Err(_) if line_no == last_line_no && !terminated => break,
+            Err(err) => return Err(err),
+        }
     }
     let header_text = |key: &str| {
         v3_header
@@ -416,6 +419,7 @@ pub fn migrate_v3_to_v4<R: BufRead>(
         metadata: None,
     };
     let leaf_id = entries.last().map(|e| e.id.clone());
+    let max_seq = entries.iter().map(|entry| entry.seq).max().unwrap_or(0);
     Ok(JsonlSession {
         persistence_error: None,
         path: path.to_path_buf(),
@@ -423,6 +427,11 @@ pub fn migrate_v3_to_v4<R: BufRead>(
         entries,
         records: Vec::new(),
         leaf_id,
+        max_seq,
+        writer: WriterState {
+            rewrite_as_v4: true,
+            ..WriterState::default()
+        },
     })
 }
 

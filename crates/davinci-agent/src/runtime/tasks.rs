@@ -1826,16 +1826,17 @@ impl TaskRegistry {
             .write()
             .map_err(|_| TaskError::RegistryPoisoned)?;
 
-        if !stored.contains_key(&task_id) {
+        let mut next = stored.clone();
+        if !next.contains_key(&task_id) {
             return Err(TaskError::TaskNotFound(task_id));
         }
 
-        let downstream_ids = collect_downstream_dependents(&stored, task_id);
+        let downstream_ids = collect_downstream_dependents(&next, task_id);
         let mut stale_tasks = Vec::new();
         let mut stale_evidence = Vec::new();
 
         for dep_id in downstream_ids {
-            if let Some(dep_task) = stored.get_mut(&dep_id) {
+            if let Some(dep_task) = next.get_mut(&dep_id) {
                 stale_tasks.push(dep_id);
                 stale_evidence.extend(dep_task.evidence_refs.iter().copied());
                 dep_task.state = TaskState::Blocked;
@@ -1849,11 +1850,11 @@ impl TaskRegistry {
                         task_id, checkpoint_id
                     ),
                 });
-                let _ = dep_task.advance_revision(committed_at);
+                dep_task.advance_revision(committed_at)?;
             }
         }
 
-        let task = stored.get_mut(&task_id).unwrap();
+        let task = next.get_mut(&task_id).unwrap();
         stale_evidence.extend(task.evidence_refs.iter().copied());
         task.attempt += 1;
         task.result = None;
@@ -1861,13 +1862,14 @@ impl TaskRegistry {
         task.blocked_reasons.retain(|r| r.code != "rewound");
 
         let task_clone = task.clone();
-        let ready_state = initial_task_state(&task_clone, &stored, self.lineage.as_deref())?;
+        let ready_state = initial_task_state(&task_clone, &next, self.lineage.as_deref())?;
 
-        let task = stored.get_mut(&task_id).unwrap();
+        let task = next.get_mut(&task_id).unwrap();
         task.state = ready_state;
         task.advance_revision(committed_at)?;
 
         let updated_record = task.clone();
+        *stored = next;
         Ok((updated_record, stale_tasks, stale_evidence))
     }
 
@@ -2982,6 +2984,51 @@ mod tests {
     use super::*;
     use crate::runtime::bus::{RuntimeDecision, RuntimeSubscriber};
     use std::sync::Mutex;
+
+    #[test]
+    fn task_rewind_is_atomic() {
+        let registry = TaskRegistry::new();
+        let run = RunId::new();
+        let root = registry.create_task(TaskRecord::new(run, "root")).unwrap();
+        let dependent = registry
+            .create_task(TaskRecord::new(run, "dependent").with_dependencies(vec![root]))
+            .unwrap();
+        let missing = TaskId::new();
+        registry
+            .tasks
+            .write()
+            .unwrap()
+            .get_mut(&root)
+            .unwrap()
+            .dependencies
+            .push(missing);
+
+        let before = registry.tasks.read().unwrap().clone();
+        assert_eq!(
+            registry.rewind_task_state(root, "checkpoint"),
+            Err(TaskError::UnknownDependency(missing))
+        );
+        let after = registry.tasks.read().unwrap().clone();
+        assert_eq!(after, before);
+        assert_eq!(after[&dependent].state, TaskState::Pending);
+
+        {
+            let mut tasks = registry.tasks.write().unwrap();
+            tasks
+                .get_mut(&root)
+                .unwrap()
+                .dependencies
+                .retain(|dependency| *dependency != missing);
+            tasks.get_mut(&dependent).unwrap().revision = u64::MAX;
+        }
+        let before = registry.tasks.read().unwrap().clone();
+        assert_eq!(
+            registry.rewind_task_state(root, "checkpoint"),
+            Err(TaskError::RevisionOverflow(dependent))
+        );
+        let after = registry.tasks.read().unwrap().clone();
+        assert_eq!(after, before);
+    }
 
     #[test]
     fn f03_no_publish_without_commit() {

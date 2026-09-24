@@ -216,13 +216,8 @@ pub fn forget_file_rule(path: &Path, list: &str, rule: &str) -> Result<(), Strin
 /// Write a settings file through a sibling temp file and a rename, so a
 /// crash mid-write leaves the old file rather than an empty one.
 fn write_atomically(path: &Path, text: &str) -> Result<(), String> {
-    let temp = path.with_extension(format!("json.{}.tmp", std::process::id()));
-    std::fs::write(&temp, text).map_err(|err| err.to_string())?;
-    if let Err(err) = std::fs::rename(&temp, path) {
-        let _ = std::fs::remove_file(&temp);
-        return Err(err.to_string());
-    }
-    Ok(())
+    davinci_sys::fs::atomic_write(path, text.as_bytes()).map_err(|err| err.to_string())
+
 }
 
 /// The rows `/permissions` says: the mode, then every rule by source.

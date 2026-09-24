@@ -453,7 +453,11 @@ pub struct Hunk {
 
 impl Hunk {
     pub fn new(kind: HunkKind, text: &str) -> Self {
-        Self { kind, text: text.to_string(), line: None }
+        Self {
+            kind,
+            text: super::sanitize::terminal_safe(text).into_owned(),
+            line: None,
+        }
     }
 
     pub fn at(kind: HunkKind, line: u32, text: &str) -> Self {
@@ -522,41 +526,41 @@ pub enum Entry {
 
 impl Entry {
     pub fn user(text: &str) -> Self {
-        Entry::User(text.to_string())
+        Entry::User(super::sanitize::terminal_safe(text).into_owned())
     }
 
     pub fn agent(name: &str) -> Self {
-        Entry::Agent(name.to_string())
+        Entry::Agent(super::sanitize::terminal_safe(name).into_owned())
     }
 
     pub fn prose(text: &str) -> Self {
-        Entry::Prose(text.to_string())
+        Entry::Prose(super::sanitize::terminal_safe(text).into_owned())
     }
 
     pub fn thinking(text: &str, live: bool, seconds: u64) -> Self {
         Entry::Thinking {
-            text: text.to_string(),
+            text: super::sanitize::terminal_safe(text).into_owned(),
             live,
             seconds,
         }
     }
 
     pub fn detail(text: &str) -> Self {
-        Entry::Detail(text.to_string())
+        Entry::Detail(super::sanitize::terminal_safe(text).into_owned())
     }
 
     pub fn failure(what: &str, subject: &str) -> Self {
         Entry::Failure {
-            what: what.to_string(),
-            subject: subject.to_string(),
+            what: super::sanitize::terminal_safe(what).into_owned(),
+            subject: super::sanitize::terminal_safe(subject).into_owned(),
         }
     }
 
     pub fn tool(state: State, instrument: &str, target: &str, duration: Option<&str>) -> Self {
         Entry::Tool {
             state,
-            instrument: instrument.to_string(),
-            target: target.to_string(),
+            instrument: super::sanitize::terminal_safe(instrument).into_owned(),
+            target: super::sanitize::terminal_safe(target).into_owned(),
             duration: duration.map(str::to_string),
             summary: None,
             output: Vec::new(),
@@ -566,7 +570,7 @@ impl Entry {
     /// The same tool line, with what it came back with.
     pub fn summarised(mut self, text: &str) -> Self {
         if let Entry::Tool { summary, .. } = &mut self {
-            *summary = Some(text.to_string());
+            *summary = Some(super::sanitize::terminal_safe(text).into_owned());
         }
         self
     }
@@ -587,7 +591,8 @@ pub const TOOL_OUTPUT_KEPT: usize = 200;
 /// A result's non-empty lines, trimmed at the right, clipped to
 /// `TOOL_OUTPUT_KEPT` with a last row that counts the rest.
 pub fn tool_output_rows(text: &str) -> Vec<String> {
-    let lines: Vec<&str> = text
+    let safe = super::sanitize::terminal_safe(text);
+    let lines: Vec<&str> = safe
         .lines()
         .map(str::trim_end)
         .filter(|line| !line.trim().is_empty())
@@ -1695,6 +1700,8 @@ pub struct Model {
     pub height: u16,
     /// One clock, 250ms per step, driving both animations (design.md §8).
     pub tick: u64,
+    /// Whether the next loop iteration needs to compose and paint a frame.
+    pub dirty: bool,
     /// Latest governor action, shown briefly without stealing keyboard focus.
     pub governor_notice: Option<(String, std::time::Instant)>,
     /// Reading position in graph, governor, and vector memory sheets.
@@ -1925,6 +1932,7 @@ impl Model {
             width,
             height,
             tick: 0,
+            dirty: true,
             governor_notice: None,
             feature_scroll: 0,
             section_offset: None,
@@ -2622,10 +2630,11 @@ impl Model {
         if self.transcript.len() <= TRANSCRIPT_CAP {
             return;
         }
-        let mut cut = self.transcript.len() - TRANSCRIPT_CAP;
-        while cut < self.transcript.len() && !matches!(self.transcript[cut], Entry::Gap) {
-            cut += 1;
-        }
+        let len = self.transcript.len();
+        let minimum = len - TRANSCRIPT_CAP;
+        let cut = (minimum..len)
+            .find(|&index| matches!(self.transcript[index], Entry::Gap))
+            .unwrap_or(minimum);
         self.transcript.drain(..cut);
     }
 

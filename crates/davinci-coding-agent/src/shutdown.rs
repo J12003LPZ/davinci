@@ -44,7 +44,7 @@ pub fn install_shutdown_watchers(dispose: impl Fn(i32) + Send + Sync + 'static) 
             dispose(129);
             std::process::exit(129);
         }
-        thread::sleep(Duration::from_millis(20));
+        thread::sleep(Duration::from_millis(250));
     });
 }
 

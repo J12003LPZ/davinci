@@ -467,6 +467,9 @@ pub fn effort_rule(model: &Model) -> Line<'static> {
 pub fn composer(model: &Model, lines: Option<&[String]>, hint: Hint) -> Vec<Line<'static>> {
     let th = &model.theme;
     let cc = th.cc();
+    let editor = model.composer.editor();
+    editor.set_layout_width(usize::MAX);
+    editor.set_terminal_rows(model.height as usize);
 
     if model.screen == Screen::Memoria {
         let keys = if model.minimal() { "enter pin · r reindex · esc close" }

@@ -11,11 +11,21 @@ pub struct ProviderRetryOptions {
     pub max_retry_delay_ms: Option<u64>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum RequestPhase {
+    /// DNS, TCP connect, TLS: the request never reached the provider.
+    Connect,
+    /// Anything after the request may have been received.
+    #[default]
+    Response,
+}
+
 #[derive(Debug, Clone)]
 pub struct ProviderError {
     pub status: Option<u16>,
     pub headers: HashMap<String, String>,
     pub message: String,
+    pub phase: RequestPhase,
 }
 
 impl ProviderError {
@@ -24,12 +34,18 @@ impl ProviderError {
             status,
             headers: HashMap::new(),
             message: message.into(),
+            phase: RequestPhase::Response,
         }
     }
 
     pub fn with_header(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
         self.headers
             .insert(key.into().to_ascii_lowercase(), value.into());
+        self
+    }
+
+    pub fn with_phase(mut self, phase: RequestPhase) -> Self {
+        self.phase = phase;
         self
     }
 
@@ -57,7 +73,7 @@ pub fn is_retryable_provider_error(error: &ProviderError) -> bool {
         _ => {}
     }
     match error.status {
-        None => true,
+        None => error.phase == RequestPhase::Connect,
         Some(408 | 409 | 429) => true,
         Some(status) => status >= 500,
     }
@@ -269,13 +285,23 @@ pub fn provider_error_from_ureq(err: ureq::Error) -> ProviderError {
                 status: Some(status),
                 headers,
                 message: format!("Provider request failed: {message}"),
+                phase: RequestPhase::Response,
             }
         }
-        ureq::Error::Transport(transport) => ProviderError {
-            status: None,
-            headers: HashMap::new(),
-            message: format!("Provider request failed: {transport}"),
-        },
+        ureq::Error::Transport(transport) => {
+            let phase = match transport.kind() {
+                ureq::ErrorKind::Dns
+                | ureq::ErrorKind::ConnectionFailed
+                | ureq::ErrorKind::ProxyConnect => RequestPhase::Connect,
+                _ => RequestPhase::Response,
+            };
+            ProviderError {
+                status: None,
+                headers: HashMap::new(),
+                message: format!("Provider request failed: {transport}"),
+                phase,
+            }
+        }
     }
 }
 
@@ -425,5 +451,68 @@ mod tests {
             .with_header("retry-after", "Tue, 01 Jan 2030 00:00:45 GMT");
         let delay = retry_delay_from_headers(&error, 0, Some(60_000), now).unwrap();
         assert_eq!(delay, (then - now) as u64);
+    }
+
+    #[test]
+    fn only_connect_phase_errors_without_status_are_retried() {
+        let connect =
+            ProviderError::new(None, "connection refused").with_phase(RequestPhase::Connect);
+        let midway = ProviderError::new(None, "timed out reading response");
+        assert!(is_retryable_provider_error(&connect));
+        assert!(!is_retryable_provider_error(&midway));
+        assert!(is_retryable_provider_error(&ProviderError::new(
+            Some(503),
+            "unavailable"
+        )));
+    }
+
+    #[test]
+    fn does_not_retry_a_transport_error_after_the_server_receives_the_request() {
+        use std::io::Read;
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0u8; 1024];
+            let _ = stream.read(&mut request);
+        });
+
+        let mut calls = 0;
+        let result = retry_provider_request(
+            || {
+                calls += 1;
+                ureq::get(&format!("http://{addr}/v1/x"))
+                    .call()
+                    .map(|_| ())
+                    .map_err(provider_error_from_ureq)
+            },
+            ProviderRetryOptions {
+                max_retries: 2,
+                max_retry_delay_ms: Some(0),
+            },
+        );
+        server.join().unwrap();
+
+        let error = result.unwrap_err();
+        assert_eq!(error.phase, RequestPhase::Response);
+        assert_eq!(calls, 1);
+    }
+
+    #[test]
+    fn a_connection_refusal_is_classified_as_retryable_connect_phase() {
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        drop(listener);
+
+        let error = ureq::get(&format!("http://{addr}/v1/x"))
+            .call()
+            .unwrap_err();
+        let error = provider_error_from_ureq(error);
+        assert_eq!(error.phase, RequestPhase::Connect);
+        assert!(is_retryable_provider_error(&error));
     }
 }

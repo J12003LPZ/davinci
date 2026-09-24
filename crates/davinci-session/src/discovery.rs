@@ -1,4 +1,5 @@
 use std::fs;
+use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::time::UNIX_EPOCH;
 
@@ -171,6 +172,49 @@ fn summarize_file(path: &Path) -> Option<SessionSummary> {
     })
 }
 
+fn summarize_header(path: &Path) -> Option<SessionSummary> {
+    let file = fs::File::open(path).ok()?;
+    let mut reader = BufReader::new(file);
+    let mut first_line = String::new();
+    reader.read_line(&mut first_line).ok()?;
+    if let Ok(header) = parse_header(first_line.trim_end()) {
+        return Some(crate::codec::metadata_from_header(
+            &header,
+            path,
+            modified_at(path),
+        ));
+    }
+    // Legacy v3 has no v4 header, so preserve compatibility by migrating it
+    // through the existing loader.
+    let session = JsonlSession::open(path).ok()?;
+    Some(SessionSummary {
+        id: session.header.id,
+        path: path.to_path_buf(),
+        cwd: session.header.cwd,
+        created_at: session.header.created_at,
+        modified_at: modified_at(path),
+        name: session
+            .header
+            .metadata
+            .as_ref()
+            .and_then(|value| value.get("name"))
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string),
+        parent_session_id: session.header.parent_session_id,
+        source_format: 3,
+        all_messages_text: String::new(),
+        message_count: 0,
+    })
+}
+
+fn is_session_jsonl(path: &Path) -> bool {
+    if path.extension().and_then(|ext| ext.to_str()) != Some("jsonl") {
+        return false;
+    }
+    let name = path.file_name().and_then(|name| name.to_str()).unwrap_or("");
+    !name.ends_with(".runtime.jsonl")
+}
+
 fn extract_text_content(content: &serde_json::Value) -> String {
     match content {
         serde_json::Value::String(text) => text.clone(),
@@ -277,8 +321,58 @@ pub fn discover_sessions(
         })?;
         for entry in entries.flatten() {
             let path = entry.path();
-            if path.extension().and_then(|e| e.to_str()) == Some("jsonl") {
+            if is_session_jsonl(&path) {
                 if let Some(summary) = summarize_file(&path) {
+                    sessions.push(summary);
+                }
+            }
+        }
+    }
+    sessions.sort_by(|a, b| b.modified_at.cmp(&a.modified_at));
+    sessions.dedup_by(|a, b| a.path == b.path);
+    Ok(sessions)
+}
+
+/// List sessions using only the v4 header line. This is intended for callers
+/// that need metadata but not transcript search text.
+pub fn discover_session_headers(
+    session_dir: &Path,
+    cwd: Option<&str>,
+) -> Result<Vec<SessionSummary>, SessionError> {
+    let mut sessions = Vec::new();
+    if !session_dir.exists() {
+        return Ok(sessions);
+    }
+    let scan_roots: Vec<PathBuf> = if let Some(cwd) = cwd {
+        let primary = cwd_encoded_dir(session_dir, cwd);
+        let legacy = session_dir.join(legacy_encode_cwd_component(cwd));
+        if legacy == primary {
+            vec![primary]
+        } else {
+            vec![primary, legacy]
+        }
+    } else {
+        let mut roots: Vec<PathBuf> = fs::read_dir(session_dir)
+            .map_err(|err| {
+                SessionError::storage(format!("Unable to list session directory: {err}"))
+            })?
+            .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+            .filter(|path| path.is_dir())
+            .collect();
+        roots.push(session_dir.to_path_buf());
+        roots
+    };
+    for root in scan_roots {
+        if !root.is_dir() {
+            continue;
+        }
+        for entry in fs::read_dir(&root)
+            .map_err(|err| SessionError::storage(format!("Unable to list session directory: {err}")))?
+            .flatten()
+        {
+            let path = entry.path();
+            if is_session_jsonl(&path) {
+                if let Some(summary) = summarize_header(&path) {
                     sessions.push(summary);
                 }
             }
@@ -378,6 +472,35 @@ mod tests {
             .find(|session| session.id == first.header.id)
             .unwrap();
         assert_eq!(found.all_messages_text, "a");
+    }
+
+    #[test]
+    fn runtime_sidecar_logs_are_not_sessions_and_header_listing_is_lightweight() {
+        let dir = tempdir().unwrap();
+        let mut session = JsonlSession::create(dir.path(), "/tmp/work", Some("one")).unwrap();
+        session
+            .append_entry(crate::SessionEntry::message(
+                "user",
+                serde_json::json!([{"type":"text","text":"searchable"}]),
+            ))
+            .unwrap();
+        let sidecar = session.path.with_extension("runtime.jsonl");
+        std::fs::write(
+            &sidecar,
+            "{\"type\":\"runtime\",\"schema_version\":1}\n",
+        )
+        .unwrap();
+
+        let found = discover_sessions(dir.path(), None).unwrap();
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].path, session.path);
+        assert_eq!(found[0].all_messages_text, "searchable");
+
+        let headers = discover_session_headers(dir.path(), None).unwrap();
+        assert_eq!(headers.len(), 1);
+        assert_eq!(headers[0].path, session.path);
+        assert!(headers[0].all_messages_text.is_empty());
+        assert_eq!(headers[0].message_count, 0);
     }
 
     #[test]

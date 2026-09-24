@@ -1,5 +1,0 @@
-{
-  "first": "AgentStart",
-  "last": "AgentEnd",
-  "required": ["AgentStart", "TurnStart", "TurnEnd", "AgentEnd"]
-}

@@ -82,7 +82,6 @@ pub struct FrameDecoder {
     header_length: usize,
     max_frame_length: u32,
     payload_blocks: Vec<Vec<u8>>,
-    current_payload_block: Option<Vec<u8>>,
     current_payload_block_length: usize,
     expected_payload_length: Option<u32>,
     payload_length: u32,
@@ -96,7 +95,6 @@ impl FrameDecoder {
             header_length: 0,
             max_frame_length: resolve_max_frame_length(options)?,
             payload_blocks: Vec::new(),
-            current_payload_block: None,
             current_payload_block_length: 0,
             expected_payload_length: None,
             payload_length: 0,
@@ -145,7 +143,6 @@ impl FrameDecoder {
                 }
                 self.expected_payload_length = Some(frame_length);
                 self.payload_blocks.clear();
-                self.current_payload_block = None;
                 self.current_payload_block_length = 0;
                 self.payload_length = 0;
             }
@@ -156,15 +153,14 @@ impl FrameDecoder {
             };
             while chunk_offset < chunk.len() && self.payload_length < expected {
                 if self
-                    .current_payload_block
-                    .as_ref()
-                    .map(|b| self.current_payload_block_length == b.len())
+                    .payload_blocks
+                    .last()
+                    .map(|block| self.current_payload_block_length == block.len())
                     .unwrap_or(true)
                 {
                     let remaining = (expected - self.payload_length) as usize;
                     let block = vec![0; remaining.min(PAYLOAD_BLOCK_SIZE)];
                     self.payload_blocks.push(block);
-                    self.current_payload_block = self.payload_blocks.last().cloned();
                     self.current_payload_block_length = 0;
                 }
                 let block = self.payload_blocks.last_mut().expect("payload block");
@@ -189,7 +185,6 @@ impl FrameDecoder {
                 };
                 frames.push(payload);
                 self.payload_blocks.clear();
-                self.current_payload_block = None;
                 self.current_payload_block_length = 0;
                 self.expected_payload_length = None;
                 self.payload_length = 0;
@@ -216,7 +211,6 @@ impl FrameDecoder {
         self.state = DecoderState::Failed;
         self.header_length = 0;
         self.payload_blocks.clear();
-        self.current_payload_block = None;
         self.current_payload_block_length = 0;
         self.expected_payload_length = None;
         self.payload_length = 0;
@@ -296,6 +290,18 @@ mod tests {
         let frames = decoder.push(&chunk).unwrap();
         chunk.fill(9);
         assert_eq!(frames, vec![vec![1, 2, 3]]);
+    }
+
+    #[test]
+    fn decodes_maximum_frame_byte_identically() {
+        let payload: Vec<u8> = (0..DEFAULT_MAX_FRAME_LENGTH as usize)
+            .map(|index| (index % 251) as u8)
+            .collect();
+        let wire = encode_frame(&payload).unwrap();
+        let mut decoder = FrameDecoder::new(None).unwrap();
+        let frames = decoder.push(&wire).unwrap();
+        decoder.end().unwrap();
+        assert_eq!(frames, vec![payload]);
     }
 
     #[test]

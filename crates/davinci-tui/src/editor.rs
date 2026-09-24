@@ -62,7 +62,7 @@ pub struct Editor {
     padding_x: usize,
     last_width: Cell<usize>,
     scroll_offset: Cell<usize>,
-    terminal_rows: usize,
+    terminal_rows: Cell<usize>,
     focused: bool,
 }
 
@@ -85,7 +85,7 @@ impl Editor {
             padding_x: 0,
             last_width: Cell::new(80),
             scroll_offset: Cell::new(0),
-            terminal_rows: 24,
+            terminal_rows: Cell::new(24),
             focused: true,
         }
     }
@@ -94,8 +94,14 @@ impl Editor {
         self.padding_x = padding;
     }
 
-    pub fn set_terminal_rows(&mut self, rows: usize) {
-        self.terminal_rows = rows.max(1);
+    pub fn set_terminal_rows(&self, rows: usize) {
+        self.terminal_rows.set(rows.max(1));
+    }
+
+    /// Width used for visual-line navigation. Hosts that render the editor
+    /// themselves must keep this synchronized with their composer layout.
+    pub fn set_layout_width(&self, width: usize) {
+        self.last_width.set(width.max(1));
     }
 
     pub fn get_text(&self) -> &str {
@@ -219,7 +225,7 @@ impl Editor {
 
     fn page_scroll(&mut self, direction: isize) {
         self.last_action = None;
-        let page_size = (self.terminal_rows as f64 * 0.3).floor() as usize;
+        let page_size = (self.terminal_rows.get() as f64 * 0.3).floor() as usize;
         let page_size = page_size.max(5);
         let visual_lines = self.build_visual_line_map(self.last_width.get());
         if visual_lines.is_empty() {
@@ -397,11 +403,7 @@ impl Editor {
             self.cursor = start;
             return;
         }
-        self.cursor -= self.buffer[..self.cursor]
-            .chars()
-            .next_back()
-            .map(|c| c.len_utf8())
-            .unwrap_or(0);
+        self.cursor -= prev_grapheme_len(&self.buffer[..self.cursor]);
     }
 
     pub fn move_right(&mut self) {
@@ -414,11 +416,7 @@ impl Editor {
             self.cursor = end;
             return;
         }
-        self.cursor += self.buffer[self.cursor..]
-            .chars()
-            .next()
-            .map(|c| c.len_utf8())
-            .unwrap_or(0);
+        self.cursor += next_grapheme_len(&self.buffer[self.cursor..]);
     }
 
     pub fn move_line_start(&mut self) {
@@ -1073,7 +1071,7 @@ impl Component for Editor {
         self.last_width.set(layout_width);
 
         let layout = self.layout_text(layout_width);
-        let max_visible = ((self.terminal_rows as f64) * 0.3).floor() as usize;
+        let max_visible = ((self.terminal_rows.get() as f64) * 0.3).floor() as usize;
         let max_visible = max_visible.max(5);
         let cursor_line = layout.iter().position(|line| line.has_cursor).unwrap_or(0);
         let mut scroll = self.scroll_offset.get();

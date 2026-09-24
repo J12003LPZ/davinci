@@ -757,6 +757,27 @@ fn parse_scalar_string(s: &str, line: usize) -> Result<String, DefinitionParseEr
                     Some('r') => out.push('\r'),
                     Some('"') => out.push('"'),
                     Some('\\') => out.push('\\'),
+                    Some('u') => {
+                        let digits = chars.by_ref().take(4).collect::<String>();
+                        if digits.len() != 4 {
+                            return Err(DefinitionParseError {
+                                line,
+                                column: 1,
+                                message: "incomplete unicode escape".into(),
+                            });
+                        }
+                        let value = u32::from_str_radix(&digits, 16).map_err(|_| DefinitionParseError {
+                            line,
+                            column: 1,
+                            message: "invalid unicode escape".into(),
+                        })?;
+                        let decoded = char::from_u32(value).ok_or_else(|| DefinitionParseError {
+                            line,
+                            column: 1,
+                            message: "invalid unicode scalar".into(),
+                        })?;
+                        out.push(decoded);
+                    }
                     Some(other) => {
                         out.push('\\');
                         out.push(other);
@@ -1052,13 +1073,31 @@ fn read_flow_scalar_or_quoted(
     Ok(s[start..*idx].to_string())
 }
 
+fn yaml_quote(value: &str) -> String {
+    let mut out = String::with_capacity(value.len() + 2);
+    out.push('"');
+    for ch in value.chars() {
+        match ch {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            ch if ch.is_control() => out.push_str(&format!("\\u{:04x}", ch as u32)),
+            ch => out.push(ch),
+        }
+    }
+    out.push('"');
+    out
+}
+
 pub fn to_yaml_string(def: &SavedGraphDefinitionV1) -> String {
     let mut out = String::new();
     out.push_str(&format!("schema_version: {}\n", def.schema_version));
-    out.push_str(&format!("name: \"{}\"\n", def.name));
-    out.push_str(&format!("description: \"{}\"\n", def.description));
+    out.push_str(&format!("name: {}\n", yaml_quote(&def.name)));
+    out.push_str(&format!("description: {}\n", yaml_quote(&def.description)));
     out.push_str("graph:\n");
-    out.push_str(&format!("  graph_id: \"{}\"\n", def.graph.graph_id));
+    out.push_str(&format!("  graph_id: {}\n", yaml_quote(&def.graph.graph_id)));
     out.push_str(&format!("  version: {}\n", def.graph.version));
     out.push_str(&format!(
         "  mode: \"{}\"\n",
@@ -1073,9 +1112,9 @@ pub fn to_yaml_string(def: &SavedGraphDefinitionV1) -> String {
     } else {
         out.push_str("  nodes:\n");
         for node in &def.graph.nodes {
-            out.push_str(&format!("    - id: \"{}\"\n", node.id));
-            out.push_str(&format!("      role: \"{}\"\n", node.role.as_str()));
-            out.push_str(&format!("      expect: \"{}\"\n", node.expect.as_str()));
+            out.push_str(&format!("    - id: {}\n", yaml_quote(&node.id)));
+            out.push_str(&format!("      role: {}\n", yaml_quote(node.role.as_str())));
+            out.push_str(&format!("      expect: {}\n", yaml_quote(node.expect.as_str())));
             out.push_str(&format!("      required: {}\n", node.required));
             out.push_str(&format!("      allowsMutation: {}\n", node.allows_mutation));
         }
@@ -1085,8 +1124,8 @@ pub fn to_yaml_string(def: &SavedGraphDefinitionV1) -> String {
     } else {
         out.push_str("  edges:\n");
         for edge in &def.graph.edges {
-            out.push_str(&format!("    - from: \"{}\"\n", edge.from));
-            out.push_str(&format!("      to: \"{}\"\n", edge.to));
+            out.push_str(&format!("    - from: {}\n", yaml_quote(&edge.from)));
+            out.push_str(&format!("      to: {}\n", yaml_quote(&edge.to)));
             out.push_str(&format!(
                 "      condition: \"{}\"\n",
                 match edge.condition {
@@ -1102,14 +1141,14 @@ pub fn to_yaml_string(def: &SavedGraphDefinitionV1) -> String {
     } else {
         out.push_str("bindings:\n");
         for b in &def.bindings {
-            out.push_str(&format!("  - node_id: \"{}\"\n", b.node_id));
-            out.push_str(&format!("    stage: \"{}\"\n", b.stage));
+            out.push_str(&format!("  - node_id: {}\n", yaml_quote(&b.node_id)));
+            out.push_str(&format!("    stage: {}\n", yaml_quote(&b.stage)));
             if b.input_artifacts.is_empty() {
                 out.push_str("    input_artifacts: []\n");
             } else {
                 out.push_str("    input_artifacts:\n");
                 for art in &b.input_artifacts {
-                    out.push_str(&format!("      - \"{}\"\n", art));
+                    out.push_str(&format!("      - {}\n", yaml_quote(art)));
                 }
             }
         }
@@ -1128,7 +1167,7 @@ pub fn to_yaml_string(def: &SavedGraphDefinitionV1) -> String {
     }
     if let Some(vp) = &def.verification_policy {
         out.push_str("verification_policy:\n");
-        out.push_str(&format!("  command_profile: \"{}\"\n", vp.command_profile));
+        out.push_str(&format!("  command_profile: {}\n", yaml_quote(&vp.command_profile)));
         out.push_str(&format!("  required: {}\n", vp.required));
     }
     if def.artifact_contract_versions.is_empty() {
@@ -1136,7 +1175,7 @@ pub fn to_yaml_string(def: &SavedGraphDefinitionV1) -> String {
     } else {
         out.push_str("artifact_contract_versions:\n");
         for (k, v) in &def.artifact_contract_versions {
-            out.push_str(&format!("  \"{}\": {}\n", k, v));
+            out.push_str(&format!("  {}: {}\n", yaml_quote(k), v));
         }
     }
     if def.parameters.is_empty() {
@@ -1144,20 +1183,20 @@ pub fn to_yaml_string(def: &SavedGraphDefinitionV1) -> String {
     } else {
         out.push_str("parameters:\n");
         for p in &def.parameters {
-            out.push_str(&format!("  - name: \"{}\"\n", p.name));
-            out.push_str(&format!("    param_type: \"{}\"\n", p.param_type));
+            out.push_str(&format!("  - name: {}\n", yaml_quote(&p.name)));
+            out.push_str(&format!("    param_type: {}\n", yaml_quote(&p.param_type)));
             if let Some(d) = &p.description {
-                out.push_str(&format!("    description: \"{}\"\n", d));
+                out.push_str(&format!("    description: {}\n", yaml_quote(d)));
             }
             if let Some(def_val) = &p.default {
-                out.push_str(&format!("    default: \"{}\"\n", def_val));
+                out.push_str(&format!("    default: {}\n", yaml_quote(def_val)));
             }
             if p.allowed_values.is_empty() {
                 out.push_str("    allowed_values: []\n");
             } else {
                 out.push_str("    allowed_values:\n");
                 for v in &p.allowed_values {
-                    out.push_str(&format!("      - \"{}\"\n", v));
+                    out.push_str(&format!("      - {}\n", yaml_quote(v)));
                 }
             }
         }
@@ -2117,6 +2156,24 @@ parameters:
             artifact_contract_versions: BTreeMap::new(),
             parameters: vec![],
         }
+    }
+
+    #[test]
+    fn saved_definition_round_trips_quotes_backslashes_and_newlines() {
+        let mut def = sample_valid_saved_def("quoted-roundtrip");
+        def.description = "say \"hi\" at C:\\temp\nsecond line".into();
+        def.parameters = vec![SavedParameter {
+            name: "target".into(),
+            description: Some("line one\nline \"two\"".into()),
+            param_type: "string".into(),
+            default: Some("C:\\work\\file".into()),
+            allowed_values: vec!["a\\b".into(), "say \"yes\"".into()],
+        }];
+
+        let yaml = to_yaml_string(&def);
+        let parsed = parse_saved_definition(&yaml).unwrap();
+        assert_eq!(parsed.description, def.description);
+        assert_eq!(parsed.parameters, def.parameters);
     }
 
     #[test]

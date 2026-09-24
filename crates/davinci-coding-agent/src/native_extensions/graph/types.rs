@@ -724,6 +724,45 @@ impl GraphRun {
             .collect()
     }
 
+    pub fn baseline_hashes(&self) -> Vec<String> {
+        fn add(
+            hashes: &mut Vec<String>,
+            baseline: &super::mutation::MutationBaseline,
+        ) {
+            hashes.extend(
+                baseline
+                    .files
+                    .values()
+                    .map(|fingerprint| fingerprint.hash.clone()),
+            );
+        }
+
+        let mut hashes = Vec::new();
+        if let Some(cursor) = &self.continuation {
+            if let Some(delivery) = &cursor.delivery {
+                add(&mut hashes, &delivery.baseline);
+                if let Some(baseline) = &delivery.attempt_baseline {
+                    add(&mut hashes, baseline);
+                }
+            }
+            if let Some(delivery) = &cursor.completed_delivery {
+                add(&mut hashes, &delivery.baseline);
+                if let Some(baseline) = &delivery.attempt_baseline {
+                    add(&mut hashes, baseline);
+                }
+            }
+            if let Some(baseline) = &cursor.saved_baseline {
+                add(&mut hashes, baseline);
+            }
+            for baseline in cursor.saved_attempt_baselines.values() {
+                add(&mut hashes, baseline);
+            }
+        }
+        hashes.sort();
+        hashes.dedup();
+        hashes
+    }
+
     pub fn total_input(&self) -> u64 {
         self.tasks.iter().map(|task| task.usage.input).sum()
     }

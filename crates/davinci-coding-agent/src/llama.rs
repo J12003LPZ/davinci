@@ -473,17 +473,41 @@ pub fn watch_live(
     if !(200..300).contains(&status) {
         return Err(format!("llama.cpp SSE returned HTTP {status}"));
     }
-    let mut reader = response.into_reader();
+    read_sse_stream(response.into_reader(), cancel, &mut on_event)
+}
+
+fn read_sse_stream(
+    mut reader: impl Read,
+    cancel: Option<&AtomicBool>,
+    on_event: &mut impl FnMut(LlamaModelEvent),
+) -> Result<(), String> {
     let mut buffer = String::new();
+    let mut pending = Vec::new();
     let mut chunk = [0u8; 2048];
     loop {
         if cancel.is_some_and(|flag| flag.load(Ordering::Relaxed)) {
             return Ok(());
         }
         match reader.read(&mut chunk) {
-            Ok(0) => break,
+            Ok(0) => {
+                if !pending.is_empty() {
+                    buffer.push_str(&String::from_utf8_lossy(&pending).replace("\r\n", "\n"));
+                }
+                break;
+            }
             Ok(n) => {
-                buffer.push_str(&String::from_utf8_lossy(&chunk[..n]).replace("\r\n", "\n"));
+                pending.extend_from_slice(&chunk[..n]);
+                let valid_up_to = match std::str::from_utf8(&pending) {
+                    Ok(_) => pending.len(),
+                    Err(err) if err.error_len().is_none() => err.valid_up_to(),
+                    Err(err) => err.valid_up_to() + err.error_len().unwrap_or(1),
+                };
+                if valid_up_to > 0 {
+                    buffer.push_str(
+                        &String::from_utf8_lossy(&pending[..valid_up_to]).replace("\r\n", "\n"),
+                    );
+                    pending.drain(..valid_up_to);
+                }
                 while let Some(boundary) = buffer.find("\n\n") {
                     let frame = buffer[..boundary].to_string();
                     buffer = buffer[boundary + 2..].to_string();
@@ -1367,6 +1391,33 @@ mod tests {
         std::env::set_var("PI_LLAMA_DRY_RUN", "1");
         load_model("http://127.0.0.1:8080", "local").unwrap();
         std::env::remove_var("PI_LLAMA_DRY_RUN");
+    }
+
+    #[test]
+    fn utf8_split_across_reads_is_preserved() {
+        struct Chunked {
+            chunks: std::collections::VecDeque<Vec<u8>>,
+        }
+        impl Read for Chunked {
+            fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
+                let Some(chunk) = self.chunks.pop_front() else {
+                    return Ok(0);
+                };
+                out[..chunk.len()].copy_from_slice(&chunk);
+                Ok(chunk.len())
+            }
+        }
+
+        let body =
+            "data: {\"model\":\"local\",\"event\":\"モデル\"}\n\n".as_bytes().to_vec();
+        let first_non_ascii = body.iter().position(|byte| *byte >= 0x80).unwrap();
+        let split = first_non_ascii + 1;
+        let reader = Chunked {
+            chunks: [body[..split].to_vec(), body[split..].to_vec()].into(),
+        };
+        let mut events = Vec::new();
+        read_sse_stream(reader, None, &mut |event| events.push(event)).unwrap();
+        assert_eq!(events[0].event, "モデル");
     }
 
     #[test]

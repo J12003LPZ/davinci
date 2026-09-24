@@ -166,6 +166,14 @@ Keep `retry.provider.maxRetries` at `0` unless provider-level retries are explic
 }
 ```
 
+### Model turn limit
+
+| Setting | Type | Default | Description |
+|---------|------|---------|-------------|
+| `maxModelTurns` | number | `200` | Maximum model turns in one main-agent run. Set to `0` for no limit. Worker agents use a default limit of `60`. |
+
+When the limit is reached, the agent adds a message explaining that it stopped and can continue after you send another message.
+
 ### Message Delivery
 
 | Setting | Type | Default | Description |

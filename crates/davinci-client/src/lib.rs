@@ -18,15 +18,14 @@ pub use unix::{
     resolve_unix_transport_options, UnixByteTransport, UnixTransportOptions,
 };
 
-use std::collections::HashMap;
-use std::io::{Read, Write};
+use std::io::Write;
 use std::net::TcpStream;
 #[cfg(unix)]
 use std::os::unix::net::UnixStream;
 use std::time::Duration;
 
 use davinci_protocol::{
-    encode_client_message, ClientMessage, ClientMessageDecoder, Command, ProtocolError,
+    encode_client_message, ClientMessage, Command, ProtocolError,
     ProtocolErrorCode, ServerMessage, PROTOCOL_VERSION,
 };
 use thiserror::Error;
@@ -63,7 +62,6 @@ impl MemoryPipe {
 
 pub struct PiClient {
     pub connection_id: Option<String>,
-    pending: HashMap<String, String>,
     handshake_timeout: Duration,
 }
 
@@ -71,7 +69,6 @@ impl Default for PiClient {
     fn default() -> Self {
         Self {
             connection_id: None,
-            pending: HashMap::new(),
             handshake_timeout: Duration::from_secs(5),
         }
     }
@@ -90,7 +87,6 @@ impl PiClient {
 
     pub fn request(&mut self, command: Command) -> (String, ClientMessage) {
         let id = Uuid::new_v4().to_string();
-        self.pending.insert(id.clone(), command.name().to_string());
         (
             id.clone(),
             ClientMessage::Request {
@@ -137,19 +133,6 @@ pub fn write_message<W: Write>(writer: &mut W, message: &ClientMessage) -> Resul
     writer
         .write_all(&bytes)
         .map_err(|err| ClientError::Io(err.to_string()))
-}
-
-pub fn read_messages<R: Read>(
-    reader: &mut R,
-    decoder: &mut ClientMessageDecoder,
-) -> Result<Vec<ClientMessage>, ClientError> {
-    let mut buf = [0u8; 4096];
-    let n = reader
-        .read(&mut buf)
-        .map_err(|err| ClientError::Io(err.to_string()))?;
-    decoder
-        .push(&buf[..n])
-        .map_err(|err| ClientError::Protocol(err.to_string()))
 }
 
 #[cfg(test)]

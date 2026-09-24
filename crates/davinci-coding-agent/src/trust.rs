@@ -8,6 +8,8 @@ use serde_json::Value;
 
 use crate::settings::with_settings_lock;
 
+/// Project resources under either config directory that can run code or change
+/// the agent's prompt or permissions. Keep in sync with every project loader.
 const TRUST_REQUIRING_PROJECT_CONFIG_RESOURCES: &[&str] = &[
     "settings.json",
     "extensions",
@@ -17,6 +19,10 @@ const TRUST_REQUIRING_PROJECT_CONFIG_RESOURCES: &[&str] = &[
     "SYSTEM.md",
     "APPEND_SYSTEM.md",
     "hooks.json",
+    "mcp.json",
+    "agents",
+    "git",
+    "npm",
 ];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -64,6 +70,23 @@ impl ProjectTrustStore {
         .flatten()
     }
 
+    /// `Err` means a decision may exist but cannot be read. Callers that
+    /// grant trust must treat that as "not trusted".
+    pub fn try_get(&self, cwd: &Path) -> Result<Option<bool>, String> {
+        if let Some(parent) = self.trust_path.parent() {
+            fs::create_dir_all(parent).map_err(|err| {
+                format!(
+                    "Failed to create trust store directory {}: {err}",
+                    parent.display()
+                )
+            })?;
+        }
+        with_settings_lock(&self.trust_path, || {
+            let data = read_trust_file(&self.trust_path)?;
+            Ok(find_nearest_trust_entry(&data, cwd).map(|entry| entry.decision))
+        })
+    }
+
     #[allow(dead_code)]
     pub fn set(&self, cwd: &Path, decision: Option<bool>) -> Result<(), String> {
         self.set_many(&[ProjectTrustUpdate {
@@ -108,9 +131,12 @@ pub fn resolve_project_trusted(
     if !has_trust_requiring_project_resources(cwd) {
         return true;
     }
-    let store = ProjectTrustStore::open(agent_dir);
-    if let Some(decision) = store.get(cwd) {
-        return decision;
+    match ProjectTrustStore::open(agent_dir).try_get(cwd) {
+        Ok(Some(decision)) => return decision,
+        Ok(None) => {}
+        // A stored "Do not trust" we cannot read must not be overridden by
+        // `defaultProjectTrust` or `trustedProjects`.
+        Err(_) => return false,
     }
     let canonical = canonicalize_trust_path(cwd);
     let display = cwd.to_string_lossy();
@@ -124,8 +150,12 @@ pub fn resolve_project_trusted(
 }
 
 pub fn canonicalize_trust_path(path: &Path) -> String {
-    fs::canonicalize(path)
-        .unwrap_or_else(|_| path.to_path_buf())
+    let canonical = fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    display_path(&canonical)
+}
+
+pub fn display_path(path: &Path) -> String {
+    davinci_agent::strip_verbatim_prefix(path)
         .to_string_lossy()
         .into_owned()
 }
@@ -207,16 +237,7 @@ pub fn has_trust_requiring_project_resources(cwd: &Path) -> bool {
     let user_agents_skills = PathBuf::from(&home).join(".agents").join("skills");
     let user_agents_skills = canonicalize_trust_path(&user_agents_skills);
     let mut current = PathBuf::from(canonicalize_trust_path(cwd));
-    let davinci_dir = current.join(".davinci");
-    let config_dir = if davinci_dir.exists() {
-        davinci_dir
-    } else {
-        current.join(".pi")
-    };
-    if TRUST_REQUIRING_PROJECT_CONFIG_RESOURCES
-        .iter()
-        .any(|entry| config_dir.join(entry).exists())
-    {
+    if crate::project_config::any_exists(&current, TRUST_REQUIRING_PROJECT_CONFIG_RESOURCES) {
         return true;
     }
     loop {
@@ -277,7 +298,7 @@ fn write_trust_file(path: &Path, data: &BTreeMap<String, Value>) -> Result<(), S
         "{}\n",
         serde_json::to_string_pretty(&Value::Object(sorted)).map_err(|err| err.to_string())?
     );
-    fs::write(path, body).map_err(|err| err.to_string())
+    davinci_sys::fs::atomic_write(path, body.as_bytes()).map_err(|err| err.to_string())
 }
 
 fn find_nearest_trust_entry(
@@ -287,7 +308,8 @@ fn find_nearest_trust_entry(
     let mut current = PathBuf::from(canonicalize_trust_path(cwd));
     loop {
         let key = current.to_string_lossy().into_owned();
-        if let Some(Value::Bool(decision)) = data.get(&key) {
+        let legacy = format!(r"\\?\{key}");
+        if let Some(Value::Bool(decision)) = data.get(&key).or_else(|| data.get(&legacy)) {
             return Some(ProjectTrustStoreEntry {
                 path: key,
                 decision: *decision,
@@ -305,6 +327,12 @@ fn find_nearest_trust_entry(
 mod tests {
     use super::*;
     use tempfile::tempdir;
+
+    #[test]
+    fn display_path_never_exposes_a_windows_verbatim_prefix() {
+        let path = Path::new(r"\\?\C:\work\repo");
+        assert_eq!(display_path(path), r"C:\work\repo");
+    }
 
     #[test]
     fn stores_decisions_and_inherits_from_parent_directories() {
@@ -397,6 +425,92 @@ mod tests {
         ProjectTrustStore::open(&agent)
             .set(&project, Some(false))
             .unwrap();
+        assert!(!resolve_project_trusted(
+            &agent,
+            &project,
+            None,
+            Some("always"),
+            &[]
+        ));
+    }
+
+    #[test]
+    fn project_mcp_config_requires_trust() {
+        let dir = tempdir().unwrap();
+        let cwd = dir.path().join("repo");
+        fs::create_dir_all(cwd.join(".pi")).unwrap();
+        fs::write(
+            cwd.join(".pi").join("mcp.json"),
+            r#"{"mcpServers":{"x":{"command":"calc"}}}"#,
+        )
+        .unwrap();
+        assert!(has_trust_requiring_project_resources(&cwd));
+    }
+
+    #[test]
+    fn empty_davinci_dir_does_not_hide_legacy_hooks() {
+        let dir = tempdir().unwrap();
+        let cwd = dir.path().join("repo");
+        fs::create_dir_all(cwd.join(".davinci")).unwrap();
+        fs::write(cwd.join(".davinci").join("README"), "").unwrap();
+        fs::create_dir_all(cwd.join(".pi")).unwrap();
+        fs::write(cwd.join(".pi").join("hooks.json"), "{}").unwrap();
+        assert!(has_trust_requiring_project_resources(&cwd));
+    }
+
+    #[test]
+    fn project_agents_and_local_package_roots_require_trust() {
+        for name in ["agents", "git", "npm"] {
+            let dir = tempdir().unwrap();
+            let cwd = dir.path().join("repo");
+            fs::create_dir_all(cwd.join(".pi").join(name)).unwrap();
+            assert!(has_trust_requiring_project_resources(&cwd), "{name}");
+        }
+    }
+
+    #[test]
+    fn untrusted_repo_with_only_mcp_json_is_not_auto_trusted() {
+        let dir = tempdir().unwrap();
+        let agent = dir.path().join("agent");
+        let cwd = dir.path().join("repo");
+        fs::create_dir_all(cwd.join(".pi")).unwrap();
+        fs::write(cwd.join(".pi").join("mcp.json"), "{}").unwrap();
+        assert!(!resolve_project_trusted(
+            &agent,
+            &cwd,
+            None,
+            Some("ask"),
+            &[]
+        ));
+    }
+
+    #[test]
+    fn unreadable_trust_store_is_not_trusted_even_with_default_always() {
+        let dir = tempdir().unwrap();
+        let agent = dir.path().join("agent");
+        let project = dir.path().join("project");
+        fs::create_dir_all(project.join(".pi")).unwrap();
+        fs::write(project.join(".pi").join("settings.json"), "{}").unwrap();
+        fs::create_dir_all(&agent).unwrap();
+        fs::write(agent.join("trust.json"), "{ not json").unwrap();
+        assert!(!resolve_project_trusted(
+            &agent,
+            &project,
+            None,
+            Some("always"),
+            &[]
+        ));
+    }
+
+    #[test]
+    fn held_trust_lock_is_not_trusted_even_with_default_always() {
+        let dir = tempdir().unwrap();
+        let agent = dir.path().join("agent");
+        let project = dir.path().join("project");
+        fs::create_dir_all(project.join(".pi")).unwrap();
+        fs::write(project.join(".pi").join("settings.json"), "{}").unwrap();
+        fs::create_dir_all(&agent).unwrap();
+        fs::write(agent.join("trust.json.lock"), "1\n").unwrap();
         assert!(!resolve_project_trusted(
             &agent,
             &project,

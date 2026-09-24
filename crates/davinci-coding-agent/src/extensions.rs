@@ -22,6 +22,8 @@ pub struct ExtensionTool {
     pub description: String,
     #[serde(default)]
     pub command: Option<String>,
+    #[serde(default, rename = "timeoutMs")]
+    pub timeout_ms: Option<u64>,
 }
 
 pub fn discover_extensions(agent_dir: &Path, names: &[String]) -> Vec<ExtensionManifest> {

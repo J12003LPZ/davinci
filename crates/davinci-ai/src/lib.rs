@@ -1,5 +1,29 @@
 //! Unified multi-provider LLM API matching `@earendil-works/pi-ai`.
 
+/// Set on a finished tool call whose arguments were not valid JSON. The agent
+/// answers such a call with an error and never executes it.
+pub const INVALID_ARGUMENTS_KEY: &str = "__davinci_invalid_arguments";
+
+pub(crate) fn invalid_arguments(raw: &str) -> serde_json::Value {
+    let mut arguments = serde_json::Map::new();
+    arguments.insert(
+        INVALID_ARGUMENTS_KEY.to_owned(),
+        serde_json::Value::String(raw.chars().take(2_000).collect()),
+    );
+    serde_json::Value::Object(arguments)
+}
+
+pub(crate) fn final_tool_arguments(raw: &str) -> serde_json::Value {
+    if raw.trim().is_empty() {
+        return serde_json::Value::Object(serde_json::Map::new());
+    }
+
+    match serde_json::from_str::<serde_json::Value>(raw) {
+        Ok(value @ serde_json::Value::Object(_)) => value,
+        _ => invalid_arguments(raw),
+    }
+}
+
 mod apply_patch_grammar;
 mod attribution;
 mod auth;
@@ -13,6 +37,8 @@ pub mod codex_transport;
 pub mod codex_usage;
 mod codex_ws;
 mod deferred;
+pub mod fixtures;
+mod http;
 mod http_proxy;
 mod images;
 mod model_config;
@@ -47,7 +73,7 @@ pub use auth::{
     copilot_base_url_from_token, credential_expires_by, default_auth_path,
     fetch_github_copilot_available_model_ids, parse_copilot_available_model_ids,
     resolve_provider_auth, vertex_ambient_auth, AuthStorage, AuthStorageError, Credential,
-    CredentialKind, ResolvedAuth,
+    CredentialKind, ResolvedAuth, ANTHROPIC_OAUTH_UNSUPPORTED_MESSAGE,
 };
 pub use catalog::{
     builtin_catalog_json, builtin_provider_ids, effective_model_cost_rates, flatten_catalog,
@@ -100,7 +126,7 @@ pub use models_store::{
     save_models_store, ModelsStore, ModelsStoreEntry, DEFAULT_CATALOG_BASE_URL,
     REMOTE_CATALOG_REFRESH_INTERVAL_MS,
 };
-pub use oauth::{poll_oauth_device_code_flow, DeviceCodePoller, DevicePollStatus};
+pub use oauth::{DeviceCodePoller, DevicePollStatus};
 pub use oauth_callback::{
     callback_host, handle_callback_request, oauth_error_html, oauth_success_html, CallbackProvider,
     CallbackResponse, CallbackServer, ERR_CALLBACK_ROUTE_NOT_FOUND, ERR_INTERNAL_HTML,
@@ -109,7 +135,8 @@ pub use oauth_callback::{
 pub use oauth_providers::{
     authorize_request, device_status_from_error, exchange_authorization_code,
     fresh_authorize_request, generate_pkce, oauth_providers, parse_authorization_input,
-    refresh_oauth_token, token_exchange_request, token_refresh_request, AuthorizeRequest,
+    refresh_oauth_token, save_pending_login, take_pending_login, token_exchange_request,
+    token_refresh_request, AuthorizeRequest,
     OauthTokens, Pkce, TokenExchangeRequest,
 };
 pub use openai_cache_diagnostics::{
@@ -183,8 +210,10 @@ pub enum MessageContent {
     },
     Thinking {
         thinking: String,
-        #[serde(skip_serializing_if = "Option::is_none")]
+        #[serde(default, skip_serializing_if = "Option::is_none")]
         redacted: Option<bool>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        signature: Option<String>,
     },
     Image {
         data: String,

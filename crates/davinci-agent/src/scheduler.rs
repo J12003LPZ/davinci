@@ -6,11 +6,12 @@
 //! `Promise.all`, results finalized in source order), with one refinement
 //! the TypeScript runtime leaves to each tool's `executionMode`: calls are
 //! placed in a *lane*. Read-only calls (`read`, `grep`, `find`, `ls`, the
-//! web tools, `mcp_read`, read-only MCP tools, `agent`) share the parallel
-//! lane and overlap; anything that mutates or has unknown side effects
-//! (`write`, `edit`, shell commands, extension tools) is a barrier that
-//! runs alone, after everything before it has finished and before anything
-//! after it starts. Source order therefore still means what the model
+//! web tools, `mcp_read`, read-only MCP tools) share the parallel lane and
+//! overlap. `agent` calls use per-call routing so writable workers in the
+//! shared checkout become barriers. Anything that mutates or has unknown
+//! side effects (`write`, `edit`, shell commands, extension tools) is a
+//! barrier that runs alone, after everything before it has finished and
+//! before anything after it starts. Source order still means what the model
 //! thinks it means (`edit A` then `read A` sees the edit) while a burst of
 //! independent reads costs one round of latency instead of N.
 
@@ -39,7 +40,7 @@ pub enum ToolLane {
 /// `readOnlyHint`).
 pub fn lane_for(tool: &str, class: ToolClass) -> ToolLane {
     match tool {
-        // A worker is read-only by construction; several may search at once.
+        // Agent::lane_for_call makes writable shared-checkout workers serial.
         "agent" => ToolLane::Parallel,
         // A batch is a barrier: it schedules its own operations, and it
         // runs on the calling thread so the permission approver is asked

@@ -45,9 +45,7 @@ impl Agent {
         let message = match command {
             "approve" if rest.is_empty() => {
                 next.approve(&self.cwd)?;
-                if let Ok(c) = crate::runtime::contracts::compile_plan_contract(&next, None, None) {
-                    compiled_contract = Some(c);
-                }
+                compiled_contract = Some(self.compile_plan_contract_or_refuse(&next, None)?);
                 "Plan approved for review; execution mode is unchanged.".to_string()
             }
             "accept" => {
@@ -59,11 +57,8 @@ impl Agent {
                 {
                     next.decide(rest, true)?;
                     let step_filter = if rest == "all" { None } else { Some(rest) };
-                    if let Ok(c) =
-                        crate::runtime::contracts::compile_plan_contract(&next, step_filter, None)
-                    {
-                        compiled_contract = Some(c);
-                    }
+                    compiled_contract =
+                        Some(self.compile_plan_contract_or_refuse(&next, step_filter)?);
                     format!("Accepted plan decision {rest}; execution mode is unchanged.")
                 } else {
                     let target = if rest.is_empty() {
@@ -77,11 +72,7 @@ impl Agent {
                     }
                     next.approve(&self.cwd)?;
                     next.ready(&self.cwd)?;
-                    if let Ok(c) =
-                        crate::runtime::contracts::compile_plan_contract(&next, None, None)
-                    {
-                        compiled_contract = Some(c);
-                    }
+                    compiled_contract = Some(self.compile_plan_contract_or_refuse(&next, None)?);
                     execution_target = Some(target);
                     format!(
                         "Accepted plan revision {}. Execution mode: {}.",
@@ -150,6 +141,22 @@ impl Agent {
             self.set_permission_mode(mode);
         }
         Ok(format!("{message}\n{}", self.render_plan()))
+    }
+
+    fn compile_plan_contract_or_refuse(
+        &mut self,
+        plan: &LivingPlan,
+        step_filter: Option<&str>,
+    ) -> Result<crate::runtime::contracts::TaskContract, String> {
+        match crate::runtime::contracts::compile_plan_contract(plan, step_filter, None) {
+            Ok(contract) => Ok(contract),
+            Err(error) => {
+                self.clear_active_contract();
+                Err(format!(
+                    "The plan cannot be turned into an execution contract: {error}. Fix the step file lists (relative paths, no line numbers, within contract limits) and accept again."
+                ))
+            }
+        }
     }
 
     pub fn apply_host_decision_reply(
@@ -757,6 +764,62 @@ mod tests {
         assert!(agent.restore_plan().is_err());
         assert!(agent.is_plan_mode());
         assert!(agent.render_plan().contains("Invalid stored plan"));
+    }
+
+    #[test]
+    fn accepting_a_plan_that_cannot_compile_is_refused_and_clears_stale_contract() {
+        let (dir, mut agent) = fixture();
+        agent.handle_plan_command("accept").unwrap();
+        assert!(agent.active_contract().is_some());
+        agent.handle_plan_command("").unwrap();
+
+        let plan_revision = agent.tool_context.living_plan.lock().unwrap().revision;
+        let steps = (0..9)
+            .map(|step| {
+                serde_json::json!({
+                    "id": format!("overflow-{step}"),
+                    "change": "Add a bounded group of files",
+                    "files": (0..32)
+                        .map(|file| format!("src/overflow-{step}/file-{file}.rs"))
+                        .collect::<Vec<_>>(),
+                    "why": "Exercise the task contract path limit",
+                    "verify": ["cargo test --offline"]
+                })
+            })
+            .collect::<Vec<_>>();
+        agent
+            .tool_context
+            .living_plan
+            .lock()
+            .unwrap()
+            .update(
+                &serde_json::json!({
+                    "expected_revision": plan_revision,
+                    "steps": steps
+                }),
+                dir.path(),
+            )
+            .unwrap();
+        let updated_revision = agent.tool_context.living_plan.lock().unwrap().revision;
+
+        let error = agent
+            .handle_plan_command("accept auto")
+            .expect_err("oversized contracts must not be silently accepted");
+        assert!(error.contains("execution contract"), "{error}");
+        assert!(error.contains("256"), "{error}");
+        assert_eq!(agent.permission_mode(), PermissionMode::ReadOnly);
+        assert_eq!(
+            agent.tool_context.living_plan.lock().unwrap().revision,
+            updated_revision
+        );
+        assert!(agent
+            .tool_context
+            .living_plan
+            .lock()
+            .unwrap()
+            .approved_revision
+            .is_none());
+        assert!(agent.active_contract().is_none());
     }
 
     #[test]

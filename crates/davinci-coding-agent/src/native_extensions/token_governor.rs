@@ -511,8 +511,9 @@ impl OutputStore {
         let id = format!("out-{}", &digest[..12]);
         fs::create_dir_all(&self.root).map_err(|err| ToolError::Failed(err.to_string()))?;
         let path = self.root.join(format!("{id}.txt"));
-        if !path.exists() {
-            fs::write(&path, content).map_err(|err| ToolError::Failed(err.to_string()))?;
+        if !stored_output_is_intact(&path, &digest) {
+            davinci_sys::fs::atomic_write(&path, content.as_bytes())
+                .map_err(|err| ToolError::Failed(err.to_string()))?;
         }
         Ok(StoredOutputRef {
             id,
@@ -565,6 +566,12 @@ impl OutputStore {
         removed
     }
 }
+fn stored_output_is_intact(path: &Path, digest: &str) -> bool {
+    fs::read_to_string(path)
+        .map(|content| file_content_hash(&content) == digest)
+        .unwrap_or(false)
+}
+
 
 /// The most recent mtime among a directory's files; the directory's own
 /// mtime only when it holds none.
@@ -1475,6 +1482,17 @@ mod tests {
             compress_threshold_lines: 1,
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn torn_stored_output_is_rewritten() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = OutputStore::new(dir.path().to_path_buf());
+        let saved = store.save("full content").unwrap();
+        let path = dir.path().join(format!("{}.txt", saved.id));
+        fs::write(&path, "full con").unwrap();
+        store.save("full content").unwrap();
+        assert_eq!(store.load(&saved.id).unwrap(), "full content");
     }
 
     #[test]

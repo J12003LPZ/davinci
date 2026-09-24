@@ -143,12 +143,6 @@ impl RunStats {
         self.peak_context_tokens = self.peak_context_tokens.max(tokens);
     }
 
-    pub fn apply_budget_snapshot(&mut self, snapshot: &crate::runtime::BudgetSnapshot) {
-        self.budget_tokens_charged = snapshot.tokens_charged;
-        self.has_unknown_cost = snapshot.has_unknown_cost;
-        self.cost_minor_units = snapshot.cost_minor_units;
-    }
-
     pub fn mean_batch_width(&self) -> f64 {
         if self.tool_batches == 0 {
             0.0

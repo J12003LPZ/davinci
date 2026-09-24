@@ -359,13 +359,11 @@ impl WorkerSessionBinding {
                 return Err("worker tool ledger is a reparse point".into());
             }
         }
-        let ledger: davinci_agent::tool_ledger::ToolCallLedger = serde_json::from_slice(
-            &std::fs::read(&ledger_path).map_err(|error| error.to_string())?,
+        let ledger = davinci_agent::tool_ledger::ToolCallLedger::load_bound(
+            &ledger_path,
+            &self.session_id,
         )
-        .map_err(|error| format!("worker tool ledger is corrupt: {error}"))?;
-        if !ledger.session_id.is_empty() && ledger.session_id != self.session_id {
-            return Err("worker tool ledger belongs to a different conversation".into());
-        }
+        .map_err(|error| format!("worker tool ledger could not be loaded: {error}"))?;
         let session = JsonlSession::open(&self.session_path).map_err(|error| error.to_string())?;
         let persisted_results: std::collections::HashSet<String> = session
             .entries
@@ -384,12 +382,6 @@ impl WorkerSessionBinding {
             .collect();
         for record in ledger.records().values() {
             use davinci_agent::tool_ledger::{AttemptOutcome, ToolExecutionStatus, ToolSideEffect};
-            if record.status == ToolExecutionStatus::Blocked {
-                return Err(format!(
-                    "tool '{}' requires reconciliation before retry",
-                    record.tool_name
-                ));
-            }
             let uncertain = record.outcome == AttemptOutcome::StartedUnknown
                 || record.status == ToolExecutionStatus::Executing;
             if uncertain
@@ -397,6 +389,12 @@ impl WorkerSessionBinding {
             {
                 return Err(format!(
                     "tool '{}' may have produced an uncertain side effect",
+                    record.tool_name
+                ));
+            }
+            if record.status == ToolExecutionStatus::Blocked {
+                return Err(format!(
+                    "tool '{}' requires reconciliation before retry",
                     record.tool_name
                 ));
             }

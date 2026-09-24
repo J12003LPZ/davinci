@@ -60,14 +60,16 @@ impl SecurityWorkerRunner {
         }
         let replies = std::sync::Mutex::new(replies);
         Ok(Self::new(move |request| {
-            if let Ok(path) = std::env::var("PI_SECURITY_SCAN_HOLD") {
-                let hold = std::path::PathBuf::from(path);
-                let _ = std::fs::write(hold.with_file_name("waiting"), b"1");
-                while hold.exists() && !request.run.cancelled() {
-                    std::thread::sleep(std::time::Duration::from_millis(25));
-                }
-                if request.run.cancelled() {
-                    return Err("security review cancelled".into());
+            if cfg!(any(test, feature = "test-fixtures")) {
+                if let Ok(path) = std::env::var("PI_SECURITY_SCAN_HOLD") {
+                    let hold = std::path::PathBuf::from(path);
+                    let _ = std::fs::write(hold.with_file_name("waiting"), b"1");
+                    while hold.exists() && !request.run.cancelled() {
+                        std::thread::sleep(std::time::Duration::from_millis(25));
+                    }
+                    if request.run.cancelled() {
+                        return Err("security review cancelled".into());
+                    }
                 }
             }
             let content = replies

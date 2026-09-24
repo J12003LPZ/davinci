@@ -21,8 +21,22 @@ pub struct FileFingerprint {
 #[serde(rename_all = "camelCase")]
 pub struct MutationBaseline {
     pub files: BTreeMap<String, FileFingerprint>,
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    /// Legacy-only inline bytes. Old checkpoints still deserialize, but new
+    /// checkpoints keep file bytes in the content-addressed blob store.
+    #[serde(default, skip_serializing)]
     pub contents: BTreeMap<String, Vec<u8>>,
+}
+
+impl MutationBaseline {
+    pub fn old_bytes(&self, path: &str, blob_dir: &Path) -> Vec<u8> {
+        if let Some(bytes) = self.contents.get(path) {
+            return bytes.clone();
+        }
+        self.files
+            .get(path)
+            .and_then(|fingerprint| super::blobs::get(blob_dir, &fingerprint.hash))
+            .unwrap_or_default()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -109,31 +123,21 @@ fn is_transaction_journal(path: &str) -> bool {
 fn list_workspace_files(cwd: &Path) -> Vec<String> {
     if cwd.join(".git").exists() {
         let mut list = Vec::new();
-        if let Ok(output) = Command::new("git")
-            .args(["ls-files"])
-            .current_dir(cwd)
-            .output()
-        {
-            if output.status.success() {
-                for line in String::from_utf8_lossy(&output.stdout).lines() {
-                    let trimmed = line.trim();
-                    if !trimmed.is_empty() {
-                        list.push(normalize_rel_path(trimmed));
-                    }
+        if let Ok(output) = super::git::run(cwd, &["ls-files"]) {
+            for line in String::from_utf8_lossy(&output).lines() {
+                let trimmed = line.trim();
+                if !trimmed.is_empty() {
+                    list.push(normalize_rel_path(trimmed));
                 }
             }
         }
-        if let Ok(output) = Command::new("git")
-            .args(["ls-files", "--others", "--exclude-standard"])
-            .current_dir(cwd)
-            .output()
+        if let Ok(output) =
+            super::git::run(cwd, &["ls-files", "--others", "--exclude-standard"])
         {
-            if output.status.success() {
-                for line in String::from_utf8_lossy(&output.stdout).lines() {
-                    let trimmed = line.trim();
-                    if !trimmed.is_empty() {
-                        list.push(normalize_rel_path(trimmed));
-                    }
+            for line in String::from_utf8_lossy(&output).lines() {
+                let trimmed = line.trim();
+                if !trimmed.is_empty() {
+                    list.push(normalize_rel_path(trimmed));
                 }
             }
         }
@@ -180,8 +184,8 @@ fn walk_dir_files(root: &Path) -> Vec<String> {
 
 /// Capture baseline workspace fingerprints and contents before writer mutation.
 pub fn capture_baseline(cwd: &Path) -> Result<MutationBaseline, String> {
+    let blob_dir = super::blobs::dir(cwd);
     let mut files = BTreeMap::new();
-    let mut contents = BTreeMap::new();
 
     let paths = list_workspace_files(cwd);
     for rel_path in paths {
@@ -191,20 +195,23 @@ pub fn capture_baseline(cwd: &Path) -> Result<MutationBaseline, String> {
         let full = cwd.join(&rel_path);
         if let Ok(bytes) = std::fs::read(&full) {
             let hash = sha256_hex(&bytes);
+            if bytes.len() <= 512 * 1024 {
+                super::blobs::put(&blob_dir, &hash, &bytes).map_err(|error| error.to_string())?;
+            }
             files.insert(
-                rel_path.clone(),
+                rel_path,
                 FileFingerprint {
                     hash,
                     len: bytes.len() as u64,
                 },
             );
-            if bytes.len() <= 512 * 1024 {
-                contents.insert(rel_path, bytes);
-            }
         }
     }
 
-    Ok(MutationBaseline { files, contents })
+    Ok(MutationBaseline {
+        files,
+        contents: BTreeMap::new(),
+    })
 }
 
 /// Compute graph-owned delta against a captured baseline.
@@ -212,6 +219,7 @@ pub fn capture_graph_delta(
     cwd: &Path,
     baseline: &MutationBaseline,
 ) -> Result<GraphMutation, String> {
+    let blob_dir = super::blobs::dir(cwd);
     let current_paths = list_workspace_files(cwd);
     let mut current_map = BTreeMap::new();
 
@@ -224,13 +232,10 @@ pub fn capture_graph_delta(
             let hash = sha256_hex(&bytes);
             current_map.insert(
                 rel_path,
-                (
-                    FileFingerprint {
-                        hash,
-                        len: bytes.len() as u64,
-                    },
-                    bytes,
-                ),
+                FileFingerprint {
+                    hash,
+                    len: bytes.len() as u64,
+                },
             );
         }
     }
@@ -239,12 +244,13 @@ pub fn capture_graph_delta(
     let mut patch_chunks = Vec::new();
 
     // Check for added or modified files
-    for (path, (fingerprint, current_bytes)) in &current_map {
+    for (path, fingerprint) in &current_map {
         match baseline.files.get(path) {
             None => {
                 // Newly added by graph
                 changed_files.push(ChangedFile::added(path));
-                let patch = format_added_file_diff(path, current_bytes);
+                let current_bytes = std::fs::read(cwd.join(path)).unwrap_or_default();
+                let patch = format_added_file_diff(path, &current_bytes);
                 patch_chunks.push(PatchChunk {
                     file: path.clone(),
                     patch,
@@ -253,8 +259,9 @@ pub fn capture_graph_delta(
             Some(old_fp) if old_fp.hash != fingerprint.hash => {
                 // Modified by graph
                 changed_files.push(ChangedFile::modified(path));
-                let old_bytes = baseline.contents.get(path).cloned().unwrap_or_default();
-                let patch = format_modified_file_diff(path, &old_bytes, current_bytes);
+                let old_bytes = baseline.old_bytes(path, &blob_dir);
+                let current_bytes = std::fs::read(cwd.join(path)).unwrap_or_default();
+                let patch = format_modified_file_diff(path, &old_bytes, &current_bytes);
                 patch_chunks.push(PatchChunk {
                     file: path.clone(),
                     patch,
@@ -273,7 +280,7 @@ pub fn capture_graph_delta(
         }
         if !current_map.contains_key(old_path) {
             changed_files.push(ChangedFile::deleted(old_path));
-            let old_bytes = baseline.contents.get(old_path).cloned().unwrap_or_default();
+            let old_bytes = baseline.old_bytes(old_path, &blob_dir);
             let patch = format_deleted_file_diff(old_path, &old_bytes);
             patch_chunks.push(PatchChunk {
                 file: old_path.clone(),
@@ -446,6 +453,42 @@ fn format_modified_file_diff(file: &str, old_bytes: &[u8], new_bytes: &[u8]) -> 
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn baseline_serializes_without_file_contents() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.txt"), "secret-ish content").unwrap();
+        let baseline = capture_baseline(dir.path()).unwrap();
+        let json = serde_json::to_string(&baseline).unwrap();
+        assert!(!json.contains("contents"), "{json}");
+        assert!(json.contains("a.txt"));
+        let hash = &baseline.files["a.txt"].hash;
+        assert_eq!(
+            super::super::blobs::get(&super::super::blobs::dir(dir.path()), hash).unwrap(),
+            b"secret-ish content"
+        );
+    }
+
+    #[test]
+    fn delta_reads_old_bytes_from_the_blob_store() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.txt"), "one\n").unwrap();
+        let baseline = capture_baseline(dir.path()).unwrap();
+        let reloaded: MutationBaseline =
+            serde_json::from_str(&serde_json::to_string(&baseline).unwrap()).unwrap();
+        std::fs::write(dir.path().join("a.txt"), "two\n").unwrap();
+        let delta = capture_graph_delta(dir.path(), &reloaded).unwrap();
+        let patch = delta.diff();
+        assert!(patch.contains("-one") && patch.contains("+two"), "{patch}");
+    }
+
+    #[test]
+    fn legacy_inline_contents_still_deserialize() {
+        let legacy =
+            r#"{"files":{"a.txt":{"hash":"h","len":3}},"contents":{"a.txt":[97,98,99]}}"#;
+        let baseline: MutationBaseline = serde_json::from_str(legacy).unwrap();
+        assert_eq!(baseline.contents["a.txt"], b"abc");
+    }
+
     #[test]
     fn graph_checkpoint_files_are_not_part_of_git_mutation_baselines() {
         let dir = tempfile::tempdir().unwrap();

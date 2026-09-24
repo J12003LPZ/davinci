@@ -219,6 +219,31 @@ fn prune_finished_runs(cwd: &Path) {
             let _ = fs::remove_dir_all(run_dir(cwd, &run.run_id));
         }
     }
+    collect_unreferenced_blobs(cwd);
+}
+
+fn collect_unreferenced_blobs(cwd: &Path) {
+    let referenced: std::collections::HashSet<String> = list_runs(cwd)
+        .iter()
+        .filter_map(|summary| load_run(cwd, &summary.run_id))
+        .flat_map(|run| run.baseline_hashes())
+        .collect();
+    let blob_dir = super::blobs::dir(cwd);
+    let Ok(shards) = fs::read_dir(&blob_dir) else {
+        return;
+    };
+    for shard in shards.flatten() {
+        let Ok(entries) = fs::read_dir(shard.path()) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if !referenced.contains(&name) {
+                let _ = fs::remove_file(entry.path());
+            }
+        }
+        let _ = fs::remove_dir(shard.path());
+    }
 }
 
 /// A graph checkpoint can outlive the in-memory projection when an operation
@@ -290,7 +315,7 @@ fn json_contains_operation_reference(value: &Value) -> bool {
 /// Flush the new image before replacing the previous one in a single rename.
 /// A failed replacement must leave the previous checkpoint at its original name.
 pub fn atomic_write(path: &Path, content: &[u8]) -> std::io::Result<()> {
-    atomic_write_with(path, content, |from, to| fs::rename(from, to))
+    davinci_sys::fs::atomic_write(path, content)
 }
 
 fn atomic_write_with<F>(path: &Path, content: &[u8], mut rename: F) -> std::io::Result<()>
@@ -343,14 +368,53 @@ pub fn load_graph_definition(cwd: &Path, run_id: &str) -> Option<super::topology
     serde_json::from_str(&raw).ok()
 }
 
+fn migrate_baseline(
+    baseline: &mut super::mutation::MutationBaseline,
+    blob_dir: &Path,
+) -> std::io::Result<()> {
+    for (path, bytes) in std::mem::take(&mut baseline.contents) {
+        if let Some(fingerprint) = baseline.files.get(&path) {
+            super::blobs::put(blob_dir, &fingerprint.hash, &bytes)?;
+        }
+    }
+    Ok(())
+}
+
+fn migrate_inline_baselines(run: &mut GraphRun, blob_dir: &Path) -> std::io::Result<()> {
+    let Some(cursor) = run.continuation.as_mut() else {
+        return Ok(());
+    };
+    if let Some(delivery) = cursor.delivery.as_mut() {
+        migrate_baseline(&mut delivery.baseline, blob_dir)?;
+        if let Some(baseline) = delivery.attempt_baseline.as_mut() {
+            migrate_baseline(baseline, blob_dir)?;
+        }
+    }
+    if let Some(delivery) = cursor.completed_delivery.as_mut() {
+        migrate_baseline(&mut delivery.baseline, blob_dir)?;
+        if let Some(baseline) = delivery.attempt_baseline.as_mut() {
+            migrate_baseline(baseline, blob_dir)?;
+        }
+    }
+    if let Some(baseline) = cursor.saved_baseline.as_mut() {
+        migrate_baseline(baseline, blob_dir)?;
+    }
+    for baseline in cursor.saved_attempt_baselines.values_mut() {
+        migrate_baseline(baseline, blob_dir)?;
+    }
+    Ok(())
+}
+
 pub fn save_run(run: &mut GraphRun) -> std::io::Result<()> {
     let cwd = PathBuf::from(&run.cwd);
     let state_path = run_dir(&cwd, &run.run_id).join("state.json");
 
     if let Some(definition) = &run.definition {
         let graph_path = run_dir(&cwd, &run.run_id).join("graph.json");
-        if run.saved_definition.is_none() || !graph_path.exists() {
-            write_graph_definition(&cwd, &run.run_id, definition)?;
+        let bytes = serde_json::to_vec_pretty(definition)
+            .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+        if fs::read(&graph_path).ok().as_deref() != Some(bytes.as_slice()) {
+            atomic_write(&graph_path, &bytes)?;
         }
     }
 
@@ -361,12 +425,29 @@ pub fn save_run(run: &mut GraphRun) -> std::io::Result<()> {
             atomic_write(&saved_path, yaml_str.as_bytes())?;
         }
     }
+    // Migrate legacy inline bytes before cloning so a resumed old run does
+    // not keep a second repository-sized copy in memory. Blob writes are
+    // content-addressed and atomic, so clearing the inline copy is safe once
+    // this step succeeds even if publishing state.json later fails.
+    let blob_dir = super::blobs::dir(&cwd);
+    migrate_inline_baselines(run, &blob_dir)?;
     // The self-contained run state is the commit record. Publish it only after
     // all companion writes succeed, and retain the previous timestamp on error.
     let mut snapshot = run.clone();
     snapshot.updated_at = now_ms();
-    let content = serde_json::to_vec_pretty(&snapshot)
+    let content = serde_json::to_vec(&snapshot)
         .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+    if let Ok(previous_bytes) = fs::read(&state_path) {
+        if let Ok(previous) = serde_json::from_slice::<GraphRun>(&previous_bytes) {
+            if previous.run_id == snapshot.run_id && previous.revision < snapshot.revision {
+                let history_path = super::history::history_dir(&cwd, &run.run_id)
+                    .join(format!("revision-{}.state.json", previous.revision));
+                if !history_path.exists() {
+                    atomic_write(&history_path, &previous_bytes)?;
+                }
+            }
+        }
+    }
     atomic_write(&state_path, &content)?;
     run.updated_at = snapshot.updated_at;
     Ok(())
@@ -579,11 +660,19 @@ pub fn load_run_checked(cwd: &Path, run_id: &str) -> Result<GraphRun, String> {
     if run.saved_definition.is_none() {
         let saved_path = run_dir(cwd, run_id).join("saved_definition.yaml");
         if saved_path.exists() {
-            if let Ok(raw_yaml) = fs::read_to_string(&saved_path) {
-                if let Ok(def) = super::definitions::parse_saved_definition(&raw_yaml) {
-                    run.saved_definition = Some(def);
-                }
-            }
+            let raw_yaml = fs::read_to_string(&saved_path).map_err(|error| {
+                format!(
+                    "Cannot read saved graph definition '{}': {error}",
+                    saved_path.display()
+                )
+            })?;
+            let def = super::definitions::parse_saved_definition(&raw_yaml).map_err(|error| {
+                format!(
+                    "Cannot parse saved graph definition '{}': {error}",
+                    saved_path.display()
+                )
+            })?;
+            run.saved_definition = Some(def);
         }
     }
     for task in &mut run.tasks {
@@ -719,6 +808,49 @@ mod tests {
     use tempfile::tempdir;
 
     #[test]
+    fn blob_gc_keeps_referenced_hashes_and_removes_orphans() {
+        use crate::native_extensions::graph::continuation::GraphContinuation;
+        use crate::native_extensions::graph::mutation::{FileFingerprint, MutationBaseline};
+        use std::collections::BTreeMap;
+
+        let dir = tempdir().unwrap();
+        let run_id = "blob-gc";
+        create_run_dir(dir.path(), run_id).unwrap();
+        let keep_bytes = b"keep me";
+        let orphan_bytes = b"remove me";
+        let keep_hash = crate::native_extensions::graph::replay::sha256_hex(keep_bytes);
+        let orphan_hash = crate::native_extensions::graph::replay::sha256_hex(orphan_bytes);
+        let blob_dir = super::super::blobs::dir(dir.path());
+        super::super::blobs::put(&blob_dir, &keep_hash, keep_bytes).unwrap();
+        super::super::blobs::put(&blob_dir, &orphan_hash, orphan_bytes).unwrap();
+
+        let mut run = sample_run(dir.path(), run_id, "goal");
+        let mut files = BTreeMap::new();
+        files.insert(
+            "a.txt".into(),
+            FileFingerprint {
+                hash: keep_hash.clone(),
+                len: keep_bytes.len() as u64,
+            },
+        );
+        run.continuation = Some(GraphContinuation {
+            saved_baseline: Some(MutationBaseline {
+                files,
+                contents: BTreeMap::new(),
+            }),
+            ..GraphContinuation::default()
+        });
+        save_run(&mut run).unwrap();
+
+        collect_unreferenced_blobs(dir.path());
+        assert_eq!(
+            super::super::blobs::get(&blob_dir, &keep_hash).unwrap(),
+            keep_bytes
+        );
+        assert!(super::super::blobs::get(&blob_dir, &orphan_hash).is_none());
+    }
+
+    #[test]
     fn live_transcript_tail_is_bounded_and_preserves_recent_unicode() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("worker.live.log");
@@ -787,6 +919,18 @@ mod tests {
         assert_eq!(loaded.goal, "goal text");
         assert_eq!(loaded.budgets, GraphBudgets::default());
         assert!(loaded.updated_at > 0);
+    }
+
+    #[test]
+    fn saved_state_is_compact_and_has_no_inline_contents() {
+        let dir = tempdir().unwrap();
+        let run_id = new_run_id();
+        create_run_dir(dir.path(), &run_id).unwrap();
+        let mut run = sample_run(dir.path(), &run_id, "goal");
+        save_run(&mut run).unwrap();
+        let raw = fs::read_to_string(run_dir(dir.path(), &run_id).join("state.json")).unwrap();
+        assert!(!raw.contains("\n  "), "state.json must be compact");
+        assert!(!raw.contains("\"contents\""));
     }
 
     #[test]

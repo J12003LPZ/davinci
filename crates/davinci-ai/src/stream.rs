@@ -11,13 +11,14 @@ use crate::thinking::{
 };
 use crate::{ChatMessage, MessageContent, ToolSpec};
 use davinci_protocol::{ThinkingLevel, Usage};
-use std::sync::mpsc;
-use std::time::Duration;
+use std::sync::{mpsc, Arc};
+use std::time::{Duration, Instant};
 
 #[derive(Debug, Clone, Default)]
 pub struct StreamOptions {
     pub thinking_level: Option<ThinkingLevel>,
     pub thinking_budgets: Option<ThinkingBudgets>,
+    /// Provider HTTP idle timeout per socket read, in milliseconds. Defaults to 300 seconds.
     pub timeout_ms: Option<u64>,
     pub max_retries: Option<u32>,
     pub max_retry_delay_ms: Option<u64>,
@@ -77,6 +78,12 @@ pub enum ContentBlock {
     },
     Thinking {
         thinking: String,
+        /// Anthropic's signature, or the opaque payload for redacted thinking.
+        /// Required to replay this block in the next request of a tool loop.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        signature: Option<String>,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        redacted: bool,
     },
     #[serde(rename = "toolCall")]
     ToolCall {
@@ -100,63 +107,106 @@ pub struct AssistantMessage {
     pub error_message: Option<String>,
 }
 
+/// Shares message snapshots across stream events and refreshes them at a
+/// bounded rate while content is arriving.
+pub(crate) struct PartialMessageSnapshot {
+    current: Arc<AssistantMessage>,
+    last_refresh: Instant,
+    bytes_since_refresh: usize,
+}
+
+impl PartialMessageSnapshot {
+    pub(crate) fn new(message: &AssistantMessage) -> Self {
+        Self {
+            current: Arc::new(message.clone()),
+            last_refresh: Instant::now(),
+            bytes_since_refresh: 0,
+        }
+    }
+
+    pub(crate) fn update(
+        &mut self,
+        message: &AssistantMessage,
+        appended_bytes: usize,
+    ) -> Arc<AssistantMessage> {
+        self.bytes_since_refresh = self.bytes_since_refresh.saturating_add(appended_bytes);
+        if self.bytes_since_refresh >= 4 * 1024
+            || self.last_refresh.elapsed() >= Duration::from_millis(50)
+        {
+            self.refresh(message);
+        }
+        Arc::clone(&self.current)
+    }
+
+    pub(crate) fn force(&mut self, message: &AssistantMessage) -> Arc<AssistantMessage> {
+        self.refresh(message);
+        Arc::clone(&self.current)
+    }
+
+    fn refresh(&mut self, message: &AssistantMessage) {
+        self.current = Arc::new(message.clone());
+        self.last_refresh = Instant::now();
+        self.bytes_since_refresh = 0;
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub enum AssistantMessageEvent {
     #[serde(rename = "start")]
-    Start { partial: AssistantMessage },
+    Start { partial: Arc<AssistantMessage> },
     #[serde(rename = "text_start")]
     TextStart {
         #[serde(rename = "contentIndex")]
         content_index: usize,
-        partial: AssistantMessage,
+        partial: Arc<AssistantMessage>,
     },
     #[serde(rename = "text_delta")]
     TextDelta {
         #[serde(rename = "contentIndex")]
         content_index: usize,
         delta: String,
-        partial: AssistantMessage,
+        partial: Arc<AssistantMessage>,
     },
     #[serde(rename = "text_end")]
     TextEnd {
         #[serde(rename = "contentIndex")]
         content_index: usize,
         content: String,
-        partial: AssistantMessage,
+        partial: Arc<AssistantMessage>,
     },
     #[serde(rename = "thinking_start")]
     ThinkingStart {
         #[serde(rename = "contentIndex")]
         content_index: usize,
-        partial: AssistantMessage,
+        partial: Arc<AssistantMessage>,
     },
     #[serde(rename = "thinking_delta")]
     ThinkingDelta {
         #[serde(rename = "contentIndex")]
         content_index: usize,
         delta: String,
-        partial: AssistantMessage,
+        partial: Arc<AssistantMessage>,
     },
     #[serde(rename = "thinking_end")]
     ThinkingEnd {
         #[serde(rename = "contentIndex")]
         content_index: usize,
         content: String,
-        partial: AssistantMessage,
+        partial: Arc<AssistantMessage>,
     },
     #[serde(rename = "toolcall_start")]
     ToolcallStart {
         #[serde(rename = "contentIndex")]
         content_index: usize,
-        partial: AssistantMessage,
+        partial: Arc<AssistantMessage>,
     },
     #[serde(rename = "toolcall_delta")]
     ToolcallDelta {
         #[serde(rename = "contentIndex")]
         content_index: usize,
         delta: String,
-        partial: AssistantMessage,
+        partial: Arc<AssistantMessage>,
     },
     #[serde(rename = "toolcall_end")]
     ToolcallEnd {
@@ -164,7 +214,7 @@ pub enum AssistantMessageEvent {
         content_index: usize,
         #[serde(rename = "toolCall")]
         tool_call: ContentBlock,
-        partial: AssistantMessage,
+        partial: Arc<AssistantMessage>,
     },
     #[serde(rename = "done")]
     Done {
@@ -190,7 +240,7 @@ impl AssistantMessageEvent {
             | Self::ThinkingEnd { partial, .. }
             | Self::ToolcallStart { partial, .. }
             | Self::ToolcallDelta { partial, .. }
-            | Self::ToolcallEnd { partial, .. } => partial,
+            | Self::ToolcallEnd { partial, .. } => partial.as_ref(),
             Self::Done { message, .. } => message,
             Self::Error { error, .. } => error,
         }
@@ -468,9 +518,14 @@ pub fn assistant_to_chat(message: &AssistantMessage) -> ChatMessage {
             .iter()
             .map(|block| match block {
                 ContentBlock::Text { text } => MessageContent::Text { text: text.clone() },
-                ContentBlock::Thinking { thinking } => MessageContent::Thinking {
+                ContentBlock::Thinking {
+                    thinking,
+                    signature,
+                    redacted,
+                } => MessageContent::Thinking {
                     thinking: thinking.clone(),
-                    redacted: None,
+                    redacted: redacted.then_some(true),
+                    signature: signature.clone(),
                 },
                 ContentBlock::ToolCall {
                     id,
@@ -512,6 +567,7 @@ pub fn live_complete_with(
     tools: &[ToolSpec],
     options: &StreamOptions,
 ) -> Result<AssistantMessage, String> {
+    refuse_unsupported_tools(&model.api, tools.len())?;
     let body = request_body_with(model, messages, system, tools, options);
     let prepared = crate::responses_request::PreparedProviderRequest::new(body);
     let body = prepared.body();
@@ -547,7 +603,7 @@ pub fn live_complete_with(
             }
         }
     }
-    let url = request_url(model, auth);
+    let url = request_url_checked(model, auth)?;
     let headers = crate::merge_provider_attribution_headers(
         model,
         options.session_id.as_deref(),
@@ -612,6 +668,7 @@ pub fn live_complete_streaming_with_sink_envelope(
     options: &StreamOptions,
     on_event: &mut dyn FnMut(&AssistantMessageEvent),
 ) -> Result<ProviderCompletionEnvelope, String> {
+    refuse_unsupported_tools(&model.api, tools.len())?;
     let incremental = crate::stream_decoder::supports_incremental_stream(model);
     let mut body = request_body_with(model, messages, system, tools, options);
     if crate::trace::enabled() {
@@ -707,7 +764,7 @@ pub fn live_complete_streaming_with_sink_envelope(
             }
         }
     }
-    let url = request_url(model, auth);
+    let url = request_url_checked(model, auth)?;
     let headers = crate::merge_provider_attribution_headers(
         model,
         options.session_id.as_deref(),
@@ -716,7 +773,7 @@ pub fn live_complete_streaming_with_sink_envelope(
     );
     let timeout_ms = options.timeout_ms.filter(|ms| *ms > 0);
     let compress_zstd = model.api == "openai-codex-responses";
-    crate::trace::log(&format!("sse post {url}"));
+    crate::trace::log(&format!("sse post {}", crate::trace::redact_url(&url)));
     let response = crate::provider_retry::retry_provider_request_controlled(
         || send_provider_request(&url, &headers, body, timeout_ms, compress_zstd),
         crate::provider_retry::ProviderRetryOptions {
@@ -825,7 +882,7 @@ pub fn raw_provider_post(
     body: &Value,
 ) -> Result<RawProviderReply, String> {
     let headers = collect_request_headers(model, auth, &StreamOptions::default());
-    let mut request = ureq::post(url).timeout(Duration::from_secs(120));
+    let mut request = crate::http::agent(crate::http::PROVIDER_IDLE_TIMEOUT).post(url);
     for (key, value) in &headers {
         request = request.set(key, value);
     }
@@ -897,8 +954,13 @@ fn collect_request_headers(
     for (key, value) in &model.headers {
         headers.push((key.clone(), value.clone()));
     }
-    if let Some(key) = &auth.api_key {
-        if model.api.starts_with("google") {
+    let has_authorization = auth
+        .headers
+        .keys()
+        .any(|name| name.eq_ignore_ascii_case("authorization"));
+    if let Some(key) = auth.api_key.as_ref().filter(|_| !has_authorization) {
+        if model.api == "google-generative-ai" {
+            headers.push(("x-goog-api-key".into(), key.clone()));
         } else if model.api == "anthropic-messages" {
             headers.push(("x-api-key".into(), key.clone()));
             headers.push(("anthropic-version".into(), "2023-06-01".into()));
@@ -990,10 +1052,11 @@ fn send_provider_request(
     timeout_ms: Option<u64>,
     compress_zstd: bool,
 ) -> Result<ureq::Response, crate::provider_retry::ProviderError> {
-    let mut request = ureq::post(url);
-    if let Some(timeout_ms) = timeout_ms {
-        request = request.timeout(std::time::Duration::from_millis(timeout_ms));
-    }
+    let idle = timeout_ms
+        .filter(|timeout_ms| *timeout_ms > 0)
+        .map(std::time::Duration::from_millis)
+        .unwrap_or(crate::http::PROVIDER_IDLE_TIMEOUT);
+    let mut request = crate::http::agent(idle).post(url);
     for (key, value) in headers {
         request = request.set(key, value);
     }
@@ -1472,14 +1535,15 @@ pub fn live_stream(
     system: Option<&str>,
     tools: &[ToolSpec],
 ) -> Result<Vec<AssistantMessageEvent>, String> {
+    refuse_unsupported_tools(&model.api, tools.len())?;
     let mut body = request_body(model, messages, system, tools);
     if let Value::Object(map) = &mut body {
         map.insert("stream".into(), Value::Bool(true));
     }
     let prepared = crate::responses_request::PreparedProviderRequest::new(body);
     let body = prepared.body();
-    let url = request_url(model, auth);
-    let mut request = ureq::post(&url);
+    let url = request_url_checked(model, auth)?;
+    let mut request = crate::http::agent(crate::http::PROVIDER_IDLE_TIMEOUT).post(&url);
     for (key, value) in &auth.headers {
         request = request.set(key, value);
     }
@@ -1487,7 +1551,8 @@ pub fn live_stream(
         request = request.set(key, value);
     }
     if let Some(key) = &auth.api_key {
-        if model.api.starts_with("google") {
+        if model.api == "google-generative-ai" {
+            request = request.set("x-goog-api-key", key);
         } else if model.api == "anthropic-messages" || model.api == "pi-messages" {
             request = request
                 .set("x-api-key", key)
@@ -1522,52 +1587,53 @@ pub fn live_stream(
 }
 
 pub fn events_from_complete(message: &AssistantMessage) -> Vec<AssistantMessageEvent> {
+    let partial = Arc::new(message.clone());
     let mut events = vec![AssistantMessageEvent::Start {
-        partial: message.clone(),
+        partial: Arc::clone(&partial),
     }];
     for (index, block) in message.content.iter().enumerate() {
         match block {
             ContentBlock::Text { text } => {
                 events.push(AssistantMessageEvent::TextStart {
                     content_index: index,
-                    partial: message.clone(),
+                    partial: Arc::clone(&partial),
                 });
                 events.push(AssistantMessageEvent::TextDelta {
                     content_index: index,
                     delta: text.clone(),
-                    partial: message.clone(),
+                    partial: Arc::clone(&partial),
                 });
                 events.push(AssistantMessageEvent::TextEnd {
                     content_index: index,
                     content: text.clone(),
-                    partial: message.clone(),
+                    partial: Arc::clone(&partial),
                 });
             }
-            ContentBlock::Thinking { thinking } => {
+            ContentBlock::Thinking { thinking, .. } => {
                 events.push(AssistantMessageEvent::ThinkingStart {
                     content_index: index,
-                    partial: message.clone(),
+                    partial: Arc::clone(&partial),
                 });
                 events.push(AssistantMessageEvent::ThinkingDelta {
                     content_index: index,
                     delta: thinking.clone(),
-                    partial: message.clone(),
+                    partial: Arc::clone(&partial),
                 });
                 events.push(AssistantMessageEvent::ThinkingEnd {
                     content_index: index,
                     content: thinking.clone(),
-                    partial: message.clone(),
+                    partial: Arc::clone(&partial),
                 });
             }
             ContentBlock::ToolCall { .. } => {
                 events.push(AssistantMessageEvent::ToolcallStart {
                     content_index: index,
-                    partial: message.clone(),
+                    partial: Arc::clone(&partial),
                 });
                 events.push(AssistantMessageEvent::ToolcallEnd {
                     content_index: index,
                     tool_call: block.clone(),
-                    partial: message.clone(),
+                    partial: Arc::clone(&partial),
                 });
             }
         }
@@ -1660,7 +1726,55 @@ fn mistral_body(
     body
 }
 
-pub fn request_url(model: &Model, auth: &ResolvedAuth) -> String {
+fn vertex_url(
+    model: &Model,
+    project: Option<&str>,
+    location: Option<&str>,
+) -> Result<String, String> {
+    let project = project
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| {
+            "google-vertex needs GOOGLE_CLOUD_PROJECT (and optionally GOOGLE_CLOUD_LOCATION)"
+                .to_string()
+        })?;
+    let location = location
+        .filter(|value| !value.is_empty())
+        .unwrap_or("us-central1");
+    let base = model
+        .base_url
+        .as_deref()
+        .unwrap_or("https://aiplatform.googleapis.com")
+        .trim_end_matches('/');
+    Ok(format!(
+        "{base}/v1/projects/{project}/locations/{location}/publishers/google/models/{}:generateContent",
+        model.id
+    ))
+}
+
+fn refuse_unsupported_tools(api: &str, tool_count: usize) -> Result<(), String> {
+    const STUBS: &[&str] = &[
+        "google-generative-ai",
+        "google-vertex",
+        "bedrock-converse-stream",
+    ];
+    if tool_count > 0 && STUBS.contains(&api) {
+        return Err(format!(
+            "{api} does not support tool use in davinci yet; pick a model from another provider for agent work"
+        ));
+    }
+    Ok(())
+}
+
+fn request_url_checked(model: &Model, auth: &ResolvedAuth) -> Result<String, String> {
+    if model.api == "google-vertex" {
+        let project = std::env::var("GOOGLE_CLOUD_PROJECT").ok();
+        let location = std::env::var("GOOGLE_CLOUD_LOCATION").ok();
+        return vertex_url(model, project.as_deref(), location.as_deref());
+    }
+    Ok(request_url(model, auth))
+}
+
+pub fn request_url(model: &Model, _auth: &ResolvedAuth) -> String {
     let base = model
         .base_url
         .clone()
@@ -1668,14 +1782,13 @@ pub fn request_url(model: &Model, auth: &ResolvedAuth) -> String {
     let base = base.trim_end_matches('/');
     match model.api.as_str() {
         "anthropic-messages" | "pi-messages" => format!("{base}/v1/messages"),
-        "google-generative-ai" => {
-            let key = auth.api_key.clone().unwrap_or_default();
-            format!("{base}/models/{}:generateContent?key={key}", model.id)
-        }
-        "google-vertex" => format!(
-            "{base}/v1/projects/default/locations/us-central1/publishers/google/models/{}:generateContent",
-            model.id
-        ),
+        "google-generative-ai" => format!("{base}/models/{}:generateContent", model.id),
+        "google-vertex" => vertex_url(
+            model,
+            std::env::var("GOOGLE_CLOUD_PROJECT").ok().as_deref(),
+            std::env::var("GOOGLE_CLOUD_LOCATION").ok().as_deref(),
+        )
+        .unwrap_or_else(|_| format!("{base}/v1/projects/default/locations/us-central1/publishers/google/models/{}:generateContent", model.id)),
         "openai-codex-responses" => crate::codex::resolve_codex_url(model.base_url.as_deref()),
         "openai-responses" | "azure-openai-responses" => {
             format!("{base}/responses")
@@ -1943,7 +2056,25 @@ fn anthropic_body(
                     .iter()
                     .any(|block| matches!(block, MessageContent::ToolCall { .. }))
             {
-                let content: Vec<Value> = message
+                let mut content: Vec<Value> = message
+                    .content
+                    .iter()
+                    .filter_map(|block| match block {
+                        MessageContent::Thinking {
+                            signature: Some(signature),
+                            redacted,
+                            thinking,
+                        } => Some(if redacted.unwrap_or(false) {
+                            serde_json::json!({"type":"redacted_thinking","data": signature})
+                        } else {
+                            serde_json::json!({"type":"thinking","thinking": thinking,"signature": signature})
+                        }),
+                        // Unsigned thinking cannot be replayed to Anthropic.
+                        MessageContent::Thinking { .. } => None,
+                        _ => None,
+                    })
+                    .collect();
+                content.extend(message
                     .content
                     .iter()
                     .filter_map(|block| match block {
@@ -1961,8 +2092,7 @@ fn anthropic_body(
                             "input": arguments,
                         })),
                         _ => None,
-                    })
-                    .collect();
+                    }));
                 serde_json::json!({"role":"assistant","content": content})
             } else {
                 serde_json::json!({
@@ -1996,7 +2126,7 @@ fn anthropic_body(
     }
     let mut body = serde_json::json!({
         "model": model.id,
-        "max_tokens": model.max_tokens.min(8192),
+        "max_tokens": model.max_tokens,
         "messages": converted,
         "stream": false,
     });
@@ -2110,8 +2240,14 @@ pub(crate) fn usage_from_value(model: &Model, usage: &Value) -> Usage {
     let anthropic_read = get("cache_read_input_tokens").or_else(|| get("cacheReadInputTokens"));
     let anthropic_write =
         get("cache_creation_input_tokens").or_else(|| get("cacheWriteInputTokens"));
-    let (input, cache_read, cache_write) = if anthropic_read.is_some() || anthropic_write.is_some()
+    let has_openai_prompt_total = get("prompt_tokens").is_some();
+    let (input, cache_read, cache_write) = if has_openai_prompt_total
+        && (anthropic_read.is_some() || anthropic_write.is_some())
     {
+        let read = anthropic_read.unwrap_or(0);
+        let write = anthropic_write.unwrap_or(0);
+        (base_input.saturating_sub(read).saturating_sub(write), read, write)
+    } else if anthropic_read.is_some() || anthropic_write.is_some() {
         (
             base_input,
             anthropic_read.unwrap_or(0),
@@ -2352,6 +2488,89 @@ mod tests {
     use crate::catalog::load_builtin_models;
 
     #[test]
+    fn anthropic_max_tokens_follows_the_model() {
+        let mut model = load_builtin_models()
+            .into_iter()
+            .find(|model| model.api == "anthropic-messages")
+            .unwrap();
+        model.max_tokens = 64_000;
+        let body = anthropic_body(
+            &model,
+            &[ChatMessage::text("user", "hi")],
+            None,
+            &[],
+            &StreamOptions::default(),
+        );
+        assert_eq!(body["max_tokens"], 64_000);
+    }
+
+    #[test]
+    fn vertex_url_uses_the_configured_project_and_location() {
+        let mut model = load_builtin_models()
+            .into_iter()
+            .find(|model| model.api == "google-generative-ai")
+            .unwrap();
+        model.api = "google-vertex".into();
+        model.base_url = Some("https://us-east5-aiplatform.googleapis.com".into());
+        let url = vertex_url(&model, Some("my-proj"), Some("us-east5")).unwrap();
+        assert!(url.contains("/projects/my-proj/locations/us-east5/"), "{url}");
+        assert!(vertex_url(&model, None, None).is_err());
+    }
+
+    #[test]
+    fn stub_providers_refuse_tool_use() {
+        for api in [
+            "google-generative-ai",
+            "google-vertex",
+            "bedrock-converse-stream",
+        ] {
+            assert!(refuse_unsupported_tools(api, 1).is_err(), "{api}");
+            assert!(refuse_unsupported_tools(api, 0).is_ok(), "{api}");
+        }
+        assert!(refuse_unsupported_tools("anthropic-messages", 3).is_ok());
+    }
+
+    #[test]
+    fn prompt_tokens_already_include_cache_reads() {
+        let model = load_builtin_models()
+            .into_iter()
+            .find(|model| model.api == "openai-completions")
+            .unwrap();
+        let usage = usage_from_value(
+            &model,
+            &serde_json::json!({
+                "prompt_tokens": 1000,
+                "completion_tokens": 10,
+                "cache_read_input_tokens": 800
+            }),
+        );
+        assert_eq!(usage.input, 200);
+        assert_eq!(usage.cache_read, 800);
+    }
+
+    #[test]
+    fn oauth_bearer_credentials_never_become_x_api_key() {
+        let model = load_builtin_models()
+            .into_iter()
+            .find(|model| model.api == "anthropic-messages")
+            .unwrap();
+        let mut headers = std::collections::HashMap::new();
+        headers.insert(
+            "Authorization".to_string(),
+            "Bearer sk-ant-oat01-x".to_string(),
+        );
+        let auth = ResolvedAuth {
+            api_key: Some("sk-ant-oat01-x".into()),
+            headers,
+            source: "OAuth".into(),
+        };
+        let sent = collect_request_headers(&model, &auth, &StreamOptions::default());
+        assert!(!sent
+            .iter()
+            .any(|(name, _)| name.eq_ignore_ascii_case("x-api-key")));
+    }
+
+    #[test]
     fn openai_response_control_values_are_conservative() {
         assert_eq!(verbosity_from(Some("medium")), "medium");
         assert_eq!(verbosity_from(Some("loud")), "low");
@@ -2585,7 +2804,7 @@ mod tests {
             .into_iter()
             .find(|m| m.provider == "openai")
             .expect("openai model");
-        let corpus = "data: {\"choices\":[{\"delta\":{\"content\":\"Hi\"}}]}\n\ndata: {\"usage\":{\"prompt_tokens\":3,\"completion_tokens\":1,\"total_tokens\":4}}\n\ndata: [DONE]\n";
+        let corpus = "data: {\"choices\":[{\"delta\":{\"content\":\"Hi\"},\"finish_reason\":\"stop\"}]}\n\ndata: {\"usage\":{\"prompt_tokens\":3,\"completion_tokens\":1,\"total_tokens\":4}}\n\ndata: [DONE]\n";
         let events = replay_sse_events(&model, corpus);
         let types: Vec<_> = events
             .iter()
@@ -2901,6 +3120,91 @@ mod tests {
             },
         );
         assert!(body["tools"][0].get("cache_control").is_none());
+    }
+
+    #[test]
+    fn anthropic_body_replays_signed_thinking_first_in_tool_turns() {
+        let model = load_builtin_models()
+            .into_iter()
+            .find(|m| m.api == "anthropic-messages")
+            .expect("anthropic model");
+        let assistant = ChatMessage {
+            role: "assistant".into(),
+            content: vec![
+                MessageContent::Thinking {
+                    thinking: "plan".into(),
+                    redacted: None,
+                    signature: Some("SIG".into()),
+                },
+                MessageContent::Thinking {
+                    thinking: String::new(),
+                    redacted: Some(true),
+                    signature: Some("OPAQUE".into()),
+                },
+                MessageContent::Thinking {
+                    thinking: "unsigned".into(),
+                    redacted: None,
+                    signature: None,
+                },
+                MessageContent::ToolCall {
+                    id: "t1".into(),
+                    name: "read".into(),
+                    arguments: serde_json::json!({"path":"a"}),
+                },
+            ],
+            ..ChatMessage::default()
+        };
+        let body = anthropic_body(&model, &[assistant], None, &[], &StreamOptions::default());
+        let content = body["messages"][0]["content"].as_array().unwrap();
+        assert_eq!(
+            content[0],
+            serde_json::json!({"type":"thinking","thinking":"plan","signature":"SIG"})
+        );
+        assert_eq!(
+            content[1],
+            serde_json::json!({"type":"redacted_thinking","data":"OPAQUE"})
+        );
+        assert_eq!(content[2]["type"], "tool_use");
+        assert_eq!(content.len(), 3);
+    }
+
+    #[test]
+    fn thinking_signature_fields_preserve_legacy_serialized_shapes() {
+        let old_block: ContentBlock = serde_json::from_value(serde_json::json!({
+            "type": "thinking",
+            "thinking": "plan",
+        }))
+        .unwrap();
+        assert_eq!(
+            old_block,
+            ContentBlock::Thinking {
+                thinking: "plan".into(),
+                signature: None,
+                redacted: false,
+            }
+        );
+        assert_eq!(
+            serde_json::to_value(&old_block).unwrap(),
+            serde_json::json!({"type":"thinking","thinking":"plan"})
+        );
+
+        let old_message: MessageContent = serde_json::from_value(serde_json::json!({
+            "type": "thinking",
+            "thinking": "plan",
+        }))
+        .unwrap();
+        assert_eq!(
+            old_message,
+            MessageContent::Thinking {
+                thinking: "plan".into(),
+                redacted: None,
+                signature: None,
+            }
+        );
+        assert_eq!(
+            serde_json::to_value(&old_message).unwrap(),
+            serde_json::json!({"type":"thinking","thinking":"plan"})
+        );
     }
 
     #[test]
@@ -3385,6 +3689,112 @@ mod tests {
         assert_eq!(usage.cache_read, 800);
         assert_eq!(usage.output, 30);
         assert_eq!(usage.total_tokens, 1030);
+    }
+
+    #[test]
+    fn google_api_key_is_a_header_not_a_query_parameter() {
+        let model = load_builtin_models()
+            .into_iter()
+            .find(|m| m.api == "google-generative-ai")
+            .expect("a built-in Gemini model");
+        let auth = ResolvedAuth {
+            api_key: Some("AIzaSECRET".into()),
+            headers: Default::default(),
+            source: "test".into(),
+        };
+        let url = request_url(&model, &auth);
+        assert!(!url.contains("AIzaSECRET"), "{url}");
+        assert!(!url.contains("key="), "{url}");
+        let headers = collect_request_headers(&model, &auth, &StreamOptions::default());
+        assert!(headers
+            .iter()
+            .any(|(name, value)| name == "x-goog-api-key" && value == "AIzaSECRET"));
+
+        let vertex = load_builtin_models()
+            .into_iter()
+            .find(|m| m.api == "google-vertex")
+            .expect("a built-in Vertex model");
+        let vertex_auth = ResolvedAuth {
+            api_key: Some("ya29.ACCESS_TOKEN".into()),
+            headers: Default::default(),
+            source: "test".into(),
+        };
+        let headers = collect_request_headers(&vertex, &vertex_auth, &StreamOptions::default());
+        assert!(headers.iter().any(|(name, value)| {
+            name.eq_ignore_ascii_case("authorization") && value == "Bearer ya29.ACCESS_TOKEN"
+        }));
+    }
+
+    #[test]
+    fn google_live_stream_sends_the_api_key_header() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (request_tx, request_rx) = std::sync::mpsc::channel();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = Vec::new();
+            let mut buf = [0u8; 4096];
+            let header_end = loop {
+                let n = stream.read(&mut buf).unwrap();
+                request.extend_from_slice(&buf[..n]);
+                if let Some(pos) = request.windows(4).position(|window| window == b"\r\n\r\n") {
+                    break pos + 4;
+                }
+            };
+            let content_length = String::from_utf8_lossy(&request[..header_end])
+                .lines()
+                .find_map(|line| {
+                    line.to_ascii_lowercase()
+                        .strip_prefix("content-length:")
+                        .and_then(|length| length.trim().parse::<usize>().ok())
+                })
+                .unwrap_or(0);
+            while request.len() < header_end + content_length {
+                let n = stream.read(&mut buf).unwrap();
+                request.extend_from_slice(&buf[..n]);
+            }
+            request_tx
+                .send(String::from_utf8_lossy(&request[..header_end]).into_owned())
+                .unwrap();
+            let body = r#"{"candidates":[{"content":{"parts":[{"text":"ok"}]}}]}"#;
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            )
+            .unwrap();
+        });
+
+        let mut model = load_builtin_models()
+            .into_iter()
+            .find(|model| model.api == "google-generative-ai")
+            .expect("a built-in Gemini model");
+        model.base_url = Some(format!("http://{addr}"));
+        let auth = ResolvedAuth {
+            api_key: Some("AIzaSECRET".into()),
+            headers: Default::default(),
+            source: "test".into(),
+        };
+        let events = live_stream(
+            &model,
+            &[ChatMessage::text("user", "hello")],
+            &auth,
+            None,
+            &[],
+        )
+        .unwrap();
+        let request = request_rx.recv().unwrap().to_ascii_lowercase();
+        server.join().unwrap();
+
+        assert!(
+            request.contains("x-goog-api-key: aizasecret\r\n"),
+            "{request}"
+        );
+        assert!(!request.lines().next().unwrap_or_default().contains("key="));
+        assert!(!events.is_empty());
     }
 
     #[test]

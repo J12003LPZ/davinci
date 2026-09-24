@@ -566,6 +566,7 @@ pub fn run_worker(
             spec.initially_exposed_tools.join(","),
         )
         .env("PI_GRAPH_SUPPRESS_MEMORY_INJECT", "1");
+    davinci_sys::process::set_own_process_group(&mut command);
     if let Err(error) = configure_task_contract_env(&mut command, spec) {
         let _ = fs::remove_dir_all(&temp_dir);
         return WorkerResult {
@@ -608,7 +609,7 @@ pub fn run_worker(
     }
 
     let mut state = WorkerEventState::default();
-    let mut stderr = String::new();
+    let mut stderr = super::tail::TailBuffer::new(64 * 1024);
     let mut reported_seq = 0;
     let transcript = spec.transcript_path.clone();
 
@@ -641,8 +642,8 @@ pub fn run_worker(
                 }
             },
             |line| {
-                stderr.push_str(line);
-                stderr.push('\n');
+                stderr.push(line.as_bytes());
+                stderr.push(b"\n");
             },
         )
     };
@@ -673,6 +674,7 @@ pub fn run_worker(
         append_transcript(path, &format!("══ exited {}{suffix}", outcome.exit_code));
     }
 
+    let stderr = stderr.text();
     finish_worker(spec, outcome, state, &stderr)
 }
 
@@ -880,7 +882,7 @@ pub fn run_dry_worker(
 
 /// Run a fixture child process that sleeps beyond the deadline to verify
 /// active process-tree termination.
-#[allow(dead_code)]
+#[cfg(any(test, feature = "test-fixtures"))]
 pub fn run_fixture_worker_with_deadline(
     deadline: std::time::Duration,
 ) -> Result<WorkerResult, WorkerError> {

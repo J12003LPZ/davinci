@@ -3,7 +3,6 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
-pub mod budget;
 pub mod bus;
 pub mod cache;
 pub mod cancellation;
@@ -37,13 +36,11 @@ pub use task_migration::LegacyTaskRecovery;
 pub mod task_store;
 pub mod task_transport;
 pub mod tasks;
-pub mod team;
 pub mod tools_agent;
 pub mod tools_task;
 pub mod workflow;
 pub mod worktree;
 
-pub use budget::*;
 pub use bus::{RuntimeBus, RuntimeDecision, RuntimeSubscriber};
 pub use cache::{
     hash_system_prompt, hash_system_prompt_with_manifest, hash_tool_names, CacheIdentity,
@@ -118,7 +115,6 @@ pub use task_store::{
 pub use tasks::{
     is_valid_task_transition, TaskError, TaskOwner, TaskRecord, TaskRegistry, TaskState,
 };
-pub use team::{TeamConfig, TeamError, TeamManager, TeammateHandle};
 pub use tools_agent::{agent_message_tool, agent_status_tool, agent_stop_tool, agent_tool_specs};
 pub use tools_task::{
     task_create_tool, task_get_tool, task_list_tool, task_tool_specs, task_update_tool,
@@ -155,7 +151,6 @@ pub struct RuntimeHandle {
     pub operations: Option<operations::ToolOperationRuntime>,
     pub capability_registry: RuntimeCapabilityRegistry,
     pub project_trusted: bool,
-    pub budget_ledger: Option<Arc<ResourceLedger>>,
     pub progress_watchdog: Arc<Mutex<ProgressWatchdog>>,
     pub blob_store: BlobStore,
     pub effect_ledger: Arc<std::sync::RwLock<Vec<OwnedFileEffect>>>,
@@ -206,7 +201,6 @@ impl RuntimeHandle {
             operations: None,
             capability_registry: RuntimeCapabilityRegistry::with_builtins(),
             project_trusted: false,
-            budget_ledger: None,
             progress_watchdog: Arc::new(Mutex::new(ProgressWatchdog::new())),
             blob_store: BlobStore::new(),
             effect_ledger: Arc::new(std::sync::RwLock::new(Vec::new())),
@@ -214,10 +208,6 @@ impl RuntimeHandle {
         }
     }
 
-    pub fn with_budget_ledger(mut self, ledger: Arc<ResourceLedger>) -> Self {
-        self.budget_ledger = Some(ledger);
-        self
-    }
     pub fn with_cache(mut self, cache: cache::CacheRuntime) -> Self {
         let config = self.context_vm.config().clone();
         self.cache = cache.clone();
@@ -290,7 +280,6 @@ impl RuntimeHandle {
         self.mailbox = previous.mailbox.clone();
         self.task_registry = previous.task_registry.clone();
         self.operations = previous.operations.clone();
-        self.budget_ledger = previous.budget_ledger.clone();
         self.progress_watchdog = previous.progress_watchdog.clone();
         self.worktree_manager = self
             .worktree_manager
@@ -318,7 +307,6 @@ impl RuntimeHandle {
         self.task_registry = worker.task_registry.clone();
         self.operations = worker.operations.clone();
         self.mailbox = worker.mailbox.clone();
-        self.budget_ledger = worker.budget_ledger.clone();
         self.progress_watchdog = worker.progress_watchdog.clone();
         self
     }

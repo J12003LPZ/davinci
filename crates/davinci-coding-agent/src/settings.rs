@@ -281,6 +281,8 @@ pub struct Settings {
     pub compaction: Option<CompactionSettings>,
     #[serde(default)]
     pub retry: Option<RetrySettings>,
+    #[serde(default, rename = "maxModelTurns")]
+    pub max_model_turns: Option<u32>,
     #[serde(default, rename = "thinkingBudgets")]
     pub thinking_budgets: Option<davinci_ai::ThinkingBudgets>,
     #[serde(default, rename = "branchSummary")]
@@ -289,8 +291,6 @@ pub struct Settings {
     pub http_proxy: Option<String>,
     #[serde(default, rename = "sessionDir")]
     pub session_dir: Option<String>,
-    #[serde(default, rename = "sessionBackend")]
-    pub session_backend: Option<String>,
     #[serde(default, rename = "defaultThinkingLevel")]
     pub default_thinking_level: Option<String>,
     #[serde(default, rename = "websocketConnectTimeoutMs")]
@@ -608,6 +608,7 @@ impl CompactionSettings {
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct ProviderRetrySettings {
+    /// Provider HTTP idle timeout per socket read, in milliseconds (default: 300 seconds).
     #[serde(default, rename = "timeoutMs")]
     pub timeout_ms: Option<u64>,
     #[serde(default, rename = "maxRetries")]
@@ -761,19 +762,26 @@ fn is_override_pattern(value: &str) -> bool {
     value.starts_with('!') || value.starts_with('+') || value.starts_with('-')
 }
 
-pub fn collect_package_resources(pkg: &PackageSource, kind: &str) -> Vec<PathBuf> {
-    let root = Path::new(pkg.source());
+pub fn collect_package_resources(
+    pkg: &PackageSource,
+    kind: &str,
+    agent_dir: &Path,
+    cwd: &Path,
+) -> Vec<PathBuf> {
+    let Some(root) = crate::package_source::installed_root(pkg.source(), agent_dir, cwd) else {
+        return Vec::new();
+    };
     if let Some(manifest) = read_pi_manifest(&root.join("package.json")) {
         if let Some(entries) = manifest_entries(&manifest, kind) {
-            return collect_manifest_resources(root, kind, entries, pkg);
+            return collect_manifest_resources(&root, kind, entries, pkg);
         }
     }
     let dir = if root.join(kind).is_dir() {
         root.join(kind)
     } else {
-        root.to_path_buf()
+        root.clone()
     };
-    collect_dir_resources(root, &dir, pkg, kind)
+    collect_dir_resources(&root, &dir, pkg, kind)
 }
 
 fn collect_manifest_resources(
@@ -799,22 +807,14 @@ fn collect_manifest_resources(
 }
 
 fn collect_glob_files(root: &Path, pattern: &str, out: &mut Vec<PathBuf>) {
-    collect_glob_files_from(root, root, pattern, out);
-}
-
-fn collect_glob_files_from(root: &Path, dir: &Path, pattern: &str, out: &mut Vec<PathBuf>) {
-    let Ok(entries) = fs::read_dir(dir) else {
-        return;
-    };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.is_dir() {
-            collect_glob_files_from(root, &path, pattern, out);
-            continue;
-        }
-        if !path.is_file() {
-            continue;
-        }
+    for entry in walkdir::WalkDir::new(root)
+        .follow_links(false)
+        .max_depth(16)
+        .into_iter()
+        .filter_map(Result::ok)
+        .filter(|entry| entry.file_type().is_file())
+    {
+        let path = entry.into_path();
         let relative = path
             .strip_prefix(root)
             .unwrap_or(&path)
@@ -828,21 +828,18 @@ fn collect_glob_files_from(root: &Path, dir: &Path, pattern: &str, out: &mut Vec
 
 fn collect_dir_resources(root: &Path, dir: &Path, pkg: &PackageSource, kind: &str) -> Vec<PathBuf> {
     let mut out = Vec::new();
-    if !dir.exists() {
-        return out;
-    }
-    if let Ok(entries) = fs::read_dir(dir) {
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.is_dir() {
-                out.extend(collect_dir_resources(root, &path, pkg, kind));
-            } else if path.is_file() {
-                push_if_allowed(root, path, pkg, kind, &mut out);
-            }
-        }
+    for entry in walkdir::WalkDir::new(dir)
+        .follow_links(false)
+        .max_depth(16)
+        .into_iter()
+        .filter_map(Result::ok)
+        .filter(|entry| entry.file_type().is_file())
+    {
+        push_if_allowed(root, entry.into_path(), pkg, kind, &mut out);
     }
     out
 }
+
 
 fn push_if_allowed(
     root: &Path,
@@ -951,12 +948,8 @@ pub fn load_security_scan_config(
     if !trusted {
         return Ok(global);
     }
-    let current = cwd.join(CONFIG_DIR_NAME).join("settings.json");
-    let project = if current.exists() {
-        current
-    } else {
-        cwd.join(LEGACY_CONFIG_DIR_NAME).join("settings.json")
-    };
+    let [current, legacy] = crate::project_config::candidates(cwd, "settings.json");
+    let project = if current.exists() { current } else { legacy };
     global.narrow_with(&read(&project)?)
 }
 
@@ -964,6 +957,9 @@ pub fn load_settings_file(path: &Path) -> Settings {
     let Ok(raw) = fs::read_to_string(path) else {
         return Settings::default();
     };
+    if let Some(value) = parse_settings_value(&raw) {
+        warn_removed_sqlite_backend(path, &value);
+    }
     match parse_settings_json(&raw) {
         Some(settings) => settings,
         None => {
@@ -1005,12 +1001,8 @@ pub fn load_merged_settings_with_override(
     ) {
         return global;
     }
-    let project_davinci = cwd.join(CONFIG_DIR_NAME).join("settings.json");
-    let project_path = if project_davinci.exists() {
-        project_davinci
-    } else {
-        cwd.join(LEGACY_CONFIG_DIR_NAME).join("settings.json")
-    };
+    let [current, legacy] = crate::project_config::candidates(cwd, "settings.json");
+    let project_path = if current.exists() { current } else { legacy };
     let project = load_settings_value(&project_path);
     let merged = enforce_decision_intelligence_user_boundary(
         &global_value,
@@ -1040,10 +1032,28 @@ fn enforce_decision_intelligence_user_boundary(
 }
 
 fn load_settings_value(path: &Path) -> serde_json::Value {
-    fs::read_to_string(path)
+    let value = fs::read_to_string(path)
         .ok()
         .and_then(|raw| parse_settings_value(&raw))
-        .unwrap_or(serde_json::Value::Object(Default::default()))
+        .unwrap_or(serde_json::Value::Object(Default::default()));
+    warn_removed_sqlite_backend(path, &value);
+    value
+}
+
+fn warn_removed_sqlite_backend(path: &Path, value: &serde_json::Value) {
+    if value.get("sessionBackend").and_then(serde_json::Value::as_str) != Some("sqlite") {
+        return;
+    }
+    static WARNED: std::sync::Mutex<Vec<PathBuf>> = std::sync::Mutex::new(Vec::new());
+    let mut warned = WARNED.lock().unwrap_or_else(|error| error.into_inner());
+    if warned.iter().any(|seen| seen == path) {
+        return;
+    }
+    warned.push(path.to_path_buf());
+    eprintln!(
+        "pi: the SQLite session backend was removed; sessions are stored as JSONL ({}).",
+        path.display()
+    );
 }
 
 fn parse_settings_json(raw: &str) -> Option<Settings> {
@@ -1205,6 +1215,10 @@ impl Settings {
             .unwrap_or(DEFAULT_RETRY_BASE_DELAY_MS)
     }
 
+    pub fn max_model_turns(&self) -> Option<u32> {
+        self.max_model_turns
+    }
+
     pub fn provider_timeout_ms(&self) -> Option<u64> {
         self.retry
             .as_ref()
@@ -1329,13 +1343,6 @@ impl Settings {
         })
     }
 
-    /// `jsonl` (default, TS coding-agent) or `sqlite`.
-    pub fn session_backend(&self) -> &str {
-        match self.session_backend.as_deref() {
-            Some(value) if !value.is_empty() => value,
-            _ => "jsonl",
-        }
-    }
 }
 
 /// Drop `null` members so a rewrite does not expand every unset field into an
@@ -1358,18 +1365,45 @@ fn prune_nulls(value: &mut serde_json::Value) {
     }
 }
 
+const SETTINGS_LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
+
 pub fn save_settings(agent_dir: &Path, settings: &Settings) -> Result<(), String> {
     fs::create_dir_all(agent_dir).map_err(|err| err.to_string())?;
     let path = settings_path(agent_dir);
+    with_settings_lock(&path, || write_settings_locked(&path, settings))
+}
+
+pub fn update_settings(
+    agent_dir: &Path,
+    change: impl FnOnce(&mut Settings),
+) -> Result<Settings, String> {
+    fs::create_dir_all(agent_dir).map_err(|err| err.to_string())?;
+    let path = settings_path(agent_dir);
     with_settings_lock(&path, || {
-        let mut value = serde_json::to_value(settings).map_err(|e| e.to_string())?;
-        prune_nulls(&mut value);
-        fs::write(
-            &path,
-            serde_json::to_string_pretty(&value).map_err(|e| e.to_string())?,
-        )
-        .map_err(|err| err.to_string())
+        refuse_unparseable(&path)?;
+        let mut settings = load_settings_file(&path);
+        change(&mut settings);
+        write_settings_locked(&path, &settings)?;
+        Ok(settings)
     })
+}
+
+fn refuse_unparseable(path: &Path) -> Result<(), String> {
+    match fs::read_to_string(path) {
+        Ok(raw) if !raw.trim().is_empty() && parse_settings_value(&raw).is_none() => Err(format!(
+            "{} is not valid JSON; fix or remove it before davinci changes it (nothing was written)",
+            path.display()
+        )),
+        _ => Ok(()),
+    }
+}
+
+fn write_settings_locked(path: &Path, settings: &Settings) -> Result<(), String> {
+    refuse_unparseable(path)?;
+    let mut value = serde_json::to_value(settings).map_err(|err| err.to_string())?;
+    prune_nulls(&mut value);
+    let text = serde_json::to_string_pretty(&value).map_err(|err| err.to_string())?;
+    davinci_sys::fs::atomic_write(path, text.as_bytes()).map_err(|err| err.to_string())
 }
 
 /// TS `proper-lockfile` / `lockfile.lockSync` sibling lock (`settings.json.lock`).
@@ -1383,46 +1417,13 @@ pub fn with_settings_lock<T>(
     path: &Path,
     write: impl FnOnce() -> Result<T, String>,
 ) -> Result<T, String> {
-    let lock_path = settings_lock_path(path);
-    let _guard = acquire_settings_lock(&lock_path)?;
+    let _guard = davinci_sys::lock::LockFile::acquire(
+        &settings_lock_path(path),
+        SETTINGS_LOCK_WAIT,
+        davinci_sys::lock::DEFAULT_STALE_AFTER,
+    )
+    .map_err(|err| format!("Failed to acquire settings lock: {err}"))?;
     write()
-}
-
-struct SettingsLock(PathBuf);
-
-impl Drop for SettingsLock {
-    fn drop(&mut self) {
-        let _ = fs::remove_file(&self.0);
-    }
-}
-
-fn acquire_settings_lock(lock_path: &Path) -> Result<SettingsLock, String> {
-    const MAX_ATTEMPTS: u32 = 10;
-    const DELAY_MS: u64 = 20;
-    let mut last_error = None;
-    for attempt in 1..=MAX_ATTEMPTS {
-        match fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(lock_path)
-        {
-            Ok(_) => return Ok(SettingsLock(lock_path.to_path_buf())),
-            Err(err)
-                if err.kind() == std::io::ErrorKind::AlreadyExists && attempt < MAX_ATTEMPTS =>
-            {
-                last_error = Some(err.to_string());
-                std::thread::sleep(std::time::Duration::from_millis(DELAY_MS));
-            }
-            Err(err) => {
-                return Err(if err.kind() == std::io::ErrorKind::AlreadyExists {
-                    "Failed to acquire settings lock".into()
-                } else {
-                    err.to_string()
-                });
-            }
-        }
-    }
-    Err(last_error.unwrap_or_else(|| "Failed to acquire settings lock".into()))
 }
 
 pub fn should_run_first_time_setup(settings_path: &Path) -> bool {
@@ -1547,6 +1548,90 @@ pub fn is_trusted(settings: &Settings, cwd: &Path, override_trust: Option<bool>)
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn npm_package_skills_are_collected_from_node_modules() {
+        let dir = tempfile::tempdir().unwrap();
+        let agent = dir.path().join("agent");
+        let root = agent.join("npm").join("node_modules").join("skills-pack");
+        std::fs::create_dir_all(root.join("skills").join("demo")).unwrap();
+        std::fs::write(
+            root.join("skills").join("demo").join("SKILL.md"),
+            "---\nname: demo\n---\n",
+        )
+        .unwrap();
+        let pkg: PackageSource = "npm:skills-pack".into();
+        let found = collect_package_resources(&pkg, "skills", &agent, dir.path());
+        assert!(found.iter().any(|path| path.ends_with("SKILL.md")), "{found:?}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn package_resource_walk_does_not_follow_symlink_loops() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("a")).unwrap();
+        std::os::unix::fs::symlink(dir.path(), dir.path().join("a").join("loop")).unwrap();
+        let pkg: PackageSource = dir.path().display().to_string().as_str().into();
+        let _ = collect_package_resources(&pkg, "skills", dir.path(), dir.path());
+    }
+
+    #[test]
+    fn saving_never_overwrites_a_file_that_does_not_parse() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = settings_path(dir.path());
+        fs::write(&path, "{ \"theme\": \"dark\", // my comment\n }").unwrap();
+        let err = save_settings(dir.path(), &Settings::default()).unwrap_err();
+        assert!(err.contains("not valid JSON"), "{err}");
+        assert!(fs::read_to_string(&path).unwrap().contains("my comment"));
+        assert!(update_settings(dir.path(), |settings| {
+            settings.packages.push("npm:x".into());
+        })
+        .is_err());
+    }
+
+    #[test]
+    fn stale_settings_lock_is_taken_over() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = settings_path(dir.path());
+        let lock = settings_lock_path(&path);
+        fs::write(&lock, "999999\n").unwrap();
+        let old = std::time::SystemTime::now() - std::time::Duration::from_secs(60);
+        fs::File::options()
+            .write(true)
+            .open(&lock)
+            .unwrap()
+            .set_modified(old)
+            .unwrap();
+        save_settings(dir.path(), &Settings::default()).unwrap();
+    }
+
+    #[test]
+    fn update_settings_changes_packages_without_losing_other_fields() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            settings_path(dir.path()),
+            r#"{"theme":"dark","packages":[]}"#,
+        )
+        .unwrap();
+        update_settings(dir.path(), |settings| {
+            settings.packages.push("npm:x".into());
+        })
+        .unwrap();
+        let raw = fs::read_to_string(settings_path(dir.path())).unwrap();
+        assert!(raw.contains("\"theme\": \"dark\""));
+        assert!(raw.contains("npm:x"));
+    }
+
+    #[test]
+    fn max_model_turns_is_optional_and_zero_can_be_configured() {
+        assert_eq!(Settings::default().max_model_turns(), None);
+
+        for (value, expected) in [(7, Some(7)), (0, Some(0))] {
+            let settings: Settings =
+                serde_json::from_value(serde_json::json!({"maxModelTurns": value})).unwrap();
+            assert_eq!(settings.max_model_turns(), expected);
+        }
+    }
 
     #[test]
     fn browser_settings_fail_closed_and_preserve_unrelated_settings() {
@@ -1834,15 +1919,6 @@ mod tests {
         .expect("write");
         let merged = load_merged_settings(&agent_dir, &project);
         assert_eq!(merged.session_dir.as_deref(), Some("./sessions"));
-        assert_eq!(Settings::default().session_backend(), "jsonl");
-        assert_eq!(
-            Settings {
-                session_backend: Some("sqlite".into()),
-                ..Settings::default()
-            }
-            .session_backend(),
-            "sqlite"
-        );
         assert_eq!(
             Settings {
                 session_dir: Some("~/sessions".into()),
@@ -1883,11 +1959,11 @@ mod tests {
         std::fs::write(pkg_dir.join("skills").join("review.md"), "# review").ok();
         std::fs::write(pkg_dir.join("skills").join("skip.txt"), "no").ok();
         let manifest_pkg = PackageSource::from_spec(pkg_dir.display().to_string());
-        let extensions = collect_package_resources(&manifest_pkg, "extensions");
+        let extensions = collect_package_resources(&manifest_pkg, "extensions", dir.path(), dir.path());
         assert!(extensions
             .iter()
             .any(|path| path.ends_with("src/index.js") || path.ends_with("src\\index.js")));
-        let skills = collect_package_resources(&manifest_pkg, "skills");
+        let skills = collect_package_resources(&manifest_pkg, "skills", dir.path(), dir.path());
         assert!(skills.iter().any(|path| path.ends_with("review.md")));
         assert!(!skills.iter().any(|path| path.ends_with("skip.txt")));
         assert!(read_pi_manifest(&pkg_dir.join("package.json"))

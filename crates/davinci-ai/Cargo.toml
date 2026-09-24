@@ -8,6 +8,7 @@ description = "Unified multi-provider LLM API matching @earendil-works/pi-ai"
 
 [dependencies]
 davinci-protocol = { path = "../davinci-protocol" }
+davinci-sys = { path = "../davinci-sys" }
 davinci-telemetry = { path = "../davinci-telemetry" }
 base64.workspace = true
 regex.workspace = true
@@ -25,5 +26,10 @@ sha1 = { workspace = true }
 sha2.workspace = true
 zstd.workspace = true
 
+[features]
+default = []
+test-fixtures = []
+
 [dev-dependencies]
+davinci-ai = { path = ".", features = ["test-fixtures"] }
 tempfile.workspace = true

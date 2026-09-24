@@ -22,6 +22,14 @@ fn non_retryable_limit_pattern() -> &'static Regex {
             "out of budget",
             "quota exceeded",
             "billing",
+            // Retrying a request that exceeds the model's context cannot help.
+            "prompt is too long",
+            "context.?length.?exceeded",
+            "maximum context length",
+            "exceeds the context window",
+            "input is too long",
+            "too many (input )?tokens",
+            "request too large",
         ])
     })
 }
@@ -33,12 +41,7 @@ fn retryable_provider_pattern() -> &'static Regex {
             "overloaded",
             "rate.?limit",
             "too many requests",
-            "429",
-            "500",
-            "502",
-            "503",
-            "504",
-            "524",
+            r"\b(?:429|5\d\d)\b",
             "service.?unavailable",
             "server.?error",
             "internal.?error",
@@ -151,5 +154,28 @@ mod tests {
             stop_reason: Some(StopReason::Stop),
             error_message: None,
         }));
+    }
+
+    #[test]
+    fn numbers_inside_other_numbers_are_not_status_codes() {
+        assert!(!is_retryable_error_text(
+            "prompt is too long: 205000 tokens > 200000 maximum"
+        ));
+        assert!(!is_retryable_error_text("input has 135000 tokens"));
+        assert!(is_retryable_error_text("HTTP 500 Internal Server Error"));
+        assert!(is_retryable_error_text("status=429"));
+    }
+
+    #[test]
+    fn context_overflow_is_never_retryable() {
+        for text in [
+            "prompt is too long: 205000 tokens > 200000 maximum",
+            "This model's maximum context length is 128000 tokens",
+            "context_length_exceeded",
+            "input exceeds the context window",
+            "Request too large: 500 server error while counting; prompt is too long",
+        ] {
+            assert!(!is_retryable_error_text(text), "{text}");
+        }
     }
 }

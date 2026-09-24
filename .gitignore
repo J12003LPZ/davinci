@@ -11,3 +11,12 @@ node_modules/
 .davinci/
 .serena/
 --Users--*/
+.gitconfig-gh
+/.expansion-clone/
+/.expansion-objects/
+/final-git/
+/final-worktree/
+/program-git/
+/program-worktree/
+/.codex-p9/
+/*.patch

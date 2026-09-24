@@ -246,25 +246,35 @@ impl RunHandle {
         self.state.1.notify_all();
     }
 
-    pub fn wait(&self) {
+    pub fn wait_timeout(&self, timeout: std::time::Duration) -> bool {
+        let started = std::time::Instant::now();
         let state = self.state.0.lock().unwrap_or_else(|e| e.into_inner());
-        drop(
-            self.state
-                .1
-                .wait_while(state, |state| !state.status.terminal())
-                .unwrap_or_else(|e| e.into_inner()),
-        );
+        let (state, _) = self
+            .state
+            .1
+            .wait_timeout_while(state, timeout, |state| !state.status.terminal())
+            .unwrap_or_else(|e| e.into_inner());
+        if !state.status.terminal() {
+            return false;
+        }
+        drop(state);
+
+        let remaining = timeout.saturating_sub(started.elapsed());
         let exited = self
             .worker_exited
             .0
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        drop(
-            self.worker_exited
-                .1
-                .wait_while(exited, |exited| !*exited)
-                .unwrap_or_else(|e| e.into_inner()),
-        );
+        let (exited, _) = self
+            .worker_exited
+            .1
+            .wait_timeout_while(exited, remaining, |exited| !*exited)
+            .unwrap_or_else(|e| e.into_inner());
+        *exited
+    }
+
+    pub fn wait(&self) {
+        let _ = self.wait_timeout(std::time::Duration::from_secs(30));
     }
 }
 
@@ -276,15 +286,17 @@ impl ScanCoordinator {
             .as_ref()
             .and_then(RunHandle::partial_report)
     }
-    pub fn wait(&self) {
+    pub fn wait_timeout(&self, timeout: std::time::Duration) -> bool {
         let run = self
             .current
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .clone();
-        if let Some(run) = run {
-            run.wait();
-        }
+        run.is_none_or(|run| run.wait_timeout(timeout))
+    }
+
+    pub fn wait(&self) {
+        let _ = self.wait_timeout(std::time::Duration::from_secs(30));
     }
 
     pub fn status(&self) -> Option<RunProgress> {
@@ -402,6 +414,21 @@ mod tests {
         release_tx.send(()).unwrap();
         handle.wait();
         assert_eq!(handle.status().status, RunStatus::Cancelled);
+    }
+
+    #[test]
+    fn waiting_for_a_stuck_review_gives_up() {
+        let controller = ScanCoordinator::default();
+        let (_release_tx, release_rx) = mpsc::channel::<()>();
+        let handle = controller
+            .start(move |_| {
+                let _ = release_rx.recv();
+            })
+            .unwrap();
+        let started = std::time::Instant::now();
+        assert!(!handle.wait_timeout(Duration::from_millis(100)));
+        assert!(started.elapsed() < Duration::from_secs(2));
+        controller.abort(None).unwrap();
     }
 
     #[test]

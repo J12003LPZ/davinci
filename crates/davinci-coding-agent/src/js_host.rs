@@ -165,10 +165,24 @@ pub fn node_available() -> bool {
 fn runner_path() -> Result<PathBuf, String> {
     static PATH: OnceLock<Result<PathBuf, String>> = OnceLock::new();
     PATH.get_or_init(|| {
-        let dir = std::env::temp_dir().join("pi-extension-runner");
-        std::fs::create_dir_all(&dir).map_err(|err| err.to_string())?;
-        let path = dir.join(format!("extension_runner-{}.js", std::process::id()));
-        std::fs::write(&path, RUNNER_JS).map_err(|err| err.to_string())?;
+        use sha2::{Digest, Sha256};
+        let digest = format!("{:x}", Sha256::digest(RUNNER_JS.as_bytes()));
+        let path = davinci_session::default_agent_dir()
+            .join("runtime")
+            .join(format!("extension_runner-{}.js", &digest[..16]));
+        let current = std::fs::read(&path).ok();
+        let mut needs_private_write = current.as_deref() != Some(RUNNER_JS.as_bytes());
+        #[cfg(unix)]
+        if !needs_private_write {
+            use std::os::unix::fs::PermissionsExt;
+            needs_private_write = std::fs::metadata(&path)
+                .map(|metadata| metadata.permissions().mode() & 0o777 != 0o600)
+                .unwrap_or(true);
+        }
+        if needs_private_write {
+            davinci_sys::fs::atomic_write_private(&path, RUNNER_JS.as_bytes())
+                .map_err(|err| err.to_string())?;
+        }
         Ok(path)
     })
     .clone()
@@ -206,6 +220,10 @@ pub fn resolve_extension_module(dir: &Path) -> Option<PathBuf> {
     None
 }
 
+#[cfg(test)]
+static JS_SESSION_SPAWNS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
 struct PersistentJsSession {
     child: Child,
     stdin: ChildStdin,
@@ -235,8 +253,69 @@ fn extension_reply_timeout() -> Duration {
 /// from a crashed one and skip the respawn-and-retry that would hang again.
 pub(crate) const EXTENSION_TIMEOUT_MARK: &str = "extension reply timed out";
 
+fn spawn_capped_drain<R>(
+    mut reader: R,
+    cap: usize,
+) -> (
+    std::sync::Arc<Mutex<Vec<u8>>>,
+    std::sync::Arc<std::sync::atomic::AtomicBool>,
+)
+where
+    R: Read + Send + 'static,
+{
+    let data = std::sync::Arc::new(Mutex::new(Vec::new()));
+    let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let thread_data = data.clone();
+    let thread_done = done.clone();
+    std::thread::spawn(move || {
+        let mut chunk = [0_u8; 8192];
+        loop {
+            match reader.read(&mut chunk) {
+                Ok(0) | Err(_) => break,
+                Ok(read) => {
+                    let mut out = thread_data.lock().unwrap_or_else(|err| err.into_inner());
+                    let remaining = cap.saturating_sub(out.len());
+                    if remaining > 0 {
+                        out.extend_from_slice(&chunk[..read.min(remaining)]);
+                    }
+                }
+            }
+        }
+        thread_done.store(true, std::sync::atomic::Ordering::Release);
+    });
+    (data, done)
+}
+
+fn drain_snapshot(
+    data: &std::sync::Arc<Mutex<Vec<u8>>>,
+    done: &std::sync::Arc<std::sync::atomic::AtomicBool>,
+) -> Vec<u8> {
+    let deadline = std::time::Instant::now() + Duration::from_millis(500);
+    while !done.load(std::sync::atomic::Ordering::Acquire)
+        && std::time::Instant::now() < deadline
+    {
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    data.lock()
+        .unwrap_or_else(|err| err.into_inner())
+        .clone()
+}
+
+fn extension_timeout_for_op(op: &str) -> Duration {
+    if op == "streamSimple" {
+        // Provider streams may legitimately outlive the ordinary extension
+        // reply budget. Keep an idle bound rather than the 120 s total cap.
+        Duration::from_secs(300)
+    } else {
+        extension_reply_timeout()
+    }
+}
+
+
 impl PersistentJsSession {
     fn start(module: &Path) -> Result<Self, String> {
+        #[cfg(test)]
+        JS_SESSION_SPAWNS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let node =
             find_node().ok_or_else(|| "Node.js is not available for JS extensions".to_string())?;
         let runner = runner_path()?;
@@ -257,6 +336,22 @@ impl PersistentJsSession {
             .stdout
             .take()
             .ok_or_else(|| "persistent stdout".to_string())?;
+        let stderr = child.stderr.take();
+        if let Some(stderr) = stderr {
+            let module_name = module.display().to_string();
+            std::thread::spawn(move || {
+                let reader = BufReader::new(stderr);
+                for line in reader.lines().map_while(Result::ok) {
+                    if davinci_ai::trace::enabled() {
+                        davinci_ai::trace::log(&format!(
+                            "extension {module_name}: {}",
+                            line.chars().take(500).collect::<String>()
+                        ));
+                    }
+                }
+            });
+        }
+        let module_name = module.display().to_string();
         let (tx, lines) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
             let mut reader = BufReader::new(stdout);
@@ -265,6 +360,15 @@ impl PersistentJsSession {
                 match reader.read_line(&mut line) {
                     Ok(0) => break,
                     Ok(_) => {
+                        if !line.trim_start().starts_with('{') {
+                            if davinci_ai::trace::enabled() {
+                                davinci_ai::trace::log(&format!(
+                                    "extension {module_name} wrote non-protocol stdout: {}",
+                                    line.chars().take(500).collect::<String>()
+                                ));
+                            }
+                            continue;
+                        }
                         if tx.send(Ok(line)).is_err() {
                             break;
                         }
@@ -283,7 +387,7 @@ impl PersistentJsSession {
             module: module.to_path_buf(),
             initial_load: None,
         };
-        session.initial_load = session.read_line().ok();
+        session.initial_load = session.read_line(extension_reply_timeout()).ok();
         Ok(session)
     }
 
@@ -293,11 +397,11 @@ impl PersistentJsSession {
             .write_all(format!("{line}\n").as_bytes())
             .map_err(|err| err.to_string())?;
         self.stdin.flush().map_err(|err| err.to_string())?;
-        self.read_line()
+        self.read_line(extension_timeout_for_op(op))
     }
 
-    fn read_line(&mut self) -> Result<JsExtensionResult, String> {
-        match self.lines.recv_timeout(extension_reply_timeout()) {
+    fn read_line(&mut self, timeout: Duration) -> Result<JsExtensionResult, String> {
+        match self.lines.recv_timeout(timeout) {
             Ok(Ok(line)) => serde_json::from_str(line.trim())
                 .map_err(|err| format!("extension runner: {err}: {line}")),
             Ok(Err(err)) => Err(err.to_string()),
@@ -308,7 +412,7 @@ impl PersistentJsSession {
                 let _ = self.child.wait();
                 Err(format!(
                     "{EXTENSION_TIMEOUT_MARK} after {}s ({})",
-                    extension_reply_timeout().as_secs(),
+                    timeout.as_secs(),
                     self.module.display()
                 ))
             }
@@ -326,7 +430,6 @@ impl Drop for PersistentJsSession {
     }
 }
 
-static PERSISTENT_JS: Mutex<Option<PersistentJsSession>> = Mutex::new(None);
 static NODE_LOCK: Mutex<()> = Mutex::new(());
 
 type UiWaiter = Box<dyn FnMut(&Value) -> Value>;
@@ -390,32 +493,11 @@ pub fn run_persistent_js_extension(
     payload: &Value,
 ) -> Result<JsExtensionResult, String> {
     let _guard = NODE_LOCK.lock().map_err(|err| err.to_string())?;
-    let mut slot = PERSISTENT_JS.lock().map_err(|err| err.to_string())?;
-    if slot
-        .as_ref()
-        .is_some_and(|session| session.module != module)
-    {
-        *slot = None;
-    }
-    if slot.is_none() {
-        *slot = Some(PersistentJsSession::start(module)?);
-    }
-    let result = slot
-        .as_mut()
-        .ok_or_else(|| "persistent JS session missing".to_string())?
-        .send(op, payload);
-    // A dead or hung runner must not linger in the slot: the next call should
-    // start a fresh one rather than write into a closed pipe.
-    if result.is_err() {
-        *slot = None;
-    }
-    result
+    run_pooled_js_extension(module, op, payload)
 }
 
 pub fn stop_persistent_js_extension() {
-    if let Ok(mut slot) = PERSISTENT_JS.lock() {
-        *slot = None;
-    }
+    shutdown_js_pool();
 }
 
 /// One long-lived `--persistent` runner per extension module. A fresh node
@@ -423,8 +505,36 @@ pub fn stop_persistent_js_extension() {
 /// (worse with TypeScript extensions that load a transpiler); the runner
 /// already speaks line-delimited `{op, payload}` in persistent mode, and the
 /// TS reference keeps extensions loaded for the whole session anyway.
-static JS_POOL: Mutex<Option<std::collections::HashMap<PathBuf, PersistentJsSession>>> =
-    Mutex::new(None);
+const MAX_PERSISTENT_JS_SESSIONS: usize = 8;
+
+#[derive(Default)]
+struct PersistentJsPool {
+    sessions: std::collections::HashMap<PathBuf, PersistentJsSession>,
+    lru: std::collections::VecDeque<PathBuf>,
+}
+
+impl PersistentJsPool {
+    fn touch(&mut self, module: &Path) {
+        self.lru.retain(|path| path != module);
+        self.lru.push_back(module.to_path_buf());
+    }
+
+    fn remove(&mut self, module: &Path) {
+        self.sessions.remove(module);
+        self.lru.retain(|path| path != module);
+    }
+
+    fn ensure_capacity(&mut self) {
+        while self.sessions.len() >= MAX_PERSISTENT_JS_SESSIONS {
+            let Some(oldest) = self.lru.pop_front() else {
+                break;
+            };
+            self.sessions.remove(&oldest);
+        }
+    }
+}
+
+static JS_POOL: Mutex<Option<PersistentJsPool>> = Mutex::new(None);
 
 fn js_pool_enabled() -> bool {
     !matches!(
@@ -439,11 +549,14 @@ fn run_pooled_js_extension(
     payload: &Value,
 ) -> Result<JsExtensionResult, String> {
     let mut pool = JS_POOL.lock().map_err(|err| err.to_string())?;
-    let pool = pool.get_or_insert_with(std::collections::HashMap::new);
-    if !pool.contains_key(module) {
-        pool.insert(module.to_path_buf(), PersistentJsSession::start(module)?);
+    let pool = pool.get_or_insert_with(PersistentJsPool::default);
+    if !pool.sessions.contains_key(module) {
+        pool.ensure_capacity();
+        pool.sessions
+            .insert(module.to_path_buf(), PersistentJsSession::start(module)?);
     }
-    let session = pool.get_mut(module).expect("pooled session");
+    pool.touch(module);
+    let session = pool.sessions.get_mut(module).expect("pooled session");
     if op == "load" {
         if let Some(initial) = session.initial_load.take() {
             return Ok(initial);
@@ -460,9 +573,11 @@ fn run_pooled_js_extension(
         Err(_) => {
             // The runner died (crash, stdin closed): respawn once and retry.
             pool.remove(module);
+            pool.ensure_capacity();
             let mut fresh = PersistentJsSession::start(module)?;
             let result = fresh.send(op, payload);
-            pool.insert(module.to_path_buf(), fresh);
+            pool.sessions.insert(module.to_path_buf(), fresh);
+            pool.touch(module);
             result
         }
     }
@@ -550,21 +665,45 @@ pub fn run_js_extension(
             .map_err(|err| err.to_string())?;
     }
     if let Some(dir) = &channel {
+        let stdout_drain = child
+            .stdout
+            .take()
+            .map(|pipe| spawn_capped_drain(pipe, 16 * 1024 * 1024));
+        let stderr_drain = child
+            .stderr
+            .take()
+            .map(|pipe| spawn_capped_drain(pipe, 64 * 1024));
+        let mut deadline = std::time::Instant::now() + extension_reply_timeout();
         while child.try_wait().map_err(|err| err.to_string())?.is_none() {
+            let ui_started = std::time::Instant::now();
             poll_ui_channel(dir);
+            deadline = deadline
+                .checked_add(ui_started.elapsed())
+                .unwrap_or(deadline);
+            if std::time::Instant::now() >= deadline {
+                davinci_sys::process::kill_tree(child.id());
+                let _ = child.kill();
+                let _ = child.wait();
+                let _ = std::fs::remove_dir_all(dir);
+                return Err(format!(
+                    "{EXTENSION_TIMEOUT_MARK} after {}s",
+                    extension_reply_timeout().as_secs()
+                ));
+            }
             std::thread::sleep(Duration::from_millis(20));
         }
         poll_ui_channel(dir);
-        let mut stdout = String::new();
-        if let Some(mut pipe) = child.stdout.take() {
-            pipe.read_to_string(&mut stdout)
-                .map_err(|err| err.to_string())?;
-        }
-        let mut stderr = String::new();
-        if let Some(mut pipe) = child.stderr.take() {
-            let _ = pipe.read_to_string(&mut stderr);
-        }
+        let stdout = stdout_drain
+            .as_ref()
+            .map(|(data, done)| drain_snapshot(data, done))
+            .unwrap_or_default();
+        let stderr = stderr_drain
+            .as_ref()
+            .map(|(data, done)| drain_snapshot(data, done))
+            .unwrap_or_default();
         let _ = std::fs::remove_dir_all(dir);
+        let stdout = String::from_utf8_lossy(&stdout);
+        let stderr = String::from_utf8_lossy(&stderr);
         return serde_json::from_str(&stdout)
             .map_err(|err| format!("extension runner: {err}: {} {stderr}", stdout.trim()));
     }
@@ -876,22 +1015,39 @@ fn render_js_tool(module: &Path, op: &str, name: &str, args: &Value, width: usiz
         .unwrap_or_default()
 }
 
-pub fn execute_command_tool(command: &str, cwd: &Path) -> Result<String, String> {
-    let output = if cfg!(windows) {
-        Command::new("cmd")
-            .args(["/C", command])
-            .current_dir(cwd)
-            .output()
+pub fn execute_command_tool(
+    command: &str,
+    args: &Value,
+    cwd: &Path,
+    timeout_ms: Option<u64>,
+) -> Result<String, String> {
+    let args_json = serde_json::to_string(args).map_err(|err| err.to_string())?;
+    let mut process = if cfg!(windows) {
+        let mut process = Command::new(davinci_sys::process::resolve_program("cmd"));
+        process.args(["/C", command]);
+        process
     } else {
-        Command::new("sh")
-            .args(["-c", command])
-            .current_dir(cwd)
-            .output()
-    }
+        let mut process = Command::new(davinci_sys::process::resolve_program("sh"));
+        process.args(["-c", command]);
+        process
+    };
+    process.current_dir(cwd).env("DAVINCI_TOOL_ARGS", &args_json);
+    let output = davinci_sys::process::run_bounded(
+        process,
+        Some(args_json.into_bytes()),
+        davinci_sys::process::RunLimits {
+            timeout: Duration::from_millis(timeout_ms.unwrap_or(120_000)),
+            output_cap: 1024 * 1024,
+        },
+        &|| false,
+    )
     .map_err(|err| err.to_string())?;
+    if output.timed_out {
+        return Err("manifest command tool timed out".into());
+    }
     let stdout = String::from_utf8_lossy(&output.stdout).to_string();
     let stderr = String::from_utf8_lossy(&output.stderr).to_string();
-    if output.status.success() {
+    if output.status.is_some_and(|status| status.success()) {
         Ok(stdout)
     } else {
         Err(if stderr.is_empty() { stdout } else { stderr })
@@ -903,15 +1059,67 @@ mod tests {
     use super::*;
     use tempfile::tempdir;
 
-    /// PERSISTENT_JS is one process-wide slot keyed by module path; parallel
-    /// tests with different modules evict each other's live session mid-test.
-    /// Every test that touches the persistent host must hold this lock.
+    /// Persistent JS sessions are process-wide. Tests that inspect spawn counts
+    /// or clear the shared pool serialize through this lock.
     static PERSISTENT_HOST_TEST_LOCK: Mutex<()> = Mutex::new(());
 
     fn persistent_host_guard() -> std::sync::MutexGuard<'static, ()> {
         PERSISTENT_HOST_TEST_LOCK
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    #[test]
+    fn command_tool_receives_model_arguments() {
+        let dir = tempdir().unwrap();
+        let command = if cfg!(windows) { "more" } else { "cat" };
+        let out = execute_command_tool(
+            command,
+            &serde_json::json!({"path":"a.txt"}),
+            dir.path(),
+            Some(5_000),
+        )
+        .unwrap();
+        assert!(out.contains("\"path\""), "{out}");
+    }
+
+    #[test]
+    fn alternating_modules_reuse_exactly_two_persistent_runners() {
+        let _persistent = persistent_host_guard();
+        let Some(_) = find_node() else {
+            return;
+        };
+        shutdown_js_pool();
+        JS_SESSION_SPAWNS.store(0, std::sync::atomic::Ordering::SeqCst);
+
+        let first = tempdir().unwrap();
+        let second = tempdir().unwrap();
+        for dir in [&first, &second] {
+            std::fs::write(
+                dir.path().join("index.js"),
+                "module.exports = () => {};\n",
+            )
+            .unwrap();
+        }
+        let first_module = resolve_extension_module(first.path()).unwrap();
+        let second_module = resolve_extension_module(second.path()).unwrap();
+        for _ in 0..10 {
+            let _ = run_persistent_js_extension(
+                &first_module,
+                "load",
+                &serde_json::json!({}),
+            );
+            let _ = run_persistent_js_extension(
+                &second_module,
+                "load",
+                &serde_json::json!({}),
+            );
+        }
+        assert_eq!(
+            JS_SESSION_SPAWNS.load(std::sync::atomic::Ordering::SeqCst),
+            2
+        );
+        shutdown_js_pool();
     }
 
     #[test]
@@ -1653,7 +1861,8 @@ module.exports = (pi) => {
         } else {
             "printf fixture-ok"
         };
-        let out = execute_command_tool(command, dir.path()).unwrap();
+        let out =
+            execute_command_tool(command, &serde_json::json!({}), dir.path(), None).unwrap();
         assert_eq!(out.trim_end_matches(['\r', '\n']), "fixture-ok");
     }
 

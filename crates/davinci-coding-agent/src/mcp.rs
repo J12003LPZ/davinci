@@ -17,11 +17,8 @@ pub fn load(agent_dir: &Path, cwd: &Path, trusted: bool) -> ConfigFile {
     if !trusted {
         return user;
     }
-    let current = cwd.join(".davinci").join("mcp.json");
-    let path = if current.exists() {
-        current
-    } else {
-        cwd.join(".pi").join("mcp.json")
+    let Some(path) = crate::project_config::resolve(cwd, "mcp.json") else {
+        return user;
     };
     let project = davinci_mcp::load_path(&path).unwrap_or_default();
     davinci_mcp::merge(user, project)

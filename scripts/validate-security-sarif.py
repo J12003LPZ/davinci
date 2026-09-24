@@ -12,7 +12,7 @@ def deny_remote(uri):
     raise NoSuchResource(ref=uri)
 
 
-schema_path = pathlib.Path(__file__).resolve().parents[1] / "crates/davinci-parity/fixtures/sarif/schema.json"
+schema_path = pathlib.Path(__file__).resolve().parents[1] / "fixtures/sarif/schema.json"
 schema = json.loads(schema_path.read_text(encoding="utf-8"))
 Draft4Validator.check_schema(schema)
 validator = Draft4Validator(schema, format_checker=FormatChecker(), registry=Registry(retrieve=deny_remote))

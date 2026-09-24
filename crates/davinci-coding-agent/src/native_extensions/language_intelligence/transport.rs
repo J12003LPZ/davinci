@@ -244,14 +244,17 @@ impl Transport {
         match receiver.recv_timeout(timeout.saturating_sub(started.elapsed())) {
             Ok(result) => result,
             Err(_) => {
+                self.shared
+                    .state
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .pending
+                    .remove(&id);
                 let _ = self.notify("$/cancelRequest", json!({"id":id}));
-                let error = IntelligenceError::new(
+                Err(IntelligenceError::new(
                     "request_timeout",
                     "Language-server request exceeded its deadline",
-                );
-                self.shared.fail(error.clone());
-                self.terminate();
-                Err(error)
+                ))
             }
         }
     }
@@ -721,6 +724,20 @@ mod tests {
             state.diagnostics[&diagnostic_key("file:///fixture.ts")].version,
             Some(1)
         );
+    }
+
+    #[test]
+    fn a_request_timeout_leaves_the_server_running() {
+        let transport = fixture("timeout");
+        let error = transport
+            .request(
+                "fixture/echo",
+                json!({}),
+                std::time::Duration::from_millis(200),
+            )
+            .unwrap_err();
+        assert_eq!(error.code, "request_timeout");
+        assert!(transport.is_alive());
     }
 
     #[test]

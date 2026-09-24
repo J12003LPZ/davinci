@@ -9,13 +9,12 @@
 //! name duplicates it and is ignored.
 //!
 //! Deliberate departures from the TypeScript, each noted at the site:
-//! - a stream that ends before `message_stop` keeps the text it received (TS
-//!   throws "Anthropic stream ended before message_stop") and errors only
-//!   when a tool call was cut off, the rule `ResponsesDecoder::finish` uses;
+//! - a stream that ends before `message_stop` keeps the text it received but
+//!   marks the turn as errored;
 //! - streamed tool arguments are re-parsed only once the buffer is a complete
 //!   JSON object (TS repairs and partially parses the fragment);
-//! - thinking signatures and redacted-thinking payloads are dropped because
-//!   `ContentBlock::Thinking` has nowhere to keep them;
+//! - thinking signatures and redacted-thinking payloads are retained for
+//!   replay in the next request of a tool loop;
 //! - a provider `error` event carries `error.message` (TS throws the raw
 //!   `data` string).
 
@@ -24,7 +23,9 @@ use std::collections::HashMap;
 use serde_json::{Map, Value};
 
 use crate::catalog::{Model, ModelCost};
-use crate::stream::{AssistantMessage, AssistantMessageEvent, ContentBlock, StopReason};
+use crate::stream::{
+    AssistantMessage, AssistantMessageEvent, ContentBlock, PartialMessageSnapshot, StopReason,
+};
 use crate::stream_decoder::{new_message, StreamDecoder};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -65,6 +66,7 @@ pub struct AnthropicDecoder {
     /// the allowed fallback the response says it was served by.
     usage_model: Model,
     message: AssistantMessage,
+    partial_snapshot: PartialMessageSnapshot,
     blocks: HashMap<u64, Block>,
     counts: TokenCounts,
     started: bool,
@@ -73,10 +75,12 @@ pub struct AnthropicDecoder {
 
 impl AnthropicDecoder {
     pub fn new(model: &Model) -> Self {
+        let message = new_message(model);
         Self {
             model: model.clone(),
             usage_model: model.clone(),
-            message: new_message(model),
+            partial_snapshot: PartialMessageSnapshot::new(&message),
+            message,
             blocks: HashMap::new(),
             counts: TokenCounts::default(),
             started: false,
@@ -88,7 +92,7 @@ impl AnthropicDecoder {
         if !self.started {
             self.started = true;
             out.push(AssistantMessageEvent::Start {
-                partial: self.message.clone(),
+                partial: self.partial_snapshot.force(&self.message),
             });
         }
     }
@@ -154,31 +158,31 @@ impl AnthropicDecoder {
                 });
                 out.push(AssistantMessageEvent::TextStart {
                     content_index,
-                    partial: self.message.clone(),
+                    partial: self.partial_snapshot.force(&self.message),
                 });
                 BlockKind::Text
             }
             "thinking" => {
                 self.message.content.push(ContentBlock::Thinking {
                     thinking: string_field(content_block, "thinking"),
+                    signature: None,
+                    redacted: false,
                 });
                 out.push(AssistantMessageEvent::ThinkingStart {
                     content_index,
-                    partial: self.message.clone(),
+                    partial: self.partial_snapshot.force(&self.message),
                 });
                 BlockKind::Thinking
             }
             "redacted_thinking" => {
-                // TS keeps the opaque `data` payload as the block's signature
-                // (with `redacted: true` and a "[Reasoning redacted]" label);
-                // `ContentBlock::Thinking` has no signature field, so the
-                // block stays empty and the payload is dropped.
                 self.message.content.push(ContentBlock::Thinking {
                     thinking: String::new(),
+                    signature: Some(string_field(content_block, "data")),
+                    redacted: true,
                 });
                 out.push(AssistantMessageEvent::ThinkingStart {
                     content_index,
-                    partial: self.message.clone(),
+                    partial: self.partial_snapshot.force(&self.message),
                 });
                 BlockKind::Thinking
             }
@@ -194,7 +198,7 @@ impl AnthropicDecoder {
                 });
                 out.push(AssistantMessageEvent::ToolcallStart {
                     content_index,
-                    partial: self.message.clone(),
+                    partial: self.partial_snapshot.force(&self.message),
                 });
                 BlockKind::ToolCall
             }
@@ -219,65 +223,67 @@ impl AnthropicDecoder {
         };
         // A delta for an index no content_block_start opened is dropped, as
         // in TS.
-        let Some(block) = self.blocks.get(&index).cloned() else {
+        let Some((kind, content_index)) = self
+            .blocks
+            .get(&index)
+            .map(|block| (block.kind, block.content_index))
+        else {
             return;
         };
         let delta_type = delta.get("type").and_then(Value::as_str).unwrap_or("");
-        match (delta_type, block.kind) {
+        match (delta_type, kind) {
             ("text_delta", BlockKind::Text) => {
                 let text = string_field(delta, "text");
+                let appended_bytes = text.len();
                 if let Some(ContentBlock::Text { text: existing }) =
-                    self.message.content.get_mut(block.content_index)
+                    self.message.content.get_mut(content_index)
                 {
                     existing.push_str(&text);
                 }
                 out.push(AssistantMessageEvent::TextDelta {
-                    content_index: block.content_index,
+                    content_index,
                     delta: text,
-                    partial: self.message.clone(),
+                    partial: self.partial_snapshot.update(&self.message, appended_bytes),
                 });
             }
             ("thinking_delta", BlockKind::Thinking) => {
                 let thinking = string_field(delta, "thinking");
-                if let Some(ContentBlock::Thinking { thinking: existing }) =
-                    self.message.content.get_mut(block.content_index)
+                let appended_bytes = thinking.len();
+                if let Some(ContentBlock::Thinking {
+                    thinking: existing, ..
+                }) = self.message.content.get_mut(content_index)
                 {
                     existing.push_str(&thinking);
                 }
                 out.push(AssistantMessageEvent::ThinkingDelta {
-                    content_index: block.content_index,
+                    content_index,
                     delta: thinking,
-                    partial: self.message.clone(),
+                    partial: self.partial_snapshot.update(&self.message, appended_bytes),
                 });
             }
             ("input_json_delta", BlockKind::ToolCall) => {
                 let fragment = string_field(delta, "partial_json");
-                let partial_json = match self.blocks.get_mut(&index) {
-                    Some(stored) => {
-                        stored.partial_json.push_str(&fragment);
-                        stored.partial_json.clone()
-                    }
-                    None => return,
+                let appended_bytes = fragment.len();
+                let Some(stored) = self.blocks.get_mut(&index) else {
+                    return;
                 };
-                self.set_arguments(block.content_index, &partial_json);
+                stored.partial_json.push_str(&fragment);
                 out.push(AssistantMessageEvent::ToolcallDelta {
-                    content_index: block.content_index,
+                    content_index,
                     delta: fragment,
-                    partial: self.message.clone(),
+                    partial: self.partial_snapshot.update(&self.message, appended_bytes),
                 });
             }
-            // The signature authenticates the thinking block on replay; there
-            // is no field to keep it in, so it is dropped.
-            ("signature_delta", _) => {}
+            ("signature_delta", _) => {
+                let signature = string_field(delta, "signature");
+                if let Some(ContentBlock::Thinking {
+                    signature: stored, ..
+                }) = self.message.content.get_mut(content_index)
+                {
+                    stored.get_or_insert_with(String::new).push_str(&signature);
+                }
+            }
             _ => {}
-        }
-    }
-
-    fn set_arguments(&mut self, content_index: usize, partial_json: &str) {
-        if let Some(ContentBlock::ToolCall { arguments, .. }) =
-            self.message.content.get_mut(content_index)
-        {
-            *arguments = parse_streaming_json(partial_json, arguments);
         }
     }
 
@@ -294,27 +300,31 @@ impl AnthropicDecoder {
                 out.push(AssistantMessageEvent::TextEnd {
                     content_index: block.content_index,
                     content,
-                    partial: self.message.clone(),
+                    partial: self.partial_snapshot.force(&self.message),
                 });
             }
             BlockKind::Thinking => {
                 let content = match self.message.content.get(block.content_index) {
-                    Some(ContentBlock::Thinking { thinking }) => thinking.clone(),
+                    Some(ContentBlock::Thinking { thinking, .. }) => thinking.clone(),
                     _ => String::new(),
                 };
                 out.push(AssistantMessageEvent::ThinkingEnd {
                     content_index: block.content_index,
                     content,
-                    partial: self.message.clone(),
+                    partial: self.partial_snapshot.force(&self.message),
                 });
             }
             BlockKind::ToolCall => {
-                // TS re-parses the buffer here, which yields `{}` when nothing
-                // streamed. An empty buffer keeps whatever the block already
-                // holds (`{}` unless the input arrived whole in
-                // content_block_start), so a proxy that sends the input up
-                // front is not silently emptied.
-                self.set_arguments(block.content_index, &block.partial_json);
+                // Keep input supplied whole in content_block_start when no
+                // JSON deltas arrived; otherwise validate only the completed
+                // buffer, leaving streaming partial events unchanged.
+                if !block.partial_json.is_empty() {
+                    if let Some(ContentBlock::ToolCall { arguments, .. }) =
+                        self.message.content.get_mut(block.content_index)
+                    {
+                        *arguments = crate::final_tool_arguments(&block.partial_json);
+                    }
+                }
                 let tool_call = self
                     .message
                     .content
@@ -328,7 +338,7 @@ impl AnthropicDecoder {
                 out.push(AssistantMessageEvent::ToolcallEnd {
                     content_index: block.content_index,
                     tool_call,
-                    partial: self.message.clone(),
+                    partial: self.partial_snapshot.force(&self.message),
                 });
             }
         }
@@ -386,10 +396,7 @@ impl AnthropicDecoder {
             .any(|block| matches!(block, ContentBlock::ToolCall { .. }))
     }
 
-    /// `message_stop`, or the connection closing on a message whose blocks
-    /// were all complete: the stop reason seen in `message_delta`, else
-    /// `Stop`. TS raises "Anthropic stream ended without a stop reason" for
-    /// the latter; the text received is worth more than the complaint.
+    /// `message_stop`: the stop reason seen in `message_delta`, else `Stop`.
     fn finalize(&mut self, out: &mut Vec<AssistantMessageEvent>) {
         if self.done {
             return;
@@ -467,9 +474,8 @@ impl StreamDecoder for AnthropicDecoder {
 
     fn finish(&mut self, out: &mut Vec<AssistantMessageEvent>) -> AssistantMessage {
         if !self.done {
-            // The connection closed before message_stop. Text already
-            // received is worth keeping; a tool call cut off mid-arguments is
-            // not, because executing it would guess at what the model meant.
+            // The connection closed before the terminal event: keep what
+            // arrived, but the turn did not finish.
             let cut_tool_call = self
                 .blocks
                 .values()
@@ -477,7 +483,7 @@ impl StreamDecoder for AnthropicDecoder {
             if cut_tool_call {
                 self.fail("Stream ended before the tool call was complete".into(), out);
             } else {
-                self.finalize(out);
+                self.fail(crate::stream_decoder::TRUNCATED_STREAM.into(), out);
             }
         }
         self.message.clone()
@@ -546,24 +552,6 @@ fn usage_model_for(model: &Model, served_by: &str) -> Model {
             ..model.clone()
         },
         None => model.clone(),
-    }
-}
-
-/// Lenient JSON for streamed tool arguments: the text so far if it parses as
-/// an object, otherwise the last value that did. TS `parseStreamingJson`
-/// additionally repairs and partially parses the fragment, so its arguments
-/// track the stream more closely; only the complete object matters to
-/// callers.
-fn parse_streaming_json(text: &str, previous: &Value) -> Value {
-    match serde_json::from_str::<Value>(text) {
-        Ok(Value::Object(map)) => Value::Object(map),
-        Ok(_) | Err(_) => {
-            if previous.is_object() {
-                previous.clone()
-            } else {
-                Value::Object(Map::new())
-            }
-        }
     }
 }
 
@@ -663,6 +651,58 @@ mod tests {
 data: {"type":"message_start","message":{"id":"msg_01","type":"message","role":"assistant","model":"claude-sonnet-4-5","content":[],"stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":25,"cache_creation_input_tokens":0,"cache_read_input_tokens":10,"output_tokens":1}}}
 
 "#;
+
+    #[test]
+    fn malformed_final_tool_input_is_preserved_for_rejection() {
+        let raw = r#"{"command":"rm"#;
+        let body = [
+            format!(
+                "event: content_block_start\ndata: {}",
+                serde_json::json!({
+                    "type": "content_block_start",
+                    "index": 0,
+                    "content_block": {
+                        "type": "tool_use",
+                        "id": "toolu_bad",
+                        "name": "exec_command",
+                        "input": {}
+                    }
+                })
+            ),
+            format!(
+                "event: content_block_delta\ndata: {}",
+                serde_json::json!({
+                    "type": "content_block_delta",
+                    "index": 0,
+                    "delta": {"type": "input_json_delta", "partial_json": raw}
+                })
+            ),
+            format!(
+                "event: content_block_stop\ndata: {}",
+                serde_json::json!({"type": "content_block_stop", "index": 0})
+            ),
+            format!(
+                "event: message_delta\ndata: {}",
+                serde_json::json!({
+                    "type": "message_delta",
+                    "delta": {"stop_reason": "max_tokens"}
+                })
+            ),
+            format!(
+                "event: message_stop\ndata: {}",
+                serde_json::json!({"type": "message_stop"})
+            ),
+        ]
+        .join("\n\n");
+        let corpus = format!("{MESSAGE_START}{body}");
+        let (message, _) = run(&corpus);
+
+        assert!(matches!(
+            &message.content[0],
+            ContentBlock::ToolCall { arguments, .. }
+                if arguments == &serde_json::json!({"__davinci_invalid_arguments": raw})
+        ));
+    }
 
     #[test]
     fn text_only_stream_keeps_message_start_usage_and_prices_it() {
@@ -775,7 +815,7 @@ data: {"type":"message_stop"}
         );
         assert_eq!(message.content.len(), 2);
         assert!(
-            matches!(&message.content[0], ContentBlock::Thinking { thinking } if thinking == "Let me think")
+            matches!(&message.content[0], ContentBlock::Thinking { thinking, .. } if thinking == "Let me think")
         );
         assert!(matches!(&message.content[1], ContentBlock::Text { text } if text == "Answer"));
         assert!(events.iter().any(|event| matches!(
@@ -846,8 +886,8 @@ data: {"type":"message_stop"}
             }
             other => panic!("expected a tool call, got {other:?}"),
         }
-        // While the JSON is incomplete the arguments stay at the last object
-        // that parsed; each delta still carries its fragment.
+        // Deltas carry each raw fragment while the parsed arguments are
+        // finalized once, at the block boundary.
         let deltas: Vec<(&str, &Value)> = events
             .iter()
             .filter_map(|event| match event {
@@ -866,15 +906,34 @@ data: {"type":"message_stop"}
         assert_eq!(deltas[1].1, &serde_json::json!({}));
         assert_eq!(deltas[2].1, &serde_json::json!({}));
         assert_eq!(deltas[3].0, "}");
-        assert_eq!(deltas[3].1, &serde_json::json!({"path": "Cargo.toml"}));
+        assert_eq!(deltas[3].1, &serde_json::json!({}));
+        let delta_snapshots: Vec<_> = events
+            .iter()
+            .filter_map(|event| match event {
+                AssistantMessageEvent::ToolcallDelta { partial, .. } => Some(partial),
+                _ => None,
+            })
+            .collect();
+        assert!(delta_snapshots
+            .iter()
+            .all(|snapshot| std::sync::Arc::ptr_eq(delta_snapshots[0], snapshot)));
         match &events[6] {
             AssistantMessageEvent::ToolcallEnd {
                 content_index,
                 tool_call,
+                partial,
                 ..
             } => {
                 assert_eq!(*content_index, 0);
                 assert_eq!(tool_call, &message.content[0]);
+                assert_eq!(
+                    &partial.content[0],
+                    &ContentBlock::ToolCall {
+                        id: "toolu_01".into(),
+                        name: "read".into(),
+                        arguments: serde_json::json!({"path": "Cargo.toml"}),
+                    }
+                );
             }
             other => panic!("expected toolcall_end, got {other:?}"),
         }
@@ -1018,29 +1077,38 @@ data: {"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta"
             message.error_message.as_deref(),
             Some("Stream ended before the tool call was complete")
         );
-        // The half-received JSON never became arguments.
+        // The half-received JSON is marked invalid for the agent to reject.
         assert!(matches!(
             &message.content[0],
-            ContentBlock::ToolCall { arguments, .. } if arguments == &serde_json::json!({})
+            ContentBlock::ToolCall { arguments, .. }
+                if arguments == &serde_json::json!({
+                    "__davinci_invalid_arguments": "{\"command\":\"rm"
+                })
         ));
     }
 
     #[test]
-    fn a_stream_cut_mid_text_keeps_the_text() {
+    fn eof_before_message_stop_is_an_error_that_keeps_text() {
         let (message, events) = run(
-            r#"data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}
+            r#"data: {"type":"message_start","message":{"id":"m","model":"claude","usage":{}}}
 
-data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"half"}}
+data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}
+
+data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"half an ans"}}
 "#,
         );
+        assert_eq!(message.stop_reason, Some(StopReason::Error));
         assert_eq!(
-            names(&events),
-            ["start", "text_start", "text_delta", "text_end", "done"]
+            message.error_message.as_deref(),
+            Some("stream ended before a terminal response event")
         );
-        assert_eq!(message.stop_reason, Some(StopReason::Stop));
-        assert!(matches!(&message.content[0], ContentBlock::Text { text } if text == "half"));
+        assert!(
+            matches!(&message.content[0], ContentBlock::Text { text } if text == "half an ans")
+        );
+        assert!(crate::is_retryable_assistant_error(&message));
+        assert_eq!(names(&events).last(), Some(&"error"));
 
-        // With a stop reason already seen, the cut stream keeps it.
+        // A message_delta stop reason is not the terminal message_stop event.
         let (message, events) = run(
             r#"data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}
 
@@ -1051,8 +1119,13 @@ data: {"type":"content_block_stop","index":0}
 data: {"type":"message_delta","delta":{"stop_reason":"max_tokens","stop_sequence":null},"usage":{"output_tokens":3}}
 "#,
         );
-        assert_eq!(message.stop_reason, Some(StopReason::Length));
-        assert_eq!(names(&events).last(), Some(&"done"));
+        assert_eq!(message.stop_reason, Some(StopReason::Error));
+        assert_eq!(
+            message.error_message.as_deref(),
+            Some("stream ended before a terminal response event")
+        );
+        assert!(matches!(&message.content[0], ContentBlock::Text { text } if text == "cut"));
+        assert_eq!(names(&events).last(), Some(&"error"));
     }
 
     #[test]
@@ -1087,10 +1160,68 @@ data: {"type":"message_stop"}
         );
         assert_eq!(message.content.len(), 2);
         assert!(
-            matches!(&message.content[0], ContentBlock::Thinking { thinking } if thinking.is_empty())
+            matches!(&message.content[0], ContentBlock::Thinking { thinking, .. } if thinking.is_empty())
         );
         assert!(matches!(&message.content[1], ContentBlock::Text { text } if text == "ok"));
         assert_eq!(message.stop_reason, Some(StopReason::Stop));
+    }
+
+    #[test]
+    fn thinking_signature_and_redacted_payload_are_kept() {
+        let corpus = r#"
+data: {"type":"message_start","message":{"id":"m","model":"claude","usage":{}}}
+
+data: {"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":""}}
+
+data: {"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"plan"}}
+
+data: {"type":"content_block_delta","index":0,"delta":{"type":"signature_delta","signature":"SIG"}}
+
+data: {"type":"content_block_stop","index":0}
+
+data: {"type":"content_block_start","index":1,"content_block":{"type":"redacted_thinking","data":"OPAQUE"}}
+
+data: {"type":"content_block_stop","index":1}
+
+data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{}}
+
+data: {"type":"message_stop"}
+"#;
+        let (message, _) = run(corpus);
+        assert_eq!(
+            message.content[0],
+            ContentBlock::Thinking {
+                thinking: "plan".into(),
+                signature: Some("SIG".into()),
+                redacted: false,
+            }
+        );
+        assert_eq!(
+            message.content[1],
+            ContentBlock::Thinking {
+                thinking: String::new(),
+                signature: Some("OPAQUE".into()),
+                redacted: true,
+            }
+        );
+
+        let chat = crate::assistant_to_chat(&message);
+        assert_eq!(
+            chat.content[0],
+            crate::MessageContent::Thinking {
+                thinking: "plan".into(),
+                redacted: None,
+                signature: Some("SIG".into()),
+            }
+        );
+        assert_eq!(
+            chat.content[1],
+            crate::MessageContent::Thinking {
+                thinking: String::new(),
+                redacted: Some(true),
+                signature: Some("OPAQUE".into()),
+            }
+        );
     }
 
     #[test]
@@ -1341,7 +1472,11 @@ data: {"type":"message_stop"}
         assert!(matches!(
             &message.content[0],
             ContentBlock::ToolCall { id, name, arguments }
-                if id.is_empty() && name.is_empty() && arguments == &serde_json::json!({})
+                if id.is_empty()
+                    && name.is_empty()
+                    && arguments == &serde_json::json!({
+                        "__davinci_invalid_arguments": "not json"
+                    })
         ));
         // The refusal delta was malformed but its stop reason still counts.
         assert_eq!(message.stop_reason, Some(StopReason::Error));
@@ -1387,10 +1522,14 @@ data: {"type":"message_stop"}
     }
 
     #[test]
-    fn finishing_an_empty_stream_emits_start_and_done() {
+    fn finishing_an_empty_stream_emits_start_and_error() {
         let (message, events) = run("");
-        assert_eq!(names(&events), ["start", "done"]);
-        assert_eq!(message.stop_reason, Some(StopReason::Stop));
+        assert_eq!(names(&events), ["start", "error"]);
+        assert_eq!(message.stop_reason, Some(StopReason::Error));
+        assert_eq!(
+            message.error_message.as_deref(),
+            Some("stream ended before a terminal response event")
+        );
         assert!(message.content.is_empty());
         assert_eq!(message.usage, None);
     }

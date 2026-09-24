@@ -5,7 +5,7 @@
 
 use serde_json::Value;
 use std::collections::BTreeMap;
-use std::io::Read;
+use std::io::{BufRead, BufReader, Read};
 use std::time::Duration;
 
 use crate::jsonrpc::{Notification, Request, Response};
@@ -32,9 +32,8 @@ pub struct HttpTransport {
 
 /// What one `POST` came back with.
 struct Reply {
-    content_type: String,
     session_id: Option<String>,
-    text: String,
+    value: Value,
 }
 
 impl HttpTransport {
@@ -90,25 +89,8 @@ impl HttpTransport {
         self.protocol_version = Some(version.to_string());
     }
 
-    fn post(&mut self, body: &Value) -> Result<Reply> {
-        let mut request = self.agent.post(&self.url);
-        for (key, value) in self.request_headers() {
-            request = request.set(&key, &value);
-        }
-        let response = match request.send_json(body) {
-            Ok(response) => response,
-            Err(ureq::Error::Status(code, response)) => {
-                let mut text = String::new();
-                let _ = response.into_reader().take(4096).read_to_string(&mut text);
-                let text = text.trim();
-                return Err(Error::Transport(if text.is_empty() {
-                    format!("mcp http {code}")
-                } else {
-                    format!("mcp http {code}: {text}")
-                }));
-            }
-            Err(err) => return Err(Error::Transport(format!("mcp http: {err}"))),
-        };
+    fn post(&mut self, body: &Value, want: Option<&Value>) -> Result<Reply> {
+        let response = self.send_post(body)?;
         let content_type = response
             .header("content-type")
             .unwrap_or("application/json")
@@ -118,12 +100,125 @@ impl HttpTransport {
             .map(str::trim)
             .filter(|value| !value.is_empty())
             .map(str::to_string);
-        let text = read_response_body(response.into_reader(), MAX_BODY_BYTES)?;
-        Ok(Reply {
-            content_type,
-            session_id,
-            text,
-        })
+        let value = if content_type.contains("text/event-stream") {
+            self.read_sse_response(response.into_reader(), want)?
+        } else {
+            let text = read_response_body(response.into_reader(), MAX_BODY_BYTES)?;
+            parse_http_body(&content_type, &text, want)?
+        };
+        Ok(Reply { session_id, value })
+    }
+
+    fn send_post(&self, body: &Value) -> Result<ureq::Response> {
+        let mut request = self.agent.post(&self.url);
+        for (key, value) in self.request_headers() {
+            request = request.set(&key, &value);
+        }
+        match request.send_json(body) {
+            Ok(response) => Ok(response),
+            Err(ureq::Error::Status(code, response)) => {
+                let mut text = String::new();
+                let _ = response.into_reader().take(4096).read_to_string(&mut text);
+                let text = text.trim();
+                Err(Error::Transport(if text.is_empty() {
+                    format!("mcp http {code}")
+                } else {
+                    format!("mcp http {code}: {text}")
+                }))
+            }
+            Err(err) => Err(Error::Transport(format!("mcp http: {err}"))),
+        }
+    }
+
+    fn answer_server_request(&self, id: Value, method: &str) -> Result<()> {
+        let reply = if method == "ping" {
+            serde_json::json!({ "jsonrpc": "2.0", "id": id, "result": {} })
+        } else {
+            serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "error": { "code": -32601, "message": "method not supported" }
+            })
+        };
+        let _ = self.send_post(&reply)?;
+        Ok(())
+    }
+
+    fn read_sse_response(
+        &self,
+        reader: impl Read,
+        want: Option<&Value>,
+    ) -> Result<Value> {
+        let mut reader = BufReader::new(reader);
+        let mut line = String::new();
+        let mut data = String::new();
+        let mut total = 0usize;
+        let mut last = None;
+        loop {
+            line.clear();
+            let read = reader
+                .read_line(&mut line)
+                .map_err(|err| Error::Transport(format!("mcp http SSE: {err}")))?;
+            if read == 0 {
+                break;
+            }
+            total = total.saturating_add(read);
+            if total > MAX_BODY_BYTES {
+                return Err(Error::Transport(format!(
+                    "mcp http body exceeds {MAX_BODY_BYTES} bytes"
+                )));
+            }
+            let trimmed = line.trim_end_matches(['\r', '\n']);
+            if trimmed.is_empty() {
+                if data.is_empty() {
+                    continue;
+                }
+                let event = std::mem::take(&mut data);
+                let Ok(value) = serde_json::from_str::<Value>(&event) else {
+                    continue;
+                };
+                if let (Some(id), Some(method)) = (
+                    value.get("id").cloned(),
+                    value.get("method").and_then(Value::as_str),
+                ) {
+                    self.answer_server_request(id, method)?;
+                    continue;
+                }
+                match want {
+                    Some(id) if value.get("id") == Some(id) => {
+                        validate_response(&value, id)?;
+                        return Ok(value);
+                    }
+                    Some(_) => {}
+                    None => last = Some(value),
+                }
+                continue;
+            }
+            if let Some(rest) = trimmed.strip_prefix("data:") {
+                if !data.is_empty() {
+                    data.push('\n');
+                }
+                data.push_str(rest.strip_prefix(' ').unwrap_or(rest));
+            }
+        }
+        if !data.is_empty() {
+            let value: Value = serde_json::from_str(&data)
+                .map_err(|err| Error::Transport(format!("mcp http SSE: {err}")))?;
+            if let Some(id) = want {
+                if value.get("id") == Some(id) {
+                    validate_response(&value, id)?;
+                    return Ok(value);
+                }
+            } else {
+                last = Some(value);
+            }
+        }
+        match want {
+            Some(id) => Err(Error::Transport(format!(
+                "SSE stream ended without a response for id {id}"
+            ))),
+            None => last.ok_or_else(|| Error::Transport("SSE body had no data frame".into())),
+        }
     }
 
     fn fixture_answer(fixture: &Value, method: &str) -> Result<Value> {
@@ -159,8 +254,9 @@ impl Rpc for HttpTransport {
         let request = Request::new(id, method, params);
         let body = serde_json::to_value(&request)
             .map_err(|err| Error::Protocol(format!("encode: {err}")))?;
-        let reply = self.post(&body)?;
-        let parsed = parse_http_body(&reply.content_type, &reply.text, Some(&Value::from(id)))?;
+        let wanted = Value::from(id);
+        let reply = self.post(&body, Some(&wanted))?;
+        let parsed = reply.value;
         if parsed.is_null() {
             return Err(Error::Transport(format!(
                 "mcp http: empty reply to {method}"
@@ -190,7 +286,7 @@ impl Rpc for HttpTransport {
             serde_json::to_value(&note).map_err(|err| Error::Protocol(format!("encode: {err}")))?;
         // A compliant server answers `202 Accepted` with no body; anything
         // it does send back is not addressed to a request of ours.
-        let _ = self.post(&body)?;
+        let _ = self.post(&body, None)?;
         Ok(())
     }
 }
@@ -249,6 +345,9 @@ fn build_agent(timeout: Duration) -> ureq::Agent {
 /// `fixture:<path>` loads a method→result map from disk so tests never hit
 /// the network and never share `PI_MCP_FIXTURE` across threads.
 fn load_fixture(url: &str) -> Option<Value> {
+    if !crate::fixtures::enabled() {
+        return None;
+    }
     if let Some(path) = url.strip_prefix("fixture:") {
         return std::fs::read_to_string(path)
             .ok()
@@ -337,6 +436,112 @@ fn sse_events(text: &str) -> impl Iterator<Item = String> + '_ {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    fn read_test_request(stream: &mut std::net::TcpStream) -> String {
+        let mut bytes = Vec::new();
+        let mut buf = [0u8; 1024];
+        let mut header_end = None;
+        while header_end.is_none() {
+            let n = stream.read(&mut buf).unwrap();
+            if n == 0 {
+                break;
+            }
+            bytes.extend_from_slice(&buf[..n]);
+            header_end = bytes.windows(4).position(|window| window == b"\r\n\r\n").map(|i| i + 4);
+        }
+        if let Some(end) = header_end {
+            let headers = String::from_utf8_lossy(&bytes[..end]);
+            let length = headers
+                .lines()
+                .find_map(|line| {
+                    let (name, value) = line.split_once(':')?;
+                    name.eq_ignore_ascii_case("content-length")
+                        .then(|| value.trim().parse::<usize>().ok())
+                        .flatten()
+                })
+                .unwrap_or(0);
+            while bytes.len() < end + length {
+                let n = stream.read(&mut buf).unwrap();
+                if n == 0 {
+                    break;
+                }
+                bytes.extend_from_slice(&buf[..n]);
+            }
+        }
+        String::from_utf8_lossy(&bytes).into_owned()
+    }
+
+    #[test]
+    fn sse_reply_returns_before_the_stream_closes() {
+        use std::io::Write;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let _ = read_test_request(&mut stream);
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n"
+            )
+            .unwrap();
+            write!(
+                stream,
+                "data: {{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{{\"ok\":true}}}}\n\n"
+            )
+            .unwrap();
+            stream.flush().unwrap();
+            std::thread::sleep(Duration::from_secs(2));
+        });
+        let mut transport =
+            HttpTransport::new(&format!("http://{addr}/mcp"), BTreeMap::new()).unwrap();
+        transport.set_call_timeout(Duration::from_secs(5));
+        let started = std::time::Instant::now();
+        let result = transport.call("tools/call", serde_json::json!({})).unwrap();
+        assert_eq!(result["ok"], true);
+        assert!(started.elapsed() < Duration::from_secs(1));
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn sse_ping_is_answered_before_our_reply() {
+        use std::io::Write;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut first, _) = listener.accept().unwrap();
+            let _ = read_test_request(&mut first);
+            write!(
+                first,
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n"
+            )
+            .unwrap();
+            write!(
+                first,
+                "data: {{\"jsonrpc\":\"2.0\",\"id\":\"s1\",\"method\":\"ping\"}}\n\n"
+            )
+            .unwrap();
+            first.flush().unwrap();
+
+            let (mut second, _) = listener.accept().unwrap();
+            let request = read_test_request(&mut second);
+            assert!(request.contains("\"id\":\"s1\""), "{request}");
+            assert!(request.contains("\"result\":{}"), "{request}");
+            write!(second, "HTTP/1.1 202 Accepted\r\nContent-Length: 0\r\n\r\n").unwrap();
+            second.flush().unwrap();
+
+            write!(
+                first,
+                "data: {{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{{\"ok\":true}}}}\n\n"
+            )
+            .unwrap();
+            first.flush().unwrap();
+        });
+        let mut transport =
+            HttpTransport::new(&format!("http://{addr}/mcp"), BTreeMap::new()).unwrap();
+        let result = transport.call("tools/call", serde_json::json!({})).unwrap();
+        assert_eq!(result["ok"], true);
+        server.join().unwrap();
+    }
 
     #[test]
     fn security_http_body_is_bounded_before_buffering() {

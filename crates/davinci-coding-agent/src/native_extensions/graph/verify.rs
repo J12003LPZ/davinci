@@ -247,17 +247,17 @@ pub fn default_verify_exec(
     timeout_ms: u64,
 ) -> (i32, String, u64) {
     let started = Instant::now();
-    // stdout and stderr interleave into one transcript, so both sinks share it.
-    let collected = std::cell::RefCell::new(String::new());
+    // stdout and stderr interleave into one bounded transcript tail.
+    let collected = std::cell::RefCell::new(super::tail::TailBuffer::new(64 * 1024));
     let append = |line: &str| {
         let mut output = collected.borrow_mut();
-        output.push_str(line);
-        output.push('\n');
+        output.push(line.as_bytes());
+        output.push(b"\n");
     };
     let process = shell_command(command, cwd);
     let outcome = run_child(process, abort, timeout_ms, append, append);
     let duration_ms = started.elapsed().as_millis() as u64;
-    let mut output = collected.into_inner();
+    let mut output = collected.into_inner().text();
     match outcome {
         Ok(outcome) => {
             if outcome.timed_out {

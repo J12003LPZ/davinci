@@ -28,10 +28,13 @@ impl LearningStore {
         let mut skills: BTreeMap<String, SkillLedgerRecord> = BTreeMap::new();
         let mut skill_versions = BTreeMap::new();
         let mut diagnostics = Vec::new();
+        let mut candidate_line_count = 0usize;
+        let mut skill_line_count = 0usize;
 
         let candidates_path = root.join("candidates.jsonl");
         if candidates_path.exists() {
             if let Ok(content) = fs::read_to_string(&candidates_path) {
+                candidate_line_count = content.lines().count();
                 for (line_no, line) in content.lines().enumerate() {
                     let trimmed = line.trim();
                     if trimmed.is_empty() {
@@ -56,6 +59,7 @@ impl LearningStore {
         let skills_path = root.join("skills.jsonl");
         if skills_path.exists() {
             if let Ok(content) = fs::read_to_string(&skills_path) {
+                skill_line_count = content.lines().count();
                 for (line_no, line) in content.lines().enumerate() {
                     let trimmed = line.trim();
                     if trimmed.is_empty() {
@@ -85,13 +89,19 @@ impl LearningStore {
             }
         }
 
-        Ok(Self {
+        let mut store = Self {
             root,
             candidates,
             skills,
             skill_versions,
             diagnostics,
-        })
+        };
+        let candidates_bloated = candidate_line_count > 2 * store.candidates.len() + 32;
+        let skills_bloated = skill_line_count > 2 * store.skill_versions.len() + 32;
+        if candidates_bloated || skills_bloated {
+            store.compact()?;
+        }
+        Ok(store)
     }
 
     pub fn root(&self) -> &Path {
@@ -247,62 +257,33 @@ impl LearningStore {
             version: 1,
         };
         let state_path = self.root.join("state.json");
-        let tmp_path = self.root.join(format!(
-            "state.json.tmp.{}",
-            crate::native_extensions::learning::types::now_ms()
-        ));
-        let json_str = serde_json::to_string_pretty(&state).map_err(|e| e.to_string())?;
-        fs::write(&tmp_path, json_str).map_err(|e| e.to_string())?;
-        if state_path.exists() {
-            let _ = fs::remove_file(&state_path);
-        }
-        fs::rename(&tmp_path, &state_path).map_err(|e| e.to_string())?;
-        Ok(())
+        let json_str = serde_json::to_string_pretty(&state).map_err(|err| err.to_string())?;
+        davinci_sys::fs::atomic_write(&state_path, json_str.as_bytes())
+            .map_err(|err| err.to_string())
     }
 
-    #[allow(dead_code)]
     pub fn compact(&mut self) -> Result<(), String> {
-        let now = crate::native_extensions::learning::types::now_ms();
         let candidates_path = self.root.join("candidates.jsonl");
-        let candidates_tmp = self.root.join(format!("candidates.jsonl.tmp.{}", now));
-        {
-            let mut file = OpenOptions::new()
-                .create(true)
-                .write(true)
-                .truncate(true)
-                .open(&candidates_tmp)
-                .map_err(|e| format!("failed to open {:?}: {}", candidates_tmp, e))?;
-            for cand in self.candidates.values() {
-                let line = serde_json::to_string(cand).map_err(|e| e.to_string())?;
-                writeln!(file, "{}", line).map_err(|e| format!("failed to write line: {}", e))?;
-            }
+        let mut candidates = String::new();
+        for candidate in self.candidates.values() {
+            candidates.push_str(
+                &serde_json::to_string(candidate).map_err(|err| err.to_string())?,
+            );
+            candidates.push('\n');
         }
-        if candidates_path.exists() {
-            let _ = fs::remove_file(&candidates_path);
-        }
-        fs::rename(&candidates_tmp, &candidates_path).map_err(|e| e.to_string())?;
+        davinci_sys::fs::atomic_write(&candidates_path, candidates.as_bytes())
+            .map_err(|err| err.to_string())?;
 
         let skills_path = self.root.join("skills.jsonl");
-        let skills_tmp = self.root.join(format!("skills.jsonl.tmp.{}", now));
-        {
-            let mut file = OpenOptions::new()
-                .create(true)
-                .write(true)
-                .truncate(true)
-                .open(&skills_tmp)
-                .map_err(|e| format!("failed to open {:?}: {}", skills_tmp, e))?;
-            for sk in self.skill_versions.values() {
-                let line = serde_json::to_string(sk).map_err(|e| e.to_string())?;
-                writeln!(file, "{}", line).map_err(|e| format!("failed to write line: {}", e))?;
-            }
+        let mut skills = String::new();
+        for skill in self.skill_versions.values() {
+            skills.push_str(&serde_json::to_string(skill).map_err(|err| err.to_string())?);
+            skills.push('\n');
         }
-        if skills_path.exists() {
-            let _ = fs::remove_file(&skills_path);
-        }
-        fs::rename(&skills_tmp, &skills_path).map_err(|e| e.to_string())?;
+        davinci_sys::fs::atomic_write(&skills_path, skills.as_bytes())
+            .map_err(|err| err.to_string())?;
 
-        self.save_state()?;
-        Ok(())
+        self.save_state()
     }
 
     #[allow(dead_code)]
@@ -515,6 +496,24 @@ mod tests {
         store.upsert_candidate(c2).unwrap();
         store2.reload().unwrap();
         assert!(store2.candidate("cand-2").is_some());
+    }
+
+    #[test]
+    fn opening_a_bloated_ledger_compacts_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = LearningStore::open(dir.path().to_path_buf()).unwrap();
+        let mut candidate = fixture_candidate("cand-bloated");
+        for i in 0..100 {
+            candidate.confidence = (i as f64) / 100.0;
+            store.upsert_candidate(candidate.clone()).unwrap();
+        }
+        drop(store);
+
+        let path = dir.path().join("candidates.jsonl");
+        assert!(fs::read_to_string(&path).unwrap().lines().count() >= 100);
+        let reopened = LearningStore::open(dir.path().to_path_buf()).unwrap();
+        assert_eq!(reopened.candidate("cand-bloated").unwrap().confidence, 0.99);
+        assert_eq!(fs::read_to_string(&path).unwrap().lines().count(), 1);
     }
 
     #[test]

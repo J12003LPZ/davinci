@@ -3,8 +3,9 @@
 //! One decoder per wire format, fed one parsed SSE payload at a time and
 //! producing `AssistantMessageEvent`s as it goes, so a token can be painted
 //! the moment it arrives instead of after the whole body has been buffered.
-//! Each decoder carries the partial `AssistantMessage` that every event
-//! references, exactly as the TypeScript stream functions do.
+//! Events share bounded-rate `AssistantMessage` snapshots; deltas carry the
+//! immediate text so consumers can render each fragment without cloning the
+//! full message on every event.
 //!
 //! `ResponsesDecoder` mirrors `processResponsesStream` in
 //! `vendor/pi/packages/ai/src/api/openai-responses-shared.ts` (with the Codex
@@ -16,7 +17,14 @@ use serde_json::{Map, Value};
 use uuid::Uuid;
 
 use crate::catalog::Model;
-use crate::stream::{AssistantMessage, AssistantMessageEvent, ContentBlock, StopReason};
+use crate::stream::{
+    AssistantMessage, AssistantMessageEvent, ContentBlock, PartialMessageSnapshot, StopReason,
+};
+
+/// Recorded when a stream closes before the provider's terminal event. The
+/// received content is kept, but the turn is not complete; `retry.rs` matches
+/// this wording.
+pub(crate) const TRUNCATED_STREAM: &str = "stream ended before a terminal response event";
 
 /// A decoder for one provider wire format.
 pub trait StreamDecoder {
@@ -148,10 +156,7 @@ impl SseFramer {
                 // The frames that fail to parse are the ones a trace is
                 // read for: a truncated tail, a proxy's HTML, a stray line.
                 if crate::trace::enabled() {
-                    crate::trace::log(&format!(
-                        "sse frame dropped: {err}: {}",
-                        data.chars().take(200).collect::<String>()
-                    ));
+                    crate::trace::log(&format!("sse frame dropped: {err} ({} bytes)", data.len()));
                 }
                 return None;
             }
@@ -178,21 +183,6 @@ pub fn frames_of(corpus: &str) -> Vec<SseFrame> {
     frames
 }
 
-/// Lenient JSON for streamed tool arguments: the text so far if it parses,
-/// otherwise the last value that did. Arguments are always an object.
-fn parse_streaming_json(text: &str, previous: &Value) -> Value {
-    match serde_json::from_str::<Value>(text) {
-        Ok(Value::Object(map)) => Value::Object(map),
-        Ok(_) | Err(_) => {
-            if previous.is_object() {
-                previous.clone()
-            } else {
-                Value::Object(Map::new())
-            }
-        }
-    }
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SlotKind {
     Text,
@@ -200,7 +190,7 @@ enum SlotKind {
     ToolCall,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 struct Slot {
     kind: SlotKind,
     content_index: usize,
@@ -210,10 +200,26 @@ struct Slot {
     custom_input: bool,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct SlotHandle {
+    content_index: usize,
+    custom_input: bool,
+}
+
+impl Slot {
+    fn handle(&self) -> SlotHandle {
+        SlotHandle {
+            content_index: self.content_index,
+            custom_input: self.custom_input,
+        }
+    }
+}
+
 /// Decoder for the OpenAI Responses API and the ChatGPT Codex flavour of it.
 pub struct ResponsesDecoder {
     model: Model,
     message: AssistantMessage,
+    partial_snapshot: PartialMessageSnapshot,
     slots: HashMap<u64, Slot>,
     started: bool,
     done: bool,
@@ -223,9 +229,11 @@ pub struct ResponsesDecoder {
 
 impl ResponsesDecoder {
     pub fn new(model: &Model) -> Self {
+        let message = new_message(model);
         Self {
             model: model.clone(),
-            message: new_message(model),
+            partial_snapshot: PartialMessageSnapshot::new(&message),
+            message,
             slots: HashMap::new(),
             started: false,
             done: false,
@@ -246,7 +254,7 @@ impl ResponsesDecoder {
         if !self.started {
             self.started = true;
             out.push(AssistantMessageEvent::Start {
-                partial: self.message.clone(),
+                partial: self.partial_snapshot.force(&self.message),
             });
         }
     }
@@ -263,17 +271,19 @@ impl ResponsesDecoder {
         output_index: u64,
         item: &Value,
         out: &mut Vec<AssistantMessageEvent>,
-    ) -> Option<Slot> {
+    ) -> Option<SlotHandle> {
         let item_type = item.get("type").and_then(Value::as_str).unwrap_or("");
         let content_index = self.message.content.len();
         let slot = match item_type {
             "reasoning" => {
                 self.message.content.push(ContentBlock::Thinking {
                     thinking: String::new(),
+                    signature: None,
+                    redacted: false,
                 });
                 out.push(AssistantMessageEvent::ThinkingStart {
                     content_index,
-                    partial: self.message.clone(),
+                    partial: self.partial_snapshot.force(&self.message),
                 });
                 Slot {
                     kind: SlotKind::Thinking,
@@ -288,7 +298,7 @@ impl ResponsesDecoder {
                 });
                 out.push(AssistantMessageEvent::TextStart {
                     content_index,
-                    partial: self.message.clone(),
+                    partial: self.partial_snapshot.force(&self.message),
                 });
                 Slot {
                     kind: SlotKind::Text,
@@ -310,11 +320,11 @@ impl ResponsesDecoder {
                         .and_then(Value::as_str)
                         .unwrap_or_default()
                         .to_string(),
-                    arguments: parse_streaming_json(&partial, &Value::Null),
+                    arguments: Value::Object(Map::new()),
                 });
                 out.push(AssistantMessageEvent::ToolcallStart {
                     content_index,
-                    partial: self.message.clone(),
+                    partial: self.partial_snapshot.force(&self.message),
                 });
                 Slot {
                     kind: SlotKind::ToolCall,
@@ -329,8 +339,6 @@ impl ResponsesDecoder {
                     .and_then(Value::as_str)
                     .unwrap_or("")
                     .to_string();
-                let mut arguments = Map::new();
-                arguments.insert("input".into(), Value::String(input.clone()));
                 self.message.content.push(ContentBlock::ToolCall {
                     id: tool_call_id(item),
                     name: item
@@ -338,11 +346,11 @@ impl ResponsesDecoder {
                         .and_then(Value::as_str)
                         .unwrap_or_default()
                         .to_string(),
-                    arguments: Value::Object(arguments),
+                    arguments: Value::Object(Map::new()),
                 });
                 out.push(AssistantMessageEvent::ToolcallStart {
                     content_index,
-                    partial: self.message.clone(),
+                    partial: self.partial_snapshot.force(&self.message),
                 });
                 Slot {
                     kind: SlotKind::ToolCall,
@@ -353,8 +361,9 @@ impl ResponsesDecoder {
             }
             _ => return None,
         };
-        self.slots.insert(output_index, slot.clone());
-        Some(slot)
+        let handle = slot.handle();
+        self.slots.insert(output_index, slot);
+        Some(handle)
     }
 
     /// The slot at `output_index` if it is of `kind`. A delta that arrives
@@ -366,9 +375,9 @@ impl ResponsesDecoder {
         output_index: u64,
         kind: SlotKind,
         out: &mut Vec<AssistantMessageEvent>,
-    ) -> Option<Slot> {
+    ) -> Option<SlotHandle> {
         match self.slots.get(&output_index) {
-            Some(slot) if slot.kind == kind => Some(slot.clone()),
+            Some(slot) if slot.kind == kind => Some(slot.handle()),
             Some(_) => None,
             None => {
                 let item = match kind {
@@ -381,7 +390,12 @@ impl ResponsesDecoder {
         }
     }
 
-    fn append_text(&mut self, slot: &Slot, delta: &str, out: &mut Vec<AssistantMessageEvent>) {
+    fn append_text(
+        &mut self,
+        slot: &SlotHandle,
+        delta: &str,
+        out: &mut Vec<AssistantMessageEvent>,
+    ) {
         if let Some(ContentBlock::Text { text }) = self.message.content.get_mut(slot.content_index)
         {
             text.push_str(delta);
@@ -389,12 +403,17 @@ impl ResponsesDecoder {
         out.push(AssistantMessageEvent::TextDelta {
             content_index: slot.content_index,
             delta: delta.to_string(),
-            partial: self.message.clone(),
+            partial: self.partial_snapshot.update(&self.message, delta.len()),
         });
     }
 
-    fn append_thinking(&mut self, slot: &Slot, delta: &str, out: &mut Vec<AssistantMessageEvent>) {
-        if let Some(ContentBlock::Thinking { thinking }) =
+    fn append_thinking(
+        &mut self,
+        slot: &SlotHandle,
+        delta: &str,
+        out: &mut Vec<AssistantMessageEvent>,
+    ) {
+        if let Some(ContentBlock::Thinking { thinking, .. }) =
             self.message.content.get_mut(slot.content_index)
         {
             thinking.push_str(delta);
@@ -402,37 +421,29 @@ impl ResponsesDecoder {
         out.push(AssistantMessageEvent::ThinkingDelta {
             content_index: slot.content_index,
             delta: delta.to_string(),
-            partial: self.message.clone(),
+            partial: self.partial_snapshot.update(&self.message, delta.len()),
         });
     }
 
-    fn set_arguments(&mut self, slot: &Slot, partial: &str) {
-        if let Some(ContentBlock::ToolCall { arguments, .. }) =
-            self.message.content.get_mut(slot.content_index)
-        {
-            if slot.custom_input {
-                if let Value::Object(map) = arguments {
-                    map.insert("input".into(), Value::String(partial.to_string()));
-                }
-            } else {
-                *arguments = parse_streaming_json(partial, arguments);
-            }
-        }
-        if let Some(stored) = self
-            .slots
-            .values_mut()
-            .find(|stored| stored.content_index == slot.content_index)
-        {
-            stored.partial = partial.to_string();
-        }
-    }
-
-    fn tool_delta(&mut self, slot: &Slot, delta: &str, out: &mut Vec<AssistantMessageEvent>) {
+    fn tool_delta(&mut self, slot: &SlotHandle, delta: &str, out: &mut Vec<AssistantMessageEvent>) {
         out.push(AssistantMessageEvent::ToolcallDelta {
             content_index: slot.content_index,
             delta: delta.to_string(),
-            partial: self.message.clone(),
+            partial: self.partial_snapshot.update(&self.message, delta.len()),
         });
+    }
+
+    fn replace_slot_partial(&mut self, output_index: u64, value: &str) -> Option<usize> {
+        let suffix_start = self.slots.get(&output_index).and_then(|slot| {
+            value
+                .strip_prefix(slot.partial.as_str())
+                .map(|suffix| value.len() - suffix.len())
+        });
+        if let Some(slot) = self.slots.get_mut(&output_index) {
+            slot.partial.clear();
+            slot.partial.push_str(value);
+        }
+        suffix_start
     }
 
     fn close_slot(
@@ -456,20 +467,20 @@ impl ResponsesDecoder {
                     } else {
                         None
                     };
-                    if let (Some(text), Some(ContentBlock::Thinking { thinking })) =
+                    if let (Some(text), Some(ContentBlock::Thinking { thinking, .. })) =
                         (text, self.message.content.get_mut(slot.content_index))
                     {
                         *thinking = text;
                     }
                 }
                 let content = match self.message.content.get(slot.content_index) {
-                    Some(ContentBlock::Thinking { thinking }) => thinking.clone(),
+                    Some(ContentBlock::Thinking { thinking, .. }) => thinking.clone(),
                     _ => String::new(),
                 };
                 out.push(AssistantMessageEvent::ThinkingEnd {
                     content_index: slot.content_index,
                     content,
-                    partial: self.message.clone(),
+                    partial: self.partial_snapshot.force(&self.message),
                 });
             }
             SlotKind::Text => {
@@ -503,36 +514,33 @@ impl ResponsesDecoder {
                 out.push(AssistantMessageEvent::TextEnd {
                     content_index: slot.content_index,
                     content,
-                    partial: self.message.clone(),
+                    partial: self.partial_snapshot.force(&self.message),
                 });
             }
             SlotKind::ToolCall => {
-                if let Some(item) = item {
-                    if slot.custom_input {
-                        if let Some(input) = item.get("input").and_then(Value::as_str) {
-                            self.set_arguments(&slot, input);
-                        }
-                    } else {
-                        let raw = item
-                            .get("arguments")
-                            .and_then(Value::as_str)
-                            .filter(|raw| !raw.is_empty())
-                            .map(str::to_string)
-                            .unwrap_or_else(|| slot.partial.clone());
-                        let raw = if raw.is_empty() {
-                            "{}".to_string()
-                        } else {
-                            raw
-                        };
-                        self.set_arguments(&slot, &raw);
+                if slot.custom_input {
+                    let input = item
+                        .and_then(|item| item.get("input"))
+                        .and_then(Value::as_str)
+                        .unwrap_or(slot.partial.as_str());
+                    if let Some(ContentBlock::ToolCall {
+                        arguments: Value::Object(map),
+                        ..
+                    }) = self.message.content.get_mut(slot.content_index)
+                    {
+                        map.insert("input".into(), Value::String(input.to_string()));
                     }
-                } else if !slot.custom_input {
-                    let raw = if slot.partial.is_empty() {
-                        "{}".to_string()
-                    } else {
-                        slot.partial.clone()
-                    };
-                    self.set_arguments(&slot, &raw);
+                } else {
+                    let raw = item
+                        .and_then(|item| item.get("arguments"))
+                        .and_then(Value::as_str)
+                        .filter(|raw| !raw.is_empty())
+                        .unwrap_or(&slot.partial);
+                    if let Some(ContentBlock::ToolCall { arguments, .. }) =
+                        self.message.content.get_mut(slot.content_index)
+                    {
+                        *arguments = crate::final_tool_arguments(raw);
+                    }
                 }
                 let block = self
                     .message
@@ -547,7 +555,7 @@ impl ResponsesDecoder {
                 out.push(AssistantMessageEvent::ToolcallEnd {
                     content_index: slot.content_index,
                     tool_call: block,
-                    partial: self.message.clone(),
+                    partial: self.partial_snapshot.force(&self.message),
                 });
             }
         }
@@ -777,8 +785,9 @@ impl StreamDecoder for ResponsesDecoder {
                         return;
                     }
                     let delta = event_delta(event);
-                    let partial = format!("{}{}", slot.partial, delta);
-                    self.set_arguments(&slot, &partial);
+                    if let Some(stored) = self.slots.get_mut(&output_index) {
+                        stored.partial.push_str(&delta);
+                    }
                     self.tool_delta(&slot, &delta, out);
                 }
             }
@@ -790,11 +799,10 @@ impl StreamDecoder for ResponsesDecoder {
                     let arguments = event
                         .get("arguments")
                         .and_then(Value::as_str)
-                        .unwrap_or_default()
-                        .to_string();
-                    let previous = slot.partial.clone();
-                    self.set_arguments(&slot, &arguments);
-                    if let Some(rest) = arguments.strip_prefix(previous.as_str()) {
+                        .unwrap_or_default();
+                    let suffix_start = self.replace_slot_partial(output_index, arguments);
+                    if let Some(start) = suffix_start {
+                        let rest = &arguments[start..];
                         if !rest.is_empty() {
                             self.tool_delta(&slot, rest, out);
                         }
@@ -807,8 +815,9 @@ impl StreamDecoder for ResponsesDecoder {
                         return;
                     }
                     let delta = event_delta(event);
-                    let input = format!("{}{}", slot.partial, delta);
-                    self.set_arguments(&slot, &input);
+                    if let Some(stored) = self.slots.get_mut(&output_index) {
+                        stored.partial.push_str(&delta);
+                    }
                     self.tool_delta(&slot, &delta, out);
                 }
             }
@@ -820,11 +829,10 @@ impl StreamDecoder for ResponsesDecoder {
                     let input = event
                         .get("input")
                         .and_then(Value::as_str)
-                        .unwrap_or_default()
-                        .to_string();
-                    let previous = slot.partial.clone();
-                    self.set_arguments(&slot, &input);
-                    if let Some(rest) = input.strip_prefix(previous.as_str()) {
+                        .unwrap_or_default();
+                    let suffix_start = self.replace_slot_partial(output_index, input);
+                    if let Some(start) = suffix_start {
+                        let rest = &input[start..];
                         if !rest.is_empty() {
                             self.tool_delta(&slot, rest, out);
                         }
@@ -872,9 +880,8 @@ impl StreamDecoder for ResponsesDecoder {
 
     fn finish(&mut self, out: &mut Vec<AssistantMessageEvent>) -> AssistantMessage {
         if !self.done {
-            // The connection closed before the terminal event. Text already
-            // received is worth keeping; a tool call cut off mid-arguments is
-            // not, because executing it would guess at what the model meant.
+            // The connection closed before the terminal event: keep what
+            // arrived, but the turn did not finish.
             let cut_tool_call = self
                 .slots
                 .values()
@@ -882,7 +889,7 @@ impl StreamDecoder for ResponsesDecoder {
             if cut_tool_call {
                 self.fail("Stream ended before the tool call was complete".into(), out);
             } else {
-                self.finalize(None, out);
+                self.fail(TRUNCATED_STREAM.into(), out);
             }
         }
         self.message.clone()
@@ -1068,7 +1075,7 @@ data: {"type":"response.completed","response":{"status":"completed"}}
         let (message, events) = run(corpus);
         assert_eq!(message.content.len(), 4);
         assert!(
-            matches!(&message.content[0], ContentBlock::Thinking { thinking } if thinking == "Need the file")
+            matches!(&message.content[0], ContentBlock::Thinking { thinking, .. } if thinking == "Need the file")
         );
         assert!(
             matches!(&message.content[1], ContentBlock::Text { text } if text == "Reading both.")
@@ -1090,6 +1097,27 @@ data: {"type":"response.completed","response":{"status":"completed"}}
         assert_eq!(ends, [2, 3]);
         // The summary_part.done newline is replaced by the item's own summary.
         assert!(names(&events).contains(&"thinking_end"));
+    }
+
+    #[test]
+    fn malformed_final_function_arguments_are_preserved_for_rejection() {
+        let raw = r#"{"path":"#;
+        let encoded_raw = serde_json::to_string(raw).unwrap();
+        let corpus = format!(
+            r#"data: {{"type":"response.output_item.added","output_index":0,"item":{{"type":"function_call","id":"fc_bad","call_id":"call_bad","name":"read","arguments":{encoded_raw}}}}}
+
+data: {{"type":"response.output_item.done","output_index":0,"item":{{"type":"function_call","id":"fc_bad","call_id":"call_bad","name":"read","arguments":{encoded_raw}}}}}
+
+data: {{"type":"response.completed","response":{{"status":"completed"}}}}
+"#
+        );
+        let (message, _) = run(&corpus);
+
+        assert!(matches!(
+            &message.content[0],
+            ContentBlock::ToolCall { arguments, .. }
+                if arguments == &serde_json::json!({"__davinci_invalid_arguments": raw})
+        ));
     }
 
     #[test]
@@ -1157,16 +1185,21 @@ data: {"type":"response.completed","response":{"status":"completed"}}
     }
 
     #[test]
-    fn a_stream_cut_mid_text_keeps_the_text_but_cut_mid_tool_call_is_an_error() {
+    fn eof_before_response_completed_is_an_error_that_keeps_text() {
         let (message, events) = run(
             r#"data: {"type":"response.output_item.added","output_index":0,"item":{"type":"message"}}
 
 data: {"type":"response.output_text.delta","output_index":0,"delta":"half"}
 "#,
         );
-        assert_eq!(message.stop_reason, Some(StopReason::Stop));
+        assert_eq!(message.stop_reason, Some(StopReason::Error));
+        assert_eq!(
+            message.error_message.as_deref(),
+            Some("stream ended before a terminal response event")
+        );
         assert!(matches!(&message.content[0], ContentBlock::Text { text } if text == "half"));
-        assert_eq!(names(&events).last(), Some(&"done"));
+        assert!(crate::is_retryable_assistant_error(&message));
+        assert_eq!(names(&events).last(), Some(&"error"));
 
         let (message, _) = run(
             r#"data: {"type":"response.output_item.added","output_index":0,"item":{"type":"function_call","id":"fc","call_id":"c","name":"bash","arguments":""}}
