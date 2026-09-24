@@ -846,6 +846,9 @@ fn build_agent(parsed: &Args, session_dir: &Path, cwd: &Path) -> Result<Agent, S
     if let Some(value) = settings.reasoning_summary.as_deref() {
         std::env::set_var("DAVINCI_REASONING_SUMMARY", value);
     }
+    if let Some(value) = settings.graph_economy_model.as_deref() {
+        std::env::set_var("DAVINCI_GRAPH_ECONOMY_MODEL", value);
+    }
     let (images, true_color, hyperlinks) = settings.terminal_capability_overrides();
     if let Some(kind) = images {
         std::env::set_var("PI_TERMINAL_IMAGES", kind);
