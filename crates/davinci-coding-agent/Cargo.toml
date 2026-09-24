@@ -52,7 +52,10 @@ notify.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
+davinci-ai = { path = "../davinci-ai", features = ["test-fixtures"] }
+davinci-mcp = { path = "../davinci-mcp", features = ["test-fixtures"] }
 
 [features]
 default = []
 interaction-testing = []
+test-fixtures = ["davinci-ai/test-fixtures", "davinci-mcp/test-fixtures"]

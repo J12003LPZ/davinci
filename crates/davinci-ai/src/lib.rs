@@ -37,6 +37,7 @@ pub mod codex_transport;
 pub mod codex_usage;
 mod codex_ws;
 mod deferred;
+pub mod fixtures;
 mod http;
 mod http_proxy;
 mod images;

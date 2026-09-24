@@ -249,6 +249,9 @@ fn build_agent(timeout: Duration) -> ureq::Agent {
 /// `fixture:<path>` loads a method→result map from disk so tests never hit
 /// the network and never share `PI_MCP_FIXTURE` across threads.
 fn load_fixture(url: &str) -> Option<Value> {
+    if !crate::fixtures::enabled() {
+        return None;
+    }
     if let Some(path) = url.strip_prefix("fixture:") {
         return std::fs::read_to_string(path)
             .ok()

@@ -4,6 +4,7 @@
 //! `docs/superpowers/specs/2026-09-01-native-mcp-design.md`.
 
 mod config;
+pub mod fixtures;
 mod http;
 mod jsonrpc;
 mod stdio;

@@ -247,6 +247,15 @@ jobs:
         run: cargo fmt --check
       - name: Clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: Release credential fixture exclusion
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo build --release -p davinci-coding-agent --bin davinci
+          if strings target/release/davinci | grep -Eq 'PI_OAUTH_FIXTURE|PI_OAUTH_REFRESH_URL|PI_OAUTH_TOKEN_URL|PI_MCP_FIXTURE|PI_SECURITY_SCAN_FIXTURE|PI_SECURITY_SCAN_HOLD'; then
+            echo "credential-affecting test fixture hook leaked into release binary" >&2
+            exit 1
+          fi
       - name: Prompt contracts
         run: |
           cargo test -p davinci-agent prompt::

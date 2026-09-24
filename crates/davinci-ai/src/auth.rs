@@ -202,11 +202,12 @@ impl AuthStorage {
             return Ok(false);
         }
         let refresh = cred.refresh.clone().unwrap_or_default();
-        let fixture = refresh.starts_with("pi-fixture-")
-            || matches!(
-                std::env::var("PI_OAUTH_FIXTURE").as_deref(),
-                Ok("1") | Ok("true")
-            );
+        let fixture = crate::fixtures::enabled()
+            && (refresh.starts_with("pi-fixture-")
+                || matches!(
+                    std::env::var("PI_OAUTH_FIXTURE").as_deref(),
+                    Ok("1") | Ok("true")
+                ));
         if fixture {
             return self
                 .login_oauth(
@@ -217,7 +218,10 @@ impl AuthStorage {
                 )
                 .map(|_| true);
         }
-        if let Ok(url) = std::env::var("PI_OAUTH_REFRESH_URL") {
+        let refresh_url = crate::fixtures::enabled()
+            .then(|| std::env::var("PI_OAUTH_REFRESH_URL").ok())
+            .flatten();
+        if let Some(url) = refresh_url {
             let body = serde_json::json!({
                 "provider": provider,
                 "refresh": refresh,
@@ -718,6 +722,12 @@ pub fn parse_copilot_available_model_ids(raw: &str) -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn fixture_hooks_are_on_in_test_builds() {
+        assert!(crate::fixtures::enabled());
+    }
+
+
     use super::*;
     use tempfile::tempdir;
 

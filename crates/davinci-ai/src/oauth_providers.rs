@@ -423,7 +423,9 @@ pub fn token_refresh_request(provider: &str, refresh: &str) -> Option<TokenExcha
 /// Trade a refresh token for a fresh access token. Fixture refresh (a
 /// `pi-fixture-` token or `PI_OAUTH_FIXTURE`) never hits the network.
 pub fn refresh_oauth_token(provider: &str, refresh: &str) -> Result<OauthTokens, String> {
-    if refresh.starts_with("pi-fixture-") || std::env::var("PI_OAUTH_FIXTURE").is_ok() {
+    if crate::fixtures::enabled()
+        && (refresh.starts_with("pi-fixture-") || std::env::var("PI_OAUTH_FIXTURE").is_ok())
+    {
         return Ok(OauthTokens {
             access: format!("{refresh}-access"),
             refresh: Some(refresh.to_string()),
@@ -450,7 +452,9 @@ pub fn exchange_authorization_code(
     pkce: Option<&Pkce>,
     state: Option<&str>,
 ) -> Result<OauthTokens, String> {
-    if code.starts_with("pi-fixture-") || std::env::var("PI_OAUTH_FIXTURE").is_ok() {
+    if crate::fixtures::enabled()
+        && (code.starts_with("pi-fixture-") || std::env::var("PI_OAUTH_FIXTURE").is_ok())
+    {
         return Ok(OauthTokens {
             access: format!("{provider}-{code}-access"),
             refresh: pkce.map(|p| format!("pi-fixture-{}", p.verifier)),
@@ -464,7 +468,10 @@ pub fn exchange_authorization_code(
 }
 
 fn post_token_exchange(request: &TokenExchangeRequest) -> Result<OauthTokens, String> {
-    let url = std::env::var("PI_OAUTH_TOKEN_URL").unwrap_or_else(|_| request.url.clone());
+    let url = crate::fixtures::enabled()
+        .then(|| std::env::var("PI_OAUTH_TOKEN_URL").ok())
+        .flatten()
+        .unwrap_or_else(|| request.url.clone());
     let response = crate::http::agent(crate::http::CONTROL_IDLE_TIMEOUT)
         .post(&url)
         .set("content-type", &request.content_type)

@@ -6643,8 +6643,12 @@ fn sync_agent_from_settings(agent: &mut Agent) {
     }
 }
 
+fn fixtures_enabled() -> bool {
+    cfg!(any(test, feature = "test-fixtures"))
+}
+
 fn looks_like_oauth_input(value: &str) -> bool {
-    value.starts_with("pi-fixture-")
+    (fixtures_enabled() && value.starts_with("pi-fixture-"))
         || value.contains("://")
         || value.contains("code=")
         || value.contains('#')
@@ -7998,8 +8002,9 @@ fn configure_security_review(
             .iter()
             .any(|name| matches!(std::env::var(name).as_deref(), Ok("1" | "true" | "yes")))
     {
-        if let Ok(path) = std::env::var("PI_SECURITY_SCAN_FIXTURE") {
-            let runner = SecurityWorkerRunner::from_offline_fixture(Path::new(&path))?;
+        if fixtures_enabled() {
+            if let Ok(path) = std::env::var("PI_SECURITY_SCAN_FIXTURE") {
+                let runner = SecurityWorkerRunner::from_offline_fixture(Path::new(&path))?;
             let config = crate::settings::load_security_scan_config(
                 &default_agent_dir(),
                 &agent.cwd,
@@ -8014,7 +8019,8 @@ fn configure_security_review(
             davinci_agent::runtime::capacity::bind_shared_directory(
                 default_agent_dir().join("capacity"),
             );
-            return Ok(());
+                return Ok(());
+            }
         }
         return Err(
             "offline mode forbids security provider requests; no model review was started".into(),
