@@ -38,7 +38,7 @@ pub fn handle_package_command(
 ) -> Result<String, String> {
     let local = args.iter().any(|a| a == "-l" || a == "--local");
     let source = args.iter().find(|a| !a.starts_with('-')).cloned();
-    let mut settings = load_settings(agent_dir);
+    let settings = load_settings(agent_dir);
     match command {
         "install" => {
             let source = source.ok_or("install <source> [-l]")?;
