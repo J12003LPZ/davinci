@@ -6,8 +6,8 @@
 
 use std::collections::VecDeque;
 use std::io::{self, Stdout, Write};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Once;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Once, OnceLock};
 use std::time::{Duration, Instant};
 
 use crossterm::cursor::Show;
@@ -85,6 +85,27 @@ fn supports_keyboard_enhancement() -> bool {
 static DISAMBIGUATED: AtomicBool = AtomicBool::new(false);
 /// Whether the alternate screen is currently ours.
 static HELD: AtomicBool = AtomicBool::new(false);
+static GENERATION: AtomicU64 = AtomicU64::new(0);
+static MAIN_THREAD: OnceLock<std::thread::ThreadId> = OnceLock::new();
+
+#[derive(Debug, Clone, Copy)]
+struct Generation(u64);
+
+impl Generation {
+    fn begin() -> Self {
+        Self(GENERATION.fetch_add(1, Ordering::SeqCst) + 1)
+    }
+
+    fn is_current(self) -> bool {
+        GENERATION.load(Ordering::SeqCst) == self.0
+    }
+}
+
+fn panic_restores_terminal() -> bool {
+    MAIN_THREAD
+        .get()
+        .is_some_and(|main| *main == std::thread::current().id())
+}
 static MOUSE: AtomicBool = AtomicBool::new(false);
 
 /// Undo everything [`Session::open`] did, from anywhere, at most once.
@@ -115,10 +136,13 @@ pub fn restore() -> io::Result<()> {
 /// printed as usual — onto the real screen.
 pub fn install_panic_hook() {
     static ONCE: Once = Once::new();
+    MAIN_THREAD.get_or_init(|| std::thread::current().id());
     ONCE.call_once(|| {
         let previous = std::panic::take_hook();
         std::panic::set_hook(Box::new(move |info| {
-            let _ = restore();
+            if panic_restores_terminal() {
+                let _ = restore();
+            }
             previous(info);
         }));
     });
@@ -311,6 +335,7 @@ impl PasteFilter {
 /// The terminal, for as long as the TUI owns it.
 pub struct Session {
     terminal: Terminal<CrosstermBackend<Stdout>>,
+    generation: Generation,
     keyboard: Keyboard,
     paste: PasteFilter,
     mic_rect: Option<Rect>,
@@ -324,30 +349,36 @@ impl Session {
     /// protocol when the terminal supports it.
     pub fn open() -> io::Result<Self> {
         install_panic_hook();
-        enable_raw_mode()?;
-        // Held from here, not after the screen is taken: if entering the
-        // alternate screen fails, `restore()` still has to turn raw mode back
-        // off, and it short-circuits on `HELD`.
-        HELD.store(true, Ordering::SeqCst);
-        let mut out = io::stdout();
-        execute!(out, EnterAlternateScreen)?;
-        // A multi-line paste arrives as one `Event::Paste` rather than as a
-        // burst of keys with newlines in it, which the composer would have
-        // read as one submit per line.
-        let _ = execute!(out, EnableBracketedPaste);
-
-        let disambiguated = supports_keyboard_enhancement();
-        if disambiguated {
-            execute!(
-                out,
-                PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
-            )?;
-            DISAMBIGUATED.store(true, Ordering::SeqCst);
-        }
-
-        let terminal = Terminal::new(CrosstermBackend::new(out))?;
+        let generation = Generation::begin();
+        let opened = (|| {
+            enable_raw_mode()?;
+            HELD.store(true, Ordering::SeqCst);
+            let mut out = io::stdout();
+            execute!(out, EnterAlternateScreen)?;
+            let _ = execute!(out, EnableBracketedPaste);
+            let disambiguated = supports_keyboard_enhancement();
+            if disambiguated {
+                execute!(
+                    out,
+                    PushKeyboardEnhancementFlags(
+                        KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
+                    )
+                )?;
+                DISAMBIGUATED.store(true, Ordering::SeqCst);
+            }
+            let terminal = Terminal::new(CrosstermBackend::new(out))?;
+            Ok::<_, io::Error>((terminal, disambiguated))
+        })();
+        let (terminal, disambiguated) = match opened {
+            Ok(parts) => parts,
+            Err(err) => {
+                let _ = restore();
+                return Err(err);
+            }
+        };
         Ok(Self {
             terminal,
+            generation,
             keyboard: Keyboard { disambiguated },
             paste: PasteFilter {
                 burst: cfg!(windows).then(super::paste_burst::PasteBurst::default),
@@ -447,6 +478,9 @@ impl Session {
 
     /// Paint one frame.
     pub fn draw(&mut self, model: &Model) -> io::Result<()> {
+        if !HELD.load(Ordering::SeqCst) {
+            return Ok(());
+        }
         self.mic_rect = None;
         let mouse = true;
         if mouse != MOUSE.load(Ordering::SeqCst) {
@@ -606,7 +640,11 @@ impl Session {
 
     /// Give the terminal back. Safe to call twice.
     pub fn close(&mut self) -> io::Result<()> {
-        restore()
+        if self.generation.is_current() {
+            restore()
+        } else {
+            Ok(())
+        }
     }
 }
 
