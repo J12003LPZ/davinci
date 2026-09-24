@@ -11,7 +11,7 @@ mod codex_probe;
 mod davinci_interactive;
 mod davinci_sources;
 mod davinci_surfaces;
-#[cfg(unix)]
+#[cfg(all(unix, feature = "experimental-ipc"))]
 mod experimental;
 #[cfg(test)]
 mod process_manager_integration_tests;
@@ -19,12 +19,12 @@ mod process_manager_integration_tests;
 mod test_impact_integration_tests;
 mod voice_input;
 mod voice_models;
-#[cfg(not(unix))]
+#[cfg(not(all(unix, feature = "experimental-ipc")))]
 #[allow(dead_code)]
 mod experimental {
     use crate::args::{parse_args, Args};
-    pub fn is_experimental_command(_: Option<&str>) -> bool {
-        false
+    pub fn is_experimental_command(command: Option<&str>) -> bool {
+        matches!(command, Some("server") | Some("client"))
     }
     pub fn experimental_features_enabled() -> bool {
         false
@@ -71,16 +71,26 @@ mod experimental {
         Ok(String::new())
     }
     pub fn run_server(_: ServerCommand) -> Result<String, String> {
-        Err("Unix server is unavailable on this platform".into())
+        Err("experimental IPC is not available in this build".into())
     }
     pub fn run_client(_: ClientCommand) -> Result<String, String> {
-        Err("Unix client is unavailable on this platform".into())
+        Err("experimental IPC is not available in this build".into())
     }
     pub fn parse_experimental_cli(raw: &[String]) -> Result<ExperimentalCli, Vec<String>> {
-        Ok(ExperimentalCli::Pi {
-            options: parse_args(raw),
-            listen: vec![],
-        })
+        match raw.first().map(String::as_str) {
+            Some("server") => Ok(ExperimentalCli::Server {
+                listen: vec![],
+                auth: None,
+            }),
+            Some("client") => Ok(ExperimentalCli::Client {
+                connect: None,
+                auth: None,
+            }),
+            _ => Ok(ExperimentalCli::Pi {
+                options: parse_args(raw),
+                listen: vec![],
+            }),
+        }
     }
 }
 

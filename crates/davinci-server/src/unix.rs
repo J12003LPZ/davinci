@@ -112,8 +112,10 @@ pub fn resolve_unix_listener_options(
 pub fn owned_bind_path(path: &str) -> PathBuf {
     let suffix = hex8(&Sha256::digest(path.as_bytes()));
     match Path::new(path).parent() {
-        Some(parent) if !parent.as_os_str().is_empty() => parent.join(format!(".p-{suffix}")),
-        _ => PathBuf::from(format!(".p-{suffix}")),
+        Some(parent) if !parent.as_os_str().is_empty() => {
+            parent.join(format!(".p-{suffix}")).join("socket")
+        }
+        _ => PathBuf::from(format!(".p-{suffix}")).join("socket"),
     }
 }
 
@@ -140,9 +142,14 @@ pub fn bind_unix_with(options: UnixListenerOptions) -> Result<BoundUnixListener,
     if let Some(parent) = public_path.parent() {
         if !parent.as_os_str().is_empty() {
             fs::create_dir_all(parent).map_err(|err| ServerError::Io(err.to_string()))?;
-            let _ = fs::set_permissions(parent, Permissions::from_mode(0o700));
         }
     }
+    let owned_dir = owned.parent().ok_or_else(|| {
+        ServerError::Io("PiServer private Unix bind path has no parent".into())
+    })?;
+    fs::create_dir_all(owned_dir).map_err(|err| ServerError::Io(err.to_string()))?;
+    fs::set_permissions(owned_dir, Permissions::from_mode(0o700))
+        .map_err(|err| ServerError::Io(err.to_string()))?;
     remove_stale_socket(&public_path)?;
     remove_stale_socket(&owned)?;
     let listener = UnixListener::bind(&owned).map_err(|err| ServerError::Io(err.to_string()))?;
@@ -190,7 +197,13 @@ impl BoundUnixListener {
         self.listener.take();
         let cleanup = self.cleanup_owned_socket();
         let owned = remove_path(&self.owned_bind_path);
-        cleanup.and(owned)
+        let owned_dir = self
+            .owned_bind_path
+            .parent()
+            .map(|path| fs::remove_dir(path))
+            .transpose()
+            .map_err(|err| ServerError::Io(err.to_string()));
+        cleanup.and(owned).and(owned_dir)
     }
 
     fn cleanup_owned_socket(&mut self) -> Result<(), ServerError> {
@@ -568,6 +581,23 @@ mod tests {
     }
 
     #[test]
+    fn binding_does_not_change_existing_parent_permissions() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::set_permissions(dir.path(), Permissions::from_mode(0o755)).unwrap();
+        let before = fs::metadata(dir.path()).unwrap().permissions().mode() & 0o777;
+        let path = dir.path().join("server.sock");
+        let mut bound = bind_unix(&path.to_string_lossy()).unwrap();
+        let after = fs::metadata(dir.path()).unwrap().permissions().mode() & 0o777;
+        assert_eq!(before, after);
+        let private_dir = bound.owned_bind_path.parent().unwrap();
+        assert_eq!(
+            fs::metadata(private_dir).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        bound.close().unwrap();
+    }
+
+    #[test]
     fn creates_nested_parents_restricts_permissions_and_removes_its_own_socket() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("p").join("n").join("server.sock");
@@ -577,7 +607,7 @@ mod tests {
         assert!(stats.file_type().is_socket());
         assert_eq!(stats.permissions().mode() & 0o777, 0o600);
         assert_eq!(
-            fs::metadata(path.parent().unwrap())
+            fs::metadata(bound.owned_bind_path.parent().unwrap())
                 .unwrap()
                 .permissions()
                 .mode()
