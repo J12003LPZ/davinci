@@ -41,7 +41,6 @@ pub fn run_migrations(cwd: &Path, agent_dir: &Path) -> MigrationResult {
     };
     migrate_sessions_from_agent_root(agent_dir);
     migrate_tools_to_bin(agent_dir, &mut result);
-    migrate_keybindings_config_file(agent_dir);
     let warnings = migrate_extension_system(cwd, agent_dir, &mut result);
     result.deprecation_warnings.extend(warnings);
     result
@@ -189,24 +188,6 @@ fn migrate_tools_to_bin(agent_dir: &Path, result: &mut MigrationResult) {
             .notes
             .push("Migrated managed binaries tools/ → bin/".into());
     }
-}
-
-fn migrate_keybindings_config_file(agent_dir: &Path) {
-    let path = agent_dir.join("keybindings.json");
-    if !path.exists() {
-        return;
-    }
-    let Ok(raw) = fs::read_to_string(&path) else {
-        return;
-    };
-    let Ok(parsed) = serde_json::from_str::<serde_json::Value>(raw.trim_start_matches('\u{feff}'))
-    else {
-        return;
-    };
-    if !parsed.is_object() {
-        return;
-    }
-    let _ = parsed;
 }
 
 fn migrate_commands_to_prompts(base_dir: &Path, label: &str, result: &mut MigrationResult) {
