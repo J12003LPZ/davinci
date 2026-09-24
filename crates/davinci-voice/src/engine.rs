@@ -92,13 +92,17 @@ impl Engine {
                 VoiceError::InferenceFailed
             });
         }
-        let end = text
-            .iter()
-            .position(|b| *b == 0)
-            .ok_or(VoiceError::InferenceFailed)?;
-        let raw = std::str::from_utf8(&text[..end]).map_err(|_| VoiceError::InferenceFailed)?;
-        normalize::normalize(raw).map_err(|_| VoiceError::TextTooLong)
+        text_from_decoder(&text)
     }
+}
+
+fn text_from_decoder(buffer: &[u8]) -> Result<String, VoiceError> {
+    let end = buffer
+        .iter()
+        .position(|b| *b == 0)
+        .ok_or(VoiceError::InferenceFailed)?;
+    let raw = String::from_utf8_lossy(&buffer[..end]);
+    normalize::normalize(&raw).map_err(|_| VoiceError::TextTooLong)
 }
 
 impl Drop for Engine {
@@ -138,6 +142,12 @@ mod tests {
         assert!(crate::audio::no_speech(&vec![0.0; 16000]));
         cancel.store(true, Ordering::Release);
         assert!(engine.decode(&pcm, "en", &cancel).is_err());
+    }
+
+    #[test]
+    fn invalid_utf8_from_the_decoder_is_decoded_lossily() {
+        let bytes = b"caf\xc3 ok\0".to_vec();
+        assert_eq!(text_from_decoder(&bytes).unwrap(), "caf\u{fffd} ok");
     }
 
     #[test]

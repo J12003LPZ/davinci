@@ -51,7 +51,9 @@ extern "C" int dv_decode(void *context, const float *pcm, size_t samples,
         if (whisper_full_with_state(ctx, state.get(), params, pcm, static_cast<int>(samples)) != 0 || abort(user)) return 1;
         size_t used = 0;
         for (int i = 0; i < whisper_full_n_segments_from_state(state.get()); ++i) {
-            if (whisper_full_get_segment_no_speech_prob_from_state(state.get(), i) > params.no_speech_thold) continue;
+            // whisper_full already drops no-speech windows using the combined
+            // no-speech probability and log-probability rule. Filtering again
+            // on no_speech_prob alone drops real speech.
             const char *segment = whisper_full_get_segment_text_from_state(state.get(), i);
             if (!segment) return 1;
             size_t len = std::strlen(segment);
