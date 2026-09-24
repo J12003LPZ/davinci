@@ -499,6 +499,24 @@ mod tests {
     }
 
     #[test]
+    fn opening_a_bloated_ledger_compacts_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = LearningStore::open(dir.path().to_path_buf()).unwrap();
+        let mut candidate = fixture_candidate("cand-bloated");
+        for i in 0..100 {
+            candidate.confidence = (i as f64) / 100.0;
+            store.upsert_candidate(candidate.clone()).unwrap();
+        }
+        drop(store);
+
+        let path = dir.path().join("candidates.jsonl");
+        assert!(fs::read_to_string(&path).unwrap().lines().count() >= 100);
+        let reopened = LearningStore::open(dir.path().to_path_buf()).unwrap();
+        assert_eq!(reopened.candidate("cand-bloated").unwrap().confidence, 0.99);
+        assert_eq!(fs::read_to_string(&path).unwrap().lines().count(), 1);
+    }
+
+    #[test]
     fn skill_version_outcome_attribution_only_affects_targeted_version() {
         let dir = tempfile::tempdir().unwrap();
         let mut store = LearningStore::open(dir.path().to_path_buf()).unwrap();
