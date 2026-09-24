@@ -1,5 +1,32 @@
 # davinci TUI — design specification
 
+## Claude Code conversation contract (September 2026)
+
+The default conversation UI follows the captured Claude Code 2.1.281 frames in
+`docs/ui/claude-code-reference/`. Those frames are the visual ground truth for
+the composer, completion list, footer, transcript rows, working line, permission
+panel, and picker panels. The implementation keeps DaVinci's own product identity
+and behavior where the reference contract explicitly differs.
+
+Intentional differences from the captured reference:
+
+1. The product name, version, and DaVinci block-letter logo remain DaVinci's.
+2. The completion line omits Claude Code's local-time `done` clock.
+3. User `!` shell commands do not automatically start a model reply afterwards.
+4. Failed calls are not folded into grouped exploration rows.
+5. Always Approve keeps the explicit words `no prompts`.
+6. The voice `[mic …]` label remains on the top rule when voice is enabled.
+7. The working area has no tip row and no `/btw` behavior.
+8. Light-theme Claude Code colors are documented values rather than captured frames.
+
+Enter runs the highlighted slash command, Tab only completes it, Enter on an
+`@` file suggestion inserts the path, `?` in an empty composer opens the
+shortcuts panel, and a leading `!` switches the composer into shell mode.
+`NO_COLOR`, narrow terminals, and the non-default themes remain supported.
+
+The editorial print notes below describe the optional `vox` theme. They are no
+longer the visual contract for the default conversation surface.
+
 ### Experimental local voice
 
 The composer upper rule carries a right-aligned mic control. Its mouse target
