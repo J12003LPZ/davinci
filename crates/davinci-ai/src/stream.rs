@@ -1024,6 +1024,31 @@ pub(crate) fn responses_call_id(id: &str) -> &str {
     id.split_once('|').map(|(call_id, _)| call_id).unwrap_or(id)
 }
 
+fn verbosity_from(value: Option<&str>) -> &'static str {
+    match value {
+        Some("medium") => "medium",
+        Some("high") => "high",
+        _ => "low",
+    }
+}
+
+fn summary_from(value: Option<&str>) -> Option<&'static str> {
+    match value {
+        Some("none") => None,
+        Some("concise") => Some("concise"),
+        Some("detailed") => Some("detailed"),
+        _ => Some("auto"),
+    }
+}
+
+fn openai_verbosity() -> &'static str {
+    verbosity_from(std::env::var("DAVINCI_OPENAI_VERBOSITY").ok().as_deref())
+}
+
+fn reasoning_summary() -> Option<&'static str> {
+    summary_from(std::env::var("DAVINCI_REASONING_SUMMARY").ok().as_deref())
+}
+
 #[doc(hidden)]
 pub fn openai_responses_input(messages: &[ChatMessage]) -> Vec<Value> {
     let mut input = Vec::new();
@@ -1137,7 +1162,7 @@ fn openai_responses_body(
         body["instructions"] = Value::String(instructions.to_string());
     }
     if codex {
-        body["text"] = serde_json::json!({"verbosity": "low"});
+        body["text"] = serde_json::json!({"verbosity": openai_verbosity()});
         body["include"] = serde_json::json!(["reasoning.encrypted_content"]);
         body["tool_choice"] = Value::String("auto".into());
         body["parallel_tool_calls"] = Value::Bool(true);
@@ -1226,10 +1251,11 @@ fn openai_responses_body(
                 None => Some(level.as_str().to_string()),
             };
             if let Some(effort) = mapped {
-                body["reasoning"] = serde_json::json!({
-                    "effort": effort,
-                    "summary": "auto",
-                });
+                let mut reasoning = serde_json::json!({ "effort": effort });
+                if let Some(summary) = reasoning_summary() {
+                    reasoning["summary"] = Value::String(summary.into());
+                }
+                body["reasoning"] = reasoning;
             }
         }
     }
