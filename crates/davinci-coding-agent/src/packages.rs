@@ -1,16 +1,12 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use crate::args::{APP_NAME, VERSION};
-use crate::self_update::{
-    current_install_method, inferred_npm_prefix, package_dir_from_env,
-    self_update_command_for_method, self_update_unavailable_instruction, update_instruction,
-    InstallMethod, PackageTarget, PACKAGE_NAME,
-};
+use crate::args::APP_NAME;
+use crate::self_update::{current_install_method, InstallMethod};
 use crate::settings::{load_settings, save_settings, update_settings, PackageSource, Settings};
 use davinci_tui::{Component, ConfigResource, ConfigResourceKind, ConfigScope, ConfigSelector};
 
-const CANNOT_SELF_UPDATE: &str = "error: pi cannot self-update this installation.";
+const CANNOT_SELF_UPDATE: &str = "Davinci cannot self-update this installation automatically. Update it manually by building the release binary and replacing the installed executable (for this repository: cargo build --release -p davinci-coding-agent, then copy target/release/davinci or davinci.exe).";
 const ALL_CONFLICT: &str =
     "--all cannot be combined with --self, --extensions, --models, or --extension";
 const MODELS_CONFLICT: &str =
@@ -123,15 +119,16 @@ fn handle_update(args: &[String], agent_dir: &Path) -> Result<String, String> {
             .clone()
             .filter(|value| !matches!(value.as_str(), "self" | "pi"))
     });
-    let do_self = flags.self_flag
+    let explicit_surface = flags.self_flag
         || positional_self
+        || flags.models_flag
+        || flags.extensions_flag
         || flags.all_flag
-        || !flags.models_flag
-            && !flags.extensions_flag
-            && flags.extension.is_none()
-            && flags.positional.is_none();
+        || extension_source.is_some();
+    let do_self = flags.self_flag || positional_self;
     let do_models = flags.models_flag || flags.all_flag;
-    let do_extensions = flags.extensions_flag || flags.all_flag || extension_source.is_some();
+    let do_extensions =
+        flags.extensions_flag || flags.all_flag || extension_source.is_some() || !explicit_surface;
     let mut parts = Vec::new();
     if do_self {
         parts.push(self_update_binary(agent_dir, flags.force)?);
@@ -280,133 +277,18 @@ fn refresh_model_catalogs(agent_dir: &Path, _target: Option<&str>) -> Result<Str
 }
 
 /// TS `pi update --self`: managed-install, package-manager argv, or copy `~/.pi/bin/pi`.
-pub fn self_update_binary(agent_dir: &Path, _force: bool) -> Result<String, String> {
-    if let Some(root) = crate::self_update::get_active_managed_install_root()? {
-        let version = std::env::var("PI_MANAGED_UPDATE_VERSION")
-            .ok()
-            .filter(|value| !value.is_empty())
-            .unwrap_or_else(|| VERSION.to_string());
-        crate::self_update::run_managed_self_update(&root, &version)?;
-        return Ok(format!("Updated {APP_NAME} from {VERSION} to {version}"));
-    }
+pub fn self_update_binary(_agent_dir: &Path, _force: bool) -> Result<String, String> {
     let method = current_install_method();
-    let target = PackageTarget::new(PACKAGE_NAME, None);
-    let package_dir = package_dir_from_env();
-    let windows = cfg!(windows)
-        || package_dir
-            .as_ref()
-            .is_some_and(|path| path.to_string_lossy().contains('\\'));
-    let inferred = package_dir
-        .as_ref()
-        .and_then(|path| inferred_npm_prefix(&path.to_string_lossy(), windows));
-    let command = self_update_command_for_method(
-        method,
-        PACKAGE_NAME,
-        &target,
-        None,
-        inferred.as_deref(),
-        std::env::var("PNPM_HOME").ok().as_deref(),
-    );
     match method {
-        InstallMethod::Npm | InstallMethod::Pnpm | InstallMethod::Yarn | InstallMethod::Bun => {
-            if let Some(command) = command.as_ref() {
-                let writable = package_dir
-                    .as_ref()
-                    .map(|path| {
-                        path.metadata()
-                            .map(|meta| !meta.permissions().readonly())
-                            .unwrap_or(false)
-                    })
-                    .unwrap_or(true);
-                if !writable {
-                    return Err(self_update_unavailable_instruction(
-                        method,
-                        PACKAGE_NAME,
-                        &target,
-                        Some(command),
-                        true,
-                        false,
-                    ));
-                }
-                if std::env::var("PI_SELF_UPDATE_DRY_RUN").is_ok() {
-                    return Ok(update_instruction(method, Some(command), &command.display));
-                }
-                run_self_update_command(command)?;
-                return Ok(format!("Updated {APP_NAME} from {VERSION} to {VERSION}"));
-            }
-            Err(self_update_unavailable_instruction(
-                method,
-                PACKAGE_NAME,
-                &target,
-                None,
-                false,
-                true,
-            ))
-        }
-        InstallMethod::BunBinary => Err(self_update_unavailable_instruction(
-            method,
-            PACKAGE_NAME,
-            &target,
-            None,
-            false,
-            true,
+        InstallMethod::Unknown => Err(CANNOT_SELF_UPDATE.into()),
+        InstallMethod::Npm
+        | InstallMethod::Pnpm
+        | InstallMethod::Yarn
+        | InstallMethod::Bun
+        | InstallMethod::BunBinary => Err(format!(
+            "{CANNOT_SELF_UPDATE} Detected install method: {}. Davinci does not publish a self-update package for this method.",
+            method.as_str()
         )),
-        InstallMethod::Unknown => copy_native_binary(agent_dir),
-    }
-}
-
-fn run_self_update_command(command: &crate::self_update::SelfUpdateCommand) -> Result<(), String> {
-    let steps = command.steps.clone().unwrap_or_else(|| {
-        vec![crate::self_update::SelfUpdateCommandStep {
-            command: command.command.clone(),
-            args: command.args.clone(),
-            display: command.display.clone(),
-        }]
-    });
-    for step in steps {
-        let status = std::process::Command::new(davinci_sys::process::resolve_program(&step.command))
-            .args(&step.args)
-            .status()
-            .map_err(|err| err.to_string())?;
-        if !status.success() {
-            return Err(format!("self-update failed: {}", step.display));
-        }
-    }
-    Ok(())
-}
-
-fn copy_native_binary(agent_dir: &Path) -> Result<String, String> {
-    let dest_dir = managed_bin_dir(agent_dir);
-    fs::create_dir_all(&dest_dir).map_err(|err| err.to_string())?;
-    let dest = dest_dir.join(APP_NAME);
-    let current = std::env::current_exe().map_err(|err| err.to_string())?;
-    if same_path(&current, &dest) {
-        return Err(CANNOT_SELF_UPDATE.into());
-    }
-    if !dest_dir
-        .metadata()
-        .map(|meta| !meta.permissions().readonly())
-        .unwrap_or(false)
-    {
-        return Err(CANNOT_SELF_UPDATE.into());
-    }
-    fs::copy(&current, &dest).map_err(|_| CANNOT_SELF_UPDATE.to_string())?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let mut perms = fs::metadata(&dest)
-            .map_err(|err| err.to_string())?
-            .permissions();
-        perms.set_mode(0o755);
-        fs::set_permissions(&dest, perms).map_err(|err| err.to_string())?;
-    }
-    Ok(format!("Updated {APP_NAME} from {VERSION} to {VERSION}"))
-}
-
-fn same_path(a: &Path, b: &Path) -> bool {
-    match (fs::canonicalize(a), fs::canonicalize(b)) {
-        (Ok(left), Ok(right)) => left == right,
-        _ => a == b,
     }
 }
 
@@ -1279,7 +1161,7 @@ mod tests {
     }
 
     #[test]
-    fn update_self_copies_binary_and_rejects_conflicts() {
+    fn update_self_refuses_unknown_install_and_rejects_conflicts() {
         assert_eq!(
             handle_package_command(
                 "update",
@@ -1292,9 +1174,27 @@ mod tests {
         let dir = tempdir().unwrap();
         let agent = dir.path().join("agent");
         fs::create_dir_all(&agent).unwrap();
-        let message = self_update_binary(&agent, true).unwrap();
-        assert!(message.starts_with("Updated davinci from "));
-        assert!(managed_bin_dir(&agent).join("davinci").exists());
+        std::env::set_var("PI_PACKAGE_DIR", "");
+        std::env::set_var("PI_EXEC_PATH", dir.path().join("davinci"));
+        std::env::remove_var("PI_BUN_BINARY");
+        std::env::remove_var("PI_BUN_RUNTIME");
+        let error = self_update_binary(&agent, true).unwrap_err();
+        std::env::remove_var("PI_PACKAGE_DIR");
+        std::env::remove_var("PI_EXEC_PATH");
+        assert!(error.contains("manually"), "{error}");
+        assert!(!error.contains("Updated davinci from"));
+    }
+
+    #[test]
+    fn plain_update_updates_packages_without_self_update() {
+        let dir = tempdir().unwrap();
+        let agent = dir.path().join("agent");
+        fs::create_dir_all(&agent).unwrap();
+        std::env::set_var("PI_INSTALL_DRY_RUN", "1");
+        let result = handle_package_command("update", &[], &agent).unwrap();
+        std::env::remove_var("PI_INSTALL_DRY_RUN");
+        assert_eq!(result, "Updated packages");
+        assert!(!result.contains("Updated davinci"));
     }
 
     #[test]
