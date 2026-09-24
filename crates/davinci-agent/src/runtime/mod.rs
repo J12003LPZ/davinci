@@ -37,7 +37,6 @@ pub use task_migration::LegacyTaskRecovery;
 pub mod task_store;
 pub mod task_transport;
 pub mod tasks;
-pub mod team;
 pub mod tools_agent;
 pub mod tools_task;
 pub mod workflow;
@@ -118,7 +117,6 @@ pub use task_store::{
 pub use tasks::{
     is_valid_task_transition, TaskError, TaskOwner, TaskRecord, TaskRegistry, TaskState,
 };
-pub use team::{TeamConfig, TeamError, TeamManager, TeammateHandle};
 pub use tools_agent::{agent_message_tool, agent_status_tool, agent_stop_tool, agent_tool_specs};
 pub use tools_task::{
     task_create_tool, task_get_tool, task_list_tool, task_tool_specs, task_update_tool,
