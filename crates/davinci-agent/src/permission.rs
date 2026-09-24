@@ -1051,7 +1051,11 @@ impl PermissionPolicy {
             )
         };
         let effective_root = self.filesystem_boundary.root.as_deref().unwrap_or(cwd);
-        let class = self.class_of(tool);
+        let class = if tool == "agent" && self.agent_call_is_read_only(args) {
+            ToolClass::Read
+        } else {
+            self.class_of(tool)
+        };
         // Git metadata is a narrow read-boundary exception, never a deny-rule
         // exception or permission to write outside an isolated root.
         let is_git_meta = class == ToolClass::Read && self.is_git_metadata_call(tool, args, cwd);
@@ -1299,6 +1303,24 @@ impl PermissionPolicy {
             Some(request) => PermissionVerdict::Ask(request),
             None => PermissionVerdict::Allow,
         }
+    }
+
+    fn agent_call_is_read_only(&self, args: &Value) -> bool {
+        if args.get("isolation").and_then(Value::as_str) == Some("worktree") {
+            return false;
+        }
+        let Some(tools) = args.get("tools") else {
+            return true;
+        };
+        let Some(tools) = tools.as_array() else {
+            return false;
+        };
+        tools.iter().all(|tool| {
+            tool.as_str().is_some_and(|name| {
+                name != "agent"
+                    && matches!(self.class_of(name), ToolClass::Read | ToolClass::Network)
+            })
+        })
     }
 
     pub fn class_of(&self, tool: &str) -> ToolClass {
@@ -2834,12 +2856,28 @@ mod tests {
             }
             other => panic!("{other:?}"),
         }
-        match policy.decide("c1", "agent", &json!({"prompt": "x"}), &cwd()) {
-            PermissionVerdict::Deny { reason } => {
-                assert!(reason.contains("plan mode"), "{reason}");
-            }
-            other => panic!("{other:?}"),
-        }
+        assert!(matches!(
+            policy.decide("c1", "agent", &json!({"prompt": "research"}), &cwd()),
+            PermissionVerdict::Allow
+        ));
+        assert!(matches!(
+            policy.decide(
+                "c2",
+                "agent",
+                &json!({"prompt": "edit", "tools": ["read", "write"]}),
+                &cwd(),
+            ),
+            PermissionVerdict::Deny { .. }
+        ));
+        assert!(matches!(
+            policy.decide(
+                "c3",
+                "agent",
+                &json!({"prompt": "research", "isolation": "worktree"}),
+                &cwd(),
+            ),
+            PermissionVerdict::Deny { .. }
+        ));
     }
 
     #[test]
