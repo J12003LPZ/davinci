@@ -19,6 +19,33 @@ use crate::{Error, Result, Rpc, CALL_TIMEOUT_SECS};
 /// How much of the child's stderr is kept for the error row.
 pub const STDERR_TAIL_BYTES: usize = 64 * 1024;
 
+/// Variables a stdio server inherits, matching the MCP TypeScript SDK's
+/// `getDefaultEnvironment`. Everything else must be passed explicitly in the
+/// server's `env` configuration.
+pub const INHERITED_ENV: &[&str] = if cfg!(windows) {
+    &[
+        "APPDATA",
+        "HOMEDRIVE",
+        "HOMEPATH",
+        "LOCALAPPDATA",
+        "PATH",
+        "PATHEXT",
+        "PROCESSOR_ARCHITECTURE",
+        "SYSTEMDRIVE",
+        "SYSTEMROOT",
+        "TEMP",
+        "TMP",
+        "USERNAME",
+        "USERPROFILE",
+        "PROGRAMFILES",
+        "COMSPEC",
+    ]
+} else {
+    &[
+        "HOME", "LOGNAME", "PATH", "SHELL", "TERM", "USER", "LANG", "TMPDIR",
+    ]
+};
+
 /// How many trailing stderr lines a transport error quotes.
 const STDERR_QUOTE_LINES: usize = 5;
 
@@ -54,7 +81,8 @@ impl StdioTransport {
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
-        for (key, value) in env {
+        cmd.env_clear();
+        for (key, value) in child_environment(std::env::vars(), env) {
             cmd.env(key, value);
         }
         let mut child = cmd
@@ -307,6 +335,25 @@ impl Rpc for StdioTransport {
     }
 }
 
+fn child_environment(
+    parent: impl Iterator<Item = (String, String)>,
+    config: &BTreeMap<String, String>,
+) -> BTreeMap<String, String> {
+    let mut env: BTreeMap<String, String> = parent
+        .filter(|(key, _)| {
+            INHERITED_ENV
+                .iter()
+                .any(|name| name.eq_ignore_ascii_case(key))
+        })
+        .collect();
+    env.extend(
+        config
+            .iter()
+            .map(|(key, value)| (key.clone(), value.clone())),
+    );
+    env
+}
+
 /// On Windows `CreateProcess` does not consult `PATHEXT`, so `npx` from
 /// `mcp.json` would not find `npx.cmd`. Resolve it ourselves; the standard
 /// library then runs a `.cmd`/`.bat` through `cmd.exe` with safe quoting.
@@ -362,6 +409,21 @@ pub fn resolve_command_in(command: &str, dirs: &[PathBuf], exts: &[String]) -> O
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn child_environment_is_allowlisted_plus_config() {
+        let parent = vec![
+            ("PATH".to_string(), "/bin".to_string()),
+            ("OPENAI_API_KEY".to_string(), "sk-x".to_string()),
+            ("HOME".to_string(), "/home/u".to_string()),
+        ];
+        let mut config = BTreeMap::new();
+        config.insert("FOO".to_string(), "bar".to_string());
+        let env = child_environment(parent.into_iter(), &config);
+        assert_eq!(env.get("PATH").map(String::as_str), Some("/bin"));
+        assert_eq!(env.get("FOO").map(String::as_str), Some("bar"));
+        assert!(!env.contains_key("OPENAI_API_KEY"));
+    }
 
     #[test]
     fn security_stdout_line_is_bounded_before_buffering() {

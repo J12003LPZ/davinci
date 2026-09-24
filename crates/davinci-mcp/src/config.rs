@@ -34,10 +34,20 @@ pub struct ServerConfig {
 
 impl ServerConfig {
     pub fn transport(&self) -> Result<TransportConfig> {
+        let expand = |map: &BTreeMap<String, String>| {
+            map.iter()
+                .map(|(key, value)| {
+                    (
+                        key.clone(),
+                        expand_env(value, |name| std::env::var(name).ok()),
+                    )
+                })
+                .collect::<BTreeMap<_, _>>()
+        };
         if let Some(url) = &self.url {
             return Ok(TransportConfig::Http {
                 url: url.clone(),
-                headers: self.headers.clone(),
+                headers: expand(&self.headers),
             });
         }
         let command = self
@@ -47,9 +57,27 @@ impl ServerConfig {
         Ok(TransportConfig::Stdio {
             command,
             args: self.args.clone(),
-            env: self.env.clone(),
+            env: expand(&self.env),
         })
     }
+}
+
+/// `${NAME}` becomes the parent's value of NAME (empty when unset). A bare
+/// `$NAME` is left alone, so values that legitimately contain `$` survive.
+fn expand_env(value: &str, lookup: impl Fn(&str) -> Option<String>) -> String {
+    let mut out = String::with_capacity(value.len());
+    let mut rest = value;
+    while let Some(start) = rest.find("${") {
+        let Some(len) = rest[start + 2..].find('}') else {
+            break;
+        };
+        out.push_str(&rest[..start]);
+        let name = &rest[start + 2..start + 2 + len];
+        out.push_str(&lookup(name).unwrap_or_default());
+        rest = &rest[start + 2 + len + 1..];
+    }
+    out.push_str(rest);
+    out
 }
 
 pub fn load_path(path: &Path) -> Result<File> {
@@ -118,5 +146,17 @@ mod tests {
         let merged = merge(user, project);
         assert!(merged.mcp_servers["a"].command.is_some());
         assert_eq!(merged.mcp_servers["b"].url.as_deref(), Some("https://p"));
+    }
+
+    #[test]
+    fn env_values_expand_parent_variables() {
+        let lookup = |name: &str| (name == "GITHUB_TOKEN").then(|| "ghp_x".to_string());
+        assert_eq!(expand_env("${GITHUB_TOKEN}", lookup), "ghp_x");
+        assert_eq!(
+            expand_env("Bearer ${GITHUB_TOKEN}!", lookup),
+            "Bearer ghp_x!"
+        );
+        assert_eq!(expand_env("${MISSING}", lookup), "");
+        assert_eq!(expand_env("plain $HOME", lookup), "plain $HOME");
     }
 }
