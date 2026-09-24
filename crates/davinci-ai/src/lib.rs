@@ -10,6 +10,7 @@ pub mod codex_capabilities;
 pub mod codex_flags;
 pub mod codex_telemetry;
 pub mod codex_transport;
+pub mod codex_usage;
 mod codex_ws;
 mod deferred;
 mod http_proxy;
