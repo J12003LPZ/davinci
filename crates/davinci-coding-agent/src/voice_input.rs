@@ -124,7 +124,7 @@ impl Worker {
                     }
                     Ok(None) => {}
                 }
-                thread::sleep(Duration::from_millis(10));
+                thread::sleep(Duration::from_millis(100));
             }
             stop.store(true, Ordering::Release);
             let _ = writer.join();
