@@ -174,6 +174,16 @@ pub fn run_status_interruptible(
         return Err("git execution cancelled".into());
     }
     let exe = executable()?;
+    run_status_with_executable(root, args, cancelled, timeout, exe)
+}
+
+fn run_status_with_executable(
+    root: &Path,
+    args: &[&str],
+    cancelled: &dyn Fn() -> bool,
+    timeout: Duration,
+    exe: PathBuf,
+) -> Result<(Vec<u8>, std::process::ExitStatus), String> {
     if exe.starts_with(root) {
         return Err("repository-owned Git executable denied".into());
     }
@@ -234,4 +244,41 @@ pub fn run_status_interruptible(
         output.stdout
     };
     Ok((bytes, status))
+}
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn a_git_that_floods_stderr_does_not_block() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = tempfile::tempdir().unwrap();
+        let bin = tempfile::tempdir().unwrap();
+        let fake = bin.path().join("git");
+        std::fs::write(
+            &fake,
+            "#!/bin/sh\nhead -c 200000 /dev/zero >&2\necho ok\n",
+        )
+        .unwrap();
+        let mut permissions = std::fs::metadata(&fake).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&fake, permissions).unwrap();
+
+        let started = std::time::Instant::now();
+        let (out, status) = run_status_with_executable(
+            root.path(),
+            &["status"],
+            &|| false,
+            Duration::from_secs(5),
+            fake,
+        )
+        .unwrap();
+        assert!(status.success());
+        assert!(String::from_utf8_lossy(&out).contains("ok"));
+        assert!(started.elapsed() < Duration::from_secs(3));
+    }
 }
