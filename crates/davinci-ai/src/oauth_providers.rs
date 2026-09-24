@@ -442,14 +442,20 @@ fn post_token_exchange(request: &TokenExchangeRequest) -> Result<OauthTokens, St
         )
     })?;
     let value: serde_json::Value = serde_json::from_str(&body).map_err(|err| {
-        format!("Token exchange returned invalid JSON. url={url}; body={body}; details={err}")
+        format!(
+            "Token exchange returned invalid JSON. url={url}; {}; details={err}",
+            describe_token_body(&body)
+        )
     })?;
     let access = value
         .get("access_token")
         .or_else(|| value.get("access"))
         .and_then(|v| v.as_str())
         .ok_or_else(|| {
-            format!("Token exchange returned invalid JSON. url={url}; body={body}; details=missing access_token")
+            format!(
+                "Token exchange returned invalid JSON. url={url}; {}; details=missing access_token",
+                describe_token_body(&body)
+            )
         })?;
     let refresh = value
         .get("refresh_token")
@@ -473,6 +479,23 @@ fn post_token_exchange(request: &TokenExchangeRequest) -> Result<OauthTokens, St
         refresh,
         expires,
     })
+}
+
+/// What an error message may say about a token endpoint reply: the OAuth
+/// `error` / `error_description` strings (RFC 6749 5.2, never secret) and
+/// the key names, never any other value.
+fn describe_token_body(body: &str) -> String {
+    let Ok(serde_json::Value::Object(map)) = serde_json::from_str::<serde_json::Value>(body) else {
+        return format!("non-JSON body, {} bytes", body.len());
+    };
+    let text = |key: &str| map.get(key).and_then(|v| v.as_str()).unwrap_or("");
+    let keys: Vec<&str> = map.keys().map(String::as_str).collect();
+    format!(
+        "error={:?}; error_description={:?}; keys=[{}]",
+        text("error"),
+        text("error_description"),
+        keys.join(",")
+    )
 }
 
 pub fn oauth_providers() -> &'static [&'static str] {
@@ -501,6 +524,20 @@ pub fn device_status_from_error(error: &str) -> DevicePollStatus<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn token_error_description_never_includes_values() {
+        let body =
+            r#"{"weird_token":"sk-SECRET","error":"invalid_grant","error_description":"expired"}"#;
+        let described = describe_token_body(body);
+        assert!(!described.contains("sk-SECRET"), "{described}");
+        assert!(described.contains("invalid_grant"));
+        assert!(described.contains("expired"));
+        assert!(described.contains("weird_token"));
+        let not_json = describe_token_body("<html>proxy error sk-SECRET</html>");
+        assert!(!not_json.contains("sk-SECRET"));
+        assert!(not_json.contains("bytes"));
+    }
 
     #[test]
     fn fresh_codex_authorize_request_uses_ts_sized_secrets() {

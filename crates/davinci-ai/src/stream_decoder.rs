@@ -156,10 +156,7 @@ impl SseFramer {
                 // The frames that fail to parse are the ones a trace is
                 // read for: a truncated tail, a proxy's HTML, a stray line.
                 if crate::trace::enabled() {
-                    crate::trace::log(&format!(
-                        "sse frame dropped: {err}: {}",
-                        data.chars().take(200).collect::<String>()
-                    ));
+                    crate::trace::log(&format!("sse frame dropped: {err} ({} bytes)", data.len()));
                 }
                 return None;
             }
