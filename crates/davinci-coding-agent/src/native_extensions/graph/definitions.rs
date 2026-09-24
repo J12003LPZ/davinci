@@ -2159,6 +2159,24 @@ parameters:
     }
 
     #[test]
+    fn saved_definition_round_trips_quotes_backslashes_and_newlines() {
+        let mut def = sample_valid_saved_def("quoted-roundtrip");
+        def.description = "say \"hi\" at C:\\temp\nsecond line".into();
+        def.parameters = vec![SavedParameter {
+            name: "target".into(),
+            description: Some("line one\nline \"two\"".into()),
+            param_type: "string".into(),
+            default: Some("C:\\work\\file".into()),
+            allowed_values: vec!["a\\b".into(), "say \"yes\"".into()],
+        }];
+
+        let yaml = to_yaml_string(&def);
+        let parsed = parse_saved_definition(&yaml).unwrap();
+        assert_eq!(parsed.description, def.description);
+        assert_eq!(parsed.parameters, def.parameters);
+    }
+
+    #[test]
     fn test_atomic_save_load_roundtrip() {
         let dir = tempfile::tempdir().unwrap();
         let def = sample_valid_saved_def("save-roundtrip");
