@@ -175,6 +175,7 @@ pub struct ExtensionHost {
     pub editor_text: String,
     pub runtime_system_prompt: String,
     pub unregistered_providers: Vec<String>,
+    pub load_errors: Vec<(String, String)>,
     pub native: Arc<Mutex<NativeExtensionHost>>,
     before_agent_start_messages: Vec<Value>,
     before_agent_start_system_prompt: Option<String>,
@@ -207,6 +208,7 @@ impl ExtensionHost {
             editor_text: String::new(),
             runtime_system_prompt: String::new(),
             unregistered_providers: Vec::new(),
+            load_errors: Vec::new(),
             native: Arc::new(Mutex::new(NativeExtensionHost::new_with_agent_dir(
                 "runtime",
                 cwd,
@@ -232,7 +234,7 @@ impl ExtensionHost {
                         })
                     })
                     .collect();
-                if let Ok(loaded) = run_js_extension(
+                match run_js_extension(
                     &module,
                     "load",
                     &serde_json::json!({
@@ -241,53 +243,20 @@ impl ExtensionHost {
                         "toolsExpanded": false,
                     }),
                 ) {
-                    if loaded.ok {
-                        let path = module.display().to_string();
-                        for custom_type in &loaded.message_renderers {
-                            host.message_renderers
-                                .insert(custom_type.clone(), path.clone());
-                        }
-                        for custom_type in &loaded.entry_renderers {
-                            host.entry_renderers
-                                .insert(custom_type.clone(), path.clone());
-                        }
-                        if loaded.markdown_transformers > 0 {
-                            host.markdown_modules.push(path.clone());
-                        }
-                        host.ui_calls.extend(loaded.ui_calls.clone());
-                        host.session_calls.extend(loaded.session_calls.clone());
-                        host.unregistered_providers
-                            .extend(loaded.unregistered_providers.clone());
-                        let has_editor = loaded.has_editor
-                            || loaded.handlers.iter().any(|name| name == "session_start");
-                        if has_editor {
-                            host.editor_modules.push(path.clone());
-                        }
-                        host.js.push(LoadedJsExtension {
-                            path,
-                            handlers: loaded.handlers,
-                            tools: loaded.tools.iter().map(|tool| tool.name.clone()).collect(),
-                            tool_defs: loaded.tools,
-                            commands: loaded
-                                .commands
-                                .iter()
-                                .map(|command| command.name.clone())
-                                .collect(),
-                            command_details: loaded.commands,
-                            autocomplete_providers: loaded.autocomplete_providers,
-                            message_renderers: loaded.message_renderers,
-                            entry_renderers: loaded.entry_renderers,
-                            markdown_transformers: loaded.markdown_transformers,
-                            shortcuts: loaded.shortcuts,
-                            has_editor,
-                            providers: loaded.providers,
-                            flags: loaded.flags,
-                            terminal_input: loaded.terminal_input_handlers > 0
-                                || loaded.ui_calls.iter().any(|call| {
-                                    call.get("op").and_then(Value::as_str)
-                                        == Some("onTerminalInput")
-                                }),
-                        });
+                    Ok(loaded) if loaded.ok => {
+                    }
+                    Ok(loaded) => {
+                        let error = loaded
+                            .error
+                            .unwrap_or_else(|| "extension load returned ok=false".into());
+                        eprintln!("davinci: extension {} failed to load: {error}", module.display());
+                        host.load_errors
+                            .push((module.display().to_string(), error));
+                    }
+                    Err(error) => {
+                        eprintln!("davinci: extension {} failed to load: {error}", module.display());
+                        host.load_errors
+                            .push((module.display().to_string(), error));
                     }
                 }
             }
@@ -1548,6 +1517,30 @@ fn resolve_extension_shortcuts(
 mod tests {
     use super::*;
     use crate::js_host::JsRegisteredProvider;
+
+    #[test]
+    fn malformed_js_extension_is_reported() {
+        if !node_available() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let ext = dir.path().join("extensions").join("broken");
+        std::fs::create_dir_all(&ext).unwrap();
+        std::fs::write(
+            ext.join("pi.extension.json"),
+            r#"{"name":"broken","tools":[]}"#,
+        )
+        .unwrap();
+        std::fs::write(ext.join("index.js"), "module.exports = (pi) => {").unwrap();
+        let host = ExtensionHost::load_with_cwd(
+            dir.path(),
+            &["broken".into()],
+            dir.path(),
+        );
+        assert_eq!(host.js.len(), 0);
+        assert_eq!(host.load_errors.len(), 1);
+        assert!(host.load_errors[0].0.contains("broken"));
+    }
 
     #[test]
     fn browser_worker_dispatch_does_not_fall_back_when_parent_transport_is_unavailable() {
