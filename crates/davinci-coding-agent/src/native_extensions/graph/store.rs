@@ -219,6 +219,31 @@ fn prune_finished_runs(cwd: &Path) {
             let _ = fs::remove_dir_all(run_dir(cwd, &run.run_id));
         }
     }
+    collect_unreferenced_blobs(cwd);
+}
+
+fn collect_unreferenced_blobs(cwd: &Path) {
+    let referenced: std::collections::HashSet<String> = list_runs(cwd)
+        .iter()
+        .filter_map(|summary| load_run(cwd, &summary.run_id))
+        .flat_map(|run| run.baseline_hashes())
+        .collect();
+    let blob_dir = super::blobs::dir(cwd);
+    let Ok(shards) = fs::read_dir(&blob_dir) else {
+        return;
+    };
+    for shard in shards.flatten() {
+        let Ok(entries) = fs::read_dir(shard.path()) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if !referenced.contains(&name) {
+                let _ = fs::remove_file(entry.path());
+            }
+        }
+        let _ = fs::remove_dir(shard.path());
+    }
 }
 
 /// A graph checkpoint can outlive the in-memory projection when an operation
@@ -762,6 +787,49 @@ mod tests {
         ArtifactKind, GraphBudgets, GraphCounters, Phase, ReviewDecision, Verdict,
     };
     use tempfile::tempdir;
+
+    #[test]
+    fn blob_gc_keeps_referenced_hashes_and_removes_orphans() {
+        use crate::native_extensions::graph::continuation::GraphContinuation;
+        use crate::native_extensions::graph::mutation::{FileFingerprint, MutationBaseline};
+        use std::collections::BTreeMap;
+
+        let dir = tempdir().unwrap();
+        let run_id = "blob-gc";
+        create_run_dir(dir.path(), run_id).unwrap();
+        let keep_bytes = b"keep me";
+        let orphan_bytes = b"remove me";
+        let keep_hash = crate::native_extensions::graph::replay::sha256_hex(keep_bytes);
+        let orphan_hash = crate::native_extensions::graph::replay::sha256_hex(orphan_bytes);
+        let blob_dir = super::super::blobs::dir(dir.path());
+        super::super::blobs::put(&blob_dir, &keep_hash, keep_bytes).unwrap();
+        super::super::blobs::put(&blob_dir, &orphan_hash, orphan_bytes).unwrap();
+
+        let mut run = sample_run(dir.path(), run_id, "goal");
+        let mut files = BTreeMap::new();
+        files.insert(
+            "a.txt".into(),
+            FileFingerprint {
+                hash: keep_hash.clone(),
+                len: keep_bytes.len() as u64,
+            },
+        );
+        run.continuation = Some(GraphContinuation {
+            saved_baseline: Some(MutationBaseline {
+                files,
+                contents: BTreeMap::new(),
+            }),
+            ..GraphContinuation::default()
+        });
+        save_run(&mut run).unwrap();
+
+        collect_unreferenced_blobs(dir.path());
+        assert_eq!(
+            super::super::blobs::get(&blob_dir, &keep_hash).unwrap(),
+            keep_bytes
+        );
+        assert!(super::super::blobs::get(&blob_dir, &orphan_hash).is_none());
+    }
 
     #[test]
     fn live_transcript_tail_is_bounded_and_preserves_recent_unicode() {
