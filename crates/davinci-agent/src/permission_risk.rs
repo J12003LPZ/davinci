@@ -88,13 +88,18 @@ pub(super) fn is_secret_path(path: &str) -> bool {
 }
 
 pub(super) fn is_protected_path(path: &str) -> bool {
+    let parts = normalized_parts(path);
     is_secret_path(path)
-        || normalized_parts(path).iter().any(|part| {
-            matches!(part.as_str(), ".pi" | ".davinci" | ".git")
+        || parts.iter().any(|part| {
+            matches!(part.as_str(), ".pi" | ".davinci" | ".git" | ".cargo")
                 || matches!(
                     part.as_str(),
                     ".pi_patch_journal.json" | ".davinci_patch_journal.json"
                 )
+        })
+        // Toolchain pins persist beyond the session into the user's own builds.
+        || parts.last().is_some_and(|name| {
+            matches!(name.as_str(), "rust-toolchain" | "rust-toolchain.toml")
         })
 }
 
@@ -472,5 +477,20 @@ mod tests {
         assert!(!is_secret_path(".git/config"));
         assert!(!is_protected_path("src/environment.rs"));
         assert!(!is_protected_path(".pinned/file.txt"));
+    }
+
+    #[test]
+    fn toolchain_config_is_protected() {
+        for path in [
+            ".cargo/config.toml",
+            ".cargo/config",
+            "sub/.cargo/config.toml",
+            "rust-toolchain",
+            "rust-toolchain.toml",
+        ] {
+            assert!(is_protected_path(path), "{path}");
+        }
+        assert!(!is_protected_path("src/lib.rs"));
+        assert!(!is_protected_path("Cargo.toml"));
     }
 }

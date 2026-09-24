@@ -95,7 +95,7 @@ impl PermissionMode {
             Self::Ask => "read tools run; edits and shell commands ask",
             Self::Edits => "edits inside the project run; shell commands ask",
             Self::Auto => {
-                "workspace edits and recognized local checks run; risky or unknown actions ask"
+                "workspace edits and recognized local checks run; risky or unknown actions ask. Tests it runs execute code it wrote."
             }
             Self::AlwaysApprove => {
                 "WARNING: no harness approval prompts; explicit denies and isolation still apply"
