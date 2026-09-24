@@ -431,6 +431,9 @@ pub fn effort_rule(model: &Model) -> Line<'static> {
 /// with its own keys (`2b`).
 pub fn composer(model: &Model, lines: Option<&[String]>, hint: Hint) -> Vec<Line<'static>> {
     let th = &model.theme;
+    let editor = model.composer.editor();
+    editor.set_layout_width(usize::MAX);
+    editor.set_terminal_rows(model.height as usize);
 
     // `2b` — the composer carries Memoria's keys while recall is open.
     if model.screen == Screen::Memoria {
