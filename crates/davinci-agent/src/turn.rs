@@ -88,15 +88,63 @@ impl Agent {
         self.ensure_session_persistence()?;
         self.recover_pending_operation_publications()?;
         let result = self.run_loop_body(emit_prompt_messages, complete);
-        if let Err(error) = self.ensure_session_persistence() {
-            self.is_streaming = false;
-            if let Some(runtime) = &self.runtime {
-                runtime.mark_turn_failed();
-                runtime.emit_turn_end(false);
+        let persistence = self.ensure_session_persistence();
+        match (&result, persistence) {
+            (_, Err(error)) => {
+                self.fail_turn(&error);
+                Err(error)
             }
-            return Err(error);
+            (Err(error), Ok(())) => {
+                if self.is_streaming {
+                    self.fail_turn(error);
+                }
+                result
+            }
+            (Ok(_), Ok(())) => result,
         }
-        result
+    }
+
+    /// Leave the agent idle after a failed turn and close every dangling tool call.
+    fn fail_turn(&mut self, error: &str) {
+        let answered: std::collections::HashSet<String> = self
+            .messages
+            .iter()
+            .filter(|message| message.role == "toolResult")
+            .filter_map(|message| message.tool_call_id.clone())
+            .collect();
+        let dangling: Vec<(String, String)> = self
+            .messages
+            .iter()
+            .filter(|message| message.role == "assistant")
+            .flat_map(|message| message.content.iter())
+            .filter_map(|content| match content {
+                davinci_ai::MessageContent::ToolCall { id, name, .. } if !answered.contains(id) => {
+                    Some((id.clone(), name.clone()))
+                }
+                _ => None,
+            })
+            .collect();
+        for (id, name) in dangling {
+            // Keep this repair in memory; persistence is the failed boundary.
+            self.messages.push(tool_result_message(
+                &id,
+                &name,
+                crate::ToolResult {
+                    content: format!(
+                        "The turn stopped before this tool result was recorded: {error}"
+                    ),
+                    is_error: true,
+                    details: None,
+                },
+                self.auto_resize_images,
+            ));
+        }
+        self.is_streaming = false;
+        self.flush_pending_bash_messages();
+        if let Some(runtime) = &self.runtime {
+            runtime.mark_turn_failed();
+            runtime.emit_turn_end(false);
+        }
     }
 
     fn run_loop_body<F, T>(
@@ -237,11 +285,6 @@ impl Agent {
             // must not bypass the budget through the legacy accessor fallback.
             if active_context_vm {
                 if let Err(error) = self.prepared_context_image() {
-                    if let Some(runtime) = &self.runtime {
-                        runtime.emit_turn_end(false);
-                    }
-                    self.is_streaming = false;
-                    self.flush_pending_bash_messages();
                     return Err(format!(
                         "Request blocked: context compilation failed: {error}"
                     ));
@@ -253,8 +296,6 @@ impl Agent {
                 .as_ref()
                 .is_some_and(|m| m.is_mandatory_violated())
             {
-                self.is_streaming = false;
-                self.flush_pending_bash_messages();
                 return Err(
                     "Request blocked: mandatory context policy is violated or unavailable".into(),
                 );
@@ -268,15 +309,7 @@ impl Agent {
             let (assistant, stream_events, streamed_live, native_responses_resume) =
                 match completion {
                     Ok(output) => output,
-                    Err(err) => {
-                        if let Some(runtime) = &self.runtime {
-                            runtime.mark_turn_failed();
-                            runtime.emit_turn_end(false);
-                        }
-                        self.is_streaming = false;
-                        self.flush_pending_bash_messages();
-                        return Err(err);
-                    }
+                    Err(err) => return Err(err),
                 };
             let mut chat = assistant_to_chat(&assistant);
             if let Some(record) = &native_responses_resume {
