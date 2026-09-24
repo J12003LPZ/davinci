@@ -318,6 +318,9 @@ pub fn graph_worker_context() -> Option<GraphWorkerContext> {
     GraphWorkerContext::from_env()
 }
 
+pub type SharedVectorMemory = Arc<Mutex<VectorMemory>>;
+pub type SharedTokenGovernor = Arc<Mutex<TokenGovernor>>;
+
 #[derive(Debug, Clone, Default)]
 pub struct NativeExtensionHost {
     pub browser: browser::BrowserController,
@@ -332,8 +335,8 @@ pub struct NativeExtensionHost {
     pub repo_intelligence: repo_intelligence::RepoIntelligence,
     pub cache: davinci_agent::runtime::cache::CacheRuntime,
     pub language_intelligence: language_intelligence::LanguageIntelligence,
-    pub governor: TokenGovernor,
-    pub memory: VectorMemory,
+    pub governor: SharedTokenGovernor,
+    pub memory: SharedVectorMemory,
     pub graph: GraphController,
     pub security: SecurityScanController,
     pub learning: LearningController,
@@ -373,17 +376,22 @@ impl NativeExtensionHost {
         let memory_config = agent_dir
             .map(|dir| VectorMemoryConfig::from_file(&dir.join("vector-memory.json")))
             .unwrap_or_else(VectorMemoryConfig::from_env);
-        let governor = TokenGovernor::new(session_key.clone(), governor_config);
+        let governor_value = TokenGovernor::new(session_key.clone(), governor_config);
         // Only the product host sweeps: other sessions' stored outputs past
         // the retention window go, never the live session's.
-        let _ = governor.sweep_stale_outputs();
+        let _ = governor_value.sweep_stale_outputs();
+        let language_governor = governor_value.clone();
+        let governor = Arc::new(Mutex::new(governor_value));
         let learning_config = cache_settings.and_then(|settings| settings.learning);
         let learning = LearningController::new(cwd, agent_dir, learning_config);
-        let memory = VectorMemory::with_config(cwd.to_path_buf(), memory_config);
+        let memory = Arc::new(Mutex::new(VectorMemory::with_config(
+            cwd.to_path_buf(),
+            memory_config,
+        )));
         let mut graph = GraphController::new(cwd.to_path_buf());
-        graph.memory = Some(memory.clone());
+        graph.memory = Some(Arc::clone(&memory));
         graph.learning = Some(learning.clone());
-        graph.governor = Some(governor.clone());
+        graph.governor = Some(Arc::clone(&governor));
         let visual_snapshot = VisualSnapshotHost::discover(cwd);
         let repo_agent_dir = agent_dir
             .map(Path::to_path_buf)
@@ -424,7 +432,7 @@ impl NativeExtensionHost {
             .unwrap_or_default();
         let language_intelligence =
             language_intelligence::LanguageIntelligence::new(cwd, language_config);
-        language_intelligence.set_governor(governor.clone());
+        language_intelligence.set_governor(language_governor);
         graph.language_intelligence = Some(language_intelligence.clone());
         let change_config = crate::settings::load_merged_settings(&repo_agent_dir, cwd)
             .change_impact
@@ -546,7 +554,10 @@ impl NativeExtensionHost {
                 return Some(reason);
             }
         }
-        self.governor.before_tool(name, args, state_hash)
+        self.governor
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .before_tool(name, args, state_hash)
     }
 
     pub fn after_tool(&mut self, name: &str, args: &Value, result: ToolResult) -> ToolResult {
@@ -560,28 +571,49 @@ impl NativeExtensionHost {
         {
             self.engineering.invalidate();
         }
-        self.governor.after_tool(name, args, result)
+        self.governor
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .after_tool(name, args, result)
     }
 
     pub fn memory_inject(&self, query: &str) -> Option<String> {
-        self.memory.inject(query)
+        self.memory
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .inject(query)
     }
 
     pub fn memory_index_messages(
         &mut self,
         messages: &[MemoryMessage],
     ) -> Result<usize, ToolError> {
-        self.memory.index_messages(messages)
+        self.memory
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .index_messages(messages)
     }
 
     pub fn session_start(&mut self) {
-        self.governor.session_start();
-        self.memory.session_start();
+        self.governor
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .session_start();
+        self.memory
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .session_start();
     }
 
     pub fn session_compact(&mut self) {
-        self.governor.session_compact();
-        self.memory.session_compact();
+        self.governor
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .session_compact();
+        self.memory
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .session_compact();
     }
 
     /// A background graph run must not outlive the session that started it.
@@ -607,6 +639,10 @@ impl NativeExtensionHost {
             }
         }
 
+        let mut memory = self
+            .memory
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
         for candidate in to_sync {
             match &candidate.artifact {
                 LearningArtifact::Memory {
@@ -629,7 +665,7 @@ impl NativeExtensionHost {
                         "conversation" => vector_memory::MemoryKind::Conversation,
                         _ => vector_memory::MemoryKind::Fact,
                     };
-                    let _ = self.memory.index_learning_memory(
+                    let _ = memory.index_learning_memory(
                         text,
                         kind,
                         *importance,
@@ -640,7 +676,7 @@ impl NativeExtensionHost {
                     );
                 }
                 LearningArtifact::FailureLesson { text, importance } => {
-                    let _ = self.memory.index_learning_memory(
+                    let _ = memory.index_learning_memory(
                         text,
                         vector_memory::MemoryKind::Bug,
                         *importance,
@@ -726,8 +762,17 @@ impl NativeExtensionHost {
                 }
             }
             VISUAL_SNAPSHOT_TOOL => self.visual_snapshot.execute_tool(_cwd, args),
-            "memory_search" => self.memory.search_tool(args),
-            "retrieve_output" => self.governor.retrieve(args).or_else(|error| {
+            "memory_search" => self
+                .memory
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .search_tool(args),
+            "retrieve_output" => self
+                .governor
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .retrieve(args)
+                .or_else(|error| {
                 if std::env::var_os("PI_GRAPH_ROLE").is_some() {
                     if let Some(client) =
                         davinci_agent::runtime::task_transport::TaskCoordinatorClient::from_env()
@@ -739,10 +784,16 @@ impl NativeExtensionHost {
             }),
             "skill_list" => {
                 let query = args.get("query").and_then(Value::as_str).unwrap_or("");
-                let query_embedding = if !query.trim().is_empty() && self.memory.dense_available() {
-                    self.memory.embed_query_text(query).ok()
-                } else {
-                    None
+                let query_embedding = {
+                    let memory = self
+                        .memory
+                        .lock()
+                        .unwrap_or_else(|error| error.into_inner());
+                    if !query.trim().is_empty() && memory.dense_available() {
+                        memory.embed_query_text(query).ok()
+                    } else {
+                        None
+                    }
                 };
                 self.learning.skill_list_tool_with_query_embedding(
                     _cwd,

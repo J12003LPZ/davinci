@@ -111,9 +111,9 @@ pub struct ControllerDeps {
     pub session_thinking: Option<String>,
     pub project_trusted: bool,
     pub on_update: Arc<UpdateSink>,
-    pub memory: Option<crate::native_extensions::VectorMemory>,
+    pub memory: Option<crate::native_extensions::SharedVectorMemory>,
     pub learning: Option<crate::native_extensions::LearningController>,
-    pub governor: Option<crate::native_extensions::TokenGovernor>,
+    pub governor: Option<crate::native_extensions::SharedTokenGovernor>,
     pub language_intelligence:
         Option<crate::native_extensions::language_intelligence::LanguageIntelligence>,
     pub processes: Option<davinci_agent::process_manager::ProcessManager>,
@@ -384,7 +384,12 @@ impl GraphExecution {
                 run.lifecycle = Some(GraphLifecycle::Stopped);
             }
             self.acknowledge_controls(&mut run);
-            let gov_stats = self.deps.governor.as_ref().map(|g| g.stats());
+            let gov_stats = self.deps.governor.as_ref().map(|governor| {
+                governor
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .stats()
+            });
             if let Some(ref gs) = gov_stats {
                 run.ecosystem_stats.governor_bytes_omitted = gs.bytes_withheld;
                 run.ecosystem_stats.governor_retrievals = gs.retrievals;
@@ -903,11 +908,14 @@ impl GraphExecution {
                 .lock()
                 .unwrap_or_else(|error| error.into_inner());
             match (&self.deps.memory, guard.as_ref()) {
-                (Some(mem), Some(learn)) => {
+                (Some(memory), Some(learn)) => {
+                    let memory = memory
+                        .lock()
+                        .unwrap_or_else(|error| error.into_inner());
                     let context_query = retry_query.render();
                     let skill_query = retry_query.render_skill_query();
                     crate::native_extensions::ecosystem::select_capabilities(
-                        mem,
+                        &memory,
                         learn,
                         authorized_tools,
                         crate::native_extensions::ecosystem::CapabilityRequest::new(
@@ -1412,14 +1420,19 @@ impl GraphExecution {
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             retry_context_delta = match (&self.deps.memory, guard.as_ref()) {
-                (Some(memory), Some(learning)) => build_retry_context_delta(
-                    memory,
+                (Some(memory), Some(learning)) => {
+                    let memory = memory
+                        .lock()
+                        .unwrap_or_else(|error| error.into_inner());
+                    build_retry_context_delta(
+                    &memory,
                     learning,
                     role,
                     &retry_query,
                     failure_class,
                     &error,
-                ),
+                )
+                }
                 _ => crate::native_extensions::ecosystem::ContextPacket::empty(),
             };
         }

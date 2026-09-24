@@ -343,9 +343,9 @@ pub struct GraphController {
     session_thinking: Option<String>,
     session_role_models: Option<std::collections::BTreeMap<Role, String>>,
     project_trusted: bool,
-    pub memory: Option<crate::native_extensions::VectorMemory>,
+    pub memory: Option<crate::native_extensions::SharedVectorMemory>,
     pub learning: Option<crate::native_extensions::LearningController>,
-    pub governor: Option<crate::native_extensions::TokenGovernor>,
+    pub governor: Option<crate::native_extensions::SharedTokenGovernor>,
     pub language_intelligence:
         Option<crate::native_extensions::language_intelligence::LanguageIntelligence>,
     pub processes: Option<davinci_agent::process_manager::ProcessManager>,
