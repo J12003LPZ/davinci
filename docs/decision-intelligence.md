@@ -70,8 +70,10 @@ Authorization: Bearer <candidate>
 Content-Type: application/json
 ```
 
-It uses model `jev-latest` and requires the `answers.probe` answer to be a
-finite `noul` value in `[0, 1]`. No `/model` discovery request is used.
+It uses model `jev-latest`, asks one fixed Noul and one fixed Score about a
+constant probe string, and requires the full response to pass the runtime
+response validator described below. No task text is sent. No `/model`
+discovery request is used.
 
 ## Request privacy contract
 
@@ -142,15 +144,30 @@ discarded as stale.
 
 ## Response and routing policy
 
-The response validator accepts only the requested answer types:
+The request and response shapes follow the published System One API
+(`https://docs.typesafe.ai/api.md`). Question ids are never sent to the model,
+so every question states its full judgment and names the state fields it reads.
+Noul questions describe their `true` and `false` outcomes in `criteria`, Choice
+questions map 2 to 255 option ids to descriptions, and Score questions carry an
+ordered array of 2 to 10 level descriptions. `DecisionRequest::validate_size`
+rejects any other shape before a network call.
+
+A response has exactly the documented top-level fields `model` (the concrete
+model, such as `jev-1.13.0`), `answers`, and `usage` (`input_tokens`,
+`output_tokens`). The validator accepts only the requested answer types:
 
 - Noul: a finite probability value;
-- Choice: a declared choice, a finite probability distribution, and confidence;
-- Score: a finite score, a finite probability distribution, and confidence.
+- Choice: a declared option, a finite probability distribution, and confidence;
+- Score: a level position in `0..=levels - 1` (not a probability), an optional
+  `legend` object, a distribution keyed by exactly the requested level
+  numbers, and confidence. Telemetry records the position divided by
+  `levels - 1`.
 
-Unknown fields, missing answers, unknown choices, non-finite values,
-out-of-range probabilities, malformed distributions, and oversized responses
-are rejected.
+Undocumented fields, missing answers, unknown choices, non-finite values,
+out-of-range probabilities or scores, malformed distributions, and oversized
+responses are rejected. Credential validation asks one Noul and one Score and
+runs the reply through the same validator, so a response shape the runtime
+would reject fails at key entry rather than in every later request.
 
 Deterministic requirements remain authoritative:
 
