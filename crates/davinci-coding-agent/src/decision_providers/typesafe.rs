@@ -63,42 +63,16 @@ impl TypeSafeProvider {
 
     pub fn validate_api_key(api_key: &str) -> Result<(), CredentialValidationError> {
         let api_key = normalize_api_key(api_key).ok_or(CredentialValidationError::Empty)?;
-        let body = serde_json::json!({
-            "state": {
-                "probe": "davinci_typesafe_credential_validation",
-                "schemaVersion": 1
-            },
-            "model": TYPESAFE_MODEL,
-            "questions": {
-                "probe": {
-                    "type": "noul",
-                    "instructions": "The field named probe equals davinci_typesafe_credential_validation."
-                }
-            }
-        });
+        let request = validation_request();
         let raw = super::typesafe_http::TypeSafeHttp::new(TYPESAFE_URL)
-            .send(api_key, &body, VALIDATION_TIMEOUT, 1)
+            .send(
+                api_key,
+                &ProviderPayload::from_request(&request),
+                VALIDATION_TIMEOUT,
+                1,
+            )
             .map_err(map_validation_error)?;
-        if raw.len() > MAX_RESPONSE_BYTES {
-            return Err(CredentialValidationError::SchemaMismatch);
-        }
-        let value: Value =
-            serde_json::from_slice(&raw).map_err(|_| CredentialValidationError::SchemaMismatch)?;
-        let answer = value
-            .get("answers")
-            .and_then(|answers| answers.get("probe"))
-            .ok_or(CredentialValidationError::SchemaMismatch)?;
-        if answer.get("type").and_then(Value::as_str) != Some("noul") {
-            return Err(CredentialValidationError::SchemaMismatch);
-        }
-        let value = answer
-            .get("noul")
-            .and_then(Value::as_f64)
-            .ok_or(CredentialValidationError::SchemaMismatch)?;
-        if !value.is_finite() || !(0.0..=1.0).contains(&value) {
-            return Err(CredentialValidationError::SchemaMismatch);
-        }
-        Ok(())
+        validate_probe_response(&raw, &request)
     }
 
     pub fn from_auth(auth: &AuthStorage) -> Result<Option<Arc<Self>>, TypeSafeAuthError> {
@@ -163,6 +137,49 @@ impl<'a> ProviderPayload<'a> {
             questions: &request.questions,
         }
     }
+}
+
+/// The key probe exercises one Noul and one Score so that it hits the same
+/// response parser as real requests: a response shape the runtime would
+/// reject fails here, at key entry, instead of silently in every shadow call.
+fn validation_request() -> DecisionRequest {
+    use davinci_agent::decision::request::DecisionQuestion;
+    DecisionRequest::new(
+        "credential-validation",
+        davinci_agent::decision::risk::DecisionClass::Ranking,
+        serde_json::json!({
+            "probe": "davinci_typesafe_credential_validation",
+            "schemaVersion": 2
+        }),
+        TYPESAFE_MODEL,
+        [
+            (
+                "probe".to_owned(),
+                DecisionQuestion::noul(
+                    "The field named probe equals davinci_typesafe_credential_validation.",
+                ),
+            ),
+            (
+                "probe_scale".to_owned(),
+                DecisionQuestion::score(
+                    "How long is the text in the field named probe?",
+                    ["Under ten characters.", "Ten characters or more."],
+                ),
+            ),
+        ],
+    )
+}
+
+fn validate_probe_response(
+    raw: &[u8],
+    request: &DecisionRequest,
+) -> Result<(), CredentialValidationError> {
+    if raw.len() > MAX_RESPONSE_BYTES {
+        return Err(CredentialValidationError::SchemaMismatch);
+    }
+    parse_and_validate_response(raw, request)
+        .map(|_| ())
+        .map_err(|_| CredentialValidationError::SchemaMismatch)
 }
 
 /// Normalize text copied from a credential field or an Authorization header.
@@ -306,23 +323,50 @@ mod tests {
 
     #[test]
     fn validation_payload_does_not_contain_task_or_session_fields() {
-        let body = serde_json::json!({
-            "state": {
-                "probe": "davinci_typesafe_credential_validation",
-                "schemaVersion": 1
-            },
-            "model": TYPESAFE_MODEL,
-            "questions": {
-                "probe": {
-                    "type": "noul",
-                    "instructions": "The field named probe equals davinci_typesafe_credential_validation."
-                }
-            }
-        });
-        let encoded = serde_json::to_string(&body).unwrap();
+        let request = validation_request();
+        request
+            .validate_size()
+            .expect("probe matches the API shape");
+        let encoded = serde_json::to_string(&ProviderPayload::from_request(&request)).unwrap();
         assert!(!encoded.contains("request_id"));
+        assert!(!encoded.contains("credential-validation"));
         assert!(!encoded.contains("Authorization"));
         assert!(!encoded.contains("session"));
+        assert!(!encoded.contains("\"task\""));
+    }
+
+    #[test]
+    fn probe_accepts_the_documented_response_shape() {
+        let raw = br#"{
+  "model": "jev-1.13.0",
+  "answers": {
+    "probe": { "type": "noul", "noul": 0.97 },
+    "probe_scale": {
+      "type": "score",
+      "score": 0.98,
+      "legend": { "0": "Under ten characters.", "1": "Ten characters or more." },
+      "probabilities": { "0": 0.02, "1": 0.98 },
+      "confidence": 0.95
+    }
+  },
+  "usage": { "input_tokens": 120, "output_tokens": 12 }
+}"#;
+        assert_eq!(validate_probe_response(raw, &validation_request()), Ok(()));
+    }
+
+    #[test]
+    fn probe_rejects_a_response_the_runtime_parser_would_reject() {
+        // Old probe only read answers.probe.noul, so a key could validate
+        // while every real request failed the stricter runtime parser.
+        let missing_score =
+            br#"{"model":"jev-1.13.0","answers":{"probe":{"type":"noul","noul":0.9}}}"#;
+        let unknown_top_level = br#"{"answers":{"probe":{"type":"noul","noul":0.9},"probe_scale":{"type":"score","score":1.0,"probabilities":{"0":0.0,"1":1.0},"confidence":1.0}},"extra":1}"#;
+        for raw in [&missing_score[..], &unknown_top_level[..]] {
+            assert_eq!(
+                validate_probe_response(raw, &validation_request()),
+                Err(CredentialValidationError::SchemaMismatch)
+            );
+        }
     }
 }
 

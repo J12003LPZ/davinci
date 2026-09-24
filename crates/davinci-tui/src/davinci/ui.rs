@@ -508,29 +508,34 @@ pub fn tool_line(
     instrument: &str,
     target: &str,
     duration: Option<&str>,
-    summary: Option<&str>,
+    tick: u64,
+    live: bool,
 ) -> Line<'static> {
     let (label, argument) = tool_caption(instrument, target);
-    let mark = if theme.no_color
-        || matches!(
-            state,
-            State::Failed | State::Attention | State::Skipped | State::Queued
-        ) {
+    let cc = theme.cc();
+    let failed = matches!(state, State::Failed | State::Attention);
+    let running = live
+        && duration.is_none()
+        && !failed
+        && !matches!(state, State::Skipped | State::Queued);
+    let mark = if theme.no_color {
         state.glyph()
+    } else if running && tick % 2 == 1 {
+        " "
     } else {
         "●"
     };
-    let color = if matches!(state, State::Failed | State::Attention | State::Skipped) {
-        theme.state_color(state)
-    } else if duration.is_some() {
-        theme.success
+    let color = if failed {
+        cc.error
+    } else if running {
+        cc.inactive
     } else {
-        theme.muted
+        cc.success
     };
-    let mut run = vec![
+    let run = vec![
         span(format!("{mark} "), color),
         span(label, theme.text).add_modifier(Modifier::BOLD),
-        span("(", theme.muted),
+        span("(", theme.text),
         span(
             clip_ellipsis(
                 argument,
@@ -540,20 +545,10 @@ pub fn tool_line(
                         .saturating_add(6),
                 ),
             ),
-            theme.muted,
+            theme.text,
         ),
-        span(")", theme.muted),
+        span(")", theme.text),
     ];
-    for fact in [summary, duration]
-        .into_iter()
-        .flatten()
-        .filter(|s| !s.is_empty())
-    {
-        let tail = format!(" · {fact}");
-        if run_width(&run) as usize + UnicodeWidthStr::width(tail.as_str()) <= width as usize {
-            run.push(span(tail, theme.muted));
-        }
-    }
     Line::from(truncate_run(run, width))
 }
 
@@ -718,15 +713,16 @@ pub fn footnote(
 /// The 3-cell copper bar that marks the selected row (design.md §6,
 /// Instrumenta). The bar is three cells wide on screen, whatever its byte
 /// length.
-pub const SELECTION_BAR: &str = "❯  ";
-const UNSELECTED_BAR: &str = "   ";
+pub const SELECTION_BAR: &str = "❯ ";
+const UNSELECTED_BAR: &str = "  ";
 
 /// The selection bar on the tint, or its blank.
 pub fn selection_bar(selected: bool, theme: &Theme) -> Span<'static> {
+    let cc = theme.cc();
     if selected {
-        span_on(SELECTION_BAR, theme.primary, Some(theme.surface))
+        span(SELECTION_BAR, cc.permission)
     } else {
-        span(UNSELECTED_BAR, theme.border)
+        span(UNSELECTED_BAR, cc.inactive)
     }
 }
 
@@ -739,17 +735,21 @@ pub fn hint_row(
     escape: Option<&str>,
     theme: &Theme,
 ) -> Line<'static> {
+    let quiet = theme.cc().inactive;
     let right: Vec<Span<'static>> = escape
-        .map(|esc| vec![span(esc, theme.border)])
+        .map(|esc| vec![span(esc, quiet)])
         .unwrap_or_default();
     let room = width.saturating_sub(run_width(&right)).saturating_sub(3);
     let mut left: Vec<Span<'static>> = Vec::new();
     for (index, hint) in hints.iter().enumerate() {
         let mut candidate = left.clone();
         if index > 0 {
-            candidate.push(span(" │ ", theme.border));
+            candidate.push(span(" · ", quiet));
         }
-        candidate.extend(hint.iter().cloned());
+        candidate.extend(hint.iter().cloned().map(|mut item| {
+            item.style = item.style.fg(quiet);
+            item
+        }));
         if run_width(&candidate) > room {
             break;
         }
@@ -1272,28 +1272,18 @@ pub fn section_row(
     label: &str,
     value: &str,
 ) -> Line<'static> {
-    let band = selected.then_some(theme.surface);
+    let cc = theme.cc();
     let width = width.min(96);
-    let available = width.saturating_sub(3);
-    let value_room = if width < 32 {
-        0
-    } else {
-        (available / 3).min(28)
-    };
+    let available = width.saturating_sub(2);
+    let value_room = if width < 32 { 0 } else { (available / 3).min(28) };
     let value = clip_ellipsis(value, value_room);
-    let value_width = run_width(&[span(value.clone(), theme.muted)]);
+    let value_width = run_width(&[span(value.clone(), cc.inactive)]);
     let name_room = available.saturating_sub(value_width + u16::from(!value.is_empty()));
-    let mut left = vec![selection_bar(selected, theme)];
-    let mut name = span_on(
-        clip_ellipsis(label, name_room),
-        if selected { theme.primary } else { theme.text },
-        band,
-    );
-    if selected {
-        name.style = name.style.add_modifier(ratatui::style::Modifier::BOLD);
-    }
-    left.push(name);
-    spread_on(width, left, vec![span_on(value, theme.muted, band)], band)
+    let left = vec![
+        span(if selected { SELECTION_BAR } else { UNSELECTED_BAR }, if selected { cc.permission } else { cc.inactive }),
+        span(clip_ellipsis(label, name_room), if selected { cc.permission } else { theme.text }),
+    ];
+    spread(width, left, vec![span(value, cc.inactive)])
 }
 
 /// Wrapped secondary information aligns with picker labels, never with the marker.

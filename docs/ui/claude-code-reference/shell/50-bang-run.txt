@@ -1,0 +1,40 @@
+
+           Claude Code v2.1.281
+           Opus 5.5 with high effort · <plan>
+           ~\project
+
+▎ ※ You've been granted a $100 bonus credit for cloud sessions, on top of your plan limits · /claim-credit
+
+! echo hi
+  ⎿  hi
+
+● The command ran and printed hi, so the shell is working. What would you like to do next?
+
+✻ Churned for 2s · done 2:27 AM
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  ⏵⏵ auto mode on (shift+tab to cycle) · ← 1 agent

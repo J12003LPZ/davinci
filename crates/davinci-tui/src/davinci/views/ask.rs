@@ -2,9 +2,13 @@
 //! focus does not imply approval, and the runtime still owns every decision.
 
 use super::sheet::hint;
-use crate::davinci::model::Model;
-use crate::davinci::ui::{self, section_detail, section_row, span, Surface};
-use ratatui::text::Line;
+use crate::davinci::model::{AskKind, Hunk, HunkKind, Model};
+use crate::davinci::theme::Theme;
+use crate::davinci::ui::{
+    self, blank, clip_ellipsis, run_width, section_detail, section_row, span, truncate_run, Surface,
+};
+use ratatui::style::{Color, Modifier, Style};
+use ratatui::text::{Line, Span};
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
@@ -67,6 +71,7 @@ pub fn lines(model: &Model) -> Vec<Line<'static>> {
                 .rows(body.into_iter().map(|r| r.spans).collect())
                 .lines();
         }
+        return approval_lines(model);
     }
     let selected = model.selection(ask.items.len());
     let mut body = section_detail(inner, th, &ask.note);
@@ -126,6 +131,130 @@ pub fn lines(model: &Model) -> Vec<Line<'static>> {
         .title(title)
         .rows(body.into_iter().map(|r| r.spans).collect())
         .lines()
+}
+
+
+fn approval_lines(model: &Model) -> Vec<Line<'static>> {
+    let th = &model.theme;
+    let cc = th.cc();
+    let ask = &model.ask;
+    let width = model.width;
+    let mut rows = vec![Line::from(span("─".repeat(width as usize), cc.permission))];
+
+    let mut title = span(format!(" {}", ask.title), cc.permission);
+    title.style = title.style.add_modifier(Modifier::BOLD);
+    rows.push(Line::from(title));
+
+    match ask.kind {
+        AskKind::Shell => {
+            rows.push(blank());
+            for line in ask.subject.lines() {
+                rows.push(Line::from(truncate_run(
+                    vec![span(format!("   {line}"), th.text)],
+                    width,
+                )));
+            }
+            rows.push(blank());
+        }
+        AskKind::File => {
+            rows.push(Line::from(span(format!(" {}", ask.subject), cc.inactive)));
+            if !ask.preview.is_empty() {
+                let dashes = Line::from(span("╌".repeat(width as usize), cc.subtle));
+                rows.push(dashes.clone());
+                let digits = ask
+                    .preview
+                    .iter()
+                    .filter_map(|hunk| hunk.line)
+                    .max()
+                    .map_or(1, |line| line.to_string().len());
+                rows.extend(
+                    ask.preview
+                        .iter()
+                        .map(|hunk| approval_hunk(th, hunk, digits, width)),
+                );
+                rows.push(dashes);
+            }
+        }
+        AskKind::List => {
+            if !ask.note.is_empty() {
+                rows.push(Line::from(span(format!(" {}", ask.note), cc.inactive)));
+            }
+            rows.push(blank());
+        }
+    }
+
+    rows.push(question_line(th, &ask.question, &ask.subject));
+    let selected = model.selection(ask.items.len());
+    for (index, item) in ask.items.iter().enumerate() {
+        let focused = Some(index) == selected;
+        let mut row = vec![span(
+            if focused { " ❯ " } else { "   " },
+            cc.permission,
+        )];
+        row.push(span(format!("{}. ", index + 1), cc.inactive));
+        row.push(span(
+            item.label.clone(),
+            if focused { cc.permission } else { th.text },
+        ));
+        rows.push(Line::from(truncate_run(row, width)));
+    }
+    rows.push(blank());
+    rows.push(Line::from(span(" Esc to cancel", cc.inactive)));
+    rows
+}
+
+fn question_line(theme: &Theme, question: &str, subject: &str) -> Line<'static> {
+    let clean_subject = subject
+        .strip_suffix(" · outside the project")
+        .unwrap_or(subject);
+    let name = std::path::Path::new(clean_subject)
+        .file_name()
+        .map(|name| name.to_string_lossy().to_string())
+        .unwrap_or_default();
+    match (!name.is_empty()).then(|| question.find(&name)).flatten() {
+        Some(at) => {
+            let mut bold = span(name.clone(), theme.text);
+            bold.style = bold.style.add_modifier(Modifier::BOLD);
+            Line::from(vec![
+                span(format!(" {}", &question[..at]), theme.text),
+                bold,
+                span(question[at + name.len()..].to_string(), theme.text),
+            ])
+        }
+        None => Line::from(span(format!(" {question}"), theme.text)),
+    }
+}
+
+fn approval_hunk(theme: &Theme, hunk: &Hunk, digits: usize, width: u16) -> Line<'static> {
+    let cc = theme.cc();
+    let number = hunk.line.map_or(String::new(), |line| line.to_string());
+    let (sign, foreground, background) = match hunk.kind {
+        HunkKind::Add => ("+", cc.diff_add, Some(cc.diff_add_bg)),
+        HunkKind::Del => ("-", cc.diff_del, Some(cc.diff_del_bg)),
+        HunkKind::Context => (" ", cc.diff_text, None),
+    };
+    let paint = |foreground: Color| match background {
+        Some(background) => Style::default().fg(foreground).bg(background),
+        None => Style::default().fg(foreground),
+    };
+    let mut gutter = paint(foreground);
+    if background.is_none() {
+        gutter = gutter.add_modifier(Modifier::DIM);
+    }
+    let text = clip_ellipsis(&hunk.text, width.saturating_sub(digits as u16 + 4));
+    let mut spans = vec![
+        Span::styled(format!(" {number:>digits$} "), gutter),
+        Span::styled(sign.to_string(), paint(foreground)),
+        Span::styled(text, paint(cc.diff_text)),
+    ];
+    if let Some(background) = background {
+        let used = run_width(&spans);
+        spans.push(Span::styled(
+            " ".repeat(width.saturating_sub(used) as usize),
+            Style::default().bg(background),
+        ));
+    }
+    Line::from(truncate_run(spans, width))
 }
 
 #[cfg(test)]
@@ -204,10 +333,9 @@ mod tests {
         let mut m = model(80);
         m.ask.key = "/permissions".into();
         let shown = text(&m);
-        assert!(shown.contains("esc deny"));
+        assert!(shown.contains("Esc to cancel"));
         assert!(shown.contains("1. Trust this folder"));
         assert!(shown.contains("2. Do not trust"));
-        assert!(shown.contains("1-5 focus"));
     }
     #[test]
     fn empty_choices_still_offer_an_exit() {

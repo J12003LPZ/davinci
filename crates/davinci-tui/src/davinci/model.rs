@@ -21,7 +21,7 @@ use super::theme::{State, Theme};
 /// How many completions the composer offers at once. The list sits between the
 /// transcript and the composer, so it stays short enough to leave the turn it
 /// belongs to visible (design.md §2).
-pub const SUGGESTION_ROWS: usize = 6;
+pub const SUGGESTION_ROWS: usize = 5;
 
 #[derive(Debug, Default, Clone)]
 pub struct VoiceView {
@@ -234,12 +234,24 @@ impl PickerItem {
 /// A question put to the user as a list. `title` is the paired name the panel
 /// wears (design.md §5), `key` the right-hand run, `note` the line above the
 /// footer that says what is being decided.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum AskKind {
+    #[default]
+    List,
+    Shell,
+    File,
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Ask {
     pub title: String,
     pub name: String,
     pub key: String,
     pub note: String,
+    pub subject: String,
+    pub question: String,
+    pub preview: Vec<Hunk>,
+    pub kind: AskKind,
     pub items: Vec<PickerItem>,
 }
 
@@ -369,6 +381,12 @@ pub struct Working {
     pub thinking: Option<String>,
     /// Whether an interrupt was requested and the turn is concluding.
     pub interrupting: bool,
+    /// Stable per-turn seed selecting the working/completion verb.
+    pub verb_seed: u64,
+    /// Seconds spent reasoning after the reasoning stream settles.
+    pub thought_for: Option<u64>,
+    /// Whether reasoning is actively streaming.
+    pub reasoning: bool,
 }
 
 impl Working {
@@ -382,30 +400,19 @@ impl Working {
         if self.interrupting {
             return "Interrupting";
         }
-        // A workshop's vocabulary, one word every three seconds.
         const VERBS: [&str; 20] = [
-            "Pondering",
-            "Sketching",
-            "Drafting",
-            "Composing",
-            "Measuring",
-            "Devising",
-            "Chiselling",
-            "Layering",
-            "Gilding",
-            "Mixing",
-            "Sculpting",
-            "Etching",
-            "Burnishing",
-            "Contemplating",
-            "Refining",
-            "Rendering",
-            "Studying",
-            "Tinkering",
-            "Weaving",
-            "Distilling",
+            "Boondoggling", "Levitating", "Envisioning", "Unraveling", "Pondering",
+            "Percolating", "Mulling", "Noodling", "Ruminating", "Simmering",
+            "Brewing", "Crunching", "Churning", "Conjuring", "Tinkering",
+            "Whittling", "Musing", "Deliberating", "Cogitating", "Synthesizing",
         ];
-        VERBS[((self.seconds / 3) as usize) % VERBS.len()]
+        VERBS[(self.verb_seed as usize) % VERBS.len()]
+    }
+
+    /// The past-tense word shown on the completion line.
+    pub fn past_verb(&self) -> &'static str {
+        const PAST: [&str; 6] = ["Worked", "Crunched", "Churned", "Baked", "Brewed", "Cooked"];
+        PAST[(self.verb_seed as usize) % PAST.len()]
     }
 }
 
@@ -428,17 +435,20 @@ impl Step {
 }
 
 /// One row of a Δ block.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum HunkKind {
     Add,
     Del,
+    #[default]
     Context,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Hunk {
     pub kind: HunkKind,
     pub text: String,
+    /// The file line represented by this diff row, when known.
+    pub line: Option<u32>,
 }
 
 impl Hunk {
@@ -446,7 +456,12 @@ impl Hunk {
         Self {
             kind,
             text: super::sanitize::terminal_safe(text).into_owned(),
+            line: None,
         }
+    }
+
+    pub fn at(kind: HunkKind, line: u32, text: &str) -> Self {
+        Self { kind, text: text.to_string(), line: Some(line) }
     }
 }
 
@@ -456,6 +471,12 @@ impl Hunk {
 pub enum Entry {
     Gap,
     User(String),
+    /// A user-entered shell-mode command and its captured output.
+    Shell {
+        command: String,
+        output: Vec<String>,
+        failed: bool,
+    },
     Agent(String),
     Tool {
         state: State,
@@ -495,6 +516,11 @@ pub enum Entry {
         adds: u32,
         dels: u32,
         hunks: Vec<Hunk>,
+    },
+    /// Completion marker for a settled, non-interrupted turn.
+    Done {
+        verb: String,
+        seconds: u64,
     },
 }
 
@@ -1697,6 +1723,10 @@ pub struct Model {
     pub codex: bool,
 
     pub composer: Composer,
+    /// Which empty-composer example this session shows.
+    pub placeholder: usize,
+    /// `?` in an empty composer: the shortcuts panel replaces the footer.
+    pub shortcuts_open: bool,
     /// Lightweight host projection; never owns native/audio resources.
     pub voice: VoiceView,
     pub composer_epoch: u64,
@@ -1915,6 +1945,8 @@ impl Model {
             overlay: None,
             codex: false,
             composer: Composer::default(),
+            placeholder: 0,
+            shortcuts_open: false,
             voice: VoiceView::default(),
             composer_epoch: 0,
             keybindings: Keybindings::defaults(),

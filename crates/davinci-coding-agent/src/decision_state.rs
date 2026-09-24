@@ -207,7 +207,12 @@ impl DecisionState {
             "jev-latest",
             questions(),
         );
-        while request.validate_size().is_err() && !state.task.is_empty() {
+        // Only a size failure is fixed by shortening the task. A malformed
+        // question must surface as-is, not strip the task to nothing.
+        while request.validate_questions().is_ok()
+            && request.validate_size().is_err()
+            && !state.task.is_empty()
+        {
             state.task.pop();
             state.refresh_task_signals();
             state.refresh_framework_signals();
@@ -280,42 +285,108 @@ pub fn build_request_with_metadata(
     DecisionState::from_task_with_metadata(task, metadata).request(request_id, decision_class)
 }
 
+/// Question ids never reach the model, so each question carries its full
+/// meaning and names the state fields it should read.
 fn questions() -> BTreeMap<String, DecisionQuestion> {
-    let noul = [
-        "browser_relevant",
-        "git_history_relevant",
-        "package_intelligence_relevant",
-        "test_impact_relevant",
-        "change_impact_relevant",
-        "verification_planner_relevant",
-    ];
-    let mut questions = noul
-        .into_iter()
-        .map(|id| (id.to_owned(), DecisionQuestion::noul(id.replace('_', " "))))
-        .collect::<BTreeMap<_, _>>();
+    let capability = |what: &str, field: &str, yes: &str| {
+        DecisionQuestion::noul_with(
+            format!(
+                "A coding agent is about to work on `task`. Would {what} materially help \
+                 complete `task` correctly? Consider `task`, `taskSignals`, `languages`, \
+                 `frameworkSignals` and `recentFileKinds`. If `{field}` is false the tool \
+                 is unavailable, which does not change whether it would help."
+            ),
+            yes,
+            "The task can be done well without it, or it would add only noise.",
+        )
+    };
+    let mut questions = BTreeMap::from([
+        (
+            "browser_relevant".to_owned(),
+            capability(
+                "opening the running app in a real browser to click through and inspect the page",
+                "availableCapabilities.browser",
+                "The task changes or debugs something a user sees or does in a web page.",
+            ),
+        ),
+        (
+            "git_history_relevant".to_owned(),
+            capability(
+                "reading git history (who changed a symbol, related commits, branch diffs)",
+                "availableCapabilities.git",
+                "The task depends on why or when code changed, a regression window, or branch differences.",
+            ),
+        ),
+        (
+            "package_intelligence_relevant".to_owned(),
+            capability(
+                "looking up a third-party package's version, exports or dependents",
+                "availableCapabilities.packageIntelligence",
+                "The task involves adding, upgrading, or correctly using an external dependency.",
+            ),
+        ),
+        (
+            "test_impact_relevant".to_owned(),
+            capability(
+                "finding which existing tests cover the code being changed",
+                "availableCapabilities.testImpact",
+                "The task changes behavior that existing tests should confirm or that could break them.",
+            ),
+        ),
+        (
+            "change_impact_relevant".to_owned(),
+            capability(
+                "tracing which callers and modules depend on the code being changed",
+                "availableCapabilities.changeImpact",
+                "The task edits a function, type or interface that other code relies on.",
+            ),
+        ),
+        (
+            "verification_planner_relevant".to_owned(),
+            capability(
+                "planning which build, lint and test commands prove the change works",
+                "availableCapabilities.verificationPlanner",
+                "The task produces a code change whose correctness needs more than one kind of check.",
+            ),
+        ),
+    ]);
     questions.insert(
         "verification_scope".to_owned(),
         DecisionQuestion::choice(
-            "Choose the least restrictive verification scope that remains useful.",
+            "A coding agent will finish `task` by running checks. Choose the smallest \
+             verification scope that would still catch the mistakes this change could \
+             realistically cause.",
             [
                 (
                     "targeted".to_owned(),
-                    "Run only the touched module checks.".to_owned(),
+                    "Only the checks for the module being touched: a local, self-contained change."
+                        .to_owned(),
                 ),
                 (
                     "standard".to_owned(),
-                    "Run the normal affected-service checks.".to_owned(),
+                    "The test suite of the affected service or crate: behavior changes other code in it may see."
+                        .to_owned(),
                 ),
                 (
                     "full".to_owned(),
-                    "Run the full workspace checks.".to_owned(),
+                    "Every check in the workspace: a shared contract, build config, or cross-service change."
+                        .to_owned(),
                 ),
             ],
         ),
     );
     questions.insert(
         "regression_risk".to_owned(),
-        DecisionQuestion::score("Estimate regression risk for telemetry only."),
+        DecisionQuestion::score(
+            "How likely is completing `task` to break behavior that currently works \
+             somewhere other than the intended change?",
+            [
+                "Almost none: text, comments, docs, or an isolated new file nothing uses yet.",
+                "Low: a small local edit inside one function with obvious effects.",
+                "Moderate: changes behavior of a module other code calls.",
+                "High: changes a shared interface, data format, concurrency, or security-sensitive path.",
+            ],
+        ),
     );
     questions
 }
@@ -591,6 +662,41 @@ mod tests {
         assert!(serialized.contains("changeImpact"));
         assert!(serialized.contains("verificationPlanner"));
         assert!(serialized.len() <= MAX_REQUEST_BYTES);
+    }
+
+    #[test]
+    fn routing_questions_match_the_api_shape_and_carry_their_own_meaning() {
+        let request = build_request("shape", "Fix the React login bug", DecisionClass::Ranking);
+        request
+            .validate_size()
+            .expect("routing questions pass the API shape check");
+        for (id, question) in &request.questions {
+            // Ids are not sent to the model; the text must stand alone.
+            assert!(
+                question.instructions.len() > 60 && question.instructions.contains("`task`"),
+                "{id} instructions do not explain the judgment: {:?}",
+                question.instructions
+            );
+            assert!(question.criteria.is_some(), "{id} has no criteria");
+        }
+        let wire = serde_json::to_value(&request.questions).unwrap();
+        assert_eq!(
+            wire["regression_risk"]["criteria"]
+                .as_array()
+                .unwrap()
+                .len(),
+            4
+        );
+        assert!(wire["browser_relevant"]["criteria"]["true"].is_string());
+        assert!(wire["browser_relevant"]["criteria"]["false"].is_string());
+    }
+
+    #[test]
+    fn a_maximal_task_still_fits_the_request_bound_with_full_questions() {
+        let request = build_request("big", &"word ".repeat(5000), DecisionClass::Ranking);
+        let encoded = request.validate_size().expect("bounded request");
+        assert!(encoded.len() <= MAX_REQUEST_BYTES);
+        assert!(!request.state["task"].as_str().unwrap().is_empty());
     }
 
     #[test]

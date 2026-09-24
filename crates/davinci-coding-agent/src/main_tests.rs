@@ -838,6 +838,81 @@
     }
 
     #[test]
+    fn model_runtime_snapshot_is_reused_until_an_input_changes() {
+        let _lock = PROCESS_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        let _config = EnvRestore::set("PI_CODING_AGENT_DIR", &dir.path().to_string_lossy());
+        let _current = EnvRestore::set("DAVINCI_CODING_AGENT_DIR", &dir.path().to_string_lossy());
+        let parsed = Args {
+            no_extensions: true,
+            ..Args::default()
+        };
+        clear_model_runtime_cache();
+        let first = load_model_runtime(&parsed);
+        assert!(!first.stored_providers.contains(&"anthropic".to_string()));
+
+        // Unchanged inputs are served from the cache, not rebuilt: a marker
+        // planted in the cached snapshot comes back.
+        {
+            let key = ModelRuntimeKey::current(&parsed);
+            let mut cache = MODEL_RUNTIME_CACHE
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let (_, snapshot) = cache
+                .iter_mut()
+                .find(|(cached, _)| *cached == key)
+                .expect("first load fills the cache");
+            snapshot
+                .composition_errors
+                .insert("cache-marker".into(), "reused".into());
+        }
+        assert!(load_model_runtime(&parsed)
+            .composition_errors
+            .contains_key("cache-marker"));
+
+        // A login rewrites auth.json, so the next load is rebuilt from disk.
+        let mut storage = AuthStorage::create().unwrap();
+        storage.login_api_key("anthropic", "sk-test").unwrap();
+        let after_login = load_model_runtime(&parsed);
+        assert!(!after_login.composition_errors.contains_key("cache-marker"));
+        assert!(after_login
+            .stored_providers
+            .contains(&"anthropic".to_string()));
+        // The rebuild replaced the stale entry for the same inputs.
+        let login_key = ModelRuntimeKey::current(&parsed);
+        assert_eq!(
+            MODEL_RUNTIME_CACHE
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .iter()
+                .filter(|(cached, _)| cached.same_inputs(&login_key))
+                .count(),
+            1
+        );
+
+        // Environment and argument changes are part of the key too.
+        let key = ModelRuntimeKey::current(&parsed);
+        {
+            let _env = EnvRestore::set("DAVINCI_MODEL_RUNTIME_KEY_PROBE", "1");
+            assert_ne!(ModelRuntimeKey::current(&parsed), key);
+        }
+        let other_model = Args {
+            model: Some("openai/gpt-test".into()),
+            ..parsed.clone()
+        };
+        assert_ne!(ModelRuntimeKey::current(&other_model), key);
+
+        clear_model_runtime_cache();
+        assert!(!MODEL_RUNTIME_CACHE
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .iter()
+            .any(|(cached, _)| cached.same_inputs(&login_key)));
+    }
+
+    #[test]
     fn the_offline_tool_call_fixture_scripts_one_call_then_the_usual_stub() {
         let _lock = PROCESS_ENV_LOCK
             .lock()

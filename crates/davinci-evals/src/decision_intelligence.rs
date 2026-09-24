@@ -35,6 +35,54 @@ pub struct DecisionIntelligenceEvalReport {
     pub turn_latency_ms: u64,
     pub jev_usage_tokens: usize,
     pub guarded_policy_is_explicit: bool,
+    /// Scenarios whose real routing request fails the API shape check, or
+    /// whose reply in the documented response shape the runtime rejects.
+    pub wire_contract_failures: Vec<&'static str>,
+}
+
+/// A reply in the documented System One response shape
+/// (`https://docs.typesafe.ai/api.md`) for every question in `request`.
+/// Call only after `request.validate_size()` succeeds.
+pub fn documented_reply(request: &davinci_agent::decision::request::DecisionRequest) -> Vec<u8> {
+    use davinci_agent::decision::request::DecisionQuestionType;
+    let answers = request
+        .questions
+        .iter()
+        .map(|(id, question)| {
+            let answer = match question.question_type {
+                DecisionQuestionType::Noul => serde_json::json!({"type": "noul", "noul": 0.93}),
+                DecisionQuestionType::Choice => {
+                    let ids: Vec<&str> = question.choice_ids().collect();
+                    let share = 1.0 / ids.len() as f64;
+                    serde_json::json!({
+                        "type": "choice",
+                        "choice": ids[0],
+                        "probabilities": ids.iter().map(|id| (id.to_string(), serde_json::json!(share))).collect::<serde_json::Map<_, _>>(),
+                        "confidence": 0.41,
+                    })
+                }
+                DecisionQuestionType::Score => {
+                    let levels = question.score_levels();
+                    let top = (levels - 1).to_string();
+                    serde_json::json!({
+                        "type": "score",
+                        // The top level position, above 1.0 for 3+ levels.
+                        "score": (levels - 1) as f64,
+                        "legend": (0..levels).map(|n| (n.to_string(), "level".into())).collect::<serde_json::Map<_, _>>(),
+                        "probabilities": (0..levels).map(|n| (n.to_string(), serde_json::json!(if n.to_string() == top { 1.0 } else { 0.0 }))).collect::<serde_json::Map<_, _>>(),
+                        "confidence": 0.88,
+                    })
+                }
+            };
+            (id.clone(), answer)
+        })
+        .collect::<serde_json::Map<_, _>>();
+    serde_json::to_vec(&serde_json::json!({
+        "model": "jev-1.13.0",
+        "answers": answers,
+        "usage": {"input_tokens": 900, "output_tokens": 40},
+    }))
+    .expect("static reply serializes")
 }
 
 pub fn scenarios() -> Vec<DecisionIntelligenceScenario> {
@@ -132,6 +180,7 @@ pub fn run_offline_eval() -> DecisionIntelligenceEvalReport {
     let mut fallback_cases = 0;
     let mut provider_failure_fallback_success = true;
     let mut input_token_estimate = 0;
+    let mut wire_contract_failures = Vec::new();
 
     for scenario in &scenarios {
         let request = build_request(
@@ -139,7 +188,22 @@ pub fn run_offline_eval() -> DecisionIntelligenceEvalReport {
             scenario.task,
             davinci_agent::decision::risk::DecisionRisk::Planning,
         );
-        input_token_estimate += request.validate_size().unwrap_or_default().len() / 4;
+        // A shape failure is recorded and the synthetic reply skipped: the
+        // reply builder assumes the shapes the check guarantees.
+        match request.validate_size() {
+            Ok(encoded) => {
+                input_token_estimate += encoded.len() / 4;
+                if davinci_agent::decision::response::parse_and_validate_response(
+                    &documented_reply(&request),
+                    &request,
+                )
+                .is_err()
+                {
+                    wire_contract_failures.push(scenario.name);
+                }
+            }
+            Err(_) => wire_contract_failures.push(scenario.name),
+        }
 
         let shadow = add_optional_capabilities(
             &scenario
@@ -212,6 +276,7 @@ pub fn run_offline_eval() -> DecisionIntelligenceEvalReport {
         turn_latency_ms: 0,
         jev_usage_tokens: 0,
         guarded_policy_is_explicit: true,
+        wire_contract_failures,
     }
 }
 
@@ -236,6 +301,7 @@ mod tests {
         assert!(report.input_token_estimate > 0);
         assert_eq!(report.jev_usage_tokens, 0);
         assert!(report.guarded_policy_is_explicit);
+        assert_eq!(report.wire_contract_failures, Vec::<&str>::new());
     }
 
     #[test]

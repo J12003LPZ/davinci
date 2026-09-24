@@ -5,8 +5,9 @@
 //!
 //! The behavioural reference is the TypeScript renderer,
 //! `vendor/pi/packages/tui/src/components/markdown.ts`; the visual rules are
-//! davinci's own — colours only through `Theme`, a `│` left rule for code, the
-//! `·` tick for bullets, a hair rule under the two top heading levels — and
+//! the Claude Code conversation contract: headings are bold without rules,
+//! bullets use `- `, inline code uses the permission accent, and fenced code
+//! has no fence/language/prefix row — and
 //! there is no `.ex` mirror yet, so this file is the reference for the Elixir
 //! tree rather than the other way round.
 //!
@@ -93,7 +94,7 @@ impl Face {
     fn span(self, text: String, ctx: &Ctx) -> Span<'static> {
         let theme = ctx.theme;
         let color = if self.code || self.link {
-            theme.secondary
+            theme.cc().permission
         } else if self.html {
             theme.muted
         } else {
@@ -608,13 +609,7 @@ fn render_block(block: &Block, width: u16, ctx: &Ctx) -> Vec<Line<'static>> {
     let theme = ctx.theme;
     match block {
         Block::Paragraph(inlines) => wrap_inlines(inlines, measure(width), false, ctx),
-        Block::Heading { level, inlines } => {
-            let mut rows = wrap_inlines(inlines, measure(width), true, ctx);
-            if !rows.is_empty() && *level <= 2 {
-                rows.push(hair_rule(width, theme, ""));
-            }
-            rows
-        }
+        Block::Heading { inlines, .. } => wrap_inlines(inlines, measure(width), true, ctx),
         Block::Code { lang, text } => code_rows(lang.as_deref(), text, width, ctx),
         Block::Quote(children) => {
             render_blocks(children, width.saturating_sub(2), &ctx.muted(), true)
@@ -726,31 +721,55 @@ fn wrap_run(run: &[(&str, Face)], width: u16, ctx: &Ctx) -> Vec<Line<'static>> {
 /// width is clipped, and tabs are four spaces. A fence that names its
 /// language gets that name as a muted first row.
 fn code_rows(lang: Option<&str>, text: &str, width: u16, ctx: &Ctx) -> Vec<Line<'static>> {
-    let theme = ctx.theme;
-    let room = width.saturating_sub(CODE_INSET);
-    let mut out = Vec::new();
-    if let Some(lang) = lang {
-        out.push(indent(
-            2,
-            vec![
-                span("│ ", theme.border),
-                span(clip_ellipsis(lang, room), theme.muted),
-            ],
-        ));
-    }
-    if text.is_empty() {
-        return out;
-    }
-    // The fence names the language; keywords, strings, comments and
-    // numbers take their ink from it, the rest keeps the block's.
+    use super::highlight::Token;
+    let cc = ctx.theme.cc();
     let language = lang.and_then(super::highlight::language_of);
     let body = text.strip_suffix('\n').unwrap_or(text);
-    out.extend(body.split('\n').map(|line| {
-        let content = clip_ellipsis(&line.trim_end_matches('\r').replace('\t', "    "), room);
-        let mut spans = vec![span("│ ", theme.border)];
-        spans.extend(super::highlight::spans(theme, language, &content, ctx.base));
-        indent(2, spans)
-    }));
+    if body.is_empty() {
+        return Vec::new();
+    }
+    body.split('\n')
+        .map(|line| {
+            let content = clip_ellipsis(&line.trim_end_matches('\r').replace('\t', "    "), width);
+            let mut spans = Vec::new();
+            for (token, run) in super::highlight::tokens(language, &content) {
+                match token {
+                    Token::Keyword => spans.push(span(run, cc.code_keyword)),
+                    Token::String => spans.push(span(run, cc.code_string)),
+                    Token::Comment => spans.push(span(run, cc.inactive)),
+                    Token::Number | Token::Plain => {
+                        spans.extend(split_macros(&run, ctx.base, cc.code_macro));
+                    }
+                }
+            }
+            Line::from(spans)
+        })
+        .collect()
+}
+
+fn split_macros(run: &str, base: Color, macro_color: Color) -> Vec<Span<'static>> {
+    let mut out = Vec::new();
+    let mut rest = run;
+    while let Some(bang) = rest.find('!') {
+        let before = &rest[..bang];
+        let start = before
+            .char_indices()
+            .rev()
+            .find(|(_, ch)| !(ch.is_alphanumeric() || *ch == '_'))
+            .map_or(0, |(index, ch)| index + ch.len_utf8());
+        if start == bang {
+            out.push(span(rest[..=bang].to_string(), base));
+        } else {
+            if start > 0 {
+                out.push(span(before[..start].to_string(), base));
+            }
+            out.push(span(rest[start..=bang].to_string(), macro_color));
+        }
+        rest = &rest[bang + 1..];
+    }
+    if !rest.is_empty() {
+        out.push(span(rest.to_string(), base));
+    }
     out
 }
 
@@ -775,9 +794,9 @@ fn list_rows(start: Option<u64>, items: &[Item], width: u16, ctx: &Ctx) -> Vec<L
                     format!("{}.", first.saturating_add(index as u64)),
                     width = label_width
                 ),
-                theme.muted,
+                ctx.base,
             )],
-            None => vec![span(format!("{} ", glyph::TICK), theme.border)],
+            None => vec![span("- ", ctx.base)],
         };
         match item.task {
             Some(true) => marker.push(span(format!("{} ", glyph::DONE), theme.success)),
@@ -787,8 +806,6 @@ fn list_rows(start: Option<u64>, items: &[Item], width: u16, ctx: &Ctx) -> Vec<L
         let hang = run_width(&marker);
         let body = render_blocks(&item.blocks, width.saturating_sub(hang), ctx, false);
         if body.is_empty() {
-            // A bare marker — `* ` as it streams in — with no space hanging
-            // off it.
             if let Some(last) = marker.last_mut() {
                 last.content = last.content.trim_end().to_string().into();
             }
@@ -796,11 +813,7 @@ fn list_rows(start: Option<u64>, items: &[Item], width: u16, ctx: &Ctx) -> Vec<L
             continue;
         }
         for (row, line) in body.into_iter().enumerate() {
-            out.push(if row == 0 {
-                prefixed(marker.clone(), line)
-            } else {
-                indent(hang, line.spans)
-            });
+            out.push(if row == 0 { prefixed(marker.clone(), line) } else { indent(hang, line.spans) });
         }
     }
     out

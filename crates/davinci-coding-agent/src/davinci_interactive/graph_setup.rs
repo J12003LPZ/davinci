@@ -87,6 +87,7 @@ impl Setup {
             key: "/graph setup".into(),
             note,
             items,
+            ..Default::default()
         }
     }
 }
