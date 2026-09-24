@@ -13,7 +13,7 @@ use davinci_agent::{
     ToolApprovalDecision, ToolApprovalRequest,
 };
 use davinci_tui::davinci::model::{
-    Ask, CatalogRow, Choice, Compaction, CorpusItem, Credential, Entry, ExportLedger, FailedRun,
+    Ask, AskKind, CatalogRow, Choice, Compaction, CorpusItem, Credential, Entry, ExportLedger, FailedRun,
     Finding, GovernorCounter, GovernorSheet, GovernorStored, GraphRunSheet, GraphTask, Hunk,
     HunkKind, KeymapGroup, McpServerRow, McpSheet, Model, ModelItem, Overlay, PermissionRow,
     PickerItem, PlanStep, ProviderRow, ResumeRow, ReviewFile, ReviewSheet, Screen, SecurityScan,
@@ -839,6 +839,9 @@ impl Turn {
         if let Some(Entry::Thinking { text, .. }) = model.transcript.get_mut(index) {
             text.push_str(delta);
         }
+        if let Some(working) = model.working.as_mut() {
+            working.reasoning = true;
+        }
     }
 
     /// Close the live reasoning row, if any: it collapses to its one-line
@@ -860,6 +863,10 @@ impl Turn {
         {
             *live = false;
             *took = seconds;
+        }
+        if let Some(working) = model.working.as_mut() {
+            working.reasoning = false;
+            working.thought_for = Some(seconds);
         }
     }
 
@@ -1059,6 +1066,11 @@ pub fn hunks_from_diff(diff: &str) -> (u32, u32, Vec<Hunk>) {
         // `NN text` — the number column, then one space, then the text.
         let trimmed = rest.trim_start();
         let digits = trimmed.chars().take_while(|ch| ch.is_ascii_digit()).count();
+        let line_number = if digits > 0 {
+            trimmed[..digits].parse::<u32>().ok()
+        } else {
+            None
+        };
         let text = if digits > 0 {
             trimmed[digits..]
                 .strip_prefix(' ')
@@ -1079,6 +1091,8 @@ pub fn hunks_from_diff(diff: &str) -> (u32, u32, Vec<Hunk>) {
         };
         if kind == HunkKind::Context && text.trim() == "..." {
             hunks.push(Hunk::new(HunkKind::Context, "…"));
+        } else if let Some(line_number) = line_number {
+            hunks.push(Hunk::at(kind, line_number, text));
         } else {
             hunks.push(Hunk::new(kind, text));
         }
@@ -1432,11 +1446,19 @@ fn run_turn(
     let jobs = agent.tool_context.jobs.clone();
     // The working line above the composer, for as long as the turn runs.
     let started = Instant::now();
+    let verb_seed = model
+        .transcript
+        .iter()
+        .filter(|entry| matches!(entry, Entry::User(_)))
+        .count() as u64;
     model.working = Some(Working {
         seconds: 0,
         tokens: 0,
         thinking: thinking_effort(agent),
         interrupting: false,
+        verb_seed,
+        reasoning: false,
+        thought_for: None,
     });
     if model.terminal_progress {
         let _ = session.set_progress(true);
@@ -1707,7 +1729,7 @@ fn run_turn(
     }
     let interrupted = abort.load(Ordering::Relaxed);
     // The turn is over: the working line goes with it.
-    model.working = None;
+    let finished_working = model.working.take();
     turn.close(model, interrupted);
 
     for entry in turn_outcome(
@@ -1718,6 +1740,15 @@ fn run_turn(
         &reply,
     ) {
         model.transcript.push(entry);
+    }
+    if !interrupted {
+        if let Some(working) = finished_working {
+            model.transcript.push(Entry::Gap);
+            model.transcript.push(Entry::Done {
+                verb: working.past_verb().to_string(),
+                seconds: started.elapsed().as_secs(),
+            });
+        }
     }
     if let Some(warning) = davinci_ai::codex_usage::take_warning() {
         model.transcript.push(Entry::Gap);
@@ -2713,33 +2744,78 @@ pub fn permission_ask(request: &ToolApprovalRequest, trusted: bool) -> Ask {
         .host_choices(trusted)
         .into_iter()
         .map(|choice| match choice {
-            ToolApprovalDecision::AllowOnce => PickerItem::new("allow once", "runs this call only"),
-            ToolApprovalDecision::AllowForSession => {
-                PickerItem::new("allow for this session", &format!("{rule} until pi exits"))
-            }
-            ToolApprovalDecision::AllowAlways => PickerItem::new(
-                "always allow here",
-                &format!("{rule} saved to .pi/settings.json"),
+            ToolApprovalDecision::AllowOnce => PickerItem::new("Yes", ""),
+            ToolApprovalDecision::AllowForSession => PickerItem::new(
+                &format!("Yes, and don't ask again this session for: {rule}"),
+                "",
             ),
-            ToolApprovalDecision::Deny => PickerItem::new("deny", "the model is told no"),
+            ToolApprovalDecision::AllowAlways => {
+                PickerItem::new(&format!("Yes, and don't ask again for: {rule}"), "")
+            }
+            ToolApprovalDecision::Deny => PickerItem::new("No", ""),
         })
         .collect();
     if offers_denial_instructions(request) {
         items.push(PickerItem::new(
-            "deny with instructions",
-            "tell the model what to do instead; this call will not run",
+            "No, and tell the model what to do differently",
+            "",
         ));
     }
-    let mut note = request.summary.clone();
-    if request.outside_project {
-        note.push_str(" · outside the project");
-    }
+    let file_tool = matches!(
+        request.tool.as_str(),
+        "edit" | "write" | "notebook_edit" | "apply_patch"
+    );
+    let shell_tool = matches!(request.tool.as_str(), "bash" | "powershell");
+    let subject = if request.outside_project {
+        format!("{} · outside the project", request.subject)
+    } else {
+        request.subject.clone()
+    };
+    let name = std::path::Path::new(&request.subject)
+        .file_name()
+        .map(|name| name.to_string_lossy().to_string())
+        .unwrap_or_else(|| request.subject.clone());
+    let question = if request.tool == "write" {
+        format!("Do you want to create {name}?")
+    } else if file_tool {
+        format!("Do you want to make this edit to {name}?")
+    } else {
+        "Do you want to proceed?".to_string()
+    };
     Ask {
-        title: "Permission".into(),
+        title: permission_title(&request.tool, false),
         name: "PERMISSION".into(),
         key: "/permissions".into(),
-        note,
+        note: request.summary.clone(),
+        subject,
+        question,
+        preview: Vec::new(),
+        kind: if shell_tool {
+            AskKind::Shell
+        } else if file_tool {
+            AskKind::File
+        } else {
+            AskKind::List
+        },
         items,
+    }
+}
+
+pub fn permission_title(tool: &str, exists: bool) -> String {
+    match tool {
+        "bash" => "Bash command".into(),
+        "powershell" => "PowerShell command".into(),
+        "edit" | "notebook_edit" | "apply_patch" => "Edit file".into(),
+        "write" if exists => "Overwrite file".into(),
+        "write" => "Create file".into(),
+        other => {
+            let words = other.replace('_', " ");
+            let mut chars = words.chars();
+            match chars.next() {
+                Some(first) => format!("{}{}", first.to_uppercase(), chars.as_str()),
+                None => "Tool".into(),
+            }
+        }
     }
 }
 
@@ -2784,7 +2860,8 @@ pub fn scope_expansion_ask(
                 "keep the current contract and provide host-authored guidance",
             ),
         ],
-    }
+,
+        ..Default::default()    }
 }
 
 /// Map only the three scope-expansion rows to trusted-host decisions.
@@ -4077,6 +4154,7 @@ pub fn run(
 
     let cwd = agent.cwd.clone();
     let mut model = davinci_tui::davinci::boot(raw, 100, 44);
+    model.placeholder = (std::process::id() as usize) % 3;
     let session_dir = davinci_session::default_session_dir();
     model.cwd = cwd.display().to_string();
     model.startup = crate::davinci_sources::startup(&cwd, "", !agent.messages.is_empty());
@@ -7673,30 +7751,18 @@ fn run_user_bash(shell: &mut Shell<'_>, line: &str) -> Next {
     let say_output = |shell: &mut Shell<'_>, output: &str, failed: bool| {
         shell.model.running = false;
         shell.model.transcript.push(Entry::Gap);
-        let lines: Vec<&str> = output
+        let lines: Vec<String> = output
             .lines()
             .map(str::trim_end)
             .filter(|line| !line.is_empty())
+            .take(20)
+            .map(|line| clip(line, 100))
             .collect();
-        let summary = if lines.len() == 1 {
-            "1 line".to_string()
-        } else {
-            format!("{} lines", lines.len())
-        };
-        shell.model.transcript.push(
-            Entry::tool(state_of("bash", failed), "manus", &clip(command, 60), None)
-                .summarised(&summary),
-        );
-        let shown = lines.len().min(20);
-        for line in &lines[..shown] {
-            shell.model.transcript.push(Entry::detail(&clip(line, 100)));
-        }
-        if lines.len() > shown {
-            shell
-                .model
-                .transcript
-                .push(Entry::detail(&format!("… {} more", lines.len() - shown)));
-        }
+        shell.model.transcript.push(Entry::Shell {
+            command: command.to_string(),
+            output: lines,
+            failed,
+        });
     };
 
     // An extension may have run the command itself.
