@@ -204,11 +204,13 @@ fn answer_metadata(
         }
         DecisionAnswer::Score {
             score,
+            levels,
             probabilities,
             confidence,
         } => {
             metadata.answer_type = "score".to_owned();
-            metadata.value = Some(*score);
+            // Normalized to 0..1 so scales with different level counts compare.
+            metadata.value = Some(score / levels.saturating_sub(1).max(1) as f32);
             metadata.confidence = Some(*confidence);
             metadata.probability_margin = distribution_margin(probabilities);
         }
@@ -243,8 +245,13 @@ mod tests {
         answers.insert(
             "change_impact_relevant".to_owned(),
             DecisionAnswer::Score {
-                score: 0.8,
-                probabilities: BTreeMap::from([("low".to_owned(), 0.2), ("high".to_owned(), 0.8)]),
+                score: 1.6,
+                levels: 3,
+                probabilities: BTreeMap::from([
+                    ("0".to_owned(), 0.0),
+                    ("1".to_owned(), 0.4),
+                    ("2".to_owned(), 0.6),
+                ]),
                 confidence: 0.8,
             },
         );
@@ -256,6 +263,7 @@ mod tests {
         telemetry.record_answers(
             &DecisionResponse {
                 answers,
+                model: None,
                 input_tokens: None,
                 output_tokens: None,
             },
@@ -279,6 +287,13 @@ mod tests {
         assert_eq!(browser.choice.as_deref(), Some("browser"));
         assert_eq!(browser.confidence, Some(0.92));
         assert!((browser.probability_margin.unwrap_or_default() - 0.8).abs() < 0.001);
+        let score = snapshot
+            .answers
+            .iter()
+            .find(|answer| answer.question_id == "change_impact_relevant")
+            .expect("score metadata");
+        // Level position 1.6 on a 0..=2 scale is recorded as 0.8.
+        assert!((score.value.unwrap_or_default() - 0.8).abs() < 0.001);
     }
 
     #[test]
@@ -291,6 +306,7 @@ mod tests {
         let telemetry = DecisionTelemetry::default();
         let response = DecisionResponse {
             answers,
+            model: None,
             input_tokens: None,
             output_tokens: None,
         };
