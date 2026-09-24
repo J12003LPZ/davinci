@@ -335,11 +335,6 @@ fn run(raw: Vec<String>) -> Result<i32, String> {
         std::env::set_var("PI_DAVINCI", "0");
     }
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-    apply_http_proxy_settings(
-        load_merged_settings(&default_agent_dir(), &cwd)
-            .http_proxy
-            .as_deref(),
-    );
     tools_manager::prepend_tools_bin_to_path();
     if is_package_command(raw.first().map(String::as_str)) {
         let command = raw[0].as_str();
@@ -349,6 +344,8 @@ fn run(raw: Vec<String>) -> Result<i32, String> {
         }
         let agent_dir = default_agent_dir();
         packages::ensure_agent_dir(&agent_dir)?;
+        let user_settings = load_settings(&agent_dir);
+        apply_http_proxy_settings(user_settings.http_proxy.as_deref());
         println!(
             "{}",
             handle_package_command(command, &raw[1..], &agent_dir)?
@@ -611,6 +608,37 @@ fn build_agent(parsed: &Args, session_dir: &Path, cwd: &Path) -> Result<Agent, S
         cwd,
         parsed.project_trust_override,
     );
+    // set_var is only sound before other threads exist. These values are
+    // resolved from trust-aware merged settings before MCP or extension
+    // runners can spawn any background work.
+    if let Some(ms) = settings.websocket_connect_timeout_ms {
+        std::env::set_var("PI_WEBSOCKET_CONNECT_TIMEOUT_MS", ms.to_string());
+    }
+    if let Some(value) = settings.openai_verbosity.as_deref() {
+        std::env::set_var("DAVINCI_OPENAI_VERBOSITY", value);
+    }
+    if let Some(value) = settings.reasoning_summary.as_deref() {
+        std::env::set_var("DAVINCI_REASONING_SUMMARY", value);
+    }
+    if let Some(value) = settings.graph_economy_model.as_deref() {
+        std::env::set_var("DAVINCI_GRAPH_ECONOMY_MODEL", value);
+    }
+    let (images, true_color, hyperlinks) = settings.terminal_capability_overrides();
+    if let Some(kind) = images {
+        std::env::set_var("PI_TERMINAL_IMAGES", kind);
+    }
+    if let Some(value) = true_color {
+        std::env::set_var("PI_TERMINAL_TRUECOLOR", if value { "1" } else { "0" });
+    }
+    if let Some(value) = hyperlinks {
+        std::env::set_var("PI_TERMINAL_HYPERLINKS", if value { "1" } else { "0" });
+    }
+    if let Some(path) = settings.shell_path.as_deref() {
+        std::env::set_var("PI_SHELL", path);
+    }
+    if let Some(prefix) = settings.shell_command_prefix.as_deref() {
+        std::env::set_var("PI_SHELL_COMMAND_PREFIX", prefix);
+    }
     let env_profile = std::env::var("DAVINCI_PROMPT_PROFILE")
         .ok()
         .or_else(|| std::env::var("PI_PROMPT_PROFILE").ok());
@@ -840,34 +868,6 @@ fn build_agent(parsed: &Args, session_dir: &Path, cwd: &Path) -> Result<Agent, S
     agent.auto_resize_images = settings.image_auto_resize();
     agent.transport = settings.transport.clone();
     agent.install_telemetry = settings.install_telemetry_enabled();
-    if let Some(ms) = settings.websocket_connect_timeout_ms {
-        std::env::set_var("PI_WEBSOCKET_CONNECT_TIMEOUT_MS", ms.to_string());
-    }
-    if let Some(value) = settings.openai_verbosity.as_deref() {
-        std::env::set_var("DAVINCI_OPENAI_VERBOSITY", value);
-    }
-    if let Some(value) = settings.reasoning_summary.as_deref() {
-        std::env::set_var("DAVINCI_REASONING_SUMMARY", value);
-    }
-    if let Some(value) = settings.graph_economy_model.as_deref() {
-        std::env::set_var("DAVINCI_GRAPH_ECONOMY_MODEL", value);
-    }
-    let (images, true_color, hyperlinks) = settings.terminal_capability_overrides();
-    if let Some(kind) = images {
-        std::env::set_var("PI_TERMINAL_IMAGES", kind);
-    }
-    if let Some(value) = true_color {
-        std::env::set_var("PI_TERMINAL_TRUECOLOR", if value { "1" } else { "0" });
-    }
-    if let Some(value) = hyperlinks {
-        std::env::set_var("PI_TERMINAL_HYPERLINKS", if value { "1" } else { "0" });
-    }
-    if let Some(path) = settings.shell_path.as_deref() {
-        std::env::set_var("PI_SHELL", path);
-    }
-    if let Some(prefix) = settings.shell_command_prefix.as_deref() {
-        std::env::set_var("PI_SHELL_COMMAND_PREFIX", prefix);
-    }
     let mut extensions = if parsed.no_extensions {
         parsed.extensions.clone()
     } else {
