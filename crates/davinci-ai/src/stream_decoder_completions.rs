@@ -228,19 +228,28 @@ impl CompletionsDecoder {
             .and_then(Value::as_str)
             .unwrap_or("");
 
-        let found = stream_index
-            .and_then(|index| {
+        let by_index = stream_index.and_then(|index| {
+            self.tool_calls
+                .iter()
+                .rposition(|slot| slot.stream_index == Some(index))
+        });
+        // Some providers reuse an index for parallel calls. A distinct id
+        // means this fragment starts another call, while id-less fragments
+        // continue the latest call using that index.
+        let by_index = by_index.filter(|position| match id {
+            Some(id) => {
+                let slot_id = self.block_id(self.tool_calls[*position].content_index);
+                slot_id.is_empty() || slot_id == id
+            }
+            None => true,
+        });
+        let found = by_index.or_else(|| {
+            id.and_then(|id| {
                 self.tool_calls
                     .iter()
-                    .position(|slot| slot.stream_index == Some(index))
+                    .position(|slot| self.block_id(slot.content_index) == id)
             })
-            .or_else(|| {
-                id.and_then(|id| {
-                    self.tool_calls
-                        .iter()
-                        .position(|slot| self.block_id(slot.content_index) == id)
-                })
-            });
+        });
         let position = match found {
             Some(position) => position,
             None => {
@@ -838,6 +847,32 @@ data: [DONE]
             .collect();
         assert_eq!(end_indices, [0, 1]);
         assert_eq!(names(&events).last(), Some(&"done"));
+    }
+
+    #[test]
+    fn same_index_different_ids_are_two_tool_calls() {
+        let corpus = r#"
+data: {"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"a","function":{"name":"read","arguments":"{\"path\":\"x\"}"}}]},"finish_reason":null}]}
+
+data: {"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"b","function":{"name":"read","arguments":"{\"path\":\"y\"}"}}]},"finish_reason":null}]}
+
+data: {"choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}
+
+data: [DONE]
+"#;
+        let (message, _) = run(corpus);
+        let calls: Vec<_> = message
+            .content
+            .iter()
+            .filter_map(|block| match block {
+                ContentBlock::ToolCall { id, arguments, .. } => Some((id.as_str(), arguments)),
+                _ => None,
+            })
+            .collect();
+
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0], ("a", &serde_json::json!({"path": "x"})));
+        assert_eq!(calls[1], ("b", &serde_json::json!({"path": "y"})));
     }
 
     #[test]
