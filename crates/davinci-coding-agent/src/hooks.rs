@@ -729,7 +729,20 @@ pub fn run_supervised_hook(
 }
 
 pub fn status_report(cwd: &Path) -> Value {
-    let hooks = load(&davinci_session::default_agent_dir(), cwd, true);
+    let agent_dir = davinci_session::default_agent_dir();
+    status_report_with_agent_dir(&agent_dir, cwd)
+}
+
+fn status_report_with_agent_dir(agent_dir: &Path, cwd: &Path) -> Value {
+    let settings = crate::settings::load_merged_settings(agent_dir, cwd);
+    let trusted = crate::trust::resolve_project_trusted(
+        agent_dir,
+        cwd,
+        None,
+        settings.default_project_trust.as_deref(),
+        &settings.trusted_projects,
+    );
+    let hooks = load(agent_dir, cwd, trusted);
     serde_json::json!({
         "trusted": hooks.project_trusted,
         "projectPath": hooks.project_path.as_ref().map(|p| p.to_string_lossy()),
@@ -804,6 +817,24 @@ mod tests {
                 format!("cat > '{capture}'; exit {code}"),
             ]
         }
+    }
+
+    #[test]
+    fn status_report_does_not_trust_project_hooks_by_default() {
+        let dir = tempfile::tempdir().unwrap();
+        let agent = dir.path().join("agent");
+        let project = dir.path().join("proj");
+        std::fs::create_dir_all(&agent).unwrap();
+        std::fs::create_dir_all(project.join(".pi")).unwrap();
+        std::fs::write(
+            project.join(".pi").join("hooks.json"),
+            r#"{"rules":[{"event":"beforeWrite","action":["true"]}]}"#,
+        )
+        .unwrap();
+
+        let report = status_report_with_agent_dir(&agent, &project);
+        assert_eq!(report["trusted"], false);
+        assert_eq!(report["rulesCount"], 0);
     }
 
     #[test]
