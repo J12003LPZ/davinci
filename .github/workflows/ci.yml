@@ -270,10 +270,11 @@ jobs:
         run: cargo test -p davinci-coding-agent runtime_migration_preserves_ecosystem_baseline -- --nocapture
 
   workspace-test-shards:
-    name: workspace-test (${{ matrix.package }})
+    name: workspace-test (${{ matrix.os }}, ${{ matrix.package }})
     strategy:
       fail-fast: false
       matrix:
+        os: [ubuntu-latest, windows-latest]
         package:
           - davinci-agent
           - davinci-ai
@@ -286,10 +287,14 @@ jobs:
           - davinci-server
           - davinci-session
           - davinci-session-sqlite
+          - davinci-sys
           - davinci-telemetry
           - davinci-tui
           - davinci-voice
-    runs-on: ubuntu-latest
+        exclude:
+          - os: windows-latest
+            package: davinci-voice
+    runs-on: ${{ matrix.os }}
     env:
       CARGO_INCREMENTAL: "0"
     steps:
@@ -302,9 +307,16 @@ jobs:
           set -euo pipefail
           umask 077
           if [[ "${{ matrix.package }}" == "davinci-coding-agent" ]]; then
-            cargo build -p davinci-coding-agent --bin davinci
+            cargo build -p davinci-coding-agent --bin davinci --locked
           fi
-          cargo test -p "${{ matrix.package }}"
+          cargo test -p "${{ matrix.package }}" --locked
+      - name: Release build contains no credential fixtures
+        if: matrix.os == 'ubuntu-latest' && matrix.package == 'davinci-coding-agent'
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo build --release -p davinci-coding-agent --bin davinci --locked
+          ! strings target/release/davinci | grep -E "PI_OAUTH_FIXTURE|PI_OAUTH_REFRESH_URL|PI_OAUTH_TOKEN_URL|PI_MCP_FIXTURE|PI_SECURITY_SCAN_FIXTURE"
 
   workspace-tests:
     needs: workspace-test-shards
