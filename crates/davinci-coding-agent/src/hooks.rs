@@ -402,15 +402,7 @@ pub fn load(agent_dir: &Path, cwd: &Path, trusted: bool) -> HooksFile {
     let mut file = load_path(&agent_dir.join("hooks.json"));
     file.project_trusted = trusted;
     if trusted {
-        let davinci_path = cwd.join(".davinci").join("hooks.json");
-        let pi_path = cwd.join(".pi").join("hooks.json");
-        let project_path = if davinci_path.exists() {
-            Some(davinci_path)
-        } else if pi_path.exists() {
-            Some(pi_path)
-        } else {
-            None
-        };
+        let project_path = crate::project_config::resolve(cwd, "hooks.json");
         if let Some(p) = project_path {
             if let Ok(bytes) = std::fs::read(&p) {
                 file.content_hash = Some(compute_sha256(&bytes));

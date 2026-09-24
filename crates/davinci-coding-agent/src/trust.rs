@@ -8,6 +8,8 @@ use serde_json::Value;
 
 use crate::settings::with_settings_lock;
 
+/// Project resources under either config directory that can run code or change
+/// the agent's prompt or permissions. Keep in sync with every project loader.
 const TRUST_REQUIRING_PROJECT_CONFIG_RESOURCES: &[&str] = &[
     "settings.json",
     "extensions",
@@ -17,6 +19,10 @@ const TRUST_REQUIRING_PROJECT_CONFIG_RESOURCES: &[&str] = &[
     "SYSTEM.md",
     "APPEND_SYSTEM.md",
     "hooks.json",
+    "mcp.json",
+    "agents",
+    "git",
+    "npm",
 ];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -207,16 +213,7 @@ pub fn has_trust_requiring_project_resources(cwd: &Path) -> bool {
     let user_agents_skills = PathBuf::from(&home).join(".agents").join("skills");
     let user_agents_skills = canonicalize_trust_path(&user_agents_skills);
     let mut current = PathBuf::from(canonicalize_trust_path(cwd));
-    let davinci_dir = current.join(".davinci");
-    let config_dir = if davinci_dir.exists() {
-        davinci_dir
-    } else {
-        current.join(".pi")
-    };
-    if TRUST_REQUIRING_PROJECT_CONFIG_RESOURCES
-        .iter()
-        .any(|entry| config_dir.join(entry).exists())
-    {
+    if crate::project_config::any_exists(&current, TRUST_REQUIRING_PROJECT_CONFIG_RESOURCES) {
         return true;
     }
     loop {
@@ -402,6 +399,56 @@ mod tests {
             &project,
             None,
             Some("always"),
+            &[]
+        ));
+    }
+
+    #[test]
+    fn project_mcp_config_requires_trust() {
+        let dir = tempdir().unwrap();
+        let cwd = dir.path().join("repo");
+        fs::create_dir_all(cwd.join(".pi")).unwrap();
+        fs::write(
+            cwd.join(".pi").join("mcp.json"),
+            r#"{"mcpServers":{"x":{"command":"calc"}}}"#,
+        )
+        .unwrap();
+        assert!(has_trust_requiring_project_resources(&cwd));
+    }
+
+    #[test]
+    fn empty_davinci_dir_does_not_hide_legacy_hooks() {
+        let dir = tempdir().unwrap();
+        let cwd = dir.path().join("repo");
+        fs::create_dir_all(cwd.join(".davinci")).unwrap();
+        fs::write(cwd.join(".davinci").join("README"), "").unwrap();
+        fs::create_dir_all(cwd.join(".pi")).unwrap();
+        fs::write(cwd.join(".pi").join("hooks.json"), "{}").unwrap();
+        assert!(has_trust_requiring_project_resources(&cwd));
+    }
+
+    #[test]
+    fn project_agents_and_local_package_roots_require_trust() {
+        for name in ["agents", "git", "npm"] {
+            let dir = tempdir().unwrap();
+            let cwd = dir.path().join("repo");
+            fs::create_dir_all(cwd.join(".pi").join(name)).unwrap();
+            assert!(has_trust_requiring_project_resources(&cwd), "{name}");
+        }
+    }
+
+    #[test]
+    fn untrusted_repo_with_only_mcp_json_is_not_auto_trusted() {
+        let dir = tempdir().unwrap();
+        let agent = dir.path().join("agent");
+        let cwd = dir.path().join("repo");
+        fs::create_dir_all(cwd.join(".pi")).unwrap();
+        fs::write(cwd.join(".pi").join("mcp.json"), "{}").unwrap();
+        assert!(!resolve_project_trusted(
+            &agent,
+            &cwd,
+            None,
+            Some("ask"),
             &[]
         ));
     }

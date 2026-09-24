@@ -954,12 +954,8 @@ pub fn load_security_scan_config(
     if !trusted {
         return Ok(global);
     }
-    let current = cwd.join(CONFIG_DIR_NAME).join("settings.json");
-    let project = if current.exists() {
-        current
-    } else {
-        cwd.join(LEGACY_CONFIG_DIR_NAME).join("settings.json")
-    };
+    let [current, legacy] = crate::project_config::candidates(cwd, "settings.json");
+    let project = if current.exists() { current } else { legacy };
     global.narrow_with(&read(&project)?)
 }
 
@@ -1008,12 +1004,8 @@ pub fn load_merged_settings_with_override(
     ) {
         return global;
     }
-    let project_davinci = cwd.join(CONFIG_DIR_NAME).join("settings.json");
-    let project_path = if project_davinci.exists() {
-        project_davinci
-    } else {
-        cwd.join(LEGACY_CONFIG_DIR_NAME).join("settings.json")
-    };
+    let [current, legacy] = crate::project_config::candidates(cwd, "settings.json");
+    let project_path = if current.exists() { current } else { legacy };
     let project = load_settings_value(&project_path);
     let merged = enforce_decision_intelligence_user_boundary(
         &global_value,
