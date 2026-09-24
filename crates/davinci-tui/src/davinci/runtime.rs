@@ -108,6 +108,15 @@ fn panic_restores_terminal() -> bool {
 }
 static MOUSE: AtomicBool = AtomicBool::new(false);
 
+#[cfg(unix)]
+const MOUSE_ON: &str = "\x1b[?1000h\x1b[?1002h\x1b[?1006h";
+#[cfg(unix)]
+const MOUSE_OFF: &str = "\x1b[?1006l\x1b[?1002l\x1b[?1000l";
+
+fn event_marks_dirty(event: &Event) -> bool {
+    !matches!(event, Event::Mouse(mouse) if mouse.kind == event::MouseEventKind::Moved)
+}
+
 /// Undo everything [`Session::open`] did, from anywhere, at most once.
 ///
 /// Idempotent and safe to call when the terminal was never taken.
@@ -119,7 +128,16 @@ pub fn restore() -> io::Result<()> {
         let _ = execute!(io::stdout(), PopKeyboardEnhancementFlags);
     }
     if MOUSE.swap(false, Ordering::SeqCst) {
-        let _ = execute!(io::stdout(), event::DisableMouseCapture);
+        #[cfg(unix)]
+        {
+            let mut out = io::stdout();
+            let _ = out.write_all(MOUSE_OFF.as_bytes());
+            let _ = out.flush();
+        }
+        #[cfg(windows)]
+        {
+            let _ = execute!(io::stdout(), event::DisableMouseCapture);
+        }
     }
     let _ = execute!(io::stdout(), DisableBracketedPaste);
     let _ = execute!(io::stdout(), LeaveAlternateScreen, Show);
@@ -426,6 +444,9 @@ impl Session {
                 if matches!(ready, Event::Resize(..)) {
                     self.mic_rect = None;
                 }
+                if matches!(ready, Event::Mouse(mouse) if mouse.kind == event::MouseEventKind::Moved) {
+                    continue;
+                }
                 return Ok(Some(ready));
             }
             // While a partial marker is held, wait only briefly: the rest of
@@ -449,6 +470,9 @@ impl Session {
             if let Some(ready) = self.paste.next_ready() {
                 if matches!(ready, Event::Resize(..)) {
                     self.mic_rect = None;
+                }
+                if matches!(ready, Event::Mouse(mouse) if mouse.kind == event::MouseEventKind::Moved) {
+                    continue;
                 }
                 return Ok(Some(ready));
             }
@@ -485,10 +509,19 @@ impl Session {
         self.mic_rect = None;
         let mouse = true;
         if mouse != MOUSE.load(Ordering::SeqCst) {
-            if mouse {
-                execute!(io::stdout(), event::EnableMouseCapture)?;
-            } else {
-                execute!(io::stdout(), event::DisableMouseCapture)?;
+            #[cfg(unix)]
+            {
+                let mut out = io::stdout();
+                out.write_all(if mouse { MOUSE_ON } else { MOUSE_OFF }.as_bytes())?;
+                out.flush()?;
+            }
+            #[cfg(windows)]
+            {
+                if mouse {
+                    execute!(io::stdout(), event::EnableMouseCapture)?;
+                } else {
+                    execute!(io::stdout(), event::DisableMouseCapture)?;
+                }
             }
             MOUSE.store(mouse, Ordering::SeqCst);
         }
@@ -678,10 +711,14 @@ pub fn run(model: &mut Model, mut on_submit: impl FnMut(&mut Model, String)) -> 
 
     let mut last_tick = Instant::now();
     loop {
-        session.draw(model)?;
+        if model.dirty {
+            session.draw(model)?;
+            model.dirty = false;
+        }
 
         let timeout = TICK.saturating_sub(last_tick.elapsed());
         if let Some(event) = session.poll_event(timeout)? {
+            model.dirty |= event_marks_dirty(&event);
             match event {
                 Event::Key(key) if key.kind != KeyEventKind::Release => {
                     match app::handle_key(model, key) {
@@ -711,6 +748,7 @@ pub fn run(model: &mut Model, mut on_submit: impl FnMut(&mut Model, String)) -> 
 
         if last_tick.elapsed() >= TICK {
             model.tick = model.tick.wrapping_add(1);
+            model.dirty = true;
             last_tick = Instant::now();
         }
     }
@@ -721,6 +759,21 @@ pub fn run(model: &mut Model, mut on_submit: impl FnMut(&mut Model, String)) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mouse_motion_does_not_mark_the_frame_dirty() {
+        let moved = Event::Mouse(event::MouseEvent {
+            kind: event::MouseEventKind::Moved,
+            column: 3,
+            row: 3,
+            modifiers: KeyModifiers::NONE,
+        });
+        assert!(!event_marks_dirty(&moved));
+        assert!(event_marks_dirty(&Event::Key(KeyEvent::new(
+            KeyCode::Char('a'),
+            KeyModifiers::NONE,
+        ))));
+    }
 
     #[test]
     fn graph_mouse_preserves_microphone_and_other_surfaces() {

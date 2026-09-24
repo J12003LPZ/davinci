@@ -1674,6 +1674,8 @@ pub struct Model {
     pub height: u16,
     /// One clock, 250ms per step, driving both animations (design.md §8).
     pub tick: u64,
+    /// Whether the next loop iteration needs to compose and paint a frame.
+    pub dirty: bool,
     /// Latest governor action, shown briefly without stealing keyboard focus.
     pub governor_notice: Option<(String, std::time::Instant)>,
     /// Reading position in graph, governor, and vector memory sheets.
@@ -1900,6 +1902,7 @@ impl Model {
             width,
             height,
             tick: 0,
+            dirty: true,
             governor_notice: None,
             feature_scroll: 0,
             section_offset: None,
