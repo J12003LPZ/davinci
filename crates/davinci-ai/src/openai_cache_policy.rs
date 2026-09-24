@@ -178,7 +178,11 @@ impl OpenAiCacheCapabilities {
                 // Public Responses diagnostics are not assumed to exist on the
                 // ChatGPT-backed adapter merely because its request shape is similar.
                 supports_cache_diagnostics: false,
-                supports_ttl_30m: false,
+                supports_ttl_30m: model
+                    .compat
+                    .get("supportsPromptCacheTtl")
+                    .and_then(|value| value.as_bool())
+                    .unwrap_or(false),
                 supports_native_item_replay: true,
                 supports_incremental_continuation: codex.incremental_continuation,
                 supports_paid_prewarm: codex.generate_false_prewarm,
