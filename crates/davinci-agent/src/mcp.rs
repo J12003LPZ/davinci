@@ -35,6 +35,7 @@ type SharedClient = Arc<Mutex<davinci_mcp::Client>>;
 #[derive(Default)]
 struct Inner {
     clients: BTreeMap<String, SharedClient>,
+    routes: BTreeMap<String, (String, String)>,
     trusted_read_only_servers: BTreeSet<String>,
     rows: Vec<McpServerRow>,
 }
@@ -181,6 +182,23 @@ impl McpRegistry {
         }
     }
 
+    /// Resolve one provider-visible MCP function name to the original server
+    /// and tool names captured at handshake time.
+    pub fn resolve_tool(&self, exposed: &str) -> Option<(String, String)> {
+        self.lock().routes.get(exposed).cloned()
+    }
+
+    pub fn call_exposed(
+        &self,
+        exposed: &str,
+        arguments: &Value,
+    ) -> Result<ToolResult, ToolError> {
+        let Some((server, tool)) = self.resolve_tool(exposed) else {
+            return Err(ToolError::Unknown(exposed.to_string()));
+        };
+        self.call(&server, &tool, arguments)
+    }
+
     /// The server's own handle, fetched under the registry lock and used
     /// after it is released.
     fn client(&self, server: &str) -> Result<SharedClient, ToolError> {
@@ -253,13 +271,13 @@ impl Inner {
         } else {
             "stdio"
         };
-        if !davinci_mcp::is_ident(name) {
+        if let Err(error) = davinci_mcp::validate_server_name(name) {
             self.rows.push(McpServerRow {
                 name: name.to_string(),
                 transport: transport_label.into(),
                 status: "error".into(),
                 tools: 0,
-                error: Some("name is not [A-Za-z0-9_-]+".into()),
+                error: Some(error),
                 skipped: Vec::new(),
             });
             return;
@@ -293,6 +311,12 @@ impl Inner {
             Ok(client) => {
                 let tools = client.tools.len();
                 let skipped = client.skipped.clone();
+                for tool in &client.tools {
+                    self.routes.insert(
+                        client.agent_tool_name(&tool.name),
+                        (name.to_string(), tool.name.clone()),
+                    );
+                }
                 if server.trust_read_only_hints {
                     self.trusted_read_only_servers.insert(name.to_string());
                 }
@@ -322,6 +346,7 @@ impl Inner {
 
     fn drop_server(&mut self, name: &str, error: String) {
         self.clients.remove(name);
+        self.routes.retain(|_, (server, _)| server != name);
         self.trusted_read_only_servers.remove(name);
         if let Some(row) = self.rows.iter_mut().find(|row| row.name == name) {
             row.status = "error".into();
@@ -462,6 +487,10 @@ mod tests {
         )
         .unwrap();
         assert_eq!(result.content, "hi");
+        assert_eq!(
+            registry.resolve_tool("mcp__memory__echo"),
+            Some(("memory".to_string(), "echo".to_string()))
+        );
         let read = crate::execute_tool_with(
             Path::new("."),
             "mcp_read",
@@ -470,6 +499,43 @@ mod tests {
         )
         .unwrap();
         assert_eq!(read.content, "a note");
+    }
+
+    #[test]
+    fn shortened_tool_names_resolve_to_the_original_tool() {
+        let long = "x".repeat(80);
+        let (_dir, config) = http_fixture(&format!(
+            r#"{{
+              "initialize": {{"protocolVersion":"2025-03-26","capabilities":{{}},"serverInfo":{{"name":"f","version":"0"}}}},
+              "tools/list": {{"tools":[{{"name":{},"inputSchema":{{"type":"object"}}}}]}},
+              "tools/call": {{"content":[{{"type":"text","text":"ok"}}]}},
+              "resources/list": {{"resources":[]}}
+            }}"#,
+            serde_json::to_string(&long).unwrap()
+        ));
+        let registry = McpRegistry::connect(&config, Path::new("."));
+        let exposed = registry.tool_names().into_iter().next().unwrap();
+        assert!(exposed.len() <= 64, "{exposed}");
+        assert_eq!(
+            registry.resolve_tool(&exposed),
+            Some(("memory".to_string(), long.clone()))
+        );
+        assert_eq!(
+            registry.call_exposed(&exposed, &json!({})).unwrap().content,
+            "ok"
+        );
+    }
+
+    #[test]
+    fn ambiguous_server_names_become_error_rows() {
+        let config = davinci_mcp::parse_config(
+            r#"{"mcpServers":{"my__srv":{"command":"does-not-run"},"a_":{"command":"does-not-run"}}}"#
+        ).unwrap();
+        let registry = McpRegistry::connect(&config, Path::new("."));
+        let rows = registry.rows();
+        assert_eq!(rows.len(), 2);
+        assert!(rows.iter().all(|row| row.status == "error"));
+        assert!(rows.iter().all(|row| row.error.as_deref().is_some_and(|e| e.contains("server name"))));
     }
 
     #[test]

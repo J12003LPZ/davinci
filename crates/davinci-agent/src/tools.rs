@@ -1025,10 +1025,7 @@ fn mcp_call_tool(
     input: &serde_json::Value,
     context: &ToolContext,
 ) -> Result<ToolResult, ToolError> {
-    let Some((server, tool)) = davinci_mcp::split_agent_tool_name(name) else {
-        return Err(ToolError::Unknown(name.to_string()));
-    };
-    context.mcp.call(server, tool, input)
+    context.mcp.call_exposed(name, input)
 }
 
 fn update_plan_parameters() -> Value {
