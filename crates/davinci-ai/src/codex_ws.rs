@@ -66,12 +66,9 @@ pub fn process_codex_websocket(
     if !allows_live_websocket(url) {
         return Err("WebSocket transport is not available in this runtime".into());
     }
-    let (continuation_hit, continuation) =
+    let (_, continuation) =
         acquire_cached_continuation(cache_session_id, account_id, Instant::now());
-    let _ = continuation_hit;
-    let (request_body, used_delta) =
-        build_cached_websocket_request_body(body, continuation.as_ref());
-    let _ = used_delta;
+    let (request_body, _) = build_cached_websocket_request_body(body, continuation.as_ref());
     let acquired = acquire_live_socket(
         url,
         headers,
