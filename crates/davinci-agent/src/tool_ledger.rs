@@ -15,6 +15,7 @@ use crate::runtime::{conservative_replay_policy, ReplayPolicy};
 
 const MAX_STORED_OUTPUT: usize = 64 * 1024;
 const MAX_TERMINAL_RECORDS: usize = 256;
+const MAX_JOURNAL_BYTES: u64 = 48 * 1024 * 1024;
 const OUTPUT_TRUNCATED_MARKER: &str = "\n[output truncated in ledger; digest covers the full text]";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -122,6 +123,13 @@ fn compute_digest(content: &str) -> String {
     format!("{:x}", hasher.finalize())
 }
 
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(tag = "event", rename_all = "snake_case")]
+enum LedgerJournalEvent {
+    Upsert { record: ToolCallRecord },
+    Remove { call_id: String },
+}
+
 fn bounded_output(output: &str) -> String {
     if output.len() <= MAX_STORED_OUTPUT {
         return output.to_string();
@@ -196,6 +204,75 @@ fn atomic_write_json(path: &Path, bytes: &[u8]) -> Result<(), String> {
     write_result
 }
 
+fn journal_path(path: &Path) -> PathBuf {
+    let name = path
+        .file_name()
+        .unwrap_or_else(|| std::ffi::OsStr::new("ledger"))
+        .to_string_lossy();
+    path.with_file_name(format!("{name}.events.jsonl"))
+}
+
+fn read_journal(
+    path: &Path,
+    repair_torn_tail: bool,
+) -> Result<(Vec<LedgerJournalEvent>, Vec<u8>), String> {
+    let mut bytes = match std::fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok((Vec::new(), Vec::new()))
+        }
+        Err(error) => return Err(error.to_string()),
+    };
+    let complete_len = bytes
+        .iter()
+        .rposition(|byte| *byte == b'\n')
+        .map_or(0, |index| index + 1);
+    if repair_torn_tail && complete_len < bytes.len() {
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .open(path)
+            .map_err(|error| error.to_string())?;
+        file.set_len(complete_len as u64)
+            .map_err(|error| error.to_string())?;
+        file.sync_all().map_err(|error| error.to_string())?;
+        bytes.truncate(complete_len);
+    }
+    let mut events = Vec::new();
+    for line in bytes[..complete_len].split(|byte| *byte == b'\n') {
+        if line.is_empty() {
+            continue;
+        }
+        events.push(
+            serde_json::from_slice(line)
+                .map_err(|error| format!("tool ledger journal is corrupt: {error}"))?,
+        );
+    }
+    Ok((events, bytes))
+}
+
+fn append_journal(path: &Path, bytes: &[u8]) -> Result<(), String> {
+    if bytes.is_empty() {
+        return Ok(());
+    }
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    std::fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .map_err(|error| error.to_string())?;
+    file.write_all(bytes).map_err(|error| error.to_string())?;
+    file.sync_all().map_err(|error| error.to_string())?;
+    #[cfg(unix)]
+    std::fs::File::open(parent)
+        .and_then(|directory| directory.sync_all())
+        .map_err(|error| error.to_string())?;
+    Ok(())
+}
+
 fn default_condvar() -> Arc<Condvar> {
     Arc::new(Condvar::new())
 }
@@ -213,6 +290,12 @@ pub struct ToolCallLedger {
     persistence_path: Option<PathBuf>,
     #[serde(skip, default)]
     persistence_error: Option<String>,
+    #[serde(skip, default)]
+    dirty_call_ids: HashSet<String>,
+    #[serde(skip, default)]
+    snapshot_metadata_dirty: bool,
+    #[serde(skip, default)]
+    persistence_bytes_written: u64,
 }
 
 impl Default for ToolCallLedger {
@@ -225,6 +308,9 @@ impl Default for ToolCallLedger {
             condvar: default_condvar(),
             persistence_path: None,
             persistence_error: None,
+            dirty_call_ids: HashSet::new(),
+            snapshot_metadata_dirty: false,
+            persistence_bytes_written: 0,
         }
     }
 }
@@ -245,20 +331,41 @@ impl ToolCallLedger {
         path: &Path,
         session_id: &str,
     ) -> Result<Vec<LegacyObservation>, String> {
-        if !path.is_file() {
+        let snapshot_exists = path.is_file();
+        let snapshot_bytes = if snapshot_exists {
+            std::fs::read(path).map_err(|error| error.to_string())?
+        } else {
+            Vec::new()
+        };
+        let (events, journal_bytes) = read_journal(&journal_path(path), false)?;
+        if !snapshot_exists && journal_bytes.is_empty() {
             return Ok(Vec::new());
         }
-        let bytes = std::fs::read(path).map_err(|error| error.to_string())?;
-        let ledger: Self = serde_json::from_slice(&bytes)
-            .map_err(|error| format!("tool ledger is corrupt: {error}"))?;
+        let mut ledger: Self = if snapshot_exists {
+            serde_json::from_slice(&snapshot_bytes)
+                .map_err(|error| format!("tool ledger is corrupt: {error}"))?
+        } else {
+            Self::new(session_id, session_id)
+        };
         if !ledger.session_id.is_empty() && ledger.session_id != session_id {
             return Err("tool ledger belongs to a different session".into());
         }
+        ledger.apply_journal_events(events)?;
+        ledger.prune_terminal_records();
         let source_identity = std::fs::canonicalize(path)
             .unwrap_or_else(|_| path.to_path_buf())
             .to_string_lossy()
             .into_owned();
-        let source_digest = digest_bytes(&bytes);
+        let source_digest = if journal_bytes.is_empty() {
+            digest_bytes(&snapshot_bytes)
+        } else {
+            let mut source_bytes =
+                Vec::with_capacity(snapshot_bytes.len() + journal_bytes.len() + 8);
+            source_bytes.extend_from_slice(&(snapshot_bytes.len() as u64).to_le_bytes());
+            source_bytes.extend_from_slice(&snapshot_bytes);
+            source_bytes.extend_from_slice(&journal_bytes);
+            digest_bytes(&source_bytes)
+        };
         let mut records = Vec::with_capacity(ledger.records.len());
         let mut ordered_ids = ledger.record_order.clone();
         let ordered_set: std::collections::HashSet<_> = ordered_ids.iter().cloned().collect();
@@ -330,6 +437,9 @@ impl ToolCallLedger {
             condvar: default_condvar(),
             persistence_path: None,
             persistence_error: None,
+            dirty_call_ids: HashSet::new(),
+            snapshot_metadata_dirty: false,
+            persistence_bytes_written: 0,
         }
     }
 
@@ -344,14 +454,42 @@ impl ToolCallLedger {
         if !ledger.session_id.is_empty() && ledger.session_id != session_id {
             return Err("tool ledger belongs to a different session".into());
         }
+        let metadata_changed = ledger.session_id != session_id || ledger.lineage_id.is_empty();
         ledger.session_id = session_id.to_string();
         if ledger.lineage_id.is_empty() {
             ledger.lineage_id = session_id.to_string();
         }
+        let (events, _) = read_journal(&journal_path(path), true)?;
+        ledger.apply_journal_events(events)?;
+        ledger.dirty_call_ids.clear();
+        ledger.snapshot_metadata_dirty = metadata_changed;
         ledger.persistence_path = Some(path.to_path_buf());
+        ledger.prune_terminal_records();
         ledger.reconcile_after_restart();
         ledger.persist()?;
         Ok(ledger)
+    }
+
+    fn apply_journal_events(&mut self, events: Vec<LedgerJournalEvent>) -> Result<(), String> {
+        for event in events {
+            match event {
+                LedgerJournalEvent::Upsert { record } => {
+                    if record.call_id.is_empty() {
+                        return Err("tool ledger journal contains an empty call id".into());
+                    }
+                    if !self.records.contains_key(&record.call_id) {
+                        self.record_order.push(record.call_id.clone());
+                    }
+                    self.records.insert(record.call_id.clone(), record);
+                }
+                LedgerJournalEvent::Remove { call_id } => {
+                    self.records.remove(&call_id);
+                    self.record_order
+                        .retain(|recorded_id| recorded_id != &call_id);
+                }
+            }
+        }
+        Ok(())
     }
 
     fn reconcile_after_restart(&mut self) {
@@ -375,28 +513,101 @@ impl ToolCallLedger {
                             record.replay_policy,
                         ));
                         record.is_error = true;
+                        self.dirty_call_ids.insert(id.clone());
                     }
                 }
             }
         }
         for id in &remove {
             self.records.remove(id);
+            self.dirty_call_ids.insert(id.clone());
         }
         self.record_order.retain(|id| self.records.contains_key(id));
     }
 
     pub fn persist(&mut self) -> Result<(), String> {
         self.ensure_durable()?;
-        let Some(path) = &self.persistence_path else {
+        let Some(path) = self.persistence_path.clone() else {
             return Ok(());
         };
-        let result = serde_json::to_vec(self)
-            .map_err(|err| err.to_string())
-            .and_then(|bytes| atomic_write_json(path, &bytes));
+        let result = self.persist_changes(&path);
         if let Err(error) = &result {
             self.fail_persistence(format!("Tool ledger persistence failed: {error}"));
         }
         self.ensure_durable()
+    }
+
+    fn persist_changes(&mut self, path: &Path) -> Result<(), String> {
+        let journal = journal_path(path);
+        if !path.is_file() || self.snapshot_metadata_dirty {
+            return self.compact_snapshot(path, &journal);
+        }
+
+        let mut event_bytes = Vec::new();
+        for call_id in self.ordered_record_ids() {
+            if self.dirty_call_ids.contains(&call_id) {
+                let record = self
+                    .records
+                    .get(&call_id)
+                    .expect("ordered ids only contain current records");
+                serde_json::to_writer(
+                    &mut event_bytes,
+                    &LedgerJournalEvent::Upsert {
+                        record: record.clone(),
+                    },
+                )
+                .map_err(|error| error.to_string())?;
+                event_bytes.push(b'\n');
+            }
+        }
+        let mut removed: Vec<_> = self
+            .dirty_call_ids
+            .iter()
+            .filter(|call_id| !self.records.contains_key(*call_id))
+            .cloned()
+            .collect();
+        removed.sort();
+        for call_id in removed {
+            serde_json::to_writer(&mut event_bytes, &LedgerJournalEvent::Remove { call_id })
+                .map_err(|error| error.to_string())?;
+            event_bytes.push(b'\n');
+        }
+
+        if !event_bytes.is_empty() {
+            append_journal(&journal, &event_bytes)?;
+            self.persistence_bytes_written = self
+                .persistence_bytes_written
+                .saturating_add(event_bytes.len() as u64);
+            self.dirty_call_ids.clear();
+        }
+
+        let journal_len = match std::fs::metadata(&journal) {
+            Ok(metadata) => metadata.len(),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => 0,
+            Err(error) => return Err(error.to_string()),
+        };
+        if journal_len >= MAX_JOURNAL_BYTES {
+            self.compact_snapshot(path, &journal)?;
+        }
+        Ok(())
+    }
+
+    fn compact_snapshot(&mut self, path: &Path, journal: &Path) -> Result<(), String> {
+        let snapshot = serde_json::to_vec(self).map_err(|error| error.to_string())?;
+        atomic_write_json(path, &snapshot)?;
+        self.persistence_bytes_written = self
+            .persistence_bytes_written
+            .saturating_add(snapshot.len() as u64);
+
+        match std::fs::metadata(journal) {
+            Ok(metadata) if metadata.len() > 0 => atomic_write_json(journal, &[])?,
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.to_string()),
+        }
+        self.dirty_call_ids.clear();
+        self.snapshot_metadata_dirty = false;
+        Ok(())
     }
 
     pub(crate) fn fail_persistence(&mut self, error: String) {
@@ -456,6 +667,7 @@ impl ToolCallLedger {
         let excess = terminal.len().saturating_sub(MAX_TERMINAL_RECORDS);
         for id in terminal.into_iter().take(excess) {
             self.records.remove(&id);
+            self.dirty_call_ids.insert(id);
         }
         let records = &self.records;
         let mut seen = HashSet::with_capacity(self.record_order.len());
@@ -641,6 +853,7 @@ impl ToolCallLedger {
                 executed_at: None,
             },
         );
+        self.dirty_call_ids.insert(call_id.to_string());
         self.persist()
             .map_err(|err| format!("tool ledger persistence failed: {err}"))?;
         Ok(ReservationOutcome::Reserved)
@@ -705,6 +918,7 @@ impl ToolCallLedger {
                 ToolExecutionStatus::Pending => {
                     rec.status = ToolExecutionStatus::Executing;
                     rec.outcome = AttemptOutcome::StartedUnknown;
+                    self.dirty_call_ids.insert(call_id.to_string());
                     BeginOutcome::Execute
                 }
             }
@@ -729,6 +943,7 @@ impl ToolCallLedger {
                     executed_at: None,
                 },
             );
+            self.dirty_call_ids.insert(call_id.to_string());
             BeginOutcome::Execute
         }
     }
@@ -796,12 +1011,14 @@ impl ToolCallLedger {
                     ))
                 } else {
                     record.status = ToolExecutionStatus::Pending;
+                    self.dirty_call_ids.insert(call_id.to_string());
                     Ok(RecoveryAction::Retry)
                 }
             }
             AttemptOutcome::StartedUnknown => match record.replay_policy {
                 ReplayPolicy::SafeToReplay => {
                     record.status = ToolExecutionStatus::Pending;
+                    self.dirty_call_ids.insert(call_id.to_string());
                     Ok(RecoveryAction::Retry)
                 }
                 ReplayPolicy::ReconcileBeforeReplay => Ok(RecoveryAction::ReconcileBeforeRetry(
@@ -827,6 +1044,7 @@ impl ToolCallLedger {
             .ok_or_else(|| format!("Tool call `{call_id}` is not present in the ledger"))?;
         record.pre_state_hash = pre_state_hash;
         record.post_state_hash = post_state_hash;
+        self.dirty_call_ids.insert(call_id.to_string());
         Ok(())
     }
 
@@ -834,6 +1052,7 @@ impl ToolCallLedger {
         if let Some(rec) = self.records.get(call_id) {
             if rec.status == ToolExecutionStatus::Pending {
                 self.records.remove(call_id);
+                self.dirty_call_ids.insert(call_id.to_string());
                 self.record_order
                     .retain(|recorded_id| recorded_id != call_id);
                 self.condvar.notify_all();
@@ -901,7 +1120,11 @@ impl ToolCallLedger {
                 entry.status,
                 ToolExecutionStatus::Pending | ToolExecutionStatus::Executing
             ) {
+                let changed = entry.status == ToolExecutionStatus::Pending;
                 entry.status = ToolExecutionStatus::Executing;
+                if changed {
+                    self.dirty_call_ids.insert(call_id.to_string());
+                }
             }
         } else {
             self.record_order.push(call_id.to_string());
@@ -924,6 +1147,7 @@ impl ToolCallLedger {
                     executed_at: None,
                 },
             );
+            self.dirty_call_ids.insert(call_id.to_string());
         }
         let _ = self.persist();
     }
@@ -941,6 +1165,7 @@ impl ToolCallLedger {
                     .unwrap_or_default()
                     .as_millis() as u64,
             );
+            self.dirty_call_ids.insert(call_id.to_string());
         }
         self.prune_terminal_records();
         self.condvar.notify_all();
@@ -953,6 +1178,7 @@ impl ToolCallLedger {
             entry.output = Some(bounded_output(error));
             entry.result_digest = Some(compute_digest(error));
             entry.is_error = true;
+            self.dirty_call_ids.insert(call_id.to_string());
         }
         self.prune_terminal_records();
         self.condvar.notify_all();
@@ -963,6 +1189,7 @@ impl ToolCallLedger {
             entry.status = ToolExecutionStatus::Blocked;
             entry.output = Some(bounded_output(reason));
             entry.is_error = true;
+            self.dirty_call_ids.insert(call_id.to_string());
         }
         self.prune_terminal_records();
         self.condvar.notify_all();
@@ -1232,14 +1459,35 @@ mod tests {
         ledger.record_start("reserved", "write", &json!({"path": "pending.txt"}));
         for i in 0..2_000 {
             let id = format!("call-{i}");
-            ledger.record_start(&id, "read", &json!({"path": i}));
+            let arguments = json!({"path": i});
+            assert_eq!(
+                ledger.reserve_call(&id, "read", &arguments).unwrap(),
+                ReservationOutcome::Reserved
+            );
+            assert_eq!(
+                ledger.begin_execution(&id, "read", &arguments),
+                BeginOutcome::Execute
+            );
+            ledger.persist().unwrap();
             ledger.record_completion(&id, &output, false);
+            ledger.persist().unwrap();
         }
         ledger.persist().unwrap();
 
         let bytes = std::fs::read(&path).unwrap();
         assert!(bytes.len() < 8 * 1024 * 1024, "{} bytes", bytes.len());
         assert!(!bytes.contains(&b'\n'), "ledger JSON should be compact");
+        let journal_bytes = std::fs::metadata(journal_path(&path)).unwrap().len();
+        assert!(
+            bytes.len() as u64 + journal_bytes < 50_000_000,
+            "{} total persisted bytes",
+            bytes.len() as u64 + journal_bytes
+        );
+        assert!(
+            ledger.persistence_bytes_written < 50_000_000,
+            "{} cumulative ledger bytes written",
+            ledger.persistence_bytes_written
+        );
         assert_eq!(ledger.records().len(), 257);
         assert!(ledger.records().contains_key("reserved"));
         assert!(!ledger.records().contains_key("call-1743"));
@@ -1249,6 +1497,113 @@ mod tests {
             ledger.begin_execution("call-0", "read", &json!({"path": 0})),
             BeginOutcome::Execute
         ));
+
+        let restored = ToolCallLedger::load_bound(&path, "session-bounded").unwrap();
+        assert_eq!(restored.records().len(), 257);
+        assert_eq!(
+            restored.records()["call-1999"].output.as_deref(),
+            Some(output.as_str())
+        );
+        assert!(!restored.records().contains_key("call-0"));
+    }
+
+    #[test]
+    fn ledger_persistence_write_budget_scales_with_call_output() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ledger.json");
+        let mut ledger = ToolCallLedger::load_bound(&path, "session-write-budget").unwrap();
+        let output = "y".repeat(20_000);
+
+        for i in 0..20 {
+            let id = format!("budget-call-{i}");
+            let arguments = json!({"path": i});
+            assert_eq!(
+                ledger.reserve_call(&id, "read", &arguments).unwrap(),
+                ReservationOutcome::Reserved
+            );
+            assert_eq!(
+                ledger.begin_execution(&id, "read", &arguments),
+                BeginOutcome::Execute
+            );
+            ledger.persist().unwrap();
+            ledger.record_completion(&id, &output, false);
+            ledger.persist().unwrap();
+        }
+
+        assert!(
+            ledger.persistence_bytes_written < 1_000_000,
+            "{} ledger bytes written for 20 calls",
+            ledger.persistence_bytes_written
+        );
+    }
+
+    #[test]
+    fn ledger_journal_replays_for_legacy_observations_and_repairs_torn_tail() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ledger.json");
+        let mut ledger = ToolCallLedger::load_bound(&path, "session-journal").unwrap();
+        let id = "journal-call";
+        ledger.record_start(id, "read", &json!({"path": "notes.txt"}));
+        ledger.record_completion(id, "read result", false);
+        ledger.persist().unwrap();
+
+        let observations =
+            ToolCallLedger::legacy_observations_from_path(&path, "session-journal").unwrap();
+        assert_eq!(observations.len(), 1);
+        assert_eq!(observations[0].record_identity, id);
+        assert_eq!(observations[0].state, "completed");
+        assert!(observations[0]
+            .known_result
+            .as_ref()
+            .is_some_and(|result| result["is_error"] == false));
+
+        let journal = journal_path(&path);
+        let mut torn = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&journal)
+            .unwrap();
+        torn.write_all(b"{\"event\":\"upsert\"").unwrap();
+        drop(torn);
+
+        let restored = ToolCallLedger::load_bound(&path, "session-journal").unwrap();
+        assert_eq!(
+            restored.records()[id].output.as_deref(),
+            Some("read result")
+        );
+        assert!(std::fs::read(&journal).unwrap().ends_with(b"\n"));
+    }
+
+    #[test]
+    fn ledger_journal_compacts_into_snapshot_and_continues_appending() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ledger.json");
+        let journal = journal_path(&path);
+        let mut ledger = ToolCallLedger::load_bound(&path, "session-compact").unwrap();
+
+        ledger.record_start("first", "read", &json!({"path": "first.txt"}));
+        ledger.record_completion("first", "first result", false);
+        ledger.persist().unwrap();
+        assert!(std::fs::metadata(&journal).unwrap().len() > 0);
+
+        let checkpoint = serde_json::to_vec(&ledger).unwrap();
+        atomic_write_json(&path, &checkpoint).unwrap();
+        let mut restored = ToolCallLedger::load_bound(&path, "session-compact").unwrap();
+        assert_eq!(
+            restored.records()["first"].output.as_deref(),
+            Some("first result")
+        );
+
+        restored.compact_snapshot(&path, &journal).unwrap();
+        assert_eq!(std::fs::metadata(&journal).unwrap().len(), 0);
+        restored.record_start("second", "read", &json!({"path": "second.txt"}));
+        restored.record_completion("second", "second result", false);
+        restored.persist().unwrap();
+
+        let restored = ToolCallLedger::load_bound(&path, "session-compact").unwrap();
+        assert_eq!(
+            restored.records()["second"].output.as_deref(),
+            Some("second result")
+        );
     }
 
     #[test]
