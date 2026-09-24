@@ -290,7 +290,7 @@ fn json_contains_operation_reference(value: &Value) -> bool {
 /// Flush the new image before replacing the previous one in a single rename.
 /// A failed replacement must leave the previous checkpoint at its original name.
 pub fn atomic_write(path: &Path, content: &[u8]) -> std::io::Result<()> {
-    atomic_write_with(path, content, |from, to| fs::rename(from, to))
+    davinci_sys::fs::atomic_write(path, content)
 }
 
 fn atomic_write_with<F>(path: &Path, content: &[u8], mut rename: F) -> std::io::Result<()>

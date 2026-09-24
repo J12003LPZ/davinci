@@ -172,36 +172,8 @@ pub enum BeginOutcome {
 }
 
 fn atomic_write_json(path: &Path, bytes: &[u8]) -> Result<(), String> {
-    let parent = path
-        .parent()
-        .ok_or_else(|| "tool ledger path has no parent directory".to_string())?;
-    std::fs::create_dir_all(parent).map_err(|err| err.to_string())?;
-    let name = path
-        .file_name()
-        .and_then(|value| value.to_str())
-        .unwrap_or("ledger");
-    let temp = parent.join(format!(".{name}.tmp-{}", uuid::Uuid::new_v4()));
-    let write_result = (|| -> Result<(), String> {
-        let mut file = std::fs::OpenOptions::new()
-            .create_new(true)
-            .write(true)
-            .open(&temp)
-            .map_err(|err| err.to_string())?;
-        file.write_all(bytes).map_err(|err| err.to_string())?;
-        file.sync_all().map_err(|err| err.to_string())?;
+    davinci_sys::fs::atomic_write(path, bytes).map_err(|err| err.to_string())
 
-        drop(file);
-        std::fs::rename(&temp, path).map_err(|err| err.to_string())?;
-        #[cfg(unix)]
-        std::fs::File::open(parent)
-            .and_then(|directory| directory.sync_all())
-            .map_err(|err| err.to_string())?;
-        Ok(())
-    })();
-    if write_result.is_err() {
-        let _ = std::fs::remove_file(&temp);
-    }
-    write_result
 }
 
 fn journal_path(path: &Path) -> PathBuf {

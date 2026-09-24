@@ -910,22 +910,8 @@ fn remove_path(path: &Path) -> Result<(), String> {
 }
 
 fn atomic_write(path: &Path, bytes: &[u8]) -> Result<(), String> {
-    let temp = path.with_extension(format!("tmp-{}", std::process::id()));
-    let _ = fs::remove_file(&temp);
-    {
-        let mut file = OpenOptions::new()
-            .create_new(true)
-            .truncate(true)
-            .write(true)
-            .open(&temp)
-            .map_err(|error| format!("create atomic file: {error}"))?;
-        file.write_all(bytes)
-            .map_err(|error| format!("write atomic file: {error}"))?;
-        file.sync_all()
-            .map_err(|error| format!("sync atomic file: {error}"))?;
-    }
-    let _ = fs::remove_file(path);
-    fs::rename(&temp, path).map_err(|error| format!("publish atomic file: {error}"))
+    davinci_sys::fs::atomic_write(path, bytes)
+        .map_err(|error| format!("publish atomic file: {error}"))
 }
 
 fn digest(bytes: &[u8]) -> String {
