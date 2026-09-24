@@ -818,8 +818,13 @@ impl SecurityScanController {
         self.review.status().is_some()
     }
 
-    pub fn wait_for_review(&self) {
-        self.review.wait();
+    pub fn wait_for_review(&self) -> bool {
+        self.review
+            .wait_timeout(std::time::Duration::from_secs(30))
+    }
+
+    pub fn abort_review(&self) {
+        let _ = self.review.abort(None);
     }
 
     pub fn wait_for_review_interruptible(&self, interrupt: &interrupt::Interrupt) {
@@ -833,7 +838,7 @@ impl SecurityScanController {
             }
             std::thread::sleep(std::time::Duration::from_millis(25));
         }
-        self.wait_for_review();
+        let _ = self.wait_for_review();
     }
 
     pub fn command(&mut self, name: &str, args: &str) -> Result<Option<Value>, String> {
