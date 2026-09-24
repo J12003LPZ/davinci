@@ -2320,6 +2320,19 @@ fn run_extension_command_inner(shell: &mut Shell<'_>, line: &str, setup: bool) -
                 shell.model.governor = Some(governor_sheet(&value));
                 open_sheet(shell.model, Screen::Governor);
             }
+            "memory-page" => {
+                let mut line = format!(
+                    "Memory page: {} ({} records, {} embedded) {}",
+                    value["verdict"].as_str().unwrap_or("unknown"),
+                    value["records"].as_u64().unwrap_or(0),
+                    value["embedded"].as_u64().unwrap_or(0),
+                    value["path"].as_str().unwrap_or_default()
+                );
+                if let Some(first) = value["warnings"].get(0).and_then(|w| w.as_str()) {
+                    line.push_str(&format!("\n{first}"));
+                }
+                shell.note(&line);
+            }
             "security-scan" | "sec-resume" | "sec-status" => {
                 shell.model.security = Some(security_sheet(&value));
                 shell.model.security_index = 0;
