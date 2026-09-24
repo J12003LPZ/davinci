@@ -150,6 +150,13 @@ pub fn create_agent_session(
         .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
     let agent_dir = options.agent_dir.clone().unwrap_or_else(default_agent_dir);
     let settings = load_merged_settings(&agent_dir, &cwd);
+    let trusted = crate::trust::resolve_project_trusted(
+        &agent_dir,
+        &cwd,
+        None,
+        settings.default_project_trust.as_deref(),
+        &settings.trusted_projects,
+    );
     let env_profile = std::env::var("DAVINCI_PROMPT_PROFILE")
         .ok()
         .or_else(|| std::env::var("PI_PROMPT_PROFILE").ok());
@@ -162,9 +169,15 @@ pub fn create_agent_session(
     let mut agent = Agent::new_builtin(resolved_profile);
     agent.cwd = cwd.clone();
     agent.context_files = load_context_files(&cwd, true);
-    agent.skills = discover_skills(&[cwd.join(".pi").join("skills"), agent_dir.join("skills")]);
-    agent.templates =
-        discover_prompt_templates(&[cwd.join(".pi").join("prompts"), agent_dir.join("prompts")]);
+    let mut skill_roots = project_resource_roots(&cwd, trusted, "skills");
+    skill_roots.push(agent_dir.join("skills"));
+    agent.skills = discover_skills(&skill_roots);
+    let mut prompt_roots = project_resource_roots(&cwd, trusted, "prompts");
+    prompt_roots.push(agent_dir.join("prompts"));
+    agent.templates = discover_prompt_templates(&prompt_roots);
+    agent.permissions = std::sync::Arc::new(davinci_agent::PermissionState::new(
+        sdk_permission_policy(&agent_dir, &cwd),
+    ));
 
     let models = load_builtin_models();
     let mut model_fallback_message = None;
@@ -266,7 +279,7 @@ pub fn create_agent_session(
     }
 
     let model_runtime = embed_model_runtime(&agent_dir);
-    let extensions_result = load_extensions_result(&agent_dir, &cwd, &settings.extensions);
+    let extensions_result = load_extensions_result(&agent_dir, &cwd, &settings.extensions, trusted);
 
     Ok(CreateAgentSessionResult {
         session: AgentSession {
@@ -292,17 +305,38 @@ fn embed_model_runtime(agent_dir: &std::path::Path) -> ModelRuntimeSnapshot {
     snapshot_availability(models, &config, &storage, &env, Default::default(), None)
 }
 
+/// Project resource directories are included only after project trust is
+/// established, so untrusted files never enter SDK prompts or extensions.
+fn project_resource_roots(cwd: &Path, trusted: bool, kind: &str) -> Vec<PathBuf> {
+    if trusted {
+        crate::project_config::all(cwd, kind)
+    } else {
+        Vec::new()
+    }
+}
+
+/// SDK sessions keep their documented AlwaysApprove default while honoring
+/// user deny rules and any deny rules from a trusted project.
+fn sdk_permission_policy(agent_dir: &Path, cwd: &Path) -> davinci_agent::PermissionPolicy {
+    let product = crate::permissions::policy_for(agent_dir, cwd, None, None);
+    davinci_agent::PermissionPolicy {
+        deny: product.deny,
+        project_trusted: product.project_trusted,
+        ..davinci_agent::PermissionPolicy::default()
+    }
+}
+
 fn load_extensions_result(
     agent_dir: &std::path::Path,
     cwd: &std::path::Path,
     configured: &[String],
+    trusted: bool,
 ) -> LoadExtensionsResult {
     let mut names = configured.to_vec();
-    for root in [
-        agent_dir.join("extensions"),
-        cwd.join(".pi").join("extensions"),
-    ] {
-        if let Ok(entries) = std::fs::read_dir(&root) {
+    let mut roots = vec![agent_dir.join("extensions")];
+    roots.extend(project_resource_roots(cwd, trusted, "extensions"));
+    for root in &roots {
+        if let Ok(entries) = std::fs::read_dir(root) {
             for entry in entries.flatten() {
                 if !entry.path().is_dir() {
                     continue;
@@ -318,10 +352,7 @@ fn load_extensions_result(
     let mut extensions = Vec::new();
     let mut errors = Vec::new();
     for name in names {
-        let candidates = [
-            agent_dir.join("extensions").join(&name),
-            cwd.join(".pi").join("extensions").join(&name),
-        ];
+        let candidates: Vec<PathBuf> = roots.iter().map(|root| root.join(&name)).collect();
         let dir = candidates.iter().find(|path| path.is_dir());
         let Some(dir) = dir else {
             errors.push(ExtensionLoadError {
@@ -537,13 +568,23 @@ mod tests {
     #[test]
     fn prompt_expands_templates_and_continue_restores() {
         let dir = tempdir().unwrap();
+        let agent_dir = dir.path().join("agent");
+        std::fs::create_dir_all(&agent_dir).unwrap();
+        std::fs::write(
+            agent_dir.join("trust.json"),
+            format!(
+                "{{{:?}: true}}\n",
+                crate::trust::canonicalize_trust_path(dir.path())
+            ),
+        )
+        .unwrap();
         let prompts = dir.path().join(".pi").join("prompts");
         std::fs::create_dir_all(&prompts).unwrap();
         std::fs::write(prompts.join("review.md"), "Review this code: $1").unwrap();
         let session_dir = dir.path().join("sessions");
         let first = create_agent_session(CreateAgentSessionOptions {
             cwd: Some(dir.path().to_path_buf()),
-            agent_dir: Some(dir.path().join("agent")),
+            agent_dir: Some(agent_dir.clone()),
             session_dir: Some(session_dir.clone()),
             session_name: Some("one".into()),
             ..CreateAgentSessionOptions::default()
@@ -568,7 +609,7 @@ mod tests {
         drop(session);
         let restored = create_agent_session(CreateAgentSessionOptions {
             cwd: Some(dir.path().to_path_buf()),
-            agent_dir: Some(dir.path().join("agent")),
+            agent_dir: Some(agent_dir),
             session_dir: Some(session_dir),
             continue_session: true,
             ..CreateAgentSessionOptions::default()
@@ -647,6 +688,16 @@ mod tests {
     #[test]
     fn extensions_result_loads_project_manifest() {
         let dir = tempdir().unwrap();
+        let agent_dir = dir.path().join("agent");
+        std::fs::create_dir_all(&agent_dir).unwrap();
+        std::fs::write(
+            agent_dir.join("trust.json"),
+            format!(
+                "{{{:?}: true}}\n",
+                crate::trust::canonicalize_trust_path(dir.path())
+            ),
+        )
+        .unwrap();
         let ext = dir.path().join(".pi").join("extensions").join("demo");
         std::fs::create_dir_all(&ext).unwrap();
         std::fs::write(
@@ -656,7 +707,7 @@ mod tests {
         .unwrap();
         let result = create_agent_session(CreateAgentSessionOptions {
             cwd: Some(dir.path().to_path_buf()),
-            agent_dir: Some(dir.path().join("agent")),
+            agent_dir: Some(agent_dir),
             session_dir: Some(dir.path().join("sessions")),
             ..CreateAgentSessionOptions::default()
         })
@@ -666,6 +717,54 @@ mod tests {
             result.session.model_runtime.get_error().is_none()
                 || result.session.model_runtime.availability_error.is_none()
         );
+    }
+
+    #[test]
+    fn untrusted_project_skills_prompts_and_extensions_are_not_loaded() {
+        let dir = tempdir().unwrap();
+        let agent_dir = dir.path().join("agent");
+        std::fs::create_dir_all(&agent_dir).unwrap();
+        let project = dir.path().join("project");
+        let skill = project.join(".pi").join("skills").join("planted");
+        std::fs::create_dir_all(&skill).unwrap();
+        std::fs::write(
+            skill.join("SKILL.md"),
+            "---\nname: planted\ndescription: x\n---\n# x\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(project.join(".pi").join("extensions").join("evil")).unwrap();
+        let result = load_extensions_result(&agent_dir, &project, &[], false);
+        assert!(result.extensions.is_empty());
+        assert!(result.errors.is_empty());
+        let skills = project_resource_roots(&project, false, "skills");
+        assert!(skills.is_empty());
+        assert_eq!(
+            project_resource_roots(&project, true, "skills"),
+            vec![project.join(".pi").join("skills")]
+        );
+    }
+
+    #[test]
+    fn user_deny_rules_apply_to_sdk_sessions() {
+        let dir = tempdir().unwrap();
+        let agent_dir = dir.path().join("agent");
+        std::fs::create_dir_all(&agent_dir).unwrap();
+        std::fs::write(
+            agent_dir.join("settings.json"),
+            r#"{"permissions":{"deny":["bash(rm *)"]}}"#,
+        )
+        .unwrap();
+        let policy = sdk_permission_policy(&agent_dir, dir.path());
+        assert_eq!(policy.mode, davinci_agent::PermissionMode::AlwaysApprove);
+        assert!(matches!(
+            policy.decide(
+                "c1",
+                "bash",
+                &serde_json::json!({"command":"rm -rf x"}),
+                dir.path()
+            ),
+            davinci_agent::PermissionVerdict::Deny { .. }
+        ));
     }
 
     #[test]
