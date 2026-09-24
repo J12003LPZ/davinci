@@ -57,6 +57,19 @@ struct Slot {
     session: Option<Session>,
     starts: usize,
     last_error: Option<IntelligenceError>,
+    healthy_since: Option<Instant>,
+}
+
+impl Slot {
+    fn refresh_budget(&mut self) {
+        if self
+            .healthy_since
+            .is_some_and(|since| since.elapsed() >= Duration::from_secs(300))
+        {
+            self.starts = 0;
+            self.healthy_since = Some(Instant::now());
+        }
+    }
 }
 #[derive(Debug)]
 struct Manager {
@@ -268,7 +281,10 @@ impl LanguageIntelligence {
         self.ensure_open()?;
         if slot.session.as_ref().is_some_and(|s| !s.is_alive()) {
             slot.session = None;
+            slot.healthy_since = None;
         }
+        slot.refresh_budget();
+        let mut started_now = false;
         if slot.session.is_none() {
             if slot.starts >= 2 {
                 return Err(slot.last_error.clone().unwrap_or_else(|| {
@@ -312,6 +328,8 @@ impl LanguageIntelligence {
                 match Session::start(command, deadline) {
                     Ok(session) => {
                         slot.session = Some(session);
+                        slot.healthy_since = Some(Instant::now());
+                        started_now = true;
                         break;
                     }
                     Err(error) => {
@@ -324,13 +342,18 @@ impl LanguageIntelligence {
         let Some(session) = slot.session.as_mut() else {
             return Err(slot.last_error.clone().unwrap_or_else(launch_denied));
         };
+        let request_deadline = if started_now {
+            Instant::now() + Duration::from_secs(120)
+        } else {
+            deadline
+        };
         let response = session.execute(
             method,
             capability,
             source.as_deref(),
             parsed.params(name),
             &TypeScriptAdapter,
-            deadline,
+            request_deadline,
         );
         let mut raw = match response {
             Ok(raw) => raw,
@@ -464,6 +487,17 @@ fn lock_until<T>(mutex: &Mutex<T>, deadline: Instant) -> Result<MutexGuard<'_, T
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn restart_budget_recovers_after_a_healthy_period() {
+        let mut slot = Slot {
+            starts: 2,
+            healthy_since: Some(Instant::now() - Duration::from_secs(301)),
+            ..Default::default()
+        };
+        slot.refresh_budget();
+        assert_eq!(slot.starts, 0);
+    }
 
     #[test]
     fn worker_worktrees_resolve_against_their_own_checkout() {
