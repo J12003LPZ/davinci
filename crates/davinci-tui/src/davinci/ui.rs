@@ -504,15 +504,23 @@ pub fn tool_line(
     instrument: &str,
     target: &str,
     duration: Option<&str>,
-    _summary: Option<&str>,
+    tick: u64,
+    live: bool,
 ) -> Line<'static> {
     let (label, argument) = tool_caption(instrument, target);
     let cc = theme.cc();
     let failed = matches!(state, State::Failed | State::Attention);
-    let running = duration.is_none()
+    let running = live
+        && duration.is_none()
         && !failed
         && !matches!(state, State::Skipped | State::Queued);
-    let mark = if theme.no_color { state.glyph() } else { "●" };
+    let mark = if theme.no_color {
+        state.glyph()
+    } else if running && tick % 2 == 1 {
+        " "
+    } else {
+        "●"
+    };
     let color = if failed {
         cc.error
     } else if running {

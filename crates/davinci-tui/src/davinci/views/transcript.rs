@@ -24,10 +24,7 @@ pub const ELBOW: &str = "  ⎿ \u{a0}";
 /// Render a whole transcript, at a width that may be narrower than the window
 /// when the Codex sidebar is open.
 pub fn lines(model: &Model, entries: &[Entry], width: u16) -> Vec<Line<'static>> {
-    entries
-        .iter()
-        .flat_map(|entry| entry_lines(model, entry, width))
-        .collect()
+    rendered_blocks(model, entries, width).into_iter().flatten().collect()
 }
 
 /// The last `height` rows of the transcript, rendered from the end.
@@ -41,10 +38,10 @@ pub fn tail_lines(
     width: u16,
     height: usize,
 ) -> Vec<Line<'static>> {
+    let blocks = rendered_blocks(model, entries, width);
     let mut chunks: Vec<Vec<Line<'static>>> = Vec::new();
     let mut total = 0usize;
-    for entry in entries.iter().rev() {
-        let rows = entry_lines(model, entry, width);
+    for rows in blocks.into_iter().rev() {
         total += rows.len();
         chunks.push(rows);
         if total >= height {
@@ -56,6 +53,123 @@ pub fn tail_lines(
         out = crate::davinci::ui::tail(out, height);
     }
     out
+}
+
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Explore {
+    Read,
+    Search,
+    List,
+    Shell,
+}
+
+fn explore_kind(instrument: &str, target: &str) -> Option<Explore> {
+    if instrument == "manus" {
+        return Some(Explore::Shell);
+    }
+    match target.split_once(' ').map_or(target, |(verb, _)| verb) {
+        "read" => Some(Explore::Read),
+        "search" | "grep" | "find" => Some(Explore::Search),
+        "list" | "ls" => Some(Explore::List),
+        _ => None,
+    }
+}
+
+fn rendered_blocks(model: &Model, entries: &[Entry], width: u16) -> Vec<Vec<Line<'static>>> {
+    let mut out = Vec::new();
+    let mut index = 0usize;
+    while index < entries.len() {
+        if !model.show_tool_output {
+            let mut calls: Vec<(Explore, &str, bool)> = Vec::new();
+            let mut cursor = index;
+            let mut consumed = index;
+            while cursor < entries.len() {
+                match &entries[cursor] {
+                    Entry::Gap if !calls.is_empty() => {
+                        cursor += 1;
+                        consumed = cursor;
+                    }
+                    Entry::Tool { state, instrument, target, duration, .. }
+                        if !matches!(state, State::Failed | State::Attention) =>
+                    {
+                        if let Some(kind) = explore_kind(instrument, target) {
+                            calls.push((kind, target.as_str(), duration.is_some()));
+                            cursor += 1;
+                            consumed = cursor;
+                        } else {
+                            break;
+                        }
+                    }
+                    _ => break,
+                }
+            }
+            if !calls.is_empty() {
+                out.push(group_rows(model, &calls, width));
+                index = consumed;
+                continue;
+            }
+        }
+        out.push(entry_lines(model, &entries[index], width));
+        index += 1;
+    }
+    out
+}
+
+fn group_rows(model: &Model, calls: &[(Explore, &str, bool)], width: u16) -> Vec<Line<'static>> {
+    let th = &model.theme;
+    let cc = th.cc();
+    let running = model.running && calls.iter().any(|(_, _, done)| !done);
+    let mut order: Vec<Explore> = Vec::new();
+    for (kind, _, _) in calls {
+        if !order.contains(kind) {
+            order.push(*kind);
+        }
+    }
+    let clause = |kind: Explore, n: usize| -> String {
+        let noun = |one: &str, many: &str| if n == 1 { one } else { many };
+        match (kind, running) {
+            (Explore::Read, false) => format!("read {n} {}", noun("file", "files")),
+            (Explore::Read, true) => format!("reading {n} {}", noun("file", "files")),
+            (Explore::Search, false) => format!("searched for {n} {}", noun("pattern", "patterns")),
+            (Explore::Search, true) => format!("searching for {n} {}", noun("pattern", "patterns")),
+            (Explore::List, false) => format!("listed {n} {}", noun("directory", "directories")),
+            (Explore::List, true) => format!("listing {n} {}", noun("directory", "directories")),
+            (Explore::Shell, false) => format!("ran {n} shell {}", noun("command", "commands")),
+            (Explore::Shell, true) => format!("running {n} shell {}", noun("command", "commands")),
+        }
+    };
+    let mut sentence = order
+        .iter()
+        .map(|kind| clause(*kind, calls.iter().filter(|(candidate, _, _)| candidate == kind).count()))
+        .collect::<Vec<_>>()
+        .join(", ");
+    if let Some(first) = sentence.get(0..1) {
+        sentence = format!("{}{}", first.to_uppercase(), &sentence[1..]);
+    }
+    if !running {
+        let mut spans = vec![span("  ", cc.inactive)];
+        spans.extend(bold_numbers(&sentence, cc.inactive));
+        return vec![Line::from(truncate_run(spans, width))];
+    }
+    let bullet = if model.tick % 2 == 1 { "  " } else { "● " };
+    let mut spans = vec![span(bullet, cc.inactive)];
+    spans.extend(bold_numbers(&format!("{sentence}…"), th.text));
+    let (kind, target, _) = calls.last().expect("a group has a call");
+    let newest = match kind {
+        Explore::Shell => format!("$ {target}"),
+        _ => target.split_once(' ').map_or(*target, |(_, rest)| rest).to_string(),
+    };
+    vec![
+        Line::from(truncate_run(spans, width)),
+        Line::from(truncate_run(
+            vec![span(
+                format!("{ELBOW}{}", clip_ellipsis(&newest, width.saturating_sub(5))),
+                cc.inactive,
+            )],
+            width,
+        )),
+    ]
 }
 
 fn entry_lines(model: &Model, entry: &Entry, width: u16) -> Vec<Line<'static>> {
@@ -87,7 +201,8 @@ fn entry_lines(model: &Model, entry: &Entry, width: u16) -> Vec<Line<'static>> {
                 instrument,
                 target,
                 duration.as_deref(),
-                None,
+                model.tick,
+                model.running,
             )];
             if let Some(summary) = summary.as_deref().filter(|s| !s.is_empty()) {
                 rows.push(tool_result(th, summary, width));
