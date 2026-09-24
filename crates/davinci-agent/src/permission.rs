@@ -110,8 +110,9 @@ pub enum ToolClass {
     Read,
     Edit,
     Shell,
-    /// Reaches outside the machine (`web_fetch`, `web_search`): allowed in
-    /// Plan Mode for research; other prompted modes require approval.
+    /// Reaches outside the machine (`web_fetch`, `web_search`,
+    /// `visual_snapshot`). Plan Mode allows `web_search` without a prompt;
+    /// fetching a URL asks in every prompted mode unless a rule allows it.
     Network,
     Other,
 }
@@ -1186,7 +1187,10 @@ impl PermissionPolicy {
         if class == ToolClass::Read && !secret && !read_needs_approval {
             return PermissionVerdict::Allow;
         }
-        if class == ToolClass::Network && self.mode == PermissionMode::ReadOnly {
+        if class == ToolClass::Network
+            && self.mode == PermissionMode::ReadOnly
+            && tool == "web_search"
+        {
             return PermissionVerdict::Allow;
         }
         if matches!(self.mode, PermissionMode::Edits | PermissionMode::Auto)
@@ -2709,6 +2713,16 @@ mod tests {
         let read_only = PermissionPolicy::new(PermissionMode::ReadOnly);
         assert!(matches!(
             read_only.decide("c1", "web_fetch", &fetch, &cwd()),
+            PermissionVerdict::Ask(_)
+        ));
+        assert!(matches!(
+            read_only.decide("c1", "web_search", &json!({"query": "rust diff"}), &cwd()),
+            PermissionVerdict::Allow
+        ));
+        let mut read_only_granted = PermissionPolicy::new(PermissionMode::ReadOnly);
+        read_only_granted.allow = vec![PermissionRule::parse("web_fetch(docs.rs)").unwrap()];
+        assert!(matches!(
+            read_only_granted.decide("c1", "web_fetch", &fetch, &cwd()),
             PermissionVerdict::Allow
         ));
         let edits = PermissionPolicy::new(PermissionMode::Edits);
