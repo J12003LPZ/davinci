@@ -61,7 +61,12 @@ impl CodexCapabilities {
             .compat
             .get("supportsOpenAIGrammarTools")
             .and_then(|v| v.as_bool())
-            .unwrap_or(true); // Enabled by default for ChatGPT Codex profile
+            .unwrap_or(true); // Existing Codex compatibility behavior.
+        let explicit_cache = model
+            .compat
+            .get("supportsExplicitPromptCacheMode")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
         Self {
             responses_items: true,
             websocket_transport: true,
@@ -74,7 +79,7 @@ impl CodexCapabilities {
             custom_grammar_tools: grammar,
             tool_namespaces: true,
             tool_search: ToolSearchMode::Emulated,
-            explicit_cache_breakpoints: true,
+            explicit_cache_breakpoints: explicit_cache,
             server_side_compaction: false,
             service_tier: None,
             zero_data_retention: false,
