@@ -126,7 +126,7 @@ pub use models_store::{
     save_models_store, ModelsStore, ModelsStoreEntry, DEFAULT_CATALOG_BASE_URL,
     REMOTE_CATALOG_REFRESH_INTERVAL_MS,
 };
-pub use oauth::{poll_oauth_device_code_flow, DeviceCodePoller, DevicePollStatus};
+pub use oauth::{DeviceCodePoller, DevicePollStatus};
 pub use oauth_callback::{
     callback_host, handle_callback_request, oauth_error_html, oauth_success_html, CallbackProvider,
     CallbackResponse, CallbackServer, ERR_CALLBACK_ROUTE_NOT_FOUND, ERR_INTERNAL_HTML,

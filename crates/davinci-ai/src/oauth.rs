@@ -54,39 +54,6 @@ impl DeviceCodePoller {
     }
 }
 
-pub fn poll_oauth_device_code_flow<T, F>(
-    interval_seconds: u64,
-    expires_in_seconds: u64,
-    wait_before_first_poll: bool,
-    mut poll: F,
-) -> Result<T, String>
-where
-    F: FnMut() -> DevicePollStatus<T>,
-{
-    let mut poller = DeviceCodePoller::new(
-        interval_seconds,
-        expires_in_seconds,
-        wait_before_first_poll,
-        0,
-    );
-    let mut now = 0_u64;
-    loop {
-        if poller.expired(now) {
-            return Err("OAuth device-code flow expired".into());
-        }
-        let delay = poller.next_delay_ms().unwrap_or(0);
-        now = now.saturating_add(delay);
-        match poll() {
-            DevicePollStatus::Complete(value) => return Ok(value),
-            DevicePollStatus::Pending => {}
-            DevicePollStatus::SlowDown { interval_seconds } => {
-                poller.on_slow_down(interval_seconds);
-            }
-            DevicePollStatus::Expired => return Err("OAuth device-code flow expired".into()),
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -104,17 +71,6 @@ mod tests {
     fn wait_before_first_poll_matches_ts() {
         let mut poller = DeviceCodePoller::new(2, 30, true, 0);
         assert_eq!(poller.next_delay_ms(), Some(2000));
-        let mut calls = 0;
-        let token = poll_oauth_device_code_flow(2, 30, false, || {
-            calls += 1;
-            if calls == 1 {
-                DevicePollStatus::Pending
-            } else {
-                DevicePollStatus::Complete("token")
-            }
-        })
-        .unwrap();
-        assert_eq!(token, "token");
-        assert_eq!(calls, 2);
+        assert_eq!(poller.next_delay_ms(), Some(2000));
     }
 }
