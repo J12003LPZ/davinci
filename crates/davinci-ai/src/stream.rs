@@ -794,6 +794,63 @@ pub fn live_complete_streaming_with_sink_envelope(
     }
 }
 
+/// One raw provider exchange used by the explicit maintainer Codex probe.
+#[derive(Debug, Clone)]
+pub struct RawProviderReply {
+    pub status: u16,
+    pub headers: Vec<(String, String)>,
+    pub body: String,
+}
+
+/// Perform one direct provider POST without retries or response decoding.
+/// Normal product traffic continues to use the standard retry/stream path.
+pub fn raw_provider_post(
+    model: &Model,
+    auth: &ResolvedAuth,
+    url: &str,
+    body: &Value,
+) -> Result<RawProviderReply, String> {
+    let headers = collect_request_headers(model, auth, &StreamOptions::default());
+    let mut request = ureq::post(url).timeout(Duration::from_secs(120));
+    for (key, value) in &headers {
+        request = request.set(key, value);
+    }
+
+    let result = if model.api == "openai-codex-responses" {
+        let (bytes, compressed) = crate::codex::encode_codex_sse_body(body);
+        if compressed {
+            request = request.set("content-encoding", "zstd");
+        }
+        request.send_bytes(&bytes)
+    } else {
+        request.send_string(&body.to_string())
+    };
+
+    let response = match result {
+        Ok(response) => response,
+        Err(ureq::Error::Status(_, response)) => response,
+        Err(error) => return Err(error.to_string()),
+    };
+    let status = response.status();
+    let headers = response
+        .headers_names()
+        .into_iter()
+        .filter_map(|name| {
+            response
+                .header(&name)
+                .map(|value| (name.clone(), value.to_string()))
+        })
+        .collect();
+    let body = response
+        .into_string()
+        .map_err(|error| error.to_string())?;
+    Ok(RawProviderReply {
+        status,
+        headers,
+        body,
+    })
+}
+
 fn collect_request_headers(
     model: &Model,
     auth: &ResolvedAuth,
