@@ -14,8 +14,8 @@
 //!   when a tool call was cut off, the rule `ResponsesDecoder::finish` uses;
 //! - streamed tool arguments are re-parsed only once the buffer is a complete
 //!   JSON object (TS repairs and partially parses the fragment);
-//! - thinking signatures and redacted-thinking payloads are dropped because
-//!   `ContentBlock::Thinking` has nowhere to keep them;
+//! - thinking signatures and redacted-thinking payloads are retained for
+//!   replay in the next request of a tool loop;
 //! - a provider `error` event carries `error.message` (TS throws the raw
 //!   `data` string).
 
@@ -161,6 +161,8 @@ impl AnthropicDecoder {
             "thinking" => {
                 self.message.content.push(ContentBlock::Thinking {
                     thinking: string_field(content_block, "thinking"),
+                    signature: None,
+                    redacted: false,
                 });
                 out.push(AssistantMessageEvent::ThinkingStart {
                     content_index,
@@ -169,12 +171,10 @@ impl AnthropicDecoder {
                 BlockKind::Thinking
             }
             "redacted_thinking" => {
-                // TS keeps the opaque `data` payload as the block's signature
-                // (with `redacted: true` and a "[Reasoning redacted]" label);
-                // `ContentBlock::Thinking` has no signature field, so the
-                // block stays empty and the payload is dropped.
                 self.message.content.push(ContentBlock::Thinking {
                     thinking: String::new(),
+                    signature: Some(string_field(content_block, "data")),
+                    redacted: true,
                 });
                 out.push(AssistantMessageEvent::ThinkingStart {
                     content_index,
@@ -239,8 +239,9 @@ impl AnthropicDecoder {
             }
             ("thinking_delta", BlockKind::Thinking) => {
                 let thinking = string_field(delta, "thinking");
-                if let Some(ContentBlock::Thinking { thinking: existing }) =
-                    self.message.content.get_mut(block.content_index)
+                if let Some(ContentBlock::Thinking {
+                    thinking: existing, ..
+                }) = self.message.content.get_mut(block.content_index)
                 {
                     existing.push_str(&thinking);
                 }
@@ -266,9 +267,15 @@ impl AnthropicDecoder {
                     partial: self.message.clone(),
                 });
             }
-            // The signature authenticates the thinking block on replay; there
-            // is no field to keep it in, so it is dropped.
-            ("signature_delta", _) => {}
+            ("signature_delta", _) => {
+                let signature = string_field(delta, "signature");
+                if let Some(ContentBlock::Thinking {
+                    signature: stored, ..
+                }) = self.message.content.get_mut(block.content_index)
+                {
+                    stored.get_or_insert_with(String::new).push_str(&signature);
+                }
+            }
             _ => {}
         }
     }
@@ -299,7 +306,7 @@ impl AnthropicDecoder {
             }
             BlockKind::Thinking => {
                 let content = match self.message.content.get(block.content_index) {
-                    Some(ContentBlock::Thinking { thinking }) => thinking.clone(),
+                    Some(ContentBlock::Thinking { thinking, .. }) => thinking.clone(),
                     _ => String::new(),
                 };
                 out.push(AssistantMessageEvent::ThinkingEnd {
@@ -775,7 +782,7 @@ data: {"type":"message_stop"}
         );
         assert_eq!(message.content.len(), 2);
         assert!(
-            matches!(&message.content[0], ContentBlock::Thinking { thinking } if thinking == "Let me think")
+            matches!(&message.content[0], ContentBlock::Thinking { thinking, .. } if thinking == "Let me think")
         );
         assert!(matches!(&message.content[1], ContentBlock::Text { text } if text == "Answer"));
         assert!(events.iter().any(|event| matches!(
@@ -1087,10 +1094,68 @@ data: {"type":"message_stop"}
         );
         assert_eq!(message.content.len(), 2);
         assert!(
-            matches!(&message.content[0], ContentBlock::Thinking { thinking } if thinking.is_empty())
+            matches!(&message.content[0], ContentBlock::Thinking { thinking, .. } if thinking.is_empty())
         );
         assert!(matches!(&message.content[1], ContentBlock::Text { text } if text == "ok"));
         assert_eq!(message.stop_reason, Some(StopReason::Stop));
+    }
+
+    #[test]
+    fn thinking_signature_and_redacted_payload_are_kept() {
+        let corpus = r#"
+data: {"type":"message_start","message":{"id":"m","model":"claude","usage":{}}}
+
+data: {"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":""}}
+
+data: {"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"plan"}}
+
+data: {"type":"content_block_delta","index":0,"delta":{"type":"signature_delta","signature":"SIG"}}
+
+data: {"type":"content_block_stop","index":0}
+
+data: {"type":"content_block_start","index":1,"content_block":{"type":"redacted_thinking","data":"OPAQUE"}}
+
+data: {"type":"content_block_stop","index":1}
+
+data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{}}
+
+data: {"type":"message_stop"}
+"#;
+        let (message, _) = run(corpus);
+        assert_eq!(
+            message.content[0],
+            ContentBlock::Thinking {
+                thinking: "plan".into(),
+                signature: Some("SIG".into()),
+                redacted: false,
+            }
+        );
+        assert_eq!(
+            message.content[1],
+            ContentBlock::Thinking {
+                thinking: String::new(),
+                signature: Some("OPAQUE".into()),
+                redacted: true,
+            }
+        );
+
+        let chat = crate::assistant_to_chat(&message);
+        assert_eq!(
+            chat.content[0],
+            crate::MessageContent::Thinking {
+                thinking: "plan".into(),
+                redacted: None,
+                signature: Some("SIG".into()),
+            }
+        );
+        assert_eq!(
+            chat.content[1],
+            crate::MessageContent::Thinking {
+                thinking: String::new(),
+                redacted: Some(true),
+                signature: Some("OPAQUE".into()),
+            }
+        );
     }
 
     #[test]

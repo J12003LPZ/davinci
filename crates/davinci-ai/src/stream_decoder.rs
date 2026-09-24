@@ -270,6 +270,8 @@ impl ResponsesDecoder {
             "reasoning" => {
                 self.message.content.push(ContentBlock::Thinking {
                     thinking: String::new(),
+                    signature: None,
+                    redacted: false,
                 });
                 out.push(AssistantMessageEvent::ThinkingStart {
                     content_index,
@@ -394,7 +396,7 @@ impl ResponsesDecoder {
     }
 
     fn append_thinking(&mut self, slot: &Slot, delta: &str, out: &mut Vec<AssistantMessageEvent>) {
-        if let Some(ContentBlock::Thinking { thinking }) =
+        if let Some(ContentBlock::Thinking { thinking, .. }) =
             self.message.content.get_mut(slot.content_index)
         {
             thinking.push_str(delta);
@@ -456,14 +458,14 @@ impl ResponsesDecoder {
                     } else {
                         None
                     };
-                    if let (Some(text), Some(ContentBlock::Thinking { thinking })) =
+                    if let (Some(text), Some(ContentBlock::Thinking { thinking, .. })) =
                         (text, self.message.content.get_mut(slot.content_index))
                     {
                         *thinking = text;
                     }
                 }
                 let content = match self.message.content.get(slot.content_index) {
-                    Some(ContentBlock::Thinking { thinking }) => thinking.clone(),
+                    Some(ContentBlock::Thinking { thinking, .. }) => thinking.clone(),
                     _ => String::new(),
                 };
                 out.push(AssistantMessageEvent::ThinkingEnd {
@@ -1068,7 +1070,7 @@ data: {"type":"response.completed","response":{"status":"completed"}}
         let (message, events) = run(corpus);
         assert_eq!(message.content.len(), 4);
         assert!(
-            matches!(&message.content[0], ContentBlock::Thinking { thinking } if thinking == "Need the file")
+            matches!(&message.content[0], ContentBlock::Thinking { thinking, .. } if thinking == "Need the file")
         );
         assert!(
             matches!(&message.content[1], ContentBlock::Text { text } if text == "Reading both.")

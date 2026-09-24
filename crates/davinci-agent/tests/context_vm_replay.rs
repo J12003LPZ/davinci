@@ -126,6 +126,7 @@ fn replay_is_repeatable_and_never_projects_thinking() {
                 MessageContent::Thinking {
                     thinking: "private reasoning".into(),
                     redacted: None,
+                    signature: None,
                 },
                 MessageContent::Text {
                     text: "visible answer".into(),

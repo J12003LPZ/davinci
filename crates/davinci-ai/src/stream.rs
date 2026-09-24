@@ -77,6 +77,12 @@ pub enum ContentBlock {
     },
     Thinking {
         thinking: String,
+        /// Anthropic's signature, or the opaque payload for redacted thinking.
+        /// Required to replay this block in the next request of a tool loop.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        signature: Option<String>,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        redacted: bool,
     },
     #[serde(rename = "toolCall")]
     ToolCall {
@@ -468,9 +474,14 @@ pub fn assistant_to_chat(message: &AssistantMessage) -> ChatMessage {
             .iter()
             .map(|block| match block {
                 ContentBlock::Text { text } => MessageContent::Text { text: text.clone() },
-                ContentBlock::Thinking { thinking } => MessageContent::Thinking {
+                ContentBlock::Thinking {
+                    thinking,
+                    signature,
+                    redacted,
+                } => MessageContent::Thinking {
                     thinking: thinking.clone(),
-                    redacted: None,
+                    redacted: redacted.then_some(true),
+                    signature: signature.clone(),
                 },
                 ContentBlock::ToolCall {
                     id,
@@ -1543,7 +1554,7 @@ pub fn events_from_complete(message: &AssistantMessage) -> Vec<AssistantMessageE
                     partial: message.clone(),
                 });
             }
-            ContentBlock::Thinking { thinking } => {
+            ContentBlock::Thinking { thinking, .. } => {
                 events.push(AssistantMessageEvent::ThinkingStart {
                     content_index: index,
                     partial: message.clone(),
@@ -1943,7 +1954,25 @@ fn anthropic_body(
                     .iter()
                     .any(|block| matches!(block, MessageContent::ToolCall { .. }))
             {
-                let content: Vec<Value> = message
+                let mut content: Vec<Value> = message
+                    .content
+                    .iter()
+                    .filter_map(|block| match block {
+                        MessageContent::Thinking {
+                            signature: Some(signature),
+                            redacted,
+                            thinking,
+                        } => Some(if redacted.unwrap_or(false) {
+                            serde_json::json!({"type":"redacted_thinking","data": signature})
+                        } else {
+                            serde_json::json!({"type":"thinking","thinking": thinking,"signature": signature})
+                        }),
+                        // Unsigned thinking cannot be replayed to Anthropic.
+                        MessageContent::Thinking { .. } => None,
+                        _ => None,
+                    })
+                    .collect();
+                content.extend(message
                     .content
                     .iter()
                     .filter_map(|block| match block {
@@ -1961,8 +1990,7 @@ fn anthropic_body(
                             "input": arguments,
                         })),
                         _ => None,
-                    })
-                    .collect();
+                    }));
                 serde_json::json!({"role":"assistant","content": content})
             } else {
                 serde_json::json!({
@@ -2901,6 +2929,91 @@ mod tests {
             },
         );
         assert!(body["tools"][0].get("cache_control").is_none());
+    }
+
+    #[test]
+    fn anthropic_body_replays_signed_thinking_first_in_tool_turns() {
+        let model = load_builtin_models()
+            .into_iter()
+            .find(|m| m.api == "anthropic-messages")
+            .expect("anthropic model");
+        let assistant = ChatMessage {
+            role: "assistant".into(),
+            content: vec![
+                MessageContent::Thinking {
+                    thinking: "plan".into(),
+                    redacted: None,
+                    signature: Some("SIG".into()),
+                },
+                MessageContent::Thinking {
+                    thinking: String::new(),
+                    redacted: Some(true),
+                    signature: Some("OPAQUE".into()),
+                },
+                MessageContent::Thinking {
+                    thinking: "unsigned".into(),
+                    redacted: None,
+                    signature: None,
+                },
+                MessageContent::ToolCall {
+                    id: "t1".into(),
+                    name: "read".into(),
+                    arguments: serde_json::json!({"path":"a"}),
+                },
+            ],
+            ..ChatMessage::default()
+        };
+        let body = anthropic_body(&model, &[assistant], None, &[], &StreamOptions::default());
+        let content = body["messages"][0]["content"].as_array().unwrap();
+        assert_eq!(
+            content[0],
+            serde_json::json!({"type":"thinking","thinking":"plan","signature":"SIG"})
+        );
+        assert_eq!(
+            content[1],
+            serde_json::json!({"type":"redacted_thinking","data":"OPAQUE"})
+        );
+        assert_eq!(content[2]["type"], "tool_use");
+        assert_eq!(content.len(), 3);
+    }
+
+    #[test]
+    fn thinking_signature_fields_preserve_legacy_serialized_shapes() {
+        let old_block: ContentBlock = serde_json::from_value(serde_json::json!({
+            "type": "thinking",
+            "thinking": "plan",
+        }))
+        .unwrap();
+        assert_eq!(
+            old_block,
+            ContentBlock::Thinking {
+                thinking: "plan".into(),
+                signature: None,
+                redacted: false,
+            }
+        );
+        assert_eq!(
+            serde_json::to_value(&old_block).unwrap(),
+            serde_json::json!({"type":"thinking","thinking":"plan"})
+        );
+
+        let old_message: MessageContent = serde_json::from_value(serde_json::json!({
+            "type": "thinking",
+            "thinking": "plan",
+        }))
+        .unwrap();
+        assert_eq!(
+            old_message,
+            MessageContent::Thinking {
+                thinking: "plan".into(),
+                redacted: None,
+                signature: None,
+            }
+        );
+        assert_eq!(
+            serde_json::to_value(&old_message).unwrap(),
+            serde_json::json!({"type":"thinking","thinking":"plan"})
+        );
     }
 
     #[test]

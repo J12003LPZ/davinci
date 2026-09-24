@@ -183,8 +183,10 @@ pub enum MessageContent {
     },
     Thinking {
         thinking: String,
-        #[serde(skip_serializing_if = "Option::is_none")]
+        #[serde(default, skip_serializing_if = "Option::is_none")]
         redacted: Option<bool>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        signature: Option<String>,
     },
     Image {
         data: String,

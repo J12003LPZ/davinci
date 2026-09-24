@@ -119,7 +119,7 @@ impl CompletionsDecoder {
             }
             Some(Open::Thinking(content_index)) => {
                 let content = match self.message.content.get(content_index) {
-                    Some(ContentBlock::Thinking { thinking }) => thinking.clone(),
+                    Some(ContentBlock::Thinking { thinking, .. }) => thinking.clone(),
                     _ => String::new(),
                 };
                 out.push(AssistantMessageEvent::ThinkingEnd {
@@ -160,6 +160,8 @@ impl CompletionsDecoder {
         let content_index = self.message.content.len();
         self.message.content.push(ContentBlock::Thinking {
             thinking: String::new(),
+            signature: None,
+            redacted: false,
         });
         self.open = Some(Open::Thinking(content_index));
         out.push(AssistantMessageEvent::ThinkingStart {
@@ -183,7 +185,7 @@ impl CompletionsDecoder {
 
     fn append_thinking(&mut self, delta: &str, out: &mut Vec<AssistantMessageEvent>) {
         let content_index = self.ensure_thinking(out);
-        if let Some(ContentBlock::Thinking { thinking }) =
+        if let Some(ContentBlock::Thinking { thinking, .. }) =
             self.message.content.get_mut(content_index)
         {
             thinking.push_str(delta);
@@ -905,7 +907,7 @@ data: [DONE]
         );
         assert_eq!(message.content.len(), 2);
         assert!(
-            matches!(&message.content[0], ContentBlock::Thinking { thinking } if thinking == "Think hard")
+            matches!(&message.content[0], ContentBlock::Thinking { thinking, .. } if thinking == "Think hard")
         );
         assert!(matches!(&message.content[1], ContentBlock::Text { text } if text == "Answer"));
         match &events[4] {
@@ -931,7 +933,7 @@ data: {"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}
         let (message, events) = run(corpus);
         assert_eq!(message.content.len(), 1);
         assert!(
-            matches!(&message.content[0], ContentBlock::Thinking { thinking } if thinking == "same more!")
+            matches!(&message.content[0], ContentBlock::Thinking { thinking, .. } if thinking == "same more!")
         );
         assert_eq!(
             names(&events)

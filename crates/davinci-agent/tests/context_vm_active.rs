@@ -111,6 +111,7 @@ fn active_projection_and_manual_fold_never_replace_authoritative_messages() {
                 MessageContent::Thinking {
                     thinking: "private reasoning must stay private".into(),
                     redacted: None,
+                    signature: None,
                 },
                 MessageContent::Text {
                     text: "I will inspect the API".into(),
