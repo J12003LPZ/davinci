@@ -39,8 +39,11 @@ impl PasteBurst {
         if printable || whitespace {
             self.keys.push(key);
             self.last = Some(now);
+            let trailing_short_enter = self.keys.len() < 8
+                && matches!(self.keys.last().map(|key| key.code), Some(KeyCode::Enter));
             self.pasting |= self.keys.len() >= 8
                 || (self.keys.len() > 1
+                    && !trailing_short_enter
                     && self
                         .keys
                         .iter()
@@ -145,6 +148,23 @@ mod tests {
         assert_eq!(
             burst.idle(start + TYPING_WAIT * 2 + PASTE_WAIT),
             vec![Event::Paste("\nb".into())]
+        );
+    }
+
+    #[test]
+    fn short_typed_burst_ending_in_enter_still_submits() {
+        let start = Instant::now();
+        let mut burst = PasteBurst::default();
+        assert!(burst.feed(key(KeyCode::Char('o')), start).is_empty());
+        assert!(burst.feed(key(KeyCode::Char('k')), start).is_empty());
+        assert!(burst.feed(key(KeyCode::Enter), start).is_empty());
+        assert_eq!(
+            burst.idle(start + TYPING_WAIT),
+            vec![
+                key(KeyCode::Char('o')),
+                key(KeyCode::Char('k')),
+                key(KeyCode::Enter),
+            ]
         );
     }
 
