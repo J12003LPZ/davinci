@@ -30,3 +30,4 @@ libc.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
+davinci-mcp = { path = "../davinci-mcp", features = ["test-fixtures"] }

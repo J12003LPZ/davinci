@@ -17,5 +17,9 @@ thiserror.workspace = true
 ureq.workspace = true
 url.workspace = true
 
+[features]
+default = []
+test-fixtures = []
+
 [dev-dependencies]
 tempfile.workspace = true
