@@ -50,9 +50,10 @@ globset.workspace = true
 notify.workspace = true
 
 [dev-dependencies]
-tempfile.workspace = true
+davinci-coding-agent = { path = ".", features = ["test-fixtures"] }
 davinci-ai = { path = "../davinci-ai", features = ["test-fixtures"] }
 davinci-mcp = { path = "../davinci-mcp", features = ["test-fixtures"] }
+tempfile.workspace = true
 
 [features]
 default = []
