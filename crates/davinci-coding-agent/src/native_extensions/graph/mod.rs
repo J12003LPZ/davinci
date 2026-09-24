@@ -1537,12 +1537,18 @@ impl GraphController {
                                     latest.run_id
                                 ));
                             };
-                            if run.phase == types::Phase::Done
-                                || run.current_lifecycle() == types::GraphLifecycle::Paused
-                            {
-                                self.status(Some(&run.run_id))
-                            } else {
+                            let resumable =
+                                run.current_lifecycle() == types::GraphLifecycle::Running
+                                    && !matches!(
+                                        run.phase,
+                                        types::Phase::Done
+                                            | types::Phase::Blocked
+                                            | types::Phase::Cancelled
+                                    );
+                            if resumable {
                                 self.resume(&run.run_id)?
+                            } else {
+                                self.status(Some(&run.run_id))
                             }
                         }
                     }
@@ -2550,6 +2556,22 @@ mod tests {
         assert!(resumed.blocked_reason.is_none());
         assert!(resumed.counters.cost_usd >= 6.83);
         assert!(resumed.counters.revision_cycles >= 3);
+    }
+
+    #[test]
+    fn bare_graph_command_shows_cancelled_run_without_resuming() {
+        let _guard = registry_guard();
+        let dir = tempdir().unwrap();
+        let controller = controller(dir.path());
+        let mut run = controller
+            .run_to_completion(parse_graph_args("--dry-run --simple cancelled fixture"))
+            .unwrap();
+        run.phase = Phase::Cancelled;
+        run.lifecycle = Some(types::GraphLifecycle::Stopped);
+        store::save_run(&mut run).unwrap();
+        let response = controller.command("graph", "").unwrap().unwrap();
+        assert_eq!(response["phase"], "cancelled");
+        assert!(!is_running(dir.path()));
     }
 
     #[test]
