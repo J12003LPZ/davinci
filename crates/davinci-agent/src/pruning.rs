@@ -44,6 +44,36 @@ impl Default for PruneSettings {
     }
 }
 
+impl PruneSettings {
+    /// Cache-sensitive routes prune in fewer, larger passes because every
+    /// rewrite invalidates the suffix of the cached conversation.
+    pub fn cached_route() -> Self {
+        Self {
+            start_fraction: 0.65,
+            target_fraction: 0.35,
+            ..Self::default()
+        }
+    }
+
+    /// `DAVINCI_PRUNE_PROFILE=default|cached|off` overrides the route.
+    /// Explicit caller settings are never replaced.
+    pub fn for_route(base: &PruneSettings, cache_sensitive: bool) -> PruneSettings {
+        if *base != PruneSettings::default() {
+            return *base;
+        }
+        match std::env::var("DAVINCI_PRUNE_PROFILE").ok().as_deref() {
+            Some("off") => PruneSettings {
+                enabled: false,
+                ..*base
+            },
+            Some("default") => *base,
+            Some("cached") => PruneSettings::cached_route(),
+            _ if cache_sensitive => PruneSettings::cached_route(),
+            _ => *base,
+        }
+    }
+}
+
 /// The text the provider sees in place of a pruned body.
 pub fn placeholder(tool_name: &str, chars: usize) -> String {
     format!(
