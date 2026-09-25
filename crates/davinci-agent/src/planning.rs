@@ -826,6 +826,40 @@ mod tests {
     }
 
     #[test]
+    fn failed_accept_cannot_leave_auto_mode_without_a_contract() {
+        let (dir, mut agent) = fixture();
+        agent.handle_plan_command("accept auto").unwrap();
+        assert_eq!(agent.permission_mode(), PermissionMode::Auto);
+        assert!(agent.active_contract().is_some());
+
+        let revision = agent.tool_context.living_plan.lock().unwrap().revision;
+        agent
+            .tool_context
+            .living_plan
+            .lock()
+            .unwrap()
+            .update(
+                &json!({
+                    "expected_revision": revision,
+                    "steps": [{
+                        "id": "one",
+                        "files": ["src.rs:120"],
+                        "change": "invalid scoped path",
+                        "why": "exercise failed handoff",
+                        "verify": ["cargo test --offline"]
+                    }]
+                }),
+                dir.path(),
+            )
+            .unwrap();
+
+        let error = agent.handle_plan_command("accept auto").unwrap_err();
+        assert!(error.contains("execution contract"), "{error}");
+        assert!(agent.active_contract().is_none());
+        assert_eq!(agent.permission_mode(), PermissionMode::ReadOnly);
+    }
+
+    #[test]
     fn plan_acceptance_compiles_task_contract() {
         let (_dir, mut agent) = fixture();
         assert!(agent.active_contract().is_none());
