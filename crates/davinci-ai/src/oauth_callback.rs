@@ -424,7 +424,9 @@ impl CallbackServer {
     }
 
     fn serve(&mut self, mut stream: TcpStream) -> Result<CallbackResponse, String> {
-        stream.set_read_timeout(Some(Duration::from_secs(5))).ok();
+        if stream.read_timeout().ok().flatten().is_none() {
+            stream.set_read_timeout(Some(Duration::from_secs(5))).ok();
+        }
         let mut buf = [0u8; 8192];
         let n = stream.read(&mut buf).map_err(|err| err.to_string())?;
         let request = String::from_utf8_lossy(&buf[..n]);
