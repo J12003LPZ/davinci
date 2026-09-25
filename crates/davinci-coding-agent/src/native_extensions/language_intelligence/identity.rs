@@ -4,10 +4,12 @@ use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
 pub enum LanguageFamily {
+    #[serde(rename = "typescript")]
     TypeScript,
+    #[serde(rename = "rust")]
     Rust,
+    #[serde(rename = "python")]
     Python,
 }
 
