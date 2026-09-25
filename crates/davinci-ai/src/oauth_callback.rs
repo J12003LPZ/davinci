@@ -392,9 +392,24 @@ impl CallbackServer {
                     stream
                         .set_nonblocking(false)
                         .map_err(|err| err.to_string())?;
-                    let response = self.serve(stream)?;
-                    if response.code.is_some() {
-                        return Ok(response);
+                    let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+                    if remaining.is_zero() {
+                        return Err("Timed out waiting for the browser login callback.".into());
+                    }
+                    stream
+                        .set_read_timeout(Some(remaining.min(Duration::from_secs(5))))
+                        .map_err(|err| err.to_string())?;
+                    match self.serve(stream) {
+                        Ok(response) if response.code.is_some() => return Ok(response),
+                        Ok(_) => {}
+                        Err(_) if std::time::Instant::now() < deadline => {
+                            // Browser speculative connections can connect and
+                            // send no request at all. A per-connection failure
+                            // must not consume the OAuth callback.
+                        }
+                        Err(_) => {
+                            return Err("Timed out waiting for the browser login callback.".into())
+                        }
                     }
                 }
                 Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
