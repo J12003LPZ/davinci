@@ -3050,7 +3050,8 @@ impl Agent {
                 crate::runtime::ExecutorCapabilities::default(),
                 cwd,
             )
-            .with_contract(contract.clone());
+            .with_contract(contract.clone())
+            .allowing_unconfined_shell();
             if let Err(error) = executor.execute_shell(command, false) {
                 return Err(crate::runtime::ScopeViolation {
                     requested_target: name.to_string(),
