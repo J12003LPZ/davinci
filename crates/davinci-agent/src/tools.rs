@@ -3424,14 +3424,9 @@ fn glob_match(pattern: &str, name: &str) -> bool {
     }
     let pattern = pattern.replace('\\', "/");
     let name = name.replace('\\', "/");
-    if let Some(stripped) = pattern.strip_prefix("**/") {
-        return glob_match(stripped, &name)
-            || name
-                .rsplit('/')
-                .next()
-                .is_some_and(|part| glob_match(stripped, part))
-            || name.split('/').any(|part| glob_match(stripped, part));
-    }
+    // The DP matcher already understands **. Do not recursively peel **/
+    // prefixes here: patterns such as **/**/**/... otherwise branch
+    // exponentially before reaching the memoized matcher.
     match_glob_chars(&pattern, &name)
 }
 
