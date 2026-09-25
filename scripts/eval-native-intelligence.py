@@ -7,6 +7,7 @@ or downloads them.
 import argparse
 import json
 import os
+import shutil
 from pathlib import Path
 import subprocess
 import sys
@@ -119,6 +120,15 @@ def main():
             if extra_checks:
                 (config / "settings.json").write_text(json.dumps(settings), encoding="utf-8")
             if "typescript" in languages:
+                tls = os.environ.get("DAVINCI_TEST_LANGUAGE_SERVER")
+                typescript = os.environ.get("DAVINCI_TEST_TYPESCRIPT")
+                if tls and typescript:
+                    source_node_modules = Path(tls).resolve().parent
+                    shutil.copytree(
+                        source_node_modules,
+                        root / "node_modules",
+                        dirs_exist_ok=True,
+                    )
                 (root / "package.json").write_text('{"private":true}', encoding="utf-8")
                 (root / "tsconfig.json").write_text(
                     json.dumps(
