@@ -544,6 +544,16 @@ impl OutputStore {
         })
     }
 
+    pub fn clear(&self) -> Result<(), ToolError> {
+        match fs::remove_dir_all(&self.root) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(ToolError::Failed(format!(
+                "unable to clear stored outputs for this session: {error}"
+            ))),
+        }
+    }
+
     /// Remove sibling session directories under the store's parent that no
     /// file has touched for `max_age`. Nothing else ever deletes them, and a
     /// session's outputs are useless once that session is gone. Best effort:
@@ -1057,7 +1067,9 @@ impl TokenGovernor {
     /// `/governor-reset`: the ledgers and the counters.
     pub fn reset(&mut self) {
         self.session_start();
+        let _ = self.store.clear();
         self.stored.clear();
+        self.lsp_permissions = None;
         self.tool_calls = 0;
         self.compressed_outputs = 0;
         self.deduplicated_reads = 0;
