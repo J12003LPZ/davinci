@@ -188,6 +188,10 @@ compatibility issue rather than evidence for or against the LSP implementation.
 Per the explicit instruction for this implementation pass, unrelated CI/baseline
 failures were not used as a blocker.
 
+The language-intelligence workflow itself passes the repository's workflow
+linter after consolidating environment writes and using native Windows paths for
+provisioned server/package identities.
+
 The manual live-server workflow could not be dispatched through the available
 GitHub connector in this session. Therefore this report does **not** mark any
 real backend/platform combination as verified yet.
