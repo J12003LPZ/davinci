@@ -636,8 +636,7 @@ mod tests {
     #[test]
     fn stray_requests_do_not_consume_the_callback() {
         let mut server =
-            CallbackServer::bind("127.0.0.1", 0, CallbackProvider::OpenAiCodex, "state-1")
-                .unwrap();
+            CallbackServer::bind("127.0.0.1", 0, CallbackProvider::OpenAiCodex, "state-1").unwrap();
         let addr = server.local_addr().unwrap();
         let client = std::thread::spawn(move || {
             for target in ["/favicon.ico", "/auth/callback?code=real&state=state-1"] {
@@ -661,8 +660,7 @@ mod tests {
     #[test]
     fn disconnected_preconnect_does_not_consume_the_callback() {
         let mut server =
-            CallbackServer::bind("127.0.0.1", 0, CallbackProvider::OpenAiCodex, "state-1")
-                .unwrap();
+            CallbackServer::bind("127.0.0.1", 0, CallbackProvider::OpenAiCodex, "state-1").unwrap();
         let addr = server.local_addr().unwrap();
         let client = std::thread::spawn(move || {
             // A browser can preconnect and keep the socket open without ever
@@ -672,12 +670,20 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(400));
             drop(speculative);
             let mut stream = std::net::TcpStream::connect(addr).unwrap();
-            use std::io::Write;
+            use std::io::{Read, Write};
             write!(
                 stream,
                 "GET /auth/callback?code=real&state=state-1 HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n"
             )
             .unwrap();
+            // Keep the real callback connected until its response is read.
+            // Closing early can reset the server's response write on Windows.
+            stream
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            let mut response = String::new();
+            stream.read_to_string(&mut response).unwrap();
+            assert!(response.starts_with("HTTP/1.1 200"));
         });
         let response = server
             .accept_until(std::time::Instant::now() + std::time::Duration::from_secs(2))
