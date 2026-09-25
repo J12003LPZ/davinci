@@ -7,7 +7,8 @@ Start with the [architecture and navigation guide](ARCHITECTURE.md). The
 verified improvements and remaining risks.
 
 Native capability guides: [repository intelligence](repo-intelligence.md),
-[language intelligence](language-intelligence.md), [test impact](test-impact.md),
+[language intelligence](language-intelligence.md), [language compatibility report](language-intelligence-compatibility.md),
+[test impact](test-impact.md),
 [managed processes](process-manager.md), [transactional edits](transactional-edits.md),
 and [browser verification](browser-verification.md).
 Context and routing: [Context VM](context-vm.md), [Jev](decision-intelligence.md),
