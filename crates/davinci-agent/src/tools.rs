@@ -3424,17 +3424,11 @@ fn glob_match(pattern: &str, name: &str) -> bool {
     }
     let pattern = pattern.replace('\\', "/");
     let name = name.replace('\\', "/");
-    if let Some(stripped) = pattern.strip_prefix("**/") {
-        return glob_match(stripped, &name)
-            || name
-                .rsplit('/')
-                .next()
-                .is_some_and(|part| glob_match(stripped, part))
-            || name.split('/').any(|part| glob_match(stripped, part));
-    }
+    // The memoized matcher already gives **/ zero-directory and recursive
+    // semantics. Recursively stripping **/ here made repeated prefixes branch
+    // exponentially before the memoized matcher was reached.
     match_glob_chars(&pattern, &name)
 }
-
 fn match_glob_chars(pattern: &str, name: &str) -> bool {
     let p: Vec<char> = pattern.chars().collect();
     let n: Vec<char> = name.chars().collect();
