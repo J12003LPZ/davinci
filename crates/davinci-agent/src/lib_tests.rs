@@ -3072,3 +3072,199 @@ fn unrelated_successful_test_does_not_verify_mutation() {
         Some(VerificationCoverage::Unrelated)
     );
 }
+
+fn shell_tool() -> &'static str {
+    if cfg!(windows) {
+        "powershell"
+    } else {
+        "bash"
+    }
+}
+
+fn verifying_agent(dir: &std::path::Path) -> Agent {
+    let mut agent = Agent::new(default_system_prompt());
+    agent.cwd = dir.to_path_buf();
+    agent.set_permission_mode(PermissionMode::Ask);
+    agent.approver = Some(ToolApprover(Arc::new(|_| ToolApprovalDecision::AllowOnce)));
+    agent
+}
+
+fn harness_runs(agent: &Agent) -> usize {
+    agent
+        .messages
+        .iter()
+        .filter(|message| message.extra.contains_key("davinciHarnessVerification"))
+        .count()
+}
+
+fn reminders(agent: &Agent) -> Vec<String> {
+    agent
+        .messages
+        .iter()
+        .filter(|message| message.extra.contains_key("davinciCapabilityReminder"))
+        .map(|message| davinci_ai::content_text(&message.content))
+        .collect()
+}
+
+#[test]
+fn harness_reruns_the_last_verification_after_a_later_edit() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut agent = verifying_agent(dir.path());
+    agent.prompt("edit, verify, edit again");
+    let mut model_calls = 0;
+    let mut script = scripted_tool_calls(vec![
+        (
+            "write",
+            serde_json::json!({"path": "a.txt", "content": "one"}),
+        ),
+        (
+            shell_tool(),
+            serde_json::json!({"command": "cargo check --help"}),
+        ),
+        (
+            "write",
+            serde_json::json!({"path": "a.txt", "content": "two"}),
+        ),
+    ]);
+    agent
+        .run_loop(|current| {
+            model_calls += 1;
+            script(current)
+        })
+        .unwrap();
+
+    assert_eq!(
+        model_calls, 4,
+        "write, verify, write, done: no reminder round trip"
+    );
+    assert_eq!(harness_runs(&agent), 1);
+    assert!(reminders(&agent).is_empty(), "{:?}", reminders(&agent));
+    assert_eq!(agent.completion_evidence(), CompletionEvidence::Verified);
+}
+
+#[test]
+fn a_failing_harness_rerun_is_reported_to_the_model() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut agent = verifying_agent(dir.path());
+    agent.prompt("edit, verify, edit again");
+    let mut model_calls = 0;
+    let mut script = scripted_tool_calls(vec![
+        (
+            "write",
+            serde_json::json!({"path": "a.txt", "content": "one"}),
+        ),
+        (
+            shell_tool(),
+            serde_json::json!({"command": "cargo check --definitely-not-a-flag"}),
+        ),
+        (
+            "write",
+            serde_json::json!({"path": "a.txt", "content": "two"}),
+        ),
+    ]);
+    agent
+        .run_loop(|current| {
+            model_calls += 1;
+            script(current)
+        })
+        .unwrap();
+
+    assert_eq!(harness_runs(&agent), 1);
+    let reminders = reminders(&agent);
+    assert_eq!(reminders.len(), 1, "{reminders:?}");
+    assert!(
+        reminders[0].contains("the harness re-ran"),
+        "{}",
+        reminders[0]
+    );
+    assert_eq!(model_calls, 5, "the model answers the reminder once");
+}
+
+#[test]
+fn auto_verify_off_keeps_the_plain_reminder() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut agent = verifying_agent(dir.path());
+    agent.auto_verify = false;
+    agent.prompt("edit, verify, edit again");
+    let mut script = scripted_tool_calls(vec![
+        (
+            "write",
+            serde_json::json!({"path": "a.txt", "content": "one"}),
+        ),
+        (
+            shell_tool(),
+            serde_json::json!({"command": "cargo check --help"}),
+        ),
+        (
+            "write",
+            serde_json::json!({"path": "a.txt", "content": "two"}),
+        ),
+    ]);
+    agent.run_loop(|current| script(current)).unwrap();
+
+    assert_eq!(harness_runs(&agent), 0);
+    let reminders = reminders(&agent);
+    assert_eq!(reminders.len(), 1);
+    assert!(reminders[0].contains("have not completed a verification command"));
+}
+
+#[test]
+fn harness_rerun_respects_permission_denial() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut agent = verifying_agent(dir.path());
+    agent.approver = Some(ToolApprover(Arc::new(|_| ToolApprovalDecision::Deny)));
+    agent.prompt("finish the change");
+    agent.remember_verification_command(shell_tool(), "cargo check --help");
+    agent.record_successful_mutation();
+    let events = agent.run_loop(scripted_tool_calls(vec![])).unwrap();
+    let outcomes = tool_outcomes(&events);
+    assert_eq!(outcomes.len(), 1);
+    assert!(outcomes[0].1);
+    assert!(outcomes[0].2.contains("Permission denied"), "{outcomes:?}");
+    assert_eq!(harness_runs(&agent), 1);
+    assert_ne!(agent.completion_evidence(), CompletionEvidence::Verified);
+}
+
+#[test]
+fn harness_rerun_preserves_context_and_stops_on_cancellation() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let original = tempfile::tempdir().unwrap();
+    let current = tempfile::tempdir().unwrap();
+    let mut agent = verifying_agent(current.path());
+    agent.prompt("finish the change");
+    let args = serde_json::json!({"command":"cargo check --help", "timeout":17});
+    agent.remember_verification_call(shell_tool(), &args, original.path());
+    agent.record_successful_mutation();
+    let cancelled = Arc::new(AtomicBool::new(false));
+    agent.abort_signal = Some(cancelled.clone());
+    let observed = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let capture = observed.clone();
+    agent.post_tool = Some(PostToolHook(Arc::new(move |_, cwd, name, args, result| {
+        capture
+            .lock()
+            .unwrap()
+            .push((cwd.to_path_buf(), name.to_string(), args.clone()));
+        cancelled.store(true, Ordering::SeqCst);
+        result
+    })));
+    let mut model_calls = 0;
+    let mut script = scripted_tool_calls(vec![]);
+    agent
+        .run_loop(|current| {
+            model_calls += 1;
+            script(current)
+        })
+        .unwrap();
+    assert_eq!(model_calls, 1);
+    assert!(agent.abort_requested());
+    assert_eq!(
+        *observed.lock().unwrap(),
+        vec![(
+            original.path().to_path_buf(),
+            shell_tool().to_string(),
+            args
+        )]
+    );
+    assert_eq!(harness_runs(&agent), 1);
+    assert!(reminders(&agent).is_empty());
+}

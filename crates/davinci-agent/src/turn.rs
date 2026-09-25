@@ -69,7 +69,87 @@ fn agent_call_may_write_shared(args: &Value, mode: crate::PermissionMode) -> boo
     }
 }
 
+/// What happened when the harness re-ran the last verification command.
+enum HarnessVerification {
+    Passed,
+    Failed { output_tail: String },
+}
+
 impl Agent {
+    /// Run `last` as a normal tool call issued by the harness: an assistant
+    /// message with the call, then the tool result, both in history and in
+    /// the session, so replay and recovery see an ordinary tool exchange.
+    fn run_harness_verification(
+        &mut self,
+        last: &crate::LastVerification,
+        events: &mut Vec<AgentEvent>,
+        new_messages: &mut Vec<ChatMessage>,
+    ) -> Result<HarnessVerification, String> {
+        let call_token = uuid::Uuid::new_v4();
+        let call_id = format!("davinci_verify_{call_token}");
+        let arguments = if last.arguments.is_object() {
+            last.arguments.clone()
+        } else {
+            serde_json::json!({ "command": last.command })
+        };
+        let assistant = AssistantMessage {
+            id: format!("davinci-verify-{call_token}"),
+            role: "assistant".into(),
+            content: vec![ContentBlock::ToolCall {
+                id: call_id.clone(),
+                name: last.tool.clone(),
+                arguments: arguments.clone(),
+            }],
+            model: format!("{}/{}", self.provider, self.model_id),
+            usage: None,
+            stop_reason: Some(StopReason::ToolUse),
+            error_message: None,
+        };
+        let mut chat = assistant_to_chat(&assistant);
+        chat.extra
+            .insert("davinciHarnessVerification".into(), Value::Bool(true));
+        self.messages.push(chat.clone());
+        self.persist_assistant(&assistant, &chat, None);
+        self.ensure_session_persistence()?;
+        new_messages.push(chat.clone());
+        self.push_event(
+            events,
+            AgentEvent::MessageStart {
+                message: chat.clone(),
+            },
+        );
+        self.push_event(events, AgentEvent::MessageEnd { message: chat });
+
+        let cwd = last.cwd.clone().unwrap_or_else(|| self.cwd.clone());
+        let results =
+            self.execute_tool_batch(&cwd, vec![(call_id, last.tool.clone(), arguments)], events);
+        let mut output_tail = String::new();
+        for mut result in results {
+            let name = result.tool_name.clone().unwrap_or_default();
+            self.after_tool(&name, &mut result);
+            let text = davinci_ai::content_text(&result.content);
+            let lines: Vec<&str> = text.lines().collect();
+            output_tail = lines[lines.len().saturating_sub(30)..].join("\n");
+            self.messages.push(result.clone());
+            self.persist_chat(&result)?;
+            new_messages.push(result.clone());
+            self.push_event(
+                events,
+                AgentEvent::MessageStart {
+                    message: result.clone(),
+                },
+            );
+            self.push_event(events, AgentEvent::MessageEnd { message: result });
+        }
+        Ok(
+            if self.completion_evidence() == crate::CompletionEvidence::Verified {
+                HarnessVerification::Passed
+            } else {
+                HarnessVerification::Failed { output_tail }
+            },
+        )
+    }
+
     /// Start a loop after user prompts have already been appended.
     pub fn run_loop<F, T>(&mut self, complete: F) -> Result<Vec<AgentEvent>, String>
     where
@@ -483,21 +563,53 @@ impl Agent {
                 ) && verification_reminded_generation != Some(mutation_generation)
                 {
                     verification_reminded_generation = Some(mutation_generation);
-                    let message = match completion_evidence {
-                        crate::CompletionEvidence::VerificationFailed => {
-                            "The latest verification command failed after a file change. Investigate the failure or report it explicitly before finalizing."
+                    let last = self.mutation_verification_state().last_verification;
+                    let rerun = match (&last, completion_evidence) {
+                        (Some(last), crate::CompletionEvidence::Unverified) if self.auto_verify => {
+                            Some(self.run_harness_verification(
+                                last,
+                                &mut events,
+                                &mut new_messages,
+                            )?)
                         }
-                        _ => {
-                            "You changed files but have not completed a verification command. Run the narrowest appropriate test, check, or lint command before finalizing."
-                        }
+                        _ => None,
                     };
-                    self.queue_capability_reminder(
-                        message,
-                        "verification_required",
-                        &mut events,
-                        &mut new_messages,
-                    );
-                    continue;
+                    if self.abort_requested() {
+                        continue;
+                    }
+                    match rerun {
+                        Some(HarnessVerification::Passed) => {}
+                        Some(HarnessVerification::Failed { output_tail }) => {
+                            let command = last.map(|last| last.command).unwrap_or_default();
+                            let message = format!(
+                                "After your last change the harness re-ran `{command}` and it failed:\n{output_tail}\nFix the failure, or report it explicitly before finalizing."
+                            );
+                            self.queue_capability_reminder(
+                                &message,
+                                "verification_required",
+                                &mut events,
+                                &mut new_messages,
+                            );
+                            continue;
+                        }
+                        None => {
+                            let message = match completion_evidence {
+                                crate::CompletionEvidence::VerificationFailed => {
+                                    "The latest verification command failed after a file change. Investigate the failure or report it explicitly before finalizing."
+                                }
+                                _ => {
+                                    "You changed files but have not completed a verification command. Run the narrowest appropriate test, check, or lint command before finalizing."
+                                }
+                            };
+                            self.queue_capability_reminder(
+                                message,
+                                "verification_required",
+                                &mut events,
+                                &mut new_messages,
+                            );
+                            continue;
+                        }
+                    }
                 }
             }
 

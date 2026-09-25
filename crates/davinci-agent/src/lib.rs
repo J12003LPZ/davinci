@@ -356,6 +356,8 @@ pub struct Agent {
     pub system_prompt: String,
     pub messages: Vec<ChatMessage>,
     pub thinking_level: ThinkingLevel,
+    /// Repeat the last verification call after later mutations at completion.
+    pub auto_verify: bool,
     pub auto_compaction: bool,
     pub compaction: CompactionSettings,
     pub auto_retry: bool,
@@ -505,6 +507,7 @@ impl Agent {
             last_real_user_request: None,
             messages: Vec::new(),
             thinking_level: ThinkingLevel::Off,
+            auto_verify: true,
             auto_compaction: true,
             compaction: CompactionSettings::default(),
             auto_retry: true,
