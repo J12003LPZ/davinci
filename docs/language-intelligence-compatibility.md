@@ -184,9 +184,8 @@ Local evidence, Windows 11 Pro, Rust 1.83.0, Node v24.19.0:
 - `cargo check --workspace --all-targets --offline --locked`: pass.
 - `cargo fmt --all --check`: pass.
 - `cargo clippy --workspace --all-targets --offline --locked -- -D warnings`: pass.
-- `cargo test --workspace --offline --locked`: 4501 passed, 0 failed,
-  37 ignored before the rust-analyzer readiness gate was added; the focused
-  language-intelligence suites pass after it.
+- `cargo test --workspace --offline --locked`: 4504 passed, 0 failed,
+  37 ignored.
 - `real_rust_lsp_semantics` with rust-analyzer 1.98.0 (88d9e12a 2026-08-18):
   **pass** (about 18 s). The first run returned an empty definition because the
   query ran before rust-analyzer finished loading the workspace. The client now
