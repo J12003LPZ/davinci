@@ -85,8 +85,8 @@ pub use render::{
     GraphCommand, ParsedGraphArgs,
 };
 use serde_json::{json, Value};
-pub use store::now_ms;
-use store::{list_runs, load_run, transcript_path};
+pub use store::{list_runs, load_run, now_ms};
+use store::transcript_path;
 use verify::{contracted_verify_exec, default_verify_exec, dry_run_verify_exec};
 use worker::{run_dry_worker, run_worker};
 

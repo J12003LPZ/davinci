@@ -883,6 +883,7 @@ pub fn run_dry_worker(
 /// Run a fixture child process that sleeps beyond the deadline to verify
 /// active process-tree termination.
 #[cfg(any(test, feature = "test-fixtures"))]
+#[allow(dead_code)]
 pub fn run_fixture_worker_with_deadline(
     deadline: std::time::Duration,
 ) -> Result<WorkerResult, WorkerError> {

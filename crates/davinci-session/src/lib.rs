@@ -14,8 +14,9 @@ pub use codec::{
     parse_mutation,
 };
 pub use discovery::{
-    cwd_encoded_dir, default_agent_dir, default_session_dir, discover_sessions,
-    encode_cwd_component, expand_tilde, home_dir, latest_session, resolve_session_dir,
+    cwd_encoded_dir, default_agent_dir, default_session_dir, discover_session_headers,
+    discover_sessions, encode_cwd_component, expand_tilde, home_dir, latest_session,
+    resolve_session_dir,
     resolve_session_dir_from, resolve_session_ref, SessionSummary,
 };
 pub use errors::{JsonlDecodeError, SessionError};

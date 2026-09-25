@@ -318,48 +318,6 @@ pub fn atomic_write(path: &Path, content: &[u8]) -> std::io::Result<()> {
     davinci_sys::fs::atomic_write(path, content)
 }
 
-fn atomic_write_with<F>(path: &Path, content: &[u8], mut rename: F) -> std::io::Result<()>
-where
-    F: FnMut(&Path, &Path) -> std::io::Result<()>,
-{
-    let parent = path.parent().unwrap_or(Path::new("."));
-    fs::create_dir_all(parent)?;
-    let file_name = path
-        .file_name()
-        .map(|name| name.to_string_lossy().into_owned())
-        .unwrap_or_else(|| "state".into());
-    let temporary = parent.join(format!(".{file_name}.{}.tmp", uuid::Uuid::new_v4()));
-    let mut file = fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&temporary)?;
-    let result = (|| {
-        use std::io::Write;
-        file.write_all(content)?;
-        file.sync_all()?;
-        drop(file);
-        rename(&temporary, path)?;
-        #[cfg(unix)]
-        fs::File::open(parent)?.sync_all()?;
-        Ok(())
-    })();
-    if result.is_err() {
-        let _ = fs::remove_file(&temporary);
-    }
-    result
-}
-
-pub fn write_graph_definition(
-    cwd: &Path,
-    run_id: &str,
-    definition: &super::topology::GraphDefinition,
-) -> std::io::Result<()> {
-    let path = run_dir(cwd, run_id).join("graph.json");
-    let content = serde_json::to_vec_pretty(definition)
-        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
-    atomic_write(&path, &content)
-}
-
 pub fn load_graph_definition(cwd: &Path, run_id: &str) -> Option<super::topology::GraphDefinition> {
     if !is_safe_run_id(run_id) {
         return None;

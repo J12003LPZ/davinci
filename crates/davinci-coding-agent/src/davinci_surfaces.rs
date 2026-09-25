@@ -22,8 +22,7 @@ use davinci_tui::davinci::model::{
 use davinci_tui::davinci::theme::State;
 use davinci_tui::davinci::views::disegno::roman;
 
-use crate::native_extensions::graph::store;
-use crate::native_extensions::graph::types::{GraphRun, Role, TaskStatus};
+use crate::native_extensions::graph::{list_runs, load_run, GraphRun, Role, TaskStatus};
 use crate::native_extensions::vector_memory::{VectorMemory, VectorMemoryConfig};
 
 /// The plan sheet (`1c`) from the newest graph run in this project, or an
@@ -37,8 +36,8 @@ pub fn plan(cwd: &Path) -> Vec<PlanStep> {
 
 /// The newest persisted run, live or finished.
 pub fn latest_run(cwd: &Path) -> Option<GraphRun> {
-    let newest = store::list_runs(cwd).into_iter().next()?;
-    store::load_run(cwd, &newest.run_id)
+    let newest = list_runs(cwd).into_iter().next()?;
+    load_run(cwd, &newest.run_id)
 }
 
 /// Pure form of [`plan`].
@@ -770,7 +769,7 @@ pub fn interaction_coverage_report(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::native_extensions::graph::types::{ArtifactKind, GraphTaskState};
+    use crate::native_extensions::graph::{ArtifactKind, GraphTaskState};
 
     fn task(id: &str, role: Role, status: TaskStatus, focus: Option<&str>) -> GraphTaskState {
         let mut task = GraphTaskState::new(
@@ -955,7 +954,7 @@ mod tests {
     }
 
     fn sample_run() -> GraphRun {
-        use crate::native_extensions::graph::types::{GraphBudgets, GraphCounters, Phase};
+        use crate::native_extensions::graph::{GraphBudgets, GraphCounters, Phase};
         GraphRun {
             version: 1,
             run_id: "run-1".into(),
