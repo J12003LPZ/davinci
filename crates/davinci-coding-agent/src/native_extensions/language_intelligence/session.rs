@@ -51,6 +51,7 @@ impl Session {
             "capabilities": {
                 "general":{"positionEncodings":["utf-16"]},
                 "window":{"workDoneProgress":true},
+                "experimental":{"serverStatusNotification":true},
                 "workspace":{
                     "applyEdit":false,
                     "configuration":true,
@@ -105,6 +106,11 @@ impl Session {
 
     pub fn is_alive(&self) -> bool {
         self.transport.is_alive()
+    }
+
+    /// See [`ClientRequestState::wait_quiescent`].
+    pub fn wait_until_ready(&self, budget: &RequestBudget) -> Option<bool> {
+        self.transport.wait_quiescent(budget)
     }
     pub fn status(&self) -> Value {
         json!({

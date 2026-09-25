@@ -332,6 +332,10 @@ impl Transport {
         self.client.status()
     }
 
+    pub fn wait_quiescent(&self, budget: &RequestBudget) -> Option<bool> {
+        self.client.wait_quiescent(budget)
+    }
+
     pub fn is_alive(&self) -> bool {
         self.shared
             .state

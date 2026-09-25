@@ -1,10 +1,11 @@
 //! Bounded server-to-client LSP callbacks.
-use super::protocol::{IntelligenceError, Result};
+use super::protocol::{IntelligenceError, RequestBudget, Result};
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
+use std::time::{Duration, Instant};
 
 #[derive(Debug, Clone)]
 pub(super) struct ClientRequestState {
@@ -15,6 +16,9 @@ pub(super) struct ClientRequestState {
     progress: Arc<Mutex<BTreeMap<String, Value>>>,
     refresh_generation: Arc<AtomicU64>,
     messages: Arc<Mutex<Vec<String>>>,
+    /// Last `experimental/serverStatus` (rust-analyzer). `None` until reported.
+    server_status: Arc<(Mutex<Option<Value>>, Condvar)>,
+    started: Instant,
 }
 
 #[derive(Debug, Clone)]
@@ -36,6 +40,8 @@ impl ClientRequestState {
             progress: Arc::new(Mutex::new(BTreeMap::new())),
             refresh_generation: Arc::new(AtomicU64::new(0)),
             messages: Arc::new(Mutex::new(Vec::new())),
+            server_status: Arc::new((Mutex::new(None), Condvar::new())),
+            started: Instant::now(),
         })
     }
 
@@ -88,6 +94,19 @@ impl ClientRequestState {
                     }
                 }
             }
+            "experimental/serverStatus" => {
+                let status = json!({
+                    "health": params.get("health").and_then(Value::as_str),
+                    "quiescent": params.get("quiescent").and_then(Value::as_bool),
+                    "message": params
+                        .get("message")
+                        .and_then(Value::as_str)
+                        .map(|message| super::normalize::compact(message, 1024)),
+                });
+                let (lock, changed) = &*self.server_status;
+                *lock.lock().unwrap_or_else(|e| e.into_inner()) = Some(status);
+                changed.notify_all();
+            }
             "window/logMessage" | "window/showMessage" => {
                 if let Some(message) = params.get("message").and_then(Value::as_str) {
                     let mut messages = self.messages.lock().unwrap_or_else(|e| e.into_inner());
@@ -98,6 +117,35 @@ impl ClientRequestState {
                 }
             }
             _ => {}
+        }
+    }
+
+    /// Wait, within `budget`, until the server reports it has finished loading
+    /// and indexing. Returns `None` when the server never reports readiness
+    /// (servers without `experimental/serverStatus`), otherwise the last
+    /// observed `quiescent` value.
+    pub fn wait_quiescent(&self, budget: &RequestBudget) -> Option<bool> {
+        // A server that supports the extension reports its first status right
+        // after `initialized`; one that has not by then is treated as silent.
+        let first_status_grace = self.started + Duration::from_secs(1);
+        let (lock, changed) = &*self.server_status;
+        let mut status = lock.lock().unwrap_or_else(|e| e.into_inner());
+        loop {
+            let quiescent = status
+                .as_ref()
+                .map(|status| status["quiescent"].as_bool() == Some(true));
+            if quiescent == Some(true)
+                || (quiescent.is_none() && Instant::now() >= first_status_grace)
+            {
+                return quiescent;
+            }
+            let Ok(remaining) = budget.remaining() else {
+                return quiescent;
+            };
+            status = changed
+                .wait_timeout(status, remaining.min(Duration::from_millis(50)))
+                .unwrap_or_else(|e| e.into_inner())
+                .0;
         }
     }
 
@@ -122,6 +170,7 @@ impl ClientRequestState {
             "diagnosticRefreshGeneration": self.refresh_generation(),
             "progressEntries": progress.len(),
             "messages": messages.clone(),
+            "serverStatus": self.server_status.0.lock().unwrap_or_else(|e| e.into_inner()).clone(),
         })
     }
 
@@ -256,5 +305,58 @@ fn truncate_json_strings(value: &mut Value, max: usize) {
             .values_mut()
             .for_each(|item| truncate_json_strings(item, max)),
         _ => {}
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn state() -> (tempfile::TempDir, ClientRequestState) {
+        let dir = tempfile::tempdir().unwrap();
+        let state = ClientRequestState::new(dir.path().to_path_buf(), Value::Null).unwrap();
+        (dir, state)
+    }
+
+    fn budget(millis: u64) -> RequestBudget {
+        RequestBudget::from_timeout(Duration::from_millis(millis))
+    }
+
+    #[test]
+    fn readiness_waits_for_quiescent_server_status() {
+        let (_dir, state) = state();
+        state.observe_notification(
+            "experimental/serverStatus",
+            &json!({"health":"ok","quiescent":false}),
+        );
+        let observer = state.clone();
+        let reporter = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(100));
+            observer.observe_notification(
+                "experimental/serverStatus",
+                &json!({"health":"ok","quiescent":true}),
+            );
+        });
+        let started = Instant::now();
+        assert_eq!(state.wait_quiescent(&budget(5_000)), Some(true));
+        assert!(started.elapsed() >= Duration::from_millis(90));
+        reporter.join().unwrap();
+        assert_eq!(state.status()["serverStatus"]["quiescent"], true);
+    }
+
+    #[test]
+    fn readiness_reports_still_indexing_when_the_budget_ends() {
+        let (_dir, state) = state();
+        state.observe_notification("experimental/serverStatus", &json!({"quiescent":false}));
+        assert_eq!(state.wait_quiescent(&budget(100)), Some(false));
+    }
+
+    #[test]
+    fn a_server_without_status_notifications_is_not_waited_on_after_grace() {
+        let (_dir, state) = state();
+        std::thread::sleep(Duration::from_millis(1_050));
+        let started = Instant::now();
+        assert_eq!(state.wait_quiescent(&budget(5_000)), None);
+        assert!(started.elapsed() < Duration::from_millis(200));
     }
 }

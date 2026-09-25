@@ -176,25 +176,32 @@ zero.
 
 ## Verification status for this implementation session
 
-A dedicated deterministic workflow did start on Linux, Windows, and macOS.
-The LSP slice's missing `toml_edit` dependency entry was repaired, so the
-workflow now passes lockfile consistency and reaches dependency loading. All
-three jobs still stop before compiling language intelligence because the
-repository's existing locked graph selects Edition-2024 transitive releases
-that Cargo 1.83 cannot parse (for example `indexmap 2.14.2` /
-`hashbrown 0.17.1` and `toml_parser 1.1.3` / `winnow 1.0.4`).
-The same versions are already present on `main`; this is a workspace baseline
-compatibility issue rather than evidence for or against the LSP implementation.
-Per the explicit instruction for this implementation pass, unrelated CI/baseline
-failures were not used as a blocker.
+Integration into PR #49 (2026-09-25) keeps the Rust 1.83 lockfile decision
+(`toml_edit 0.22.27`, `indexmap 2.7.1`), so Cargo 1.83 compiles the workspace.
 
-The language-intelligence workflow itself passes the repository's workflow
-linter after consolidating environment writes and using native Windows paths for
-provisioned server/package identities.
+Local evidence, Windows 11 Pro, Rust 1.83.0, Node v24.19.0:
 
-The manual live-server workflow could not be dispatched through the available
-GitHub connector in this session. Therefore this report does **not** mark any
-real backend/platform combination as verified yet.
+- `cargo check --workspace --all-targets --offline --locked`: pass.
+- `cargo fmt --all --check`: pass.
+- `cargo clippy --workspace --all-targets --offline --locked -- -D warnings`: pass.
+- `cargo test --workspace --offline --locked`: 4501 passed, 0 failed,
+  37 ignored before the rust-analyzer readiness gate was added; the focused
+  language-intelligence suites pass after it.
+- `real_rust_lsp_semantics` with rust-analyzer 1.98.0 (88d9e12a 2026-08-18):
+  **pass** (about 18 s). The first run returned an empty definition because the
+  query ran before rust-analyzer finished loading the workspace. The client now
+  advertises `experimental.serverStatusNotification`, waits for `quiescent`
+  within the request budget, and marks results obtained earlier
+  `analysisState: "indexing"` / `workspaceCoverage: "partial"`.
+- `real_basedpyright_lsp_semantics`, `real_pyright_lsp_semantics` and
+  `real_python_project_venv_executes_only_after_trusted_launch`: **unverified**
+  (servers not installed on the verification host).
+- `real_typescript_semantics_and_edit_synchronization`: not run in this pass.
+- Task 19 benchmark (`scripts/lsp-benchmark.py`): not run in this pass; no
+  latency, RSS or process numbers are claimed.
+
+Linux and macOS, and every backend marked unverified above, still require the
+manual **Language intelligence** workflow before they are advertised.
 
 ## Release-readiness handoff
 

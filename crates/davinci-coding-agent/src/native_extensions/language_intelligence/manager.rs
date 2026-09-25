@@ -459,6 +459,23 @@ impl LanguageIntelligence {
             let Some(session) = slot.session.as_mut() else {
                 continue;
             };
+            // rust-analyzer answers navigation requests while it is still
+            // loading the workspace, returning empty results that would read
+            // as complete. Wait for it to report quiescence, keeping part of
+            // the budget for the query itself.
+            let ready = if family == LanguageFamily::Rust {
+                let reserve = Duration::from_secs(2);
+                let wait_deadline = operation_budget
+                    .deadline
+                    .checked_sub(reserve)
+                    .unwrap_or(operation_budget.deadline);
+                session.wait_until_ready(&RequestBudget {
+                    deadline: wait_deadline,
+                    cancelled: operation_budget.cancelled.clone(),
+                })
+            } else {
+                None
+            };
             let response = session.execute_with_budget(
                 method,
                 capability,
@@ -561,6 +578,12 @@ impl LanguageIntelligence {
             }
             if let Some(version) = document_version {
                 normalized["documentVersion"] = version;
+            }
+            if ready == Some(false) || (family == LanguageFamily::Rust && ready.is_none()) {
+                // Results obtained before indexing finished are not complete.
+                normalized["analysisState"] = json!("indexing");
+                normalized["advisory"] = json!(true);
+                normalized["workspaceCoverage"] = json!("partial");
             }
             if name == "lsp_diagnostics" {
                 normalized["freshness"] = freshness.unwrap_or(json!("diagnostics_pending"));
