@@ -8,7 +8,6 @@ mod catalog_refresh;
 mod changelog;
 use davinci_coding_agent::completion_delivery;
 mod codex_probe;
-mod completion_delivery;
 mod davinci_interactive;
 mod davinci_sources;
 mod davinci_surfaces;
@@ -1253,7 +1252,6 @@ fn resolve_or_create_session(
             })
             .map_err(|err| err.to_string())?;
         let session = JsonlSession::open(&created.info.path).map_err(|err| err.to_string())?;
-        persist_selected_backend(&session, session_dir);
         return Ok(session);
     }
     if parsed.continue_session {
@@ -3680,15 +3678,22 @@ fn run_rpc_with_host(
             let templates = runtime.agent.templates.clone();
             let (_reply, events) = std::thread::scope(|scope| {
                 let stop = std::sync::atomic::AtomicBool::new(false);
-                let watcher = scope.spawn(|| {
+                let stop_ref = &stop;
+                let leftover_ref = &leftover;
+                let rx_ref = &rx;
+                let ui_abort_ref = &ui_abort;
+                let remote_ref = &remote;
+                let skills_ref = &skills;
+                let templates_ref = &templates;
+                let watcher = scope.spawn(move || {
                     rpc_watch_during_turn(
-                        &leftover,
-                        &rx,
-                        &ui_abort,
-                        &remote,
-                        &skills,
-                        &templates,
-                        &stop,
+                        leftover_ref,
+                        rx_ref,
+                        ui_abort_ref,
+                        remote_ref,
+                        skills_ref,
+                        templates_ref,
+                        stop_ref,
                     )
                 });
                 let result = complete_prompt_with_host(
@@ -9214,7 +9219,17 @@ fn apply_session_calls(
                             .unwrap_or("")
                     ));
                 } else if let Some(command) = call.get("command").and_then(|value| value.as_str()) {
-                    match crate::js_host::execute_command_tool(command, &agent.cwd) {
+                    let args = call
+                        .get("args")
+                        .cloned()
+                        .unwrap_or_else(|| serde_json::json!({}));
+                    let timeout_ms = call.get("timeoutMs").and_then(|value| value.as_u64());
+                    match crate::js_host::execute_command_tool(
+                        command,
+                        &args,
+                        &agent.cwd,
+                        timeout_ms,
+                    ) {
                         Ok(out) => {
                             ui.push("exec", &out);
                             ui.status(&format!("exec {command}"));

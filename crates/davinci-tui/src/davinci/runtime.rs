@@ -439,6 +439,10 @@ impl Session {
     /// delivers as a burst of keys (Windows; see [`PasteFilter`]) is
     /// reassembled into the one [`Event::Paste`] the model expects.
     pub fn poll_event(&mut self, timeout: Duration) -> io::Result<Option<Event>> {
+        // Dropped mouse-motion events must consume the caller's existing wait,
+        // not start a fresh full timeout. Otherwise continuous motion on
+        // Windows can prevent the turn loop from reaching its next tick.
+        let deadline = Instant::now() + timeout;
         loop {
             if let Some(ready) = self.paste.next_ready() {
                 if matches!(ready, Event::Resize(..)) {
@@ -452,14 +456,31 @@ impl Session {
             // While a partial marker is held, wait only briefly: the rest of
             // a real marker is already in the queue, and a real escape should
             // not sit swallowed for a full tick.
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                self.paste.idle();
+                let ready = self.paste.next_ready();
+                return Ok(ready.filter(|event| {
+                    !matches!(
+                        event,
+                        Event::Mouse(mouse) if mouse.kind == event::MouseEventKind::Moved
+                    )
+                }));
+            }
             let wait = if self.paste.holding() {
-                timeout.min(super::paste_burst::TYPING_WAIT)
+                remaining.min(super::paste_burst::TYPING_WAIT)
             } else {
-                timeout
+                remaining
             };
             if !event::poll(wait)? {
                 self.paste.idle();
-                return Ok(self.paste.next_ready());
+                let ready = self.paste.next_ready();
+                return Ok(ready.filter(|event| {
+                    !matches!(
+                        event,
+                        Event::Mouse(mouse) if mouse.kind == event::MouseEventKind::Moved
+                    )
+                }));
             }
             self.paste.feed(event::read()?);
             // Feed everything already queued before answering, so a whole

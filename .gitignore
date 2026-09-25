@@ -20,3 +20,6 @@ node_modules/
 /program-worktree/
 /.codex-p9/
 /*.patch
+
+__pycache__/
+*.py[cod]

@@ -3398,16 +3398,9 @@ pub fn apply_watchdog_choice(
     choice: &str,
     signal: &davinci_agent::runtime::progress_watchdog::LoopSignal,
 ) -> Result<String, String> {
-    let tokens_remaining = if let Some(ledger) = agent
-        .runtime
-        .as_ref()
-        .and_then(|rt| rt.budget_ledger.as_ref())
-    {
-        let snap = ledger.snapshot();
-        snap.token_ceiling.saturating_sub(snap.tokens_charged)
-    } else {
-        u64::MAX
-    };
+    // The unwired whole-task budget ledger was removed. The watchdog still
+    // owns loop-control choices, but it no longer derives a token ceiling here.
+    let tokens_remaining = u64::MAX;
 
     let decision = if let Some(runtime) = &agent.runtime {
         if let Ok(mut wd) = runtime.progress_watchdog.lock() {
@@ -4276,7 +4269,7 @@ struct HostedTuiGuard;
 
 impl HostedTuiGuard {
     fn activate() -> Self {
-        let _hosted = HostedTuiGuard::activate();
+        crate::set_hosted_tui_active(true);
         Self
     }
 }
@@ -4452,8 +4445,9 @@ pub fn run(
     crate::startup_mark("shell: terminal open");
     let mut first_frame = true;
     // From here the alternate screen is ours, so a `println!` from shared code
-    // is queued for the transcript instead of painted over the frame.
-    crate::set_hosted_tui_active(true);
+    // is queued for the transcript instead of painted over the frame. The
+    // guard clears the flag on every return path, including early errors.
+    let _hosted = HostedTuiGuard::activate();
     // Proving the panic hook gives the terminal back needs a panic to happen
     // inside the alternate screen, which nothing else can arrange.
     if std::env::var("PI_DAVINCI_PANIC_FIXTURE").is_ok() {

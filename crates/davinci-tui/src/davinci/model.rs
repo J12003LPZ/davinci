@@ -322,6 +322,10 @@ impl Extensions {
         if lines.is_empty() {
             return;
         }
+        let lines = lines
+            .into_iter()
+            .map(|line| super::sanitize::terminal_safe(&line).into_owned())
+            .collect();
         self.widgets.push(Widget {
             key: key.to_string(),
             lines,
@@ -332,7 +336,10 @@ impl Extensions {
     pub fn set_status(&mut self, key: &str, text: Option<&str>) {
         self.status.retain(|(existing, _)| existing != key);
         if let Some(text) = text.filter(|text| !text.is_empty()) {
-            self.status.push((key.to_string(), text.to_string()));
+            self.status.push((
+                key.to_string(),
+                super::sanitize::terminal_safe(text).into_owned(),
+            ));
         }
     }
 

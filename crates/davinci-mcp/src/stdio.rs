@@ -6,6 +6,7 @@
 
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
+use std::ffi::OsString;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, Stdio};
@@ -82,7 +83,7 @@ impl StdioTransport {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
         cmd.env_clear();
-        for (key, value) in child_environment(std::env::vars(), env) {
+        for (key, value) in child_environment(std::env::vars_os(), env) {
             cmd.env(key, value);
         }
         let mut child = cmd
@@ -375,20 +376,22 @@ impl Rpc for StdioTransport {
 }
 
 fn child_environment(
-    parent: impl Iterator<Item = (String, String)>,
+    parent: impl Iterator<Item = (OsString, OsString)>,
     config: &BTreeMap<String, String>,
-) -> BTreeMap<String, String> {
-    let mut env: BTreeMap<String, String> = parent
+) -> BTreeMap<OsString, OsString> {
+    let mut env: BTreeMap<OsString, OsString> = parent
         .filter(|(key, _)| {
-            INHERITED_ENV
-                .iter()
-                .any(|name| name.eq_ignore_ascii_case(key))
+            key.to_str().is_some_and(|key| {
+                INHERITED_ENV
+                    .iter()
+                    .any(|name| name.eq_ignore_ascii_case(key))
+            })
         })
         .collect();
     env.extend(
         config
             .iter()
-            .map(|(key, value)| (key.clone(), value.clone())),
+            .map(|(key, value)| (OsString::from(key), OsString::from(value))),
     );
     env
 }
@@ -452,16 +455,38 @@ mod tests {
     #[test]
     fn child_environment_is_allowlisted_plus_config() {
         let parent = vec![
-            ("PATH".to_string(), "/bin".to_string()),
-            ("OPENAI_API_KEY".to_string(), "sk-x".to_string()),
-            ("HOME".to_string(), "/home/u".to_string()),
+            (OsString::from("PATH"), OsString::from("/bin")),
+            (OsString::from("OPENAI_API_KEY"), OsString::from("sk-x")),
+            (OsString::from("HOME"), OsString::from("/home/u")),
         ];
         let mut config = BTreeMap::new();
         config.insert("FOO".to_string(), "bar".to_string());
         let env = child_environment(parent.into_iter(), &config);
-        assert_eq!(env.get("PATH").map(String::as_str), Some("/bin"));
-        assert_eq!(env.get("FOO").map(String::as_str), Some("bar"));
-        assert!(!env.contains_key("OPENAI_API_KEY"));
+        assert_eq!(
+            env.get(std::ffi::OsStr::new("PATH")).and_then(|value| value.to_str()),
+            Some("/bin")
+        );
+        assert_eq!(
+            env.get(std::ffi::OsStr::new("FOO")).and_then(|value| value.to_str()),
+            Some("bar")
+        );
+        assert!(!env.contains_key(std::ffi::OsStr::new("OPENAI_API_KEY")));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn child_environment_tolerates_non_unicode_values_and_keys() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let invalid_value = OsString::from_vec(vec![0xff, b'x']);
+        let invalid_key = OsString::from_vec(vec![0xfe, b'K']);
+        let parent = vec![
+            (OsString::from("PATH"), invalid_value.clone()),
+            (invalid_key, OsString::from("ignored")),
+        ];
+        let env = child_environment(parent.into_iter(), &BTreeMap::new());
+        assert_eq!(env.get(std::ffi::OsStr::new("PATH")), Some(&invalid_value));
+        assert_eq!(env.len(), 1);
     }
 
     #[test]

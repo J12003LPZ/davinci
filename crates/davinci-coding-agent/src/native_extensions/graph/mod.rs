@@ -75,7 +75,7 @@ pub use topology::{
 pub use types::*;
 
 use crate::native_extensions::ecosystem::verification::{SecurityPolicyMode, SecurityVerification};
-use config::load_config;
+use config::{load_config, GraphConfig};
 #[allow(unused_imports)]
 pub use controller::{run_graph, run_saved_graph, ControllerDeps, RunOptions};
 use davinci_agent::{ToolError, ToolResult};
@@ -2063,7 +2063,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let controller = controller(dir.path());
         let run = controller
-            .run_to_completion(parse_graph_args("--dry-run improve the parser"))
+            .run_to_completion(parse_graph_args("--dry-run improve the parser"), None)
             .expect("runs");
         assert_eq!(run.phase, Phase::Done, "blocked: {:?}", run.blocked_reason);
         assert_eq!(run.counters.cost_usd, 0.0);
@@ -2115,7 +2115,7 @@ mod tests {
 
         let controller = controller(dir.path()).with_runtime(runtime.clone());
         let run = controller
-            .run_to_completion(parse_graph_args("--dry-run test runtime registration"))
+            .run_to_completion(parse_graph_args("--dry-run test runtime registration"), None)
             .expect("runs");
 
         assert_eq!(run.phase, Phase::Done);
@@ -2148,7 +2148,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let controller = controller(dir.path());
         let run = controller
-            .run_to_completion(parse_graph_args("--dry-run persist me"))
+            .run_to_completion(parse_graph_args("--dry-run persist me"), None)
             .expect("runs");
         let reloaded = load_run(dir.path(), &run.run_id).expect("state.json written");
         assert_eq!(reloaded.goal, "persist me");
@@ -2176,7 +2176,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let controller = controller(dir.path());
         let run = controller
-            .run_to_completion(parse_graph_args("--dry-run --simple tiny tweak"))
+            .run_to_completion(parse_graph_args("--dry-run --simple tiny tweak"), None)
             .expect("runs");
         assert_eq!(run.phase, Phase::Done);
         let ids: Vec<&str> = run.tasks.iter().map(|task| task.id.as_str()).collect();
@@ -2200,7 +2200,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let controller = controller(dir.path());
         let mut stopped = controller
-            .run_to_completion(parse_graph_args("--dry-run continue me"))
+            .run_to_completion(parse_graph_args("--dry-run continue me"), None)
             .expect("initial run completes");
         drain_active(dir.path());
         stopped.phase = Phase::Cancelled;
@@ -2224,7 +2224,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let controller = controller(dir.path());
         controller
-            .run_to_completion(parse_graph_args("--dry-run inspect me"))
+            .run_to_completion(parse_graph_args("--dry-run inspect me"), None)
             .expect("runs");
         drain_active(dir.path());
 
@@ -2247,7 +2247,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let controller = controller(dir.path());
         controller
-            .run_to_completion(parse_graph_args("--dry-run list tasks"))
+            .run_to_completion(parse_graph_args("--dry-run list tasks"), None)
             .expect("runs");
         drain_active(dir.path());
         let view = controller.command("graph-view", "nope").unwrap().unwrap();
@@ -2298,7 +2298,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let controller = controller(dir.path());
         controller
-            .run_to_completion(parse_graph_args("--dry-run finished already"))
+            .run_to_completion(parse_graph_args("--dry-run finished already"), None)
             .expect("runs");
         drain_active(dir.path());
         let error = controller.command("graph-resume", "").unwrap_err();
@@ -2361,7 +2361,7 @@ mod tests {
         // Project overrides are applied only after explicit project trust.
         controller.set_session_context(None, None, true);
         let run = controller
-            .run_to_completion(parse_graph_args("--dry-run budgeted"))
+            .run_to_completion(parse_graph_args("--dry-run budgeted"), None)
             .expect("runs");
         assert_eq!(run.budgets.max_cost_usd, 5.0);
         assert_eq!(run.budgets.run_deadline_ms, 600_000);
@@ -2374,7 +2374,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let controller = controller(dir.path());
         let run = controller
-            .run_to_completion(parse_graph_args("--dry-run unbounded"))
+            .run_to_completion(parse_graph_args("--dry-run unbounded"), None)
             .expect("runs");
         assert_eq!(run.budgets.max_cost_usd, 0.0);
         assert_eq!(run.budgets.run_deadline_ms, 0);
@@ -2391,7 +2391,7 @@ mod tests {
 
         // 1. Initial dry-run to completion
         let run = controller
-            .run_to_completion(parse_graph_args("--dry-run audit code"))
+            .run_to_completion(parse_graph_args("--dry-run audit code"), None)
             .expect("runs");
         assert_eq!(run.phase, types::Phase::Done);
 
@@ -2527,7 +2527,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let controller = controller(dir.path());
         let mut run = controller
-            .run_to_completion(parse_graph_args("--dry-run --simple resume regression"))
+            .run_to_completion(parse_graph_args("--dry-run --simple resume regression"), None)
             .unwrap();
         assert_eq!(run.lifecycle, Some(types::GraphLifecycle::Stopped));
         run.phase = Phase::Blocked;
@@ -2559,7 +2559,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let controller = controller(dir.path());
         let mut run = controller
-            .run_to_completion(parse_graph_args("--dry-run --simple cancelled fixture"))
+            .run_to_completion(parse_graph_args("--dry-run --simple cancelled fixture"), None)
             .unwrap();
         run.phase = Phase::Cancelled;
         run.lifecycle = Some(types::GraphLifecycle::Stopped);
@@ -2710,7 +2710,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let mut controller = controller(dir.path());
         let run = controller
-            .run_to_completion(parse_graph_args("--dry-run budget and export"))
+            .run_to_completion(parse_graph_args("--dry-run budget and export"), None)
             .expect("runs");
         drain_active(dir.path());
 

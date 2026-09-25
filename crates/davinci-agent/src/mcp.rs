@@ -475,7 +475,7 @@ mod tests {
         assert_eq!(rows[0].tools, 1);
 
         let mut agent = crate::Agent::new("test");
-        agent.attach_mcp(registry);
+        agent.attach_mcp(registry.clone());
         assert!(agent.tools.iter().any(|name| name == "mcp__memory__echo"));
         let specs = agent.builtin_and_mcp_specs();
         assert!(specs.iter().any(|tool| tool.name == "mcp__memory__echo"));

@@ -3333,7 +3333,6 @@
         assert!(modal.irreversible_effects[0].details.contains("[REDACTED]"));
         assert!(!modal.irreversible_effects[0].details.contains("secret123"));
     }
-}
 
 #[cfg(test)]
 mod terminal_rebuild_host_contracts {
@@ -3349,3 +3348,4 @@ mod terminal_rebuild_host_contracts {
         assert!(graph_command_opens_view("graph-view", ""));
         assert!(!graph_command_opens_view("model", ""));
     }
+}

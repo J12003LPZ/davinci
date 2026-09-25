@@ -1855,6 +1855,9 @@ fn working() -> crate::davinci::model::Working {
         tokens: 423,
         thinking: Some("high".into()),
         interrupting: false,
+        verb_seed: 0,
+        thought_for: None,
+        reasoning: false,
     }
 }
 

@@ -43,7 +43,7 @@ use crate::native_tools::visual_snapshot::{
 use davinci_agent::{ToolError, ToolResult};
 use serde_json::{json, Value};
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 /// Shared adapter for Context VM artifact retrieval. Keeping this at the
 /// native-extension boundary lets callers use the governor's existing
@@ -845,11 +845,26 @@ impl NativeExtensionHost {
             "impact-status" => Ok(Some(self.change_impact.status())),
             "verification-status" => Ok(Some(self.verification_planner.status())),
             "workspace-status" => Ok(Some(self.workspace_snapshot.status())),
-            "memory-status" => Ok(Some(self.memory.status())),
-            "memory-search" => Ok(Some(self.memory.search_text(args))),
-            "memory-reindex" => Ok(Some(self.memory.reindex().map_err(|err| err.to_string())?)),
-            "memory-clear" => Ok(Some(self.memory.clear().map_err(|err| err.to_string())?)),
-            "memory-page" => Ok(Some(memory_page::command(&self.memory, args)?)),
+            "memory-status" => {
+                let memory = self.memory.lock().map_err(|err| err.to_string())?;
+                Ok(Some(memory.status()))
+            }
+            "memory-search" => {
+                let memory = self.memory.lock().map_err(|err| err.to_string())?;
+                Ok(Some(memory.search_text(args)))
+            }
+            "memory-reindex" => {
+                let mut memory = self.memory.lock().map_err(|err| err.to_string())?;
+                Ok(Some(memory.reindex().map_err(|err| err.to_string())?))
+            }
+            "memory-clear" => {
+                let mut memory = self.memory.lock().map_err(|err| err.to_string())?;
+                Ok(Some(memory.clear().map_err(|err| err.to_string())?))
+            }
+            "memory-page" => {
+                let memory = self.memory.lock().map_err(|err| err.to_string())?;
+                Ok(Some(memory_page::command(&memory, args)?))
+            }
             "cache-status" => {
                 let stats = self.cache.stats();
                 let raw_input = stats
@@ -882,10 +897,14 @@ impl NativeExtensionHost {
                     "transportContinuationSource":"separate Codex websocket/session diagnostics"
                 })))
             }
-            "governor-status" => Ok(Some(self.governor.status())),
+            "governor-status" => {
+                let governor = self.governor.lock().map_err(|err| err.to_string())?;
+                Ok(Some(governor.status()))
+            }
             "governor-reset" => {
-                self.governor.reset();
-                Ok(Some(self.governor.status()))
+                let mut governor = self.governor.lock().map_err(|err| err.to_string())?;
+                governor.reset();
+                Ok(Some(governor.status()))
             }
             "learning-status" => Ok(Some(self.learning.status_command())),
             "learning-pending" => Ok(Some(self.learning.pending_command())),
@@ -1371,7 +1390,7 @@ mod tests {
         let agent_dir = tempfile::tempdir().unwrap();
         let mut host = NativeExtensionHost {
             learning: LearningController::new(root.path(), Some(agent_dir.path()), None),
-            memory: VectorMemory::with_config(root.path().into(), VectorMemoryConfig::default()),
+            memory: Arc::new(Mutex::new(VectorMemory::with_config(root.path().into(), VectorMemoryConfig::default()))),
             ..NativeExtensionHost::default()
         };
         let cand = LearningCandidate {
@@ -1385,7 +1404,7 @@ mod tests {
             },
             confidence: 0.9,
             source_session_id: "sess-sync".into(),
-            source_repo_id: host.memory.repo_id.clone(),
+            source_repo_id: host.memory.lock().unwrap().repo_id.clone(),
             source_turn: 1,
             created_at_ms: 1000,
             evidence: VerificationEvidence::default(),
@@ -1394,7 +1413,7 @@ mod tests {
         host.learning.project_store.upsert_candidate(cand).unwrap();
         host.sync_active_learning_memories();
 
-        let search_res = host.memory.search("PostgreSQL pool connections", 5);
+        let search_res = host.memory.lock().unwrap().search("PostgreSQL pool connections", 5);
         assert!(!search_res.is_empty());
         assert!(search_res[0]
             .record

@@ -140,7 +140,9 @@ fn group_rows(model: &Model, calls: &[(Explore, &str, bool)], width: u16) -> Vec
         }
     }
     let clause = |kind: Explore, n: usize| -> String {
-        let noun = |one: &str, many: &str| if n == 1 { one } else { many };
+        let noun = |one: &'static str, many: &'static str| -> &'static str {
+            if n == 1 { one } else { many }
+        };
         match (kind, running) {
             (Explore::Read, false) => format!("read {n} {}", noun("file", "files")),
             (Explore::Read, true) => format!("reading {n} {}", noun("file", "files")),
@@ -238,15 +240,20 @@ fn entry_lines(model: &Model, entry: &Entry, width: u16) -> Vec<Line<'static>> {
 
         Entry::Failure { what, subject } => vec![failure_line(th, what, subject)],
 
-        Entry::Prose(text) => markdown::lines(th, text, MEASURE.min(width.saturating_sub(2)))
-            .into_iter()
-            .enumerate()
-            .map(|(index, row)| {
-                let mut spans = vec![span(if index == 0 { "● " } else { "  " }, th.text)];
-                spans.extend(row.spans);
-                Line::from(truncate_run(spans, width))
-            })
-            .collect(),
+        Entry::Prose(text) => {
+            // Streaming deltas can mutate a prose entry after its constructor,
+            // so sanitize again at the final rendering boundary.
+            let safe = crate::davinci::sanitize::terminal_safe(text);
+            markdown::lines(th, safe.as_ref(), MEASURE.min(width.saturating_sub(2)))
+                .into_iter()
+                .enumerate()
+                .map(|(index, row)| {
+                    let mut spans = vec![span(if index == 0 { "● " } else { "  " }, th.text)];
+                    spans.extend(row.spans);
+                    Line::from(truncate_run(spans, width))
+                })
+                .collect()
+        },
 
         Entry::Thinking {
             text,
@@ -254,7 +261,8 @@ fn entry_lines(model: &Model, entry: &Entry, width: u16) -> Vec<Line<'static>> {
             seconds,
         } => {
             if model.show_tool_output {
-                thinking_lines(th, text, *live, *seconds, width)
+                let safe = crate::davinci::sanitize::terminal_safe(text);
+                thinking_lines(th, safe.as_ref(), *live, *seconds, width)
             } else {
                 Vec::new()
             }

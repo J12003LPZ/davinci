@@ -3424,14 +3424,9 @@ fn glob_match(pattern: &str, name: &str) -> bool {
     }
     let pattern = pattern.replace('\\', "/");
     let name = name.replace('\\', "/");
-    if let Some(stripped) = pattern.strip_prefix("**/") {
-        return glob_match(stripped, &name)
-            || name
-                .rsplit('/')
-                .next()
-                .is_some_and(|part| glob_match(stripped, part))
-            || name.split('/').any(|part| glob_match(stripped, part));
-    }
+    // match_glob_chars already implements **/ as zero-or-more path
+    // components. Recursing here for every leading **/ reintroduced an
+    // exponential search for patterns such as **/**/**/....
     match_glob_chars(&pattern, &name)
 }
 
@@ -3732,6 +3727,15 @@ mod tests {
         let name = "a".repeat(40);
         let started = std::time::Instant::now();
         assert!(!match_glob_chars("*a*a*a*a*a*a*a*a*a*b", &name));
+        assert!(started.elapsed() < std::time::Duration::from_millis(100));
+    }
+
+    #[test]
+    fn repeated_double_star_prefixes_finish_quickly() {
+        let pattern = format!("{}missing.rs", "**/".repeat(48));
+        let name = format!("{}/present.rs", "a/".repeat(48));
+        let started = std::time::Instant::now();
+        assert!(!glob_match(&pattern, &name));
         assert!(started.elapsed() < std::time::Duration::from_millis(100));
     }
 

@@ -1390,10 +1390,21 @@ pub fn update_settings(
 
 fn refuse_unparseable(path: &Path) -> Result<(), String> {
     match fs::read_to_string(path) {
-        Ok(raw) if !raw.trim().is_empty() && parse_settings_value(&raw).is_none() => Err(format!(
-            "{} is not valid JSON; fix or remove it before davinci changes it (nothing was written)",
-            path.display()
-        )),
+        Ok(raw) if !raw.trim().is_empty() => {
+            if parse_settings_value(&raw).is_none() {
+                return Err(format!(
+                    "{} is not valid JSON; fix or remove it before davinci changes it (nothing was written)",
+                    path.display()
+                ));
+            }
+            if parse_settings_json(&raw).is_none() {
+                return Err(format!(
+                    "{} contains an invalid settings value; fix it before davinci changes the file (nothing was written)",
+                    path.display()
+                ));
+            }
+            Ok(())
+        }
         _ => Ok(()),
     }
 }
@@ -1587,6 +1598,23 @@ mod tests {
             settings.packages.push("npm:x".into());
         })
         .is_err());
+    }
+
+    #[test]
+    fn schema_invalid_settings_are_never_overwritten() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = settings_path(dir.path());
+        fs::write(&path, r#"{"theme":"dark","quietStartup":"not-a-bool","futureKey":7}"#)
+            .unwrap();
+        let original = fs::read_to_string(&path).unwrap();
+        let err = update_settings(dir.path(), |settings| {
+            settings.packages.push("npm:x".into());
+        })
+        .unwrap_err();
+        assert!(err.contains("invalid settings value"), "{err}");
+        assert_eq!(fs::read_to_string(&path).unwrap(), original);
+        assert!(save_settings(dir.path(), &Settings::default()).is_err());
+        assert_eq!(fs::read_to_string(&path).unwrap(), original);
     }
 
     #[test]
@@ -1805,12 +1833,12 @@ mod tests {
         };
         save_settings(agent, &dark).unwrap();
         assert_eq!(load_settings(agent).theme.as_deref(), Some("dark"));
-        assert!(!settings_lock_path(&settings_path(agent)).exists());
         let lock = settings_lock_path(&settings_path(agent));
-        std::fs::write(&lock, "held").unwrap();
+        assert!(lock.is_file(), "OS-backed lock keeps a stable lock inode");
+        let held = davinci_sys::lock::ExclusiveFileLock::try_acquire(&lock).unwrap();
         let err = save_settings(agent, &dark).unwrap_err();
-        assert_eq!(err, "Failed to acquire settings lock");
-        std::fs::remove_file(&lock).unwrap();
+        assert!(err.starts_with("Failed to acquire settings lock:"), "{err}");
+        drop(held);
         let light = Settings {
             theme: Some("light".into()),
             ..Settings::default()

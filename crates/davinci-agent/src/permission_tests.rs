@@ -1095,6 +1095,18 @@
     }
 
     #[test]
+    fn agent_without_tool_scope_still_requires_approval_outside_plan_mode() {
+        let call = json!({"prompt": "inspect and then make any needed changes"});
+        for mode in [PermissionMode::Edits, PermissionMode::Auto] {
+            let policy = PermissionPolicy::new(mode);
+            assert!(
+                is_ask(&policy.decide("agent-scope", "agent", &call, &cwd())),
+                "{mode:?} must not treat an unscoped child agent as read-only"
+            );
+        }
+    }
+
+    #[test]
     fn agent_isolation_permission_rules() {
         let root = cwd();
         let wt_call = json!({"prompt": "edit", "isolation": "worktree"});
@@ -1135,6 +1147,24 @@
             {"prompt":"b","isolation":"worktree"}
         ]});
         assert!(is_deny(&verdict(&policy, "agent", batch)));
+    }
+
+    #[test]
+    fn agent_batch_approval_names_every_task_and_is_once_only() {
+        let policy = PermissionPolicy::new(PermissionMode::Ask);
+        let batch = json!({"tasks":[
+            {"prompt":"inspect authentication", "isolation":"shared"},
+            {"prompt":"review database writes", "isolation":"shared"}
+        ]});
+        let PermissionVerdict::Ask(request) = verdict(&policy, "agent", batch) else {
+            panic!("expected batch approval")
+        };
+        assert!(request.summary.contains("inspect authentication"));
+        assert!(request.summary.contains("review database writes"));
+        assert!(request.session_rule.is_empty());
+        assert!(request.allows(ToolApprovalDecision::AllowOnce));
+        assert!(!request.allows(ToolApprovalDecision::AllowForSession));
+        assert!(!request.allows(ToolApprovalDecision::AllowAlways));
     }
 
     #[test]
@@ -1420,10 +1450,10 @@
         ));
 
         let call_sync = json!({"command": "cargo build --offline"});
-        assert_eq!(
+        assert!(matches!(
             auto_policy.decide("c4", "bash", &call_sync, &root),
-            PermissionVerdict::Allow
-        );
+            PermissionVerdict::Ask(_)
+        ));
     }
 
     #[test]
