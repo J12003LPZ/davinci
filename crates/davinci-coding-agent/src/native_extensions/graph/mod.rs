@@ -55,8 +55,8 @@ mod operation_retry_tests;
 pub use control::*;
 #[allow(unused_imports)]
 pub use mutation::{
-    capture_baseline, capture_graph_delta, ChangedFile, FileFingerprint, GraphMutation,
-    MutationBaseline, PatchChunk,
+    capture_baseline, capture_graph_delta, compute_owned_diff, ChangedFile, FileFingerprint,
+    GraphMutation, MutationBaseline, PatchChunk,
 };
 #[allow(unused_imports)]
 pub use recovery::{
@@ -86,6 +86,7 @@ pub use render::{
 };
 use serde_json::{json, Value};
 use store::{list_runs, load_run, transcript_path};
+pub use store::now_ms;
 use verify::{contracted_verify_exec, default_verify_exec, dry_run_verify_exec};
 use worker::{run_dry_worker, run_worker};
 

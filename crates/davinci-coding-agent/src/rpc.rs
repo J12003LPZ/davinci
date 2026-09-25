@@ -94,7 +94,7 @@ pub struct RpcCommand {
     #[serde(rename = "expectedAttempt", default)]
     pub expected_attempt: Option<u32>,
     #[serde(rename = "control", default)]
-    pub control: Option<crate::native_extensions::graph::control::GraphControl>,
+    pub control: Option<crate::native_extensions::graph::GraphControl>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -706,10 +706,10 @@ pub fn handle_rpc(runtime: &mut RpcRuntime, command: RpcCommand) -> RpcResponse 
                 }
                 "diff" => {
                     let baseline_res =
-                        crate::native_extensions::graph::mutation::capture_baseline(&runtime.cwd);
+                        crate::native_extensions::graph::capture_baseline(&runtime.cwd);
                     match baseline_res {
                         Ok(baseline) => {
-                            match crate::native_extensions::graph::mutation::compute_owned_diff(
+                            match crate::native_extensions::graph::compute_owned_diff(
                                 &runtime.cwd,
                                 &baseline,
                                 &[],
@@ -813,24 +813,24 @@ pub fn handle_rpc(runtime: &mut RpcRuntime, command: RpcCommand) -> RpcResponse 
                     );
                 };
                 let action = match command.action.as_deref().unwrap_or("pause") {
-                    "pause" => crate::native_extensions::graph::control::GraphControlAction::Pause,
+                    "pause" => crate::native_extensions::graph::GraphControlAction::Pause,
                     "resume" => {
-                        crate::native_extensions::graph::control::GraphControlAction::Resume
+                        crate::native_extensions::graph::GraphControlAction::Resume
                     }
                     "stop_node" => {
-                        crate::native_extensions::graph::control::GraphControlAction::StopNode
+                        crate::native_extensions::graph::GraphControlAction::StopNode
                     }
                     "stop_graph" | "stop" => {
-                        crate::native_extensions::graph::control::GraphControlAction::StopGraph
+                        crate::native_extensions::graph::GraphControlAction::StopGraph
                     }
                     "retry_node" | "retry" => {
-                        crate::native_extensions::graph::control::GraphControlAction::RetryNode
+                        crate::native_extensions::graph::GraphControlAction::RetryNode
                     }
                     other => {
                         return fail(id, &kind, format!("Unknown graph control action: {other}"))
                     }
                 };
-                crate::native_extensions::graph::control::GraphControl {
+                crate::native_extensions::graph::GraphControl {
                     operation_id: command
                         .operation_id
                         .clone()
@@ -2185,12 +2185,12 @@ mod tests {
         let run_id = crate::native_extensions::graph::store::new_run_id();
         crate::native_extensions::graph::store::create_run_dir(dir.path(), &run_id).unwrap();
 
-        let mut run = crate::native_extensions::graph::types::GraphRun {
+        let mut run = crate::native_extensions::graph::GraphRun {
             version: 1,
             run_id: run_id.clone(),
             goal: "rpc test goal".into(),
             cwd: dir.path().to_string_lossy().into_owned(),
-            phase: crate::native_extensions::graph::types::Phase::Implement,
+            phase: crate::native_extensions::graph::Phase::Implement,
             forced: None,
             dry_run: true,
             execution_origin: None,
@@ -2204,19 +2204,19 @@ mod tests {
             verification: None,
             verification_bundle: None,
             review_coverage: None,
-            budgets: crate::native_extensions::graph::types::GraphBudgets::default(),
-            counters: crate::native_extensions::graph::types::GraphCounters {
+            budgets: crate::native_extensions::graph::GraphBudgets::default(),
+            counters: crate::native_extensions::graph::GraphCounters {
                 workers_spawned: 1,
                 revision_cycles: 0,
                 replans: 0,
                 cost_usd: 0.0,
-                started_at: crate::native_extensions::graph::store::now_ms(),
+                started_at: crate::native_extensions::graph::now_ms(),
             },
             blocked_reason: None,
             resource_snapshot: None,
             ecosystem_stats: Default::default(),
             updated_at: 0,
-            lifecycle: Some(crate::native_extensions::graph::types::GraphLifecycle::Running),
+            lifecycle: Some(crate::native_extensions::graph::GraphLifecycle::Running),
             revision: 1,
             control_history: Vec::new(),
             continuation: None,
@@ -2244,7 +2244,7 @@ mod tests {
         let loaded = crate::native_extensions::graph::store::load_run(dir.path(), &run_id).unwrap();
         assert_eq!(
             loaded.current_lifecycle(),
-            crate::native_extensions::graph::types::GraphLifecycle::Paused
+            crate::native_extensions::graph::GraphLifecycle::Paused
         );
 
         // An idle checkpoint cannot truthfully acknowledge an executing resume.
@@ -2265,17 +2265,17 @@ mod tests {
         assert_eq!(loaded.control_history.len(), 2);
         assert_eq!(
             loaded.current_lifecycle(),
-            crate::native_extensions::graph::types::GraphLifecycle::Paused
+            crate::native_extensions::graph::GraphLifecycle::Paused
         );
         let mut interrupted = loaded;
-        let mut task = crate::native_extensions::graph::types::GraphTaskState::new(
+        let mut task = crate::native_extensions::graph::GraphTaskState::new(
             "interrupted-worker",
-            crate::native_extensions::graph::types::Role::Writer,
-            crate::native_extensions::graph::types::ArtifactKind::PatchReport,
+            crate::native_extensions::graph::Role::Writer,
+            crate::native_extensions::graph::ArtifactKind::PatchReport,
             vec![],
             None,
         );
-        task.status = crate::native_extensions::graph::types::TaskStatus::Running;
+        task.status = crate::native_extensions::graph::TaskStatus::Running;
         interrupted.tasks.push(task);
         crate::native_extensions::graph::store::save_run(&mut interrupted).unwrap();
         let stop = handle_rpc(

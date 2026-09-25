@@ -6268,6 +6268,10 @@ mod tests {
         let seen = Arc::clone(&updates);
         let deps = ControllerDeps {
             runner: Arc::new(|_, _, _| WorkerResult::default()),
+            verify_exec: Arc::new(|_, _, _, _| (0, "ok".into(), 1)),
+            session_model: None,
+            session_thinking: None,
+            project_trusted: false,
             on_update: Arc::new(move |_, _| {
                 seen.fetch_add(1, Ordering::SeqCst);
             }),

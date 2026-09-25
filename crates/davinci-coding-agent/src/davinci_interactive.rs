@@ -7380,7 +7380,7 @@ fn graph_verification_facts(verification: Option<&serde_json::Value>) -> Vec<Str
             .and_then(serde_json::Value::as_u64)
             .unwrap_or(0);
         let elapsed =
-            crate::native_extensions::graph::store::now_ms().saturating_sub(started) / 1000;
+            crate::native_extensions::graph::now_ms().saturating_sub(started) / 1000;
         facts.push(format!(
             "Verification running · {index}/{total} · {elapsed}s elapsed"
         ));
@@ -9141,9 +9141,9 @@ fn apply_agent_action(shell: &mut Shell<'_>, action: &str, index: usize) -> Next
         }
         "diff" => {
             if let Ok(baseline) =
-                crate::native_extensions::graph::mutation::capture_baseline(&shell.agent.cwd)
+                crate::native_extensions::graph::capture_baseline(&shell.agent.cwd)
             {
-                if let Ok(report) = crate::native_extensions::graph::mutation::compute_owned_diff(
+                if let Ok(report) = crate::native_extensions::graph::compute_owned_diff(
                     &shell.agent.cwd,
                     &baseline,
                     &[],
