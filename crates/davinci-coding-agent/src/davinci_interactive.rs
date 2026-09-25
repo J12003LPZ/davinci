@@ -7312,7 +7312,7 @@ fn graph_sheet(value: &serde_json::Value) -> Option<GraphRunSheet> {
             run.get("runId").and_then(serde_json::Value::as_str),
         ) {
             (Some(cwd), Some(id)) => {
-                crate::native_extensions::graph::store::run_dir(std::path::Path::new(cwd), id)
+                crate::native_extensions::graph::run_dir(std::path::Path::new(cwd), id)
                     .display()
                     .to_string()
             }
@@ -7380,7 +7380,7 @@ fn graph_verification_facts(verification: Option<&serde_json::Value>) -> Vec<Str
             .and_then(serde_json::Value::as_u64)
             .unwrap_or(0);
         let elapsed =
-            crate::native_extensions::graph::store::now_ms().saturating_sub(started) / 1000;
+            crate::native_extensions::graph::graph_now_ms().saturating_sub(started) / 1000;
         facts.push(format!(
             "Verification running · {index}/{total} · {elapsed}s elapsed"
         ));
@@ -7431,7 +7431,7 @@ fn graph_verification_facts(verification: Option<&serde_json::Value>) -> Vec<Str
 #[cfg(test)]
 mod graph_canvas_fact_tests {
     use super::*;
-    use crate::native_extensions::graph::types::*;
+    use crate::native_extensions::graph::*;
     use serde_json::json;
 
     #[test]
@@ -7550,7 +7550,7 @@ mod graph_canvas_fact_tests {
         assert_eq!(sheet.phase, "blocked");
         assert_eq!(
             sheet.artifacts,
-            crate::native_extensions::graph::store::run_dir(
+            crate::native_extensions::graph::run_dir(
                 std::path::Path::new(&run.cwd),
                 &run.run_id
             )
@@ -9141,9 +9141,9 @@ fn apply_agent_action(shell: &mut Shell<'_>, action: &str, index: usize) -> Next
         }
         "diff" => {
             if let Ok(baseline) =
-                crate::native_extensions::graph::mutation::capture_baseline(&shell.agent.cwd)
+                crate::native_extensions::graph::capture_baseline(&shell.agent.cwd)
             {
-                if let Ok(report) = crate::native_extensions::graph::mutation::compute_owned_diff(
+                if let Ok(report) = crate::native_extensions::graph::compute_owned_diff(
                     &shell.agent.cwd,
                     &baseline,
                     &[],

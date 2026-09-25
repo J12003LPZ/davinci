@@ -117,8 +117,8 @@ use davinci_coding_agent::project_config;
 mod rpc;
 use davinci_coding_agent::runtime_host;
 mod self_update;
-use davinci_coding_agent::settings;
 use davinci_coding_agent::semantic;
+use davinci_coding_agent::settings;
 mod shutdown;
 mod slash;
 mod startup;
@@ -625,11 +625,8 @@ fn build_agent(parsed: &Args, session_dir: &Path, cwd: &Path) -> Result<Agent, S
     if std::env::var_os("PI_GRAPH_ROLE").is_some() && graph_worker.is_none() {
         return Err("invalid Graph worker context; refusing ordinary-session fallback".into());
     }
-    let worker_runtime = crate::native_extensions::graph::worker_sessions::runtime_from_env(
-        parsed,
-        cwd,
-        graph_worker.as_ref(),
-    )?;
+    let worker_runtime =
+        crate::native_extensions::graph::runtime_from_env(parsed, cwd, graph_worker.as_ref())?;
     if worker_runtime.is_some() && parsed.no_session {
         return Err("bound Graph worker cannot disable its conversation".into());
     }
@@ -2664,7 +2661,7 @@ fn complete_prompt_with_host(
                             }
                             if let Some(v) = graph.get("verification") {
                                 if let Ok(vr) = serde_json::from_value::<
-                                    crate::native_extensions::graph::types::VerificationResult,
+                                    crate::native_extensions::graph::VerificationResult,
                                 >(v.clone())
                                 {
                                     for cmd in &vr.commands {
@@ -3676,8 +3673,8 @@ fn run_rpc_with_host(
             let remote = runtime.agent.remote_queue();
             let skills = runtime.agent.skills.clone();
             let templates = runtime.agent.templates.clone();
+            let stop = std::sync::atomic::AtomicBool::new(false);
             let (_reply, events) = std::thread::scope(|scope| {
-                let stop = std::sync::atomic::AtomicBool::new(false);
                 let stop_ref = &stop;
                 let leftover_ref = &leftover;
                 let rx_ref = &rx;
@@ -7423,8 +7420,7 @@ pub fn format_session_status(parsed: &Args, agent: &Agent) -> String {
         }
     }
     let cwd = std::env::current_dir().unwrap_or_default();
-    if let Some(run) = crate::native_extensions::graph::active_run(&cwd).and_then(|r| r.snapshot())
-    {
+    if let Some(run) = crate::native_extensions::graph::active_run_snapshot(&cwd) {
         let compact = run.ecosystem_stats.render_compact_lines();
         if !compact.is_empty() {
             text.push('\n');
@@ -7969,7 +7965,12 @@ fn apply_discovered_resources(parsed: &Args, agent: &mut Agent) {
             roots.extend(extra.iter().map(PathBuf::from));
         }
         for pkg in &settings.packages {
-            roots.extend(settings::collect_package_resources(pkg, "skills", &default_agent_dir(), &agent.cwd));
+            roots.extend(settings::collect_package_resources(
+                pkg,
+                "skills",
+                &default_agent_dir(),
+                &agent.cwd,
+            ));
         }
         agent.skills = discover_skills(&roots);
     }
@@ -7983,7 +7984,12 @@ fn apply_discovered_resources(parsed: &Args, agent: &mut Agent) {
             roots.extend(extra.iter().map(PathBuf::from));
         }
         for pkg in &settings.packages {
-            roots.extend(settings::collect_package_resources(pkg, "prompts", &default_agent_dir(), &agent.cwd));
+            roots.extend(settings::collect_package_resources(
+                pkg,
+                "prompts",
+                &default_agent_dir(),
+                &agent.cwd,
+            ));
         }
         agent.templates = discover_prompt_templates(&roots);
     }

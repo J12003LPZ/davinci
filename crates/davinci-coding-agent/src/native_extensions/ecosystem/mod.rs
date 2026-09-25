@@ -48,7 +48,7 @@ mod tests {
     use std::fmt::Write as _;
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-    use std::sync::Arc;
+    use std::sync::{Arc, Mutex};
     use tempfile::tempdir;
 
     #[test]
@@ -1471,7 +1471,9 @@ mod tests {
             session_thinking: None,
             project_trusted: true,
             on_update: Arc::new(|_, _| {}),
-            memory: Some(Arc::new(Mutex::new(VectorMemory::new(dir.path().to_path_buf())))),
+            memory: Some(Arc::new(Mutex::new(VectorMemory::new(
+                dir.path().to_path_buf(),
+            )))),
             learning: Some(learning),
             governor: None,
             language_intelligence: None,

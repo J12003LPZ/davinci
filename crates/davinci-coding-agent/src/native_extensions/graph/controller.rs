@@ -419,10 +419,7 @@ impl GraphExecution {
                 run.blocked_reason = Some(reason.clone());
                 run.clone()
             };
-            (self.deps.on_update)(
-                &failed,
-                Some(&format!("{reason}; stopped state not saved")),
-            );
+            (self.deps.on_update)(&failed, Some(&format!("{reason}; stopped state not saved")));
             return false;
         }
 
@@ -6268,6 +6265,10 @@ mod tests {
         let seen = Arc::clone(&updates);
         let deps = ControllerDeps {
             runner: Arc::new(|_, _, _| WorkerResult::default()),
+            verify_exec: Arc::new(super::super::verify::dry_run_verify_exec),
+            session_model: None,
+            session_thinking: None,
+            project_trusted: false,
             on_update: Arc::new(move |_, _| {
                 seen.fetch_add(1, Ordering::SeqCst);
             }),

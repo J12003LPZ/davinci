@@ -495,8 +495,8 @@ fn session_persistence_failure_reaches_host_reply_and_json_event() {
     assert!(reply.starts_with("Session recovery required:"), "{reply}");
     assert_eq!(print_text_exit(&events), (1, Some(reply.clone())));
     let event = to_json_print_event(events.last().unwrap()).unwrap();
-    let mut state = native_extensions::graph::worker::WorkerEventState::default();
-    native_extensions::graph::worker::parse_worker_event(&event.to_string(), &mut state, |_| {});
+    let mut state = native_extensions::graph::WorkerEventState::default();
+    native_extensions::graph::parse_worker_event(&event.to_string(), &mut state, |_| {});
     assert_eq!(state.error_message.as_deref(), Some(reply.as_str()));
     assert_eq!(state.stop_reason.as_deref(), Some("session_persistence"));
 }
@@ -556,7 +556,7 @@ fn host_worker_session_preserves_parent_authority_across_turns() {
 
 #[test]
 fn graph_worker_launch_opens_its_private_bound_conversation() {
-    use crate::native_extensions::graph::worker_sessions::{tests as fixture, SESSION_ENV};
+    use crate::native_extensions::graph::{worker_session_fixtures as fixture, SESSION_ENV};
     let _env_lock = PROCESS_ENV_LOCK
         .lock()
         .unwrap_or_else(|error| error.into_inner());

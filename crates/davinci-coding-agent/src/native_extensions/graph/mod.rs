@@ -15,8 +15,6 @@
 
 pub(crate) mod bindings;
 pub(crate) mod blobs;
-pub(crate) mod git;
-pub(crate) mod tail;
 pub(crate) mod briefings;
 pub(crate) mod config;
 pub(crate) mod continuation;
@@ -25,6 +23,7 @@ pub(crate) mod controller;
 mod coordinator_handler;
 pub(crate) mod definitions;
 pub(crate) mod export;
+pub(crate) mod git;
 pub(crate) mod history;
 mod lease;
 pub(crate) mod mutation;
@@ -38,6 +37,7 @@ pub(crate) mod replay;
 pub(crate) mod review_coverage;
 pub(crate) mod roles;
 pub(crate) mod store;
+pub(crate) mod tail;
 pub(crate) mod topology;
 pub(crate) mod types;
 pub(crate) mod validate;
@@ -55,8 +55,8 @@ mod operation_retry_tests;
 pub use control::*;
 #[allow(unused_imports)]
 pub use mutation::{
-    capture_baseline, capture_graph_delta, ChangedFile, FileFingerprint, GraphMutation,
-    MutationBaseline, PatchChunk,
+    capture_baseline, capture_graph_delta, compute_owned_diff, ChangedFile, FileFingerprint,
+    GraphMutation, MutationBaseline, PatchChunk,
 };
 #[allow(unused_imports)]
 pub use recovery::{
@@ -81,11 +81,12 @@ pub use controller::{run_graph, run_saved_graph, ControllerDeps, RunOptions};
 use davinci_agent::{ToolError, ToolResult};
 #[allow(unused_imports)]
 pub use render::{
-    graph_command_kind, parse_graph_args, parse_graph_command, render_now, render_run_summary,
-    GraphCommand, ParsedGraphArgs,
+    graph_command_kind, parse_advanced_graph_command, parse_graph_args, parse_graph_command,
+    render_now, render_run_summary, GraphCommand, ParsedGraphArgs,
 };
 use serde_json::{json, Value};
-use store::{list_runs, load_run, transcript_path};
+use store::transcript_path;
+pub use store::{list_runs, load_run, now_ms as graph_now_ms, run_dir};
 use verify::{contracted_verify_exec, default_verify_exec, dry_run_verify_exec};
 use worker::{run_dry_worker, run_worker};
 
@@ -97,11 +98,17 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 pub use roles::GRAPH_SUBMIT_TOOL;
+#[cfg(feature = "test-fixtures")]
+pub use store::{create_run_dir, new_run_id, save_run};
 #[allow(unused_imports)]
 pub use worker::{build_worker_args, worker_cache_profile, WorkerCacheProfile};
+#[cfg(feature = "test-fixtures")]
+pub use worker::{parse_worker_event, WorkerEventState};
 pub use worker_hooks::GraphWorkerContext;
+#[cfg(feature = "test-fixtures")]
+pub use worker_sessions::fixtures as worker_session_fixtures;
 #[allow(unused_imports)]
-pub use worker_sessions::WorkerSessionBinding;
+pub use worker_sessions::{runtime_from_env, WorkerSessionBinding, SESSION_ENV};
 
 /// Resolve the concrete worker model identity used by both the launch and
 /// provider cache partition. Empty overrides are ignored; when neither the
@@ -169,6 +176,11 @@ impl Drop for FinishedOnDrop {
 fn active_runs() -> &'static Mutex<HashMap<PathBuf, Arc<ActiveRun>>> {
     static ACTIVE: OnceLock<Mutex<HashMap<PathBuf, Arc<ActiveRun>>>> = OnceLock::new();
     ACTIVE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Read the current graph snapshot without exposing its mutable runtime.
+pub fn active_run_snapshot(cwd: &Path) -> Option<GraphRun> {
+    active_run(cwd).and_then(|run| run.snapshot())
 }
 
 pub(crate) fn active_run(cwd: &Path) -> Option<Arc<ActiveRun>> {
@@ -392,9 +404,7 @@ fn economy_role_models_with(
     models
 }
 
-fn economy_role_models(
-    session_model: Option<&str>,
-) -> std::collections::BTreeMap<Role, String> {
+fn economy_role_models(session_model: Option<&str>) -> std::collections::BTreeMap<Role, String> {
     economy_role_models_with(
         session_model,
         std::env::var("DAVINCI_GRAPH_ECONOMY_MODEL").ok().as_deref(),
@@ -2115,7 +2125,10 @@ mod tests {
 
         let controller = controller(dir.path()).with_runtime(runtime.clone());
         let run = controller
-            .run_to_completion(parse_graph_args("--dry-run test runtime registration"), None)
+            .run_to_completion(
+                parse_graph_args("--dry-run test runtime registration"),
+                None,
+            )
             .expect("runs");
 
         assert_eq!(run.phase, Phase::Done);
@@ -2527,7 +2540,10 @@ mod tests {
         let dir = tempdir().unwrap();
         let controller = controller(dir.path());
         let mut run = controller
-            .run_to_completion(parse_graph_args("--dry-run --simple resume regression"), None)
+            .run_to_completion(
+                parse_graph_args("--dry-run --simple resume regression"),
+                None,
+            )
             .unwrap();
         assert_eq!(run.lifecycle, Some(types::GraphLifecycle::Stopped));
         run.phase = Phase::Blocked;
@@ -2559,7 +2575,10 @@ mod tests {
         let dir = tempdir().unwrap();
         let controller = controller(dir.path());
         let mut run = controller
-            .run_to_completion(parse_graph_args("--dry-run --simple cancelled fixture"), None)
+            .run_to_completion(
+                parse_graph_args("--dry-run --simple cancelled fixture"),
+                None,
+            )
             .unwrap();
         run.phase = Phase::Cancelled;
         run.lifecycle = Some(types::GraphLifecycle::Stopped);

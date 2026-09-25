@@ -529,8 +529,8 @@ impl BrowserController {
         })
     }
 
-    #[cfg(test)]
-    pub(crate) fn shutdown_backend_for_test(&self) {
+    #[cfg(any(test, feature = "test-fixtures"))]
+    pub fn shutdown_backend_for_test(&self) {
         let engine = self.store.lock().unwrap().engine.clone().unwrap();
         engine
             .request(json!({"op":"shutdown"}), Duration::from_secs(5))
@@ -544,8 +544,8 @@ impl BrowserController {
             .is_err());
     }
 
-    #[cfg(test)]
-    pub(crate) fn context_count(&self) -> usize {
+    #[cfg(any(test, feature = "test-fixtures"))]
+    pub fn context_count(&self) -> usize {
         self.store.lock().unwrap().resources.len()
     }
     pub fn new(workspace: &Path, config: BrowserConfig) -> Self {
