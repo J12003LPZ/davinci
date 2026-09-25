@@ -154,3 +154,23 @@ jobs:
         run: cargo test -p davinci-coding-agent --locked --lib real_basedpyright_lsp_semantics -- --ignored --nocapture
       - name: Real Pyright semantics
         run: cargo test -p davinci-coding-agent --locked --lib real_pyright_lsp_semantics -- --ignored --nocapture
+      - name: Build production CLI for workflow evaluation
+        run: cargo build -p davinci-coding-agent --locked --bin davinci
+      - name: Real CLI language-intelligence evaluation
+        shell: bash
+        run: python scripts/eval-native-intelligence.py "target/debug/davinci${{ runner.os == 'Windows' && '.exe' || '' }}" --lsp
+      - name: Measure startup and polyglot scenarios
+        shell: bash
+        run: |
+          set -euo pipefail
+          binary="target/debug/davinci${{ runner.os == 'Windows' && '.exe' || '' }}"
+          python scripts/lsp-benchmark.py --binary "$binary" --scenario startup --repetitions 20 --output "$RUNNER_TEMP/lsp-startup.json"
+          python scripts/lsp-benchmark.py --binary "$binary" --scenario polyglot --repetitions 20 --output "$RUNNER_TEMP/lsp-polyglot.json"
+      - name: Preserve language-intelligence measurements
+        uses: actions/upload-artifact@v4
+        with:
+          name: language-intelligence-${{ runner.os }}
+          path: |
+            ${{ runner.temp }}/lsp-startup.json
+            ${{ runner.temp }}/lsp-polyglot.json
+          if-no-files-found: error
