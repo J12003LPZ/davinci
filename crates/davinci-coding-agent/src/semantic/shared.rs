@@ -8,7 +8,6 @@ use davinci_agent::semantic::{
 use davinci_agent::{ToolError, ToolResult};
 use serde_json::{json, Value};
 use std::path::Path;
-use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 #[derive(Debug, Clone)]
@@ -26,7 +25,7 @@ impl SemanticClient {
         Self::Parent(client)
     }
 
-    fn execute(
+    pub(crate) fn execute_tool(
         &self,
         tool: &str,
         args: &Value,
@@ -150,7 +149,7 @@ impl SemanticServiceFacade {
             ),
         };
 
-        let output = self.client.execute(tool, &args, context)?;
+        let output = self.client.execute_tool(tool, &args, context)?;
         if output.is_error {
             let details = output.details.unwrap_or(Value::Null);
             let code = details.pointer("/error/code").and_then(Value::as_str).unwrap_or("semantic_unavailable");
