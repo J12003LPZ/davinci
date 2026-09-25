@@ -207,7 +207,7 @@ const TEST_PATTERNS: &[&str] = &[
     r"(?i)^\s*ctest\b",
     r"(?i)^\s*mvn\s+test\b",
     r"(?i)^\s*gradle\s+test\b",
-    r"(?i)^\s*(?:python|python3|pytest|cargo(?:\.exe)?(?:\s+\+[a-z0-9_.-]+)?(?:\s+--(?:offline|locked|frozen))*\s+(?:test|check|clippy|fmt|build|nextest)|go\s+(?:test|vet|build)|dotnet\s+(?:test|build))\b",
+    r"(?i)^\s*(?:python|python3|pytest|cargo(?:\.exe)?(?:\s+\+[a-z0-9_.-]+)?(?:\s+--(?:offline|locked|frozen))*\s+(?:test|check|clippy|fmt|nextest)|go\s+(?:test|vet|build)|dotnet\s+(?:test|build))\b",
     r"(?i)^\s*make\s+(test|check|lint|fmt|clippy|build)\b",
     r"(?i)^\s*\.[/\\]test\.sh\b",
 ];
@@ -245,6 +245,35 @@ fn read_regex() -> &'static RegexSet {
 fn test_regex() -> &'static RegexSet {
     static SET: OnceLock<RegexSet> = OnceLock::new();
     SET.get_or_init(|| RegexSet::new(TEST_PATTERNS).expect("test patterns compile"))
+}
+
+fn strip_leading_env_assignments(mut segment: &str) -> &str {
+    loop {
+        let trimmed = segment.trim_start();
+        let Some(split) = trimmed.find(char::is_whitespace) else {
+            return trimmed;
+        };
+        let first = &trimmed[..split];
+        let Some((key, _value)) = first.split_once('=') else {
+            return trimmed;
+        };
+        let valid_key = !key.is_empty()
+            && key
+                .chars()
+                .enumerate()
+                .all(|(index, ch)| ch == '_' || ch.is_ascii_alphanumeric() && (index > 0 || !ch.is_ascii_digit()));
+        if !valid_key {
+            return trimmed;
+        }
+        segment = &trimmed[split..];
+    }
+}
+
+fn is_verification_segment(segment: &str) -> bool {
+    let segment = strip_leading_env_assignments(segment);
+    test_regex().is_match(segment)
+        && !segment.contains("--no-run")
+        && test_arguments_are_safe(segment)
 }
 
 // ----------------------------------------------------------------------------
@@ -766,9 +795,10 @@ pub fn analyze_command(command: &str) -> ShellAnalysisReport {
         && !has_substitution
         && !has_nested_shell
         && segments.iter().all(|s| {
-            ((read_regex().is_match(s) && read_arguments_are_safe(s))
-                || (test_regex().is_match(s) && test_arguments_are_safe(s)))
-                && !destructive_regex().is_match(&s.replace("2>&1", ""))
+            let normalized = strip_leading_env_assignments(s);
+            ((read_regex().is_match(normalized) && read_arguments_are_safe(normalized))
+                || is_verification_segment(normalized))
+                && !destructive_regex().is_match(&normalized.replace("2>&1", ""))
         });
 
     ShellAnalysisReport {
@@ -788,12 +818,33 @@ pub fn analyze_command(command: &str) -> ShellAnalysisReport {
 /// exit status can be trusted as the verification result.
 pub fn verification_outcome(command: &str) -> Option<bool> {
     let report = analyze_command(command);
-    let test_position = report
+    let verification_positions = report
         .segments
         .iter()
-        .position(|segment| test_regex().is_match(segment) && !segment.contains("--no-run"))?;
-    let status_masked = command.contains("||") || test_position + 1 != report.segments.len();
-    Some(!status_masked)
+        .enumerate()
+        .filter_map(|(index, segment)| is_verification_segment(segment).then_some(index))
+        .collect::<Vec<_>>();
+    let first = *verification_positions.first()?;
+
+    if command.contains("||") {
+        return Some(false);
+    }
+
+    if verification_positions.len() == report.segments.len() {
+        if report.segments.len() == 1 {
+            return Some(true);
+        }
+        // A pure && verification chain has a successful final status iff all
+        // verification commands succeeded. Other separators can mask an
+        // earlier failure with a later success.
+        let only_and_chain = command.contains("&&")
+            && !command.contains(';')
+            && !command.contains('\n')
+            && !command.contains('|');
+        return Some(only_and_chain);
+    }
+
+    Some(first + 1 == report.segments.len())
 }
 
 impl ShellAnalysisReport {
@@ -949,6 +1000,10 @@ mod tests {
             ("gradle test", Some(true)),
             ("cargo test 2>&1 | tail-20", Some(false)),
             ("cargo test || true", Some(false)),
+            ("cargo test && cargo clippy", Some(true)),
+            ("RUST_BACKTRACE=1 cargo test", Some(true)),
+            ("python script.py", None),
+            ("cargo build", None),
             ("echo cargo test", None),
             ("cargo test --no-run", None),
             ("ls", None),
