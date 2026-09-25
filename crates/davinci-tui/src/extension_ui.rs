@@ -37,7 +37,10 @@ pub struct ExtensionWidget {
 
 impl ExtensionWidget {
     pub fn new(key: impl Into<String>, lines: Vec<String>, placement: WidgetPlacement) -> Self {
-        let mut lines = lines;
+        let mut lines: Vec<String> = lines
+            .into_iter()
+            .map(|line| crate::davinci::sanitize::terminal_safe(&line).into_owned())
+            .collect();
         if lines.len() > MAX_WIDGET_LINES {
             lines.truncate(MAX_WIDGET_LINES);
             lines.push("... (widget truncated)".into());
