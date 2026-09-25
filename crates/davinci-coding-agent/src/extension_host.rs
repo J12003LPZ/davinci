@@ -1130,15 +1130,9 @@ impl ExtensionHost {
                 );
             }
         }
-        for manifest in &self.manifests {
-            for tool in &manifest.tools {
-                if tool.name == name {
-                    if let Some(command) = &tool.command {
-                        return Some(execute_command_tool(command, &Value::Object(Default::default()), cwd, tool.timeout_ms));
-                    }
-                }
-            }
-        }
+        // Manifest command tools are also executed by the normal tool
+        // executor with the model-supplied arguments. The notification path
+        // must not invoke them again with an empty argument object.
         None
     }
 
