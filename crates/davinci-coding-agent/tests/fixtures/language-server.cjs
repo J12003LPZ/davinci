@@ -174,6 +174,11 @@ function handle(message) {
     send({ id: message.id, result: { kind: 'full', resultId: `r-${sequence}`, items: diagnosticItems(message.params.textDocument.uri) } });
     return;
   }
+  if (mode === 'delayed-query' && /^textDocument\//.test(message.method) && message.id !== undefined) {
+    const result = normalResult(message.method, message);
+    setTimeout(() => send({ id: message.id, result: result === undefined ? null : result }), 250);
+    return;
+  }
   if (mode === 'late-once' && /^textDocument\//.test(message.method) && message.id !== undefined) {
     if (!delayedQuery) {
       delayedQuery = message;
