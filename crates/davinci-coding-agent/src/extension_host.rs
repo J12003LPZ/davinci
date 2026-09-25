@@ -1115,39 +1115,11 @@ impl ExtensionHost {
     }
 
     pub fn execute_named_tool(&self, name: &str, cwd: &Path) -> Option<Result<String, String>> {
-        // Native tools are executed by Agent's custom-tool executor with the
-        // model-supplied arguments. This helper is called from the event
-        // notification path, where arguments are intentionally unavailable;
-        // invoking a native tool here would run it a second time with an empty
-        // object (and could duplicate stateful scans or mutations).
-        for ext in &self.js {
-            if ext.tools.iter().any(|tool| tool == name) {
-                return Some(
-                    execute_js_tool(
-                        Path::new(&ext.path),
-                        name,
-                        &Value::Object(Default::default()),
-                        cwd,
-                    )
-                    .map(|result| result.content)
-                    .map_err(|err| err.to_string()),
-                );
-            }
-        }
-        for manifest in &self.manifests {
-            for tool in &manifest.tools {
-                if tool.name == name {
-                    if let Some(command) = &tool.command {
-                        return Some(execute_command_tool(
-                            command,
-                            &Value::Object(Default::default()),
-                            cwd,
-                            tool.timeout_ms,
-                        ));
-                    }
-                }
-            }
-        }
+        // Event notifications do not carry the model-supplied arguments.
+        // Extension tools are executed exactly once through
+        // execute_js_or_manifest_tool_with_context; running them here with {}
+        // duplicates side effects and corrupts argument-dependent commands.
+        let _ = (name, cwd);
         None
     }
 
