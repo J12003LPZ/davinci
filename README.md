@@ -678,6 +678,12 @@ Omit it for the standard tier. Priority processing may consume plan limits faste
 availability and speed depend on the backend. `DAVINCI_OPENAI_SERVICE_TIER` accepts
 the same values when the setting is absent. Other values omit the request field.
 
+`effortPolicy` defaults to `fixed`. Opt in with `adaptive` to request lower reasoning
+effort before the turn's first successful edit, the configured effort after an edit,
+and higher effort after two consecutive failed tool results (including batch children).
+`off` remains off. `DAVINCI_EFFORT_POLICY` overrides the setting; unknown values use
+`fixed`. The configured thinking level and system prompt identity stay unchanged.
+
 ~~~text
 DAVINCI_CODING_AGENT_DIR
 DAVINCI_CODING_AGENT_SESSION_DIR

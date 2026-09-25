@@ -884,6 +884,8 @@ fn build_agent(parsed: &Args, session_dir: &Path, cwd: &Path) -> Result<Agent, S
     agent.auto_compaction = settings.compaction_enabled();
     agent.auto_verify =
         settings.auto_verify_enabled(std::env::var("DAVINCI_AUTO_VERIFY").ok().as_deref());
+    agent.effort_policy =
+        settings.effort_policy(std::env::var("DAVINCI_EFFORT_POLICY").ok().as_deref());
     agent.compaction = settings.compaction_settings();
     agent.auto_retry = settings.retry_enabled();
     agent.retry_attempts = settings.retry_max_retries();
@@ -2526,7 +2528,7 @@ fn complete_prompt_with_host(
                         Some(&system),
                         &provider_tools(current),
                         &StreamOptions {
-                            thinking_level: Some(current.thinking_level),
+                            thinking_level: Some(current.request_thinking_level()),
                             thinking_budgets: current.thinking_budgets.clone(),
                             timeout_ms: current.provider_timeout_ms,
                             max_retries: current.provider_max_retries,
@@ -6904,6 +6906,8 @@ fn sync_agent_from_settings(agent: &mut Agent) {
     agent.auto_compaction = stored.compaction_enabled();
     agent.auto_verify =
         stored.auto_verify_enabled(std::env::var("DAVINCI_AUTO_VERIFY").ok().as_deref());
+    agent.effort_policy =
+        stored.effort_policy(std::env::var("DAVINCI_EFFORT_POLICY").ok().as_deref());
     agent.compaction = stored.compaction_settings();
     agent.block_images = stored.block_images();
     agent.auto_resize_images = stored.image_auto_resize();

@@ -319,6 +319,8 @@ pub struct Settings {
     pub auto_verify: Option<bool>,
     #[serde(default, rename = "serviceTier")]
     pub service_tier: Option<String>,
+    #[serde(default, rename = "effortPolicy")]
+    pub effort_policy: Option<String>,
     #[serde(default, rename = "reasoningSummary")]
     pub reasoning_summary: Option<String>,
     #[serde(default, rename = "graphEconomyModel")]
@@ -1161,6 +1163,13 @@ pub fn apply_http_proxy_settings(http_proxy: Option<&str>) {
 }
 
 impl Settings {
+    pub fn effort_policy(&self, environment: Option<&str>) -> davinci_agent::effort::EffortPolicy {
+        environment
+            .or(self.effort_policy.as_deref())
+            .and_then(davinci_agent::effort::EffortPolicy::parse)
+            .unwrap_or_default()
+    }
+
     pub fn auto_verify_enabled(&self, environment: Option<&str>) -> bool {
         self.auto_verify.unwrap_or(true) && !matches!(environment, Some("0" | "false" | "off"))
     }
@@ -1574,6 +1583,21 @@ mod tests {
         assert_eq!(settings.service_tier.as_deref(), Some("fast"));
         assert!(super::Settings::default().service_tier.is_none());
     }
+
+    #[test]
+    fn effort_policy_setting_defaults_to_fixed_and_environment_overrides() {
+        use davinci_agent::effort::EffortPolicy;
+        let settings: super::Settings =
+            serde_json::from_str(r#"{"effortPolicy":"adaptive"}"#).unwrap();
+        assert_eq!(settings.effort_policy(None), EffortPolicy::Adaptive);
+        assert_eq!(settings.effort_policy(Some("fixed")), EffortPolicy::Fixed);
+        assert_eq!(settings.effort_policy(Some("unknown")), EffortPolicy::Fixed);
+        assert_eq!(
+            super::Settings::default().effort_policy(None),
+            EffortPolicy::Fixed
+        );
+    }
+
     #[test]
     fn auto_verify_setting_parses_and_environment_can_disable_it() {
         let settings: super::Settings = serde_json::from_str(r#"{"autoVerify":false}"#).unwrap();
