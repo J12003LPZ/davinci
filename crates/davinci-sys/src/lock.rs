@@ -1,18 +1,15 @@
-//! A cross-process lock held by owning a `<target>.lock` file.
+//! Cross-process file locks.
 //!
-//! `create_new` is atomic on every platform we ship. A holder that crashed
-//! leaves the file behind, so a lock whose mtime is older than
-//! `stale_after` is treated as abandoned and taken over.
-//!
-//! Known window: two waiters that see the same stale lock within ~20 ms can
-//! both remove it. Holders keep locks for milliseconds and the default stale
-//! threshold is 10 s, so this needs a crashed holder plus two simultaneous
-//! waiters. proper-lockfile (used by TypeScript pi) has the same window.
+//! `LockFile` uses the operating-system lock held by `ExclusiveFileLock`.
+//! The lock pathname is intentionally retained after release: deleting a lock
+//! file can let concurrent waiters lock different inodes under the same name.
+//! A crashed process releases the OS lock automatically, so stale-file
+//! deletion is unnecessary.
 
 use std::fs;
-use std::io::{self, Write};
+use std::io;
 use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant, SystemTime};
+use std::time::{Duration, Instant};
 
 /// proper-lockfile's default, so TS pi and davinci agree on staleness.
 pub const DEFAULT_STALE_AFTER: Duration = Duration::from_secs(10);
@@ -22,39 +19,16 @@ const RETRY_EVERY: Duration = Duration::from_millis(20);
 #[derive(Debug)]
 pub struct LockFile {
     path: PathBuf,
+    _lock: ExclusiveFileLock,
 }
 
 impl LockFile {
-    pub fn acquire(path: &Path, wait: Duration, stale_after: Duration) -> io::Result<Self> {
-        let started = Instant::now();
-        loop {
-            match fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(path)
-            {
-                Ok(mut file) => {
-                    let _ = writeln!(file, "{}", std::process::id());
-                    return Ok(Self {
-                        path: path.to_path_buf(),
-                    });
-                }
-                Err(err) if err.kind() == io::ErrorKind::AlreadyExists => {
-                    if is_stale(path, stale_after) {
-                        let _ = fs::remove_file(path);
-                        continue;
-                    }
-                    if started.elapsed() >= wait {
-                        return Err(io::Error::new(
-                            io::ErrorKind::WouldBlock,
-                            format!("{} is held by another process", path.display()),
-                        ));
-                    }
-                    std::thread::sleep(RETRY_EVERY);
-                }
-                Err(err) => return Err(err),
-            }
-        }
+    pub fn acquire(path: &Path, wait: Duration, _stale_after: Duration) -> io::Result<Self> {
+        let lock = ExclusiveFileLock::acquire(path, wait)?;
+        Ok(Self {
+            path: path.to_path_buf(),
+            _lock: lock,
+        })
     }
 
     pub fn path(&self) -> &Path {
@@ -62,26 +36,10 @@ impl LockFile {
     }
 }
 
-impl Drop for LockFile {
-    fn drop(&mut self) {
-        let _ = fs::remove_file(&self.path);
-    }
-}
-
 pub fn lock_path_for(target: &Path) -> PathBuf {
     let mut name = target.file_name().unwrap_or_default().to_os_string();
     name.push(".lock");
     target.with_file_name(name)
-}
-
-fn is_stale(path: &Path, stale_after: Duration) -> bool {
-    let Ok(modified) = fs::metadata(path).and_then(|meta| meta.modified()) else {
-        return false;
-    };
-    SystemTime::now()
-        .duration_since(modified)
-        .map(|age| age >= stale_after)
-        .unwrap_or(false)
 }
 
 /// A lock held by the operating system until its owner exits, crash
@@ -240,23 +198,22 @@ mod tests {
     }
 
     #[test]
-    fn drop_releases_the_lock() {
+    fn drop_releases_the_lock_without_deleting_the_lock_file() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("x.lock");
         drop(LockFile::acquire(&path, Duration::ZERO, DEFAULT_STALE_AFTER).unwrap());
-        assert!(!path.exists());
+        assert!(path.is_file());
         LockFile::acquire(&path, Duration::ZERO, DEFAULT_STALE_AFTER).unwrap();
     }
 
     #[test]
-    fn stale_lock_left_by_a_crash_is_taken_over() {
+    fn an_existing_unlocked_file_is_safe_to_take_over() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("x.lock");
-        std::fs::write(&path, "12345\n").unwrap();
-        // Zero stale_after: any existing lock counts as abandoned.
+        std::fs::write(&path, "legacy stale marker\n").unwrap();
         let lock = LockFile::acquire(&path, Duration::ZERO, Duration::ZERO).unwrap();
         drop(lock);
-        assert!(!path.exists());
+        assert!(path.is_file());
     }
 
     #[test]
