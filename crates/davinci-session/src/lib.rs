@@ -223,6 +223,7 @@ impl JsonlSession {
     }
 
     pub fn append_entry(&mut self, mut entry: SessionEntry) -> Result<(), SessionError> {
+        self.prepare_first_write()?;
         entry.seq = self.max_seq.saturating_add(1);
         if entry.timestamp == 0 {
             entry.timestamp = now_ms();
@@ -251,6 +252,7 @@ impl JsonlSession {
         expected_parent_id: Option<&str>,
         mut entry: SessionEntry,
     ) -> Result<SessionEntry, SessionError> {
+        self.prepare_first_write()?;
         prepare_operation_entry(event_id, &mut entry)?;
         if let Some(existing) = self.entries.iter().find(|existing| existing.id == event_id) {
             if operation_entry_matches(existing, &entry)
@@ -306,6 +308,7 @@ impl JsonlSession {
         usage: Option<serde_json::Value>,
         from_hook: bool,
     ) -> Result<String, SessionError> {
+        self.prepare_first_write()?;
         if let Some(id) = branch_from_id.as_deref() {
             if !id.is_empty() && !self.entries.iter().any(|entry| entry.id == id) {
                 return Err(SessionError::not_found(format!("Entry {id} not found")));
@@ -371,6 +374,7 @@ impl JsonlSession {
     }
 
     pub fn set_name(&mut self, name: &str) -> Result<(), SessionError> {
+        self.prepare_first_write()?;
         let original = self.header.metadata.clone();
         let mut map = match &self.header.metadata {
             Some(serde_json::Value::Object(map)) => map.clone(),
@@ -436,16 +440,65 @@ impl JsonlSession {
                     }
                 })?;
             self.writer.lock = Some(std::sync::Arc::new(lock));
+
+            // The handle may have been opened before another process finished
+            // writing. Once ownership is exclusive, refresh all durable state
+            // before deriving seq/parent IDs for this writer.
+            let refreshed = JsonlSession::open(&self.path)?;
+            self.header = refreshed.header;
+            self.entries = refreshed.entries;
+            self.records = refreshed.records;
+            self.leaf_id = refreshed.leaf_id;
+            self.max_seq = refreshed.max_seq;
+            self.writer.rewrite_as_v4 = refreshed.writer.rewrite_as_v4;
         }
-        if !self.writer.tail_checked {
-            davinci_sys::fs::truncate_torn_tail(&self.path).map_err(|err| {
-                SessionError::storage(format!("Unable to repair session tail: {err}"))
-            })?;
-            self.writer.tail_checked = true;
-        }
+
         if self.writer.rewrite_as_v4 {
+            // Publishing from the in-memory v3 migration also drops any torn
+            // trailing v3 record, so no separate tail truncation is needed.
             self.publish_as_v4()?;
             self.writer.rewrite_as_v4 = false;
+            self.writer.tail_checked = true;
+        }
+
+        if !self.writer.tail_checked {
+            let content = fs::read_to_string(&self.path).map_err(|err| {
+                SessionError::storage(format!("Unable to inspect session tail: {err}"))
+            })?;
+            if !content.is_empty() && !content.ends_with('\n') {
+                let last = content.lines().last().unwrap_or("");
+                let line_count = content.lines().count();
+                let complete = if line_count == 1 {
+                    parse_header(last).is_ok()
+                } else {
+                    parse_mutation(last).is_ok()
+                };
+                if complete {
+                    // A complete JSONL record without its optional final
+                    // newline is valid. Terminate it before the next append
+                    // rather than deleting it or gluing the next record to it.
+                    let mut file = OpenOptions::new()
+                        .append(true)
+                        .open(&self.path)
+                        .map_err(|err| {
+                            SessionError::storage(format!(
+                                "Unable to terminate session tail: {err}"
+                            ))
+                        })?;
+                    file.write_all(b"\n")
+                        .and_then(|()| file.sync_all())
+                        .map_err(|err| {
+                            SessionError::storage(format!(
+                                "Unable to terminate session tail: {err}"
+                            ))
+                        })?;
+                } else {
+                    davinci_sys::fs::truncate_torn_tail(&self.path).map_err(|err| {
+                        SessionError::storage(format!("Unable to repair session tail: {err}"))
+                    })?;
+                }
+            }
+            self.writer.tail_checked = true;
         }
         Ok(())
     }
@@ -618,6 +671,56 @@ mod tests {
         fs::write(&path, bytes).unwrap();
         let reopened = JsonlSession::open(&path).unwrap();
         assert_eq!(reopened.entries.len(), 1);
+    }
+
+    #[test]
+    fn complete_unterminated_last_line_is_preserved_before_append() {
+        let dir = tempdir().unwrap();
+        let mut session = JsonlSession::create(dir.path(), "/work", None).unwrap();
+        session
+            .append_entry(SessionEntry::message("user", serde_json::json!("one")))
+            .unwrap();
+        let path = session.path.clone();
+        drop(session);
+
+        let mut bytes = fs::read(&path).unwrap();
+        assert_eq!(bytes.last(), Some(&b'\n'));
+        bytes.pop();
+        fs::write(&path, bytes).unwrap();
+
+        let mut reopened = JsonlSession::open(&path).unwrap();
+        assert_eq!(reopened.entries.len(), 1);
+        reopened
+            .append_entry(SessionEntry::message("user", serde_json::json!("two")))
+            .unwrap();
+        drop(reopened);
+
+        let again = JsonlSession::open(&path).unwrap();
+        assert_eq!(again.entries.len(), 2);
+        assert_eq!(again.entries[1].parent_id, Some(again.entries[0].id.clone()));
+    }
+
+    #[test]
+    fn stale_handle_reloads_after_it_acquires_writer_lock() {
+        let dir = tempdir().unwrap();
+        let mut seed = JsonlSession::create(dir.path(), "/work", None).unwrap();
+        let path = seed.path.clone();
+        drop(seed);
+
+        let mut first = JsonlSession::open(&path).unwrap();
+        let mut second = JsonlSession::open(&path).unwrap();
+        first
+            .append_entry(SessionEntry::message("user", serde_json::json!("one")))
+            .unwrap();
+        let first_id = first.leaf_id.clone();
+        drop(first);
+
+        second
+            .append_entry(SessionEntry::message("user", serde_json::json!("two")))
+            .unwrap();
+        assert_eq!(second.entries.len(), 2);
+        assert_eq!(second.entries[1].seq, 2);
+        assert_eq!(second.entries[1].parent_id, first_id);
     }
 
     #[test]
