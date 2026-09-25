@@ -82,7 +82,10 @@ impl StdioTransport {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
         cmd.env_clear();
-        for (key, value) in child_environment(std::env::vars(), env) {
+        let parent_env = std::env::vars_os().filter_map(|(key, value)| {
+            Some((key.into_string().ok()?, value.into_string().ok()?))
+        });
+        for (key, value) in child_environment(parent_env, env) {
             cmd.env(key, value);
         }
         let mut child = cmd
