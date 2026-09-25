@@ -82,10 +82,12 @@ def fixture(root: Path) -> None:
     ts = os.environ.get("DAVINCI_TEST_TYPESCRIPT")
     tls = os.environ.get("DAVINCI_TEST_LANGUAGE_SERVER")
     if ts and tls:
-        node_modules = root / "node_modules"
-        node_modules.mkdir(exist_ok=True)
-        shutil.copytree(Path(ts), node_modules / "typescript", dirs_exist_ok=True)
-        shutil.copytree(Path(tls), node_modules / "typescript-language-server", dirs_exist_ok=True)
+        source_node_modules = Path(tls).resolve().parent
+        shutil.copytree(
+            source_node_modules,
+            root / "node_modules",
+            dirs_exist_ok=True,
+        )
 
     (agent / "settings.json").write_text(json.dumps(settings), encoding="utf-8")
 
