@@ -54,6 +54,14 @@ mod tests {
     }
 
     #[test]
+    fn bidi_controls_are_removed() {
+        assert_eq!(
+            terminal_safe("safe\u{202e}txt\u{2066}!\u{2069}"),
+            "safetxt!"
+        );
+    }
+
+    #[test]
     fn carriage_return_keeps_what_the_terminal_would_show() {
         assert_eq!(terminal_safe("10%\r50%\r100%"), "100%");
         assert_eq!(terminal_safe("line\r\n"), "line\n");
