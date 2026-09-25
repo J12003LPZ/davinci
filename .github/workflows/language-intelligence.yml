@@ -3,6 +3,9 @@ name: Language intelligence
 on:
   push:
     paths:
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "crates/davinci-coding-agent/Cargo.toml"
       - "crates/davinci-coding-agent/src/native_extensions/language_intelligence/**"
       - "crates/davinci-coding-agent/src/semantic/**"
       - "crates/davinci-coding-agent/src/sdk.rs"
@@ -12,6 +15,9 @@ on:
       - ".github/workflows/language-intelligence.yml"
   pull_request:
     paths:
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "crates/davinci-coding-agent/Cargo.toml"
       - "crates/davinci-coding-agent/src/native_extensions/language_intelligence/**"
       - "crates/davinci-coding-agent/src/semantic/**"
       - "crates/davinci-coding-agent/src/sdk.rs"
