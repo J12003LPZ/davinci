@@ -3,8 +3,11 @@
 mod config;
 mod documents;
 mod identity;
+mod metadata;
 #[cfg(test)]
 mod integration_tests;
+#[cfg(test)]
+mod test_support;
 mod manager;
 mod normalize;
 mod protocol;
