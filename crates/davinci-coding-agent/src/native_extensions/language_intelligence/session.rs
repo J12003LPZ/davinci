@@ -21,7 +21,9 @@ pub(super) struct Session {
     documents: BTreeMap<PathBuf, Document>,
     diagnostic_floor: BTreeMap<String, u64>,
     diagnostic_result_ids: BTreeMap<String, String>,
+    diagnostic_pull_items: BTreeMap<String, Vec<Value>>,
     diagnostic_refresh_generation: u64,
+    needs_resync: bool,
 }
 
 impl Session {
@@ -82,7 +84,9 @@ impl Session {
             documents: BTreeMap::new(),
             diagnostic_floor: BTreeMap::new(),
             diagnostic_result_ids: BTreeMap::new(),
+            diagnostic_pull_items: BTreeMap::new(),
             diagnostic_refresh_generation,
+            needs_resync: false,
         })
     }
 
@@ -118,6 +122,12 @@ impl Session {
         adapter: &dyn ServerAdapter,
         budget: &RequestBudget,
     ) -> Result<()> {
+        if self.needs_resync {
+            return Err(IntelligenceError::new(
+                "resync_required",
+                "Document delivery became uncertain; restart this language-server session before using semantic evidence",
+            ));
+        }
         let sync = &self.capabilities["textDocumentSync"];
         let kind = sync
             .as_u64()
@@ -153,6 +163,8 @@ impl Session {
                     )?;
                     self.transport.unwatch_document(&old.uri);
                     self.diagnostic_floor.remove(&old.uri);
+                    self.diagnostic_result_ids.remove(&old.uri);
+                    self.diagnostic_pull_items.remove(&old.uri);
                     changed = true;
                 }
                 continue;
@@ -182,6 +194,8 @@ impl Session {
         }
         // Changes to dependencies invalidate cached diagnostics for every open document.
         if changed {
+            self.diagnostic_result_ids.clear();
+            self.diagnostic_pull_items.clear();
             for (document, _) in &updates {
                 self.diagnostic_floor.insert(
                     document.uri.clone(),
@@ -192,12 +206,25 @@ impl Session {
             }
         }
         for (document, events) in updates {
+            let mut sent = 0usize;
             for event in events {
-                self.transport.notify_with_budget(
+                match self.transport.notify_with_budget(
                     event["method"].as_str().expect("internal event"),
                     event["params"].clone(),
                     budget,
-                )?;
+                ) {
+                    Ok(()) => sent += 1,
+                    Err(error) => {
+                        if sent > 0 {
+                            self.needs_resync = true;
+                            return Err(IntelligenceError::new(
+                                "resync_required",
+                                "A document notification batch was only partially delivered; semantic state must be recreated",
+                            ));
+                        }
+                        return Err(error);
+                    }
+                }
             }
             self.documents.insert(document.path.clone(), document);
         }
@@ -236,6 +263,7 @@ impl Session {
         if refresh != self.diagnostic_refresh_generation {
             self.diagnostic_refresh_generation = refresh;
             self.diagnostic_result_ids.clear();
+            self.diagnostic_pull_items.clear();
         }
         if let Some(path) = source {
             let document = &self.documents[path];
@@ -265,18 +293,33 @@ impl Session {
                 let response = self.transport.request_with_budget(method, params, budget)?;
                 match response.get("kind").and_then(Value::as_str) {
                     Some("full") => {
-                        let items = response.get("items").filter(|v| v.is_array()).cloned().ok_or_else(|| IntelligenceError::new("protocol_error", "Expected diagnostic items"))?;
+                        let items = response
+                            .get("items")
+                            .and_then(Value::as_array)
+                            .cloned()
+                            .ok_or_else(|| IntelligenceError::new("protocol_error", "Expected diagnostic items"))?;
                         if let Some(result_id) = response.get("resultId").and_then(Value::as_str) {
                             self.diagnostic_result_ids.insert(document.uri.clone(), result_id.into());
                         } else {
                             self.diagnostic_result_ids.remove(&document.uri);
                         }
+                        self.diagnostic_pull_items.insert(document.uri.clone(), items.clone());
                         return Ok(json!({"items":items,"omitted":0,"freshness":"pull-response","documentVersion":document.version}));
                     }
                     Some("unchanged") => {
                         let result_id = response.get("resultId").and_then(Value::as_str);
-                        if result_id.is_some() && result_id == self.diagnostic_result_ids.get(&document.uri).map(String::as_str) {
-                            return Ok(json!({"items":[],"omitted":0,"freshness":"pull-response","unchanged":true,"documentVersion":document.version}));
+                        if result_id.is_some()
+                            && result_id == self.diagnostic_result_ids.get(&document.uri).map(String::as_str)
+                        {
+                            let items = self
+                                .diagnostic_pull_items
+                                .get(&document.uri)
+                                .cloned()
+                                .ok_or_else(|| IntelligenceError::new(
+                                    "diagnostics_pending",
+                                    "Unchanged diagnostic report has no retained current full report",
+                                ))?;
+                            return Ok(json!({"items":items,"omitted":0,"freshness":"pull-response","unchanged":true,"documentVersion":document.version}));
                         }
                         return Err(IntelligenceError::new("diagnostics_pending", "Unchanged diagnostic report did not match the current provider result id"));
                     }
@@ -500,6 +543,42 @@ mod tests {
             )
             .unwrap();
         assert!(session.documents.is_empty());
+    }
+
+    #[test]
+    fn partial_notification_delivery_marks_session_for_resynchronization() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let path = root.join("a.ts");
+        std::fs::write(&path, "first").unwrap();
+        let mut session = Session::start(fixture(&root, "normal"), deadline()).unwrap();
+        session
+            .execute(
+                "textDocument/hover",
+                "hoverProvider",
+                Some(&path),
+                json!({}),
+                &TypeScriptAdapter,
+                deadline(),
+            )
+            .unwrap();
+        // This assertion locks the fail-closed state transition itself; the
+        // transport queue-failure fixture exercises the actual partial batch.
+        session.needs_resync = true;
+        assert_eq!(
+            session
+                .execute(
+                    "textDocument/hover",
+                    "hoverProvider",
+                    Some(&path),
+                    json!({}),
+                    &TypeScriptAdapter,
+                    deadline(),
+                )
+                .unwrap_err()
+                .code,
+            "resync_required"
+        );
     }
 
     #[test]
