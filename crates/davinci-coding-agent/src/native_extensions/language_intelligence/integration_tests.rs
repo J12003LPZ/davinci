@@ -51,7 +51,7 @@ fn real_typescript_semantics_and_edit_synchronization() {
     .unwrap();
     let mut config = LanguageIntelligenceConfig::default();
     config.typescript.request_timeout_ms = 30000;
-    config.typescript.backend = super::servers::Backend::TypeScriptLanguageServer;
+    config.typescript.backend = super::config::TypeScriptBackend::TypeScriptLanguageServer;
     let started = Instant::now();
     let manager = LanguageIntelligence::new(root, config);
     let startup = started.elapsed();
