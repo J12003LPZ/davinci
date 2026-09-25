@@ -1772,6 +1772,28 @@ mod tests {
     }
 
     #[test]
+    fn lsp_bad_language_section_never_rewrites_settings_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = settings_path(dir.path());
+        fs::write(
+            &path,
+            r#"{"theme":"fixture","languageIntelligence":{"rust":{"enabled":true},"python":{"backend":42}}}"#,
+        )
+        .unwrap();
+
+        update_settings(dir.path(), |settings| {
+            settings.theme = Some("changed".into());
+        })
+        .unwrap();
+
+        let saved: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(saved["theme"], "changed");
+        assert_eq!(saved["languageIntelligence"]["python"]["backend"], 42);
+        assert_eq!(saved["languageIntelligence"]["rust"]["enabled"], true);
+    }
+
+    #[test]
     fn rewriting_settings_keeps_unknown_keys_and_writes_no_nulls() {
         let dir = tempfile::tempdir().unwrap();
         let path = settings_path(dir.path());
