@@ -862,6 +862,42 @@ mod tests {
     }
 
     #[test]
+    fn family_cap_evicts_idle_same_family_session_first() {
+        let first = TestWorkspace::new("typescript", "capture");
+        let second_root = tempfile::tempdir().unwrap();
+        std::fs::write(second_root.path().join("package.json"), "{}").unwrap();
+        std::fs::write(second_root.path().join("a.ts"), "export const value = 1;\n").unwrap();
+
+        let mut config = first.manager.inner.config.clone();
+        config.max_sessions = 8;
+        config.typescript.max_sessions = 1;
+        let manager = LanguageIntelligence::new(first.root(), config);
+        let mut policy =
+            davinci_agent::PermissionPolicy::new(davinci_agent::PermissionMode::AlwaysApprove);
+        policy.project_trusted = true;
+        manager.set_permissions(Some(Arc::new(davinci_agent::PermissionState::new(policy))));
+
+        let first_result = manager
+            .execute("lsp_hover", &json!({"path":"a.ts","line":1,"column":1}))
+            .unwrap();
+        assert!(!first_result.is_error, "{}", first_result.content);
+        assert_eq!(manager.status()["sessions"].as_array().unwrap().len(), 1);
+
+        let second = manager.for_workspace(second_root.path());
+        let second_result = second
+            .execute("lsp_hover", &json!({"path":"a.ts","line":1,"column":1}))
+            .unwrap();
+        assert!(!second_result.is_error, "{}", second_result.content);
+        let sessions = manager.status()["sessions"].as_array().unwrap().to_vec();
+        assert_eq!(sessions.len(), 1, "{sessions:?}");
+        assert_eq!(
+            sessions[0]["workspace"],
+            json!(second_root.path().canonicalize().unwrap())
+        );
+        manager.shutdown();
+    }
+
+    #[test]
     fn disabled_and_untrusted_requests_never_launch() {
         let workspace = TestWorkspace::new("typescript", "capture");
         workspace.manager.set_permissions(None);
