@@ -385,6 +385,21 @@ mod tests {
         assert_eq!(found, Some(dir.path().join("npm.cmd")));
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn resolve_program_in_skips_empty_path_entries() {
+        let cwd = std::env::current_dir().unwrap();
+        let probe = cwd.join("_davinci_empty_path_probe.cmd");
+        std::fs::write(&probe, "@echo off").unwrap();
+        let found = resolve_program_in(
+            "_davinci_empty_path_probe",
+            std::ffi::OsStr::new(";"),
+            Some(".CMD"),
+        );
+        let _ = std::fs::remove_file(&probe);
+        assert_eq!(found, None);
+    }
+
     #[test]
     fn resolve_program_in_without_pathext_needs_exact_name() {
         let dir = tempfile::tempdir().unwrap();
