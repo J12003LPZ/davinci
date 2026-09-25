@@ -833,6 +833,9 @@ mod tests {
         assert!(agent.active_contract().is_some());
 
         let revision = agent.tool_context.living_plan.lock().unwrap().revision;
+        let files = (0..257)
+            .map(|file| format!("src/overflow/file-{file}.rs"))
+            .collect::<Vec<_>>();
         agent
             .tool_context
             .living_plan
@@ -843,8 +846,8 @@ mod tests {
                     "expected_revision": revision,
                     "steps": [{
                         "id": "one",
-                        "files": ["src.rs:120"],
-                        "change": "invalid scoped path",
+                        "files": files,
+                        "change": "oversized scoped plan",
                         "why": "exercise failed handoff",
                         "verify": ["cargo test --offline"]
                     }]
