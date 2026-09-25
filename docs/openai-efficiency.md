@@ -186,3 +186,14 @@ The following plan items are intentionally not enabled until the explicit authen
 - final Codex usage-header names if the live backend differs from the conservative parser names.
 
 Live before/after cache measurements and Codex CLI comparison results are also pending. The implementation does not commit synthetic benchmark numbers or claim probe acceptance without an authenticated run.
+
+## 2026-09-25 execution audit
+
+This plan was re-audited against current `main` at `0cadf67d0081b969ac0b8fc495c0271acaeacd82`.
+
+- The cache-stable turn path is wired through the production host: OpenAI reasoning routes commit the persisted turn-context message, install the runtime capability registry, then freeze the authorized provider tool schema before provider dispatch.
+- Non-OpenAI families retain system-prompt turn state.
+- The branch adds regressions that prove those two compatibility/cache invariants, including that `tool_search` cannot mutate the provider `tools` prefix after the OpenAI cache freeze.
+- Backend-specific features remain evidence-gated. `docs/cache/codex-backend-probe.md` still records the authenticated probe as not run, so freeform grammar `apply_patch`, `additional_tools`, cache-sharing compaction, and remote compaction remain disabled or unimplemented as required by the plan.
+- Live cache measurements, Codex CLI comparison runs, and installed-executable delivery were not repeated in this audit because the connected development device was offline. No synthetic probe or benchmark result is substituted for those gates.
+

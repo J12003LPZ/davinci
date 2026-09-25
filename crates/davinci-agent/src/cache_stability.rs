@@ -188,6 +188,7 @@ mod tests {
         let second = wire_body_for_next_request(&agent, &model);
         assert_eq!(first_prefix_break(&first, &second), None);
     }
+
     #[test]
     fn a_tool_turn_with_a_verification_reminder_stays_append_only() {
         use davinci_ai::{AssistantMessage, ContentBlock, StopReason};
@@ -268,5 +269,60 @@ mod tests {
                 pair[1]["input"]
             );
         }
+    }
+
+    #[test]
+    fn anthropic_system_prompt_route_keeps_per_turn_state_in_the_system_prompt() {
+        let mut agent = Agent::new_builtin(crate::prompt::PromptProfile::Stable);
+        agent.provider = "anthropic".into();
+        agent.model_id = "claude-opus-4-5".into();
+
+        assert!(!crate::turn_context::is_cache_sensitive_route(
+            &agent.provider,
+            &agent.model_id
+        ));
+        // Route-family classification is checked above. Force the behavioral
+        // placement so DAVINCI_TURN_CONTEXT cannot make this regression flaky.
+        agent.turn_context_placement_override =
+            Some(crate::turn_context::TurnContextPlacement::SystemPrompt);
+        agent.prompt("Diagnose the root cause of this failure.");
+
+        assert_eq!(
+            agent.turn_context_placement(),
+            crate::turn_context::TurnContextPlacement::SystemPrompt
+        );
+        assert!(agent.system_prompt.contains("Permission mode:"));
+    }
+
+    #[test]
+    fn tool_search_does_not_change_the_tool_list_on_cached_routes() {
+        let (mut agent, model) = appended_codex_agent();
+        agent.set_runtime(crate::RuntimeHandle::new(
+            crate::RunId::new(),
+            crate::AgentId::new(),
+            crate::RuntimeBus::new(),
+        ));
+        agent.freeze_tools_for_cache();
+
+        user_turn(&mut agent, "Search the web for the changelog", None);
+        let first = wire_body_for_next_request(&agent, &model);
+        assert!(
+            first["tools"].to_string().contains("web_search"),
+            "the frozen schema set must include authorized deferred tools"
+        );
+
+        crate::execute_tool_with(
+            std::path::Path::new("."),
+            "tool_search",
+            &serde_json::json!({"query": "web_search"}),
+            &agent.tool_context,
+        )
+        .unwrap();
+        agent
+            .messages
+            .push(davinci_ai::ChatMessage::text("assistant", "Found it."));
+
+        let second = wire_body_for_next_request(&agent, &model);
+        assert_eq!(first_prefix_break(&first, &second), None);
     }
 }
