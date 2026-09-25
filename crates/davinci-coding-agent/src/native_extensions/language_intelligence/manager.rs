@@ -465,7 +465,14 @@ impl LanguageIntelligence {
                     governor
                         .lock()
                         .ok()?
-                        .retain_native_output(name, args, full)
+                        .retain_lsp_output(
+                            name,
+                            args,
+                            full,
+                            &workspace,
+                            source.as_deref(),
+                            permissions.clone(),
+                        )
                         .ok()
                 },
             )?;
