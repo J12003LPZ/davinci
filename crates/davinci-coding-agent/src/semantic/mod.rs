@@ -3,6 +3,7 @@ pub mod documents;
 pub mod manager;
 pub mod rename;
 pub mod session;
+pub mod shared;
 pub mod tools;
 pub mod transport;
 
@@ -18,6 +19,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 pub use backend::LocalSemanticBackend;
+pub use shared::SemanticServiceFacade;
 pub use session::{
     normalize_language, resolve_language_server, LanguageServerSpec, LazySemanticSessionRegistry,
     SemanticSessionKey, SemanticSessionState,

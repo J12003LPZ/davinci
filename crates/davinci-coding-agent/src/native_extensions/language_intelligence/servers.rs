@@ -1,5 +1,9 @@
 //! Language-specific project markers, IDs and server discovery live here.
 
+pub(super) mod project;
+pub(super) mod python;
+pub(super) mod rust;
+
 use super::protocol::{IntelligenceError, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -18,9 +22,19 @@ pub enum Backend {
     TypeScriptLanguageServer,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(super) enum ServerKind {
+    TypeScriptNative,
+    TypeScriptLanguageServer,
+    RustAnalyzer,
+    Basedpyright,
+    Pyright,
+}
+
 #[derive(Debug, Clone)]
 pub(super) struct ServerCommand {
-    pub kind: Backend,
+    pub kind: ServerKind,
     pub program: PathBuf,
     pub args: Vec<String>,
     pub workspace: PathBuf,
@@ -73,7 +87,7 @@ fn local_package(workspace: &Path, project: &Path, name: &str) -> Option<Package
         .find_map(|path| read_package(&path.join("node_modules").join(name)))
 }
 
-fn path_executable(search_path: &OsStr, name: &str) -> Option<PathBuf> {
+pub(super) fn path_executable(search_path: &OsStr, name: &str) -> Option<PathBuf> {
     std::env::split_paths(search_path)
         .filter(|path| path.is_absolute())
         .find_map(|path| {
@@ -225,7 +239,7 @@ pub(super) fn discover(
                 if let Some((program, mut args)) = package_command(package, bin, search_path) {
                     args.extend(["--lsp".into(), "--stdio".into()]);
                     candidates.push(ServerCommand {
-                        kind: Backend::TypeScriptNative,
+                        kind: ServerKind::TypeScriptNative,
                         program,
                         args,
                         workspace: project.into(),
@@ -261,7 +275,7 @@ pub(super) fn discover(
                     .unwrap_or(path));
             }
             candidates.push(ServerCommand {
-                kind: Backend::TypeScriptLanguageServer,
+                kind: ServerKind::TypeScriptLanguageServer,
                 program,
                 args,
                 workspace: project.into(),
@@ -278,14 +292,33 @@ pub(super) fn discover(
     }
 }
 
-pub(super) trait ServerAdapter {
+pub(super) fn discover_for_family(
+    family: crate::native_extensions::language_intelligence::LanguageFamily,
+    workspace: &Path,
+    project: &Path,
+    config: &crate::native_extensions::language_intelligence::LanguageIntelligenceConfig,
+    search_path: &OsStr,
+) -> Result<Vec<ServerCommand>> {
+    use crate::native_extensions::language_intelligence::LanguageFamily;
+    match family {
+        LanguageFamily::TypeScript => discover(workspace, project, config.typescript.backend, search_path),
+        LanguageFamily::Rust => rust::discover(project, &config.rust, search_path),
+        LanguageFamily::Python => python::discover(project, &config.python, search_path),
+    }
+}
+
+pub(super) trait ServerAdapter: Send + Sync {
+    fn family(&self) -> crate::native_extensions::language_intelligence::LanguageFamily;
     fn language_id(&self, path: &Path) -> Option<&'static str>;
-    fn project_markers(&self) -> &'static [&'static str];
+    fn project_markers(&self) -> &'static [&'static str] { &[] }
 }
 
 pub(super) struct TypeScriptAdapter;
 
 impl ServerAdapter for TypeScriptAdapter {
+    fn family(&self) -> crate::native_extensions::language_intelligence::LanguageFamily {
+        crate::native_extensions::language_intelligence::LanguageFamily::TypeScript
+    }
     fn language_id(&self, path: &Path) -> Option<&'static str> {
         match path.extension()?.to_str()? {
             "ts" | "mts" | "cts" => Some("typescript"),
@@ -297,6 +330,51 @@ impl ServerAdapter for TypeScriptAdapter {
     }
     fn project_markers(&self) -> &'static [&'static str] {
         &["tsconfig.json", "jsconfig.json", "package.json"]
+    }
+}
+
+
+pub(super) struct RustAdapter;
+pub(super) struct PythonAdapter;
+
+impl ServerAdapter for RustAdapter {
+    fn family(&self) -> crate::native_extensions::language_intelligence::LanguageFamily {
+        crate::native_extensions::language_intelligence::LanguageFamily::Rust
+    }
+    fn language_id(&self, path: &Path) -> Option<&'static str> {
+        (path.extension()?.to_str()? == "rs").then_some("rust")
+    }
+}
+
+impl ServerAdapter for PythonAdapter {
+    fn family(&self) -> crate::native_extensions::language_intelligence::LanguageFamily {
+        crate::native_extensions::language_intelligence::LanguageFamily::Python
+    }
+    fn language_id(&self, path: &Path) -> Option<&'static str> {
+        matches!(path.extension()?.to_str()?, "py" | "pyi").then_some("python")
+    }
+}
+
+static TYPESCRIPT_ADAPTER: TypeScriptAdapter = TypeScriptAdapter;
+static RUST_ADAPTER: RustAdapter = RustAdapter;
+static PYTHON_ADAPTER: PythonAdapter = PythonAdapter;
+
+pub(super) fn family_for_path(path: &Path) -> Option<crate::native_extensions::language_intelligence::LanguageFamily> {
+    use crate::native_extensions::language_intelligence::LanguageFamily;
+    match path.extension()?.to_str()? {
+        "ts" | "tsx" | "mts" | "cts" | "js" | "jsx" | "mjs" | "cjs" => Some(LanguageFamily::TypeScript),
+        "rs" => Some(LanguageFamily::Rust),
+        "py" | "pyi" => Some(LanguageFamily::Python),
+        _ => None,
+    }
+}
+
+pub(super) fn adapter(family: crate::native_extensions::language_intelligence::LanguageFamily) -> &'static dyn ServerAdapter {
+    use crate::native_extensions::language_intelligence::LanguageFamily;
+    match family {
+        LanguageFamily::TypeScript => &TYPESCRIPT_ADAPTER,
+        LanguageFamily::Rust => &RUST_ADAPTER,
+        LanguageFamily::Python => &PYTHON_ADAPTER,
     }
 }
 
@@ -391,6 +469,9 @@ mod tests {
     fn generic_project_detection_uses_adapter_not_typescript_constants() {
         struct FixtureAdapter;
         impl ServerAdapter for FixtureAdapter {
+            fn family(&self) -> crate::native_extensions::language_intelligence::LanguageFamily {
+                crate::native_extensions::language_intelligence::LanguageFamily::TypeScript
+            }
             fn language_id(&self, path: &Path) -> Option<&'static str> {
                 (path.extension()?.to_str()? == "fixture").then_some("fixture")
             }
@@ -491,7 +572,7 @@ mod tests {
             Some(("tsgo", "bin/tsgo")),
         );
         let found = discover(&root, &root, Backend::Auto, &search).unwrap();
-        assert_eq!(found[0].kind, Backend::TypeScriptNative);
+        assert_eq!(found[0].kind, ServerKind::TypeScriptNative);
         package(
             &root,
             "typescript",

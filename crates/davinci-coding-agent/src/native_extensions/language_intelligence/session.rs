@@ -1,4 +1,5 @@
 //! One initialized server and its synchronized documents.
+use super::client_requests::ClientRequestConfig;
 use super::documents::{self, Document};
 use super::protocol::{IntelligenceError, Result};
 use super::servers::{ServerAdapter, ServerCommand};
@@ -23,14 +24,22 @@ pub(super) struct Session {
 
 impl Session {
     pub fn start(command: ServerCommand, deadline: Instant) -> Result<Self> {
-        let transport = Transport::spawn(&mut command.command())?;
         let uri = documents::file_uri(&command.workspace)?;
+        let client = ClientRequestConfig::for_command(&command, &uri);
+        let transport = Transport::spawn_with_client(&mut command.command(), client)?;
         let result = transport.request("initialize", json!({
             "processId": std::process::id(), "clientInfo":{"name":"DaVinci"},
             "rootUri":uri, "workspaceFolders":[{"uri":uri,"name":"project"}],
             "capabilities": {
                 "general":{"positionEncodings":["utf-16"]},
-                "workspace":{"applyEdit":false,"workspaceEdit":{"documentChanges":false}},
+                "workspace":{
+                    "applyEdit":false,
+                    "workspaceEdit":{"documentChanges":false},
+                    "configuration":true,
+                    "workspaceFolders":true,
+                    "diagnostics":{"refreshSupport":true}
+                },
+                "window":{"workDoneProgress":true},
                 "textDocument": {
                     "synchronization":{"dynamicRegistration":false,"didSave":true},
                     "hover":{"contentFormat":["plaintext","markdown"]},
@@ -38,7 +47,7 @@ impl Session {
                     "implementation":{"linkSupport":true},
                     "documentSymbol":{"hierarchicalDocumentSymbolSupport":true},
                     "publishDiagnostics":{"versionSupport":true},
-                    "diagnostic":{"dynamicRegistration":false,"relatedDocumentSupport":false}
+                    "diagnostic":{"dynamicRegistration":true,"relatedDocumentSupport":false}
                 }
             }, "initializationOptions":command.initialization_options
         }), remaining(deadline)?).map_err(|e| IntelligenceError::new("initialization_failed", &format!("Language-server initialization failed ({})", e.code)))?;
@@ -288,7 +297,7 @@ pub(super) fn remaining(deadline: Instant) -> Result<std::time::Duration> {
 
 #[cfg(test)]
 mod tests {
-    use super::super::servers::{Backend, TypeScriptAdapter};
+    use super::super::servers::{ServerKind, TypeScriptAdapter};
     use super::*;
     use std::time::Duration;
 
@@ -297,7 +306,7 @@ mod tests {
     }
     fn fixture(root: &Path, mode: &str) -> ServerCommand {
         ServerCommand {
-            kind: Backend::TypeScriptLanguageServer,
+            kind: ServerKind::TypeScriptLanguageServer,
             program: "node".into(),
             args: vec![
                 concat!(

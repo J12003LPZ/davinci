@@ -1,5 +1,6 @@
 //! Bounded Content-Length framing and supervised stdio JSON-RPC.
 
+use super::client_requests::ClientRequestConfig;
 use super::protocol::{IntelligenceError, Result};
 use serde_json::{json, Value};
 use std::collections::HashMap;
@@ -48,12 +49,26 @@ struct State {
     diagnostics: HashMap<String, DiagnosticSnapshot>,
     stderr: Vec<u8>,
     rejected_edits: u64,
+    registrations: HashMap<String, Value>,
+    progress: HashMap<String, Value>,
+    messages: Vec<String>,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct Shared {
     state: Mutex<State>,
     changed: Condvar,
+    client: ClientRequestConfig,
+}
+
+impl Shared {
+    fn new(client: ClientRequestConfig) -> Self {
+        Self {
+            state: Mutex::new(State::default()),
+            changed: Condvar::new(),
+            client,
+        }
+    }
 }
 
 impl Shared {
@@ -88,6 +103,13 @@ impl std::fmt::Debug for Transport {
 
 impl Transport {
     pub fn spawn(command: &mut Command) -> Result<Self> {
+        Self::spawn_with_client(command, ClientRequestConfig::default())
+    }
+
+    pub fn spawn_with_client(
+        command: &mut Command,
+        client: ClientRequestConfig,
+    ) -> Result<Self> {
         command
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -120,7 +142,7 @@ impl Transport {
         let stdin = child.stdin.take().expect("piped stdin");
         let stdout = child.stdout.take().expect("piped stdout");
         let stderr = child.stderr.take().expect("piped stderr");
-        let shared = Arc::new(Shared::default());
+        let shared = Arc::new(Shared::new(client));
         let (sender, receiver) = mpsc::sync_channel::<Value>(32);
         let mut transport = Self {
             shared: shared.clone(),
@@ -443,20 +465,102 @@ fn dispatch_message(
                     json!({"jsonrpc":"2.0", "id":id, "result":{"applied":false,"failureReason":"DaVinci Language Intelligence is read-only"}})
                 }
                 "workspace/configuration" => {
-                    let items = message
-                        .pointer("/params/items")
+                    let response = shared
+                        .client
+                        .configuration_response(&message["params"])
+                        .ok_or_else(protocol_error)?;
+                    json!({"jsonrpc":"2.0", "id":id, "result":response})
+                }
+                "workspace/workspaceFolders" => {
+                    json!({"jsonrpc":"2.0", "id":id, "result":shared.client.workspace_folders})
+                }
+                "client/registerCapability" => {
+                    let registrations = message
+                        .pointer("/params/registrations")
                         .and_then(Value::as_array)
                         .ok_or_else(protocol_error)?;
-                    if items.len() > 64 {
+                    if registrations.len() > 64 {
                         return Err(protocol_error());
                     }
-                    json!({"jsonrpc":"2.0", "id":id, "result":vec![Value::Null; items.len()]})
+                    let supported = registrations.iter().all(|registration| {
+                        registration.get("id").and_then(Value::as_str).is_some()
+                            && registration.get("method").and_then(Value::as_str)
+                                == Some("textDocument/diagnostic")
+                    });
+                    if !supported {
+                        json!({"jsonrpc":"2.0","id":id,"error":{"code":-32601,"message":"Unsupported capability registration"}})
+                    } else {
+                        let mut state = shared.state.lock().unwrap_or_else(|e| e.into_inner());
+                        for registration in registrations {
+                            let registration_id = registration["id"]
+                                .as_str()
+                                .expect("validated registration id");
+                            state.registrations.insert(
+                                registration_id.to_string(),
+                                registration.clone(),
+                            );
+                        }
+                        json!({"jsonrpc":"2.0", "id":id, "result":Value::Null})
+                    }
+                }
+                "client/unregisterCapability" => {
+                    let unregisterations = message
+                        .pointer("/params/unregisterations")
+                        .or_else(|| message.pointer("/params/unregistrations"))
+                        .and_then(Value::as_array)
+                        .ok_or_else(protocol_error)?;
+                    let mut state = shared.state.lock().unwrap_or_else(|e| e.into_inner());
+                    for registration in unregisterations {
+                        if let Some(registration_id) = registration.get("id").and_then(Value::as_str) {
+                            state.registrations.remove(registration_id);
+                        }
+                    }
+                    json!({"jsonrpc":"2.0", "id":id, "result":Value::Null})
+                }
+                "workspace/diagnostic/refresh" => {
+                    let mut state = shared.state.lock().unwrap_or_else(|e| e.into_inner());
+                    for snapshot in state.diagnostics.values_mut() {
+                        snapshot.items.clear();
+                        snapshot.version = None;
+                        snapshot.sequence = snapshot.sequence.saturating_add(1);
+                    }
+                    shared.changed.notify_all();
+                    json!({"jsonrpc":"2.0", "id":id, "result":Value::Null})
+                }
+                "window/workDoneProgress/create" => {
+                    json!({"jsonrpc":"2.0", "id":id, "result":Value::Null})
+                }
+                "window/showMessageRequest" => {
+                    json!({"jsonrpc":"2.0", "id":id, "result":Value::Null})
                 }
                 _ => {
                     json!({"jsonrpc":"2.0", "id":id, "error":{"code":-32601,"message":"Unsupported client method"}})
                 }
             };
             writer.try_send(response).map_err(|_| protocol_error())?;
+        } else if method == "$/progress" {
+            let token = message
+                .pointer("/params/token")
+                .map(|value| value.to_string())
+                .unwrap_or_default();
+            let value = message.pointer("/params/value").cloned().unwrap_or(Value::Null);
+            let mut state = shared.state.lock().unwrap_or_else(|e| e.into_inner());
+            if state.progress.len() < 64 || state.progress.contains_key(&token) {
+                state.progress.insert(token, value);
+            }
+        } else if matches!(method, "window/logMessage" | "window/showMessage") {
+            if let Some(text) = message.pointer("/params/message").and_then(Value::as_str) {
+                let mut state = shared.state.lock().unwrap_or_else(|e| e.into_inner());
+                let text = text
+                    .chars()
+                    .filter(|ch| !ch.is_control() || matches!(ch, '\n' | '\t'))
+                    .take(2048)
+                    .collect::<String>();
+                if state.messages.len() == 64 {
+                    state.messages.remove(0);
+                }
+                state.messages.push(text);
+            }
         } else if method == "textDocument/publishDiagnostics" {
             let params = &message["params"];
             let uri = params["uri"].as_str().ok_or_else(protocol_error)?;
@@ -465,21 +569,24 @@ fn dispatch_message(
                 .ok_or_else(protocol_error)?;
             let mut state = shared.state.lock().unwrap_or_else(|e| e.into_inner());
             if let Some(snapshot) = state.diagnostics.get_mut(&diagnostic_key(uri)) {
-                // Bound retained diagnostics separately from wire frame limits.
-                let mut bytes = 0;
-                snapshot.items = items
-                    .iter()
-                    .take(1000)
-                    .take_while(|item| {
-                        bytes += item.to_string().len();
-                        bytes <= 256 * 1024
-                    })
-                    .cloned()
-                    .collect();
-                snapshot.omitted = items.len().saturating_sub(snapshot.items.len());
-                snapshot.version = params.get("version").and_then(Value::as_i64);
-                snapshot.sequence = snapshot.sequence.saturating_add(1);
-                shared.changed.notify_all();
+                let incoming_version = params.get("version").and_then(Value::as_i64);
+                if accepts_diagnostic_version(snapshot.version, incoming_version) {
+                    // Bound retained diagnostics separately from wire frame limits.
+                    let mut bytes = 0;
+                    snapshot.items = items
+                        .iter()
+                        .take(1000)
+                        .take_while(|item| {
+                            bytes += item.to_string().len();
+                            bytes <= 256 * 1024
+                        })
+                        .cloned()
+                        .collect();
+                    snapshot.omitted = items.len().saturating_sub(snapshot.items.len());
+                    snapshot.version = incoming_version;
+                    snapshot.sequence = snapshot.sequence.saturating_add(1);
+                    shared.changed.notify_all();
+                }
             }
         }
         return Ok(());
@@ -510,6 +617,14 @@ fn dispatch_message(
         let _ = sender.try_send(result);
     }
     Ok(())
+}
+
+fn accepts_diagnostic_version(previous: Option<i64>, incoming: Option<i64>) -> bool {
+    match (previous, incoming) {
+        (Some(old), Some(new)) => new >= old,
+        (Some(_), None) => false,
+        _ => true,
+    }
 }
 
 fn protocol_error() -> IntelligenceError {
@@ -581,6 +696,14 @@ fn write_frame(writer: &mut impl Write, value: &Value) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stale_or_unversioned_push_cannot_replace_versioned_current() {
+        assert!(!accepts_diagnostic_version(Some(8), Some(7)));
+        assert!(!accepts_diagnostic_version(Some(8), None));
+        assert!(accepts_diagnostic_version(Some(8), Some(8)));
+        assert!(accepts_diagnostic_version(None, None));
+    }
 
     #[test]
     fn diagnostic_uri_encodings_share_identity() {

@@ -310,81 +310,241 @@ impl<'a> ChangeImpactAnalyzer<'a> {
         let mut reference_count = 0;
         let mut lsp_failed = false;
 
-        // Query LSP references for symbols
+        // Workspace symbols are declaration candidates, not usage evidence.
+        // Resolve each candidate to actual references before incrementing counts.
         for sym in symbols {
-            let res = self
-                .language
-                .execute("lsp_workspace_symbols", &json!({ "query": sym }));
+            let res = self.language.execute(
+                "lsp_workspace_symbols",
+                &json!({ "query": sym, "limit": self.config.max_references }),
+            );
             match res {
                 Ok(out) if !out.is_error => {
                     if let Some(details) = out.details {
-                        if let Some(arr) = details.get("items").and_then(|v| v.as_array()) {
-                            for item in arr {
-                                let path = item["path"].as_str().unwrap_or("").to_string();
-                                let line = item["line"].as_u64().unwrap_or(1) as usize;
-                                let col = item["column"].as_u64().unwrap_or(1) as usize;
-                                reference_count += 1;
-                                items.push(ImpactItem {
-                                    name: sym.clone(),
-                                    path: path.clone(),
-                                    evidence_source: EvidenceSource::Lsp,
-                                    description: format!("Semantic reference to symbol '{sym}' at {path}:{line}:{col}"),
-                                    range: Some(SourceRange {
-                                        start_line: line,
-                                        start_column: col,
-                                        end_line: line,
-                                        end_column: col + sym.len(),
+                        if let Some(arr) = details.get("items").and_then(Value::as_array) {
+                            for declaration in arr.iter().take(self.config.max_references) {
+                                let Some(path) = declaration.get("path").and_then(Value::as_str) else {
+                                    lsp_failed = true;
+                                    continue;
+                                };
+                                let Some(line) = declaration
+                                    .pointer("/range/start/line")
+                                    .and_then(Value::as_u64)
+                                else {
+                                    lsp_failed = true;
+                                    continue;
+                                };
+                                let Some(column) = declaration
+                                    .pointer("/range/start/column")
+                                    .and_then(Value::as_u64)
+                                else {
+                                    lsp_failed = true;
+                                    continue;
+                                };
+                                let refs = self.language.execute(
+                                    "lsp_references",
+                                    &json!({
+                                        "path": path,
+                                        "line": line,
+                                        "column": column,
+                                        "includeDeclaration": false,
+                                        "limit": self.config.max_references
                                     }),
-                                    details: Some(item.clone()),
-                                });
+                                );
+                                match refs {
+                                    Ok(refs) if !refs.is_error => {
+                                        if let Some(reference_items) = refs
+                                            .details
+                                            .as_ref()
+                                            .and_then(|details| details.get("items"))
+                                            .and_then(Value::as_array)
+                                        {
+                                            for item in reference_items
+                                                .iter()
+                                                .take(self.config.max_references.saturating_sub(reference_count))
+                                            {
+                                                let Some(item_path) =
+                                                    item.get("path").and_then(Value::as_str)
+                                                else {
+                                                    lsp_failed = true;
+                                                    continue;
+                                                };
+                                                let Some(start_line) = item
+                                                    .pointer("/range/start/line")
+                                                    .and_then(Value::as_u64)
+                                                else {
+                                                    lsp_failed = true;
+                                                    continue;
+                                                };
+                                                let Some(start_col) = item
+                                                    .pointer("/range/start/column")
+                                                    .and_then(Value::as_u64)
+                                                else {
+                                                    lsp_failed = true;
+                                                    continue;
+                                                };
+                                                let end_line = item
+                                                    .pointer("/range/end/line")
+                                                    .and_then(Value::as_u64)
+                                                    .unwrap_or(start_line);
+                                                let end_col = item
+                                                    .pointer("/range/end/column")
+                                                    .and_then(Value::as_u64)
+                                                    .unwrap_or(start_col);
+                                                reference_count += 1;
+                                                items.push(ImpactItem {
+                                                    name: sym.clone(),
+                                                    path: item_path.to_string(),
+                                                    evidence_source: EvidenceSource::Lsp,
+                                                    description: format!(
+                                                        "Semantic reference to symbol '{sym}' at {item_path}:{start_line}:{start_col}"
+                                                    ),
+                                                    range: Some(SourceRange {
+                                                        start_line: start_line as usize,
+                                                        start_column: start_col as usize,
+                                                        end_line: end_line as usize,
+                                                        end_column: end_col as usize,
+                                                    }),
+                                                    details: Some(item.clone()),
+                                                });
+                                                if reference_count >= self.config.max_references {
+                                                    break;
+                                                }
+                                            }
+                                        }
+                                    }
+                                    _ => lsp_failed = true,
+                                }
+                                if reference_count >= self.config.max_references {
+                                    break;
+                                }
                             }
                         }
                     }
                 }
-                _ => {
-                    lsp_failed = true;
-                }
+                _ => lsp_failed = true,
+            }
+            if reference_count >= self.config.max_references {
+                break;
             }
         }
 
-        // Also query document symbols / references for files
+        // For changed files, use document symbols only as anchors, then query
+        // references at their normalized selection ranges.
         for file in files {
             let res = self
                 .language
-                .execute("lsp_document_symbols", &json!({ "path": file }));
+                .execute("lsp_document_symbols", &json!({ "path": file, "limit": self.config.max_references }));
             match res {
                 Ok(out) if !out.is_error => {
                     if let Some(details) = out.details {
-                        if let Some(arr) = details.get("items").and_then(|v| v.as_array()) {
-                            for item in arr.iter().take(self.config.max_references) {
-                                let name = item["name"].as_str().unwrap_or("").to_string();
-                                let line =
-                                    item["range"]["start"]["line"].as_u64().unwrap_or(1) as usize;
-                                let col =
-                                    item["range"]["start"]["column"].as_u64().unwrap_or(1) as usize;
-                                reference_count += 1;
-                                items.push(ImpactItem {
-                                    name: name.clone(),
-                                    path: file.clone(),
-                                    evidence_source: EvidenceSource::Lsp,
-                                    description: format!(
-                                        "Document semantic symbol '{name}' in {file}:{line}"
-                                    ),
-                                    range: Some(SourceRange {
-                                        start_line: line,
-                                        start_column: col,
-                                        end_line: line,
-                                        end_column: col,
+                        if let Some(arr) = details.get("items").and_then(Value::as_array) {
+                            for declaration in arr
+                                .iter()
+                                .take(self.config.max_references.saturating_sub(reference_count))
+                            {
+                                let name = declaration
+                                    .get("name")
+                                    .and_then(Value::as_str)
+                                    .unwrap_or("")
+                                    .to_string();
+                                let Some(line) = declaration
+                                    .pointer("/range/start/line")
+                                    .and_then(Value::as_u64)
+                                else {
+                                    lsp_failed = true;
+                                    continue;
+                                };
+                                let Some(column) = declaration
+                                    .pointer("/range/start/column")
+                                    .and_then(Value::as_u64)
+                                else {
+                                    lsp_failed = true;
+                                    continue;
+                                };
+                                match self.language.execute(
+                                    "lsp_references",
+                                    &json!({
+                                        "path": file,
+                                        "line": line,
+                                        "column": column,
+                                        "includeDeclaration": false,
+                                        "limit": self.config.max_references
                                     }),
-                                    details: Some(item.clone()),
-                                });
+                                ) {
+                                    Ok(refs) if !refs.is_error => {
+                                        if let Some(reference_items) = refs
+                                            .details
+                                            .as_ref()
+                                            .and_then(|details| details.get("items"))
+                                            .and_then(Value::as_array)
+                                        {
+                                            for item in reference_items
+                                                .iter()
+                                                .take(self.config.max_references.saturating_sub(reference_count))
+                                            {
+                                                let Some(item_path) =
+                                                    item.get("path").and_then(Value::as_str)
+                                                else {
+                                                    lsp_failed = true;
+                                                    continue;
+                                                };
+                                                let Some(start_line) = item
+                                                    .pointer("/range/start/line")
+                                                    .and_then(Value::as_u64)
+                                                else {
+                                                    lsp_failed = true;
+                                                    continue;
+                                                };
+                                                let Some(start_col) = item
+                                                    .pointer("/range/start/column")
+                                                    .and_then(Value::as_u64)
+                                                else {
+                                                    lsp_failed = true;
+                                                    continue;
+                                                };
+                                                let end_line = item
+                                                    .pointer("/range/end/line")
+                                                    .and_then(Value::as_u64)
+                                                    .unwrap_or(start_line);
+                                                let end_col = item
+                                                    .pointer("/range/end/column")
+                                                    .and_then(Value::as_u64)
+                                                    .unwrap_or(start_col);
+                                                reference_count += 1;
+                                                items.push(ImpactItem {
+                                                    name: name.clone(),
+                                                    path: item_path.to_string(),
+                                                    evidence_source: EvidenceSource::Lsp,
+                                                    description: format!(
+                                                        "Semantic reference to '{name}' at {item_path}:{start_line}:{start_col}"
+                                                    ),
+                                                    range: Some(SourceRange {
+                                                        start_line: start_line as usize,
+                                                        start_column: start_col as usize,
+                                                        end_line: end_line as usize,
+                                                        end_column: end_col as usize,
+                                                    }),
+                                                    details: Some(item.clone()),
+                                                });
+                                                if reference_count >= self.config.max_references {
+                                                    break;
+                                                }
+                                            }
+                                        }
+                                    }
+                                    _ => lsp_failed = true,
+                                }
+                                if reference_count >= self.config.max_references {
+                                    break;
+                                }
                             }
                         }
                     }
                 }
-                _ => {
-                    lsp_failed = true;
-                }
+                _ => lsp_failed = true,
+            }
+            if reference_count >= self.config.max_references {
+                break;
             }
         }
 

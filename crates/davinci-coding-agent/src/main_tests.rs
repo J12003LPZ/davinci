@@ -38,6 +38,94 @@ fn contextual_dispatch_attachments_require_context_and_live_cancellation() {
 }
 use super::*;
 
+#[test]
+fn attached_agents_keep_independent_language_intelligence_permissions() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    let package = root.join("node_modules/typescript-language-server");
+    std::fs::create_dir_all(&package).unwrap();
+    std::fs::write(
+        package.join("package.json"),
+        r#"{"name":"typescript-language-server","version":"fixture","bin":"server.cjs"}"#,
+    )
+    .unwrap();
+    std::fs::copy(
+        concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/language-server.cjs"
+        ),
+        package.join("server.cjs"),
+    )
+    .unwrap();
+    std::fs::write(root.join("a.ts"), "hello").unwrap();
+
+    let mut host = ExtensionHost::default();
+    host.native = std::sync::Arc::new(std::sync::Mutex::new(
+        native_extensions::NativeExtensionHost::new_with_agent_dir(
+            "lsp-permission-isolation",
+            &root,
+            None,
+        ),
+    ));
+
+    let permissions = |deny_hover: bool| {
+        let mut policy =
+            davinci_agent::PermissionPolicy::new(davinci_agent::PermissionMode::AlwaysApprove);
+        policy.project_trusted = true;
+        if deny_hover {
+            policy
+                .deny
+                .push(davinci_agent::PermissionRule::bare("lsp_hover"));
+        }
+        std::sync::Arc::new(davinci_agent::PermissionState::new(policy))
+    };
+
+    let mut agent_a = Agent::new_builtin(davinci_agent::PromptProfile::Stable);
+    agent_a.cwd = root.clone();
+    agent_a.permissions = permissions(false);
+    attach_tool_executor(&mut agent_a, &host);
+
+    let mut agent_b = Agent::new_builtin(davinci_agent::PromptProfile::Stable);
+    agent_b.cwd = root.clone();
+    agent_b.permissions = permissions(true);
+    attach_tool_executor(&mut agent_b, &host);
+
+    let args = serde_json::json!({"path":"a.ts","line":1,"column":1});
+    let result_a = agent_a
+        .custom_tool_executor
+        .as_ref()
+        .unwrap()
+        .execute(&root, "lsp_hover", &args)
+        .unwrap();
+    assert!(!result_a.is_error, "{}", result_a.content);
+
+    let result_b = agent_b
+        .custom_tool_executor
+        .as_ref()
+        .unwrap()
+        .execute(&root, "lsp_hover", &args)
+        .unwrap();
+    assert!(result_b.is_error);
+    assert_eq!(
+        result_b.details.unwrap()["error"]["code"],
+        "permission_denied"
+    );
+
+    let result_a_again = agent_a
+        .custom_tool_executor
+        .as_ref()
+        .unwrap()
+        .execute(&root, "lsp_hover", &args)
+        .unwrap();
+    assert!(!result_a_again.is_error, "{}", result_a_again.content);
+
+    host.native
+        .lock()
+        .unwrap()
+        .language_intelligence
+        .shutdown();
+}
+
 static PROCESS_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 #[test]

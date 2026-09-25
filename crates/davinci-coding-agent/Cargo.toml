@@ -48,6 +48,7 @@ tree-sitter-javascript.workspace = true
 ignore.workspace = true
 globset.workspace = true
 notify.workspace = true
+toml_edit.workspace = true
 
 [dev-dependencies]
 davinci-coding-agent = { path = ".", features = ["test-fixtures"] }

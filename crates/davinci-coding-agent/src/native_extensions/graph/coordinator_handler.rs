@@ -8,7 +8,7 @@ use davinci_agent::{
 use serde_json::Value;
 use std::{
     path::PathBuf,
-    sync::{atomic::AtomicBool, Arc},
+    sync::{atomic::AtomicBool, Arc, Mutex},
 };
 
 struct ParentTools {
@@ -841,7 +841,7 @@ mod tests {
         );
         let args = json!({"id":processed.details.unwrap()["tokenGovernor"]["outputId"], "startLine":10,"endLine":20});
         let language = LanguageIntelligence::new(dir.path(), Default::default());
-        language.set_governor(governor.clone());
+        language.set_governor(Arc::new(Mutex::new(governor.clone())));
         let handler = ParentTools {
             language: Some(language),
             processes: None,

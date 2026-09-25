@@ -48,6 +48,16 @@ pub fn tool_spec(name: &str) -> Option<davinci_ai::ToolSpec> {
     }
     if name == "code_query" {
         properties["includeEvidence"] = json!({"type":"boolean","default":true});
+        properties["semantic"] = json!({
+            "type":"object",
+            "additionalProperties":false,
+            "properties":{
+                "operation":{"type":"string","enum":["definition","references","implementations","typeDefinition","diagnostics"]},
+                "line":{"type":"integer","minimum":1},
+                "column":{"type":"integer","minimum":1}
+            },
+            "required":["operation"]
+        });
     }
     let required: Vec<&str> = match name {
         "symbol_search" | "code_query" => vec!["query"],
@@ -60,6 +70,45 @@ pub fn tool_spec(name: &str) -> Option<davinci_ai::ToolSpec> {
         parameters: json!({"type":"object","additionalProperties":false,"properties":properties,"required":required}),
         constrained_sampling: None,
     })
+}
+
+
+fn validate_semantic_anchor(value: &Value) -> Result<(), String> {
+    let object = value
+        .as_object()
+        .ok_or("query_invalid: semantic must be an object")?;
+    if object
+        .keys()
+        .any(|key| !matches!(key.as_str(), "operation" | "line" | "column"))
+    {
+        return Err("query_invalid: semantic has unknown fields".into());
+    }
+    let operation = object
+        .get("operation")
+        .and_then(Value::as_str)
+        .ok_or("query_invalid: semantic.operation required")?;
+    if !matches!(
+        operation,
+        "definition" | "references" | "implementations" | "typeDefinition" | "diagnostics"
+    ) {
+        return Err("query_invalid: unsupported semantic.operation".into());
+    }
+    let line = object.get("line");
+    let column = object.get("column");
+    if operation == "diagnostics" {
+        if line.is_some() || column.is_some() {
+            return Err("query_invalid: diagnostics semantic anchor has no position".into());
+        }
+    } else if !line
+        .and_then(Value::as_u64)
+        .is_some_and(|value| value >= 1)
+        || !column
+            .and_then(Value::as_u64)
+            .is_some_and(|value| value >= 1)
+    {
+        return Err("query_invalid: semantic line and column must be >= 1".into());
+    }
+    Ok(())
 }
 
 impl RepoIntelligence {
@@ -83,6 +132,10 @@ pub(super) fn validate(name: &str, args: &Value) -> Result<(), String> {
     }
     for (key, value) in object {
         let schema = &spec.parameters["properties"][key];
+        if name == "code_query" && key == "semantic" {
+            validate_semantic_anchor(value)?;
+            continue;
+        }
         let valid = match schema["type"].as_str() {
             Some("string") => value.as_str().is_some_and(|s| {
                 !s.trim().is_empty()

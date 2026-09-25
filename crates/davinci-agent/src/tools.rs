@@ -3505,11 +3505,19 @@ fn code_definition_tool(
     let symbol = input.get("symbol").and_then(Value::as_str);
 
     if let Some(semantic) = &context.semantic {
-        match semantic.definition(
-            cwd,
-            raw_path,
-            line.saturating_sub(1),
-            character.saturating_sub(1),
+        match semantic.query_with_context(
+            crate::semantic::SemanticQuery::Definition {
+                cwd,
+                path: raw_path,
+                position: crate::semantic::Position {
+                    line: line.saturating_sub(1),
+                    character: character.saturating_sub(1),
+                },
+            },
+            &crate::semantic::SemanticRequestContext {
+                deadline: None,
+                abort: context.abort.clone(),
+            },
         ) {
             Ok(res) => {
                 let content = serde_json::to_string_pretty(&res).unwrap_or_default();
@@ -3559,12 +3567,20 @@ fn code_references_tool(
         .unwrap_or(true);
 
     if let Some(semantic) = &context.semantic {
-        match semantic.references(
-            cwd,
-            raw_path,
-            line.saturating_sub(1),
-            character.saturating_sub(1),
-            include_decl,
+        match semantic.query_with_context(
+            crate::semantic::SemanticQuery::References {
+                cwd,
+                path: raw_path,
+                position: crate::semantic::Position {
+                    line: line.saturating_sub(1),
+                    character: character.saturating_sub(1),
+                },
+                include_declaration: include_decl,
+            },
+            &crate::semantic::SemanticRequestContext {
+                deadline: None,
+                abort: context.abort.clone(),
+            },
         ) {
             Ok(res) => {
                 let content = serde_json::to_string_pretty(&res).unwrap_or_default();
@@ -3607,7 +3623,13 @@ fn code_outline_tool(
     let _path = resolve(cwd, raw_path)?;
 
     if let Some(semantic) = &context.semantic {
-        match semantic.outline(cwd, raw_path) {
+        match semantic.query_with_context(
+            crate::semantic::SemanticQuery::Outline { cwd, path: raw_path },
+            &crate::semantic::SemanticRequestContext {
+                deadline: None,
+                abort: context.abort.clone(),
+            },
+        ) {
             Ok(res) => {
                 let content = serde_json::to_string_pretty(&res).unwrap_or_default();
                 return Ok(ToolResult {
@@ -3641,7 +3663,13 @@ fn code_diagnostics_tool(
     let _path = resolve(cwd, raw_path)?;
 
     if let Some(semantic) = &context.semantic {
-        match semantic.diagnostics(cwd, raw_path) {
+        match semantic.query_with_context(
+            crate::semantic::SemanticQuery::Diagnostics { cwd, path: raw_path },
+            &crate::semantic::SemanticRequestContext {
+                deadline: None,
+                abort: context.abort.clone(),
+            },
+        ) {
             Ok(res) => {
                 let content = serde_json::to_string_pretty(&res).unwrap_or_default();
                 return Ok(ToolResult {

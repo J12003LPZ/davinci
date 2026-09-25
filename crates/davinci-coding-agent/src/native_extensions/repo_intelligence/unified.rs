@@ -42,6 +42,72 @@ impl RepoIntelligence {
         if query.trim().is_empty() {
             return Err("query_invalid: query required".into());
         }
+        if let Some(anchor) = args.get("semantic") {
+            let path = args
+                .get("path")
+                .and_then(Value::as_str)
+                .ok_or("query_invalid: semantic code_query requires path")?;
+            self.validate_path(path)?;
+            let operation_name = anchor
+                .get("operation")
+                .and_then(Value::as_str)
+                .ok_or("query_invalid: semantic.operation required")?;
+            let operation = match operation_name {
+                "definition" => SemanticOperation::Definition,
+                "references" => SemanticOperation::References,
+                "implementations" => SemanticOperation::Implementations,
+                "typeDefinition" => SemanticOperation::TypeDefinition,
+                "diagnostics" => SemanticOperation::Diagnostics,
+                _ => return Err("query_invalid: unsupported semantic.operation".into()),
+            };
+            let line = anchor.get("line").and_then(Value::as_u64).unwrap_or(1) as usize;
+            let column = anchor.get("column").and_then(Value::as_u64).unwrap_or(1) as usize;
+            let range = SourceRange {
+                start_line: line,
+                start_column: column,
+                end_line: line,
+                end_column: column,
+            };
+            let mut results = Vec::new();
+            let mut semantic_warning = None;
+            match self.semantic.as_ref() {
+                Some(provider) => match provider.query(operation, path, &range, limit) {
+                    Ok(evidence) => {
+                        for item in evidence.into_iter().take(limit) {
+                            if self.validate_path(&item.path).is_ok()
+                                && (scope == "."
+                                    || item.path == scope
+                                    || item.path.starts_with(&format!("{scope}/")))
+                            {
+                                results.push(json!({
+                                    "source":"lsp",
+                                    "confidence":"semantic",
+                                    "path":item.path,
+                                    "range":item.range,
+                                    "reason":item.description.chars().take(500).collect::<String>()
+                                }));
+                            }
+                        }
+                    }
+                    Err(error) => {
+                        semantic_warning = Some(error.chars().take(500).collect::<String>());
+                    }
+                },
+                None => semantic_warning = Some("semantic provider unavailable".into()),
+            }
+            let mut value = queries::envelope(results, limit);
+            value["route"] = json!("semantic");
+            value["semantic_status"] = json!(if semantic_warning.is_some() {
+                "partial"
+            } else {
+                "available"
+            });
+            if let Some(warning) = semantic_warning {
+                value["semantic_warning"] = json!(warning);
+            }
+            return Ok(value);
+        }
+
         let lower = query.to_lowercase();
         let words: Vec<_> = query
             .split(|c: char| !c.is_alphanumeric() && c != '_')

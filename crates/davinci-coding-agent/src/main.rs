@@ -800,12 +800,9 @@ fn build_agent(parsed: &Args, session_dir: &Path, cwd: &Path) -> Result<Agent, S
             .tool_registry
             .retain(|name| !davinci_agent::runtime::transactions::is_tool(name));
     }
-    agent.tool_context.semantic = Some(Arc::new(
-        davinci_coding_agent::semantic::NativeSemanticService::with_permissions_and_cache(
-            agent.permissions.clone(),
-            agent.tool_context.cache.clone(),
-        ),
-    ));
+    // Semantic service is attached from the native extension host below so
+    // core and native semantic tools share one process owner.
+    agent.tool_context.semantic = None;
     agent.tool_context.foreground_supervisor = std::env::current_exe().ok().map(|executable| {
         davinci_agent::jobs::supervisor::SupervisorCommand {
             executable,
@@ -8292,21 +8289,59 @@ fn bind_test_impact_context(agent: &Agent, host: &ExtensionHost) {
 
 fn attach_tool_executor(agent: &mut Agent, host: &ExtensionHost) {
     bind_test_impact_context(agent, host);
+    let language = host.native.lock().ok().map(|native| {
+        native
+            .language_intelligence
+            .with_permissions(Some(agent.permissions.clone()))
+    });
+    if let Some(language) = language.as_ref() {
+        agent.tool_context.semantic = Some(Arc::new(
+            davinci_coding_agent::semantic::SemanticServiceFacade::new(language.clone()),
+        ));
+    }
     let host = host.clone();
     agent.custom_tool_executor = Some(CustomToolExecutor::new_with_context(
         move |cwd, name, args, context| {
+            if std::env::var_os("PI_GRAPH_ROLE").is_none()
+                && native_extensions::language_intelligence::TOOL_NAMES.contains(&name)
+            {
+                if let Some(language) = language.as_ref() {
+                    return language.execute(name, args);
+                }
+            }
             host.execute_js_or_manifest_tool_with_context(cwd, name, args, context)
         },
     ));
 }
 
 fn attach_shared_tool_executor(agent: &mut Agent, host: Arc<Mutex<ExtensionHost>>) {
-    bind_test_impact_context(
-        agent,
-        &host.lock().unwrap_or_else(|error| error.into_inner()),
-    );
+    let language = {
+        let host_guard = host.lock().unwrap_or_else(|error| error.into_inner());
+        bind_test_impact_context(agent, &host_guard);
+        match host_guard.native.lock() {
+            Ok(native) => {
+                let language = native
+                    .language_intelligence
+                    .with_permissions(Some(agent.permissions.clone()));
+                agent.tool_context.semantic = Some(Arc::new(
+                    davinci_coding_agent::semantic::SemanticServiceFacade::new(
+                        language.clone(),
+                    ),
+                ));
+                Some(language)
+            }
+            Err(_) => None,
+        }
+    };
     agent.custom_tool_executor = Some(CustomToolExecutor::new_with_context(
         move |cwd, name, args, context| {
+            if std::env::var_os("PI_GRAPH_ROLE").is_none()
+                && native_extensions::language_intelligence::TOOL_NAMES.contains(&name)
+            {
+                if let Some(language) = language.as_ref() {
+                    return language.execute(name, args);
+                }
+            }
             let host = host
                 .lock()
                 .map_err(|error| davinci_agent::ToolError::Failed(error.to_string()))?

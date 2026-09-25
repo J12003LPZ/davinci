@@ -222,7 +222,7 @@ pub fn command_specs() -> Vec<(&'static str, &'static str, Option<&'static str>)
         ),
         (
             "lsp-status",
-            "Show native TypeScript/JavaScript language-server sessions and availability.",
+            "Show native TypeScript/JavaScript, Rust, and Python language-server sessions and availability.",
             None,
         ),
         (
@@ -409,7 +409,6 @@ impl NativeExtensionHost {
             .unwrap_or_else(VectorMemoryConfig::from_env);
         let governor_value = TokenGovernor::new(session_key.clone(), governor_config);
         let _ = governor_value.sweep_stale_outputs();
-        let language_governor = governor_value.clone();
         let governor = Arc::new(Mutex::new(governor_value));
         let learning_config = if agent_dir.is_some() {
             merged_settings.learning.clone()
@@ -467,7 +466,7 @@ impl NativeExtensionHost {
         };
         let language_intelligence =
             language_intelligence::LanguageIntelligence::new(cwd, language_config);
-        language_intelligence.set_governor(language_governor);
+        language_intelligence.set_governor(Arc::clone(&governor));
         graph.language_intelligence = Some(language_intelligence.clone());
         let change_config = merged_settings.change_impact.clone().unwrap_or_default();
         let change_impact = change_impact::ChangeImpact::new(

@@ -25,7 +25,7 @@ impl SemanticLanguageProvider for LanguageIntelligenceAdapter {
         operation: SemanticOperation,
         path: &str,
         range: &SourceRange,
-        _limit: usize,
+        limit: usize,
     ) -> Result<Vec<SemanticEvidence>, String> {
         let tool_name = match operation {
             SemanticOperation::References => "lsp_references",
@@ -35,11 +35,18 @@ impl SemanticLanguageProvider for LanguageIntelligenceAdapter {
             SemanticOperation::Diagnostics => "lsp_diagnostics",
         };
 
-        let args = json!({
-            "path": path,
-            "line": range.start_line,
-            "column": range.start_column
-        });
+        let args = match operation {
+            SemanticOperation::Diagnostics => json!({
+                "path": path,
+                "limit": limit,
+            }),
+            _ => json!({
+                "path": path,
+                "line": range.start_line,
+                "column": range.start_column,
+                "limit": limit,
+            }),
+        };
 
         let res = self
             .language
@@ -47,7 +54,7 @@ impl SemanticLanguageProvider for LanguageIntelligenceAdapter {
             .map_err(|e| e.to_string())?;
 
         if res.is_error {
-            return Ok(Vec::new());
+            return Err(res.content);
         }
 
         let Some(details) = res.details else {

@@ -150,16 +150,80 @@ fn parse_language_intelligence<'de, D: serde::Deserializer<'de>>(
     Option<crate::native_extensions::language_intelligence::LanguageIntelligenceConfig>,
     D::Error,
 > {
-    use crate::native_extensions::language_intelligence::LanguageIntelligenceConfig;
+    use crate::native_extensions::language_intelligence::{
+        LanguageIntelligenceConfig, PythonConfig, RustConfig, TypeScriptConfig,
+    };
+
     let value = Option::<serde_json::Value>::deserialize(deserializer)?;
     Ok(value.map(|value| {
-        serde_json::from_value(value).unwrap_or_else(|_| LanguageIntelligenceConfig {
-            enabled: false,
-            configuration_error: Some(
-                "Invalid languageIntelligence settings; check backend and value types".into(),
-            ),
-            ..Default::default()
-        })
+        let Some(mut object) = value.as_object().cloned() else {
+            return LanguageIntelligenceConfig {
+                enabled: false,
+                configuration_error: Some(
+                    "languageIntelligence must be a JSON object".into(),
+                ),
+                ..Default::default()
+            };
+        };
+
+        let typescript = object.remove("typescript");
+        let rust = object.remove("rust");
+        let python = object.remove("python");
+
+        // Parse the common envelope without allowing one language subsection to
+        // poison unrelated settings. Unknown/invalid common fields remain a
+        // subsystem-wide configuration error.
+        let mut config: LanguageIntelligenceConfig =
+            match serde_json::from_value(serde_json::Value::Object(object)) {
+                Ok(config) => config,
+                Err(_) => {
+                    return LanguageIntelligenceConfig {
+                        enabled: false,
+                        configuration_error: Some(
+                            "Invalid global languageIntelligence settings".into(),
+                        ),
+                        ..Default::default()
+                    }
+                }
+            };
+
+        if let Some(value) = typescript {
+            match serde_json::from_value::<TypeScriptConfig>(value) {
+                Ok(profile) => config.typescript = profile,
+                Err(_) => {
+                    config.typescript.enabled = false;
+                    config.profile_errors.insert(
+                        "typescript".into(),
+                        "Invalid languageIntelligence.typescript settings".into(),
+                    );
+                }
+            }
+        }
+        if let Some(value) = rust {
+            match serde_json::from_value::<RustConfig>(value) {
+                Ok(profile) => config.rust = profile,
+                Err(_) => {
+                    config.rust.enabled = false;
+                    config.profile_errors.insert(
+                        "rust".into(),
+                        "Invalid languageIntelligence.rust settings".into(),
+                    );
+                }
+            }
+        }
+        if let Some(value) = python {
+            match serde_json::from_value::<PythonConfig>(value) {
+                Ok(profile) => config.python = profile,
+                Err(_) => {
+                    config.python.enabled = false;
+                    config.profile_errors.insert(
+                        "python".into(),
+                        "Invalid languageIntelligence.python settings".into(),
+                    );
+                }
+            }
+        }
+        config
     }))
 }
 

@@ -150,6 +150,35 @@ pub struct SemanticResult {
     pub fallback_reason: Option<String>,
 }
 
+#[derive(Debug, Clone, Default)]
+pub struct SemanticRequestContext {
+    pub deadline: Option<std::time::Instant>,
+    pub abort: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+}
+
+#[derive(Debug, Clone)]
+pub enum SemanticQuery<'a> {
+    Definition {
+        cwd: &'a Path,
+        path: &'a str,
+        position: Position,
+    },
+    References {
+        cwd: &'a Path,
+        path: &'a str,
+        position: Position,
+        include_declaration: bool,
+    },
+    Outline {
+        cwd: &'a Path,
+        path: &'a str,
+    },
+    Diagnostics {
+        cwd: &'a Path,
+        path: &'a str,
+    },
+}
+
 /// Core interface for semantic capabilities, injected into ToolContext.
 pub trait SemanticService: std::fmt::Debug + Send + Sync {
     fn is_server_available(&self, language: &str, path: &Path) -> bool;
@@ -187,6 +216,45 @@ pub trait SemanticService: std::fmt::Debug + Send + Sync {
         character: u32,
         new_name: &str,
     ) -> Result<RenamePreview, String>;
+
+    fn query_with_context(
+        &self,
+        query: SemanticQuery<'_>,
+        context: &SemanticRequestContext,
+    ) -> Result<SemanticResult, String> {
+        if context
+            .abort
+            .as_ref()
+            .is_some_and(|abort| abort.load(std::sync::atomic::Ordering::Acquire))
+        {
+            return Err("Operation aborted".into());
+        }
+        if context
+            .deadline
+            .is_some_and(|deadline| std::time::Instant::now() >= deadline)
+        {
+            return Err("Semantic request deadline expired".into());
+        }
+        match query {
+            SemanticQuery::Definition { cwd, path, position } => {
+                self.definition(cwd, path, position.line, position.character)
+            }
+            SemanticQuery::References {
+                cwd,
+                path,
+                position,
+                include_declaration,
+            } => self.references(
+                cwd,
+                path,
+                position.line,
+                position.character,
+                include_declaration,
+            ),
+            SemanticQuery::Outline { cwd, path } => self.outline(cwd, path),
+            SemanticQuery::Diagnostics { cwd, path } => self.diagnostics(cwd, path),
+        }
+    }
 }
 
 /// Fallback definition finder using text search patterns.
