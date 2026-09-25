@@ -43,7 +43,7 @@ use crate::native_tools::visual_snapshot::{
 use davinci_agent::{ToolError, ToolResult};
 use serde_json::{json, Value};
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 /// Shared adapter for Context VM artifact retrieval. Keeping this at the
 /// native-extension boundary lets callers use the governor's existing
