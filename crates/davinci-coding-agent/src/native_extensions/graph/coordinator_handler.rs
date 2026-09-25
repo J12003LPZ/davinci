@@ -840,6 +840,7 @@ mod tests {
             },
         );
         let args = json!({"id":processed.details.unwrap()["tokenGovernor"]["outputId"], "startLine":10,"endLine":20});
+        let governor = Arc::new(Mutex::new(governor));
         let language = LanguageIntelligence::new(dir.path(), Default::default());
         language.set_governor(governor.clone());
         let handler = ParentTools {
@@ -851,7 +852,7 @@ mod tests {
             abort: Arc::new(AtomicBool::new(false)),
         };
         assert!(handler.handles("retrieve_output"));
-        let direct = governor.retrieve(&args).unwrap();
+        let direct = governor.lock().unwrap().retrieve(&args).unwrap();
         let composed = handler.execute("retrieve_output", &args).unwrap();
         assert_eq!(composed.content, direct.content);
         assert!(composed.content.contains("fixture output line"));

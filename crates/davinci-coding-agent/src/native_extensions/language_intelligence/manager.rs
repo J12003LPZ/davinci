@@ -304,7 +304,8 @@ impl LanguageIntelligence {
             };
             let (slot, evicted) = self.slot_for(&key, limits.family_sessions, &budget)?;
             drop(evicted);
-            let mut slot = lock_until(&slot, &budget)?;
+            let mut slot_guard = lock_until(&slot, &budget)?;
+            let slot: &mut Slot = &mut slot_guard;
             self.ensure_open()?;
             slot.last_used = Instant::now();
 
@@ -389,7 +390,7 @@ impl LanguageIntelligence {
             };
             let (method, capability) = tools::operation(name).expect("validated tool");
             let generation = slot.generation;
-            let source_hash_before = source.as_deref().map(source_hash);
+            let source_hash_before = source.as_deref().and_then(source_hash);
             let Some(session) = slot.session.as_mut() else { continue; };
             let response = session.execute_with_budget(
                 method,
@@ -424,7 +425,7 @@ impl LanguageIntelligence {
             if let (Some(source), Some(expected_hash)) =
                 (source.as_deref(), source_hash_before.as_deref())
             {
-                if source_hash(source) != expected_hash {
+                if source_hash(source).as_deref() != Some(expected_hash) {
                     return Err(IntelligenceError::new(
                         "stale_result",
                         "Source bytes changed while semantic analysis was running; retry against the current checkout",
@@ -467,17 +468,9 @@ impl LanguageIntelligence {
                 uri.as_deref(),
                 parsed.limit.unwrap_or(cap).min(cap),
                 |full| {
-                    let governor = self
-                        .inner
-                        .governor
-                        .lock()
-                        .ok()?
-                        .as_ref()?
-                        .clone();
-                    governor
-                        .lock()
-                        .ok()?
-                        .retain_lsp_output(
+                    let governor = self.inner.governor.lock().ok()?.as_ref()?.clone();
+                    let mut governor = governor.lock().ok()?;
+                    governor.retain_lsp_output(
                             name,
                             args,
                             full,

@@ -668,6 +668,34 @@ pub fn live_complete_streaming_with_sink_envelope(
     options: &StreamOptions,
     on_event: &mut dyn FnMut(&AssistantMessageEvent),
 ) -> Result<ProviderCompletionEnvelope, String> {
+    let dump = crate::wire_dump::begin();
+    if let Some(dump) = &dump {
+        dump.write(
+            "logical",
+            &request_body_with(model, messages, system, tools, options),
+        );
+    }
+    let result = live_complete_streaming_with_sink_envelope_inner(
+        model, messages, auth, system, tools, options, on_event,
+    );
+    if let (Some(dump), Ok(envelope)) = (&dump, &result) {
+        dump.write(
+            "usage",
+            &serde_json::to_value(&envelope.message.usage).unwrap_or_default(),
+        );
+    }
+    result
+}
+
+fn live_complete_streaming_with_sink_envelope_inner(
+    model: &Model,
+    messages: &[ChatMessage],
+    auth: &ResolvedAuth,
+    system: Option<&str>,
+    tools: &[ToolSpec],
+    options: &StreamOptions,
+    on_event: &mut dyn FnMut(&AssistantMessageEvent),
+) -> Result<ProviderCompletionEnvelope, String> {
     refuse_unsupported_tools(&model.api, tools.len())?;
     let incremental = crate::stream_decoder::supports_incremental_stream(model);
     let mut body = request_body_with(model, messages, system, tools, options);
@@ -1287,6 +1315,30 @@ fn openai_responses_body(
     tools: &[ToolSpec],
     options: &StreamOptions,
 ) -> Value {
+    let tier = service_tier_from(std::env::var("DAVINCI_OPENAI_SERVICE_TIER").ok().as_deref());
+    openai_responses_body_with_service_tier(model, messages, system, tools, options, tier)
+}
+
+/// Codex's fast setting uses the priority wire value. Unknown values omit it.
+fn service_tier_from(value: Option<&str>) -> Option<&'static str> {
+    match value
+        .map(|value| value.trim().to_ascii_lowercase())
+        .as_deref()
+    {
+        Some("fast" | "priority") => Some("priority"),
+        Some("flex") => Some("flex"),
+        _ => None,
+    }
+}
+
+fn openai_responses_body_with_service_tier(
+    model: &Model,
+    messages: &[ChatMessage],
+    system: Option<&str>,
+    tools: &[ToolSpec],
+    options: &StreamOptions,
+    service_tier: Option<&str>,
+) -> Value {
     let codex = model.api == "openai-codex-responses";
     let retention = crate::cache::cache_retention_from_options(options);
     let cache_capabilities = match model.api.as_str() {
@@ -1347,6 +1399,9 @@ fn openai_responses_body(
         body["instructions"] = Value::String(instructions.to_string());
     }
     if codex {
+        if let Some(tier) = service_tier {
+            body["service_tier"] = Value::String(tier.into());
+        }
         body["text"] = serde_json::json!({"verbosity": openai_verbosity()});
         body["include"] = serde_json::json!(["reasoning.encrypted_content"]);
         body["tool_choice"] = Value::String("auto".into());
@@ -2483,6 +2538,47 @@ fn parse_provider_response(model: &Model, raw: &str) -> AssistantMessage {
 mod tests {
     use super::*;
     use crate::catalog::load_builtin_models;
+
+    #[test]
+    fn service_tier_maps_codex_names_to_wire_values() {
+        for value in ["fast", "priority", " FAST "] {
+            assert_eq!(service_tier_from(Some(value)), Some("priority"));
+        }
+        assert_eq!(service_tier_from(Some("Flex")), Some("flex"));
+        assert_eq!(service_tier_from(Some("standard")), None);
+        assert_eq!(service_tier_from(None), None);
+    }
+
+    #[test]
+    fn service_tier_is_optional_and_only_sent_on_codex_requests() {
+        let mut model = load_builtin_models()
+            .into_iter()
+            .find(|model| model.api == "openai-codex-responses")
+            .unwrap();
+        for api in [
+            "openai-codex-responses",
+            "openai-responses",
+            "azure-openai-responses",
+        ] {
+            model.api = api.into();
+            for tier in [None, Some("priority"), Some("flex")] {
+                let body = openai_responses_body_with_service_tier(
+                    &model,
+                    &[],
+                    None,
+                    &[],
+                    &StreamOptions::default(),
+                    tier,
+                );
+                let expected = if api == "openai-codex-responses" {
+                    tier
+                } else {
+                    None
+                };
+                assert_eq!(body.get("service_tier").and_then(Value::as_str), expected);
+            }
+        }
+    }
 
     #[test]
     fn anthropic_max_tokens_follows_the_model() {

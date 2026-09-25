@@ -56,7 +56,6 @@ clap = { version = "=4.5.23", features = ["derive"] }
 uuid = { version = "=1.11.0", features = ["v4", "v7", "serde"] }
 tempfile = "=3.14.0"
 thiserror = "=1.0.69"
-toml_edit = { version = "=0.23.4", default-features = false, features = ["parse"] }
 ureq = { version = "=2.10.1", default-features = false, features = ["json", "tls"] }
 url = "=2.5.4"
 rustls = { version = "=0.23.45", default-features = false, features = ["std", "tls12", "ring", "logging"] }
@@ -65,6 +64,7 @@ webpki-roots = "=0.26.7"
 zeroize = { version = "=1.8.1", features = ["serde"] }
 signal-hook = "=0.3.18"
 zstd = "=0.13.2"
+toml_edit = { version = "=0.22.27", default-features = false, features = ["parse"] }
 
 [profile.release]
 lto = "thin"

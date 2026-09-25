@@ -315,6 +315,7 @@ fn compaction_proposal(agent: &Agent, in_use: u64, window: u64) -> Option<Propos
 }
 
 /// Format cost minor units or label as unknown.
+#[cfg(test)]
 pub fn cost_label(cost_minor_units: Option<u64>) -> String {
     cost_minor_units
         .map(|v| format!("{v} minor units"))
@@ -1395,16 +1396,12 @@ mod tests {
     #[test]
     fn test_diff_of_binary_path() {
         let dir = tempfile::tempdir().unwrap();
-        let baseline =
-            crate::native_extensions::graph::mutation::capture_baseline(dir.path()).unwrap();
+        let baseline = crate::native_extensions::graph::capture_baseline(dir.path()).unwrap();
         let bin_file = dir.path().join("image.bin");
         std::fs::write(&bin_file, [0u8, 159, 255, 0, 12, 0]).unwrap();
-        let report = crate::native_extensions::graph::mutation::compute_owned_diff(
-            dir.path(),
-            &baseline,
-            &[],
-        )
-        .unwrap();
+        let report =
+            crate::native_extensions::graph::compute_owned_diff(dir.path(), &baseline, &[])
+                .unwrap();
         assert!(report.owned_diff.contains("new binary file"));
     }
 

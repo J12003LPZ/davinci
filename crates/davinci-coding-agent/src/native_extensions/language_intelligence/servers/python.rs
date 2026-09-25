@@ -10,7 +10,7 @@ use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 
 #[derive(Debug, Default)]
-pub(super) struct PythonAdapter;
+pub(in crate::native_extensions::language_intelligence) struct PythonAdapter;
 
 impl ServerAdapter for PythonAdapter {
     fn family(&self) -> LanguageFamily { LanguageFamily::Python }
@@ -116,7 +116,10 @@ pub(super) fn discover(
     }
 
     Ok(vec![ServerCommand {
+        kind: backend,
         backend,
+        program: invocation.program.clone(),
+        args: invocation.args.clone(),
         invocation,
         workspace: project.root.clone(),
         version: None,

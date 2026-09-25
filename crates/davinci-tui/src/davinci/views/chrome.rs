@@ -117,6 +117,18 @@ pub fn status(model: &Model) -> Line<'static> {
 /// One quiet footer. Permissions remain explicit even on narrow terminals.
 fn conversation_status(model: &Model) -> Line<'static> {
     let cc = model.theme.cc();
+    // The warning takes priority over padding and cycle hints on narrow screens.
+    if model.permission_mode == "always-approve" && model.width < 36 {
+        let label = if model.width >= 28 {
+            "always approve · no prompts"
+        } else {
+            "no prompts"
+        };
+        return Line::from(super::super::ui::truncate_run(
+            vec![span(label, cc.error)],
+            model.width,
+        ));
+    }
     if model.exit_armed {
         return Line::from(span("  Press Ctrl-C again to exit", cc.inactive));
     }
@@ -1189,14 +1201,9 @@ mod tests {
         assert_eq!(total, 26, "nothing past the cap is discarded");
 
         let drawn: Vec<String> = suggestions(&m).iter().map(text).collect();
-        assert!(
-            drawn.iter().any(|row| row.contains("below")),
-            "the fold is counted: {drawn:?}"
-        );
-        assert!(
-            drawn.iter().any(|row| row.contains("26 commands")),
-            "the header states the real total: {drawn:?}"
-        );
+        assert_eq!(drawn.len(), 5, "compact completion window: {drawn:?}");
+        assert!(drawn[0].contains("provider-a"));
+        assert!(drawn[4].contains("provider-e"));
         assert_eq!(
             suggestions_height(&m) as usize,
             suggestions(&m).len(),
@@ -1212,7 +1219,10 @@ mod tests {
             drawn.iter().any(|row| row.contains("provider-z")),
             "the selection walked past the fold: {drawn:?}"
         );
-        assert!(drawn.iter().any(|row| row.contains("above")), "{drawn:?}");
+        assert!(
+            !drawn.iter().any(|row| row.contains("provider-a")),
+            "{drawn:?}"
+        );
         assert_eq!(suggestions_height(&m) as usize, suggestions(&m).len());
     }
 
@@ -1304,10 +1314,10 @@ mod tests {
     fn permission_status_uses_all_five_exact_labels() {
         for (id, label) in [
             ("ask", "manual mode on"),
-            ("edits", "accept edits mode on"),
+            ("edits", "accept edits on"),
             ("read-only", "plan mode on"),
             ("auto", "auto mode on"),
-            ("always-approve", "Always Approve"),
+            ("always-approve", "always approve on"),
         ] {
             let mut m = model(100);
             m.permission_mode = id.into();
@@ -1327,13 +1337,13 @@ mod tests {
                 let drawn = text(&row);
                 assert!(drawn.contains("no prompts"), "width {width}: {drawn}");
                 if width >= 32 {
-                    assert!(drawn.contains("Always Approve"), "{drawn}");
+                    assert!(drawn.contains("always approve"), "{drawn}");
                 }
                 assert!(line_width(&row) <= width);
                 assert!(row
                     .spans
                     .iter()
-                    .any(|s| s.style.fg == Some(m.theme.warning)));
+                    .any(|s| s.style.fg == Some(m.theme.cc().error)));
             }
         }
     }
@@ -1404,7 +1414,7 @@ mod tests {
     #[test]
     fn a_sheet_suggests_its_summoning_command_and_the_chat_suggests_nothing() {
         // The agent chat carries no placeholder prose; an open sheet is the
-        // one exception, and its hint is muted so nothing about it reads as
+        // one exception, and its hint is dimmed so nothing about it reads as
         // typed text.
         let mut m = model(100);
         m.composer = String::new().into();
@@ -1415,7 +1425,11 @@ mod tests {
             .iter()
             .find(|span| span.content.starts_with('/'))
             .expect("the sheet hint");
-        assert_eq!(hint.style.fg, Some(m.theme.muted), "{:?}", hint.content);
+        assert_eq!(hint.style.fg, Some(m.theme.text), "{:?}", hint.content);
+        assert!(hint
+            .style
+            .add_modifier
+            .contains(ratatui::style::Modifier::DIM));
 
         m.screen = crate::davinci::model::Screen::Agent;
         let drawn = text(&composer(&m, None, Hint::None)[1]);

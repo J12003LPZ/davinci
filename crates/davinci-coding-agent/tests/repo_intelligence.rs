@@ -58,7 +58,7 @@ fn repo_intelligence_native_output_retention_and_disabled_settings() {
     let mut host =
         NativeExtensionHost::new_with_agent_dir("retention-test", repo.path(), Some(cache.path()));
     let store = OutputStore::new(cache.path().join("outputs/retention-test"));
-    host.governor = TokenGovernor::new(
+    host.governor = std::sync::Arc::new(std::sync::Mutex::new(TokenGovernor::new(
         "retention-test",
         TokenGovernorConfig {
             compress_threshold_bytes: 50,
@@ -66,7 +66,7 @@ fn repo_intelligence_native_output_retention_and_disabled_settings() {
             store_dir: Some(cache.path().to_path_buf()),
             ..Default::default()
         },
-    );
+    )));
     let args = json!({"path":"entry.ts"});
     let original = host
         .execute_tool(repo.path(), "file_symbols", &args)
@@ -81,11 +81,13 @@ fn repo_intelligence_native_output_retention_and_disabled_settings() {
     assert_eq!(store.load(&id).unwrap(), content);
     let artifact = host
         .governor
+        .lock()
+        .unwrap()
         .artifact_ref(&id, "tool:file_symbols")
         .unwrap();
     assert_eq!(artifact.content_hash.len(), 64);
     assert_eq!(
-        retrieve_context_artifact(&mut host.governor, &artifact.uri).unwrap(),
+        retrieve_context_artifact(&mut host.governor.lock().unwrap(), &artifact.uri).unwrap(),
         content
     );
     fs::write(

@@ -112,19 +112,20 @@ fn resolve_rust(context: &ResolutionContext, source: &Path) -> Result<ResolvedPr
             if exists(context, &candidate) {
                 let doc = read_toml(context, &candidate)?;
                 if doc.get("workspace").is_some() {
-                    return rust_result(context, candidate.parent().unwrap_or(&context.workspace), vec![package_manifest, candidate]);
+                    let root = candidate.parent().unwrap_or(&context.workspace).to_path_buf();
+                    return rust_result(context, &root, vec![package_manifest, candidate]);
                 }
             }
             return Err(IntelligenceError::new("project_resolution_incomplete", "package.workspace does not resolve to an authorized Cargo workspace"));
         }
-        let package_dir = package_manifest.parent().unwrap_or(&context.workspace);
+        let package_dir = package_manifest.parent().unwrap_or(&context.workspace).to_path_buf();
         for (manifest, doc) in &manifests {
             let Some(root) = manifest.parent() else { continue; };
-            if doc.get("workspace").is_some() && workspace_contains(doc, root, package_dir)? {
+            if doc.get("workspace").is_some() && workspace_contains(doc, root, &package_dir)? {
                 return rust_result(context, root, vec![package_manifest.clone(), manifest.clone()]);
             }
         }
-        return rust_result(context, package_dir, vec![package_manifest]);
+        return rust_result(context, &package_dir, vec![package_manifest]);
     }
     if let Some((manifest, _)) = manifests.iter().find(|(_, doc)| doc.get("workspace").is_some()) {
         return rust_result(context, manifest.parent().unwrap_or(&context.workspace), vec![manifest.clone()]);

@@ -253,6 +253,7 @@ impl Agent {
                             if let Some(trustworthy) =
                                 crate::shell_policy::verification_outcome(command)
                             {
+                                agent.remember_verification_call(&tool, &args, cwd);
                                 agent.record_verification_command(
                                     command,
                                     trustworthy && !pre_hook_error && !result.is_error,

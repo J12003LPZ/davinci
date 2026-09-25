@@ -670,12 +670,20 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(400));
             drop(speculative);
             let mut stream = std::net::TcpStream::connect(addr).unwrap();
-            use std::io::Write;
+            use std::io::{Read, Write};
             write!(
                 stream,
                 "GET /auth/callback?code=real&state=state-1 HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n"
             )
             .unwrap();
+            // Keep the real callback connected until its response is read.
+            // Closing early can reset the server's response write on Windows.
+            stream
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            let mut response = String::new();
+            stream.read_to_string(&mut response).unwrap();
+            assert!(response.starts_with("HTTP/1.1 200"));
         });
         let response = server
             .accept_until(std::time::Instant::now() + std::time::Duration::from_secs(2))

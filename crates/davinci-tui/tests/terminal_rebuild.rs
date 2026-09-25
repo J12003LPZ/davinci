@@ -206,7 +206,7 @@ fn rebuild_reference_shell_uses_claude_120x40_geometry() {
     assert_eq!(rows[38].to_string(), "─".repeat(120));
     assert!(rows[39]
         .to_string()
-        .contains("⏸ manual mode on · ? for shortcuts · ← for agents"));
+        .contains("⏸ manual mode on · ? for shortcuts"));
 }
 
 #[test]
@@ -221,7 +221,7 @@ fn rebuild_model_sheet_matches_reference_height() {
     let rows = app::compose(&m, 40);
     assert!(rows[24].to_string().contains("/effort"));
     assert!(rows[25].to_string().contains("Select model"));
-    assert!(rows[39].to_string().contains("Enter to set as default"));
+    assert!(rows[39].to_string().contains("Enter to confirm"));
 }
 
 #[test]

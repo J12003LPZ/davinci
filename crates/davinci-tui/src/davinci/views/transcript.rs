@@ -705,8 +705,10 @@ mod tests {
     }
 
     #[test]
-    fn live_reasoning_shows_its_tail_and_collapses_to_one_row_when_done() {
-        let m = model(100);
+    fn verbose_reasoning_shows_its_tail_and_collapses_when_done() {
+        let mut m = model(100);
+        assert!(lines(&m, &[Entry::thinking("hidden", true, 0)], 100).is_empty());
+        m.show_tool_output = true;
         let long = (1..=12)
             .map(|n| format!("step {n} of the plan"))
             .collect::<Vec<_>>()
@@ -746,7 +748,7 @@ mod tests {
         assert!(
             texts
                 .iter()
-                .any(|row| row.trim_start().starts_with("· one")),
+                .any(|row| row.trim_start().starts_with("- one")),
             "{texts:?}"
         );
     }
@@ -831,9 +833,10 @@ mod tests {
         let m = model(100);
         let rows = lines(&m, &[Entry::user("run the tests")], 100);
         assert_eq!(rows.len(), 1);
-        assert_eq!(text(&rows[0]), "❯ run the tests");
+        assert_eq!(text(&rows[0]), "❯ run the tests ");
         assert!(rows[0].style.bg.is_none());
-        assert_eq!(rows[0].spans[0].style.fg, Some(m.theme.text));
+        assert_eq!(rows[0].spans[0].style.fg, Some(m.theme.cc().subtle));
+        assert_eq!(rows[0].spans[0].style.bg, Some(m.theme.cc().user_bg));
     }
 
     #[test]
@@ -854,7 +857,7 @@ mod tests {
             !texts.iter().any(|row| row.contains("davinci")),
             "{texts:?}"
         );
-        assert_eq!(texts[0], "❯ hello");
+        assert_eq!(texts[0], "❯ hello ");
         assert_eq!(texts[2], "● Hello! How can I help?");
     }
 
@@ -892,20 +895,19 @@ mod tests {
         );
         assert_eq!(rows.len(), 1);
         let drawn = text(&rows[0]);
-        assert!(drawn.starts_with("● Shell(cargo fmt)"), "{drawn}");
-        assert!(drawn.contains("· 0.31s"), "{drawn}");
+        assert_eq!(drawn, "  Ran 1 shell command");
         assert!(!drawn.contains("manus"), "{drawn}");
         assert!(!drawn.contains('╭'));
     }
 
     #[test]
-    fn collapsed_success_shows_only_the_first_output_row() {
+    fn collapsed_success_groups_the_call_and_hides_output() {
         let m = model(100);
         let entry = Entry::tool(State::Done, "manus", "cargo fmt", Some("0.31s"))
             .with_output("ok\nfmt done");
         let rows = lines(&m, &[entry], 100);
-        assert_eq!(rows.len(), 2);
-        assert_eq!(text(&rows[1]), "  ⎿ ok");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(text(&rows[0]), "  Ran 1 shell command");
     }
 
     #[test]
@@ -977,7 +979,8 @@ mod tests {
         assert!(
             hunk.spans
                 .iter()
-                .any(|span| span.content.contains('+') && span.style.fg == Some(m.theme.success)),
+                .any(|span| span.content.contains('+')
+                    && span.style.fg == Some(m.theme.cc().diff_add)),
             "{hunk:?}"
         );
         assert!(
@@ -1008,9 +1011,9 @@ mod tests {
             100,
         );
         let drawn: String = rows.iter().map(text).collect();
-        assert!(drawn.contains('✓'), "{drawn}");
+        assert!(drawn.contains("Ran 1 shell command"), "{drawn}");
         assert!(drawn.contains('×'), "{drawn}");
-        assert!(drawn.contains('Δ'), "{drawn}");
+        assert!(drawn.contains("Added 1 line"), "{drawn}");
     }
 
     #[test]
@@ -1059,31 +1062,31 @@ mod tests {
     }
 
     #[test]
-    fn a_delta_block_names_its_path_and_its_counts() {
+    fn a_delta_block_states_counts_and_colours_change_signs() {
         let m = model(100);
         let rows = lines(&m, &transcript()[13..], 100);
         let head = text(&rows[0]);
-        assert!(
-            head.starts_with("Δ crates\\davinci-agent\\src\\runtime.rs"),
-            "{head}"
-        );
-        assert!(head.contains("+31 -8"), "{head}");
-        assert_eq!(rows[1].spans[1].style.fg, Some(m.theme.border));
-        assert!(text(&rows[1]).contains("│ + pub async fn execute_stream("));
-        assert!(text(&rows[2]).contains("│ -     self.execute(req).await"));
-        assert_eq!(rows[2].spans[3].style.fg, Some(m.theme.error));
+        assert!(head.contains("Added 31 lines, removed 8 lines"), "{head}");
+        assert!(text(&rows[1]).contains("+pub async fn execute_stream("));
+        assert!(text(&rows[2]).contains("-    self.execute(req).await"));
+        assert!(rows[1]
+            .spans
+            .iter()
+            .any(|span| span.content == "+" && span.style.fg == Some(m.theme.cc().diff_add)));
+        assert!(rows[2]
+            .spans
+            .iter()
+            .any(|span| span.content == "-" && span.style.fg == Some(m.theme.cc().diff_del)));
     }
 
     #[test]
-    fn hunks_sit_behind_a_single_left_rule_with_no_line_numbers() {
+    fn hunks_without_line_metadata_have_a_blank_gutter() {
         let m = model(100);
         for row in lines(&m, &transcript()[13..], 100).iter().skip(1) {
             let drawn = text(row);
-            assert!(drawn.starts_with("  │ "), "{drawn}");
+            assert!(drawn.starts_with("        "), "{drawn}");
             assert!(
-                !drawn
-                    .trim_start_matches("  │ ")
-                    .starts_with(char::is_numeric),
+                !drawn.trim_start().starts_with(char::is_numeric),
                 "line numbers appeared: {drawn}"
             );
         }

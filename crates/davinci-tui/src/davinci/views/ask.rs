@@ -321,7 +321,7 @@ mod tests {
         assert!(rows[ui::focused_row(&rows).unwrap()]
             .spans
             .iter()
-            .any(|s| s.style.bg == Some(m.theme.surface)));
+            .any(|s| s.style.fg == Some(m.theme.cc().permission)));
         assert!(text.contains("enter select") && text.contains("esc close"));
     }
     #[test]

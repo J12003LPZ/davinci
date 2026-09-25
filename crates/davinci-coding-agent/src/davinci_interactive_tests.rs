@@ -1,4 +1,3 @@
-
 #[test]
 fn security_tui_maps_cancelled_failed_and_admission_without_success() {
     use davinci_tui::davinci::{
@@ -860,14 +859,14 @@ fn f01_native_offers_policy_owned_denial_instructions() {
     let mut request = approval("write", "ordinary.txt", false);
     assert_eq!(
         permission_ask(&request, true).items.last().unwrap().label,
-        "deny with instructions"
+        "No, and tell the model what to do differently"
     );
     request
         .legal_choices
         .retain(|choice| choice.scope != davinci_agent::approval::GrantScope::DenyWithInstructions);
     assert_eq!(
         permission_ask(&request, true).items.last().unwrap().label,
-        "deny"
+        "No"
     );
 }
 
@@ -1054,39 +1053,36 @@ fn approval(tool: &str, subject: &str, outside: bool) -> ToolApprovalRequest {
 #[test]
 fn the_permission_panel_offers_always_only_in_a_trusted_project() {
     let ask = permission_ask(&approval("bash", "git status --short", false), true);
-    assert_eq!(ask.title, "Permission");
+    assert_eq!(ask.title, "Bash command");
     assert_eq!(ask.name, "PERMISSION");
     assert_eq!(ask.key, "/permissions");
-    assert_eq!(ask.note, "bash · git status --short");
+    assert_eq!(ask.subject, "git status --short");
     let labels: Vec<&str> = ask.items.iter().map(|item| item.label.as_str()).collect();
     assert_eq!(
         labels,
         [
-            "allow once",
-            "allow for this session",
-            "always allow here",
-            "deny",
-            "deny with instructions"
+            "Yes",
+            "Yes, and don't ask again this session for: bash(git status *)",
+            "Yes, and don't ask again for: bash(git status *)",
+            "No",
+            "No, and tell the model what to do differently"
         ]
     );
-    assert_eq!(ask.items[1].detail, "bash(git status *) until pi exits");
-    assert_eq!(
-        ask.items[2].detail,
-        "bash(git status *) saved to .pi/settings.json"
-    );
+    assert!(ask.items[1].detail.is_empty());
+    assert!(ask.items[2].detail.is_empty());
 
     let ask = permission_ask(&approval("write", "../out.txt", true), false);
     let labels: Vec<&str> = ask.items.iter().map(|item| item.label.as_str()).collect();
     assert_eq!(
         labels,
         [
-            "allow once",
-            "allow for this session",
-            "deny",
-            "deny with instructions"
+            "Yes",
+            "Yes, and don't ask again this session for: write",
+            "No",
+            "No, and tell the model what to do differently"
         ]
     );
-    assert_eq!(ask.note, "write · ../out.txt · outside the project");
+    assert_eq!(ask.subject, "../out.txt · outside the project");
 }
 
 #[test]
@@ -1592,7 +1588,7 @@ fn permission_panel_uses_policy_choices_even_in_a_trusted_project() {
             .iter()
             .map(|item| item.label.as_str())
             .collect::<Vec<_>>(),
-        ["allow once", "deny", "deny with instructions"]
+        ["Yes", "No", "No, and tell the model what to do differently"]
     );
     open_ask_overlay(&mut m);
     m.ask_index = 1;

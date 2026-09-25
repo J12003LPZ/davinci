@@ -307,6 +307,14 @@ pub struct Settings {
     pub transport: Option<String>,
     #[serde(default, rename = "openaiVerbosity")]
     pub openai_verbosity: Option<String>,
+    #[serde(default, rename = "autoVerify")]
+    pub auto_verify: Option<bool>,
+    #[serde(default, rename = "serviceTier")]
+    pub service_tier: Option<String>,
+    #[serde(default, rename = "effortPolicy")]
+    pub effort_policy: Option<String>,
+    #[serde(default, rename = "toolSurface")]
+    pub tool_surface: Option<String>,
     #[serde(default, rename = "reasoningSummary")]
     pub reasoning_summary: Option<String>,
     #[serde(default, rename = "graphEconomyModel")]
@@ -1149,6 +1157,24 @@ pub fn apply_http_proxy_settings(http_proxy: Option<&str>) {
 }
 
 impl Settings {
+    pub fn tool_surface(&self, environment: Option<&str>) -> davinci_agent::ToolSurface {
+        environment
+            .or(self.tool_surface.as_deref())
+            .and_then(davinci_agent::ToolSurface::parse)
+            .unwrap_or_default()
+    }
+
+    pub fn effort_policy(&self, environment: Option<&str>) -> davinci_agent::effort::EffortPolicy {
+        environment
+            .or(self.effort_policy.as_deref())
+            .and_then(davinci_agent::effort::EffortPolicy::parse)
+            .unwrap_or_default()
+    }
+
+    pub fn auto_verify_enabled(&self, environment: Option<&str>) -> bool {
+        self.auto_verify.unwrap_or(true) && !matches!(environment, Some("0" | "false" | "off"))
+    }
+
     pub fn decision_intelligence_enabled(&self) -> bool {
         self.decision_intelligence
             .as_ref()
@@ -1593,6 +1619,52 @@ pub fn is_trusted(settings: &Settings, cwd: &Path, override_trust: Option<bool>)
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn service_tier_setting_parses() {
+        let settings: super::Settings = serde_json::from_str(r#"{"serviceTier":"fast"}"#).unwrap();
+        assert_eq!(settings.service_tier.as_deref(), Some("fast"));
+        assert!(super::Settings::default().service_tier.is_none());
+    }
+
+    #[test]
+    fn tool_surface_setting_defaults_to_full_and_environment_overrides() {
+        use davinci_agent::ToolSurface;
+        let settings: super::Settings = serde_json::from_str(r#"{"toolSurface":"lean"}"#).unwrap();
+        assert_eq!(settings.tool_surface(None), ToolSurface::Lean);
+        assert_eq!(settings.tool_surface(Some(" FULL ")), ToolSurface::Full);
+        assert_eq!(settings.tool_surface(Some("unknown")), ToolSurface::Full);
+        assert_eq!(
+            super::Settings::default().tool_surface(None),
+            ToolSurface::Full
+        );
+    }
+    #[test]
+    fn effort_policy_setting_defaults_to_fixed_and_environment_overrides() {
+        use davinci_agent::effort::EffortPolicy;
+        let settings: super::Settings =
+            serde_json::from_str(r#"{"effortPolicy":"adaptive"}"#).unwrap();
+        assert_eq!(settings.effort_policy(None), EffortPolicy::Adaptive);
+        assert_eq!(settings.effort_policy(Some("fixed")), EffortPolicy::Fixed);
+        assert_eq!(settings.effort_policy(Some("unknown")), EffortPolicy::Fixed);
+        assert_eq!(
+            super::Settings::default().effort_policy(None),
+            EffortPolicy::Fixed
+        );
+    }
+
+    #[test]
+    fn auto_verify_setting_parses_and_environment_can_disable_it() {
+        let settings: super::Settings = serde_json::from_str(r#"{"autoVerify":false}"#).unwrap();
+        assert_eq!(settings.auto_verify, Some(false));
+        assert!(!settings.auto_verify_enabled(None));
+        let defaults = super::Settings::default();
+        assert!(defaults.auto_verify_enabled(None));
+        for value in ["0", "false", "off"] {
+            assert!(!defaults.auto_verify_enabled(Some(value)));
+        }
+        assert!(defaults.auto_verify_enabled(Some("1")));
+        assert!(!settings.auto_verify_enabled(Some("1")));
+    }
     use super::*;
 
     #[test]
@@ -1644,7 +1716,7 @@ mod tests {
         let path = settings_path(dir.path());
         fs::write(
             &path,
-            r#"{"theme":"dark","quietStartup":"not-a-bool","futureKey":7}"#,
+            r#"{"theme":"dark","quiet_startup":"not-a-bool","futureKey":7}"#,
         )
         .unwrap();
         let original = fs::read_to_string(&path).unwrap();

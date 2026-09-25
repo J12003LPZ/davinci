@@ -2751,6 +2751,7 @@ impl Question {
 /// The permission panel for one tool call the policy could not
 /// decide on its own (spec: trust-and-control, *davinci*). The policy supplies
 /// legal choices; an untrusted host additionally removes project persistence.
+#[cfg(test)]
 pub fn permission_ask(request: &ToolApprovalRequest, trusted: bool) -> Ask {
     permission_ask_at(request, trusted, std::path::Path::new("."))
 }
@@ -7311,7 +7312,7 @@ fn graph_sheet(value: &serde_json::Value) -> Option<GraphRunSheet> {
             run.get("runId").and_then(serde_json::Value::as_str),
         ) {
             (Some(cwd), Some(id)) => {
-                crate::native_extensions::graph::store::run_dir(std::path::Path::new(cwd), id)
+                crate::native_extensions::graph::run_dir(std::path::Path::new(cwd), id)
                     .display()
                     .to_string()
             }
@@ -7378,7 +7379,8 @@ fn graph_verification_facts(verification: Option<&serde_json::Value>) -> Vec<Str
             .get("startedAt")
             .and_then(serde_json::Value::as_u64)
             .unwrap_or(0);
-        let elapsed = crate::native_extensions::graph::now_ms().saturating_sub(started) / 1000;
+        let elapsed =
+            crate::native_extensions::graph::graph_now_ms().saturating_sub(started) / 1000;
         facts.push(format!(
             "Verification running · {index}/{total} · {elapsed}s elapsed"
         ));
@@ -7429,7 +7431,7 @@ fn graph_verification_facts(verification: Option<&serde_json::Value>) -> Vec<Str
 #[cfg(test)]
 mod graph_canvas_fact_tests {
     use super::*;
-    use crate::native_extensions::graph::types::*;
+    use crate::native_extensions::graph::*;
     use serde_json::json;
 
     #[test]
@@ -7548,12 +7550,9 @@ mod graph_canvas_fact_tests {
         assert_eq!(sheet.phase, "blocked");
         assert_eq!(
             sheet.artifacts,
-            crate::native_extensions::graph::store::run_dir(
-                std::path::Path::new(&run.cwd),
-                &run.run_id
-            )
-            .display()
-            .to_string()
+            crate::native_extensions::graph::run_dir(std::path::Path::new(&run.cwd), &run.run_id)
+                .display()
+                .to_string()
         );
         assert_eq!(sheet.lifecycle, "stopped");
         assert!(sheet

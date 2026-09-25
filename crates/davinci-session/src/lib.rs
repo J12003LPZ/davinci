@@ -16,8 +16,7 @@ pub use codec::{
 pub use discovery::{
     cwd_encoded_dir, default_agent_dir, default_session_dir, discover_session_headers,
     discover_sessions, encode_cwd_component, expand_tilde, home_dir, latest_session,
-    resolve_session_dir,
-    resolve_session_dir_from, resolve_session_ref, SessionSummary,
+    resolve_session_dir, resolve_session_dir_from, resolve_session_ref, SessionSummary,
 };
 pub use errors::{JsonlDecodeError, SessionError};
 pub use jsonl_repo::{
@@ -41,7 +40,7 @@ pub use tree::{
 };
 pub use types::*;
 
-use std::fs::{self, File, OpenOptions};
+use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -428,6 +427,17 @@ impl JsonlSession {
     }
 
     fn prepare_first_write(&mut self) -> Result<(), SessionError> {
+        if let Some(error) = &self.persistence_error {
+            return Err(SessionError::storage(format!(
+                "Session recovery required: {error}"
+            )));
+        }
+        self.prepare_first_write_inner().inspect_err(|error| {
+            self.persistence_error = Some(error.to_string());
+        })
+    }
+
+    fn prepare_first_write_inner(&mut self) -> Result<(), SessionError> {
         if self.writer.lock.is_none() {
             let mut lock_path = self.path.as_os_str().to_owned();
             lock_path.push(".lock");
@@ -577,7 +587,7 @@ fn repair_jsonl_tail(path: &Path) -> Result<(), SessionError> {
 fn sync_parent(path: &Path) -> std::io::Result<()> {
     #[cfg(unix)]
     if let Some(parent) = path.parent() {
-        File::open(parent)?.sync_all()?;
+        fs::File::open(parent)?.sync_all()?;
     }
     #[cfg(not(unix))]
     let _ = path;
@@ -588,6 +598,28 @@ fn sync_parent(path: &Path) -> std::io::Result<()> {
 mod tests {
     use super::*;
     use tempfile::tempdir;
+
+    #[test]
+    fn first_write_failure_requires_reopening_even_after_storage_is_restored() {
+        let dir = tempdir().unwrap();
+        let mut session = JsonlSession::create(dir.path(), "/fixture", None).unwrap();
+        let backup = session.path.with_extension("backup");
+        fs::rename(&session.path, &backup).unwrap();
+        fs::create_dir(&session.path).unwrap();
+        assert!(session
+            .append_entry(SessionEntry::message("user", serde_json::json!("lost")))
+            .is_err());
+        assert!(session.persistence_error().is_some());
+        fs::remove_dir(&session.path).unwrap();
+        fs::rename(&backup, &session.path).unwrap();
+        assert!(session
+            .append_entry(SessionEntry::message(
+                "user",
+                serde_json::json!("must reopen")
+            ))
+            .is_err());
+        assert!(session.entries.is_empty());
+    }
 
     #[test]
     fn failed_session_writes_preserve_cursor_and_metadata() {

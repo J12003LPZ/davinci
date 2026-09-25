@@ -1399,9 +1399,9 @@ mod tests {
     fn public_native_commands_have_discoverable_metadata() {
         let specs = command_specs();
         assert!(specs.iter().any(|(name, _, _)| *name == "security-scan"));
-        for internal in ["sec-status", "sec-report", "sec-abort", "sec-resume"] {
-            assert!(!specs.iter().any(|(name, _, _)| *name == internal));
-            assert!(NATIVE_COMMANDS.contains(&internal));
+        for public in ["sec-status", "sec-report", "sec-abort", "sec-resume"] {
+            assert!(specs.iter().any(|(name, _, _)| *name == public));
+            assert!(NATIVE_COMMANDS.contains(&public));
         }
         for (name, description, _) in specs {
             assert!(NATIVE_COMMANDS.contains(&name));

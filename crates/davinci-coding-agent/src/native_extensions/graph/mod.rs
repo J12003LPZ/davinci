@@ -81,12 +81,12 @@ pub use controller::{run_graph, run_saved_graph, ControllerDeps, RunOptions};
 use davinci_agent::{ToolError, ToolResult};
 #[allow(unused_imports)]
 pub use render::{
-    graph_command_kind, parse_graph_args, parse_graph_command, render_now, render_run_summary,
-    GraphCommand, ParsedGraphArgs,
+    graph_command_kind, parse_advanced_graph_command, parse_graph_args, parse_graph_command,
+    render_now, render_run_summary, GraphCommand, ParsedGraphArgs,
 };
 use serde_json::{json, Value};
-pub use store::{list_runs, load_run, now_ms};
 use store::transcript_path;
+pub use store::{list_runs, load_run, now_ms as graph_now_ms, run_dir, write_graph_definition};
 use verify::{contracted_verify_exec, default_verify_exec, dry_run_verify_exec};
 use worker::{run_dry_worker, run_worker};
 
@@ -98,11 +98,19 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 pub use roles::GRAPH_SUBMIT_TOOL;
+#[cfg(feature = "test-fixtures")]
+pub use store::{create_run_dir, new_run_id, save_run};
+#[cfg(feature = "test-fixtures")]
+pub use worker::run_fixture_worker_with_deadline;
 #[allow(unused_imports)]
 pub use worker::{build_worker_args, worker_cache_profile, WorkerCacheProfile};
+#[cfg(feature = "test-fixtures")]
+pub use worker::{parse_worker_event, WorkerEventState};
 pub use worker_hooks::GraphWorkerContext;
+#[cfg(feature = "test-fixtures")]
+pub use worker_sessions::fixtures as worker_session_fixtures;
 #[allow(unused_imports)]
-pub use worker_sessions::WorkerSessionBinding;
+pub use worker_sessions::{runtime_from_env, WorkerSessionBinding, SESSION_ENV};
 
 /// Resolve the concrete worker model identity used by both the launch and
 /// provider cache partition. Empty overrides are ignored; when neither the
@@ -170,6 +178,11 @@ impl Drop for FinishedOnDrop {
 fn active_runs() -> &'static Mutex<HashMap<PathBuf, Arc<ActiveRun>>> {
     static ACTIVE: OnceLock<Mutex<HashMap<PathBuf, Arc<ActiveRun>>>> = OnceLock::new();
     ACTIVE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Read the current graph snapshot without exposing its mutable runtime.
+pub fn active_run_snapshot(cwd: &Path) -> Option<GraphRun> {
+    active_run(cwd).and_then(|run| run.snapshot())
 }
 
 pub(crate) fn active_run(cwd: &Path) -> Option<Arc<ActiveRun>> {
@@ -2201,7 +2214,7 @@ mod tests {
     }
 
     #[test]
-    fn bare_graph_continues_a_stopped_run_with_the_same_identity_and_counters() {
+    fn bare_graph_preserves_a_stopped_run_with_the_same_identity_and_counters() {
         let _guard = registry_guard();
         let dir = tempdir().unwrap();
         let controller = controller(dir.path());
@@ -2214,13 +2227,13 @@ mod tests {
         store::save_run(&mut stopped).expect("stopped state persists");
 
         let started = controller.command("graph", "").unwrap().unwrap();
-        assert_eq!(started["started"], true);
-        assert_eq!(started["runId"], stopped.run_id);
+        assert_eq!(started["run"]["phase"], "cancelled");
+        assert_eq!(started["run"]["runId"], stopped.run_id);
         drain_active(dir.path());
 
         let continued = load_run(dir.path(), &stopped.run_id).expect("continued state persists");
         assert_eq!(continued.run_id, stopped.run_id);
-        assert!(continued.counters.workers_spawned >= 41);
+        assert_eq!(continued.counters.workers_spawned, 41);
         assert_eq!(list_runs(dir.path()).len(), 1, "continuation is one run");
     }
 
@@ -2375,17 +2388,17 @@ mod tests {
     }
 
     #[test]
-    fn an_unlimited_default_run_records_no_caps() {
+    fn a_tool_started_run_records_default_cost_and_time_caps() {
         let _guard = registry_guard();
         let dir = tempdir().unwrap();
         let controller = controller(dir.path());
         let run = controller
             .run_to_completion(parse_graph_args("--dry-run unbounded"), None)
             .expect("runs");
-        assert_eq!(run.budgets.max_cost_usd, 0.0);
-        assert_eq!(run.budgets.run_deadline_ms, 0);
+        assert_eq!(run.budgets.max_cost_usd, 5.0);
+        assert_eq!(run.budgets.run_deadline_ms, 7_200_000);
         assert_eq!(run.budgets.max_workers, 0);
-        assert_eq!(run.budgets.verify_command_timeout_ms, 0);
+        assert_eq!(run.budgets.verify_command_timeout_ms, 600_000);
         drain_active(dir.path());
     }
 
@@ -2577,7 +2590,7 @@ mod tests {
         run.lifecycle = Some(types::GraphLifecycle::Stopped);
         store::save_run(&mut run).unwrap();
         let response = controller.command("graph", "").unwrap().unwrap();
-        assert_eq!(response["phase"], "cancelled");
+        assert_eq!(response["run"]["phase"], "cancelled");
         assert!(!is_running(dir.path()));
     }
 
@@ -2728,7 +2741,7 @@ mod tests {
 
         let inspected = controller.command("graph", "budget").unwrap().unwrap();
         assert_eq!(inspected["runId"], run.run_id);
-        assert_eq!(inspected["ceilings"]["maxCostUsd"], 0.0);
+        assert_eq!(inspected["ceilings"]["maxCostUsd"], 5.0);
 
         let unauthorized = controller
             .command(

@@ -367,8 +367,9 @@ impl GraphExecution {
         note: Option<&str>,
         persist_companions: impl FnOnce(&mut GraphRun) -> std::io::Result<()>,
     ) -> bool {
-        // Serialize checkpoint publication without holding the run mutex. The
-        // I/O lock preserves snapshot order while workers keep updating memory.
+        // Serialize checkpoint publication. Companion state transitions must
+        // reach the live run before it is cloned; the main snapshot write stays
+        // outside the run mutex so workers can keep reporting progress.
         let _checkpoint_io = self
             .checkpoint_io
             .lock()
@@ -377,7 +378,7 @@ impl GraphExecution {
             return false;
         }
 
-        let mut snapshot = {
+        let (mut snapshot, companion_result) = {
             let mut run = self.run.lock().unwrap_or_else(|error| error.into_inner());
             if matches!(run.phase, Phase::Done | Phase::Blocked | Phase::Cancelled) {
                 run.lifecycle = Some(GraphLifecycle::Stopped);
@@ -400,11 +401,11 @@ impl GraphExecution {
                     gov_stats.as_ref(),
                 ),
             );
-            run.clone()
+            let companion_result = persist_companions(&mut run);
+            (run.clone(), companion_result)
         };
 
-        if let Err(error) = persist_companions(&mut snapshot).and_then(|()| save_run(&mut snapshot))
-        {
+        if let Err(error) = companion_result.and_then(|()| save_run(&mut snapshot)) {
             let reason = format!("checkpoint persistence failed: {error}");
             *self
                 .persistence_error
@@ -6260,7 +6261,7 @@ mod tests {
         let seen = Arc::clone(&updates);
         let deps = ControllerDeps {
             runner: Arc::new(|_, _, _| WorkerResult::default()),
-            verify_exec: Arc::new(|_, _, _, _| (0, "ok".into(), 1)),
+            verify_exec: Arc::new(super::super::verify::dry_run_verify_exec),
             session_model: None,
             session_thinking: None,
             project_trusted: false,

@@ -14,6 +14,7 @@ pub mod command_receipt;
 mod compaction;
 mod context;
 mod edit_diff;
+pub mod effort;
 mod events;
 mod evidence;
 mod file_mutation_queue;
@@ -301,6 +302,20 @@ pub struct MutationVerificationState {
     pub mutation_paths: Vec<PathBuf>,
     #[serde(default)]
     pub latest_evidence: Option<VerificationEvidence>,
+    #[serde(default)]
+    pub last_verification: Option<LastVerification>,
+}
+
+/// The last classified verification call, retained across later mutations.
+/// Preserve its full execution context when the harness repeats it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LastVerification {
+    pub tool: String,
+    pub command: String,
+    #[serde(default)]
+    pub arguments: Value,
+    #[serde(default)]
+    pub cwd: Option<PathBuf>,
 }
 
 /// Evidence available when a coding turn reaches a normal stop.
@@ -341,11 +356,33 @@ impl std::fmt::Debug for PendingToolOperation {
     }
 }
 
+/// How many authorized tool schemas a cache-sensitive route sends up front.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ToolSurface {
+    #[default]
+    Full,
+    Lean,
+}
+
+impl ToolSurface {
+    pub fn parse(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "full" => Some(Self::Full),
+            "lean" => Some(Self::Lean),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Agent {
     pub system_prompt: String,
     pub messages: Vec<ChatMessage>,
     pub thinking_level: ThinkingLevel,
+    pub effort_policy: effort::EffortPolicy,
+    pub tool_surface: ToolSurface,
+    /// Repeat the last verification call after later mutations at completion.
+    pub auto_verify: bool,
     pub auto_compaction: bool,
     pub compaction: CompactionSettings,
     pub auto_retry: bool,
@@ -495,6 +532,9 @@ impl Agent {
             last_real_user_request: None,
             messages: Vec::new(),
             thinking_level: ThinkingLevel::Off,
+            effort_policy: effort::EffortPolicy::default(),
+            tool_surface: ToolSurface::default(),
+            auto_verify: true,
             auto_compaction: true,
             compaction: CompactionSettings::default(),
             auto_retry: true,
@@ -865,6 +905,28 @@ impl Agent {
         });
     }
 
+    #[cfg(test)]
+    pub(crate) fn remember_verification_command(&self, tool: &str, command: &str) {
+        self.remember_verification_call(tool, &serde_json::json!({"command": command}), &self.cwd);
+    }
+
+    pub(crate) fn remember_verification_call(&self, tool: &str, arguments: &Value, cwd: &Path) {
+        let mut state = self
+            .mutation_verification
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        state.last_verification = Some(LastVerification {
+            tool: tool.to_string(),
+            command: arguments
+                .get("command")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string(),
+            arguments: arguments.clone(),
+            cwd: Some(cwd.to_path_buf()),
+        });
+    }
+
     pub(crate) fn record_verification_command(&self, command: &str, succeeded: bool) {
         let mut state = self
             .mutation_verification
@@ -1182,6 +1244,53 @@ impl Agent {
 
     pub fn prompt(&mut self, text: &str) -> ChatMessage {
         self.prompt_user_with(text, &[])
+    }
+
+    /// Tool outcomes since the latest real user prompt. Injected reminders and
+    /// context messages do not begin a new turn; batch children count separately.
+    pub fn effort_signals(&self) -> effort::EffortSignals {
+        let start = self
+            .messages
+            .iter()
+            .rposition(|message| {
+                message.role == "user" && message.extra_bool(REAL_USER_ORIGIN_FIELD)
+            })
+            .unwrap_or(0);
+        let mut signals = effort::EffortSignals::default();
+        for message in &self.messages[start..] {
+            if message.role != "toolResult" {
+                continue;
+            }
+            if message.tool_name.as_deref() == Some("batch") {
+                if let Some(operations) = message
+                    .extra
+                    .get("details")
+                    .and_then(|details| details.get("operations"))
+                    .and_then(Value::as_array)
+                {
+                    for operation in operations {
+                        let error = match operation.get("status").and_then(Value::as_str) {
+                            Some("ok") => false,
+                            Some("error") => true,
+                            _ => continue,
+                        };
+                        signals.observe(operation.get("tool").and_then(Value::as_str), error);
+                    }
+                    continue;
+                }
+            }
+            signals.observe(message.tool_name.as_deref(), message.is_error == Some(true));
+        }
+        signals
+    }
+
+    /// The next request's effort; the configured level and prompt stay stable.
+    pub fn request_thinking_level(&self) -> ThinkingLevel {
+        effort::request_level(
+            self.effort_policy,
+            self.thinking_level,
+            self.effort_signals(),
+        )
     }
 
     pub fn prompt_user_with(
@@ -2204,7 +2313,9 @@ impl Agent {
 
     pub fn last_assistant_text(&self) -> Option<String> {
         self.messages.iter().rev().find_map(|message| {
-            if message.role == "assistant" {
+            if message.role == "assistant"
+                && !message.extra.contains_key(HARNESS_VERIFICATION_FIELD)
+            {
                 Some(content_text(&message.content))
             } else {
                 None
@@ -2280,10 +2391,28 @@ impl Agent {
         }
     }
 
-    /// On cache-sensitive routes, expose the full authorized schema set before
-    /// the first request so `tool_search` cannot mutate the provider tool list.
+    /// On cache-sensitive routes, expose the selected initial schema set.
+    /// Lean keeps discovered tools visible across requests and user turns.
     pub fn freeze_tools_for_cache(&self) {
         if self.turn_context_placement() != turn_context::TurnContextPlacement::Appended {
+            return;
+        }
+        if self.tool_surface == ToolSurface::Lean {
+            self.sync_tool_authorization();
+            let authorized = self
+                .tool_context
+                .authorized_tools
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clone();
+            let mut exposure = self
+                .tool_context
+                .tool_exposure
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            for name in crate::tools::LEAN_TOOLS {
+                exposure.activate_authorized(name, authorized.contains(*name));
+            }
             return;
         }
         self.expose_active_tools();
@@ -3089,7 +3218,108 @@ fn verification_coverage_for_command(
         }
         return (VerificationCoverage::Unrelated, targets);
     }
-    (VerificationCoverage::Unknown, Vec::new())
+    if lower.contains("cargo") {
+        return (VerificationCoverage::Unknown, Vec::new());
+    }
+    path_scoped_coverage(command, mutation_paths)
+}
+
+/// Coverage for verifiers outside Cargo (pytest, go test, npm test, ...).
+/// Without path arguments the command runs the project's suite. With path
+/// arguments it covers the change only when one names a test directory, a
+/// changed file, a directory above one, or the conventional test file for one.
+fn path_scoped_coverage(
+    command: &str,
+    mutation_paths: &[PathBuf],
+) -> (VerificationCoverage, Vec<String>) {
+    let targets = command
+        .split_whitespace()
+        .map(|word| word.trim_matches(|c| c == '"' || c == '\''))
+        .filter(|word| is_path_argument(word))
+        .map(|word| {
+            word.split("::")
+                .next()
+                .unwrap_or(word)
+                .replace('\\', "/")
+                .trim_start_matches("./")
+                .trim_end_matches('/')
+                .to_string()
+        })
+        .filter(|target| !target.is_empty())
+        .collect::<Vec<_>>();
+    if targets.is_empty() {
+        return (VerificationCoverage::Broad, vec!["project".into()]);
+    }
+    let covered = mutation_paths.iter().any(|path| {
+        let changed = path.to_string_lossy().replace('\\', "/");
+        let stem = path
+            .file_stem()
+            .and_then(|stem| stem.to_str())
+            .unwrap_or_default();
+        targets.iter().any(|target| {
+            is_test_suite_directory(target)
+                || changed == *target
+                || changed.ends_with(&format!("/{target}"))
+                || changed.starts_with(&format!("{target}/"))
+                || changed.contains(&format!("/{target}/"))
+                || (!stem.is_empty() && names_test_for(target, stem))
+        })
+    });
+    let coverage = if covered {
+        VerificationCoverage::Targeted
+    } else {
+        VerificationCoverage::Unrelated
+    };
+    (coverage, targets)
+}
+
+fn is_path_argument(word: &str) -> bool {
+    const SOURCE_EXTENSIONS: &[&str] = &[
+        "py", "go", "js", "jsx", "mjs", "cjs", "ts", "tsx", "mts", "cts", "cs", "java", "kt", "rb",
+        "php", "c", "cc", "cpp", "h", "hpp", "swift",
+    ];
+    if word.is_empty()
+        || word.starts_with('-')
+        || word.ends_with("...")
+        || word == "."
+        || word.contains(['>', '<', '|', '&', ';', '$', '='])
+    {
+        return false;
+    }
+    word.contains('/')
+        || word.contains('\\')
+        || word.contains("::")
+        || Path::new(word.split("::").next().unwrap_or(word))
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .is_some_and(|extension| SOURCE_EXTENSIONS.contains(&extension))
+}
+
+/// A whole test directory (`tests/`, `spec/`, ...) is the project's suite.
+fn is_test_suite_directory(target: &str) -> bool {
+    let name = target.rsplit('/').next().unwrap_or(target);
+    matches!(
+        name,
+        "test" | "tests" | "spec" | "specs" | "__tests__" | "testing"
+    )
+}
+
+/// `test_calc.py`, `calc_test.go`, `calc.test.ts` and `calc.spec.ts` test `calc`.
+fn names_test_for(target: &str, stem: &str) -> bool {
+    let name = target.rsplit('/').next().unwrap_or(target);
+    let target_stem = Path::new(name)
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .unwrap_or(name);
+    [
+        format!("test_{stem}"),
+        format!("{stem}_test"),
+        format!("{stem}.test"),
+        format!("{stem}.spec"),
+        format!("{stem}_spec"),
+    ]
+    .iter()
+    .any(|candidate| candidate == target_stem)
 }
 
 #[derive(Debug, Clone, Default)]
@@ -3223,6 +3453,9 @@ impl From<AssistantMessage> for CompleteOutput {
 /// job finished.
 pub const JOB_NOTICE_TYPE: &str = "backgroundJob";
 const REAL_USER_ORIGIN_FIELD: &str = "davinciRealUserOrigin";
+/// Marks the assistant tool call the harness issues when it re-runs the last
+/// verification command. It carries no text and is never the model's reply.
+pub const HARNESS_VERIFICATION_FIELD: &str = "davinciHarnessVerification";
 
 pub fn default_system_prompt() -> String {
     prompt::compose_legacy_default().text

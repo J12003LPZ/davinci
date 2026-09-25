@@ -10,7 +10,7 @@ use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 
 #[derive(Debug, Default)]
-pub(super) struct RustAdapter;
+pub(in crate::native_extensions::language_intelligence) struct RustAdapter;
 
 impl ServerAdapter for RustAdapter {
     fn family(&self) -> LanguageFamily { LanguageFamily::Rust }
@@ -80,7 +80,10 @@ pub(super) fn discover(
     }
 
     Ok(vec![ServerCommand {
+        kind: ServerBackend::RustAnalyzer,
         backend: ServerBackend::RustAnalyzer,
+        program: invocation.program.clone(),
+        args: invocation.args.clone(),
         invocation,
         workspace: project.root.clone(),
         version: None,

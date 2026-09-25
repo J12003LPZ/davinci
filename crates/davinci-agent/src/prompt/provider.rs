@@ -50,9 +50,10 @@ pub fn prompt_model_family(provider: &str, model_id: &str) -> PromptModelFamily 
 
 const OPENAI_REASONING_ADAPTER: &str = "\
 OpenAI model guidance:
-- When several independent reads or searches are known up front, request them as parallel tool calls instead of serializing work unnecessarily.
+- Before each tool call, work out what else you already know you will need. Send every independent read, search and listing in the same response as parallel calls, or put them in one batch call. Chain related shell commands into one command.
+- For a small, clear task (one or two files), read the relevant code, make the change, run the narrowest test, and finish. Do not create a task list for it.
 - Use apply_patch for multi-hunk or multi-file edits and keep patches minimal with enough context to match once.
-- After a change, report what changed and how it was verified without repeating whole files or the plan.
+- After a change, report what changed and how it was verified in a few sentences, without repeating whole files or the plan.
 - Stop when the requested task is complete and verified; do not start unrelated work.";
 
 pub fn provider_adapter(family: PromptModelFamily) -> Option<PromptModule> {
@@ -78,6 +79,17 @@ pub fn create_family_adapter(family: PromptModelFamily, body: &str) -> PromptMod
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn openai_adapter_asks_for_fewer_round_trips() {
+        let body = provider_adapter(PromptModelFamily::OpenAiReasoning)
+            .expect("OpenAI adapter")
+            .body;
+        assert!(body.contains("one batch call"), "{body}");
+        assert!(body.contains("Chain related shell commands"), "{body}");
+        assert!(body.contains("Do not create a task list"), "{body}");
+        assert!(estimate_tokens_from_str(&body) <= PROVIDER_ADAPTER_MAX_TOKENS);
+    }
+
     use super::*;
     use crate::prompt::manifest::estimate_tokens_from_str;
 

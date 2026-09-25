@@ -148,12 +148,12 @@ mod tests {
         assert_eq!(height(&m), 1);
         assert_eq!(
             text(&rows[0]),
-            "◜ Measuring… (esc to interrupt · 12s · ↓ 423 tokens · thinking with high effort)"
+            "· Boondoggling… (12s · ↓ 423 tokens · thinking with high effort)"
         );
     }
 
     #[test]
-    fn the_verb_turns_over_every_three_seconds_and_never_repeats_adjacently() {
+    fn the_verb_stays_stable_for_the_turn() {
         let mut m = model(120);
         let mut seen = Vec::new();
         for seconds in [0u64, 2, 3, 6, 9] {
@@ -163,29 +163,37 @@ mod tests {
             });
             seen.push(text(&lines(&m)[0]).split('…').next().unwrap().to_string());
         }
-        assert_eq!(seen[0], seen[1], "the word holds for three seconds");
-        assert_ne!(seen[1], seen[2]);
-        assert_ne!(seen[2], seen[3]);
-        assert_ne!(seen[3], seen[4]);
+        assert!(seen.iter().all(|verb| verb == &seen[0]));
+        m.working.as_mut().unwrap().verb_seed = 1;
+        assert!(text(&lines(&m)[0]).starts_with("· Levitating"));
+        m.working.as_mut().unwrap().interrupting = true;
+        assert!(text(&lines(&m)[0]).contains("Interrupting"));
     }
 
     #[test]
     fn it_spins_on_the_shared_clock_and_freezes_without_animation() {
         let mut m = model(120);
         m.working = Some(working());
-        for (tick, frame) in [(0u64, '◜'), (1, '◝'), (2, '◞'), (3, '◟')] {
+        for (tick, frame) in [
+            (0u64, '·'),
+            (1, '✢'),
+            (2, '*'),
+            (3, '✶'),
+            (6, '✻'),
+            (9, '✢'),
+        ] {
             m.tick = tick;
             assert!(text(&lines(&m)[0]).starts_with(frame), "{tick}");
         }
         m.animate = false;
-        assert!(text(&lines(&m)[0]).starts_with('◉'));
+        assert!(text(&lines(&m)[0]).starts_with('✻'));
     }
 
     #[test]
-    fn a_silent_model_keeps_the_interrupt_hint_and_elapsed_time() {
+    fn a_silent_model_keeps_its_verb_and_elapsed_time() {
         let mut m = model(120);
         m.working = Some(Working::new());
-        assert_eq!(text(&lines(&m)[0]), "◜ Pondering… (esc to interrupt · 0s)");
+        assert_eq!(text(&lines(&m)[0]), "· Boondoggling… (0s)");
     }
 
     #[test]
@@ -198,7 +206,7 @@ mod tests {
 
         m.width = 34;
         let drawn = text(&lines(&m)[0]);
-        assert_eq!(drawn, "◜ Measuring… (esc to interrupt)");
+        assert_eq!(drawn, "· Boondoggling… (12s)");
     }
 
     #[test]

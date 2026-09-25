@@ -2178,8 +2178,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let agent = Agent::new("fixture");
         let mut runtime = RpcRuntime::new(agent, dir.path().into(), dir.path().into());
-        let run_id = crate::native_extensions::graph::store::new_run_id();
-        crate::native_extensions::graph::store::create_run_dir(dir.path(), &run_id).unwrap();
+        let run_id = crate::native_extensions::graph::new_run_id();
+        crate::native_extensions::graph::create_run_dir(dir.path(), &run_id).unwrap();
 
         let mut run = crate::native_extensions::graph::GraphRun {
             version: 1,
@@ -2206,7 +2206,7 @@ mod tests {
                 revision_cycles: 0,
                 replans: 0,
                 cost_usd: 0.0,
-                started_at: crate::native_extensions::graph::now_ms(),
+                started_at: crate::native_extensions::graph::graph_now_ms(),
             },
             blocked_reason: None,
             resource_snapshot: None,
@@ -2217,7 +2217,7 @@ mod tests {
             control_history: Vec::new(),
             continuation: None,
         };
-        crate::native_extensions::graph::store::save_run(&mut run).unwrap();
+        crate::native_extensions::graph::save_run(&mut run).unwrap();
 
         // 1. Send graph_control command to pause
         let res = handle_rpc(
@@ -2237,7 +2237,7 @@ mod tests {
         assert_eq!(receipt["state"], "applied");
 
         // Verify state is paused on disk
-        let loaded = crate::native_extensions::graph::store::load_run(dir.path(), &run_id).unwrap();
+        let loaded = crate::native_extensions::graph::load_run(dir.path(), &run_id).unwrap();
         assert_eq!(
             loaded.current_lifecycle(),
             crate::native_extensions::graph::GraphLifecycle::Paused
@@ -2257,7 +2257,7 @@ mod tests {
         );
         assert!(resume.success);
         assert_eq!(resume.data.unwrap()["state"], "rejected");
-        let loaded = crate::native_extensions::graph::store::load_run(dir.path(), &run_id).unwrap();
+        let loaded = crate::native_extensions::graph::load_run(dir.path(), &run_id).unwrap();
         assert_eq!(loaded.control_history.len(), 2);
         assert_eq!(
             loaded.current_lifecycle(),
@@ -2273,7 +2273,7 @@ mod tests {
         );
         task.status = crate::native_extensions::graph::TaskStatus::Running;
         interrupted.tasks.push(task);
-        crate::native_extensions::graph::store::save_run(&mut interrupted).unwrap();
+        crate::native_extensions::graph::save_run(&mut interrupted).unwrap();
         let stop = handle_rpc(
             &mut runtime,
             RpcCommand {
