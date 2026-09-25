@@ -297,6 +297,49 @@ fn run_bounded(
     }
     Ok(output.stdout)
 }
+
+fn parse_signals(bytes: &[u8]) -> Result<Vec<AdvisorySignal>, String> {
+    let value: Value =
+        serde_json::from_slice(bytes).map_err(|_| "cargo-audit returned invalid JSON")?;
+    let list = value
+        .pointer("/vulnerabilities/list")
+        .and_then(Value::as_array)
+        .ok_or("cargo-audit returned invalid JSON")?;
+    let mut signals = Vec::new();
+    for item in list {
+        let id = item
+            .pointer("/advisory/id")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        let title = item
+            .pointer("/advisory/title")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        let package = item
+            .pointer("/package/name")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        let version = item
+            .pointer("/package/version")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        if id.is_empty() || package.is_empty() {
+            return Err("cargo-audit returned invalid JSON".into());
+        }
+        signals.push(AdvisorySignal {
+            id,
+            package,
+            version,
+            title,
+        });
+    }
+    Ok(signals)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
