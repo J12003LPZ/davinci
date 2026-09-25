@@ -34,8 +34,6 @@ use crate::davinci::ui::{
 /// Below this width there is no measure to wrap to: rows are clipped instead.
 const NARROW: u16 = 8;
 
-/// Code rows sit two columns in, behind `│ `.
-const CODE_INSET: u16 = 4;
 
 /// Containers deeper than this are flattened into their parent. Rendering
 /// recurses once per container, and a reply is never legitimately this deep.
@@ -137,7 +135,7 @@ struct Item {
 enum Block {
     Paragraph(Vec<Inline>),
     Heading {
-        level: u8,
+        _level: u8,
         inlines: Vec<Inline>,
     },
     Code {
@@ -446,7 +444,7 @@ impl Builder {
         };
         let block = match leaf {
             Leaf::Paragraph(inlines) => Block::Paragraph(inlines),
-            Leaf::Heading { level, inlines } => Block::Heading { level, inlines },
+            Leaf::Heading { level, inlines } => Block::Heading { _level: level, inlines },
             Leaf::Code { lang, text } => Block::Code { lang, text },
             Leaf::Html(text) => Block::Html(text),
             Leaf::Table { header, rows, .. } => Block::Table { header, rows },

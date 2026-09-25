@@ -308,7 +308,7 @@ fn render_list(settings: &Settings) -> String {
 }
 
 pub use crate::package_source::{
-    git_checkout_path, git_install_root, npm_install_args, npm_install_root, parse_git_source,
+    git_checkout_path, npm_install_args, npm_install_root, parse_git_source,
     parse_package_source, ParsedSource,
 };
 

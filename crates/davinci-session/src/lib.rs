@@ -14,7 +14,7 @@ pub use codec::{
     parse_mutation,
 };
 pub use discovery::{
-    cwd_encoded_dir, default_agent_dir, default_session_dir, discover_sessions,
+    cwd_encoded_dir, default_agent_dir, default_session_dir, discover_session_headers, discover_sessions,
     encode_cwd_component, expand_tilde, home_dir, latest_session, resolve_session_dir,
     resolve_session_dir_from, resolve_session_ref, SessionSummary,
 };
@@ -40,7 +40,7 @@ pub use tree::{
 };
 pub use types::*;
 
-use std::fs::{self, File, OpenOptions};
+use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -587,7 +587,7 @@ fn repair_jsonl_tail(path: &Path) -> Result<(), SessionError> {
 fn sync_parent(path: &Path) -> std::io::Result<()> {
     #[cfg(unix)]
     if let Some(parent) = path.parent() {
-        File::open(parent)?.sync_all()?;
+        fs::File::open(parent)?.sync_all()?;
     }
     #[cfg(not(unix))]
     let _ = path;

@@ -6,7 +6,6 @@ mod browser_integration_tests;
 mod cache_stats;
 mod catalog_refresh;
 mod changelog;
-use davinci_coding_agent::completion_delivery;
 mod codex_probe;
 mod davinci_interactive;
 mod davinci_sources;
@@ -96,7 +95,6 @@ mod experimental {
 
 mod export;
 mod extension_host;
-use davinci_coding_agent::interaction_testing;
 mod extensions;
 mod external_editor;
 mod file_processor;
@@ -108,7 +106,6 @@ mod mcp;
 mod migrations;
 mod model_resolver;
 use davinci_coding_agent::native_extensions;
-use davinci_coding_agent::native_tools;
 mod output;
 use davinci_coding_agent::package_source;
 mod packages;
@@ -116,8 +113,9 @@ use davinci_coding_agent::permissions;
 use davinci_coding_agent::project_config;
 mod rpc;
 use davinci_coding_agent::runtime_host;
-mod self_update;
-use davinci_coding_agent::semantic;
+use davinci_coding_agent::self_update;
+#[cfg(test)]
+use davinci_coding_agent::interaction_testing;
 use davinci_coding_agent::settings;
 mod shutdown;
 mod slash;
@@ -129,7 +127,6 @@ use std::io::{self, BufRead, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
-use davinci_coding_agent::prompt_host;
 
 /// True while the raw-mode TUI owns the screen. Any raw `println!` in that
 /// state moves the hardware cursor behind the renderer's back and corrupts
@@ -4036,6 +4033,7 @@ fn rpc_watch_during_turn(
 
 type RpcUiAbort = Mutex<Option<Arc<std::sync::atomic::AtomicBool>>>;
 
+#[cfg(test)]
 fn rpc_with_ui_abort<T>(
     agent: &mut Agent,
     active: &RpcUiAbort,

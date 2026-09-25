@@ -2751,6 +2751,7 @@ impl Question {
 /// The permission panel for one tool call the policy could not
 /// decide on its own (spec: trust-and-control, *davinci*). The policy supplies
 /// legal choices; an untrusted host additionally removes project persistence.
+#[cfg(test)]
 pub fn permission_ask(request: &ToolApprovalRequest, trusted: bool) -> Ask {
     permission_ask_at(request, trusted, std::path::Path::new("."))
 }

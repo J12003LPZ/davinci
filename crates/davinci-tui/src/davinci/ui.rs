@@ -501,6 +501,7 @@ pub fn hair_rule(width: u16, theme: &Theme, mark: &str) -> Line<'static> {
 
 /// A compact `● Read(path)` call with optional timing and outcome. Keep
 /// explicit state glyphs for errors and monochrome terminals.
+#[allow(clippy::too_many_arguments)]
 pub fn tool_line(
     width: u16,
     theme: &Theme,

@@ -246,7 +246,7 @@ fn run_status_with_executable(
     Ok((bytes, status))
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
 

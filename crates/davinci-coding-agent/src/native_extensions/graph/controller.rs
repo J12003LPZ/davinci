@@ -44,7 +44,6 @@ use crate::native_extensions::ecosystem::verification::{SecurityPolicyMode, Secu
 use std::collections::HashMap;
 use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -186,7 +185,7 @@ pub fn default_get_diff(cwd: &Path) -> String {
             continue;
         }
         let mut bytes = Vec::with_capacity(metadata.len() as usize);
-        let Ok(mut input) = std::fs::File::open(&path) else {
+        let Ok(input) = std::fs::File::open(&path) else {
             continue;
         };
         if input

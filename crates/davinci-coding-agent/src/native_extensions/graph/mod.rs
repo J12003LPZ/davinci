@@ -86,7 +86,7 @@ pub use render::{
 };
 use serde_json::{json, Value};
 use store::transcript_path;
-pub use store::{list_runs, load_run, now_ms as graph_now_ms, run_dir};
+pub use store::{list_runs, load_run, now_ms as graph_now_ms, run_dir, write_graph_definition};
 use verify::{contracted_verify_exec, default_verify_exec, dry_run_verify_exec};
 use worker::{run_dry_worker, run_worker};
 
@@ -100,6 +100,8 @@ use std::time::{Duration, Instant};
 pub use roles::GRAPH_SUBMIT_TOOL;
 #[cfg(feature = "test-fixtures")]
 pub use store::{create_run_dir, new_run_id, save_run};
+#[cfg(feature = "test-fixtures")]
+pub use worker::run_fixture_worker_with_deadline;
 #[allow(unused_imports)]
 pub use worker::{build_worker_args, worker_cache_profile, WorkerCacheProfile};
 #[cfg(feature = "test-fixtures")]

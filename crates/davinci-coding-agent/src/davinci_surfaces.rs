@@ -316,6 +316,7 @@ fn compaction_proposal(agent: &Agent, in_use: u64, window: u64) -> Option<Propos
 }
 
 /// Format cost minor units or label as unknown.
+#[cfg(test)]
 pub fn cost_label(cost_minor_units: Option<u64>) -> String {
     cost_minor_units
         .map(|v| format!("{v} minor units"))
