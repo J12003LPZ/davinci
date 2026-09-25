@@ -16,10 +16,7 @@ fn node() -> PathBuf {
 }
 
 fn config() -> LanguageIntelligenceConfig {
-    let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("tests/fixtures/language-server.cjs")
-        .canonicalize()
-        .unwrap();
+    let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/language-server.cjs");
     LanguageIntelligenceConfig::from_value(json!({
         "typescript": {
             "server": {"program": node(), "args": [fixture]}

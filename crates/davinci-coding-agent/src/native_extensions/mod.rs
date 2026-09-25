@@ -1150,9 +1150,11 @@ mod tests {
             )
             .unwrap();
         assert!(result.is_error);
+        // Authorization precedes any path or project inspection, so a host
+        // without bound permissions fails closed before touching the file.
         assert_eq!(
             result.details.unwrap()["error"]["code"],
-            "invalid_source_path"
+            "server_launch_denied"
         );
     }
 
@@ -1173,9 +1175,7 @@ mod tests {
         let fixture = std::path::PathBuf::from(concat!(
             env!("CARGO_MANIFEST_DIR"),
             "/tests/fixtures/language-server.cjs"
-        ))
-        .canonicalize()
-        .unwrap();
+        ));
         std::fs::write(
             agent.path().join("settings.json"),
             serde_json::to_vec_pretty(&json!({

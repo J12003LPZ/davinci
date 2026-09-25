@@ -54,7 +54,13 @@ pub(super) fn invocation_for_path(
                 "Language-server script is unavailable",
             )
         })?;
-        let mut node_args = vec![script.to_string_lossy().into_owned()];
+        // Node's module resolver cannot load Windows verbatim (\\?\) script paths.
+        // Keep canonical identity for fingerprinting; use the file-URI roundtrip for argv.
+        let argv_script = url::Url::from_file_path(&script)
+            .ok()
+            .and_then(|url| url.to_file_path().ok())
+            .unwrap_or_else(|| script.clone());
+        let mut node_args = vec![argv_script.to_string_lossy().into_owned()];
         node_args.extend(args);
         let mut invocation = ServerInvocation::new(node, node_args).map_err(|_| {
             IntelligenceError::new(
@@ -110,4 +116,30 @@ fn fingerprint_with_files(invocation: &ServerInvocation, files: &[PathBuf]) -> S
         }
     }
     format!("{:x}", hasher.finalize())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn node_script_argv_is_never_a_windows_verbatim_path() {
+        let node = davinci_sys::process::resolve_program("node");
+        let Some(node_dir) = node.parent().filter(|_| node.is_absolute()) else {
+            return; // Node is not installed; nothing to launch.
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let script = dir.path().join("server.cjs");
+        std::fs::write(&script, "").unwrap();
+        let search_path = std::env::join_paths([node_dir]).unwrap();
+        let invocation =
+            invocation_for_path(&script, vec!["--stdio".into()], &search_path).unwrap();
+        assert!(
+            !invocation.args[0].starts_with(r"\\?\"),
+            "{:?}",
+            invocation.args
+        );
+        assert!(Path::new(&invocation.args[0]).is_file());
+        assert_eq!(invocation.args[1], "--stdio");
+    }
 }

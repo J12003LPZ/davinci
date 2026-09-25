@@ -1840,7 +1840,15 @@ mod tests {
         }))
         .unwrap();
         assert_eq!(settings.theme.as_deref(), Some("fixture"));
-        assert!(!settings.language_intelligence.unwrap().enabled);
+        // Only the malformed language profile is disabled; the other profiles
+        // and the subsystem itself keep working.
+        let language = settings.language_intelligence.unwrap();
+        assert!(!language.typescript.enabled);
+        assert!(language.rust.enabled && language.python.enabled);
+        assert!(language
+            .profile_errors
+            .iter()
+            .any(|error| error.starts_with("typescript:")));
     }
 
     #[test]

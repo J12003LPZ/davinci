@@ -30,12 +30,13 @@ impl TestWorkspace {
             node.is_absolute() && node.is_file(),
             "DAVINCI_TEST_NODE/node must resolve to an existing absolute executable"
         );
+        // Not canonicalized: on Windows that yields a `\\?\` verbatim path,
+        // which Node cannot load as its main module.
         let script = PathBuf::from(concat!(
             env!("CARGO_MANIFEST_DIR"),
             "/tests/fixtures/language-server.cjs"
-        ))
-        .canonicalize()
-        .expect("fixture server");
+        ));
+        assert!(script.is_file(), "fixture server");
         let server = ServerOverride {
             program: node,
             args: vec![
