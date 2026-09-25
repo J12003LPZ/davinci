@@ -86,13 +86,15 @@ impl RepoIntelligence {
                             .into_iter()
                             .take(limit)
                             .filter(|item| self.validate_path(&item.path).is_ok())
-                            .map(|item| json!({
-                                "source":"lsp",
-                                "confidence":"semantic",
-                                "path":item.path,
-                                "range":item.range,
-                                "reason":item.description.chars().take(500).collect::<String>()
-                            }))
+                            .map(|item| {
+                                json!({
+                                    "source":"lsp",
+                                    "confidence":"semantic",
+                                    "path":item.path,
+                                    "range":item.range,
+                                    "reason":item.description.chars().take(500).collect::<String>()
+                                })
+                            })
                             .collect::<Vec<_>>();
                         let mut value = queries::envelope(results, limit);
                         value["route"] = json!("semantic");
@@ -104,7 +106,8 @@ impl RepoIntelligence {
                         if let Some(object) = fallback_args.as_object_mut() {
                             object.remove("semantic");
                         }
-                        let mut value = self.unified_query(index, query, scope, limit, &fallback_args)?;
+                        let mut value =
+                            self.unified_query(index, query, scope, limit, &fallback_args)?;
                         value["semantic_status"] = json!("unavailable");
                         value["semantic_warning"] = json!(format!(
                             "semantic provider unavailable: {}",
@@ -120,7 +123,8 @@ impl RepoIntelligence {
             }
             let mut value = self.unified_query(index, query, scope, limit, &fallback_args)?;
             value["semantic_status"] = json!("unavailable");
-            value["semantic_warning"] = json!("semantic provider unavailable; structural/text evidence only");
+            value["semantic_warning"] =
+                json!("semantic provider unavailable; structural/text evidence only");
             return Ok(value);
         }
         let lower = query.to_lowercase();

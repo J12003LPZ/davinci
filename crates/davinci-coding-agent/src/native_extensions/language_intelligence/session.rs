@@ -27,12 +27,22 @@ pub(super) struct Session {
 }
 
 impl Session {
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn start(command: ServerCommand, deadline: Instant) -> Result<Self> {
-        Self::start_with_budget(command, RequestBudget { deadline, cancelled: None })
+        Self::start_with_budget(
+            command,
+            RequestBudget {
+                deadline,
+                cancelled: None,
+            },
+        )
     }
 
     pub fn start_with_budget(command: ServerCommand, budget: RequestBudget) -> Result<Self> {
-        let client = ClientRequestState::new(command.workspace.clone(), command.client_configuration.clone())?;
+        let client = ClientRequestState::new(
+            command.workspace.clone(),
+            command.client_configuration.clone(),
+        )?;
         let transport = Transport::spawn_with_client(&mut command.command(), client)?;
         let uri = documents::file_uri(&command.workspace)?;
         let result = transport.request_with_budget("initialize", json!({
@@ -76,7 +86,10 @@ impl Session {
             ));
         }
         transport.notify_with_budget("initialized", json!({}), &budget)?;
-        let diagnostic_refresh_generation = transport.client_status()["diagnosticRefreshGeneration"].as_u64().unwrap_or(0);
+        let diagnostic_refresh_generation = transport.client_status()
+            ["diagnosticRefreshGeneration"]
+            .as_u64()
+            .unwrap_or(0);
         Ok(Self {
             command,
             transport,
@@ -232,6 +245,7 @@ impl Session {
         Ok(())
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn execute(
         &mut self,
         method: &str,
@@ -241,7 +255,17 @@ impl Session {
         adapter: &dyn ServerAdapter,
         deadline: Instant,
     ) -> Result<Value> {
-        self.execute_with_budget(method, capability, source, params, adapter, &RequestBudget { deadline, cancelled: None })
+        self.execute_with_budget(
+            method,
+            capability,
+            source,
+            params,
+            adapter,
+            &RequestBudget {
+                deadline,
+                cancelled: None,
+            },
+        )
     }
 
     pub fn execute_with_budget(
@@ -260,7 +284,9 @@ impl Session {
             ));
         }
         self.synchronize(source, adapter, budget)?;
-        let refresh = self.transport.client_status()["diagnosticRefreshGeneration"].as_u64().unwrap_or(0);
+        let refresh = self.transport.client_status()["diagnosticRefreshGeneration"]
+            .as_u64()
+            .unwrap_or(0);
         if refresh != self.diagnostic_refresh_generation {
             self.diagnostic_refresh_generation = refresh;
             self.diagnostic_result_ids.clear();
@@ -286,7 +312,12 @@ impl Session {
         }
         if method == "textDocument/diagnostic" {
             if self.supports("diagnosticProvider") || self.transport.has_dynamic_diagnostics() {
-                let path = source.ok_or_else(|| IntelligenceError::new("invalid_source_path", "Diagnostics require a source file"))?;
+                let path = source.ok_or_else(|| {
+                    IntelligenceError::new(
+                        "invalid_source_path",
+                        "Diagnostics require a source file",
+                    )
+                })?;
                 let document = &self.documents[path];
                 if let Some(previous) = self.diagnostic_result_ids.get(&document.uri) {
                     params["previousResultId"] = json!(previous);
@@ -298,19 +329,32 @@ impl Session {
                             .get("items")
                             .and_then(Value::as_array)
                             .cloned()
-                            .ok_or_else(|| IntelligenceError::new("protocol_error", "Expected diagnostic items"))?;
+                            .ok_or_else(|| {
+                                IntelligenceError::new(
+                                    "protocol_error",
+                                    "Expected diagnostic items",
+                                )
+                            })?;
                         if let Some(result_id) = response.get("resultId").and_then(Value::as_str) {
-                            self.diagnostic_result_ids.insert(document.uri.clone(), result_id.into());
+                            self.diagnostic_result_ids
+                                .insert(document.uri.clone(), result_id.into());
                         } else {
                             self.diagnostic_result_ids.remove(&document.uri);
                         }
-                        self.diagnostic_pull_items.insert(document.uri.clone(), items.clone());
-                        return Ok(json!({"items":items,"omitted":0,"freshness":"pull-response","documentVersion":document.version}));
+                        self.diagnostic_pull_items
+                            .insert(document.uri.clone(), items.clone());
+                        return Ok(
+                            json!({"items":items,"omitted":0,"freshness":"pull-response","documentVersion":document.version}),
+                        );
                     }
                     Some("unchanged") => {
                         let result_id = response.get("resultId").and_then(Value::as_str);
                         if result_id.is_some()
-                            && result_id == self.diagnostic_result_ids.get(&document.uri).map(String::as_str)
+                            && result_id
+                                == self
+                                    .diagnostic_result_ids
+                                    .get(&document.uri)
+                                    .map(String::as_str)
                         {
                             let items = self
                                 .diagnostic_pull_items
@@ -320,11 +364,18 @@ impl Session {
                                     "diagnostics_pending",
                                     "Unchanged diagnostic report has no retained current full report",
                                 ))?;
-                            return Ok(json!({"items":items,"omitted":0,"freshness":"pull-response","unchanged":true,"documentVersion":document.version}));
+                            return Ok(
+                                json!({"items":items,"omitted":0,"freshness":"pull-response","unchanged":true,"documentVersion":document.version}),
+                            );
                         }
                         return Err(IntelligenceError::new("diagnostics_pending", "Unchanged diagnostic report did not match the current provider result id"));
                     }
-                    _ => return Err(IntelligenceError::new("protocol_error", "Expected a full or unchanged document diagnostic report")),
+                    _ => {
+                        return Err(IntelligenceError::new(
+                            "protocol_error",
+                            "Expected a full or unchanged document diagnostic report",
+                        ))
+                    }
                 }
             }
             let path = source.ok_or_else(|| {
@@ -349,7 +400,8 @@ impl Session {
                 // the server has been quiet for the settle window, so a
                 // file with type errors is not reported clean.
                 loop {
-                    let window = budget.remaining()
+                    let window = budget
+                        .remaining()
                         .map(|left| left.min(DIAGNOSTIC_SETTLE))
                         .unwrap_or_default();
                     if window.is_zero() {
@@ -380,6 +432,7 @@ impl Session {
     }
 }
 
+#[allow(dead_code)]
 pub(super) fn remaining(deadline: Instant) -> Result<std::time::Duration> {
     deadline
         .checked_duration_since(Instant::now())

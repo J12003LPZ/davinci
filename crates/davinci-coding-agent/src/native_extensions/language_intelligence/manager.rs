@@ -47,6 +47,8 @@ impl Slot {
     }
 }
 
+type SharedSlot = Arc<Mutex<Slot>>;
+
 #[derive(Debug, Clone)]
 struct NegativeDiscovery {
     error: IntelligenceError,
@@ -102,35 +104,67 @@ impl LanguageIntelligence {
     }
 
     pub fn set_permissions(&self, permissions: Option<Arc<PermissionState>>) {
-        *self.inner.permissions.lock().unwrap_or_else(|e| e.into_inner()) = permissions;
+        *self
+            .inner
+            .permissions
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = permissions;
     }
 
-    /// A graph worker is rebound by its authenticated parent. Session storage is
-    /// shared, but the workspace remains part of every key.
-    pub fn for_workspace(&self, workspace: &Path) -> Self {
+    fn fork(&self, workspace: PathBuf, permissions: Option<Arc<PermissionState>>) -> Self {
         Self {
             inner: Arc::new(Manager {
-                workspace: workspace.into(),
+                workspace,
                 config: self.inner.config.clone(),
                 slots: self.inner.slots.clone(),
                 negative: self.inner.negative.clone(),
                 closed: self.inner.closed.clone(),
-                permissions: Mutex::new(
-                    self.inner.permissions.lock().unwrap_or_else(|e| e.into_inner()).clone(),
-                ),
+                permissions: Mutex::new(permissions),
                 governor: Mutex::new(
-                    self.inner.governor.lock().unwrap_or_else(|e| e.into_inner()).clone(),
+                    self.inner
+                        .governor
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .clone(),
                 ),
             }),
         }
     }
 
+    /// Bind request authority to one caller while sharing the process/session
+    /// owner. Attaching another agent can never overwrite this handle's policy.
+    pub fn with_permissions(&self, permissions: Option<Arc<PermissionState>>) -> Self {
+        self.fork(self.inner.workspace.clone(), permissions)
+    }
+
+    /// A graph worker is rebound by its authenticated parent. Session storage is
+    /// shared, but the workspace remains part of every key.
+    pub fn for_workspace(&self, workspace: &Path) -> Self {
+        let permissions = self
+            .inner
+            .permissions
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        self.fork(workspace.into(), permissions)
+    }
+
     pub fn set_governor(&self, governor: crate::native_extensions::SharedTokenGovernor) {
-        *self.inner.governor.lock().unwrap_or_else(|e| e.into_inner()) = Some(governor);
+        *self
+            .inner
+            .governor
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = Some(governor);
     }
 
     pub fn timeout(&self) -> Duration {
-        Duration::from_millis(self.inner.config.typescript.request_timeout_ms.clamp(100, 30_000))
+        Duration::from_millis(
+            self.inner
+                .config
+                .typescript
+                .request_timeout_ms
+                .clamp(100, 30_000),
+        )
     }
 
     pub fn shutdown(&self) {
@@ -139,9 +173,16 @@ impl LanguageIntelligence {
             self.inner.closed.store(true, Ordering::Release);
             std::mem::take(&mut *slots)
         };
-        self.inner.negative.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        self.inner
+            .negative
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
         for slot in slots.into_values() {
-            slot.lock().unwrap_or_else(|e| e.into_inner()).session.take();
+            slot.lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .session
+                .take();
         }
     }
 
@@ -162,23 +203,35 @@ impl LanguageIntelligence {
                 if slot.session.is_none() && slot.last_error.is_none() {
                     continue;
                 }
-                let mut status = slot.session.as_ref().map(Session::status).unwrap_or_else(|| {
-                    json!({
-                        "workspace":key.workspace,
-                        "project":key.project_root,
-                        "language":key.family,
-                        "session":"unavailable"
-                    })
-                });
+                let mut status = slot
+                    .session
+                    .as_ref()
+                    .map(Session::status)
+                    .unwrap_or_else(|| {
+                        json!({
+                            "workspace":key.workspace,
+                            "project":key.project_root,
+                            "language":key.family,
+                            "session":"unavailable"
+                        })
+                    });
                 status["generation"] = json!(slot.generation);
                 status["starts"] = json!(slot.starts);
                 status["lastError"] = json!(slot.last_error);
-                status["idleMs"] = json!(slot.last_used.elapsed().as_millis().min(u128::from(u64::MAX)) as u64);
+                status["idleMs"] = json!(slot
+                    .last_used
+                    .elapsed()
+                    .as_millis()
+                    .min(u128::from(u64::MAX)) as u64);
                 sessions.push(status);
             }
         }
         let negative = {
-            let mut negative = self.inner.negative.lock().unwrap_or_else(|e| e.into_inner());
+            let mut negative = self
+                .inner
+                .negative
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
             negative.retain(|_, entry| entry.expires > Instant::now());
             negative.len()
         };
@@ -202,28 +255,23 @@ impl LanguageIntelligence {
         })
     }
 
-    fn request(&self, name: &str, args: &Value) -> Result<Value> {
-        let parsed = tools::Arguments::parse(name, args)?;
-        let family = family_from_arguments(&parsed)?;
-        let limits = self.limits(family);
-        let budget = RequestBudget::from_timeout(Duration::from_millis(limits.cold_ms));
-        self.request_with_budget(name, args, parsed, family, budget)
-    }
-
     fn request_with_budget(
         &self,
         name: &str,
         args: &Value,
         parsed: tools::Arguments,
         family: LanguageFamily,
-        mut budget: RequestBudget,
+        budget: RequestBudget,
     ) -> Result<Value> {
         self.ensure_open()?;
         if let Some(message) = &self.inner.config.configuration_error {
             return Err(IntelligenceError::new("invalid_settings", message));
         }
         if !self.inner.config.enabled || !self.family_enabled(family) {
-            return Err(IntelligenceError::new("disabled", "Language intelligence is disabled for this language"));
+            return Err(IntelligenceError::new(
+                "disabled",
+                "Language intelligence is disabled for this language",
+            ));
         }
         budget.check()?;
         let workspace = self.inner.workspace.canonicalize().map_err(|_| {
@@ -250,13 +298,23 @@ impl LanguageIntelligence {
             }
         }
 
-        let source = parsed.path.as_deref().map(|path| documents::source_path(&workspace, path)).transpose()?;
+        let source = parsed
+            .path
+            .as_deref()
+            .map(|path| documents::source_path(&workspace, path))
+            .transpose()?;
         if let Some(source) = &source {
             let source_family = LanguageFamily::from_path(source).ok_or_else(|| {
-                IntelligenceError::new("unsupported_language", "No language-intelligence adapter supports this source file")
+                IntelligenceError::new(
+                    "unsupported_language",
+                    "No language-intelligence adapter supports this source file",
+                )
             })?;
             if source_family != family {
-                return Err(IntelligenceError::new("language_path_conflict", "Explicit language conflicts with the source path"));
+                return Err(IntelligenceError::new(
+                    "language_path_conflict",
+                    "Explicit language conflicts with the source path",
+                ));
             }
         }
         let context = self.resolution_context(workspace.clone(), budget.clone());
@@ -280,7 +338,8 @@ impl LanguageIntelligence {
         }
 
         let search_path = std::env::var_os("PATH").unwrap_or_default();
-        let commands = match adapter.discover(&context, &project, &self.inner.config, &search_path) {
+        let commands = match adapter.discover(&context, &project, &self.inner.config, &search_path)
+        {
             Ok(commands) => commands,
             Err(error) => {
                 self.remember_negative(negative_key, error.clone());
@@ -298,8 +357,7 @@ impl LanguageIntelligence {
                 family,
                 profile_fingerprint: format!(
                     "{}:{}",
-                    command.profile_fingerprint,
-                    command.invocation.executable_fingerprint
+                    command.profile_fingerprint, command.invocation.executable_fingerprint
                 ),
             };
             let (slot, evicted) = self.slot_for(&key, limits.family_sessions, &budget)?;
@@ -309,7 +367,11 @@ impl LanguageIntelligence {
             self.ensure_open()?;
             slot.last_used = Instant::now();
 
-            if slot.session.as_ref().is_some_and(|session| !session.is_alive()) {
+            if slot
+                .session
+                .as_ref()
+                .is_some_and(|session| !session.is_alive())
+            {
                 // Record healthy elapsed time before clearing process state.
                 slot.refresh_budget();
                 slot.session = None;
@@ -322,7 +384,10 @@ impl LanguageIntelligence {
             if !warm {
                 if slot.starts >= 2 {
                     last_error = Some(slot.last_error.clone().unwrap_or_else(|| {
-                        IntelligenceError::new("server_exited", "Language-server restart budget exhausted for this profile")
+                        IntelligenceError::new(
+                            "server_exited",
+                            "Language-server restart budget exhausted for this profile",
+                        )
                     }));
                     continue;
                 }
@@ -391,7 +456,9 @@ impl LanguageIntelligence {
             let (method, capability) = tools::operation(name).expect("validated tool");
             let generation = slot.generation;
             let source_hash_before = source.as_deref().and_then(source_hash);
-            let Some(session) = slot.session.as_mut() else { continue; };
+            let Some(session) = slot.session.as_mut() else {
+                continue;
+            };
             let response = session.execute_with_budget(
                 method,
                 capability,
@@ -470,7 +537,8 @@ impl LanguageIntelligence {
                 |full| {
                     let governor = self.inner.governor.lock().ok()?.as_ref()?.clone();
                     let mut governor = governor.lock().ok()?;
-                    governor.retain_lsp_output(
+                    governor
+                        .retain_lsp_output(
                             name,
                             args,
                             full,
@@ -502,7 +570,12 @@ impl LanguageIntelligence {
             }
             return Ok(normalized);
         }
-        Err(last_error.unwrap_or_else(|| IntelligenceError::new("server_not_installed", "No eligible installed language server could be started")))
+        Err(last_error.unwrap_or_else(|| {
+            IntelligenceError::new(
+                "server_not_installed",
+                "No eligible installed language server could be started",
+            )
+        }))
     }
 
     pub fn execute_with_budget(
@@ -511,11 +584,10 @@ impl LanguageIntelligence {
         args: &Value,
         budget: RequestBudget,
     ) -> std::result::Result<ToolResult, ToolError> {
-        let (value, is_error) = match tools::Arguments::parse(name, args)
-            .and_then(|parsed| {
-                let family = family_from_arguments(&parsed)?;
-                self.request_with_budget(name, args, parsed, family, budget)
-            }) {
+        let (value, is_error) = match tools::Arguments::parse(name, args).and_then(|parsed| {
+            let family = family_from_arguments(&parsed)?;
+            self.request_with_budget(name, args, parsed, family, budget)
+        }) {
             Ok(value) => (value, false),
             Err(error) => (
                 json!({
@@ -541,12 +613,19 @@ impl LanguageIntelligence {
             .and_then(|parsed| family_from_arguments(parsed).ok())
             .map(|family| self.limits(family).cold_ms)
             .unwrap_or(60_000);
-        self.execute_with_budget(name, args, RequestBudget::from_timeout(Duration::from_millis(timeout)))
+        self.execute_with_budget(
+            name,
+            args,
+            RequestBudget::from_timeout(Duration::from_millis(timeout)),
+        )
     }
 
     fn ensure_open(&self) -> Result<()> {
         if self.inner.closed.load(Ordering::Acquire) {
-            Err(IntelligenceError::new("session_closed", "Language intelligence has shut down"))
+            Err(IntelligenceError::new(
+                "session_closed",
+                "Language intelligence has shut down",
+            ))
         } else {
             Ok(())
         }
@@ -564,42 +643,98 @@ impl LanguageIntelligence {
         match family {
             LanguageFamily::TypeScript => {
                 let profile = &self.inner.config.typescript;
-                Limits { warm_ms: profile.request_timeout_ms, init_ms: profile.initialization_timeout_ms, cold_ms: profile.cold_request_timeout_ms, references: profile.max_references, workspace_symbols: profile.max_workspace_symbols, diagnostics: profile.max_diagnostics, family_sessions: profile.max_sessions }
+                Limits {
+                    warm_ms: profile.request_timeout_ms,
+                    init_ms: profile.initialization_timeout_ms,
+                    cold_ms: profile.cold_request_timeout_ms,
+                    references: profile.max_references,
+                    workspace_symbols: profile.max_workspace_symbols,
+                    diagnostics: profile.max_diagnostics,
+                    family_sessions: profile.max_sessions,
+                }
             }
             LanguageFamily::Rust => {
                 let profile = &self.inner.config.rust;
-                Limits { warm_ms: profile.request_timeout_ms, init_ms: profile.initialization_timeout_ms, cold_ms: profile.cold_request_timeout_ms, references: profile.max_references, workspace_symbols: profile.max_workspace_symbols, diagnostics: profile.max_diagnostics, family_sessions: profile.max_sessions }
+                Limits {
+                    warm_ms: profile.request_timeout_ms,
+                    init_ms: profile.initialization_timeout_ms,
+                    cold_ms: profile.cold_request_timeout_ms,
+                    references: profile.max_references,
+                    workspace_symbols: profile.max_workspace_symbols,
+                    diagnostics: profile.max_diagnostics,
+                    family_sessions: profile.max_sessions,
+                }
             }
             LanguageFamily::Python => {
                 let profile = &self.inner.config.python;
-                Limits { warm_ms: profile.request_timeout_ms, init_ms: profile.initialization_timeout_ms, cold_ms: profile.cold_request_timeout_ms, references: profile.max_references, workspace_symbols: profile.max_workspace_symbols, diagnostics: profile.max_diagnostics, family_sessions: profile.max_sessions }
+                Limits {
+                    warm_ms: profile.request_timeout_ms,
+                    init_ms: profile.initialization_timeout_ms,
+                    cold_ms: profile.cold_request_timeout_ms,
+                    references: profile.max_references,
+                    workspace_symbols: profile.max_workspace_symbols,
+                    diagnostics: profile.max_diagnostics,
+                    family_sessions: profile.max_sessions,
+                }
             }
         }
     }
 
     fn profile_fingerprint(&self, family: LanguageFamily) -> String {
         match family {
-            LanguageFamily::TypeScript => self.inner.config.profile_fingerprint(&self.inner.config.typescript),
-            LanguageFamily::Rust => self.inner.config.profile_fingerprint(&self.inner.config.rust),
-            LanguageFamily::Python => self.inner.config.profile_fingerprint(&self.inner.config.python),
+            LanguageFamily::TypeScript => self
+                .inner
+                .config
+                .profile_fingerprint(&self.inner.config.typescript),
+            LanguageFamily::Rust => self
+                .inner
+                .config
+                .profile_fingerprint(&self.inner.config.rust),
+            LanguageFamily::Python => self
+                .inner
+                .config
+                .profile_fingerprint(&self.inner.config.python),
         }
     }
 
     fn resolution_context(&self, workspace: PathBuf, budget: RequestBudget) -> ResolutionContext {
-        let mut roots: Vec<PathBuf> = std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default())
-            .filter(|path| path.is_absolute())
-            .filter_map(|path| path.canonicalize().ok())
-            .collect();
+        let mut roots: Vec<PathBuf> =
+            std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default())
+                .filter(|path| path.is_absolute())
+                .filter_map(|path| path.canonicalize().ok())
+                .collect();
         for path in [
-            self.inner.config.typescript.server.as_ref().map(|v| v.program.as_path()),
-            self.inner.config.rust.server.as_ref().map(|v| v.program.as_path()),
-            self.inner.config.python.server.as_ref().map(|v| v.program.as_path()),
+            self.inner
+                .config
+                .typescript
+                .server
+                .as_ref()
+                .map(|v| v.program.as_path()),
+            self.inner
+                .config
+                .rust
+                .server
+                .as_ref()
+                .map(|v| v.program.as_path()),
+            self.inner
+                .config
+                .python
+                .server
+                .as_ref()
+                .map(|v| v.program.as_path()),
             self.inner.config.python.interpreter.as_deref(),
             self.inner.config.rust.toolchain_dir.as_deref(),
             self.inner.config.rust.sysroot.as_deref(),
             self.inner.config.rust.sysroot_src.as_deref(),
-        ].into_iter().flatten() {
-            let candidate = if path.is_dir() { path } else { path.parent().unwrap_or(path) };
+        ]
+        .into_iter()
+        .flatten()
+        {
+            let candidate = if path.is_dir() {
+                path
+            } else {
+                path.parent().unwrap_or(path)
+            };
             if let Ok(candidate) = candidate.canonicalize() {
                 roots.push(candidate);
             }
@@ -613,30 +748,61 @@ impl LanguageIntelligence {
         }
     }
 
-    fn pathless_project(&self, family: LanguageFamily, context: &ResolutionContext) -> Result<ResolvedProject> {
+    fn pathless_project(
+        &self,
+        family: LanguageFamily,
+        context: &ResolutionContext,
+    ) -> Result<ResolvedProject> {
         let explicit = match family {
             LanguageFamily::TypeScript => &[][..],
             LanguageFamily::Rust => self.inner.config.rust.project_roots.as_slice(),
             LanguageFamily::Python => self.inner.config.python.project_roots.as_slice(),
         };
         if explicit.len() == 1 {
-            let root = context.workspace.join(&explicit[0]).canonicalize().map_err(|_| {
-                IntelligenceError::new("project_root_required", "Configured project root is unavailable")
-            })?;
+            let root = context
+                .workspace
+                .join(&explicit[0])
+                .canonicalize()
+                .map_err(|_| {
+                    IntelligenceError::new(
+                        "project_root_required",
+                        "Configured project root is unavailable",
+                    )
+                })?;
             if !root.starts_with(&context.workspace) {
-                return Err(IntelligenceError::new("outside_workspace", "Configured project root escapes the workspace"));
+                return Err(IntelligenceError::new(
+                    "outside_workspace",
+                    "Configured project root escapes the workspace",
+                ));
             }
-            return Ok(ResolvedProject { workspace: context.workspace.clone(), root, family, analysis_environment: None, config_files: Vec::new(), limitations: Vec::new() });
+            return Ok(ResolvedProject {
+                workspace: context.workspace.clone(),
+                root,
+                family,
+                analysis_environment: None,
+                config_files: Vec::new(),
+                limitations: Vec::new(),
+            });
         }
         let unambiguous = match family {
             LanguageFamily::TypeScript => true,
             LanguageFamily::Rust => context.workspace.join("Cargo.toml").is_file(),
-            LanguageFamily::Python => context.workspace.join("pyrightconfig.json").is_file() || context.workspace.join("pyproject.toml").is_file(),
+            LanguageFamily::Python => {
+                context.workspace.join("pyrightconfig.json").is_file()
+                    || context.workspace.join("pyproject.toml").is_file()
+            }
         };
         if !unambiguous {
             return Err(IntelligenceError::new("project_root_required", "A source path or one explicit project root is required for this workspace-symbol query"));
         }
-        Ok(ResolvedProject { workspace: context.workspace.clone(), root: context.workspace.clone(), family, analysis_environment: None, config_files: Vec::new(), limitations: Vec::new() })
+        Ok(ResolvedProject {
+            workspace: context.workspace.clone(),
+            root: context.workspace.clone(),
+            family,
+            analysis_environment: None,
+            config_files: Vec::new(),
+            limitations: Vec::new(),
+        })
     }
 
     fn slot_for(
@@ -644,7 +810,7 @@ impl LanguageIntelligence {
         key: &SessionKey,
         family_cap: usize,
         budget: &RequestBudget,
-    ) -> Result<(Arc<Mutex<Slot>>, Vec<Arc<Mutex<Slot>>>)> {
+    ) -> Result<(SharedSlot, Vec<SharedSlot>)> {
         let mut slots = lock_until(&self.inner.slots, budget)?;
         if let Some(slot) = slots.get(key) {
             return Ok((slot.clone(), Vec::new()));
@@ -672,7 +838,10 @@ impl LanguageIntelligence {
                 .min_by_key(|(_, last_used)| *last_used)
                 .map(|(candidate, _)| candidate);
             let Some(candidate) = candidate else {
-                return Err(IntelligenceError::new("session_limit", "All language-server session slots are busy"));
+                return Err(IntelligenceError::new(
+                    "session_limit",
+                    "All language-server session slots are busy",
+                ));
             };
             if let Some(slot) = slots.remove(&candidate) {
                 evicted.push(slot);
@@ -684,19 +853,36 @@ impl LanguageIntelligence {
     }
 
     fn remember_negative(&self, key: SessionKey, error: IntelligenceError) {
-        let mut negative = self.inner.negative.lock().unwrap_or_else(|e| e.into_inner());
+        let mut negative = self
+            .inner
+            .negative
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         negative.retain(|_, entry| entry.expires > Instant::now());
         if negative.len() >= 32 && !negative.contains_key(&key) {
             if let Some(oldest) = negative.keys().next().cloned() {
                 negative.remove(&oldest);
             }
         }
-        negative.insert(key, NegativeDiscovery { error, expires: Instant::now() + Duration::from_secs(30) });
+        negative.insert(
+            key,
+            NegativeDiscovery {
+                error,
+                expires: Instant::now() + Duration::from_secs(30),
+            },
+        );
     }
 
     fn cached_negative(&self, key: &SessionKey) -> Option<IntelligenceError> {
-        let mut negative = self.inner.negative.lock().unwrap_or_else(|e| e.into_inner());
-        if negative.get(key).is_some_and(|entry| entry.expires <= Instant::now()) {
+        let mut negative = self
+            .inner
+            .negative
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if negative
+            .get(key)
+            .is_some_and(|entry| entry.expires <= Instant::now())
+        {
             negative.remove(key);
         }
         negative.get(key).map(|entry| entry.error.clone())
@@ -706,17 +892,28 @@ impl LanguageIntelligence {
 fn family_from_arguments(parsed: &tools::Arguments) -> Result<LanguageFamily> {
     if let Some(path) = parsed.path.as_deref() {
         let family = LanguageFamily::from_path(Path::new(path)).ok_or_else(|| {
-            IntelligenceError::new("unsupported_language", "Source extension is not supported by language intelligence")
+            IntelligenceError::new(
+                "unsupported_language",
+                "Source extension is not supported by language intelligence",
+            )
         })?;
         if let Some(language) = parsed.language.as_deref() {
             let explicit = family_from_selector(language)?;
             if explicit != family {
-                return Err(IntelligenceError::new("language_path_conflict", "Explicit language conflicts with the source path"));
+                return Err(IntelligenceError::new(
+                    "language_path_conflict",
+                    "Explicit language conflicts with the source path",
+                ));
             }
         }
         return Ok(family);
     }
-    parsed.language.as_deref().map(family_from_selector).transpose()?.map_or(Ok(LanguageFamily::TypeScript), Ok)
+    parsed
+        .language
+        .as_deref()
+        .map(family_from_selector)
+        .transpose()?
+        .map_or(Ok(LanguageFamily::TypeScript), Ok)
 }
 
 fn family_from_selector(language: &str) -> Result<LanguageFamily> {
@@ -724,7 +921,10 @@ fn family_from_selector(language: &str) -> Result<LanguageFamily> {
         "typescript" | "javascript" => Ok(LanguageFamily::TypeScript),
         "rust" => Ok(LanguageFamily::Rust),
         "python" => Ok(LanguageFamily::Python),
-        _ => Err(IntelligenceError::new("invalid_arguments", "Unknown language selector")),
+        _ => Err(IntelligenceError::new(
+            "invalid_arguments",
+            "Unknown language selector",
+        )),
     }
 }
 
@@ -748,15 +948,30 @@ fn source_hash(path: &Path) -> Option<String> {
 }
 
 fn live_count(slots: &BTreeMap<SessionKey, Arc<Mutex<Slot>>>) -> usize {
-    slots.values().filter(|slot| {
-        slot.try_lock().map(|slot| slot.session.is_some()).unwrap_or(true)
-    }).count()
+    slots
+        .values()
+        .filter(|slot| {
+            slot.try_lock()
+                .map(|slot| slot.session.is_some())
+                .unwrap_or(true)
+        })
+        .count()
 }
 
-fn live_family_count(slots: &BTreeMap<SessionKey, Arc<Mutex<Slot>>>, family: LanguageFamily) -> usize {
-    slots.iter().filter(|(key, slot)| {
-        key.family == family && slot.try_lock().map(|slot| slot.session.is_some()).unwrap_or(true)
-    }).count()
+fn live_family_count(
+    slots: &BTreeMap<SessionKey, Arc<Mutex<Slot>>>,
+    family: LanguageFamily,
+) -> usize {
+    slots
+        .iter()
+        .filter(|(key, slot)| {
+            key.family == family
+                && slot
+                    .try_lock()
+                    .map(|slot| slot.session.is_some())
+                    .unwrap_or(true)
+        })
+        .count()
 }
 
 fn launch_denied() -> IntelligenceError {
@@ -817,7 +1032,10 @@ fn lock_until<'a, T>(mutex: &'a Mutex<T>, budget: &RequestBudget) -> Result<Mute
         match mutex.try_lock() {
             Ok(guard) => return Ok(guard),
             Err(TryLockError::Poisoned(_)) => {
-                return Err(IntelligenceError::new("session_unavailable", "Language-intelligence state unavailable"))
+                return Err(IntelligenceError::new(
+                    "session_unavailable",
+                    "Language-intelligence state unavailable",
+                ))
             }
             Err(TryLockError::WouldBlock) => std::thread::sleep(Duration::from_millis(2)),
         }
@@ -848,7 +1066,10 @@ mod tests {
             family: LanguageFamily::Rust,
             profile_fingerprint: "same".into(),
         };
-        let python = SessionKey { family: LanguageFamily::Python, ..base.clone() };
+        let python = SessionKey {
+            family: LanguageFamily::Python,
+            ..base.clone()
+        };
         assert_ne!(base, python);
     }
 
@@ -860,9 +1081,15 @@ mod tests {
             ("python", "app.py"),
         ] {
             let workspace = TestWorkspace::new(language, "capture");
-            let result = workspace.manager.execute("lsp_hover", &json!({"path":path,"line":1,"column":1})).unwrap();
+            let result = workspace
+                .manager
+                .execute("lsp_hover", &json!({"path":path,"line":1,"column":1}))
+                .unwrap();
             assert!(!result.is_error, "{language}: {}", result.content);
-            assert_eq!(result.details.unwrap()["language"], json!(LanguageFamily::from_path(Path::new(path)).unwrap()));
+            assert_eq!(
+                result.details.unwrap()["language"],
+                json!(LanguageFamily::from_path(Path::new(path)).unwrap())
+            );
         }
     }
 
@@ -906,9 +1133,15 @@ mod tests {
     fn disabled_and_untrusted_requests_never_launch() {
         let workspace = TestWorkspace::new("typescript", "capture");
         workspace.manager.set_permissions(None);
-        let result = workspace.manager.execute("lsp_hover", &json!({"path":"a.ts","line":1,"column":1})).unwrap();
+        let result = workspace
+            .manager
+            .execute("lsp_hover", &json!({"path":"a.ts","line":1,"column":1}))
+            .unwrap();
         assert!(result.is_error);
-        assert_eq!(result.details.unwrap()["error"]["code"], "server_launch_denied");
+        assert_eq!(
+            result.details.unwrap()["error"]["code"],
+            "server_launch_denied"
+        );
     }
 
     #[test]
@@ -924,22 +1157,21 @@ mod tests {
         let deadline = Instant::now() + Duration::from_secs(3);
         loop {
             if workspace.events().iter().any(|event| {
-                event["kind"] == "client_message"
-                    && event["method"] == "textDocument/hover"
+                event["kind"] == "client_message" && event["method"] == "textDocument/hover"
             }) {
                 break;
             }
-            assert!(Instant::now() < deadline, "fixture never received hover request");
+            assert!(
+                Instant::now() < deadline,
+                "fixture never received hover request"
+            );
             std::thread::sleep(Duration::from_millis(5));
         }
 
         workspace.write("a.ts", "changed while query was pending");
         let result = handle.join().unwrap();
         assert!(result.is_error, "{result:?}");
-        assert_eq!(
-            result.details.unwrap()["error"]["code"],
-            "stale_result"
-        );
+        assert_eq!(result.details.unwrap()["error"]["code"], "stale_result");
     }
 
     #[test]

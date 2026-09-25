@@ -5,7 +5,7 @@ use davinci_agent::semantic::{
     Diagnostic, DiagnosticSeverity, Location, Position, Range, RenamePreview, SemanticCapabilities,
     SemanticQuery, SemanticRequestContext, SemanticResult, SemanticService, SymbolItem,
 };
-use davinci_agent::{ToolError, ToolResult};
+use davinci_agent::ToolResult;
 use serde_json::{json, Value};
 use std::path::Path;
 use std::time::{Duration, Instant};
@@ -106,7 +106,11 @@ impl SemanticServiceFacade {
         context: &SemanticRequestContext,
     ) -> Result<SemanticResult, String> {
         let (tool, args, capability, cwd, path, fallback_position) = match query {
-            SemanticQuery::Definition { cwd, path, position } => (
+            SemanticQuery::Definition {
+                cwd,
+                path,
+                position,
+            } => (
                 "lsp_definition",
                 positional_args(path, position)?,
                 "definition",
@@ -152,7 +156,10 @@ impl SemanticServiceFacade {
         let output = self.client.execute_tool(tool, &args, context)?;
         if output.is_error {
             let details = output.details.unwrap_or(Value::Null);
-            let code = details.pointer("/error/code").and_then(Value::as_str).unwrap_or("semantic_unavailable");
+            let code = details
+                .pointer("/error/code")
+                .and_then(Value::as_str)
+                .unwrap_or("semantic_unavailable");
             if matches!(
                 code,
                 "server_not_installed"
@@ -302,7 +309,10 @@ fn normalized_to_core(
     let document_version = details["documentVersion"]
         .as_i64()
         .and_then(|value| i32::try_from(value).ok());
-    let limitations = details["limitations"].as_array().cloned().unwrap_or_default();
+    let limitations = details["limitations"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
     let partial = details["remaining"].as_u64().unwrap_or(0) > 0
         || details["omittedExternal"].as_u64().unwrap_or(0) > 0
         || !limitations.is_empty()
@@ -342,9 +352,9 @@ fn normalized_to_core(
         partial,
         fallback_reason,
     };
-    let items = details["items"]
-        .as_array()
-        .ok_or_else(|| "protocol_error: normalized semantic result contains no items".to_string())?;
+    let items = details["items"].as_array().ok_or_else(|| {
+        "protocol_error: normalized semantic result contains no items".to_string()
+    })?;
     for item in items {
         let range = core_range(&item["range"])?;
         match tool {
@@ -511,8 +521,20 @@ mod tests {
             "end":{"line":2,"column":8}
         }))
         .unwrap();
-        assert_eq!(range.start, Position { line: 1, character: 4 });
-        assert_eq!(range.end, Position { line: 1, character: 7 });
+        assert_eq!(
+            range.start,
+            Position {
+                line: 1,
+                character: 4
+            }
+        );
+        assert_eq!(
+            range.end,
+            Position {
+                line: 1,
+                character: 7
+            }
+        );
         assert!(core_range(&json!({
             "start":{"line":0,"column":1},
             "end":{"line":1,"column":1}

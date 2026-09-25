@@ -136,7 +136,6 @@ pub(super) fn validate(name: &str, args: &Value) -> Result<(), String> {
     Ok(())
 }
 
-
 fn validate_semantic_anchor(
     outer: &serde_json::Map<String, Value>,
     value: &Value,
@@ -144,7 +143,10 @@ fn validate_semantic_anchor(
     let anchor = value
         .as_object()
         .ok_or("query_invalid: semantic must be an object")?;
-    if anchor.keys().any(|key| !matches!(key.as_str(), "operation" | "line" | "column")) {
+    if anchor
+        .keys()
+        .any(|key| !matches!(key.as_str(), "operation" | "line" | "column"))
+    {
         return Err("query_invalid: semantic contains an unknown field".into());
     }
     let operation = anchor
@@ -157,14 +159,26 @@ fn validate_semantic_anchor(
     ) {
         return Err("query_invalid: invalid semantic.operation".into());
     }
-    if !outer.get("path").and_then(Value::as_str).is_some_and(|path| !path.trim().is_empty()) {
+    let has_path = outer
+        .get("path")
+        .and_then(Value::as_str)
+        .is_some_and(|path| !path.trim().is_empty());
+    if !has_path {
         return Err("query_invalid: semantic anchor requires a source path".into());
     }
-    let has_line = anchor.get("line").and_then(Value::as_u64).is_some_and(|value| value > 0);
-    let has_column = anchor.get("column").and_then(Value::as_u64).is_some_and(|value| value > 0);
+    let has_line = anchor
+        .get("line")
+        .and_then(Value::as_u64)
+        .is_some_and(|value| value > 0);
+    let has_column = anchor
+        .get("column")
+        .and_then(Value::as_u64)
+        .is_some_and(|value| value > 0);
     if operation == "diagnostics" {
         if anchor.contains_key("line") || anchor.contains_key("column") {
-            return Err("query_invalid: diagnostics semantic anchor does not accept line/column".into());
+            return Err(
+                "query_invalid: diagnostics semantic anchor does not accept line/column".into(),
+            );
         }
     } else if !has_line || !has_column {
         return Err("query_invalid: semantic anchor requires one-based line and column".into());

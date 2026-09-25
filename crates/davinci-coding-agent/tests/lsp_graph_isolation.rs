@@ -54,20 +54,14 @@ fn lsp_graph_same_worktree_reuses_owner_and_distinct_worktrees_isolate_sessions(
 
     for worker in [&first_worker, &peer_worker] {
         let result = worker
-            .execute(
-                "lsp_hover",
-                &json!({"path":"a.ts","line":1,"column":1}),
-            )
+            .execute("lsp_hover", &json!({"path":"a.ts","line":1,"column":1}))
             .unwrap();
         assert!(!result.is_error, "{}", result.content);
     }
     assert_eq!(owner.status()["sessions"].as_array().unwrap().len(), 1);
 
     let result = second_worker
-        .execute(
-            "lsp_hover",
-            &json!({"path":"a.ts","line":1,"column":1}),
-        )
+        .execute("lsp_hover", &json!({"path":"a.ts","line":1,"column":1}))
         .unwrap();
     assert!(!result.is_error, "{}", result.content);
     let sessions = owner.status()["sessions"].as_array().unwrap().to_vec();

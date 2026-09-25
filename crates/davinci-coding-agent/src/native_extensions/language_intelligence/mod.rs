@@ -5,20 +5,20 @@ mod config;
 mod diagnostics;
 mod documents;
 mod identity;
-mod metadata;
 #[cfg(test)]
 mod integration_tests;
+mod manager;
+mod metadata;
+mod normalize;
+mod protocol;
 #[cfg(test)]
 mod python_integration_tests;
 #[cfg(test)]
 mod rust_integration_tests;
-#[cfg(test)]
-mod test_support;
-mod manager;
-mod normalize;
-mod protocol;
 mod servers;
 mod session;
+#[cfg(test)]
+mod test_support;
 mod tools;
 mod transport;
 

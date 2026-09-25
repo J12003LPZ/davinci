@@ -19,11 +19,11 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 pub use backend::LocalSemanticBackend;
-pub use shared::{SemanticClient, SemanticServiceFacade};
 pub use session::{
     normalize_language, resolve_language_server, LanguageServerSpec, LazySemanticSessionRegistry,
     SemanticSessionKey, SemanticSessionState,
 };
+pub use shared::{SemanticClient, SemanticServiceFacade};
 
 /// Backend used after a separately authorized language-server session is ready.
 ///

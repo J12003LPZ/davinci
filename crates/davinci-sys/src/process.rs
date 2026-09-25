@@ -419,7 +419,12 @@ mod tests {
             .prefix("davinci-relative-path-entry-")
             .tempfile_in(".")
             .unwrap();
-        let name = file.path().file_name().unwrap().to_string_lossy().into_owned();
+        let name = file
+            .path()
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
         let relative = std::env::join_paths([std::path::PathBuf::from(".")]).unwrap();
         assert_eq!(resolve_program_in(&name, &relative, None), None);
     }

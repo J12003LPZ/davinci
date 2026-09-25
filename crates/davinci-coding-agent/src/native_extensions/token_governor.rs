@@ -1277,7 +1277,9 @@ impl TokenGovernor {
             .lock()
             .ok()
             .and_then(|guard| guard.revision())
-            .ok_or_else(|| ToolError::Failed("language evidence permission revision unavailable".into()))?;
+            .ok_or_else(|| {
+                ToolError::Failed("language evidence permission revision unavailable".into())
+            })?;
         let scope = Arc::as_ptr(&permissions) as usize as u64;
         let workspace = workspace
             .canonicalize()
@@ -1320,22 +1322,27 @@ impl TokenGovernor {
         let Some(auth) = &entry.lsp_authorization else {
             return Ok(());
         };
-        let permissions = self
-            .lsp_permissions
-            .as_ref()
-            .ok_or_else(|| ToolError::Failed("stored language evidence is no longer authorized".into()))?;
+        let permissions = self.lsp_permissions.as_ref().ok_or_else(|| {
+            ToolError::Failed("stored language evidence is no longer authorized".into())
+        })?;
         if Arc::as_ptr(permissions) as usize as u64 != auth.permission_scope {
-            return Err(ToolError::Failed("stored language evidence permission scope changed".into()));
+            return Err(ToolError::Failed(
+                "stored language evidence permission scope changed".into(),
+            ));
         }
-        let guard = permissions
-            .lock()
-            .map_err(|_| ToolError::Failed("stored language evidence permission state unavailable".into()))?;
+        let guard = permissions.lock().map_err(|_| {
+            ToolError::Failed("stored language evidence permission state unavailable".into())
+        })?;
         if guard.revision() != Some(auth.permission_revision) {
-            return Err(ToolError::Failed("stored language evidence permission revision changed".into()));
+            return Err(ToolError::Failed(
+                "stored language evidence permission revision changed".into(),
+            ));
         }
         for path in &auth.paths {
             if !path.starts_with(&auth.workspace) {
-                return Err(ToolError::Failed("stored language evidence path escaped its workspace".into()));
+                return Err(ToolError::Failed(
+                    "stored language evidence path escaped its workspace".into(),
+                ));
             }
             let relative = path
                 .strip_prefix(&auth.workspace)
@@ -1351,7 +1358,9 @@ impl TokenGovernor {
                 ),
                 PermissionVerdict::Allow
             ) {
-                return Err(ToolError::Failed("stored language evidence is no longer permitted".into()));
+                return Err(ToolError::Failed(
+                    "stored language evidence is no longer permitted".into(),
+                ));
             }
         }
         Ok(())
@@ -1656,7 +1665,10 @@ mod tests {
         let store = OutputStore::new(dir.path().join("outputs"));
         let mut governor = TokenGovernor::with_store("reset-output", tiny_thresholds(), store);
         let saved = governor.store.save("secret semantic evidence").unwrap();
-        assert_eq!(governor.store.load(&saved.id).unwrap(), "secret semantic evidence");
+        assert_eq!(
+            governor.store.load(&saved.id).unwrap(),
+            "secret semantic evidence"
+        );
         governor.reset();
         assert!(governor.store.load(&saved.id).is_err());
         assert!(governor.retrieve(&json!({"id": saved.id})).is_err());

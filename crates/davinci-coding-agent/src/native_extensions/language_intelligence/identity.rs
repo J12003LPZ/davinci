@@ -64,7 +64,10 @@ impl ServerInvocation {
         let mut hasher = Sha256::new();
         hasher.update(canonical_program.to_string_lossy().as_bytes());
         hasher.update(metadata.len().to_le_bytes());
-        if let Ok(modified) = metadata.modified().and_then(|v| v.duration_since(std::time::UNIX_EPOCH).map_err(std::io::Error::other)) {
+        if let Ok(modified) = metadata.modified().and_then(|v| {
+            v.duration_since(std::time::UNIX_EPOCH)
+                .map_err(std::io::Error::other)
+        }) {
             hasher.update(modified.as_nanos().to_le_bytes());
         }
         for arg in &args {

@@ -327,7 +327,8 @@ impl<'a> ChangeImpactAnalyzer<'a> {
                         items: Vec::new(),
                         lsp_status: "disabled".into(),
                         reference_count: 0,
-                        summary: "Semantic LSP analysis is disabled; blast radius remains partial".into(),
+                        summary: "Semantic LSP analysis is disabled; blast radius remains partial"
+                            .into(),
                     },
                     true,
                 );
@@ -366,7 +367,9 @@ impl<'a> ChangeImpactAnalyzer<'a> {
                         continue;
                     };
                     let Some(candidate) = details["items"].as_array().and_then(|items| {
-                        items.iter().find(|item| item["name"].as_str() == Some(symbol.as_str()))
+                        items
+                            .iter()
+                            .find(|item| item["name"].as_str() == Some(symbol.as_str()))
                             .or_else(|| items.first())
                     }) else {
                         continue;
@@ -399,7 +402,7 @@ impl<'a> ChangeImpactAnalyzer<'a> {
                             {
                                 lsp_failed = true;
                             }
-                        },
+                        }
                         Err(_) => lsp_failed = true,
                     }
                 }
@@ -462,7 +465,7 @@ impl<'a> ChangeImpactAnalyzer<'a> {
                         {
                             lsp_failed = true;
                         }
-                    },
+                    }
                     Err(_) => lsp_failed = true,
                 }
             }
@@ -479,7 +482,9 @@ impl<'a> ChangeImpactAnalyzer<'a> {
             warnings.push("Language intelligence is unavailable or incomplete; semantic impact remains uncertain".into());
             "unavailable".to_string()
         } else if lsp_failed {
-            warnings.push("Some semantic queries failed or were truncated; impact evidence is partial".into());
+            warnings.push(
+                "Some semantic queries failed or were truncated; impact evidence is partial".into(),
+            );
             "partial".to_string()
         } else {
             "available".to_string()
@@ -981,14 +986,12 @@ fn normalized_source_range(value: Option<&Value>) -> Option<SourceRange> {
     let start_column = value["start"]["column"].as_u64()? as usize;
     let end_line = value["end"]["line"].as_u64()? as usize;
     let end_column = value["end"]["column"].as_u64()? as usize;
-    (start_line > 0 && start_column > 0 && end_line > 0 && end_column > 0).then_some(
-        SourceRange {
-            start_line,
-            start_column,
-            end_line,
-            end_column,
-        },
-    )
+    (start_line > 0 && start_column > 0 && end_line > 0 && end_column > 0).then_some(SourceRange {
+        start_line,
+        start_column,
+        end_line,
+        end_column,
+    })
 }
 
 fn import_matches_target(importing_file: &str, specifier: &str, target_file: &str) -> bool {

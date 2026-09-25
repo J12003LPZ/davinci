@@ -1,5 +1,5 @@
 //! Deterministic language-server fixture helpers.
-#![cfg(test)]
+#![allow(dead_code)]
 
 use super::config::{LanguageIntelligenceConfig, ServerOverride};
 use super::manager::LanguageIntelligence;
@@ -26,7 +26,10 @@ impl TestWorkspace {
             .map(PathBuf::from)
             .unwrap_or_else(|| davinci_sys::process::resolve_program("node"));
         let node = node.canonicalize().unwrap_or(node);
-        assert!(node.is_absolute() && node.is_file(), "DAVINCI_TEST_NODE/node must resolve to an existing absolute executable");
+        assert!(
+            node.is_absolute() && node.is_file(),
+            "DAVINCI_TEST_NODE/node must resolve to an existing absolute executable"
+        );
         let script = PathBuf::from(concat!(
             env!("CARGO_MANIFEST_DIR"),
             "/tests/fixtures/language-server.cjs"
@@ -55,7 +58,11 @@ impl TestWorkspace {
                 config.python.enabled = false;
                 config.rust.server = Some(server);
                 std::fs::create_dir_all(root.join("src")).unwrap();
-                std::fs::write(root.join("Cargo.toml"), "[package]\nname=\"fixture\"\nversion=\"0.1.0\"\nedition=\"2021\"\n").unwrap();
+                std::fs::write(
+                    root.join("Cargo.toml"),
+                    "[package]\nname=\"fixture\"\nversion=\"0.1.0\"\nedition=\"2021\"\n",
+                )
+                .unwrap();
                 std::fs::write(root.join("src/lib.rs"), "pub fn value() -> u8 { 1 }\n").unwrap();
             }
             "python" => {
@@ -71,7 +78,11 @@ impl TestWorkspace {
         let mut policy = PermissionPolicy::new(PermissionMode::AlwaysApprove);
         policy.project_trusted = true;
         manager.set_permissions(Some(Arc::new(PermissionState::new(policy))));
-        Self { dir, manager, events_path }
+        Self {
+            dir,
+            manager,
+            events_path,
+        }
     }
 
     pub fn root(&self) -> &Path {

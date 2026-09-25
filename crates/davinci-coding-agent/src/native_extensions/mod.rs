@@ -1201,8 +1201,11 @@ mod tests {
         )
         .unwrap();
 
-        let mut host =
-            NativeExtensionHost::new_with_agent_dir("lsp-governor", root.path(), Some(agent.path()));
+        let mut host = NativeExtensionHost::new_with_agent_dir(
+            "lsp-governor",
+            root.path(),
+            Some(agent.path()),
+        );
         let mut policy =
             davinci_agent::PermissionPolicy::new(davinci_agent::PermissionMode::AlwaysApprove);
         policy.project_trusted = true;

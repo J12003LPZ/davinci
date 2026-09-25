@@ -607,8 +607,7 @@ impl RuntimeCapabilityRegistry {
             .write()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         if let Some(name) = registration.names.iter().find(|name| {
-            owners.get(*name).copied() != Some(registration.owner)
-                || !caps.contains_key(*name)
+            owners.get(*name).copied() != Some(registration.owner) || !caps.contains_key(*name)
         }) {
             return Err(CapabilityRegistrationError::OwnershipChanged(name.clone()));
         }
@@ -751,14 +750,16 @@ mod tests {
     #[test]
     fn owned_registration_is_atomic_and_refuses_foreign_replacement() {
         let registry = RuntimeCapabilityRegistry::new();
-        let cap = |name: &str| RuntimeCapability::new(
-            name,
-            CapabilitySource::NativeExtension,
-            ToolClass::Read,
-            true,
-            &serde_json::json!({"type":"object"}),
-            None,
-        );
+        let cap = |name: &str| {
+            RuntimeCapability::new(
+                name,
+                CapabilitySource::NativeExtension,
+                ToolClass::Read,
+                true,
+                &serde_json::json!({"type":"object"}),
+                None,
+            )
+        };
         let registration = registry.register_owned([cap("a"), cap("b")]).unwrap();
         assert!(registry.register_owned([cap("b"), cap("c")]).is_err());
         registry.register(cap("a"));

@@ -223,9 +223,11 @@ pub trait SemanticService: std::fmt::Debug + Send + Sync {
         _context: &SemanticRequestContext,
     ) -> Result<SemanticResult, String> {
         match query {
-            SemanticQuery::Definition { cwd, path, position } => {
-                self.definition(cwd, path, position.line, position.character)
-            }
+            SemanticQuery::Definition {
+                cwd,
+                path,
+                position,
+            } => self.definition(cwd, path, position.line, position.character),
             SemanticQuery::References {
                 cwd,
                 path,

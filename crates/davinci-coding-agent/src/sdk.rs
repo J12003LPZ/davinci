@@ -69,7 +69,8 @@ struct LanguageIntelligenceAttachment {
     attached_executor: CustomToolExecutor,
     attached_semantic: std::sync::Arc<dyn davinci_agent::semantic::SemanticService>,
     tools: Vec<String>,
-    output_governor: std::sync::Arc<std::sync::Mutex<Option<crate::native_extensions::SharedTokenGovernor>>>,
+    output_governor:
+        std::sync::Arc<std::sync::Mutex<Option<crate::native_extensions::SharedTokenGovernor>>>,
     output_registration: Option<davinci_agent::runtime::capabilities::CapabilityRegistration>,
     output_tool_inserted: bool,
 }
@@ -167,7 +168,8 @@ impl AgentSession {
         }
         let mut selected = Vec::new();
         for tool in tools {
-            if !crate::native_extensions::language_intelligence::TOOL_NAMES.contains(&tool.as_str()) {
+            if !crate::native_extensions::language_intelligence::TOOL_NAMES.contains(&tool.as_str())
+            {
                 return Err(format!("unsupported language-intelligence tool: {tool}"));
             }
             if self.attachment_excluded_tools.contains(tool)
@@ -176,7 +178,9 @@ impl AgentSession {
                     .as_ref()
                     .is_some_and(|allowed| !allowed.contains(tool))
             {
-                return Err(format!("language-intelligence tool excluded by session policy: {tool}"));
+                return Err(format!(
+                    "language-intelligence tool excluded by session policy: {tool}"
+                ));
             }
             if !selected.contains(tool) {
                 selected.push(tool.clone());
@@ -184,12 +188,13 @@ impl AgentSession {
         }
 
         let manager = crate::native_extensions::language_intelligence::LanguageIntelligence::new(
-            &self.cwd,
-            config,
+            &self.cwd, config,
         );
         manager.set_permissions(Some(self.agent.permissions.clone()));
         let facade: std::sync::Arc<dyn davinci_agent::semantic::SemanticService> =
-            std::sync::Arc::new(crate::semantic::SemanticServiceFacade::local(manager.clone()));
+            std::sync::Arc::new(crate::semantic::SemanticServiceFacade::local(
+                manager.clone(),
+            ));
 
         let capabilities = selected
             .iter()
@@ -220,8 +225,8 @@ impl AgentSession {
             std::sync::Mutex<Option<crate::native_extensions::SharedTokenGovernor>>,
         > = std::sync::Arc::new(std::sync::Mutex::new(None));
         let output_for_executor = output_governor.clone();
-        let attached_executor = CustomToolExecutor::new_with_context(
-            move |cwd, name, args, context| {
+        let attached_executor =
+            CustomToolExecutor::new_with_context(move |cwd, name, args, context| {
                 if name == "retrieve_output" {
                     if let Some(governor) = output_for_executor
                         .lock()
@@ -247,8 +252,7 @@ impl AgentSession {
                     return previous.execute_with_context(cwd, name, args, context);
                 }
                 Err(ToolError::Unknown(name.into()))
-            },
-        );
+            });
 
         {
             let mut authorized = self
@@ -341,7 +345,11 @@ impl AgentSession {
             .output_governor
             .lock()
             .unwrap_or_else(|error| error.into_inner()) = Some(governor);
-        attachment.output_tool_inserted = !self.agent.tool_registry.iter().any(|name| name == "retrieve_output");
+        attachment.output_tool_inserted = !self
+            .agent
+            .tool_registry
+            .iter()
+            .any(|name| name == "retrieve_output");
         attachment.output_registration = Some(registration);
         if attachment.output_tool_inserted {
             self.agent.tool_registry.push("retrieve_output".into());
@@ -428,7 +436,9 @@ impl AgentSession {
         self.agent
             .tool_registry
             .retain(|name| !attachment.tools.contains(name));
-        self.agent.tools.retain(|name| !attachment.tools.contains(name));
+        self.agent
+            .tools
+            .retain(|name| !attachment.tools.contains(name));
         {
             let mut authorized = self
                 .agent
@@ -947,18 +957,15 @@ mod tests {
             ),
         ));
         let original = "alpha\nbeta\ngamma\n";
-        let processed = governor
-            .lock()
-            .unwrap()
-            .after_tool(
-                "bash",
-                &serde_json::json!({"command":"fixture"}),
-                davinci_agent::ToolResult {
-                    content: original.into(),
-                    is_error: false,
-                    details: None,
-                },
-            );
+        let processed = governor.lock().unwrap().after_tool(
+            "bash",
+            &serde_json::json!({"command":"fixture"}),
+            davinci_agent::ToolResult {
+                content: original.into(),
+                is_error: false,
+                details: None,
+            },
+        );
         let id = processed
             .details
             .as_ref()

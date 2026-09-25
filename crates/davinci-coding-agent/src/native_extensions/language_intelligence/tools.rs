@@ -118,7 +118,10 @@ impl Arguments {
                 .as_ref()
                 .is_some_and(|v| v.len() > 256 || v.contains('\0'))
             || parsed.limit.is_some_and(|v| !(1..=200).contains(&v))
-            || parsed.language.as_deref().is_some_and(|v| !["typescript","javascript","rust","python"].contains(&v))
+            || parsed
+                .language
+                .as_deref()
+                .is_some_and(|v| !["typescript", "javascript", "rust", "python"].contains(&v))
             || [parsed.line, parsed.column]
                 .into_iter()
                 .flatten()

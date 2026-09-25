@@ -455,8 +455,10 @@ impl GraphController {
 
     #[allow(dead_code)]
     pub fn set_permissions(&mut self, permissions: Option<Arc<davinci_agent::PermissionState>>) {
+        // Rebind a private handle so the graph parent's authority never changes
+        // the policy of other agents sharing the same language-server owner.
         if let Some(language) = &self.language_intelligence {
-            language.set_permissions(permissions.clone());
+            self.language_intelligence = Some(language.with_permissions(permissions.clone()));
         }
         self.permissions = permissions;
     }

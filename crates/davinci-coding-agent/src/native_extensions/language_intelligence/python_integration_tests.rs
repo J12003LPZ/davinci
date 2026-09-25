@@ -63,7 +63,8 @@ fn run_python_backend(backend: PythonBackend, server_env: &str) {
         "class User:\n    name: str\n",
     )
     .unwrap();
-    let good = "from .models import User\n\ndef greeting(user: User) -> str:\n    return user.name\n";
+    let good =
+        "from .models import User\n\ndef greeting(user: User) -> str:\n    return user.name\n";
     std::fs::write(root.join("src/example/service.py"), good).unwrap();
     let baseline = root.join(".basedpyright/baseline.json");
     std::fs::create_dir_all(baseline.parent().unwrap()).unwrap();
@@ -97,9 +98,14 @@ fn run_python_backend(backend: PythonBackend, server_env: &str) {
         json!({"path":"src/example/service.py","line":1,"column":22}),
     );
     if definition["available"] == true {
-        assert!(definition["items"].as_array().unwrap().iter().any(|item| {
-            item["path"] == "src/example/models.py"
-        }), "{definition}");
+        assert!(
+            definition["items"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|item| { item["path"] == "src/example/models.py" }),
+            "{definition}"
+        );
     }
     let references = call(
         &manager,
@@ -123,7 +129,11 @@ fn run_python_backend(backend: PythonBackend, server_env: &str) {
         json!({"path":"src/example/service.py"}),
     );
     if symbols["available"] == true {
-        assert!(symbols["items"].as_array().unwrap().iter().any(|item| item["name"] == "greeting"));
+        assert!(symbols["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|item| item["name"] == "greeting"));
     }
     let workspace = call(
         &manager,
@@ -156,7 +166,10 @@ fn run_python_backend(backend: PythonBackend, server_env: &str) {
     );
     if diagnostics["available"] == true {
         assert_eq!(diagnostics["advisory"], true);
-        assert!(diagnostics["total"].as_u64().unwrap_or(0) >= 1, "{diagnostics}");
+        assert!(
+            diagnostics["total"].as_u64().unwrap_or(0) >= 1,
+            "{diagnostics}"
+        );
     }
     std::fs::write(root.join("src/example/service.py"), good).unwrap();
     let fixed = call(
@@ -188,7 +201,10 @@ fn real_python_project_venv_executes_only_after_trusted_launch() {
         .arg(&venv)
         .status()
         .unwrap();
-    assert!(status.success(), "unable to provision test virtual environment");
+    assert!(
+        status.success(),
+        "unable to provision test virtual environment"
+    );
     let venv_python = if cfg!(windows) {
         venv.join("Scripts/python.exe")
     } else {
@@ -243,7 +259,10 @@ fn real_python_project_venv_executes_only_after_trusted_launch() {
     {
         std::thread::sleep(std::time::Duration::from_millis(20));
     }
-    assert!(pth_sentinel.exists(), "project .pth code was not observed during trusted interpreter probing");
+    assert!(
+        pth_sentinel.exists(),
+        "project .pth code was not observed during trusted interpreter probing"
+    );
     assert!(
         sitecustomize_sentinel.exists(),
         "project sitecustomize code was not observed during trusted interpreter probing"

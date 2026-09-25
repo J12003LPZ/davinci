@@ -32,6 +32,7 @@ pub(super) enum ServerBackend {
 #[derive(Debug, Clone)]
 pub(super) struct ServerCommand {
     pub kind: ServerBackend,
+    #[allow(dead_code)]
     pub backend: ServerBackend,
     pub program: PathBuf,
     pub args: Vec<String>,
@@ -327,6 +328,7 @@ pub(super) trait ServerAdapter: Send + Sync + std::fmt::Debug {
     fn explicit_roots<'a>(&self, _settings: &'a LanguageIntelligenceConfig) -> &'a [PathBuf] {
         &[]
     }
+    #[cfg_attr(not(test), allow(dead_code))]
     fn project_markers(&self) -> &'static [&'static str] {
         &[]
     }
@@ -336,7 +338,12 @@ pub(super) trait ServerAdapter: Send + Sync + std::fmt::Debug {
         source: &Path,
         settings: &LanguageIntelligenceConfig,
     ) -> Result<ResolvedProject> {
-        project::resolve_project(self.family(), context, source, self.explicit_roots(settings))
+        project::resolve_project(
+            self.family(),
+            context,
+            source,
+            self.explicit_roots(settings),
+        )
     }
     fn discover(
         &self,
@@ -353,7 +360,9 @@ pub(super) trait ServerAdapter: Send + Sync + std::fmt::Debug {
 pub(super) struct TypeScriptAdapter;
 
 impl ServerAdapter for TypeScriptAdapter {
-    fn family(&self) -> LanguageFamily { LanguageFamily::TypeScript }
+    fn family(&self) -> LanguageFamily {
+        LanguageFamily::TypeScript
+    }
     fn language_id(&self, path: &Path) -> Option<&'static str> {
         match path.extension()?.to_str()? {
             "ts" | "mts" | "cts" => Some("typescript"),
@@ -385,7 +394,10 @@ pub(super) fn discover_for_project(
     match project.family {
         LanguageFamily::TypeScript => {
             if !settings.typescript.enabled {
-                return Err(IntelligenceError::new("disabled", "TypeScript language intelligence is disabled"));
+                return Err(IntelligenceError::new(
+                    "disabled",
+                    "TypeScript language intelligence is disabled",
+                ));
             }
             if let Some(server) = &settings.typescript.server {
                 let invocation = discovery::explicit(server, search_path)?;
@@ -411,7 +423,12 @@ pub(super) fn discover_for_project(
                     env: BTreeMap::new(),
                 }]);
             }
-            let mut commands = discover(&project.workspace, &project.root, settings.typescript.backend, search_path)?;
+            let mut commands = discover(
+                &project.workspace,
+                &project.root,
+                settings.typescript.backend,
+                search_path,
+            )?;
             let fingerprint = settings.profile_fingerprint(&settings.typescript);
             for command in &mut commands {
                 command.profile_fingerprint = fingerprint.clone();
@@ -423,6 +440,7 @@ pub(super) fn discover_for_project(
     }
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 pub(super) fn project_root(
     workspace: &Path,
     source: &Path,

@@ -111,9 +111,12 @@ pub const MACRO_VALUE: u8 = macro_fixture::sentinel!();\n",
         json!({"path":"src/lib.rs","line":3,"column":7}),
     );
     if definition["available"] == true {
-        assert!(definition["items"].as_array().unwrap().iter().any(|item| {
-            item["path"] == "src/lib.rs" && item["range"]["start"]["line"] == 1
-        }), "{definition}");
+        assert!(
+            definition["items"].as_array().unwrap().iter().any(|item| {
+                item["path"] == "src/lib.rs" && item["range"]["start"]["line"] == 1
+            }),
+            "{definition}"
+        );
     }
     let references = call(
         &manager,
@@ -121,7 +124,10 @@ pub const MACRO_VALUE: u8 = macro_fixture::sentinel!();\n",
         json!({"path":"src/lib.rs","line":1,"column":12,"includeDeclaration":true}),
     );
     if references["available"] == true {
-        assert!(references["total"].as_u64().unwrap_or(0) >= 2, "{references}");
+        assert!(
+            references["total"].as_u64().unwrap_or(0) >= 2,
+            "{references}"
+        );
     }
     let hover = call(
         &manager,
@@ -129,7 +135,10 @@ pub const MACRO_VALUE: u8 = macro_fixture::sentinel!();\n",
         json!({"path":"src/lib.rs","line":1,"column":12}),
     );
     if hover["available"] == true {
-        assert!(hover["text"].as_str().unwrap_or_default().contains("Formatter"));
+        assert!(hover["text"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("Formatter"));
     }
     let symbols = call(
         &manager,
@@ -137,7 +146,11 @@ pub const MACRO_VALUE: u8 = macro_fixture::sentinel!();\n",
         json!({"path":"src/lib.rs"}),
     );
     if symbols["available"] == true {
-        assert!(symbols["items"].as_array().unwrap().iter().any(|item| item["name"] == "Formatter"));
+        assert!(symbols["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|item| item["name"] == "Formatter"));
     }
     let workspace = call(
         &manager,
@@ -160,17 +173,16 @@ pub const MACRO_VALUE: u8 = macro_fixture::sentinel!();\n",
         "lsp_type_definition",
         json!({"path":"src/lib.rs","line":4,"column":28}),
     );
-    let diagnostics = call(
-        &manager,
-        "lsp_diagnostics",
-        json!({"path":"src/lib.rs"}),
-    );
+    let diagnostics = call(&manager, "lsp_diagnostics", json!({"path":"src/lib.rs"}));
     if diagnostics["available"] == true {
         assert_eq!(diagnostics["advisory"], true);
     }
 
     assert_eq!(hash(&root.join("Cargo.lock")), lock_before);
-    assert!(!target.exists(), "analysis wrote into the project target directory");
+    assert!(
+        !target.exists(),
+        "analysis wrote into the project target directory"
+    );
     assert!(
         !root.join("build-script-ran").exists(),
         "navigation analysis executed the fixture build script"

@@ -90,6 +90,7 @@ impl std::fmt::Debug for Transport {
 }
 
 impl Transport {
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn spawn(command: &mut Command) -> Result<Self> {
         let workspace = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
         let client = ClientRequestState::new(workspace, Value::Null)?;
@@ -222,13 +223,25 @@ impl Transport {
         self.send(json!({"jsonrpc":"2.0", "method":method, "params":params}))
     }
 
-    pub fn notify_with_budget(&self, method: &str, params: Value, budget: &RequestBudget) -> Result<()> {
+    pub fn notify_with_budget(
+        &self,
+        method: &str,
+        params: Value,
+        budget: &RequestBudget,
+    ) -> Result<()> {
         budget.check()?;
-        self.send_until(json!({"jsonrpc":"2.0", "method":method, "params":params}), budget.deadline)
+        self.send_until(
+            json!({"jsonrpc":"2.0", "method":method, "params":params}),
+            budget.deadline,
+        )
     }
 
     fn send_until(&self, mut value: Value, deadline: Instant) -> Result<()> {
-        if serde_json::to_vec(&value).map_err(|_| protocol_error())?.len() > MAX_FRAME {
+        if serde_json::to_vec(&value)
+            .map_err(|_| protocol_error())?
+            .len()
+            > MAX_FRAME
+        {
             return Err(protocol_error());
         }
         let sender = self.writer.as_ref().ok_or_else(exited)?;
@@ -238,7 +251,10 @@ impl Transport {
                 Err(mpsc::TrySendError::Full(returned)) => {
                     value = returned;
                     if Instant::now() >= deadline {
-                        return Err(IntelligenceError::new("request_timeout", "Language-server write queue stayed full until the deadline"));
+                        return Err(IntelligenceError::new(
+                            "request_timeout",
+                            "Language-server write queue stayed full until the deadline",
+                        ));
                     }
                     thread::sleep(Duration::from_millis(2));
                 }
@@ -252,7 +268,12 @@ impl Transport {
         self.request_with_budget(method, params, &budget)
     }
 
-    pub fn request_with_budget(&self, method: &str, params: Value, budget: &RequestBudget) -> Result<Value> {
+    pub fn request_with_budget(
+        &self,
+        method: &str,
+        params: Value,
+        budget: &RequestBudget,
+    ) -> Result<Value> {
         budget.check()?;
         let (sender, receiver) = mpsc::sync_channel(1);
         let id = {
@@ -271,9 +292,10 @@ impl Transport {
             state.pending.insert(id, sender);
             id
         };
-        if let Err(error) =
-            self.send_until(json!({"jsonrpc":"2.0", "id":id, "method":method, "params":params}), budget.deadline)
-        {
+        if let Err(error) = self.send_until(
+            json!({"jsonrpc":"2.0", "id":id, "method":method, "params":params}),
+            budget.deadline,
+        ) {
             self.shared
                 .state
                 .lock()
@@ -284,7 +306,12 @@ impl Transport {
         }
         loop {
             if let Err(error) = budget.check() {
-                self.shared.state.lock().unwrap_or_else(|e| e.into_inner()).pending.remove(&id);
+                self.shared
+                    .state
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .pending
+                    .remove(&id);
                 let _ = self.notify("$/cancelRequest", json!({"id":id}));
                 return Err(error);
             }
@@ -402,12 +429,16 @@ impl Transport {
         #[cfg(unix)]
         {
             let group = -(child.id() as i32);
-            unsafe { libc::kill(group, libc::SIGTERM); }
+            unsafe {
+                libc::kill(group, libc::SIGTERM);
+            }
             let grace = Instant::now() + Duration::from_millis(200);
             while child.try_wait().ok().flatten().is_none() && Instant::now() < grace {
                 thread::sleep(Duration::from_millis(10));
             }
-            unsafe { libc::kill(group, libc::SIGKILL); }
+            unsafe {
+                libc::kill(group, libc::SIGKILL);
+            }
         }
         if child.try_wait().ok().flatten().is_none() {
             let _ = child.kill();
@@ -427,7 +458,12 @@ mod process_job {
         fn CreateJobObjectW(attributes: *const c_void, name: *const u16) -> *mut c_void;
         fn AssignProcessToJobObject(job: *mut c_void, process: *mut c_void) -> i32;
         fn TerminateJobObject(job: *mut c_void, exit_code: u32) -> i32;
-        fn SetInformationJobObject(job: *mut c_void, info_class: i32, info: *const c_void, info_len: u32) -> i32;
+        fn SetInformationJobObject(
+            job: *mut c_void,
+            info_class: i32,
+            info: *const c_void,
+            info_len: u32,
+        ) -> i32;
     }
 
     pub(super) struct Job(OwnedHandle);
@@ -486,11 +522,17 @@ mod process_job {
                     scheduling_class: 0,
                 },
                 io_info: IoCounters {
-                    read_operation_count: 0, write_operation_count: 0, other_operation_count: 0,
-                    read_transfer_count: 0, write_transfer_count: 0, other_transfer_count: 0,
+                    read_operation_count: 0,
+                    write_operation_count: 0,
+                    other_operation_count: 0,
+                    read_transfer_count: 0,
+                    write_transfer_count: 0,
+                    other_transfer_count: 0,
                 },
-                process_memory_limit: 0, job_memory_limit: 0,
-                peak_process_memory_used: 0, peak_job_memory_used: 0,
+                process_memory_limit: 0,
+                job_memory_limit: 0,
+                peak_process_memory_used: 0,
+                peak_job_memory_used: 0,
             };
             if unsafe {
                 SetInformationJobObject(
@@ -499,10 +541,13 @@ mod process_job {
                     &info as *const _ as *const c_void,
                     std::mem::size_of::<ExtendedLimit>() as u32,
                 )
-            } == 0 {
+            } == 0
+            {
                 return Err(std::io::Error::last_os_error());
             }
-            if unsafe { AssignProcessToJobObject(job.0.as_raw_handle(), child.as_raw_handle()) } == 0 {
+            if unsafe { AssignProcessToJobObject(job.0.as_raw_handle(), child.as_raw_handle()) }
+                == 0
+            {
                 return Err(std::io::Error::last_os_error());
             }
             Ok(job)
@@ -618,7 +663,9 @@ fn dispatch_message(
             }
             let response = match client.handle_request(method, &message["params"]) {
                 Ok(result) => json!({"jsonrpc":"2.0", "id":id, "result":result}),
-                Err((code, text)) => json!({"jsonrpc":"2.0", "id":id, "error":{"code":code,"message":text}}),
+                Err((code, text)) => {
+                    json!({"jsonrpc":"2.0", "id":id, "error":{"code":code,"message":text}})
+                }
             };
             writer.try_send(response).map_err(|_| protocol_error())?;
         } else if method == "textDocument/publishDiagnostics" {

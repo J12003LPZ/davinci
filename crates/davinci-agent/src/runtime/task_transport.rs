@@ -365,14 +365,10 @@ fn dispatch(
         "task_get" => super::task_get_tool(&request.args, context),
         "task_list" => super::task_list_tool(&request.args, context),
         _ => {
-            let handler = handler
-                .ok_or_else(|| "parent native handler unavailable".to_string())?;
-            let requested = Duration::from_millis(
-                request
-                    .timeout_ms
-                    .unwrap_or(IO_TIMEOUT.as_millis() as u64),
-            )
-            .min(Duration::from_secs(120));
+            let handler = handler.ok_or_else(|| "parent native handler unavailable".to_string())?;
+            let requested =
+                Duration::from_millis(request.timeout_ms.unwrap_or(IO_TIMEOUT.as_millis() as u64))
+                    .min(Duration::from_secs(120));
             let remaining = requested
                 .saturating_sub(received_at.elapsed())
                 .max(Duration::from_millis(1));
@@ -382,7 +378,7 @@ fn dispatch(
                 remaining,
                 context.abort.clone(),
             )
-        },
+        }
     }
     .map_err(|error| error.to_string())
 }

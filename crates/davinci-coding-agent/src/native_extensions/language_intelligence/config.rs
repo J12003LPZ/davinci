@@ -214,9 +214,13 @@ impl LanguageIntelligenceConfig {
             return out;
         };
         for key in object.keys() {
-            if !matches!(key.as_str(), "enabled" | "maxSessions" | "idleTimeoutMs" | "typescript" | "rust" | "python") {
+            if !matches!(
+                key.as_str(),
+                "enabled" | "maxSessions" | "idleTimeoutMs" | "typescript" | "rust" | "python"
+            ) {
                 out.enabled = false;
-                out.configuration_error = Some(format!("unknown languageIntelligence setting '{key}'"));
+                out.configuration_error =
+                    Some(format!("unknown languageIntelligence setting '{key}'"));
                 return out;
             }
         }
@@ -225,17 +229,23 @@ impl LanguageIntelligenceConfig {
                 Some(value) => out.enabled = value,
                 None => {
                     out.enabled = false;
-                    out.configuration_error = Some("languageIntelligence.enabled must be boolean".into());
+                    out.configuration_error =
+                        Some("languageIntelligence.enabled must be boolean".into());
                     return out;
                 }
             }
         }
         if let Some(v) = object.get("maxSessions") {
-            match v.as_u64().and_then(|n| usize::try_from(n).ok()).filter(|n| (1..=8).contains(n)) {
+            match v
+                .as_u64()
+                .and_then(|n| usize::try_from(n).ok())
+                .filter(|n| (1..=8).contains(n))
+            {
                 Some(value) => out.max_sessions = value,
                 None => {
                     out.enabled = false;
-                    out.configuration_error = Some("languageIntelligence.maxSessions must be 1..8".into());
+                    out.configuration_error =
+                        Some("languageIntelligence.maxSessions must be 1..8".into());
                     return out;
                 }
             }
@@ -245,13 +255,16 @@ impl LanguageIntelligenceConfig {
                 Some(value) => out.idle_timeout_ms = value,
                 None => {
                     out.enabled = false;
-                    out.configuration_error = Some("languageIntelligence.idleTimeoutMs must be 30000..900000".into());
+                    out.configuration_error =
+                        Some("languageIntelligence.idleTimeoutMs must be 30000..900000".into());
                     return out;
                 }
             }
         }
         if let Some(v) = object.get("typescript") {
-            match serde_json::from_value::<TypeScriptConfig>(v.clone()).and_then(validate_typescript) {
+            match serde_json::from_value::<TypeScriptConfig>(v.clone())
+                .and_then(validate_typescript)
+            {
                 Ok(profile) => out.typescript = profile,
                 Err(error) => {
                     out.typescript.enabled = false;
@@ -289,7 +302,15 @@ impl LanguageIntelligenceConfig {
     }
 }
 
-fn validate_common(request: u64, init: u64, cold: u64, refs: usize, symbols: usize, diagnostics: usize, sessions: usize) -> Result<(), String> {
+fn validate_common(
+    request: u64,
+    init: u64,
+    cold: u64,
+    refs: usize,
+    symbols: usize,
+    diagnostics: usize,
+    sessions: usize,
+) -> Result<(), String> {
     if !(100..=30_000).contains(&request) {
         return Err("requestTimeoutMs must be 100..30000".into());
     }
@@ -297,9 +318,14 @@ fn validate_common(request: u64, init: u64, cold: u64, refs: usize, symbols: usi
         return Err("initializationTimeoutMs must be 1000..60000".into());
     }
     if !(1_000..=120_000).contains(&cold) || cold < init {
-        return Err("coldRequestTimeoutMs must be 1000..120000 and at least initializationTimeoutMs".into());
+        return Err(
+            "coldRequestTimeoutMs must be 1000..120000 and at least initializationTimeoutMs".into(),
+        );
     }
-    if [refs, symbols, diagnostics].iter().any(|n| !(1..=200).contains(n)) {
+    if [refs, symbols, diagnostics]
+        .iter()
+        .any(|n| !(1..=200).contains(n))
+    {
         return Err("result limits must be 1..200".into());
     }
     if !(1..=8).contains(&sessions) {
@@ -312,34 +338,79 @@ fn validate_server(server: &Option<ServerOverride>) -> Result<(), String> {
         if !server.program.is_absolute() {
             return Err("server.program must be an absolute trusted path".into());
         }
-        if server.args.len() > 64 || server.args.iter().any(|arg| arg.len() > 4096 || arg.contains('\0')) {
+        if server.args.len() > 64
+            || server
+                .args
+                .iter()
+                .any(|arg| arg.len() > 4096 || arg.contains('\0'))
+        {
             return Err("server.args exceed bounded argument policy".into());
         }
     }
     Ok(())
 }
 fn validate_typescript(profile: TypeScriptConfig) -> Result<TypeScriptConfig, serde_json::Error> {
-    validate_common(profile.request_timeout_ms, profile.initialization_timeout_ms, profile.cold_request_timeout_ms, profile.max_references, profile.max_workspace_symbols, profile.max_diagnostics, profile.max_sessions)
-        .and_then(|_| validate_server(&profile.server))
-        .map_err(custom_json_error)?;
+    validate_common(
+        profile.request_timeout_ms,
+        profile.initialization_timeout_ms,
+        profile.cold_request_timeout_ms,
+        profile.max_references,
+        profile.max_workspace_symbols,
+        profile.max_diagnostics,
+        profile.max_sessions,
+    )
+    .and_then(|_| validate_server(&profile.server))
+    .map_err(custom_json_error)?;
     Ok(profile)
 }
 fn validate_rust(profile: RustConfig) -> Result<RustConfig, serde_json::Error> {
-    validate_common(profile.request_timeout_ms, profile.initialization_timeout_ms, profile.cold_request_timeout_ms, profile.max_references, profile.max_workspace_symbols, profile.max_diagnostics, profile.max_sessions)
-        .and_then(|_| validate_server(&profile.server))
-        .map_err(custom_json_error)?;
-    if profile.features.len() > 128 || profile.features.iter().any(|f| f.is_empty() || f.len() > 128 || !f.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-'))) {
-        return Err(custom_json_error("rust.features must contain at most 128 bounded Cargo feature names".into()));
+    validate_common(
+        profile.request_timeout_ms,
+        profile.initialization_timeout_ms,
+        profile.cold_request_timeout_ms,
+        profile.max_references,
+        profile.max_workspace_symbols,
+        profile.max_diagnostics,
+        profile.max_sessions,
+    )
+    .and_then(|_| validate_server(&profile.server))
+    .map_err(custom_json_error)?;
+    if profile.features.len() > 128
+        || profile.features.iter().any(|f| {
+            f.is_empty()
+                || f.len() > 128
+                || !f
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-'))
+        })
+    {
+        return Err(custom_json_error(
+            "rust.features must contain at most 128 bounded Cargo feature names".into(),
+        ));
     }
-    if profile.target.as_ref().is_some_and(|v| v.is_empty() || v.len() > 128 || !v.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.'))) {
+    if profile.target.as_ref().is_some_and(|v| {
+        v.is_empty()
+            || v.len() > 128
+            || !v
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.'))
+    }) {
         return Err(custom_json_error("rust.target is invalid".into()));
     }
     Ok(profile)
 }
 fn validate_python(profile: PythonConfig) -> Result<PythonConfig, serde_json::Error> {
-    validate_common(profile.request_timeout_ms, profile.initialization_timeout_ms, profile.cold_request_timeout_ms, profile.max_references, profile.max_workspace_symbols, profile.max_diagnostics, profile.max_sessions)
-        .and_then(|_| validate_server(&profile.server))
-        .map_err(custom_json_error)?;
+    validate_common(
+        profile.request_timeout_ms,
+        profile.initialization_timeout_ms,
+        profile.cold_request_timeout_ms,
+        profile.max_references,
+        profile.max_workspace_symbols,
+        profile.max_diagnostics,
+        profile.max_sessions,
+    )
+    .and_then(|_| validate_server(&profile.server))
+    .map_err(custom_json_error)?;
     Ok(profile)
 }
 fn custom_json_error(message: String) -> serde_json::Error {
@@ -376,7 +447,10 @@ mod tests {
             "rust":{"enabled":true},
             "python":{"backend":"misspelled"}
         }));
-        assert_eq!(config.typescript.backend, TypeScriptBackend::TypeScriptLanguageServer);
+        assert_eq!(
+            config.typescript.backend,
+            TypeScriptBackend::TypeScriptLanguageServer
+        );
         assert!(config.typescript.enabled);
         assert!(config.rust.enabled);
         assert!(!config.python.enabled);
@@ -389,6 +463,9 @@ mod tests {
         let config = LanguageIntelligenceConfig::default();
         let a = json!({"b":2,"a":1});
         let b = json!({"a":1,"b":2});
-        assert_eq!(config.profile_fingerprint(&a), config.profile_fingerprint(&b));
+        assert_eq!(
+            config.profile_fingerprint(&a),
+            config.profile_fingerprint(&b)
+        );
     }
 }

@@ -68,19 +68,20 @@ impl SemanticLanguageProvider for LanguageIntelligenceAdapter {
             })
         };
 
-        let res = self
-            .effective_client()?
-            .execute_tool(tool_name, &args, &SemanticRequestContext::default())?;
+        let res = self.effective_client()?.execute_tool(
+            tool_name,
+            &args,
+            &SemanticRequestContext::default(),
+        )?;
 
         if res.is_error {
-            return Err(
-                res.details
-                    .as_ref()
-                    .and_then(|details| details.pointer("/error/message"))
-                    .and_then(|message| message.as_str())
-                    .unwrap_or(&res.content)
-                    .to_string(),
-            );
+            return Err(res
+                .details
+                .as_ref()
+                .and_then(|details| details.pointer("/error/message"))
+                .and_then(|message| message.as_str())
+                .unwrap_or(&res.content)
+                .to_string());
         }
 
         let details = res
@@ -90,10 +91,7 @@ impl SemanticLanguageProvider for LanguageIntelligenceAdapter {
         let mut evidence = Vec::new();
         if let Some(items) = details.get("items").and_then(|i| i.as_array()) {
             for item in items {
-                let item_path = item["path"]
-                    .as_str()
-                    .unwrap_or(path)
-                    .to_string();
+                let item_path = item["path"].as_str().unwrap_or(path).to_string();
                 let start_line = item["range"]["start"]["line"].as_u64().unwrap_or(0) as usize;
                 let start_col = item["range"]["start"]["column"].as_u64().unwrap_or(0) as usize;
                 let end_line = item["range"]["end"]["line"].as_u64().unwrap_or(0) as usize;
