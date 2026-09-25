@@ -22,11 +22,13 @@ const RETRY_EVERY: Duration = Duration::from_millis(20);
 #[derive(Debug)]
 pub struct LockFile {
     path: PathBuf,
+    token: String,
 }
 
 impl LockFile {
     pub fn acquire(path: &Path, wait: Duration, stale_after: Duration) -> io::Result<Self> {
         let started = Instant::now();
+        let token = uuid::Uuid::new_v4().to_string();
         loop {
             match fs::OpenOptions::new()
                 .write(true)
@@ -34,15 +36,38 @@ impl LockFile {
                 .open(path)
             {
                 Ok(mut file) => {
-                    let _ = writeln!(file, "{}", std::process::id());
+                    writeln!(file, "{} {token}", std::process::id())?;
+                    file.sync_all()?;
                     return Ok(Self {
                         path: path.to_path_buf(),
+                        token,
                     });
                 }
                 Err(err) if err.kind() == io::ErrorKind::AlreadyExists => {
                     if is_stale(path, stale_after) {
-                        let _ = fs::remove_file(path);
-                        continue;
+                        // Never unlink the stale path in-place. An atomic rename
+                        // makes exactly one contender the takeover winner; other
+                        // contenders either observe the replacement lock or retry.
+                        let stale = path.with_extension(format!(
+                            "stale.{}.{}",
+                            std::process::id(),
+                            uuid::Uuid::new_v4()
+                        ));
+                        match fs::rename(path, &stale) {
+                            Ok(()) => {
+                                let _ = fs::remove_file(stale);
+                                continue;
+                            }
+                            Err(rename_err)
+                                if rename_err.kind() == io::ErrorKind::NotFound =>
+                            {
+                                continue;
+                            }
+                            Err(_) => {
+                                // A failed stale takeover must obey the same
+                                // bounded wait as an ordinary held lock.
+                            }
+                        }
                     }
                     if started.elapsed() >= wait {
                         return Err(io::Error::new(
@@ -64,7 +89,14 @@ impl LockFile {
 
 impl Drop for LockFile {
     fn drop(&mut self) {
-        let _ = fs::remove_file(&self.path);
+        // A stale owner may wake up after another process has taken over.
+        // Remove only the path that still carries this guard's unique token.
+        let owned = fs::read_to_string(&self.path)
+            .ok()
+            .is_some_and(|text| text.split_whitespace().nth(1) == Some(self.token.as_str()));
+        if owned {
+            let _ = fs::remove_file(&self.path);
+        }
     }
 }
 
@@ -246,6 +278,23 @@ mod tests {
         drop(LockFile::acquire(&path, Duration::ZERO, DEFAULT_STALE_AFTER).unwrap());
         assert!(!path.exists());
         LockFile::acquire(&path, Duration::ZERO, DEFAULT_STALE_AFTER).unwrap();
+    }
+
+    #[test]
+    fn stale_takeover_does_not_remove_the_new_owners_lock() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("x.lock");
+        let old = LockFile::acquire(&path, Duration::ZERO, Duration::from_secs(10)).unwrap();
+
+        // Simulate a stale-path takeover while the old guard is still alive.
+        let displaced = dir.path().join("displaced.lock");
+        std::fs::rename(&path, &displaced).unwrap();
+        let new = LockFile::acquire(&path, Duration::ZERO, Duration::from_secs(10)).unwrap();
+
+        drop(old);
+        assert!(path.exists(), "old owner must not delete the replacement lock");
+        drop(new);
+        assert!(!path.exists());
     }
 
     #[test]
