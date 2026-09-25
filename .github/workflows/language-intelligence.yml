@@ -79,22 +79,29 @@ jobs:
         env:
           RA_TAG: "2026-09-21"
           RA_LINUX_SHA256: "b2d24ce2bda2ea05b1ad7c2917d205f8111775f703ccd908e6061803ae8257d0"
-          RA_MAC_SHA256: "1e2f706ee97d9f931ea36ed4e83f839efd0ac09870e18ec8350877d7b98ad8a0"
+          RA_MAC_X64_SHA256: "1e2f706ee97d9f931ea36ed4e83f839efd0ac09870e18ec8350877d7b98ad8a0"
+          RA_MAC_ARM64_SHA256: "eb474adfd12b6e66a6d0a7c25ed51210a64a0237f326f898e32e25164c9b11ad"
           RA_WINDOWS_SHA256: "f62a18aad35568fd9205006a62f97613eac8c4f2ec5fe43c830dde09684e5e6f"
         run: |
           set -euo pipefail
           prefix="$RUNNER_TEMP/davinci-lsp-live"
           mkdir -p "$prefix"
-          python - "$prefix" "$RUNNER_OS" "$RA_TAG" "$RA_LINUX_SHA256" "$RA_MAC_SHA256" "$RA_WINDOWS_SHA256" <<'PY'
+          python - "$prefix" "$RUNNER_OS" "$RUNNER_ARCH" "$RA_TAG" "$RA_LINUX_SHA256" "$RA_MAC_X64_SHA256" "$RA_MAC_ARM64_SHA256" "$RA_WINDOWS_SHA256" <<'PY'
           import gzip, hashlib, pathlib, stat, sys, urllib.request, zipfile
           root = pathlib.Path(sys.argv[1])
-          runner, tag = sys.argv[2], sys.argv[3]
-          expected = {"Linux": sys.argv[4], "macOS": sys.argv[5], "Windows": sys.argv[6]}[runner]
+          runner, arch, tag = sys.argv[2], sys.argv[3], sys.argv[4]
+          expected = {
+              ("Linux", "X64"): sys.argv[5],
+              ("macOS", "X64"): sys.argv[6],
+              ("macOS", "ARM64"): sys.argv[7],
+              ("Windows", "X64"): sys.argv[8],
+          }[(runner, arch)]
           asset = {
-              "Linux": "rust-analyzer-x86_64-unknown-linux-gnu.gz",
-              "macOS": "rust-analyzer-x86_64-apple-darwin.gz",
-              "Windows": "rust-analyzer-x86_64-pc-windows-msvc.zip",
-          }[runner]
+              ("Linux", "X64"): "rust-analyzer-x86_64-unknown-linux-gnu.gz",
+              ("macOS", "X64"): "rust-analyzer-x86_64-apple-darwin.gz",
+              ("macOS", "ARM64"): "rust-analyzer-aarch64-apple-darwin.gz",
+              ("Windows", "X64"): "rust-analyzer-x86_64-pc-windows-msvc.zip",
+          }[(runner, arch)]
           archive = root / asset
           url = f"https://github.com/rust-lang/rust-analyzer/releases/download/{tag}/{asset}"
           urllib.request.urlretrieve(url, archive)
@@ -123,7 +130,7 @@ jobs:
           fi
           npm install --prefix "$prefix/pyright" --no-save --no-package-lock pyright@1.1.414
           npm install --prefix "$prefix/typescript" --no-save --no-package-lock typescript@5.9.3 typescript-language-server@5.3.0
-          echo "DAVINCI_TEST_PYRIGHT=$prefix/pyright/node_modules/pyright/index.js" >> "$GITHUB_ENV"
+          echo "DAVINCI_TEST_PYRIGHT=$prefix/pyright/node_modules/pyright/langserver.index.js" >> "$GITHUB_ENV"
           echo "DAVINCI_TEST_TYPESCRIPT=$prefix/typescript/node_modules/typescript" >> "$GITHUB_ENV"
           echo "DAVINCI_TEST_LANGUAGE_SERVER=$prefix/typescript/node_modules/typescript-language-server" >> "$GITHUB_ENV"
           echo "DAVINCI_TEST_RUST_ANALYZER=$(cat "$prefix/rust-analyzer-path.txt")" >> "$GITHUB_ENV"
