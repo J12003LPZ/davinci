@@ -61,7 +61,7 @@ struct Manager {
     negative: Arc<Mutex<BTreeMap<SessionKey, NegativeDiscovery>>>,
     closed: Arc<AtomicBool>,
     permissions: Mutex<Option<Arc<PermissionState>>>,
-    governor: Mutex<Option<crate::native_extensions::TokenGovernor>>,
+    governor: Mutex<Option<crate::native_extensions::SharedTokenGovernor>>,
 }
 
 #[derive(Debug, Clone)]
@@ -125,7 +125,7 @@ impl LanguageIntelligence {
         }
     }
 
-    pub fn set_governor(&self, governor: crate::native_extensions::TokenGovernor) {
+    pub fn set_governor(&self, governor: crate::native_extensions::SharedTokenGovernor) {
         *self.inner.governor.lock().unwrap_or_else(|e| e.into_inner()) = Some(governor);
     }
 
@@ -455,11 +455,16 @@ impl LanguageIntelligence {
                 uri.as_deref(),
                 parsed.limit.unwrap_or(cap).min(cap),
                 |full| {
-                    self.inner
+                    let governor = self
+                        .inner
                         .governor
                         .lock()
                         .ok()?
-                        .as_mut()?
+                        .as_ref()?
+                        .clone();
+                    governor
+                        .lock()
+                        .ok()?
                         .retain_native_output(name, args, full)
                         .ok()
                 },
@@ -756,13 +761,17 @@ impl davinci_agent::runtime::task_transport::CoordinatorToolHandler for Language
 
     fn execute(&self, tool: &str, args: &Value) -> std::result::Result<ToolResult, ToolError> {
         if tool == "retrieve_output" {
-            return self
+            let governor = self
                 .inner
                 .governor
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
-                .as_mut()
-                .ok_or_else(|| ToolError::Failed("Parent output store unavailable".into()))?
+                .as_ref()
+                .cloned()
+                .ok_or_else(|| ToolError::Failed("Parent output store unavailable".into()))?;
+            return governor
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
                 .retrieve(args);
         }
         LanguageIntelligence::execute(self, tool, args)
