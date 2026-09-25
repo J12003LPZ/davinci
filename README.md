@@ -665,6 +665,13 @@ Project-local resources are supported under DaVinci/Pi-compatible project direct
 
 ### Useful environment variables
 
+`autoVerify` defaults to `true` in `settings.json`. After an edit invalidates a
+previous verification, the harness repeats the last verification call through
+the normal permission checks. It preserves the arguments and working directory.
+Set `autoVerify` to `false`, or `DAVINCI_AUTO_VERIFY` to `0`, `false`, or `off`,
+to keep the model reminder instead. The environment switch takes precedence
+and also applies when settings are reloaded.
+
 ~~~text
 DAVINCI_CODING_AGENT_DIR
 DAVINCI_CODING_AGENT_SESSION_DIR

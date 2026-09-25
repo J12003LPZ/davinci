@@ -879,6 +879,8 @@ fn build_agent(parsed: &Args, session_dir: &Path, cwd: &Path) -> Result<Agent, S
     }
     startup_mark("session opened");
     agent.auto_compaction = settings.compaction_enabled();
+    agent.auto_verify =
+        settings.auto_verify_enabled(std::env::var("DAVINCI_AUTO_VERIFY").ok().as_deref());
     agent.compaction = settings.compaction_settings();
     agent.auto_retry = settings.retry_enabled();
     agent.retry_attempts = settings.retry_max_retries();
@@ -6897,6 +6899,8 @@ fn persist_interactive_setting(spec: &str) -> Result<(), String> {
 fn sync_agent_from_settings(agent: &mut Agent) {
     let stored = load_merged_settings(&default_agent_dir(), &agent.cwd);
     agent.auto_compaction = stored.compaction_enabled();
+    agent.auto_verify =
+        stored.auto_verify_enabled(std::env::var("DAVINCI_AUTO_VERIFY").ok().as_deref());
     agent.compaction = stored.compaction_settings();
     agent.block_images = stored.block_images();
     agent.auto_resize_images = stored.image_auto_resize();

@@ -315,6 +315,8 @@ pub struct Settings {
     pub transport: Option<String>,
     #[serde(default, rename = "openaiVerbosity")]
     pub openai_verbosity: Option<String>,
+    #[serde(default, rename = "autoVerify")]
+    pub auto_verify: Option<bool>,
     #[serde(default, rename = "reasoningSummary")]
     pub reasoning_summary: Option<String>,
     #[serde(default, rename = "graphEconomyModel")]
@@ -1157,6 +1159,10 @@ pub fn apply_http_proxy_settings(http_proxy: Option<&str>) {
 }
 
 impl Settings {
+    pub fn auto_verify_enabled(&self, environment: Option<&str>) -> bool {
+        self.auto_verify.unwrap_or(true) && !matches!(environment, Some("0" | "false" | "off"))
+    }
+
     pub fn decision_intelligence_enabled(&self) -> bool {
         self.decision_intelligence
             .as_ref()
@@ -1560,6 +1566,19 @@ pub fn is_trusted(settings: &Settings, cwd: &Path, override_trust: Option<bool>)
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn auto_verify_setting_parses_and_environment_can_disable_it() {
+        let settings: super::Settings = serde_json::from_str(r#"{"autoVerify":false}"#).unwrap();
+        assert_eq!(settings.auto_verify, Some(false));
+        assert!(!settings.auto_verify_enabled(None));
+        let defaults = super::Settings::default();
+        assert!(defaults.auto_verify_enabled(None));
+        for value in ["0", "false", "off"] {
+            assert!(!defaults.auto_verify_enabled(Some(value)));
+        }
+        assert!(defaults.auto_verify_enabled(Some("1")));
+        assert!(!settings.auto_verify_enabled(Some("1")));
+    }
     use super::*;
 
     #[test]
