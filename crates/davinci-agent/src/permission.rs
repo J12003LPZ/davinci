@@ -1051,7 +1051,10 @@ impl PermissionPolicy {
             )
         };
         let effective_root = self.filesystem_boundary.root.as_deref().unwrap_or(cwd);
-        let class = if tool == "agent" && self.agent_call_is_read_only(args) {
+        let class = if self.mode == PermissionMode::ReadOnly
+            && tool == "agent"
+            && self.agent_call_is_read_only(args)
+        {
             ToolClass::Read
         } else {
             self.class_of(tool)
