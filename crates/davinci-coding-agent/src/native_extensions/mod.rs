@@ -1157,6 +1157,89 @@ mod tests {
     }
 
     #[test]
+    fn lsp_output_reaches_shared_governor_and_reset_revokes_it() {
+        let root = tempfile::tempdir().unwrap();
+        let agent = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("package.json"), "{}").unwrap();
+        std::fs::write(root.path().join("a.ts"), "export const value = 1;\n").unwrap();
+
+        let node_name = if cfg!(windows) { "node.exe" } else { "node" };
+        let node = std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default())
+            .filter(|path| path.is_absolute())
+            .map(|path| path.join(node_name))
+            .find(|path| path.is_file())
+            .and_then(|path| path.canonicalize().ok())
+            .expect("Node is required by the deterministic language fixture");
+        let fixture = std::path::PathBuf::from(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/language-server.cjs"
+        ))
+        .canonicalize()
+        .unwrap();
+        std::fs::write(
+            agent.path().join("settings.json"),
+            serde_json::to_vec_pretty(&json!({
+                "languageIntelligence": {
+                    "typescript": {
+                        "maxReferences": 1,
+                        "server": {
+                            "program": node,
+                            "args": [fixture]
+                        }
+                    }
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        std::fs::write(
+            agent.path().join("token-governor.json"),
+            serde_json::to_vec_pretty(&json!({
+                "storeDir": agent.path().join("governor")
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let mut host =
+            NativeExtensionHost::new_with_agent_dir("lsp-governor", root.path(), Some(agent.path()));
+        let mut policy =
+            davinci_agent::PermissionPolicy::new(davinci_agent::PermissionMode::AlwaysApprove);
+        policy.project_trusted = true;
+        host.language_intelligence
+            .set_permissions(Some(Arc::new(davinci_agent::PermissionState::new(policy))));
+
+        let args = json!({
+            "path": "a.ts",
+            "line": 1,
+            "column": 1,
+            "includeDeclaration": true
+        });
+        let result = host
+            .execute_tool(root.path(), "lsp_references", &args)
+            .unwrap();
+        assert!(!result.is_error, "{}", result.content);
+        let details = result.details.unwrap();
+        assert_eq!(details["remaining"], 2);
+        let id = details["fullResult"]["id"]
+            .as_str()
+            .expect("overflow retained in the host governor")
+            .to_string();
+
+        let retrieved = host
+            .execute_tool(root.path(), "retrieve_output", &json!({"id":id}))
+            .unwrap();
+        assert!(!retrieved.is_error);
+        assert!(retrieved.content.contains("\"total\": 3"));
+
+        host.command("governor-reset", "").unwrap();
+        assert!(host
+            .execute_tool(root.path(), "retrieve_output", &json!({"id":id}))
+            .is_err());
+        host.session_shutdown();
+    }
+
+    #[test]
     fn cache_status_is_lazy_and_separates_provider_usage() {
         let root = tempfile::tempdir().unwrap();
         let state = tempfile::tempdir().unwrap();
