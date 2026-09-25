@@ -1,17 +1,34 @@
-//! Stable language, project, invocation and session identities.
-
+//! Stable language, project, process and session identities.
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
-use std::sync::atomic::AtomicBool;
-use std::sync::Arc;
-use std::time::Instant;
+use sha2::{Digest, Sha256};
+use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
 pub enum LanguageFamily {
+    #[serde(rename = "typescript")]
     TypeScript,
+    #[serde(rename = "rust")]
     Rust,
+    #[serde(rename = "python")]
     Python,
+}
+
+impl LanguageFamily {
+    pub fn from_path(path: &Path) -> Option<Self> {
+        match path.extension()?.to_str()?.to_ascii_lowercase().as_str() {
+            "ts" | "tsx" | "mts" | "cts" | "js" | "jsx" | "mjs" | "cjs" => Some(Self::TypeScript),
+            "rs" => Some(Self::Rust),
+            "py" | "pyi" => Some(Self::Python),
+            _ => None,
+        }
+    }
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::TypeScript => "typescript",
+            Self::Rust => "rust",
+            Self::Python => "python",
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -32,7 +49,7 @@ pub struct SessionKey {
     pub profile_fingerprint: String,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ServerInvocation {
     pub program: PathBuf,
     pub args: Vec<String>,
@@ -40,41 +57,28 @@ pub struct ServerInvocation {
     pub executable_fingerprint: String,
 }
 
-#[derive(Debug, Clone)]
-pub struct RequestBudget {
-    pub deadline: Instant,
-    pub cancelled: Option<Arc<AtomicBool>>,
-}
-
-impl RequestBudget {
-    pub fn remaining(&self) -> Option<std::time::Duration> {
-        if self
-            .cancelled
-            .as_ref()
-            .is_some_and(|cancelled| cancelled.load(std::sync::atomic::Ordering::Acquire))
-        {
-            return None;
+impl ServerInvocation {
+    pub fn new(program: PathBuf, args: Vec<String>) -> std::io::Result<Self> {
+        let canonical_program = program.canonicalize()?;
+        let metadata = std::fs::metadata(&canonical_program)?;
+        let mut hasher = Sha256::new();
+        hasher.update(canonical_program.to_string_lossy().as_bytes());
+        hasher.update(metadata.len().to_le_bytes());
+        if let Ok(modified) = metadata.modified().and_then(|v| {
+            v.duration_since(std::time::UNIX_EPOCH)
+                .map_err(std::io::Error::other)
+        }) {
+            hasher.update(modified.as_nanos().to_le_bytes());
         }
-        self.deadline.checked_duration_since(Instant::now())
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn same_root_different_languages_have_distinct_session_keys() {
-        let rust = SessionKey {
-            workspace: "/work".into(),
-            project_root: "/work".into(),
-            family: LanguageFamily::Rust,
-            profile_fingerprint: "same".into(),
-        };
-        let python = SessionKey {
-            family: LanguageFamily::Python,
-            ..rust.clone()
-        };
-        assert_ne!(rust, python);
+        for arg in &args {
+            hasher.update([0]);
+            hasher.update(arg.as_bytes());
+        }
+        Ok(Self {
+            program,
+            args,
+            canonical_program,
+            executable_fingerprint: format!("{:x}", hasher.finalize()),
+        })
     }
 }

@@ -800,9 +800,6 @@ fn build_agent(parsed: &Args, session_dir: &Path, cwd: &Path) -> Result<Agent, S
             .tool_registry
             .retain(|name| !davinci_agent::runtime::transactions::is_tool(name));
     }
-    // Semantic service is attached from the native extension host below so
-    // core and native semantic tools share one process owner.
-    agent.tool_context.semantic = None;
     agent.tool_context.foreground_supervisor = std::env::current_exe().ok().map(|executable| {
         davinci_agent::jobs::supervisor::SupervisorCommand {
             executable,
@@ -916,6 +913,23 @@ fn build_agent(parsed: &Args, session_dir: &Path, cwd: &Path) -> Result<Agent, S
     }
     let mut host = ExtensionHost::load_with_cwd(&default_agent_dir(), &extensions, cwd);
     startup_mark("extensions loaded");
+    let language_owner = {
+        let native = host
+            .native
+            .lock()
+            .map_err(|_| "native host lock poisoned".to_string())?;
+        native.language_intelligence.clone()
+    };
+    language_owner.set_permissions(Some(agent.permissions.clone()));
+    if graph_worker.is_none() {
+        agent.tool_context.semantic = Some(Arc::new(
+            davinci_coding_agent::semantic::SemanticServiceFacade::local(language_owner.clone()),
+        ));
+    } else {
+        // Workers never own a local semantic process. Their facade is attached
+        // only after the authenticated parent coordinator is resolved below.
+        agent.tool_context.semantic = None;
+    }
     let native_names = host.native_tool_names();
     let mut names = native_names.clone();
     // The extension *paths* are not tool names — TS registers only what an
@@ -980,7 +994,14 @@ fn build_agent(parsed: &Args, session_dir: &Path, cwd: &Path) -> Result<Agent, S
         agent.sync_tool_authorization();
     }
     if let Some(coord) = davinci_agent::runtime::task_transport::TaskCoordinatorClient::from_env() {
+        if graph_worker.is_some() {
+            agent.tool_context.semantic = Some(Arc::new(
+                davinci_coding_agent::semantic::SemanticServiceFacade::parent(coord.clone()),
+            ));
+        }
         agent.tool_context.task_coordinator = Some(coord);
+    } else if graph_worker.is_some() {
+        agent.tool_context.semantic = None;
     }
     if let Ok(raw_contract) = std::env::var("DAVINCI_TASK_CONTRACT_JSON") {
         let contract: davinci_agent::runtime::TaskContract = serde_json::from_str(&raw_contract)
@@ -8287,27 +8308,67 @@ fn bind_test_impact_context(agent: &Agent, host: &ExtensionHost) {
         .set_cancellation(agent.abort_signal.clone());
 }
 
-fn attach_tool_executor(agent: &mut Agent, host: &ExtensionHost) {
-    bind_test_impact_context(agent, host);
-    let language = host.native.lock().ok().map(|native| {
-        native
-            .language_intelligence
-            .with_permissions(Some(agent.permissions.clone()))
-    });
-    if let Some(language) = language.as_ref() {
+/// Give one agent its own language-intelligence handle. The server/session
+/// owner stays shared with the host, but request authority is this agent's
+/// permission state, so attaching another agent cannot widen or narrow it.
+fn bind_agent_language_intelligence(
+    agent: &mut Agent,
+    host: &ExtensionHost,
+) -> Option<native_extensions::language_intelligence::LanguageIntelligence> {
+    let language = host
+        .native
+        .lock()
+        .ok()?
+        .language_intelligence
+        .with_permissions(Some(agent.permissions.clone()));
+    // Graph workers keep the parent-bound facade installed by `build_agent`.
+    if agent.tool_context.task_coordinator.is_none() && std::env::var_os("PI_GRAPH_ROLE").is_none()
+    {
         agent.tool_context.semantic = Some(Arc::new(
-            davinci_coding_agent::semantic::SemanticServiceFacade::new(language.clone()),
+            davinci_coding_agent::semantic::SemanticServiceFacade::local(language.clone()),
         ));
     }
+    Some(language)
+}
+
+fn execute_agent_language_tool(
+    language: Option<&native_extensions::language_intelligence::LanguageIntelligence>,
+    name: &str,
+    args: &serde_json::Value,
+    context: &davinci_agent::ToolContext,
+) -> Option<Result<davinci_agent::ToolResult, davinci_agent::ToolError>> {
+    let language = language?;
+    if !native_extensions::language_intelligence::TOOL_NAMES.contains(&name)
+        || context.task_coordinator.is_some()
+        || std::env::var_os("PI_GRAPH_ROLE").is_some()
+    {
+        return None;
+    }
+    if context.is_aborted() {
+        return Some(Err(davinci_agent::ToolError::Failed(
+            "tool request cancelled".into(),
+        )));
+    }
+    Some(language.execute_with_budget(
+        name,
+        args,
+        native_extensions::language_intelligence::RequestBudget {
+            deadline: std::time::Instant::now() + std::time::Duration::from_secs(120),
+            cancelled: context.abort.clone(),
+        },
+    ))
+}
+
+fn attach_tool_executor(agent: &mut Agent, host: &ExtensionHost) {
+    bind_test_impact_context(agent, host);
+    let language = bind_agent_language_intelligence(agent, host);
     let host = host.clone();
     agent.custom_tool_executor = Some(CustomToolExecutor::new_with_context(
         move |cwd, name, args, context| {
-            if std::env::var_os("PI_GRAPH_ROLE").is_none()
-                && native_extensions::language_intelligence::TOOL_NAMES.contains(&name)
+            if let Some(result) =
+                execute_agent_language_tool(language.as_ref(), name, args, context)
             {
-                if let Some(language) = language.as_ref() {
-                    return language.execute(name, args);
-                }
+                return result;
             }
             host.execute_js_or_manifest_tool_with_context(cwd, name, args, context)
         },
@@ -8316,31 +8377,16 @@ fn attach_tool_executor(agent: &mut Agent, host: &ExtensionHost) {
 
 fn attach_shared_tool_executor(agent: &mut Agent, host: Arc<Mutex<ExtensionHost>>) {
     let language = {
-        let host_guard = host.lock().unwrap_or_else(|error| error.into_inner());
-        bind_test_impact_context(agent, &host_guard);
-        match host_guard.native.lock() {
-            Ok(native) => {
-                let language = native
-                    .language_intelligence
-                    .with_permissions(Some(agent.permissions.clone()));
-                agent.tool_context.semantic = Some(Arc::new(
-                    davinci_coding_agent::semantic::SemanticServiceFacade::new(
-                        language.clone(),
-                    ),
-                ));
-                Some(language)
-            }
-            Err(_) => None,
-        }
+        let host = host.lock().unwrap_or_else(|error| error.into_inner());
+        bind_test_impact_context(agent, &host);
+        bind_agent_language_intelligence(agent, &host)
     };
     agent.custom_tool_executor = Some(CustomToolExecutor::new_with_context(
         move |cwd, name, args, context| {
-            if std::env::var_os("PI_GRAPH_ROLE").is_none()
-                && native_extensions::language_intelligence::TOOL_NAMES.contains(&name)
+            if let Some(result) =
+                execute_agent_language_tool(language.as_ref(), name, args, context)
             {
-                if let Some(language) = language.as_ref() {
-                    return language.execute(name, args);
-                }
+                return result;
             }
             let host = host
                 .lock()
@@ -8455,6 +8501,8 @@ fn apply_graph_session_context(parsed: &Args, agent: &Agent, host: &ExtensionHos
         native
             .test_impact
             .set_permissions(agent.permissions.clone());
+        // Host-owned adapters (code_query anchors, change impact) act for the
+        // session owner. Per-agent lsp_* calls use their own handles instead.
         native
             .language_intelligence
             .set_permissions(Some(agent.permissions.clone()));

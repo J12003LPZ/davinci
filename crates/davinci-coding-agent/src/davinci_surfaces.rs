@@ -22,8 +22,7 @@ use davinci_tui::davinci::model::{
 use davinci_tui::davinci::theme::State;
 use davinci_tui::davinci::views::disegno::roman;
 
-use crate::native_extensions::graph as store;
-use crate::native_extensions::graph::{GraphRun, Role, TaskStatus};
+use crate::native_extensions::graph::{list_runs, load_run, GraphRun, Role, TaskStatus};
 use crate::native_extensions::vector_memory::{VectorMemory, VectorMemoryConfig};
 
 /// The plan sheet (`1c`) from the newest graph run in this project, or an
@@ -37,8 +36,8 @@ pub fn plan(cwd: &Path) -> Vec<PlanStep> {
 
 /// The newest persisted run, live or finished.
 pub fn latest_run(cwd: &Path) -> Option<GraphRun> {
-    let newest = store::list_runs(cwd).into_iter().next()?;
-    store::load_run(cwd, &newest.run_id)
+    let newest = list_runs(cwd).into_iter().next()?;
+    load_run(cwd, &newest.run_id)
 }
 
 /// Pure form of [`plan`].

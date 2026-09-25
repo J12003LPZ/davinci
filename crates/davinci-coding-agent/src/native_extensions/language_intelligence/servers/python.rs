@@ -1,184 +1,195 @@
-//! BasedPyright/Pyright adapter and interpreter selection.
-
-use super::{path_executable, ServerCommand, ServerKind};
-use crate::native_extensions::language_intelligence::config::{PythonBackend, PythonConfig};
-use crate::native_extensions::language_intelligence::protocol::{IntelligenceError, Result};
+//! BasedPyright/Pyright adapter with explicit target-interpreter identity.
+use super::super::config::{LanguageIntelligenceConfig, PythonBackend, PythonDiagnosticMode};
+use super::super::identity::{LanguageFamily, ResolvedProject};
+use super::super::metadata::ResolutionContext;
+use super::super::protocol::{IntelligenceError, Result};
+use super::{discovery, ServerAdapter, ServerBackend, ServerCommand};
 use serde_json::json;
+use std::collections::BTreeMap;
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 
-pub(super) fn discover(
-    project: &Path,
-    config: &PythonConfig,
-    search_path: &OsStr,
-) -> Result<Vec<ServerCommand>> {
-    let interpreter = select_interpreter(project, config, search_path)?;
-    let mut candidates = Vec::new();
+#[derive(Debug, Default)]
+pub(in crate::native_extensions::language_intelligence) struct PythonAdapter;
 
-    if let Some(server) = &config.server {
-        if server.program.is_file() {
-            let kind = match config.backend {
-                PythonBackend::Pyright => ServerKind::Pyright,
-                _ => ServerKind::Basedpyright,
-            };
-            candidates.push(command(
-                project,
-                server.program.clone(),
-                server.args.clone(),
-                kind,
-                &interpreter,
-                config,
-            ));
-        }
-    } else {
-        let based = project_executable(project, "basedpyright-langserver")
-            .or_else(|| path_executable(search_path, "basedpyright-langserver"));
-        let pyright = project_executable(project, "pyright-langserver")
-            .or_else(|| path_executable(search_path, "pyright-langserver"));
-
-        match config.backend {
-            PythonBackend::Auto | PythonBackend::Basedpyright => {
-                if let Some(program) = based {
-                    candidates.push(command(
-                        project,
-                        program,
-                        vec!["--stdio".into()],
-                        ServerKind::Basedpyright,
-                        &interpreter,
-                        config,
-                    ));
-                } else if matches!(config.backend, PythonBackend::Auto) {
-                    if let Some(program) = pyright {
-                        candidates.push(command(
-                            project,
-                            program,
-                            vec!["--stdio".into()],
-                            ServerKind::Pyright,
-                            &interpreter,
-                            config,
-                        ));
-                    }
-                }
-            }
-            PythonBackend::Pyright => {
-                if let Some(program) = pyright {
-                    candidates.push(command(
-                        project,
-                        program,
-                        vec!["--stdio".into()],
-                        ServerKind::Pyright,
-                        &interpreter,
-                        config,
-                    ));
-                }
-            }
-        }
+impl ServerAdapter for PythonAdapter {
+    fn family(&self) -> LanguageFamily {
+        LanguageFamily::Python
     }
-
-    if candidates.is_empty() {
-        Err(IntelligenceError::new(
-            "server_not_installed",
-            "Install BasedPyright or Pyright, or configure an absolute python.server.program; DaVinci never installs language servers",
-        ))
-    } else {
-        Ok(candidates)
+    fn language_id(&self, path: &Path) -> Option<&'static str> {
+        matches!(path.extension()?.to_str()?, "py" | "pyi").then_some("python")
+    }
+    fn explicit_roots<'a>(&self, settings: &'a LanguageIntelligenceConfig) -> &'a [PathBuf] {
+        &settings.python.project_roots
     }
 }
 
-pub(super) fn select_interpreter(
-    project: &Path,
-    config: &PythonConfig,
+fn interpreter(
+    project: &ResolvedProject,
+    settings: &LanguageIntelligenceConfig,
     search_path: &OsStr,
-) -> Result<PathBuf> {
-    if let Some(path) = &config.interpreter {
-        if !path.is_absolute() || !path.is_file() {
+) -> Result<Option<PathBuf>> {
+    let profile = &settings.python;
+    if let Some(path) = &profile.interpreter {
+        let path = if path.is_absolute() {
+            path.clone()
+        } else {
+            project.root.join(path)
+        };
+        if !path.is_file() {
             return Err(IntelligenceError::new(
                 "interpreter_not_found",
-                "Configured Python interpreter is unavailable",
+                "The configured Python interpreter does not exist",
             ));
         }
-        return Ok(path.clone());
+        return Ok(Some(path.canonicalize().unwrap_or(path)));
     }
-
-    for environment in [".venv", "venv"] {
-        let root = project.join(environment);
-        let candidate = if cfg!(windows) {
-            root.join("Scripts/python.exe")
-        } else {
-            root.join("bin/python")
-        };
-        if candidate.is_file() {
-            return Ok(candidate);
+    let names: &[&str] = if cfg!(windows) {
+        &[".venv/Scripts/python.exe", "venv/Scripts/python.exe"]
+    } else {
+        &[".venv/bin/python", "venv/bin/python"]
+    };
+    for name in names {
+        let path = project.root.join(name);
+        if path.is_file() {
+            return Ok(Some(path.canonicalize().unwrap_or(path)));
         }
     }
+    if let Some(venv) = std::env::var_os("VIRTUAL_ENV") {
+        let path = if cfg!(windows) {
+            PathBuf::from(venv).join("Scripts/python.exe")
+        } else {
+            PathBuf::from(venv).join("bin/python")
+        };
+        if path.is_file() {
+            return Ok(Some(path.canonicalize().unwrap_or(path)));
+        }
+    }
+    Ok(discovery::path_program(
+        search_path,
+        if cfg!(windows) {
+            "python.exe"
+        } else {
+            "python3"
+        },
+    )
+    .or_else(|| discovery::path_program(search_path, "python")))
+}
 
-    path_executable(search_path, if cfg!(windows) { "python" } else { "python3" })
-        .or_else(|| path_executable(search_path, "python"))
+fn project_server(
+    project: &ResolvedProject,
+    name: &str,
+    search_path: &OsStr,
+) -> Option<super::super::identity::ServerInvocation> {
+    let path = if cfg!(windows) {
+        project
+            .root
+            .join(".venv/Scripts")
+            .join(format!("{name}.exe"))
+    } else {
+        project.root.join(".venv/bin").join(name)
+    };
+    path.is_file()
+        .then(|| discovery::invocation_for_path(&path, vec!["--stdio".into()], search_path))
+        .and_then(Result::ok)
+}
+
+pub(super) fn discover(
+    _context: &ResolutionContext,
+    project: &ResolvedProject,
+    settings: &LanguageIntelligenceConfig,
+    search_path: &OsStr,
+) -> Result<Vec<ServerCommand>> {
+    let profile = &settings.python;
+    if !profile.enabled {
+        return Err(IntelligenceError::new(
+            "disabled",
+            "Python language intelligence is disabled",
+        ));
+    }
+    let target = interpreter(project, settings, search_path)?;
+    let explicit = profile
+        .server
+        .as_ref()
+        .map(|server| discovery::explicit(server, search_path))
+        .transpose()?;
+    let choose = |backend: PythonBackend| -> Option<(ServerBackend, super::super::identity::ServerInvocation)> {
+        match backend {
+            PythonBackend::Basedpyright => project_server(project, "basedpyright-langserver", search_path)
+                .or_else(|| discovery::named(search_path, "basedpyright-langserver", vec!["--stdio".into()]))
+                .map(|v| (ServerBackend::BasedPyright, v)),
+            PythonBackend::Pyright => project_server(project, "pyright-langserver", search_path)
+                .or_else(|| discovery::named(search_path, "pyright-langserver", vec!["--stdio".into()]))
+                .map(|v| (ServerBackend::Pyright, v)),
+            PythonBackend::Auto => None,
+        }
+    };
+    let (backend, invocation) = if let Some(invocation) = explicit {
+        let backend = match profile.backend {
+            PythonBackend::Pyright => ServerBackend::Pyright,
+            _ => ServerBackend::BasedPyright,
+        };
+        (backend, invocation)
+    } else {
+        match profile.backend {
+            PythonBackend::Auto => {
+                choose(PythonBackend::Basedpyright).or_else(|| choose(PythonBackend::Pyright))
+            }
+            other => choose(other),
+        }
         .ok_or_else(|| {
             IntelligenceError::new(
-                "interpreter_not_found",
-                "No configured, project, or system Python interpreter is available",
+                "server_not_installed",
+                "Install BasedPyright/Pyright or configure languageIntelligence.python.server",
             )
-        })
-}
+        })?
+    };
 
-fn project_executable(project: &Path, name: &str) -> Option<PathBuf> {
-    for environment in [".venv", "venv"] {
-        let root = project.join(environment);
-        let candidate = if cfg!(windows) {
-            root.join("Scripts").join(format!("{name}.exe"))
-        } else {
-            root.join("bin").join(name)
-        };
-        if candidate.is_file() {
-            return candidate.canonicalize().ok();
+    let diagnostic_mode = match profile.diagnostic_mode {
+        PythonDiagnosticMode::OpenFilesOnly => "openFilesOnly",
+        PythonDiagnosticMode::Workspace => "workspace",
+    };
+    let mut configuration = json!({
+        "python": {
+            "pythonPath": target.as_ref().map(|p| p.to_string_lossy().into_owned())
         }
-    }
-    None
-}
-
-fn command(
-    project: &Path,
-    program: PathBuf,
-    mut args: Vec<String>,
-    kind: ServerKind,
-    interpreter: &Path,
-    config: &PythonConfig,
-) -> ServerCommand {
-    if args.is_empty() && config.server.is_none() {
-        args.push("--stdio".into());
-    }
-    let mut initialization_options = json!({
-        "python": {"pythonPath": interpreter},
-        "analysis": {"diagnosticMode": config.diagnostic_mode}
     });
-    if kind == ServerKind::Basedpyright {
-        initialization_options["analysis"]["baselineMode"] = json!("discard");
+    match backend {
+        ServerBackend::BasedPyright => {
+            configuration["basedpyright"] =
+                json!({"analysis":{"diagnosticMode":diagnostic_mode,"baselineMode":"discard"}});
+        }
+        ServerBackend::Pyright => {
+            configuration["pyright"] = json!({"analysis":{"diagnosticMode":diagnostic_mode}});
+        }
+        _ => {}
     }
-    ServerCommand {
-        kind,
-        program,
-        args,
-        workspace: project.into(),
+    let mut limitations = Vec::new();
+    if target.is_none() {
+        limitations.push("python_interpreter_unresolved".into());
+    }
+    if target
+        .as_ref()
+        .is_some_and(|p| p.starts_with(&project.workspace))
+    {
+        limitations.push("project_interpreter_executed_requires_trust".into());
+    }
+
+    Ok(vec![ServerCommand {
+        kind: backend,
+        backend,
+        program: invocation.program.clone(),
+        args: invocation.args.clone(),
+        invocation,
+        workspace: project.root.clone(),
         version: None,
         typescript_version: None,
-        initialization_options,
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn explicit_missing_interpreter_is_an_error() {
-        let mut config = PythonConfig::default();
-        config.interpreter = Some(PathBuf::from("/definitely/missing/python"));
-        assert_eq!(
-            select_interpreter(Path::new("."), &config, OsStr::new(""))
-                .unwrap_err()
-                .code,
-            "interpreter_not_found"
-        );
-    }
+        initialization_options: json!({}),
+        client_configuration: configuration,
+        family: LanguageFamily::Python,
+        profile_fingerprint: settings.profile_fingerprint(profile),
+        analysis_environment: target,
+        limitations,
+        env: BTreeMap::new(),
+    }])
 }

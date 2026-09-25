@@ -5,6 +5,7 @@
 //! provider-safe prompt-cache keys using capability schema/version hashes.
 
 use std::collections::{BTreeSet, HashMap};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 
 use serde::{Deserialize, Serialize};
@@ -470,7 +471,32 @@ pub fn builtin_capabilities() -> Vec<RuntimeCapability> {
 #[derive(Debug, Clone)]
 pub struct RuntimeCapabilityRegistry {
     capabilities: Arc<RwLock<HashMap<String, RuntimeCapability>>>,
+    owners: Arc<RwLock<HashMap<String, u64>>>,
+    next_owner: Arc<AtomicU64>,
 }
+
+#[derive(Debug, Clone)]
+pub struct CapabilityRegistration {
+    owner: u64,
+    names: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CapabilityRegistrationError {
+    NameCollision(String),
+    OwnershipChanged(String),
+}
+
+impl std::fmt::Display for CapabilityRegistrationError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NameCollision(name) => write!(f, "capability already registered: {name}"),
+            Self::OwnershipChanged(name) => write!(f, "capability ownership changed: {name}"),
+        }
+    }
+}
+
+impl std::error::Error for CapabilityRegistrationError {}
 
 impl Default for RuntimeCapabilityRegistry {
     fn default() -> Self {
@@ -483,6 +509,8 @@ impl RuntimeCapabilityRegistry {
     pub fn new() -> Self {
         Self {
             capabilities: Arc::new(RwLock::new(HashMap::new())),
+            owners: Arc::new(RwLock::new(HashMap::new())),
+            next_owner: Arc::new(AtomicU64::new(1)),
         }
     }
 
@@ -499,26 +527,108 @@ impl RuntimeCapabilityRegistry {
             .capabilities
             .write()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut owners = self
+            .owners
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        owners.remove(&capability.name);
         caps.insert(capability.name.clone(), capability);
     }
 
     /// Register multiple capabilities.
     pub fn register_all(&self, capabilities: impl IntoIterator<Item = RuntimeCapability>) {
+        let capabilities: Vec<_> = capabilities.into_iter().collect();
         let mut caps = self
             .capabilities
             .write()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut owners = self
+            .owners
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         for cap in capabilities {
+            owners.remove(&cap.name);
             caps.insert(cap.name.clone(), cap);
         }
     }
 
+    /// Atomically register a batch only when every selected name is free.
+    pub fn register_owned(
+        &self,
+        capabilities: impl IntoIterator<Item = RuntimeCapability>,
+    ) -> Result<CapabilityRegistration, CapabilityRegistrationError> {
+        let capabilities: Vec<_> = capabilities.into_iter().collect();
+        let mut seen = BTreeSet::new();
+        for capability in &capabilities {
+            if !seen.insert(capability.name.clone()) {
+                return Err(CapabilityRegistrationError::NameCollision(
+                    capability.name.clone(),
+                ));
+            }
+        }
+        let mut caps = self
+            .capabilities
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(name) = capabilities
+            .iter()
+            .map(|capability| capability.name.as_str())
+            .find(|name| caps.contains_key(*name))
+        {
+            return Err(CapabilityRegistrationError::NameCollision(name.into()));
+        }
+        let mut owners = self
+            .owners
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let owner = self.next_owner.fetch_add(1, Ordering::Relaxed);
+        let names = capabilities
+            .iter()
+            .map(|capability| capability.name.clone())
+            .collect::<Vec<_>>();
+        for capability in capabilities {
+            owners.insert(capability.name.clone(), owner);
+            caps.insert(capability.name.clone(), capability);
+        }
+        Ok(CapabilityRegistration { owner, names })
+    }
+
+    /// Remove an owned registration only when the whole batch still belongs to it.
+    pub fn unregister_owned(
+        &self,
+        registration: &CapabilityRegistration,
+    ) -> Result<(), CapabilityRegistrationError> {
+        let mut caps = self
+            .capabilities
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut owners = self
+            .owners
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(name) = registration.names.iter().find(|name| {
+            owners.get(*name).copied() != Some(registration.owner) || !caps.contains_key(*name)
+        }) {
+            return Err(CapabilityRegistrationError::OwnershipChanged(name.clone()));
+        }
+        for name in &registration.names {
+            caps.remove(name);
+            owners.remove(name);
+        }
+        Ok(())
+    }
+
     /// Unregister a capability by name.
     pub fn unregister(&self, name: &str) -> Option<RuntimeCapability> {
-        self.capabilities
+        let mut caps = self
+            .capabilities
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        self.owners
             .write()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .remove(name)
+            .remove(name);
+        caps.remove(name)
     }
 
     /// Retrieve a capability by name.
@@ -636,6 +746,29 @@ mod tests {
         );
     }
     use serde_json::json;
+
+    #[test]
+    fn owned_registration_is_atomic_and_refuses_foreign_replacement() {
+        let registry = RuntimeCapabilityRegistry::new();
+        let cap = |name: &str| {
+            RuntimeCapability::new(
+                name,
+                CapabilitySource::NativeExtension,
+                ToolClass::Read,
+                true,
+                &serde_json::json!({"type":"object"}),
+                None,
+            )
+        };
+        let registration = registry.register_owned([cap("a"), cap("b")]).unwrap();
+        assert!(registry.register_owned([cap("b"), cap("c")]).is_err());
+        registry.register(cap("a"));
+        assert!(matches!(
+            registry.unregister_owned(&registration),
+            Err(CapabilityRegistrationError::OwnershipChanged(name)) if name == "a"
+        ));
+        assert!(registry.get("b").is_some());
+    }
 
     #[test]
     fn test_builtin_capabilities_registered() {

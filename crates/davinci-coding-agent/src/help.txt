@@ -69,7 +69,8 @@ Options:
 
 Native intelligence (also available in -p and with --no-extensions):
   tool_search discovers graph_run, memory_search, retrieve_output, and lsp_* tools.
-  JavaScript/TypeScript semantic tools start their language server only on demand.
+  TypeScript/JavaScript, Rust, and Python semantic servers start only on demand.
+  DaVinci never installs a language server, Rust component, or Python environment automatically.
   /lsp-status, /governor-status, /memory-status show native service health.
   Use --no-mcp for small tasks that only need native tools.
 

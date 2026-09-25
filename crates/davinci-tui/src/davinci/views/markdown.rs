@@ -134,7 +134,6 @@ struct Item {
 enum Block {
     Paragraph(Vec<Inline>),
     Heading {
-        _level: u8,
         inlines: Vec<Inline>,
     },
     Code {
@@ -177,7 +176,6 @@ enum Container {
 enum Leaf {
     Paragraph(Vec<Inline>),
     Heading {
-        level: u8,
         inlines: Vec<Inline>,
     },
     Code {
@@ -275,8 +273,7 @@ impl Builder {
     fn start(&mut self, tag: Tag<'_>) {
         match tag {
             Tag::Paragraph => self.open_leaf(Leaf::Paragraph(Vec::new())),
-            Tag::Heading { level, .. } => self.open_leaf(Leaf::Heading {
-                level: level as u8,
+            Tag::Heading { .. } => self.open_leaf(Leaf::Heading {
                 inlines: Vec::new(),
             }),
             Tag::CodeBlock(kind) => {
@@ -443,10 +440,7 @@ impl Builder {
         };
         let block = match leaf {
             Leaf::Paragraph(inlines) => Block::Paragraph(inlines),
-            Leaf::Heading { level, inlines } => Block::Heading {
-                _level: level,
-                inlines,
-            },
+            Leaf::Heading { inlines } => Block::Heading { inlines },
             Leaf::Code { lang, text } => Block::Code { lang, text },
             Leaf::Html(text) => Block::Html(text),
             Leaf::Table { header, rows, .. } => Block::Table { header, rows },

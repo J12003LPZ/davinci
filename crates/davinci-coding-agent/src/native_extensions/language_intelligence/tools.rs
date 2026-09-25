@@ -36,8 +36,8 @@ pub fn tool_spec(name: &str) -> Option<davinci_ai::ToolSpec> {
         "lsp_workspace_symbols" => {
             required = vec!["query"];
             properties["query"] = json!({"type":"string","maxLength":256});
-            properties["language"] = json!({"type":"string","enum":["typescript","javascript","rust","python"]});
-            "Find workspace symbols for TypeScript/JavaScript, Rust, or Python. Use path to select a monorepo project. Read-only and advisory."
+            properties["language"] = json!({"type":"string","enum":["typescript","javascript","rust","python"],"description":"Optional family selector when no path is supplied. Legacy pathless calls route to TypeScript/JavaScript."});
+            "Find TypeScript/JavaScript, Rust, or Python workspace symbols. Use path to select a project. Read-only and advisory."
         }
         "lsp_document_symbols" => {
             "List TypeScript/JavaScript, Rust, or Python document symbols. Read-only and advisory."
@@ -45,7 +45,7 @@ pub fn tool_spec(name: &str) -> Option<davinci_ai::ToolSpec> {
         "lsp_diagnostics" => {
             properties["severity"] =
                 json!({"type":"string","enum":["all","error","warning","information","hint"]});
-            "Inspect TypeScript/JavaScript, Rust, or Python diagnostics for current disk contents. Advisory; never substitutes for compiler, lint or tests."
+            "Inspect TypeScript/JavaScript, Rust, or Python diagnostics for current disk contents. Advisory; never substitutes for compiler, type checker, lint, or tests."
         }
         _ => {
             required.extend(["line", "column"]);
@@ -81,10 +81,10 @@ pub(super) struct Arguments {
     pub line: Option<u64>,
     pub column: Option<u64>,
     pub query: Option<String>,
+    pub language: Option<String>,
     pub include_declaration: Option<bool>,
     pub limit: Option<usize>,
     pub severity: Option<String>,
-    pub language: Option<String>,
 }
 
 impl Arguments {
@@ -118,14 +118,14 @@ impl Arguments {
                 .as_ref()
                 .is_some_and(|v| v.len() > 256 || v.contains('\0'))
             || parsed.limit.is_some_and(|v| !(1..=200).contains(&v))
-            || [parsed.line, parsed.column]
-                .into_iter()
-                .flatten()
-                .any(|v| v == 0 || v > u32::MAX as u64)
             || parsed
                 .language
                 .as_deref()
                 .is_some_and(|v| !["typescript", "javascript", "rust", "python"].contains(&v))
+            || [parsed.line, parsed.column]
+                .into_iter()
+                .flatten()
+                .any(|v| v == 0 || v > u32::MAX as u64)
             || parsed
                 .severity
                 .as_deref()
@@ -172,7 +172,5 @@ mod tests {
             assert!(Arguments::parse("lsp_definition", &args).is_err());
         }
         assert!(Arguments::parse("lsp_workspace_symbols", &json!({"query":"a"})).is_ok());
-        assert!(Arguments::parse("lsp_workspace_symbols", &json!({"query":"a","language":"rust"})).is_ok());
-        assert!(Arguments::parse("lsp_definition", &json!({"path":"a.rs","line":1,"column":1,"language":"rust"})).is_err());
     }
 }

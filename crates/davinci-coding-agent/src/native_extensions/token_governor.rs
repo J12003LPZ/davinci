@@ -10,7 +10,7 @@
 //! the output id and how to call `retrieve_output` — is written into the
 //! digest itself.
 
-use davinci_agent::{ToolError, ToolResult};
+use davinci_agent::{PermissionState, PermissionVerdict, ToolError, ToolResult};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -324,6 +324,17 @@ pub struct StoredOutputEntry {
     pub content_kind: String,
     #[serde(default)]
     pub strategy: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lsp_authorization: Option<LspAuthorization>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct LspAuthorization {
+    pub workspace: PathBuf,
+    pub permission_scope: u64,
+    pub permission_revision: u64,
+    pub paths: Vec<PathBuf>,
 }
 
 pub fn call_fingerprint(tool_name: &str, args: &Value, state_hash: &str) -> String {
@@ -531,6 +542,16 @@ impl OutputStore {
                 "no stored output {id} in this session ({err}); only ids named in a compressed result can be retrieved"
             ))
         })
+    }
+
+    pub fn clear(&self) -> Result<(), ToolError> {
+        match fs::remove_dir_all(&self.root) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(ToolError::Failed(format!(
+                "unable to clear stored outputs for this session: {error}"
+            ))),
+        }
     }
 
     /// Remove sibling session directories under the store's parent that no
@@ -954,6 +975,7 @@ pub struct TokenGovernor {
     retrievals: Arc<AtomicU64>,
     prunings: usize,
     content_routing: ContentRoutingStats,
+    lsp_permissions: Option<Arc<PermissionState>>,
 }
 
 impl Default for TokenGovernor {
@@ -986,6 +1008,7 @@ impl TokenGovernor {
             retrievals: Arc::new(AtomicU64::new(0)),
             prunings: 0,
             content_routing: ContentRoutingStats::default(),
+            lsp_permissions: None,
         }
     }
 
@@ -1044,7 +1067,9 @@ impl TokenGovernor {
     /// `/governor-reset`: the ledgers and the counters.
     pub fn reset(&mut self) {
         self.session_start();
+        let _ = self.store.clear();
         self.stored.clear();
+        self.lsp_permissions = None;
         self.tool_calls = 0;
         self.compressed_outputs = 0;
         self.deduplicated_reads = 0;
@@ -1189,7 +1214,7 @@ impl TokenGovernor {
         };
         let view_bytes = chosen_content.len();
         let content_hash = file_content_hash(&result.content);
-        self.remember_stored(name, args, &reference, kind.as_str(), strategy);
+        self.remember_stored(name, args, &reference, kind.as_str(), strategy, None);
         self.bytes_withheld += result.content.len().saturating_sub(view_bytes);
         result.content = chosen_content;
         result.details = merge_details(
@@ -1221,6 +1246,7 @@ impl TokenGovernor {
         reference: &StoredOutputRef,
         content_kind: &str,
         strategy: &str,
+        lsp_authorization: Option<LspAuthorization>,
     ) {
         self.stored.retain(|entry| entry.id != reference.id);
         self.stored.push_front(StoredOutputEntry {
@@ -1231,20 +1257,113 @@ impl TokenGovernor {
             lines: reference.lines,
             content_kind: content_kind.to_string(),
             strategy: strategy.to_string(),
+            lsp_authorization,
         });
         self.stored.truncate(STORED_MANIFEST_ENTRIES);
     }
 
-    /// Retain a native tool's normalized full result before applying its semantic cap.
-    pub(crate) fn retain_native_output(
+    /// Retain normalized LSP evidence with the permission generation that
+    /// authorized it. Retrieval fails closed after a policy revision.
+    pub(crate) fn retain_lsp_output(
         &mut self,
         name: &str,
         args: &Value,
         content: &str,
+        workspace: &Path,
+        source: Option<&Path>,
+        permissions: Arc<PermissionState>,
     ) -> Result<String, ToolError> {
+        let revision = permissions
+            .lock()
+            .ok()
+            .and_then(|guard| guard.revision())
+            .ok_or_else(|| {
+                ToolError::Failed("language evidence permission revision unavailable".into())
+            })?;
+        let scope = Arc::as_ptr(&permissions) as usize as u64;
+        let workspace = workspace
+            .canonicalize()
+            .unwrap_or_else(|_| workspace.to_path_buf());
+        let mut paths = Vec::new();
+        if let Some(source) = source {
+            if let Ok(source) = source.canonicalize() {
+                if source.starts_with(&workspace) {
+                    paths.push(source);
+                }
+            }
+        }
+        if let Ok(value) = serde_json::from_str::<Value>(content) {
+            collect_lsp_paths(&value, &workspace, &mut paths);
+        }
+        paths.sort();
+        paths.dedup();
         let reference = self.store.save(content)?;
-        self.remember_stored(name, args, &reference, "json", "semantic-cap");
+        self.lsp_permissions = Some(permissions);
+        self.remember_stored(
+            name,
+            args,
+            &reference,
+            "json",
+            "semantic-cap",
+            Some(LspAuthorization {
+                workspace,
+                permission_scope: scope,
+                permission_revision: revision,
+                paths,
+            }),
+        );
         Ok(reference.id)
+    }
+
+    fn authorize_lsp_retrieval(&self, id: &str) -> Result<(), ToolError> {
+        let Some(entry) = self.stored.iter().find(|entry| entry.id == id) else {
+            return Ok(());
+        };
+        let Some(auth) = &entry.lsp_authorization else {
+            return Ok(());
+        };
+        let permissions = self.lsp_permissions.as_ref().ok_or_else(|| {
+            ToolError::Failed("stored language evidence is no longer authorized".into())
+        })?;
+        if Arc::as_ptr(permissions) as usize as u64 != auth.permission_scope {
+            return Err(ToolError::Failed(
+                "stored language evidence permission scope changed".into(),
+            ));
+        }
+        let guard = permissions.lock().map_err(|_| {
+            ToolError::Failed("stored language evidence permission state unavailable".into())
+        })?;
+        if guard.revision() != Some(auth.permission_revision) {
+            return Err(ToolError::Failed(
+                "stored language evidence permission revision changed".into(),
+            ));
+        }
+        for path in &auth.paths {
+            if !path.starts_with(&auth.workspace) {
+                return Err(ToolError::Failed(
+                    "stored language evidence path escaped its workspace".into(),
+                ));
+            }
+            let relative = path
+                .strip_prefix(&auth.workspace)
+                .unwrap_or(path)
+                .to_string_lossy()
+                .replace('\\', "/");
+            if !matches!(
+                guard.decide(
+                    "language-intelligence",
+                    &entry.tool,
+                    &json!({"path": relative}),
+                    &auth.workspace,
+                ),
+                PermissionVerdict::Allow
+            ) {
+                return Err(ToolError::Failed(
+                    "stored language evidence is no longer permitted".into(),
+                ));
+            }
+        }
+        Ok(())
     }
 
     pub fn retrieve(&mut self, args: &Value) -> Result<ToolResult, ToolError> {
@@ -1253,6 +1372,7 @@ impl TokenGovernor {
             .or_else(|| args.get("outputId"))
             .and_then(Value::as_str)
             .ok_or_else(|| ToolError::Failed("retrieve_output requires id".into()))?;
+        self.authorize_lsp_retrieval(id)?;
         let content = self.store.load(id)?;
         self.retrievals.fetch_add(1, Ordering::Relaxed);
         if let Some(kind) = self
@@ -1391,6 +1511,7 @@ impl TokenGovernor {
             .strip_prefix("governor://output/")
             .or_else(|| uri.strip_prefix("governor://"))
             .ok_or_else(|| ToolError::Failed("invalid governor artifact URI".into()))?;
+        self.authorize_lsp_retrieval(id)?;
         let content = self.store.load(id)?;
         self.retrievals.fetch_add(1, Ordering::Relaxed);
         Ok(content)
@@ -1448,6 +1569,30 @@ impl TokenGovernor {
     }
 }
 
+fn collect_lsp_paths(value: &Value, workspace: &Path, out: &mut Vec<PathBuf>) {
+    match value {
+        Value::Object(map) => {
+            if let Some(path) = map.get("path").and_then(Value::as_str) {
+                let candidate = workspace.join(path);
+                if let Ok(candidate) = candidate.canonicalize() {
+                    if candidate.starts_with(workspace) {
+                        out.push(candidate);
+                    }
+                }
+            }
+            for value in map.values() {
+                collect_lsp_paths(value, workspace, out);
+            }
+        }
+        Value::Array(values) => {
+            for value in values {
+                collect_lsp_paths(value, workspace, out);
+            }
+        }
+        _ => {}
+    }
+}
+
 fn merge_details(existing: Option<Value>, addition: Value) -> Option<Value> {
     match (existing, addition) {
         (Some(Value::Object(mut existing)), Value::Object(addition)) => {
@@ -1481,6 +1626,52 @@ mod tests {
             compress_threshold_lines: 1,
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn lsp_retained_output_is_denied_after_permission_revision() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = dir.path().join("workspace");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let source = workspace.join("lib.rs");
+        std::fs::write(&source, "pub fn value() {}\n").unwrap();
+        let permissions = Arc::new(PermissionState::new(davinci_agent::PermissionPolicy::new(
+            davinci_agent::PermissionMode::AlwaysApprove,
+        )));
+        permissions.lock().unwrap().project_trusted = true;
+        let store = OutputStore::new(dir.path().join("outputs"));
+        let mut governor = TokenGovernor::with_store("lsp-auth", tiny_thresholds(), store);
+        let id = governor
+            .retain_lsp_output(
+                "lsp_references",
+                &json!({"path":"lib.rs","line":1,"column":1}),
+                r#"{"items":[{"path":"lib.rs"}]}"#,
+                &workspace,
+                Some(&source),
+                permissions.clone(),
+            )
+            .unwrap();
+        assert!(!governor.retrieve(&json!({"id":id})).unwrap().is_error);
+        permissions.lock().unwrap().project_trusted = false;
+        assert!(governor.retrieve(&json!({"id":id})).is_err());
+        assert!(governor
+            .retrieve_artifact(&format!("governor://output/{id}"))
+            .is_err());
+    }
+
+    #[test]
+    fn governor_reset_revokes_stored_output_ids() {
+        let dir = tempdir().unwrap();
+        let store = OutputStore::new(dir.path().join("outputs"));
+        let mut governor = TokenGovernor::with_store("reset-output", tiny_thresholds(), store);
+        let saved = governor.store.save("secret semantic evidence").unwrap();
+        assert_eq!(
+            governor.store.load(&saved.id).unwrap(),
+            "secret semantic evidence"
+        );
+        governor.reset();
+        assert!(governor.store.load(&saved.id).is_err());
+        assert!(governor.retrieve(&json!({"id": saved.id})).is_err());
     }
 
     #[test]

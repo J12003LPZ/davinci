@@ -91,39 +91,27 @@ fn attached_agents_keep_independent_language_intelligence_permissions() {
     attach_tool_executor(&mut agent_b, &host);
 
     let args = serde_json::json!({"path":"a.ts","line":1,"column":1});
-    let result_a = agent_a
-        .custom_tool_executor
-        .as_ref()
-        .unwrap()
-        .execute(&root, "lsp_hover", &args)
-        .unwrap();
+    let hover = |agent: &Agent| {
+        agent
+            .custom_tool_executor
+            .as_ref()
+            .unwrap()
+            .execute_with_context(&root, "lsp_hover", &args, &agent.tool_context)
+            .unwrap()
+    };
+    let result_a = hover(&agent_a);
     assert!(!result_a.is_error, "{}", result_a.content);
-
-    let result_b = agent_b
-        .custom_tool_executor
-        .as_ref()
-        .unwrap()
-        .execute(&root, "lsp_hover", &args)
-        .unwrap();
-    assert!(result_b.is_error);
+    let result_b = hover(&agent_b);
+    assert!(result_b.is_error, "{}", result_b.content);
     assert_eq!(
         result_b.details.unwrap()["error"]["code"],
         "permission_denied"
     );
-
-    let result_a_again = agent_a
-        .custom_tool_executor
-        .as_ref()
-        .unwrap()
-        .execute(&root, "lsp_hover", &args)
-        .unwrap();
+    // Attaching B must not have narrowed A's authority on the shared owner.
+    let result_a_again = hover(&agent_a);
     assert!(!result_a_again.is_error, "{}", result_a_again.content);
 
-    host.native
-        .lock()
-        .unwrap()
-        .language_intelligence
-        .shutdown();
+    host.native.lock().unwrap().language_intelligence.shutdown();
 }
 
 static PROCESS_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());

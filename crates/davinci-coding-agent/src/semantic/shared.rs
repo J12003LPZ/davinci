@@ -1,60 +1,199 @@
-//! Compatibility facade from host-neutral core semantic DTOs to the single
-//! native language-intelligence process owner.
-
-use crate::native_extensions::language_intelligence::LanguageIntelligence;
+//! Compatibility facade from host-neutral core semantic tools to the canonical native LSP owner.
+use crate::native_extensions::language_intelligence::{LanguageIntelligence, RequestBudget};
+use davinci_agent::runtime::task_transport::TaskCoordinatorClient;
 use davinci_agent::semantic::{
     Diagnostic, DiagnosticSeverity, Location, Position, Range, RenamePreview, SemanticCapabilities,
     SemanticQuery, SemanticRequestContext, SemanticResult, SemanticService, SymbolItem,
 };
+use davinci_agent::ToolResult;
 use serde_json::{json, Value};
 use std::path::Path;
+use std::time::{Duration, Instant};
+
+#[derive(Debug, Clone)]
+pub enum SemanticClient {
+    Local(LanguageIntelligence),
+    Parent(TaskCoordinatorClient),
+}
+
+impl SemanticClient {
+    pub fn local(language: LanguageIntelligence) -> Self {
+        Self::Local(language)
+    }
+
+    pub fn parent(client: TaskCoordinatorClient) -> Self {
+        Self::Parent(client)
+    }
+
+    pub(crate) fn execute_tool(
+        &self,
+        tool: &str,
+        args: &Value,
+        context: &SemanticRequestContext,
+    ) -> Result<ToolResult, String> {
+        let deadline = context
+            .deadline
+            .unwrap_or_else(|| Instant::now() + Duration::from_secs(60));
+        match self {
+            Self::Local(language) => language
+                .execute_with_budget(
+                    tool,
+                    args,
+                    RequestBudget {
+                        deadline,
+                        cancelled: context.abort.clone(),
+                    },
+                )
+                .map_err(|error| error.to_string()),
+            Self::Parent(client) => {
+                let timeout = deadline
+                    .checked_duration_since(Instant::now())
+                    .unwrap_or_default()
+                    .max(Duration::from_millis(1));
+                client
+                    .call_with_timeout(tool, args, context.abort.as_deref(), timeout)
+                    .map_err(|error| error.to_string())
+            }
+        }
+    }
+
+    fn live_language(&self, language: &str) -> bool {
+        let Self::Local(manager) = self else {
+            return false;
+        };
+        let expected = match language {
+            "javascript" | "typescript" | "javascriptreact" | "typescriptreact" => "typescript",
+            "rust" => "rust",
+            "python" => "python",
+            _ => return false,
+        };
+        manager.status()["sessions"]
+            .as_array()
+            .is_some_and(|sessions| {
+                sessions.iter().any(|session| {
+                    session["language"].as_str() == Some(expected)
+                        && session["session"].as_str() == Some("running")
+                })
+            })
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct SemanticServiceFacade {
-    language: LanguageIntelligence,
+    client: SemanticClient,
 }
 
 impl SemanticServiceFacade {
-    pub fn new(language: LanguageIntelligence) -> Self {
-        Self { language }
-    }
-
-    fn source_supported(path: &Path) -> bool {
-        matches!(
-            path.extension().and_then(|ext| ext.to_str()),
-            Some("ts" | "tsx" | "mts" | "cts" | "js" | "jsx" | "mjs" | "cjs" | "rs" | "py" | "pyi")
-        )
-    }
-
-    fn run(&self, tool: &str, args: Value, capability: &str) -> Result<SemanticResult, String> {
-        let output = self
-            .language
-            .execute(tool, &args)
-            .map_err(|error| error.to_string())?;
-        if output.is_error {
-            return Err(output.content);
+    pub fn local(language: LanguageIntelligence) -> Self {
+        Self {
+            client: SemanticClient::local(language),
         }
-        let details = output.details.unwrap_or(Value::Null);
-        semantic_result(capability, details)
+    }
+
+    pub fn parent(client: TaskCoordinatorClient) -> Self {
+        Self {
+            client: SemanticClient::parent(client),
+        }
+    }
+
+    pub fn client(&self) -> &SemanticClient {
+        &self.client
+    }
+
+    fn native_query(
+        &self,
+        query: SemanticQuery<'_>,
+        context: &SemanticRequestContext,
+    ) -> Result<SemanticResult, String> {
+        let (tool, args, capability, cwd, path, fallback_position) = match query {
+            SemanticQuery::Definition {
+                cwd,
+                path,
+                position,
+            } => (
+                "lsp_definition",
+                positional_args(path, position)?,
+                "definition",
+                cwd,
+                path,
+                Some(position),
+            ),
+            SemanticQuery::References {
+                cwd,
+                path,
+                position,
+                include_declaration,
+            } => {
+                let mut args = positional_args(path, position)?;
+                args["includeDeclaration"] = json!(include_declaration);
+                (
+                    "lsp_references",
+                    args,
+                    "references",
+                    cwd,
+                    path,
+                    Some(position),
+                )
+            }
+            SemanticQuery::Outline { cwd, path } => (
+                "lsp_document_symbols",
+                json!({"path":path}),
+                "outline",
+                cwd,
+                path,
+                None,
+            ),
+            SemanticQuery::Diagnostics { cwd, path } => (
+                "lsp_diagnostics",
+                json!({"path":path}),
+                "diagnostics",
+                cwd,
+                path,
+                None,
+            ),
+        };
+
+        let output = self.client.execute_tool(tool, &args, context)?;
+        if output.is_error {
+            let details = output.details.unwrap_or(Value::Null);
+            let code = details
+                .pointer("/error/code")
+                .and_then(Value::as_str)
+                .unwrap_or("semantic_unavailable");
+            if matches!(
+                code,
+                "server_not_installed"
+                    | "disabled"
+                    | "unsupported_method"
+                    | "project_not_found"
+                    | "project_root_required"
+            ) {
+                return textual_fallback(cwd, path, capability, fallback_position, context);
+            }
+            return Err(format!(
+                "{code}: {}",
+                details
+                    .pointer("/error/message")
+                    .and_then(Value::as_str)
+                    .unwrap_or("semantic query failed")
+            ));
+        }
+        normalized_to_core(tool, capability, output.details.unwrap_or(Value::Null))
     }
 }
 
 impl SemanticService for SemanticServiceFacade {
-    fn is_server_available(&self, _language: &str, path: &Path) -> bool {
-        // This is intentionally a no-launch observation. Installed executable
-        // discovery happens only inside an authorized direct query.
-        Self::source_supported(path)
+    fn is_server_available(&self, language: &str, _path: &Path) -> bool {
+        self.client.live_language(language)
     }
 
-    fn capabilities(&self, _language: &str, path: &Path) -> SemanticCapabilities {
-        if !Self::source_supported(path) {
-            return SemanticCapabilities::default();
-        }
+    fn capabilities(&self, language: &str, path: &Path) -> SemanticCapabilities {
+        let live = self.is_server_available(language, path);
         SemanticCapabilities {
-            definition: true,
-            references: true,
-            outline: true,
-            diagnostics: true,
+            definition: live,
+            references: live,
+            outline: live,
+            diagnostics: live,
             call_hierarchy: false,
             rename_preview: false,
         }
@@ -62,55 +201,57 @@ impl SemanticService for SemanticServiceFacade {
 
     fn definition(
         &self,
-        _cwd: &Path,
+        cwd: &Path,
         file_path: &str,
         line: u32,
         character: u32,
     ) -> Result<SemanticResult, String> {
-        self.run(
-            "lsp_definition",
-            json!({
-                "path":file_path,
-                "line": line.checked_add(1).ok_or("line overflow")?,
-                "column": character.checked_add(1).ok_or("column overflow")?
-            }),
-            "definition",
+        self.query_with_context(
+            SemanticQuery::Definition {
+                cwd,
+                path: file_path,
+                position: Position { line, character },
+            },
+            &SemanticRequestContext::default(),
         )
     }
 
     fn references(
         &self,
-        _cwd: &Path,
+        cwd: &Path,
         file_path: &str,
         line: u32,
         character: u32,
         include_declaration: bool,
     ) -> Result<SemanticResult, String> {
-        self.run(
-            "lsp_references",
-            json!({
-                "path":file_path,
-                "line": line.checked_add(1).ok_or("line overflow")?,
-                "column": character.checked_add(1).ok_or("column overflow")?,
-                "includeDeclaration":include_declaration
-            }),
-            "references",
+        self.query_with_context(
+            SemanticQuery::References {
+                cwd,
+                path: file_path,
+                position: Position { line, character },
+                include_declaration,
+            },
+            &SemanticRequestContext::default(),
         )
     }
 
-    fn outline(&self, _cwd: &Path, file_path: &str) -> Result<SemanticResult, String> {
-        self.run(
-            "lsp_document_symbols",
-            json!({"path":file_path}),
-            "outline",
+    fn outline(&self, cwd: &Path, file_path: &str) -> Result<SemanticResult, String> {
+        self.query_with_context(
+            SemanticQuery::Outline {
+                cwd,
+                path: file_path,
+            },
+            &SemanticRequestContext::default(),
         )
     }
 
-    fn diagnostics(&self, _cwd: &Path, file_path: &str) -> Result<SemanticResult, String> {
-        self.run(
-            "lsp_diagnostics",
-            json!({"path":file_path}),
-            "diagnostics",
+    fn diagnostics(&self, cwd: &Path, file_path: &str) -> Result<SemanticResult, String> {
+        self.query_with_context(
+            SemanticQuery::Diagnostics {
+                cwd,
+                path: file_path,
+            },
+            &SemanticRequestContext::default(),
         )
     }
 
@@ -122,7 +263,7 @@ impl SemanticService for SemanticServiceFacade {
         _character: u32,
         _incoming: bool,
     ) -> Result<SemanticResult, String> {
-        Err("Semantic call hierarchy is not supported by the shared LSP facade".into())
+        Err("unsupported_method: call hierarchy is outside the shared read-only LSP scope".into())
     }
 
     fn rename_preview(
@@ -133,7 +274,7 @@ impl SemanticService for SemanticServiceFacade {
         _character: u32,
         _new_name: &str,
     ) -> Result<RenamePreview, String> {
-        Err("Semantic rename preview is not supported by the shared LSP facade".into())
+        Err("unsupported_method: rename preview is outside the shared read-only LSP scope".into())
     }
 
     fn query_with_context(
@@ -141,130 +282,117 @@ impl SemanticService for SemanticServiceFacade {
         query: SemanticQuery<'_>,
         context: &SemanticRequestContext,
     ) -> Result<SemanticResult, String> {
-        if context
-            .abort
-            .as_ref()
-            .is_some_and(|abort| abort.load(std::sync::atomic::Ordering::Acquire))
-        {
-            return Err("Operation aborted".into());
-        }
-        if context
-            .deadline
-            .is_some_and(|deadline| std::time::Instant::now() >= deadline)
-        {
-            return Err("Semantic request deadline expired".into());
-        }
-        match query {
-            SemanticQuery::Definition { cwd, path, position } => {
-                self.definition(cwd, path, position.line, position.character)
-            }
-            SemanticQuery::References {
-                cwd,
-                path,
-                position,
-                include_declaration,
-            } => self.references(
-                cwd,
-                path,
-                position.line,
-                position.character,
-                include_declaration,
-            ),
-            SemanticQuery::Outline { cwd, path } => self.outline(cwd, path),
-            SemanticQuery::Diagnostics { cwd, path } => self.diagnostics(cwd, path),
-        }
+        self.native_query(query, context)
     }
 }
 
-fn semantic_result(capability: &str, details: Value) -> Result<SemanticResult, String> {
+fn positional_args(path: &str, position: Position) -> Result<Value, String> {
+    let line = u64::from(position.line)
+        .checked_add(1)
+        .ok_or_else(|| "invalid_position: line overflow".to_string())?;
+    let column = u64::from(position.character)
+        .checked_add(1)
+        .ok_or_else(|| "invalid_position: column overflow".to_string())?;
+    Ok(json!({"path":path,"line":line,"column":column}))
+}
+
+fn normalized_to_core(
+    tool: &str,
+    capability: &str,
+    details: Value,
+) -> Result<SemanticResult, String> {
+    let server_identity = Some(format!(
+        "{}#{}",
+        details["backend"].as_str().unwrap_or("language-server"),
+        details["generation"].as_u64().unwrap_or(0)
+    ));
+    let document_version = details["documentVersion"]
+        .as_i64()
+        .and_then(|value| i32::try_from(value).ok());
+    let limitations = details["limitations"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    let partial = details["remaining"].as_u64().unwrap_or(0) > 0
+        || details["omittedExternal"].as_u64().unwrap_or(0) > 0
+        || !limitations.is_empty()
+        || details["workspaceCoverage"].as_str() == Some("partial")
+        || matches!(
+            details["freshness"].as_str(),
+            Some("diagnostics_pending" | "unversioned-publication" | "stale_result")
+        );
+    let fallback_reason = if limitations.is_empty() {
+        details["freshness"]
+            .as_str()
+            .filter(|_| partial)
+            .map(str::to_string)
+    } else {
+        Some(
+            limitations
+                .iter()
+                .filter_map(Value::as_str)
+                .collect::<Vec<_>>()
+                .join(","),
+        )
+    };
     let mut result = SemanticResult {
-        request_id: format!("native-lsp-{capability}"),
-        server_identity: details
-            .get("backend")
-            .map(Value::to_string),
+        request_id: format!(
+            "native:{}:{}",
+            tool,
+            details["generation"].as_u64().unwrap_or(0)
+        ),
+        server_identity,
         capability: capability.into(),
-        document_version: details
-            .get("documentVersion")
-            .and_then(Value::as_i64)
-            .and_then(|value| i32::try_from(value).ok()),
-        source_manifest: details
-            .get("sourceHash")
-            .and_then(Value::as_str)
-            .map(str::to_string),
+        document_version,
+        source_manifest: details["sourceHash"].as_str().map(str::to_string),
         locations: Vec::new(),
         diagnostics: Vec::new(),
         symbols: Vec::new(),
         calls: Vec::new(),
-        partial: details
-            .get("remaining")
-            .and_then(Value::as_u64)
-            .is_some_and(|remaining| remaining > 0)
-            || details.get("available") == Some(&Value::Bool(false)),
-        fallback_reason: None,
+        partial,
+        fallback_reason,
     };
-
-    for item in details
-        .get("items")
-        .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-    {
-        let range = core_range(
-            item.get("range")
-                .ok_or_else(|| "Semantic result is missing a range".to_string())?,
-        )?;
-        let path = item
-            .get("path")
-            .and_then(Value::as_str)
-            .ok_or_else(|| "Semantic result is missing a path".to_string())?
-            .to_string();
-        if capability == "diagnostics" {
-            let severity = match item.get("severity").and_then(Value::as_str) {
-                Some("error") => DiagnosticSeverity::Error,
-                Some("warning") => DiagnosticSeverity::Warning,
-                Some("information") => DiagnosticSeverity::Information,
-                _ => DiagnosticSeverity::Hint,
-            };
-            result.diagnostics.push(Diagnostic {
-                range,
-                severity,
-                code: item.get("code").map(|code| {
-                    code.as_str()
+    let items = details["items"].as_array().ok_or_else(|| {
+        "protocol_error: normalized semantic result contains no items".to_string()
+    })?;
+    for item in items {
+        let range = core_range(&item["range"])?;
+        match tool {
+            "lsp_definition" | "lsp_references" => {
+                result.locations.push(Location {
+                    path: item["path"].as_str().unwrap_or_default().into(),
+                    range,
+                    snippet: None,
+                    is_textual_fallback: false,
+                });
+            }
+            "lsp_document_symbols" => {
+                result.symbols.push(SymbolItem {
+                    name: item["name"].as_str().unwrap_or_default().into(),
+                    kind: symbol_kind(item["kind"].as_u64().unwrap_or(0)).into(),
+                    range,
+                    selection_range: range,
+                    detail: item["detail"].as_str().map(str::to_string),
+                });
+            }
+            "lsp_diagnostics" => {
+                result.diagnostics.push(Diagnostic {
+                    range,
+                    severity: match item["severity"].as_str() {
+                        Some("error") => DiagnosticSeverity::Error,
+                        Some("warning") => DiagnosticSeverity::Warning,
+                        Some("information") => DiagnosticSeverity::Information,
+                        _ => DiagnosticSeverity::Hint,
+                    },
+                    code: item["code"]
+                        .as_str()
                         .map(str::to_string)
-                        .unwrap_or_else(|| code.to_string())
-                }),
-                source: item
-                    .get("source")
-                    .and_then(Value::as_str)
-                    .map(str::to_string),
-                message: item
-                    .get("message")
-                    .and_then(Value::as_str)
-                    .unwrap_or("")
-                    .to_string(),
-            });
-        } else if capability == "outline" {
-            result.symbols.push(SymbolItem {
-                name: item
-                    .get("name")
-                    .and_then(Value::as_str)
-                    .unwrap_or("")
-                    .to_string(),
-                kind: item
-                    .get("kind")
-                    .map(Value::to_string)
-                    .unwrap_or_default(),
-                range,
-                selection_range: range,
-                detail: None,
-            });
-        } else {
-            result.locations.push(Location {
-                path,
-                range,
-                snippet: None,
-                is_textual_fallback: false,
-            });
+                        .or_else(|| item["code"].as_i64().map(|value| value.to_string())),
+                    source: item["source"].as_str().map(str::to_string),
+                    message: item["message"].as_str().unwrap_or_default().into(),
+                });
+            }
+            _ => {}
         }
     }
     Ok(result)
@@ -272,24 +400,17 @@ fn semantic_result(capability: &str, details: Value) -> Result<SemanticResult, S
 
 fn core_range(value: &Value) -> Result<Range, String> {
     let point = |name: &str| -> Result<Position, String> {
-        let value = value
-            .get(name)
-            .ok_or_else(|| "Semantic range point is missing".to_string())?;
-        let line = value
-            .get("line")
-            .and_then(Value::as_u64)
-            .and_then(|line| line.checked_sub(1))
-            .ok_or_else(|| "Semantic line is invalid".to_string())?;
-        let character = value
-            .get("column")
-            .and_then(Value::as_u64)
-            .and_then(|column| column.checked_sub(1))
-            .ok_or_else(|| "Semantic column is invalid".to_string())?;
-        Ok(Position {
-            line: u32::try_from(line).map_err(|_| "Semantic line overflow".to_string())?,
-            character: u32::try_from(character)
-                .map_err(|_| "Semantic column overflow".to_string())?,
-        })
+        let line = value[name]["line"]
+            .as_u64()
+            .and_then(|value| value.checked_sub(1))
+            .and_then(|value| u32::try_from(value).ok())
+            .ok_or_else(|| "protocol_error: invalid normalized semantic line".to_string())?;
+        let character = value[name]["column"]
+            .as_u64()
+            .and_then(|value| value.checked_sub(1))
+            .and_then(|value| u32::try_from(value).ok())
+            .ok_or_else(|| "protocol_error: invalid normalized semantic column".to_string())?;
+        Ok(Position { line, character })
     };
     Ok(Range {
         start: point("start")?,
@@ -297,19 +418,123 @@ fn core_range(value: &Value) -> Result<Range, String> {
     })
 }
 
+fn symbol_kind(kind: u64) -> &'static str {
+    match kind {
+        2 => "module",
+        3 => "namespace",
+        5 => "class",
+        6 => "method",
+        8 => "field",
+        9 => "constructor",
+        10 => "enum",
+        11 => "interface",
+        12 => "function",
+        13 => "variable",
+        14 => "constant",
+        22 => "enumMember",
+        23 => "struct",
+        26 => "typeParameter",
+        _ => "symbol",
+    }
+}
+
+fn textual_fallback(
+    cwd: &Path,
+    path: &str,
+    capability: &str,
+    position: Option<Position>,
+    context: &SemanticRequestContext,
+) -> Result<SemanticResult, String> {
+    match capability {
+        "definition" | "references" => {
+            let position = position.ok_or_else(|| "fallback position missing".to_string())?;
+            let symbol = symbol_at_position(cwd, path, position)?;
+            if capability == "definition" {
+                davinci_agent::semantic::text_fallback_definition(
+                    cwd,
+                    &symbol,
+                    Some(Path::new(path)),
+                    context.abort.as_deref(),
+                )
+            } else {
+                davinci_agent::semantic::text_fallback_references(
+                    cwd,
+                    &symbol,
+                    Some(Path::new(path)),
+                    context.abort.as_deref(),
+                )
+            }
+        }
+        "outline" => davinci_agent::semantic::text_fallback_outline(cwd, path),
+        "diagnostics" => davinci_agent::semantic::text_fallback_diagnostics(cwd, path),
+        _ => Err("unsupported_method: no fallback exists for this semantic operation".into()),
+    }
+}
+
+fn symbol_at_position(cwd: &Path, path: &str, position: Position) -> Result<String, String> {
+    let full = cwd.join(path);
+    let text = std::fs::read_to_string(&full).map_err(|error| error.to_string())?;
+    let line = text
+        .lines()
+        .nth(position.line as usize)
+        .ok_or_else(|| "invalid_position: line is outside the source file".to_string())?;
+    let target_units = position.character as usize;
+    let mut byte = line.len();
+    let mut units = 0usize;
+    for (index, ch) in line.char_indices() {
+        if units >= target_units {
+            byte = index;
+            break;
+        }
+        units += ch.len_utf16();
+        if units > target_units {
+            return Err("invalid_position: character splits a UTF-16 code point".into());
+        }
+    }
+    if target_units > units {
+        return Err("invalid_position: character is outside the source line".into());
+    }
+    let bytes = line.as_bytes();
+    let is_ident = |value: u8| value.is_ascii_alphanumeric() || matches!(value, b'_' | b'$');
+    let mut start = byte.min(bytes.len());
+    while start > 0 && is_ident(bytes[start - 1]) {
+        start -= 1;
+    }
+    let mut end = byte.min(bytes.len());
+    while end < bytes.len() && is_ident(bytes[end]) {
+        end += 1;
+    }
+    if start == end {
+        return Err("text_fallback_unavailable: no identifier at semantic position".into());
+    }
+    Ok(line[start..end].to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn native_ranges_convert_once_to_core_zero_based_coordinates() {
+    fn native_points_convert_to_zero_based_core_ranges() {
         let range = core_range(&json!({
             "start":{"line":2,"column":5},
             "end":{"line":2,"column":8}
         }))
         .unwrap();
-        assert_eq!(range.start.line, 1);
-        assert_eq!(range.start.character, 4);
+        assert_eq!(
+            range.start,
+            Position {
+                line: 1,
+                character: 4
+            }
+        );
+        assert_eq!(
+            range.end,
+            Position {
+                line: 1,
+                character: 7
+            }
+        );
         assert!(core_range(&json!({
             "start":{"line":0,"column":1},
             "end":{"line":1,"column":1}

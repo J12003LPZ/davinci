@@ -25,6 +25,16 @@ const POLL: Duration = Duration::from_millis(10);
 pub trait CoordinatorToolHandler: Send + Sync {
     fn handles(&self, tool: &str) -> bool;
     fn execute(&self, tool: &str, args: &Value) -> Result<ToolResult, ToolError>;
+    fn execute_with_context(
+        &self,
+        tool: &str,
+        args: &Value,
+        timeout: Duration,
+        abort: Option<Arc<AtomicBool>>,
+    ) -> Result<ToolResult, ToolError> {
+        let _ = (timeout, abort);
+        self.execute(tool, args)
+    }
 }
 
 #[derive(Serialize, Deserialize)]
@@ -34,6 +44,8 @@ struct Request {
     credential: String,
     tool: String,
     args: Value,
+    #[serde(default)]
+    timeout_ms: Option<u64>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -112,10 +124,11 @@ impl TaskCoordinatorClient {
             credential: self.credential.clone(),
             tool: tool.into(),
             args: args.clone(),
+            timeout_ms: Some(timeout.as_millis().min(120_000) as u64),
         };
         let default_stop = AtomicBool::new(false);
         let stop = abort.unwrap_or(&default_stop);
-        let deadline = Instant::now() + timeout.min(Duration::from_secs(35));
+        let deadline = Instant::now() + timeout.min(Duration::from_secs(120));
         let mut stream =
             TcpStream::connect_timeout(&self.address, IO_TIMEOUT).map_err(|_| transport_error())?;
         configure(&stream)?;
@@ -202,6 +215,7 @@ impl TaskCoordinatorTransport {
                             else {
                                 continue;
                             };
+                            let received_at = Instant::now();
                             let result = dispatch(
                                 request,
                                 &credential,
@@ -211,6 +225,7 @@ impl TaskCoordinatorTransport {
                                 &cwd,
                                 &stopping,
                                 handler.as_deref(),
+                                received_at,
                             );
                             let _ = write_frame(
                                 &mut stream,
@@ -266,6 +281,7 @@ fn dispatch(
     cwd: &std::path::Path,
     stop: &AtomicBool,
     handler: Option<&dyn CoordinatorToolHandler>,
+    received_at: Instant,
 ) -> Result<ToolResult, String> {
     // Fixed-size comparison does not reveal a matching credential prefix.
     let authenticated = request.credential.len() == credential.len()
@@ -348,9 +364,21 @@ fn dispatch(
         "task_update" => super::task_update_tool(&request.args, context),
         "task_get" => super::task_get_tool(&request.args, context),
         "task_list" => super::task_list_tool(&request.args, context),
-        _ => handler
-            .ok_or_else(|| "parent native handler unavailable".to_string())?
-            .execute(&request.tool, &request.args),
+        _ => {
+            let handler = handler.ok_or_else(|| "parent native handler unavailable".to_string())?;
+            let requested =
+                Duration::from_millis(request.timeout_ms.unwrap_or(IO_TIMEOUT.as_millis() as u64))
+                    .min(Duration::from_secs(120));
+            let remaining = requested
+                .saturating_sub(received_at.elapsed())
+                .max(Duration::from_millis(1));
+            handler.execute_with_context(
+                &request.tool,
+                &request.args,
+                remaining,
+                context.abort.clone(),
+            )
+        }
     }
     .map_err(|error| error.to_string())
 }

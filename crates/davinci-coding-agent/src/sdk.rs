@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 
 use davinci_agent::{
     discover_prompt_templates, discover_skills, expand_user_text, load_context_files, Agent,
-    CompactionResult, BUILTIN_TOOLS,
+    CompactionResult, CustomToolExecutor, ToolError, BUILTIN_TOOLS,
 };
 use davinci_ai::{
     find_model, load_builtin_models, snapshot_availability, AuthStorage, ModelConfig,
@@ -61,6 +61,20 @@ pub struct ExtensionManifest {
     pub path: Option<String>,
 }
 
+struct LanguageIntelligenceAttachment {
+    manager: crate::native_extensions::language_intelligence::LanguageIntelligence,
+    registration: davinci_agent::runtime::capabilities::CapabilityRegistration,
+    previous_executor: Option<CustomToolExecutor>,
+    previous_semantic: Option<std::sync::Arc<dyn davinci_agent::semantic::SemanticService>>,
+    attached_executor: CustomToolExecutor,
+    attached_semantic: std::sync::Arc<dyn davinci_agent::semantic::SemanticService>,
+    tools: Vec<String>,
+    output_governor:
+        std::sync::Arc<std::sync::Mutex<Option<crate::native_extensions::SharedTokenGovernor>>>,
+    output_registration: Option<davinci_agent::runtime::capabilities::CapabilityRegistration>,
+    output_tool_inserted: bool,
+}
+
 pub struct AgentSession {
     pub agent: Agent,
     pub cwd: PathBuf,
@@ -69,6 +83,10 @@ pub struct AgentSession {
     pub custom_tools: Vec<String>,
     pub model_runtime: ModelRuntimeSnapshot,
     listeners: Vec<AgentEventListener>,
+    language_intelligence: Option<LanguageIntelligenceAttachment>,
+    attachment_allowed_tools: Option<std::collections::HashSet<String>>,
+    attachment_excluded_tools: std::collections::HashSet<String>,
+    attachment_no_tools: Option<String>,
 }
 
 impl AgentSession {
@@ -132,6 +150,327 @@ impl AgentSession {
 
     pub fn abort(&mut self) {
         self.agent.abort();
+    }
+
+    /// Opt in to the canonical native language-intelligence owner for this
+    /// embedding session. The SDK never enables unrelated native extensions.
+    pub fn attach_language_intelligence(
+        &mut self,
+        config: crate::native_extensions::language_intelligence::LanguageIntelligenceConfig,
+        tools: &[String],
+    ) -> Result<(), String> {
+        if self.language_intelligence.is_some() {
+            return Err("language_intelligence_already_attached".into());
+        }
+        let runtime = self.agent.runtime.clone().ok_or("sdk_runtime_required")?;
+        if self.attachment_no_tools.as_deref() == Some("all") {
+            return Err("language_intelligence_tools_excluded".into());
+        }
+        let mut selected = Vec::new();
+        for tool in tools {
+            if !crate::native_extensions::language_intelligence::TOOL_NAMES.contains(&tool.as_str())
+            {
+                return Err(format!("unsupported language-intelligence tool: {tool}"));
+            }
+            if self.attachment_excluded_tools.contains(tool)
+                || self
+                    .attachment_allowed_tools
+                    .as_ref()
+                    .is_some_and(|allowed| !allowed.contains(tool))
+            {
+                return Err(format!(
+                    "language-intelligence tool excluded by session policy: {tool}"
+                ));
+            }
+            if !selected.contains(tool) {
+                selected.push(tool.clone());
+            }
+        }
+
+        let manager = crate::native_extensions::language_intelligence::LanguageIntelligence::new(
+            &self.cwd, config,
+        );
+        manager.set_permissions(Some(self.agent.permissions.clone()));
+        let facade: std::sync::Arc<dyn davinci_agent::semantic::SemanticService> =
+            std::sync::Arc::new(crate::semantic::SemanticServiceFacade::local(
+                manager.clone(),
+            ));
+
+        let capabilities = selected
+            .iter()
+            .filter_map(|name| crate::native_extensions::language_intelligence::tool_spec(name))
+            .map(|spec| {
+                davinci_agent::runtime::RuntimeCapability::new(
+                    spec.name.clone(),
+                    davinci_agent::runtime::CapabilitySource::NativeExtension,
+                    davinci_agent::ToolClass::Read,
+                    true,
+                    &spec.parameters,
+                    Some(env!("CARGO_PKG_VERSION").to_string()),
+                )
+                .with_description(spec.description)
+            })
+            .collect::<Vec<_>>();
+        let registration = runtime
+            .capability_registry
+            .register_owned(capabilities)
+            .map_err(|error| error.to_string())?;
+
+        let previous_executor = self.agent.custom_tool_executor.clone();
+        let previous_semantic = self.agent.tool_context.semantic.clone();
+        let manager_for_executor = manager.clone();
+        let selected_for_executor = selected.clone();
+        let previous_for_executor = previous_executor.clone();
+        let output_governor: std::sync::Arc<
+            std::sync::Mutex<Option<crate::native_extensions::SharedTokenGovernor>>,
+        > = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let output_for_executor = output_governor.clone();
+        let attached_executor =
+            CustomToolExecutor::new_with_context(move |cwd, name, args, context| {
+                if name == "retrieve_output" {
+                    if let Some(governor) = output_for_executor
+                        .lock()
+                        .unwrap_or_else(|error| error.into_inner())
+                        .as_ref()
+                        .cloned()
+                    {
+                        return governor
+                            .lock()
+                            .unwrap_or_else(|error| error.into_inner())
+                            .retrieve(args);
+                    }
+                }
+                if selected_for_executor.iter().any(|tool| tool == name) {
+                    let timeout = std::time::Duration::from_secs(60);
+                    let budget = crate::native_extensions::language_intelligence::RequestBudget {
+                        deadline: std::time::Instant::now() + timeout,
+                        cancelled: context.abort.clone(),
+                    };
+                    return manager_for_executor.execute_with_budget(name, args, budget);
+                }
+                if let Some(previous) = &previous_for_executor {
+                    return previous.execute_with_context(cwd, name, args, context);
+                }
+                Err(ToolError::Unknown(name.into()))
+            });
+
+        {
+            let mut authorized = self
+                .agent
+                .tool_context
+                .authorized_tools
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            for tool in &selected {
+                authorized.insert(tool.clone());
+            }
+        }
+        {
+            let mut exposure = self
+                .agent
+                .tool_context
+                .tool_exposure
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            for tool in &selected {
+                exposure.activate_authorized(tool, true);
+            }
+        }
+        for tool in &selected {
+            if !self.agent.tool_registry.contains(tool) {
+                self.agent.tool_registry.push(tool.clone());
+            }
+            if !self.agent.tools.contains(tool) {
+                self.agent.tools.push(tool.clone());
+            }
+        }
+        self.agent.custom_tool_executor = Some(attached_executor.clone());
+        self.agent.tool_context.semantic = Some(facade.clone());
+        self.language_intelligence = Some(LanguageIntelligenceAttachment {
+            manager,
+            registration,
+            previous_executor,
+            previous_semantic,
+            attached_executor,
+            attached_semantic: facade,
+            tools: selected,
+            output_governor,
+            output_registration: None,
+            output_tool_inserted: false,
+        });
+        Ok(())
+    }
+
+    pub fn attach_language_output_store(
+        &mut self,
+        governor: crate::native_extensions::SharedTokenGovernor,
+    ) -> Result<(), String> {
+        if self.attachment_no_tools.as_deref() == Some("all")
+            || self.attachment_excluded_tools.contains("retrieve_output")
+            || self
+                .attachment_allowed_tools
+                .as_ref()
+                .is_some_and(|allowed| !allowed.contains("retrieve_output"))
+        {
+            return Err("retrieve_output_excluded".into());
+        }
+        let runtime = self.agent.runtime.clone().ok_or("sdk_runtime_required")?;
+        let attachment = self
+            .language_intelligence
+            .as_mut()
+            .ok_or("language_intelligence_not_attached")?;
+        if attachment.output_registration.is_some() {
+            return Err("language_output_store_already_attached".into());
+        }
+        let spec = crate::native_extensions::NativeExtensionHost::tool_specs()
+            .into_iter()
+            .find(|spec| spec.name == "retrieve_output")
+            .ok_or("retrieve_output_schema_unavailable")?;
+        let capability = davinci_agent::runtime::RuntimeCapability::new(
+            spec.name.clone(),
+            davinci_agent::runtime::CapabilitySource::NativeExtension,
+            davinci_agent::ToolClass::Read,
+            true,
+            &spec.parameters,
+            Some(env!("CARGO_PKG_VERSION").to_string()),
+        )
+        .with_description(spec.description);
+        let registration = runtime
+            .capability_registry
+            .register_owned([capability])
+            .map_err(|_| "retrieval_owner_conflict".to_string())?;
+
+        attachment.manager.set_governor(governor.clone());
+        *attachment
+            .output_governor
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = Some(governor);
+        attachment.output_tool_inserted = !self
+            .agent
+            .tool_registry
+            .iter()
+            .any(|name| name == "retrieve_output");
+        attachment.output_registration = Some(registration);
+        if attachment.output_tool_inserted {
+            self.agent.tool_registry.push("retrieve_output".into());
+            self.agent.tools.push("retrieve_output".into());
+        }
+        self.agent
+            .tool_context
+            .authorized_tools
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .insert("retrieve_output".into());
+        self.agent
+            .tool_context
+            .tool_exposure
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .activate_authorized("retrieve_output", true);
+        Ok(())
+    }
+
+    pub fn detach_language_intelligence(&mut self) -> Result<(), String> {
+        if self.agent.is_streaming {
+            return Err("language_intelligence_detach_while_running".into());
+        }
+        let Some(attachment) = self.language_intelligence.take() else {
+            return Ok(());
+        };
+        let runtime = self.agent.runtime.clone().ok_or("sdk_runtime_required")?;
+        if !self
+            .agent
+            .custom_tool_executor
+            .as_ref()
+            .is_some_and(|executor| executor.same_instance(&attachment.attached_executor))
+        {
+            self.language_intelligence = Some(attachment);
+            return Err("language_intelligence_executor_ownership_changed".into());
+        }
+        if !self
+            .agent
+            .tool_context
+            .semantic
+            .as_ref()
+            .is_some_and(|semantic| std::sync::Arc::ptr_eq(semantic, &attachment.attached_semantic))
+        {
+            self.language_intelligence = Some(attachment);
+            return Err("language_intelligence_semantic_ownership_changed".into());
+        }
+        if let Some(output_registration) = &attachment.output_registration {
+            runtime
+                .capability_registry
+                .unregister_owned(output_registration)
+                .map_err(|_| "retrieval_owner_conflict".to_string())?;
+        }
+        runtime
+            .capability_registry
+            .unregister_owned(&attachment.registration)
+            .map_err(|error| error.to_string())?;
+
+        if attachment.output_tool_inserted {
+            self.agent
+                .tool_registry
+                .retain(|name| name != "retrieve_output");
+            self.agent.tools.retain(|name| name != "retrieve_output");
+            self.agent
+                .tool_context
+                .authorized_tools
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .remove("retrieve_output");
+            self.agent
+                .tool_context
+                .tool_exposure
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .activate_authorized("retrieve_output", false);
+        }
+        *attachment
+            .output_governor
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = None;
+
+        self.agent.custom_tool_executor = attachment.previous_executor;
+        self.agent.tool_context.semantic = attachment.previous_semantic;
+        self.agent
+            .tool_registry
+            .retain(|name| !attachment.tools.contains(name));
+        self.agent
+            .tools
+            .retain(|name| !attachment.tools.contains(name));
+        {
+            let mut authorized = self
+                .agent
+                .tool_context
+                .authorized_tools
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            for tool in &attachment.tools {
+                authorized.remove(tool);
+            }
+        }
+        {
+            let mut exposure = self
+                .agent
+                .tool_context
+                .tool_exposure
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            for tool in &attachment.tools {
+                exposure.activate_authorized(tool, false);
+            }
+        }
+        attachment.manager.shutdown();
+        Ok(())
+    }
+}
+
+impl Drop for AgentSession {
+    fn drop(&mut self) {
+        if let Some(attachment) = self.language_intelligence.take() {
+            attachment.manager.shutdown();
+        }
     }
 }
 
@@ -290,6 +629,18 @@ pub fn create_agent_session(
             custom_tools,
             model_runtime,
             listeners: Vec::new(),
+            language_intelligence: None,
+            attachment_allowed_tools: options
+                .tools
+                .as_ref()
+                .map(|tools| tools.iter().cloned().collect()),
+            attachment_excluded_tools: options
+                .exclude_tools
+                .clone()
+                .unwrap_or_default()
+                .into_iter()
+                .collect(),
+            attachment_no_tools: options.no_tools.clone(),
         },
         extensions_result,
         model_fallback_message,
@@ -550,6 +901,111 @@ mod tests {
         session.prompt("hello from sdk");
         assert_eq!(session.agent.messages.len(), message + 1);
         assert_eq!(session.agent.messages.last().unwrap().role, "user");
+    }
+
+    #[test]
+    fn sdk_language_intelligence_attachment_is_explicit_and_reversible() {
+        let dir = tempdir().unwrap();
+        let mut session = create_agent_session(CreateAgentSessionOptions {
+            cwd: Some(dir.path().to_path_buf()),
+            agent_dir: Some(dir.path().join("agent")),
+            session_dir: Some(dir.path().join("sessions")),
+            ..CreateAgentSessionOptions::default()
+        })
+        .unwrap()
+        .session;
+        let tools = vec!["lsp_hover".to_string(), "lsp_diagnostics".to_string()];
+        session
+            .attach_language_intelligence(Default::default(), &tools)
+            .unwrap();
+        assert!(session.agent.tools.contains(&"lsp_hover".to_string()));
+        assert!(session.agent.tool_context.semantic.is_some());
+        assert_eq!(
+            session
+                .attach_language_intelligence(Default::default(), &tools)
+                .unwrap_err(),
+            "language_intelligence_already_attached"
+        );
+        session.detach_language_intelligence().unwrap();
+        assert!(!session.agent.tools.contains(&"lsp_hover".to_string()));
+    }
+
+    #[test]
+    fn sdk_language_output_store_serves_exact_retained_content() {
+        let dir = tempdir().unwrap();
+        let mut session = create_agent_session(CreateAgentSessionOptions {
+            cwd: Some(dir.path().to_path_buf()),
+            agent_dir: Some(dir.path().join("agent")),
+            session_dir: Some(dir.path().join("sessions")),
+            ..CreateAgentSessionOptions::default()
+        })
+        .unwrap()
+        .session;
+        session
+            .attach_language_intelligence(Default::default(), &[])
+            .unwrap();
+
+        let governor = std::sync::Arc::new(std::sync::Mutex::new(
+            crate::native_extensions::TokenGovernor::new(
+                "sdk-lsp-output",
+                crate::native_extensions::TokenGovernorConfig {
+                    compress_threshold_bytes: 1,
+                    compress_threshold_lines: 1,
+                    store_dir: Some(dir.path().join("governor")),
+                    ..Default::default()
+                },
+            ),
+        ));
+        let original = "alpha\nbeta\ngamma\n";
+        let processed = governor.lock().unwrap().after_tool(
+            "bash",
+            &serde_json::json!({"command":"fixture"}),
+            davinci_agent::ToolResult {
+                content: original.into(),
+                is_error: false,
+                details: None,
+            },
+        );
+        let id = processed
+            .details
+            .as_ref()
+            .unwrap()
+            .pointer("/tokenGovernor/outputId")
+            .and_then(serde_json::Value::as_str)
+            .unwrap()
+            .to_string();
+
+        session.attach_language_output_store(governor).unwrap();
+        let executor = session.agent.custom_tool_executor.clone().unwrap();
+        let retrieved = executor
+            .execute_with_context(
+                &session.cwd,
+                "retrieve_output",
+                &serde_json::json!({"id":id}),
+                &session.agent.tool_context,
+            )
+            .unwrap();
+        assert!(retrieved.content.contains("alpha"));
+        assert!(retrieved.content.contains("gamma"));
+        session.detach_language_intelligence().unwrap();
+    }
+
+    #[test]
+    fn sdk_language_intelligence_honors_original_exclusions() {
+        let dir = tempdir().unwrap();
+        let mut session = create_agent_session(CreateAgentSessionOptions {
+            cwd: Some(dir.path().to_path_buf()),
+            agent_dir: Some(dir.path().join("agent")),
+            session_dir: Some(dir.path().join("sessions")),
+            exclude_tools: Some(vec!["lsp_hover".into()]),
+            ..CreateAgentSessionOptions::default()
+        })
+        .unwrap()
+        .session;
+        let error = session
+            .attach_language_intelligence(Default::default(), &["lsp_hover".into()])
+            .unwrap_err();
+        assert!(error.contains("excluded by session policy"));
     }
 
     #[test]

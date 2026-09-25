@@ -220,25 +220,14 @@ pub trait SemanticService: std::fmt::Debug + Send + Sync {
     fn query_with_context(
         &self,
         query: SemanticQuery<'_>,
-        context: &SemanticRequestContext,
+        _context: &SemanticRequestContext,
     ) -> Result<SemanticResult, String> {
-        if context
-            .abort
-            .as_ref()
-            .is_some_and(|abort| abort.load(std::sync::atomic::Ordering::Acquire))
-        {
-            return Err("Operation aborted".into());
-        }
-        if context
-            .deadline
-            .is_some_and(|deadline| std::time::Instant::now() >= deadline)
-        {
-            return Err("Semantic request deadline expired".into());
-        }
         match query {
-            SemanticQuery::Definition { cwd, path, position } => {
-                self.definition(cwd, path, position.line, position.character)
-            }
+            SemanticQuery::Definition {
+                cwd,
+                path,
+                position,
+            } => self.definition(cwd, path, position.line, position.character),
             SemanticQuery::References {
                 cwd,
                 path,

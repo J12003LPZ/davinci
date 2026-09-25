@@ -284,10 +284,7 @@ pub fn run_bounded(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Mutex;
     use std::time::{Duration, Instant};
-
-    static CWD_LOCK: Mutex<()> = Mutex::new(());
 
     fn shell(script: &str) -> Command {
         if cfg!(windows) {
@@ -403,25 +400,33 @@ mod tests {
 
     #[test]
     fn empty_path_entries_never_resolve_from_the_current_directory() {
-        let _cwd_lock = CWD_LOCK.lock().unwrap_or_else(|error| error.into_inner());
         let file = tempfile::Builder::new()
             .prefix("davinci-path-entry-")
             .tempfile_in(".")
             .unwrap();
-        let name = file.path().file_name().unwrap().to_string_lossy().into_owned();
+        let name = file
+            .path()
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
         assert_eq!(resolve_program_in(&name, OsStr::new(""), None), None);
     }
 
     #[test]
-    fn relative_path_entries_are_never_searched() {
-        let _cwd_lock = CWD_LOCK.lock().unwrap_or_else(|error| error.into_inner());
-        let dir = tempfile::tempdir().unwrap();
-        let previous = std::env::current_dir().unwrap();
-        std::env::set_current_dir(dir.path()).unwrap();
-        std::fs::write("repo-tool", "sentinel").unwrap();
-        let found = resolve_program_in("repo-tool", OsStr::new("."), None);
-        std::env::set_current_dir(previous).unwrap();
-        assert_eq!(found, None);
+    fn relative_path_entries_never_resolve_from_the_current_directory() {
+        let file = tempfile::Builder::new()
+            .prefix("davinci-relative-path-entry-")
+            .tempfile_in(".")
+            .unwrap();
+        let name = file
+            .path()
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        let relative = std::env::join_paths([std::path::PathBuf::from(".")]).unwrap();
+        assert_eq!(resolve_program_in(&name, &relative, None), None);
     }
 
     #[test]

@@ -208,7 +208,10 @@ mod tests {
         let dir = tempdir().unwrap();
         let path = dir.path().join("x.lock");
         drop(LockFile::acquire(&path, Duration::ZERO, DEFAULT_STALE_AFTER).unwrap());
-        assert!(path.is_file(), "OS-backed lock file remains as a stable inode");
+        assert!(
+            path.is_file(),
+            "OS-backed lock file remains as a stable inode"
+        );
         LockFile::acquire(&path, Duration::ZERO, DEFAULT_STALE_AFTER).unwrap();
     }
 

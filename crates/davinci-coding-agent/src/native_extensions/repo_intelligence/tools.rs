@@ -72,45 +72,6 @@ pub fn tool_spec(name: &str) -> Option<davinci_ai::ToolSpec> {
     })
 }
 
-
-fn validate_semantic_anchor(value: &Value) -> Result<(), String> {
-    let object = value
-        .as_object()
-        .ok_or("query_invalid: semantic must be an object")?;
-    if object
-        .keys()
-        .any(|key| !matches!(key.as_str(), "operation" | "line" | "column"))
-    {
-        return Err("query_invalid: semantic has unknown fields".into());
-    }
-    let operation = object
-        .get("operation")
-        .and_then(Value::as_str)
-        .ok_or("query_invalid: semantic.operation required")?;
-    if !matches!(
-        operation,
-        "definition" | "references" | "implementations" | "typeDefinition" | "diagnostics"
-    ) {
-        return Err("query_invalid: unsupported semantic.operation".into());
-    }
-    let line = object.get("line");
-    let column = object.get("column");
-    if operation == "diagnostics" {
-        if line.is_some() || column.is_some() {
-            return Err("query_invalid: diagnostics semantic anchor has no position".into());
-        }
-    } else if !line
-        .and_then(Value::as_u64)
-        .is_some_and(|value| value >= 1)
-        || !column
-            .and_then(Value::as_u64)
-            .is_some_and(|value| value >= 1)
-    {
-        return Err("query_invalid: semantic line and column must be >= 1".into());
-    }
-    Ok(())
-}
-
 impl RepoIntelligence {
     pub fn execute_tool(&self, name: &str, args: &Value) -> Result<ToolResult, ToolError> {
         let value = self.query(name, args).map_err(ToolError::Failed)?;
@@ -133,7 +94,7 @@ pub(super) fn validate(name: &str, args: &Value) -> Result<(), String> {
     for (key, value) in object {
         let schema = &spec.parameters["properties"][key];
         if name == "code_query" && key == "semantic" {
-            validate_semantic_anchor(value)?;
+            validate_semantic_anchor(object, value)?;
             continue;
         }
         let valid = match schema["type"].as_str() {
@@ -156,6 +117,9 @@ pub(super) fn validate(name: &str, args: &Value) -> Result<(), String> {
             return Err(format!("query_invalid: invalid {key}"));
         }
     }
+    if name == "code_query" && object.contains_key("semantic") && !object.contains_key("path") {
+        return Err("query_invalid: semantic code_query requires path".into());
+    }
     if name == "symbol_relationships"
         && !object.contains_key("symbolId")
         && !(object.contains_key("path") && object.contains_key("line"))
@@ -168,6 +132,56 @@ pub(super) fn validate(name: &str, args: &Value) -> Result<(), String> {
             .any(|key| object.contains_key(*key))
     {
         return Err("query_invalid: file, symbol or task hint required".into());
+    }
+    Ok(())
+}
+
+fn validate_semantic_anchor(
+    outer: &serde_json::Map<String, Value>,
+    value: &Value,
+) -> Result<(), String> {
+    let anchor = value
+        .as_object()
+        .ok_or("query_invalid: semantic must be an object")?;
+    if anchor
+        .keys()
+        .any(|key| !matches!(key.as_str(), "operation" | "line" | "column"))
+    {
+        return Err("query_invalid: semantic contains an unknown field".into());
+    }
+    let operation = anchor
+        .get("operation")
+        .and_then(Value::as_str)
+        .ok_or("query_invalid: semantic.operation required")?;
+    if !matches!(
+        operation,
+        "definition" | "references" | "implementations" | "typeDefinition" | "diagnostics"
+    ) {
+        return Err("query_invalid: invalid semantic.operation".into());
+    }
+    let has_path = outer
+        .get("path")
+        .and_then(Value::as_str)
+        .is_some_and(|path| !path.trim().is_empty());
+    if !has_path {
+        return Err("query_invalid: semantic anchor requires a source path".into());
+    }
+    let has_line = anchor
+        .get("line")
+        .and_then(Value::as_u64)
+        .is_some_and(|value| value > 0);
+    let has_column = anchor
+        .get("column")
+        .and_then(Value::as_u64)
+        .is_some_and(|value| value > 0);
+    if operation == "diagnostics" {
+        if anchor.contains_key("line") || anchor.contains_key("column") {
+            return Err(
+                "query_invalid: diagnostics semantic anchor does not accept line/column".into(),
+            );
+        }
+    } else if !has_line || !has_column {
+        return Err("query_invalid: semantic anchor requires one-based line and column".into());
     }
     Ok(())
 }

@@ -42,12 +42,11 @@ impl RepoIntelligence {
         if query.trim().is_empty() {
             return Err("query_invalid: query required".into());
         }
-        if let Some(anchor) = args.get("semantic") {
+        if let Some(anchor) = args.get("semantic").and_then(Value::as_object) {
             let path = args
                 .get("path")
                 .and_then(Value::as_str)
-                .ok_or("query_invalid: semantic code_query requires path")?;
-            self.validate_path(path)?;
+                .ok_or("query_invalid: semantic anchor requires path")?;
             let operation_name = anchor
                 .get("operation")
                 .and_then(Value::as_str)
@@ -58,56 +57,76 @@ impl RepoIntelligence {
                 "implementations" => SemanticOperation::Implementations,
                 "typeDefinition" => SemanticOperation::TypeDefinition,
                 "diagnostics" => SemanticOperation::Diagnostics,
-                _ => return Err("query_invalid: unsupported semantic.operation".into()),
+                _ => return Err("query_invalid: invalid semantic.operation".into()),
             };
-            let line = anchor.get("line").and_then(Value::as_u64).unwrap_or(1) as usize;
-            let column = anchor.get("column").and_then(Value::as_u64).unwrap_or(1) as usize;
-            let range = SourceRange {
-                start_line: line,
-                start_column: column,
-                end_line: line,
-                end_column: column,
+            let range = if matches!(operation, SemanticOperation::Diagnostics) {
+                SourceRange {
+                    start_line: 1,
+                    start_column: 1,
+                    end_line: 1,
+                    end_column: 1,
+                }
+            } else {
+                let line = anchor.get("line").and_then(Value::as_u64).unwrap_or(0) as usize;
+                let column = anchor.get("column").and_then(Value::as_u64).unwrap_or(0) as usize;
+                if line == 0 || column == 0 {
+                    return Err("query_invalid: semantic position must be one-based".into());
+                }
+                SourceRange {
+                    start_line: line,
+                    start_column: column,
+                    end_line: line,
+                    end_column: column,
+                }
             };
-            let mut results = Vec::new();
-            let mut semantic_warning = None;
-            match self.semantic.as_ref() {
-                Some(provider) => match provider.query(operation, path, &range, limit) {
+            if let Some(provider) = &self.semantic {
+                match provider.query(operation, path, &range, limit) {
                     Ok(evidence) => {
-                        for item in evidence.into_iter().take(limit) {
-                            if self.validate_path(&item.path).is_ok()
-                                && (scope == "."
-                                    || item.path == scope
-                                    || item.path.starts_with(&format!("{scope}/")))
-                            {
-                                results.push(json!({
+                        let results = evidence
+                            .into_iter()
+                            .take(limit)
+                            .filter(|item| self.validate_path(&item.path).is_ok())
+                            .map(|item| {
+                                json!({
                                     "source":"lsp",
                                     "confidence":"semantic",
                                     "path":item.path,
                                     "range":item.range,
                                     "reason":item.description.chars().take(500).collect::<String>()
-                                }));
-                            }
-                        }
+                                })
+                            })
+                            .collect::<Vec<_>>();
+                        let mut value = queries::envelope(results, limit);
+                        value["route"] = json!("semantic");
+                        value["semantic_status"] = json!("provider");
+                        return Ok(value);
                     }
                     Err(error) => {
-                        semantic_warning = Some(error.chars().take(500).collect::<String>());
+                        let mut fallback_args = args.clone();
+                        if let Some(object) = fallback_args.as_object_mut() {
+                            object.remove("semantic");
+                        }
+                        let mut value =
+                            self.unified_query(index, query, scope, limit, &fallback_args)?;
+                        value["semantic_status"] = json!("unavailable");
+                        value["semantic_warning"] = json!(format!(
+                            "semantic provider unavailable: {}",
+                            error.chars().take(300).collect::<String>()
+                        ));
+                        return Ok(value);
                     }
-                },
-                None => semantic_warning = Some("semantic provider unavailable".into()),
+                }
             }
-            let mut value = queries::envelope(results, limit);
-            value["route"] = json!("semantic");
-            value["semantic_status"] = json!(if semantic_warning.is_some() {
-                "partial"
-            } else {
-                "available"
-            });
-            if let Some(warning) = semantic_warning {
-                value["semantic_warning"] = json!(warning);
+            let mut fallback_args = args.clone();
+            if let Some(object) = fallback_args.as_object_mut() {
+                object.remove("semantic");
             }
+            let mut value = self.unified_query(index, query, scope, limit, &fallback_args)?;
+            value["semantic_status"] = json!("unavailable");
+            value["semantic_warning"] =
+                json!("semantic provider unavailable; structural/text evidence only");
             return Ok(value);
         }
-
         let lower = query.to_lowercase();
         let words: Vec<_> = query
             .split(|c: char| !c.is_alphanumeric() && c != '_')

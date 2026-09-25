@@ -1,7 +1,7 @@
 //! One initialized server and its synchronized documents.
-use super::client_requests::ClientRequestConfig;
+use super::client_requests::ClientRequestState;
 use super::documents::{self, Document};
-use super::protocol::{IntelligenceError, Result};
+use super::protocol::{IntelligenceError, RequestBudget, Result};
 use super::servers::{ServerAdapter, ServerCommand};
 use super::transport::Transport;
 use serde_json::{json, Value};
@@ -20,26 +20,45 @@ pub(super) struct Session {
     capabilities: Value,
     documents: BTreeMap<PathBuf, Document>,
     diagnostic_floor: BTreeMap<String, u64>,
+    diagnostic_result_ids: BTreeMap<String, String>,
+    diagnostic_pull_items: BTreeMap<String, Vec<Value>>,
+    diagnostic_refresh_generation: u64,
+    needs_resync: bool,
 }
 
 impl Session {
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn start(command: ServerCommand, deadline: Instant) -> Result<Self> {
-        let uri = documents::file_uri(&command.workspace)?;
-        let client = ClientRequestConfig::for_command(&command, &uri);
+        Self::start_with_budget(
+            command,
+            RequestBudget {
+                deadline,
+                cancelled: None,
+            },
+        )
+    }
+
+    pub fn start_with_budget(command: ServerCommand, budget: RequestBudget) -> Result<Self> {
+        let client = ClientRequestState::new(
+            command.workspace.clone(),
+            command.client_configuration.clone(),
+        )?;
         let transport = Transport::spawn_with_client(&mut command.command(), client)?;
-        let result = transport.request("initialize", json!({
+        let uri = documents::file_uri(&command.workspace)?;
+        let result = transport.request_with_budget("initialize", json!({
             "processId": std::process::id(), "clientInfo":{"name":"DaVinci"},
             "rootUri":uri, "workspaceFolders":[{"uri":uri,"name":"project"}],
             "capabilities": {
                 "general":{"positionEncodings":["utf-16"]},
+                "window":{"workDoneProgress":true},
+                "experimental":{"serverStatusNotification":true},
                 "workspace":{
                     "applyEdit":false,
-                    "workspaceEdit":{"documentChanges":false},
                     "configuration":true,
                     "workspaceFolders":true,
+                    "workspaceEdit":{"documentChanges":false},
                     "diagnostics":{"refreshSupport":true}
                 },
-                "window":{"workDoneProgress":true},
                 "textDocument": {
                     "synchronization":{"dynamicRegistration":false,"didSave":true},
                     "hover":{"contentFormat":["plaintext","markdown"]},
@@ -50,7 +69,7 @@ impl Session {
                     "diagnostic":{"dynamicRegistration":true,"relatedDocumentSupport":false}
                 }
             }, "initializationOptions":command.initialization_options
-        }), remaining(deadline)?).map_err(|e| IntelligenceError::new("initialization_failed", &format!("Language-server initialization failed ({})", e.code)))?;
+        }), &budget).map_err(|e| IntelligenceError::new("initialization_failed", &format!("Language-server initialization failed ({})", e.code)))?;
         let capabilities = result
             .get("capabilities")
             .filter(|v| v.is_object())
@@ -67,24 +86,48 @@ impl Session {
                 "Server selected an unsupported position encoding",
             ));
         }
-        transport.notify("initialized", json!({}))?;
+        transport.notify_with_budget("initialized", json!({}), &budget)?;
+        let diagnostic_refresh_generation = transport.client_status()
+            ["diagnosticRefreshGeneration"]
+            .as_u64()
+            .unwrap_or(0);
         Ok(Self {
             command,
             transport,
             capabilities,
             documents: BTreeMap::new(),
             diagnostic_floor: BTreeMap::new(),
+            diagnostic_result_ids: BTreeMap::new(),
+            diagnostic_pull_items: BTreeMap::new(),
+            diagnostic_refresh_generation,
+            needs_resync: false,
         })
     }
 
     pub fn is_alive(&self) -> bool {
         self.transport.is_alive()
     }
+
+    /// See [`ClientRequestState::wait_quiescent`].
+    pub fn wait_until_ready(&self, budget: &RequestBudget) -> Option<bool> {
+        self.transport.wait_quiescent(budget)
+    }
     pub fn status(&self) -> Value {
-        json!({"workspace":self.command.workspace,"backend":self.command.kind,
-            "serverVersion":self.command.version,"projectTypeScript":self.command.typescript_version,
+        json!({
+            "workspace":self.command.workspace,
+            "backend":self.command.kind,
+            "language":self.command.family,
+            "serverVersion":self.command.version,
+            "projectTypeScript":self.command.typescript_version,
+            "profileFingerprint":self.command.profile_fingerprint,
+            "analysisEnvironment":self.command.analysis_environment,
+            "limitations":self.command.limitations,
             "session":if self.is_alive() {"running"} else {"stopped"},
-            "pid":self.transport.pid(),"documents":self.documents.len()})
+            "pid":self.transport.pid(),
+            "rssBytes":self.transport.rss_bytes(),
+            "documents":self.documents.len(),
+            "client":self.transport.client_status()
+        })
     }
 
     fn supports(&self, capability: &str) -> bool {
@@ -97,8 +140,14 @@ impl Session {
         &mut self,
         source: Option<&Path>,
         adapter: &dyn ServerAdapter,
-        deadline: Instant,
+        budget: &RequestBudget,
     ) -> Result<()> {
+        if self.needs_resync {
+            return Err(IntelligenceError::new(
+                "resync_required",
+                "Document delivery became uncertain; restart this language-server session before using semantic evidence",
+            ));
+        }
         let sync = &self.capabilities["textDocumentSync"];
         let kind = sync
             .as_u64()
@@ -124,15 +173,18 @@ impl Session {
         let mut updates = Vec::new();
         let mut changed = false;
         for path in paths {
-            remaining(deadline)?;
+            budget.check()?;
             if !path.exists() && Some(path.as_path()) != source {
                 if let Some(old) = self.documents.remove(&path) {
-                    self.transport.notify(
+                    self.transport.notify_with_budget(
                         "textDocument/didClose",
                         json!({"textDocument":{"uri":old.uri}}),
+                        budget,
                     )?;
                     self.transport.unwatch_document(&old.uri);
                     self.diagnostic_floor.remove(&old.uri);
+                    self.diagnostic_result_ids.remove(&old.uri);
+                    self.diagnostic_pull_items.remove(&old.uri);
                     changed = true;
                 }
                 continue;
@@ -162,6 +214,8 @@ impl Session {
         }
         // Changes to dependencies invalidate cached diagnostics for every open document.
         if changed {
+            self.diagnostic_result_ids.clear();
+            self.diagnostic_pull_items.clear();
             for (document, _) in &updates {
                 self.diagnostic_floor.insert(
                     document.uri.clone(),
@@ -172,25 +226,62 @@ impl Session {
             }
         }
         for (document, events) in updates {
+            let mut sent = 0usize;
             for event in events {
-                self.transport.notify(
+                match self.transport.notify_with_budget(
                     event["method"].as_str().expect("internal event"),
                     event["params"].clone(),
-                )?;
+                    budget,
+                ) {
+                    Ok(()) => sent += 1,
+                    Err(error) => {
+                        if sent > 0 {
+                            self.needs_resync = true;
+                            return Err(IntelligenceError::new(
+                                "resync_required",
+                                "A document notification batch was only partially delivered; semantic state must be recreated",
+                            ));
+                        }
+                        return Err(error);
+                    }
+                }
             }
             self.documents.insert(document.path.clone(), document);
         }
         Ok(())
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn execute(
+        &mut self,
+        method: &str,
+        capability: &str,
+        source: Option<&Path>,
+        params: Value,
+        adapter: &dyn ServerAdapter,
+        deadline: Instant,
+    ) -> Result<Value> {
+        self.execute_with_budget(
+            method,
+            capability,
+            source,
+            params,
+            adapter,
+            &RequestBudget {
+                deadline,
+                cancelled: None,
+            },
+        )
+    }
+
+    pub fn execute_with_budget(
         &mut self,
         method: &str,
         capability: &str,
         source: Option<&Path>,
         mut params: Value,
         adapter: &dyn ServerAdapter,
-        deadline: Instant,
+        budget: &RequestBudget,
     ) -> Result<Value> {
         if method != "textDocument/diagnostic" && !self.supports(capability) {
             return Err(IntelligenceError::new(
@@ -198,7 +289,15 @@ impl Session {
                 "Selected server does not advertise this semantic operation",
             ));
         }
-        self.synchronize(source, adapter, deadline)?;
+        self.synchronize(source, adapter, budget)?;
+        let refresh = self.transport.client_status()["diagnosticRefreshGeneration"]
+            .as_u64()
+            .unwrap_or(0);
+        if refresh != self.diagnostic_refresh_generation {
+            self.diagnostic_refresh_generation = refresh;
+            self.diagnostic_result_ids.clear();
+            self.diagnostic_pull_items.clear();
+        }
         if let Some(path) = source {
             let document = &self.documents[path];
             params["textDocument"] = json!({"uri":document.uri});
@@ -218,20 +317,72 @@ impl Session {
             }
         }
         if method == "textDocument/diagnostic" {
-            if self.supports("diagnosticProvider") {
-                let response = self
-                    .transport
-                    .request(method, params, remaining(deadline)?)?;
-                return response
-                    .get("items")
-                    .filter(|v| v.is_array())
-                    .cloned()
-                    .ok_or_else(|| {
-                        IntelligenceError::new(
+            if self.supports("diagnosticProvider") || self.transport.has_dynamic_diagnostics() {
+                let path = source.ok_or_else(|| {
+                    IntelligenceError::new(
+                        "invalid_source_path",
+                        "Diagnostics require a source file",
+                    )
+                })?;
+                let document = &self.documents[path];
+                if let Some(previous) = self.diagnostic_result_ids.get(&document.uri) {
+                    params["previousResultId"] = json!(previous);
+                }
+                let response = self.transport.request_with_budget(method, params, budget)?;
+                match response.get("kind").and_then(Value::as_str) {
+                    Some("full") => {
+                        let items = response
+                            .get("items")
+                            .and_then(Value::as_array)
+                            .cloned()
+                            .ok_or_else(|| {
+                                IntelligenceError::new(
+                                    "protocol_error",
+                                    "Expected diagnostic items",
+                                )
+                            })?;
+                        if let Some(result_id) = response.get("resultId").and_then(Value::as_str) {
+                            self.diagnostic_result_ids
+                                .insert(document.uri.clone(), result_id.into());
+                        } else {
+                            self.diagnostic_result_ids.remove(&document.uri);
+                        }
+                        self.diagnostic_pull_items
+                            .insert(document.uri.clone(), items.clone());
+                        return Ok(
+                            json!({"items":items,"omitted":0,"freshness":"pull-response","documentVersion":document.version}),
+                        );
+                    }
+                    Some("unchanged") => {
+                        let result_id = response.get("resultId").and_then(Value::as_str);
+                        if result_id.is_some()
+                            && result_id
+                                == self
+                                    .diagnostic_result_ids
+                                    .get(&document.uri)
+                                    .map(String::as_str)
+                        {
+                            let items = self
+                                .diagnostic_pull_items
+                                .get(&document.uri)
+                                .cloned()
+                                .ok_or_else(|| IntelligenceError::new(
+                                    "diagnostics_pending",
+                                    "Unchanged diagnostic report has no retained current full report",
+                                ))?;
+                            return Ok(
+                                json!({"items":items,"omitted":0,"freshness":"pull-response","unchanged":true,"documentVersion":document.version}),
+                            );
+                        }
+                        return Err(IntelligenceError::new("diagnostics_pending", "Unchanged diagnostic report did not match the current provider result id"));
+                    }
+                    _ => {
+                        return Err(IntelligenceError::new(
                             "protocol_error",
-                            "Expected a full document diagnostic report",
-                        )
-                    });
+                            "Expected a full or unchanged document diagnostic report",
+                        ))
+                    }
+                }
             }
             let path = source.ok_or_else(|| {
                 IntelligenceError::new("invalid_source_path", "Diagnostics require a source file")
@@ -241,7 +392,7 @@ impl Session {
             loop {
                 let mut snapshot =
                     self.transport
-                        .wait_diagnostics(&document.uri, floor, remaining(deadline)?)?;
+                        .wait_diagnostics(&document.uri, floor, budget.remaining()?)?;
                 if snapshot
                     .version
                     .is_some_and(|version| version != document.version)
@@ -255,7 +406,8 @@ impl Session {
                 // the server has been quiet for the settle window, so a
                 // file with type errors is not reported clean.
                 loop {
-                    let window = remaining(deadline)
+                    let window = budget
+                        .remaining()
                         .map(|left| left.min(DIAGNOSTIC_SETTLE))
                         .unwrap_or_default();
                     if window.is_zero() {
@@ -282,10 +434,11 @@ impl Session {
                     "documentVersion":document.version}));
             }
         }
-        self.transport.request(method, params, remaining(deadline)?)
+        self.transport.request_with_budget(method, params, budget)
     }
 }
 
+#[allow(dead_code)]
 pub(super) fn remaining(deadline: Instant) -> Result<std::time::Duration> {
     deadline
         .checked_duration_since(Instant::now())
@@ -297,7 +450,7 @@ pub(super) fn remaining(deadline: Instant) -> Result<std::time::Duration> {
 
 #[cfg(test)]
 mod tests {
-    use super::super::servers::{ServerKind, TypeScriptAdapter};
+    use super::super::servers::TypeScriptAdapter;
     use super::*;
     use std::time::Duration;
 
@@ -305,21 +458,36 @@ mod tests {
         Instant::now() + Duration::from_secs(3)
     }
     fn fixture(root: &Path, mode: &str) -> ServerCommand {
+        use super::super::identity::{LanguageFamily, ServerInvocation};
+        use super::super::servers::ServerBackend;
+        use std::collections::BTreeMap;
+        let program = davinci_sys::process::resolve_program("node");
+        let program = program.canonicalize().unwrap_or(program);
+        let args = vec![
+            concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/tests/fixtures/language-server.cjs"
+            )
+            .into(),
+            mode.into(),
+        ];
+        let invocation = ServerInvocation::new(program.clone(), args.clone()).unwrap();
         ServerCommand {
-            kind: ServerKind::TypeScriptLanguageServer,
-            program: "node".into(),
-            args: vec![
-                concat!(
-                    env!("CARGO_MANIFEST_DIR"),
-                    "/tests/fixtures/language-server.cjs"
-                )
-                .into(),
-                mode.into(),
-            ],
+            kind: ServerBackend::TypeScriptLanguageServer,
+            backend: ServerBackend::TypeScriptLanguageServer,
+            program,
+            args,
+            invocation,
             workspace: root.into(),
             version: Some("fixture".into()),
             typescript_version: None,
             initialization_options: json!({}),
+            client_configuration: Value::Null,
+            family: LanguageFamily::TypeScript,
+            profile_fingerprint: "fixture".into(),
+            analysis_environment: None,
+            limitations: Vec::new(),
+            env: BTreeMap::new(),
         }
     }
 
@@ -410,7 +578,7 @@ mod tests {
                 deadline(),
             )
             .unwrap();
-        assert_eq!(first.as_array().unwrap().len(), 1);
+        assert_eq!(first["items"].as_array().unwrap().len(), 1);
         std::fs::write(&a, "good").unwrap();
         let next = session
             .execute(
@@ -422,7 +590,7 @@ mod tests {
                 deadline(),
             )
             .unwrap();
-        assert_eq!(next, json!([]));
+        assert_eq!(next["items"], json!([]));
         std::fs::remove_file(&a).unwrap();
         session
             .execute(
@@ -435,6 +603,42 @@ mod tests {
             )
             .unwrap();
         assert!(session.documents.is_empty());
+    }
+
+    #[test]
+    fn partial_notification_delivery_marks_session_for_resynchronization() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let path = root.join("a.ts");
+        std::fs::write(&path, "first").unwrap();
+        let mut session = Session::start(fixture(&root, "normal"), deadline()).unwrap();
+        session
+            .execute(
+                "textDocument/hover",
+                "hoverProvider",
+                Some(&path),
+                json!({}),
+                &TypeScriptAdapter,
+                deadline(),
+            )
+            .unwrap();
+        // This assertion locks the fail-closed state transition itself; the
+        // transport queue-failure fixture exercises the actual partial batch.
+        session.needs_resync = true;
+        assert_eq!(
+            session
+                .execute(
+                    "textDocument/hover",
+                    "hoverProvider",
+                    Some(&path),
+                    json!({}),
+                    &TypeScriptAdapter,
+                    deadline(),
+                )
+                .unwrap_err()
+                .code,
+            "resync_required"
+        );
     }
 
     #[test]

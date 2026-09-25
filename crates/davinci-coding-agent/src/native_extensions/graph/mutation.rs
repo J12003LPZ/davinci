@@ -8,8 +8,6 @@ use super::replay::sha256_hex;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::Path;
-#[cfg(test)]
-use std::process::Command;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -525,6 +523,7 @@ mod tests {
     }
 
     use super::*;
+    use std::process::Command;
     use tempfile::tempdir;
 
     fn setup_git_repo(path: &Path) {

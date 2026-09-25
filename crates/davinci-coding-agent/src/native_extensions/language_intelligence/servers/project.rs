@@ -1,409 +1,419 @@
-//! Static Rust and Python project resolution. No subprocess execution.
+//! Static Rust/Python project-root resolution. This module never executes code.
+use super::super::identity::{LanguageFamily, ResolvedProject};
+use super::super::metadata::{MetadataClass, ResolutionContext};
+use super::super::protocol::{IntelligenceError, Result};
+use globset::{Glob, GlobSetBuilder};
+use std::path::{Path, PathBuf};
+use std::str::FromStr;
 
-use crate::native_extensions::language_intelligence::identity::{LanguageFamily, ResolvedProject};
-use crate::native_extensions::language_intelligence::metadata::{
-    MetadataClass, ResolutionContext,
-};
-use crate::native_extensions::language_intelligence::protocol::{
-    IntelligenceError, Result,
-};
-use std::path::{Component, Path, PathBuf};
-
-const MAX_MANIFEST: usize = 256 * 1024;
+const MANIFEST_CAP: usize = 256 * 1024;
 const MAX_ANCESTORS: usize = 64;
-const MAX_MEMBER_PATHS: usize = 1024;
 
-pub(crate) fn resolve_project(
+pub(super) fn resolve_project(
     family: LanguageFamily,
     context: &ResolutionContext,
     source: &Path,
     explicit_roots: &[PathBuf],
 ) -> Result<ResolvedProject> {
-    let workspace = context
-        .reader
-        .resolve_path(
-            &context.workspace,
-            MetadataClass::WorkspaceConfiguration,
-            &context.budget,
-        )?;
+    context.budget.check()?;
     let source = context.reader.resolve_path(
         source,
         MetadataClass::WorkspaceConfiguration,
         &context.budget,
     )?;
-    if !source.starts_with(&workspace) || !source.is_file() {
+    if !source.starts_with(&context.workspace) {
         return Err(IntelligenceError::new(
-            "invalid_source_path",
-            "Source must be a file inside the authorized workspace",
+            "outside_workspace",
+            "Source path escapes the authorized workspace",
         ));
     }
-    if let Some(root) = explicit_root(&workspace, &source, explicit_roots) {
+    if let Some(root) = explicit_root(context, &source, explicit_roots)? {
         return Ok(ResolvedProject {
-            workspace,
+            workspace: context.workspace.clone(),
             root,
             family,
             analysis_environment: None,
             config_files: Vec::new(),
-            limitations: vec!["explicit_project_root".into()],
+            limitations: Vec::new(),
         });
     }
     match family {
-        LanguageFamily::Rust => resolve_rust(context, workspace, source),
-        LanguageFamily::Python => resolve_python(context, workspace, source),
-        LanguageFamily::TypeScript => Err(IntelligenceError::new(
-            "unsupported_language",
-            "TypeScript project resolution remains on the compatibility resolver",
-        )),
+        LanguageFamily::TypeScript => resolve_typescript(context, &source),
+        LanguageFamily::Rust => resolve_rust(context, &source),
+        LanguageFamily::Python => resolve_python(context, &source),
     }
 }
 
-fn explicit_root(workspace: &Path, source: &Path, roots: &[PathBuf]) -> Option<PathBuf> {
-    roots
-        .iter()
-        .filter_map(|root| {
-            let joined = if root.is_absolute() {
-                root.clone()
-            } else {
-                workspace.join(root)
-            };
-            let canonical = joined.canonicalize().ok()?;
-            (canonical.starts_with(workspace)
-                && source.starts_with(&canonical)
-                && canonical.is_dir())
-            .then_some(canonical)
-        })
-        .max_by_key(|root| root.components().count())
-}
-
-fn resolve_rust(
+fn explicit_root(
     context: &ResolutionContext,
-    workspace: PathBuf,
-    source: PathBuf,
-) -> Result<ResolvedProject> {
-    if source.extension().and_then(|value| value.to_str()) != Some("rs") {
-        return Err(IntelligenceError::new(
-            "unsupported_language",
-            "Rust project resolution requires a .rs source file",
-        ));
+    source: &Path,
+    roots: &[PathBuf],
+) -> Result<Option<PathBuf>> {
+    let mut matches = Vec::new();
+    for root in roots {
+        if root.is_absolute()
+            || root
+                .components()
+                .any(|c| matches!(c, std::path::Component::ParentDir))
+        {
+            return Err(IntelligenceError::new(
+                "invalid_settings",
+                "Explicit project roots must be workspace-relative",
+            ));
+        }
+        let joined = context.workspace.join(root);
+        let canonical = context.reader.resolve_path(
+            &joined,
+            MetadataClass::WorkspaceConfiguration,
+            &context.budget,
+        )?;
+        if source.starts_with(&canonical) {
+            matches.push(canonical);
+        }
     }
-    let mut manifests = Vec::new();
-    for directory in source
+    matches.sort_by_key(|p| p.components().count());
+    Ok(matches.pop())
+}
+
+fn ancestors<'a>(workspace: &'a Path, source: &'a Path) -> impl Iterator<Item = &'a Path> {
+    source
         .parent()
         .into_iter()
         .flat_map(Path::ancestors)
         .take(MAX_ANCESTORS)
-    {
-        if !directory.starts_with(&workspace) {
-            break;
+        .take_while(move |path| path.starts_with(workspace))
+}
+
+fn exists(context: &ResolutionContext, path: &Path) -> bool {
+    context
+        .reader
+        .resolve_path(path, MetadataClass::WorkspaceConfiguration, &context.budget)
+        .is_ok()
+}
+
+fn resolve_typescript(context: &ResolutionContext, source: &Path) -> Result<ResolvedProject> {
+    for dir in ancestors(&context.workspace, source) {
+        for marker in ["tsconfig.json", "jsconfig.json", "package.json"] {
+            let path = dir.join(marker);
+            if exists(context, &path) {
+                return Ok(ResolvedProject {
+                    workspace: context.workspace.clone(),
+                    root: dir.to_path_buf(),
+                    family: LanguageFamily::TypeScript,
+                    analysis_environment: None,
+                    config_files: vec![path],
+                    limitations: Vec::new(),
+                });
+            }
         }
-        let manifest = directory.join("Cargo.toml");
-        if manifest.is_file() {
-            let doc = read_toml(context, &manifest)?;
-            manifests.push((directory.to_path_buf(), manifest, doc));
-        }
-        if directory == workspace {
-            break;
+    }
+    Ok(ResolvedProject {
+        workspace: context.workspace.clone(),
+        root: context.workspace.clone(),
+        family: LanguageFamily::TypeScript,
+        analysis_environment: None,
+        config_files: Vec::new(),
+        limitations: Vec::new(),
+    })
+}
+
+fn read_toml(context: &ResolutionContext, path: &Path) -> Result<toml_edit::DocumentMut> {
+    let raw = context.reader.read(
+        path,
+        MetadataClass::WorkspaceConfiguration,
+        MANIFEST_CAP,
+        &context.budget,
+    )?;
+    let text = std::str::from_utf8(&raw).map_err(|_| {
+        IntelligenceError::new("project_resolution_incomplete", "Cargo.toml must be UTF-8")
+    })?;
+    toml_edit::DocumentMut::from_str(text).map_err(|_| {
+        IntelligenceError::new("project_resolution_incomplete", "Cargo.toml is malformed")
+    })
+}
+
+fn resolve_rust(context: &ResolutionContext, source: &Path) -> Result<ResolvedProject> {
+    let mut manifests = Vec::<(PathBuf, toml_edit::DocumentMut)>::new();
+    for dir in ancestors(&context.workspace, source) {
+        let manifest = dir.join("Cargo.toml");
+        if exists(context, &manifest) {
+            manifests.push((manifest.clone(), read_toml(context, &manifest)?));
         }
     }
     if manifests.is_empty() {
         return Err(IntelligenceError::new(
             "project_not_found",
-            "No Cargo.toml owns this Rust source",
+            "No Cargo project owns this Rust source",
         ));
     }
-
-    // Explicit package.workspace wins when it resolves to an ancestor manifest.
-    if let Some((package_dir, _, package_doc)) = manifests.first() {
-        if let Some(workspace_value) = package_doc
+    let package = manifests
+        .iter()
+        .find(|(_, doc)| doc.get("package").is_some())
+        .map(|(path, doc)| (path.clone(), doc));
+    if let Some((package_manifest, package_doc)) = package {
+        if let Some(relative) = package_doc
             .get("package")
-            .and_then(|value| value.get("workspace"))
-            .and_then(|value| value.as_str())
+            .and_then(|v| v.get("workspace"))
+            .and_then(|v| v.as_str())
         {
-            let candidate = normalize_join(package_dir, Path::new(workspace_value))?;
-            if !candidate.starts_with(&workspace) {
-                return Err(IntelligenceError::new(
-                    "project_resolution_incomplete",
-                    "package.workspace escapes the authorized checkout",
-                ));
-            }
-            let manifest = candidate.join("Cargo.toml");
-            if manifest.is_file() {
-                let doc = read_toml(context, &manifest)?;
+            let package_dir = package_manifest.parent().unwrap_or(&context.workspace);
+            let candidate = package_dir.join(relative).join("Cargo.toml");
+            if exists(context, &candidate) {
+                let doc = read_toml(context, &candidate)?;
                 if doc.get("workspace").is_some() {
-                    return Ok(ResolvedProject {
-                        workspace,
-                        root: candidate,
-                        family: LanguageFamily::Rust,
-                        analysis_environment: None,
-                        config_files: vec![manifest],
-                        limitations: Vec::new(),
-                    });
+                    let root = candidate
+                        .parent()
+                        .unwrap_or(&context.workspace)
+                        .to_path_buf();
+                    return rust_result(context, &root, vec![package_manifest, candidate]);
                 }
             }
             return Err(IntelligenceError::new(
                 "project_resolution_incomplete",
-                "package.workspace does not name a valid workspace manifest",
+                "package.workspace does not resolve to an authorized Cargo workspace",
             ));
         }
-    }
-
-    // Prefer the nearest ancestor workspace that statically includes the
-    // package. A virtual workspace is valid; a nested independent workspace
-    // prevents walking out to an unrelated outer workspace.
-    let package_root = manifests
-        .first()
-        .map(|(root, _, _)| root.clone())
-        .expect("non-empty manifest list");
-    for (root, manifest, doc) in &manifests {
-        if doc.get("workspace").is_none() {
-            continue;
-        }
-        if workspace_contains(context, root, doc, &package_root)? {
-            return Ok(ResolvedProject {
-                workspace,
-                root: root.clone(),
-                family: LanguageFamily::Rust,
-                analysis_environment: None,
-                config_files: vec![manifest.clone()],
-                limitations: Vec::new(),
-            });
-        }
-        if root == &package_root {
-            break;
-        }
-    }
-
-    let (root, manifest, _) = manifests
-        .first()
-        .cloned()
-        .expect("non-empty manifest list");
-    Ok(ResolvedProject {
-        workspace,
-        root,
-        family: LanguageFamily::Rust,
-        analysis_environment: None,
-        config_files: vec![manifest],
-        limitations: vec!["cargo_workspace_membership_not_proven".into()],
-    })
-}
-
-fn workspace_contains(
-    context: &ResolutionContext,
-    workspace_root: &Path,
-    doc: &toml_edit::DocumentMut,
-    package_root: &Path,
-) -> Result<bool> {
-    if workspace_root == package_root {
-        return Ok(true);
-    }
-    let Some(table) = doc.get("workspace") else {
-        return Ok(false);
-    };
-    if let Some(excludes) = table.get("exclude").and_then(|value| value.as_array()) {
-        for value in excludes.iter().filter_map(|value| value.as_str()) {
-            if member_pattern_matches(workspace_root, value, package_root)? {
-                return Ok(false);
-            }
-        }
-    }
-    let Some(members) = table.get("members").and_then(|value| value.as_array()) else {
-        return Ok(false);
-    };
-    if members.len() > MAX_MEMBER_PATHS {
-        return Err(IntelligenceError::new(
-            "project_resolution_incomplete",
-            "Cargo workspace has too many member patterns",
-        ));
-    }
-    for value in members.iter().filter_map(|value| value.as_str()) {
-        if member_pattern_matches(workspace_root, value, package_root)? {
-            return Ok(true);
-        }
-    }
-
-    // Keep a bounded directory read in the policy seam so wildcard-heavy
-    // manifests cannot silently trigger an unbounded filesystem traversal.
-    let _ = context.reader.list_directory(
-        workspace_root,
-        MetadataClass::WorkspaceConfiguration,
-        MAX_MEMBER_PATHS,
-        &context.budget,
-    )?;
-    Ok(false)
-}
-
-fn member_pattern_matches(root: &Path, pattern: &str, package_root: &Path) -> Result<bool> {
-    let normalized = pattern.replace('\\', "/");
-    if normalized.is_empty() || normalized.starts_with('/') || normalized.contains("..") {
-        return Ok(false);
-    }
-    let package_relative = package_root
-        .strip_prefix(root)
-        .map_err(|_| {
-            IntelligenceError::new(
-                "project_resolution_incomplete",
-                "Cargo member is outside its workspace",
-            )
-        })?
-        .to_string_lossy()
-        .replace('\\', "/");
-
-    if !normalized.contains('*') {
-        return Ok(package_relative.trim_end_matches('/') == normalized.trim_end_matches('/'));
-    }
-    let p: Vec<&str> = normalized.split('/').collect();
-    let v: Vec<&str> = package_relative.split('/').collect();
-    if p.len() != v.len() {
-        return Ok(false);
-    }
-    Ok(p.iter().zip(v.iter()).all(|(pattern, value)| {
-        *pattern == "*" || (!pattern.contains('*') && *pattern == *value)
-    }))
-}
-
-fn resolve_python(
-    context: &ResolutionContext,
-    workspace: PathBuf,
-    source: PathBuf,
-) -> Result<ResolvedProject> {
-    if !matches!(
-        source.extension().and_then(|value| value.to_str()),
-        Some("py" | "pyi")
-    ) {
-        return Err(IntelligenceError::new(
-            "unsupported_language",
-            "Python project resolution requires a .py or .pyi source file",
-        ));
-    }
-
-    let mut fallback = None;
-    for directory in source
-        .parent()
-        .into_iter()
-        .flat_map(Path::ancestors)
-        .take(MAX_ANCESTORS)
-    {
-        if !directory.starts_with(&workspace) {
-            break;
-        }
-
-        let pyright = directory.join("pyrightconfig.json");
-        if pyright.is_file() {
-            bounded_read(context, &pyright)?;
-            return python_project(
-                workspace,
-                directory.to_path_buf(),
-                source,
-                vec![pyright],
-            );
-        }
-
-        let pyproject = directory.join("pyproject.toml");
-        if pyproject.is_file() {
-            let doc = read_toml(context, &pyproject)?;
-            if doc
-                .get("tool")
-                .is_some_and(|tool| tool.get("basedpyright").is_some() || tool.get("pyright").is_some())
-            {
-                return python_project(
-                    workspace,
-                    directory.to_path_buf(),
-                    source,
-                    vec![pyproject],
+        let package_dir = package_manifest
+            .parent()
+            .unwrap_or(&context.workspace)
+            .to_path_buf();
+        for (manifest, doc) in &manifests {
+            let Some(root) = manifest.parent() else {
+                continue;
+            };
+            if doc.get("workspace").is_some() && workspace_contains(doc, root, &package_dir)? {
+                return rust_result(
+                    context,
+                    root,
+                    vec![package_manifest.clone(), manifest.clone()],
                 );
             }
-            fallback.get_or_insert((directory.to_path_buf(), pyproject));
         }
-
-        for marker in ["setup.cfg", "setup.py", "requirements.txt"] {
-            let path = directory.join(marker);
-            if path.is_file() && fallback.is_none() {
-                bounded_read(context, &path)?;
-                fallback = Some((directory.to_path_buf(), path));
-            }
-        }
-
-        if directory == workspace {
-            break;
-        }
+        return rust_result(context, &package_dir, vec![package_manifest]);
     }
-
-    let (root, config) = fallback.unwrap_or_else(|| (workspace.clone(), source.clone()));
-    python_project(workspace, root, source, vec![config])
+    if let Some((manifest, _)) = manifests
+        .iter()
+        .find(|(_, doc)| doc.get("workspace").is_some())
+    {
+        return rust_result(
+            context,
+            manifest.parent().unwrap_or(&context.workspace),
+            vec![manifest.clone()],
+        );
+    }
+    Err(IntelligenceError::new(
+        "project_resolution_incomplete",
+        "Cargo ownership could not be established safely",
+    ))
 }
 
-fn python_project(
-    workspace: PathBuf,
-    root: PathBuf,
-    source: PathBuf,
-    config_files: Vec<PathBuf>,
+fn rust_result(
+    context: &ResolutionContext,
+    root: &Path,
+    mut config_files: Vec<PathBuf>,
 ) -> Result<ResolvedProject> {
-    let analysis_environment = [".venv", "venv"]
-        .into_iter()
-        .map(|name| root.join(name))
-        .find(|candidate| candidate.is_dir());
+    for name in [
+        "Cargo.lock",
+        "rust-toolchain.toml",
+        "rust-analyzer.toml",
+        ".cargo/config.toml",
+    ] {
+        let path = root.join(name);
+        if exists(context, &path) {
+            config_files.push(path);
+        }
+    }
+    config_files.sort();
+    config_files.dedup();
     Ok(ResolvedProject {
-        workspace,
-        root,
-        family: LanguageFamily::Python,
-        analysis_environment,
-        config_files: config_files
-            .into_iter()
-            .filter(|path| path != &source)
-            .collect(),
+        workspace: context.workspace.clone(),
+        root: root.to_path_buf(),
+        family: LanguageFamily::Rust,
+        analysis_environment: None,
+        config_files,
         limitations: Vec::new(),
     })
 }
 
-fn read_toml(
-    context: &ResolutionContext,
-    path: &Path,
-) -> Result<toml_edit::DocumentMut> {
-    let bytes = bounded_read(context, path)?;
-    let text = std::str::from_utf8(&bytes).map_err(|_| {
-        IntelligenceError::new("invalid_project_config", "Project TOML is not UTF-8")
-    })?;
-    text.parse::<toml_edit::DocumentMut>().map_err(|_| {
-        IntelligenceError::new("invalid_project_config", "Project TOML could not be parsed")
-    })
+fn workspace_contains(
+    doc: &toml_edit::DocumentMut,
+    workspace: &Path,
+    package: &Path,
+) -> Result<bool> {
+    if workspace == package {
+        return Ok(true);
+    }
+    let relative = match package.strip_prefix(workspace) {
+        Ok(value) => value.to_string_lossy().replace('\\', "/"),
+        Err(_) => return Ok(false),
+    };
+    let Some(table) = doc.get("workspace") else {
+        return Ok(false);
+    };
+    let excluded = table
+        .get("exclude")
+        .and_then(|v| v.as_array())
+        .map(|v| v.iter().filter_map(|x| x.as_str()).collect::<Vec<_>>())
+        .unwrap_or_default();
+    if matches_patterns(&relative, &excluded)? {
+        return Ok(false);
+    }
+    let members = table
+        .get("members")
+        .and_then(|v| v.as_array())
+        .map(|v| v.iter().filter_map(|x| x.as_str()).collect::<Vec<_>>())
+        .unwrap_or_default();
+    if members.is_empty() {
+        return Ok(false);
+    }
+    matches_patterns(&relative, &members)
 }
 
-fn bounded_read(context: &ResolutionContext, path: &Path) -> Result<Vec<u8>> {
-    context.reader.read(
-        path,
-        MetadataClass::WorkspaceConfiguration,
-        MAX_MANIFEST,
-        &context.budget,
-    )
-}
-
-fn normalize_join(base: &Path, relative: &Path) -> Result<PathBuf> {
-    if relative.is_absolute() {
+fn matches_patterns(relative: &str, patterns: &[&str]) -> Result<bool> {
+    if patterns.len() > 1_024 {
         return Err(IntelligenceError::new(
             "project_resolution_incomplete",
-            "Project-relative root must be relative",
+            "Cargo member expansion exceeded its bounded limit",
         ));
     }
-    let mut output = base.to_path_buf();
-    for component in relative.components() {
-        match component {
-            Component::CurDir => {}
-            Component::Normal(value) => output.push(value),
-            Component::ParentDir => {
-                output.pop();
+    let mut builder = GlobSetBuilder::new();
+    for pattern in patterns {
+        builder.add(Glob::new(pattern).map_err(|_| {
+            IntelligenceError::new(
+                "project_resolution_incomplete",
+                "Cargo workspace member pattern is invalid",
+            )
+        })?);
+    }
+    let set = builder.build().map_err(|_| {
+        IntelligenceError::new(
+            "project_resolution_incomplete",
+            "Cargo workspace member patterns are invalid",
+        )
+    })?;
+    Ok(set.is_match(relative))
+}
+
+fn resolve_python(context: &ResolutionContext, source: &Path) -> Result<ResolvedProject> {
+    let dirs: Vec<_> = ancestors(&context.workspace, source).collect();
+    for marker in ["pyrightconfig.json", "pyproject.toml"] {
+        if let Some(dir) = dirs
+            .iter()
+            .copied()
+            .find(|dir| exists(context, &dir.join(marker)))
+        {
+            let mut configs = vec![dir.join(marker)];
+            if marker == "pyrightconfig.json" && exists(context, &dir.join("pyproject.toml")) {
+                configs.push(dir.join("pyproject.toml"));
             }
-            _ => {
-                return Err(IntelligenceError::new(
-                    "project_resolution_incomplete",
-                    "Unsupported project root component",
-                ))
+            return Ok(ResolvedProject {
+                workspace: context.workspace.clone(),
+                root: dir.to_path_buf(),
+                family: LanguageFamily::Python,
+                analysis_environment: None,
+                config_files: configs,
+                limitations: Vec::new(),
+            });
+        }
+    }
+    for dir in dirs {
+        for marker in ["setup.cfg", "setup.py", "requirements.txt"] {
+            let path = dir.join(marker);
+            if exists(context, &path) {
+                return Ok(ResolvedProject {
+                    workspace: context.workspace.clone(),
+                    root: dir.to_path_buf(),
+                    family: LanguageFamily::Python,
+                    analysis_environment: None,
+                    config_files: vec![path],
+                    limitations: vec!["fallback_python_project_marker".into()],
+                });
             }
         }
     }
-    output.canonicalize().map_err(|_| {
-        IntelligenceError::new(
-            "project_resolution_incomplete",
-            "Referenced project root is unavailable",
+    Err(IntelligenceError::new(
+        "project_not_found",
+        "No supported Python project boundary was found",
+    ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::native_extensions::language_intelligence::metadata::FsMetadataReader;
+    use crate::native_extensions::language_intelligence::protocol::RequestBudget;
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    fn context(root: &Path) -> ResolutionContext {
+        ResolutionContext {
+            workspace: root.to_path_buf(),
+            reader: Arc::new(FsMetadataReader::new(root.to_path_buf(), Vec::new())),
+            budget: RequestBudget::from_timeout(Duration::from_secs(3)),
+        }
+    }
+
+    #[test]
+    fn rust_member_uses_workspace_root_and_python_nesting_stays_local() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        std::fs::create_dir_all(root.join("crates/core/src")).unwrap();
+        std::fs::write(
+            root.join("Cargo.toml"),
+            "[workspace]\nmembers=[\"crates/*\"]\n",
         )
-    })
+        .unwrap();
+        std::fs::write(
+            root.join("crates/core/Cargo.toml"),
+            "[package]\nname=\"core_fixture\"\nversion=\"0.1.0\"\n",
+        )
+        .unwrap();
+        std::fs::write(root.join("crates/core/src/lib.rs"), "pub fn x(){}").unwrap();
+        let rust = resolve_project(
+            LanguageFamily::Rust,
+            &context(&root),
+            &root.join("crates/core/src/lib.rs"),
+            &[],
+        )
+        .unwrap();
+        assert_eq!(rust.root, root);
+
+        std::fs::create_dir_all(root.join("service/nested")).unwrap();
+        std::fs::write(root.join("service/pyproject.toml"), "[tool.pyright]\n").unwrap();
+        std::fs::write(root.join("service/nested/pyrightconfig.json"), "{}").unwrap();
+        std::fs::write(root.join("service/nested/app.py"), "x=1").unwrap();
+        let python = resolve_project(
+            LanguageFamily::Python,
+            &context(&root),
+            &root.join("service/nested/app.py"),
+            &[],
+        )
+        .unwrap();
+        assert_eq!(
+            python.root,
+            root.join("service/nested").canonicalize().unwrap()
+        );
+    }
+
+    #[test]
+    fn setup_py_is_never_executed() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let marker = root.join("executed");
+        std::fs::write(
+            root.join("setup.py"),
+            format!("open({:?}, 'w').write('bad')", marker),
+        )
+        .unwrap();
+        std::fs::write(root.join("app.py"), "x=1").unwrap();
+        let project = resolve_project(
+            LanguageFamily::Python,
+            &context(&root),
+            &root.join("app.py"),
+            &[],
+        )
+        .unwrap();
+        assert_eq!(project.root, root);
+        assert!(!marker.exists());
+    }
 }

@@ -1,46 +1,52 @@
-//! Language-specific project markers, IDs and server discovery live here.
+//! Language-specific project markers, IDs and installed-server discovery live here.
 
-pub(super) mod project;
-pub(super) mod python;
-pub(super) mod rust;
+mod discovery;
+mod project;
+mod python;
+mod rust;
 
+use super::config::LanguageIntelligenceConfig;
+use super::identity::{LanguageFamily, ResolvedProject, ServerInvocation};
+use super::metadata::ResolutionContext;
 use super::protocol::{IntelligenceError, Result};
-use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use std::collections::BTreeMap;
 use std::ffi::OsStr;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub enum Backend {
-    #[default]
-    Auto,
-    #[serde(rename = "typescriptNative")]
-    TypeScriptNative,
-    #[serde(rename = "typescriptLanguageServer")]
-    TypeScriptLanguageServer,
-}
+pub(crate) use super::config::TypeScriptBackend as Backend;
+pub(super) use python::PythonAdapter;
+pub(super) use rust::RustAdapter;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
-pub(super) enum ServerKind {
+pub(super) enum ServerBackend {
     TypeScriptNative,
     TypeScriptLanguageServer,
     RustAnalyzer,
-    Basedpyright,
+    BasedPyright,
     Pyright,
 }
 
 #[derive(Debug, Clone)]
 pub(super) struct ServerCommand {
-    pub kind: ServerKind,
+    pub kind: ServerBackend,
+    #[allow(dead_code)]
+    pub backend: ServerBackend,
     pub program: PathBuf,
     pub args: Vec<String>,
+    pub invocation: ServerInvocation,
     pub workspace: PathBuf,
     pub version: Option<String>,
     pub typescript_version: Option<String>,
     pub initialization_options: Value,
+    pub client_configuration: Value,
+    pub family: LanguageFamily,
+    pub profile_fingerprint: String,
+    pub analysis_environment: Option<PathBuf>,
+    pub limitations: Vec<String>,
+    pub env: BTreeMap<String, String>,
 }
 
 impl ServerCommand {
@@ -48,7 +54,7 @@ impl ServerCommand {
         use crate::semantic::manager::{
             build_sanitized_command, LspServerConfig, ServerExecutionPolicy,
         };
-        build_sanitized_command(&LspServerConfig {
+        let mut command = build_sanitized_command(&LspServerConfig {
             executable: self.program.clone(),
             args: self.args.clone(),
             languages: Vec::new(),
@@ -57,7 +63,11 @@ impl ServerCommand {
             idle_timeout: std::time::Duration::from_secs(300),
             env_allowlist: Vec::new(),
             executable_hash: None,
-        })
+        });
+        for (key, value) in &self.env {
+            command.env(key, value);
+        }
+        command
     }
 }
 
@@ -87,7 +97,7 @@ fn local_package(workspace: &Path, project: &Path, name: &str) -> Option<Package
         .find_map(|path| read_package(&path.join("node_modules").join(name)))
 }
 
-pub(super) fn path_executable(search_path: &OsStr, name: &str) -> Option<PathBuf> {
+fn path_executable(search_path: &OsStr, name: &str) -> Option<PathBuf> {
     std::env::split_paths(search_path)
         .filter(|path| path.is_absolute())
         .find_map(|path| {
@@ -238,15 +248,25 @@ pub(super) fn discover(
             if backend == Backend::TypeScriptNative || native_ts.is_some() || tsserver.is_none() {
                 if let Some((program, mut args)) = package_command(package, bin, search_path) {
                     args.extend(["--lsp".into(), "--stdio".into()]);
-                    candidates.push(ServerCommand {
-                        kind: ServerKind::TypeScriptNative,
-                        program,
-                        args,
-                        workspace: project.into(),
-                        version: version(package),
-                        typescript_version: version(package),
-                        initialization_options: json!({"disableAutomaticTypingAcquisition":true}),
-                    });
+                    if let Ok(invocation) = ServerInvocation::new(program.clone(), args.clone()) {
+                        candidates.push(ServerCommand {
+                            kind: ServerBackend::TypeScriptNative,
+                            backend: ServerBackend::TypeScriptNative,
+                            program,
+                            args,
+                            invocation,
+                            workspace: project.into(),
+                            version: version(package),
+                            typescript_version: version(package),
+                            initialization_options: json!({"disableAutomaticTypingAcquisition":true}),
+                            client_configuration: Value::Null,
+                            family: LanguageFamily::TypeScript,
+                            profile_fingerprint: "typescript-compat".into(),
+                            analysis_environment: None,
+                            limitations: Vec::new(),
+                            env: BTreeMap::new(),
+                        });
+                    }
                 }
             }
         }
@@ -274,15 +294,25 @@ pub(super) fn discover(
                     .and_then(|uri| uri.to_file_path().ok())
                     .unwrap_or(path));
             }
-            candidates.push(ServerCommand {
-                kind: ServerKind::TypeScriptLanguageServer,
-                program,
-                args,
-                workspace: project.into(),
-                version: package.as_ref().and_then(version),
-                typescript_version: ts_version,
-                initialization_options: options,
-            });
+            if let Ok(invocation) = ServerInvocation::new(program.clone(), args.clone()) {
+                candidates.push(ServerCommand {
+                    kind: ServerBackend::TypeScriptLanguageServer,
+                    backend: ServerBackend::TypeScriptLanguageServer,
+                    program,
+                    args,
+                    invocation,
+                    workspace: project.into(),
+                    version: package.as_ref().and_then(version),
+                    typescript_version: ts_version,
+                    initialization_options: options,
+                    client_configuration: Value::Null,
+                    family: LanguageFamily::TypeScript,
+                    profile_fingerprint: "typescript-compat".into(),
+                    analysis_environment: None,
+                    limitations: Vec::new(),
+                    env: BTreeMap::new(),
+                });
+            }
         }
     }
     if candidates.is_empty() {
@@ -292,32 +322,46 @@ pub(super) fn discover(
     }
 }
 
-pub(super) fn discover_for_family(
-    family: crate::native_extensions::language_intelligence::LanguageFamily,
-    workspace: &Path,
-    project: &Path,
-    config: &crate::native_extensions::language_intelligence::LanguageIntelligenceConfig,
-    search_path: &OsStr,
-) -> Result<Vec<ServerCommand>> {
-    use crate::native_extensions::language_intelligence::LanguageFamily;
-    match family {
-        LanguageFamily::TypeScript => discover(workspace, project, config.typescript.backend, search_path),
-        LanguageFamily::Rust => rust::discover(project, &config.rust, search_path),
-        LanguageFamily::Python => python::discover(project, &config.python, search_path),
+pub(super) trait ServerAdapter: Send + Sync + std::fmt::Debug {
+    fn family(&self) -> LanguageFamily;
+    fn language_id(&self, path: &Path) -> Option<&'static str>;
+    fn explicit_roots<'a>(&self, _settings: &'a LanguageIntelligenceConfig) -> &'a [PathBuf] {
+        &[]
+    }
+    #[cfg_attr(not(test), allow(dead_code))]
+    fn project_markers(&self) -> &'static [&'static str] {
+        &[]
+    }
+    fn resolve_project(
+        &self,
+        context: &ResolutionContext,
+        source: &Path,
+        settings: &LanguageIntelligenceConfig,
+    ) -> Result<ResolvedProject> {
+        project::resolve_project(
+            self.family(),
+            context,
+            source,
+            self.explicit_roots(settings),
+        )
+    }
+    fn discover(
+        &self,
+        context: &ResolutionContext,
+        project: &ResolvedProject,
+        settings: &LanguageIntelligenceConfig,
+        search_path: &OsStr,
+    ) -> Result<Vec<ServerCommand>> {
+        discover_for_project(context, project, settings, search_path)
     }
 }
 
-pub(super) trait ServerAdapter: Send + Sync {
-    fn family(&self) -> crate::native_extensions::language_intelligence::LanguageFamily;
-    fn language_id(&self, path: &Path) -> Option<&'static str>;
-    fn project_markers(&self) -> &'static [&'static str] { &[] }
-}
-
+#[derive(Debug, Default)]
 pub(super) struct TypeScriptAdapter;
 
 impl ServerAdapter for TypeScriptAdapter {
-    fn family(&self) -> crate::native_extensions::language_intelligence::LanguageFamily {
-        crate::native_extensions::language_intelligence::LanguageFamily::TypeScript
+    fn family(&self) -> LanguageFamily {
+        LanguageFamily::TypeScript
     }
     fn language_id(&self, path: &Path) -> Option<&'static str> {
         match path.extension()?.to_str()? {
@@ -333,51 +377,70 @@ impl ServerAdapter for TypeScriptAdapter {
     }
 }
 
-
-pub(super) struct RustAdapter;
-pub(super) struct PythonAdapter;
-
-impl ServerAdapter for RustAdapter {
-    fn family(&self) -> crate::native_extensions::language_intelligence::LanguageFamily {
-        crate::native_extensions::language_intelligence::LanguageFamily::Rust
-    }
-    fn language_id(&self, path: &Path) -> Option<&'static str> {
-        (path.extension()?.to_str()? == "rs").then_some("rust")
-    }
-}
-
-impl ServerAdapter for PythonAdapter {
-    fn family(&self) -> crate::native_extensions::language_intelligence::LanguageFamily {
-        crate::native_extensions::language_intelligence::LanguageFamily::Python
-    }
-    fn language_id(&self, path: &Path) -> Option<&'static str> {
-        matches!(path.extension()?.to_str()?, "py" | "pyi").then_some("python")
-    }
-}
-
-static TYPESCRIPT_ADAPTER: TypeScriptAdapter = TypeScriptAdapter;
-static RUST_ADAPTER: RustAdapter = RustAdapter;
-static PYTHON_ADAPTER: PythonAdapter = PythonAdapter;
-
-pub(super) fn family_for_path(path: &Path) -> Option<crate::native_extensions::language_intelligence::LanguageFamily> {
-    use crate::native_extensions::language_intelligence::LanguageFamily;
-    match path.extension()?.to_str()? {
-        "ts" | "tsx" | "mts" | "cts" | "js" | "jsx" | "mjs" | "cjs" => Some(LanguageFamily::TypeScript),
-        "rs" => Some(LanguageFamily::Rust),
-        "py" | "pyi" => Some(LanguageFamily::Python),
-        _ => None,
-    }
-}
-
-pub(super) fn adapter(family: crate::native_extensions::language_intelligence::LanguageFamily) -> &'static dyn ServerAdapter {
-    use crate::native_extensions::language_intelligence::LanguageFamily;
+pub(super) fn adapter_for(family: LanguageFamily) -> Box<dyn ServerAdapter> {
     match family {
-        LanguageFamily::TypeScript => &TYPESCRIPT_ADAPTER,
-        LanguageFamily::Rust => &RUST_ADAPTER,
-        LanguageFamily::Python => &PYTHON_ADAPTER,
+        LanguageFamily::TypeScript => Box::new(TypeScriptAdapter),
+        LanguageFamily::Rust => Box::new(RustAdapter),
+        LanguageFamily::Python => Box::new(PythonAdapter),
     }
 }
 
+pub(super) fn discover_for_project(
+    context: &ResolutionContext,
+    project: &ResolvedProject,
+    settings: &LanguageIntelligenceConfig,
+    search_path: &OsStr,
+) -> Result<Vec<ServerCommand>> {
+    match project.family {
+        LanguageFamily::TypeScript => {
+            if !settings.typescript.enabled {
+                return Err(IntelligenceError::new(
+                    "disabled",
+                    "TypeScript language intelligence is disabled",
+                ));
+            }
+            if let Some(server) = &settings.typescript.server {
+                let invocation = discovery::explicit(server, search_path)?;
+                let backend = match settings.typescript.backend {
+                    Backend::TypeScriptNative => ServerBackend::TypeScriptNative,
+                    _ => ServerBackend::TypeScriptLanguageServer,
+                };
+                return Ok(vec![ServerCommand {
+                    kind: backend,
+                    backend,
+                    program: invocation.program.clone(),
+                    args: invocation.args.clone(),
+                    invocation,
+                    workspace: project.root.clone(),
+                    version: None,
+                    typescript_version: None,
+                    initialization_options: json!({"disableAutomaticTypingAcquisition":true}),
+                    client_configuration: Value::Null,
+                    family: LanguageFamily::TypeScript,
+                    profile_fingerprint: settings.profile_fingerprint(&settings.typescript),
+                    analysis_environment: None,
+                    limitations: Vec::new(),
+                    env: BTreeMap::new(),
+                }]);
+            }
+            let mut commands = discover(
+                &project.workspace,
+                &project.root,
+                settings.typescript.backend,
+                search_path,
+            )?;
+            let fingerprint = settings.profile_fingerprint(&settings.typescript);
+            for command in &mut commands {
+                command.profile_fingerprint = fingerprint.clone();
+            }
+            Ok(commands)
+        }
+        LanguageFamily::Rust => rust::discover(context, project, settings, search_path),
+        LanguageFamily::Python => python::discover(context, project, settings, search_path),
+    }
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
 pub(super) fn project_root(
     workspace: &Path,
     source: &Path,
@@ -392,7 +455,7 @@ pub(super) fn project_root(
     if adapter.language_id(source).is_none() {
         return Err(IntelligenceError::new(
             "unsupported_language",
-            "V1 supports TypeScript and JavaScript source files",
+            "No language-intelligence adapter supports this source file",
         ));
     }
     for directory in source.parent().into_iter().flat_map(Path::ancestors) {
@@ -467,10 +530,11 @@ mod tests {
 
     #[test]
     fn generic_project_detection_uses_adapter_not_typescript_constants() {
+        #[derive(Debug)]
         struct FixtureAdapter;
         impl ServerAdapter for FixtureAdapter {
-            fn family(&self) -> crate::native_extensions::language_intelligence::LanguageFamily {
-                crate::native_extensions::language_intelligence::LanguageFamily::TypeScript
+            fn family(&self) -> LanguageFamily {
+                LanguageFamily::TypeScript
             }
             fn language_id(&self, path: &Path) -> Option<&'static str> {
                 (path.extension()?.to_str()? == "fixture").then_some("fixture")
@@ -572,7 +636,7 @@ mod tests {
             Some(("tsgo", "bin/tsgo")),
         );
         let found = discover(&root, &root, Backend::Auto, &search).unwrap();
-        assert_eq!(found[0].kind, ServerKind::TypeScriptNative);
+        assert_eq!(found[0].kind, ServerBackend::TypeScriptNative);
         package(
             &root,
             "typescript",
@@ -607,7 +671,7 @@ mod tests {
 
         let found = discover(&root, &root, Backend::Auto, &search).unwrap();
 
-        assert_eq!(found[0].kind, Backend::TypeScriptLanguageServer);
+        assert_eq!(found[0].kind, ServerBackend::TypeScriptLanguageServer);
         assert!(
             found[0].args.iter().any(|arg| arg.ends_with("server.cjs")),
             "{:?}",
@@ -637,7 +701,7 @@ mod tests {
             &std::env::var_os("PATH").unwrap(),
         )
         .unwrap();
-        assert_eq!(servers[0].kind, Backend::TypeScriptLanguageServer);
+        assert_eq!(servers[0].kind, ServerBackend::TypeScriptLanguageServer);
         assert_eq!(servers[0].typescript_version.as_deref(), Some("5.9.3"));
         assert_eq!(servers[0].version.as_deref(), Some("5.1.0"));
         assert!(servers[0].initialization_options["tsserver"]["path"]
@@ -663,7 +727,7 @@ mod tests {
             &std::env::var_os("PATH").unwrap(),
         )
         .unwrap();
-        assert_eq!(servers[0].kind, Backend::TypeScriptNative);
+        assert_eq!(servers[0].kind, ServerBackend::TypeScriptNative);
         assert!(servers[0]
             .args
             .ends_with(&["--lsp".into(), "--stdio".into()]));
@@ -693,7 +757,7 @@ mod tests {
             &std::env::var_os("PATH").unwrap(),
         )
         .unwrap();
-        assert_eq!(servers[0].kind, Backend::TypeScriptNative);
+        assert_eq!(servers[0].kind, ServerBackend::TypeScriptNative);
         assert!(discover(
             &root,
             &root,

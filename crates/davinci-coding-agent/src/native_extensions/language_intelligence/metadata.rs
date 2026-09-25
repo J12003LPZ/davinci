@@ -1,14 +1,9 @@
-//! Bounded metadata access used by project and executable discovery.
-//!
-//! This seam deliberately exposes no subprocess API. Production callers can
-//! narrow installation roots separately from workspace configuration reads.
-
-use super::identity::RequestBudget;
-use super::protocol::{IntelligenceError, Result};
+//! Bounded metadata access for project and installed-tool discovery.
+use super::protocol::{IntelligenceError, RequestBudget, Result};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)]
 pub(super) enum MetadataClass {
     WorkspaceConfiguration,
     InstalledExecutable,
@@ -29,6 +24,7 @@ pub(super) trait MetadataReader: Send + Sync + std::fmt::Debug {
         max_bytes: usize,
         budget: &RequestBudget,
     ) -> Result<Vec<u8>>;
+    #[allow(dead_code)]
     fn list_directory(
         &self,
         path: &Path,
@@ -38,35 +34,25 @@ pub(super) trait MetadataReader: Send + Sync + std::fmt::Debug {
     ) -> Result<Vec<PathBuf>>;
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub(super) struct ResolutionContext {
     pub workspace: PathBuf,
-    pub reader: Arc<dyn MetadataReader>,
+    pub reader: std::sync::Arc<dyn MetadataReader>,
     pub budget: RequestBudget,
 }
 
-#[derive(Debug)]
-pub(super) struct WorkspaceMetadataReader {
+#[derive(Debug, Clone)]
+pub(super) struct FsMetadataReader {
     workspace: PathBuf,
     installation_roots: Vec<PathBuf>,
 }
 
-impl WorkspaceMetadataReader {
-    pub(super) fn new(workspace: PathBuf, installation_roots: Vec<PathBuf>) -> Self {
+impl FsMetadataReader {
+    pub fn new(workspace: PathBuf, installation_roots: Vec<PathBuf>) -> Self {
         Self {
             workspace,
             installation_roots,
         }
-    }
-
-    fn check_budget(budget: &RequestBudget) -> Result<()> {
-        if budget.remaining().is_none() {
-            return Err(IntelligenceError::new(
-                "request_timeout",
-                "Language metadata resolution exceeded its request budget",
-            ));
-        }
-        Ok(())
     }
 
     fn allowed(&self, path: &Path, class: MetadataClass) -> bool {
@@ -81,30 +67,26 @@ impl WorkspaceMetadataReader {
             }
         }
     }
-
-    fn canonical_allowed(&self, path: &Path, class: MetadataClass) -> Result<PathBuf> {
-        let canonical = path.canonicalize().map_err(|_| {
-            IntelligenceError::new("metadata_unavailable", "Metadata path is unavailable")
-        })?;
-        if !self.allowed(&canonical, class) {
-            return Err(IntelligenceError::new(
-                "outside_workspace",
-                "Metadata path escapes its authorized roots",
-            ));
-        }
-        Ok(canonical)
-    }
 }
 
-impl MetadataReader for WorkspaceMetadataReader {
+impl MetadataReader for FsMetadataReader {
     fn resolve_path(
         &self,
         path: &Path,
         class: MetadataClass,
         budget: &RequestBudget,
     ) -> Result<PathBuf> {
-        Self::check_budget(budget)?;
-        self.canonical_allowed(path, class)
+        budget.check()?;
+        let canonical = path.canonicalize().map_err(|_| {
+            IntelligenceError::new("metadata_unavailable", "Metadata path is unavailable")
+        })?;
+        if !self.allowed(&canonical, class) {
+            return Err(IntelligenceError::new(
+                "permission_denied",
+                "Metadata path is outside the authorized discovery scope",
+            ));
+        }
+        Ok(canonical)
     }
 
     fn read(
@@ -114,26 +96,20 @@ impl MetadataReader for WorkspaceMetadataReader {
         max_bytes: usize,
         budget: &RequestBudget,
     ) -> Result<Vec<u8>> {
-        Self::check_budget(budget)?;
-        let canonical = self.canonical_allowed(path, class)?;
-        let metadata = std::fs::metadata(&canonical).map_err(|_| {
-            IntelligenceError::new("metadata_unavailable", "Metadata path is unavailable")
+        let path = self.resolve_path(path, class, budget)?;
+        let metadata = std::fs::metadata(&path).map_err(|_| {
+            IntelligenceError::new("metadata_unavailable", "Metadata file is unavailable")
         })?;
         if !metadata.is_file() || metadata.len() > max_bytes as u64 {
             return Err(IntelligenceError::new(
-                "metadata_too_large",
-                "Metadata input exceeds its bounded size",
+                "project_resolution_incomplete",
+                "Metadata file exceeds the bounded discovery policy",
             ));
         }
-        let bytes = std::fs::read(canonical).map_err(|_| {
-            IntelligenceError::new("metadata_unavailable", "Metadata could not be read")
+        let bytes = std::fs::read(path).map_err(|_| {
+            IntelligenceError::new("metadata_unavailable", "Could not read project metadata")
         })?;
-        if bytes.len() > max_bytes {
-            return Err(IntelligenceError::new(
-                "metadata_too_large",
-                "Metadata input exceeds its bounded size",
-            ));
-        }
+        budget.check()?;
         Ok(bytes)
     }
 
@@ -144,30 +120,30 @@ impl MetadataReader for WorkspaceMetadataReader {
         max_entries: usize,
         budget: &RequestBudget,
     ) -> Result<Vec<PathBuf>> {
-        Self::check_budget(budget)?;
-        let canonical = self.canonical_allowed(path, class)?;
-        let mut result = Vec::new();
-        let entries = std::fs::read_dir(canonical).map_err(|_| {
-            IntelligenceError::new("metadata_unavailable", "Metadata directory is unavailable")
+        let path = self.resolve_path(path, class, budget)?;
+        let mut out = Vec::new();
+        let entries = std::fs::read_dir(path).map_err(|_| {
+            IntelligenceError::new(
+                "metadata_unavailable",
+                "Could not list project metadata directory",
+            )
         })?;
         for entry in entries {
-            Self::check_budget(budget)?;
-            if result.len() >= max_entries {
+            budget.check()?;
+            if out.len() >= max_entries {
                 return Err(IntelligenceError::new(
                     "project_resolution_incomplete",
-                    "Metadata directory exceeds the bounded entry limit",
+                    "Directory expansion exceeded its bounded discovery limit",
                 ));
             }
-            let path = entry
-                .map_err(|_| {
-                    IntelligenceError::new(
-                        "metadata_unavailable",
-                        "Metadata directory entry is unavailable",
-                    )
-                })?
-                .path();
-            result.push(path);
+            let entry = entry.map_err(|_| {
+                IntelligenceError::new(
+                    "metadata_unavailable",
+                    "Could not inspect project metadata entry",
+                )
+            })?;
+            out.push(entry.path());
         }
-        Ok(result)
+        Ok(out)
     }
 }
