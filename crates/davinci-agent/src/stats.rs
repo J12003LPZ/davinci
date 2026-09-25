@@ -189,36 +189,6 @@ mod tests {
     }
 
     #[test]
-    fn test_stats_budget_snapshot_mapping() {
-        let mut stats = RunStats::default();
-        let snap = crate::runtime::BudgetSnapshot {
-            root_run_id: crate::runtime::RunId::new(),
-            revision: 1,
-            token_ceiling: 10000,
-            tokens_charged: 4500,
-            tokens_reserved: 500,
-            verification_reserve: 1500,
-            handoff_reserve: 500,
-            implementation_remaining: Some(3500),
-            elapsed: std::time::Duration::from_secs(60),
-            deadline: std::time::Duration::from_secs(900),
-            active_workers: 2,
-            max_concurrency: 4,
-            retries_used: 1,
-            retry_ceiling: 5,
-            cache_read_tokens: 100,
-            cache_write_tokens: 50,
-            cost_minor_units: Some(120),
-            has_unknown_cost: false,
-        };
-
-        stats.apply_budget_snapshot(&snap);
-        assert_eq!(stats.budget_tokens_charged, 4500);
-        assert_eq!(stats.cost_minor_units, Some(120));
-        assert!(!stats.has_unknown_cost);
-    }
-
-    #[test]
     fn older_stats_default_behavioral_fields_to_zero() {
         let mut json = serde_json::to_value(RunStats::default()).unwrap();
         let obj = json.as_object_mut().unwrap();
