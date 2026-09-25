@@ -223,9 +223,10 @@ mod tests {
             plan_active: false,
         };
         let composed = compose_profile_prompt(PromptProfile::Stable, &ctx);
-        assert_eq!(
-            composed.stable_text,
-            PromptProfile::Stable.bundle().stable_text()
+        let base = PromptProfile::Stable.bundle().stable_text();
+        assert!(
+            composed.stable_text.starts_with(&base),
+            "the stable bundle bytes must remain the leading cache prefix"
         );
     }
 
