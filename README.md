@@ -684,6 +684,13 @@ and higher effort after two consecutive failed tool results (including batch chi
 `off` remains off. `DAVINCI_EFFORT_POLICY` overrides the setting; unknown values use
 `fixed`. The configured thinking level and system prompt identity stay unchanged.
 
+`toolSurface` defaults to `full`. Set it to `lean` to initially send core tool schemas
+on cache-sensitive routes; other authorized tools remain available through
+`tool_search`. Discovery adds a schema once and keeps it visible for later requests.
+Permission rules still apply. `DAVINCI_TOOL_SURFACE` overrides the setting; unknown
+values use `full`. This setting applies when a new agent starts. Explicit tool
+selections stay exposed, and routes without appended turn context are unchanged.
+
 ~~~text
 DAVINCI_CODING_AGENT_DIR
 DAVINCI_CODING_AGENT_SESSION_DIR

@@ -1,6 +1,87 @@
 use super::*;
 
 #[test]
+fn lean_surface_exposes_only_core_tools_on_cache_routes() {
+    let visible_with = |surface: crate::ToolSurface| {
+        let mut agent = Agent::new_builtin(crate::prompt::PromptProfile::Stable);
+        agent.turn_context_placement_override =
+            Some(crate::turn_context::TurnContextPlacement::Appended);
+        agent.apply_extension_tools(&["ticket".into()]);
+        agent.tool_surface = surface;
+        agent.freeze_tools_for_cache();
+        agent.visible_tool_names()
+    };
+    let lean = visible_with(crate::ToolSurface::Lean);
+    let full = visible_with(crate::ToolSurface::Full);
+    assert!(
+        lean.contains("read") && lean.contains("tool_search"),
+        "{lean:?}"
+    );
+    assert!(!lean.contains("ticket"), "{lean:?}");
+    assert!(lean
+        .iter()
+        .all(|name| crate::tools::LEAN_TOOLS.contains(&name.as_str())));
+    assert!(full.len() > lean.len(), "full={full:?} lean={lean:?}");
+}
+
+#[test]
+fn lean_surface_discovery_changes_schema_once_and_respects_authorization() {
+    let mut agent = Agent::new("x");
+    agent.set_runtime(RuntimeHandle::new(
+        RunId::new(),
+        AgentId::new(),
+        RuntimeBus::new(),
+    ));
+    agent.turn_context_placement_override =
+        Some(crate::turn_context::TurnContextPlacement::Appended);
+    agent.tool_surface = crate::ToolSurface::Lean;
+    agent.freeze_tools_for_cache();
+    assert!(!agent.is_tool_visible("code_outline"));
+    let before = agent.provider_tool_schema_identity();
+    execute_tool_with(
+        Path::new("."),
+        "tool_search",
+        &serde_json::json!({"query":"code_outline"}),
+        &agent.tool_context,
+    )
+    .unwrap();
+    assert!(agent.is_tool_visible("code_outline"));
+    let after = agent.provider_tool_schema_identity();
+    assert_ne!(before, after);
+    agent.freeze_tools_for_cache();
+    execute_tool_with(
+        Path::new("."),
+        "tool_search",
+        &serde_json::json!({"query":"code_outline"}),
+        &agent.tool_context,
+    )
+    .unwrap();
+    assert_eq!(after, agent.provider_tool_schema_identity());
+    agent.set_active_tools_by_name(&["read".into(), "tool_search".into()]);
+    agent.freeze_tools_for_cache();
+    execute_tool_with(
+        Path::new("."),
+        "tool_search",
+        &serde_json::json!({"query":"code_outline"}),
+        &agent.tool_context,
+    )
+    .unwrap();
+    assert!(!agent.is_tool_visible("code_outline"));
+    assert!(!agent.is_tool_visible("write"));
+}
+
+#[test]
+fn lean_surface_does_not_change_non_cache_routes() {
+    let mut agent = Agent::new("x");
+    agent.turn_context_placement_override =
+        Some(crate::turn_context::TurnContextPlacement::SystemPrompt);
+    let before = agent.visible_tool_names();
+    agent.tool_surface = crate::ToolSurface::Lean;
+    agent.freeze_tools_for_cache();
+    assert_eq!(before, agent.visible_tool_names());
+}
+
+#[test]
 fn effort_signals_track_real_turns_and_preserve_configured_identity() {
     let mut agent = Agent::new("stable system");
     agent.prompt("fix it");

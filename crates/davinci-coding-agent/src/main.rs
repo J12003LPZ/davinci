@@ -886,6 +886,8 @@ fn build_agent(parsed: &Args, session_dir: &Path, cwd: &Path) -> Result<Agent, S
         settings.auto_verify_enabled(std::env::var("DAVINCI_AUTO_VERIFY").ok().as_deref());
     agent.effort_policy =
         settings.effort_policy(std::env::var("DAVINCI_EFFORT_POLICY").ok().as_deref());
+    agent.tool_surface =
+        settings.tool_surface(std::env::var("DAVINCI_TOOL_SURFACE").ok().as_deref());
     agent.compaction = settings.compaction_settings();
     agent.auto_retry = settings.retry_enabled();
     agent.retry_attempts = settings.retry_max_retries();

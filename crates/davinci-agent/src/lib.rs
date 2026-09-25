@@ -352,12 +352,31 @@ impl std::fmt::Debug for PendingToolOperation {
     }
 }
 
+/// How many authorized tool schemas a cache-sensitive route sends up front.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ToolSurface {
+    #[default]
+    Full,
+    Lean,
+}
+
+impl ToolSurface {
+    pub fn parse(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "full" => Some(Self::Full),
+            "lean" => Some(Self::Lean),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Agent {
     pub system_prompt: String,
     pub messages: Vec<ChatMessage>,
     pub thinking_level: ThinkingLevel,
     pub effort_policy: effort::EffortPolicy,
+    pub tool_surface: ToolSurface,
     /// Repeat the last verification call after later mutations at completion.
     pub auto_verify: bool,
     pub auto_compaction: bool,
@@ -510,6 +529,7 @@ impl Agent {
             messages: Vec::new(),
             thinking_level: ThinkingLevel::Off,
             effort_policy: effort::EffortPolicy::default(),
+            tool_surface: ToolSurface::default(),
             auto_verify: true,
             auto_compaction: true,
             compaction: CompactionSettings::default(),
@@ -2365,10 +2385,28 @@ impl Agent {
         }
     }
 
-    /// On cache-sensitive routes, expose the full authorized schema set before
-    /// the first request so `tool_search` cannot mutate the provider tool list.
+    /// On cache-sensitive routes, expose the selected initial schema set.
+    /// Lean keeps discovered tools visible across requests and user turns.
     pub fn freeze_tools_for_cache(&self) {
         if self.turn_context_placement() != turn_context::TurnContextPlacement::Appended {
+            return;
+        }
+        if self.tool_surface == ToolSurface::Lean {
+            self.sync_tool_authorization();
+            let authorized = self
+                .tool_context
+                .authorized_tools
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clone();
+            let mut exposure = self
+                .tool_context
+                .tool_exposure
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            for name in crate::tools::LEAN_TOOLS {
+                exposure.activate_authorized(name, authorized.contains(*name));
+            }
             return;
         }
         self.expose_active_tools();

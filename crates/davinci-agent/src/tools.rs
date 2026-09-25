@@ -129,6 +129,33 @@ pub const CODEX_HOT_TOOLS: &[&str] = &[
     "tool_search",
 ];
 
+/// Initial schemas for the opt-in lean surface. Other authorized tools remain
+/// discoverable through `tool_search` without changing permission policy.
+pub const LEAN_TOOLS: &[&str] = &[
+    "read",
+    "grep",
+    "find",
+    "ls",
+    "edit",
+    "write",
+    "apply_patch",
+    "bash",
+    "powershell",
+    "exec_command",
+    "write_stdin",
+    "job_output",
+    "job_kill",
+    "batch",
+    "agent",
+    "todo",
+    "update_plan",
+    "propose_plan",
+    "ask_user_question",
+    "tool_search",
+    "web_search",
+    "web_fetch",
+];
+
 /// What the built-in tools share across calls: the background jobs and the
 /// model's ledger. Both are behind `Arc<Mutex>` because the agent loop, the
 /// tool thread and the davinci shell all read them.

@@ -86,12 +86,18 @@ mod tests {
     use davinci_protocol::ThinkingLevel::*;
 
     fn signals(mutations: u64, consecutive_failures: u32) -> EffortSignals {
-        EffortSignals { mutations, consecutive_failures }
+        EffortSignals {
+            mutations,
+            consecutive_failures,
+        }
     }
 
     #[test]
     fn fixed_always_sends_the_configured_level() {
-        assert_eq!(request_level(EffortPolicy::Fixed, Medium, signals(0, 5)), Medium);
+        assert_eq!(
+            request_level(EffortPolicy::Fixed, Medium, signals(0, 5)),
+            Medium
+        );
     }
 
     #[test]
@@ -106,7 +112,10 @@ mod tests {
 
     #[test]
     fn parse_accepts_known_names_only() {
-        assert_eq!(EffortPolicy::parse(" Adaptive "), Some(EffortPolicy::Adaptive));
+        assert_eq!(
+            EffortPolicy::parse(" Adaptive "),
+            Some(EffortPolicy::Adaptive)
+        );
         assert_eq!(EffortPolicy::parse("fixed"), Some(EffortPolicy::Fixed));
         assert_eq!(EffortPolicy::parse("fast"), None);
     }
