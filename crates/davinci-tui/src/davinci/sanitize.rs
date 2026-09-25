@@ -7,10 +7,21 @@
 
 use std::borrow::Cow;
 
+fn is_bidi_control(ch: char) -> bool {
+    matches!(
+        ch,
+        '\u{061c}'
+            | '\u{200e}'
+            | '\u{200f}'
+            | '\u{202a}'..='\u{202e}'
+            | '\u{2066}'..='\u{2069}'
+    )
+}
+
 pub fn terminal_safe(text: &str) -> Cow<'_, str> {
     if !text
         .chars()
-        .any(|ch| ch.is_control() && ch != '\n' && ch != '\t')
+        .any(|ch| (ch.is_control() && ch != '\n' && ch != '\t') || is_bidi_control(ch))
     {
         return Cow::Borrowed(text);
     }
