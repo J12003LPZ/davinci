@@ -1390,8 +1390,8 @@ pub fn update_settings(
 
 fn refuse_unparseable(path: &Path) -> Result<(), String> {
     match fs::read_to_string(path) {
-        Ok(raw) if !raw.trim().is_empty() && parse_settings_value(&raw).is_none() => Err(format!(
-            "{} is not valid JSON; fix or remove it before davinci changes it (nothing was written)",
+        Ok(raw) if !raw.trim().is_empty() && parse_settings_json(&raw).is_none() => Err(format!(
+            "{} is not valid settings JSON; fix the invalid value or remove the file before davinci changes it (nothing was written)",
             path.display()
         )),
         _ => Ok(()),
@@ -1581,12 +1581,32 @@ mod tests {
         let path = settings_path(dir.path());
         fs::write(&path, "{ \"theme\": \"dark\", // my comment\n }").unwrap();
         let err = save_settings(dir.path(), &Settings::default()).unwrap_err();
-        assert!(err.contains("not valid JSON"), "{err}");
+        assert!(err.contains("not valid settings JSON"), "{err}");
         assert!(fs::read_to_string(&path).unwrap().contains("my comment"));
         assert!(update_settings(dir.path(), |settings| {
             settings.packages.push("npm:x".into());
         })
         .is_err());
+    }
+
+    #[test]
+    fn saving_never_overwrites_valid_json_with_an_invalid_typed_field() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = settings_path(dir.path());
+        let original = r#"{"theme":["wrong-type"],"packages":["npm:keep-me"]}"#;
+        fs::write(&path, original).unwrap();
+
+        let loaded = load_settings(dir.path());
+        let err = save_settings(dir.path(), &loaded).unwrap_err();
+        assert!(err.contains("not valid settings JSON"), "{err}");
+        assert_eq!(fs::read_to_string(&path).unwrap(), original);
+
+        let err = update_settings(dir.path(), |settings| {
+            settings.packages.push("npm:must-not-write".into());
+        })
+        .unwrap_err();
+        assert!(err.contains("not valid settings JSON"), "{err}");
+        assert_eq!(fs::read_to_string(&path).unwrap(), original);
     }
 
     #[test]
