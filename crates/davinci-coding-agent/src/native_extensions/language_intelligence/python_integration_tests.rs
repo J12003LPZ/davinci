@@ -64,8 +64,16 @@ fn run_python_backend(backend: PythonBackend, server_env: &str) {
     .unwrap();
     let good = "from .models import User\n\ndef greeting(user: User) -> str:\n    return user.name\n";
     std::fs::write(root.join("src/example/service.py"), good).unwrap();
-    let baseline = root.join(".basedpyright");
-    std::fs::write(&baseline, "fixture baseline must remain unchanged\n").unwrap();
+    let baseline = root.join(".basedpyright/baseline.json");
+    std::fs::create_dir_all(baseline.parent().unwrap()).unwrap();
+    std::fs::write(
+        &baseline,
+        r#"{
+  "files": {}
+}
+"#,
+    )
+    .unwrap();
     let baseline_before = bytes(&baseline);
 
     let mut config = LanguageIntelligenceConfig::default();
