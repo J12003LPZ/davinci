@@ -1450,10 +1450,10 @@
         ));
 
         let call_sync = json!({"command": "cargo build --offline"});
-        assert_eq!(
+        assert!(matches!(
             auto_policy.decide("c4", "bash", &call_sync, &root),
-            PermissionVerdict::Allow
-        );
+            PermissionVerdict::Ask(_)
+        ));
     }
 
     #[test]
