@@ -1390,10 +1390,21 @@ pub fn update_settings(
 
 fn refuse_unparseable(path: &Path) -> Result<(), String> {
     match fs::read_to_string(path) {
-        Ok(raw) if !raw.trim().is_empty() && parse_settings_value(&raw).is_none() => Err(format!(
-            "{} is not valid JSON; fix or remove it before davinci changes it (nothing was written)",
-            path.display()
-        )),
+        Ok(raw) if !raw.trim().is_empty() => {
+            if parse_settings_value(&raw).is_none() {
+                return Err(format!(
+                    "{} is not valid JSON; fix or remove it before davinci changes it (nothing was written)",
+                    path.display()
+                ));
+            }
+            if parse_settings_json(&raw).is_none() {
+                return Err(format!(
+                    "{} contains an invalid settings value; fix it before davinci changes the file (nothing was written)",
+                    path.display()
+                ));
+            }
+            Ok(())
+        }
         _ => Ok(()),
     }
 }
