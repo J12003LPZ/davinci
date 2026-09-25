@@ -2211,7 +2211,6 @@ fn complete_prompt_with_host(
         };
         match agent.turn_context_placement() {
             davinci_agent::turn_context::TurnContextPlacement::Appended => {
-                agent.freeze_tools_for_cache();
                 agent.commit_turn_context(memory);
             }
             davinci_agent::turn_context::TurnContextPlacement::SystemPrompt => {
@@ -2331,6 +2330,11 @@ fn complete_prompt_with_host(
         .unwrap_or_else(|error| error.into_inner())
         .register_with(&runtime_handle.capability_registry);
     agent.set_runtime(runtime_handle);
+    if agent.turn_context_placement()
+        == davinci_agent::turn_context::TurnContextPlacement::Appended
+    {
+        agent.freeze_tools_for_cache();
+    }
     // Print/RPC turns need the same native permission, model and runtime
     // bindings as the interactive shell before a discovered tool executes.
     apply_graph_session_context(
