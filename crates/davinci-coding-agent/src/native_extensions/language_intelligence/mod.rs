@@ -1,6 +1,8 @@
 //! Native, read-only language intelligence. No model-facing generic LSP method.
 
+mod client_requests;
 mod config;
+mod diagnostics;
 mod documents;
 mod identity;
 mod metadata;
