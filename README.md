@@ -98,7 +98,7 @@ Optional dependencies:
 - **Node.js** — required only for JavaScript extensions, selected compatibility features, and some test fixtures. The core Rust CLI does not require Node.
 - **CMake and a C++17 compiler** — required to build the native local voice worker.
 - **Linux local voice builds** — ALSA development headers and pkg-config.
-- **Language intelligence** — may require project-local language-server packages such as TypeScript and typescript-language-server.
+- **Language intelligence** — optional local servers: TypeScript/typescript-language-server, rust-analyzer, and BasedPyright or Pyright. DaVinci discovers installed tools but never installs them automatically; see [docs/language-intelligence.md](docs/language-intelligence.md).
 
 ### 1. Clone the repository
 
