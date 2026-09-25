@@ -105,6 +105,7 @@ impl Session {
             "limitations":self.command.limitations,
             "session":if self.is_alive() {"running"} else {"stopped"},
             "pid":self.transport.pid(),
+            "rssBytes":self.transport.rss_bytes(),
             "documents":self.documents.len(),
             "client":self.transport.client_status()
         })
