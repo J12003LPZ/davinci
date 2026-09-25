@@ -122,7 +122,10 @@ jobs:
             echo "DAVINCI_TEST_BASEDPYRIGHT=$prefix/basedpyright/bin/basedpyright-langserver" >> "$GITHUB_ENV"
           fi
           npm install --prefix "$prefix/pyright" --no-save --no-package-lock pyright@1.1.414
+          npm install --prefix "$prefix/typescript" --no-save --no-package-lock typescript@5.9.3 typescript-language-server@5.3.0
           echo "DAVINCI_TEST_PYRIGHT=$prefix/pyright/node_modules/pyright/index.js" >> "$GITHUB_ENV"
+          echo "DAVINCI_TEST_TYPESCRIPT=$prefix/typescript/node_modules/typescript" >> "$GITHUB_ENV"
+          echo "DAVINCI_TEST_LANGUAGE_SERVER=$prefix/typescript/node_modules/typescript-language-server" >> "$GITHUB_ENV"
           echo "DAVINCI_TEST_RUST_ANALYZER=$(cat "$prefix/rust-analyzer-path.txt")" >> "$GITHUB_ENV"
           echo "DAVINCI_TEST_PYTHON=$(python -c 'import sys; print(sys.executable)')" >> "$GITHUB_ENV"
           sysroot="$(rustc --print sysroot)"
@@ -136,6 +139,8 @@ jobs:
           "$DAVINCI_TEST_PYTHON" --version
           node "$DAVINCI_TEST_PYRIGHT" --version
           "$DAVINCI_TEST_BASEDPYRIGHT" --version
+      - name: Real TypeScript semantics
+        run: cargo test -p davinci-coding-agent --locked --lib real_typescript_semantics_and_edit_synchronization -- --ignored --nocapture
       - name: Real rust-analyzer semantics
         run: cargo test -p davinci-coding-agent --locked --lib real_rust_lsp_semantics -- --ignored --nocapture
       - name: Real BasedPyright semantics
