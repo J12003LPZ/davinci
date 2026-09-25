@@ -188,4 +188,85 @@ mod tests {
         let second = wire_body_for_next_request(&agent, &model);
         assert_eq!(first_prefix_break(&first, &second), None);
     }
+    #[test]
+    fn a_tool_turn_with_a_verification_reminder_stays_append_only() {
+        use davinci_ai::{AssistantMessage, ContentBlock, StopReason};
+        use std::cell::RefCell;
+        use std::rc::Rc;
+
+        let dir = tempfile::tempdir().unwrap();
+        let (mut agent, model) = appended_codex_agent();
+        agent.cwd = dir.path().to_path_buf();
+        agent.set_permission_mode(crate::PermissionMode::Ask);
+        agent.approver = Some(crate::ToolApprover(std::sync::Arc::new(|_| {
+            crate::ToolApprovalDecision::AllowOnce
+        })));
+        user_turn(
+            &mut agent,
+            "Create notes.txt containing hello, then read it back.",
+            None,
+        );
+
+        let bodies: Rc<RefCell<Vec<Value>>> = Rc::default();
+        let seen = Rc::clone(&bodies);
+        let mut step = 0usize;
+        agent
+            .run_loop(move |current: &Agent| {
+                seen.borrow_mut()
+                    .push(wire_body_for_next_request(current, &model));
+                step += 1;
+                let call = |name: &str, arguments: Value| ContentBlock::ToolCall {
+                    id: format!("call_{step}"),
+                    name: name.into(),
+                    arguments,
+                };
+                let (content, stop_reason) = match step {
+                    1 => (
+                        vec![call(
+                            "write",
+                            serde_json::json!({"path": "notes.txt", "content": "hello"}),
+                        )],
+                        StopReason::ToolUse,
+                    ),
+                    2 => (
+                        vec![call("read", serde_json::json!({"path": "notes.txt"}))],
+                        StopReason::ToolUse,
+                    ),
+                    _ => (
+                        vec![ContentBlock::Text {
+                            text: "done".into(),
+                        }],
+                        StopReason::Stop,
+                    ),
+                };
+                Ok(AssistantMessage {
+                    id: format!("a{step}"),
+                    role: "assistant".into(),
+                    content,
+                    model: "fixture".into(),
+                    usage: None,
+                    stop_reason: Some(stop_reason),
+                    error_message: None,
+                })
+            })
+            .unwrap();
+
+        let bodies = bodies.borrow();
+        assert!(
+            bodies.len() >= 4,
+            "expected write, read, done, and a reminder follow-up; got {} requests",
+            bodies.len()
+        );
+        for (index, pair) in bodies.windows(2).enumerate() {
+            assert_eq!(
+                first_prefix_break(&pair[0], &pair[1]),
+                None,
+                "request {} does not extend request {}:\nbefore={}\nafter={}",
+                index + 2,
+                index + 1,
+                pair[0]["input"],
+                pair[1]["input"]
+            );
+        }
+    }
 }
