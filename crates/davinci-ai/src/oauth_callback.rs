@@ -397,7 +397,7 @@ impl CallbackServer {
                         return Err("Timed out waiting for the browser login callback.".into());
                     }
                     stream
-                        .set_read_timeout(Some(remaining.min(Duration::from_secs(5))))
+                        .set_read_timeout(Some(remaining.min(Duration::from_millis(250))))
                         .map_err(|err| err.to_string())?;
                     match self.serve(stream) {
                         Ok(response) if response.code.is_some() => return Ok(response),
