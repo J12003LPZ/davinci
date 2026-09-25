@@ -1131,7 +1131,7 @@ mod tests {
     }
 
     #[test]
-    fn a_tool_call_names_the_action_and_its_outcome() {
+    fn a_tool_call_names_the_action() {
         let th = theme();
         let line = tool_line(
             100,
@@ -1140,16 +1140,11 @@ mod tests {
             "manus",
             "cargo check -p davinci-agent",
             Some("1.84s"),
-            Some("12 lines"),
+            0,
+            false,
         );
         let drawn = text_of(&line);
-        assert!(
-            drawn.starts_with("● Shell(cargo check -p davinci-agent)"),
-            "got {drawn:?}"
-        );
-        // The action stays first; outcome and elapsed time follow when they fit.
-        assert!(drawn.contains("· 12 lines · 1.84s"), "got {drawn:?}");
-        assert!(drawn.ends_with("· 1.84s"), "got {drawn:?}");
+        assert_eq!(drawn, "● Shell(cargo check -p davinci-agent)");
         assert_eq!(line.spans.iter().filter(|s| is_strong(s)).count(), 1);
     }
 
@@ -1163,7 +1158,8 @@ mod tests {
             "manus",
             "cargo check -p davinci-agent",
             Some("1.84s"),
-            None,
+            0,
+            false,
         ));
         assert!(!drawn.contains("manus"), "got {drawn:?}");
         assert!(drawn.starts_with("● Shell(cargo check"), "got {drawn:?}");
@@ -1180,20 +1176,39 @@ mod tests {
             "instrumenta",
             "read lib.rs",
             Some("0.01s"),
-            Some("412 lines"),
+            0,
+            false,
         ));
-        assert_eq!(drawn.trim_end(), "● Read(lib.rs) · 412 lines · 0.01s");
+        assert_eq!(drawn.trim_end(), "● Read(lib.rs)");
     }
 
     #[test]
-    fn arguments_stay_muted_and_failures_keep_their_error_glyph() {
+    fn arguments_keep_text_ink_and_failures_keep_error_ink() {
         let th = theme();
-        let read = tool_line(100, &th, State::Read, "instrumenta", "lib.rs", None, None);
-        assert_eq!(read.spans[3].style.fg, Some(th.muted));
-        let failed = tool_line(100, &th, State::Failed, "manus", "cargo test", None, None);
-        assert_eq!(failed.spans[3].style.fg, Some(th.muted));
+        let read = tool_line(
+            100,
+            &th,
+            State::Read,
+            "instrumenta",
+            "lib.rs",
+            None,
+            0,
+            false,
+        );
+        assert_eq!(read.spans[3].style.fg, Some(th.text));
+        let failed = tool_line(
+            100,
+            &th,
+            State::Failed,
+            "manus",
+            "cargo test",
+            None,
+            0,
+            false,
+        );
+        assert_eq!(failed.spans[3].style.fg, Some(th.text));
         assert_eq!(failed.spans[0].style.fg, Some(th.error));
-        assert!(text_of(&failed).starts_with("× Shell("));
+        assert!(text_of(&failed).starts_with("● Shell("));
     }
 
     #[test]
