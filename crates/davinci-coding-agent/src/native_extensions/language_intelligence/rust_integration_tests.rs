@@ -62,7 +62,7 @@ fn real_rust_lsp_semantics() {
     .unwrap();
     std::fs::write(
         root.join("build.rs"),
-        "fn main() { let _ = std::fs::write(\"build-script-ran\", \"ran\"); }\n",
+        "fn main() { let root = std::path::Path::new(env!(\"CARGO_MANIFEST_DIR\")); let _ = std::fs::write(root.join(\"build-script-ran\"), \"ran\"); }\n",
     )
     .unwrap();
     std::fs::write(
@@ -72,7 +72,7 @@ fn real_rust_lsp_semantics() {
     .unwrap();
     std::fs::write(
         root.join("macro_fixture/src/lib.rs"),
-        "use proc_macro::TokenStream;\n#[proc_macro]\npub fn sentinel(_: TokenStream) -> TokenStream { let _ = std::fs::write(\"proc-macro-ran\", \"ran\"); \"0u8\".parse().unwrap() }\n",
+        "use proc_macro::TokenStream;\n#[proc_macro]\npub fn sentinel(_: TokenStream) -> TokenStream { let root = std::path::Path::new(env!(\"CARGO_MANIFEST_DIR\")).parent().unwrap(); let _ = std::fs::write(root.join(\"proc-macro-ran\"), \"ran\"); \"0u8\".parse().unwrap() }\n",
     )
     .unwrap();
     std::fs::write(
