@@ -1053,6 +1053,15 @@
         }
         assert!(matches!(
             policy.decide("c1", "agent", &json!({"prompt": "research"}), &cwd()),
+            PermissionVerdict::Deny { .. }
+        ));
+        assert!(matches!(
+            policy.decide(
+                "c1-read",
+                "agent",
+                &json!({"prompt": "research", "tools": ["read", "grep", "find", "ls"]}),
+                &cwd(),
+            ),
             PermissionVerdict::Allow
         ));
         assert!(matches!(
