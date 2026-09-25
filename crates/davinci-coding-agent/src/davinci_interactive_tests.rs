@@ -3333,7 +3333,6 @@
         assert!(modal.irreversible_effects[0].details.contains("[REDACTED]"));
         assert!(!modal.irreversible_effects[0].details.contains("secret123"));
     }
-}
 
 #[cfg(test)]
 mod terminal_rebuild_host_contracts {
