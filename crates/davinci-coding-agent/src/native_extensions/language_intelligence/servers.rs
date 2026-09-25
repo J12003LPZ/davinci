@@ -512,8 +512,12 @@ mod tests {
 
     #[test]
     fn generic_project_detection_uses_adapter_not_typescript_constants() {
+        #[derive(Debug)]
         struct FixtureAdapter;
         impl ServerAdapter for FixtureAdapter {
+            fn family(&self) -> LanguageFamily {
+                LanguageFamily::TypeScript
+            }
             fn language_id(&self, path: &Path) -> Option<&'static str> {
                 (path.extension()?.to_str()? == "fixture").then_some("fixture")
             }
