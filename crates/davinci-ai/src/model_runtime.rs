@@ -514,7 +514,7 @@ mod tests {
         assert_eq!(check.kind, "oauth");
         assert_eq!(check.source, "OAuth");
         assert_eq!(
-            storage.get("anthropic").and_then(|c| c.access.as_deref()),
+            storage.get("xai").and_then(|c| c.access.as_deref()),
             Some("expired")
         );
     }
