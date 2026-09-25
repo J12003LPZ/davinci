@@ -1475,6 +1475,8 @@ mod tests {
             .lock()
             .unwrap()
             .governor
+            .lock()
+            .unwrap()
             .before_tool("grep", &args, || "head-123".into());
         let res = ToolResult {
             content: "match 1".into(),
@@ -1485,6 +1487,8 @@ mod tests {
             .lock()
             .unwrap()
             .governor
+            .lock()
+            .unwrap()
             .after_tool("grep", &args, res);
 
         // 2. Immediate duplicate call is blocked
@@ -1492,6 +1496,8 @@ mod tests {
             .lock()
             .unwrap()
             .governor
+            .lock()
+            .unwrap()
             .before_tool("grep", &args, || "head-123".into());
         assert!(
             blocked.is_some(),
@@ -1515,6 +1521,8 @@ mod tests {
                 .lock()
                 .unwrap()
                 .governor
+                .lock()
+                .unwrap()
                 .before_tool("grep", &args, || "head-123".into())
                 .is_some(),
             "PreCompact must not clear governor ledgers prematurely"
@@ -1539,6 +1547,8 @@ mod tests {
             .lock()
             .unwrap()
             .governor
+            .lock()
+            .unwrap()
             .before_tool("grep", &args, || "head-123".into());
         assert!(
             allowed.is_none(),
