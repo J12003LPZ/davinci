@@ -149,7 +149,9 @@ impl HttpTransport {
         reader: impl Read,
         want: Option<&Value>,
     ) -> Result<Value> {
-        let mut reader = BufReader::new(reader);
+        // Bound the underlying stream before read_line so one unterminated
+        // SSE line cannot allocate past the response cap before we inspect it.
+        let mut reader = BufReader::new(reader.take((MAX_BODY_BYTES + 1) as u64));
         let mut line = String::new();
         let mut data = String::new();
         let mut total = 0usize;
