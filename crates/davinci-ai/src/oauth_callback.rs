@@ -396,19 +396,11 @@ impl CallbackServer {
                     if remaining.is_zero() {
                         return Err("Timed out waiting for the browser login callback.".into());
                     }
-                    stream
-                        .set_read_timeout(Some(remaining.min(Duration::from_millis(250))))
-                        .map_err(|err| err.to_string())?;
-                    match self.serve(stream) {
-                        Ok(response) if response.code.is_some() => return Ok(response),
-                        Ok(_) => {}
-                        Err(_) if std::time::Instant::now() < deadline => {
-                            // Browser speculative connections can connect and
-                            // send no request at all. A per-connection failure
-                            // must not consume the OAuth callback.
-                        }
-                        Err(_) => {
-                            return Err("Timed out waiting for the browser login callback.".into())
+                    if let Some(response) =
+                        self.serve_with_timeout(stream, remaining.min(Duration::from_millis(100)))?
+                    {
+                        if response.code.is_some() {
+                            return Ok(response);
                         }
                     }
                 }
@@ -423,12 +415,33 @@ impl CallbackServer {
         }
     }
 
-    fn serve(&mut self, mut stream: TcpStream) -> Result<CallbackResponse, String> {
-        if stream.read_timeout().ok().flatten().is_none() {
-            stream.set_read_timeout(Some(Duration::from_secs(5))).ok();
-        }
+    fn serve(&mut self, stream: TcpStream) -> Result<CallbackResponse, String> {
+        self.serve_with_timeout(stream, Duration::from_secs(5))?
+            .ok_or_else(|| "OAuth callback connection closed before sending a request.".into())
+    }
+
+    fn serve_with_timeout(
+        &mut self,
+        mut stream: TcpStream,
+        read_timeout: Duration,
+    ) -> Result<Option<CallbackResponse>, String> {
+        stream
+            .set_read_timeout(Some(read_timeout))
+            .map_err(|err| err.to_string())?;
         let mut buf = [0u8; 8192];
-        let n = stream.read(&mut buf).map_err(|err| err.to_string())?;
+        let n = match stream.read(&mut buf) {
+            Ok(0) => return Ok(None),
+            Ok(n) => n,
+            Err(err)
+                if matches!(
+                    err.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) =>
+            {
+                return Ok(None);
+            }
+            Err(err) => return Err(err.to_string()),
+        };
         let request = String::from_utf8_lossy(&buf[..n]);
         let response = match parse_http_target(&request) {
             Some((path, query)) => handle_callback_request(
@@ -450,7 +463,7 @@ impl CallbackServer {
             self.used = true;
         }
         write_http_response(&mut stream, &response)?;
-        Ok(response)
+        Ok(Some(response))
     }
 }
 
