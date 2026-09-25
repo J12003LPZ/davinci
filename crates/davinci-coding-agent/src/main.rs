@@ -8,7 +8,6 @@ mod catalog_refresh;
 mod changelog;
 use davinci_coding_agent::completion_delivery;
 mod codex_probe;
-mod completion_delivery;
 mod davinci_interactive;
 mod davinci_sources;
 mod davinci_surfaces;
