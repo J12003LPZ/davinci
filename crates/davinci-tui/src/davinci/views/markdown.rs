@@ -34,9 +34,6 @@ use crate::davinci::ui::{
 /// Below this width there is no measure to wrap to: rows are clipped instead.
 const NARROW: u16 = 8;
 
-/// Code rows sit two columns in, behind `│ `.
-const CODE_INSET: u16 = 4;
-
 /// Containers deeper than this are flattened into their parent. Rendering
 /// recurses once per container, and a reply is never legitimately this deep.
 const MAX_DEPTH: usize = 32;
@@ -137,7 +134,7 @@ struct Item {
 enum Block {
     Paragraph(Vec<Inline>),
     Heading {
-        level: u8,
+        _level: u8,
         inlines: Vec<Inline>,
     },
     Code {
@@ -446,7 +443,10 @@ impl Builder {
         };
         let block = match leaf {
             Leaf::Paragraph(inlines) => Block::Paragraph(inlines),
-            Leaf::Heading { level, inlines } => Block::Heading { level, inlines },
+            Leaf::Heading { level, inlines } => Block::Heading {
+                _level: level,
+                inlines,
+            },
             Leaf::Code { lang, text } => Block::Code { lang, text },
             Leaf::Html(text) => Block::Html(text),
             Leaf::Table { header, rows, .. } => Block::Table { header, rows },
@@ -932,15 +932,10 @@ mod tests {
     }
 
     #[test]
-    fn heading_drops_the_hash_and_level_one_gets_a_rule() {
+    fn heading_drops_the_hash_and_uses_bold_without_a_rule() {
         let rows = render("# Title\n\nBody text.", MEASURE);
         let shown = texts(&rows);
-        assert_eq!(shown.len(), 4, "{shown:?}");
-        assert_eq!(shown[0], "Title");
-        assert!(shown[1].contains('─'), "{:?} is not a rule", shown[1]);
-        assert!(width_of(&rows[1]) <= MEASURE);
-        assert!(shown[2].is_empty());
-        assert_eq!(shown[3], "Body text.");
+        assert_eq!(shown, vec!["Title", "", "Body text."]);
         assert!(shown.iter().all(|row| !row.contains('#')));
         let title = span_with(&rows[0], "Title");
         assert_eq!(title.style.fg, Some(theme().text));
@@ -948,11 +943,9 @@ mod tests {
     }
 
     #[test]
-    fn level_two_gets_a_rule_and_deeper_levels_do_not() {
+    fn headings_at_every_level_omit_rules() {
         let two = texts(&render("## Second", MEASURE));
-        assert_eq!(two.len(), 2, "{two:?}");
-        assert_eq!(two[0], "Second");
-        assert!(two[1].contains('─'));
+        assert_eq!(two, vec!["Second"]);
 
         let three = texts(&render("### Third\n\nafter", MEASURE));
         assert_eq!(three, vec!["Third", "", "after"]);
@@ -965,17 +958,17 @@ mod tests {
             20,
         );
         let shown = texts(&rows);
-        assert_eq!(shown[0], "· alpha beta gamma");
+        assert_eq!(shown[0], "- alpha beta gamma");
         assert_eq!(shown[1], "  delta epsilon");
-        assert_eq!(shown[2], "· short");
-        assert_eq!(shown[3], "  · nested item here");
+        assert_eq!(shown[2], "- short");
+        assert_eq!(shown[3], "  - nested item here");
         assert_eq!(shown.len(), 4, "{shown:?}");
         for row in &rows {
             assert!(width_of(row) <= 20, "{:?}", text(row));
         }
-        let marker = span_with(&rows[0], "· ");
-        assert_eq!(marker.style.fg, Some(theme().border));
-        assert!(!shown.iter().any(|row| row.contains("- ")));
+        let marker = span_with(&rows[0], "- ");
+        assert_eq!(marker.style.fg, Some(theme().text));
+        assert!(!shown.iter().any(|row| row.contains("· ")));
     }
 
     #[test]
@@ -983,7 +976,7 @@ mod tests {
         let rows = render("3. three\n4. four\n5. five", MEASURE);
         assert_eq!(texts(&rows), vec!["3. three", "4. four", "5. five"]);
         let label = span_with(&rows[0], "3. ");
-        assert_eq!(label.style.fg, Some(theme().muted));
+        assert_eq!(label.style.fg, Some(theme().text));
 
         let wide = texts(&render("9. nine\n10. ten\n11. eleven", MEASURE));
         assert_eq!(wide, vec![" 9. nine", "10. ten", "11. eleven"]);
@@ -992,33 +985,33 @@ mod tests {
     #[test]
     fn task_items_carry_state_glyphs() {
         let rows = render("- [x] done\n- [ ] later", MEASURE);
-        assert_eq!(texts(&rows), vec!["· ✓ done", "· ○ later"]);
+        assert_eq!(texts(&rows), vec!["- ✓ done", "- ○ later"]);
         assert_eq!(span_with(&rows[0], "✓ ").style.fg, Some(theme().success));
         assert_eq!(span_with(&rows[1], "○ ").style.fg, Some(theme().border));
     }
 
     #[test]
-    fn fenced_code_names_its_language_and_clips_long_rows() {
+    fn fenced_code_uses_language_for_highlighting_and_clips_long_rows() {
         let long = "x".repeat(40);
         let source = format!("```rust\nfn main() {{}}\n\tindented\n{long}\n```\n");
         let rows = render(&source, 24);
         let shown = texts(&rows);
-        assert_eq!(shown[0], "  │ rust");
-        assert_eq!(shown[1], "  │ fn main() {}");
-        assert_eq!(shown[2], "  │     indented");
-        assert!(shown[3].ends_with('…'), "{:?}", shown[3]);
-        assert_eq!(shown.len(), 4, "{shown:?}");
+        assert_eq!(shown[0], "fn main() {}");
+        assert_eq!(shown[1], "    indented");
+        assert!(shown[2].ends_with('…'), "{:?}", shown[2]);
+        assert_eq!(shown.len(), 3, "{shown:?}");
         for row in &rows {
             assert!(width_of(row) <= 24, "{:?}", text(row));
         }
         assert!(!shown.iter().any(|row| row.contains("```")));
-        assert_eq!(span_with(&rows[0], "rust").style.fg, Some(theme().muted));
-        assert_eq!(span_with(&rows[1], "│ ").style.fg, Some(theme().border));
-        // The fence names the language: `fn` takes the keyword ink, the
+        // The fence selects the language: `fn` takes the keyword ink, the
         // rest of the row keeps the block's.
-        assert_eq!(span_with(&rows[1], "fn").style.fg, Some(theme().secondary));
         assert_eq!(
-            span_with(&rows[1], " main() {}").style.fg,
+            span_with(&rows[0], "fn").style.fg,
+            Some(theme().cc().code_keyword)
+        );
+        assert_eq!(
+            span_with(&rows[0], " main() {}").style.fg,
             Some(theme().text)
         );
     }
@@ -1044,7 +1037,7 @@ fn main() {}
             MEASURE,
         );
         assert_eq!(
-            span_with(&text_rows[1], "fn main() {}").style.fg,
+            span_with(&text_rows[0], "fn main() {}").style.fg,
             Some(theme().text)
         );
     }
@@ -1052,32 +1045,23 @@ fn main() {}
     #[test]
     fn indented_code_is_code_too() {
         let rows = render("para\n\n    let x = 1;\n    let y = 2;\n", MEASURE);
-        assert_eq!(
-            texts(&rows),
-            vec!["para", "", "  │ let x = 1;", "  │ let y = 2;"]
-        );
+        assert_eq!(texts(&rows), vec!["para", "", "let x = 1;", "let y = 2;"]);
     }
 
     #[test]
-    fn inline_code_is_verdigris() {
+    fn inline_code_uses_reference_link_ink() {
         let rows = render("run `cargo test` now", MEASURE);
         assert_eq!(texts(&rows), vec!["run cargo test now"]);
         let code = span_with(&rows[0], "cargo test");
-        assert_eq!(code.style.fg, Some(theme().secondary));
+        assert_eq!(code.style.fg, Some(theme().cc().permission));
         assert_eq!(span_with(&rows[0], "run ").style.fg, Some(theme().text));
     }
 
     #[test]
     fn unclosed_fence_still_renders_as_code() {
         let rows = render("Look:\n\n```\nlet x = 1;\nlet y", MEASURE);
-        assert_eq!(
-            texts(&rows),
-            vec!["Look:", "", "  │ let x = 1;", "  │ let y"]
-        );
-        assert_eq!(
-            texts(&render("```py\nprint(1)", MEASURE)),
-            vec!["  │ py", "  │ print(1)"]
-        );
+        assert_eq!(texts(&rows), vec!["Look:", "", "let x = 1;", "let y"]);
+        assert_eq!(texts(&render("```py\nprint(1)", MEASURE)), vec!["print(1)"]);
     }
 
     #[test]
@@ -1094,7 +1078,7 @@ fn main() {}
         // A list is one block: no blank rows between its items, even loose.
         assert_eq!(
             texts(&render("- a\n\n- b\n\nafter", MEASURE)),
-            vec!["· a", "· b", "", "after"]
+            vec!["- a", "- b", "", "after"]
         );
     }
 
@@ -1149,9 +1133,9 @@ fn main() {}
             vec!["see the docs (https://example.com/docs) or https://example.com"]
         );
         let link = span_with(&rows[0], "the docs (https://example.com/docs)");
-        assert_eq!(link.style.fg, Some(theme().secondary));
+        assert_eq!(link.style.fg, Some(theme().cc().permission));
         let bare = span_with(&rows[0], "https://example.com");
-        assert_eq!(bare.style.fg, Some(theme().secondary));
+        assert_eq!(bare.style.fg, Some(theme().cc().permission));
         assert_eq!(
             texts(&render("<me@example.com>", MEASURE)),
             vec!["me@example.com"]
@@ -1221,7 +1205,7 @@ fn main() {}
         let rows = render("hello wide world", 5);
         assert_eq!(texts(&rows), vec!["hell…"]);
         let rows = render("- item text here", 7);
-        assert_eq!(texts(&rows), vec!["· item…"]);
+        assert_eq!(texts(&rows), vec!["- item…"]);
         assert_eq!(
             texts(&render("hello wide world", 8)),
             vec!["hello", "wide", "world"]
@@ -1231,9 +1215,9 @@ fn main() {}
     #[test]
     fn nested_blocks_keep_their_prefixes() {
         let rows = render("- item\n\n  ```\n  code\n  ```\n\n  > quote\n", MEASURE);
-        assert_eq!(texts(&rows), vec!["· item", "    │ code", "  │ quote"]);
+        assert_eq!(texts(&rows), vec!["- item", "  code", "  │ quote"]);
         let rows = render("> - one\n> - two", MEASURE);
-        assert_eq!(texts(&rows), vec!["│ · one", "│ · two"]);
+        assert_eq!(texts(&rows), vec!["│ - one", "│ - two"]);
     }
 
     #[test]
@@ -1285,7 +1269,7 @@ fn main() {}
         assert!(render("```", MEASURE).is_empty());
         assert!(render("> ", MEASURE).is_empty());
         assert!(render("# ", MEASURE).is_empty());
-        assert_eq!(texts(&render("* ", MEASURE)), vec!["·"]);
+        assert_eq!(texts(&render("* ", MEASURE)), vec!["-"]);
         assert_eq!(texts(&render("[x](", MEASURE)), vec!["[x]("]);
         assert_eq!(texts(&render("**unclosed", MEASURE)), vec!["**unclosed"]);
         assert_eq!(
@@ -1300,11 +1284,11 @@ fn main() {}
         let rows = lines(&no_color, "# Title\n\nplain **strong**", MEASURE);
         let title = span_with(&rows[0], "Title");
         assert!(title.style.add_modifier.contains(Modifier::BOLD));
-        assert!(!span_with(&rows[3], "plain ")
+        assert!(!span_with(&rows[2], "plain ")
             .style
             .add_modifier
             .contains(Modifier::BOLD));
-        assert!(span_with(&rows[3], "strong")
+        assert!(span_with(&rows[2], "strong")
             .style
             .add_modifier
             .contains(Modifier::BOLD));

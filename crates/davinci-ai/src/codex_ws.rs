@@ -94,6 +94,7 @@ pub fn process_codex_websocket(
     if let Value::Object(map) = &mut outgoing {
         map.insert("type".into(), Value::String("response.create".into()));
     }
+    crate::wire_dump::write_current("wire", &outgoing);
     let send = write_text_frame(&mut stream, &outgoing.to_string());
     if let Err(err) = send {
         release_live_socket(acquired.key, stream, false);

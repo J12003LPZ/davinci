@@ -15,6 +15,7 @@
 use super::process::run_child_with_deadline;
 pub use super::process::WorkerDeadline;
 use super::store::{iso8601_utc, now_ms, write_artifact};
+#[cfg(any(test, feature = "test-fixtures"))]
 pub use super::types::WorkerError;
 use super::types::{
     Artifact, ArtifactKind, Classification, Complexity, EvidenceArtifact, EvidenceFinding,

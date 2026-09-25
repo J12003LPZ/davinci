@@ -65,6 +65,7 @@ mod stream_decoder_completions;
 mod stream_reader;
 mod thinking;
 pub mod trace;
+pub mod wire_dump;
 
 pub use apply_patch_grammar::APPLY_PATCH_LARK;
 pub use attribution::{is_install_telemetry_enabled, merge_provider_attribution_headers};

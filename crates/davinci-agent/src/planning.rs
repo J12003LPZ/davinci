@@ -833,8 +833,14 @@ mod tests {
         assert!(agent.active_contract().is_some());
 
         let revision = agent.tool_context.living_plan.lock().unwrap().revision;
-        let files = (0..257)
-            .map(|file| format!("src/overflow/file-{file}.rs"))
+        let steps = (0..9)
+            .map(|step| json!({
+                "id": format!("overflow-{step}"),
+                "files": (0..32).map(|file| format!("src/overflow-{step}/file-{file}.rs")).collect::<Vec<_>>(),
+                "change": "oversized scoped plan",
+                "why": "exercise failed handoff",
+                "verify": ["cargo test --offline"]
+            }))
             .collect::<Vec<_>>();
         agent
             .tool_context
@@ -844,13 +850,7 @@ mod tests {
             .update(
                 &json!({
                     "expected_revision": revision,
-                    "steps": [{
-                        "id": "one",
-                        "files": files,
-                        "change": "oversized scoped plan",
-                        "why": "exercise failed handoff",
-                        "verify": ["cargo test --offline"]
-                    }]
+                    "steps": steps
                 }),
                 dir.path(),
             )

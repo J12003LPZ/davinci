@@ -1,5 +1,160 @@
-
 use super::*;
+
+#[test]
+fn lean_surface_exposes_only_core_tools_on_cache_routes() {
+    let visible_with = |surface: crate::ToolSurface| {
+        let mut agent = Agent::new_builtin(crate::prompt::PromptProfile::Stable);
+        agent.turn_context_placement_override =
+            Some(crate::turn_context::TurnContextPlacement::Appended);
+        agent.apply_extension_tools(&["ticket".into()]);
+        agent.tool_surface = surface;
+        agent.freeze_tools_for_cache();
+        agent.visible_tool_names()
+    };
+    let lean = visible_with(crate::ToolSurface::Lean);
+    let full = visible_with(crate::ToolSurface::Full);
+    assert!(
+        lean.contains("read") && lean.contains("tool_search"),
+        "{lean:?}"
+    );
+    assert!(!lean.contains("ticket"), "{lean:?}");
+    assert!(lean
+        .iter()
+        .all(|name| crate::tools::LEAN_TOOLS.contains(&name.as_str())));
+    assert!(full.len() > lean.len(), "full={full:?} lean={lean:?}");
+}
+
+#[test]
+fn lean_surface_discovery_changes_schema_once_and_respects_authorization() {
+    let mut agent = Agent::new("x");
+    agent.set_runtime(RuntimeHandle::new(
+        RunId::new(),
+        AgentId::new(),
+        RuntimeBus::new(),
+    ));
+    agent.turn_context_placement_override =
+        Some(crate::turn_context::TurnContextPlacement::Appended);
+    agent.tool_surface = crate::ToolSurface::Lean;
+    agent.freeze_tools_for_cache();
+    assert!(!agent.is_tool_visible("code_outline"));
+    let before = agent.provider_tool_schema_identity();
+    execute_tool_with(
+        Path::new("."),
+        "tool_search",
+        &serde_json::json!({"query":"code_outline"}),
+        &agent.tool_context,
+    )
+    .unwrap();
+    assert!(agent.is_tool_visible("code_outline"));
+    let after = agent.provider_tool_schema_identity();
+    assert_ne!(before, after);
+    agent.freeze_tools_for_cache();
+    execute_tool_with(
+        Path::new("."),
+        "tool_search",
+        &serde_json::json!({"query":"code_outline"}),
+        &agent.tool_context,
+    )
+    .unwrap();
+    assert_eq!(after, agent.provider_tool_schema_identity());
+    agent.set_active_tools_by_name(&["read".into(), "tool_search".into()]);
+    agent.freeze_tools_for_cache();
+    execute_tool_with(
+        Path::new("."),
+        "tool_search",
+        &serde_json::json!({"query":"code_outline"}),
+        &agent.tool_context,
+    )
+    .unwrap();
+    assert!(!agent.is_tool_visible("code_outline"));
+    assert!(!agent.is_tool_visible("write"));
+}
+
+#[test]
+fn lean_surface_does_not_change_non_cache_routes() {
+    let mut agent = Agent::new("x");
+    agent.turn_context_placement_override =
+        Some(crate::turn_context::TurnContextPlacement::SystemPrompt);
+    let before = agent.visible_tool_names();
+    agent.tool_surface = crate::ToolSurface::Lean;
+    agent.freeze_tools_for_cache();
+    assert_eq!(before, agent.visible_tool_names());
+}
+
+#[test]
+fn effort_signals_track_real_turns_and_preserve_configured_identity() {
+    let mut agent = Agent::new("stable system");
+    agent.prompt("fix it");
+    agent
+        .messages
+        .push(ChatMessage::tool_result("c1", "write", "ok", false));
+    agent
+        .messages
+        .push(ChatMessage::tool_result("c2", "bash", "boom", true));
+    agent
+        .messages
+        .push(ChatMessage::tool_result("c3", "bash", "boom", true));
+    let mut reminder = ChatMessage::text("user", "Verify before finishing");
+    reminder
+        .extra
+        .insert("davinciCapabilityReminder".into(), Value::Bool(true));
+    agent.messages.push(reminder);
+    agent.messages.push(ChatMessage::text("custom", "context"));
+    agent.prompt_with("injected context", &[]);
+    assert_eq!(
+        agent.effort_signals(),
+        crate::effort::EffortSignals {
+            mutations: 1,
+            consecutive_failures: 2
+        }
+    );
+    agent.thinking_level = ThinkingLevel::Medium;
+    assert_eq!(agent.request_thinking_level(), ThinkingLevel::Medium);
+    agent.effort_policy = crate::effort::EffortPolicy::Adaptive;
+    assert_eq!(agent.request_thinking_level(), ThinkingLevel::High);
+    assert_eq!(agent.thinking_level, ThinkingLevel::Medium);
+    assert_eq!(agent.system_prompt, "stable system");
+    agent.prompt("a new task");
+    assert_eq!(
+        agent.effort_signals(),
+        crate::effort::EffortSignals::default()
+    );
+    assert_eq!(agent.request_thinking_level(), ThinkingLevel::Low);
+}
+
+#[test]
+fn effort_signals_count_batch_children_and_ignore_skipped_operations() {
+    let mut agent = Agent::new("x");
+    agent.prompt("fix it");
+    let mut result = ChatMessage::tool_result("batch-1", "batch", "summary", false);
+    result.extra.insert(
+        "details".into(),
+        serde_json::json!({"operations": [
+            {"tool": "write", "status": "ok"},
+            {"tool": "edit", "status": "error"},
+            {"tool": "bash", "status": "error"},
+            {"tool": "read", "status": "skipped"}
+        ]}),
+    );
+    agent.messages.push(result);
+    assert_eq!(
+        agent.effort_signals(),
+        crate::effort::EffortSignals {
+            mutations: 1,
+            consecutive_failures: 2
+        }
+    );
+    agent
+        .messages
+        .push(ChatMessage::tool_result("c2", "read", "ok", false));
+    assert_eq!(
+        agent.effort_signals(),
+        crate::effort::EffortSignals {
+            mutations: 1,
+            consecutive_failures: 0
+        }
+    );
+}
 
 #[test]
 fn f03_equivalent_session_path_reuses_live_runtime() {
@@ -2487,6 +2642,37 @@ fn later_mutation_invalidates_previous_verification() {
 }
 
 #[test]
+fn last_verification_command_survives_a_later_mutation() {
+    let agent = Agent::new("x");
+    agent.record_successful_mutation();
+    agent.remember_verification_command("bash", "cargo check --help");
+    agent.record_verification_command("cargo check --help", true);
+    agent.record_successful_mutation();
+    assert_eq!(agent.completion_evidence(), CompletionEvidence::Unverified);
+    let last = agent
+        .mutation_verification_state()
+        .last_verification
+        .unwrap();
+    assert_eq!(last.tool, "bash");
+    assert_eq!(last.command, "cargo check --help");
+}
+
+#[test]
+fn last_verification_preserves_arguments_and_working_directory() {
+    let agent = Agent::new("x");
+    let cwd = tempfile::tempdir().unwrap();
+    let args = serde_json::json!({"command":"cargo check --help", "timeout":17, "workdir":"child"});
+    agent.remember_verification_call("powershell", &args, cwd.path());
+    agent.record_successful_mutation();
+    let last = agent
+        .mutation_verification_state()
+        .last_verification
+        .unwrap();
+    assert_eq!(last.arguments, args);
+    assert_eq!(last.cwd.as_deref(), Some(cwd.path()));
+}
+
+#[test]
 fn read_only_turn_does_not_require_verification() {
     let agent = Agent::new("x");
 
@@ -3041,4 +3227,278 @@ fn unrelated_successful_test_does_not_verify_mutation() {
         state.latest_evidence.as_ref().map(|e| e.coverage),
         Some(VerificationCoverage::Unrelated)
     );
+}
+
+fn shell_tool() -> &'static str {
+    if cfg!(windows) {
+        "powershell"
+    } else {
+        "bash"
+    }
+}
+
+fn verifying_agent(dir: &std::path::Path) -> Agent {
+    let mut agent = Agent::new(default_system_prompt());
+    agent.cwd = dir.to_path_buf();
+    agent.set_permission_mode(PermissionMode::Ask);
+    agent.approver = Some(ToolApprover(Arc::new(|_| ToolApprovalDecision::AllowOnce)));
+    agent
+}
+
+fn harness_runs(agent: &Agent) -> usize {
+    agent
+        .messages
+        .iter()
+        .filter(|message| message.extra.contains_key("davinciHarnessVerification"))
+        .count()
+}
+
+fn reminders(agent: &Agent) -> Vec<String> {
+    agent
+        .messages
+        .iter()
+        .filter(|message| message.extra.contains_key("davinciCapabilityReminder"))
+        .map(|message| davinci_ai::content_text(&message.content))
+        .collect()
+}
+
+#[test]
+fn harness_reruns_the_last_verification_after_a_later_edit() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut agent = verifying_agent(dir.path());
+    agent.prompt("edit, verify, edit again");
+    let mut model_calls = 0;
+    let mut script = scripted_tool_calls(vec![
+        (
+            "write",
+            serde_json::json!({"path": "a.txt", "content": "one"}),
+        ),
+        (
+            shell_tool(),
+            serde_json::json!({"command": "cargo check --help"}),
+        ),
+        (
+            "write",
+            serde_json::json!({"path": "a.txt", "content": "two"}),
+        ),
+    ]);
+    agent
+        .run_loop(|current| {
+            model_calls += 1;
+            script(current)
+        })
+        .unwrap();
+
+    assert_eq!(
+        model_calls, 4,
+        "write, verify, write, done: no reminder round trip"
+    );
+    assert_eq!(harness_runs(&agent), 1);
+    assert!(reminders(&agent).is_empty(), "{:?}", reminders(&agent));
+    assert_eq!(agent.completion_evidence(), CompletionEvidence::Verified);
+    assert_eq!(
+        agent.last_assistant_text().as_deref(),
+        Some("done"),
+        "the harness tool call must not replace the model's reply"
+    );
+}
+
+#[test]
+fn a_passing_rerun_that_misses_the_change_is_not_reported_as_failed() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut agent = verifying_agent(dir.path());
+    agent.prompt("edit, verify, edit again");
+    let mut model_calls = 0;
+    let mut script = scripted_tool_calls(vec![
+        (
+            "write",
+            serde_json::json!({"path": "a.txt", "content": "one"}),
+        ),
+        (
+            shell_tool(),
+            serde_json::json!({"command": "cargo test -p unrelated-crate --help"}),
+        ),
+        (
+            "write",
+            serde_json::json!({"path": "a.txt", "content": "two"}),
+        ),
+    ]);
+    agent
+        .run_loop(|current| {
+            model_calls += 1;
+            script(current)
+        })
+        .unwrap();
+
+    assert_eq!(harness_runs(&agent), 1);
+    let reminders = reminders(&agent);
+    assert_eq!(reminders.len(), 1, "{reminders:?}");
+    assert!(
+        reminders[0].contains("have not completed a verification command"),
+        "{}",
+        reminders[0]
+    );
+    assert!(!reminders[0].contains("failed"), "{}", reminders[0]);
+    assert_eq!(model_calls, 5);
+}
+
+#[test]
+fn non_cargo_verifiers_cover_the_files_they_test() {
+    let cases = [
+        ("pytest -q", true, CompletionEvidence::Verified),
+        ("python -m pytest -q", true, CompletionEvidence::Verified),
+        (
+            "python -m pytest tests/test_intervals.py -q",
+            true,
+            CompletionEvidence::Verified,
+        ),
+        ("pytest tests/", true, CompletionEvidence::Verified),
+        ("pytest .\\tests\\", true, CompletionEvidence::Verified),
+        (
+            "pytest tests/test_intervals.py::test_touching",
+            true,
+            CompletionEvidence::Verified,
+        ),
+        ("go test ./...", true, CompletionEvidence::Verified),
+        ("npm test", true, CompletionEvidence::Verified),
+        (
+            "pytest tests/test_checkout.py",
+            true,
+            CompletionEvidence::Unverified,
+        ),
+        ("pytest -q", false, CompletionEvidence::VerificationFailed),
+    ];
+    for (command, succeeded, expected) in cases {
+        let agent = Agent::new("x");
+        agent.record_successful_mutation_paths(vec![PathBuf::from("src/intervals.py")]);
+        agent.record_verification_command(command, succeeded);
+        assert_eq!(agent.completion_evidence(), expected, "{command}");
+    }
+}
+
+#[test]
+fn a_failing_harness_rerun_is_reported_to_the_model() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut agent = verifying_agent(dir.path());
+    agent.prompt("edit, verify, edit again");
+    let mut model_calls = 0;
+    let mut script = scripted_tool_calls(vec![
+        (
+            "write",
+            serde_json::json!({"path": "a.txt", "content": "one"}),
+        ),
+        (
+            shell_tool(),
+            serde_json::json!({"command": "cargo check --definitely-not-a-flag"}),
+        ),
+        (
+            "write",
+            serde_json::json!({"path": "a.txt", "content": "two"}),
+        ),
+    ]);
+    agent
+        .run_loop(|current| {
+            model_calls += 1;
+            script(current)
+        })
+        .unwrap();
+
+    assert_eq!(harness_runs(&agent), 1);
+    let reminders = reminders(&agent);
+    assert_eq!(reminders.len(), 1, "{reminders:?}");
+    assert!(
+        reminders[0].contains("the harness re-ran"),
+        "{}",
+        reminders[0]
+    );
+    assert_eq!(model_calls, 5, "the model answers the reminder once");
+}
+
+#[test]
+fn auto_verify_off_keeps_the_plain_reminder() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut agent = verifying_agent(dir.path());
+    agent.auto_verify = false;
+    agent.prompt("edit, verify, edit again");
+    let mut script = scripted_tool_calls(vec![
+        (
+            "write",
+            serde_json::json!({"path": "a.txt", "content": "one"}),
+        ),
+        (
+            shell_tool(),
+            serde_json::json!({"command": "cargo check --help"}),
+        ),
+        (
+            "write",
+            serde_json::json!({"path": "a.txt", "content": "two"}),
+        ),
+    ]);
+    agent.run_loop(|current| script(current)).unwrap();
+
+    assert_eq!(harness_runs(&agent), 0);
+    let reminders = reminders(&agent);
+    assert_eq!(reminders.len(), 1);
+    assert!(reminders[0].contains("have not completed a verification command"));
+}
+
+#[test]
+fn harness_rerun_respects_permission_denial() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut agent = verifying_agent(dir.path());
+    agent.approver = Some(ToolApprover(Arc::new(|_| ToolApprovalDecision::Deny)));
+    agent.prompt("finish the change");
+    agent.remember_verification_command(shell_tool(), "cargo check --help");
+    agent.record_successful_mutation();
+    let events = agent.run_loop(scripted_tool_calls(vec![])).unwrap();
+    let outcomes = tool_outcomes(&events);
+    assert_eq!(outcomes.len(), 1);
+    assert!(outcomes[0].1);
+    assert!(outcomes[0].2.contains("Permission denied"), "{outcomes:?}");
+    assert_eq!(harness_runs(&agent), 1);
+    assert_ne!(agent.completion_evidence(), CompletionEvidence::Verified);
+}
+
+#[test]
+fn harness_rerun_preserves_context_and_stops_on_cancellation() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let original = tempfile::tempdir().unwrap();
+    let current = tempfile::tempdir().unwrap();
+    let mut agent = verifying_agent(current.path());
+    agent.prompt("finish the change");
+    let args = serde_json::json!({"command":"cargo check --help", "timeout":17});
+    agent.remember_verification_call(shell_tool(), &args, original.path());
+    agent.record_successful_mutation();
+    let cancelled = Arc::new(AtomicBool::new(false));
+    agent.abort_signal = Some(cancelled.clone());
+    let observed = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let capture = observed.clone();
+    agent.post_tool = Some(PostToolHook(Arc::new(move |_, cwd, name, args, result| {
+        capture
+            .lock()
+            .unwrap()
+            .push((cwd.to_path_buf(), name.to_string(), args.clone()));
+        cancelled.store(true, Ordering::SeqCst);
+        result
+    })));
+    let mut model_calls = 0;
+    let mut script = scripted_tool_calls(vec![]);
+    agent
+        .run_loop(|current| {
+            model_calls += 1;
+            script(current)
+        })
+        .unwrap();
+    assert_eq!(model_calls, 1);
+    assert!(agent.abort_requested());
+    assert_eq!(
+        *observed.lock().unwrap(),
+        vec![(
+            original.path().to_path_buf(),
+            shell_tool().to_string(),
+            args
+        )]
+    );
+    assert_eq!(harness_runs(&agent), 1);
+    assert!(reminders(&agent).is_empty());
 }

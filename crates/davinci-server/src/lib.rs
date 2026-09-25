@@ -1015,7 +1015,7 @@ mod tests {
             request: Command::List,
         };
         let input = encode_client_message(&request, None).unwrap();
-        let mut stream = std::io::Cursor::new(input);
+        let stream = std::io::Cursor::new(input);
         let mut output = Vec::new();
         struct Duplex<'a> {
             input: std::io::Cursor<Vec<u8>>,

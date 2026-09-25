@@ -23,3 +23,7 @@ node_modules/
 
 __pycache__/
 *.py[cod]
+
+# Benchmark tasks are generated; runs hold model transcripts.
+scripts/bench/tasks/
+scripts/bench/runs/

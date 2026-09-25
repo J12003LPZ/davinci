@@ -542,8 +542,8 @@ mod tests {
         for label in [
             "▔",
             "Select model",
-            "Enter to set as default",
-            "s to use this session only",
+            "Enter to confirm",
+            "←/→ effort",
             "OpenAI Codex",
             "gpt-6-astra",
             "gpt-5.6-luna",

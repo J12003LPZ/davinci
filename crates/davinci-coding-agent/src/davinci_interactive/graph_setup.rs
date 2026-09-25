@@ -23,7 +23,7 @@ pub struct Setup {
 }
 
 pub fn is_launch(args: &str) -> bool {
-    use crate::native_extensions::graph::render;
+    use crate::native_extensions::graph as render;
     matches!(render::parse_advanced_graph_command(args), Ok(None))
         && matches!(
             render::parse_graph_command(args),

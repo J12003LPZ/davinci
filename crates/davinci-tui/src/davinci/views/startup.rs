@@ -103,12 +103,12 @@ mod tests {
     }
 
     #[test]
-    fn welcome_matches_reference_masthead_without_extra_helper_rows() {
+    fn welcome_matches_reference_masthead_with_model_hint() {
         let mut m = model(100);
         m.startup.restored = true;
         m.startup.found = vec!["loaded 1 context file · 41 skills".into()];
         let rows: Vec<String> = lines(&m, &m.startup).iter().map(text).collect();
-        assert_eq!(rows.len(), 4);
+        assert_eq!(rows.len(), 6);
         assert!(rows[0].is_empty());
         let drawn = rows.join("\n");
         assert!(drawn.contains("DaVinci"));
@@ -117,15 +117,15 @@ mod tests {
         assert!(!drawn.contains("session restored"));
         assert!(!drawn.contains("new session"));
         assert!(!drawn.contains("/help"));
-        assert!(!drawn.contains("/model"));
+        assert!(drawn.contains("/model"));
     }
 
     #[test]
-    fn banner_uses_editorial_masthead() {
+    fn banner_uses_compact_identity_and_model_hint() {
         let m = model(100);
         let rows = banner(&m, &m.startup);
         let art = rows.iter().map(text).collect::<Vec<_>>().join("\n");
-        assert_eq!(rows.len(), 3);
+        assert_eq!(rows.len(), 5);
         assert!(art.contains("DaVinci"));
         assert!(art.contains(&m.model_name));
         assert!(!art.contains("▓"));

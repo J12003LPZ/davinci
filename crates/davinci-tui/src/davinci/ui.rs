@@ -501,6 +501,7 @@ pub fn hair_rule(width: u16, theme: &Theme, mark: &str) -> Line<'static> {
 
 /// A compact `● Read(path)` call with optional timing and outcome. Keep
 /// explicit state glyphs for errors and monochrome terminals.
+#[allow(clippy::too_many_arguments)]
 pub fn tool_line(
     width: u16,
     theme: &Theme,
@@ -514,10 +515,8 @@ pub fn tool_line(
     let (label, argument) = tool_caption(instrument, target);
     let cc = theme.cc();
     let failed = matches!(state, State::Failed | State::Attention);
-    let running = live
-        && duration.is_none()
-        && !failed
-        && !matches!(state, State::Skipped | State::Queued);
+    let running =
+        live && duration.is_none() && !failed && !matches!(state, State::Skipped | State::Queued);
     let mark = if theme.no_color {
         state.glyph()
     } else if running && tick % 2 == 1 {
@@ -736,9 +735,7 @@ pub fn hint_row(
     theme: &Theme,
 ) -> Line<'static> {
     let quiet = theme.cc().inactive;
-    let right: Vec<Span<'static>> = escape
-        .map(|esc| vec![span(esc, quiet)])
-        .unwrap_or_default();
+    let right: Vec<Span<'static>> = escape.map(|esc| vec![span(esc, quiet)]).unwrap_or_default();
     let room = width.saturating_sub(run_width(&right)).saturating_sub(3);
     let mut left: Vec<Span<'static>> = Vec::new();
     for (index, hint) in hints.iter().enumerate() {
@@ -874,19 +871,20 @@ mod tests {
         let text = text_of(&row);
         assert_eq!(width_of(&row), 40);
         assert!(text.ends_with("esc close"));
-        assert!(text.starts_with("↑↓ move │ enter select"), "{text}");
+        assert!(text.starts_with("↑↓ move · enter select"), "{text}");
         assert!(!text.contains("ctrl+p"), "{text}");
     }
 
     #[test]
-    fn the_selection_bar_is_three_cells_on_the_tint() {
+    fn the_selection_bar_is_two_cells_in_reference_focus_ink() {
         let th = theme();
         let bar = selection_bar(true, &th);
-        assert_eq!(UnicodeWidthStr::width(bar.content.as_ref()), 3);
-        assert_eq!(bar.style.bg, Some(th.surface));
+        assert_eq!(UnicodeWidthStr::width(bar.content.as_ref()), 2);
+        assert_eq!(bar.style.fg, Some(th.cc().permission));
+        assert_eq!(bar.style.bg, None);
         assert_eq!(
             UnicodeWidthStr::width(selection_bar(false, &th).content.as_ref()),
-            3
+            2
         );
     }
 
@@ -1207,7 +1205,7 @@ mod tests {
             false,
         );
         assert_eq!(failed.spans[3].style.fg, Some(th.text));
-        assert_eq!(failed.spans[0].style.fg, Some(th.error));
+        assert_eq!(failed.spans[0].style.fg, Some(th.cc().error));
         assert!(text_of(&failed).starts_with("● Shell("));
     }
 
@@ -1290,13 +1288,27 @@ pub fn section_row(
     let cc = theme.cc();
     let width = width.min(96);
     let available = width.saturating_sub(2);
-    let value_room = if width < 32 { 0 } else { (available / 3).min(28) };
+    let value_room = if width < 32 {
+        0
+    } else {
+        (available / 3).min(28)
+    };
     let value = clip_ellipsis(value, value_room);
     let value_width = run_width(&[span(value.clone(), cc.inactive)]);
     let name_room = available.saturating_sub(value_width + u16::from(!value.is_empty()));
     let left = vec![
-        span(if selected { SELECTION_BAR } else { UNSELECTED_BAR }, if selected { cc.permission } else { cc.inactive }),
-        span(clip_ellipsis(label, name_room), if selected { cc.permission } else { theme.text }),
+        span(
+            if selected {
+                SELECTION_BAR
+            } else {
+                UNSELECTED_BAR
+            },
+            if selected { cc.permission } else { cc.inactive },
+        ),
+        span(
+            clip_ellipsis(label, name_room),
+            if selected { cc.permission } else { theme.text },
+        ),
     ];
     spread(width, left, vec![span(value, cc.inactive)])
 }

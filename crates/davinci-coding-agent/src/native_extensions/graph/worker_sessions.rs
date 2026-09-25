@@ -11,6 +11,10 @@ mod windows;
 
 pub const SESSION_ENV: &str = "DAVINCI_GRAPH_WORKER_SESSION";
 
+#[cfg(any(test, feature = "test-fixtures"))]
+#[path = "worker_session_fixtures.rs"]
+pub mod fixtures;
+
 #[cfg(test)]
 #[path = "worker_sessions_tests.rs"]
 pub(crate) mod tests;

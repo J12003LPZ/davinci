@@ -9,10 +9,14 @@ pub(super) struct Store {
 }
 impl Store {
     pub fn open(root: &Path) -> Result<Self, String> {
-        Ok(Self {
-            directory: Directory::open(&root.join(STORE_NAME), true)
-                .map_err(|e| format!("transaction store: {e}"))?,
-        })
+        let directory = Directory::open(&root.join(STORE_NAME), true)
+            .map_err(|e| format!("transaction store: {e}"))?;
+        // Recovery records are local state. Exclusive creation preserves any
+        // existing entry, and Directory keeps the store's link protections.
+        if let Ok(mut file) = directory.file(".gitignore", true) {
+            let _ = file.write_all(b"*\n");
+        }
+        Ok(Self { directory })
     }
     pub fn load(
         &self,
@@ -178,6 +182,38 @@ impl Store {
                 .map_err(|e| e.to_string())?;
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod git_ignore_tests {
+    use super::*;
+
+    #[test]
+    fn store_keeps_its_records_out_of_git() {
+        let root = tempfile::tempdir().unwrap();
+        Store::open(root.path()).unwrap();
+        let ignore = root.path().join(STORE_NAME).join(".gitignore");
+        assert_eq!(std::fs::read_to_string(&ignore).unwrap(), "*\n");
+        std::fs::write(root.path().join(STORE_NAME).join("record.json"), "{}").unwrap();
+        assert!(
+            std::process::Command::new(davinci_sys::process::resolve_program("git"))
+                .args(["init", "--quiet"])
+                .current_dir(root.path())
+                .status()
+                .unwrap()
+                .success()
+        );
+        let status = std::process::Command::new(davinci_sys::process::resolve_program("git"))
+            .args(["status", "--porcelain"])
+            .current_dir(root.path())
+            .output()
+            .unwrap();
+        assert!(status.status.success());
+        assert!(status.stdout.is_empty(), "{:?}", status.stdout);
+        std::fs::write(&ignore, "custom\n").unwrap();
+        Store::open(root.path()).unwrap();
+        assert_eq!(std::fs::read_to_string(&ignore).unwrap(), "custom\n");
     }
 }
 

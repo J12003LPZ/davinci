@@ -69,7 +69,108 @@ fn agent_call_may_write_shared(args: &Value, mode: crate::PermissionMode) -> boo
     }
 }
 
+/// What happened when the harness re-ran the last verification command.
+enum HarnessVerification {
+    Passed,
+    Failed {
+        output_tail: String,
+    },
+    /// The rerun did not fail, but it does not cover the changed files (or it
+    /// was denied). The plain verification reminder applies.
+    Inconclusive,
+}
+
 impl Agent {
+    /// Run `last` as a normal tool call issued by the harness: an assistant
+    /// message with the call, then the tool result, both in history and in
+    /// the session, so replay and recovery see an ordinary tool exchange.
+    fn run_harness_verification(
+        &mut self,
+        last: &crate::LastVerification,
+        events: &mut Vec<AgentEvent>,
+        new_messages: &mut Vec<ChatMessage>,
+    ) -> Result<HarnessVerification, String> {
+        let call_token = uuid::Uuid::new_v4();
+        let call_id = format!("davinci_verify_{call_token}");
+        let arguments = if last.arguments.is_object() {
+            last.arguments.clone()
+        } else {
+            serde_json::json!({ "command": last.command })
+        };
+        let assistant = AssistantMessage {
+            id: format!("davinci-verify-{call_token}"),
+            role: "assistant".into(),
+            content: vec![ContentBlock::ToolCall {
+                id: call_id.clone(),
+                name: last.tool.clone(),
+                arguments: arguments.clone(),
+            }],
+            model: format!("{}/{}", self.provider, self.model_id),
+            usage: None,
+            stop_reason: Some(StopReason::ToolUse),
+            error_message: None,
+        };
+        let mut chat = assistant_to_chat(&assistant);
+        chat.extra
+            .insert(crate::HARNESS_VERIFICATION_FIELD.into(), Value::Bool(true));
+        self.messages.push(chat.clone());
+        self.persist_assistant(&assistant, &chat, None);
+        self.ensure_session_persistence()?;
+        new_messages.push(chat.clone());
+        self.push_event(
+            events,
+            AgentEvent::MessageStart {
+                message: chat.clone(),
+            },
+        );
+        self.push_event(events, AgentEvent::MessageEnd { message: chat });
+
+        let cwd = last.cwd.clone().unwrap_or_else(|| self.cwd.clone());
+        let results =
+            self.execute_tool_batch(&cwd, vec![(call_id, last.tool.clone(), arguments)], events);
+        let mut output_tail = String::new();
+        let mut rerun_failed = false;
+        let mut rerun_denied = false;
+        for mut result in results {
+            let name = result.tool_name.clone().unwrap_or_default();
+            self.after_tool(&name, &mut result);
+            let denied = result
+                .extra
+                .get("details")
+                .and_then(|details| details.get("denied"))
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            rerun_denied |= denied;
+            rerun_failed |= !denied && result.is_error == Some(true);
+            let text = davinci_ai::content_text(&result.content);
+            let lines: Vec<&str> = text.lines().collect();
+            output_tail = lines[lines.len().saturating_sub(30)..].join("\n");
+            self.messages.push(result.clone());
+            self.persist_chat(&result)?;
+            new_messages.push(result.clone());
+            self.push_event(
+                events,
+                AgentEvent::MessageStart {
+                    message: result.clone(),
+                },
+            );
+            self.push_event(events, AgentEvent::MessageEnd { message: result });
+        }
+        // The rerun's own exit status decides failure. Evidence alone cannot:
+        // a passing run whose command does not cover the changed files is
+        // unverified, not failed, and telling the model it failed sends it
+        // chasing a failure that does not exist.
+        Ok(match self.completion_evidence() {
+            _ if rerun_denied => HarnessVerification::Inconclusive,
+            crate::CompletionEvidence::Verified => HarnessVerification::Passed,
+            crate::CompletionEvidence::VerificationFailed => {
+                HarnessVerification::Failed { output_tail }
+            }
+            _ if rerun_failed => HarnessVerification::Failed { output_tail },
+            _ => HarnessVerification::Inconclusive,
+        })
+    }
+
     /// Start a loop after user prompts have already been appended.
     pub fn run_loop<F, T>(&mut self, complete: F) -> Result<Vec<AgentEvent>, String>
     where
@@ -483,21 +584,53 @@ impl Agent {
                 ) && verification_reminded_generation != Some(mutation_generation)
                 {
                     verification_reminded_generation = Some(mutation_generation);
-                    let message = match completion_evidence {
-                        crate::CompletionEvidence::VerificationFailed => {
-                            "The latest verification command failed after a file change. Investigate the failure or report it explicitly before finalizing."
+                    let last = self.mutation_verification_state().last_verification;
+                    let rerun = match (&last, completion_evidence) {
+                        (Some(last), crate::CompletionEvidence::Unverified) if self.auto_verify => {
+                            Some(self.run_harness_verification(
+                                last,
+                                &mut events,
+                                &mut new_messages,
+                            )?)
                         }
-                        _ => {
-                            "You changed files but have not completed a verification command. Run the narrowest appropriate test, check, or lint command before finalizing."
-                        }
+                        _ => None,
                     };
-                    self.queue_capability_reminder(
-                        message,
-                        "verification_required",
-                        &mut events,
-                        &mut new_messages,
-                    );
-                    continue;
+                    if self.abort_requested() {
+                        continue;
+                    }
+                    match rerun {
+                        Some(HarnessVerification::Passed) => {}
+                        Some(HarnessVerification::Failed { output_tail }) => {
+                            let command = last.map(|last| last.command).unwrap_or_default();
+                            let message = format!(
+                                "After your last change the harness re-ran `{command}` and it failed:\n{output_tail}\nFix the failure, or report it explicitly before finalizing."
+                            );
+                            self.queue_capability_reminder(
+                                &message,
+                                "verification_required",
+                                &mut events,
+                                &mut new_messages,
+                            );
+                            continue;
+                        }
+                        Some(HarnessVerification::Inconclusive) | None => {
+                            let message = match completion_evidence {
+                                crate::CompletionEvidence::VerificationFailed => {
+                                    "The latest verification command failed after a file change. Investigate the failure or report it explicitly before finalizing."
+                                }
+                                _ => {
+                                    "You changed files but have not completed a verification command. Run the narrowest appropriate test, check, or lint command before finalizing."
+                                }
+                            };
+                            self.queue_capability_reminder(
+                                message,
+                                "verification_required",
+                                &mut events,
+                                &mut new_messages,
+                            );
+                            continue;
+                        }
+                    }
                 }
             }
 
@@ -2478,6 +2611,7 @@ impl Agent {
                     .and_then(Value::as_str)
                     .unwrap_or_default();
                 if let Some(trustworthy) = crate::shell_policy::verification_outcome(cmd) {
+                    self.remember_verification_call(name, args, cwd);
                     self.record_verification_command(
                         cmd,
                         trustworthy && !pre_hook_error && !result.is_error,
@@ -5104,7 +5238,7 @@ mod tests {
     }
 
     #[test]
-    fn f05_hard_contract_refuses_unconfined_process_before_dispatch() {
+    fn f05_host_contract_defers_unconfined_process_to_permission_policy() {
         let temp = tempfile::tempdir().unwrap();
         let mut agent = Agent::new("turn contract process boundary test");
         agent.tools = vec!["bash".into()];
@@ -5133,13 +5267,16 @@ mod tests {
             &serde_json::json!({"command": "cargo test"}),
             0,
         );
-        match prep {
-            Preparation::Immediate(result) => {
-                assert!(result.is_error);
-                assert!(result.content.contains("execution_contract_unenforceable"));
-            }
-            _ => panic!("hard contract must refuse an unconfined process before dispatch"),
-        }
+        assert!(matches!(prep, Preparation::Ready { .. }));
+        agent.set_permission_mode(crate::PermissionMode::ReadOnly);
+        let denied = agent.prepare_tool_call(
+            temp.path(),
+            "call_denied",
+            "bash",
+            &serde_json::json!({"command": "cargo test"}),
+            0,
+        );
+        assert!(matches!(denied, Preparation::Immediate(result) if result.is_error));
     }
 
     #[test]

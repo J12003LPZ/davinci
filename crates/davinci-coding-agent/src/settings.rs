@@ -315,6 +315,14 @@ pub struct Settings {
     pub transport: Option<String>,
     #[serde(default, rename = "openaiVerbosity")]
     pub openai_verbosity: Option<String>,
+    #[serde(default, rename = "autoVerify")]
+    pub auto_verify: Option<bool>,
+    #[serde(default, rename = "serviceTier")]
+    pub service_tier: Option<String>,
+    #[serde(default, rename = "effortPolicy")]
+    pub effort_policy: Option<String>,
+    #[serde(default, rename = "toolSurface")]
+    pub tool_surface: Option<String>,
     #[serde(default, rename = "reasoningSummary")]
     pub reasoning_summary: Option<String>,
     #[serde(default, rename = "graphEconomyModel")]
@@ -840,7 +848,6 @@ fn collect_dir_resources(root: &Path, dir: &Path, pkg: &PackageSource, kind: &st
     out
 }
 
-
 fn push_if_allowed(
     root: &Path,
     path: PathBuf,
@@ -1041,7 +1048,11 @@ fn load_settings_value(path: &Path) -> serde_json::Value {
 }
 
 fn warn_removed_sqlite_backend(path: &Path, value: &serde_json::Value) {
-    if value.get("sessionBackend").and_then(serde_json::Value::as_str) != Some("sqlite") {
+    if value
+        .get("sessionBackend")
+        .and_then(serde_json::Value::as_str)
+        != Some("sqlite")
+    {
         return;
     }
     static WARNED: std::sync::Mutex<Vec<PathBuf>> = std::sync::Mutex::new(Vec::new());
@@ -1154,6 +1165,24 @@ pub fn apply_http_proxy_settings(http_proxy: Option<&str>) {
 }
 
 impl Settings {
+    pub fn tool_surface(&self, environment: Option<&str>) -> davinci_agent::ToolSurface {
+        environment
+            .or(self.tool_surface.as_deref())
+            .and_then(davinci_agent::ToolSurface::parse)
+            .unwrap_or_default()
+    }
+
+    pub fn effort_policy(&self, environment: Option<&str>) -> davinci_agent::effort::EffortPolicy {
+        environment
+            .or(self.effort_policy.as_deref())
+            .and_then(davinci_agent::effort::EffortPolicy::parse)
+            .unwrap_or_default()
+    }
+
+    pub fn auto_verify_enabled(&self, environment: Option<&str>) -> bool {
+        self.auto_verify.unwrap_or(true) && !matches!(environment, Some("0" | "false" | "off"))
+    }
+
     pub fn decision_intelligence_enabled(&self) -> bool {
         self.decision_intelligence
             .as_ref()
@@ -1342,7 +1371,6 @@ impl Settings {
                 .into_owned()
         })
     }
-
 }
 
 /// Drop `null` members so a rewrite does not expand every unset field into an
@@ -1558,6 +1586,52 @@ pub fn is_trusted(settings: &Settings, cwd: &Path, override_trust: Option<bool>)
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn service_tier_setting_parses() {
+        let settings: super::Settings = serde_json::from_str(r#"{"serviceTier":"fast"}"#).unwrap();
+        assert_eq!(settings.service_tier.as_deref(), Some("fast"));
+        assert!(super::Settings::default().service_tier.is_none());
+    }
+
+    #[test]
+    fn tool_surface_setting_defaults_to_full_and_environment_overrides() {
+        use davinci_agent::ToolSurface;
+        let settings: super::Settings = serde_json::from_str(r#"{"toolSurface":"lean"}"#).unwrap();
+        assert_eq!(settings.tool_surface(None), ToolSurface::Lean);
+        assert_eq!(settings.tool_surface(Some(" FULL ")), ToolSurface::Full);
+        assert_eq!(settings.tool_surface(Some("unknown")), ToolSurface::Full);
+        assert_eq!(
+            super::Settings::default().tool_surface(None),
+            ToolSurface::Full
+        );
+    }
+    #[test]
+    fn effort_policy_setting_defaults_to_fixed_and_environment_overrides() {
+        use davinci_agent::effort::EffortPolicy;
+        let settings: super::Settings =
+            serde_json::from_str(r#"{"effortPolicy":"adaptive"}"#).unwrap();
+        assert_eq!(settings.effort_policy(None), EffortPolicy::Adaptive);
+        assert_eq!(settings.effort_policy(Some("fixed")), EffortPolicy::Fixed);
+        assert_eq!(settings.effort_policy(Some("unknown")), EffortPolicy::Fixed);
+        assert_eq!(
+            super::Settings::default().effort_policy(None),
+            EffortPolicy::Fixed
+        );
+    }
+
+    #[test]
+    fn auto_verify_setting_parses_and_environment_can_disable_it() {
+        let settings: super::Settings = serde_json::from_str(r#"{"autoVerify":false}"#).unwrap();
+        assert_eq!(settings.auto_verify, Some(false));
+        assert!(!settings.auto_verify_enabled(None));
+        let defaults = super::Settings::default();
+        assert!(defaults.auto_verify_enabled(None));
+        for value in ["0", "false", "off"] {
+            assert!(!defaults.auto_verify_enabled(Some(value)));
+        }
+        assert!(defaults.auto_verify_enabled(Some("1")));
+        assert!(!settings.auto_verify_enabled(Some("1")));
+    }
     use super::*;
 
     #[test]
@@ -1573,7 +1647,10 @@ mod tests {
         .unwrap();
         let pkg: PackageSource = "npm:skills-pack".into();
         let found = collect_package_resources(&pkg, "skills", &agent, dir.path());
-        assert!(found.iter().any(|path| path.ends_with("SKILL.md")), "{found:?}");
+        assert!(
+            found.iter().any(|path| path.ends_with("SKILL.md")),
+            "{found:?}"
+        );
     }
 
     #[cfg(unix)]
@@ -1604,8 +1681,11 @@ mod tests {
     fn schema_invalid_settings_are_never_overwritten() {
         let dir = tempfile::tempdir().unwrap();
         let path = settings_path(dir.path());
-        fs::write(&path, r#"{"theme":"dark","quietStartup":"not-a-bool","futureKey":7}"#)
-            .unwrap();
+        fs::write(
+            &path,
+            r#"{"theme":"dark","quiet_startup":"not-a-bool","futureKey":7}"#,
+        )
+        .unwrap();
         let original = fs::read_to_string(&path).unwrap();
         let err = update_settings(dir.path(), |settings| {
             settings.packages.push("npm:x".into());
@@ -1987,7 +2067,8 @@ mod tests {
         std::fs::write(pkg_dir.join("skills").join("review.md"), "# review").ok();
         std::fs::write(pkg_dir.join("skills").join("skip.txt"), "no").ok();
         let manifest_pkg = PackageSource::from_spec(pkg_dir.display().to_string());
-        let extensions = collect_package_resources(&manifest_pkg, "extensions", dir.path(), dir.path());
+        let extensions =
+            collect_package_resources(&manifest_pkg, "extensions", dir.path(), dir.path());
         assert!(extensions
             .iter()
             .any(|path| path.ends_with("src/index.js") || path.ends_with("src\\index.js")));

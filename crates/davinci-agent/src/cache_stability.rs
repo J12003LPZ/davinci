@@ -188,4 +188,141 @@ mod tests {
         let second = wire_body_for_next_request(&agent, &model);
         assert_eq!(first_prefix_break(&first, &second), None);
     }
+
+    #[test]
+    fn a_tool_turn_with_a_verification_reminder_stays_append_only() {
+        use davinci_ai::{AssistantMessage, ContentBlock, StopReason};
+        use std::cell::RefCell;
+        use std::rc::Rc;
+
+        let dir = tempfile::tempdir().unwrap();
+        let (mut agent, model) = appended_codex_agent();
+        agent.cwd = dir.path().to_path_buf();
+        agent.set_permission_mode(crate::PermissionMode::Ask);
+        agent.approver = Some(crate::ToolApprover(std::sync::Arc::new(|_| {
+            crate::ToolApprovalDecision::AllowOnce
+        })));
+        user_turn(
+            &mut agent,
+            "Create notes.txt containing hello, then read it back.",
+            None,
+        );
+
+        let bodies: Rc<RefCell<Vec<Value>>> = Rc::default();
+        let seen = Rc::clone(&bodies);
+        let mut step = 0usize;
+        agent
+            .run_loop(move |current: &Agent| {
+                seen.borrow_mut()
+                    .push(wire_body_for_next_request(current, &model));
+                step += 1;
+                let call = |name: &str, arguments: Value| ContentBlock::ToolCall {
+                    id: format!("call_{step}"),
+                    name: name.into(),
+                    arguments,
+                };
+                let (content, stop_reason) = match step {
+                    1 => (
+                        vec![call(
+                            "write",
+                            serde_json::json!({"path": "notes.txt", "content": "hello"}),
+                        )],
+                        StopReason::ToolUse,
+                    ),
+                    2 => (
+                        vec![call("read", serde_json::json!({"path": "notes.txt"}))],
+                        StopReason::ToolUse,
+                    ),
+                    _ => (
+                        vec![ContentBlock::Text {
+                            text: "done".into(),
+                        }],
+                        StopReason::Stop,
+                    ),
+                };
+                Ok(AssistantMessage {
+                    id: format!("a{step}"),
+                    role: "assistant".into(),
+                    content,
+                    model: "fixture".into(),
+                    usage: None,
+                    stop_reason: Some(stop_reason),
+                    error_message: None,
+                })
+            })
+            .unwrap();
+
+        let bodies = bodies.borrow();
+        assert!(
+            bodies.len() >= 4,
+            "expected write, read, done, and a reminder follow-up; got {} requests",
+            bodies.len()
+        );
+        for (index, pair) in bodies.windows(2).enumerate() {
+            assert_eq!(
+                first_prefix_break(&pair[0], &pair[1]),
+                None,
+                "request {} does not extend request {}:\nbefore={}\nafter={}",
+                index + 2,
+                index + 1,
+                pair[0]["input"],
+                pair[1]["input"]
+            );
+        }
+    }
+
+    #[test]
+    fn anthropic_system_prompt_route_keeps_per_turn_state_in_the_system_prompt() {
+        let mut agent = Agent::new_builtin(crate::prompt::PromptProfile::Stable);
+        agent.provider = "anthropic".into();
+        agent.model_id = "claude-opus-4-5".into();
+
+        assert!(!crate::turn_context::is_cache_sensitive_route(
+            &agent.provider,
+            &agent.model_id
+        ));
+        // Route-family classification is checked above. Force the behavioral
+        // placement so DAVINCI_TURN_CONTEXT cannot make this regression flaky.
+        agent.turn_context_placement_override =
+            Some(crate::turn_context::TurnContextPlacement::SystemPrompt);
+        agent.prompt("Diagnose the root cause of this failure.");
+
+        assert_eq!(
+            agent.turn_context_placement(),
+            crate::turn_context::TurnContextPlacement::SystemPrompt
+        );
+        assert!(agent.system_prompt.contains("Permission mode:"));
+    }
+
+    #[test]
+    fn tool_search_does_not_change_the_tool_list_on_cached_routes() {
+        let (mut agent, model) = appended_codex_agent();
+        agent.set_runtime(crate::RuntimeHandle::new(
+            crate::RunId::new(),
+            crate::AgentId::new(),
+            crate::RuntimeBus::new(),
+        ));
+        agent.freeze_tools_for_cache();
+
+        user_turn(&mut agent, "Search the web for the changelog", None);
+        let first = wire_body_for_next_request(&agent, &model);
+        assert!(
+            first["tools"].to_string().contains("web_search"),
+            "the frozen schema set must include authorized deferred tools"
+        );
+
+        crate::execute_tool_with(
+            std::path::Path::new("."),
+            "tool_search",
+            &serde_json::json!({"query": "web_search"}),
+            &agent.tool_context,
+        )
+        .unwrap();
+        agent
+            .messages
+            .push(davinci_ai::ChatMessage::text("assistant", "Found it."));
+
+        let second = wire_body_for_next_request(&agent, &model);
+        assert_eq!(first_prefix_break(&first, &second), None);
+    }
 }

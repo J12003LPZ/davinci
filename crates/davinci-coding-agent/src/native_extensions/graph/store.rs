@@ -318,6 +318,7 @@ pub fn atomic_write(path: &Path, content: &[u8]) -> std::io::Result<()> {
     davinci_sys::fs::atomic_write(path, content)
 }
 
+#[cfg(test)]
 fn atomic_write_with<F>(path: &Path, content: &[u8], mut rename: F) -> std::io::Result<()>
 where
     F: FnMut(&Path, &Path) -> std::io::Result<()>,

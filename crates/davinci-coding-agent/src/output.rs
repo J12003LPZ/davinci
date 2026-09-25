@@ -299,8 +299,8 @@ pub struct StructuredGraphStatus {
 
 #[allow(dead_code)]
 impl StructuredGraphStatus {
-    pub fn from_graph_run(run: &crate::native_extensions::graph::types::GraphRun) -> Self {
-        let now = crate::native_extensions::graph::store::now_ms();
+    pub fn from_graph_run(run: &crate::native_extensions::graph::GraphRun) -> Self {
+        let now = crate::native_extensions::graph::graph_now_ms();
         let elapsed_ms = now.saturating_sub(run.counters.started_at);
         let tasks = run
             .tasks

@@ -22,8 +22,8 @@ use davinci_tui::davinci::model::{
 use davinci_tui::davinci::theme::State;
 use davinci_tui::davinci::views::disegno::roman;
 
-use crate::native_extensions::graph::store;
-use crate::native_extensions::graph::types::{GraphRun, Role, TaskStatus};
+use crate::native_extensions::graph as store;
+use crate::native_extensions::graph::{GraphRun, Role, TaskStatus};
 use crate::native_extensions::vector_memory::{VectorMemory, VectorMemoryConfig};
 
 /// The plan sheet (`1c`) from the newest graph run in this project, or an
@@ -316,6 +316,7 @@ fn compaction_proposal(agent: &Agent, in_use: u64, window: u64) -> Option<Propos
 }
 
 /// Format cost minor units or label as unknown.
+#[cfg(test)]
 pub fn cost_label(cost_minor_units: Option<u64>) -> String {
     cost_minor_units
         .map(|v| format!("{v} minor units"))
@@ -770,7 +771,7 @@ pub fn interaction_coverage_report(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::native_extensions::graph::types::{ArtifactKind, GraphTaskState};
+    use crate::native_extensions::graph::{ArtifactKind, GraphTaskState};
 
     fn task(id: &str, role: Role, status: TaskStatus, focus: Option<&str>) -> GraphTaskState {
         let mut task = GraphTaskState::new(
@@ -955,7 +956,7 @@ mod tests {
     }
 
     fn sample_run() -> GraphRun {
-        use crate::native_extensions::graph::types::{GraphBudgets, GraphCounters, Phase};
+        use crate::native_extensions::graph::{GraphBudgets, GraphCounters, Phase};
         GraphRun {
             version: 1,
             run_id: "run-1".into(),
@@ -1396,16 +1397,12 @@ mod tests {
     #[test]
     fn test_diff_of_binary_path() {
         let dir = tempfile::tempdir().unwrap();
-        let baseline =
-            crate::native_extensions::graph::mutation::capture_baseline(dir.path()).unwrap();
+        let baseline = crate::native_extensions::graph::capture_baseline(dir.path()).unwrap();
         let bin_file = dir.path().join("image.bin");
         std::fs::write(&bin_file, [0u8, 159, 255, 0, 12, 0]).unwrap();
-        let report = crate::native_extensions::graph::mutation::compute_owned_diff(
-            dir.path(),
-            &baseline,
-            &[],
-        )
-        .unwrap();
+        let report =
+            crate::native_extensions::graph::compute_owned_diff(dir.path(), &baseline, &[])
+                .unwrap();
         assert!(report.owned_diff.contains("new binary file"));
     }
 

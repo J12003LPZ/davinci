@@ -6,7 +6,6 @@ mod browser_integration_tests;
 mod cache_stats;
 mod catalog_refresh;
 mod changelog;
-use davinci_coding_agent::completion_delivery;
 mod codex_probe;
 mod davinci_interactive;
 mod davinci_sources;
@@ -96,7 +95,6 @@ mod experimental {
 
 mod export;
 mod extension_host;
-use davinci_coding_agent::interaction_testing;
 mod extensions;
 mod external_editor;
 mod file_processor;
@@ -108,17 +106,17 @@ mod mcp;
 mod migrations;
 mod model_resolver;
 use davinci_coding_agent::native_extensions;
-use davinci_coding_agent::native_tools;
 mod output;
 use davinci_coding_agent::package_source;
 mod packages;
 use davinci_coding_agent::permissions;
 use davinci_coding_agent::project_config;
 mod rpc;
+#[cfg(test)]
+use davinci_coding_agent::interaction_testing;
 use davinci_coding_agent::runtime_host;
-mod self_update;
+use davinci_coding_agent::self_update;
 use davinci_coding_agent::settings;
-use davinci_coding_agent::semantic;
 mod shutdown;
 mod slash;
 mod startup;
@@ -128,8 +126,6 @@ use davinci_coding_agent::trust;
 use std::io::{self, BufRead, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
-
-use davinci_coding_agent::prompt_host;
 
 /// True while the raw-mode TUI owns the screen. Any raw `println!` in that
 /// state moves the hardware cursor behind the renderer's back and corrupts
@@ -625,11 +621,8 @@ fn build_agent(parsed: &Args, session_dir: &Path, cwd: &Path) -> Result<Agent, S
     if std::env::var_os("PI_GRAPH_ROLE").is_some() && graph_worker.is_none() {
         return Err("invalid Graph worker context; refusing ordinary-session fallback".into());
     }
-    let worker_runtime = crate::native_extensions::graph::worker_sessions::runtime_from_env(
-        parsed,
-        cwd,
-        graph_worker.as_ref(),
-    )?;
+    let worker_runtime =
+        crate::native_extensions::graph::runtime_from_env(parsed, cwd, graph_worker.as_ref())?;
     if worker_runtime.is_some() && parsed.no_session {
         return Err("bound Graph worker cannot disable its conversation".into());
     }
@@ -648,6 +641,9 @@ fn build_agent(parsed: &Args, session_dir: &Path, cwd: &Path) -> Result<Agent, S
     }
     if let Some(value) = settings.openai_verbosity.as_deref() {
         std::env::set_var("DAVINCI_OPENAI_VERBOSITY", value);
+    }
+    if let Some(tier) = settings.service_tier.as_deref() {
+        std::env::set_var("DAVINCI_OPENAI_SERVICE_TIER", tier);
     }
     if let Some(value) = settings.reasoning_summary.as_deref() {
         std::env::set_var("DAVINCI_REASONING_SUMMARY", value);
@@ -886,6 +882,12 @@ fn build_agent(parsed: &Args, session_dir: &Path, cwd: &Path) -> Result<Agent, S
     }
     startup_mark("session opened");
     agent.auto_compaction = settings.compaction_enabled();
+    agent.auto_verify =
+        settings.auto_verify_enabled(std::env::var("DAVINCI_AUTO_VERIFY").ok().as_deref());
+    agent.effort_policy =
+        settings.effort_policy(std::env::var("DAVINCI_EFFORT_POLICY").ok().as_deref());
+    agent.tool_surface =
+        settings.tool_surface(std::env::var("DAVINCI_TOOL_SURFACE").ok().as_deref());
     agent.compaction = settings.compaction_settings();
     agent.auto_retry = settings.retry_enabled();
     agent.retry_attempts = settings.retry_max_retries();
@@ -908,7 +910,9 @@ fn build_agent(parsed: &Args, session_dir: &Path, cwd: &Path) -> Result<Agent, S
     };
     for pkg in &settings.packages {
         if !parsed.no_extensions {
-            for path in settings::collect_package_resources(pkg, "extensions", &default_agent_dir(), cwd) {
+            for path in
+                settings::collect_package_resources(pkg, "extensions", &default_agent_dir(), cwd)
+            {
                 extensions.push(path.to_string_lossy().into_owned());
             }
         }
@@ -1921,6 +1925,34 @@ fn new_worker_agent(system_prompt: impl Into<String>) -> Agent {
     agent
 }
 
+struct ProviderTransportSession {
+    id: String,
+    ephemeral: bool,
+}
+
+impl ProviderTransportSession {
+    fn new(agent: &Agent) -> Self {
+        Self {
+            id: agent.session.as_ref().map_or_else(
+                || uuid::Uuid::new_v4().to_string(),
+                |session| session.header.id.clone(),
+            ),
+            ephemeral: agent.session.is_none(),
+        }
+    }
+}
+
+impl Drop for ProviderTransportSession {
+    fn drop(&mut self) {
+        if self.ephemeral {
+            // --no-session disables persistence, not in-turn socket reuse.
+            // Its private transport lease ends with this loop, including errors.
+            davinci_ai::close_openai_codex_websocket_sessions(Some(&self.id));
+            davinci_ai::reset_openai_codex_websocket_debug_stats(Some(&self.id));
+        }
+    }
+}
+
 fn run_nested_subagent(
     parsed: &Args,
     cwd: &Path,
@@ -2211,7 +2243,6 @@ fn complete_prompt_with_host(
         };
         match agent.turn_context_placement() {
             davinci_agent::turn_context::TurnContextPlacement::Appended => {
-                agent.freeze_tools_for_cache();
                 agent.commit_turn_context(memory);
             }
             davinci_agent::turn_context::TurnContextPlacement::SystemPrompt => {
@@ -2331,6 +2362,9 @@ fn complete_prompt_with_host(
         .unwrap_or_else(|error| error.into_inner())
         .register_with(&runtime_handle.capability_registry);
     agent.set_runtime(runtime_handle);
+    // After the runtime registry exists, so its tools are part of the frozen
+    // prefix. A no-op outside cache-sensitive (appended) routes.
+    agent.freeze_tools_for_cache();
     // Print/RPC turns need the same native permission, model and runtime
     // bindings as the interactive shell before a discovered tool executes.
     apply_graph_session_context(
@@ -2441,6 +2475,7 @@ fn complete_prompt_with_host(
             }
         })));
     }
+    let transport_session = ProviderTransportSession::new(agent);
     let mut loop_failure = None;
     let mut conversation_failure = None;
     let mut events = agent
@@ -2497,7 +2532,7 @@ fn complete_prompt_with_host(
                         Some(&system),
                         &provider_tools(current),
                         &StreamOptions {
-                            thinking_level: Some(current.thinking_level),
+                            thinking_level: Some(current.request_thinking_level()),
                             thinking_budgets: current.thinking_budgets.clone(),
                             timeout_ms: current.provider_timeout_ms,
                             max_retries: current.provider_max_retries,
@@ -2506,10 +2541,7 @@ fn complete_prompt_with_host(
                             websocket_connect_timeout_ms: load_settings(&default_agent_dir())
                                 .websocket_connect_timeout_ms,
                             transport: current.transport.clone(),
-                            session_id: current
-                                .session
-                                .as_ref()
-                                .map(|session| session.header.id.clone()),
+                            session_id: Some(transport_session.id.clone()),
                             cache_key: std::env::var("PI_GRAPH_CACHE_KEY")
                                 .ok()
                                 .filter(|s| !s.is_empty())
@@ -2612,7 +2644,12 @@ fn complete_prompt_with_host(
                 AgentEvent::AgentEnd { messages, .. } => messages
                     .iter()
                     .rev()
-                    .find(|m| m.role == "assistant")
+                    .find(|m| {
+                        m.role == "assistant"
+                            && !m
+                                .extra
+                                .contains_key(davinci_agent::HARNESS_VERIFICATION_FIELD)
+                    })
                     .map(|m| content_text(&m.content)),
                 _ => None,
             })
@@ -2664,7 +2701,7 @@ fn complete_prompt_with_host(
                             }
                             if let Some(v) = graph.get("verification") {
                                 if let Ok(vr) = serde_json::from_value::<
-                                    crate::native_extensions::graph::types::VerificationResult,
+                                    crate::native_extensions::graph::VerificationResult,
                                 >(v.clone())
                                 {
                                     for cmd in &vr.commands {
@@ -3434,8 +3471,7 @@ fn run_rpc_with_host(
         let mut command: RpcCommand = match serde_json::from_str(&line) {
             Ok(command) => command,
             Err(err) => {
-                let response =
-                    rpc::fail_response(None, "parse", format!("parse error: {err}"));
+                let response = rpc::fail_response(None, "parse", format!("parse error: {err}"));
                 output::write_raw_stdout_line(
                     &serde_json::to_string(&response).map_err(|err| err.to_string())?,
                 )
@@ -3676,8 +3712,8 @@ fn run_rpc_with_host(
             let remote = runtime.agent.remote_queue();
             let skills = runtime.agent.skills.clone();
             let templates = runtime.agent.templates.clone();
+            let stop = std::sync::atomic::AtomicBool::new(false);
             let (_reply, events) = std::thread::scope(|scope| {
-                let stop = std::sync::atomic::AtomicBool::new(false);
                 let stop_ref = &stop;
                 let leftover_ref = &leftover;
                 let rx_ref = &rx;
@@ -4013,6 +4049,7 @@ fn rpc_watch_during_turn(
 
 type RpcUiAbort = Mutex<Option<Arc<std::sync::atomic::AtomicBool>>>;
 
+#[cfg(test)]
 fn rpc_with_ui_abort<T>(
     agent: &mut Agent,
     active: &RpcUiAbort,
@@ -6876,6 +6913,10 @@ fn persist_interactive_setting(spec: &str) -> Result<(), String> {
 fn sync_agent_from_settings(agent: &mut Agent) {
     let stored = load_merged_settings(&default_agent_dir(), &agent.cwd);
     agent.auto_compaction = stored.compaction_enabled();
+    agent.auto_verify =
+        stored.auto_verify_enabled(std::env::var("DAVINCI_AUTO_VERIFY").ok().as_deref());
+    agent.effort_policy =
+        stored.effort_policy(std::env::var("DAVINCI_EFFORT_POLICY").ok().as_deref());
     agent.compaction = stored.compaction_settings();
     agent.block_images = stored.block_images();
     agent.auto_resize_images = stored.image_auto_resize();
@@ -7076,8 +7117,7 @@ fn login_provider_with_wait(
                         "No login in progress for {provider}. Run /login {provider} first, then paste the redirect URL."
                     )
                 })?;
-            if let (Some(expected), Some(got)) =
-                (pending.state.as_deref(), pasted_state.as_deref())
+            if let (Some(expected), Some(got)) = (pending.state.as_deref(), pasted_state.as_deref())
             {
                 if expected != got {
                     return Err(
@@ -7423,8 +7463,7 @@ pub fn format_session_status(parsed: &Args, agent: &Agent) -> String {
         }
     }
     let cwd = std::env::current_dir().unwrap_or_default();
-    if let Some(run) = crate::native_extensions::graph::active_run(&cwd).and_then(|r| r.snapshot())
-    {
+    if let Some(run) = crate::native_extensions::graph::active_run_snapshot(&cwd) {
         let compact = run.ecosystem_stats.render_compact_lines();
         if !compact.is_empty() {
             text.push('\n');
@@ -7969,7 +8008,12 @@ fn apply_discovered_resources(parsed: &Args, agent: &mut Agent) {
             roots.extend(extra.iter().map(PathBuf::from));
         }
         for pkg in &settings.packages {
-            roots.extend(settings::collect_package_resources(pkg, "skills", &default_agent_dir(), &agent.cwd));
+            roots.extend(settings::collect_package_resources(
+                pkg,
+                "skills",
+                &default_agent_dir(),
+                &agent.cwd,
+            ));
         }
         agent.skills = discover_skills(&roots);
     }
@@ -7983,7 +8027,12 @@ fn apply_discovered_resources(parsed: &Args, agent: &mut Agent) {
             roots.extend(extra.iter().map(PathBuf::from));
         }
         for pkg in &settings.packages {
-            roots.extend(settings::collect_package_resources(pkg, "prompts", &default_agent_dir(), &agent.cwd));
+            roots.extend(settings::collect_package_resources(
+                pkg,
+                "prompts",
+                &default_agent_dir(),
+                &agent.cwd,
+            ));
         }
         agent.templates = discover_prompt_templates(&roots);
     }
@@ -9225,10 +9274,7 @@ fn apply_session_calls(
                         .unwrap_or_else(|| serde_json::json!({}));
                     let timeout_ms = call.get("timeoutMs").and_then(|value| value.as_u64());
                     match crate::js_host::execute_command_tool(
-                        command,
-                        &args,
-                        &agent.cwd,
-                        timeout_ms,
+                        command, &args, &agent.cwd, timeout_ms,
                     ) {
                         Ok(out) => {
                             ui.push("exec", &out);

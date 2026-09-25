@@ -132,7 +132,7 @@ fn impact_large_selection_uses_complete_package_commands_and_retains_exact_outpu
     }
     let mut host =
         NativeExtensionHost::new_with_agent_dir("impact-output", root.path(), Some(state.path()));
-    host.governor = TokenGovernor::new(
+    host.governor = std::sync::Arc::new(std::sync::Mutex::new(TokenGovernor::new(
         "impact-output",
         TokenGovernorConfig {
             compress_threshold_bytes: 50,
@@ -140,7 +140,7 @@ fn impact_large_selection_uses_complete_package_commands_and_retains_exact_outpu
             store_dir: Some(state.path().to_path_buf()),
             ..Default::default()
         },
-    );
+    )));
     let args = json!({"path":"value.ts","limit":100});
     let original = host.execute_tool(root.path(), "test_plan", &args).unwrap();
     let details = original.details.as_ref().unwrap();

@@ -1,4 +1,3 @@
-
 #[test]
 fn contextual_dispatch_attachments_require_context_and_live_cancellation() {
     for shared in [false, true] {
@@ -40,6 +39,39 @@ fn contextual_dispatch_attachments_require_context_and_live_cancellation() {
 use super::*;
 
 static PROCESS_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+#[test]
+fn nonpersistent_provider_loop_has_an_isolated_transport_session() {
+    let agent = Agent::new("transport fixture");
+    assert!(agent.session.is_none());
+    let first = ProviderTransportSession::new(&agent);
+    let second = ProviderTransportSession::new(&agent);
+    let id = &first.id;
+    assert!(!id.is_empty());
+    assert_ne!(
+        first.id, second.id,
+        "independent loops cannot share continuations"
+    );
+    assert!(
+        agent.session.is_none(),
+        "transport reuse must not create a durable session"
+    );
+}
+
+#[test]
+fn persisted_provider_transport_session_keeps_the_durable_id() {
+    let dir = tempfile::tempdir().unwrap();
+    let args = Args {
+        session_id: Some("durable-transport-fixture".into()),
+        ..Args::default()
+    };
+    let session = resolve_or_create_session(&args, dir.path(), dir.path()).unwrap();
+    let mut agent = Agent::new("fixture");
+    agent.session = Some(session);
+    let lease = ProviderTransportSession::new(&agent);
+    assert_eq!(lease.id, "durable-transport-fixture");
+    assert!(!lease.ephemeral);
+}
 
 #[test]
 fn main_model_turn_setting_overrides_the_default_and_keeps_zero() {
@@ -495,8 +527,8 @@ fn session_persistence_failure_reaches_host_reply_and_json_event() {
     assert!(reply.starts_with("Session recovery required:"), "{reply}");
     assert_eq!(print_text_exit(&events), (1, Some(reply.clone())));
     let event = to_json_print_event(events.last().unwrap()).unwrap();
-    let mut state = native_extensions::graph::worker::WorkerEventState::default();
-    native_extensions::graph::worker::parse_worker_event(&event.to_string(), &mut state, |_| {});
+    let mut state = native_extensions::graph::WorkerEventState::default();
+    native_extensions::graph::parse_worker_event(&event.to_string(), &mut state, |_| {});
     assert_eq!(state.error_message.as_deref(), Some(reply.as_str()));
     assert_eq!(state.stop_reason.as_deref(), Some("session_persistence"));
 }
@@ -556,7 +588,7 @@ fn host_worker_session_preserves_parent_authority_across_turns() {
 
 #[test]
 fn graph_worker_launch_opens_its_private_bound_conversation() {
-    use crate::native_extensions::graph::worker_sessions::{tests as fixture, SESSION_ENV};
+    use crate::native_extensions::graph::{worker_session_fixtures as fixture, SESSION_ENV};
     let _env_lock = PROCESS_ENV_LOCK
         .lock()
         .unwrap_or_else(|error| error.into_inner());

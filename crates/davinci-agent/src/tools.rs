@@ -129,6 +129,33 @@ pub const CODEX_HOT_TOOLS: &[&str] = &[
     "tool_search",
 ];
 
+/// Initial schemas for the opt-in lean surface. Other authorized tools remain
+/// discoverable through `tool_search` without changing permission policy.
+pub const LEAN_TOOLS: &[&str] = &[
+    "read",
+    "grep",
+    "find",
+    "ls",
+    "edit",
+    "write",
+    "apply_patch",
+    "bash",
+    "powershell",
+    "exec_command",
+    "write_stdin",
+    "job_output",
+    "job_kill",
+    "batch",
+    "agent",
+    "todo",
+    "update_plan",
+    "propose_plan",
+    "ask_user_question",
+    "tool_search",
+    "web_search",
+    "web_fetch",
+];
+
 /// What the built-in tools share across calls: the background jobs and the
 /// model's ledger. Both are behind `Arc<Mutex>` because the agent loop, the
 /// tool thread and the davinci shell all read them.
@@ -360,7 +387,7 @@ pub fn tool_specs() -> Vec<AgentTool> {
         },
         AgentTool {
             name: "todo".into(),
-            description: "Keep your task list current. Send the whole list every time (it replaces the previous one): each item has text and a status of pending, active or done. Use it for tasks of three or more steps, mark the step you are on active, and mark steps done as you finish them.".into(),
+            description: "Keep a task list for long work only: four or more distinct steps across several files or commands. Skip it for a one-file fix, a small feature, or read-edit-test work. Send the whole list every time (it replaces the previous one): each item has text and a status of pending, active or done. Update it only when a step changes status, and send the update in the same response as your next real tool call.".into(),
             parameters: crate::todo::tool_parameters(),
         },
         AgentTool {
@@ -432,7 +459,7 @@ pub fn tool_specs() -> Vec<AgentTool> {
         },
         AgentTool {
             name: "update_plan".into(),
-            description: "Track execution progress using plan:[{step,status}]. This progress ledger never approves a plan or changes permissions; use propose_plan for evidence-backed implementation decisions.".into(),
+            description: "Track execution progress using plan:[{step,status}] for long work only: four or more distinct steps. Skip it for small tasks, and send updates in the same response as your next real tool call. This progress ledger never approves a plan or changes permissions; use propose_plan for evidence-backed implementation decisions.".into(),
             parameters: update_plan_parameters(),
         },
         AgentTool {
@@ -3719,6 +3746,32 @@ fn code_rename_preview_tool(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn planning_tools_are_reserved_for_long_tasks() {
+        let specs = tool_specs();
+        for name in ["todo", "update_plan"] {
+            let spec = specs
+                .iter()
+                .find(|spec| spec.name == name)
+                .unwrap_or_else(|| panic!("{name} spec"));
+            assert!(
+                spec.description.contains("four or more"),
+                "{name}: {}",
+                spec.description
+            );
+            assert!(
+                !spec.description.contains("three or more"),
+                "{name}: {}",
+                spec.description
+            );
+            assert!(
+                spec.description.contains("same response"),
+                "{name}: {}",
+                spec.description
+            );
+        }
+    }
+
     use super::*;
     use tempfile::tempdir;
 
@@ -4166,6 +4219,29 @@ mod tests {
         assert_eq!(
             std::fs::read_to_string(path).unwrap(),
             "ALPHA\nBETA\ngamma\n"
+        );
+    }
+
+    #[test]
+    fn multi_edit_executes_with_empty_legacy_placeholders() {
+        let dir = tempdir().unwrap();
+        std::fs::write(dir.path().join("a.txt"), "alpha\nbeta\ngamma\n").unwrap();
+        execute_tool(
+            dir.path(),
+            "edit",
+            &serde_json::json!({
+                "path": "a.txt",
+                "edits": [
+                    {"oldText": "alpha", "newText": "ALPHA"},
+                    {"oldText": "gamma", "newText": "GAMMA"}
+                ],
+                "oldText": "", "newText": ""
+            }),
+        )
+        .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("a.txt")).unwrap(),
+            "ALPHA\nbeta\nGAMMA\n"
         );
     }
 

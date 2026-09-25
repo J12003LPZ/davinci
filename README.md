@@ -665,6 +665,32 @@ Project-local resources are supported under DaVinci/Pi-compatible project direct
 
 ### Useful environment variables
 
+`autoVerify` defaults to `true` in `settings.json`. After an edit invalidates a
+previous verification, the harness repeats the last verification call through
+the normal permission checks. It preserves the arguments and working directory.
+Set `autoVerify` to `false`, or `DAVINCI_AUTO_VERIFY` to `0`, `false`, or `off`,
+to keep the model reminder instead. The environment switch takes precedence
+and also applies when settings are reloaded.
+
+`serviceTier` is optional and applies only to ChatGPT sign-in (Codex) requests.
+`fast` and `priority` request priority processing; `flex` requests flex processing.
+Omit it for the standard tier. Priority processing may consume plan limits faster;
+availability and speed depend on the backend. `DAVINCI_OPENAI_SERVICE_TIER` accepts
+the same values when the setting is absent. Other values omit the request field.
+
+`effortPolicy` defaults to `fixed`. Opt in with `adaptive` to request lower reasoning
+effort before the turn's first successful edit, the configured effort after an edit,
+and higher effort after two consecutive failed tool results (including batch children).
+`off` remains off. `DAVINCI_EFFORT_POLICY` overrides the setting; unknown values use
+`fixed`. The configured thinking level and system prompt identity stay unchanged.
+
+`toolSurface` defaults to `full`. Set it to `lean` to initially send core tool schemas
+on cache-sensitive routes; other authorized tools remain available through
+`tool_search`. Discovery adds a schema once and keeps it visible for later requests.
+Permission rules still apply. `DAVINCI_TOOL_SURFACE` overrides the setting; unknown
+values use `full`. This setting applies when a new agent starts. Explicit tool
+selections stay exposed, and routes without appended turn context are unchanged.
+
 ~~~text
 DAVINCI_CODING_AGENT_DIR
 DAVINCI_CODING_AGENT_SESSION_DIR
