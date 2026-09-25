@@ -777,6 +777,51 @@ mod tests {
     }
 
     #[test]
+    fn sdk_language_intelligence_attachment_is_explicit_and_reversible() {
+        let dir = tempdir().unwrap();
+        let mut session = create_agent_session(CreateAgentSessionOptions {
+            cwd: Some(dir.path().to_path_buf()),
+            agent_dir: Some(dir.path().join("agent")),
+            session_dir: Some(dir.path().join("sessions")),
+            ..CreateAgentSessionOptions::default()
+        })
+        .unwrap()
+        .session;
+        let tools = vec!["lsp_hover".to_string(), "lsp_diagnostics".to_string()];
+        session
+            .attach_language_intelligence(Default::default(), &tools)
+            .unwrap();
+        assert!(session.agent.tools.contains(&"lsp_hover".to_string()));
+        assert!(session.agent.tool_context.semantic.is_some());
+        assert_eq!(
+            session
+                .attach_language_intelligence(Default::default(), &tools)
+                .unwrap_err(),
+            "language_intelligence_already_attached"
+        );
+        session.detach_language_intelligence().unwrap();
+        assert!(!session.agent.tools.contains(&"lsp_hover".to_string()));
+    }
+
+    #[test]
+    fn sdk_language_intelligence_honors_original_exclusions() {
+        let dir = tempdir().unwrap();
+        let mut session = create_agent_session(CreateAgentSessionOptions {
+            cwd: Some(dir.path().to_path_buf()),
+            agent_dir: Some(dir.path().join("agent")),
+            session_dir: Some(dir.path().join("sessions")),
+            exclude_tools: Some(vec!["lsp_hover".into()]),
+            ..CreateAgentSessionOptions::default()
+        })
+        .unwrap()
+        .session;
+        let error = session
+            .attach_language_intelligence(Default::default(), &["lsp_hover".into()])
+            .unwrap_err();
+        assert!(error.contains("excluded by session policy"));
+    }
+
+    #[test]
     fn no_tools_all_starts_empty() {
         let dir = tempdir().unwrap();
         let result = create_agent_session(CreateAgentSessionOptions {
