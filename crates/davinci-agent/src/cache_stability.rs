@@ -235,5 +235,4 @@ mod tests {
         let second = wire_body_for_next_request(&agent, &model);
         assert_eq!(first_prefix_break(&first, &second), None);
     }
-
 }
