@@ -532,6 +532,7 @@ dependencies = [
  "signal-hook",
  "tempfile",
  "thiserror",
+ "toml_edit",
  "tree-sitter",
  "tree-sitter-javascript",
  "tree-sitter-typescript",
