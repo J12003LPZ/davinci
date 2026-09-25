@@ -15,13 +15,24 @@ pub fn open_browser_argv(target: &str) -> (&'static str, Vec<String>) {
     }
 }
 
+fn oauth_fixture_dry_run() -> bool {
+    #[cfg(any(test, debug_assertions))]
+    {
+        return std::env::var(concat!("PI_OAUTH_", "FIXTURE")).is_ok();
+    }
+    #[cfg(not(any(test, debug_assertions)))]
+    {
+        false
+    }
+}
+
 pub fn open_browser_dry_run() -> bool {
     cfg!(test)
         || matches!(
             std::env::var("PI_OPEN_BROWSER_DRY_RUN").as_deref(),
             Ok("1") | Ok("true") | Ok("yes")
         )
-        || std::env::var("PI_OAUTH_FIXTURE").is_ok()
+        || oauth_fixture_dry_run()
 }
 
 pub fn copy_text_dry_run() -> bool {
