@@ -399,6 +399,16 @@ mod tests {
     }
 
     #[test]
+    fn empty_path_entries_never_resolve_from_the_current_directory() {
+        let file = tempfile::Builder::new()
+            .prefix("davinci-path-entry-")
+            .tempfile_in(".")
+            .unwrap();
+        let name = file.path().file_name().unwrap().to_string_lossy().into_owned();
+        assert_eq!(resolve_program_in(&name, OsStr::new(""), None), None);
+    }
+
+    #[test]
     fn names_with_a_separator_are_not_searched() {
         let path_var = std::ffi::OsString::new();
         assert_eq!(resolve_program_in("./npm", &path_var, Some(".CMD")), None);
