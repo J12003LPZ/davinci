@@ -4269,7 +4269,7 @@ struct HostedTuiGuard;
 
 impl HostedTuiGuard {
     fn activate() -> Self {
-        let _hosted = HostedTuiGuard::activate();
+        crate::set_hosted_tui_active(true);
         Self
     }
 }
@@ -4446,7 +4446,7 @@ pub fn run(
     let mut first_frame = true;
     // From here the alternate screen is ours, so a `println!` from shared code
     // is queued for the transcript instead of painted over the frame.
-    crate::set_hosted_tui_active(true);
+    let _hosted_tui = HostedTuiGuard::activate();
     // Proving the panic hook gives the terminal back needs a panic to happen
     // inside the alternate screen, which nothing else can arrange.
     if std::env::var("PI_DAVINCI_PANIC_FIXTURE").is_ok() {
