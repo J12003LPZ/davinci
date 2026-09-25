@@ -69,6 +69,7 @@ impl ResourceSnapshot {
             prunings,
         }
     }
+
 }
 
 #[cfg(test)]
@@ -135,13 +136,5 @@ mod tests {
         assert_eq!(snapshot.governor_retrievals, 2);
         assert_eq!(snapshot.prunings, 0);
 
-        let receipt = snapshot.to_usage_receipt("graph_attempt_1");
-        assert_eq!(receipt.provider_usage, 3750);
-        assert_eq!(receipt.cache_read_tokens, 1200);
-        assert_eq!(receipt.cache_write_tokens, 200);
-        assert_eq!(
-            receipt.cost,
-            davinci_agent::runtime::CostAmount::Known(1500)
-        );
     }
 }

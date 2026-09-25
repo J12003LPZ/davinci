@@ -439,14 +439,16 @@ impl Session {
     /// delivers as a burst of keys (Windows; see [`PasteFilter`]) is
     /// reassembled into the one [`Event::Paste`] the model expects.
     pub fn poll_event(&mut self, timeout: Duration) -> io::Result<Option<Event>> {
+        // Dropped mouse-motion events must consume the caller's existing wait,
+        // not start a fresh full timeout. Otherwise continuous motion on
+        // Windows can prevent the turn loop from reaching its next tick.
         let deadline = Instant::now() + timeout;
         loop {
             if let Some(ready) = self.paste.next_ready() {
                 if matches!(ready, Event::Resize(..)) {
                     self.mic_rect = None;
                 }
-                if matches!(ready, Event::Mouse(mouse) if mouse.kind == event::MouseEventKind::Moved)
-                {
+                if matches!(ready, Event::Mouse(mouse) if mouse.kind == event::MouseEventKind::Moved) {
                     continue;
                 }
                 return Ok(Some(ready));
@@ -457,7 +459,13 @@ impl Session {
             let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
                 self.paste.idle();
-                return Ok(self.paste.next_ready());
+                let ready = self.paste.next_ready();
+                return Ok(ready.filter(|event| {
+                    !matches!(
+                        event,
+                        Event::Mouse(mouse) if mouse.kind == event::MouseEventKind::Moved
+                    )
+                }));
             }
             let wait = if self.paste.holding() {
                 remaining.min(super::paste_burst::TYPING_WAIT)
@@ -466,7 +474,13 @@ impl Session {
             };
             if !event::poll(wait)? {
                 self.paste.idle();
-                return Ok(self.paste.next_ready());
+                let ready = self.paste.next_ready();
+                return Ok(ready.filter(|event| {
+                    !matches!(
+                        event,
+                        Event::Mouse(mouse) if mouse.kind == event::MouseEventKind::Moved
+                    )
+                }));
             }
             self.paste.feed(event::read()?);
             // Feed everything already queued before answering, so a whole
@@ -478,8 +492,7 @@ impl Session {
                 if matches!(ready, Event::Resize(..)) {
                     self.mic_rect = None;
                 }
-                if matches!(ready, Event::Mouse(mouse) if mouse.kind == event::MouseEventKind::Moved)
-                {
+                if matches!(ready, Event::Mouse(mouse) if mouse.kind == event::MouseEventKind::Moved) {
                     continue;
                 }
                 return Ok(Some(ready));

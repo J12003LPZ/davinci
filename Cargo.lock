@@ -467,8 +467,8 @@ dependencies = [
 name = "davinci-ai"
 version = "1.0.71"
 dependencies = [
- "davinci-ai",
  "base64",
+ "davinci-ai",
  "davinci-protocol",
  "davinci-sys",
  "davinci-telemetry",
@@ -505,13 +505,13 @@ dependencies = [
 name = "davinci-coding-agent"
 version = "1.0.71"
 dependencies = [
- "davinci-coding-agent",
  "base64",
  "clap",
  "crossterm",
  "davinci-agent",
  "davinci-ai",
  "davinci-client",
+ "davinci-coding-agent",
  "davinci-mcp",
  "davinci-protocol",
  "davinci-server",

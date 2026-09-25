@@ -15,6 +15,8 @@
 
 pub(crate) mod bindings;
 pub(crate) mod blobs;
+pub(crate) mod git;
+pub(crate) mod tail;
 pub(crate) mod briefings;
 pub(crate) mod config;
 pub(crate) mod continuation;
@@ -23,7 +25,6 @@ pub(crate) mod controller;
 mod coordinator_handler;
 pub(crate) mod definitions;
 pub(crate) mod export;
-pub(crate) mod git;
 pub(crate) mod history;
 mod lease;
 pub(crate) mod mutation;
@@ -37,7 +38,6 @@ pub(crate) mod replay;
 pub(crate) mod review_coverage;
 pub(crate) mod roles;
 pub(crate) mod store;
-pub(crate) mod tail;
 pub(crate) mod topology;
 pub(crate) mod types;
 pub(crate) mod validate;
@@ -368,10 +368,7 @@ fn economy_role_models_with(
     setting: Option<&str>,
 ) -> std::collections::BTreeMap<Role, String> {
     let mut models = std::collections::BTreeMap::new();
-    let Some(session_model) = session_model
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-    else {
+    let Some(session_model) = session_model.map(str::trim).filter(|value| !value.is_empty()) else {
         return models;
     };
     if !session_model.starts_with("openai-codex/") || setting == Some("off") {
@@ -395,7 +392,9 @@ fn economy_role_models_with(
     models
 }
 
-fn economy_role_models(session_model: Option<&str>) -> std::collections::BTreeMap<Role, String> {
+fn economy_role_models(
+    session_model: Option<&str>,
+) -> std::collections::BTreeMap<Role, String> {
     economy_role_models_with(
         session_model,
         std::env::var("DAVINCI_GRAPH_ECONOMY_MODEL").ok().as_deref(),
@@ -630,10 +629,7 @@ impl GraphController {
         }
         for role in Role::ALL {
             if config.budgets.worker_timeout_ms.get(*role) == 0 {
-                config
-                    .budgets
-                    .worker_timeout_ms
-                    .set(*role, WORKER_TIMEOUT_MS);
+                config.budgets.worker_timeout_ms.set(*role, WORKER_TIMEOUT_MS);
             }
         }
     }
@@ -1536,14 +1532,14 @@ impl GraphController {
                                     latest.run_id
                                 ));
                             };
-                            let resumable = run.current_lifecycle()
-                                == types::GraphLifecycle::Running
-                                && !matches!(
-                                    run.phase,
-                                    types::Phase::Done
-                                        | types::Phase::Blocked
-                                        | types::Phase::Cancelled
-                                );
+                            let resumable =
+                                run.current_lifecycle() == types::GraphLifecycle::Running
+                                    && !matches!(
+                                        run.phase,
+                                        types::Phase::Done
+                                            | types::Phase::Blocked
+                                            | types::Phase::Cancelled
+                                    );
                             if resumable {
                                 self.resume(&run.run_id)?
                             } else {
@@ -1705,7 +1701,9 @@ mod tests {
         assert!(!models.contains_key(&Role::Reviewer));
 
         assert!(economy_role_models_with(Some("anthropic/claude-opus-4-5"), None).is_empty());
-        assert!(economy_role_models_with(Some("openai-codex/gpt-5.6-sol"), Some("off")).is_empty());
+        assert!(
+            economy_role_models_with(Some("openai-codex/gpt-5.6-sol"), Some("off")).is_empty()
+        );
     }
 
     fn controller(cwd: &Path) -> GraphController {
@@ -2065,7 +2063,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let controller = controller(dir.path());
         let run = controller
-            .run_to_completion(parse_graph_args("--dry-run improve the parser"))
+            .run_to_completion(parse_graph_args("--dry-run improve the parser"), None)
             .expect("runs");
         assert_eq!(run.phase, Phase::Done, "blocked: {:?}", run.blocked_reason);
         assert_eq!(run.counters.cost_usd, 0.0);
@@ -2117,7 +2115,7 @@ mod tests {
 
         let controller = controller(dir.path()).with_runtime(runtime.clone());
         let run = controller
-            .run_to_completion(parse_graph_args("--dry-run test runtime registration"))
+            .run_to_completion(parse_graph_args("--dry-run test runtime registration"), None)
             .expect("runs");
 
         assert_eq!(run.phase, Phase::Done);
@@ -2150,7 +2148,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let controller = controller(dir.path());
         let run = controller
-            .run_to_completion(parse_graph_args("--dry-run persist me"))
+            .run_to_completion(parse_graph_args("--dry-run persist me"), None)
             .expect("runs");
         let reloaded = load_run(dir.path(), &run.run_id).expect("state.json written");
         assert_eq!(reloaded.goal, "persist me");
@@ -2178,7 +2176,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let controller = controller(dir.path());
         let run = controller
-            .run_to_completion(parse_graph_args("--dry-run --simple tiny tweak"))
+            .run_to_completion(parse_graph_args("--dry-run --simple tiny tweak"), None)
             .expect("runs");
         assert_eq!(run.phase, Phase::Done);
         let ids: Vec<&str> = run.tasks.iter().map(|task| task.id.as_str()).collect();
@@ -2202,7 +2200,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let controller = controller(dir.path());
         let mut stopped = controller
-            .run_to_completion(parse_graph_args("--dry-run continue me"))
+            .run_to_completion(parse_graph_args("--dry-run continue me"), None)
             .expect("initial run completes");
         drain_active(dir.path());
         stopped.phase = Phase::Cancelled;
@@ -2226,7 +2224,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let controller = controller(dir.path());
         controller
-            .run_to_completion(parse_graph_args("--dry-run inspect me"))
+            .run_to_completion(parse_graph_args("--dry-run inspect me"), None)
             .expect("runs");
         drain_active(dir.path());
 
@@ -2249,7 +2247,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let controller = controller(dir.path());
         controller
-            .run_to_completion(parse_graph_args("--dry-run list tasks"))
+            .run_to_completion(parse_graph_args("--dry-run list tasks"), None)
             .expect("runs");
         drain_active(dir.path());
         let view = controller.command("graph-view", "nope").unwrap().unwrap();
@@ -2300,7 +2298,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let controller = controller(dir.path());
         controller
-            .run_to_completion(parse_graph_args("--dry-run finished already"))
+            .run_to_completion(parse_graph_args("--dry-run finished already"), None)
             .expect("runs");
         drain_active(dir.path());
         let error = controller.command("graph-resume", "").unwrap_err();
@@ -2363,7 +2361,7 @@ mod tests {
         // Project overrides are applied only after explicit project trust.
         controller.set_session_context(None, None, true);
         let run = controller
-            .run_to_completion(parse_graph_args("--dry-run budgeted"))
+            .run_to_completion(parse_graph_args("--dry-run budgeted"), None)
             .expect("runs");
         assert_eq!(run.budgets.max_cost_usd, 5.0);
         assert_eq!(run.budgets.run_deadline_ms, 600_000);
@@ -2376,7 +2374,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let controller = controller(dir.path());
         let run = controller
-            .run_to_completion(parse_graph_args("--dry-run unbounded"))
+            .run_to_completion(parse_graph_args("--dry-run unbounded"), None)
             .expect("runs");
         assert_eq!(run.budgets.max_cost_usd, 0.0);
         assert_eq!(run.budgets.run_deadline_ms, 0);
@@ -2393,7 +2391,7 @@ mod tests {
 
         // 1. Initial dry-run to completion
         let run = controller
-            .run_to_completion(parse_graph_args("--dry-run audit code"))
+            .run_to_completion(parse_graph_args("--dry-run audit code"), None)
             .expect("runs");
         assert_eq!(run.phase, types::Phase::Done);
 
@@ -2529,7 +2527,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let controller = controller(dir.path());
         let mut run = controller
-            .run_to_completion(parse_graph_args("--dry-run --simple resume regression"))
+            .run_to_completion(parse_graph_args("--dry-run --simple resume regression"), None)
             .unwrap();
         assert_eq!(run.lifecycle, Some(types::GraphLifecycle::Stopped));
         run.phase = Phase::Blocked;
@@ -2561,7 +2559,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let controller = controller(dir.path());
         let mut run = controller
-            .run_to_completion(parse_graph_args("--dry-run --simple cancelled fixture"))
+            .run_to_completion(parse_graph_args("--dry-run --simple cancelled fixture"), None)
             .unwrap();
         run.phase = Phase::Cancelled;
         run.lifecycle = Some(types::GraphLifecycle::Stopped);
@@ -2712,7 +2710,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let mut controller = controller(dir.path());
         let run = controller
-            .run_to_completion(parse_graph_args("--dry-run budget and export"))
+            .run_to_completion(parse_graph_args("--dry-run budget and export"), None)
             .expect("runs");
         drain_active(dir.path());
 

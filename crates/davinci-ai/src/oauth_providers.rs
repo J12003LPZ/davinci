@@ -95,7 +95,10 @@ pub fn save_pending_login(
         .map_err(|err| err.to_string())
 }
 
-pub fn take_pending_login(agent_dir: &std::path::Path, provider: &str) -> Option<AuthorizeRequest> {
+pub fn take_pending_login(
+    agent_dir: &std::path::Path,
+    provider: &str,
+) -> Option<AuthorizeRequest> {
     let path = pending_path(agent_dir, provider);
     let raw = std::fs::read(&path).ok()?;
     let _ = std::fs::remove_file(&path);
@@ -576,8 +579,7 @@ mod tests {
         // credential nothing ever renews.
         let pkce = generate_pkce(&[7u8; 32]);
         let exchanged =
-            exchange_authorization_code("openai-codex", "pi-fixture-code", Some(&pkce), None)
-                .unwrap();
+            exchange_authorization_code("openai-codex", "pi-fixture-code", Some(&pkce), None).unwrap();
         assert!(exchanged.expires.is_some());
         assert!(exchanged.refresh.is_some());
 
@@ -591,11 +593,14 @@ mod tests {
         let pkce = generate_pkce(b"0123456789abcdef0123456789abcdef");
         assert!(authorize_request("anthropic", &pkce, "random-state").is_none());
         assert!(fresh_authorize_request("anthropic").is_none());
-        assert!(
-            exchange_authorization_code("anthropic", "pi-fixture-code", Some(&pkce), None,)
-                .unwrap_err()
-                .contains("/login anthropic <api-key>")
-        );
+        assert!(exchange_authorization_code(
+            "anthropic",
+            "pi-fixture-code",
+            Some(&pkce),
+            None,
+        )
+        .unwrap_err()
+        .contains("/login anthropic <api-key>"));
         assert!(refresh_oauth_token("anthropic", "pi-fixture-refresh")
             .unwrap_err()
             .contains("/login anthropic <api-key>"));

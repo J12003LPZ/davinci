@@ -10,9 +10,9 @@
 //! waiters. proper-lockfile (used by TypeScript pi) has the same window.
 
 use std::fs;
-use std::io::{self, Write};
+use std::io;
 use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant, SystemTime};
+use std::time::{Duration, Instant};
 
 /// proper-lockfile's default, so TS pi and davinci agree on staleness.
 pub const DEFAULT_STALE_AFTER: Duration = Duration::from_secs(10);
@@ -22,62 +22,19 @@ const RETRY_EVERY: Duration = Duration::from_millis(20);
 #[derive(Debug)]
 pub struct LockFile {
     path: PathBuf,
-    token: String,
+    // Keep an OS-backed lock for the full guard lifetime. The previous
+    // create/delete stale-lock scheme could race: two contenders could both
+    // decide an old file was stale and one could delete the other's new lock.
+    _lock: ExclusiveFileLock,
 }
 
 impl LockFile {
-    pub fn acquire(path: &Path, wait: Duration, stale_after: Duration) -> io::Result<Self> {
-        let started = Instant::now();
-        let token = uuid::Uuid::new_v4().to_string();
-        loop {
-            match fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(path)
-            {
-                Ok(mut file) => {
-                    writeln!(file, "{} {token}", std::process::id())?;
-                    file.sync_all()?;
-                    return Ok(Self {
-                        path: path.to_path_buf(),
-                        token,
-                    });
-                }
-                Err(err) if err.kind() == io::ErrorKind::AlreadyExists => {
-                    if is_stale(path, stale_after) {
-                        // Never unlink the stale path in-place. An atomic rename
-                        // makes exactly one contender the takeover winner; other
-                        // contenders either observe the replacement lock or retry.
-                        let stale = path.with_extension(format!(
-                            "stale.{}.{}",
-                            std::process::id(),
-                            uuid::Uuid::new_v4()
-                        ));
-                        match fs::rename(path, &stale) {
-                            Ok(()) => {
-                                let _ = fs::remove_file(stale);
-                                continue;
-                            }
-                            Err(rename_err) if rename_err.kind() == io::ErrorKind::NotFound => {
-                                continue;
-                            }
-                            Err(_) => {
-                                // A failed stale takeover must obey the same
-                                // bounded wait as an ordinary held lock.
-                            }
-                        }
-                    }
-                    if started.elapsed() >= wait {
-                        return Err(io::Error::new(
-                            io::ErrorKind::WouldBlock,
-                            format!("{} is held by another process", path.display()),
-                        ));
-                    }
-                    std::thread::sleep(RETRY_EVERY);
-                }
-                Err(err) => return Err(err),
-            }
-        }
+    pub fn acquire(path: &Path, wait: Duration, _stale_after: Duration) -> io::Result<Self> {
+        let lock = ExclusiveFileLock::acquire(path, wait)?;
+        Ok(Self {
+            path: path.to_path_buf(),
+            _lock: lock,
+        })
     }
 
     pub fn path(&self) -> &Path {
@@ -85,33 +42,10 @@ impl LockFile {
     }
 }
 
-impl Drop for LockFile {
-    fn drop(&mut self) {
-        // A stale owner may wake up after another process has taken over.
-        // Remove only the path that still carries this guard's unique token.
-        let owned = fs::read_to_string(&self.path)
-            .ok()
-            .is_some_and(|text| text.split_whitespace().nth(1) == Some(self.token.as_str()));
-        if owned {
-            let _ = fs::remove_file(&self.path);
-        }
-    }
-}
-
 pub fn lock_path_for(target: &Path) -> PathBuf {
     let mut name = target.file_name().unwrap_or_default().to_os_string();
     name.push(".lock");
     target.with_file_name(name)
-}
-
-fn is_stale(path: &Path, stale_after: Duration) -> bool {
-    let Ok(modified) = fs::metadata(path).and_then(|meta| meta.modified()) else {
-        return false;
-    };
-    SystemTime::now()
-        .duration_since(modified)
-        .map(|age| age >= stale_after)
-        .unwrap_or(false)
 }
 
 /// A lock held by the operating system until its owner exits, crash
@@ -274,39 +208,18 @@ mod tests {
         let dir = tempdir().unwrap();
         let path = dir.path().join("x.lock");
         drop(LockFile::acquire(&path, Duration::ZERO, DEFAULT_STALE_AFTER).unwrap());
-        assert!(!path.exists());
+        assert!(path.is_file(), "OS-backed lock file remains as a stable inode");
         LockFile::acquire(&path, Duration::ZERO, DEFAULT_STALE_AFTER).unwrap();
     }
 
     #[test]
-    fn stale_takeover_does_not_remove_the_new_owners_lock() {
+    fn preexisting_unlocked_lock_file_is_taken_over_safely() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("x.lock");
-        let old = LockFile::acquire(&path, Duration::ZERO, Duration::from_secs(10)).unwrap();
-
-        // Simulate a stale-path takeover while the old guard is still alive.
-        let displaced = dir.path().join("displaced.lock");
-        std::fs::rename(&path, &displaced).unwrap();
-        let new = LockFile::acquire(&path, Duration::ZERO, Duration::from_secs(10)).unwrap();
-
-        drop(old);
-        assert!(
-            path.exists(),
-            "old owner must not delete the replacement lock"
-        );
-        drop(new);
-        assert!(!path.exists());
-    }
-
-    #[test]
-    fn stale_lock_left_by_a_crash_is_taken_over() {
-        let dir = tempdir().unwrap();
-        let path = dir.path().join("x.lock");
-        std::fs::write(&path, "12345\n").unwrap();
-        // Zero stale_after: any existing lock counts as abandoned.
+        std::fs::write(&path, "left by a crashed process\n").unwrap();
         let lock = LockFile::acquire(&path, Duration::ZERO, Duration::ZERO).unwrap();
         drop(lock);
-        assert!(!path.exists());
+        assert!(path.is_file());
     }
 
     #[test]

@@ -514,8 +514,10 @@ pub fn tool_line(
     let (label, argument) = tool_caption(instrument, target);
     let cc = theme.cc();
     let failed = matches!(state, State::Failed | State::Attention);
-    let running =
-        live && duration.is_none() && !failed && !matches!(state, State::Skipped | State::Queued);
+    let running = live
+        && duration.is_none()
+        && !failed
+        && !matches!(state, State::Skipped | State::Queued);
     let mark = if theme.no_color {
         state.glyph()
     } else if running && tick % 2 == 1 {
@@ -734,7 +736,9 @@ pub fn hint_row(
     theme: &Theme,
 ) -> Line<'static> {
     let quiet = theme.cc().inactive;
-    let right: Vec<Span<'static>> = escape.map(|esc| vec![span(esc, quiet)]).unwrap_or_default();
+    let right: Vec<Span<'static>> = escape
+        .map(|esc| vec![span(esc, quiet)])
+        .unwrap_or_default();
     let room = width.saturating_sub(run_width(&right)).saturating_sub(3);
     let mut left: Vec<Span<'static>> = Vec::new();
     for (index, hint) in hints.iter().enumerate() {
@@ -1127,7 +1131,7 @@ mod tests {
     }
 
     #[test]
-    fn a_tool_call_names_the_action_and_its_outcome() {
+    fn a_tool_call_names_the_action() {
         let th = theme();
         let line = tool_line(
             100,
@@ -1136,16 +1140,11 @@ mod tests {
             "manus",
             "cargo check -p davinci-agent",
             Some("1.84s"),
-            Some("12 lines"),
+            0,
+            false,
         );
         let drawn = text_of(&line);
-        assert!(
-            drawn.starts_with("● Shell(cargo check -p davinci-agent)"),
-            "got {drawn:?}"
-        );
-        // The action stays first; outcome and elapsed time follow when they fit.
-        assert!(drawn.contains("· 12 lines · 1.84s"), "got {drawn:?}");
-        assert!(drawn.ends_with("· 1.84s"), "got {drawn:?}");
+        assert_eq!(drawn, "● Shell(cargo check -p davinci-agent)");
         assert_eq!(line.spans.iter().filter(|s| is_strong(s)).count(), 1);
     }
 
@@ -1159,7 +1158,8 @@ mod tests {
             "manus",
             "cargo check -p davinci-agent",
             Some("1.84s"),
-            None,
+            0,
+            false,
         ));
         assert!(!drawn.contains("manus"), "got {drawn:?}");
         assert!(drawn.starts_with("● Shell(cargo check"), "got {drawn:?}");
@@ -1176,20 +1176,39 @@ mod tests {
             "instrumenta",
             "read lib.rs",
             Some("0.01s"),
-            Some("412 lines"),
+            0,
+            false,
         ));
-        assert_eq!(drawn.trim_end(), "● Read(lib.rs) · 412 lines · 0.01s");
+        assert_eq!(drawn.trim_end(), "● Read(lib.rs)");
     }
 
     #[test]
-    fn arguments_stay_muted_and_failures_keep_their_error_glyph() {
+    fn arguments_keep_text_ink_and_failures_keep_error_ink() {
         let th = theme();
-        let read = tool_line(100, &th, State::Read, "instrumenta", "lib.rs", None, None);
-        assert_eq!(read.spans[3].style.fg, Some(th.muted));
-        let failed = tool_line(100, &th, State::Failed, "manus", "cargo test", None, None);
-        assert_eq!(failed.spans[3].style.fg, Some(th.muted));
+        let read = tool_line(
+            100,
+            &th,
+            State::Read,
+            "instrumenta",
+            "lib.rs",
+            None,
+            0,
+            false,
+        );
+        assert_eq!(read.spans[3].style.fg, Some(th.text));
+        let failed = tool_line(
+            100,
+            &th,
+            State::Failed,
+            "manus",
+            "cargo test",
+            None,
+            0,
+            false,
+        );
+        assert_eq!(failed.spans[3].style.fg, Some(th.text));
         assert_eq!(failed.spans[0].style.fg, Some(th.error));
-        assert!(text_of(&failed).starts_with("× Shell("));
+        assert!(text_of(&failed).starts_with("● Shell("));
     }
 
     #[test]
@@ -1271,27 +1290,13 @@ pub fn section_row(
     let cc = theme.cc();
     let width = width.min(96);
     let available = width.saturating_sub(2);
-    let value_room = if width < 32 {
-        0
-    } else {
-        (available / 3).min(28)
-    };
+    let value_room = if width < 32 { 0 } else { (available / 3).min(28) };
     let value = clip_ellipsis(value, value_room);
     let value_width = run_width(&[span(value.clone(), cc.inactive)]);
     let name_room = available.saturating_sub(value_width + u16::from(!value.is_empty()));
     let left = vec![
-        span(
-            if selected {
-                SELECTION_BAR
-            } else {
-                UNSELECTED_BAR
-            },
-            if selected { cc.permission } else { cc.inactive },
-        ),
-        span(
-            clip_ellipsis(label, name_room),
-            if selected { cc.permission } else { theme.text },
-        ),
+        span(if selected { SELECTION_BAR } else { UNSELECTED_BAR }, if selected { cc.permission } else { cc.inactive }),
+        span(clip_ellipsis(label, name_room), if selected { cc.permission } else { theme.text }),
     ];
     spread(width, left, vec![span(value, cc.inactive)])
 }

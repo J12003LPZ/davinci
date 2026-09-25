@@ -392,15 +392,16 @@ impl CallbackServer {
                     stream
                         .set_nonblocking(false)
                         .map_err(|err| err.to_string())?;
-                    // Browsers may open speculative/preconnect sockets that send
-                    // no request before our per-connection read timeout. Treat
-                    // those as noise and keep waiting for the real callback.
-                    let response = match self.serve(stream) {
-                        Ok(response) => response,
-                        Err(_) => continue,
-                    };
-                    if response.code.is_some() {
-                        return Ok(response);
+                    let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+                    if remaining.is_zero() {
+                        return Err("Timed out waiting for the browser login callback.".into());
+                    }
+                    if let Some(response) =
+                        self.serve_with_timeout(stream, remaining.min(Duration::from_millis(100)))?
+                    {
+                        if response.code.is_some() {
+                            return Ok(response);
+                        }
                     }
                 }
                 Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
@@ -414,10 +415,33 @@ impl CallbackServer {
         }
     }
 
-    fn serve(&mut self, mut stream: TcpStream) -> Result<CallbackResponse, String> {
-        stream.set_read_timeout(Some(Duration::from_secs(5))).ok();
+    fn serve(&mut self, stream: TcpStream) -> Result<CallbackResponse, String> {
+        self.serve_with_timeout(stream, Duration::from_secs(5))?
+            .ok_or_else(|| "OAuth callback connection closed before sending a request.".into())
+    }
+
+    fn serve_with_timeout(
+        &mut self,
+        mut stream: TcpStream,
+        read_timeout: Duration,
+    ) -> Result<Option<CallbackResponse>, String> {
+        stream
+            .set_read_timeout(Some(read_timeout))
+            .map_err(|err| err.to_string())?;
         let mut buf = [0u8; 8192];
-        let n = stream.read(&mut buf).map_err(|err| err.to_string())?;
+        let n = match stream.read(&mut buf) {
+            Ok(0) => return Ok(None),
+            Ok(n) => n,
+            Err(err)
+                if matches!(
+                    err.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) =>
+            {
+                return Ok(None);
+            }
+            Err(err) => return Err(err.to_string()),
+        };
         let request = String::from_utf8_lossy(&buf[..n]);
         let response = match parse_http_target(&request) {
             Some((path, query)) => handle_callback_request(
@@ -439,7 +463,7 @@ impl CallbackServer {
             self.used = true;
         }
         write_http_response(&mut stream, &response)?;
-        Ok(response)
+        Ok(Some(response))
     }
 }
 
@@ -612,7 +636,8 @@ mod tests {
     #[test]
     fn stray_requests_do_not_consume_the_callback() {
         let mut server =
-            CallbackServer::bind("127.0.0.1", 0, CallbackProvider::OpenAiCodex, "state-1").unwrap();
+            CallbackServer::bind("127.0.0.1", 0, CallbackProvider::OpenAiCodex, "state-1")
+                .unwrap();
         let addr = server.local_addr().unwrap();
         let client = std::thread::spawn(move || {
             for target in ["/favicon.ico", "/auth/callback?code=real&state=state-1"] {
@@ -629,6 +654,34 @@ mod tests {
         });
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
         let response = server.accept_until(deadline).unwrap();
+        client.join().unwrap();
+        assert_eq!(response.code.as_deref(), Some("real"));
+    }
+
+    #[test]
+    fn disconnected_preconnect_does_not_consume_the_callback() {
+        let mut server =
+            CallbackServer::bind("127.0.0.1", 0, CallbackProvider::OpenAiCodex, "state-1")
+                .unwrap();
+        let addr = server.local_addr().unwrap();
+        let client = std::thread::spawn(move || {
+            // A browser can preconnect and keep the socket open without ever
+            // sending an HTTP request. It must not monopolize the callback
+            // listener until the overall login deadline.
+            let speculative = std::net::TcpStream::connect(addr).unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(400));
+            drop(speculative);
+            let mut stream = std::net::TcpStream::connect(addr).unwrap();
+            use std::io::Write;
+            write!(
+                stream,
+                "GET /auth/callback?code=real&state=state-1 HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n"
+            )
+            .unwrap();
+        });
+        let response = server
+            .accept_until(std::time::Instant::now() + std::time::Duration::from_secs(2))
+            .unwrap();
         client.join().unwrap();
         assert_eq!(response.code.as_deref(), Some("real"));
     }

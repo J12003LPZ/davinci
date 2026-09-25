@@ -1051,11 +1051,8 @@ impl PermissionPolicy {
             )
         };
         let effective_root = self.filesystem_boundary.root.as_deref().unwrap_or(cwd);
-        // D11: only Plan/ReadOnly mode may treat a provably read-only
-        // subagent request as a read tool. In Edits/Auto modes an omitted
-        // tools field must not bypass the normal agent approval boundary.
-        let class = if tool == "agent"
-            && self.mode == PermissionMode::ReadOnly
+        let class = if self.mode == PermissionMode::ReadOnly
+            && tool == "agent"
             && self.agent_call_is_read_only(args)
         {
             ToolClass::Read
@@ -1296,11 +1293,7 @@ impl PermissionPolicy {
         cwd: &Path,
     ) -> PermissionVerdict {
         let mut first_ask = None;
-        let mut task_summaries = Vec::with_capacity(tasks.len());
         for task in tasks {
-            let (subject, _) =
-                subject_of_with_boundary("agent", task, cwd, Some(&self.filesystem_boundary));
-            task_summaries.push(summary_of("agent", &subject));
             match self.decide(tool_call_id, "agent", task, cwd) {
                 PermissionVerdict::Allow => {}
                 deny @ PermissionVerdict::Deny { .. } => return deny,
@@ -1311,15 +1304,33 @@ impl PermissionPolicy {
         }
         match first_ask {
             Some(mut request) => {
-                request.args = serde_json::json!({ "tasks": tasks });
-                request.subject = task_summaries.join("; ");
+                let task_rows = tasks
+                    .iter()
+                    .enumerate()
+                    .map(|(index, task)| {
+                        let prompt = task
+                            .get("prompt")
+                            .and_then(Value::as_str)
+                            .unwrap_or("<missing prompt>")
+                            .trim();
+                        let (subject, _) = subject_of_with_boundary(
+                            "agent",
+                            task,
+                            cwd,
+                            Some(&self.filesystem_boundary),
+                        );
+                        format!("{}. {} [{}]", index + 1, prompt, subject)
+                    })
+                    .collect::<Vec<_>>()
+                    .join(" | ");
+                request.args = serde_json::json!({"tasks": tasks});
+                request.subject = format!("{} agent tasks", tasks.len());
                 request.summary = crate::approval::display_text(&format!(
-                    "Approve agent batch ({} tasks): {}",
-                    tasks.len(),
-                    task_summaries.join(" | ")
+                    "Agent batch: {task_rows}"
                 ));
-                // A heterogeneous batch must never inherit a persistent rule
-                // derived from only the first task.
+                // A mixed batch can carry different prompts, tool sets, and
+                // isolation modes. A durable grant derived from one member is
+                // not a safe authorization for the whole batch.
                 request.session_rule.clear();
                 request.legal_choices = crate::approval::offer_scopes(true, false, false);
                 PermissionVerdict::Ask(request)

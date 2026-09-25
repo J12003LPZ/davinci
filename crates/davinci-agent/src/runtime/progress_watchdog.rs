@@ -215,12 +215,12 @@ impl ProgressWatchdog {
         let decision = if remaining_budget == 0 {
             "hard_stop"
         } else if !is_paused {
-            "running"
+            "continue"
         } else {
             match choice {
                 "continue" => "continue",
-                "plan" | "return_to_plan" => "return_to_plan",
-                "stop" | "stop_checkpoint" => "stop_checkpoint",
+                "plan" => "return_to_plan",
+                "stop" => "stop_checkpoint",
                 _ => "paused",
             }
         };

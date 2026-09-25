@@ -56,9 +56,9 @@ pub fn resolve_program_in(name: &str, path_var: &OsStr, pathext: Option<&str>) -
     }
     let has_extension = Path::new(name).extension().is_some();
     for dir in std::env::split_paths(path_var) {
-        // Empty PATH entries mean the current working directory on common
-        // platforms. Never resolve an executable from an untrusted repo
-        // before the repository trust decision has been made.
+        // Empty PATH entries mean the current working directory on both Unix
+        // and Windows. Never let an untrusted repository satisfy a trusted
+        // program lookup through an empty component.
         if dir.as_os_str().is_empty() {
             continue;
         }
@@ -396,6 +396,16 @@ mod tests {
             Some(dir.path().join("tool"))
         );
         assert_eq!(resolve_program_in("missing", &path_var, None), None);
+    }
+
+    #[test]
+    fn empty_path_entries_never_resolve_from_the_current_directory() {
+        let file = tempfile::Builder::new()
+            .prefix("davinci-path-entry-")
+            .tempfile_in(".")
+            .unwrap();
+        let name = file.path().file_name().unwrap().to_string_lossy().into_owned();
+        assert_eq!(resolve_program_in(&name, OsStr::new(""), None), None);
     }
 
     #[test]

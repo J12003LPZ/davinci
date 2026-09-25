@@ -117,8 +117,8 @@ use davinci_coding_agent::project_config;
 mod rpc;
 use davinci_coding_agent::runtime_host;
 mod self_update;
-use davinci_coding_agent::semantic;
 use davinci_coding_agent::settings;
+use davinci_coding_agent::semantic;
 mod shutdown;
 mod slash;
 mod startup;
@@ -908,9 +908,7 @@ fn build_agent(parsed: &Args, session_dir: &Path, cwd: &Path) -> Result<Agent, S
     };
     for pkg in &settings.packages {
         if !parsed.no_extensions {
-            for path in
-                settings::collect_package_resources(pkg, "extensions", &default_agent_dir(), cwd)
-            {
+            for path in settings::collect_package_resources(pkg, "extensions", &default_agent_dir(), cwd) {
                 extensions.push(path.to_string_lossy().into_owned());
             }
         }
@@ -1254,7 +1252,6 @@ fn resolve_or_create_session(
             })
             .map_err(|err| err.to_string())?;
         let session = JsonlSession::open(&created.info.path).map_err(|err| err.to_string())?;
-        persist_selected_backend(&session, session_dir);
         return Ok(session);
     }
     if parsed.continue_session {
@@ -3437,7 +3434,8 @@ fn run_rpc_with_host(
         let mut command: RpcCommand = match serde_json::from_str(&line) {
             Ok(command) => command,
             Err(err) => {
-                let response = rpc::fail_response(None, "parse", format!("parse error: {err}"));
+                let response =
+                    rpc::fail_response(None, "parse", format!("parse error: {err}"));
                 output::write_raw_stdout_line(
                     &serde_json::to_string(&response).map_err(|err| err.to_string())?,
                 )
@@ -3680,9 +3678,22 @@ fn run_rpc_with_host(
             let templates = runtime.agent.templates.clone();
             let (_reply, events) = std::thread::scope(|scope| {
                 let stop = std::sync::atomic::AtomicBool::new(false);
-                let watcher = scope.spawn(|| {
+                let stop_ref = &stop;
+                let leftover_ref = &leftover;
+                let rx_ref = &rx;
+                let ui_abort_ref = &ui_abort;
+                let remote_ref = &remote;
+                let skills_ref = &skills;
+                let templates_ref = &templates;
+                let watcher = scope.spawn(move || {
                     rpc_watch_during_turn(
-                        &leftover, &rx, &ui_abort, &remote, &skills, &templates, &stop,
+                        leftover_ref,
+                        rx_ref,
+                        ui_abort_ref,
+                        remote_ref,
+                        skills_ref,
+                        templates_ref,
+                        stop_ref,
                     )
                 });
                 let result = complete_prompt_with_host(
@@ -7065,7 +7076,8 @@ fn login_provider_with_wait(
                         "No login in progress for {provider}. Run /login {provider} first, then paste the redirect URL."
                     )
                 })?;
-            if let (Some(expected), Some(got)) = (pending.state.as_deref(), pasted_state.as_deref())
+            if let (Some(expected), Some(got)) =
+                (pending.state.as_deref(), pasted_state.as_deref())
             {
                 if expected != got {
                     return Err(
@@ -7957,12 +7969,7 @@ fn apply_discovered_resources(parsed: &Args, agent: &mut Agent) {
             roots.extend(extra.iter().map(PathBuf::from));
         }
         for pkg in &settings.packages {
-            roots.extend(settings::collect_package_resources(
-                pkg,
-                "skills",
-                &default_agent_dir(),
-                &agent.cwd,
-            ));
+            roots.extend(settings::collect_package_resources(pkg, "skills", &default_agent_dir(), &agent.cwd));
         }
         agent.skills = discover_skills(&roots);
     }
@@ -7976,12 +7983,7 @@ fn apply_discovered_resources(parsed: &Args, agent: &mut Agent) {
             roots.extend(extra.iter().map(PathBuf::from));
         }
         for pkg in &settings.packages {
-            roots.extend(settings::collect_package_resources(
-                pkg,
-                "prompts",
-                &default_agent_dir(),
-                &agent.cwd,
-            ));
+            roots.extend(settings::collect_package_resources(pkg, "prompts", &default_agent_dir(), &agent.cwd));
         }
         agent.templates = discover_prompt_templates(&roots);
     }
@@ -9217,7 +9219,17 @@ fn apply_session_calls(
                             .unwrap_or("")
                     ));
                 } else if let Some(command) = call.get("command").and_then(|value| value.as_str()) {
-                    match crate::js_host::execute_command_tool(command, &agent.cwd) {
+                    let args = call
+                        .get("args")
+                        .cloned()
+                        .unwrap_or_else(|| serde_json::json!({}));
+                    let timeout_ms = call.get("timeoutMs").and_then(|value| value.as_u64());
+                    match crate::js_host::execute_command_tool(
+                        command,
+                        &args,
+                        &agent.cwd,
+                        timeout_ms,
+                    ) {
                         Ok(out) => {
                             ui.push("exec", &out);
                             ui.status(&format!("exec {command}"));

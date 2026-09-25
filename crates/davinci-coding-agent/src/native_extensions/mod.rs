@@ -427,10 +427,7 @@ impl NativeExtensionHost {
         graph.governor = Some(Arc::clone(&governor));
         let visual_snapshot = VisualSnapshotHost::discover(cwd);
 
-        let repo_config = merged_settings
-            .repo_intelligence
-            .clone()
-            .unwrap_or_default();
+        let repo_config = merged_settings.repo_intelligence.clone().unwrap_or_default();
         let repo_intelligence =
             repo_intelligence::RepoIntelligence::new(cwd, &repo_agent_dir, repo_config);
         let engineering = engineering_snapshot::EngineeringSnapshots::default();
@@ -441,16 +438,10 @@ impl NativeExtensionHost {
             merged_settings.test_impact.clone().unwrap_or_default(),
         )
         .with_snapshots(engineering.clone());
-        let package_config = merged_settings
-            .package_intelligence
-            .clone()
-            .unwrap_or_default();
+        let package_config = merged_settings.package_intelligence.clone().unwrap_or_default();
         let package_intelligence =
             package_intelligence::PackageIntelligence::new(cwd, cache.clone(), package_config);
-        let build_config = merged_settings
-            .build_intelligence
-            .clone()
-            .unwrap_or_default();
+        let build_config = merged_settings.build_intelligence.clone().unwrap_or_default();
         let build_intelligence =
             build_intelligence::BuildIntelligence::new(cwd, cache.clone(), build_config)
                 .with_snapshots(engineering.clone());
@@ -491,10 +482,8 @@ impl NativeExtensionHost {
         let verification_planner =
             verification_planner::VerificationPlanner::new(cwd, verification_planner_config)
                 .with_snapshots(engineering.clone());
-        let workspace_snapshot_config = merged_settings
-            .workspace_snapshots
-            .clone()
-            .unwrap_or_default();
+        let workspace_snapshot_config =
+            merged_settings.workspace_snapshots.clone().unwrap_or_default();
         let workspace_snapshot =
             workspace_snapshot::WorkspaceSnapshot::new(cwd, workspace_snapshot_config);
 
@@ -803,22 +792,21 @@ impl NativeExtensionHost {
                 .lock()
                 .unwrap_or_else(|error| error.into_inner())
                 .search_tool(args),
-            "retrieve_output" => {
-                self.governor
-                    .lock()
-                    .unwrap_or_else(|error| error.into_inner())
-                    .retrieve(args)
-                    .or_else(|error| {
-                        if std::env::var_os("PI_GRAPH_ROLE").is_some() {
-                            if let Some(client) =
+            "retrieve_output" => self
+                .governor
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .retrieve(args)
+                .or_else(|error| {
+                if std::env::var_os("PI_GRAPH_ROLE").is_some() {
+                    if let Some(client) =
                         davinci_agent::runtime::task_transport::TaskCoordinatorClient::from_env()
                     {
                         return client.call(name, args);
                     }
-                        }
-                        Err(error)
-                    })
-            }
+                }
+                Err(error)
+            }),
             "skill_list" => {
                 let query = args.get("query").and_then(Value::as_str).unwrap_or("");
                 let query_embedding = {
@@ -857,11 +845,26 @@ impl NativeExtensionHost {
             "impact-status" => Ok(Some(self.change_impact.status())),
             "verification-status" => Ok(Some(self.verification_planner.status())),
             "workspace-status" => Ok(Some(self.workspace_snapshot.status())),
-            "memory-status" => Ok(Some(self.memory.status())),
-            "memory-search" => Ok(Some(self.memory.search_text(args))),
-            "memory-reindex" => Ok(Some(self.memory.reindex().map_err(|err| err.to_string())?)),
-            "memory-clear" => Ok(Some(self.memory.clear().map_err(|err| err.to_string())?)),
-            "memory-page" => Ok(Some(memory_page::command(&self.memory, args)?)),
+            "memory-status" => {
+                let memory = self.memory.lock().map_err(|err| err.to_string())?;
+                Ok(Some(memory.status()))
+            }
+            "memory-search" => {
+                let memory = self.memory.lock().map_err(|err| err.to_string())?;
+                Ok(Some(memory.search_text(args)))
+            }
+            "memory-reindex" => {
+                let mut memory = self.memory.lock().map_err(|err| err.to_string())?;
+                Ok(Some(memory.reindex().map_err(|err| err.to_string())?))
+            }
+            "memory-clear" => {
+                let mut memory = self.memory.lock().map_err(|err| err.to_string())?;
+                Ok(Some(memory.clear().map_err(|err| err.to_string())?))
+            }
+            "memory-page" => {
+                let memory = self.memory.lock().map_err(|err| err.to_string())?;
+                Ok(Some(memory_page::command(&memory, args)?))
+            }
             "cache-status" => {
                 let stats = self.cache.stats();
                 let raw_input = stats
@@ -894,10 +897,14 @@ impl NativeExtensionHost {
                     "transportContinuationSource":"separate Codex websocket/session diagnostics"
                 })))
             }
-            "governor-status" => Ok(Some(self.governor.status())),
+            "governor-status" => {
+                let governor = self.governor.lock().map_err(|err| err.to_string())?;
+                Ok(Some(governor.status()))
+            }
             "governor-reset" => {
-                self.governor.reset();
-                Ok(Some(self.governor.status()))
+                let mut governor = self.governor.lock().map_err(|err| err.to_string())?;
+                governor.reset();
+                Ok(Some(governor.status()))
             }
             "learning-status" => Ok(Some(self.learning.status_command())),
             "learning-pending" => Ok(Some(self.learning.pending_command())),
@@ -1067,10 +1074,8 @@ mod tests {
 
     #[test]
     fn every_external_native_command_is_listed() {
-        let listed: std::collections::BTreeSet<_> = command_specs()
-            .into_iter()
-            .map(|(name, _, _)| name)
-            .collect();
+        let listed: std::collections::BTreeSet<_> =
+            command_specs().into_iter().map(|(name, _, _)| name).collect();
         let internal_graph = ["graph-resume", "graph-status", "graph-view", "graph-abort"];
         for name in NATIVE_COMMANDS {
             if internal_graph.contains(name) {
@@ -1385,7 +1390,7 @@ mod tests {
         let agent_dir = tempfile::tempdir().unwrap();
         let mut host = NativeExtensionHost {
             learning: LearningController::new(root.path(), Some(agent_dir.path()), None),
-            memory: VectorMemory::with_config(root.path().into(), VectorMemoryConfig::default()),
+            memory: Arc::new(Mutex::new(VectorMemory::with_config(root.path().into(), VectorMemoryConfig::default()))),
             ..NativeExtensionHost::default()
         };
         let cand = LearningCandidate {
@@ -1399,7 +1404,7 @@ mod tests {
             },
             confidence: 0.9,
             source_session_id: "sess-sync".into(),
-            source_repo_id: host.memory.repo_id.clone(),
+            source_repo_id: host.memory.lock().unwrap().repo_id.clone(),
             source_turn: 1,
             created_at_ms: 1000,
             evidence: VerificationEvidence::default(),
@@ -1408,7 +1413,7 @@ mod tests {
         host.learning.project_store.upsert_candidate(cand).unwrap();
         host.sync_active_learning_memories();
 
-        let search_res = host.memory.search("PostgreSQL pool connections", 5);
+        let search_res = host.memory.lock().unwrap().search("PostgreSQL pool connections", 5);
         assert!(!search_res.is_empty());
         assert!(search_res[0]
             .record

@@ -571,7 +571,7 @@ impl GraphTaskState {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct GraphCounters {
     pub workers_spawned: u32,
@@ -725,7 +725,10 @@ impl GraphRun {
     }
 
     pub fn baseline_hashes(&self) -> Vec<String> {
-        fn add(hashes: &mut Vec<String>, baseline: &super::mutation::MutationBaseline) {
+        fn add(
+            hashes: &mut Vec<String>,
+            baseline: &super::mutation::MutationBaseline,
+        ) {
             hashes.extend(
                 baseline
                     .files

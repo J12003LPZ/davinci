@@ -7,10 +7,21 @@
 
 use std::borrow::Cow;
 
+fn is_bidi_control(ch: char) -> bool {
+    matches!(
+        ch,
+        '\u{061c}'
+            | '\u{200e}'
+            | '\u{200f}'
+            | '\u{202a}'..='\u{202e}'
+            | '\u{2066}'..='\u{2069}'
+    )
+}
+
 pub fn terminal_safe(text: &str) -> Cow<'_, str> {
     if !text
         .chars()
-        .any(|ch| ch.is_control() && ch != '\n' && ch != '\t')
+        .any(|ch| (ch.is_control() && ch != '\n' && ch != '\t') || is_bidi_control(ch))
     {
         return Cow::Borrowed(text);
     }
@@ -23,7 +34,9 @@ pub fn terminal_safe(text: &str) -> Cow<'_, str> {
         }
         let line = line.strip_suffix('\r').unwrap_or(line);
         let visible = line.rsplit('\r').next().unwrap_or(line);
-        out.extend(visible.chars().filter(|ch| !ch.is_control() || *ch == '\t'));
+        out.extend(visible.chars().filter(|ch| {
+            (!ch.is_control() || *ch == '\t') && !is_bidi_control(*ch)
+        }));
     }
     Cow::Owned(out)
 }
@@ -38,6 +51,14 @@ mod tests {
         assert_eq!(terminal_safe("x\x1b[2Jy"), "xy");
         assert_eq!(terminal_safe("bell\x07"), "bell");
         assert_eq!(terminal_safe("tab\tkept"), "tab\tkept");
+    }
+
+    #[test]
+    fn bidi_controls_are_removed() {
+        assert_eq!(
+            terminal_safe("safe\u{202e}txt\u{2066}!\u{2069}"),
+            "safetxt!"
+        );
     }
 
     #[test]

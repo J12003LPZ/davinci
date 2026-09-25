@@ -207,7 +207,7 @@ const TEST_PATTERNS: &[&str] = &[
     r"(?i)^\s*ctest\b",
     r"(?i)^\s*mvn\s+test\b",
     r"(?i)^\s*gradle\s+test\b",
-    r"(?i)^\s*(?:pytest|python(?:3)?\s+-m\s+pytest|cargo(?:\.exe)?(?:\s+\+[a-z0-9_.-]+)?(?:\s+--(?:offline|locked|frozen))*\s+(?:test|check|clippy|fmt|nextest)|go\s+(?:test|vet)|dotnet\s+test)\b",
+    r"(?i)^\s*(?:(?:python|python3)\s+-m\s+(?:pytest|unittest)|pytest|cargo(?:\.exe)?(?:\s+\+[a-z0-9_.-]+)?(?:\s+--(?:offline|locked|frozen))*\s+(?:test|check|clippy|fmt|nextest)|go\s+(?:test|vet)|dotnet\s+test)\b",
     r"(?i)^\s*make\s+(test|check|lint|fmt|clippy|build)\b",
     r"(?i)^\s*\.[/\\]test\.sh\b",
 ];
@@ -784,44 +784,50 @@ pub fn analyze_command(command: &str) -> ShellAnalysisReport {
     }
 }
 
-/// Classifies whether a command runs a verification program and whether its
-/// exit status can be trusted as the verification result.
+fn shell_env_assignment(word: &str) -> bool {
+    let Some((name, _)) = word.split_once('=') else {
+        return false;
+    };
+    let mut chars = name.chars();
+    matches!(chars.next(), Some('_') | Some('a'..='z') | Some('A'..='Z'))
+        && chars.all(|ch| ch == '_' || ch.is_ascii_alphanumeric())
+}
+
+fn verification_segment(segment: &str) -> bool {
+    let cleaned = segment.replace("2>&1", "");
+    let Some(words) = literal_shell_words(cleaned.trim()) else {
+        return false;
+    };
+    let first_command = words
+        .iter()
+        .position(|word| !shell_env_assignment(word))
+        .unwrap_or(words.len());
+    if first_command == words.len() {
+        return false;
+    }
+    let normalized = words[first_command..].join(" ");
+    test_regex().is_match(&normalized) && !normalized.contains("--no-run")
+}
+
+/// Classifies whether a command runs verification programs and whether the
+/// command's exit status can be trusted as their combined verification result.
 pub fn verification_outcome(command: &str) -> Option<bool> {
     let report = analyze_command(command);
-
-    let is_verification = |segment: &str| {
-        let mut rest = segment.trim_start();
-        loop {
-            let Some(split_at) = rest.find(char::is_whitespace) else {
-                break;
-            };
-            let first = &rest[..split_at];
-            let tail = &rest[split_at..];
-            let Some((name, _value)) = first.split_once('=') else {
-                break;
-            };
-            let mut chars = name.chars();
-            let Some(first_ch) = chars.next() else {
-                break;
-            };
-            if !(first_ch == '_' || first_ch.is_ascii_alphabetic())
-                || !chars.all(|ch| ch == '_' || ch.is_ascii_alphanumeric())
-            {
-                break;
-            }
-            rest = tail.trim_start();
-        }
-        test_regex().is_match(rest) && !rest.contains("--no-run")
-    };
-
-    report
+    let verification: Vec<bool> = report
         .segments
         .iter()
-        .any(|segment| is_verification(segment))
-        .then_some(())?;
-    // An && chain cannot succeed if an earlier verification fails; || can
-    // mask a failing verification and therefore is not trustworthy evidence.
-    Some(!command.contains("||"))
+        .map(|segment| verification_segment(segment))
+        .collect();
+    if !verification.iter().any(|is_verification| *is_verification) {
+        return None;
+    }
+    // An OR chain can turn a failed verifier into success. Likewise, mixing a
+    // verifier with a non-verification segment means the final status can be
+    // caused by something else. A chain of verifiers joined with AND is safe:
+    // success means every verifier succeeded and any failure remains failure.
+    let status_masked = command.contains("||")
+        || verification.iter().any(|is_verification| !is_verification);
+    Some(!status_masked)
 }
 
 impl ShellAnalysisReport {
@@ -967,6 +973,8 @@ mod tests {
         for (command, expected) in [
             ("cargo test", Some(true)),
             ("cargo test --workspace -- --nocapture", Some(true)),
+            ("RUST_BACKTRACE=1 cargo test", Some(true)),
+            ("cargo test && cargo clippy", Some(true)),
             ("cargo nextest run", Some(true)),
             ("npx vitest run", Some(true)),
             ("npx jest", Some(true)),
@@ -979,6 +987,10 @@ mod tests {
             ("cargo test || true", Some(false)),
             ("echo cargo test", None),
             ("cargo test --no-run", None),
+            ("python script.py", None),
+            ("cargo build", None),
+            ("go build ./...", None),
+            ("dotnet build", None),
             ("ls", None),
         ] {
             assert_eq!(verification_outcome(command), expected, "{command}");

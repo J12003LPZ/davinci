@@ -502,10 +502,10 @@ mod tests {
         let dir = tempdir().unwrap();
         let mut storage = AuthStorage::open(&dir.path().join("auth.json")).unwrap();
         storage
-            .login_oauth("anthropic", "expired", Some("refresh".into()), Some(0))
+            .login_oauth("xai", "expired", Some("refresh".into()), Some(0))
             .unwrap();
         let check = check_auth(
-            "anthropic",
+            "xai",
             &ModelConfig::empty(),
             &storage,
             &Default::default(),
@@ -514,7 +514,7 @@ mod tests {
         assert_eq!(check.kind, "oauth");
         assert_eq!(check.source, "OAuth");
         assert_eq!(
-            storage.get("anthropic").and_then(|c| c.access.as_deref()),
+            storage.get("xai").and_then(|c| c.access.as_deref()),
             Some("expired")
         );
     }

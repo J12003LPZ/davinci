@@ -3424,11 +3424,12 @@ fn glob_match(pattern: &str, name: &str) -> bool {
     }
     let pattern = pattern.replace('\\', "/");
     let name = name.replace('\\', "/");
-    // The memoized matcher already gives **/ zero-directory and recursive
-    // semantics. Recursively stripping **/ here made repeated prefixes branch
-    // exponentially before the memoized matcher was reached.
+    // match_glob_chars already implements **/ as zero-or-more path
+    // components. Recursing here for every leading **/ reintroduced an
+    // exponential search for patterns such as **/**/**/....
     match_glob_chars(&pattern, &name)
 }
+
 fn match_glob_chars(pattern: &str, name: &str) -> bool {
     let p: Vec<char> = pattern.chars().collect();
     let n: Vec<char> = name.chars().collect();
@@ -3726,6 +3727,15 @@ mod tests {
         let name = "a".repeat(40);
         let started = std::time::Instant::now();
         assert!(!match_glob_chars("*a*a*a*a*a*a*a*a*a*b", &name));
+        assert!(started.elapsed() < std::time::Duration::from_millis(100));
+    }
+
+    #[test]
+    fn repeated_double_star_prefixes_finish_quickly() {
+        let pattern = format!("{}missing.rs", "**/".repeat(48));
+        let name = format!("{}/present.rs", "a/".repeat(48));
+        let started = std::time::Instant::now();
+        assert!(!glob_match(&pattern, &name));
         assert!(started.elapsed() < std::time::Duration::from_millis(100));
     }
 

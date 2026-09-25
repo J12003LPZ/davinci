@@ -266,7 +266,9 @@ impl LearningStore {
         let candidates_path = self.root.join("candidates.jsonl");
         let mut candidates = String::new();
         for candidate in self.candidates.values() {
-            candidates.push_str(&serde_json::to_string(candidate).map_err(|err| err.to_string())?);
+            candidates.push_str(
+                &serde_json::to_string(candidate).map_err(|err| err.to_string())?,
+            );
             candidates.push('\n');
         }
         davinci_sys::fs::atomic_write(&candidates_path, candidates.as_bytes())
@@ -502,7 +504,7 @@ mod tests {
         let mut store = LearningStore::open(dir.path().to_path_buf()).unwrap();
         let mut candidate = fixture_candidate("cand-bloated");
         for i in 0..100 {
-            candidate.confidence = (i as f64) / 100.0;
+            candidate.confidence = (i as f32) / 100.0;
             store.upsert_candidate(candidate.clone()).unwrap();
         }
         drop(store);

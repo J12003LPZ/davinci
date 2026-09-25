@@ -419,7 +419,10 @@ impl GraphExecution {
                 run.blocked_reason = Some(reason.clone());
                 run.clone()
             };
-            (self.deps.on_update)(&failed, Some(&format!("{reason}; stopped state not saved")));
+            (self.deps.on_update)(
+                &failed,
+                Some(&format!("{reason}; stopped state not saved")),
+            );
             return false;
         }
 
@@ -906,7 +909,9 @@ impl GraphExecution {
                 .unwrap_or_else(|error| error.into_inner());
             match (&self.deps.memory, guard.as_ref()) {
                 (Some(memory), Some(learn)) => {
-                    let memory = memory.lock().unwrap_or_else(|error| error.into_inner());
+                    let memory = memory
+                        .lock()
+                        .unwrap_or_else(|error| error.into_inner());
                     let context_query = retry_query.render();
                     let skill_query = retry_query.render_skill_query();
                     crate::native_extensions::ecosystem::select_capabilities(
@@ -1416,15 +1421,17 @@ impl GraphExecution {
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             retry_context_delta = match (&self.deps.memory, guard.as_ref()) {
                 (Some(memory), Some(learning)) => {
-                    let memory = memory.lock().unwrap_or_else(|error| error.into_inner());
+                    let memory = memory
+                        .lock()
+                        .unwrap_or_else(|error| error.into_inner());
                     build_retry_context_delta(
-                        &memory,
-                        learning,
-                        role,
-                        &retry_query,
-                        failure_class,
-                        &error,
-                    )
+                    &memory,
+                    learning,
+                    role,
+                    &retry_query,
+                    failure_class,
+                    &error,
+                )
                 }
                 _ => crate::native_extensions::ecosystem::ContextPacket::empty(),
             };
@@ -5248,7 +5255,7 @@ mod tests {
             session_thinking: None,
             project_trusted: true,
             on_update: Arc::new(|_, _| {}),
-            memory: Some(vector_mem.clone()),
+            memory: Some(Arc::new(Mutex::new(vector_mem.clone()))),
             learning: Some(learning.clone()),
             governor: None,
             language_intelligence: None,
@@ -5358,7 +5365,7 @@ mod tests {
             session_thinking: None,
             project_trusted: true,
             on_update: Arc::new(|_, _| {}),
-            memory: Some(vector_mem.clone()),
+            memory: Some(Arc::new(Mutex::new(vector_mem.clone()))),
             learning: Some(learning.clone()),
             governor: None,
             language_intelligence: None,
@@ -6268,7 +6275,6 @@ mod tests {
             learning: None,
             memory: None,
             governor: None,
-            security: None,
             language_intelligence: None,
             processes: None,
             browser: None,

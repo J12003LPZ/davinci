@@ -322,6 +322,10 @@ impl Extensions {
         if lines.is_empty() {
             return;
         }
+        let lines = lines
+            .into_iter()
+            .map(|line| super::sanitize::terminal_safe(&line).into_owned())
+            .collect();
         self.widgets.push(Widget {
             key: key.to_string(),
             lines,
@@ -332,7 +336,10 @@ impl Extensions {
     pub fn set_status(&mut self, key: &str, text: Option<&str>) {
         self.status.retain(|(existing, _)| existing != key);
         if let Some(text) = text.filter(|text| !text.is_empty()) {
-            self.status.push((key.to_string(), text.to_string()));
+            self.status.push((
+                key.to_string(),
+                super::sanitize::terminal_safe(text).into_owned(),
+            ));
         }
     }
 
@@ -401,26 +408,10 @@ impl Working {
             return "Interrupting";
         }
         const VERBS: [&str; 20] = [
-            "Boondoggling",
-            "Levitating",
-            "Envisioning",
-            "Unraveling",
-            "Pondering",
-            "Percolating",
-            "Mulling",
-            "Noodling",
-            "Ruminating",
-            "Simmering",
-            "Brewing",
-            "Crunching",
-            "Churning",
-            "Conjuring",
-            "Tinkering",
-            "Whittling",
-            "Musing",
-            "Deliberating",
-            "Cogitating",
-            "Synthesizing",
+            "Boondoggling", "Levitating", "Envisioning", "Unraveling", "Pondering",
+            "Percolating", "Mulling", "Noodling", "Ruminating", "Simmering",
+            "Brewing", "Crunching", "Churning", "Conjuring", "Tinkering",
+            "Whittling", "Musing", "Deliberating", "Cogitating", "Synthesizing",
         ];
         VERBS[(self.verb_seed as usize) % VERBS.len()]
     }
@@ -477,11 +468,7 @@ impl Hunk {
     }
 
     pub fn at(kind: HunkKind, line: u32, text: &str) -> Self {
-        Self {
-            kind,
-            text: text.to_string(),
-            line: Some(line),
-        }
+        Self { kind, text: text.to_string(), line: Some(line) }
     }
 }
 
