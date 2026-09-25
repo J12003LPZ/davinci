@@ -567,20 +567,22 @@ fn dispatch_message(
                 .ok_or_else(protocol_error)?;
             let mut state = shared.state.lock().unwrap_or_else(|e| e.into_inner());
             if let Some(snapshot) = state.diagnostics.get_mut(&diagnostic_key(uri)) {
-                // Bound retained diagnostics separately from wire frame limits.
-                let mut bytes = 0;
-                snapshot.items = items
-                    .iter()
-                    .take(1000)
-                    .take_while(|item| {
-                        bytes += item.to_string().len();
-                        bytes <= 256 * 1024
-                    })
-                    .cloned()
-                    .collect();
-                snapshot.omitted = items.len().saturating_sub(snapshot.items.len());
                 let incoming = params.get("version").and_then(Value::as_i64);
                 if diagnostics::accepts_version(snapshot.version, incoming) {
+                    // Bound retained diagnostics separately from wire frame limits.
+                    // Reject stale/unversioned replacement before mutating the current set.
+                    let mut bytes = 0;
+                    let next_items: Vec<Value> = items
+                        .iter()
+                        .take(1000)
+                        .take_while(|item| {
+                            bytes += item.to_string().len();
+                            bytes <= 256 * 1024
+                        })
+                        .cloned()
+                        .collect();
+                    snapshot.omitted = items.len().saturating_sub(next_items.len());
+                    snapshot.items = next_items;
                     snapshot.version = incoming;
                     snapshot.sequence = snapshot.sequence.saturating_add(1);
                     shared.changed.notify_all();
