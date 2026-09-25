@@ -804,12 +804,6 @@ fn build_agent(parsed: &Args, session_dir: &Path, cwd: &Path) -> Result<Agent, S
             .tool_registry
             .retain(|name| !davinci_agent::runtime::transactions::is_tool(name));
     }
-    agent.tool_context.semantic = Some(Arc::new(
-        davinci_coding_agent::semantic::NativeSemanticService::with_permissions_and_cache(
-            agent.permissions.clone(),
-            agent.tool_context.cache.clone(),
-        ),
-    ));
     agent.tool_context.foreground_supervisor = std::env::current_exe().ok().map(|executable| {
         davinci_agent::jobs::supervisor::SupervisorCommand {
             executable,
@@ -917,6 +911,25 @@ fn build_agent(parsed: &Args, session_dir: &Path, cwd: &Path) -> Result<Agent, S
     }
     let mut host = ExtensionHost::load_with_cwd(&default_agent_dir(), &extensions, cwd);
     startup_mark("extensions loaded");
+    let language_owner = {
+        let native = host
+            .native
+            .lock()
+            .map_err(|_| "native host lock poisoned".to_string())?;
+        native.language_intelligence.clone()
+    };
+    language_owner.set_permissions(Some(agent.permissions.clone()));
+    if graph_worker.is_none() {
+        agent.tool_context.semantic = Some(Arc::new(
+            davinci_coding_agent::semantic::SemanticServiceFacade::local(
+                language_owner.clone(),
+            ),
+        ));
+    } else {
+        // Workers never own a local semantic process. Their facade is attached
+        // only after the authenticated parent coordinator is resolved below.
+        agent.tool_context.semantic = None;
+    }
     let native_names = host.native_tool_names();
     let mut names = native_names.clone();
     // The extension *paths* are not tool names — TS registers only what an
@@ -981,7 +994,14 @@ fn build_agent(parsed: &Args, session_dir: &Path, cwd: &Path) -> Result<Agent, S
         agent.sync_tool_authorization();
     }
     if let Some(coord) = davinci_agent::runtime::task_transport::TaskCoordinatorClient::from_env() {
+        if graph_worker.is_some() {
+            agent.tool_context.semantic = Some(Arc::new(
+                davinci_coding_agent::semantic::SemanticServiceFacade::parent(coord.clone()),
+            ));
+        }
         agent.tool_context.task_coordinator = Some(coord);
+    } else if graph_worker.is_some() {
+        agent.tool_context.semantic = None;
     }
     if let Ok(raw_contract) = std::env::var("DAVINCI_TASK_CONTRACT_JSON") {
         let contract: davinci_agent::runtime::TaskContract = serde_json::from_str(&raw_contract)
