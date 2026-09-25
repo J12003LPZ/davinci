@@ -652,10 +652,12 @@ mod tests {
                 .unwrap();
         let addr = server.local_addr().unwrap();
         let client = std::thread::spawn(move || {
-            // A speculative browser connection may disappear without sending
-            // an HTTP request. The real callback must still be accepted.
-            drop(std::net::TcpStream::connect(addr).unwrap());
-            std::thread::sleep(std::time::Duration::from_millis(50));
+            // A browser can preconnect and keep the socket open without ever
+            // sending an HTTP request. It must not monopolize the callback
+            // listener until the overall login deadline.
+            let speculative = std::net::TcpStream::connect(addr).unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(400));
+            drop(speculative);
             let mut stream = std::net::TcpStream::connect(addr).unwrap();
             use std::io::Write;
             write!(
