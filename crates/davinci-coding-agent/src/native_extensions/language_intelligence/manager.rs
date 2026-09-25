@@ -919,6 +919,37 @@ mod tests {
     }
 
     #[test]
+    fn source_change_while_query_runs_returns_stale_result() {
+        let workspace = TestWorkspace::new("typescript", "delayed-query");
+        let manager = workspace.manager.clone();
+        let handle = std::thread::spawn(move || {
+            manager
+                .execute("lsp_hover", &json!({"path":"a.ts","line":1,"column":1}))
+                .unwrap()
+        });
+
+        let deadline = Instant::now() + Duration::from_secs(3);
+        loop {
+            if workspace.events().iter().any(|event| {
+                event["kind"] == "client_message"
+                    && event["method"] == "textDocument/hover"
+            }) {
+                break;
+            }
+            assert!(Instant::now() < deadline, "fixture never received hover request");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+
+        workspace.write("a.ts", "changed while query was pending");
+        let result = handle.join().unwrap();
+        assert!(result.is_error, "{result:?}");
+        assert_eq!(
+            result.details.unwrap()["error"]["code"],
+            "stale_result"
+        );
+    }
+
+    #[test]
     fn python_project_venv_requires_trust_and_is_reported_when_selected() {
         let workspace = TestWorkspace::new("python", "capture");
         let interpreter = if cfg!(windows) {
