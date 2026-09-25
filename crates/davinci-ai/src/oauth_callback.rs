@@ -392,6 +392,16 @@ impl CallbackServer {
                     stream
                         .set_nonblocking(false)
                         .map_err(|err| err.to_string())?;
+                    let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+                    if remaining.is_zero() {
+                        return Err("Timed out waiting for the browser login callback.".into());
+                    }
+                    // Browsers may preconnect to loopback without sending an
+                    // HTTP request. Bound each idle connection so one silent
+                    // socket cannot consume the whole login deadline.
+                    stream
+                        .set_read_timeout(Some(remaining.min(Duration::from_millis(250))))
+                        .map_err(|err| err.to_string())?;
                     let response = self.serve(stream)?;
                     if response.code.is_some() {
                         return Ok(response);
@@ -409,9 +419,37 @@ impl CallbackServer {
     }
 
     fn serve(&mut self, mut stream: TcpStream) -> Result<CallbackResponse, String> {
-        stream.set_read_timeout(Some(Duration::from_secs(5))).ok();
+        if stream.read_timeout().ok().flatten().is_none() {
+            stream.set_read_timeout(Some(Duration::from_secs(5))).ok();
+        }
         let mut buf = [0u8; 8192];
-        let n = stream.read(&mut buf).map_err(|err| err.to_string())?;
+        let n = match stream.read(&mut buf) {
+            Ok(0) => {
+                return Ok(CallbackResponse {
+                    status: 400,
+                    content_type: CONTENT_TYPE_PLAIN.into(),
+                    body: "Empty OAuth callback request".into(),
+                    code: None,
+                    state: None,
+                })
+            }
+            Ok(n) => n,
+            Err(err)
+                if matches!(
+                    err.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) =>
+            {
+                return Ok(CallbackResponse {
+                    status: 408,
+                    content_type: CONTENT_TYPE_PLAIN.into(),
+                    body: "OAuth callback request timed out".into(),
+                    code: None,
+                    state: None,
+                })
+            }
+            Err(err) => return Err(err.to_string()),
+        };
         let request = String::from_utf8_lossy(&buf[..n]);
         let response = match parse_http_target(&request) {
             Some((path, query)) => handle_callback_request(
@@ -474,6 +512,7 @@ fn reason_phrase(status: u16) -> &'static str {
         200 => "OK",
         400 => "Bad Request",
         404 => "Not Found",
+        408 => "Request Timeout",
         409 => "Conflict",
         500 => "Internal Server Error",
         502 => "Bad Gateway",
@@ -623,6 +662,29 @@ mod tests {
             }
         });
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let response = server.accept_until(deadline).unwrap();
+        client.join().unwrap();
+        assert_eq!(response.code.as_deref(), Some("real"));
+    }
+
+    #[test]
+    fn silent_preconnect_does_not_end_login() {
+        let mut server =
+            CallbackServer::bind("127.0.0.1", 0, CallbackProvider::OpenAiCodex, "state-1")
+                .unwrap();
+        let addr = server.local_addr().unwrap();
+        let client = std::thread::spawn(move || {
+            let silent = std::net::TcpStream::connect(addr).unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(400));
+            drop(silent);
+            let mut stream = std::net::TcpStream::connect(addr).unwrap();
+            write!(
+                stream,
+                "GET /auth/callback?code=real&state=state-1 HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n"
+            )
+            .unwrap();
+        });
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
         let response = server.accept_until(deadline).unwrap();
         client.join().unwrap();
         assert_eq!(response.code.as_deref(), Some("real"));
