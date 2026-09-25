@@ -376,20 +376,22 @@ impl Rpc for StdioTransport {
 }
 
 fn child_environment(
-    parent: impl Iterator<Item = (String, String)>,
+    parent: impl Iterator<Item = (OsString, OsString)>,
     config: &BTreeMap<String, String>,
-) -> BTreeMap<String, String> {
-    let mut env: BTreeMap<String, String> = parent
+) -> BTreeMap<OsString, OsString> {
+    let mut env: BTreeMap<OsString, OsString> = parent
         .filter(|(key, _)| {
-            INHERITED_ENV
-                .iter()
-                .any(|name| name.eq_ignore_ascii_case(key))
+            key.to_str().is_some_and(|key| {
+                INHERITED_ENV
+                    .iter()
+                    .any(|name| name.eq_ignore_ascii_case(key))
+            })
         })
         .collect();
     env.extend(
         config
             .iter()
-            .map(|(key, value)| (key.clone(), value.clone())),
+            .map(|(key, value)| (OsString::from(key), OsString::from(value))),
     );
     env
 }
