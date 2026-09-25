@@ -421,7 +421,8 @@ impl JsonlSession {
     }
 
     fn prepare_first_write(&mut self) -> Result<(), SessionError> {
-        if self.writer.lock.is_none() {
+        let acquired_lock = self.writer.lock.is_none();
+        if acquired_lock {
             let mut lock_path = self.path.as_os_str().to_owned();
             lock_path.push(".lock");
             let lock = davinci_sys::lock::ExclusiveFileLock::try_acquire(Path::new(&lock_path))
@@ -437,12 +438,58 @@ impl JsonlSession {
                 })?;
             self.writer.lock = Some(std::sync::Arc::new(lock));
         }
+
         if !self.writer.tail_checked {
-            davinci_sys::fs::truncate_torn_tail(&self.path).map_err(|err| {
-                SessionError::storage(format!("Unable to repair session tail: {err}"))
+            let bytes = fs::read(&self.path).map_err(|err| {
+                SessionError::storage(format!("Unable to inspect session tail: {err}"))
             })?;
+            if !bytes.is_empty() && !bytes.ends_with(b"\n") {
+                let text = std::str::from_utf8(&bytes).map_err(|err| {
+                    SessionError::storage(format!("Session is not valid UTF-8: {err}"))
+                })?;
+                let tail = text.rsplit('\n').next().unwrap_or_default();
+                let complete = if text.contains('\n') {
+                    parse_mutation(tail).is_ok()
+                } else {
+                    parse_header(tail).is_ok()
+                };
+                if complete {
+                    let mut file = OpenOptions::new()
+                        .append(true)
+                        .open(&self.path)
+                        .map_err(|err| {
+                            SessionError::storage(format!(
+                                "Unable to terminate complete session tail: {err}"
+                            ))
+                        })?;
+                    file.write_all(b"\n")
+                        .and_then(|()| file.sync_all())
+                        .map_err(|err| {
+                            SessionError::storage(format!(
+                                "Unable to terminate complete session tail: {err}"
+                            ))
+                        })?;
+                } else {
+                    davinci_sys::fs::truncate_torn_tail(&self.path).map_err(|err| {
+                        SessionError::storage(format!("Unable to repair session tail: {err}"))
+                    })?;
+                }
+            }
             self.writer.tail_checked = true;
         }
+
+        // A handle can sit idle while a previous writer owns and advances the
+        // session. Once this process obtains the writer lease, refresh the
+        // lineage and sequence state from disk before deriving the next entry.
+        if acquired_lock && !self.writer.rewrite_as_v4 {
+            let loaded = Self::open(&self.path)?;
+            self.header = loaded.header;
+            self.entries = loaded.entries;
+            self.records = loaded.records;
+            self.leaf_id = loaded.leaf_id;
+            self.max_seq = loaded.max_seq;
+        }
+
         if self.writer.rewrite_as_v4 {
             self.publish_as_v4()?;
             self.writer.rewrite_as_v4 = false;
@@ -639,6 +686,59 @@ mod tests {
         drop(reopened);
         let again = JsonlSession::open(&path).unwrap();
         assert_eq!(again.entries.len(), 2);
+    }
+
+    #[test]
+    fn complete_unterminated_last_line_is_preserved_on_next_write() {
+        let dir = tempdir().unwrap();
+        let mut session = JsonlSession::create(dir.path(), "/work", None).unwrap();
+        session
+            .append_entry(SessionEntry::message("user", serde_json::json!("one")))
+            .unwrap();
+        let path = session.path.clone();
+        drop(session);
+
+        let mut bytes = fs::read(&path).unwrap();
+        assert_eq!(bytes.pop(), Some(b'\n'));
+        fs::write(&path, bytes).unwrap();
+
+        let mut reopened = JsonlSession::open(&path).unwrap();
+        assert_eq!(reopened.entries.len(), 1);
+        reopened
+            .append_entry(SessionEntry::message("user", serde_json::json!("two")))
+            .unwrap();
+        drop(reopened);
+
+        let again = JsonlSession::open(&path).unwrap();
+        assert_eq!(again.entries.len(), 2);
+        assert_eq!(again.entries[1].parent_id, Some(again.entries[0].id.clone()));
+    }
+
+    #[test]
+    fn delayed_second_writer_reloads_lineage_after_acquiring_lock() {
+        let dir = tempdir().unwrap();
+        let mut first = JsonlSession::create(dir.path(), "/work", None).unwrap();
+        let path = first.path.clone();
+        let mut delayed = JsonlSession::open(&path).unwrap();
+
+        first
+            .append_entry(SessionEntry::message("user", serde_json::json!("one")))
+            .unwrap();
+        drop(first);
+
+        delayed
+            .append_entry(SessionEntry::message("user", serde_json::json!("two")))
+            .unwrap();
+        drop(delayed);
+
+        let reopened = JsonlSession::open(&path).unwrap();
+        assert_eq!(reopened.entries.len(), 2);
+        assert_eq!(reopened.entries[0].seq, 1);
+        assert_eq!(reopened.entries[1].seq, 2);
+        assert_eq!(
+            reopened.entries[1].parent_id,
+            Some(reopened.entries[0].id.clone())
+        );
     }
 
     #[test]
