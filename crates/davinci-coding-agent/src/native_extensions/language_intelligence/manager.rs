@@ -403,10 +403,18 @@ impl LanguageIntelligence {
                 Ok(raw) => raw,
                 Err(error) => {
                     slot.last_error = Some(error.clone());
-                    if !slot.session.as_ref().is_some_and(Session::is_alive) {
+                    if error.code == "resync_required"
+                        || !slot.session.as_ref().is_some_and(Session::is_alive)
+                    {
                         slot.refresh_budget();
                         slot.session = None;
                         slot.healthy_since = None;
+                    }
+                    if error.code == "resync_required" {
+                        return Err(IntelligenceError::new(
+                            "stale_result",
+                            "Source synchronization became uncertain; the session was discarded and the query should be retried within a fresh budget",
+                        ));
                     }
                     return Err(error);
                 }
