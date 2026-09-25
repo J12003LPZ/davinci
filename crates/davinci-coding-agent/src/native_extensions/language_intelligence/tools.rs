@@ -36,26 +36,27 @@ pub fn tool_spec(name: &str) -> Option<davinci_ai::ToolSpec> {
         "lsp_workspace_symbols" => {
             required = vec!["query"];
             properties["query"] = json!({"type":"string","maxLength":256});
-            "Find TypeScript/JavaScript workspace symbols. Use path to select a monorepo project. Read-only and advisory."
+            properties["language"] = json!({"type":"string","enum":["typescript","javascript","rust","python"],"description":"Optional family selector when no path is supplied. Legacy pathless calls route to TypeScript/JavaScript."});
+            "Find TypeScript/JavaScript, Rust, or Python workspace symbols. Use path to select a project. Read-only and advisory."
         }
         "lsp_document_symbols" => {
-            "List TypeScript/JavaScript document symbols. Read-only and advisory."
+            "List TypeScript/JavaScript, Rust, or Python document symbols. Read-only and advisory."
         }
         "lsp_diagnostics" => {
             properties["severity"] =
                 json!({"type":"string","enum":["all","error","warning","information","hint"]});
-            "Inspect TypeScript/JavaScript diagnostics for current disk contents. Advisory; never substitutes for compiler, lint or tests."
+            "Inspect TypeScript/JavaScript, Rust, or Python diagnostics for current disk contents. Advisory; never substitutes for compiler, type checker, lint, or tests."
         }
         _ => {
             required.extend(["line", "column"]);
             properties["line"] = json!({"type":"integer","minimum":1,"maximum":u32::MAX,"description":"1-based line"});
             properties["column"] = json!({"type":"integer","minimum":1,"maximum":u32::MAX,"description":"1-based UTF-16 column"});
             match name {
-                "lsp_definition" => "Find TypeScript/JavaScript symbol definitions. Read-only and advisory.",
-                "lsp_references" => "Find TypeScript/JavaScript symbol references. Read-only and advisory.",
-                "lsp_hover" => "Inspect a TypeScript/JavaScript type signature and short documentation. Read-only and advisory.",
-                "lsp_implementations" => "Find TypeScript/JavaScript implementations. Read-only and advisory.",
-                _ => "Find TypeScript/JavaScript type definitions. Read-only and advisory.",
+                "lsp_definition" => "Find TypeScript/JavaScript, Rust, or Python symbol definitions. Read-only and advisory.",
+                "lsp_references" => "Find TypeScript/JavaScript, Rust, or Python symbol references. Read-only and advisory.",
+                "lsp_hover" => "Inspect a TypeScript/JavaScript, Rust, or Python type signature and short documentation. Read-only and advisory.",
+                "lsp_implementations" => "Find TypeScript/JavaScript, Rust, or Python implementations. Read-only and advisory.",
+                _ => "Find TypeScript/JavaScript, Rust, or Python type definitions. Read-only and advisory.",
             }
         }
     };
@@ -80,6 +81,7 @@ pub(super) struct Arguments {
     pub line: Option<u64>,
     pub column: Option<u64>,
     pub query: Option<String>,
+    pub language: Option<String>,
     pub include_declaration: Option<bool>,
     pub limit: Option<usize>,
     pub severity: Option<String>,
@@ -116,6 +118,7 @@ impl Arguments {
                 .as_ref()
                 .is_some_and(|v| v.len() > 256 || v.contains('\0'))
             || parsed.limit.is_some_and(|v| !(1..=200).contains(&v))
+            || parsed.language.as_deref().is_some_and(|v| !["typescript","javascript","rust","python"].contains(&v))
             || [parsed.line, parsed.column]
                 .into_iter()
                 .flatten()
