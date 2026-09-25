@@ -1095,6 +1095,18 @@
     }
 
     #[test]
+    fn agent_without_tool_scope_still_requires_approval_outside_plan_mode() {
+        let call = json!({"prompt": "inspect and then make any needed changes"});
+        for mode in [PermissionMode::Edits, PermissionMode::Auto] {
+            let policy = PermissionPolicy::new(mode);
+            assert!(
+                is_ask(&policy.decide("agent-scope", "agent", &call, &cwd())),
+                "{mode:?} must not treat an unscoped child agent as read-only"
+            );
+        }
+    }
+
+    #[test]
     fn agent_isolation_permission_rules() {
         let root = cwd();
         let wt_call = json!({"prompt": "edit", "isolation": "worktree"});
