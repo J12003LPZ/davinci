@@ -646,6 +646,32 @@ mod tests {
     }
 
     #[test]
+    fn disconnected_preconnect_does_not_consume_the_callback() {
+        let mut server =
+            CallbackServer::bind("127.0.0.1", 0, CallbackProvider::OpenAiCodex, "state-1")
+                .unwrap();
+        let addr = server.local_addr().unwrap();
+        let client = std::thread::spawn(move || {
+            // A speculative browser connection may disappear without sending
+            // an HTTP request. The real callback must still be accepted.
+            drop(std::net::TcpStream::connect(addr).unwrap());
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            let mut stream = std::net::TcpStream::connect(addr).unwrap();
+            use std::io::Write;
+            write!(
+                stream,
+                "GET /auth/callback?code=real&state=state-1 HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n"
+            )
+            .unwrap();
+        });
+        let response = server
+            .accept_until(std::time::Instant::now() + std::time::Duration::from_secs(2))
+            .unwrap();
+        client.join().unwrap();
+        assert_eq!(response.code.as_deref(), Some("real"));
+    }
+
+    #[test]
     fn accept_until_times_out() {
         let mut server =
             CallbackServer::bind("127.0.0.1", 0, CallbackProvider::OpenAiCodex, "s").unwrap();
