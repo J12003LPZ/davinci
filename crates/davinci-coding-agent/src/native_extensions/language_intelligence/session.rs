@@ -1,6 +1,7 @@
 //! One initialized server and its synchronized documents.
+use super::client_requests::ClientRequestState;
 use super::documents::{self, Document};
-use super::protocol::{IntelligenceError, Result};
+use super::protocol::{IntelligenceError, RequestBudget, Result};
 use super::servers::{ServerAdapter, ServerCommand};
 use super::transport::Transport;
 use serde_json::{json, Value};
@@ -19,18 +20,32 @@ pub(super) struct Session {
     capabilities: Value,
     documents: BTreeMap<PathBuf, Document>,
     diagnostic_floor: BTreeMap<String, u64>,
+    diagnostic_result_ids: BTreeMap<String, String>,
+    diagnostic_refresh_generation: u64,
 }
 
 impl Session {
     pub fn start(command: ServerCommand, deadline: Instant) -> Result<Self> {
-        let transport = Transport::spawn(&mut command.command())?;
+        Self::start_with_budget(command, RequestBudget { deadline, cancelled: None })
+    }
+
+    pub fn start_with_budget(command: ServerCommand, budget: RequestBudget) -> Result<Self> {
+        let client = ClientRequestState::new(command.workspace.clone(), command.client_configuration.clone())?;
+        let transport = Transport::spawn_with_client(&mut command.command(), client)?;
         let uri = documents::file_uri(&command.workspace)?;
-        let result = transport.request("initialize", json!({
+        let result = transport.request_with_budget("initialize", json!({
             "processId": std::process::id(), "clientInfo":{"name":"DaVinci"},
             "rootUri":uri, "workspaceFolders":[{"uri":uri,"name":"project"}],
             "capabilities": {
                 "general":{"positionEncodings":["utf-16"]},
-                "workspace":{"applyEdit":false,"workspaceEdit":{"documentChanges":false}},
+                "window":{"workDoneProgress":true},
+                "workspace":{
+                    "applyEdit":false,
+                    "configuration":true,
+                    "workspaceFolders":true,
+                    "workspaceEdit":{"documentChanges":false},
+                    "diagnostics":{"refreshSupport":true}
+                },
                 "textDocument": {
                     "synchronization":{"dynamicRegistration":false,"didSave":true},
                     "hover":{"contentFormat":["plaintext","markdown"]},
@@ -38,10 +53,10 @@ impl Session {
                     "implementation":{"linkSupport":true},
                     "documentSymbol":{"hierarchicalDocumentSymbolSupport":true},
                     "publishDiagnostics":{"versionSupport":true},
-                    "diagnostic":{"dynamicRegistration":false,"relatedDocumentSupport":false}
+                    "diagnostic":{"dynamicRegistration":true,"relatedDocumentSupport":false}
                 }
             }, "initializationOptions":command.initialization_options
-        }), remaining(deadline)?).map_err(|e| IntelligenceError::new("initialization_failed", &format!("Language-server initialization failed ({})", e.code)))?;
+        }), &budget).map_err(|e| IntelligenceError::new("initialization_failed", &format!("Language-server initialization failed ({})", e.code)))?;
         let capabilities = result
             .get("capabilities")
             .filter(|v| v.is_object())
@@ -58,13 +73,15 @@ impl Session {
                 "Server selected an unsupported position encoding",
             ));
         }
-        transport.notify("initialized", json!({}))?;
+        transport.notify_with_budget("initialized", json!({}), &budget)?;
         Ok(Self {
             command,
             transport,
             capabilities,
             documents: BTreeMap::new(),
             diagnostic_floor: BTreeMap::new(),
+            diagnostic_result_ids: BTreeMap::new(),
+            diagnostic_refresh_generation: transport.client_status()["diagnosticRefreshGeneration"].as_u64().unwrap_or(0),
         })
     }
 
@@ -72,10 +89,20 @@ impl Session {
         self.transport.is_alive()
     }
     pub fn status(&self) -> Value {
-        json!({"workspace":self.command.workspace,"backend":self.command.kind,
-            "serverVersion":self.command.version,"projectTypeScript":self.command.typescript_version,
+        json!({
+            "workspace":self.command.workspace,
+            "backend":self.command.kind,
+            "language":self.command.family,
+            "serverVersion":self.command.version,
+            "projectTypeScript":self.command.typescript_version,
+            "profileFingerprint":self.command.profile_fingerprint,
+            "analysisEnvironment":self.command.analysis_environment,
+            "limitations":self.command.limitations,
             "session":if self.is_alive() {"running"} else {"stopped"},
-            "pid":self.transport.pid(),"documents":self.documents.len()})
+            "pid":self.transport.pid(),
+            "documents":self.documents.len(),
+            "client":self.transport.client_status()
+        })
     }
 
     fn supports(&self, capability: &str) -> bool {
@@ -88,7 +115,7 @@ impl Session {
         &mut self,
         source: Option<&Path>,
         adapter: &dyn ServerAdapter,
-        deadline: Instant,
+        budget: &RequestBudget,
     ) -> Result<()> {
         let sync = &self.capabilities["textDocumentSync"];
         let kind = sync
@@ -115,12 +142,13 @@ impl Session {
         let mut updates = Vec::new();
         let mut changed = false;
         for path in paths {
-            remaining(deadline)?;
+            budget.check()?;
             if !path.exists() && Some(path.as_path()) != source {
                 if let Some(old) = self.documents.remove(&path) {
-                    self.transport.notify(
+                    self.transport.notify_with_budget(
                         "textDocument/didClose",
                         json!({"textDocument":{"uri":old.uri}}),
+                        budget,
                     )?;
                     self.transport.unwatch_document(&old.uri);
                     self.diagnostic_floor.remove(&old.uri);
@@ -164,9 +192,10 @@ impl Session {
         }
         for (document, events) in updates {
             for event in events {
-                self.transport.notify(
+                self.transport.notify_with_budget(
                     event["method"].as_str().expect("internal event"),
                     event["params"].clone(),
+                    budget,
                 )?;
             }
             self.documents.insert(document.path.clone(), document);
@@ -179,9 +208,21 @@ impl Session {
         method: &str,
         capability: &str,
         source: Option<&Path>,
-        mut params: Value,
+        params: Value,
         adapter: &dyn ServerAdapter,
         deadline: Instant,
+    ) -> Result<Value> {
+        self.execute_with_budget(method, capability, source, params, adapter, &RequestBudget { deadline, cancelled: None })
+    }
+
+    pub fn execute_with_budget(
+        &mut self,
+        method: &str,
+        capability: &str,
+        source: Option<&Path>,
+        mut params: Value,
+        adapter: &dyn ServerAdapter,
+        budget: &RequestBudget,
     ) -> Result<Value> {
         if method != "textDocument/diagnostic" && !self.supports(capability) {
             return Err(IntelligenceError::new(
@@ -189,7 +230,12 @@ impl Session {
                 "Selected server does not advertise this semantic operation",
             ));
         }
-        self.synchronize(source, adapter, deadline)?;
+        self.synchronize(source, adapter, budget)?;
+        let refresh = self.transport.client_status()["diagnosticRefreshGeneration"].as_u64().unwrap_or(0);
+        if refresh != self.diagnostic_refresh_generation {
+            self.diagnostic_refresh_generation = refresh;
+            self.diagnostic_result_ids.clear();
+        }
         if let Some(path) = source {
             let document = &self.documents[path];
             params["textDocument"] = json!({"uri":document.uri});
@@ -209,20 +255,32 @@ impl Session {
             }
         }
         if method == "textDocument/diagnostic" {
-            if self.supports("diagnosticProvider") {
-                let response = self
-                    .transport
-                    .request(method, params, remaining(deadline)?)?;
-                return response
-                    .get("items")
-                    .filter(|v| v.is_array())
-                    .cloned()
-                    .ok_or_else(|| {
-                        IntelligenceError::new(
-                            "protocol_error",
-                            "Expected a full document diagnostic report",
-                        )
-                    });
+            if self.supports("diagnosticProvider") || self.transport.has_dynamic_diagnostics() {
+                let path = source.ok_or_else(|| IntelligenceError::new("invalid_source_path", "Diagnostics require a source file"))?;
+                let document = &self.documents[path];
+                if let Some(previous) = self.diagnostic_result_ids.get(&document.uri) {
+                    params["previousResultId"] = json!(previous);
+                }
+                let response = self.transport.request_with_budget(method, params, budget)?;
+                match response.get("kind").and_then(Value::as_str) {
+                    Some("full") => {
+                        let items = response.get("items").filter(|v| v.is_array()).cloned().ok_or_else(|| IntelligenceError::new("protocol_error", "Expected diagnostic items"))?;
+                        if let Some(result_id) = response.get("resultId").and_then(Value::as_str) {
+                            self.diagnostic_result_ids.insert(document.uri.clone(), result_id.into());
+                        } else {
+                            self.diagnostic_result_ids.remove(&document.uri);
+                        }
+                        return Ok(json!({"items":items,"omitted":0,"freshness":"pull-response","documentVersion":document.version}));
+                    }
+                    Some("unchanged") => {
+                        let result_id = response.get("resultId").and_then(Value::as_str);
+                        if result_id.is_some() && result_id == self.diagnostic_result_ids.get(&document.uri).map(String::as_str) {
+                            return Ok(json!({"items":[],"omitted":0,"freshness":"pull-response","unchanged":true,"documentVersion":document.version}));
+                        }
+                        return Err(IntelligenceError::new("diagnostics_pending", "Unchanged diagnostic report did not match the current provider result id"));
+                    }
+                    _ => return Err(IntelligenceError::new("protocol_error", "Expected a full or unchanged document diagnostic report")),
+                }
             }
             let path = source.ok_or_else(|| {
                 IntelligenceError::new("invalid_source_path", "Diagnostics require a source file")
@@ -232,7 +290,7 @@ impl Session {
             loop {
                 let mut snapshot =
                     self.transport
-                        .wait_diagnostics(&document.uri, floor, remaining(deadline)?)?;
+                        .wait_diagnostics(&document.uri, floor, budget.remaining()?)?;
                 if snapshot
                     .version
                     .is_some_and(|version| version != document.version)
@@ -273,7 +331,7 @@ impl Session {
                     "documentVersion":document.version}));
             }
         }
-        self.transport.request(method, params, remaining(deadline)?)
+        self.transport.request_with_budget(method, params, budget)
     }
 }
 
