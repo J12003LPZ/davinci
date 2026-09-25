@@ -253,7 +253,7 @@ fn entry_lines(model: &Model, entry: &Entry, width: u16) -> Vec<Line<'static>> {
                     Line::from(truncate_run(spans, width))
                 })
                 .collect()
-        }
+        },
 
         Entry::Thinking {
             text,
