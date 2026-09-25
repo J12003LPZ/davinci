@@ -230,8 +230,10 @@ impl ChatChrome {
         self.extension_statuses.retain(|(id, _)| id != key);
         if let Some(text) = text {
             if !text.is_empty() {
-                self.extension_statuses
-                    .push((key.to_string(), text.to_string()));
+                self.extension_statuses.push((
+                    key.to_string(),
+                    crate::davinci::sanitize::terminal_safe(text).into_owned(),
+                ));
             }
         }
     }
