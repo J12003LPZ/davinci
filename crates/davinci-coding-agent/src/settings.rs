@@ -1601,6 +1601,23 @@ mod tests {
     }
 
     #[test]
+    fn schema_invalid_settings_are_never_overwritten() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = settings_path(dir.path());
+        fs::write(&path, r#"{"theme":"dark","quietStartup":"not-a-bool","futureKey":7}"#)
+            .unwrap();
+        let original = fs::read_to_string(&path).unwrap();
+        let err = update_settings(dir.path(), |settings| {
+            settings.packages.push("npm:x".into());
+        })
+        .unwrap_err();
+        assert!(err.contains("invalid settings value"), "{err}");
+        assert_eq!(fs::read_to_string(&path).unwrap(), original);
+        assert!(save_settings(dir.path(), &Settings::default()).is_err());
+        assert_eq!(fs::read_to_string(&path).unwrap(), original);
+    }
+
+    #[test]
     fn stale_settings_lock_is_taken_over() {
         let dir = tempfile::tempdir().unwrap();
         let path = settings_path(dir.path());
