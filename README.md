@@ -438,22 +438,24 @@ Shared engineering snapshots are invalidated on relevant mutations and reused on
 
 ### Language intelligence
 
-DaVinci can talk to installed language servers through a bounded read-only semantic layer.
+DaVinci can talk to installed language servers through a bounded read-only semantic layer shared across TypeScript/JavaScript, Rust, and Python.
 
-The TypeScript integration includes operations such as:
+The stable native surface provides eight operations:
 
 - definition;
 - references;
-- implementations;
 - hover;
 - document symbols;
 - workspace symbols;
-- call hierarchy;
-- diagnostics.
+- implementations;
+- type definition;
+- document diagnostics.
 
-DaVinci does not silently install or download a language server. Install the relevant project language-server packages yourself.
+Diagnostics are advisory semantic evidence, not compiler/test verification. Rename, automatic code actions, and call hierarchy are outside the completed read-only scope.
 
-See [Language intelligence](docs/language-intelligence.md).
+DaVinci does not silently install or download a language server, Rust component, Python environment, or interpreter. Provision compatible local tools separately.
+
+See [Language intelligence](docs/language-intelligence.md) and the [compatibility report](docs/language-intelligence-compatibility.md).
 
 ### Test impact and verification planning
 
