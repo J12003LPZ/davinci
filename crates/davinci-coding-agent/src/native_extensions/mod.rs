@@ -427,7 +427,10 @@ impl NativeExtensionHost {
         graph.governor = Some(Arc::clone(&governor));
         let visual_snapshot = VisualSnapshotHost::discover(cwd);
 
-        let repo_config = merged_settings.repo_intelligence.clone().unwrap_or_default();
+        let repo_config = merged_settings
+            .repo_intelligence
+            .clone()
+            .unwrap_or_default();
         let repo_intelligence =
             repo_intelligence::RepoIntelligence::new(cwd, &repo_agent_dir, repo_config);
         let engineering = engineering_snapshot::EngineeringSnapshots::default();
@@ -438,10 +441,16 @@ impl NativeExtensionHost {
             merged_settings.test_impact.clone().unwrap_or_default(),
         )
         .with_snapshots(engineering.clone());
-        let package_config = merged_settings.package_intelligence.clone().unwrap_or_default();
+        let package_config = merged_settings
+            .package_intelligence
+            .clone()
+            .unwrap_or_default();
         let package_intelligence =
             package_intelligence::PackageIntelligence::new(cwd, cache.clone(), package_config);
-        let build_config = merged_settings.build_intelligence.clone().unwrap_or_default();
+        let build_config = merged_settings
+            .build_intelligence
+            .clone()
+            .unwrap_or_default();
         let build_intelligence =
             build_intelligence::BuildIntelligence::new(cwd, cache.clone(), build_config)
                 .with_snapshots(engineering.clone());
@@ -482,8 +491,10 @@ impl NativeExtensionHost {
         let verification_planner =
             verification_planner::VerificationPlanner::new(cwd, verification_planner_config)
                 .with_snapshots(engineering.clone());
-        let workspace_snapshot_config =
-            merged_settings.workspace_snapshots.clone().unwrap_or_default();
+        let workspace_snapshot_config = merged_settings
+            .workspace_snapshots
+            .clone()
+            .unwrap_or_default();
         let workspace_snapshot =
             workspace_snapshot::WorkspaceSnapshot::new(cwd, workspace_snapshot_config);
 
@@ -792,21 +803,22 @@ impl NativeExtensionHost {
                 .lock()
                 .unwrap_or_else(|error| error.into_inner())
                 .search_tool(args),
-            "retrieve_output" => self
-                .governor
-                .lock()
-                .unwrap_or_else(|error| error.into_inner())
-                .retrieve(args)
-                .or_else(|error| {
-                if std::env::var_os("PI_GRAPH_ROLE").is_some() {
-                    if let Some(client) =
+            "retrieve_output" => {
+                self.governor
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .retrieve(args)
+                    .or_else(|error| {
+                        if std::env::var_os("PI_GRAPH_ROLE").is_some() {
+                            if let Some(client) =
                         davinci_agent::runtime::task_transport::TaskCoordinatorClient::from_env()
                     {
                         return client.call(name, args);
                     }
-                }
-                Err(error)
-            }),
+                        }
+                        Err(error)
+                    })
+            }
             "skill_list" => {
                 let query = args.get("query").and_then(Value::as_str).unwrap_or("");
                 let query_embedding = {
@@ -1055,8 +1067,10 @@ mod tests {
 
     #[test]
     fn every_external_native_command_is_listed() {
-        let listed: std::collections::BTreeSet<_> =
-            command_specs().into_iter().map(|(name, _, _)| name).collect();
+        let listed: std::collections::BTreeSet<_> = command_specs()
+            .into_iter()
+            .map(|(name, _, _)| name)
+            .collect();
         let internal_graph = ["graph-resume", "graph-status", "graph-view", "graph-abort"];
         for name in NATIVE_COMMANDS {
             if internal_graph.contains(name) {

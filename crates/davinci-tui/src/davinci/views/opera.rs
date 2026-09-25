@@ -28,7 +28,10 @@ pub fn lines(model: &Model) -> Vec<Line<'static>> {
         return Vec::new();
     };
 
-    let mut spans = vec![span(format!("{} ", frame(model.tick, model.animate)), cc.claude)];
+    let mut spans = vec![span(
+        format!("{} ", frame(model.tick, model.animate)),
+        cc.claude,
+    )];
     spans.extend(shimmer(
         working.verb(),
         model.tick,

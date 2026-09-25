@@ -58,9 +58,7 @@ impl LockFile {
                                 let _ = fs::remove_file(stale);
                                 continue;
                             }
-                            Err(rename_err)
-                                if rename_err.kind() == io::ErrorKind::NotFound =>
-                            {
+                            Err(rename_err) if rename_err.kind() == io::ErrorKind::NotFound => {
                                 continue;
                             }
                             Err(_) => {
@@ -292,7 +290,10 @@ mod tests {
         let new = LockFile::acquire(&path, Duration::ZERO, Duration::from_secs(10)).unwrap();
 
         drop(old);
-        assert!(path.exists(), "old owner must not delete the replacement lock");
+        assert!(
+            path.exists(),
+            "old owner must not delete the replacement lock"
+        );
         drop(new);
         assert!(!path.exists());
     }

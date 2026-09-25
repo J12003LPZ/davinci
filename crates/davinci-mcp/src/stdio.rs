@@ -82,21 +82,18 @@ impl StdioTransport {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
         cmd.env_clear();
-        let parent_env = std::env::vars_os().filter_map(|(key, value)| {
-            Some((key.into_string().ok()?, value.into_string().ok()?))
-        });
+        let parent_env = std::env::vars_os()
+            .filter_map(|(key, value)| Some((key.into_string().ok()?, value.into_string().ok()?)));
         for (key, value) in child_environment(parent_env, env) {
             cmd.env(key, value);
         }
         let mut child = cmd
             .spawn()
             .map_err(|err| Error::Transport(format!("spawn `{command}`: {err}")))?;
-        let stdin = Arc::new(Mutex::new(
-            child
-                .stdin
-                .take()
-                .ok_or_else(|| Error::Transport("stdio server has no stdin".into()))?,
-        ));
+        let stdin =
+            Arc::new(Mutex::new(child.stdin.take().ok_or_else(|| {
+                Error::Transport("stdio server has no stdin".into())
+            })?));
         let stdout = child
             .stdout
             .take()
@@ -292,7 +289,6 @@ impl StdioTransport {
             return Ok(parsed.result.unwrap_or(Value::Null));
         }
     }
-
 }
 
 fn server_request_reply(id: Value, method: &str) -> Value {

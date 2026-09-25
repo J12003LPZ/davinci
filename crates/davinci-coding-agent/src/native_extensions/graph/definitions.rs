@@ -766,16 +766,18 @@ fn parse_scalar_string(s: &str, line: usize) -> Result<String, DefinitionParseEr
                                 message: "incomplete unicode escape".into(),
                             });
                         }
-                        let value = u32::from_str_radix(&digits, 16).map_err(|_| DefinitionParseError {
-                            line,
-                            column: 1,
-                            message: "invalid unicode escape".into(),
-                        })?;
-                        let decoded = char::from_u32(value).ok_or_else(|| DefinitionParseError {
-                            line,
-                            column: 1,
-                            message: "invalid unicode scalar".into(),
-                        })?;
+                        let value =
+                            u32::from_str_radix(&digits, 16).map_err(|_| DefinitionParseError {
+                                line,
+                                column: 1,
+                                message: "invalid unicode escape".into(),
+                            })?;
+                        let decoded =
+                            char::from_u32(value).ok_or_else(|| DefinitionParseError {
+                                line,
+                                column: 1,
+                                message: "invalid unicode scalar".into(),
+                            })?;
                         out.push(decoded);
                     }
                     Some(other) => {
@@ -1097,7 +1099,10 @@ pub fn to_yaml_string(def: &SavedGraphDefinitionV1) -> String {
     out.push_str(&format!("name: {}\n", yaml_quote(&def.name)));
     out.push_str(&format!("description: {}\n", yaml_quote(&def.description)));
     out.push_str("graph:\n");
-    out.push_str(&format!("  graph_id: {}\n", yaml_quote(&def.graph.graph_id)));
+    out.push_str(&format!(
+        "  graph_id: {}\n",
+        yaml_quote(&def.graph.graph_id)
+    ));
     out.push_str(&format!("  version: {}\n", def.graph.version));
     out.push_str(&format!(
         "  mode: \"{}\"\n",
@@ -1114,7 +1119,10 @@ pub fn to_yaml_string(def: &SavedGraphDefinitionV1) -> String {
         for node in &def.graph.nodes {
             out.push_str(&format!("    - id: {}\n", yaml_quote(&node.id)));
             out.push_str(&format!("      role: {}\n", yaml_quote(node.role.as_str())));
-            out.push_str(&format!("      expect: {}\n", yaml_quote(node.expect.as_str())));
+            out.push_str(&format!(
+                "      expect: {}\n",
+                yaml_quote(node.expect.as_str())
+            ));
             out.push_str(&format!("      required: {}\n", node.required));
             out.push_str(&format!("      allowsMutation: {}\n", node.allows_mutation));
         }
@@ -1167,7 +1175,10 @@ pub fn to_yaml_string(def: &SavedGraphDefinitionV1) -> String {
     }
     if let Some(vp) = &def.verification_policy {
         out.push_str("verification_policy:\n");
-        out.push_str(&format!("  command_profile: {}\n", yaml_quote(&vp.command_profile)));
+        out.push_str(&format!(
+            "  command_profile: {}\n",
+            yaml_quote(&vp.command_profile)
+        ));
         out.push_str(&format!("  required: {}\n", vp.required));
     }
     if def.artifact_contract_versions.is_empty() {

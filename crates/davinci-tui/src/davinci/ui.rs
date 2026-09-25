@@ -514,10 +514,8 @@ pub fn tool_line(
     let (label, argument) = tool_caption(instrument, target);
     let cc = theme.cc();
     let failed = matches!(state, State::Failed | State::Attention);
-    let running = live
-        && duration.is_none()
-        && !failed
-        && !matches!(state, State::Skipped | State::Queued);
+    let running =
+        live && duration.is_none() && !failed && !matches!(state, State::Skipped | State::Queued);
     let mark = if theme.no_color {
         state.glyph()
     } else if running && tick % 2 == 1 {
@@ -736,9 +734,7 @@ pub fn hint_row(
     theme: &Theme,
 ) -> Line<'static> {
     let quiet = theme.cc().inactive;
-    let right: Vec<Span<'static>> = escape
-        .map(|esc| vec![span(esc, quiet)])
-        .unwrap_or_default();
+    let right: Vec<Span<'static>> = escape.map(|esc| vec![span(esc, quiet)]).unwrap_or_default();
     let room = width.saturating_sub(run_width(&right)).saturating_sub(3);
     let mut left: Vec<Span<'static>> = Vec::new();
     for (index, hint) in hints.iter().enumerate() {
@@ -1275,13 +1271,27 @@ pub fn section_row(
     let cc = theme.cc();
     let width = width.min(96);
     let available = width.saturating_sub(2);
-    let value_room = if width < 32 { 0 } else { (available / 3).min(28) };
+    let value_room = if width < 32 {
+        0
+    } else {
+        (available / 3).min(28)
+    };
     let value = clip_ellipsis(value, value_room);
     let value_width = run_width(&[span(value.clone(), cc.inactive)]);
     let name_room = available.saturating_sub(value_width + u16::from(!value.is_empty()));
     let left = vec![
-        span(if selected { SELECTION_BAR } else { UNSELECTED_BAR }, if selected { cc.permission } else { cc.inactive }),
-        span(clip_ellipsis(label, name_room), if selected { cc.permission } else { theme.text }),
+        span(
+            if selected {
+                SELECTION_BAR
+            } else {
+                UNSELECTED_BAR
+            },
+            if selected { cc.permission } else { cc.inactive },
+        ),
+        span(
+            clip_ellipsis(label, name_room),
+            if selected { cc.permission } else { theme.text },
+        ),
     ];
     spread(width, left, vec![span(value, cc.inactive)])
 }

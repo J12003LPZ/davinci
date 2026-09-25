@@ -104,7 +104,12 @@ pub fn split_command_line(line: &str) -> Result<Vec<String>, String> {
                     // C:\\Tools\\vim.exe). Only consume the backslash as an
                     // escape when it actually quotes a shell-like separator.
                     match chars.peek().copied() {
-                        Some(next) if next == '\\' || next == '\'' || next == '"' || next.is_whitespace() => {
+                        Some(next)
+                            if next == '\\'
+                                || next == '\''
+                                || next == '"'
+                                || next.is_whitespace() =>
+                        {
                             current.push(chars.next().unwrap());
                         }
                         _ => current.push('\\'),

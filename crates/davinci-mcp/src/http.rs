@@ -144,11 +144,7 @@ impl HttpTransport {
         Ok(())
     }
 
-    fn read_sse_response(
-        &self,
-        reader: impl Read,
-        want: Option<&Value>,
-    ) -> Result<Value> {
+    fn read_sse_response(&self, reader: impl Read, want: Option<&Value>) -> Result<Value> {
         // Bound the underlying stream before read_line so one unterminated
         // SSE line cannot allocate past the response cap before we inspect it.
         let mut reader = BufReader::new(reader.take((MAX_BODY_BYTES + 1) as u64));
@@ -449,7 +445,10 @@ mod tests {
                 break;
             }
             bytes.extend_from_slice(&buf[..n]);
-            header_end = bytes.windows(4).position(|window| window == b"\r\n\r\n").map(|i| i + 4);
+            header_end = bytes
+                .windows(4)
+                .position(|window| window == b"\r\n\r\n")
+                .map(|i| i + 4);
         }
         if let Some(end) = header_end {
             let headers = String::from_utf8_lossy(&bytes[..end]);

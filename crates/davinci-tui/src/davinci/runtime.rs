@@ -445,7 +445,8 @@ impl Session {
                 if matches!(ready, Event::Resize(..)) {
                     self.mic_rect = None;
                 }
-                if matches!(ready, Event::Mouse(mouse) if mouse.kind == event::MouseEventKind::Moved) {
+                if matches!(ready, Event::Mouse(mouse) if mouse.kind == event::MouseEventKind::Moved)
+                {
                     continue;
                 }
                 return Ok(Some(ready));
@@ -477,7 +478,8 @@ impl Session {
                 if matches!(ready, Event::Resize(..)) {
                     self.mic_rect = None;
                 }
-                if matches!(ready, Event::Mouse(mouse) if mouse.kind == event::MouseEventKind::Moved) {
+                if matches!(ready, Event::Mouse(mouse) if mouse.kind == event::MouseEventKind::Moved)
+                {
                     continue;
                 }
                 return Ok(Some(ready));

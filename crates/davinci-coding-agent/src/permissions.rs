@@ -217,7 +217,6 @@ pub fn forget_file_rule(path: &Path, list: &str, rule: &str) -> Result<(), Strin
 /// crash mid-write leaves the old file rather than an empty one.
 fn write_atomically(path: &Path, text: &str) -> Result<(), String> {
     davinci_sys::fs::atomic_write(path, text.as_bytes()).map_err(|err| err.to_string())
-
 }
 
 /// The rows `/permissions` says: the mode, then every rule by source.

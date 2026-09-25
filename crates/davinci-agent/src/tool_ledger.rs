@@ -173,7 +173,6 @@ pub enum BeginOutcome {
 
 fn atomic_write_json(path: &Path, bytes: &[u8]) -> Result<(), String> {
     davinci_sys::fs::atomic_write(path, bytes).map_err(|err| err.to_string())
-
 }
 
 fn journal_path(path: &Path) -> PathBuf {

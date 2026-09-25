@@ -170,8 +170,8 @@ fn run_audit(
 }
 
 fn parse_signals(bytes: &[u8]) -> Result<Vec<AdvisorySignal>, String> {
-    let root: Value =
-        serde_json::from_slice(bytes).map_err(|_| "cargo-audit returned invalid JSON".to_string())?;
+    let root: Value = serde_json::from_slice(bytes)
+        .map_err(|_| "cargo-audit returned invalid JSON".to_string())?;
     let list = root
         .get("vulnerabilities")
         .and_then(|value| value.get("list"))

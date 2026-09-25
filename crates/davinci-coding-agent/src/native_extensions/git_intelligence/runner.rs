@@ -246,7 +246,6 @@ fn run_status_with_executable(
     Ok((bytes, status))
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -259,11 +258,7 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let bin = tempfile::tempdir().unwrap();
         let fake = bin.path().join("git");
-        std::fs::write(
-            &fake,
-            "#!/bin/sh\nhead -c 200000 /dev/zero >&2\necho ok\n",
-        )
-        .unwrap();
+        std::fs::write(&fake, "#!/bin/sh\nhead -c 200000 /dev/zero >&2\necho ok\n").unwrap();
         let mut permissions = std::fs::metadata(&fake).unwrap().permissions();
         permissions.set_mode(0o755);
         std::fs::set_permissions(&fake, permissions).unwrap();

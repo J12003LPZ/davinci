@@ -725,10 +725,7 @@ impl GraphRun {
     }
 
     pub fn baseline_hashes(&self) -> Vec<String> {
-        fn add(
-            hashes: &mut Vec<String>,
-            baseline: &super::mutation::MutationBaseline,
-        ) {
+        fn add(hashes: &mut Vec<String>, baseline: &super::mutation::MutationBaseline) {
             hashes.extend(
                 baseline
                     .files

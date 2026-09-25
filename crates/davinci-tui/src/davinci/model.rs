@@ -401,10 +401,26 @@ impl Working {
             return "Interrupting";
         }
         const VERBS: [&str; 20] = [
-            "Boondoggling", "Levitating", "Envisioning", "Unraveling", "Pondering",
-            "Percolating", "Mulling", "Noodling", "Ruminating", "Simmering",
-            "Brewing", "Crunching", "Churning", "Conjuring", "Tinkering",
-            "Whittling", "Musing", "Deliberating", "Cogitating", "Synthesizing",
+            "Boondoggling",
+            "Levitating",
+            "Envisioning",
+            "Unraveling",
+            "Pondering",
+            "Percolating",
+            "Mulling",
+            "Noodling",
+            "Ruminating",
+            "Simmering",
+            "Brewing",
+            "Crunching",
+            "Churning",
+            "Conjuring",
+            "Tinkering",
+            "Whittling",
+            "Musing",
+            "Deliberating",
+            "Cogitating",
+            "Synthesizing",
         ];
         VERBS[(self.verb_seed as usize) % VERBS.len()]
     }
@@ -461,7 +477,11 @@ impl Hunk {
     }
 
     pub fn at(kind: HunkKind, line: u32, text: &str) -> Self {
-        Self { kind, text: text.to_string(), line: Some(line) }
+        Self {
+            kind,
+            text: text.to_string(),
+            line: Some(line),
+        }
     }
 }
 

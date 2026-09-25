@@ -477,14 +477,15 @@ impl JsonlSession {
                     // A complete JSONL record without its optional final
                     // newline is valid. Terminate it before the next append
                     // rather than deleting it or gluing the next record to it.
-                    let mut file = OpenOptions::new()
-                        .append(true)
-                        .open(&self.path)
-                        .map_err(|err| {
-                            SessionError::storage(format!(
-                                "Unable to terminate session tail: {err}"
-                            ))
-                        })?;
+                    let mut file =
+                        OpenOptions::new()
+                            .append(true)
+                            .open(&self.path)
+                            .map_err(|err| {
+                                SessionError::storage(format!(
+                                    "Unable to terminate session tail: {err}"
+                                ))
+                            })?;
                     file.write_all(b"\n")
                         .and_then(|()| file.sync_all())
                         .map_err(|err| {
@@ -697,7 +698,10 @@ mod tests {
 
         let again = JsonlSession::open(&path).unwrap();
         assert_eq!(again.entries.len(), 2);
-        assert_eq!(again.entries[1].parent_id, Some(again.entries[0].id.clone()));
+        assert_eq!(
+            again.entries[1].parent_id,
+            Some(again.entries[0].id.clone())
+        );
     }
 
     #[test]

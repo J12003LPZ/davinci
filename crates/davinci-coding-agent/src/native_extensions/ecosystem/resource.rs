@@ -69,8 +69,6 @@ impl ResourceSnapshot {
             prunings,
         }
     }
-
-
 }
 
 #[cfg(test)]

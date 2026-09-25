@@ -572,7 +572,6 @@ fn stored_output_is_intact(path: &Path, digest: &str) -> bool {
         .unwrap_or(false)
 }
 
-
 /// The most recent mtime among a directory's files; the directory's own
 /// mtime only when it holds none.
 fn newest_modification(dir: &Path) -> Option<SystemTime> {

@@ -840,7 +840,6 @@ fn collect_dir_resources(root: &Path, dir: &Path, pkg: &PackageSource, kind: &st
     out
 }
 
-
 fn push_if_allowed(
     root: &Path,
     path: PathBuf,
@@ -1041,7 +1040,11 @@ fn load_settings_value(path: &Path) -> serde_json::Value {
 }
 
 fn warn_removed_sqlite_backend(path: &Path, value: &serde_json::Value) {
-    if value.get("sessionBackend").and_then(serde_json::Value::as_str) != Some("sqlite") {
+    if value
+        .get("sessionBackend")
+        .and_then(serde_json::Value::as_str)
+        != Some("sqlite")
+    {
         return;
     }
     static WARNED: std::sync::Mutex<Vec<PathBuf>> = std::sync::Mutex::new(Vec::new());
@@ -1342,7 +1345,6 @@ impl Settings {
                 .into_owned()
         })
     }
-
 }
 
 /// Drop `null` members so a rewrite does not expand every unset field into an
@@ -1562,7 +1564,10 @@ mod tests {
         .unwrap();
         let pkg: PackageSource = "npm:skills-pack".into();
         let found = collect_package_resources(&pkg, "skills", &agent, dir.path());
-        assert!(found.iter().any(|path| path.ends_with("SKILL.md")), "{found:?}");
+        assert!(
+            found.iter().any(|path| path.ends_with("SKILL.md")),
+            "{found:?}"
+        );
     }
 
     #[cfg(unix)]
@@ -1959,7 +1964,8 @@ mod tests {
         std::fs::write(pkg_dir.join("skills").join("review.md"), "# review").ok();
         std::fs::write(pkg_dir.join("skills").join("skip.txt"), "no").ok();
         let manifest_pkg = PackageSource::from_spec(pkg_dir.display().to_string());
-        let extensions = collect_package_resources(&manifest_pkg, "extensions", dir.path(), dir.path());
+        let extensions =
+            collect_package_resources(&manifest_pkg, "extensions", dir.path(), dir.path());
         assert!(extensions
             .iter()
             .any(|path| path.ends_with("src/index.js") || path.ends_with("src\\index.js")));
