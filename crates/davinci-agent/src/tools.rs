@@ -4223,6 +4223,29 @@ mod tests {
     }
 
     #[test]
+    fn multi_edit_executes_with_empty_legacy_placeholders() {
+        let dir = tempdir().unwrap();
+        std::fs::write(dir.path().join("a.txt"), "alpha\nbeta\ngamma\n").unwrap();
+        execute_tool(
+            dir.path(),
+            "edit",
+            &serde_json::json!({
+                "path": "a.txt",
+                "edits": [
+                    {"oldText": "alpha", "newText": "ALPHA"},
+                    {"oldText": "gamma", "newText": "GAMMA"}
+                ],
+                "oldText": "", "newText": ""
+            }),
+        )
+        .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("a.txt")).unwrap(),
+            "ALPHA\nbeta\nGAMMA\n"
+        );
+    }
+
+    #[test]
     fn read_write_edit_semantics() {
         let dir = tempdir().unwrap();
         execute_tool(

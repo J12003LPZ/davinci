@@ -370,10 +370,15 @@ pub fn prepare_edit_arguments(input: &serde_json::Value) -> Result<(String, Vec<
         object.get("oldText").and_then(|value| value.as_str()),
         object.get("newText").and_then(|value| value.as_str()),
     ) {
-        edits.push(Edit {
-            old_text: old.to_string(),
-            new_text: new.to_string(),
-        });
+        // Some providers fill unused legacy fields with empty strings alongside
+        // `edits`. They are placeholders, not an additional replacement. Keep
+        // real legacy edits, and let validation reject an empty standalone edit.
+        if edits.is_empty() || !old.is_empty() || !new.is_empty() {
+            edits.push(Edit {
+                old_text: old.to_string(),
+                new_text: new.to_string(),
+            });
+        }
     }
     if edits.is_empty() {
         return Err(
@@ -752,6 +757,34 @@ mod tests {
         )
         .unwrap_err();
         assert!(overlap.contains("overlap in b.txt"));
+    }
+
+    #[test]
+    fn multi_edit_ignores_empty_legacy_placeholders_only() {
+        for (old, new, expected_len) in [("", "", 1), ("", "insert", 2), ("b", "", 2)] {
+            let (_, edits) = prepare_edit_arguments(&serde_json::json!({
+                "path": "a.txt",
+                "edits": [{"oldText": "a", "newText": "A"}],
+                "oldText": old,
+                "newText": new
+            }))
+            .unwrap();
+            assert_eq!(edits.len(), expected_len, "legacy pair {old:?}/{new:?}");
+            let result = apply_edits_to_normalized_content("ab", &edits, "a.txt");
+            if old.is_empty() && !new.is_empty() {
+                assert!(result.unwrap_err().contains("oldText must not be empty"));
+            } else {
+                assert_eq!(
+                    result.unwrap().new_content,
+                    if old.is_empty() { "Ab" } else { "A" }
+                );
+            }
+        }
+        let (_, edits) = prepare_edit_arguments(&serde_json::json!({
+            "path": "a.txt", "oldText": "", "newText": ""
+        }))
+        .unwrap();
+        assert!(apply_edits_to_normalized_content("ab", &edits, "a.txt").is_err());
     }
 
     #[test]
