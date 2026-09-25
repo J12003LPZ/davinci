@@ -169,6 +169,41 @@ fn run_audit(
     parse_signals(&bytes)
 }
 
+fn parse_signals(bytes: &[u8]) -> Result<Vec<AdvisorySignal>, String> {
+    let root: Value =
+        serde_json::from_slice(bytes).map_err(|_| "cargo-audit returned invalid JSON".to_string())?;
+    let list = root
+        .get("vulnerabilities")
+        .and_then(|value| value.get("list"))
+        .and_then(Value::as_array)
+        .ok_or_else(|| "cargo-audit returned invalid JSON".to_string())?;
+
+    let mut signals = Vec::with_capacity(list.len());
+    for item in list {
+        let advisory = item
+            .get("advisory")
+            .and_then(Value::as_object)
+            .ok_or_else(|| "cargo-audit returned invalid JSON".to_string())?;
+        let package = item
+            .get("package")
+            .and_then(Value::as_object)
+            .ok_or_else(|| "cargo-audit returned invalid JSON".to_string())?;
+        let field = |map: &serde_json::Map<String, Value>, name: &str| {
+            map.get(name)
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+                .ok_or_else(|| "cargo-audit returned invalid JSON".to_string())
+        };
+        signals.push(AdvisorySignal {
+            id: field(advisory, "id")?,
+            package: field(package, "name")?,
+            version: field(package, "version")?,
+            title: field(advisory, "title")?,
+        });
+    }
+    Ok(signals)
+}
+
 struct IsolatedDir(PathBuf);
 
 impl IsolatedDir {
