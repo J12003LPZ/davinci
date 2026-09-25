@@ -99,6 +99,7 @@ pub struct ContractExecutor {
     capabilities: ExecutorCapabilities,
     contract: Option<TaskContract>,
     trusted_workspace: PathBuf,
+    allow_unconfined_shell: bool,
 }
 
 impl ContractExecutor {
@@ -111,11 +112,19 @@ impl ContractExecutor {
             capabilities,
             contract: None,
             trusted_workspace: workspace.into(),
+            allow_unconfined_shell: false,
         }
     }
 
     pub fn with_contract(mut self, contract: TaskContract) -> Self {
         self.contract = Some(contract);
+        self
+    }
+
+    /// Let the ordinary host defer shell execution to the normal permission
+    /// policy while still enforcing every statically checkable contract rule.
+    pub fn allowing_unconfined_shell(mut self) -> Self {
+        self.allow_unconfined_shell = true;
         self
     }
 
@@ -296,12 +305,6 @@ impl ContractExecutor {
         // classify apparent effects, but it cannot confine build scripts, subprocesses, or
         // dynamically loaded code. Refuse unless the selected backend really owns a process
         // isolation boundary.
-        if !self.capabilities.can_enforce_process || !self.capabilities.process_isolation {
-            return Err(ExecutionError::ContractUnenforceable(
-                "backend cannot enforce process isolation for contracted shell execution".into(),
-            ));
-        }
-
         // If verification command, verification cannot write outside artifact roots
         if is_verification
             && declared_effects.contains(&DeclaredEffect::FileSystemWrite)
@@ -310,6 +313,14 @@ impl ContractExecutor {
             return Err(ExecutionError::UnauthorizedEffect(
                 "verification command contains shell redirection writing outside artifact roots"
                     .into(),
+            ));
+        }
+
+        if !self.allow_unconfined_shell
+            && (!self.capabilities.can_enforce_process || !self.capabilities.process_isolation)
+        {
+            return Err(ExecutionError::ContractUnenforceable(
+                "backend cannot enforce process isolation for contracted shell execution".into(),
             ));
         }
 
