@@ -45,6 +45,10 @@ jobs:
         run: echo "DAVINCI_TEST_NODE=$(node -p 'process.execPath')" >> "$GITHUB_ENV"
       - name: Deterministic language-intelligence suite
         run: cargo test -p davinci-coding-agent --locked --lib language_intelligence
+      - name: Surface parity and worktree isolation
+        run: cargo test -p davinci-coding-agent --locked --test lsp_surface_parity --test lsp_graph_isolation
+      - name: Transaction freshness
+        run: cargo test -p davinci-coding-agent --locked --test transaction_intelligence
       - name: Semantic core contracts
         run: cargo test -p davinci-agent --locked semantic_tools_registration_and_fallback_execution
 
