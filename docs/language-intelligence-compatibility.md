@@ -176,12 +176,17 @@ zero.
 
 ## Verification status for this implementation session
 
-A dedicated deterministic workflow did start on Linux, Windows, and macOS, but
-all three jobs stopped before compiling language intelligence because the
-repository `Cargo.lock` requires an update while the workflow correctly uses
-`--locked`. This is a repository baseline issue rather than evidence for or
-against the LSP implementation. Per the explicit instruction for this
-implementation pass, unrelated CI/baseline failures were not used as a blocker.
+A dedicated deterministic workflow did start on Linux, Windows, and macOS.
+The LSP slice's missing `toml_edit` dependency entry was repaired, so the
+workflow now passes lockfile consistency and reaches dependency loading. All
+three jobs still stop before compiling language intelligence because the
+repository's existing locked graph selects Edition-2024 transitive releases
+that Cargo 1.83 cannot parse (for example `indexmap 2.14.2` /
+`hashbrown 0.17.1` and `toml_parser 1.1.3` / `winnow 1.0.4`).
+The same versions are already present on `main`; this is a workspace baseline
+compatibility issue rather than evidence for or against the LSP implementation.
+Per the explicit instruction for this implementation pass, unrelated CI/baseline
+failures were not used as a blocker.
 
 The manual live-server workflow could not be dispatched through the available
 GitHub connector in this session. Therefore this report does **not** mark any
