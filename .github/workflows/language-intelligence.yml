@@ -129,28 +129,42 @@ jobs:
           python -m venv "$prefix/basedpyright"
           if [[ "$RUNNER_OS" == "Windows" ]]; then
             "$prefix/basedpyright/Scripts/python.exe" -m pip install --disable-pip-version-check basedpyright==1.40.1
-            echo "DAVINCI_TEST_BASEDPYRIGHT=$(cygpath -w "$prefix/basedpyright/Scripts/basedpyright-langserver.exe")" >> "$GITHUB_ENV"
+            basedpyright_path="$(cygpath -w "$prefix/basedpyright/Scripts/basedpyright-langserver.exe")"
           else
             "$prefix/basedpyright/bin/python" -m pip install --disable-pip-version-check basedpyright==1.40.1
-            echo "DAVINCI_TEST_BASEDPYRIGHT=$prefix/basedpyright/bin/basedpyright-langserver" >> "$GITHUB_ENV"
+            basedpyright_path="$prefix/basedpyright/bin/basedpyright-langserver"
           fi
           npm install --prefix "$prefix/pyright" --no-save --no-package-lock pyright@1.1.414
           npm install --prefix "$prefix/typescript" --no-save --no-package-lock typescript@5.9.3 typescript-language-server@5.3.0
-          echo "DAVINCI_TEST_PYRIGHT=$prefix/pyright/node_modules/pyright/langserver.index.js" >> "$GITHUB_ENV"
-          echo "DAVINCI_TEST_TYPESCRIPT=$prefix/typescript/node_modules/typescript" >> "$GITHUB_ENV"
-          echo "DAVINCI_TEST_LANGUAGE_SERVER=$prefix/typescript/node_modules/typescript-language-server" >> "$GITHUB_ENV"
-          echo "DAVINCI_TEST_RUST_ANALYZER=$(cat "$prefix/rust-analyzer-path.txt")" >> "$GITHUB_ENV"
-          echo "DAVINCI_TEST_PYTHON=$(python -c 'import sys; print(sys.executable)')" >> "$GITHUB_ENV"
+          pyright_server="$prefix/pyright/node_modules/pyright/langserver.index.js"
+          pyright_cli="$prefix/pyright/node_modules/pyright/index.js"
+          typescript_path="$prefix/typescript/node_modules/typescript"
+          tls_path="$prefix/typescript/node_modules/typescript-language-server"
+          if [[ "$RUNNER_OS" == "Windows" ]]; then
+            pyright_server="$(cygpath -w "$pyright_server")"
+            pyright_cli="$(cygpath -w "$pyright_cli")"
+            typescript_path="$(cygpath -w "$typescript_path")"
+            tls_path="$(cygpath -w "$tls_path")"
+          fi
           sysroot="$(rustc --print sysroot)"
-          echo "DAVINCI_TEST_RUST_SYSROOT=$sysroot" >> "$GITHUB_ENV"
-          echo "DAVINCI_TEST_RUST_SRC=$sysroot/lib/rustlib/src/rust/library" >> "$GITHUB_ENV"
+          {
+            echo "DAVINCI_TEST_BASEDPYRIGHT=$basedpyright_path"
+            echo "DAVINCI_TEST_PYRIGHT=$pyright_server"
+            echo "DAVINCI_TEST_PYRIGHT_CLI=$pyright_cli"
+            echo "DAVINCI_TEST_TYPESCRIPT=$typescript_path"
+            echo "DAVINCI_TEST_LANGUAGE_SERVER=$tls_path"
+            echo "DAVINCI_TEST_RUST_ANALYZER=$(cat "$prefix/rust-analyzer-path.txt")"
+            echo "DAVINCI_TEST_PYTHON=$(python -c 'import sys; print(sys.executable)')"
+            echo "DAVINCI_TEST_RUST_SYSROOT=$sysroot"
+            echo "DAVINCI_TEST_RUST_SRC=$sysroot/lib/rustlib/src/rust/library"
+          } >> "$GITHUB_ENV"
       - name: Record provisioned versions
         shell: bash
         run: |
           set -euo pipefail
           "$DAVINCI_TEST_RUST_ANALYZER" --version
           "$DAVINCI_TEST_PYTHON" --version
-          node "$prefix/pyright/node_modules/pyright/index.js" --version
+          node "$DAVINCI_TEST_PYRIGHT_CLI" --version
           "$DAVINCI_TEST_BASEDPYRIGHT" --version
       - name: Real TypeScript semantics
         run: cargo test -p davinci-coding-agent --locked --lib real_typescript_semantics_and_edit_synchronization -- --ignored --nocapture
