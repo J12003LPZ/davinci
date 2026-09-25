@@ -813,7 +813,11 @@ fn list_rows(start: Option<u64>, items: &[Item], width: u16, ctx: &Ctx) -> Vec<L
             continue;
         }
         for (row, line) in body.into_iter().enumerate() {
-            out.push(if row == 0 { prefixed(marker.clone(), line) } else { indent(hang, line.spans) });
+            out.push(if row == 0 {
+                prefixed(marker.clone(), line)
+            } else {
+                indent(hang, line.spans)
+            });
         }
     }
     out

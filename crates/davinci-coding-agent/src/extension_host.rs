@@ -295,14 +295,18 @@ impl ExtensionHost {
                         let error = loaded
                             .error
                             .unwrap_or_else(|| "extension load returned ok=false".into());
-                        eprintln!("davinci: extension {} failed to load: {error}", module.display());
-                        host.load_errors
-                            .push((module.display().to_string(), error));
+                        eprintln!(
+                            "davinci: extension {} failed to load: {error}",
+                            module.display()
+                        );
+                        host.load_errors.push((module.display().to_string(), error));
                     }
                     Err(error) => {
-                        eprintln!("davinci: extension {} failed to load: {error}", module.display());
-                        host.load_errors
-                            .push((module.display().to_string(), error));
+                        eprintln!(
+                            "davinci: extension {} failed to load: {error}",
+                            module.display()
+                        );
+                        host.load_errors.push((module.display().to_string(), error));
                     }
                 }
             }
@@ -1134,7 +1138,12 @@ impl ExtensionHost {
             for tool in &manifest.tools {
                 if tool.name == name {
                     if let Some(command) = &tool.command {
-                        return Some(execute_command_tool(command, &Value::Object(Default::default()), cwd, tool.timeout_ms));
+                        return Some(execute_command_tool(
+                            command,
+                            &Value::Object(Default::default()),
+                            cwd,
+                            tool.timeout_ms,
+                        ));
                     }
                 }
             }
@@ -1591,11 +1600,7 @@ mod tests {
         )
         .unwrap();
         std::fs::write(ext.join("index.js"), "module.exports = (pi) => {").unwrap();
-        let host = ExtensionHost::load_with_cwd(
-            dir.path(),
-            &["broken".into()],
-            dir.path(),
-        );
+        let host = ExtensionHost::load_with_cwd(dir.path(), &["broken".into()], dir.path());
         assert_eq!(host.js.len(), 0);
         assert_eq!(host.load_errors.len(), 1);
         assert!(host.load_errors[0].0.contains("broken"));

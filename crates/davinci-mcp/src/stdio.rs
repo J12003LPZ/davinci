@@ -89,12 +89,10 @@ impl StdioTransport {
         let mut child = cmd
             .spawn()
             .map_err(|err| Error::Transport(format!("spawn `{command}`: {err}")))?;
-        let stdin = Arc::new(Mutex::new(
-            child
-                .stdin
-                .take()
-                .ok_or_else(|| Error::Transport("stdio server has no stdin".into()))?,
-        ));
+        let stdin =
+            Arc::new(Mutex::new(child.stdin.take().ok_or_else(|| {
+                Error::Transport("stdio server has no stdin".into())
+            })?));
         let stdout = child
             .stdout
             .take()
@@ -290,7 +288,6 @@ impl StdioTransport {
             return Ok(parsed.result.unwrap_or(Value::Null));
         }
     }
-
 }
 
 fn server_request_reply(id: Value, method: &str) -> Value {
@@ -388,9 +385,11 @@ fn child_environment(
             })
         })
         .collect();
-    env.extend(config.iter().map(|(key, value)| {
-        (OsString::from(key), OsString::from(value))
-    }));
+    env.extend(
+        config
+            .iter()
+            .map(|(key, value)| (OsString::from(key), OsString::from(value))),
+    );
     env
 }
 
@@ -460,8 +459,14 @@ mod tests {
         let mut config = BTreeMap::new();
         config.insert("FOO".to_string(), "bar".to_string());
         let env = child_environment(parent.into_iter(), &config);
-        assert_eq!(env.get(&OsString::from("PATH")), Some(&OsString::from("/bin")));
-        assert_eq!(env.get(&OsString::from("FOO")), Some(&OsString::from("bar")));
+        assert_eq!(
+            env.get(&OsString::from("PATH")),
+            Some(&OsString::from("/bin"))
+        );
+        assert_eq!(
+            env.get(&OsString::from("FOO")),
+            Some(&OsString::from("bar"))
+        );
         assert!(!env.contains_key(&OsString::from("OPENAI_API_KEY")));
     }
 

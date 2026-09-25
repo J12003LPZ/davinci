@@ -266,9 +266,7 @@ impl LearningStore {
         let candidates_path = self.root.join("candidates.jsonl");
         let mut candidates = String::new();
         for candidate in self.candidates.values() {
-            candidates.push_str(
-                &serde_json::to_string(candidate).map_err(|err| err.to_string())?,
-            );
+            candidates.push_str(&serde_json::to_string(candidate).map_err(|err| err.to_string())?);
             candidates.push('\n');
         }
         davinci_sys::fs::atomic_write(&candidates_path, candidates.as_bytes())

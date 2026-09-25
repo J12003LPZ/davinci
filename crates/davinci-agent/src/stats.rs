@@ -188,7 +188,6 @@ mod tests {
         assert_eq!(restored.cost_minor_units, None);
     }
 
-
     #[test]
     fn older_stats_default_behavioral_fields_to_zero() {
         let mut json = serde_json::to_value(RunStats::default()).unwrap();

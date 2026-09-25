@@ -359,11 +359,9 @@ impl WorkerSessionBinding {
                 return Err("worker tool ledger is a reparse point".into());
             }
         }
-        let ledger = davinci_agent::tool_ledger::ToolCallLedger::load_bound(
-            &ledger_path,
-            &self.session_id,
-        )
-        .map_err(|error| format!("worker tool ledger could not be loaded: {error}"))?;
+        let ledger =
+            davinci_agent::tool_ledger::ToolCallLedger::load_bound(&ledger_path, &self.session_id)
+                .map_err(|error| format!("worker tool ledger could not be loaded: {error}"))?;
         let session = JsonlSession::open(&self.session_path).map_err(|error| error.to_string())?;
         let persisted_results: std::collections::HashSet<String> = session
             .entries

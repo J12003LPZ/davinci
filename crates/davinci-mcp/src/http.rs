@@ -144,11 +144,7 @@ impl HttpTransport {
         Ok(())
     }
 
-    fn read_sse_response(
-        &self,
-        reader: impl Read,
-        want: Option<&Value>,
-    ) -> Result<Value> {
+    fn read_sse_response(&self, reader: impl Read, want: Option<&Value>) -> Result<Value> {
         let mut reader = BufReader::new(reader);
         let mut line = String::new();
         let mut data = String::new();
@@ -447,7 +443,10 @@ mod tests {
                 break;
             }
             bytes.extend_from_slice(&buf[..n]);
-            header_end = bytes.windows(4).position(|window| window == b"\r\n\r\n").map(|i| i + 4);
+            header_end = bytes
+                .windows(4)
+                .position(|window| window == b"\r\n\r\n")
+                .map(|i| i + 4);
         }
         if let Some(end) = header_end {
             let headers = String::from_utf8_lossy(&bytes[..end]);

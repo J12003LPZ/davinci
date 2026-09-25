@@ -221,8 +221,7 @@ pub fn resolve_extension_module(dir: &Path) -> Option<PathBuf> {
 }
 
 #[cfg(test)]
-static JS_SESSION_SPAWNS: std::sync::atomic::AtomicUsize =
-    std::sync::atomic::AtomicUsize::new(0);
+static JS_SESSION_SPAWNS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
 struct PersistentJsSession {
     child: Child,
@@ -291,14 +290,10 @@ fn drain_snapshot(
     done: &std::sync::Arc<std::sync::atomic::AtomicBool>,
 ) -> Vec<u8> {
     let deadline = std::time::Instant::now() + Duration::from_millis(500);
-    while !done.load(std::sync::atomic::Ordering::Acquire)
-        && std::time::Instant::now() < deadline
-    {
+    while !done.load(std::sync::atomic::Ordering::Acquire) && std::time::Instant::now() < deadline {
         std::thread::sleep(Duration::from_millis(5));
     }
-    data.lock()
-        .unwrap_or_else(|err| err.into_inner())
-        .clone()
+    data.lock().unwrap_or_else(|err| err.into_inner()).clone()
 }
 
 fn extension_timeout_for_op(op: &str) -> Duration {
@@ -310,7 +305,6 @@ fn extension_timeout_for_op(op: &str) -> Duration {
         extension_reply_timeout()
     }
 }
-
 
 impl PersistentJsSession {
     fn start(module: &Path) -> Result<Self, String> {
@@ -1031,7 +1025,9 @@ pub fn execute_command_tool(
         process.args(["-c", command]);
         process
     };
-    process.current_dir(cwd).env("DAVINCI_TOOL_ARGS", &args_json);
+    process
+        .current_dir(cwd)
+        .env("DAVINCI_TOOL_ARGS", &args_json);
     let output = davinci_sys::process::run_bounded(
         process,
         Some(args_json.into_bytes()),
@@ -1095,25 +1091,13 @@ mod tests {
         let first = tempdir().unwrap();
         let second = tempdir().unwrap();
         for dir in [&first, &second] {
-            std::fs::write(
-                dir.path().join("index.js"),
-                "module.exports = () => {};\n",
-            )
-            .unwrap();
+            std::fs::write(dir.path().join("index.js"), "module.exports = () => {};\n").unwrap();
         }
         let first_module = resolve_extension_module(first.path()).unwrap();
         let second_module = resolve_extension_module(second.path()).unwrap();
         for _ in 0..10 {
-            let _ = run_persistent_js_extension(
-                &first_module,
-                "load",
-                &serde_json::json!({}),
-            );
-            let _ = run_persistent_js_extension(
-                &second_module,
-                "load",
-                &serde_json::json!({}),
-            );
+            let _ = run_persistent_js_extension(&first_module, "load", &serde_json::json!({}));
+            let _ = run_persistent_js_extension(&second_module, "load", &serde_json::json!({}));
         }
         assert_eq!(
             JS_SESSION_SPAWNS.load(std::sync::atomic::Ordering::SeqCst),
@@ -1861,8 +1845,7 @@ module.exports = (pi) => {
         } else {
             "printf fixture-ok"
         };
-        let out =
-            execute_command_tool(command, &serde_json::json!({}), dir.path(), None).unwrap();
+        let out = execute_command_tool(command, &serde_json::json!({}), dir.path(), None).unwrap();
         assert_eq!(out.trim_end_matches(['\r', '\n']), "fixture-ok");
     }
 

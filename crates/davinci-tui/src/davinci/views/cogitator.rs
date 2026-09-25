@@ -256,7 +256,10 @@ fn picker_panel(model: &Model, height: usize, echo: bool) -> Vec<Line<'static>> 
     }
     out.push(ui::blank());
     if !model.catalog_query.is_empty() {
-        out.push(detail(format!("Search: {}", model.catalog_query), cc.inactive));
+        out.push(detail(
+            format!("Search: {}", model.catalog_query),
+            cc.inactive,
+        ));
     }
     let selected = visible_indices(model)
         .contains(&model.catalog_index)

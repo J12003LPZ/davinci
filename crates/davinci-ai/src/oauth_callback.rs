@@ -645,8 +645,7 @@ mod tests {
     #[test]
     fn stray_requests_do_not_consume_the_callback() {
         let mut server =
-            CallbackServer::bind("127.0.0.1", 0, CallbackProvider::OpenAiCodex, "state-1")
-                .unwrap();
+            CallbackServer::bind("127.0.0.1", 0, CallbackProvider::OpenAiCodex, "state-1").unwrap();
         let addr = server.local_addr().unwrap();
         let client = std::thread::spawn(move || {
             for target in ["/favicon.ico", "/auth/callback?code=real&state=state-1"] {
@@ -670,8 +669,7 @@ mod tests {
     #[test]
     fn silent_preconnect_does_not_end_login() {
         let mut server =
-            CallbackServer::bind("127.0.0.1", 0, CallbackProvider::OpenAiCodex, "state-1")
-                .unwrap();
+            CallbackServer::bind("127.0.0.1", 0, CallbackProvider::OpenAiCodex, "state-1").unwrap();
         let addr = server.local_addr().unwrap();
         let client = std::thread::spawn(move || {
             let silent = std::net::TcpStream::connect(addr).unwrap();

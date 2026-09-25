@@ -136,8 +136,7 @@ pub use oauth_providers::{
     authorize_request, device_status_from_error, exchange_authorization_code,
     fresh_authorize_request, generate_pkce, oauth_providers, parse_authorization_input,
     refresh_oauth_token, save_pending_login, take_pending_login, token_exchange_request,
-    token_refresh_request, AuthorizeRequest,
-    OauthTokens, Pkce, TokenExchangeRequest,
+    token_refresh_request, AuthorizeRequest, OauthTokens, Pkce, TokenExchangeRequest,
 };
 pub use openai_cache_diagnostics::{
     configured_comparison_response_id, diagnostics_every_n_from_env, latest_applied_policy,
@@ -169,14 +168,14 @@ pub use shell::{
     resolve_shell_config, CommandTransport, ResolveCommandOptions, ShellConfig,
 };
 pub use stream::{
-    assistant_to_chat, complete_from_events, complete_simple, events_from_complete,
-    fixture_complete, live_complete, live_complete_streaming_with,
+    assistant_to_chat, attach_native_items, complete_from_events, complete_simple,
+    events_from_complete, fixture_complete, live_complete, live_complete_streaming_with,
     live_complete_streaming_with_sink, live_complete_streaming_with_sink_envelope,
-    live_complete_with, live_stream, parse_sse_block, replay_sse_events, request_body,
-    attach_native_items, raw_provider_post, request_body_with, request_url,
-    resolve_json_schema_strict_sampling, AssistantMessage, AssistantMessageEvent, ContentBlock,
-    ProviderCompletionEnvelope, RawProviderReply, ResponsesInputOptions, StopReason, StreamEvent,
-    StreamOptions, NATIVE_ITEMS_KEY, NATIVE_MODEL_KEY,
+    live_complete_with, live_stream, parse_sse_block, raw_provider_post, replay_sse_events,
+    request_body, request_body_with, request_url, resolve_json_schema_strict_sampling,
+    AssistantMessage, AssistantMessageEvent, ContentBlock, ProviderCompletionEnvelope,
+    RawProviderReply, ResponsesInputOptions, StopReason, StreamEvent, StreamOptions,
+    NATIVE_ITEMS_KEY, NATIVE_MODEL_KEY,
 };
 pub use stream_decoder::{
     decoder_for, frames_of, new_message, supports_incremental_stream, ResponsesDecoder, SseFrame,

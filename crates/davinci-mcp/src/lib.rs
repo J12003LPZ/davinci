@@ -398,11 +398,7 @@ pub fn is_ident(name: &str) -> bool {
 /// and edge underscores would make delimiter parsing ambiguous in older
 /// clients, so refuse them even though tool routing no longer parses names.
 pub fn validate_server_name(name: &str) -> std::result::Result<(), String> {
-    if !is_ident(name)
-        || name.contains("__")
-        || name.starts_with('_')
-        || name.ends_with('_')
-    {
+    if !is_ident(name) || name.contains("__") || name.starts_with('_') || name.ends_with('_') {
         return Err(format!(
             "MCP server name `{name}` must use letters, digits, `-` and single `_`, and not start or end with `_`"
         ));
@@ -579,7 +575,9 @@ mod tests {
     #[test]
     fn chatty_stdio_server_does_not_deadlock_the_client() {
         let mut client = fixture_client(&["--chatty"]);
-        let ok = client.call_tool("echo", json!({"text": "still responsive"})).unwrap();
+        let ok = client
+            .call_tool("echo", json!({"text": "still responsive"}))
+            .unwrap();
         assert_eq!(ok.text(), "still responsive");
     }
 

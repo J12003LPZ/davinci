@@ -813,7 +813,12 @@ fn handle_suggestion_key(model: &mut Model, data: Option<&str>) -> Option<Flow> 
         let run = !tab && runs_on_enter(model);
         if model.accept_suggestion() || tab {
             if run {
-                let sent = model.composer.editor().get_expanded_text().trim_end().to_string();
+                let sent = model
+                    .composer
+                    .editor()
+                    .get_expanded_text()
+                    .trim_end()
+                    .to_string();
                 model.dismiss_suggestions();
                 model.submit();
                 return Some(Flow::Submit(sent));

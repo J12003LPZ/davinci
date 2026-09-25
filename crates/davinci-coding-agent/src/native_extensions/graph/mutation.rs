@@ -131,9 +131,7 @@ fn list_workspace_files(cwd: &Path) -> Vec<String> {
                 }
             }
         }
-        if let Ok(output) =
-            super::git::run(cwd, &["ls-files", "--others", "--exclude-standard"])
-        {
+        if let Ok(output) = super::git::run(cwd, &["ls-files", "--others", "--exclude-standard"]) {
             for line in String::from_utf8_lossy(&output).lines() {
                 let trimmed = line.trim();
                 if !trimmed.is_empty() {
@@ -483,8 +481,7 @@ mod tests {
 
     #[test]
     fn legacy_inline_contents_still_deserialize() {
-        let legacy =
-            r#"{"files":{"a.txt":{"hash":"h","len":3}},"contents":{"a.txt":[97,98,99]}}"#;
+        let legacy = r#"{"files":{"a.txt":{"hash":"h","len":3}},"contents":{"a.txt":[97,98,99]}}"#;
         let baseline: MutationBaseline = serde_json::from_str(legacy).unwrap();
         assert_eq!(baseline.contents["a.txt"], b"abc");
     }

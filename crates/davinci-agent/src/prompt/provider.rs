@@ -107,8 +107,7 @@ mod tests {
 
     #[test]
     fn openai_reasoning_models_get_a_stable_adapter() {
-        let module =
-            provider_adapter(PromptModelFamily::OpenAiReasoning).expect("OpenAI adapter");
+        let module = provider_adapter(PromptModelFamily::OpenAiReasoning).expect("OpenAI adapter");
         assert_eq!(module.id, "provider.openai-reasoning");
         assert_eq!(module.cache_class, PromptCacheClass::Stable);
         assert!(module.body.contains("parallel"));

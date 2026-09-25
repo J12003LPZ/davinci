@@ -1408,8 +1408,9 @@ mod tests {
             }
         }
 
-        let body =
-            "data: {\"model\":\"local\",\"event\":\"モデル\"}\n\n".as_bytes().to_vec();
+        let body = "data: {\"model\":\"local\",\"event\":\"モデル\"}\n\n"
+            .as_bytes()
+            .to_vec();
         let first_non_ascii = body.iter().position(|byte| *byte >= 0x80).unwrap();
         let split = first_non_ascii + 1;
         let reader = Chunked {

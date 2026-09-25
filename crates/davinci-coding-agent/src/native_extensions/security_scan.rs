@@ -861,8 +861,7 @@ impl SecurityScanController {
     }
 
     pub fn wait_for_review(&self) -> bool {
-        self.review
-            .wait_timeout(std::time::Duration::from_secs(30))
+        self.review.wait_timeout(std::time::Duration::from_secs(30))
     }
 
     pub fn abort_review(&self) {

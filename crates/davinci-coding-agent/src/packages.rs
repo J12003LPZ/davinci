@@ -312,7 +312,6 @@ pub use crate::package_source::{
     parse_package_source, ParsedSource,
 };
 
-
 fn settings_dir_for(local: bool, agent_dir: &Path, cwd: &Path) -> PathBuf {
     if !local {
         return agent_dir.to_path_buf();
@@ -326,9 +325,12 @@ fn settings_dir_for(local: bool, agent_dir: &Path, cwd: &Path) -> PathBuf {
 
 fn normalize_local_source(path: &str, cwd: &Path) -> Result<String, String> {
     let expanded = crate::package_source::expand_local(path, cwd);
-    let canonical = expanded
-        .canonicalize()
-        .map_err(|err| format!("Unable to resolve local package {}: {err}", expanded.display()))?;
+    let canonical = expanded.canonicalize().map_err(|err| {
+        format!(
+            "Unable to resolve local package {}: {err}",
+            expanded.display()
+        )
+    })?;
     Ok(crate::trust::display_path(&canonical))
 }
 
@@ -362,7 +364,6 @@ fn install_and_persist(source: &str, local: bool, agent_dir: &Path) -> Result<St
     })?;
     Ok(stored_source)
 }
-
 
 fn git_package_name(url: &str) -> String {
     url.rsplit('/')

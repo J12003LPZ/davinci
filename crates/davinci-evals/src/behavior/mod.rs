@@ -34,8 +34,8 @@ pub use runner::{
     aggregate_scenario_results, aggregate_suite_scores, classify_failure_signal,
     classify_process_result, evaluate_scenario_trace, require_scored_runs,
     scheduled_infrastructure_gate, summarize_dispositions, BehaviorSuiteSummary,
-    DispositionedSuiteSummary, RunDisposition,
-    RunDispositionSummary, MAX_SCHEDULED_INFRASTRUCTURE_FAILURE_RATE,
+    DispositionedSuiteSummary, RunDisposition, RunDispositionSummary,
+    MAX_SCHEDULED_INFRASTRUCTURE_FAILURE_RATE,
 };
 pub use scenario::{
     load_core_200_corpus, load_debugging_hard_corpus, load_long_horizon_corpus,

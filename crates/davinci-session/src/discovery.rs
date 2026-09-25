@@ -211,7 +211,10 @@ fn is_session_jsonl(path: &Path) -> bool {
     if path.extension().and_then(|ext| ext.to_str()) != Some("jsonl") {
         return false;
     }
-    let name = path.file_name().and_then(|name| name.to_str()).unwrap_or("");
+    let name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("");
     !name.ends_with(".runtime.jsonl")
 }
 
@@ -367,7 +370,9 @@ pub fn discover_session_headers(
             continue;
         }
         for entry in fs::read_dir(&root)
-            .map_err(|err| SessionError::storage(format!("Unable to list session directory: {err}")))?
+            .map_err(|err| {
+                SessionError::storage(format!("Unable to list session directory: {err}"))
+            })?
             .flatten()
         {
             let path = entry.path();
@@ -485,11 +490,7 @@ mod tests {
             ))
             .unwrap();
         let sidecar = session.path.with_extension("runtime.jsonl");
-        std::fs::write(
-            &sidecar,
-            "{\"type\":\"runtime\",\"schema_version\":1}\n",
-        )
-        .unwrap();
+        std::fs::write(&sidecar, "{\"type\":\"runtime\",\"schema_version\":1}\n").unwrap();
 
         let found = discover_sessions(dir.path(), None).unwrap();
         assert_eq!(found.len(), 1);
