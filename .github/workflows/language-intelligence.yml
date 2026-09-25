@@ -150,6 +150,8 @@ jobs:
         run: cargo test -p davinci-coding-agent --locked --lib real_typescript_semantics_and_edit_synchronization -- --ignored --nocapture
       - name: Real rust-analyzer semantics
         run: cargo test -p davinci-coding-agent --locked --lib real_rust_lsp_semantics -- --ignored --nocapture
+      - name: Real BasedPyright project interpreter trust boundary
+        run: cargo test -p davinci-coding-agent --locked --lib real_python_project_venv_executes_only_after_trusted_launch -- --ignored --nocapture
       - name: Real BasedPyright semantics
         run: cargo test -p davinci-coding-agent --locked --lib real_basedpyright_lsp_semantics -- --ignored --nocapture
       - name: Real Pyright semantics
