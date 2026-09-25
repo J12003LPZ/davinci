@@ -907,6 +907,57 @@ mod tests {
     }
 
     #[test]
+    fn python_project_venv_requires_trust_and_is_reported_when_selected() {
+        let workspace = TestWorkspace::new("python", "capture");
+        let interpreter = if cfg!(windows) {
+            workspace.root().join(".venv/Scripts/python.exe")
+        } else {
+            workspace.root().join(".venv/bin/python")
+        };
+        std::fs::create_dir_all(interpreter.parent().unwrap()).unwrap();
+        std::fs::write(&interpreter, b"fixture interpreter").unwrap();
+
+        let mut denied =
+            davinci_agent::PermissionPolicy::new(davinci_agent::PermissionMode::AlwaysApprove);
+        denied.project_trusted = false;
+        workspace
+            .manager
+            .set_permissions(Some(Arc::new(davinci_agent::PermissionState::new(denied))));
+        let denied_result = workspace
+            .manager
+            .execute("lsp_hover", &json!({"path":"app.py","line":1,"column":1}))
+            .unwrap();
+        assert!(denied_result.is_error);
+        assert_eq!(
+            denied_result.details.unwrap()["error"]["code"],
+            "server_launch_denied"
+        );
+        assert!(workspace.events().is_empty());
+
+        let mut trusted =
+            davinci_agent::PermissionPolicy::new(davinci_agent::PermissionMode::AlwaysApprove);
+        trusted.project_trusted = true;
+        workspace
+            .manager
+            .set_permissions(Some(Arc::new(davinci_agent::PermissionState::new(trusted))));
+        let result = workspace
+            .manager
+            .execute("lsp_hover", &json!({"path":"app.py","line":1,"column":1}))
+            .unwrap();
+        assert!(!result.is_error, "{}", result.content);
+        let status = workspace.manager.status();
+        assert_eq!(
+            status["sessions"][0]["analysisEnvironment"],
+            json!(interpreter.canonicalize().unwrap())
+        );
+        assert!(status["sessions"][0]["limitations"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|value| value == "project_interpreter_executed_requires_trust"));
+    }
+
+    #[test]
     fn status_is_nonexecuting_and_lists_all_profiles() {
         let workspace = TestWorkspace::new("rust", "capture");
         let status = workspace.manager.status();
