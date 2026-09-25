@@ -2362,11 +2362,9 @@ fn complete_prompt_with_host(
         .unwrap_or_else(|error| error.into_inner())
         .register_with(&runtime_handle.capability_registry);
     agent.set_runtime(runtime_handle);
-    if agent.turn_context_placement()
-        == davinci_agent::turn_context::TurnContextPlacement::Appended
-    {
-        agent.freeze_tools_for_cache();
-    }
+    // After the runtime registry exists, so its tools are part of the frozen
+    // prefix. A no-op outside cache-sensitive (appended) routes.
+    agent.freeze_tools_for_cache();
     // Print/RPC turns need the same native permission, model and runtime
     // bindings as the interactive shell before a discovered tool executes.
     apply_graph_session_context(
@@ -2646,7 +2644,12 @@ fn complete_prompt_with_host(
                 AgentEvent::AgentEnd { messages, .. } => messages
                     .iter()
                     .rev()
-                    .find(|m| m.role == "assistant")
+                    .find(|m| {
+                        m.role == "assistant"
+                            && !m
+                                .extra
+                                .contains_key(davinci_agent::HARNESS_VERIFICATION_FIELD)
+                    })
                     .map(|m| content_text(&m.content)),
                 _ => None,
             })

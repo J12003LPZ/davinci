@@ -2309,7 +2309,9 @@ impl Agent {
 
     pub fn last_assistant_text(&self) -> Option<String> {
         self.messages.iter().rev().find_map(|message| {
-            if message.role == "assistant" {
+            if message.role == "assistant"
+                && !message.extra.contains_key(HARNESS_VERIFICATION_FIELD)
+            {
                 Some(content_text(&message.content))
             } else {
                 None
@@ -3212,7 +3214,108 @@ fn verification_coverage_for_command(
         }
         return (VerificationCoverage::Unrelated, targets);
     }
-    (VerificationCoverage::Unknown, Vec::new())
+    if lower.contains("cargo") {
+        return (VerificationCoverage::Unknown, Vec::new());
+    }
+    path_scoped_coverage(command, mutation_paths)
+}
+
+/// Coverage for verifiers outside Cargo (pytest, go test, npm test, ...).
+/// Without path arguments the command runs the project's suite. With path
+/// arguments it covers the change only when one names a test directory, a
+/// changed file, a directory above one, or the conventional test file for one.
+fn path_scoped_coverage(
+    command: &str,
+    mutation_paths: &[PathBuf],
+) -> (VerificationCoverage, Vec<String>) {
+    let targets = command
+        .split_whitespace()
+        .map(|word| word.trim_matches(|c| c == '"' || c == '\''))
+        .filter(|word| is_path_argument(word))
+        .map(|word| {
+            word.split("::")
+                .next()
+                .unwrap_or(word)
+                .replace('\\', "/")
+                .trim_start_matches("./")
+                .trim_end_matches('/')
+                .to_string()
+        })
+        .filter(|target| !target.is_empty())
+        .collect::<Vec<_>>();
+    if targets.is_empty() {
+        return (VerificationCoverage::Broad, vec!["project".into()]);
+    }
+    let covered = mutation_paths.iter().any(|path| {
+        let changed = path.to_string_lossy().replace('\\', "/");
+        let stem = path
+            .file_stem()
+            .and_then(|stem| stem.to_str())
+            .unwrap_or_default();
+        targets.iter().any(|target| {
+            is_test_suite_directory(target)
+                || changed == *target
+                || changed.ends_with(&format!("/{target}"))
+                || changed.starts_with(&format!("{target}/"))
+                || changed.contains(&format!("/{target}/"))
+                || (!stem.is_empty() && names_test_for(target, stem))
+        })
+    });
+    let coverage = if covered {
+        VerificationCoverage::Targeted
+    } else {
+        VerificationCoverage::Unrelated
+    };
+    (coverage, targets)
+}
+
+fn is_path_argument(word: &str) -> bool {
+    const SOURCE_EXTENSIONS: &[&str] = &[
+        "py", "go", "js", "jsx", "mjs", "cjs", "ts", "tsx", "mts", "cts", "cs", "java", "kt", "rb",
+        "php", "c", "cc", "cpp", "h", "hpp", "swift",
+    ];
+    if word.is_empty()
+        || word.starts_with('-')
+        || word.ends_with("...")
+        || word == "."
+        || word.contains(['>', '<', '|', '&', ';', '$', '='])
+    {
+        return false;
+    }
+    word.contains('/')
+        || word.contains('\\')
+        || word.contains("::")
+        || Path::new(word.split("::").next().unwrap_or(word))
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .is_some_and(|extension| SOURCE_EXTENSIONS.contains(&extension))
+}
+
+/// A whole test directory (`tests/`, `spec/`, ...) is the project's suite.
+fn is_test_suite_directory(target: &str) -> bool {
+    let name = target.rsplit('/').next().unwrap_or(target);
+    matches!(
+        name,
+        "test" | "tests" | "spec" | "specs" | "__tests__" | "testing"
+    )
+}
+
+/// `test_calc.py`, `calc_test.go`, `calc.test.ts` and `calc.spec.ts` test `calc`.
+fn names_test_for(target: &str, stem: &str) -> bool {
+    let name = target.rsplit('/').next().unwrap_or(target);
+    let target_stem = Path::new(name)
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .unwrap_or(name);
+    [
+        format!("test_{stem}"),
+        format!("{stem}_test"),
+        format!("{stem}.test"),
+        format!("{stem}.spec"),
+        format!("{stem}_spec"),
+    ]
+    .iter()
+    .any(|candidate| candidate == target_stem)
 }
 
 #[derive(Debug, Clone, Default)]
@@ -3346,6 +3449,9 @@ impl From<AssistantMessage> for CompleteOutput {
 /// job finished.
 pub const JOB_NOTICE_TYPE: &str = "backgroundJob";
 const REAL_USER_ORIGIN_FIELD: &str = "davinciRealUserOrigin";
+/// Marks the assistant tool call the harness issues when it re-runs the last
+/// verification command. It carries no text and is never the model's reply.
+pub const HARNESS_VERIFICATION_FIELD: &str = "davinciHarnessVerification";
 
 pub fn default_system_prompt() -> String {
     prompt::compose_legacy_default().text

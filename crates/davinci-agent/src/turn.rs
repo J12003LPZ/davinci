@@ -72,7 +72,12 @@ fn agent_call_may_write_shared(args: &Value, mode: crate::PermissionMode) -> boo
 /// What happened when the harness re-ran the last verification command.
 enum HarnessVerification {
     Passed,
-    Failed { output_tail: String },
+    Failed {
+        output_tail: String,
+    },
+    /// The rerun did not fail, but it does not cover the changed files (or it
+    /// was denied). The plain verification reminder applies.
+    Inconclusive,
 }
 
 impl Agent {
@@ -107,7 +112,7 @@ impl Agent {
         };
         let mut chat = assistant_to_chat(&assistant);
         chat.extra
-            .insert("davinciHarnessVerification".into(), Value::Bool(true));
+            .insert(crate::HARNESS_VERIFICATION_FIELD.into(), Value::Bool(true));
         self.messages.push(chat.clone());
         self.persist_assistant(&assistant, &chat, None);
         self.ensure_session_persistence()?;
@@ -124,9 +129,19 @@ impl Agent {
         let results =
             self.execute_tool_batch(&cwd, vec![(call_id, last.tool.clone(), arguments)], events);
         let mut output_tail = String::new();
+        let mut rerun_failed = false;
+        let mut rerun_denied = false;
         for mut result in results {
             let name = result.tool_name.clone().unwrap_or_default();
             self.after_tool(&name, &mut result);
+            let denied = result
+                .extra
+                .get("details")
+                .and_then(|details| details.get("denied"))
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            rerun_denied |= denied;
+            rerun_failed |= !denied && result.is_error == Some(true);
             let text = davinci_ai::content_text(&result.content);
             let lines: Vec<&str> = text.lines().collect();
             output_tail = lines[lines.len().saturating_sub(30)..].join("\n");
@@ -141,13 +156,19 @@ impl Agent {
             );
             self.push_event(events, AgentEvent::MessageEnd { message: result });
         }
-        Ok(
-            if self.completion_evidence() == crate::CompletionEvidence::Verified {
-                HarnessVerification::Passed
-            } else {
+        // The rerun's own exit status decides failure. Evidence alone cannot:
+        // a passing run whose command does not cover the changed files is
+        // unverified, not failed, and telling the model it failed sends it
+        // chasing a failure that does not exist.
+        Ok(match self.completion_evidence() {
+            _ if rerun_denied => HarnessVerification::Inconclusive,
+            crate::CompletionEvidence::Verified => HarnessVerification::Passed,
+            crate::CompletionEvidence::VerificationFailed => {
                 HarnessVerification::Failed { output_tail }
-            },
-        )
+            }
+            _ if rerun_failed => HarnessVerification::Failed { output_tail },
+            _ => HarnessVerification::Inconclusive,
+        })
     }
 
     /// Start a loop after user prompts have already been appended.
@@ -592,7 +613,7 @@ impl Agent {
                             );
                             continue;
                         }
-                        None => {
+                        Some(HarnessVerification::Inconclusive) | None => {
                             let message = match completion_evidence {
                                 crate::CompletionEvidence::VerificationFailed => {
                                     "The latest verification command failed after a file change. Investigate the failure or report it explicitly before finalizing."

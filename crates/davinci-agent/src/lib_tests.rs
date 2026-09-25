@@ -3296,6 +3296,84 @@ fn harness_reruns_the_last_verification_after_a_later_edit() {
     assert_eq!(harness_runs(&agent), 1);
     assert!(reminders(&agent).is_empty(), "{:?}", reminders(&agent));
     assert_eq!(agent.completion_evidence(), CompletionEvidence::Verified);
+    assert_eq!(
+        agent.last_assistant_text().as_deref(),
+        Some("done"),
+        "the harness tool call must not replace the model's reply"
+    );
+}
+
+#[test]
+fn a_passing_rerun_that_misses_the_change_is_not_reported_as_failed() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut agent = verifying_agent(dir.path());
+    agent.prompt("edit, verify, edit again");
+    let mut model_calls = 0;
+    let mut script = scripted_tool_calls(vec![
+        (
+            "write",
+            serde_json::json!({"path": "a.txt", "content": "one"}),
+        ),
+        (
+            shell_tool(),
+            serde_json::json!({"command": "cargo test -p unrelated-crate --help"}),
+        ),
+        (
+            "write",
+            serde_json::json!({"path": "a.txt", "content": "two"}),
+        ),
+    ]);
+    agent
+        .run_loop(|current| {
+            model_calls += 1;
+            script(current)
+        })
+        .unwrap();
+
+    assert_eq!(harness_runs(&agent), 1);
+    let reminders = reminders(&agent);
+    assert_eq!(reminders.len(), 1, "{reminders:?}");
+    assert!(
+        reminders[0].contains("have not completed a verification command"),
+        "{}",
+        reminders[0]
+    );
+    assert!(!reminders[0].contains("failed"), "{}", reminders[0]);
+    assert_eq!(model_calls, 5);
+}
+
+#[test]
+fn non_cargo_verifiers_cover_the_files_they_test() {
+    let cases = [
+        ("pytest -q", true, CompletionEvidence::Verified),
+        ("python -m pytest -q", true, CompletionEvidence::Verified),
+        (
+            "python -m pytest tests/test_intervals.py -q",
+            true,
+            CompletionEvidence::Verified,
+        ),
+        ("pytest tests/", true, CompletionEvidence::Verified),
+        ("pytest .\\tests\\", true, CompletionEvidence::Verified),
+        (
+            "pytest tests/test_intervals.py::test_touching",
+            true,
+            CompletionEvidence::Verified,
+        ),
+        ("go test ./...", true, CompletionEvidence::Verified),
+        ("npm test", true, CompletionEvidence::Verified),
+        (
+            "pytest tests/test_checkout.py",
+            true,
+            CompletionEvidence::Unverified,
+        ),
+        ("pytest -q", false, CompletionEvidence::VerificationFailed),
+    ];
+    for (command, succeeded, expected) in cases {
+        let agent = Agent::new("x");
+        agent.record_successful_mutation_paths(vec![PathBuf::from("src/intervals.py")]);
+        agent.record_verification_command(command, succeeded);
+        assert_eq!(agent.completion_evidence(), expected, "{command}");
+    }
 }
 
 #[test]

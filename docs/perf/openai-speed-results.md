@@ -121,6 +121,25 @@ SQLite can bypass its busy handler during lock upgrades; see the
 [SQLite documentation](https://www.sqlite.org/c3ref/busy_handler.html).
 Thirty consecutive concurrent-open repetitions passed after the fix.
 
+## Post-review fix: false verification failures
+
+A review of the final campaign streams found that the completion gate fired
+in 24 of 24 runs and that the harness rerun reported "failed" in 9 of them
+although pytest passed. Two causes:
+
+- Verification coverage only understood Cargo commands. A passing `pytest`,
+  `go test` or `npm test` was classified `Unknown`, so the change stayed
+  unverified.
+- The rerun was judged failed whenever the evidence was not `Verified`,
+  rather than by the rerun's own exit status.
+
+Non-Cargo verifiers are now scoped by their path arguments (none means the
+project's suite), and a rerun is failed only when it exits with an error.
+A passing rerun that does not cover the change falls back to the plain
+reminder. The harness tool call is also excluded from the reply text so a
+passing rerun cannot blank the final answer. The campaigns above predate this
+fix; they have not been re-run.
+
 ## Settings
 
 | Setting | Environment | Behavior |
