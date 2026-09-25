@@ -672,6 +672,12 @@ Set `autoVerify` to `false`, or `DAVINCI_AUTO_VERIFY` to `0`, `false`, or `off`,
 to keep the model reminder instead. The environment switch takes precedence
 and also applies when settings are reloaded.
 
+`serviceTier` is optional and applies only to ChatGPT sign-in (Codex) requests.
+`fast` and `priority` request priority processing; `flex` requests flex processing.
+Omit it for the standard tier. Priority processing may consume plan limits faster;
+availability and speed depend on the backend. `DAVINCI_OPENAI_SERVICE_TIER` accepts
+the same values when the setting is absent. Other values omit the request field.
+
 ~~~text
 DAVINCI_CODING_AGENT_DIR
 DAVINCI_CODING_AGENT_SESSION_DIR

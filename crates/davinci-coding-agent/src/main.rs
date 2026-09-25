@@ -642,6 +642,9 @@ fn build_agent(parsed: &Args, session_dir: &Path, cwd: &Path) -> Result<Agent, S
     if let Some(value) = settings.openai_verbosity.as_deref() {
         std::env::set_var("DAVINCI_OPENAI_VERBOSITY", value);
     }
+    if let Some(tier) = settings.service_tier.as_deref() {
+        std::env::set_var("DAVINCI_OPENAI_SERVICE_TIER", tier);
+    }
     if let Some(value) = settings.reasoning_summary.as_deref() {
         std::env::set_var("DAVINCI_REASONING_SUMMARY", value);
     }

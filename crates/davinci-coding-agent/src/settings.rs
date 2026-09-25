@@ -317,6 +317,8 @@ pub struct Settings {
     pub openai_verbosity: Option<String>,
     #[serde(default, rename = "autoVerify")]
     pub auto_verify: Option<bool>,
+    #[serde(default, rename = "serviceTier")]
+    pub service_tier: Option<String>,
     #[serde(default, rename = "reasoningSummary")]
     pub reasoning_summary: Option<String>,
     #[serde(default, rename = "graphEconomyModel")]
@@ -1566,6 +1568,12 @@ pub fn is_trusted(settings: &Settings, cwd: &Path, override_trust: Option<bool>)
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn service_tier_setting_parses() {
+        let settings: super::Settings = serde_json::from_str(r#"{"serviceTier":"fast"}"#).unwrap();
+        assert_eq!(settings.service_tier.as_deref(), Some("fast"));
+        assert!(super::Settings::default().service_tier.is_none());
+    }
     #[test]
     fn auto_verify_setting_parses_and_environment_can_disable_it() {
         let settings: super::Settings = serde_json::from_str(r#"{"autoVerify":false}"#).unwrap();
