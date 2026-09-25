@@ -1608,6 +1608,37 @@ mod tests {
     }
 
     #[test]
+    fn lsp_retained_output_is_denied_after_permission_revision() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = dir.path().join("workspace");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let source = workspace.join("lib.rs");
+        std::fs::write(&source, "pub fn value() {}\n").unwrap();
+        let permissions = Arc::new(PermissionState::new(davinci_agent::PermissionPolicy::new(
+            davinci_agent::PermissionMode::AlwaysApprove,
+        )));
+        permissions.lock().unwrap().project_trusted = true;
+        let store = OutputStore::new(dir.path().join("outputs"));
+        let mut governor = TokenGovernor::with_store("lsp-auth", tiny_thresholds(), store);
+        let id = governor
+            .retain_lsp_output(
+                "lsp_references",
+                &json!({"path":"lib.rs","line":1,"column":1}),
+                r#"{"items":[{"path":"lib.rs"}]}"#,
+                &workspace,
+                Some(&source),
+                permissions.clone(),
+            )
+            .unwrap();
+        assert!(!governor.retrieve(&json!({"id":id})).unwrap().is_error);
+        permissions.lock().unwrap().project_trusted = false;
+        assert!(governor.retrieve(&json!({"id":id})).is_err());
+        assert!(governor
+            .retrieve_artifact(&format!("governor://output/{id}"))
+            .is_err());
+    }
+
+    #[test]
     fn torn_stored_output_is_rewritten() {
         let dir = tempfile::tempdir().unwrap();
         let store = OutputStore::new(dir.path().to_path_buf());
