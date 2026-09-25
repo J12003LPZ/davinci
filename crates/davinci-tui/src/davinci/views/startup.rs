@@ -25,14 +25,24 @@ pub fn banner(model: &Model, info: &Startup) -> Vec<Line<'static>> {
         info.cwd.clone()
     };
     let rows = [
-        vec![span(" ██████╗   ", cc.claude), name, span(format!(" v{}", env!("CARGO_PKG_VERSION")), cc.inactive)],
+        vec![
+            span(" ██████╗   ", cc.claude),
+            name,
+            span(format!(" v{}", env!("CARGO_PKG_VERSION")), cc.inactive),
+        ],
         vec![
             span(" ██   ██║  ", cc.claude),
-            span(format!("{} with {} effort", model.model_name, model.thinking_level), cc.inactive),
+            span(
+                format!("{} with {} effort", model.model_name, model.thinking_level),
+                cc.inactive,
+            ),
         ],
         vec![
             span(" ██████╔╝  ", cc.claude),
-            span(clip_ellipsis(&cwd, model.width.saturating_sub(12)), cc.inactive),
+            span(
+                clip_ellipsis(&cwd, model.width.saturating_sub(12)),
+                cc.inactive,
+            ),
         ],
         vec![],
         vec![

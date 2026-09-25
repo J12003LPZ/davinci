@@ -912,9 +912,7 @@ pub fn raw_provider_post(
                 .map(|value| (name.clone(), value.to_string()))
         })
         .collect();
-    let body = response
-        .into_string()
-        .map_err(|error| error.to_string())?;
+    let body = response.into_string().map_err(|error| error.to_string())?;
     Ok(RawProviderReply {
         status,
         headers,
@@ -1204,15 +1202,15 @@ pub fn attach_native_items(chat: &mut ChatMessage, items: &[Value], model_key: &
         .insert(NATIVE_MODEL_KEY.into(), Value::String(model_key.into()));
 }
 
-fn native_items<'m>(
-    message: &'m ChatMessage,
-    model_key: Option<&str>,
-) -> Option<&'m Vec<Value>> {
+fn native_items<'m>(message: &'m ChatMessage, model_key: Option<&str>) -> Option<&'m Vec<Value>> {
     let model_key = model_key?;
     if message.extra.get(NATIVE_MODEL_KEY).and_then(Value::as_str) != Some(model_key) {
         return None;
     }
-    message.extra.get(NATIVE_ITEMS_KEY).and_then(Value::as_array)
+    message
+        .extra
+        .get(NATIVE_ITEMS_KEY)
+        .and_then(Value::as_array)
 }
 
 #[doc(hidden)]
@@ -1297,13 +1295,11 @@ fn openai_responses_body(
             model.base_url.as_deref(),
             false,
         ),
-        "openai-codex-responses" => {
-            crate::openai_cache_policy::OpenAiCacheCapabilities::resolve(
-                model,
-                model.base_url.as_deref(),
-                true,
-            )
-        }
+        "openai-codex-responses" => crate::openai_cache_policy::OpenAiCacheCapabilities::resolve(
+            model,
+            model.base_url.as_deref(),
+            true,
+        ),
         _ => crate::openai_cache_policy::OpenAiCacheCapabilities::unknown(),
     };
     let cache_capabilities = crate::openai_cache_policy::apply_runtime_features(
@@ -1731,12 +1727,10 @@ fn vertex_url(
     project: Option<&str>,
     location: Option<&str>,
 ) -> Result<String, String> {
-    let project = project
-        .filter(|value| !value.is_empty())
-        .ok_or_else(|| {
-            "google-vertex needs GOOGLE_CLOUD_PROJECT (and optionally GOOGLE_CLOUD_LOCATION)"
-                .to_string()
-        })?;
+    let project = project.filter(|value| !value.is_empty()).ok_or_else(|| {
+        "google-vertex needs GOOGLE_CLOUD_PROJECT (and optionally GOOGLE_CLOUD_LOCATION)"
+            .to_string()
+    })?;
     let location = location
         .filter(|value| !value.is_empty())
         .unwrap_or("us-central1");
@@ -2241,37 +2235,40 @@ pub(crate) fn usage_from_value(model: &Model, usage: &Value) -> Usage {
     let anthropic_write =
         get("cache_creation_input_tokens").or_else(|| get("cacheWriteInputTokens"));
     let has_openai_prompt_total = get("prompt_tokens").is_some();
-    let (input, cache_read, cache_write) = if has_openai_prompt_total
-        && (anthropic_read.is_some() || anthropic_write.is_some())
-    {
-        let read = anthropic_read.unwrap_or(0);
-        let write = anthropic_write.unwrap_or(0);
-        (base_input.saturating_sub(read).saturating_sub(write), read, write)
-    } else if anthropic_read.is_some() || anthropic_write.is_some() {
-        (
-            base_input,
-            anthropic_read.unwrap_or(0),
-            anthropic_write.unwrap_or(0),
-        )
-    } else {
-        let read = usage
-            .pointer("/prompt_tokens_details/cached_tokens")
-            .or_else(|| usage.pointer("/input_tokens_details/cached_tokens"))
-            .and_then(Value::as_u64)
-            .or_else(|| get("prompt_cache_hit_tokens"))
-            .or_else(|| get("cached_tokens"))
-            .unwrap_or(0);
-        let write = usage
-            .pointer("/prompt_tokens_details/cache_write_tokens")
-            .or_else(|| usage.pointer("/input_tokens_details/cache_write_tokens"))
-            .and_then(Value::as_u64)
-            .unwrap_or(0);
-        (
-            base_input.saturating_sub(read).saturating_sub(write),
-            read,
-            write,
-        )
-    };
+    let (input, cache_read, cache_write) =
+        if has_openai_prompt_total && (anthropic_read.is_some() || anthropic_write.is_some()) {
+            let read = anthropic_read.unwrap_or(0);
+            let write = anthropic_write.unwrap_or(0);
+            (
+                base_input.saturating_sub(read).saturating_sub(write),
+                read,
+                write,
+            )
+        } else if anthropic_read.is_some() || anthropic_write.is_some() {
+            (
+                base_input,
+                anthropic_read.unwrap_or(0),
+                anthropic_write.unwrap_or(0),
+            )
+        } else {
+            let read = usage
+                .pointer("/prompt_tokens_details/cached_tokens")
+                .or_else(|| usage.pointer("/input_tokens_details/cached_tokens"))
+                .and_then(Value::as_u64)
+                .or_else(|| get("prompt_cache_hit_tokens"))
+                .or_else(|| get("cached_tokens"))
+                .unwrap_or(0);
+            let write = usage
+                .pointer("/prompt_tokens_details/cache_write_tokens")
+                .or_else(|| usage.pointer("/input_tokens_details/cache_write_tokens"))
+                .and_then(Value::as_u64)
+                .unwrap_or(0);
+            (
+                base_input.saturating_sub(read).saturating_sub(write),
+                read,
+                write,
+            )
+        };
     let mut computed = crate::calculate_usage(model, input, output, cache_read, cache_write);
     if let Some(total) = get("total_tokens").or_else(|| get("totalTokens")) {
         computed.total_tokens = total;
@@ -2513,7 +2510,10 @@ mod tests {
         model.api = "google-vertex".into();
         model.base_url = Some("https://us-east5-aiplatform.googleapis.com".into());
         let url = vertex_url(&model, Some("my-proj"), Some("us-east5")).unwrap();
-        assert!(url.contains("/projects/my-proj/locations/us-east5/"), "{url}");
+        assert!(
+            url.contains("/projects/my-proj/locations/us-east5/"),
+            "{url}"
+        );
         assert!(vertex_url(&model, None, None).is_err());
     }
 

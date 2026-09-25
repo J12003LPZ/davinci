@@ -394,10 +394,19 @@ mod tests {
         let marker = dir.path().join("still-running");
         let script = format!("(sleep 2; touch {}) & wait", marker.display());
         let abort = Arc::new(AtomicBool::new(false));
-        let _ = run_child(shell_command(&script, dir.path()), &abort, 300, |_| {}, |_| {})
-            .unwrap();
+        let _ = run_child(
+            shell_command(&script, dir.path()),
+            &abort,
+            300,
+            |_| {},
+            |_| {},
+        )
+        .unwrap();
         thread::sleep(Duration::from_secs(3));
-        assert!(!marker.exists(), "the backgrounded child survived the timeout");
+        assert!(
+            !marker.exists(),
+            "the backgrounded child survived the timeout"
+        );
     }
 
     #[test]

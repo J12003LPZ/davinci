@@ -608,9 +608,10 @@ impl JsonlStoredSession {
     }
 
     fn commit_mutation(&mut self, mutation: SessionMutation) -> Result<(), SessionError> {
-        self.append_mutation(mutation.clone()).inspect_err(|error| {
-            self.persistence_error = Some(error.to_string());
-        })?;
+        self.append_mutation(mutation.clone())
+            .inspect_err(|error| {
+                self.persistence_error = Some(error.to_string());
+            })?;
         if let Err(error) = self.session.apply_mutation(mutation) {
             self.persistence_error = Some(error.to_string());
             return Err(SessionError::storage(format!(

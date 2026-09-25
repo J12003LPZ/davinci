@@ -20,7 +20,8 @@ impl TailBuffer {
         }
         if bytes.len() >= self.cap {
             self.buf.clear();
-            self.buf.extend(bytes[bytes.len() - self.cap..].iter().copied());
+            self.buf
+                .extend(bytes[bytes.len() - self.cap..].iter().copied());
             return;
         }
         while self.buf.len() + bytes.len() > self.cap {

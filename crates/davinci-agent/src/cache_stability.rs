@@ -111,7 +111,10 @@ mod tests {
             Some(PrefixBreak::Input { index: 0 })
         );
         assert_eq!(
-            first_prefix_break(&base, &json!({"instructions": "a", "tools": [1], "input": []})),
+            first_prefix_break(
+                &base,
+                &json!({"instructions": "a", "tools": [1], "input": []})
+            ),
             Some(PrefixBreak::Shorter)
         );
     }
@@ -138,11 +141,7 @@ mod tests {
         agent
             .messages
             .push(davinci_ai::ChatMessage::text("assistant", "Done."));
-        user_turn(
-            &mut agent,
-            "Diagnose the root cause of this failure.",
-            None,
-        );
+        user_turn(&mut agent, "Diagnose the root cause of this failure.", None);
         let second = wire_body_for_next_request(&agent, &model);
         assert_eq!(first_prefix_break(&first, &second), None);
         assert!(second.to_string().contains("<turn_context>"));

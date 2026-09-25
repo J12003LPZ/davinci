@@ -13,9 +13,9 @@ use davinci_agent::{
     ToolApprovalDecision, ToolApprovalRequest,
 };
 use davinci_tui::davinci::model::{
-    Ask, AskKind, CatalogRow, Choice, Compaction, CorpusItem, Credential, Entry, ExportLedger, FailedRun,
-    Finding, GovernorCounter, GovernorSheet, GovernorStored, GraphRunSheet, GraphTask, Hunk,
-    HunkKind, KeymapGroup, McpServerRow, McpSheet, Model, ModelItem, Overlay, PermissionRow,
+    Ask, AskKind, CatalogRow, Choice, Compaction, CorpusItem, Credential, Entry, ExportLedger,
+    FailedRun, Finding, GovernorCounter, GovernorSheet, GovernorStored, GraphRunSheet, GraphTask,
+    Hunk, HunkKind, KeymapGroup, McpServerRow, McpSheet, Model, ModelItem, Overlay, PermissionRow,
     PickerItem, PlanStep, ProviderRow, ResumeRow, ReviewFile, ReviewSheet, Screen, SecurityScan,
     SettingRow, Severity, Step, ThinkingRow, Tone, TreeNode, VectorIndex, WorkflowRow,
     WorkflowsSheet, Working, WorkshopSheet,
@@ -2755,11 +2755,7 @@ pub fn permission_ask(request: &ToolApprovalRequest, trusted: bool) -> Ask {
     permission_ask_at(request, trusted, std::path::Path::new("."))
 }
 
-fn permission_ask_at(
-    request: &ToolApprovalRequest,
-    trusted: bool,
-    cwd: &std::path::Path,
-) -> Ask {
+fn permission_ask_at(request: &ToolApprovalRequest, trusted: bool, cwd: &std::path::Path) -> Ask {
     let rule = &request.session_rule;
     let mut items: Vec<_> = request
         .host_choices(trusted)
@@ -2836,10 +2832,7 @@ fn permission_ask_at(
     }
 }
 
-fn approval_preview(
-    request: &ToolApprovalRequest,
-    cwd: &std::path::Path,
-) -> (Vec<Hunk>, bool) {
+fn approval_preview(request: &ToolApprovalRequest, cwd: &std::path::Path) -> (Vec<Hunk>, bool) {
     let path = request
         .args
         .get("path")
@@ -2901,7 +2894,11 @@ fn approval_preview(
     let Some(offset) = current.find(old_text) else {
         return (Vec::new(), exists);
     };
-    let first_line = current[..offset].bytes().filter(|byte| *byte == b'\n').count() as u32 + 1;
+    let first_line = current[..offset]
+        .bytes()
+        .filter(|byte| *byte == b'\n')
+        .count() as u32
+        + 1;
     let mut preview = Vec::new();
     for (index, line) in old_text.lines().take(20).enumerate() {
         preview.push(Hunk::at(HunkKind::Del, first_line + index as u32, line));
@@ -4630,22 +4627,307 @@ pub fn run(
             Ok(Some(event)) => {
                 model.dirty = true;
                 match event {
-                crossterm::event::Event::Key(key)
-                    if key.kind != crossterm::event::KeyEventKind::Release =>
-                {
-                    // A credential overlay owns every key. Do this before
-                    // voice, extension shortcuts, clipboard handling, and
-                    // terminal hooks so the candidate cannot enter any other
-                    // input path or transcript.
-                    if model.overlay == Some(Overlay::SecretInput) {
-                        if paste_secret_clipboard(
-                            &mut model,
-                            key,
-                            crate::external_editor::clipboard_text,
-                        ) {
+                    crossterm::event::Event::Key(key)
+                        if key.kind != crossterm::event::KeyEventKind::Release =>
+                    {
+                        // A credential overlay owns every key. Do this before
+                        // voice, extension shortcuts, clipboard handling, and
+                        // terminal hooks so the candidate cannot enter any other
+                        // input path or transcript.
+                        if model.overlay == Some(Overlay::SecretInput) {
+                            if paste_secret_clipboard(
+                                &mut model,
+                                key,
+                                crate::external_editor::clipboard_text,
+                            ) {
+                                continue;
+                            }
+                            let next = match app::handle_key(&mut model, key) {
+                                Flow::SecretInputSubmitted(candidate) => on_secret_input(
+                                    &mut Shell {
+                                        voice: &mut voice,
+                                        parsed,
+                                        agent,
+                                        model: &mut model,
+                                        terminal: &mut terminal,
+                                        host: &host,
+                                        pending: &mut pending,
+                                        cwd: &cwd,
+                                        dresser: &dresser,
+                                        images: &mut attached_images,
+                                    },
+                                    candidate.into_inner(),
+                                ),
+                                Flow::Quit => Next::Leave,
+                                Flow::Interrupt | Flow::Continue => Next::Go,
+                                Flow::Submit(_) | Flow::Choose(_) | Flow::CyclePermissionMode => {
+                                    Next::Go
+                                }
+                            };
+                            match next {
+                                Next::Go => {}
+                                Next::Leave => break Ok(0),
+                                Next::Fail(err) => break Err(err),
+                            }
                             continue;
                         }
+                        if graph_setup::key(&mut model, &mut pending, agent, key) {
+                            continue;
+                        }
+                        // An extension's registered shortcut gets the chord before
+                        if voice.key(&mut model, key) {
+                            last_escape = None;
+                            continue;
+                        }
+                        // the shell's own keys, exactly as the legacy loop gives
+                        // it. Resolution already refused the reserved chords.
+                        let claimed = davinci_tui::key_event_bytes(&key).and_then(|data| {
+                            model
+                                .extension_shortcuts
+                                .iter()
+                                .find(|(chord, _)| davinci_tui::key_to_bytes(chord) == data)
+                                .cloned()
+                        });
+                        if let Some((chord, path)) = claimed {
+                            let mut shell = Shell {
+                                voice: &mut voice,
+                                parsed,
+                                agent,
+                                model: &mut model,
+                                terminal: &mut terminal,
+                                host: &host,
+                                pending: &mut pending,
+                                cwd: &cwd,
+                                dresser: &dresser,
+                                images: &mut attached_images,
+                            };
+                            match shell.run_shortcut(&chord, &path) {
+                                Next::Go => {}
+                                Next::Leave => break Ok(0),
+                                Next::Fail(err) => break Err(err),
+                            }
+                            continue;
+                        }
+                        // An extension that registered `onTerminalInput` sees the
+                        // raw chord before the shell's own keys, exactly as the
+                        // legacy loop offers it through `dispatch_terminal_input`.
+                        if model.terminal_input_registered {
+                            let taken = davinci_tui::key_event_bytes(&key).is_some_and(|data| {
+                                let mut locked = host.lock().unwrap_or_else(|err| err.into_inner());
+                                locked.dispatch_terminal_input(&data)
+                            });
+                            if taken {
+                                let mut shell = Shell {
+                                    voice: &mut voice,
+                                    parsed,
+                                    agent,
+                                    model: &mut model,
+                                    terminal: &mut terminal,
+                                    host: &host,
+                                    pending: &mut pending,
+                                    cwd: &cwd,
+                                    dresser: &dresser,
+                                    images: &mut attached_images,
+                                };
+                                match apply_host_effects(&mut shell) {
+                                    Next::Go => {}
+                                    Next::Leave => break Ok(0),
+                                    Next::Fail(err) => break Err(err),
+                                }
+                                continue;
+                            }
+                        }
+                        // ctrl+v reads the clipboard the way the legacy chrome's
+                        // `PasteClipboard` does: an image is attached to the next
+                        // prompt — the only way a vision model is reachable from
+                        // this interface — and text goes into the composer.
+                        if key.code == crossterm::event::KeyCode::Char('v')
+                            && key
+                                .modifiers
+                                .contains(crossterm::event::KeyModifiers::CONTROL)
+                        {
+                            if let Some(png) = crate::external_editor::clipboard_image_png() {
+                                let (bytes, note) =
+                                    match crate::image_convert::resize_image_in_process(
+                                        &png,
+                                        "image/png",
+                                    ) {
+                                        Some(resized) => {
+                                            let note =
+                                                format!("{}x{}", resized.width, resized.height);
+                                            let bytes = if resized.was_resized
+                                                && resized.mime_type == "image/png"
+                                            {
+                                                resized.bytes
+                                            } else {
+                                                png
+                                            };
+                                            (bytes, note)
+                                        }
+                                        None => (png, "image".to_string()),
+                                    };
+                                let data = base64::Engine::encode(
+                                    &base64::engine::general_purpose::STANDARD,
+                                    bytes,
+                                );
+                                attached_images.push(davinci_ai::MessageContent::Image {
+                                    data,
+                                    mime_type: "image/png".into(),
+                                });
+                                let count = attached_images.len();
+                                model.extensions.set_status(
+                                    "§images",
+                                    Some(&format!(
+                                    "{count} image{} attached ({note}) · sent with the next prompt",
+                                    if count == 1 { "" } else { "s" },
+                                )),
+                                );
+                                continue;
+                            }
+                            if let Some(text) = crate::external_editor::clipboard_text() {
+                                model.paste(&text);
+                                continue;
+                            }
+                            // An empty clipboard falls through to the editor's own
+                            // ctrl+v, if the user bound one.
+                        }
+                        // Two escapes on an empty composer, within the same window
+                        // the legacy chrome uses, run the stored double-escape
+                        // action: the session tree by default, a fork if asked.
+                        if key.code == crossterm::event::KeyCode::Esc
+                            && key.modifiers.is_empty()
+                            && model.overlay.is_none()
+                            && model.suggestions.is_none()
+                            && model.screen == davinci_tui::davinci::model::Screen::Agent
+                            && !model.codex_open()
+                            && model.composer.trim().is_empty()
+                            && model.double_escape_action != "none"
+                        {
+                            let now = Instant::now();
+                            let doubled = last_escape.is_some_and(|prev| {
+                                now.duration_since(prev)
+                                    < Duration::from_millis(davinci_tui::DOUBLE_ESCAPE_MS)
+                            });
+                            if doubled {
+                                last_escape = None;
+                                match davinci_tui::DoubleEscapeAction::parse(
+                                    &model.double_escape_action,
+                                ) {
+                                    davinci_tui::DoubleEscapeAction::Fork => {
+                                        let mut shell = Shell {
+                                            voice: &mut voice,
+                                            parsed,
+                                            agent,
+                                            model: &mut model,
+                                            terminal: &mut terminal,
+                                            host: &host,
+                                            pending: &mut pending,
+                                            cwd: &cwd,
+                                            dresser: &dresser,
+                                            images: &mut attached_images,
+                                        };
+                                        match on_line(&mut shell, "/fork") {
+                                            Next::Go => {}
+                                            Next::Leave => break Ok(0),
+                                            Next::Fail(err) => break Err(err),
+                                        }
+                                    }
+                                    _ => model.toggle_overlay(Overlay::Sessions),
+                                }
+                                continue;
+                            }
+                            last_escape = Some(now);
+                        } else {
+                            last_escape = None;
+                        }
+                        let is_ctrl_c = key.code == crossterm::event::KeyCode::Char('c')
+                            && key
+                                .modifiers
+                                .contains(crossterm::event::KeyModifiers::CONTROL);
+                        if !is_ctrl_c {
+                            last_ctrl_c = None;
+                            model.exit_armed = false;
+                        }
+                        let was = model.screen;
                         let next = match app::handle_key(&mut model, key) {
+                            Flow::Interrupt => {
+                                let now = Instant::now();
+                                let doubled = last_ctrl_c.is_some_and(|prev| {
+                                    now.duration_since(prev)
+                                        < Duration::from_millis(DOUBLE_CTRL_C_MS)
+                                });
+                                if doubled {
+                                    run_stop_hooks(&mut Shell {
+                                        voice: &mut voice,
+                                        parsed,
+                                        agent,
+                                        model: &mut model,
+                                        terminal: &mut terminal,
+                                        host: &host,
+                                        pending: &mut pending,
+                                        cwd: &cwd,
+                                        dresser: &dresser,
+                                        images: &mut attached_images,
+                                    });
+                                    Next::Leave
+                                } else {
+                                    if !model.composer.trim().is_empty() {
+                                        let _ = model.composer.editor_mut().submit();
+                                    }
+                                    last_ctrl_c = Some(now);
+                                    model.exit_armed = true;
+                                    Next::Go
+                                }
+                            }
+                            Flow::Quit => {
+                                run_stop_hooks(&mut Shell {
+                                    voice: &mut voice,
+                                    parsed,
+                                    agent,
+                                    model: &mut model,
+                                    terminal: &mut terminal,
+                                    host: &host,
+                                    pending: &mut pending,
+                                    cwd: &cwd,
+                                    dresser: &dresser,
+                                    images: &mut attached_images,
+                                });
+                                Next::Leave
+                            }
+                            Flow::Submit(line) => on_line(
+                                &mut Shell {
+                                    voice: &mut voice,
+                                    parsed,
+                                    agent,
+                                    model: &mut model,
+                                    terminal: &mut terminal,
+                                    host: &host,
+                                    pending: &mut pending,
+                                    cwd: &cwd,
+                                    dresser: &dresser,
+                                    images: &mut attached_images,
+                                },
+                                &line,
+                            ),
+                            Flow::Choose(choice) => on_choice(
+                                &mut Shell {
+                                    voice: &mut voice,
+                                    parsed,
+                                    agent,
+                                    model: &mut model,
+                                    terminal: &mut terminal,
+                                    host: &host,
+                                    pending: &mut pending,
+                                    cwd: &cwd,
+                                    dresser: &dresser,
+                                    images: &mut attached_images,
+                                },
+                                choice,
+                            ),
+                            Flow::CyclePermissionMode => {
+                                cycle_permission_mode(agent, &mut model);
+                                Next::Go
+                            }
                             Flow::SecretInputSubmitted(candidate) => on_secret_input(
                                 &mut Shell {
                                     voice: &mut voice,
@@ -4661,339 +4943,56 @@ pub fn run(
                                 },
                                 candidate.into_inner(),
                             ),
-                            Flow::Quit => Next::Leave,
-                            Flow::Interrupt | Flow::Continue => Next::Go,
-                            Flow::Submit(_) | Flow::Choose(_) | Flow::CyclePermissionMode => {
-                                Next::Go
-                            }
+                            Flow::Continue => Next::Go,
                         };
+                        // Recall is a search, so it runs when the instrument is
+                        // summoned rather than being kept warm behind it.
+                        if model.screen == davinci_tui::davinci::model::Screen::Memoria
+                            && was != davinci_tui::davinci::model::Screen::Memoria
+                        {
+                            let query = recall_query(&model, agent);
+                            let (hits, meta) = crate::davinci_surfaces::recall(&cwd, &query, 8);
+                            model.recall = hits;
+                            model.recall_meta = meta;
+                            model.recall_index = 0;
+                        }
                         match next {
                             Next::Go => {}
                             Next::Leave => break Ok(0),
                             Next::Fail(err) => break Err(err),
                         }
-                        continue;
                     }
-                    if graph_setup::key(&mut model, &mut pending, agent, key) {
-                        continue;
+                    crossterm::event::Event::Resize(width, height) => {
+                        // A measure of nothing wraps nothing: the prose measure and
+                        // the panel insets are all derived from this.
+                        model.width = width.max(20);
+                        model.height = height.max(4);
                     }
-                    // An extension's registered shortcut gets the chord before
-                    if voice.key(&mut model, key) {
-                        last_escape = None;
-                        continue;
-                    }
-                    // the shell's own keys, exactly as the legacy loop gives
-                    // it. Resolution already refused the reserved chords.
-                    let claimed = davinci_tui::key_event_bytes(&key).and_then(|data| {
-                        model
-                            .extension_shortcuts
-                            .iter()
-                            .find(|(chord, _)| davinci_tui::key_to_bytes(chord) == data)
-                            .cloned()
-                    });
-                    if let Some((chord, path)) = claimed {
-                        let mut shell = Shell {
-                            voice: &mut voice,
-                            parsed,
-                            agent,
-                            model: &mut model,
-                            terminal: &mut terminal,
-                            host: &host,
-                            pending: &mut pending,
-                            cwd: &cwd,
-                            dresser: &dresser,
-                            images: &mut attached_images,
-                        };
-                        match shell.run_shortcut(&chord, &path) {
-                            Next::Go => {}
-                            Next::Leave => break Ok(0),
-                            Next::Fail(err) => break Err(err),
-                        }
-                        continue;
-                    }
-                    // An extension that registered `onTerminalInput` sees the
-                    // raw chord before the shell's own keys, exactly as the
-                    // legacy loop offers it through `dispatch_terminal_input`.
-                    if model.terminal_input_registered {
-                        let taken = davinci_tui::key_event_bytes(&key).is_some_and(|data| {
-                            let mut locked = host.lock().unwrap_or_else(|err| err.into_inner());
-                            locked.dispatch_terminal_input(&data)
-                        });
-                        if taken {
-                            let mut shell = Shell {
-                                voice: &mut voice,
-                                parsed,
-                                agent,
-                                model: &mut model,
-                                terminal: &mut terminal,
-                                host: &host,
-                                pending: &mut pending,
-                                cwd: &cwd,
-                                dresser: &dresser,
-                                images: &mut attached_images,
-                            };
-                            match apply_host_effects(&mut shell) {
-                                Next::Go => {}
-                                Next::Leave => break Ok(0),
-                                Next::Fail(err) => break Err(err),
-                            }
+                    // A paste is text, never keys: dropping it made every newline
+                    // in the pasted block submit a turn of its own. On Windows the
+                    // burst of keys the console delivers is reassembled into this
+                    // event by the paste filter behind `poll_event`.
+                    crossterm::event::Event::Paste(text) => {
+                        if graph_setup::paste(&mut model, &mut pending, agent, &text) {
                             continue;
                         }
-                    }
-                    // ctrl+v reads the clipboard the way the legacy chrome's
-                    // `PasteClipboard` does: an image is attached to the next
-                    // prompt — the only way a vision model is reachable from
-                    // this interface — and text goes into the composer.
-                    if key.code == crossterm::event::KeyCode::Char('v')
-                        && key
-                            .modifiers
-                            .contains(crossterm::event::KeyModifiers::CONTROL)
-                    {
-                        if let Some(png) = crate::external_editor::clipboard_image_png() {
-                            let (bytes, note) = match crate::image_convert::resize_image_in_process(
-                                &png,
-                                "image/png",
-                            ) {
-                                Some(resized) => {
-                                    let note = format!("{}x{}", resized.width, resized.height);
-                                    let bytes = if resized.was_resized
-                                        && resized.mime_type == "image/png"
-                                    {
-                                        resized.bytes
-                                    } else {
-                                        png
-                                    };
-                                    (bytes, note)
-                                }
-                                None => (png, "image".to_string()),
-                            };
-                            let data = base64::Engine::encode(
-                                &base64::engine::general_purpose::STANDARD,
-                                bytes,
-                            );
-                            attached_images.push(davinci_ai::MessageContent::Image {
-                                data,
-                                mime_type: "image/png".into(),
-                            });
-                            let count = attached_images.len();
-                            model.extensions.set_status(
-                                "§images",
-                                Some(&format!(
-                                    "{count} image{} attached ({note}) · sent with the next prompt",
-                                    if count == 1 { "" } else { "s" },
-                                )),
-                            );
-                            continue;
-                        }
-                        if let Some(text) = crate::external_editor::clipboard_text() {
+                        if model.overlay == Some(Overlay::SecretInput)
+                            || !voice.paste(&mut model, &text)
+                        {
                             model.paste(&text);
-                            continue;
                         }
-                        // An empty clipboard falls through to the editor's own
-                        // ctrl+v, if the user bound one.
                     }
-                    // Two escapes on an empty composer, within the same window
-                    // the legacy chrome uses, run the stored double-escape
-                    // action: the session tree by default, a fork if asked.
-                    if key.code == crossterm::event::KeyCode::Esc
-                        && key.modifiers.is_empty()
-                        && model.overlay.is_none()
-                        && model.suggestions.is_none()
-                        && model.screen == davinci_tui::davinci::model::Screen::Agent
-                        && !model.codex_open()
-                        && model.composer.trim().is_empty()
-                        && model.double_escape_action != "none"
-                    {
-                        let now = Instant::now();
-                        let doubled = last_escape.is_some_and(|prev| {
-                            now.duration_since(prev)
-                                < Duration::from_millis(davinci_tui::DOUBLE_ESCAPE_MS)
-                        });
-                        if doubled {
-                            last_escape = None;
-                            match davinci_tui::DoubleEscapeAction::parse(
-                                &model.double_escape_action,
-                            ) {
-                                davinci_tui::DoubleEscapeAction::Fork => {
-                                    let mut shell = Shell {
-                                        voice: &mut voice,
-                                        parsed,
-                                        agent,
-                                        model: &mut model,
-                                        terminal: &mut terminal,
-                                        host: &host,
-                                        pending: &mut pending,
-                                        cwd: &cwd,
-                                        dresser: &dresser,
-                                        images: &mut attached_images,
-                                    };
-                                    match on_line(&mut shell, "/fork") {
-                                        Next::Go => {}
-                                        Next::Leave => break Ok(0),
-                                        Next::Fail(err) => break Err(err),
-                                    }
-                                }
-                                _ => model.toggle_overlay(Overlay::Sessions),
-                            }
-                            continue;
+                    crossterm::event::Event::Mouse(mouse) => {
+                        if terminal.handle_model_mouse(&mut model, mouse) {
+                            voice.toggle(&mut model);
                         }
-                        last_escape = Some(now);
-                    } else {
-                        last_escape = None;
                     }
-                    let is_ctrl_c = key.code == crossterm::event::KeyCode::Char('c')
-                        && key
-                            .modifiers
-                            .contains(crossterm::event::KeyModifiers::CONTROL);
-                    if !is_ctrl_c {
-                        last_ctrl_c = None;
-                        model.exit_armed = false;
-                    }
-                    let was = model.screen;
-                    let next = match app::handle_key(&mut model, key) {
-                        Flow::Interrupt => {
-                            let now = Instant::now();
-                            let doubled = last_ctrl_c.is_some_and(|prev| {
-                                now.duration_since(prev) < Duration::from_millis(DOUBLE_CTRL_C_MS)
-                            });
-                            if doubled {
-                                run_stop_hooks(&mut Shell {
-                                    voice: &mut voice,
-                                    parsed,
-                                    agent,
-                                    model: &mut model,
-                                    terminal: &mut terminal,
-                                    host: &host,
-                                    pending: &mut pending,
-                                    cwd: &cwd,
-                                    dresser: &dresser,
-                                    images: &mut attached_images,
-                                });
-                                Next::Leave
-                            } else {
-                                if !model.composer.trim().is_empty() {
-                                    let _ = model.composer.editor_mut().submit();
-                                }
-                                last_ctrl_c = Some(now);
-                                model.exit_armed = true;
-                                Next::Go
-                            }
-                        }
-                        Flow::Quit => {
-                            run_stop_hooks(&mut Shell {
-                                voice: &mut voice,
-                                parsed,
-                                agent,
-                                model: &mut model,
-                                terminal: &mut terminal,
-                                host: &host,
-                                pending: &mut pending,
-                                cwd: &cwd,
-                                dresser: &dresser,
-                                images: &mut attached_images,
-                            });
-                            Next::Leave
-                        }
-                        Flow::Submit(line) => on_line(
-                            &mut Shell {
-                                voice: &mut voice,
-                                parsed,
-                                agent,
-                                model: &mut model,
-                                terminal: &mut terminal,
-                                host: &host,
-                                pending: &mut pending,
-                                cwd: &cwd,
-                                dresser: &dresser,
-                                images: &mut attached_images,
-                            },
-                            &line,
-                        ),
-                        Flow::Choose(choice) => on_choice(
-                            &mut Shell {
-                                voice: &mut voice,
-                                parsed,
-                                agent,
-                                model: &mut model,
-                                terminal: &mut terminal,
-                                host: &host,
-                                pending: &mut pending,
-                                cwd: &cwd,
-                                dresser: &dresser,
-                                images: &mut attached_images,
-                            },
-                            choice,
-                        ),
-                        Flow::CyclePermissionMode => {
-                            cycle_permission_mode(agent, &mut model);
-                            Next::Go
-                        }
-                        Flow::SecretInputSubmitted(candidate) => on_secret_input(
-                            &mut Shell {
-                                voice: &mut voice,
-                                parsed,
-                                agent,
-                                model: &mut model,
-                                terminal: &mut terminal,
-                                host: &host,
-                                pending: &mut pending,
-                                cwd: &cwd,
-                                dresser: &dresser,
-                                images: &mut attached_images,
-                            },
-                            candidate.into_inner(),
-                        ),
-                        Flow::Continue => Next::Go,
-                    };
-                    // Recall is a search, so it runs when the instrument is
-                    // summoned rather than being kept warm behind it.
-                    if model.screen == davinci_tui::davinci::model::Screen::Memoria
-                        && was != davinci_tui::davinci::model::Screen::Memoria
-                    {
-                        let query = recall_query(&model, agent);
-                        let (hits, meta) = crate::davinci_surfaces::recall(&cwd, &query, 8);
-                        model.recall = hits;
-                        model.recall_meta = meta;
-                        model.recall_index = 0;
-                    }
-                    match next {
-                        Next::Go => {}
-                        Next::Leave => break Ok(0),
-                        Next::Fail(err) => break Err(err),
-                    }
-                }
-                crossterm::event::Event::Resize(width, height) => {
-                    // A measure of nothing wraps nothing: the prose measure and
-                    // the panel insets are all derived from this.
-                    model.width = width.max(20);
-                    model.height = height.max(4);
-                }
-                // A paste is text, never keys: dropping it made every newline
-                // in the pasted block submit a turn of its own. On Windows the
-                // burst of keys the console delivers is reassembled into this
-                // event by the paste filter behind `poll_event`.
-                crossterm::event::Event::Paste(text) => {
-                    if graph_setup::paste(&mut model, &mut pending, agent, &text) {
-                        continue;
-                    }
-                    if model.overlay == Some(Overlay::SecretInput)
-                        || !voice.paste(&mut model, &text)
-                    {
-                        model.paste(&text);
-                    }
-                }
-                crossterm::event::Event::Mouse(mouse) => {
-                    if terminal.handle_model_mouse(&mut model, mouse) {
-                        voice.toggle(&mut model);
-                    }
-                }
-                _ => {}
+                    _ => {}
                 }
             }
             Ok(None) => {}
             Err(err) => break Err(err.to_string()),
         }
-
     };
 
     {

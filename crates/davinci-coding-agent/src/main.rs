@@ -117,8 +117,8 @@ use davinci_coding_agent::project_config;
 mod rpc;
 use davinci_coding_agent::runtime_host;
 mod self_update;
-use davinci_coding_agent::settings;
 use davinci_coding_agent::semantic;
+use davinci_coding_agent::settings;
 mod shutdown;
 mod slash;
 mod startup;
@@ -908,7 +908,9 @@ fn build_agent(parsed: &Args, session_dir: &Path, cwd: &Path) -> Result<Agent, S
     };
     for pkg in &settings.packages {
         if !parsed.no_extensions {
-            for path in settings::collect_package_resources(pkg, "extensions", &default_agent_dir(), cwd) {
+            for path in
+                settings::collect_package_resources(pkg, "extensions", &default_agent_dir(), cwd)
+            {
                 extensions.push(path.to_string_lossy().into_owned());
             }
         }
@@ -3435,8 +3437,7 @@ fn run_rpc_with_host(
         let mut command: RpcCommand = match serde_json::from_str(&line) {
             Ok(command) => command,
             Err(err) => {
-                let response =
-                    rpc::fail_response(None, "parse", format!("parse error: {err}"));
+                let response = rpc::fail_response(None, "parse", format!("parse error: {err}"));
                 output::write_raw_stdout_line(
                     &serde_json::to_string(&response).map_err(|err| err.to_string())?,
                 )
@@ -3681,13 +3682,7 @@ fn run_rpc_with_host(
                 let stop = std::sync::atomic::AtomicBool::new(false);
                 let watcher = scope.spawn(|| {
                     rpc_watch_during_turn(
-                        &leftover,
-                        &rx,
-                        &ui_abort,
-                        &remote,
-                        &skills,
-                        &templates,
-                        &stop,
+                        &leftover, &rx, &ui_abort, &remote, &skills, &templates, &stop,
                     )
                 });
                 let result = complete_prompt_with_host(
@@ -7070,8 +7065,7 @@ fn login_provider_with_wait(
                         "No login in progress for {provider}. Run /login {provider} first, then paste the redirect URL."
                     )
                 })?;
-            if let (Some(expected), Some(got)) =
-                (pending.state.as_deref(), pasted_state.as_deref())
+            if let (Some(expected), Some(got)) = (pending.state.as_deref(), pasted_state.as_deref())
             {
                 if expected != got {
                     return Err(
@@ -7963,7 +7957,12 @@ fn apply_discovered_resources(parsed: &Args, agent: &mut Agent) {
             roots.extend(extra.iter().map(PathBuf::from));
         }
         for pkg in &settings.packages {
-            roots.extend(settings::collect_package_resources(pkg, "skills", &default_agent_dir(), &agent.cwd));
+            roots.extend(settings::collect_package_resources(
+                pkg,
+                "skills",
+                &default_agent_dir(),
+                &agent.cwd,
+            ));
         }
         agent.skills = discover_skills(&roots);
     }
@@ -7977,7 +7976,12 @@ fn apply_discovered_resources(parsed: &Args, agent: &mut Agent) {
             roots.extend(extra.iter().map(PathBuf::from));
         }
         for pkg in &settings.packages {
-            roots.extend(settings::collect_package_resources(pkg, "prompts", &default_agent_dir(), &agent.cwd));
+            roots.extend(settings::collect_package_resources(
+                pkg,
+                "prompts",
+                &default_agent_dir(),
+                &agent.cwd,
+            ));
         }
         agent.templates = discover_prompt_templates(&roots);
     }

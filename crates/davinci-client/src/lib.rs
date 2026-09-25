@@ -25,8 +25,8 @@ use std::os::unix::net::UnixStream;
 use std::time::Duration;
 
 use davinci_protocol::{
-    encode_client_message, ClientMessage, Command, ProtocolError,
-    ProtocolErrorCode, ServerMessage, PROTOCOL_VERSION,
+    encode_client_message, ClientMessage, Command, ProtocolError, ProtocolErrorCode, ServerMessage,
+    PROTOCOL_VERSION,
 };
 use thiserror::Error;
 use uuid::Uuid;

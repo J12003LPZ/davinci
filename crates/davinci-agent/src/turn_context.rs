@@ -56,7 +56,10 @@ impl TurnContextState {
             .rev()
             .find(|message| {
                 message.role == "custom"
-                    && message.extra.get("customType").and_then(|value| value.as_str())
+                    && message
+                        .extra
+                        .get("customType")
+                        .and_then(|value| value.as_str())
                         == Some(TURN_CONTEXT_CUSTOM_TYPE)
             })
             .and_then(|message| message.extra.get("details"))
@@ -91,10 +94,9 @@ pub fn render_turn_context(
     }
     if state_changed {
         match input.plan_mode_appendix {
-            Some(appendix) => sections.push(format!(
-                "<plan_mode>\n{}\n</plan_mode>",
-                appendix.trim()
-            )),
+            Some(appendix) => {
+                sections.push(format!("<plan_mode>\n{}\n</plan_mode>", appendix.trim()))
+            }
             None if previous.plan_mode => {
                 sections.push("<plan_mode>\nPlan Mode has ended.\n</plan_mode>".to_string())
             }
@@ -113,7 +115,11 @@ pub fn render_turn_context(
         }
     }
 
-    if let Some(memory) = input.memory.map(str::trim).filter(|memory| !memory.is_empty()) {
+    if let Some(memory) = input
+        .memory
+        .map(str::trim)
+        .filter(|memory| !memory.is_empty())
+    {
         sections.push(format!("<memory>\n{memory}\n</memory>"));
     }
     if sections.is_empty() {
@@ -149,9 +155,11 @@ mod tests {
 
     #[test]
     fn first_turn_states_runtime_state() {
-        let (text, state) =
-            render_turn_context(&TurnContextState::default(), &input("Permission mode: Ask.", None))
-                .unwrap();
+        let (text, state) = render_turn_context(
+            &TurnContextState::default(),
+            &input("Permission mode: Ask.", None),
+        )
+        .unwrap();
         assert!(text.contains("<runtime_state>\nPermission mode: Ask.\n</runtime_state>"));
         assert!(state.state_hash.is_some());
     }
@@ -196,8 +204,7 @@ mod tests {
             living_plan: Some((3, "step 1")),
             memory: None,
         };
-        let (text, state) =
-            render_turn_context(&TurnContextState::default(), &with_plan).unwrap();
+        let (text, state) = render_turn_context(&TurnContextState::default(), &with_plan).unwrap();
         assert!(text.contains("<living_plan revision=\"3\">"));
         assert_eq!(render_turn_context(&state, &with_plan), None);
     }

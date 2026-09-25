@@ -267,9 +267,7 @@ impl AuthStorage {
                 .get("access")
                 .or_else(|| value.get("access_token"))
                 .and_then(|value| value.as_str())
-                .ok_or_else(|| {
-                    AuthStorageError::Invalid("refresh response missing access".into())
-                })?
+                .ok_or_else(|| AuthStorageError::Invalid("refresh response missing access".into()))?
                 .to_string();
             let next_refresh = value
                 .get("refresh")
@@ -282,8 +280,7 @@ impl AuthStorage {
                 .or_else(|| value.get("expires_at"))
                 .and_then(|value| value.as_u64())
                 .or(Some(now_ms.saturating_add(3_600_000)));
-            let credential =
-                Self::oauth_credential(provider, access, next_refresh, expires);
+            let credential = Self::oauth_credential(provider, access, next_refresh, expires);
             self.store_locked(provider, Some(credential))?;
             return Ok(true);
         }
@@ -295,8 +292,7 @@ impl AuthStorage {
         let expires = tokens
             .expires
             .or_else(|| crate::codex::jwt_expiry_ms(&tokens.access));
-        let credential =
-            Self::oauth_credential(provider, tokens.access, tokens.refresh, expires);
+        let credential = Self::oauth_credential(provider, tokens.access, tokens.refresh, expires);
         self.store_locked(provider, Some(credential))?;
         Ok(true)
     }
@@ -315,8 +311,9 @@ impl AuthStorage {
 
     fn read_disk(&self) -> Result<HashMap<String, Credential>, AuthStorageError> {
         match fs::read_to_string(&self.path) {
-            Ok(raw) => serde_json::from_str(&raw)
-                .map_err(|err| AuthStorageError::Invalid(err.to_string())),
+            Ok(raw) => {
+                serde_json::from_str(&raw).map_err(|err| AuthStorageError::Invalid(err.to_string()))
+            }
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(HashMap::new()),
             Err(err) => Err(AuthStorageError::Read(err.to_string())),
         }
@@ -352,8 +349,6 @@ impl AuthStorage {
         self.data = data;
         Ok(())
     }
-
-
 }
 
 /// TS `os.homedir()`: `USERPROFILE` on Windows, `HOME` on POSIX (kept as a
@@ -930,13 +925,7 @@ mod tests {
         storage
             .login_oauth("anthropic", "sk-ant-oat01-x", None, Some(u64::MAX))
             .unwrap();
-        assert!(resolve_provider_auth(
-            "anthropic",
-            &storage,
-            &Default::default(),
-            true,
-        )
-        .is_none());
+        assert!(resolve_provider_auth("anthropic", &storage, &Default::default(), true,).is_none());
         let error = storage
             .maybe_refresh("anthropic", 10_000, u64::MAX, false)
             .unwrap_err()
@@ -950,12 +939,7 @@ mod tests {
         let path = dir.path().join("auth.json");
         let mut storage = AuthStorage::open(&path).unwrap();
         storage
-            .login_oauth(
-                "xai",
-                "expired",
-                Some("pi-fixture-refresh".into()),
-                Some(1),
-            )
+            .login_oauth("xai", "expired", Some("pi-fixture-refresh".into()), Some(1))
             .unwrap();
         assert!(storage.maybe_refresh("xai", 10_000, 0, false).unwrap());
         let cred = storage.get("xai").unwrap();

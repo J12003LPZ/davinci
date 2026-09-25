@@ -24,7 +24,10 @@ pub const ELBOW: &str = "  ⎿ \u{a0}";
 /// Render a whole transcript, at a width that may be narrower than the window
 /// when the Codex sidebar is open.
 pub fn lines(model: &Model, entries: &[Entry], width: u16) -> Vec<Line<'static>> {
-    rendered_blocks(model, entries, width).into_iter().flatten().collect()
+    rendered_blocks(model, entries, width)
+        .into_iter()
+        .flatten()
+        .collect()
 }
 
 /// The last `height` rows of the transcript, rendered from the end.
@@ -54,7 +57,6 @@ pub fn tail_lines(
     }
     out
 }
-
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Explore {
@@ -103,9 +105,13 @@ fn rendered_blocks(model: &Model, entries: &[Entry], width: u16) -> Vec<Vec<Line
                         cursor += 1;
                         consumed = cursor;
                     }
-                    Entry::Tool { state, instrument, target, duration, .. }
-                        if !matches!(state, State::Failed | State::Attention) =>
-                    {
+                    Entry::Tool {
+                        state,
+                        instrument,
+                        target,
+                        duration,
+                        ..
+                    } if !matches!(state, State::Failed | State::Attention) => {
                         if let Some(kind) = explore_kind(instrument, target) {
                             calls.push((kind, target.as_str(), duration.is_some()));
                             cursor += 1;
@@ -154,7 +160,15 @@ fn group_rows(model: &Model, calls: &[(Explore, &str, bool)], width: u16) -> Vec
     };
     let mut sentence = order
         .iter()
-        .map(|kind| clause(*kind, calls.iter().filter(|(candidate, _, _)| candidate == kind).count()))
+        .map(|kind| {
+            clause(
+                *kind,
+                calls
+                    .iter()
+                    .filter(|(candidate, _, _)| candidate == kind)
+                    .count(),
+            )
+        })
         .collect::<Vec<_>>()
         .join(", ");
     if let Some(first) = sentence.get(0..1) {
@@ -171,7 +185,10 @@ fn group_rows(model: &Model, calls: &[(Explore, &str, bool)], width: u16) -> Vec
     let (kind, target, _) = calls.last().expect("a group has a call");
     let newest = match kind {
         Explore::Shell => format!("$ {target}"),
-        _ => target.split_once(' ').map_or(*target, |(_, rest)| rest).to_string(),
+        _ => target
+            .split_once(' ')
+            .map_or(*target, |(_, rest)| rest)
+            .to_string(),
     };
     vec![
         Line::from(truncate_run(spans, width)),
@@ -192,7 +209,9 @@ fn entry_lines(model: &Model, entry: &Entry, width: u16) -> Vec<Line<'static>> {
 
         Entry::User(text) => user_lines(th, text, width),
 
-        Entry::Shell { command, output, .. } => shell_lines(th, command, output, width),
+        Entry::Shell {
+            command, output, ..
+        } => shell_lines(th, command, output, width),
 
         // The agent's turn is not announced: the reply follows the prompt
         // after a gap, as in claude code. The entry stays in the transcript
@@ -258,7 +277,7 @@ fn entry_lines(model: &Model, entry: &Entry, width: u16) -> Vec<Line<'static>> {
             } else {
                 Vec::new()
             }
-        },
+        }
 
         Entry::Studio(steps) => studio::lines(model, steps),
 
@@ -269,7 +288,11 @@ fn entry_lines(model: &Model, entry: &Entry, width: u16) -> Vec<Line<'static>> {
             hunks,
         } => {
             let mut rows = vec![tool_result(th, &change_summary(*adds, *dels), width)];
-            let cap = if model.show_tool_output { DELTA_ROWS_EXPANDED } else { DELTA_ROWS_COLLAPSED };
+            let cap = if model.show_tool_output {
+                DELTA_ROWS_EXPANDED
+            } else {
+                DELTA_ROWS_COLLAPSED
+            };
             let language = super::highlight::language_of(path);
             let number_width = hunks
                 .iter()
@@ -277,7 +300,9 @@ fn entry_lines(model: &Model, entry: &Entry, width: u16) -> Vec<Line<'static>> {
                 .max()
                 .map_or(1, |line| line.to_string().len());
             rows.extend(
-                hunks.iter().take(cap)
+                hunks
+                    .iter()
+                    .take(cap)
                     .map(|hunk| hunk_line(th, language, hunk, number_width, width)),
             );
             if hunks.len() > cap {
@@ -293,7 +318,10 @@ fn entry_lines(model: &Model, entry: &Entry, width: u16) -> Vec<Line<'static>> {
             let cc = th.cc();
             vec![Line::from(vec![
                 span("✻ ", cc.inactive),
-                span(format!("{verb} for {}", duration_words(*seconds)), cc.inactive),
+                span(
+                    format!("{verb} for {}", duration_words(*seconds)),
+                    cc.inactive,
+                ),
             ])]
         }
     }
@@ -302,10 +330,12 @@ fn entry_lines(model: &Model, entry: &Entry, width: u16) -> Vec<Line<'static>> {
 fn tool_result(theme: &Theme, text: &str, width: u16) -> Line<'static> {
     let cc = theme.cc();
     let mut spans = vec![span(ELBOW, cc.inactive)];
-    spans.extend(bold_numbers(&clip_ellipsis(text, width.saturating_sub(5)), theme.text));
+    spans.extend(bold_numbers(
+        &clip_ellipsis(text, width.saturating_sub(5)),
+        theme.text,
+    ));
     Line::from(truncate_run(spans, width))
 }
-
 
 fn user_lines(theme: &Theme, text: &str, width: u16) -> Vec<Line<'static>> {
     let cc = theme.cc();
@@ -313,25 +343,34 @@ fn user_lines(theme: &Theme, text: &str, width: u16) -> Vec<Line<'static>> {
     let code = code_ranges(text);
     let wrapped = crate::wrap_text_with_ansi(&plain, width.saturating_sub(3).max(1) as usize);
     let mut offset = 0usize;
-    wrapped.into_iter().enumerate().map(|(row, content)| {
-        let lead = if row == 0 { "❯ " } else { "  " };
-        let mut spans = vec![Span::styled(
-            lead,
-            Style::default().fg(if row == 0 { cc.subtle } else { cc.text }).bg(cc.user_bg),
-        )];
-        for (index, ch) in content.chars().enumerate() {
-            let at = offset + index;
-            let foreground = if code.iter().any(|(start, end)| at >= *start && at < *end) {
-                cc.permission
-            } else {
-                cc.text
-            };
-            spans.push(Span::styled(ch.to_string(), Style::default().fg(foreground).bg(cc.user_bg)));
-        }
-        offset += content.chars().count() + 1;
-        spans.push(Span::styled(" ", Style::default().bg(cc.user_bg)));
-        Line::from(truncate_run(merge_same_style(spans), width))
-    }).collect()
+    wrapped
+        .into_iter()
+        .enumerate()
+        .map(|(row, content)| {
+            let lead = if row == 0 { "❯ " } else { "  " };
+            let mut spans = vec![Span::styled(
+                lead,
+                Style::default()
+                    .fg(if row == 0 { cc.subtle } else { cc.text })
+                    .bg(cc.user_bg),
+            )];
+            for (index, ch) in content.chars().enumerate() {
+                let at = offset + index;
+                let foreground = if code.iter().any(|(start, end)| at >= *start && at < *end) {
+                    cc.permission
+                } else {
+                    cc.text
+                };
+                spans.push(Span::styled(
+                    ch.to_string(),
+                    Style::default().fg(foreground).bg(cc.user_bg),
+                ));
+            }
+            offset += content.chars().count() + 1;
+            spans.push(Span::styled(" ", Style::default().bg(cc.user_bg)));
+            Line::from(truncate_run(merge_same_style(spans), width))
+        })
+        .collect()
 }
 
 fn code_ranges(text: &str) -> Vec<(usize, usize)> {
@@ -369,7 +408,10 @@ fn shell_lines(theme: &Theme, command: &str, output: &[String], width: u16) -> V
     let mut rows = vec![Line::from(truncate_run(
         vec![
             Span::styled("! ", Style::default().fg(cc.bash).bg(cc.bash_bg)),
-            Span::styled(format!("{command} "), Style::default().fg(cc.text).bg(cc.bash_bg)),
+            Span::styled(
+                format!("{command} "),
+                Style::default().fg(cc.text).bg(cc.bash_bg),
+            ),
         ],
         width,
     ))];
@@ -394,7 +436,9 @@ fn bold_numbers(text: &str, color: Color) -> Vec<Span<'static>> {
     for ch in text.chars() {
         if ch.is_ascii_digit() != digits && !current.is_empty() {
             let mut piece = span(std::mem::take(&mut current), color);
-            if digits { piece.style = piece.style.add_modifier(Modifier::BOLD); }
+            if digits {
+                piece.style = piece.style.add_modifier(Modifier::BOLD);
+            }
             out.push(piece);
         }
         digits = ch.is_ascii_digit();
@@ -402,7 +446,9 @@ fn bold_numbers(text: &str, color: Color) -> Vec<Span<'static>> {
     }
     if !current.is_empty() {
         let mut piece = span(current, color);
-        if digits { piece.style = piece.style.add_modifier(Modifier::BOLD); }
+        if digits {
+            piece.style = piece.style.add_modifier(Modifier::BOLD);
+        }
         out.push(piece);
     }
     out
@@ -414,7 +460,11 @@ fn change_summary(adds: u32, dels: u32) -> String {
         (0, 0) => "No changes".into(),
         (adds, 0) => format!("Added {adds} {}", lines(adds)),
         (0, dels) => format!("Removed {dels} {}", lines(dels)),
-        (adds, dels) => format!("Added {adds} {}, removed {dels} {}", lines(adds), lines(dels)),
+        (adds, dels) => format!(
+            "Added {adds} {}, removed {dels} {}",
+            lines(adds),
+            lines(dels)
+        ),
     }
 }
 
@@ -560,7 +610,11 @@ fn hunk_line(
             None => style,
         }
     };
-    let mut gutter_style = paint(if background.is_some() { sign_color } else { cc.diff_text });
+    let mut gutter_style = paint(if background.is_some() {
+        sign_color
+    } else {
+        cc.diff_text
+    });
     if background.is_none() {
         gutter_style = gutter_style.add_modifier(Modifier::DIM);
     }

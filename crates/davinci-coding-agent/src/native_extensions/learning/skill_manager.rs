@@ -116,7 +116,6 @@ fn now_ms() -> u64 {
 
 fn atomic_write_file(path: &Path, content: &str) -> Result<(), String> {
     davinci_sys::fs::atomic_write(path, content.as_bytes()).map_err(|err| err.to_string())
-
 }
 
 pub struct SkillManagerContext<'a> {

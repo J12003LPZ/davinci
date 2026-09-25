@@ -101,7 +101,6 @@ pub fn git_install_root(agent_dir: &Path, local: bool, cwd: &Path) -> PathBuf {
     }
 }
 
-
 pub fn git_checkout_path(
     agent_dir: &Path,
     local: bool,
@@ -170,10 +169,8 @@ pub fn git_checkout_path(
     Ok(destination)
 }
 
-
 pub fn expand_local(path: &str, cwd: &Path) -> PathBuf {
-    let expanded = match path.strip_prefix("~/").or_else(|| path.strip_prefix("~\\"))
-    {
+    let expanded = match path.strip_prefix("~/").or_else(|| path.strip_prefix("~\\")) {
         Some(rest) => davinci_session::home_dir()
             .map(|home| home.join(rest))
             .unwrap_or_else(|| PathBuf::from(path)),
@@ -191,7 +188,11 @@ pub fn installed_root(source: &str, agent_dir: &Path, cwd: &Path) -> Option<Path
         ParsedSource::Local(path) => vec![expand_local(&path, cwd)],
         ParsedSource::Npm { name, .. } => [false, true]
             .into_iter()
-            .map(|local| npm_install_root(agent_dir, local, cwd).join("node_modules").join(&name))
+            .map(|local| {
+                npm_install_root(agent_dir, local, cwd)
+                    .join("node_modules")
+                    .join(&name)
+            })
             .collect(),
         ParsedSource::Git(_) => [false, true]
             .into_iter()
@@ -234,11 +235,7 @@ mod tests {
     fn local_sources_resolve_to_their_path() {
         let dir = tempfile::tempdir().unwrap();
         assert_eq!(
-            installed_root(
-                &dir.path().display().to_string(),
-                dir.path(),
-                dir.path()
-            ),
+            installed_root(&dir.path().display().to_string(), dir.path(), dir.path()),
             Some(dir.path().to_path_buf())
         );
     }
