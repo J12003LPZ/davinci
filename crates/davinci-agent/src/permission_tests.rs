@@ -1150,6 +1150,24 @@
     }
 
     #[test]
+    fn agent_batch_approval_names_every_task_and_is_once_only() {
+        let policy = PermissionPolicy::new(PermissionMode::Ask);
+        let batch = json!({"tasks":[
+            {"prompt":"inspect authentication", "isolation":"shared"},
+            {"prompt":"review database writes", "isolation":"shared"}
+        ]});
+        let PermissionVerdict::Ask(request) = verdict(&policy, "agent", batch) else {
+            panic!("expected batch approval")
+        };
+        assert!(request.summary.contains("inspect authentication"));
+        assert!(request.summary.contains("review database writes"));
+        assert!(request.session_rule.is_empty());
+        assert!(request.allows(ToolApprovalDecision::AllowOnce));
+        assert!(!request.allows(ToolApprovalDecision::AllowForSession));
+        assert!(!request.allows(ToolApprovalDecision::AllowAlways));
+    }
+
+    #[test]
     fn agent_allow_rule_must_match_every_task() {
         let mut policy = PermissionPolicy::new(PermissionMode::Ask);
         policy.allow = vec![PermissionRule::parse("agent(isolation:shared)").unwrap()];
