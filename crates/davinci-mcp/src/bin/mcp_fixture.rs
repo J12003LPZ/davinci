@@ -240,7 +240,6 @@ fn sample(stdout: &mut io::Stdout, lines: &mut io::Lines<io::StdinLock<'_>>, id:
     -1
 }
 
-
 /// Send a basic MCP ping and return 0 when the client answers with a result.
 fn ping(stdout: &mut io::Stdout, lines: &mut io::Lines<io::StdinLock<'_>>) -> i64 {
     let id = json!("server-ping");
@@ -255,7 +254,10 @@ fn ping(stdout: &mut io::Stdout, lines: &mut io::Lines<io::StdinLock<'_>>) -> i6
         if reply.get("method").is_some() || reply.get("id") != Some(&id) {
             continue;
         }
-        return reply.pointer("/error/code").and_then(Value::as_i64).unwrap_or(0);
+        return reply
+            .pointer("/error/code")
+            .and_then(Value::as_i64)
+            .unwrap_or(0);
     }
     -1
 }

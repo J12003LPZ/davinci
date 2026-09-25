@@ -125,7 +125,6 @@ fn drain(queue: &mut Vec<QueuedMessage>, mode: QueueMode) -> Vec<QueuedMessage> 
     }
 }
 
-
 #[cfg(test)]
 mod remote_queue_tests {
     use super::{QueueKind, RemoteQueue};

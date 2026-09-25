@@ -1031,15 +1031,24 @@ mod tests {
                 self.output.extend_from_slice(buf);
                 Ok(buf.len())
             }
-            fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
         }
-        let duplex = Duplex { input: stream, output: &mut output };
+        let duplex = Duplex {
+            input: stream,
+            output: &mut output,
+        };
         serve_stream(&mut server, duplex).unwrap();
         let mut decoder = davinci_protocol::create_server_message_decoder(None).unwrap();
         let decoded = decoder.push(&output).unwrap();
         decoder.end().unwrap();
         match &decoded[0] {
-            ServerMessage::Response { ok: false, error: Some(error), .. } => {
+            ServerMessage::Response {
+                ok: false,
+                error: Some(error),
+                ..
+            } => {
                 assert_eq!(error.code, ProtocolErrorCode::InvalidRequest);
             }
             other => panic!("expected pre-hello rejection: {other:?}"),

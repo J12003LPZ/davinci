@@ -3,7 +3,6 @@
 //! Bridges built executable artifacts to installed disk binaries, PATH resolutions,
 //! wrapper/shim targets, and running process memory images.
 
-
 /// Evaluates whether the installed binary hash matches the verified build artifact hash.
 pub fn installed_matches(
     build: Option<&str>,

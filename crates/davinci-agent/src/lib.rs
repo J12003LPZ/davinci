@@ -81,10 +81,10 @@ pub(crate) use permission::read_only_capability_allows;
 pub use permission::{
     check_path_boundary, glob_matches, is_git_metadata_path, is_outside_or_symlink_escape,
     is_sensitive_file_path, is_symlink_escape, project_relative, session_rule_for,
-    strip_verbatim_prefix, subject_of,
-    summary_of, tool_class, FilesystemBoundaryPolicy, PermissionMode, PermissionPolicy,
-    PermissionRule, PermissionVerdict, ReadOutsideRootPolicy, RuleParseError, RuleSpecifier,
-    ToolApprovalDecision, ToolApprovalRequest, ToolApprover, ToolClass,
+    strip_verbatim_prefix, subject_of, summary_of, tool_class, FilesystemBoundaryPolicy,
+    PermissionMode, PermissionPolicy, PermissionRule, PermissionVerdict, ReadOutsideRootPolicy,
+    RuleParseError, RuleSpecifier, ToolApprovalDecision, ToolApprovalRequest, ToolApprover,
+    ToolClass,
 };
 pub use prompt::{
     CapabilityGateOutcome, CapabilityRunState, DebuggingState, FrontendDesignState,

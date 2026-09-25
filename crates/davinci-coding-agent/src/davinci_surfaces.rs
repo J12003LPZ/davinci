@@ -332,8 +332,6 @@ pub fn dress_from_extensions(model: &mut Model, cwd: &Path, agent: &Agent) {
     model.budget = rows;
     model.budget_meta = meta;
     model.proposal = proposal;
-
-
 }
 
 /// Filter whether a task from `task_root` is visible to an active session run with `active_root`.

@@ -100,8 +100,19 @@ pub fn split_command_line(line: &str) -> Result<Vec<String>, String> {
             None => match ch {
                 '\'' | '"' => quote = Some(ch),
                 '\\' => {
-                    if let Some(next) = chars.next() {
-                        current.push(next);
+                    // Preserve ordinary Windows path separators (for example
+                    // C:\\Tools\\vim.exe). Only consume the backslash as an
+                    // escape when it actually quotes a shell-like separator.
+                    match chars.peek().copied() {
+                        Some(next)
+                            if next == '\\'
+                                || next == '\''
+                                || next == '"'
+                                || next.is_whitespace() =>
+                        {
+                            current.push(chars.next().unwrap());
+                        }
+                        _ => current.push('\\'),
                     }
                 }
                 ch if ch.is_whitespace() => {

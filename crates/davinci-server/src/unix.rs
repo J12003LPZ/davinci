@@ -144,9 +144,9 @@ pub fn bind_unix_with(options: UnixListenerOptions) -> Result<BoundUnixListener,
             fs::create_dir_all(parent).map_err(|err| ServerError::Io(err.to_string()))?;
         }
     }
-    let owned_dir = owned.parent().ok_or_else(|| {
-        ServerError::Io("PiServer private Unix bind path has no parent".into())
-    })?;
+    let owned_dir = owned
+        .parent()
+        .ok_or_else(|| ServerError::Io("PiServer private Unix bind path has no parent".into()))?;
     fs::create_dir_all(owned_dir).map_err(|err| ServerError::Io(err.to_string()))?;
     fs::set_permissions(owned_dir, Permissions::from_mode(0o700))
         .map_err(|err| ServerError::Io(err.to_string()))?;

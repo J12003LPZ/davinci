@@ -133,7 +133,6 @@ pub fn lines(model: &Model) -> Vec<Line<'static>> {
         .lines()
 }
 
-
 fn approval_lines(model: &Model) -> Vec<Line<'static>> {
     let th = &model.theme;
     let cc = th.cc();
@@ -187,10 +186,7 @@ fn approval_lines(model: &Model) -> Vec<Line<'static>> {
     let selected = model.selection(ask.items.len());
     for (index, item) in ask.items.iter().enumerate() {
         let focused = Some(index) == selected;
-        let mut row = vec![span(
-            if focused { " ❯ " } else { "   " },
-            cc.permission,
-        )];
+        let mut row = vec![span(if focused { " ❯ " } else { "   " }, cc.permission)];
         row.push(span(format!("{}. ", index + 1), cc.inactive));
         row.push(span(
             item.label.clone(),

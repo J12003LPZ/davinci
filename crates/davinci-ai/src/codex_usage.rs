@@ -48,11 +48,8 @@ fn window(headers: &[(String, String)], prefix: &str) -> Option<UsageWindow> {
         used_percent,
         window_minutes: header(headers, &format!("x-codex-{prefix}-window-minutes"))
             .and_then(|value| value.parse().ok()),
-        resets_in_seconds: header(
-            headers,
-            &format!("x-codex-{prefix}-reset-after-seconds"),
-        )
-        .and_then(|value| value.parse().ok()),
+        resets_in_seconds: header(headers, &format!("x-codex-{prefix}-reset-after-seconds"))
+            .and_then(|value| value.parse().ok()),
     })
 }
 

@@ -441,13 +441,11 @@ pub fn hash_to_uuid(hash: &str) -> String {
 pub use resolve_repo_id as repo_id;
 
 pub fn resolve_repo_id(cwd: &Path) -> String {
-    let remote = crate::native_extensions::graph::git::run(
-        cwd,
-        &["config", "--get", "remote.origin.url"],
-    )
-    .ok()
-    .map(|output| String::from_utf8_lossy(&output).trim().to_string())
-    .filter(|value| !value.is_empty());
+    let remote =
+        crate::native_extensions::graph::git::run(cwd, &["config", "--get", "remote.origin.url"])
+            .ok()
+            .map(|output| String::from_utf8_lossy(&output).trim().to_string())
+            .filter(|value| !value.is_empty());
     let root = crate::native_extensions::graph::git::run(cwd, &["rev-parse", "--show-toplevel"])
         .ok()
         .map(|output| String::from_utf8_lossy(&output).trim().to_string())

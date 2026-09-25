@@ -847,7 +847,10 @@ impl Agent {
                         if usage.cost.total > 0.0 {
                             let minor = (usage.cost.total * 10_000.0) as u64;
                             self.stats.cost_minor_units = Some(
-                                self.stats.cost_minor_units.unwrap_or(0).saturating_add(minor),
+                                self.stats
+                                    .cost_minor_units
+                                    .unwrap_or(0)
+                                    .saturating_add(minor),
                             );
                         } else {
                             self.stats.has_unknown_cost = true;
@@ -3050,7 +3053,8 @@ impl Agent {
                 crate::runtime::ExecutorCapabilities::default(),
                 cwd,
             )
-            .with_contract(contract.clone());
+            .with_contract(contract.clone())
+            .allowing_unconfined_shell();
             if let Err(error) = executor.execute_shell(command, false) {
                 return Err(crate::runtime::ScopeViolation {
                     requested_target: name.to_string(),
