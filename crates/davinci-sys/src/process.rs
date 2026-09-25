@@ -56,6 +56,12 @@ pub fn resolve_program_in(name: &str, path_var: &OsStr, pathext: Option<&str>) -
     }
     let has_extension = Path::new(name).extension().is_some();
     for dir in std::env::split_paths(path_var) {
+        // Empty PATH entries mean the current working directory on common
+        // platforms. Never resolve an executable from an untrusted repo
+        // before the repository trust decision has been made.
+        if dir.as_os_str().is_empty() {
+            continue;
+        }
         match pathext {
             Some(exts) if !has_extension => {
                 for ext in exts.split(';').filter(|ext| !ext.is_empty()) {
