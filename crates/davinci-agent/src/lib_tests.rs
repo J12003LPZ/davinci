@@ -1,6 +1,81 @@
 use super::*;
 
 #[test]
+fn effort_signals_track_real_turns_and_preserve_configured_identity() {
+    let mut agent = Agent::new("stable system");
+    agent.prompt("fix it");
+    agent
+        .messages
+        .push(ChatMessage::tool_result("c1", "write", "ok", false));
+    agent
+        .messages
+        .push(ChatMessage::tool_result("c2", "bash", "boom", true));
+    agent
+        .messages
+        .push(ChatMessage::tool_result("c3", "bash", "boom", true));
+    let mut reminder = ChatMessage::text("user", "Verify before finishing");
+    reminder
+        .extra
+        .insert("davinciCapabilityReminder".into(), Value::Bool(true));
+    agent.messages.push(reminder);
+    agent.messages.push(ChatMessage::text("custom", "context"));
+    agent.prompt_with("injected context", &[]);
+    assert_eq!(
+        agent.effort_signals(),
+        crate::effort::EffortSignals {
+            mutations: 1,
+            consecutive_failures: 2
+        }
+    );
+    agent.thinking_level = ThinkingLevel::Medium;
+    assert_eq!(agent.request_thinking_level(), ThinkingLevel::Medium);
+    agent.effort_policy = crate::effort::EffortPolicy::Adaptive;
+    assert_eq!(agent.request_thinking_level(), ThinkingLevel::High);
+    assert_eq!(agent.thinking_level, ThinkingLevel::Medium);
+    assert_eq!(agent.system_prompt, "stable system");
+    agent.prompt("a new task");
+    assert_eq!(
+        agent.effort_signals(),
+        crate::effort::EffortSignals::default()
+    );
+    assert_eq!(agent.request_thinking_level(), ThinkingLevel::Low);
+}
+
+#[test]
+fn effort_signals_count_batch_children_and_ignore_skipped_operations() {
+    let mut agent = Agent::new("x");
+    agent.prompt("fix it");
+    let mut result = ChatMessage::tool_result("batch-1", "batch", "summary", false);
+    result.extra.insert(
+        "details".into(),
+        serde_json::json!({"operations": [
+            {"tool": "write", "status": "ok"},
+            {"tool": "edit", "status": "error"},
+            {"tool": "bash", "status": "error"},
+            {"tool": "read", "status": "skipped"}
+        ]}),
+    );
+    agent.messages.push(result);
+    assert_eq!(
+        agent.effort_signals(),
+        crate::effort::EffortSignals {
+            mutations: 1,
+            consecutive_failures: 2
+        }
+    );
+    agent
+        .messages
+        .push(ChatMessage::tool_result("c2", "read", "ok", false));
+    assert_eq!(
+        agent.effort_signals(),
+        crate::effort::EffortSignals {
+            mutations: 1,
+            consecutive_failures: 0
+        }
+    );
+}
+
+#[test]
 fn f03_equivalent_session_path_reuses_live_runtime() {
     let dir = tempfile::tempdir().unwrap();
     let session = JsonlSession::create(dir.path(), "fixture", None).unwrap();

@@ -14,6 +14,7 @@ pub mod command_receipt;
 mod compaction;
 mod context;
 mod edit_diff;
+pub mod effort;
 mod events;
 mod evidence;
 mod file_mutation_queue;
@@ -356,6 +357,7 @@ pub struct Agent {
     pub system_prompt: String,
     pub messages: Vec<ChatMessage>,
     pub thinking_level: ThinkingLevel,
+    pub effort_policy: effort::EffortPolicy,
     /// Repeat the last verification call after later mutations at completion.
     pub auto_verify: bool,
     pub auto_compaction: bool,
@@ -507,6 +509,7 @@ impl Agent {
             last_real_user_request: None,
             messages: Vec::new(),
             thinking_level: ThinkingLevel::Off,
+            effort_policy: effort::EffortPolicy::default(),
             auto_verify: true,
             auto_compaction: true,
             compaction: CompactionSettings::default(),
@@ -1217,6 +1220,53 @@ impl Agent {
 
     pub fn prompt(&mut self, text: &str) -> ChatMessage {
         self.prompt_user_with(text, &[])
+    }
+
+    /// Tool outcomes since the latest real user prompt. Injected reminders and
+    /// context messages do not begin a new turn; batch children count separately.
+    pub fn effort_signals(&self) -> effort::EffortSignals {
+        let start = self
+            .messages
+            .iter()
+            .rposition(|message| {
+                message.role == "user" && message.extra_bool(REAL_USER_ORIGIN_FIELD)
+            })
+            .unwrap_or(0);
+        let mut signals = effort::EffortSignals::default();
+        for message in &self.messages[start..] {
+            if message.role != "toolResult" {
+                continue;
+            }
+            if message.tool_name.as_deref() == Some("batch") {
+                if let Some(operations) = message
+                    .extra
+                    .get("details")
+                    .and_then(|details| details.get("operations"))
+                    .and_then(Value::as_array)
+                {
+                    for operation in operations {
+                        let error = match operation.get("status").and_then(Value::as_str) {
+                            Some("ok") => false,
+                            Some("error") => true,
+                            _ => continue,
+                        };
+                        signals.observe(operation.get("tool").and_then(Value::as_str), error);
+                    }
+                    continue;
+                }
+            }
+            signals.observe(message.tool_name.as_deref(), message.is_error == Some(true));
+        }
+        signals
+    }
+
+    /// The next request's effort; the configured level and prompt stay stable.
+    pub fn request_thinking_level(&self) -> ThinkingLevel {
+        effort::request_level(
+            self.effort_policy,
+            self.thinking_level,
+            self.effort_signals(),
+        )
     }
 
     pub fn prompt_user_with(
