@@ -637,7 +637,7 @@ mod tests {
         assert!(openrouter_token.body.contains("code_challenge_method"));
         let failed = format!(
             "Token exchange request failed. url={}; redirect_uri={}; response_type=authorization_code; details=fixture",
-            codex_token.url, anthropic_token.redirect_uri
+            codex_token.url, codex_token.redirect_uri
         );
         assert!(failed.contains("response_type=authorization_code"));
         let invalid = format!(
