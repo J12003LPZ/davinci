@@ -657,6 +657,28 @@ mod tests {
     }
 
     #[test]
+    fn silent_preconnect_does_not_end_callback_wait() {
+        let mut server =
+            CallbackServer::bind("127.0.0.1", 0, CallbackProvider::OpenAiCodex, "state-1").unwrap();
+        let addr = server.local_addr().unwrap();
+        let silent = TcpStream::connect(addr).unwrap();
+        let client = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(350));
+            let mut stream = TcpStream::connect(addr).unwrap();
+            write!(
+                stream,
+                "GET /auth/callback?code=real&state=state-1 HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n"
+            )
+            .unwrap();
+        });
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        let response = server.accept_until(deadline).unwrap();
+        drop(silent);
+        client.join().unwrap();
+        assert_eq!(response.code.as_deref(), Some("real"));
+    }
+
+    #[test]
     fn accept_until_times_out() {
         let mut server =
             CallbackServer::bind("127.0.0.1", 0, CallbackProvider::OpenAiCodex, "s").unwrap();
