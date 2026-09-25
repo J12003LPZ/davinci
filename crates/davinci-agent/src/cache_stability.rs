@@ -190,11 +190,19 @@ mod tests {
     }
 
     #[test]
-    fn other_families_keep_per_turn_state_in_the_system_prompt() {
+    fn anthropic_system_prompt_route_keeps_per_turn_state_in_the_system_prompt() {
         let mut agent = Agent::new_builtin(crate::prompt::PromptProfile::Stable);
         agent.provider = "anthropic".into();
         agent.model_id = "claude-opus-4-5".into();
 
+        assert!(!crate::turn_context::is_cache_sensitive_route(
+            &agent.provider,
+            &agent.model_id
+        ));
+        // Route-family classification is checked above. Force the behavioral
+        // placement so DAVINCI_TURN_CONTEXT cannot make this regression flaky.
+        agent.turn_context_placement_override =
+            Some(crate::turn_context::TurnContextPlacement::SystemPrompt);
         agent.prompt("Diagnose the root cause of this failure.");
 
         assert_eq!(
