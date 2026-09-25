@@ -1,23 +1,12 @@
 //! Language-specific project markers, IDs and server discovery live here.
 
 use super::protocol::{IntelligenceError, Result};
-use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::ffi::OsStr;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub enum Backend {
-    #[default]
-    Auto,
-    #[serde(rename = "typescriptNative")]
-    TypeScriptNative,
-    #[serde(rename = "typescriptLanguageServer")]
-    TypeScriptLanguageServer,
-}
-
+pub(crate) use super::config::TypeScriptBackend as Backend;
 #[derive(Debug, Clone)]
 pub(super) struct ServerCommand {
     pub kind: Backend,

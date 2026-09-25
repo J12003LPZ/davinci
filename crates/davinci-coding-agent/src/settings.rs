@@ -152,15 +152,7 @@ fn parse_language_intelligence<'de, D: serde::Deserializer<'de>>(
 > {
     use crate::native_extensions::language_intelligence::LanguageIntelligenceConfig;
     let value = Option::<serde_json::Value>::deserialize(deserializer)?;
-    Ok(value.map(|value| {
-        serde_json::from_value(value).unwrap_or_else(|_| LanguageIntelligenceConfig {
-            enabled: false,
-            configuration_error: Some(
-                "Invalid languageIntelligence settings; check backend and value types".into(),
-            ),
-            ..Default::default()
-        })
-    }))
+    Ok(value.map(LanguageIntelligenceConfig::from_value))
 }
 
 fn parse_decision_intelligence<'de, D: serde::Deserializer<'de>>(

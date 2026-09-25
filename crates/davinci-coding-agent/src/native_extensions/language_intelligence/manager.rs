@@ -1,56 +1,16 @@
 //! Host-owned, lazy, bounded sessions. Clones share ownership across callers.
 use super::protocol::{IntelligenceError, Result};
-use super::servers::{Backend, TypeScriptAdapter};
+use super::config::LanguageIntelligenceConfig;
+use super::servers::TypeScriptAdapter;
 use super::session::Session;
 use super::{documents, normalize, servers, session, tools};
 use davinci_agent::{PermissionState, ToolError, ToolResult};
-use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, TryLockError};
 use std::time::{Duration, Instant};
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default, rename_all = "camelCase", deny_unknown_fields)]
-pub struct LanguageIntelligenceConfig {
-    pub enabled: bool,
-    pub typescript: TypeScriptConfig,
-    #[serde(skip)]
-    pub configuration_error: Option<String>,
-}
-impl Default for LanguageIntelligenceConfig {
-    fn default() -> Self {
-        Self {
-            enabled: true,
-            typescript: TypeScriptConfig::default(),
-            configuration_error: None,
-        }
-    }
-}
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default, rename_all = "camelCase", deny_unknown_fields)]
-pub struct TypeScriptConfig {
-    pub enabled: bool,
-    pub backend: Backend,
-    pub request_timeout_ms: u64,
-    pub max_references: usize,
-    pub max_workspace_symbols: usize,
-    pub max_diagnostics: usize,
-}
-impl Default for TypeScriptConfig {
-    fn default() -> Self {
-        Self {
-            enabled: true,
-            backend: Backend::Auto,
-            request_timeout_ms: 5000,
-            max_references: 50,
-            max_workspace_symbols: 50,
-            max_diagnostics: 50,
-        }
-    }
-}
 
 #[derive(Debug, Default)]
 struct Slot {
