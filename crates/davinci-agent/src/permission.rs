@@ -1303,7 +1303,37 @@ impl PermissionPolicy {
             }
         }
         match first_ask {
-            Some(request) => PermissionVerdict::Ask(request),
+            Some(mut request) => {
+                let labels = tasks
+                    .iter()
+                    .enumerate()
+                    .map(|(index, task)| {
+                        let text = task
+                            .get("description")
+                            .or_else(|| task.get("prompt"))
+                            .and_then(Value::as_str)
+                            .unwrap_or("unnamed task")
+                            .trim();
+                        let mut text = text.chars().take(160).collect::<String>();
+                        if text.chars().count() == 160 {
+                            text.push('…');
+                        }
+                        format!("{}. {}", index + 1, text)
+                    })
+                    .collect::<Vec<_>>();
+                request.args = serde_json::json!({ "tasks": tasks });
+                request.subject = labels.join(" | ");
+                request.summary = crate::approval::display_text(&format!(
+                    "agent batch ({} tasks): {}",
+                    tasks.len(),
+                    labels.join(" | ")
+                ));
+                // A batch grant based on one member must never turn into a
+                // persistent rule that silently authorizes later tasks.
+                request.session_rule.clear();
+                request.legal_choices = crate::approval::offer_scopes(true, false, false);
+                PermissionVerdict::Ask(request)
+            }
             None => PermissionVerdict::Allow,
         }
     }
