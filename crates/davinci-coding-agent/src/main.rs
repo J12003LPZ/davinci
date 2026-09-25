@@ -1918,6 +1918,34 @@ fn new_worker_agent(system_prompt: impl Into<String>) -> Agent {
     agent
 }
 
+struct ProviderTransportSession {
+    id: String,
+    ephemeral: bool,
+}
+
+impl ProviderTransportSession {
+    fn new(agent: &Agent) -> Self {
+        Self {
+            id: agent.session.as_ref().map_or_else(
+                || uuid::Uuid::new_v4().to_string(),
+                |session| session.header.id.clone(),
+            ),
+            ephemeral: agent.session.is_none(),
+        }
+    }
+}
+
+impl Drop for ProviderTransportSession {
+    fn drop(&mut self) {
+        if self.ephemeral {
+            // --no-session disables persistence, not in-turn socket reuse.
+            // Its private transport lease ends with this loop, including errors.
+            davinci_ai::close_openai_codex_websocket_sessions(Some(&self.id));
+            davinci_ai::reset_openai_codex_websocket_debug_stats(Some(&self.id));
+        }
+    }
+}
+
 fn run_nested_subagent(
     parsed: &Args,
     cwd: &Path,
@@ -2438,6 +2466,7 @@ fn complete_prompt_with_host(
             }
         })));
     }
+    let transport_session = ProviderTransportSession::new(agent);
     let mut loop_failure = None;
     let mut conversation_failure = None;
     let mut events = agent
@@ -2503,10 +2532,7 @@ fn complete_prompt_with_host(
                             websocket_connect_timeout_ms: load_settings(&default_agent_dir())
                                 .websocket_connect_timeout_ms,
                             transport: current.transport.clone(),
-                            session_id: current
-                                .session
-                                .as_ref()
-                                .map(|session| session.header.id.clone()),
+                            session_id: Some(transport_session.id.clone()),
                             cache_key: std::env::var("PI_GRAPH_CACHE_KEY")
                                 .ok()
                                 .filter(|s| !s.is_empty())

@@ -97,4 +97,28 @@ Before-fix t4: 6/6 tests, 51.9s, 15 tool calls, 9 requests, 81% cached.
 Checkpoint B: 8/8 tasks, median 55s and 10 tool calls, cache 61%, seven
 transaction-directory leaks. These are measurements, not final acceptance.
 
-After-fix validation is pending.
+## After the fix
+
+Repeated t1 with the same model/effort and a fresh `BENCH_RUNS=c3-after`
+directory, dumping to its `wire` subdirectory. All seven hidden tests passed
+in a 22.0s run with six tool calls, seven requests and 457 output tokens.
+This single stochastic sample is not a controlled speedup estimate.
+
+```text
+process 25504
+  #0001 items=  2 total=  9,902 cached=  8,704 full  key=ci-root-32db24c31195 break=-
+  #0002 items=  4 total= 10,367 cached=  9,728 delta key=ci-root-32db24c31195 break=-
+  #0003 items=  8 total= 10,501 cached=  9,728 delta key=ci-root-32db24c31195 break=-
+  #0004 items= 10 total= 10,709 cached=  9,728 delta key=ci-root-32db24c31195 break=-
+  #0005 items= 12 total= 10,764 cached=  9,728 delta key=ci-root-32db24c31195 break=-
+  #0006 items= 14 total= 10,841 cached=  9,728 delta key=ci-root-32db24c31195 break=-
+  #0007 items= 16 total= 10,900 cached= 10,752 delta key=ci-root-32db24c31195 break=-
+  total input 73,984, cached 68,096 (92%)
+```
+
+Every request after the first now uses a delta, the logical prefix remains
+append-only and cache reuse exceeds the 85% target. The no-session transport
+identity regression failed before the fix and passed afterward; the durable
+ID preservation test passed. The full agent suite passed 1,309 tests with
+five ignored. The release build passed. Transaction-file leakage remains for
+Part E; final benchmark acceptance is still separate.

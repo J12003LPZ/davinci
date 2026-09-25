@@ -42,6 +42,39 @@ use super::*;
 static PROCESS_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 #[test]
+fn nonpersistent_provider_loop_has_an_isolated_transport_session() {
+    let agent = Agent::new("transport fixture");
+    assert!(agent.session.is_none());
+    let first = ProviderTransportSession::new(&agent);
+    let second = ProviderTransportSession::new(&agent);
+    let id = &first.id;
+    assert!(!id.is_empty());
+    assert_ne!(
+        first.id, second.id,
+        "independent loops cannot share continuations"
+    );
+    assert!(
+        agent.session.is_none(),
+        "transport reuse must not create a durable session"
+    );
+}
+
+#[test]
+fn persisted_provider_transport_session_keeps_the_durable_id() {
+    let dir = tempfile::tempdir().unwrap();
+    let args = Args {
+        session_id: Some("durable-transport-fixture".into()),
+        ..Args::default()
+    };
+    let session = resolve_or_create_session(&args, dir.path(), dir.path()).unwrap();
+    let mut agent = Agent::new("fixture");
+    agent.session = Some(session);
+    let lease = ProviderTransportSession::new(&agent);
+    assert_eq!(lease.id, "durable-transport-fixture");
+    assert!(!lease.ephemeral);
+}
+
+#[test]
 fn main_model_turn_setting_overrides_the_default_and_keeps_zero() {
     let mut agent = Agent::new("main turn limit fixture");
     super::apply_max_model_turns(&mut agent, &super::settings::Settings::default());
