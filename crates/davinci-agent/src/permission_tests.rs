@@ -1166,6 +1166,38 @@
     }
 
     #[test]
+    fn agent_batch_approval_describes_every_task() {
+        let policy = PermissionPolicy::new(PermissionMode::Ask);
+        let batch = json!({"tasks":[
+            {"prompt":"inspect auth", "description":"audit authentication", "isolation":"shared"},
+            {"prompt":"inspect sessions", "description":"audit session persistence", "isolation":"worktree"}
+        ]});
+        match verdict(&policy, "agent", batch) {
+            PermissionVerdict::Ask(request) => {
+                assert!(request.summary.contains("audit authentication"), "{}", request.summary);
+                assert!(request.summary.contains("audit session persistence"), "{}", request.summary);
+                assert!(request.session_rule.is_empty());
+                assert_eq!(request.args["tasks"].as_array().map(Vec::len), Some(2));
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn edits_and_auto_never_reclassify_unscoped_agent_calls_as_reads() {
+        for mode in [PermissionMode::Edits, PermissionMode::Auto] {
+            let policy = PermissionPolicy::new(mode);
+            assert!(
+                matches!(
+                    policy.decide("c1", "agent", &json!({"prompt":"write files"}), &cwd()),
+                    PermissionVerdict::Ask(_)
+                ),
+                "{mode:?}"
+            );
+        }
+    }
+
+    #[test]
     fn agent_top_level_fields_beside_tasks_are_refused() {
         let policy = PermissionPolicy::new(PermissionMode::AlwaysApprove);
         let ambiguous =
