@@ -325,6 +325,10 @@ impl Transport {
         self.child.lock().unwrap_or_else(|e| e.into_inner()).id()
     }
 
+    pub fn rss_bytes(&self) -> Option<u64> {
+        process_tree_rss_bytes(self.pid())
+    }
+
     pub fn watch_document(&self, uri: &str) -> Result<()> {
         let uri = diagnostic_key(uri);
         let mut state = self.shared.state.lock().unwrap_or_else(|e| e.into_inner());
@@ -539,6 +543,64 @@ impl Drop for Transport {
     }
 }
 
+#[cfg(target_os = "linux")]
+fn process_tree_rss_bytes(root: u32) -> Option<u64> {
+    use std::collections::{HashMap, HashSet, VecDeque};
+    let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+    if page_size <= 0 {
+        return None;
+    }
+    let mut parents = HashMap::<u32, u32>::new();
+    let mut rss_pages = HashMap::<u32, u64>::new();
+    let entries = std::fs::read_dir("/proc").ok()?;
+    for entry in entries.flatten().take(65_536) {
+        let Ok(pid) = entry.file_name().to_string_lossy().parse::<u32>() else {
+            continue;
+        };
+        let Ok(stat) = std::fs::read_to_string(entry.path().join("stat")) else {
+            continue;
+        };
+        let Some(close) = stat.rfind(')') else {
+            continue;
+        };
+        let fields = stat[close + 1..].split_whitespace().collect::<Vec<_>>();
+        // After the closing ')': state is field 3, ppid field 4 and rss field 24.
+        if fields.len() <= 21 {
+            continue;
+        }
+        let Ok(ppid) = fields[1].parse::<u32>() else {
+            continue;
+        };
+        let Ok(rss) = fields[21].parse::<u64>() else {
+            continue;
+        };
+        parents.insert(pid, ppid);
+        rss_pages.insert(pid, rss);
+    }
+    let mut children = HashMap::<u32, Vec<u32>>::new();
+    for (pid, ppid) in &parents {
+        children.entry(*ppid).or_default().push(*pid);
+    }
+    let mut queue = VecDeque::from([root]);
+    let mut seen = HashSet::new();
+    let mut total_pages = 0u64;
+    while let Some(pid) = queue.pop_front() {
+        if !seen.insert(pid) {
+            continue;
+        }
+        total_pages = total_pages.saturating_add(rss_pages.get(&pid).copied().unwrap_or(0));
+        if let Some(descendants) = children.get(&pid) {
+            queue.extend(descendants.iter().copied());
+        }
+    }
+    Some(total_pages.saturating_mul(page_size as u64))
+}
+
+#[cfg(not(target_os = "linux"))]
+fn process_tree_rss_bytes(_root: u32) -> Option<u64> {
+    None
+}
+
 fn dispatch_message(
     shared: &Shared,
     client: &ClientRequestState,
@@ -690,6 +752,13 @@ fn write_frame(writer: &mut impl Write, value: &Value) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn process_tree_rss_reports_live_fixture_memory() {
+        let transport = fixture("normal");
+        assert!(transport.rss_bytes().is_some_and(|bytes| bytes > 0));
+    }
 
     #[test]
     fn diagnostic_uri_encodings_share_identity() {
