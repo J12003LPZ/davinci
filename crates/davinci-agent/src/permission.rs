@@ -1296,7 +1296,11 @@ impl PermissionPolicy {
         cwd: &Path,
     ) -> PermissionVerdict {
         let mut first_ask = None;
+        let mut task_summaries = Vec::with_capacity(tasks.len());
         for task in tasks {
+            let (subject, _) =
+                subject_of_with_boundary("agent", task, cwd, Some(&self.filesystem_boundary));
+            task_summaries.push(summary_of("agent", &subject));
             match self.decide(tool_call_id, "agent", task, cwd) {
                 PermissionVerdict::Allow => {}
                 deny @ PermissionVerdict::Deny { .. } => return deny,
@@ -1306,7 +1310,20 @@ impl PermissionPolicy {
             }
         }
         match first_ask {
-            Some(request) => PermissionVerdict::Ask(request),
+            Some(mut request) => {
+                request.args = serde_json::json!({ "tasks": tasks });
+                request.subject = task_summaries.join("; ");
+                request.summary = crate::approval::display_text(&format!(
+                    "Approve agent batch ({} tasks): {}",
+                    tasks.len(),
+                    task_summaries.join(" | ")
+                ));
+                // A heterogeneous batch must never inherit a persistent rule
+                // derived from only the first task.
+                request.session_rule.clear();
+                request.legal_choices = crate::approval::offer_scopes(true, false, false);
+                PermissionVerdict::Ask(request)
+            }
             None => PermissionVerdict::Allow,
         }
     }
