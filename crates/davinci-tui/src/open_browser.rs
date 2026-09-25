@@ -21,7 +21,6 @@ pub fn open_browser_dry_run() -> bool {
             std::env::var("PI_OPEN_BROWSER_DRY_RUN").as_deref(),
             Ok("1") | Ok("true") | Ok("yes")
         )
-        || std::env::var("PI_OAUTH_FIXTURE").is_ok()
 }
 
 pub fn copy_text_dry_run() -> bool {
