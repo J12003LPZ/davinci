@@ -75,7 +75,7 @@ pub use topology::{
 pub use types::*;
 
 use crate::native_extensions::ecosystem::verification::{SecurityPolicyMode, SecurityVerification};
-use config::load_config;
+use config::{load_config, GraphConfig};
 #[allow(unused_imports)]
 pub use controller::{run_graph, run_saved_graph, ControllerDeps, RunOptions};
 use davinci_agent::{ToolError, ToolResult};
