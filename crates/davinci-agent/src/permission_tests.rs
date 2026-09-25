@@ -124,6 +124,30 @@
     }
 
     #[test]
+    fn read_only_subagent_exemption_does_not_bypass_execution_mode_approval() {
+        let args_without_tools = json!({"task":"inspect the repository"});
+        assert_eq!(
+            verdict(
+                &policy(PermissionMode::ReadOnly),
+                "agent",
+                args_without_tools.clone()
+            ),
+            PermissionVerdict::Allow
+        );
+        for mode in [PermissionMode::Ask, PermissionMode::Edits, PermissionMode::Auto] {
+            assert!(
+                is_ask(&verdict(&policy(mode), "agent", args_without_tools.clone())),
+                "{mode:?}"
+            );
+        }
+        assert!(is_deny(&verdict(
+            &policy(PermissionMode::ReadOnly),
+            "agent",
+            json!({"task":"change files","tools":["write"]})
+        )));
+    }
+
+    #[test]
     fn auto_escalates_external_destructive_and_sensitive_actions() {
         let p = policy(PermissionMode::Auto);
         for (tool, args) in [
