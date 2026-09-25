@@ -1833,12 +1833,12 @@ mod tests {
         };
         save_settings(agent, &dark).unwrap();
         assert_eq!(load_settings(agent).theme.as_deref(), Some("dark"));
-        assert!(!settings_lock_path(&settings_path(agent)).exists());
         let lock = settings_lock_path(&settings_path(agent));
-        std::fs::write(&lock, "held").unwrap();
+        assert!(lock.is_file(), "OS-backed lock keeps a stable lock inode");
+        let held = davinci_sys::lock::ExclusiveFileLock::try_acquire(&lock).unwrap();
         let err = save_settings(agent, &dark).unwrap_err();
-        assert_eq!(err, "Failed to acquire settings lock");
-        std::fs::remove_file(&lock).unwrap();
+        assert!(err.starts_with("Failed to acquire settings lock:"), "{err}");
+        drop(held);
         let light = Settings {
             theme: Some("light".into()),
             ..Settings::default()
