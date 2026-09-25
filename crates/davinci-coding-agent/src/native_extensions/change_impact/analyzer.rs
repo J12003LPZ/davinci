@@ -341,42 +341,6 @@ impl<'a> ChangeImpactAnalyzer<'a> {
         let mut lsp_failed = false;
         let mut remaining = limit;
 
-        let mut record_references = |name: &str, output: davinci_agent::ToolResult| {
-            if output.is_error {
-                lsp_failed = true;
-                return;
-            }
-            let Some(details) = output.details else {
-                lsp_failed = true;
-                return;
-            };
-            for item in details["items"].as_array().into_iter().flatten() {
-                if remaining == 0 {
-                    break;
-                }
-                let Some(path) = item["path"].as_str() else {
-                    continue;
-                };
-                let Some(range) = normalized_source_range(item.get("range")) else {
-                    lsp_failed = true;
-                    continue;
-                };
-                remaining -= 1;
-                reference_count += 1;
-                items.push(ImpactItem {
-                    name: name.to_string(),
-                    path: path.to_string(),
-                    evidence_source: EvidenceSource::Lsp,
-                    description: format!(
-                        "Semantic reference to '{name}' at {path}:{}:{}",
-                        range.start_line, range.start_column
-                    ),
-                    range: Some(range),
-                    details: Some(item.clone()),
-                });
-            }
-        };
-
         // Workspace symbols are declaration candidates only. Anchor them to a
         // real source path, then ask references for actual usage evidence.
         for symbol in symbols {
@@ -423,7 +387,19 @@ impl<'a> ChangeImpactAnalyzer<'a> {
                         }),
                         &context,
                     ) {
-                        Ok(output) => record_references(symbol, output),
+                        Ok(output) => {
+                            if record_semantic_references(
+                                symbol,
+                                output,
+                                &mut remaining,
+                                &mut reference_count,
+                                &mut items,
+                            )
+                            .is_err()
+                            {
+                                lsp_failed = true;
+                            }
+                        },
                         Err(_) => lsp_failed = true,
                     }
                 }
@@ -474,7 +450,19 @@ impl<'a> ChangeImpactAnalyzer<'a> {
                     }),
                     &context,
                 ) {
-                    Ok(output) => record_references(name, output),
+                    Ok(output) => {
+                        if record_semantic_references(
+                            name,
+                            output,
+                            &mut remaining,
+                            &mut reference_count,
+                            &mut items,
+                        )
+                        .is_err()
+                        {
+                            lsp_failed = true;
+                        }
+                    },
                     Err(_) => lsp_failed = true,
                 }
             }
@@ -951,6 +939,40 @@ impl<'a> ChangeImpactAnalyzer<'a> {
             summary,
         }
     }
+}
+
+fn record_semantic_references(
+    name: &str,
+    output: davinci_agent::ToolResult,
+    remaining: &mut usize,
+    reference_count: &mut usize,
+    items: &mut Vec<ImpactItem>,
+) -> Result<(), ()> {
+    if output.is_error {
+        return Err(());
+    }
+    let details = output.details.ok_or(())?;
+    for item in details["items"].as_array().into_iter().flatten() {
+        if *remaining == 0 {
+            break;
+        }
+        let path = item["path"].as_str().ok_or(())?;
+        let range = normalized_source_range(item.get("range")).ok_or(())?;
+        *remaining -= 1;
+        *reference_count += 1;
+        items.push(ImpactItem {
+            name: name.to_string(),
+            path: path.to_string(),
+            evidence_source: EvidenceSource::Lsp,
+            description: format!(
+                "Semantic reference to '{name}' at {path}:{}:{}",
+                range.start_line, range.start_column
+            ),
+            range: Some(range),
+            details: Some(item.clone()),
+        });
+    }
+    Ok(())
 }
 
 fn normalized_source_range(value: Option<&Value>) -> Option<SourceRange> {
