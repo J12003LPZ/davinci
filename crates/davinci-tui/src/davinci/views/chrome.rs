@@ -19,11 +19,11 @@ use crate::davinci::ui::{
 use super::sheet::{self, Composer};
 
 
-/// Which hints sit under the composer. Every panel states its own exits (§9).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 /// Examples shown in an empty conversation composer, one per session.
 pub const PLACEHOLDERS: [&str; 3] = ["fix lint errors", "fix typecheck errors", "refactor <filepath>"];
 
+/// Which hints sit under the composer. Every panel states its own exits (§9).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Hint {
     Default,
     Multiline,
