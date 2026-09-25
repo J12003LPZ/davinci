@@ -776,6 +776,27 @@ impl davinci_agent::runtime::task_transport::CoordinatorToolHandler for Language
         }
         LanguageIntelligence::execute(self, tool, args)
     }
+
+    fn execute_with_context(
+        &self,
+        tool: &str,
+        args: &Value,
+        timeout: Duration,
+        abort: Option<Arc<AtomicBool>>,
+    ) -> std::result::Result<ToolResult, ToolError> {
+        if tool == "retrieve_output" {
+            return self.execute(tool, args);
+        }
+        LanguageIntelligence::execute_with_budget(
+            self,
+            tool,
+            args,
+            RequestBudget {
+                deadline: Instant::now() + timeout.min(Duration::from_secs(120)),
+                cancelled: abort,
+            },
+        )
+    }
 }
 
 fn lock_until<'a, T>(mutex: &'a Mutex<T>, budget: &RequestBudget) -> Result<MutexGuard<'a, T>> {
