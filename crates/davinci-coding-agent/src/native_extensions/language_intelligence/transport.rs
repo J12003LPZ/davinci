@@ -1,6 +1,8 @@
 //! Bounded Content-Length framing and supervised stdio JSON-RPC.
 
-use super::protocol::{IntelligenceError, Result};
+use super::client_requests::ClientRequestState;
+use super::diagnostics;
+use super::protocol::{IntelligenceError, RequestBudget, Result};
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Read, Write};
@@ -71,6 +73,7 @@ impl Shared {
 
 pub(super) struct Transport {
     shared: Arc<Shared>,
+    client: ClientRequestState,
     writer: Option<mpsc::SyncSender<Value>>,
     child: Mutex<Child>,
     #[cfg(windows)]
@@ -88,6 +91,12 @@ impl std::fmt::Debug for Transport {
 
 impl Transport {
     pub fn spawn(command: &mut Command) -> Result<Self> {
+        let workspace = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+        let client = ClientRequestState::new(workspace, Value::Null)?;
+        Self::spawn_with_client(command, client)
+    }
+
+    pub fn spawn_with_client(command: &mut Command, client: ClientRequestState) -> Result<Self> {
         command
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -100,7 +109,7 @@ impl Transport {
         #[cfg(windows)]
         {
             use std::os::windows::process::CommandExt;
-            command.creation_flags(0x08000000); // CREATE_NO_WINDOW
+            command.creation_flags(0x08000000);
         }
         let mut child = command.spawn().map_err(|_| {
             IntelligenceError::new(
@@ -124,6 +133,7 @@ impl Transport {
         let (sender, receiver) = mpsc::sync_channel::<Value>(32);
         let mut transport = Self {
             shared: shared.clone(),
+            client: client.clone(),
             writer: Some(sender.clone()),
             child: Mutex::new(child),
             #[cfg(windows)]
@@ -141,6 +151,7 @@ impl Transport {
             }
         })?;
         let read_shared = shared.clone();
+        let read_client = client.clone();
         transport.start_thread("lsp-read", move || {
             let mut reader = BufReader::new(stdout);
             loop {
@@ -151,7 +162,7 @@ impl Transport {
                         break;
                     }
                 };
-                if let Err(error) = dispatch_message(&read_shared, &sender, message) {
+                if let Err(error) = dispatch_message(&read_shared, &read_client, &sender, message) {
                     read_shared.fail(error);
                     break;
                 }
@@ -211,8 +222,38 @@ impl Transport {
         self.send(json!({"jsonrpc":"2.0", "method":method, "params":params}))
     }
 
+    pub fn notify_with_budget(&self, method: &str, params: Value, budget: &RequestBudget) -> Result<()> {
+        budget.check()?;
+        self.send_until(json!({"jsonrpc":"2.0", "method":method, "params":params}), budget.deadline)
+    }
+
+    fn send_until(&self, mut value: Value, deadline: Instant) -> Result<()> {
+        if serde_json::to_vec(&value).map_err(|_| protocol_error())?.len() > MAX_FRAME {
+            return Err(protocol_error());
+        }
+        let sender = self.writer.as_ref().ok_or_else(exited)?;
+        loop {
+            match sender.try_send(value) {
+                Ok(()) => return Ok(()),
+                Err(mpsc::TrySendError::Full(returned)) => {
+                    value = returned;
+                    if Instant::now() >= deadline {
+                        return Err(IntelligenceError::new("request_timeout", "Language-server write queue stayed full until the deadline"));
+                    }
+                    thread::sleep(Duration::from_millis(2));
+                }
+                Err(mpsc::TrySendError::Disconnected(_)) => return Err(exited()),
+            }
+        }
+    }
+
     pub fn request(&self, method: &str, params: Value, timeout: Duration) -> Result<Value> {
-        let started = Instant::now();
+        let budget = RequestBudget::from_timeout(timeout);
+        self.request_with_budget(method, params, &budget)
+    }
+
+    pub fn request_with_budget(&self, method: &str, params: Value, budget: &RequestBudget) -> Result<Value> {
+        budget.check()?;
         let (sender, receiver) = mpsc::sync_channel(1);
         let id = {
             let mut state = self.shared.state.lock().unwrap_or_else(|e| e.into_inner());
@@ -231,7 +272,7 @@ impl Transport {
             id
         };
         if let Err(error) =
-            self.send(json!({"jsonrpc":"2.0", "id":id, "method":method, "params":params}))
+            self.send_until(json!({"jsonrpc":"2.0", "id":id, "method":method, "params":params}), budget.deadline)
         {
             self.shared
                 .state
@@ -241,22 +282,27 @@ impl Transport {
                 .remove(&id);
             return Err(error);
         }
-        match receiver.recv_timeout(timeout.saturating_sub(started.elapsed())) {
-            Ok(result) => result,
-            Err(_) => {
-                self.shared
-                    .state
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .pending
-                    .remove(&id);
+        loop {
+            if let Err(error) = budget.check() {
+                self.shared.state.lock().unwrap_or_else(|e| e.into_inner()).pending.remove(&id);
                 let _ = self.notify("$/cancelRequest", json!({"id":id}));
-                Err(IntelligenceError::new(
-                    "request_timeout",
-                    "Language-server request exceeded its deadline",
-                ))
+                return Err(error);
+            }
+            let wait = budget.remaining()?.min(Duration::from_millis(25));
+            match receiver.recv_timeout(wait) {
+                Ok(result) => return result,
+                Err(mpsc::RecvTimeoutError::Timeout) => continue,
+                Err(mpsc::RecvTimeoutError::Disconnected) => return Err(exited()),
             }
         }
+    }
+
+    pub fn has_dynamic_diagnostics(&self) -> bool {
+        self.client.has_document_diagnostics()
+    }
+
+    pub fn client_status(&self) -> Value {
+        self.client.status()
     }
 
     pub fn is_alive(&self) -> bool {
@@ -350,8 +396,15 @@ impl Transport {
         #[cfg(windows)]
         self.job.terminate();
         #[cfg(unix)]
-        // Descendants can outlive the group leader, so reap the group even after exit.
-        davinci_agent::jobs::kill_tree(child.id());
+        {
+            let group = -(child.id() as i32);
+            unsafe { libc::kill(group, libc::SIGTERM); }
+            let grace = Instant::now() + Duration::from_millis(200);
+            while child.try_wait().ok().flatten().is_none() && Instant::now() < grace {
+                thread::sleep(Duration::from_millis(10));
+            }
+            unsafe { libc::kill(group, libc::SIGKILL); }
+        }
         if child.try_wait().ok().flatten().is_none() {
             let _ = child.kill();
             let _ = child.wait();
@@ -370,6 +423,7 @@ mod process_job {
         fn CreateJobObjectW(attributes: *const c_void, name: *const u16) -> *mut c_void;
         fn AssignProcessToJobObject(job: *mut c_void, process: *mut c_void) -> i32;
         fn TerminateJobObject(job: *mut c_void, exit_code: u32) -> i32;
+        fn SetInformationJobObject(job: *mut c_void, info_class: i32, info: *const c_void, info_len: u32) -> i32;
     }
 
     pub(super) struct Job(OwnedHandle);
@@ -383,9 +437,68 @@ mod process_job {
             }
             // CreateJobObjectW transferred ownership of a valid handle.
             let job = Self(unsafe { OwnedHandle::from_raw_handle(raw) });
-            if unsafe { AssignProcessToJobObject(job.0.as_raw_handle(), child.as_raw_handle()) }
-                == 0
-            {
+            #[repr(C)]
+            struct BasicLimit {
+                per_process_user_time_limit: i64,
+                per_job_user_time_limit: i64,
+                limit_flags: u32,
+                minimum_working_set_size: usize,
+                maximum_working_set_size: usize,
+                active_process_limit: u32,
+                affinity: usize,
+                priority_class: u32,
+                scheduling_class: u32,
+            }
+            #[repr(C)]
+            struct IoCounters {
+                read_operation_count: u64,
+                write_operation_count: u64,
+                other_operation_count: u64,
+                read_transfer_count: u64,
+                write_transfer_count: u64,
+                other_transfer_count: u64,
+            }
+            #[repr(C)]
+            struct ExtendedLimit {
+                basic_limit_information: BasicLimit,
+                io_info: IoCounters,
+                process_memory_limit: usize,
+                job_memory_limit: usize,
+                peak_process_memory_used: usize,
+                peak_job_memory_used: usize,
+            }
+            const JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE: u32 = 0x00002000;
+            const JOB_OBJECT_EXTENDED_LIMIT_INFORMATION: i32 = 9;
+            let info = ExtendedLimit {
+                basic_limit_information: BasicLimit {
+                    per_process_user_time_limit: 0,
+                    per_job_user_time_limit: 0,
+                    limit_flags: JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+                    minimum_working_set_size: 0,
+                    maximum_working_set_size: 0,
+                    active_process_limit: 0,
+                    affinity: 0,
+                    priority_class: 0,
+                    scheduling_class: 0,
+                },
+                io_info: IoCounters {
+                    read_operation_count: 0, write_operation_count: 0, other_operation_count: 0,
+                    read_transfer_count: 0, write_transfer_count: 0, other_transfer_count: 0,
+                },
+                process_memory_limit: 0, job_memory_limit: 0,
+                peak_process_memory_used: 0, peak_job_memory_used: 0,
+            };
+            if unsafe {
+                SetInformationJobObject(
+                    job.0.as_raw_handle(),
+                    JOB_OBJECT_EXTENDED_LIMIT_INFORMATION,
+                    &info as *const _ as *const c_void,
+                    std::mem::size_of::<ExtendedLimit>() as u32,
+                )
+            } == 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            if unsafe { AssignProcessToJobObject(job.0.as_raw_handle(), child.as_raw_handle()) } == 0 {
                 return Err(std::io::Error::last_os_error());
             }
             Ok(job)
@@ -428,6 +541,7 @@ impl Drop for Transport {
 
 fn dispatch_message(
     shared: &Shared,
+    client: &ClientRequestState,
     writer: &mpsc::SyncSender<Value>,
     message: Value,
 ) -> Result<()> {
@@ -436,25 +550,13 @@ fn dispatch_message(
     }
     if let Some(method) = message.get("method").and_then(Value::as_str) {
         if let Some(id) = message.get("id") {
-            let response = match method {
-                "workspace/applyEdit" => {
-                    let mut state = shared.state.lock().unwrap_or_else(|e| e.into_inner());
-                    state.rejected_edits = state.rejected_edits.saturating_add(1);
-                    json!({"jsonrpc":"2.0", "id":id, "result":{"applied":false,"failureReason":"DaVinci Language Intelligence is read-only"}})
-                }
-                "workspace/configuration" => {
-                    let items = message
-                        .pointer("/params/items")
-                        .and_then(Value::as_array)
-                        .ok_or_else(protocol_error)?;
-                    if items.len() > 64 {
-                        return Err(protocol_error());
-                    }
-                    json!({"jsonrpc":"2.0", "id":id, "result":vec![Value::Null; items.len()]})
-                }
-                _ => {
-                    json!({"jsonrpc":"2.0", "id":id, "error":{"code":-32601,"message":"Unsupported client method"}})
-                }
+            if method == "workspace/applyEdit" {
+                let mut state = shared.state.lock().unwrap_or_else(|e| e.into_inner());
+                state.rejected_edits = state.rejected_edits.saturating_add(1);
+            }
+            let response = match client.handle_request(method, &message["params"]) {
+                Ok(result) => json!({"jsonrpc":"2.0", "id":id, "result":result}),
+                Err((code, text)) => json!({"jsonrpc":"2.0", "id":id, "error":{"code":code,"message":text}}),
             };
             writer.try_send(response).map_err(|_| protocol_error())?;
         } else if method == "textDocument/publishDiagnostics" {
@@ -477,10 +579,15 @@ fn dispatch_message(
                     .cloned()
                     .collect();
                 snapshot.omitted = items.len().saturating_sub(snapshot.items.len());
-                snapshot.version = params.get("version").and_then(Value::as_i64);
-                snapshot.sequence = snapshot.sequence.saturating_add(1);
-                shared.changed.notify_all();
+                let incoming = params.get("version").and_then(Value::as_i64);
+                if diagnostics::accepts_version(snapshot.version, incoming) {
+                    snapshot.version = incoming;
+                    snapshot.sequence = snapshot.sequence.saturating_add(1);
+                    shared.changed.notify_all();
+                }
             }
+        } else {
+            client.observe_notification(method, &message["params"]);
         }
         return Ok(());
     }
