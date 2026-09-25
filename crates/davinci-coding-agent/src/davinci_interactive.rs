@@ -3398,16 +3398,9 @@ pub fn apply_watchdog_choice(
     choice: &str,
     signal: &davinci_agent::runtime::progress_watchdog::LoopSignal,
 ) -> Result<String, String> {
-    let tokens_remaining = if let Some(ledger) = agent
-        .runtime
-        .as_ref()
-        .and_then(|rt| rt.budget_ledger.as_ref())
-    {
-        let snap = ledger.snapshot();
-        snap.token_ceiling.saturating_sub(snap.tokens_charged)
-    } else {
-        u64::MAX
-    };
+    // The unwired runtime budget ledger was removed. Keep watchdog user choices
+    // functional without inventing a token ceiling here.
+    let tokens_remaining = u64::MAX;
 
     let decision = if let Some(runtime) = &agent.runtime {
         if let Ok(mut wd) = runtime.progress_watchdog.lock() {
