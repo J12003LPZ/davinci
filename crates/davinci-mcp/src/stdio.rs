@@ -473,6 +473,22 @@ mod tests {
         assert!(!env.contains_key(OsStr::new("OPENAI_API_KEY")));
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn child_environment_tolerates_non_unicode_values_and_keys() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let invalid_value = OsString::from_vec(vec![0xff, b'x']);
+        let invalid_key = OsString::from_vec(vec![0xfe, b'K']);
+        let parent = vec![
+            (OsString::from("PATH"), invalid_value.clone()),
+            (invalid_key, OsString::from("ignored")),
+        ];
+        let env = child_environment(parent.into_iter(), &BTreeMap::new());
+        assert_eq!(env.get(OsStr::new("PATH")), Some(&invalid_value));
+        assert_eq!(env.len(), 1);
+    }
+
     #[test]
     fn security_stdout_line_is_bounded_before_buffering() {
         for terminated in [false, true] {
