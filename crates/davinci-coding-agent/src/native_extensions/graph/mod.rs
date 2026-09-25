@@ -15,8 +15,6 @@
 
 pub(crate) mod bindings;
 pub(crate) mod blobs;
-pub(crate) mod git;
-pub(crate) mod tail;
 pub(crate) mod briefings;
 pub(crate) mod config;
 pub(crate) mod continuation;
@@ -25,6 +23,7 @@ pub(crate) mod controller;
 mod coordinator_handler;
 pub(crate) mod definitions;
 pub(crate) mod export;
+pub(crate) mod git;
 pub(crate) mod history;
 mod lease;
 pub(crate) mod mutation;
@@ -38,6 +37,7 @@ pub(crate) mod replay;
 pub(crate) mod review_coverage;
 pub(crate) mod roles;
 pub(crate) mod store;
+pub(crate) mod tail;
 pub(crate) mod topology;
 pub(crate) mod types;
 pub(crate) mod validate;
@@ -85,8 +85,8 @@ pub use render::{
     GraphCommand, ParsedGraphArgs,
 };
 use serde_json::{json, Value};
-use store::{list_runs, load_run, transcript_path};
 pub use store::now_ms;
+use store::{list_runs, load_run, transcript_path};
 use verify::{contracted_verify_exec, default_verify_exec, dry_run_verify_exec};
 use worker::{run_dry_worker, run_worker};
 
@@ -369,7 +369,10 @@ fn economy_role_models_with(
     setting: Option<&str>,
 ) -> std::collections::BTreeMap<Role, String> {
     let mut models = std::collections::BTreeMap::new();
-    let Some(session_model) = session_model.map(str::trim).filter(|value| !value.is_empty()) else {
+    let Some(session_model) = session_model
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
         return models;
     };
     if !session_model.starts_with("openai-codex/") || setting == Some("off") {
@@ -393,9 +396,7 @@ fn economy_role_models_with(
     models
 }
 
-fn economy_role_models(
-    session_model: Option<&str>,
-) -> std::collections::BTreeMap<Role, String> {
+fn economy_role_models(session_model: Option<&str>) -> std::collections::BTreeMap<Role, String> {
     economy_role_models_with(
         session_model,
         std::env::var("DAVINCI_GRAPH_ECONOMY_MODEL").ok().as_deref(),
@@ -630,7 +631,10 @@ impl GraphController {
         }
         for role in Role::ALL {
             if config.budgets.worker_timeout_ms.get(*role) == 0 {
-                config.budgets.worker_timeout_ms.set(*role, WORKER_TIMEOUT_MS);
+                config
+                    .budgets
+                    .worker_timeout_ms
+                    .set(*role, WORKER_TIMEOUT_MS);
             }
         }
     }
@@ -1533,14 +1537,14 @@ impl GraphController {
                                     latest.run_id
                                 ));
                             };
-                            let resumable =
-                                run.current_lifecycle() == types::GraphLifecycle::Running
-                                    && !matches!(
-                                        run.phase,
-                                        types::Phase::Done
-                                            | types::Phase::Blocked
-                                            | types::Phase::Cancelled
-                                    );
+                            let resumable = run.current_lifecycle()
+                                == types::GraphLifecycle::Running
+                                && !matches!(
+                                    run.phase,
+                                    types::Phase::Done
+                                        | types::Phase::Blocked
+                                        | types::Phase::Cancelled
+                                );
                             if resumable {
                                 self.resume(&run.run_id)?
                             } else {
@@ -1702,9 +1706,7 @@ mod tests {
         assert!(!models.contains_key(&Role::Reviewer));
 
         assert!(economy_role_models_with(Some("anthropic/claude-opus-4-5"), None).is_empty());
-        assert!(
-            economy_role_models_with(Some("openai-codex/gpt-5.6-sol"), Some("off")).is_empty()
-        );
+        assert!(economy_role_models_with(Some("openai-codex/gpt-5.6-sol"), Some("off")).is_empty());
     }
 
     fn controller(cwd: &Path) -> GraphController {
@@ -2116,7 +2118,10 @@ mod tests {
 
         let controller = controller(dir.path()).with_runtime(runtime.clone());
         let run = controller
-            .run_to_completion(parse_graph_args("--dry-run test runtime registration"), None)
+            .run_to_completion(
+                parse_graph_args("--dry-run test runtime registration"),
+                None,
+            )
             .expect("runs");
 
         assert_eq!(run.phase, Phase::Done);
@@ -2528,7 +2533,10 @@ mod tests {
         let dir = tempdir().unwrap();
         let controller = controller(dir.path());
         let mut run = controller
-            .run_to_completion(parse_graph_args("--dry-run --simple resume regression"), None)
+            .run_to_completion(
+                parse_graph_args("--dry-run --simple resume regression"),
+                None,
+            )
             .unwrap();
         assert_eq!(run.lifecycle, Some(types::GraphLifecycle::Stopped));
         run.phase = Phase::Blocked;
@@ -2560,7 +2568,10 @@ mod tests {
         let dir = tempdir().unwrap();
         let controller = controller(dir.path());
         let mut run = controller
-            .run_to_completion(parse_graph_args("--dry-run --simple cancelled fixture"), None)
+            .run_to_completion(
+                parse_graph_args("--dry-run --simple cancelled fixture"),
+                None,
+            )
             .unwrap();
         run.phase = Phase::Cancelled;
         run.lifecycle = Some(types::GraphLifecycle::Stopped);

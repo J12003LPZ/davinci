@@ -814,12 +814,8 @@ pub fn handle_rpc(runtime: &mut RpcRuntime, command: RpcCommand) -> RpcResponse 
                 };
                 let action = match command.action.as_deref().unwrap_or("pause") {
                     "pause" => crate::native_extensions::graph::GraphControlAction::Pause,
-                    "resume" => {
-                        crate::native_extensions::graph::GraphControlAction::Resume
-                    }
-                    "stop_node" => {
-                        crate::native_extensions::graph::GraphControlAction::StopNode
-                    }
+                    "resume" => crate::native_extensions::graph::GraphControlAction::Resume,
+                    "stop_node" => crate::native_extensions::graph::GraphControlAction::StopNode,
                     "stop_graph" | "stop" => {
                         crate::native_extensions::graph::GraphControlAction::StopGraph
                     }

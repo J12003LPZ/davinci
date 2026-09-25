@@ -541,14 +541,16 @@ impl JsonlSession {
 }
 
 fn repair_jsonl_tail(path: &Path) -> Result<(), SessionError> {
-    let content = fs::read_to_string(path).map_err(|err| {
-        SessionError::storage(format!("Unable to inspect session tail: {err}"))
-    })?;
+    let content = fs::read_to_string(path)
+        .map_err(|err| SessionError::storage(format!("Unable to inspect session tail: {err}")))?;
     if content.is_empty() || content.ends_with('\n') {
         return Ok(());
     }
 
-    let tail = content.rsplit_once('\n').map(|(_, tail)| tail).unwrap_or(&content);
+    let tail = content
+        .rsplit_once('\n')
+        .map(|(_, tail)| tail)
+        .unwrap_or(&content);
     let complete = if content.contains('\n') {
         parse_mutation(tail).is_ok()
     } else {
@@ -699,7 +701,10 @@ mod tests {
             .append_entry(SessionEntry::message("user", serde_json::json!("three")))
             .unwrap();
         assert_eq!(reopened.entries.len(), 3);
-        assert_eq!(reopened.entries[2].parent_id.as_deref(), Some(second.as_str()));
+        assert_eq!(
+            reopened.entries[2].parent_id.as_deref(),
+            Some(second.as_str())
+        );
         drop(reopened);
         assert_eq!(JsonlSession::open(&path).unwrap().entries.len(), 3);
     }

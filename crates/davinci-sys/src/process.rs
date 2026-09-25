@@ -404,7 +404,12 @@ mod tests {
             .prefix("davinci-path-entry-")
             .tempfile_in(".")
             .unwrap();
-        let name = file.path().file_name().unwrap().to_string_lossy().into_owned();
+        let name = file
+            .path()
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
         assert_eq!(resolve_program_in(&name, OsStr::new(""), None), None);
     }
 

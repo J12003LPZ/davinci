@@ -636,8 +636,7 @@ mod tests {
     #[test]
     fn stray_requests_do_not_consume_the_callback() {
         let mut server =
-            CallbackServer::bind("127.0.0.1", 0, CallbackProvider::OpenAiCodex, "state-1")
-                .unwrap();
+            CallbackServer::bind("127.0.0.1", 0, CallbackProvider::OpenAiCodex, "state-1").unwrap();
         let addr = server.local_addr().unwrap();
         let client = std::thread::spawn(move || {
             for target in ["/favicon.ico", "/auth/callback?code=real&state=state-1"] {
@@ -661,8 +660,7 @@ mod tests {
     #[test]
     fn disconnected_preconnect_does_not_consume_the_callback() {
         let mut server =
-            CallbackServer::bind("127.0.0.1", 0, CallbackProvider::OpenAiCodex, "state-1")
-                .unwrap();
+            CallbackServer::bind("127.0.0.1", 0, CallbackProvider::OpenAiCodex, "state-1").unwrap();
         let addr = server.local_addr().unwrap();
         let client = std::thread::spawn(move || {
             // A browser can preconnect and keep the socket open without ever

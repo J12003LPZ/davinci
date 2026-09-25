@@ -825,8 +825,8 @@ pub fn verification_outcome(command: &str) -> Option<bool> {
     // verifier with a non-verification segment means the final status can be
     // caused by something else. A chain of verifiers joined with AND is safe:
     // success means every verifier succeeded and any failure remains failure.
-    let status_masked = command.contains("||")
-        || verification.iter().any(|is_verification| !is_verification);
+    let status_masked =
+        command.contains("||") || verification.iter().any(|is_verification| !is_verification);
     Some(!status_masked)
 }
 
