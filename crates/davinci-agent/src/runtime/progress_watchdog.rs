@@ -212,7 +212,18 @@ impl ProgressWatchdog {
     /// Reduce user/host choice (continue/plan/stop) against remaining budget.
     pub fn reduce_choice(&mut self, remaining_budget: u64, choice: &str) -> &'static str {
         let is_paused = matches!(self.state, WatchdogState::Paused(_));
-        let decision = super::budget::budget_decision(remaining_budget, is_paused, choice);
+        let decision = if remaining_budget == 0 {
+            "hard_stop"
+        } else if !is_paused {
+            "running"
+        } else {
+            match choice {
+                "continue" => "continue",
+                "plan" => "return_to_plan",
+                "stop" => "stop_checkpoint",
+                _ => "paused",
+            }
+        };
         match decision {
             "continue" => {
                 self.state = WatchdogState::Running;
