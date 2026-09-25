@@ -207,7 +207,7 @@ const TEST_PATTERNS: &[&str] = &[
     r"(?i)^\s*ctest\b",
     r"(?i)^\s*mvn\s+test\b",
     r"(?i)^\s*gradle\s+test\b",
-    r"(?i)^\s*(?:python|python3|pytest|cargo(?:\.exe)?(?:\s+\+[a-z0-9_.-]+)?(?:\s+--(?:offline|locked|frozen))*\s+(?:test|check|clippy|fmt|build|nextest)|go\s+(?:test|vet|build)|dotnet\s+(?:test|build))\b",
+    r"(?i)^\s*(?:pytest|python(?:3)?\s+-m\s+pytest|cargo(?:\.exe)?(?:\s+\+[a-z0-9_.-]+)?(?:\s+--(?:offline|locked|frozen))*\s+(?:test|check|clippy|fmt|nextest)|go\s+(?:test|vet)|dotnet\s+test)\b",
     r"(?i)^\s*make\s+(test|check|lint|fmt|clippy|build)\b",
     r"(?i)^\s*\.[/\\]test\.sh\b",
 ];
@@ -788,12 +788,40 @@ pub fn analyze_command(command: &str) -> ShellAnalysisReport {
 /// exit status can be trusted as the verification result.
 pub fn verification_outcome(command: &str) -> Option<bool> {
     let report = analyze_command(command);
-    let test_position = report
+
+    let is_verification = |segment: &str| {
+        let mut rest = segment.trim_start();
+        loop {
+            let Some(split_at) = rest.find(char::is_whitespace) else {
+                break;
+            };
+            let first = &rest[..split_at];
+            let tail = &rest[split_at..];
+            let Some((name, _value)) = first.split_once('=') else {
+                break;
+            };
+            let mut chars = name.chars();
+            let Some(first_ch) = chars.next() else {
+                break;
+            };
+            if !(first_ch == '_' || first_ch.is_ascii_alphabetic())
+                || !chars.all(|ch| ch == '_' || ch.is_ascii_alphanumeric())
+            {
+                break;
+            }
+            rest = tail.trim_start();
+        }
+        test_regex().is_match(rest) && !rest.contains("--no-run")
+    };
+
+    report
         .segments
         .iter()
-        .position(|segment| test_regex().is_match(segment) && !segment.contains("--no-run"))?;
-    let status_masked = command.contains("||") || test_position + 1 != report.segments.len();
-    Some(!status_masked)
+        .any(|segment| is_verification(segment))
+        .then_some(())?;
+    // An && chain cannot succeed if an earlier verification fails; || can
+    // mask a failing verification and therefore is not trustworthy evidence.
+    Some(!command.contains("||"))
 }
 
 impl ShellAnalysisReport {
