@@ -668,6 +668,34 @@ pub fn live_complete_streaming_with_sink_envelope(
     options: &StreamOptions,
     on_event: &mut dyn FnMut(&AssistantMessageEvent),
 ) -> Result<ProviderCompletionEnvelope, String> {
+    let dump = crate::wire_dump::begin();
+    if let Some(dump) = &dump {
+        dump.write(
+            "logical",
+            &request_body_with(model, messages, system, tools, options),
+        );
+    }
+    let result = live_complete_streaming_with_sink_envelope_inner(
+        model, messages, auth, system, tools, options, on_event,
+    );
+    if let (Some(dump), Ok(envelope)) = (&dump, &result) {
+        dump.write(
+            "usage",
+            &serde_json::to_value(&envelope.message.usage).unwrap_or_default(),
+        );
+    }
+    result
+}
+
+fn live_complete_streaming_with_sink_envelope_inner(
+    model: &Model,
+    messages: &[ChatMessage],
+    auth: &ResolvedAuth,
+    system: Option<&str>,
+    tools: &[ToolSpec],
+    options: &StreamOptions,
+    on_event: &mut dyn FnMut(&AssistantMessageEvent),
+) -> Result<ProviderCompletionEnvelope, String> {
     refuse_unsupported_tools(&model.api, tools.len())?;
     let incremental = crate::stream_decoder::supports_incremental_stream(model);
     let mut body = request_body_with(model, messages, system, tools, options);
