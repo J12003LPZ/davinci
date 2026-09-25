@@ -3,6 +3,7 @@ use super::config::{PythonBackend, ServerOverride};
 use super::*;
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::sync::Arc;
 
 fn provisioned(name: &str) -> PathBuf {
@@ -170,6 +171,87 @@ fn run_python_backend(backend: PythonBackend, server_env: &str) {
     if backend == PythonBackend::Basedpyright {
         assert_eq!(bytes(&baseline), baseline_before);
     }
+    manager.shutdown();
+}
+
+#[test]
+#[ignore = "requires provisioned DAVINCI_TEST_BASEDPYRIGHT and DAVINCI_TEST_PYTHON"]
+fn real_python_project_venv_executes_only_after_trusted_launch() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    std::fs::write(root.join("pyrightconfig.json"), r#"{"include":["app.py"]}"#).unwrap();
+    std::fs::write(root.join("app.py"), "value: int = 1\n").unwrap();
+
+    let venv = root.join(".venv");
+    let status = Command::new(interpreter())
+        .args(["-m", "venv"])
+        .arg(&venv)
+        .status()
+        .unwrap();
+    assert!(status.success(), "unable to provision test virtual environment");
+    let venv_python = if cfg!(windows) {
+        venv.join("Scripts/python.exe")
+    } else {
+        venv.join("bin/python")
+    };
+    let output = Command::new(&venv_python)
+        .args(["-c", "import site; print(site.getsitepackages()[0])"])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let site_packages = PathBuf::from(String::from_utf8(output.stdout).unwrap().trim());
+    let pth_sentinel = root.join("pth-sentinel-ran");
+    let sitecustomize_sentinel = root.join("sitecustomize-sentinel-ran");
+    std::fs::write(
+        site_packages.join("davinci_lsp_fixture.pth"),
+        format!(
+            "import pathlib; pathlib.Path({:?}).write_text('ran')\n",
+            pth_sentinel
+        ),
+    )
+    .unwrap();
+    std::fs::write(
+        site_packages.join("sitecustomize.py"),
+        format!(
+            "import pathlib\npathlib.Path({:?}).write_text('ran')\n",
+            sitecustomize_sentinel
+        ),
+    )
+    .unwrap();
+    assert!(!pth_sentinel.exists());
+    assert!(!sitecustomize_sentinel.exists());
+
+    let mut config = LanguageIntelligenceConfig::default();
+    config.python.backend = PythonBackend::Basedpyright;
+    config.python.server = Some(ServerOverride {
+        program: provisioned("DAVINCI_TEST_BASEDPYRIGHT"),
+        args: vec!["--stdio".into()],
+    });
+    config.python.request_timeout_ms = 30_000;
+    config.python.initialization_timeout_ms = 60_000;
+    config.python.cold_request_timeout_ms = 120_000;
+
+    let manager = LanguageIntelligence::new(root, config);
+    trusted(&manager);
+    let result = manager
+        .execute("lsp_hover", &json!({"path":"app.py","line":1,"column":1}))
+        .unwrap();
+    assert!(!result.is_error, "{}", result.content);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while (!pth_sentinel.exists() || !sitecustomize_sentinel.exists())
+        && std::time::Instant::now() < deadline
+    {
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    assert!(pth_sentinel.exists(), "project .pth code was not observed during trusted interpreter probing");
+    assert!(
+        sitecustomize_sentinel.exists(),
+        "project sitecustomize code was not observed during trusted interpreter probing"
+    );
+    assert_eq!(
+        manager.status()["sessions"][0]["analysisEnvironment"],
+        json!(venv_python.canonicalize().unwrap())
+    );
     manager.shutdown();
 }
 
