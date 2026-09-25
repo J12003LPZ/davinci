@@ -1390,7 +1390,7 @@ mod tests {
         let agent_dir = tempfile::tempdir().unwrap();
         let mut host = NativeExtensionHost {
             learning: LearningController::new(root.path(), Some(agent_dir.path()), None),
-            memory: VectorMemory::with_config(root.path().into(), VectorMemoryConfig::default()),
+            memory: Arc::new(Mutex::new(VectorMemory::with_config(root.path().into(), VectorMemoryConfig::default()))),
             ..NativeExtensionHost::default()
         };
         let cand = LearningCandidate {
@@ -1404,7 +1404,7 @@ mod tests {
             },
             confidence: 0.9,
             source_session_id: "sess-sync".into(),
-            source_repo_id: host.memory.repo_id.clone(),
+            source_repo_id: host.memory.lock().unwrap().repo_id.clone(),
             source_turn: 1,
             created_at_ms: 1000,
             evidence: VerificationEvidence::default(),
@@ -1413,7 +1413,7 @@ mod tests {
         host.learning.project_store.upsert_candidate(cand).unwrap();
         host.sync_active_learning_memories();
 
-        let search_res = host.memory.search("PostgreSQL pool connections", 5);
+        let search_res = host.memory.lock().unwrap().search("PostgreSQL pool connections", 5);
         assert!(!search_res.is_empty());
         assert!(search_res[0]
             .record
