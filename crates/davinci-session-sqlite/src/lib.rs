@@ -114,6 +114,23 @@ fn operation_entry_on_main_lineage(
     Ok(false)
 }
 
+fn retry_wal_on_busy(mut enable: impl FnMut() -> rusqlite::Result<()>) -> rusqlite::Result<()> {
+    // A journal-mode lock upgrade can return BUSY without invoking SQLite's
+    // busy handler. Retry the whole statement so its read lock is released.
+    for attempt in 0..4 {
+        match enable() {
+            Err(error)
+                if attempt < 3
+                    && error.sqlite_error_code() == Some(rusqlite::ErrorCode::DatabaseBusy) =>
+            {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            result => return result,
+        }
+    }
+    unreachable!("the last attempt always returns")
+}
+
 impl SqliteSessionStore {
     pub fn open(path: &Path) -> Result<Self, SessionError> {
         if let Some(parent) = path.parent() {
@@ -126,7 +143,7 @@ impl SqliteSessionStore {
         })?;
         conn.busy_timeout(std::time::Duration::from_millis(5000))
             .map_err(|err| SessionError::storage(format!("Unable to set busy timeout: {err}")))?;
-        conn.pragma_update(None, "journal_mode", "WAL")
+        retry_wal_on_busy(|| conn.pragma_update(None, "journal_mode", "WAL"))
             .map_err(|err| SessionError::storage(format!("Unable to set WAL: {err}")))?;
         conn.pragma_update(None, "synchronous", "FULL")
             .map_err(|err| SessionError::storage(format!("Unable to set synchronous: {err}")))?;
@@ -986,6 +1003,48 @@ pub fn now_ms_i64() -> i64 {
 mod tests {
     use super::*;
     use tempfile::tempdir;
+
+    #[test]
+    fn wal_initialization_retries_busy_but_preserves_other_errors() {
+        let busy = || {
+            rusqlite::Error::SqliteFailure(
+                rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_BUSY),
+                None,
+            )
+        };
+        let mut attempts = 0;
+        retry_wal_on_busy(|| {
+            attempts += 1;
+            if attempts < 3 {
+                Err(busy())
+            } else {
+                Ok(())
+            }
+        })
+        .unwrap();
+        assert_eq!(attempts, 3);
+
+        attempts = 0;
+        let error = retry_wal_on_busy(|| {
+            attempts += 1;
+            Err(rusqlite::Error::InvalidQuery)
+        })
+        .unwrap_err();
+        assert!(matches!(error, rusqlite::Error::InvalidQuery));
+        assert_eq!(attempts, 1);
+
+        attempts = 0;
+        let error = retry_wal_on_busy(|| {
+            attempts += 1;
+            Err(busy())
+        })
+        .unwrap_err();
+        assert_eq!(
+            error.sqlite_error_code(),
+            Some(rusqlite::ErrorCode::DatabaseBusy)
+        );
+        assert_eq!(attempts, 4);
+    }
 
     #[test]
     fn two_threads_opening_a_fresh_database_both_succeed() {
