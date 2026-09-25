@@ -1137,6 +1137,35 @@ impl ExtensionHost {
                 "tool request cancelled".into(),
             ));
         }
+        if crate::native_extensions::language_intelligence::TOOL_NAMES.contains(&name) {
+            if let Some(parent) = &context.task_coordinator {
+                return parent.call_with_timeout(
+                    name,
+                    args,
+                    context.abort.as_deref(),
+                    std::time::Duration::from_secs(35),
+                );
+            }
+            if std::env::var_os("PI_GRAPH_ROLE").is_some() {
+                return Err(davinci_agent::ToolError::Failed(
+                    "Parent language-intelligence transport unavailable; no worker-local server is allowed".into(),
+                ));
+            }
+            let language = self
+                .native
+                .lock()
+                .map_err(|_| davinci_agent::ToolError::Failed("native host unavailable".into()))?
+                .language_intelligence
+                .clone();
+            return language.execute_with_budget(
+                name,
+                args,
+                crate::native_extensions::language_intelligence::RequestBudget {
+                    deadline: std::time::Instant::now() + std::time::Duration::from_secs(120),
+                    cancelled: context.abort.clone(),
+                },
+            );
+        }
         if crate::native_extensions::browser::TOOL_NAMES.contains(&name) {
             if let Some(parent) = &context.task_coordinator {
                 return parent.call_with_timeout(
