@@ -392,7 +392,13 @@ impl CallbackServer {
                     stream
                         .set_nonblocking(false)
                         .map_err(|err| err.to_string())?;
-                    let response = self.serve(stream)?;
+                    // Browsers may open speculative/preconnect sockets that send
+                    // no request before our per-connection read timeout. Treat
+                    // those as noise and keep waiting for the real callback.
+                    let response = match self.serve(stream) {
+                        Ok(response) => response,
+                        Err(_) => continue,
+                    };
                     if response.code.is_some() {
                         return Ok(response);
                     }
