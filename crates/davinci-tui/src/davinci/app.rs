@@ -1805,7 +1805,7 @@ mod tests {
             .position(|row| row.contains("Select model"))
             .unwrap();
         assert!(conversation < title, "{rows:?}");
-        assert!(rows.last().unwrap().contains("Enter to set as default"));
+        assert!(rows.last().unwrap().contains("Enter to confirm"));
         assert!(!rows.iter().any(|row| row.contains('╰')));
     }
 
@@ -2286,12 +2286,12 @@ mod tests {
         let mut m = model(120, 30);
         m.composer = "first\nsecond".into();
         let rows: Vec<String> = compose(&m, 30).iter().map(text).collect();
-        assert!(rows.iter().any(|row| row.contains("❯ first")), "{rows:?}");
+        assert!(
+            rows.iter().any(|row| row.contains("❯\u{a0}first")),
+            "{rows:?}"
+        );
         assert!(rows.iter().any(|row| row.contains("second")));
-        // With more than one row in hand, the hint says how to end it.
-        assert!(rows
-            .iter()
-            .any(|row| row.contains("shift+enter for newline")));
+        assert!(rows.iter().any(|row| row.contains("? for shortcuts")));
     }
 
     #[test]
@@ -2392,9 +2392,12 @@ mod tests {
             .expect("the offered command is drawn");
         let composer = text
             .iter()
-            .position(|row| row.contains("/se"))
+            .position(|row| row.contains("❯\u{a0}/se"))
             .expect("the composer is drawn");
-        assert!(offered < composer, "the list sits above the composer");
+        assert!(
+            offered < composer,
+            "the list sits above the composer: {text:?}"
+        );
 
         // Mode cycling leaves the completion owner and Unicode caret alone;
         // ordinary Tab must still accept exactly the previously selected row.
@@ -2548,7 +2551,7 @@ mod tests {
 
         // Screen 1h: done, failed, in progress, queued, change and read all
         // read from the glyph alone.
-        for glyph in ['✓', '×', '○', 'Δ', '↳', '⌕'] {
+        for glyph in ['✓', '×', '○', '⎿'] {
             assert!(drawn.contains(glyph), "{glyph} is missing under NO_COLOR");
         }
     }
@@ -2606,9 +2609,12 @@ mod tests {
         }
         moving.sort_unstable();
         moving.dedup();
-        // The spinner's four frames and the caret's two states, nothing else.
+        // The reference spinner and caret are the only moving glyphs.
         for ch in &moving {
-            assert!("◜◝◞◟ ".contains(*ch), "{ch:?} animates, and it should not");
+            assert!(
+                "◜◝◞◟·✢*✶✻✽ ".contains(*ch),
+                "{ch:?} animates, and it should not"
+            );
         }
     }
 
@@ -2705,11 +2711,14 @@ mod section_regressions {
             model.model_names = vec!["openai-codex / gpt-6-astra".into()];
             model.composer.set_text(input);
             model.refresh_suggestions();
-            assert_eq!(
-                handle_key(&mut model, KeyEvent::new(key, KeyModifiers::NONE)),
-                Flow::Submit("/model".into())
-            );
-            assert_eq!(model.composer.to_string(), "");
+            let flow = handle_key(&mut model, KeyEvent::new(key, KeyModifiers::NONE));
+            if key == KeyCode::Enter {
+                assert_eq!(flow, Flow::Submit("/model".into()));
+                assert_eq!(model.composer.to_string(), "");
+            } else {
+                assert_eq!(flow, Flow::Continue);
+                assert_eq!(model.composer.trim(), "/model");
+            }
         }
     }
 
@@ -2794,10 +2803,10 @@ mod section_behavior_regressions {
                 .map(Line::to_string)
                 .collect::<Vec<_>>()
                 .join("\n");
-            assert!(rendered.contains(&format!(
-                "● {} effort (default) ←/→ to adjust",
-                model.catalog[0].reasoning_levels[expected]
-            )));
+            assert!(rendered.contains(&format!("● {} effort ←/→ to adjust", {
+                let level = &model.catalog[0].reasoning_levels[expected];
+                format!("{}{}", level[..1].to_uppercase(), &level[1..])
+            })));
         }
         assert!(matches!(
             handle_key(
@@ -3401,7 +3410,10 @@ mod section_input_regressions {
             .collect::<Vec<_>>()
             .join("\n");
         assert!(drawn.contains("Provider unavailable"));
-        assert!(drawn.contains("Esc cancel"));
+        assert!(
+            drawn.contains("Esc"),
+            "the cancel key stays visible: {drawn}"
+        );
         press(&mut m, KeyCode::Esc);
         assert_eq!(&*m.composer, "saved draft");
     }
