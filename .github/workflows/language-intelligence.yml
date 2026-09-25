@@ -144,7 +144,7 @@ jobs:
           set -euo pipefail
           "$DAVINCI_TEST_RUST_ANALYZER" --version
           "$DAVINCI_TEST_PYTHON" --version
-          node "$DAVINCI_TEST_PYRIGHT" --version
+          node "$prefix/pyright/node_modules/pyright/index.js" --version
           "$DAVINCI_TEST_BASEDPYRIGHT" --version
       - name: Real TypeScript semantics
         run: cargo test -p davinci-coding-agent --locked --lib real_typescript_semantics_and_edit_synchronization -- --ignored --nocapture
