@@ -140,7 +140,9 @@ fn group_rows(model: &Model, calls: &[(Explore, &str, bool)], width: u16) -> Vec
         }
     }
     let clause = |kind: Explore, n: usize| -> String {
-        let noun = |one: &str, many: &str| if n == 1 { one } else { many };
+        let noun = |one: &'static str, many: &'static str| -> &'static str {
+            if n == 1 { one } else { many }
+        };
         match (kind, running) {
             (Explore::Read, false) => format!("read {n} {}", noun("file", "files")),
             (Explore::Read, true) => format!("reading {n} {}", noun("file", "files")),
