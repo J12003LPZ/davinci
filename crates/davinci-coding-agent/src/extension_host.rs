@@ -295,14 +295,18 @@ impl ExtensionHost {
                         let error = loaded
                             .error
                             .unwrap_or_else(|| "extension load returned ok=false".into());
-                        eprintln!("davinci: extension {} failed to load: {error}", module.display());
-                        host.load_errors
-                            .push((module.display().to_string(), error));
+                        eprintln!(
+                            "davinci: extension {} failed to load: {error}",
+                            module.display()
+                        );
+                        host.load_errors.push((module.display().to_string(), error));
                     }
                     Err(error) => {
-                        eprintln!("davinci: extension {} failed to load: {error}", module.display());
-                        host.load_errors
-                            .push((module.display().to_string(), error));
+                        eprintln!(
+                            "davinci: extension {} failed to load: {error}",
+                            module.display()
+                        );
+                        host.load_errors.push((module.display().to_string(), error));
                     }
                 }
             }
@@ -1110,11 +1114,7 @@ impl ExtensionHost {
         render_js_tool_result(path, name, result, width)
     }
 
-    pub fn execute_named_tool(
-        &self,
-        _name: &str,
-        _cwd: &Path,
-    ) -> Option<Result<String, String>> {
+    pub fn execute_named_tool(&self, _name: &str, _cwd: &Path) -> Option<Result<String, String>> {
         // Tool execution belongs exclusively to the custom-tool executor,
         // which has the model-supplied arguments and permission context.
         // Event notification has neither, so executing here would run JS or
@@ -1136,6 +1136,35 @@ impl ExtensionHost {
             return Err(davinci_agent::ToolError::Failed(
                 "tool request cancelled".into(),
             ));
+        }
+        if crate::native_extensions::language_intelligence::TOOL_NAMES.contains(&name) {
+            if let Some(parent) = &context.task_coordinator {
+                return parent.call_with_timeout(
+                    name,
+                    args,
+                    context.abort.as_deref(),
+                    std::time::Duration::from_secs(35),
+                );
+            }
+            if std::env::var_os("PI_GRAPH_ROLE").is_some() {
+                return Err(davinci_agent::ToolError::Failed(
+                    "Parent language-intelligence transport unavailable; no worker-local server is allowed".into(),
+                ));
+            }
+            let language = self
+                .native
+                .lock()
+                .map_err(|_| davinci_agent::ToolError::Failed("native host unavailable".into()))?
+                .language_intelligence
+                .clone();
+            return language.execute_with_budget(
+                name,
+                args,
+                crate::native_extensions::language_intelligence::RequestBudget {
+                    deadline: std::time::Instant::now() + std::time::Duration::from_secs(120),
+                    cancelled: context.abort.clone(),
+                },
+            );
         }
         if crate::native_extensions::browser::TOOL_NAMES.contains(&name) {
             if let Some(parent) = &context.task_coordinator {
@@ -1571,11 +1600,7 @@ mod tests {
         )
         .unwrap();
         std::fs::write(ext.join("index.js"), "module.exports = (pi) => {").unwrap();
-        let host = ExtensionHost::load_with_cwd(
-            dir.path(),
-            &["broken".into()],
-            dir.path(),
-        );
+        let host = ExtensionHost::load_with_cwd(dir.path(), &["broken".into()], dir.path());
         assert_eq!(host.js.len(), 0);
         assert_eq!(host.load_errors.len(), 1);
         assert!(host.load_errors[0].0.contains("broken"));

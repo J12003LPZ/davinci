@@ -229,17 +229,17 @@ pub fn run_child(
 
 /// Build the platform's shell invocation for a free-form command string.
 pub fn shell_command(command: &str, cwd: &std::path::Path) -> Command {
-    let mut process = if cfg!(windows) {
+    #[cfg(windows)]
+    let mut process = {
+        use std::os::windows::process::CommandExt;
         let mut process = Command::new("cmd");
-        #[cfg(windows)]
-        {
-            use std::os::windows::process::CommandExt;
-            // cmd.exe owns parsing of the command line. Avoid MSVC argv
-            // escaping, which changes nested quotes before cmd sees them.
-            process.raw_arg("/C").raw_arg(command);
-        }
+        // cmd.exe owns parsing of the command line. Avoid MSVC argv
+        // escaping, which changes nested quotes before cmd sees them.
+        process.raw_arg("/C").raw_arg(command);
         process
-    } else {
+    };
+    #[cfg(not(windows))]
+    let mut process = {
         let mut process = Command::new("sh");
         process.arg("-c").arg(command);
         process
@@ -248,7 +248,6 @@ pub fn shell_command(command: &str, cwd: &std::path::Path) -> Command {
     davinci_sys::process::set_own_process_group(&mut process);
     process
 }
-
 #[cfg(test)]
 mod tests {
     use super::*;

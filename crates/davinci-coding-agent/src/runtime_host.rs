@@ -1492,13 +1492,14 @@ mod tests {
             .after_tool("grep", &args, res);
 
         // 2. Immediate duplicate call is blocked
-        let blocked = native
-            .lock()
-            .unwrap()
-            .governor
-            .lock()
-            .unwrap()
-            .before_tool("grep", &args, || "head-123".into());
+        let blocked =
+            native
+                .lock()
+                .unwrap()
+                .governor
+                .lock()
+                .unwrap()
+                .before_tool("grep", &args, || "head-123".into());
         assert!(
             blocked.is_some(),
             "Duplicate read must be blocked by governor"
@@ -1543,13 +1544,14 @@ mod tests {
         bus.emit_observe(post_env);
 
         // 5. CompactionRuntimeSubscriber cleared governor ledgers, so duplicate is allowed again
-        let allowed = native
-            .lock()
-            .unwrap()
-            .governor
-            .lock()
-            .unwrap()
-            .before_tool("grep", &args, || "head-123".into());
+        let allowed =
+            native
+                .lock()
+                .unwrap()
+                .governor
+                .lock()
+                .unwrap()
+                .before_tool("grep", &args, || "head-123".into());
         assert!(
             allowed.is_none(),
             "PostCompact must clear governor ledgers via CompactionRuntimeSubscriber"

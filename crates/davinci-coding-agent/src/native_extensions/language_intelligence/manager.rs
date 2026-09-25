@@ -1,65 +1,40 @@
-//! Host-owned, lazy, bounded sessions. Clones share ownership across callers.
-use super::protocol::{IntelligenceError, Result};
-use super::servers::{Backend, TypeScriptAdapter};
+//! Host-owned, lazy, bounded language-server sessions.
+use super::config::LanguageIntelligenceConfig;
+use super::identity::{LanguageFamily, ResolvedProject, SessionKey};
+use super::metadata::{FsMetadataReader, ResolutionContext};
+use super::protocol::{IntelligenceError, RequestBudget, Result};
 use super::session::Session;
-use super::{documents, normalize, servers, session, tools};
+use super::{documents, normalize, servers, tools};
 use davinci_agent::{PermissionState, ToolError, ToolResult};
-use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, TryLockError};
 use std::time::{Duration, Instant};
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default, rename_all = "camelCase", deny_unknown_fields)]
-pub struct LanguageIntelligenceConfig {
-    pub enabled: bool,
-    pub typescript: TypeScriptConfig,
-    #[serde(skip)]
-    pub configuration_error: Option<String>,
-}
-impl Default for LanguageIntelligenceConfig {
-    fn default() -> Self {
-        Self {
-            enabled: true,
-            typescript: TypeScriptConfig::default(),
-            configuration_error: None,
-        }
-    }
-}
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default, rename_all = "camelCase", deny_unknown_fields)]
-pub struct TypeScriptConfig {
-    pub enabled: bool,
-    pub backend: Backend,
-    pub request_timeout_ms: u64,
-    pub max_references: usize,
-    pub max_workspace_symbols: usize,
-    pub max_diagnostics: usize,
-}
-impl Default for TypeScriptConfig {
-    fn default() -> Self {
-        Self {
-            enabled: true,
-            backend: Backend::Auto,
-            request_timeout_ms: 5000,
-            max_references: 50,
-            max_workspace_symbols: 50,
-            max_diagnostics: 50,
-        }
-    }
-}
-
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct Slot {
     session: Option<Session>,
     starts: usize,
     last_error: Option<IntelligenceError>,
     healthy_since: Option<Instant>,
+    last_used: Instant,
+    generation: u64,
 }
-
+impl Default for Slot {
+    fn default() -> Self {
+        Self {
+            session: None,
+            starts: 0,
+            last_error: None,
+            healthy_since: None,
+            last_used: Instant::now(),
+            generation: 0,
+        }
+    }
+}
 impl Slot {
     fn refresh_budget(&mut self) {
         if self
@@ -71,23 +46,46 @@ impl Slot {
         }
     }
 }
+
+type SharedSlot = Arc<Mutex<Slot>>;
+
+#[derive(Debug, Clone)]
+struct NegativeDiscovery {
+    error: IntelligenceError,
+    expires: Instant,
+}
+
 #[derive(Debug)]
 struct Manager {
     workspace: PathBuf,
     config: LanguageIntelligenceConfig,
-    slots: Arc<Mutex<BTreeMap<PathBuf, Arc<Mutex<Slot>>>>>,
+    slots: Arc<Mutex<BTreeMap<SessionKey, Arc<Mutex<Slot>>>>>,
+    negative: Arc<Mutex<BTreeMap<SessionKey, NegativeDiscovery>>>,
     closed: Arc<AtomicBool>,
     permissions: Mutex<Option<Arc<PermissionState>>>,
-    governor: Mutex<Option<crate::native_extensions::TokenGovernor>>,
+    governor: Mutex<Option<crate::native_extensions::SharedTokenGovernor>>,
 }
+
 #[derive(Debug, Clone)]
 pub struct LanguageIntelligence {
     inner: Arc<Manager>,
 }
+
 impl Default for LanguageIntelligence {
     fn default() -> Self {
         Self::new(Path::new("."), LanguageIntelligenceConfig::default())
     }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct Limits {
+    warm_ms: u64,
+    init_ms: u64,
+    cold_ms: u64,
+    references: usize,
+    workspace_symbols: usize,
+    diagnostics: usize,
+    family_sessions: usize,
 }
 
 impl LanguageIntelligence {
@@ -97,12 +95,14 @@ impl LanguageIntelligence {
                 workspace: workspace.into(),
                 config,
                 slots: Arc::new(Mutex::new(BTreeMap::new())),
+                negative: Arc::new(Mutex::new(BTreeMap::new())),
                 closed: Arc::new(AtomicBool::new(false)),
                 permissions: Mutex::new(None),
                 governor: Mutex::new(None),
             }),
         }
     }
+
     pub fn set_permissions(&self, permissions: Option<Arc<PermissionState>>) {
         *self
             .inner
@@ -110,22 +110,16 @@ impl LanguageIntelligence {
             .lock()
             .unwrap_or_else(|e| e.into_inner()) = permissions;
     }
-    /// The controller, never model arguments, chooses a worker's checkout.
-    /// Different worktrees share supervision but cannot analyze each other's files.
-    pub fn for_workspace(&self, workspace: &Path) -> Self {
+
+    fn fork(&self, workspace: PathBuf, permissions: Option<Arc<PermissionState>>) -> Self {
         Self {
             inner: Arc::new(Manager {
-                workspace: workspace.into(),
+                workspace,
                 config: self.inner.config.clone(),
                 slots: self.inner.slots.clone(),
+                negative: self.inner.negative.clone(),
                 closed: self.inner.closed.clone(),
-                permissions: Mutex::new(
-                    self.inner
-                        .permissions
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner())
-                        .clone(),
-                ),
+                permissions: Mutex::new(permissions),
                 governor: Mutex::new(
                     self.inner
                         .governor
@@ -136,30 +130,54 @@ impl LanguageIntelligence {
             }),
         }
     }
-    pub fn set_governor(&self, governor: crate::native_extensions::TokenGovernor) {
+
+    /// Bind request authority to one caller while sharing the process/session
+    /// owner. Attaching another agent can never overwrite this handle's policy.
+    pub fn with_permissions(&self, permissions: Option<Arc<PermissionState>>) -> Self {
+        self.fork(self.inner.workspace.clone(), permissions)
+    }
+
+    /// A graph worker is rebound by its authenticated parent. Session storage is
+    /// shared, but the workspace remains part of every key.
+    pub fn for_workspace(&self, workspace: &Path) -> Self {
+        let permissions = self
+            .inner
+            .permissions
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        self.fork(workspace.into(), permissions)
+    }
+
+    pub fn set_governor(&self, governor: crate::native_extensions::SharedTokenGovernor) {
         *self
             .inner
             .governor
             .lock()
             .unwrap_or_else(|e| e.into_inner()) = Some(governor);
     }
+
     pub fn timeout(&self) -> Duration {
         Duration::from_millis(
             self.inner
                 .config
                 .typescript
                 .request_timeout_ms
-                .clamp(100, 30000),
+                .clamp(100, 30_000),
         )
     }
+
     pub fn shutdown(&self) {
         let slots = {
             let mut slots = self.inner.slots.lock().unwrap_or_else(|e| e.into_inner());
             self.inner.closed.store(true, Ordering::Release);
             std::mem::take(&mut *slots)
         };
-        // In-flight requests already have finite deadlines. Drain their sessions
-        // too; dropping only the map would leave their Arc-owned children alive.
+        self.inner
+            .negative
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
         for slot in slots.into_values() {
             slot.lock()
                 .unwrap_or_else(|e| e.into_inner())
@@ -167,91 +185,101 @@ impl LanguageIntelligence {
                 .take();
         }
     }
+
     pub fn status(&self) -> Value {
-        let slots = self.inner.slots.lock().unwrap_or_else(|e| e.into_inner());
-        let sessions: Vec<_> = slots
-            .iter()
-            .map(|(root, slot)| {
+        let mut sessions = Vec::new();
+        {
+            let slots = self.inner.slots.lock().unwrap_or_else(|e| e.into_inner());
+            for (key, slot) in slots.iter() {
                 let Ok(slot) = slot.try_lock() else {
-                    return json!({"workspace":root,"session":"busy"});
+                    sessions.push(json!({
+                        "workspace":key.workspace,
+                        "project":key.project_root,
+                        "language":key.family,
+                        "session":"busy"
+                    }));
+                    continue;
                 };
+                if slot.session.is_none() && slot.last_error.is_none() {
+                    continue;
+                }
                 let mut status = slot
                     .session
                     .as_ref()
                     .map(Session::status)
-                    .unwrap_or_else(|| json!({"workspace":root,"session":"unavailable"}));
+                    .unwrap_or_else(|| {
+                        json!({
+                            "workspace":key.workspace,
+                            "project":key.project_root,
+                            "language":key.family,
+                            "session":"unavailable"
+                        })
+                    });
+                status["generation"] = json!(slot.generation);
                 status["starts"] = json!(slot.starts);
                 status["lastError"] = json!(slot.last_error);
-                status
-            })
-            .collect();
-        drop(slots);
-        let discovery = if sessions.is_empty()
-            && !self.inner.closed.load(Ordering::Acquire)
-            && self.inner.config.enabled
-            && self.inner.config.typescript.enabled
-        {
-            self.inner.workspace.canonicalize().ok().map(|root| {
-                match servers::discover(&root, &root, self.inner.config.typescript.backend, &std::env::var_os("PATH").unwrap_or_default()) {
-                    Ok(commands) => json!({"workspace":root,"available":true,"candidates":commands.iter().map(|command| json!({
-                        "backend":command.kind,"serverVersion":command.version,"projectTypeScript":command.typescript_version
-                    })).collect::<Vec<_>>()}),
-                    Err(error) => json!({"workspace":root,"available":false,"error":error}),
-                }
-            })
-        } else {
-            None
+                status["idleMs"] = json!(slot
+                    .last_used
+                    .elapsed()
+                    .as_millis()
+                    .min(u128::from(u64::MAX)) as u64);
+                sessions.push(status);
+            }
+        }
+        let negative = {
+            let mut negative = self
+                .inner
+                .negative
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            negative.retain(|_, entry| entry.expires > Instant::now());
+            negative.len()
         };
-        json!({"enabled":self.inner.config.enabled && self.inner.config.typescript.enabled,
+        json!({
+            "enabled":self.inner.config.enabled,
             "closed":self.inner.closed.load(Ordering::Acquire),
             "configurationError":self.inner.config.configuration_error,
-            "discovery":discovery,
-            "languages":["TypeScript","JavaScript"],"backend":self.inner.config.typescript.backend,
-            "sessions":sessions,"startup":"lazy; status never launches a server","verification":"Diagnostics are advisory; run repository compiler, lint and tests."})
+            "profileErrors":self.inner.config.profile_errors,
+            "languages":["TypeScript","JavaScript","Rust","Python"],
+            "backend":self.inner.config.typescript.backend,
+            "profiles":[
+                {"language":"typescript","enabled":self.inner.config.typescript.enabled,"backend":self.inner.config.typescript.backend,"maxSessions":self.inner.config.typescript.max_sessions},
+                {"language":"rust","enabled":self.inner.config.rust.enabled,"backend":self.inner.config.rust.backend,"profile":self.inner.config.rust.profile,"maxSessions":self.inner.config.rust.max_sessions},
+                {"language":"python","enabled":self.inner.config.python.enabled,"backend":self.inner.config.python.backend,"diagnosticMode":self.inner.config.python.diagnostic_mode,"maxSessions":self.inner.config.python.max_sessions}
+            ],
+            "maxSessions":self.inner.config.max_sessions,
+            "negativeDiscoveryEntries":negative,
+            "sessions":sessions,
+            "startup":"lazy; discovery and status never execute a server or version probe",
+            "verification":"Diagnostics are advisory; run repository compiler/type checker, lint and tests."
+        })
     }
 
-    fn request(&self, name: &str, args: &Value) -> Result<Value> {
+    fn request_with_budget(
+        &self,
+        name: &str,
+        args: &Value,
+        parsed: tools::Arguments,
+        family: LanguageFamily,
+        budget: RequestBudget,
+    ) -> Result<Value> {
         self.ensure_open()?;
-        let config = &self.inner.config;
-        if let Some(message) = &config.configuration_error {
+        if let Some(message) = &self.inner.config.configuration_error {
             return Err(IntelligenceError::new("invalid_settings", message));
         }
-        if !config.enabled || !config.typescript.enabled {
+        if !self.inner.config.enabled || !self.family_enabled(family) {
             return Err(IntelligenceError::new(
                 "disabled",
-                "Language intelligence is disabled in settings",
+                "Language intelligence is disabled for this language",
             ));
         }
-        if !(100..=30000).contains(&config.typescript.request_timeout_ms)
-            || [
-                config.typescript.max_references,
-                config.typescript.max_workspace_symbols,
-                config.typescript.max_diagnostics,
-            ]
-            .iter()
-            .any(|n| !(1..=200).contains(n))
-        {
-            return Err(IntelligenceError::new(
-                "invalid_settings",
-                "requestTimeoutMs must be 100..30000; result caps must be 1..200",
-            ));
-        }
-        let parsed = tools::Arguments::parse(name, args)?;
-        let deadline = Instant::now() + self.timeout();
+        budget.check()?;
         let workspace = self.inner.workspace.canonicalize().map_err(|_| {
             IntelligenceError::new("invalid_source_path", "Workspace is unavailable")
         })?;
-        let source = parsed
-            .path
-            .as_deref()
-            .map(|path| documents::source_path(&workspace, path))
-            .transpose()?;
-        let project = source
-            .as_deref()
-            .map(|path| servers::project_root(&workspace, path, &TypeScriptAdapter))
-            .transpose()?
-            .unwrap_or_else(|| workspace.clone());
-        let permissions = lock_until(&self.inner.permissions, deadline)?
+
+        // Authorization is obtained before project metadata discovery.
+        let permissions = lock_until(&self.inner.permissions, &budget)?
             .clone()
             .ok_or_else(launch_denied)?;
         {
@@ -269,45 +297,105 @@ impl LanguageIntelligence {
                 ));
             }
         }
-        let slot = {
-            let mut slots = lock_until(&self.inner.slots, deadline)?;
-            self.ensure_open()?;
-            if slots.len() >= 8 && !slots.contains_key(&project) {
-                return Err(IntelligenceError::new("session_limit","Eight language-server projects are already open; restart the session to release them"));
+
+        let source = parsed
+            .path
+            .as_deref()
+            .map(|path| documents::source_path(&workspace, path))
+            .transpose()?;
+        if let Some(source) = &source {
+            let source_family = LanguageFamily::from_path(source).ok_or_else(|| {
+                IntelligenceError::new(
+                    "unsupported_language",
+                    "No language-intelligence adapter supports this source file",
+                )
+            })?;
+            if source_family != family {
+                return Err(IntelligenceError::new(
+                    "language_path_conflict",
+                    "Explicit language conflicts with the source path",
+                ));
             }
-            slots.entry(project.clone()).or_default().clone()
-        };
-        let mut slot = lock_until(&slot, deadline)?;
-        self.ensure_open()?;
-        if slot.session.as_ref().is_some_and(|s| !s.is_alive()) {
-            slot.session = None;
-            slot.healthy_since = None;
         }
-        slot.refresh_budget();
-        let mut started_now = false;
-        if slot.session.is_none() {
-            if slot.starts >= 2 {
-                return Err(slot.last_error.clone().unwrap_or_else(|| {
-                    IntelligenceError::new(
-                        "server_exited",
-                        "Language-server restart budget exhausted; restart the DaVinci session",
-                    )
-                }));
+        let context = self.resolution_context(workspace.clone(), budget.clone());
+        let adapter = servers::adapter_for(family);
+        let project = if let Some(source) = &source {
+            adapter.resolve_project(&context, source, &self.inner.config)?
+        } else {
+            self.pathless_project(family, &context)?
+        };
+        budget.check()?;
+
+        let profile_fingerprint = self.profile_fingerprint(family);
+        let negative_key = SessionKey {
+            workspace: workspace.clone(),
+            project_root: project.root.clone(),
+            family,
+            profile_fingerprint: profile_fingerprint.clone(),
+        };
+        if let Some(error) = self.cached_negative(&negative_key) {
+            return Err(error);
+        }
+
+        let search_path = std::env::var_os("PATH").unwrap_or_default();
+        let commands = match adapter.discover(&context, &project, &self.inner.config, &search_path)
+        {
+            Ok(commands) => commands,
+            Err(error) => {
+                self.remember_negative(negative_key, error.clone());
+                return Err(error);
             }
-            let commands = servers::discover(
-                &workspace,
-                &project,
-                config.typescript.backend,
-                &std::env::var_os("PATH").unwrap_or_default(),
-            )?;
-            for command in commands.into_iter().take(2 - slot.starts) {
-                // Reuse the existing semantic process policy and sanitized environment.
-                // Read-only tool classification does not grant permission to execute project code.
+        };
+        let limits = self.limits(family);
+        let mut last_error = None;
+
+        for command in commands {
+            budget.check()?;
+            let key = SessionKey {
+                workspace: workspace.clone(),
+                project_root: project.root.clone(),
+                family,
+                profile_fingerprint: format!(
+                    "{}:{}",
+                    command.profile_fingerprint, command.invocation.executable_fingerprint
+                ),
+            };
+            let (slot, evicted) = self.slot_for(&key, limits.family_sessions, &budget)?;
+            drop(evicted);
+            let mut slot_guard = lock_until(&slot, &budget)?;
+            let slot: &mut Slot = &mut slot_guard;
+            self.ensure_open()?;
+            slot.last_used = Instant::now();
+
+            if slot
+                .session
+                .as_ref()
+                .is_some_and(|session| !session.is_alive())
+            {
+                // Record healthy elapsed time before clearing process state.
+                slot.refresh_budget();
+                slot.session = None;
+                slot.healthy_since = None;
+            } else {
+                slot.refresh_budget();
+            }
+
+            let warm = slot.session.is_some();
+            if !warm {
+                if slot.starts >= 2 {
+                    last_error = Some(slot.last_error.clone().unwrap_or_else(|| {
+                        IntelligenceError::new(
+                            "server_exited",
+                            "Language-server restart budget exhausted for this profile",
+                        )
+                    }));
+                    continue;
+                }
                 let rendered = crate::semantic::render_command_for_policy(
                     &crate::semantic::LanguageServerSpec {
                         program: command.program.to_string_lossy().into_owned(),
                         args: command.args.clone(),
-                        language: "typescript".into(),
+                        language: family.as_str().into(),
                     },
                 );
                 let policy = permissions.lock().map_err(|_| launch_denied())?;
@@ -316,106 +404,245 @@ impl LanguageIntelligence {
                         policy.decide(
                             "language-server-launch",
                             "bash",
-                            &json!({"command":rendered}),
-                            &project
+                            &json!({
+                                "command":rendered,
+                                "language":family.as_str(),
+                                "analysisInterpreter":command.analysis_environment
+                            }),
+                            &project.root,
                         ),
                         davinci_agent::PermissionVerdict::Allow
                     )
                 {
-                    return Err(IntelligenceError::new("server_launch_denied", &format!("Project trust and an existing launch permission are required for: {rendered}")));
+                    return Err(IntelligenceError::new(
+                        "server_launch_denied",
+                        &format!("Project trust and exact launch permission are required for: {rendered}"),
+                    ));
                 }
+                drop(policy);
                 slot.starts += 1;
-                match Session::start(command, deadline) {
+                let init_deadline = budget
+                    .deadline
+                    .min(Instant::now() + Duration::from_millis(limits.init_ms));
+                let init_budget = RequestBudget {
+                    deadline: init_deadline,
+                    cancelled: budget.cancelled.clone(),
+                };
+                match Session::start_with_budget(command, init_budget) {
                     Ok(session) => {
+                        slot.generation = slot.generation.saturating_add(1);
                         slot.session = Some(session);
                         slot.healthy_since = Some(Instant::now());
-                        started_now = true;
-                        break;
+                        slot.last_error = None;
                     }
                     Err(error) => {
-                        slot.last_error = Some(error);
+                        slot.last_error = Some(error.clone());
+                        last_error = Some(error);
+                        continue;
                     }
                 }
             }
-        }
-        let (method, capability) = tools::operation(name).expect("validated tool");
-        let Some(session) = slot.session.as_mut() else {
-            return Err(slot.last_error.clone().unwrap_or_else(launch_denied));
-        };
-        let request_deadline = if started_now {
-            Instant::now() + Duration::from_secs(120)
-        } else {
-            deadline
-        };
-        let response = session.execute(
-            method,
-            capability,
-            source.as_deref(),
-            parsed.params(name),
-            &TypeScriptAdapter,
-            request_deadline,
-        );
-        let mut raw = match response {
-            Ok(raw) => raw,
-            Err(error) => {
-                slot.last_error = Some(error.clone());
-                if !slot.session.as_ref().is_some_and(Session::is_alive) {
-                    slot.session = None;
+
+            let operation_budget = if warm {
+                RequestBudget {
+                    deadline: budget
+                        .deadline
+                        .min(Instant::now() + Duration::from_millis(limits.warm_ms)),
+                    cancelled: budget.cancelled.clone(),
                 }
-                return Err(error);
-            }
-        };
-        let mut freshness = None;
-        let mut omitted = 0;
-        if name == "lsp_diagnostics" && raw.is_object() {
-            freshness = raw.get("freshness").cloned();
-            omitted = raw["omitted"].as_u64().unwrap_or(0);
-            raw = raw["items"].take();
-        }
-        if name == "lsp_diagnostics" {
-            if let Some(severity) = parsed.severity.as_deref().filter(|v| *v != "all") {
-                let number = match severity {
-                    "error" => 1,
-                    "warning" => 2,
-                    "information" => 3,
-                    _ => 4,
-                };
-                if let Some(items) = raw.as_array_mut() {
-                    items.retain(|item| item["severity"] == number);
+            } else {
+                budget.clone()
+            };
+            let (method, capability) = tools::operation(name).expect("validated tool");
+            let generation = slot.generation;
+            let source_hash_before = source.as_deref().and_then(source_hash);
+            let Some(session) = slot.session.as_mut() else {
+                continue;
+            };
+            // rust-analyzer answers navigation requests while it is still
+            // loading the workspace, returning empty results that would read
+            // as complete. Wait for it to report quiescence, keeping part of
+            // the budget for the query itself.
+            let ready = if family == LanguageFamily::Rust {
+                let reserve = Duration::from_secs(2);
+                let wait_deadline = operation_budget
+                    .deadline
+                    .checked_sub(reserve)
+                    .unwrap_or(operation_budget.deadline);
+                session.wait_until_ready(&RequestBudget {
+                    deadline: wait_deadline,
+                    cancelled: operation_budget.cancelled.clone(),
+                })
+            } else {
+                None
+            };
+            let response = session.execute_with_budget(
+                method,
+                capability,
+                source.as_deref(),
+                parsed.params(name),
+                adapter.as_ref(),
+                &operation_budget,
+            );
+            slot.last_used = Instant::now();
+            let mut raw = match response {
+                Ok(raw) => raw,
+                Err(error) => {
+                    slot.last_error = Some(error.clone());
+                    if error.code == "resync_required"
+                        || !slot.session.as_ref().is_some_and(Session::is_alive)
+                    {
+                        slot.refresh_budget();
+                        slot.session = None;
+                        slot.healthy_since = None;
+                    }
+                    if error.code == "resync_required" {
+                        return Err(IntelligenceError::new(
+                            "stale_result",
+                            "Source synchronization became uncertain; the session was discarded and the query should be retried within a fresh budget",
+                        ));
+                    }
+                    return Err(error);
+                }
+            };
+
+            if let (Some(source), Some(expected_hash)) =
+                (source.as_deref(), source_hash_before.as_deref())
+            {
+                if source_hash(source).as_deref() != Some(expected_hash) {
+                    return Err(IntelligenceError::new(
+                        "stale_result",
+                        "Source bytes changed while semantic analysis was running; retry against the current checkout",
+                    ));
                 }
             }
+
+            let mut freshness = None;
+            let mut omitted = 0;
+            let mut document_version = None;
+            if name == "lsp_diagnostics" && raw.is_object() {
+                freshness = raw.get("freshness").cloned();
+                omitted = raw["omitted"].as_u64().unwrap_or(0);
+                document_version = raw.get("documentVersion").cloned();
+                raw = raw["items"].take();
+            }
+            if name == "lsp_diagnostics" {
+                if let Some(severity) = parsed.severity.as_deref().filter(|value| *value != "all") {
+                    let number = match severity {
+                        "error" => 1,
+                        "warning" => 2,
+                        "information" => 3,
+                        _ => 4,
+                    };
+                    if let Some(items) = raw.as_array_mut() {
+                        items.retain(|item| item["severity"] == number);
+                    }
+                }
+            }
+            let cap = match name {
+                "lsp_workspace_symbols" => limits.workspace_symbols,
+                "lsp_diagnostics" => limits.diagnostics,
+                _ => limits.references,
+            };
+            let uri = source.as_deref().map(documents::file_uri).transpose()?;
+            let mut normalized = normalize::normalize_retained(
+                name,
+                raw,
+                &workspace,
+                uri.as_deref(),
+                parsed.limit.unwrap_or(cap).min(cap),
+                |full| {
+                    let governor = self.inner.governor.lock().ok()?.as_ref()?.clone();
+                    let mut governor = governor.lock().ok()?;
+                    governor
+                        .retain_lsp_output(
+                            name,
+                            args,
+                            full,
+                            &workspace,
+                            source.as_deref(),
+                            permissions.clone(),
+                        )
+                        .ok()
+                },
+            )?;
+            normalized["available"] = json!(true);
+            normalized["language"] = json!(family);
+            normalized["backend"] = json!(session.command.kind);
+            normalized["generation"] = json!(generation);
+            normalized["project"] = json!(relative_project(&workspace, &project.root));
+            normalized["profileFingerprint"] = json!(session.command.profile_fingerprint);
+            normalized["limitations"] = json!(session.command.limitations);
+            if let Some(hash) = source_hash_before {
+                normalized["sourceHash"] = json!(hash);
+            }
+            if let Some(version) = document_version {
+                normalized["documentVersion"] = version;
+            }
+            if ready == Some(false) || (family == LanguageFamily::Rust && ready.is_none()) {
+                // Results obtained before indexing finished are not complete.
+                normalized["analysisState"] = json!("indexing");
+                normalized["advisory"] = json!(true);
+                normalized["workspaceCoverage"] = json!("partial");
+            }
+            if name == "lsp_diagnostics" {
+                normalized["freshness"] = freshness.unwrap_or(json!("diagnostics_pending"));
+                normalized["omittedByTransport"] = json!(omitted);
+                normalized["advisory"] = json!(true);
+                normalized["workspaceCoverage"] = json!("partial");
+            }
+            return Ok(normalized);
         }
-        let cap = match name {
-            "lsp_workspace_symbols" => config.typescript.max_workspace_symbols,
-            "lsp_diagnostics" => config.typescript.max_diagnostics,
-            _ => config.typescript.max_references,
-        };
-        let uri = source.as_deref().map(documents::file_uri).transpose()?;
-        let mut normalized = normalize::normalize_retained(
-            name,
-            raw,
-            &workspace,
-            uri.as_deref(),
-            parsed.limit.unwrap_or(cap).min(cap),
-            |full| {
-                self.inner
-                    .governor
-                    .lock()
-                    .ok()?
-                    .as_mut()?
-                    .retain_native_output(name, args, full)
-                    .ok()
-            },
-        )?;
-        normalized["available"] = json!(true);
-        normalized["backend"] = json!(session.command.kind);
-        if name == "lsp_diagnostics" {
-            normalized["freshness"] = freshness.unwrap_or(json!("pull-response"));
-            normalized["omittedByTransport"] = json!(omitted);
-            normalized["advisory"] = json!(true);
-        }
-        Ok(normalized)
+        Err(last_error.unwrap_or_else(|| {
+            IntelligenceError::new(
+                "server_not_installed",
+                "No eligible installed language server could be started",
+            )
+        }))
     }
+
+    pub fn execute_with_budget(
+        &self,
+        name: &str,
+        args: &Value,
+        budget: RequestBudget,
+    ) -> std::result::Result<ToolResult, ToolError> {
+        let (value, is_error) = match tools::Arguments::parse(name, args).and_then(|parsed| {
+            let family = family_from_arguments(&parsed)?;
+            self.request_with_budget(name, args, parsed, family, budget)
+        }) {
+            Ok(value) => (value, false),
+            Err(error) => (
+                json!({
+                    "available":false,
+                    "error":error,
+                    "fallback":"Use read/search and the repository compiler/type checker, lint and tests."
+                }),
+                true,
+            ),
+        };
+        Ok(ToolResult {
+            content: serde_json::to_string_pretty(&value).expect("JSON value"),
+            is_error,
+            details: Some(value),
+        })
+    }
+
+    pub fn execute(&self, name: &str, args: &Value) -> std::result::Result<ToolResult, ToolError> {
+        let parsed = tools::Arguments::parse(name, args);
+        let timeout = parsed
+            .as_ref()
+            .ok()
+            .and_then(|parsed| family_from_arguments(parsed).ok())
+            .map(|family| self.limits(family).cold_ms)
+            .unwrap_or(60_000);
+        self.execute_with_budget(
+            name,
+            args,
+            RequestBudget::from_timeout(Duration::from_millis(timeout)),
+        )
+    }
+
     fn ensure_open(&self) -> Result<()> {
         if self.inner.closed.load(Ordering::Acquire) {
             Err(IntelligenceError::new(
@@ -427,47 +654,404 @@ impl LanguageIntelligence {
         }
     }
 
-    pub fn execute(&self, name: &str, args: &Value) -> std::result::Result<ToolResult, ToolError> {
-        let (value, is_error) = match self.request(name, args) {
-            Ok(value) => (value, false),
-            Err(error) => (
-                json!({"available":false,"error":error,"fallback":"Use read/search and the repository compiler, lint and tests."}),
-                true,
-            ),
+    fn family_enabled(&self, family: LanguageFamily) -> bool {
+        match family {
+            LanguageFamily::TypeScript => self.inner.config.typescript.enabled,
+            LanguageFamily::Rust => self.inner.config.rust.enabled,
+            LanguageFamily::Python => self.inner.config.python.enabled,
+        }
+    }
+
+    fn limits(&self, family: LanguageFamily) -> Limits {
+        match family {
+            LanguageFamily::TypeScript => {
+                let profile = &self.inner.config.typescript;
+                Limits {
+                    warm_ms: profile.request_timeout_ms,
+                    init_ms: profile.initialization_timeout_ms,
+                    cold_ms: profile.cold_request_timeout_ms,
+                    references: profile.max_references,
+                    workspace_symbols: profile.max_workspace_symbols,
+                    diagnostics: profile.max_diagnostics,
+                    family_sessions: profile.max_sessions,
+                }
+            }
+            LanguageFamily::Rust => {
+                let profile = &self.inner.config.rust;
+                Limits {
+                    warm_ms: profile.request_timeout_ms,
+                    init_ms: profile.initialization_timeout_ms,
+                    cold_ms: profile.cold_request_timeout_ms,
+                    references: profile.max_references,
+                    workspace_symbols: profile.max_workspace_symbols,
+                    diagnostics: profile.max_diagnostics,
+                    family_sessions: profile.max_sessions,
+                }
+            }
+            LanguageFamily::Python => {
+                let profile = &self.inner.config.python;
+                Limits {
+                    warm_ms: profile.request_timeout_ms,
+                    init_ms: profile.initialization_timeout_ms,
+                    cold_ms: profile.cold_request_timeout_ms,
+                    references: profile.max_references,
+                    workspace_symbols: profile.max_workspace_symbols,
+                    diagnostics: profile.max_diagnostics,
+                    family_sessions: profile.max_sessions,
+                }
+            }
+        }
+    }
+
+    fn profile_fingerprint(&self, family: LanguageFamily) -> String {
+        match family {
+            LanguageFamily::TypeScript => self
+                .inner
+                .config
+                .profile_fingerprint(&self.inner.config.typescript),
+            LanguageFamily::Rust => self
+                .inner
+                .config
+                .profile_fingerprint(&self.inner.config.rust),
+            LanguageFamily::Python => self
+                .inner
+                .config
+                .profile_fingerprint(&self.inner.config.python),
+        }
+    }
+
+    fn resolution_context(&self, workspace: PathBuf, budget: RequestBudget) -> ResolutionContext {
+        let mut roots: Vec<PathBuf> =
+            std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default())
+                .filter(|path| path.is_absolute())
+                .filter_map(|path| path.canonicalize().ok())
+                .collect();
+        for path in [
+            self.inner
+                .config
+                .typescript
+                .server
+                .as_ref()
+                .map(|v| v.program.as_path()),
+            self.inner
+                .config
+                .rust
+                .server
+                .as_ref()
+                .map(|v| v.program.as_path()),
+            self.inner
+                .config
+                .python
+                .server
+                .as_ref()
+                .map(|v| v.program.as_path()),
+            self.inner.config.python.interpreter.as_deref(),
+            self.inner.config.rust.toolchain_dir.as_deref(),
+            self.inner.config.rust.sysroot.as_deref(),
+            self.inner.config.rust.sysroot_src.as_deref(),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            let candidate = if path.is_dir() {
+                path
+            } else {
+                path.parent().unwrap_or(path)
+            };
+            if let Ok(candidate) = candidate.canonicalize() {
+                roots.push(candidate);
+            }
+        }
+        roots.sort();
+        roots.dedup();
+        ResolutionContext {
+            workspace: workspace.clone(),
+            reader: Arc::new(FsMetadataReader::new(workspace, roots)),
+            budget,
+        }
+    }
+
+    fn pathless_project(
+        &self,
+        family: LanguageFamily,
+        context: &ResolutionContext,
+    ) -> Result<ResolvedProject> {
+        let explicit = match family {
+            LanguageFamily::TypeScript => &[][..],
+            LanguageFamily::Rust => self.inner.config.rust.project_roots.as_slice(),
+            LanguageFamily::Python => self.inner.config.python.project_roots.as_slice(),
         };
-        Ok(ToolResult {
-            content: serde_json::to_string_pretty(&value).expect("JSON value"),
-            is_error,
-            details: Some(value),
+        if explicit.len() == 1 {
+            let root = context
+                .workspace
+                .join(&explicit[0])
+                .canonicalize()
+                .map_err(|_| {
+                    IntelligenceError::new(
+                        "project_root_required",
+                        "Configured project root is unavailable",
+                    )
+                })?;
+            if !root.starts_with(&context.workspace) {
+                return Err(IntelligenceError::new(
+                    "outside_workspace",
+                    "Configured project root escapes the workspace",
+                ));
+            }
+            return Ok(ResolvedProject {
+                workspace: context.workspace.clone(),
+                root,
+                family,
+                analysis_environment: None,
+                config_files: Vec::new(),
+                limitations: Vec::new(),
+            });
+        }
+        let unambiguous = match family {
+            LanguageFamily::TypeScript => true,
+            LanguageFamily::Rust => context.workspace.join("Cargo.toml").is_file(),
+            LanguageFamily::Python => {
+                context.workspace.join("pyrightconfig.json").is_file()
+                    || context.workspace.join("pyproject.toml").is_file()
+            }
+        };
+        if !unambiguous {
+            return Err(IntelligenceError::new("project_root_required", "A source path or one explicit project root is required for this workspace-symbol query"));
+        }
+        Ok(ResolvedProject {
+            workspace: context.workspace.clone(),
+            root: context.workspace.clone(),
+            family,
+            analysis_environment: None,
+            config_files: Vec::new(),
+            limitations: Vec::new(),
         })
+    }
+
+    fn slot_for(
+        &self,
+        key: &SessionKey,
+        family_cap: usize,
+        budget: &RequestBudget,
+    ) -> Result<(SharedSlot, Vec<SharedSlot>)> {
+        let mut slots = lock_until(&self.inner.slots, budget)?;
+        if let Some(slot) = slots.get(key) {
+            return Ok((slot.clone(), Vec::new()));
+        }
+        let mut evicted = Vec::new();
+        while live_count(&slots) >= self.inner.config.max_sessions
+            || live_family_count(&slots, key.family) >= family_cap
+        {
+            let candidate = slots
+                .iter()
+                .filter(|(candidate, _)| {
+                    if live_family_count(&slots, key.family) >= family_cap {
+                        candidate.family == key.family
+                    } else {
+                        true
+                    }
+                })
+                .filter_map(|(candidate, slot)| {
+                    let guard = slot.try_lock().ok()?;
+                    if guard.session.is_none() {
+                        return Some((candidate.clone(), guard.last_used));
+                    }
+                    Some((candidate.clone(), guard.last_used))
+                })
+                .min_by_key(|(_, last_used)| *last_used)
+                .map(|(candidate, _)| candidate);
+            let Some(candidate) = candidate else {
+                return Err(IntelligenceError::new(
+                    "session_limit",
+                    "All language-server session slots are busy",
+                ));
+            };
+            if let Some(slot) = slots.remove(&candidate) {
+                evicted.push(slot);
+            }
+        }
+        let slot = Arc::new(Mutex::new(Slot::default()));
+        slots.insert(key.clone(), slot.clone());
+        Ok((slot, evicted))
+    }
+
+    fn remember_negative(&self, key: SessionKey, error: IntelligenceError) {
+        let mut negative = self
+            .inner
+            .negative
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        negative.retain(|_, entry| entry.expires > Instant::now());
+        if negative.len() >= 32 && !negative.contains_key(&key) {
+            if let Some(oldest) = negative.keys().next().cloned() {
+                negative.remove(&oldest);
+            }
+        }
+        negative.insert(
+            key,
+            NegativeDiscovery {
+                error,
+                expires: Instant::now() + Duration::from_secs(30),
+            },
+        );
+    }
+
+    fn cached_negative(&self, key: &SessionKey) -> Option<IntelligenceError> {
+        let mut negative = self
+            .inner
+            .negative
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if negative
+            .get(key)
+            .is_some_and(|entry| entry.expires <= Instant::now())
+        {
+            negative.remove(key);
+        }
+        negative.get(key).map(|entry| entry.error.clone())
     }
 }
 
+fn family_from_arguments(parsed: &tools::Arguments) -> Result<LanguageFamily> {
+    if let Some(path) = parsed.path.as_deref() {
+        let family = LanguageFamily::from_path(Path::new(path)).ok_or_else(|| {
+            IntelligenceError::new(
+                "unsupported_language",
+                "Source extension is not supported by language intelligence",
+            )
+        })?;
+        if let Some(language) = parsed.language.as_deref() {
+            let explicit = family_from_selector(language)?;
+            if explicit != family {
+                return Err(IntelligenceError::new(
+                    "language_path_conflict",
+                    "Explicit language conflicts with the source path",
+                ));
+            }
+        }
+        return Ok(family);
+    }
+    parsed
+        .language
+        .as_deref()
+        .map(family_from_selector)
+        .transpose()?
+        .map_or(Ok(LanguageFamily::TypeScript), Ok)
+}
+
+fn family_from_selector(language: &str) -> Result<LanguageFamily> {
+    match language {
+        "typescript" | "javascript" => Ok(LanguageFamily::TypeScript),
+        "rust" => Ok(LanguageFamily::Rust),
+        "python" => Ok(LanguageFamily::Python),
+        _ => Err(IntelligenceError::new(
+            "invalid_arguments",
+            "Unknown language selector",
+        )),
+    }
+}
+
+fn relative_project(workspace: &Path, project: &Path) -> String {
+    project
+        .strip_prefix(workspace)
+        .ok()
+        .filter(|path| !path.as_os_str().is_empty())
+        .map(|path| path.to_string_lossy().replace('\\', "/"))
+        .unwrap_or_else(|| ".".into())
+}
+
+fn source_hash(path: &Path) -> Option<String> {
+    let bytes = std::fs::read(path).ok()?;
+    if bytes.len() > documents::MAX_SOURCE_BYTES {
+        return None;
+    }
+    let mut hasher = Sha256::new();
+    hasher.update(bytes);
+    Some(format!("{:x}", hasher.finalize()))
+}
+
+fn live_count(slots: &BTreeMap<SessionKey, Arc<Mutex<Slot>>>) -> usize {
+    slots
+        .values()
+        .filter(|slot| {
+            slot.try_lock()
+                .map(|slot| slot.session.is_some())
+                .unwrap_or(true)
+        })
+        .count()
+}
+
+fn live_family_count(
+    slots: &BTreeMap<SessionKey, Arc<Mutex<Slot>>>,
+    family: LanguageFamily,
+) -> usize {
+    slots
+        .iter()
+        .filter(|(key, slot)| {
+            key.family == family
+                && slot
+                    .try_lock()
+                    .map(|slot| slot.session.is_some())
+                    .unwrap_or(true)
+        })
+        .count()
+}
+
 fn launch_denied() -> IntelligenceError {
-    IntelligenceError::new("server_launch_denied","Language servers require project trust and an existing permission grant for the discovered server command")
+    IntelligenceError::new(
+        "server_launch_denied",
+        "Language servers require project trust and an existing permission grant for the exact discovered command",
+    )
 }
 
 impl davinci_agent::runtime::task_transport::CoordinatorToolHandler for LanguageIntelligence {
     fn handles(&self, tool: &str) -> bool {
         tools::TOOL_NAMES.contains(&tool) || tool == "retrieve_output"
     }
+
     fn execute(&self, tool: &str, args: &Value) -> std::result::Result<ToolResult, ToolError> {
         if tool == "retrieve_output" {
-            return self
+            let governor = self
                 .inner
                 .governor
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
-                .as_mut()
-                .ok_or_else(|| ToolError::Failed("Parent output store unavailable".into()))?
+                .as_ref()
+                .cloned()
+                .ok_or_else(|| ToolError::Failed("Parent output store unavailable".into()))?;
+            return governor
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
                 .retrieve(args);
         }
         LanguageIntelligence::execute(self, tool, args)
     }
+
+    fn execute_with_context(
+        &self,
+        tool: &str,
+        args: &Value,
+        timeout: Duration,
+        abort: Option<Arc<AtomicBool>>,
+    ) -> std::result::Result<ToolResult, ToolError> {
+        if tool == "retrieve_output" {
+            return self.execute(tool, args);
+        }
+        LanguageIntelligence::execute_with_budget(
+            self,
+            tool,
+            args,
+            RequestBudget {
+                deadline: Instant::now() + timeout.min(Duration::from_secs(120)),
+                cancelled: abort,
+            },
+        )
+    }
 }
 
-fn lock_until<T>(mutex: &Mutex<T>, deadline: Instant) -> Result<MutexGuard<'_, T>> {
+fn lock_until<'a, T>(mutex: &'a Mutex<T>, budget: &RequestBudget) -> Result<MutexGuard<'a, T>> {
     loop {
+        budget.check()?;
         match mutex.try_lock() {
             Ok(guard) => return Ok(guard),
             Err(TryLockError::Poisoned(_)) => {
@@ -476,10 +1060,7 @@ fn lock_until<T>(mutex: &Mutex<T>, deadline: Instant) -> Result<MutexGuard<'_, T
                     "Language-intelligence state unavailable",
                 ))
             }
-            Err(TryLockError::WouldBlock) => {
-                session::remaining(deadline)?;
-                std::thread::sleep(Duration::from_millis(2));
-            }
+            Err(TryLockError::WouldBlock) => std::thread::sleep(Duration::from_millis(2)),
         }
     }
 }
@@ -487,6 +1068,7 @@ fn lock_until<T>(mutex: &Mutex<T>, deadline: Instant) -> Result<MutexGuard<'_, T
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::native_extensions::language_intelligence::test_support::TestWorkspace;
 
     #[test]
     fn restart_budget_recovers_after_a_healthy_period() {
@@ -500,273 +1082,178 @@ mod tests {
     }
 
     #[test]
-    fn worker_worktrees_resolve_against_their_own_checkout() {
-        let (_parent_dir, manager) = fixture();
-        let (worker_dir, _) = fixture();
-        let worker = manager.for_workspace(worker_dir.path());
-        std::fs::write(worker_dir.path().join("only-in-worker.ts"), "worker").unwrap();
-        let args = json!({"path":"only-in-worker.ts","line":1,"column":1});
-        assert!(manager.execute("lsp_hover", &args).unwrap().is_error);
-        assert!(!worker.execute("lsp_hover", &args).unwrap().is_error);
-        let source = worker_dir.path().canonicalize().unwrap();
-        assert_eq!(manager.status()["sessions"][0]["workspace"], json!(source));
-        assert_eq!(manager.status()["sessions"][0]["starts"], 1);
-    }
-
-    #[test]
-    fn capped_results_use_existing_governor_retrieval() {
-        use crate::native_extensions::{OutputStore, TokenGovernor, TokenGovernorConfig};
-        use davinci_agent::runtime::task_transport::CoordinatorToolHandler;
-        let (dir, manager) = fixture();
-        let mut governor = TokenGovernor::with_store(
-            "semantic-fixture",
-            TokenGovernorConfig::default(),
-            OutputStore::new(dir.path().join("outputs")),
-        );
-        manager.set_governor(governor.clone());
-        let result = manager
-            .execute(
-                "lsp_references",
-                &json!({"path":"a.ts","line":1,"column":1,"limit":1}),
-            )
-            .unwrap();
-        assert!(!result.is_error, "{}", result.content);
-        let details = result.details.unwrap();
-        assert_eq!(
-            details["remaining"], 2,
-            "unexpected semantic result: {details:#}"
-        );
-        assert_eq!(details["items"].as_array().unwrap().len(), 1);
-        let id = details["fullResult"]["id"]
-            .as_str()
-            .expect("existing output retrieval reference");
-        let args = json!({"id":id});
-        let local = governor.retrieve(&args).unwrap();
-        let remote = CoordinatorToolHandler::execute(&manager, "retrieve_output", &args).unwrap();
-        assert_eq!(local.content, remote.content);
-        assert!(remote.content.contains("\"total\": 3"));
-    }
-
-    #[test]
-    fn monorepo_projects_are_independent_and_dead_servers_restart_once() {
-        let (dir, manager) = fixture();
-        for project in ["app", "api"] {
-            std::fs::create_dir(dir.path().join(project)).unwrap();
-            std::fs::write(dir.path().join(project).join("tsconfig.json"), "{}").unwrap();
-            std::fs::write(dir.path().join(project).join("a.ts"), "x").unwrap();
-            let response = manager
-                .execute(
-                    "lsp_hover",
-                    &json!({"path":format!("{project}/a.ts"),"line":1,"column":1}),
-                )
-                .unwrap();
-            assert!(!response.is_error, "{}", response.content);
-        }
-        assert_eq!(manager.status()["sessions"].as_array().unwrap().len(), 2);
-        let root = dir.path().join("app").canonicalize().unwrap();
-        for expected in [2, 2] {
-            let slot = manager.inner.slots.lock().unwrap()[&root].clone();
-            let pid = slot.lock().unwrap().session.as_ref().unwrap().status()["pid"]
-                .as_u64()
-                .unwrap();
-            davinci_agent::jobs::kill_tree(pid as u32);
-            let deadline = Instant::now() + Duration::from_secs(2);
-            while slot.lock().unwrap().session.as_ref().unwrap().is_alive() {
-                assert!(Instant::now() < deadline);
-                std::thread::sleep(Duration::from_millis(5));
-            }
-            let response = manager
-                .execute("lsp_hover", &json!({"path":"app/a.ts","line":1,"column":1}))
-                .unwrap();
-            assert_eq!(slot.lock().unwrap().starts, expected);
-            if response.is_error {
-                assert_eq!(response.details.unwrap()["error"]["code"], "server_exited");
-                break;
-            }
-        }
-        assert_eq!(
-            manager.inner.slots.lock().unwrap()[&root]
-                .lock()
-                .unwrap()
-                .starts,
-            2
-        );
-    }
-
-    #[test]
-    fn graph_worker_processes_share_parent_language_session() {
-        use davinci_agent::runtime::task_transport::TaskCoordinatorTransport;
-        use davinci_agent::runtime::{
-            AgentId, AgentKind, AgentRecord, AgentState, RunId, RuntimeBus, RuntimeHandle,
+    fn same_root_rust_python_are_distinct() {
+        let base = SessionKey {
+            workspace: PathBuf::from("/work"),
+            project_root: PathBuf::from("/work"),
+            family: LanguageFamily::Rust,
+            profile_fingerprint: "same".into(),
         };
-        use std::sync::atomic::AtomicBool;
-        let (dir, manager) = fixture();
-        manager.set_governor(crate::native_extensions::TokenGovernor::with_store(
-            "graph-semantic",
-            Default::default(),
-            crate::native_extensions::OutputStore::new(dir.path().join("outputs")),
-        ));
-        let runtime = RuntimeHandle::new(RunId::new(), AgentId::new(), RuntimeBus::new());
-        let permissions = manager.inner.permissions.lock().unwrap().clone().unwrap();
-        let mut transports = Vec::new();
-        let mut workers = Vec::new();
-        for _ in 0..4 {
-            let id = AgentId::new();
-            runtime
-                .registry
-                .register_agent(AgentRecord {
-                    id,
-                    run_id: runtime.run_id,
-                    parent: Some(runtime.agent_id),
-                    kind: AgentKind::GraphWorker,
-                    name: "semantic fixture".into(),
-                    provider: "fixture".into(),
-                    model_id: "fixture".into(),
-                    cwd: dir.path().into(),
-                    state: AgentState::Running,
-                    task_id: None,
-                    worktree: None,
-                    started_ms: 0,
-                    updated_ms: 0,
-                    failure_reason: None,
-                })
-                .unwrap();
-            let transport = TaskCoordinatorTransport::bind_with_handler(
-                &runtime,
-                id,
-                permissions.clone(),
-                vec![
-                    "lsp_hover".into(),
-                    "lsp_references".into(),
-                    "retrieve_output".into(),
-                ],
-                dir.path().into(),
-                Arc::new(AtomicBool::new(false)),
-                Some(Arc::new(manager.clone())),
-            )
-            .unwrap();
-            let client = transport.client();
-            let mut command = std::process::Command::new("node");
-            command
-                .arg(concat!(
-                    env!("CARGO_MANIFEST_DIR"),
-                    "/tests/fixtures/graph-language-worker.cjs"
-                ))
-                .env(
-                    "DAVINCI_TASK_COORDINATOR_ADDR",
-                    client.address().to_string(),
-                )
-                .env("DAVINCI_TASK_COORDINATOR_CREDENTIAL", client.credential())
-                .stdout(std::process::Stdio::piped())
-                .stderr(std::process::Stdio::piped());
-            #[cfg(windows)]
-            {
-                use std::os::windows::process::CommandExt;
-                command.creation_flags(0x08000000);
-            }
-            workers.push(command.spawn().unwrap());
-            transports.push(transport);
-        }
-        let mut rss = 0;
-        for worker in workers {
-            let output = worker.wait_with_output().unwrap();
-            assert!(
-                output.status.success(),
-                "worker failed: {}",
-                String::from_utf8_lossy(&output.stderr)
-            );
-            let report: Value = serde_json::from_slice(&output.stdout).unwrap();
-            assert_eq!(report["success"], true);
-            rss += report["rss"].as_u64().unwrap();
-        }
-        assert_eq!(manager.status()["sessions"].as_array().unwrap().len(), 1);
-        assert_eq!(manager.status()["sessions"][0]["starts"], 1);
-        println!("graph semantic fixture: worker processes=4, shared LSP processes=1, summed worker RSS={rss} bytes");
-        drop(transports);
-        manager.shutdown();
+        let python = SessionKey {
+            family: LanguageFamily::Python,
+            ..base.clone()
+        };
+        assert_ne!(base, python);
     }
-    fn fixture() -> (tempfile::TempDir, LanguageIntelligence) {
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path().canonicalize().unwrap();
-        let package = root.join("node_modules/typescript-language-server");
-        std::fs::create_dir_all(&package).unwrap();
-        std::fs::write(
-            package.join("package.json"),
-            r#"{"name":"typescript-language-server","version":"fixture","bin":"server.cjs"}"#,
-        )
-        .unwrap();
-        std::fs::copy(
-            concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/tests/fixtures/language-server.cjs"
-            ),
-            package.join("server.cjs"),
-        )
-        .unwrap();
-        std::fs::write(root.join("a.ts"), "hello").unwrap();
-        let manager = LanguageIntelligence::new(&root, LanguageIntelligenceConfig::default());
+
+    #[test]
+    fn fixture_routes_rust_python_and_typescript_without_collision() {
+        for (language, path) in [
+            ("typescript", "a.ts"),
+            ("rust", "src/lib.rs"),
+            ("python", "app.py"),
+        ] {
+            let workspace = TestWorkspace::new(language, "capture");
+            let result = workspace
+                .manager
+                .execute("lsp_hover", &json!({"path":path,"line":1,"column":1}))
+                .unwrap();
+            assert!(!result.is_error, "{language}: {}", result.content);
+            assert_eq!(
+                result.details.unwrap()["language"],
+                json!(LanguageFamily::from_path(Path::new(path)).unwrap())
+            );
+        }
+    }
+
+    #[test]
+    fn family_cap_evicts_idle_same_family_session_first() {
+        let first = TestWorkspace::new("typescript", "capture");
+        let second_root = tempfile::tempdir().unwrap();
+        std::fs::write(second_root.path().join("package.json"), "{}").unwrap();
+        std::fs::write(second_root.path().join("a.ts"), "export const value = 1;\n").unwrap();
+
+        let mut config = first.manager.inner.config.clone();
+        config.max_sessions = 8;
+        config.typescript.max_sessions = 1;
+        let manager = LanguageIntelligence::new(first.root(), config);
         let mut policy =
             davinci_agent::PermissionPolicy::new(davinci_agent::PermissionMode::AlwaysApprove);
         policy.project_trusted = true;
-        manager.set_permissions(Some(Arc::new(PermissionState::new(policy))));
-        (dir, manager)
-    }
-    #[test]
-    fn lazy_concurrent_calls_share_one_session_and_shutdown_cleans_it() {
-        let (_dir, manager) = fixture();
-        assert_eq!(manager.status()["sessions"], json!([]));
-        let workers: Vec<_> = (0..6)
-            .map(|_| {
-                let manager = manager.clone();
-                std::thread::spawn(move || {
-                    let result = manager
-                        .execute("lsp_hover", &json!({"path":"a.ts","line":1,"column":1}))
-                        .unwrap();
-                    assert!(!result.is_error, "{}", result.content);
-                })
-            })
-            .collect();
-        for worker in workers {
-            worker.join().unwrap();
-        }
-        let status = manager.status();
-        assert_eq!(status["sessions"].as_array().unwrap().len(), 1);
-        assert_eq!(status["sessions"][0]["starts"], 1);
-        assert_eq!(status["sessions"][0]["documents"], 1);
-        manager.shutdown();
-        assert_eq!(manager.status()["sessions"], json!([]));
-        let stopped = manager.for_workspace(&_dir.path().canonicalize().unwrap());
+        manager.set_permissions(Some(Arc::new(davinci_agent::PermissionState::new(policy))));
+
+        let first_result = manager
+            .execute("lsp_hover", &json!({"path":"a.ts","line":1,"column":1}))
+            .unwrap();
+        assert!(!first_result.is_error, "{}", first_result.content);
+        assert_eq!(manager.status()["sessions"].as_array().unwrap().len(), 1);
+
+        let second = manager.for_workspace(second_root.path());
+        let second_result = second
+            .execute("lsp_hover", &json!({"path":"a.ts","line":1,"column":1}))
+            .unwrap();
+        assert!(!second_result.is_error, "{}", second_result.content);
+        let sessions = manager.status()["sessions"].as_array().unwrap().to_vec();
+        assert_eq!(sessions.len(), 1, "{sessions:?}");
         assert_eq!(
-            stopped
-                .request("lsp_hover", &json!({"path":"a.ts","line":1,"column":1}))
-                .unwrap_err()
-                .code,
-            "session_closed"
+            sessions[0]["workspace"],
+            json!(second_root.path().canonicalize().unwrap())
         );
+        manager.shutdown();
     }
+
     #[test]
-    fn disabled_invalid_and_untrusted_requests_never_launch() {
-        let (dir, manager) = fixture();
-        manager.set_permissions(None);
+    fn disabled_and_untrusted_requests_never_launch() {
+        let workspace = TestWorkspace::new("typescript", "capture");
+        workspace.manager.set_permissions(None);
+        let result = workspace
+            .manager
+            .execute("lsp_hover", &json!({"path":"a.ts","line":1,"column":1}))
+            .unwrap();
+        assert!(result.is_error);
         assert_eq!(
-            manager
-                .request("lsp_hover", &json!({"path":"a.ts","line":1,"column":1}))
-                .unwrap_err()
-                .code,
+            result.details.unwrap()["error"]["code"],
             "server_launch_denied"
         );
-        let config = LanguageIntelligenceConfig {
-            enabled: false,
-            ..Default::default()
-        };
-        let manager = LanguageIntelligence::new(dir.path(), config);
-        assert_eq!(
+    }
+
+    #[test]
+    fn source_change_while_query_runs_returns_stale_result() {
+        let workspace = TestWorkspace::new("typescript", "delayed-query");
+        let manager = workspace.manager.clone();
+        let handle = std::thread::spawn(move || {
             manager
-                .request("lsp_workspace_symbols", &json!({"query":"x"}))
-                .unwrap_err()
-                .code,
-            "disabled"
+                .execute("lsp_hover", &json!({"path":"a.ts","line":1,"column":1}))
+                .unwrap()
+        });
+
+        let deadline = Instant::now() + Duration::from_secs(3);
+        loop {
+            if workspace.events().iter().any(|event| {
+                event["kind"] == "client_message" && event["method"] == "textDocument/hover"
+            }) {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "fixture never received hover request"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+
+        workspace.write("a.ts", "changed while query was pending");
+        let result = handle.join().unwrap();
+        assert!(result.is_error, "{result:?}");
+        assert_eq!(result.details.unwrap()["error"]["code"], "stale_result");
+    }
+
+    #[test]
+    fn python_project_venv_requires_trust_and_is_reported_when_selected() {
+        let workspace = TestWorkspace::new("python", "capture");
+        let interpreter = if cfg!(windows) {
+            workspace.root().join(".venv/Scripts/python.exe")
+        } else {
+            workspace.root().join(".venv/bin/python")
+        };
+        std::fs::create_dir_all(interpreter.parent().unwrap()).unwrap();
+        std::fs::write(&interpreter, b"fixture interpreter").unwrap();
+
+        let mut denied =
+            davinci_agent::PermissionPolicy::new(davinci_agent::PermissionMode::AlwaysApprove);
+        denied.project_trusted = false;
+        workspace
+            .manager
+            .set_permissions(Some(Arc::new(davinci_agent::PermissionState::new(denied))));
+        let denied_result = workspace
+            .manager
+            .execute("lsp_hover", &json!({"path":"app.py","line":1,"column":1}))
+            .unwrap();
+        assert!(denied_result.is_error);
+        assert_eq!(
+            denied_result.details.unwrap()["error"]["code"],
+            "server_launch_denied"
         );
-        assert_eq!(manager.status()["sessions"], json!([]));
+        assert!(workspace.events().is_empty());
+
+        let mut trusted =
+            davinci_agent::PermissionPolicy::new(davinci_agent::PermissionMode::AlwaysApprove);
+        trusted.project_trusted = true;
+        workspace
+            .manager
+            .set_permissions(Some(Arc::new(davinci_agent::PermissionState::new(trusted))));
+        let result = workspace
+            .manager
+            .execute("lsp_hover", &json!({"path":"app.py","line":1,"column":1}))
+            .unwrap();
+        assert!(!result.is_error, "{}", result.content);
+        let status = workspace.manager.status();
+        assert_eq!(
+            status["sessions"][0]["analysisEnvironment"],
+            json!(interpreter.canonicalize().unwrap())
+        );
+        assert!(status["sessions"][0]["limitations"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|value| value == "project_interpreter_executed_requires_trust"));
+    }
+
+    #[test]
+    fn status_is_nonexecuting_and_lists_all_profiles() {
+        let workspace = TestWorkspace::new("rust", "capture");
+        let status = workspace.manager.status();
+        assert!(status["sessions"].as_array().unwrap().is_empty());
+        assert_eq!(status["profiles"].as_array().unwrap().len(), 3);
+        assert!(workspace.events().is_empty());
     }
 }

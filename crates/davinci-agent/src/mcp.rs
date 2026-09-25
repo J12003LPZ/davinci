@@ -188,11 +188,7 @@ impl McpRegistry {
         self.lock().routes.get(exposed).cloned()
     }
 
-    pub fn call_exposed(
-        &self,
-        exposed: &str,
-        arguments: &Value,
-    ) -> Result<ToolResult, ToolError> {
+    pub fn call_exposed(&self, exposed: &str, arguments: &Value) -> Result<ToolResult, ToolError> {
         let Some((server, tool)) = self.resolve_tool(exposed) else {
             return Err(ToolError::Unknown(exposed.to_string()));
         };
@@ -535,7 +531,10 @@ mod tests {
         let rows = registry.rows();
         assert_eq!(rows.len(), 2);
         assert!(rows.iter().all(|row| row.status == "error"));
-        assert!(rows.iter().all(|row| row.error.as_deref().is_some_and(|e| e.contains("server name"))));
+        assert!(rows.iter().all(|row| row
+            .error
+            .as_deref()
+            .is_some_and(|e| e.contains("server name"))));
     }
 
     #[test]

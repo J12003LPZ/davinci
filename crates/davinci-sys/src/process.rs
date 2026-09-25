@@ -59,7 +59,7 @@ pub fn resolve_program_in(name: &str, path_var: &OsStr, pathext: Option<&str>) -
         // Empty PATH entries mean the current working directory on both Unix
         // and Windows. Never let an untrusted repository satisfy a trusted
         // program lookup through an empty component.
-        if dir.as_os_str().is_empty() {
+        if dir.as_os_str().is_empty() || !dir.is_absolute() {
             continue;
         }
         match pathext {
@@ -404,8 +404,29 @@ mod tests {
             .prefix("davinci-path-entry-")
             .tempfile_in(".")
             .unwrap();
-        let name = file.path().file_name().unwrap().to_string_lossy().into_owned();
+        let name = file
+            .path()
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
         assert_eq!(resolve_program_in(&name, OsStr::new(""), None), None);
+    }
+
+    #[test]
+    fn relative_path_entries_never_resolve_from_the_current_directory() {
+        let file = tempfile::Builder::new()
+            .prefix("davinci-relative-path-entry-")
+            .tempfile_in(".")
+            .unwrap();
+        let name = file
+            .path()
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        let relative = std::env::join_paths([std::path::PathBuf::from(".")]).unwrap();
+        assert_eq!(resolve_program_in(&name, &relative, None), None);
     }
 
     #[test]

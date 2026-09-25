@@ -152,15 +152,7 @@ fn parse_language_intelligence<'de, D: serde::Deserializer<'de>>(
 > {
     use crate::native_extensions::language_intelligence::LanguageIntelligenceConfig;
     let value = Option::<serde_json::Value>::deserialize(deserializer)?;
-    Ok(value.map(|value| {
-        serde_json::from_value(value).unwrap_or_else(|_| LanguageIntelligenceConfig {
-            enabled: false,
-            configuration_error: Some(
-                "Invalid languageIntelligence settings; check backend and value types".into(),
-            ),
-            ..Default::default()
-        })
-    }))
+    Ok(value.map(LanguageIntelligenceConfig::from_value))
 }
 
 fn parse_decision_intelligence<'de, D: serde::Deserializer<'de>>(
@@ -1409,9 +1401,12 @@ pub fn update_settings(
     let path = settings_path(agent_dir);
     with_settings_lock(&path, || {
         refuse_unparseable(&path)?;
+        let original = fs::read_to_string(&path)
+            .ok()
+            .and_then(|raw| parse_settings_value(&raw));
         let mut settings = load_settings_file(&path);
         change(&mut settings);
-        write_settings_locked(&path, &settings)?;
+        write_settings_locked_preserving_invalid_language(&path, &settings, original.as_ref())?;
         Ok(settings)
     })
 }
@@ -1438,9 +1433,47 @@ fn refuse_unparseable(path: &Path) -> Result<(), String> {
 }
 
 fn write_settings_locked(path: &Path, settings: &Settings) -> Result<(), String> {
+    write_settings_locked_preserving_invalid_language(path, settings, None)
+}
+
+fn write_settings_locked_preserving_invalid_language(
+    path: &Path,
+    settings: &Settings,
+    original: Option<&serde_json::Value>,
+) -> Result<(), String> {
     refuse_unparseable(path)?;
     let mut value = serde_json::to_value(settings).map_err(|err| err.to_string())?;
     prune_nulls(&mut value);
+    if let Some(original_language) = original.and_then(|value| value.get("languageIntelligence")) {
+        let parsed =
+            crate::native_extensions::language_intelligence::LanguageIntelligenceConfig::from_value(
+                original_language.clone(),
+            );
+        if parsed.configuration_error.is_some() {
+            if let Some(object) = value.as_object_mut() {
+                object.insert("languageIntelligence".into(), original_language.clone());
+            }
+        } else if !parsed.profile_errors.is_empty() {
+            if let (Some(current), Some(original)) = (
+                value
+                    .get_mut("languageIntelligence")
+                    .and_then(serde_json::Value::as_object_mut),
+                original_language.as_object(),
+            ) {
+                for language in ["typescript", "rust", "python"] {
+                    if parsed
+                        .profile_errors
+                        .iter()
+                        .any(|error| error.starts_with(&format!("{language}:")))
+                    {
+                        if let Some(raw) = original.get(language) {
+                            current.insert(language.to_string(), raw.clone());
+                        }
+                    }
+                }
+            }
+        }
+    }
     let text = serde_json::to_string_pretty(&value).map_err(|err| err.to_string())?;
     davinci_sys::fs::atomic_write(path, text.as_bytes()).map_err(|err| err.to_string())
 }
@@ -1807,7 +1840,37 @@ mod tests {
         }))
         .unwrap();
         assert_eq!(settings.theme.as_deref(), Some("fixture"));
-        assert!(!settings.language_intelligence.unwrap().enabled);
+        // Only the malformed language profile is disabled; the other profiles
+        // and the subsystem itself keep working.
+        let language = settings.language_intelligence.unwrap();
+        assert!(!language.typescript.enabled);
+        assert!(language.rust.enabled && language.python.enabled);
+        assert!(language
+            .profile_errors
+            .iter()
+            .any(|error| error.starts_with("typescript:")));
+    }
+
+    #[test]
+    fn lsp_bad_language_section_never_rewrites_settings_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = settings_path(dir.path());
+        fs::write(
+            &path,
+            r#"{"theme":"fixture","languageIntelligence":{"rust":{"enabled":true},"python":{"backend":42}}}"#,
+        )
+        .unwrap();
+
+        update_settings(dir.path(), |settings| {
+            settings.theme = Some("changed".into());
+        })
+        .unwrap();
+
+        let saved: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(saved["theme"], "changed");
+        assert_eq!(saved["languageIntelligence"]["python"]["backend"], 42);
+        assert_eq!(saved["languageIntelligence"]["rust"]["enabled"], true);
     }
 
     #[test]

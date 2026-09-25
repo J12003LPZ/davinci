@@ -1325,9 +1325,8 @@ impl PermissionPolicy {
                     .join(" | ");
                 request.args = serde_json::json!({"tasks": tasks});
                 request.subject = format!("{} agent tasks", tasks.len());
-                request.summary = crate::approval::display_text(&format!(
-                    "Agent batch: {task_rows}"
-                ));
+                request.summary =
+                    crate::approval::display_text(&format!("Agent batch: {task_rows}"));
                 // A mixed batch can carry different prompts, tool sets, and
                 // isolation modes. A durable grant derived from one member is
                 // not a safe authorization for the whole batch.

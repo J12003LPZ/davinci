@@ -42,6 +42,91 @@ impl RepoIntelligence {
         if query.trim().is_empty() {
             return Err("query_invalid: query required".into());
         }
+        if let Some(anchor) = args.get("semantic").and_then(Value::as_object) {
+            let path = args
+                .get("path")
+                .and_then(Value::as_str)
+                .ok_or("query_invalid: semantic anchor requires path")?;
+            let operation_name = anchor
+                .get("operation")
+                .and_then(Value::as_str)
+                .ok_or("query_invalid: semantic.operation required")?;
+            let operation = match operation_name {
+                "definition" => SemanticOperation::Definition,
+                "references" => SemanticOperation::References,
+                "implementations" => SemanticOperation::Implementations,
+                "typeDefinition" => SemanticOperation::TypeDefinition,
+                "diagnostics" => SemanticOperation::Diagnostics,
+                _ => return Err("query_invalid: invalid semantic.operation".into()),
+            };
+            let range = if matches!(operation, SemanticOperation::Diagnostics) {
+                SourceRange {
+                    start_line: 1,
+                    start_column: 1,
+                    end_line: 1,
+                    end_column: 1,
+                }
+            } else {
+                let line = anchor.get("line").and_then(Value::as_u64).unwrap_or(0) as usize;
+                let column = anchor.get("column").and_then(Value::as_u64).unwrap_or(0) as usize;
+                if line == 0 || column == 0 {
+                    return Err("query_invalid: semantic position must be one-based".into());
+                }
+                SourceRange {
+                    start_line: line,
+                    start_column: column,
+                    end_line: line,
+                    end_column: column,
+                }
+            };
+            if let Some(provider) = &self.semantic {
+                match provider.query(operation, path, &range, limit) {
+                    Ok(evidence) => {
+                        let results = evidence
+                            .into_iter()
+                            .take(limit)
+                            .filter(|item| self.validate_path(&item.path).is_ok())
+                            .map(|item| {
+                                json!({
+                                    "source":"lsp",
+                                    "confidence":"semantic",
+                                    "path":item.path,
+                                    "range":item.range,
+                                    "reason":item.description.chars().take(500).collect::<String>()
+                                })
+                            })
+                            .collect::<Vec<_>>();
+                        let mut value = queries::envelope(results, limit);
+                        value["route"] = json!("semantic");
+                        value["semantic_status"] = json!("provider");
+                        return Ok(value);
+                    }
+                    Err(error) => {
+                        let mut fallback_args = args.clone();
+                        if let Some(object) = fallback_args.as_object_mut() {
+                            object.remove("semantic");
+                        }
+                        let mut value =
+                            self.unified_query(index, query, scope, limit, &fallback_args)?;
+                        value["semantic_status"] = json!("unavailable");
+                        value["semantic_warning"] = json!(format!(
+                            "semantic provider unavailable: {}",
+                            error.chars().take(300).collect::<String>()
+                        ));
+                        return Ok(value);
+                    }
+                }
+            }
+            let mut fallback_args = args.clone();
+            if let Some(object) = fallback_args.as_object_mut() {
+                object.remove("semantic");
+            }
+            let mut value = self.unified_query(index, query, scope, limit, &fallback_args)?;
+            value["semantic_status"] = json!("unavailable");
+            value["semantic_warning"] =
+                json!("semantic provider unavailable; structural/text evidence only");
+            return Ok(value);
+        }
         let lower = query.to_lowercase();
         let words: Vec<_> = query
             .split(|c: char| !c.is_alphanumeric() && c != '_')

@@ -69,7 +69,6 @@ impl ResourceSnapshot {
             prunings,
         }
     }
-
 }
 
 #[cfg(test)]
@@ -135,6 +134,5 @@ mod tests {
         assert_eq!(snapshot.governor_bytes_omitted, 12_500);
         assert_eq!(snapshot.governor_retrievals, 2);
         assert_eq!(snapshot.prunings, 0);
-
     }
 }

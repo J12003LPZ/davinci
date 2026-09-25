@@ -3,6 +3,7 @@ pub mod documents;
 pub mod manager;
 pub mod rename;
 pub mod session;
+pub mod shared;
 pub mod tools;
 pub mod transport;
 
@@ -22,6 +23,7 @@ pub use session::{
     normalize_language, resolve_language_server, LanguageServerSpec, LazySemanticSessionRegistry,
     SemanticSessionKey, SemanticSessionState,
 };
+pub use shared::{SemanticClient, SemanticServiceFacade};
 
 /// Backend used after a separately authorized language-server session is ready.
 ///

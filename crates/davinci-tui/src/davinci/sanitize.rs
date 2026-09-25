@@ -34,9 +34,11 @@ pub fn terminal_safe(text: &str) -> Cow<'_, str> {
         }
         let line = line.strip_suffix('\r').unwrap_or(line);
         let visible = line.rsplit('\r').next().unwrap_or(line);
-        out.extend(visible.chars().filter(|ch| {
-            (!ch.is_control() || *ch == '\t') && !is_bidi_control(*ch)
-        }));
+        out.extend(
+            visible
+                .chars()
+                .filter(|ch| (!ch.is_control() || *ch == '\t') && !is_bidi_control(*ch)),
+        );
     }
     Cow::Owned(out)
 }

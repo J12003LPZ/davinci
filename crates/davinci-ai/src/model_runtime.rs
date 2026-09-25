@@ -504,13 +504,8 @@ mod tests {
         storage
             .login_oauth("xai", "expired", Some("refresh".into()), Some(0))
             .unwrap();
-        let check = check_auth(
-            "xai",
-            &ModelConfig::empty(),
-            &storage,
-            &Default::default(),
-        )
-        .unwrap();
+        let check =
+            check_auth("xai", &ModelConfig::empty(), &storage, &Default::default()).unwrap();
         assert_eq!(check.kind, "oauth");
         assert_eq!(check.source, "OAuth");
         assert_eq!(

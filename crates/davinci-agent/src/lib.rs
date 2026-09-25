@@ -258,6 +258,10 @@ impl CustomToolExecutor {
     ) -> Result<ToolResult, ToolError> {
         (self.inner)(cwd, name, args, Some(context))
     }
+
+    pub fn same_instance(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.inner, &other.inner)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

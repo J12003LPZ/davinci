@@ -502,9 +502,8 @@ fn test_language_intelligence_adapter_provider() {
         end_column: 10,
     };
 
-    // When LSP is not active, provider returns Ok(empty) gracefully without panicking
+    // An unavailable/unauthorized server is reported, never turned into an
+    // empty (and therefore falsely complete) reference set.
     let res = adapter.query(SemanticOperation::References, "src/index.ts", &range, 10);
-    assert!(res.is_ok());
-    let items = res.unwrap();
-    assert!(items.is_empty());
+    assert!(res.is_err(), "{res:?}");
 }
