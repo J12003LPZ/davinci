@@ -1303,7 +1303,38 @@ impl PermissionPolicy {
             }
         }
         match first_ask {
-            Some(request) => PermissionVerdict::Ask(request),
+            Some(mut request) => {
+                let task_rows = tasks
+                    .iter()
+                    .enumerate()
+                    .map(|(index, task)| {
+                        let prompt = task
+                            .get("prompt")
+                            .and_then(Value::as_str)
+                            .unwrap_or("<missing prompt>")
+                            .trim();
+                        let (subject, _) = subject_of_with_boundary(
+                            "agent",
+                            task,
+                            cwd,
+                            Some(&self.filesystem_boundary),
+                        );
+                        format!("{}. {} [{}]", index + 1, prompt, subject)
+                    })
+                    .collect::<Vec<_>>()
+                    .join(" | ");
+                request.args = serde_json::json!({"tasks": tasks});
+                request.subject = format!("{} agent tasks", tasks.len());
+                request.summary = crate::approval::display_text(&format!(
+                    "Agent batch: {task_rows}"
+                ));
+                // A mixed batch can carry different prompts, tool sets, and
+                // isolation modes. A durable grant derived from one member is
+                // not a safe authorization for the whole batch.
+                request.session_rule.clear();
+                request.legal_choices = crate::approval::offer_scopes(true, false, false);
+                PermissionVerdict::Ask(request)
+            }
             None => PermissionVerdict::Allow,
         }
     }
