@@ -198,7 +198,7 @@ impl AgentSession {
                 davinci_agent::runtime::RuntimeCapability::new(
                     spec.name.clone(),
                     davinci_agent::runtime::CapabilitySource::NativeExtension,
-                    davinci_agent::permission::ToolClass::Read,
+                    davinci_agent::ToolClass::Read,
                     true,
                     &spec.parameters,
                     Some(env!("CARGO_PKG_VERSION").to_string()),
@@ -325,7 +325,7 @@ impl AgentSession {
         let capability = davinci_agent::runtime::RuntimeCapability::new(
             spec.name.clone(),
             davinci_agent::runtime::CapabilitySource::NativeExtension,
-            davinci_agent::permission::ToolClass::Read,
+            davinci_agent::ToolClass::Read,
             true,
             &spec.parameters,
             Some(env!("CARGO_PKG_VERSION").to_string()),
