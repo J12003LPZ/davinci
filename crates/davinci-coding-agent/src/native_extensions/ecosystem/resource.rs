@@ -70,29 +70,6 @@ impl ResourceSnapshot {
         }
     }
 
-    /// Convert graph execution resource accounting into runtime UsageReceipt.
-    #[allow(dead_code)]
-    pub fn to_usage_receipt(&self, attempt_id: &str) -> davinci_agent::runtime::UsageReceipt {
-        let total_tokens = self.input_tokens.saturating_add(self.output_tokens);
-        let cost = if self.cost_usd > 0.0 {
-            davinci_agent::runtime::CostAmount::Known((self.cost_usd * 10_000.0) as u64)
-        } else {
-            davinci_agent::runtime::CostAmount::Unknown
-        };
-
-        davinci_agent::runtime::UsageReceipt {
-            attempt_id: attempt_id.to_string(),
-            provider_usage: total_tokens,
-            estimated_usage: total_tokens,
-            cache_read_tokens: self.cache_read_tokens,
-            cache_write_tokens: self.cache_write_tokens,
-            cost,
-            finished_at: std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_millis() as u64)
-                .unwrap_or(0),
-        }
-    }
 }
 
 #[cfg(test)]
