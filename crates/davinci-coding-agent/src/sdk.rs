@@ -921,6 +921,69 @@ mod tests {
     }
 
     #[test]
+    fn sdk_language_output_store_serves_exact_retained_content() {
+        let dir = tempdir().unwrap();
+        let mut session = create_agent_session(CreateAgentSessionOptions {
+            cwd: Some(dir.path().to_path_buf()),
+            agent_dir: Some(dir.path().join("agent")),
+            session_dir: Some(dir.path().join("sessions")),
+            ..CreateAgentSessionOptions::default()
+        })
+        .unwrap()
+        .session;
+        session
+            .attach_language_intelligence(Default::default(), &[])
+            .unwrap();
+
+        let governor = std::sync::Arc::new(std::sync::Mutex::new(
+            crate::native_extensions::TokenGovernor::new(
+                "sdk-lsp-output",
+                crate::native_extensions::TokenGovernorConfig {
+                    compress_threshold_bytes: 1,
+                    compress_threshold_lines: 1,
+                    store_dir: Some(dir.path().join("governor")),
+                    ..Default::default()
+                },
+            ),
+        ));
+        let original = "alpha\nbeta\ngamma\n";
+        let processed = governor
+            .lock()
+            .unwrap()
+            .after_tool(
+                "bash",
+                &serde_json::json!({"command":"fixture"}),
+                davinci_agent::ToolResult {
+                    content: original.into(),
+                    is_error: false,
+                    details: None,
+                },
+            );
+        let id = processed
+            .details
+            .as_ref()
+            .unwrap()
+            .pointer("/tokenGovernor/outputId")
+            .and_then(serde_json::Value::as_str)
+            .unwrap()
+            .to_string();
+
+        session.attach_language_output_store(governor).unwrap();
+        let executor = session.agent.custom_tool_executor.clone().unwrap();
+        let retrieved = executor
+            .execute_with_context(
+                &session.cwd,
+                "retrieve_output",
+                &serde_json::json!({"id":id}),
+                &session.agent.tool_context,
+            )
+            .unwrap();
+        assert!(retrieved.content.contains("alpha"));
+        assert!(retrieved.content.contains("gamma"));
+        session.detach_language_intelligence().unwrap();
+    }
+
+    #[test]
     fn sdk_language_intelligence_honors_original_exclusions() {
         let dir = tempdir().unwrap();
         let mut session = create_agent_session(CreateAgentSessionOptions {
