@@ -1312,8 +1312,11 @@ impl PermissionPolicy {
         if args.get("isolation").and_then(Value::as_str) == Some("worktree") {
             return false;
         }
+        // Omitted tools inherit the normal child-agent tool surface, which
+        // includes mutation and shell tools. Only an explicit read-only list
+        // is safe to reclassify as a Plan-mode read.
         let Some(tools) = args.get("tools") else {
-            return true;
+            return false;
         };
         let Some(tools) = tools.as_array() else {
             return false;
