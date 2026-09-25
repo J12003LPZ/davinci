@@ -4269,7 +4269,7 @@ struct HostedTuiGuard;
 
 impl HostedTuiGuard {
     fn activate() -> Self {
-        let _hosted = HostedTuiGuard::activate();
+        crate::set_hosted_tui_active(true);
         Self
     }
 }
@@ -4445,8 +4445,9 @@ pub fn run(
     crate::startup_mark("shell: terminal open");
     let mut first_frame = true;
     // From here the alternate screen is ours, so a `println!` from shared code
-    // is queued for the transcript instead of painted over the frame.
-    crate::set_hosted_tui_active(true);
+    // is queued for the transcript instead of painted over the frame. The
+    // guard clears the flag on every return path, including early errors.
+    let _hosted = HostedTuiGuard::activate();
     // Proving the panic hook gives the terminal back needs a panic to happen
     // inside the alternate screen, which nothing else can arrange.
     if std::env::var("PI_DAVINCI_PANIC_FIXTURE").is_ok() {
