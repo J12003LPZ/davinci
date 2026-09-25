@@ -453,16 +453,16 @@ mod tests {
     #[test]
     fn child_environment_is_allowlisted_plus_config() {
         let parent = vec![
-            ("PATH".to_string(), "/bin".to_string()),
-            ("OPENAI_API_KEY".to_string(), "sk-x".to_string()),
-            ("HOME".to_string(), "/home/u".to_string()),
+            (OsString::from("PATH"), OsString::from("/bin")),
+            (OsString::from("OPENAI_API_KEY"), OsString::from("sk-x")),
+            (OsString::from("HOME"), OsString::from("/home/u")),
         ];
         let mut config = BTreeMap::new();
         config.insert("FOO".to_string(), "bar".to_string());
         let env = child_environment(parent.into_iter(), &config);
-        assert_eq!(env.get("PATH").map(String::as_str), Some("/bin"));
-        assert_eq!(env.get("FOO").map(String::as_str), Some("bar"));
-        assert!(!env.contains_key("OPENAI_API_KEY"));
+        assert_eq!(env.get(&OsString::from("PATH")), Some(&OsString::from("/bin")));
+        assert_eq!(env.get(&OsString::from("FOO")), Some(&OsString::from("bar")));
+        assert!(!env.contains_key(&OsString::from("OPENAI_API_KEY")));
     }
 
     #[test]
