@@ -5104,7 +5104,7 @@ mod tests {
     }
 
     #[test]
-    fn f05_hard_contract_refuses_unconfined_process_before_dispatch() {
+    fn f05_host_contract_defers_unconfined_process_to_permission_policy() {
         let temp = tempfile::tempdir().unwrap();
         let mut agent = Agent::new("turn contract process boundary test");
         agent.tools = vec!["bash".into()];
@@ -5133,13 +5133,16 @@ mod tests {
             &serde_json::json!({"command": "cargo test"}),
             0,
         );
-        match prep {
-            Preparation::Immediate(result) => {
-                assert!(result.is_error);
-                assert!(result.content.contains("execution_contract_unenforceable"));
-            }
-            _ => panic!("hard contract must refuse an unconfined process before dispatch"),
-        }
+        assert!(matches!(prep, Preparation::Ready { .. }));
+        agent.set_permission_mode(crate::PermissionMode::ReadOnly);
+        let denied = agent.prepare_tool_call(
+            temp.path(),
+            "call_denied",
+            "bash",
+            &serde_json::json!({"command": "cargo test"}),
+            0,
+        );
+        assert!(matches!(denied, Preparation::Immediate(result) if result.is_error));
     }
 
     #[test]

@@ -427,6 +427,17 @@ impl JsonlSession {
     }
 
     fn prepare_first_write(&mut self) -> Result<(), SessionError> {
+        if let Some(error) = &self.persistence_error {
+            return Err(SessionError::storage(format!(
+                "Session recovery required: {error}"
+            )));
+        }
+        self.prepare_first_write_inner().inspect_err(|error| {
+            self.persistence_error = Some(error.to_string());
+        })
+    }
+
+    fn prepare_first_write_inner(&mut self) -> Result<(), SessionError> {
         if self.writer.lock.is_none() {
             let mut lock_path = self.path.as_os_str().to_owned();
             lock_path.push(".lock");
@@ -541,14 +552,16 @@ impl JsonlSession {
 }
 
 fn repair_jsonl_tail(path: &Path) -> Result<(), SessionError> {
-    let content = fs::read_to_string(path).map_err(|err| {
-        SessionError::storage(format!("Unable to inspect session tail: {err}"))
-    })?;
+    let content = fs::read_to_string(path)
+        .map_err(|err| SessionError::storage(format!("Unable to inspect session tail: {err}")))?;
     if content.is_empty() || content.ends_with('\n') {
         return Ok(());
     }
 
-    let tail = content.rsplit_once('\n').map(|(_, tail)| tail).unwrap_or(&content);
+    let tail = content
+        .rsplit_once('\n')
+        .map(|(_, tail)| tail)
+        .unwrap_or(&content);
     let complete = if content.contains('\n') {
         parse_mutation(tail).is_ok()
     } else {
@@ -585,6 +598,28 @@ fn sync_parent(path: &Path) -> std::io::Result<()> {
 mod tests {
     use super::*;
     use tempfile::tempdir;
+
+    #[test]
+    fn first_write_failure_requires_reopening_even_after_storage_is_restored() {
+        let dir = tempdir().unwrap();
+        let mut session = JsonlSession::create(dir.path(), "/fixture", None).unwrap();
+        let backup = session.path.with_extension("backup");
+        fs::rename(&session.path, &backup).unwrap();
+        fs::create_dir(&session.path).unwrap();
+        assert!(session
+            .append_entry(SessionEntry::message("user", serde_json::json!("lost")))
+            .is_err());
+        assert!(session.persistence_error().is_some());
+        fs::remove_dir(&session.path).unwrap();
+        fs::rename(&backup, &session.path).unwrap();
+        assert!(session
+            .append_entry(SessionEntry::message(
+                "user",
+                serde_json::json!("must reopen")
+            ))
+            .is_err());
+        assert!(session.entries.is_empty());
+    }
 
     #[test]
     fn failed_session_writes_preserve_cursor_and_metadata() {
@@ -699,7 +734,10 @@ mod tests {
             .append_entry(SessionEntry::message("user", serde_json::json!("three")))
             .unwrap();
         assert_eq!(reopened.entries.len(), 3);
-        assert_eq!(reopened.entries[2].parent_id.as_deref(), Some(second.as_str()));
+        assert_eq!(
+            reopened.entries[2].parent_id.as_deref(),
+            Some(second.as_str())
+        );
         drop(reopened);
         assert_eq!(JsonlSession::open(&path).unwrap().entries.len(), 3);
     }
