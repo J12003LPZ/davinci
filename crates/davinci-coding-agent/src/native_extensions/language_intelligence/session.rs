@@ -74,6 +74,7 @@ impl Session {
             ));
         }
         transport.notify_with_budget("initialized", json!({}), &budget)?;
+        let diagnostic_refresh_generation = transport.client_status()["diagnosticRefreshGeneration"].as_u64().unwrap_or(0);
         Ok(Self {
             command,
             transport,
@@ -81,7 +82,7 @@ impl Session {
             documents: BTreeMap::new(),
             diagnostic_floor: BTreeMap::new(),
             diagnostic_result_ids: BTreeMap::new(),
-            diagnostic_refresh_generation: transport.client_status()["diagnosticRefreshGeneration"].as_u64().unwrap_or(0),
+            diagnostic_refresh_generation,
         })
     }
 
@@ -304,7 +305,7 @@ impl Session {
                 // the server has been quiet for the settle window, so a
                 // file with type errors is not reported clean.
                 loop {
-                    let window = remaining(deadline)
+                    let window = budget.remaining()
                         .map(|left| left.min(DIAGNOSTIC_SETTLE))
                         .unwrap_or_default();
                     if window.is_zero() {
@@ -346,7 +347,7 @@ pub(super) fn remaining(deadline: Instant) -> Result<std::time::Duration> {
 
 #[cfg(test)]
 mod tests {
-    use super::super::servers::{Backend, TypeScriptAdapter};
+    use super::super::servers::TypeScriptAdapter;
     use super::*;
     use std::time::Duration;
 
@@ -354,21 +355,36 @@ mod tests {
         Instant::now() + Duration::from_secs(3)
     }
     fn fixture(root: &Path, mode: &str) -> ServerCommand {
+        use super::super::identity::{LanguageFamily, ServerInvocation};
+        use super::super::servers::ServerBackend;
+        use std::collections::BTreeMap;
+        let program = davinci_sys::process::resolve_program("node");
+        let program = program.canonicalize().unwrap_or(program);
+        let args = vec![
+            concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/tests/fixtures/language-server.cjs"
+            )
+            .into(),
+            mode.into(),
+        ];
+        let invocation = ServerInvocation::new(program.clone(), args.clone()).unwrap();
         ServerCommand {
-            kind: Backend::TypeScriptLanguageServer,
-            program: "node".into(),
-            args: vec![
-                concat!(
-                    env!("CARGO_MANIFEST_DIR"),
-                    "/tests/fixtures/language-server.cjs"
-                )
-                .into(),
-                mode.into(),
-            ],
+            kind: ServerBackend::TypeScriptLanguageServer,
+            backend: ServerBackend::TypeScriptLanguageServer,
+            program,
+            args,
+            invocation,
             workspace: root.into(),
             version: Some("fixture".into()),
             typescript_version: None,
             initialization_options: json!({}),
+            client_configuration: Value::Null,
+            family: LanguageFamily::TypeScript,
+            profile_fingerprint: "fixture".into(),
+            analysis_environment: None,
+            limitations: Vec::new(),
+            env: BTreeMap::new(),
         }
     }
 
@@ -459,7 +475,7 @@ mod tests {
                 deadline(),
             )
             .unwrap();
-        assert_eq!(first.as_array().unwrap().len(), 1);
+        assert_eq!(first["items"].as_array().unwrap().len(), 1);
         std::fs::write(&a, "good").unwrap();
         let next = session
             .execute(
@@ -471,7 +487,7 @@ mod tests {
                 deadline(),
             )
             .unwrap();
-        assert_eq!(next, json!([]));
+        assert_eq!(next["items"], json!([]));
         std::fs::remove_file(&a).unwrap();
         session
             .execute(
