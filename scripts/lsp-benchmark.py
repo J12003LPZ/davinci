@@ -12,6 +12,7 @@ import json
 import os
 from pathlib import Path
 import platform
+import shutil
 import statistics
 import subprocess
 import tempfile
@@ -35,7 +36,8 @@ def percentile(values: list[float], q: float) -> float | None:
 
 
 def fixture(root: Path) -> None:
-    (root / "agent").mkdir()
+    agent = root / "agent"
+    agent.mkdir()
     (root / "package.json").write_text('{"private":true}', encoding="utf-8")
     (root / "tsconfig.json").write_text('{"include":["web/*.ts"]}', encoding="utf-8")
     (root / "web").mkdir()
@@ -49,6 +51,43 @@ def fixture(root: Path) -> None:
     (root / "python").mkdir()
     (root / "python/pyrightconfig.json").write_text('{"include":["."]}', encoding="utf-8")
     (root / "python/app.py").write_text("def answer() -> int:\n    return 42\n", encoding="utf-8")
+
+    settings: dict = {"languageIntelligence": {"enabled": True}}
+    rust_server = os.environ.get("DAVINCI_TEST_RUST_ANALYZER")
+    if rust_server:
+        profile = {
+            "server": {"program": rust_server, "args": []},
+            "requestTimeoutMs": 30000,
+            "initializationTimeoutMs": 60000,
+            "coldRequestTimeoutMs": 120000,
+        }
+        if os.environ.get("DAVINCI_TEST_RUST_SYSROOT"):
+            profile["sysroot"] = os.environ["DAVINCI_TEST_RUST_SYSROOT"]
+        if os.environ.get("DAVINCI_TEST_RUST_SRC"):
+            profile["sysrootSrc"] = os.environ["DAVINCI_TEST_RUST_SRC"]
+        settings["languageIntelligence"]["rust"] = profile
+
+    python_server = os.environ.get("DAVINCI_TEST_BASEDPYRIGHT") or os.environ.get("DAVINCI_TEST_PYRIGHT")
+    if python_server and os.environ.get("DAVINCI_TEST_PYTHON"):
+        based = bool(os.environ.get("DAVINCI_TEST_BASEDPYRIGHT"))
+        settings["languageIntelligence"]["python"] = {
+            "backend": "basedpyright" if based else "pyright",
+            "interpreter": os.environ["DAVINCI_TEST_PYTHON"],
+            "server": {"program": python_server, "args": ["--stdio"]},
+            "requestTimeoutMs": 30000,
+            "initializationTimeoutMs": 60000,
+            "coldRequestTimeoutMs": 120000,
+        }
+
+    ts = os.environ.get("DAVINCI_TEST_TYPESCRIPT")
+    tls = os.environ.get("DAVINCI_TEST_LANGUAGE_SERVER")
+    if ts and tls:
+        node_modules = root / "node_modules"
+        node_modules.mkdir(exist_ok=True)
+        shutil.copytree(Path(ts), node_modules / "typescript", dirs_exist_ok=True)
+        shutil.copytree(Path(tls), node_modules / "typescript-language-server", dirs_exist_ok=True)
+
+    (agent / "settings.json").write_text(json.dumps(settings), encoding="utf-8")
 
 
 def calls_for(scenario: str) -> list[dict]:
