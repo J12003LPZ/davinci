@@ -389,6 +389,7 @@ impl LanguageIntelligence {
             };
             let (method, capability) = tools::operation(name).expect("validated tool");
             let generation = slot.generation;
+            let source_hash_before = source.as_deref().map(source_hash);
             let Some(session) = slot.session.as_mut() else { continue; };
             let response = session.execute_with_budget(
                 method,
@@ -419,6 +420,17 @@ impl LanguageIntelligence {
                     return Err(error);
                 }
             };
+
+            if let (Some(source), Some(expected_hash)) =
+                (source.as_deref(), source_hash_before.as_deref())
+            {
+                if source_hash(source) != expected_hash {
+                    return Err(IntelligenceError::new(
+                        "stale_result",
+                        "Source bytes changed while semantic analysis was running; retry against the current checkout",
+                    ));
+                }
+            }
 
             let mut freshness = None;
             let mut omitted = 0;
@@ -483,8 +495,8 @@ impl LanguageIntelligence {
             normalized["project"] = json!(relative_project(&workspace, &project.root));
             normalized["profileFingerprint"] = json!(session.command.profile_fingerprint);
             normalized["limitations"] = json!(session.command.limitations);
-            if let Some(source) = &source {
-                normalized["sourceHash"] = json!(source_hash(source));
+            if let Some(hash) = source_hash_before {
+                normalized["sourceHash"] = json!(hash);
             }
             if let Some(version) = document_version {
                 normalized["documentVersion"] = version;
