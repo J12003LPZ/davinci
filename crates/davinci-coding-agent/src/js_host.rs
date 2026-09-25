@@ -167,7 +167,18 @@ fn runner_path() -> Result<PathBuf, String> {
     PATH.get_or_init(|| {
         use sha2::{Digest, Sha256};
         let digest = format!("{:x}", Sha256::digest(RUNNER_JS.as_bytes()));
-        let path = davinci_session::default_agent_dir()
+        // Other CLI tests temporarily redirect and remove the agent directory.
+        // Keep the cached runner alive independently of those environment fixtures.
+        #[cfg(test)]
+        let agent_dir = {
+            static DIR: OnceLock<tempfile::TempDir> = OnceLock::new();
+            DIR.get_or_init(|| tempfile::tempdir().expect("runner test directory"))
+                .path()
+                .to_path_buf()
+        };
+        #[cfg(not(test))]
+        let agent_dir = davinci_session::default_agent_dir();
+        let path = agent_dir
             .join("runtime")
             .join(format!("extension_runner-{}.js", &digest[..16]));
         let current = std::fs::read(&path).ok();
@@ -544,6 +555,15 @@ fn run_pooled_js_extension(
 ) -> Result<JsExtensionResult, String> {
     let mut pool = JS_POOL.lock().map_err(|err| err.to_string())?;
     let pool = pool.get_or_insert_with(PersistentJsPool::default);
+    run_in_js_pool(pool, module, op, payload)
+}
+
+fn run_in_js_pool(
+    pool: &mut PersistentJsPool,
+    module: &Path,
+    op: &str,
+    payload: &Value,
+) -> Result<JsExtensionResult, String> {
     if !pool.sessions.contains_key(module) {
         pool.ensure_capacity();
         pool.sessions
@@ -1082,10 +1102,11 @@ mod tests {
     #[test]
     fn alternating_modules_reuse_exactly_two_persistent_runners() {
         let _persistent = persistent_host_guard();
+        let _node = NODE_LOCK.lock().unwrap();
         let Some(_) = find_node() else {
             return;
         };
-        shutdown_js_pool();
+        let mut pool = PersistentJsPool::default();
         JS_SESSION_SPAWNS.store(0, std::sync::atomic::Ordering::SeqCst);
 
         let first = tempdir().unwrap();
@@ -1096,14 +1117,13 @@ mod tests {
         let first_module = resolve_extension_module(first.path()).unwrap();
         let second_module = resolve_extension_module(second.path()).unwrap();
         for _ in 0..10 {
-            let _ = run_persistent_js_extension(&first_module, "load", &serde_json::json!({}));
-            let _ = run_persistent_js_extension(&second_module, "load", &serde_json::json!({}));
+            run_in_js_pool(&mut pool, &first_module, "load", &serde_json::json!({})).unwrap();
+            run_in_js_pool(&mut pool, &second_module, "load", &serde_json::json!({})).unwrap();
         }
         assert_eq!(
             JS_SESSION_SPAWNS.load(std::sync::atomic::Ordering::SeqCst),
             2
         );
-        shutdown_js_pool();
     }
 
     #[test]

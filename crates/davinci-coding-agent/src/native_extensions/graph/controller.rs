@@ -367,8 +367,9 @@ impl GraphExecution {
         note: Option<&str>,
         persist_companions: impl FnOnce(&mut GraphRun) -> std::io::Result<()>,
     ) -> bool {
-        // Serialize checkpoint publication without holding the run mutex. The
-        // I/O lock preserves snapshot order while workers keep updating memory.
+        // Serialize checkpoint publication. Companion state transitions must
+        // reach the live run before it is cloned; the main snapshot write stays
+        // outside the run mutex so workers can keep reporting progress.
         let _checkpoint_io = self
             .checkpoint_io
             .lock()
@@ -377,7 +378,7 @@ impl GraphExecution {
             return false;
         }
 
-        let mut snapshot = {
+        let (mut snapshot, companion_result) = {
             let mut run = self.run.lock().unwrap_or_else(|error| error.into_inner());
             if matches!(run.phase, Phase::Done | Phase::Blocked | Phase::Cancelled) {
                 run.lifecycle = Some(GraphLifecycle::Stopped);
@@ -400,11 +401,11 @@ impl GraphExecution {
                     gov_stats.as_ref(),
                 ),
             );
-            run.clone()
+            let companion_result = persist_companions(&mut run);
+            (run.clone(), companion_result)
         };
 
-        if let Err(error) = persist_companions(&mut snapshot).and_then(|()| save_run(&mut snapshot))
-        {
+        if let Err(error) = companion_result.and_then(|()| save_run(&mut snapshot)) {
             let reason = format!("checkpoint persistence failed: {error}");
             *self
                 .persistence_error
@@ -905,9 +906,7 @@ impl GraphExecution {
                 .unwrap_or_else(|error| error.into_inner());
             match (&self.deps.memory, guard.as_ref()) {
                 (Some(memory), Some(learn)) => {
-                    let memory = memory
-                        .lock()
-                        .unwrap_or_else(|error| error.into_inner());
+                    let memory = memory.lock().unwrap_or_else(|error| error.into_inner());
                     let context_query = retry_query.render();
                     let skill_query = retry_query.render_skill_query();
                     crate::native_extensions::ecosystem::select_capabilities(
@@ -1417,17 +1416,15 @@ impl GraphExecution {
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             retry_context_delta = match (&self.deps.memory, guard.as_ref()) {
                 (Some(memory), Some(learning)) => {
-                    let memory = memory
-                        .lock()
-                        .unwrap_or_else(|error| error.into_inner());
+                    let memory = memory.lock().unwrap_or_else(|error| error.into_inner());
                     build_retry_context_delta(
-                    &memory,
-                    learning,
-                    role,
-                    &retry_query,
-                    failure_class,
-                    &error,
-                )
+                        &memory,
+                        learning,
+                        role,
+                        &retry_query,
+                        failure_class,
+                        &error,
+                    )
                 }
                 _ => crate::native_extensions::ecosystem::ContextPacket::empty(),
             };

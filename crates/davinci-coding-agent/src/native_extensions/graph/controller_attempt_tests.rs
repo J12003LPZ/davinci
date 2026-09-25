@@ -94,19 +94,8 @@ fn attempt_fixture(cwd: &Path, previous: Option<GraphRun>, fail: bool) -> GraphR
                 ..Default::default()
             };
             progress("fixture progress", &usage);
-            let durable = super::super::store::load_run_checked(&spec.cwd, &run.run_id).unwrap();
-            assert_eq!(
-                durable.task(&spec.task_id).unwrap().usage.input,
-                task.usage.input + 7
-            );
-            assert_eq!(
-                durable.continuation.unwrap().attempt_history[&spec.task_id]
-                    .last()
-                    .unwrap()
-                    .usage
-                    .input,
-                7
-            );
+            // Progress writes are debounced. The completed attempt assertions
+            // below verify that terminal persistence retains these tokens.
             std::fs::write(
                 spec.artifact_path.with_extension("effects.jsonl"),
                 format!("attempt {} receipt\n", task.attempts),

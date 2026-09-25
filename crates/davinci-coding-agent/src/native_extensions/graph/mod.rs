@@ -382,7 +382,10 @@ fn economy_role_models_with(
     setting: Option<&str>,
 ) -> std::collections::BTreeMap<Role, String> {
     let mut models = std::collections::BTreeMap::new();
-    let Some(session_model) = session_model.map(str::trim).filter(|value| !value.is_empty()) else {
+    let Some(session_model) = session_model
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
         return models;
     };
     if !session_model.starts_with("openai-codex/") || setting == Some("off") {
@@ -641,7 +644,10 @@ impl GraphController {
         }
         for role in Role::ALL {
             if config.budgets.worker_timeout_ms.get(*role) == 0 {
-                config.budgets.worker_timeout_ms.set(*role, WORKER_TIMEOUT_MS);
+                config
+                    .budgets
+                    .worker_timeout_ms
+                    .set(*role, WORKER_TIMEOUT_MS);
             }
         }
     }
@@ -1544,14 +1550,14 @@ impl GraphController {
                                     latest.run_id
                                 ));
                             };
-                            let resumable =
-                                run.current_lifecycle() == types::GraphLifecycle::Running
-                                    && !matches!(
-                                        run.phase,
-                                        types::Phase::Done
-                                            | types::Phase::Blocked
-                                            | types::Phase::Cancelled
-                                    );
+                            let resumable = run.current_lifecycle()
+                                == types::GraphLifecycle::Running
+                                && !matches!(
+                                    run.phase,
+                                    types::Phase::Done
+                                        | types::Phase::Blocked
+                                        | types::Phase::Cancelled
+                                );
                             if resumable {
                                 self.resume(&run.run_id)?
                             } else {
@@ -1713,9 +1719,7 @@ mod tests {
         assert!(!models.contains_key(&Role::Reviewer));
 
         assert!(economy_role_models_with(Some("anthropic/claude-opus-4-5"), None).is_empty());
-        assert!(
-            economy_role_models_with(Some("openai-codex/gpt-5.6-sol"), Some("off")).is_empty()
-        );
+        assert!(economy_role_models_with(Some("openai-codex/gpt-5.6-sol"), Some("off")).is_empty());
     }
 
     fn controller(cwd: &Path) -> GraphController {
@@ -2210,7 +2214,7 @@ mod tests {
     }
 
     #[test]
-    fn bare_graph_continues_a_stopped_run_with_the_same_identity_and_counters() {
+    fn bare_graph_preserves_a_stopped_run_with_the_same_identity_and_counters() {
         let _guard = registry_guard();
         let dir = tempdir().unwrap();
         let controller = controller(dir.path());
@@ -2223,13 +2227,13 @@ mod tests {
         store::save_run(&mut stopped).expect("stopped state persists");
 
         let started = controller.command("graph", "").unwrap().unwrap();
-        assert_eq!(started["started"], true);
-        assert_eq!(started["runId"], stopped.run_id);
+        assert_eq!(started["run"]["phase"], "cancelled");
+        assert_eq!(started["run"]["runId"], stopped.run_id);
         drain_active(dir.path());
 
         let continued = load_run(dir.path(), &stopped.run_id).expect("continued state persists");
         assert_eq!(continued.run_id, stopped.run_id);
-        assert!(continued.counters.workers_spawned >= 41);
+        assert_eq!(continued.counters.workers_spawned, 41);
         assert_eq!(list_runs(dir.path()).len(), 1, "continuation is one run");
     }
 
@@ -2384,17 +2388,17 @@ mod tests {
     }
 
     #[test]
-    fn an_unlimited_default_run_records_no_caps() {
+    fn a_tool_started_run_records_default_cost_and_time_caps() {
         let _guard = registry_guard();
         let dir = tempdir().unwrap();
         let controller = controller(dir.path());
         let run = controller
             .run_to_completion(parse_graph_args("--dry-run unbounded"), None)
             .expect("runs");
-        assert_eq!(run.budgets.max_cost_usd, 0.0);
-        assert_eq!(run.budgets.run_deadline_ms, 0);
+        assert_eq!(run.budgets.max_cost_usd, 5.0);
+        assert_eq!(run.budgets.run_deadline_ms, 7_200_000);
         assert_eq!(run.budgets.max_workers, 0);
-        assert_eq!(run.budgets.verify_command_timeout_ms, 0);
+        assert_eq!(run.budgets.verify_command_timeout_ms, 600_000);
         drain_active(dir.path());
     }
 
@@ -2586,7 +2590,7 @@ mod tests {
         run.lifecycle = Some(types::GraphLifecycle::Stopped);
         store::save_run(&mut run).unwrap();
         let response = controller.command("graph", "").unwrap().unwrap();
-        assert_eq!(response["phase"], "cancelled");
+        assert_eq!(response["run"]["phase"], "cancelled");
         assert!(!is_running(dir.path()));
     }
 
@@ -2737,7 +2741,7 @@ mod tests {
 
         let inspected = controller.command("graph", "budget").unwrap().unwrap();
         assert_eq!(inspected["runId"], run.run_id);
-        assert_eq!(inspected["ceilings"]["maxCostUsd"], 0.0);
+        assert_eq!(inspected["ceilings"]["maxCostUsd"], 5.0);
 
         let unauthorized = controller
             .command(

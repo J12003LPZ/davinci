@@ -308,8 +308,8 @@ fn render_list(settings: &Settings) -> String {
 }
 
 pub use crate::package_source::{
-    git_checkout_path, npm_install_args, npm_install_root, parse_git_source,
-    parse_package_source, ParsedSource,
+    git_checkout_path, npm_install_args, npm_install_root, parse_git_source, parse_package_source,
+    ParsedSource,
 };
 
 fn settings_dir_for(local: bool, agent_dir: &Path, cwd: &Path) -> PathBuf {
@@ -490,8 +490,7 @@ fn ensure_npm_project(root: &Path) -> Result<(), String> {
 }
 
 fn run_install_command(program: &str, args: &[String], cwd: Option<&Path>) -> Result<(), String> {
-    let resolved = davinci_sys::process::resolve_program(program);
-    let mut command = std::process::Command::new(resolved);
+    let mut command = std::process::Command::new(davinci_sys::process::resolve_program(program));
     command.args(args);
     if let Some(cwd) = cwd {
         command.current_dir(cwd);
@@ -1211,7 +1210,7 @@ mod tests {
             &agent,
         )
         .unwrap_err();
-        assert!(err.starts_with("Path does not exist:"));
+        assert!(err.starts_with("Unable to resolve local package "), "{err}");
         std::env::set_var("PI_INSTALL_DRY_RUN", "1");
         let npm = handle_package_command("install", &["npm:demo-ext".into()], &agent).unwrap();
         std::env::remove_var("PI_INSTALL_DRY_RUN");

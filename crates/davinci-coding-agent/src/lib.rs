@@ -18,8 +18,8 @@ pub mod prompt_host;
 pub mod runtime_host;
 pub mod runtime_inspect;
 pub mod sdk;
-pub mod semantic;
 pub mod self_update;
+pub mod semantic;
 pub mod settings;
 pub mod trust;
 

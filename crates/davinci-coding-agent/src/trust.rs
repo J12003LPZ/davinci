@@ -510,7 +510,9 @@ mod tests {
         fs::create_dir_all(project.join(".pi")).unwrap();
         fs::write(project.join(".pi").join("settings.json"), "{}").unwrap();
         fs::create_dir_all(&agent).unwrap();
-        fs::write(agent.join("trust.json.lock"), "1\n").unwrap();
+        let _held =
+            davinci_sys::lock::ExclusiveFileLock::try_acquire(&agent.join("trust.json.lock"))
+                .unwrap();
         assert!(!resolve_project_trusted(
             &agent,
             &project,

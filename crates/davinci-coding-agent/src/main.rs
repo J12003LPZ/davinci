@@ -112,10 +112,10 @@ mod packages;
 use davinci_coding_agent::permissions;
 use davinci_coding_agent::project_config;
 mod rpc;
-use davinci_coding_agent::runtime_host;
-use davinci_coding_agent::self_update;
 #[cfg(test)]
 use davinci_coding_agent::interaction_testing;
+use davinci_coding_agent::runtime_host;
+use davinci_coding_agent::self_update;
 use davinci_coding_agent::settings;
 mod shutdown;
 mod slash;
@@ -126,7 +126,6 @@ use davinci_coding_agent::trust;
 use std::io::{self, BufRead, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
-
 
 /// True while the raw-mode TUI owns the screen. Any raw `println!` in that
 /// state moves the hardware cursor behind the renderer's back and corrupts
@@ -902,7 +901,9 @@ fn build_agent(parsed: &Args, session_dir: &Path, cwd: &Path) -> Result<Agent, S
     };
     for pkg in &settings.packages {
         if !parsed.no_extensions {
-            for path in settings::collect_package_resources(pkg, "extensions", &default_agent_dir(), cwd) {
+            for path in
+                settings::collect_package_resources(pkg, "extensions", &default_agent_dir(), cwd)
+            {
                 extensions.push(path.to_string_lossy().into_owned());
             }
         }
@@ -3454,8 +3455,7 @@ fn run_rpc_with_host(
         let mut command: RpcCommand = match serde_json::from_str(&line) {
             Ok(command) => command,
             Err(err) => {
-                let response =
-                    rpc::fail_response(None, "parse", format!("parse error: {err}"));
+                let response = rpc::fail_response(None, "parse", format!("parse error: {err}"));
                 output::write_raw_stdout_line(
                     &serde_json::to_string(&response).map_err(|err| err.to_string())?,
                 )
@@ -7097,8 +7097,7 @@ fn login_provider_with_wait(
                         "No login in progress for {provider}. Run /login {provider} first, then paste the redirect URL."
                     )
                 })?;
-            if let (Some(expected), Some(got)) =
-                (pending.state.as_deref(), pasted_state.as_deref())
+            if let (Some(expected), Some(got)) = (pending.state.as_deref(), pasted_state.as_deref())
             {
                 if expected != got {
                     return Err(
@@ -9255,10 +9254,7 @@ fn apply_session_calls(
                         .unwrap_or_else(|| serde_json::json!({}));
                     let timeout_ms = call.get("timeoutMs").and_then(|value| value.as_u64());
                     match crate::js_host::execute_command_tool(
-                        command,
-                        &args,
-                        &agent.cwd,
-                        timeout_ms,
+                        command, &args, &agent.cwd, timeout_ms,
                     ) {
                         Ok(out) => {
                             ui.push("exec", &out);

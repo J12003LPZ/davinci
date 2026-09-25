@@ -34,7 +34,6 @@ use crate::davinci::ui::{
 /// Below this width there is no measure to wrap to: rows are clipped instead.
 const NARROW: u16 = 8;
 
-
 /// Containers deeper than this are flattened into their parent. Rendering
 /// recurses once per container, and a reply is never legitimately this deep.
 const MAX_DEPTH: usize = 32;
@@ -444,7 +443,10 @@ impl Builder {
         };
         let block = match leaf {
             Leaf::Paragraph(inlines) => Block::Paragraph(inlines),
-            Leaf::Heading { level, inlines } => Block::Heading { _level: level, inlines },
+            Leaf::Heading { level, inlines } => Block::Heading {
+                _level: level,
+                inlines,
+            },
             Leaf::Code { lang, text } => Block::Code { lang, text },
             Leaf::Html(text) => Block::Html(text),
             Leaf::Table { header, rows, .. } => Block::Table { header, rows },

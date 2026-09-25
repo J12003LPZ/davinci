@@ -214,8 +214,13 @@ fn security_incremental() -> Result<DeterministicAblation, String> {
     )
     .map_err(|error| error.to_string())?;
     let mut controller = SecurityScanController::new(fixture.path().to_path_buf());
-    let cold = controller.start(None).map_err(|error| error.to_string())?;
-    let warm = controller.start(None).map_err(|error| error.to_string())?;
+    // Compare the same source scope; the cold run also creates report artifacts.
+    let cold = controller
+        .start(Some("fixture.rs"))
+        .map_err(|error| error.to_string())?;
+    let warm = controller
+        .start(Some("fixture.rs"))
+        .map_err(|error| error.to_string())?;
     let cold_work = cold.coverage.files_scanned_cold + cold.coverage.files_rescanned;
     let warm_work = warm.coverage.files_scanned_cold + warm.coverage.files_rescanned;
     Ok(DeterministicAblation::new(
