@@ -1651,6 +1651,18 @@ mod tests {
     }
 
     #[test]
+    fn governor_reset_revokes_stored_output_ids() {
+        let dir = tempdir().unwrap();
+        let store = OutputStore::new(dir.path().join("outputs"));
+        let mut governor = TokenGovernor::with_store("reset-output", tiny_thresholds(), store);
+        let saved = governor.store.save("secret semantic evidence").unwrap();
+        assert_eq!(governor.store.load(&saved.id).unwrap(), "secret semantic evidence");
+        governor.reset();
+        assert!(governor.store.load(&saved.id).is_err());
+        assert!(governor.retrieve(&json!({"id": saved.id})).is_err());
+    }
+
+    #[test]
     fn torn_stored_output_is_rewritten() {
         let dir = tempfile::tempdir().unwrap();
         let store = OutputStore::new(dir.path().to_path_buf());
