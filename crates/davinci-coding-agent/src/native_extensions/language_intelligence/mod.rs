@@ -9,6 +9,10 @@ mod metadata;
 #[cfg(test)]
 mod integration_tests;
 #[cfg(test)]
+mod python_integration_tests;
+#[cfg(test)]
+mod rust_integration_tests;
+#[cfg(test)]
 mod test_support;
 mod manager;
 mod normalize;
