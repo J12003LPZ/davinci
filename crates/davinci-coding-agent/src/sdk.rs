@@ -69,6 +69,9 @@ struct LanguageIntelligenceAttachment {
     attached_executor: CustomToolExecutor,
     attached_semantic: std::sync::Arc<dyn davinci_agent::semantic::SemanticService>,
     tools: Vec<String>,
+    output_governor: std::sync::Arc<std::sync::Mutex<Option<crate::native_extensions::SharedTokenGovernor>>>,
+    output_registration: Option<davinci_agent::runtime::capabilities::CapabilityRegistration>,
+    output_tool_inserted: bool,
 }
 
 pub struct AgentSession {
@@ -213,8 +216,25 @@ impl AgentSession {
         let manager_for_executor = manager.clone();
         let selected_for_executor = selected.clone();
         let previous_for_executor = previous_executor.clone();
+        let output_governor: std::sync::Arc<
+            std::sync::Mutex<Option<crate::native_extensions::SharedTokenGovernor>>,
+        > = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let output_for_executor = output_governor.clone();
         let attached_executor = CustomToolExecutor::new_with_context(
             move |cwd, name, args, context| {
+                if name == "retrieve_output" {
+                    if let Some(governor) = output_for_executor
+                        .lock()
+                        .unwrap_or_else(|error| error.into_inner())
+                        .as_ref()
+                        .cloned()
+                    {
+                        return governor
+                            .lock()
+                            .unwrap_or_else(|error| error.into_inner())
+                            .retrieve(args);
+                    }
+                }
                 if selected_for_executor.iter().any(|tool| tool == name) {
                     let timeout = std::time::Duration::from_secs(60);
                     let budget = crate::native_extensions::language_intelligence::RequestBudget {
@@ -270,7 +290,75 @@ impl AgentSession {
             attached_executor,
             attached_semantic: facade,
             tools: selected,
+            output_governor,
+            output_registration: None,
+            output_tool_inserted: false,
         });
+        Ok(())
+    }
+
+    pub fn attach_language_output_store(
+        &mut self,
+        governor: crate::native_extensions::SharedTokenGovernor,
+    ) -> Result<(), String> {
+        if self.attachment_no_tools.as_deref() == Some("all")
+            || self.attachment_excluded_tools.contains("retrieve_output")
+            || self
+                .attachment_allowed_tools
+                .as_ref()
+                .is_some_and(|allowed| !allowed.contains("retrieve_output"))
+        {
+            return Err("retrieve_output_excluded".into());
+        }
+        let runtime = self.agent.runtime.clone().ok_or("sdk_runtime_required")?;
+        let attachment = self
+            .language_intelligence
+            .as_mut()
+            .ok_or("language_intelligence_not_attached")?;
+        if attachment.output_registration.is_some() {
+            return Err("language_output_store_already_attached".into());
+        }
+        let spec = crate::native_extensions::NativeExtensionHost::tool_specs()
+            .into_iter()
+            .find(|spec| spec.name == "retrieve_output")
+            .ok_or("retrieve_output_schema_unavailable")?;
+        let capability = davinci_agent::runtime::RuntimeCapability::new(
+            spec.name.clone(),
+            davinci_agent::runtime::CapabilitySource::NativeExtension,
+            davinci_agent::permission::ToolClass::Read,
+            true,
+            &spec.parameters,
+            Some(env!("CARGO_PKG_VERSION").to_string()),
+        )
+        .with_description(spec.description);
+        let registration = runtime
+            .capability_registry
+            .register_owned([capability])
+            .map_err(|_| "retrieval_owner_conflict".to_string())?;
+
+        attachment.manager.set_governor(governor.clone());
+        *attachment
+            .output_governor
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = Some(governor);
+        attachment.output_tool_inserted = !self.agent.tool_registry.iter().any(|name| name == "retrieve_output");
+        attachment.output_registration = Some(registration);
+        if attachment.output_tool_inserted {
+            self.agent.tool_registry.push("retrieve_output".into());
+            self.agent.tools.push("retrieve_output".into());
+        }
+        self.agent
+            .tool_context
+            .authorized_tools
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .insert("retrieve_output".into());
+        self.agent
+            .tool_context
+            .tool_exposure
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .activate_authorized("retrieve_output", true);
         Ok(())
     }
 
@@ -301,10 +389,39 @@ impl AgentSession {
             self.language_intelligence = Some(attachment);
             return Err("language_intelligence_semantic_ownership_changed".into());
         }
+        if let Some(output_registration) = &attachment.output_registration {
+            runtime
+                .capability_registry
+                .unregister_owned(output_registration)
+                .map_err(|_| "retrieval_owner_conflict".to_string())?;
+        }
         runtime
             .capability_registry
             .unregister_owned(&attachment.registration)
             .map_err(|error| error.to_string())?;
+
+        if attachment.output_tool_inserted {
+            self.agent
+                .tool_registry
+                .retain(|name| name != "retrieve_output");
+            self.agent.tools.retain(|name| name != "retrieve_output");
+            self.agent
+                .tool_context
+                .authorized_tools
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .remove("retrieve_output");
+            self.agent
+                .tool_context
+                .tool_exposure
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .activate_authorized("retrieve_output", false);
+        }
+        *attachment
+            .output_governor
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = None;
 
         self.agent.custom_tool_executor = attachment.previous_executor;
         self.agent.tool_context.semantic = attachment.previous_semantic;
