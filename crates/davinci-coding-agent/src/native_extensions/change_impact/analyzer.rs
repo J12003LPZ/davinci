@@ -3,14 +3,18 @@
 //! into an honest, bounded, structured blast radius report.
 
 use super::model::*;
-use crate::native_extensions::{
-    build_intelligence::BuildIntelligence,
-    git_intelligence::GitIntelligence,
-    language_intelligence::LanguageIntelligence,
-    package_intelligence::PackageIntelligence,
-    repo_intelligence::{parse_source, RepoIntelligence, SourceRange},
-    test_impact::TestImpact,
+use crate::{
+    native_extensions::{
+        build_intelligence::BuildIntelligence,
+        git_intelligence::GitIntelligence,
+        language_intelligence::LanguageIntelligence,
+        package_intelligence::PackageIntelligence,
+        repo_intelligence::{parse_source, RepoIntelligence, SourceRange},
+        test_impact::TestImpact,
+    },
+    semantic::SemanticClient,
 };
+use davinci_agent::semantic::SemanticRequestContext;
 use serde_json::{json, Value};
 use std::{collections::BTreeSet, fs, path::Path};
 
@@ -55,7 +59,7 @@ impl<'a> ChangeImpactAnalyzer<'a> {
         symbols: Option<Vec<String>>,
         transaction_id: Option<String>,
         _scope: Option<String>,
-        _limit: Option<usize>,
+        limit: Option<usize>,
     ) -> Result<ChangeImpactReport, String> {
         let mut target_files = BTreeSet::new();
         let mut target_symbols = BTreeSet::new();
@@ -148,8 +152,11 @@ impl<'a> ChangeImpactAnalyzer<'a> {
         let symbol_list: Vec<String> = target_symbols.iter().cloned().collect();
 
         // 5. Direct Semantic Impact (LSP)
+        let semantic_limit = limit
+            .unwrap_or(self.config.max_references)
+            .clamp(1, self.config.max_references);
         let (semantic_impact, lsp_partial) =
-            self.analyze_semantic(&file_list, &symbol_list, &mut warnings);
+            self.analyze_semantic(&file_list, &symbol_list, semantic_limit, &mut warnings);
         if lsp_partial {
             is_partial = true;
         }
@@ -289,119 +296,208 @@ impl<'a> ChangeImpactAnalyzer<'a> {
         &self,
         files: &[String],
         symbols: &[String],
+        limit: usize,
         warnings: &mut Vec<String>,
     ) -> (DirectSemanticImpact, bool) {
-        let status = self.language.status();
-        let enabled = status["enabled"].as_bool().unwrap_or(false);
-        if !enabled {
-            warnings.push("Language intelligence is disabled in settings; semantic LSP references are unavailable".into());
-            return (
-                DirectSemanticImpact {
-                    items: Vec::new(),
-                    lsp_status: "disabled".into(),
-                    reference_count: 0,
-                    summary: "Semantic LSP analysis is disabled; blast radius is based on structural AST only".into(),
-                },
-                true,
-            );
-        }
+        let client = if std::env::var_os("PI_GRAPH_ROLE").is_some() {
+            match davinci_agent::runtime::task_transport::TaskCoordinatorClient::from_env() {
+                Some(parent) => SemanticClient::parent(parent),
+                None => {
+                    warnings.push(
+                        "Parent semantic transport is unavailable; worker-local language servers are forbidden"
+                            .into(),
+                    );
+                    return (
+                        DirectSemanticImpact {
+                            items: Vec::new(),
+                            lsp_status: "unavailable".into(),
+                            reference_count: 0,
+                            summary: "Semantic analysis unavailable; no worker-local fallback was started".into(),
+                        },
+                        true,
+                    );
+                }
+            }
+        } else {
+            let status = self.language.status();
+            if !status["enabled"].as_bool().unwrap_or(false) {
+                warnings.push("Language intelligence is disabled in settings; semantic LSP references are unavailable".into());
+                return (
+                    DirectSemanticImpact {
+                        items: Vec::new(),
+                        lsp_status: "disabled".into(),
+                        reference_count: 0,
+                        summary: "Semantic LSP analysis is disabled; blast radius remains partial".into(),
+                    },
+                    true,
+                );
+            }
+            SemanticClient::local(self.language.clone())
+        };
 
+        let context = SemanticRequestContext::default();
         let mut items = Vec::new();
-        let mut reference_count = 0;
+        let mut reference_count = 0usize;
         let mut lsp_failed = false;
+        let mut remaining = limit;
 
-        // Query LSP references for symbols
-        for sym in symbols {
-            let res = self
-                .language
-                .execute("lsp_workspace_symbols", &json!({ "query": sym }));
-            match res {
-                Ok(out) if !out.is_error => {
-                    if let Some(details) = out.details {
-                        if let Some(arr) = details.get("items").and_then(|v| v.as_array()) {
-                            for item in arr {
-                                let path = item["path"].as_str().unwrap_or("").to_string();
-                                let line = item["line"].as_u64().unwrap_or(1) as usize;
-                                let col = item["column"].as_u64().unwrap_or(1) as usize;
-                                reference_count += 1;
-                                items.push(ImpactItem {
-                                    name: sym.clone(),
-                                    path: path.clone(),
-                                    evidence_source: EvidenceSource::Lsp,
-                                    description: format!("Semantic reference to symbol '{sym}' at {path}:{line}:{col}"),
-                                    range: Some(SourceRange {
-                                        start_line: line,
-                                        start_column: col,
-                                        end_line: line,
-                                        end_column: col + sym.len(),
-                                    }),
-                                    details: Some(item.clone()),
-                                });
-                            }
-                        }
+        let mut record_references = |name: &str, output: davinci_agent::ToolResult| {
+            if output.is_error {
+                lsp_failed = true;
+                return;
+            }
+            let Some(details) = output.details else {
+                lsp_failed = true;
+                return;
+            };
+            for item in details["items"].as_array().into_iter().flatten() {
+                if remaining == 0 {
+                    break;
+                }
+                let Some(path) = item["path"].as_str() else {
+                    continue;
+                };
+                let Some(range) = normalized_source_range(item.get("range")) else {
+                    lsp_failed = true;
+                    continue;
+                };
+                remaining -= 1;
+                reference_count += 1;
+                items.push(ImpactItem {
+                    name: name.to_string(),
+                    path: path.to_string(),
+                    evidence_source: EvidenceSource::Lsp,
+                    description: format!(
+                        "Semantic reference to '{name}' at {path}:{}:{}",
+                        range.start_line, range.start_column
+                    ),
+                    range: Some(range),
+                    details: Some(item.clone()),
+                });
+            }
+        };
+
+        // Workspace symbols are declaration candidates only. Anchor them to a
+        // real source path, then ask references for actual usage evidence.
+        for symbol in symbols {
+            if remaining == 0 {
+                break;
+            }
+            let Some(anchor_file) = files.first() else {
+                lsp_failed = true;
+                warnings.push(format!(
+                    "Cannot semantically anchor symbol '{symbol}' without a changed source file"
+                ));
+                continue;
+            };
+            let candidates = client.execute_tool(
+                "lsp_workspace_symbols",
+                &json!({"query":symbol,"path":anchor_file,"limit":remaining.min(20)}),
+                &context,
+            );
+            match candidates {
+                Ok(output) if !output.is_error => {
+                    let Some(details) = output.details else {
+                        lsp_failed = true;
+                        continue;
+                    };
+                    let Some(candidate) = details["items"].as_array().and_then(|items| {
+                        items.iter().find(|item| item["name"].as_str() == Some(symbol.as_str()))
+                            .or_else(|| items.first())
+                    }) else {
+                        continue;
+                    };
+                    let path = candidate["path"].as_str().unwrap_or(anchor_file);
+                    let Some(range) = normalized_source_range(candidate.get("range")) else {
+                        lsp_failed = true;
+                        continue;
+                    };
+                    match client.execute_tool(
+                        "lsp_references",
+                        &json!({
+                            "path":path,
+                            "line":range.start_line,
+                            "column":range.start_column,
+                            "includeDeclaration":true,
+                            "limit":remaining
+                        }),
+                        &context,
+                    ) {
+                        Ok(output) => record_references(symbol, output),
+                        Err(_) => lsp_failed = true,
                     }
                 }
-                _ => {
+                _ => lsp_failed = true,
+            }
+        }
+
+        // For changed files, document symbols become source anchors; each one
+        // is resolved through references until the aggregate semantic budget is spent.
+        for file in files {
+            if remaining == 0 {
+                break;
+            }
+            let symbols_output = client.execute_tool(
+                "lsp_document_symbols",
+                &json!({"path":file,"limit":remaining.min(20)}),
+                &context,
+            );
+            let Ok(symbols_output) = symbols_output else {
+                lsp_failed = true;
+                continue;
+            };
+            if symbols_output.is_error {
+                lsp_failed = true;
+                continue;
+            }
+            let Some(details) = symbols_output.details else {
+                lsp_failed = true;
+                continue;
+            };
+            for symbol in details["items"].as_array().into_iter().flatten() {
+                if remaining == 0 {
+                    break;
+                }
+                let name = symbol["name"].as_str().unwrap_or("<symbol>");
+                let Some(range) = normalized_source_range(symbol.get("range")) else {
                     lsp_failed = true;
+                    continue;
+                };
+                match client.execute_tool(
+                    "lsp_references",
+                    &json!({
+                        "path":file,
+                        "line":range.start_line,
+                        "column":range.start_column,
+                        "includeDeclaration":true,
+                        "limit":remaining
+                    }),
+                    &context,
+                ) {
+                    Ok(output) => record_references(name, output),
+                    Err(_) => lsp_failed = true,
                 }
             }
         }
 
-        // Also query document symbols / references for files
-        for file in files {
-            let res = self
-                .language
-                .execute("lsp_document_symbols", &json!({ "path": file }));
-            match res {
-                Ok(out) if !out.is_error => {
-                    if let Some(details) = out.details {
-                        if let Some(arr) = details.get("items").and_then(|v| v.as_array()) {
-                            for item in arr.iter().take(self.config.max_references) {
-                                let name = item["name"].as_str().unwrap_or("").to_string();
-                                let line =
-                                    item["range"]["start"]["line"].as_u64().unwrap_or(1) as usize;
-                                let col =
-                                    item["range"]["start"]["column"].as_u64().unwrap_or(1) as usize;
-                                reference_count += 1;
-                                items.push(ImpactItem {
-                                    name: name.clone(),
-                                    path: file.clone(),
-                                    evidence_source: EvidenceSource::Lsp,
-                                    description: format!(
-                                        "Document semantic symbol '{name}' in {file}:{line}"
-                                    ),
-                                    range: Some(SourceRange {
-                                        start_line: line,
-                                        start_column: col,
-                                        end_line: line,
-                                        end_column: col,
-                                    }),
-                                    details: Some(item.clone()),
-                                });
-                            }
-                        }
-                    }
-                }
-                _ => {
-                    lsp_failed = true;
-                }
-            }
+        if remaining == 0 {
+            warnings.push(format!(
+                "Semantic reference analysis reached its aggregate limit of {limit}; coverage is partial"
+            ));
+            lsp_failed = true;
         }
 
         let lsp_status = if lsp_failed && items.is_empty() {
-            warnings.push("Language intelligence server is unavailable or unconfigured; semantic analysis is partial".into());
+            warnings.push("Language intelligence is unavailable or incomplete; semantic impact remains uncertain".into());
             "unavailable".to_string()
         } else if lsp_failed {
-            warnings.push(
-                "Some LSP queries failed during semantic analysis; results are partial".into(),
-            );
+            warnings.push("Some semantic queries failed or were truncated; impact evidence is partial".into());
             "partial".to_string()
         } else {
             "available".to_string()
         };
-
         let summary = format!(
-            "{reference_count} direct semantic references discovered via LSP ({lsp_status})"
+            "{reference_count} actual semantic reference locations discovered via LSP ({lsp_status})"
         );
         (
             DirectSemanticImpact {
@@ -855,6 +951,22 @@ impl<'a> ChangeImpactAnalyzer<'a> {
             summary,
         }
     }
+}
+
+fn normalized_source_range(value: Option<&Value>) -> Option<SourceRange> {
+    let value = value?;
+    let start_line = value["start"]["line"].as_u64()? as usize;
+    let start_column = value["start"]["column"].as_u64()? as usize;
+    let end_line = value["end"]["line"].as_u64()? as usize;
+    let end_column = value["end"]["column"].as_u64()? as usize;
+    (start_line > 0 && start_column > 0 && end_line > 0 && end_column > 0).then_some(
+        SourceRange {
+            start_line,
+            start_column,
+            end_line,
+            end_column,
+        },
+    )
 }
 
 fn import_matches_target(importing_file: &str, specifier: &str, target_file: &str) -> bool {
