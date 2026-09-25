@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 
 use davinci_agent::{
     discover_prompt_templates, discover_skills, expand_user_text, load_context_files, Agent,
-    CompactionResult, BUILTIN_TOOLS,
+    CompactionResult, CustomToolExecutor, ToolError, BUILTIN_TOOLS,
 };
 use davinci_ai::{
     find_model, load_builtin_models, snapshot_availability, AuthStorage, ModelConfig,
@@ -61,6 +61,16 @@ pub struct ExtensionManifest {
     pub path: Option<String>,
 }
 
+struct LanguageIntelligenceAttachment {
+    manager: crate::native_extensions::language_intelligence::LanguageIntelligence,
+    registration: davinci_agent::runtime::capabilities::CapabilityRegistration,
+    previous_executor: Option<CustomToolExecutor>,
+    previous_semantic: Option<std::sync::Arc<dyn davinci_agent::semantic::SemanticService>>,
+    attached_executor: CustomToolExecutor,
+    attached_semantic: std::sync::Arc<dyn davinci_agent::semantic::SemanticService>,
+    tools: Vec<String>,
+}
+
 pub struct AgentSession {
     pub agent: Agent,
     pub cwd: PathBuf,
@@ -69,6 +79,10 @@ pub struct AgentSession {
     pub custom_tools: Vec<String>,
     pub model_runtime: ModelRuntimeSnapshot,
     listeners: Vec<AgentEventListener>,
+    language_intelligence: Option<LanguageIntelligenceAttachment>,
+    attachment_allowed_tools: Option<std::collections::HashSet<String>>,
+    attachment_excluded_tools: std::collections::HashSet<String>,
+    attachment_no_tools: Option<String>,
 }
 
 impl AgentSession {
@@ -132,6 +146,204 @@ impl AgentSession {
 
     pub fn abort(&mut self) {
         self.agent.abort();
+    }
+
+    /// Opt in to the canonical native language-intelligence owner for this
+    /// embedding session. The SDK never enables unrelated native extensions.
+    pub fn attach_language_intelligence(
+        &mut self,
+        config: crate::native_extensions::language_intelligence::LanguageIntelligenceConfig,
+        tools: &[String],
+    ) -> Result<(), String> {
+        if self.language_intelligence.is_some() {
+            return Err("language_intelligence_already_attached".into());
+        }
+        let runtime = self.agent.runtime.clone().ok_or("sdk_runtime_required")?;
+        if self.attachment_no_tools.as_deref() == Some("all") {
+            return Err("language_intelligence_tools_excluded".into());
+        }
+        let mut selected = Vec::new();
+        for tool in tools {
+            if !crate::native_extensions::language_intelligence::TOOL_NAMES.contains(&tool.as_str()) {
+                return Err(format!("unsupported language-intelligence tool: {tool}"));
+            }
+            if self.attachment_excluded_tools.contains(tool)
+                || self
+                    .attachment_allowed_tools
+                    .as_ref()
+                    .is_some_and(|allowed| !allowed.contains(tool))
+            {
+                return Err(format!("language-intelligence tool excluded by session policy: {tool}"));
+            }
+            if !selected.contains(tool) {
+                selected.push(tool.clone());
+            }
+        }
+
+        let manager = crate::native_extensions::language_intelligence::LanguageIntelligence::new(
+            &self.cwd,
+            config,
+        );
+        manager.set_permissions(Some(self.agent.permissions.clone()));
+        let facade: std::sync::Arc<dyn davinci_agent::semantic::SemanticService> =
+            std::sync::Arc::new(crate::semantic::SemanticServiceFacade::local(manager.clone()));
+
+        let capabilities = selected
+            .iter()
+            .filter_map(|name| crate::native_extensions::language_intelligence::tool_spec(name))
+            .map(|spec| {
+                davinci_agent::runtime::RuntimeCapability::new(
+                    spec.name.clone(),
+                    davinci_agent::runtime::CapabilitySource::NativeExtension,
+                    davinci_agent::permission::ToolClass::Read,
+                    true,
+                    &spec.parameters,
+                    Some(env!("CARGO_PKG_VERSION").to_string()),
+                )
+                .with_description(spec.description)
+            })
+            .collect::<Vec<_>>();
+        let registration = runtime
+            .capability_registry
+            .register_owned(capabilities)
+            .map_err(|error| error.to_string())?;
+
+        let previous_executor = self.agent.custom_tool_executor.clone();
+        let previous_semantic = self.agent.tool_context.semantic.clone();
+        let manager_for_executor = manager.clone();
+        let selected_for_executor = selected.clone();
+        let previous_for_executor = previous_executor.clone();
+        let attached_executor = CustomToolExecutor::new_with_context(
+            move |cwd, name, args, context| {
+                if selected_for_executor.iter().any(|tool| tool == name) {
+                    let timeout = std::time::Duration::from_secs(60);
+                    let budget = crate::native_extensions::language_intelligence::RequestBudget {
+                        deadline: std::time::Instant::now() + timeout,
+                        cancelled: context.abort.clone(),
+                    };
+                    return manager_for_executor.execute_with_budget(name, args, budget);
+                }
+                if let Some(previous) = &previous_for_executor {
+                    return previous.execute_with_context(cwd, name, args, context);
+                }
+                Err(ToolError::Unknown(name.into()))
+            },
+        );
+
+        {
+            let mut authorized = self
+                .agent
+                .tool_context
+                .authorized_tools
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            for tool in &selected {
+                authorized.insert(tool.clone());
+            }
+        }
+        {
+            let mut exposure = self
+                .agent
+                .tool_context
+                .tool_exposure
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            for tool in &selected {
+                exposure.activate_authorized(tool, true);
+            }
+        }
+        for tool in &selected {
+            if !self.agent.tool_registry.contains(tool) {
+                self.agent.tool_registry.push(tool.clone());
+            }
+            if !self.agent.tools.contains(tool) {
+                self.agent.tools.push(tool.clone());
+            }
+        }
+        self.agent.custom_tool_executor = Some(attached_executor.clone());
+        self.agent.tool_context.semantic = Some(facade.clone());
+        self.language_intelligence = Some(LanguageIntelligenceAttachment {
+            manager,
+            registration,
+            previous_executor,
+            previous_semantic,
+            attached_executor,
+            attached_semantic: facade,
+            tools: selected,
+        });
+        Ok(())
+    }
+
+    pub fn detach_language_intelligence(&mut self) -> Result<(), String> {
+        if self.agent.is_streaming {
+            return Err("language_intelligence_detach_while_running".into());
+        }
+        let Some(attachment) = self.language_intelligence.take() else {
+            return Ok(());
+        };
+        let runtime = self.agent.runtime.clone().ok_or("sdk_runtime_required")?;
+        if !self
+            .agent
+            .custom_tool_executor
+            .as_ref()
+            .is_some_and(|executor| executor.same_instance(&attachment.attached_executor))
+        {
+            self.language_intelligence = Some(attachment);
+            return Err("language_intelligence_executor_ownership_changed".into());
+        }
+        if !self
+            .agent
+            .tool_context
+            .semantic
+            .as_ref()
+            .is_some_and(|semantic| std::sync::Arc::ptr_eq(semantic, &attachment.attached_semantic))
+        {
+            self.language_intelligence = Some(attachment);
+            return Err("language_intelligence_semantic_ownership_changed".into());
+        }
+        runtime
+            .capability_registry
+            .unregister_owned(&attachment.registration)
+            .map_err(|error| error.to_string())?;
+
+        self.agent.custom_tool_executor = attachment.previous_executor;
+        self.agent.tool_context.semantic = attachment.previous_semantic;
+        self.agent
+            .tool_registry
+            .retain(|name| !attachment.tools.contains(name));
+        self.agent.tools.retain(|name| !attachment.tools.contains(name));
+        {
+            let mut authorized = self
+                .agent
+                .tool_context
+                .authorized_tools
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            for tool in &attachment.tools {
+                authorized.remove(tool);
+            }
+        }
+        {
+            let mut exposure = self
+                .agent
+                .tool_context
+                .tool_exposure
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            for tool in &attachment.tools {
+                exposure.activate_authorized(tool, false);
+            }
+        }
+        attachment.manager.shutdown();
+        Ok(())
+    }
+}
+
+impl Drop for AgentSession {
+    fn drop(&mut self) {
+        if let Some(attachment) = self.language_intelligence.take() {
+            attachment.manager.shutdown();
+        }
     }
 }
 
@@ -290,6 +502,18 @@ pub fn create_agent_session(
             custom_tools,
             model_runtime,
             listeners: Vec::new(),
+            language_intelligence: None,
+            attachment_allowed_tools: options
+                .tools
+                .as_ref()
+                .map(|tools| tools.iter().cloned().collect()),
+            attachment_excluded_tools: options
+                .exclude_tools
+                .clone()
+                .unwrap_or_default()
+                .into_iter()
+                .collect(),
+            attachment_no_tools: options.no_tools.clone(),
         },
         extensions_result,
         model_fallback_message,
