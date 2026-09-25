@@ -152,6 +152,9 @@ impl Agent {
             Ok(contract) => Ok(contract),
             Err(error) => {
                 self.clear_active_contract();
+                // A failed handoff must fail closed. Leaving Auto/Edits active
+                // after the contract disappears removes the plan's write scope.
+                self.set_permission_mode(PermissionMode::ReadOnly);
                 Err(format!(
                     "The plan cannot be turned into an execution contract: {error}. Fix the step file lists (relative paths, no line numbers, within contract limits) and accept again."
                 ))
