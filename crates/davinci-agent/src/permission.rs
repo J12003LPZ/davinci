@@ -1051,7 +1051,13 @@ impl PermissionPolicy {
             )
         };
         let effective_root = self.filesystem_boundary.root.as_deref().unwrap_or(cwd);
-        let class = if tool == "agent" && self.agent_call_is_read_only(args) {
+        // D11: only Plan/ReadOnly mode may treat a provably read-only
+        // subagent request as a read tool. In Edits/Auto modes an omitted
+        // tools field must not bypass the normal agent approval boundary.
+        let class = if tool == "agent"
+            && self.mode == PermissionMode::ReadOnly
+            && self.agent_call_is_read_only(args)
+        {
             ToolClass::Read
         } else {
             self.class_of(tool)
