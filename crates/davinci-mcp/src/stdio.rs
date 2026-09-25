@@ -6,7 +6,7 @@
 
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
-use std::ffi::{OsStr, OsString};
+use std::ffi::OsString;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, Stdio};
@@ -463,14 +463,14 @@ mod tests {
         config.insert("FOO".to_string(), "bar".to_string());
         let env = child_environment(parent.into_iter(), &config);
         assert_eq!(
-            env.get(OsStr::new("PATH")).and_then(|value| value.to_str()),
+            env.get(std::ffi::OsStr::new("PATH")).and_then(|value| value.to_str()),
             Some("/bin")
         );
         assert_eq!(
-            env.get(OsStr::new("FOO")).and_then(|value| value.to_str()),
+            env.get(std::ffi::OsStr::new("FOO")).and_then(|value| value.to_str()),
             Some("bar")
         );
-        assert!(!env.contains_key(OsStr::new("OPENAI_API_KEY")));
+        assert!(!env.contains_key(std::ffi::OsStr::new("OPENAI_API_KEY")));
     }
 
     #[cfg(unix)]
@@ -485,7 +485,7 @@ mod tests {
             (invalid_key, OsString::from("ignored")),
         ];
         let env = child_environment(parent.into_iter(), &BTreeMap::new());
-        assert_eq!(env.get(OsStr::new("PATH")), Some(&invalid_value));
+        assert_eq!(env.get(std::ffi::OsStr::new("PATH")), Some(&invalid_value));
         assert_eq!(env.len(), 1);
     }
 
