@@ -468,6 +468,7 @@ name = "davinci-ai"
 version = "1.0.71"
 dependencies = [
  "base64",
+ "davinci-ai",
  "davinci-protocol",
  "davinci-sys",
  "davinci-telemetry",
@@ -510,6 +511,7 @@ dependencies = [
  "davinci-agent",
  "davinci-ai",
  "davinci-client",
+ "davinci-coding-agent",
  "davinci-mcp",
  "davinci-protocol",
  "davinci-server",
@@ -562,6 +564,7 @@ dependencies = [
 name = "davinci-mcp"
 version = "1.0.71"
 dependencies = [
+ "davinci-mcp",
  "serde",
  "serde_json",
  "sha2",
