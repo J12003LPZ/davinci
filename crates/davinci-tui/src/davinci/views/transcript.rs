@@ -266,7 +266,7 @@ fn entry_lines(model: &Model, entry: &Entry, width: u16) -> Vec<Line<'static>> {
             } else {
                 Vec::new()
             }
-        }
+        },
 
         Entry::Studio(steps) => studio::lines(model, steps),
 
