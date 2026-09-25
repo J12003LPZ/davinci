@@ -397,7 +397,7 @@ impl CallbackServer {
                         return Err("Timed out waiting for the browser login callback.".into());
                     }
                     if let Some(response) =
-                        self.serve_with_timeout(stream, remaining.min(Duration::from_millis(100)))?
+                        self.serve_with_timeout(stream, remaining.min(Duration::from_millis(500)))?
                     {
                         if response.code.is_some() {
                             return Ok(response);

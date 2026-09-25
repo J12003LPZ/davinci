@@ -202,7 +202,8 @@ impl BoundUnixListener {
             .parent()
             .map(|path| fs::remove_dir(path))
             .transpose()
-            .map_err(|err| ServerError::Io(err.to_string()));
+            .map_err(|err| ServerError::Io(err.to_string()))
+            .map(|_| ());
         cleanup.and(owned).and(owned_dir)
     }
 
