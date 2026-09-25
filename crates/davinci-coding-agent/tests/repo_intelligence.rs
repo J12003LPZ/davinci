@@ -229,6 +229,68 @@ fn repo_intelligence_queries_dependencies_related_files_and_provenance() {
 }
 
 #[test]
+fn lsp_code_query_rust_anchor_bypasses_ts_index() {
+    use davinci_coding_agent::native_extensions::repo_intelligence::{
+        SemanticEvidence, SemanticLanguageProvider, SemanticOperation, SourceRange,
+    };
+    use serde_json::json;
+    use std::sync::Arc;
+
+    #[derive(Debug)]
+    struct RustSemantic;
+    impl SemanticLanguageProvider for RustSemantic {
+        fn query(
+            &self,
+            operation: SemanticOperation,
+            path: &str,
+            range: &SourceRange,
+            _limit: usize,
+        ) -> Result<Vec<SemanticEvidence>, String> {
+            assert!(matches!(operation, SemanticOperation::References));
+            assert_eq!(path, "src/lib.rs");
+            assert_eq!(range.start_line, 1);
+            assert_eq!(range.start_column, 8);
+            Ok(vec![SemanticEvidence {
+                path: "src/lib.rs".into(),
+                range: SourceRange {
+                    start_line: 1,
+                    start_column: 8,
+                    end_line: 1,
+                    end_column: 13,
+                },
+                description: "fixture Rust reference".into(),
+            }])
+        }
+    }
+
+    let repo = tempfile::tempdir().unwrap();
+    let cache = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(repo.path().join("src")).unwrap();
+    std::fs::write(
+        repo.path().join("src/lib.rs"),
+        "pub fn value() -> u8 { 1 }\n",
+    )
+    .unwrap();
+    let manager = RepoIntelligence::new(repo.path(), cache.path(), Default::default())
+        .with_semantic_provider(Arc::new(RustSemantic));
+    let result = manager
+        .query(
+            "code_query",
+            &json!({
+                "query":"Find references to value",
+                "path":"src/lib.rs",
+                "semantic":{"operation":"references","line":1,"column":8},
+                "limit":20
+            }),
+        )
+        .unwrap();
+    assert_eq!(result["route"], "semantic");
+    assert_eq!(result["semantic_status"], "provider");
+    assert_eq!(result["results"][0]["source"], "lsp");
+    assert_eq!(result["results"][0]["path"], "src/lib.rs");
+}
+
+#[test]
 fn repo_intelligence_parser_typescript_structure_and_stable_ids() {
     let source = r#"
 import { token } from './token';
