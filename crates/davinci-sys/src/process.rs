@@ -56,6 +56,12 @@ pub fn resolve_program_in(name: &str, path_var: &OsStr, pathext: Option<&str>) -
     }
     let has_extension = Path::new(name).extension().is_some();
     for dir in std::env::split_paths(path_var) {
+        // Empty PATH entries mean the current working directory on both Unix
+        // and Windows. Never let an untrusted repository satisfy a trusted
+        // program lookup through an empty component.
+        if dir.as_os_str().is_empty() {
+            continue;
+        }
         match pathext {
             Some(exts) if !has_extension => {
                 for ext in exts.split(';').filter(|ext| !ext.is_empty()) {
