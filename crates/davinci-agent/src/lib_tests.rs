@@ -1,4 +1,3 @@
-
 use super::*;
 
 #[test]
@@ -2484,6 +2483,37 @@ fn later_mutation_invalidates_previous_verification() {
     agent.record_successful_mutation();
 
     assert_eq!(agent.completion_evidence(), CompletionEvidence::Unverified);
+}
+
+#[test]
+fn last_verification_command_survives_a_later_mutation() {
+    let agent = Agent::new("x");
+    agent.record_successful_mutation();
+    agent.remember_verification_command("bash", "cargo check --help");
+    agent.record_verification_command("cargo check --help", true);
+    agent.record_successful_mutation();
+    assert_eq!(agent.completion_evidence(), CompletionEvidence::Unverified);
+    let last = agent
+        .mutation_verification_state()
+        .last_verification
+        .unwrap();
+    assert_eq!(last.tool, "bash");
+    assert_eq!(last.command, "cargo check --help");
+}
+
+#[test]
+fn last_verification_preserves_arguments_and_working_directory() {
+    let agent = Agent::new("x");
+    let cwd = tempfile::tempdir().unwrap();
+    let args = serde_json::json!({"command":"cargo check --help", "timeout":17, "workdir":"child"});
+    agent.remember_verification_call("powershell", &args, cwd.path());
+    agent.record_successful_mutation();
+    let last = agent
+        .mutation_verification_state()
+        .last_verification
+        .unwrap();
+    assert_eq!(last.arguments, args);
+    assert_eq!(last.cwd.as_deref(), Some(cwd.path()));
 }
 
 #[test]

@@ -2478,6 +2478,7 @@ impl Agent {
                     .and_then(Value::as_str)
                     .unwrap_or_default();
                 if let Some(trustworthy) = crate::shell_policy::verification_outcome(cmd) {
+                    self.remember_verification_call(name, args, cwd);
                     self.record_verification_command(
                         cmd,
                         trustworthy && !pre_hook_error && !result.is_error,

@@ -297,6 +297,20 @@ pub struct MutationVerificationState {
     pub mutation_paths: Vec<PathBuf>,
     #[serde(default)]
     pub latest_evidence: Option<VerificationEvidence>,
+    #[serde(default)]
+    pub last_verification: Option<LastVerification>,
+}
+
+/// The last classified verification call, retained across later mutations.
+/// Preserve its full execution context when the harness repeats it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LastVerification {
+    pub tool: String,
+    pub command: String,
+    #[serde(default)]
+    pub arguments: Value,
+    #[serde(default)]
+    pub cwd: Option<PathBuf>,
 }
 
 /// Evidence available when a coding turn reaches a normal stop.
@@ -858,6 +872,28 @@ impl Agent {
             mutation_paths: paths,
             verification_targets: Vec::new(),
             coverage: VerificationCoverage::Broad,
+        });
+    }
+
+    #[cfg(test)]
+    pub(crate) fn remember_verification_command(&self, tool: &str, command: &str) {
+        self.remember_verification_call(tool, &serde_json::json!({"command": command}), &self.cwd);
+    }
+
+    pub(crate) fn remember_verification_call(&self, tool: &str, arguments: &Value, cwd: &Path) {
+        let mut state = self
+            .mutation_verification
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        state.last_verification = Some(LastVerification {
+            tool: tool.to_string(),
+            command: arguments
+                .get("command")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string(),
+            arguments: arguments.clone(),
+            cwd: Some(cwd.to_path_buf()),
         });
     }
 
