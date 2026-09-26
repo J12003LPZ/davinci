@@ -210,13 +210,19 @@ pub fn persist_config_toggle(
     enabled: bool,
 ) -> Result<(), String> {
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let normalized_source = match parse_package_source(source) {
+        ParsedSource::Local(path) => {
+            normalize_local_source(&path, &cwd).unwrap_or_else(|_| source.to_string())
+        }
+        _ => source.to_string(),
+    };
     let dir = if local {
         cwd.join(".pi")
     } else {
         agent_dir.to_path_buf()
     };
     let mut settings = load_settings(&dir);
-    apply_resource_enabled(&mut settings, source, enabled);
+    apply_resource_enabled(&mut settings, &normalized_source, enabled);
     save_settings(&dir, &settings)
 }
 
