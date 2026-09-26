@@ -22,7 +22,7 @@ use uuid::Uuid;
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 /// How long an in-process caller waits for the journal writer before
 /// `WriterBusy`, and how often it checks.
-const WRITER_WAIT: Duration = Duration::from_secs(2);
+const WRITER_WAIT: Duration = BUSY_TIMEOUT;
 const WRITER_WAIT_STEP: Duration = Duration::from_millis(1);
 const LEASE_DIRECTORY: &str = ".operation-journal-leases";
 const MIGRATION_LEASE_DIRECTORY: &str = "migration";

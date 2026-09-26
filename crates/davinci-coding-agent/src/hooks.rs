@@ -808,7 +808,7 @@ mod tests {
                 "powershell".into(),
                 "-NoProfile".into(),
                 "-Command".into(),
-                format!("$input | Out-File -Encoding utf8 '{capture}'; exit {code}"),
+                format!("[IO.File]::WriteAllText('{capture}', [Console]::In.ReadToEnd()); exit {code}"),
             ]
         } else {
             vec![
@@ -1031,7 +1031,7 @@ mod tests {
         std::env::set_var("DAVINCI_RUNTIME_HOOKS_V2", "1");
         let command = if cfg!(windows) {
             vec!["powershell".into(), "-NoProfile".into(), "-Command".into(),
-                "$p = $input | ConvertFrom-Json; if ($p.event.kind -eq 'task_completed' -and $p.event.success -eq $true) { Write-Output 'legacy completion denied'; exit 1 }; exit 0".into()]
+                "$p = [Console]::In.ReadToEnd() | ConvertFrom-Json; if ($p.event.kind -eq 'task_completed' -and $p.event.success -eq $true) { Write-Output 'legacy completion denied'; exit 1 }; exit 0".into()]
         } else {
             vec!["sh".into(), "-c".into(),
                 r#"payload=$(cat); case "$payload" in *'"kind":"task_completed"'*) case "$payload" in *'"success":true'*) echo 'legacy completion denied'; exit 1;; esac;; esac; exit 0"#.into()]
