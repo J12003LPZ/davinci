@@ -407,7 +407,7 @@ pub fn split_shell_segments(command: &str) -> Vec<String> {
 /// Extract literal words for restricted-policy checks, without evaluating a
 /// shell. Unknown expansions and shell structures fail closed. Dequoting matters:
 /// `-de'lete'` is the same option as `-delete`, not harmless text.
-fn literal_shell_words(command: &str) -> Option<Vec<String>> {
+pub(crate) fn literal_shell_words(command: &str) -> Option<Vec<String>> {
     let mut words = Vec::new();
     let mut word = String::new();
     let mut quote = None;

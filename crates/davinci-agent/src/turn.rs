@@ -72,6 +72,7 @@ fn agent_call_may_write_shared(args: &Value, mode: crate::PermissionMode) -> boo
 /// What happened when the harness re-ran the last verification command.
 enum HarnessVerification {
     Passed,
+    Partial,
     Failed {
         output_tail: String,
     },
@@ -129,7 +130,6 @@ impl Agent {
         let results =
             self.execute_tool_batch(&cwd, vec![(call_id, last.tool.clone(), arguments)], events);
         let mut output_tail = String::new();
-        let mut rerun_failed = false;
         let mut rerun_denied = false;
         for mut result in results {
             let name = result.tool_name.clone().unwrap_or_default();
@@ -141,7 +141,6 @@ impl Agent {
                 .and_then(Value::as_bool)
                 .unwrap_or(false);
             rerun_denied |= denied;
-            rerun_failed |= !denied && result.is_error == Some(true);
             let text = davinci_ai::content_text(&result.content);
             let lines: Vec<&str> = text.lines().collect();
             output_tail = lines[lines.len().saturating_sub(30)..].join("\n");
@@ -163,10 +162,10 @@ impl Agent {
         Ok(match self.completion_evidence() {
             _ if rerun_denied => HarnessVerification::Inconclusive,
             crate::CompletionEvidence::Verified => HarnessVerification::Passed,
+            crate::CompletionEvidence::Partial => HarnessVerification::Partial,
             crate::CompletionEvidence::VerificationFailed => {
                 HarnessVerification::Failed { output_tail }
             }
-            _ if rerun_failed => HarnessVerification::Failed { output_tail },
             _ => HarnessVerification::Inconclusive,
         })
     }
@@ -320,7 +319,9 @@ impl Agent {
             AgentEvent::MutationObservation {
                 schema_version: 1,
                 generation: self.mutation_verification_state().mutation_generation,
-                executed_leaf_operations: self.counters.executed_leaf_operations
+                executed_leaf_operations: self
+                    .counters
+                    .executed_leaf_operations
                     .load(std::sync::atomic::Ordering::Relaxed),
             },
         );
@@ -624,7 +625,7 @@ impl Agent {
                         continue;
                     }
                     match rerun {
-                        Some(HarnessVerification::Passed) => {}
+                        Some(HarnessVerification::Passed | HarnessVerification::Partial) => {}
                         Some(HarnessVerification::Failed { output_tail }) => {
                             let command = last.map(|last| last.command).unwrap_or_default();
                             let message = format!(
@@ -776,6 +777,30 @@ impl Agent {
                 continue;
             }
 
+            let status = self.completion_evidence();
+            let notice = match status {
+                crate::CompletionEvidence::Partial => Some("Verification is partial: passing checks cover some changes; other changed paths remain unchecked."),
+                crate::CompletionEvidence::Unverified => Some("Verification is incomplete: no applicable completed check confirms the latest changes."),
+                crate::CompletionEvidence::VerificationFailed => Some("Verification failed after the latest changes; the failure remains unresolved."),
+                _ => None,
+            };
+            if let Some(text) = notice {
+                let mut message = ChatMessage::text("assistant", text);
+                message.extra.insert(
+                    "davinciVerificationStatus".into(),
+                    serde_json::json!(status),
+                );
+                self.messages.push(message.clone());
+                self.persist_chat(&message)?;
+                new_messages.push(message.clone());
+                self.push_event(
+                    &mut events,
+                    AgentEvent::MessageStart {
+                        message: message.clone(),
+                    },
+                );
+                self.push_event(&mut events, AgentEvent::MessageEnd { message });
+            }
             break;
         }
 
@@ -2212,6 +2237,13 @@ impl Agent {
                     }
                 }
                 crate::stats::SharedCounters::add(&self.counters.executed_leaf_operations, 1);
+                if matches!(name, "bash" | "powershell" | "exec_command") {
+                    let generation = self.mutation_verification_state().mutation_generation;
+                    self.verification_starts
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .insert(id.to_string(), generation);
+                }
                 let mut executed = match execute_tool_with(cwd, name, args, &context) {
                     Ok(result) => result,
                     Err(crate::tools::ToolError::Unknown(_)) => {
@@ -2521,18 +2553,6 @@ impl Agent {
         if crate::tools::is_coordinated_mutation(name) && !outcome.is_error {
             crate::stats::SharedCounters::add(&self.counters.files_changed_count, 1);
         }
-        if matches!(name, "bash" | "powershell" | "exec_command") {
-            let cmd = args
-                .get("command")
-                .and_then(Value::as_str)
-                .unwrap_or_default();
-            if is_verification_command(cmd) {
-                crate::stats::SharedCounters::add(&self.counters.verification_commands_run, 1);
-                if outcome.is_error {
-                    crate::stats::SharedCounters::add(&self.counters.verification_failures, 1);
-                }
-            }
-        }
         outcome
     }
 
@@ -2637,19 +2657,7 @@ impl Agent {
             if crate::tools::is_coordinated_mutation(name) && !pre_hook_error && !result.is_error {
                 self.record_successful_mutation_paths(mutation_paths_from_tool(name, args));
             }
-            if matches!(name, "bash" | "powershell" | "exec_command") {
-                let cmd = args
-                    .get("command")
-                    .and_then(Value::as_str)
-                    .unwrap_or_default();
-                if let Some(trustworthy) = crate::shell_policy::verification_outcome(cmd) {
-                    self.remember_verification_call(name, args, cwd);
-                    self.record_verification_command(
-                        cmd,
-                        trustworthy && !pre_hook_error && !result.is_error,
-                    );
-                }
-            }
+            self.observe_shell_verification(id, cwd, name, args, &pre_hook_result, &result);
         }
         let hook_vetoed = !pre_hook_error && result.is_error;
         if !replayed {
@@ -2680,6 +2688,109 @@ impl Agent {
             self.cache_operation_presentation(id, result.clone());
         }
         self.emit_tool_result(id, name, args, result)
+    }
+
+    pub(crate) fn observe_shell_verification(
+        &self,
+        id: &str,
+        cwd: &Path,
+        name: &str,
+        args: &Value,
+        original: &crate::ToolResult,
+        decorated: &crate::ToolResult,
+    ) {
+        let generation = self
+            .verification_starts
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(id);
+        let Some(generation) = generation else {
+            return;
+        };
+        let command = args
+            .get("command")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let state = self.mutation_verification_state();
+        if generation != state.mutation_generation {
+            return;
+        }
+        let assessment = crate::verification::classify(name, command, cwd, &state.mutation_paths);
+        {
+            let mut state = self
+                .mutation_verification
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            if state.mutation_generation == generation {
+                state.last_classification_reason = Some(assessment.reason.into());
+            }
+        }
+        if !matches!(
+            assessment.kind,
+            crate::verification::CheckKind::Suite | crate::verification::CheckKind::TargetedScript
+        ) {
+            return;
+        }
+        let receipt = self
+            .command_receipts
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .find(|receipt| receipt.operation_id == id)
+            .cloned();
+        let terminal = if original.is_error != decorated.is_error {
+            None
+        } else if let Some(receipt) = receipt {
+            if !receipt.started
+                || receipt.exit_code.is_none()
+                || receipt.timed_out
+                || receipt.cancelled
+                || receipt.killed
+                || receipt.permission_denied
+                || receipt.simulated
+                || receipt.hook_vetoed
+                || (original.is_error && receipt.exit_code == Some(0))
+            {
+                None
+            } else {
+                Some(receipt.is_passed() && !original.is_error)
+            }
+        } else {
+            original.details.as_ref().and_then(|details| {
+                if [
+                    "denied",
+                    "cancelled",
+                    "timed_out",
+                    "timeout",
+                    "not_dispatched",
+                    "pending",
+                    "background",
+                ]
+                .iter()
+                .any(|key| details.get(key).and_then(Value::as_bool) == Some(true))
+                {
+                    return None;
+                }
+                details
+                    .get("exitCode")
+                    .and_then(Value::as_i64)
+                    .and_then(|exit| {
+                        if exit == 0 && original.is_error {
+                            None
+                        } else {
+                            Some(exit == 0)
+                        }
+                    })
+            })
+        };
+        if let Some(passed) = terminal {
+            crate::stats::SharedCounters::add(&self.counters.verification_commands_run, 1);
+            if !passed {
+                crate::stats::SharedCounters::add(&self.counters.verification_failures, 1);
+            }
+            self.remember_verification_call(name, args, cwd);
+        }
+        self.record_verification_assessment(generation, command, &assessment, terminal);
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -2899,7 +3010,9 @@ impl Agent {
             AgentEvent::MutationObservation {
                 schema_version: 1,
                 generation: self.mutation_verification_state().mutation_generation,
-                executed_leaf_operations: self.counters.executed_leaf_operations
+                executed_leaf_operations: self
+                    .counters
+                    .executed_leaf_operations
                     .load(std::sync::atomic::Ordering::Relaxed),
             },
         );
@@ -4095,7 +4208,12 @@ pub(crate) fn mutation_paths_from_tool(name: &str, args: &Value) -> Vec<PathBuf>
             .and_then(Value::as_str)
         {
             for line in patch.lines() {
-                for prefix in ["*** Update File: ", "*** Add File: ", "*** Delete File: "] {
+                for prefix in [
+                    "*** Update File: ",
+                    "*** Add File: ",
+                    "*** Delete File: ",
+                    "*** Move to: ",
+                ] {
                     if let Some(path) = line.strip_prefix(prefix) {
                         let path = PathBuf::from(path.trim());
                         if !paths.contains(&path) {
@@ -4107,10 +4225,6 @@ pub(crate) fn mutation_paths_from_tool(name: &str, args: &Value) -> Vec<PathBuf>
         }
     }
     paths
-}
-
-pub(crate) fn is_verification_command(cmd: &str) -> bool {
-    crate::shell_policy::verification_outcome(cmd).is_some()
 }
 
 #[cfg(test)]
@@ -6389,7 +6503,13 @@ mod operation_dispatch_tests {
 
         let snapshot = journal.snapshot().unwrap();
         assert_eq!(snapshot.operations.len(), 3);
-        assert_eq!(agent.counters.executed_leaf_operations.load(std::sync::atomic::Ordering::Relaxed), 2);
+        assert_eq!(
+            agent
+                .counters
+                .executed_leaf_operations
+                .load(std::sync::atomic::Ordering::Relaxed),
+            2
+        );
         let parent = snapshot
             .operations
             .iter()
@@ -6436,7 +6556,13 @@ mod operation_dispatch_tests {
             Some(true)
         );
         assert!(!workspace.path().join("denied.txt").exists());
-        assert_eq!(agent.counters.executed_leaf_operations.load(std::sync::atomic::Ordering::Relaxed), 0);
+        assert_eq!(
+            agent
+                .counters
+                .executed_leaf_operations
+                .load(std::sync::atomic::Ordering::Relaxed),
+            0
+        );
 
         let snapshot = journal.snapshot().unwrap();
         assert_eq!(snapshot.operations.len(), 1);
@@ -6555,7 +6681,13 @@ mod operation_dispatch_tests {
             _ => panic!("expected journal replay"),
         };
         assert!(replay.details.as_ref().unwrap()["replayed_from_operation_journal"] == true);
-        assert_eq!(agent.counters.executed_leaf_operations.load(std::sync::atomic::Ordering::Relaxed), 1);
+        assert_eq!(
+            agent
+                .counters
+                .executed_leaf_operations
+                .load(std::sync::atomic::Ordering::Relaxed),
+            1
+        );
         assert_eq!(
             replay.details.as_ref().unwrap()["_command_receipt"],
             receipt.clone()

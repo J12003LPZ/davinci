@@ -43,6 +43,7 @@ pub mod tools;
 mod transaction_verification;
 mod turn;
 pub mod turn_context;
+pub mod verification;
 pub mod web;
 
 pub use batch::{BATCH_MAX_OPERATIONS, VISIBLE_PER_OPERATION, VISIBLE_TOTAL};
@@ -301,6 +302,12 @@ pub struct MutationVerificationState {
     #[serde(default)]
     pub mutation_paths: Vec<PathBuf>,
     #[serde(default)]
+    pub covered_paths: Vec<PathBuf>,
+    #[serde(default)]
+    pub unknown_mutation_paths: bool,
+    #[serde(default)]
+    pub last_classification_reason: Option<String>,
+    #[serde(default)]
     pub latest_evidence: Option<VerificationEvidence>,
     #[serde(default)]
     pub last_verification: Option<LastVerification>,
@@ -323,6 +330,7 @@ pub struct LastVerification {
 #[serde(rename_all = "snake_case")]
 pub enum CompletionEvidence {
     Verified,
+    Partial,
     Unverified,
     VerificationFailed,
     NotRequired,
@@ -479,6 +487,7 @@ pub struct Agent {
     /// Bounded actual command evidence, populated only by built-in execution.
     command_receipts:
         Arc<Mutex<std::collections::VecDeque<runtime::evidence_store::ExecutionReceipt>>>,
+    verification_starts: Arc<Mutex<std::collections::BTreeMap<String, u64>>>,
     plan_storage_error: Option<String>,
     pending_bash_messages: Vec<ChatMessage>,
     pending_prompt_messages: Vec<ChatMessage>,
@@ -607,6 +616,7 @@ impl Agent {
                 std::collections::BTreeMap::new(),
             )),
             command_receipts: Arc::new(Mutex::new(std::collections::VecDeque::new())),
+            verification_starts: Arc::new(Mutex::new(std::collections::BTreeMap::new())),
             plan_storage_error: None,
             pending_bash_messages: Vec::new(),
             pending_prompt_messages: Vec::new(),
@@ -859,11 +869,15 @@ impl Agent {
             Some(evidence) if evidence.generation == state.mutation_generation => {
                 if !evidence.succeeded {
                     CompletionEvidence::VerificationFailed
-                } else if matches!(
-                    evidence.coverage,
-                    VerificationCoverage::Targeted | VerificationCoverage::Broad
-                ) {
+                } else if state.verified_generation == Some(state.mutation_generation)
+                    && matches!(
+                        evidence.coverage,
+                        VerificationCoverage::Targeted | VerificationCoverage::Broad
+                    )
+                {
                     CompletionEvidence::Verified
+                } else if !state.covered_paths.is_empty() {
+                    CompletionEvidence::Partial
                 } else {
                     CompletionEvidence::Unverified
                 }
@@ -887,7 +901,11 @@ impl Agent {
             && state.last_verification_succeeded;
         if prior_was_verified {
             state.mutation_paths.clear();
+            state.unknown_mutation_paths = false;
         }
+        state.unknown_mutation_paths |= paths.is_empty();
+        state.covered_paths.clear();
+        state.last_classification_reason = None;
         state.mutation_generation = state.mutation_generation.saturating_add(1);
         for path in paths {
             if !state.mutation_paths.contains(&path) {
@@ -944,6 +962,7 @@ impl Agent {
         });
     }
 
+    #[cfg(test)]
     pub(crate) fn record_verification_command(&self, command: &str, succeeded: bool) {
         let mut state = self
             .mutation_verification
@@ -953,7 +972,12 @@ impl Agent {
         let mutation_paths = state.mutation_paths.clone();
         let (coverage, verification_targets) =
             verification_coverage_for_command(command, &mutation_paths);
-        state.verified_generation = Some(generation);
+        state.verified_generation = (succeeded
+            && matches!(
+                coverage,
+                VerificationCoverage::Broad | VerificationCoverage::Targeted
+            ))
+        .then_some(generation);
         state.last_verification_succeeded = succeeded;
         state.latest_evidence = Some(VerificationEvidence {
             generation,
@@ -962,6 +986,68 @@ impl Agent {
             mutation_paths,
             verification_targets,
             coverage,
+        });
+    }
+
+    pub(crate) fn record_verification_assessment(
+        &self,
+        generation: u64,
+        command: &str,
+        assessment: &verification::Assessment,
+        terminal: Option<bool>,
+    ) {
+        let Some(succeeded) = terminal else {
+            return;
+        };
+        if !matches!(
+            assessment.kind,
+            verification::CheckKind::Suite | verification::CheckKind::TargetedScript
+        ) {
+            return;
+        }
+        let mut state = self
+            .mutation_verification
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        if generation != state.mutation_generation {
+            return;
+        }
+        if succeeded && assessment.covered.is_empty() {
+            // An unrelated success cannot erase an applicable failure.
+            return;
+        }
+        if succeeded {
+            for path in &assessment.covered {
+                if state.mutation_paths.contains(path) && !state.covered_paths.contains(path) {
+                    state.covered_paths.push(path.clone());
+                }
+            }
+        } else {
+            state.covered_paths.clear();
+        }
+        let complete = !state.unknown_mutation_paths
+            && !state.mutation_paths.is_empty()
+            && state
+                .mutation_paths
+                .iter()
+                .all(|path| state.covered_paths.contains(path));
+        state.verified_generation = (succeeded && complete).then_some(generation);
+        state.last_verification_succeeded = succeeded;
+        state.latest_evidence = Some(VerificationEvidence {
+            generation,
+            command: command.into(),
+            succeeded,
+            mutation_paths: state.mutation_paths.clone(),
+            verification_targets: assessment
+                .covered
+                .iter()
+                .map(|p| p.display().to_string())
+                .collect(),
+            coverage: if complete {
+                VerificationCoverage::Targeted
+            } else {
+                VerificationCoverage::Unknown
+            },
         });
     }
 
@@ -3337,7 +3423,10 @@ fn verification_coverage_for_command(
             .filter_map(|path| mutation_package(path))
             .collect::<std::collections::BTreeSet<_>>();
         let targets = vec![package.clone()];
-        if !changed_packages.is_empty()
+        if mutation_paths
+            .iter()
+            .all(|path| mutation_package(path).is_some())
+            && !changed_packages.is_empty()
             && changed_packages.iter().all(|changed| changed == &package)
         {
             return (VerificationCoverage::Targeted, targets);
@@ -3376,7 +3465,7 @@ fn path_scoped_coverage(
     if targets.is_empty() {
         return (VerificationCoverage::Broad, vec!["project".into()]);
     }
-    let covered = mutation_paths.iter().any(|path| {
+    let covered = mutation_paths.iter().all(|path| {
         let changed = path.to_string_lossy().replace('\\', "/");
         let stem = path
             .file_stem()

@@ -245,21 +245,14 @@ impl Agent {
                                 crate::turn::mutation_paths_from_tool(&tool, &args),
                             );
                         }
-                        if matches!(tool.as_str(), "bash" | "powershell" | "exec_command") {
-                            let command = args
-                                .get("command")
-                                .and_then(Value::as_str)
-                                .unwrap_or_default();
-                            if let Some(trustworthy) =
-                                crate::shell_policy::verification_outcome(command)
-                            {
-                                agent.remember_verification_call(&tool, &args, cwd);
-                                agent.record_verification_command(
-                                    command,
-                                    trustworthy && !pre_hook_error && !result.is_error,
-                                );
-                            }
-                        }
+                        agent.observe_shell_verification(
+                            &op_id,
+                            cwd,
+                            &tool,
+                            &args,
+                            &pre_hook_result,
+                            &result,
+                        );
                     }
                     let hook_vetoed = !pre_hook_error && result.is_error;
                     agent.record_receipt(
