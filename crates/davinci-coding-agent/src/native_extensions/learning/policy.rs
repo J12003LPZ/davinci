@@ -19,21 +19,33 @@ pub fn evaluate_candidate(
     project_trusted: bool,
     target_skill: Option<&SkillLedgerRecord>,
 ) -> CandidateDecision {
+    // Learning runs without the user: nothing here waits for approval. What
+    // cannot be applied safely is kept as a candidate (visible in
+    // `/learning-pending`, never used) or rejected. Staging remains only for
+    // configurations that opt into it (`shadowMode`, `autoApply* = false`).
     if candidate.confidence < 0.50 {
         return CandidateDecision::Reject;
-    }
-
-    if candidate.evidence.user_corrected {
-        return CandidateDecision::StageForApproval;
     }
 
     if candidate.evidence.permission_denied {
         return CandidateDecision::Reject;
     }
 
-    // Procedural skills require command verification, whereas declarative memory facts
-    // derived from conversation or inspection can auto-apply with sufficient confidence.
-    let requires_commands = !matches!(candidate.artifact, LearningArtifact::Memory { .. });
+    let declarative = matches!(
+        candidate.artifact,
+        LearningArtifact::Memory { .. } | LearningArtifact::FailureLesson { .. }
+    );
+
+    // A correction is exactly what a memory or failure lesson should record.
+    // A procedure written in the same turn the user corrected is not trusted.
+    if candidate.evidence.user_corrected && !declarative {
+        return CandidateDecision::KeepCandidate;
+    }
+
+    // Procedural skills require command verification, whereas declarative
+    // memory facts and failure lessons derived from conversation or inspection
+    // can auto-apply with sufficient confidence.
+    let requires_commands = !declarative;
 
     // Check verification
     if requires_commands && candidate.evidence.commands_ran == 0 {
@@ -50,48 +62,52 @@ pub fn evaluate_candidate(
     }
 
     // Check ownership if patching or writing support file
+    // Skills the user wrote or imported are never rewritten automatically,
+    // and neither is anything the reviewer names that does not exist.
     match &candidate.artifact {
         LearningArtifact::SkillPatch { .. } => match target_skill {
             Some(target) => {
                 if target.origin == SkillOrigin::User || target.origin == SkillOrigin::Imported {
-                    return CandidateDecision::StageForApproval;
+                    return CandidateDecision::KeepCandidate;
                 }
                 if target.status != ArtifactStatus::Active {
-                    return CandidateDecision::StageForApproval;
+                    return CandidateDecision::KeepCandidate;
                 }
             }
             None => {
-                return CandidateDecision::StageForApproval;
+                return CandidateDecision::Reject;
             }
         },
         LearningArtifact::SkillSupportFile { relative_path, .. } => {
             let normalized = relative_path.replace('\\', "/");
+            // A script is executable content; it is never written unattended.
             if normalized.starts_with("scripts/") {
-                return CandidateDecision::StageForApproval;
+                return CandidateDecision::KeepCandidate;
             }
             match target_skill {
                 Some(target) => {
                     if target.origin == SkillOrigin::User || target.origin == SkillOrigin::Imported
                     {
-                        return CandidateDecision::StageForApproval;
+                        return CandidateDecision::KeepCandidate;
                     }
                     if target.status != ArtifactStatus::Active {
-                        return CandidateDecision::StageForApproval;
+                        return CandidateDecision::KeepCandidate;
                     }
                 }
                 None => {
-                    return CandidateDecision::StageForApproval;
+                    return CandidateDecision::Reject;
                 }
             }
         }
         _ => {}
     }
 
-    // Scope and trust gates
+    // Scope and trust gates. `project_trusted` is also true when project
+    // learning lives in the davinci-owned store.
     match candidate.scope {
         LearningScope::Project => {
             if !project_trusted {
-                return CandidateDecision::StageForApproval;
+                return CandidateDecision::KeepCandidate;
             }
             if config.shadow_mode || !config.auto_apply_project {
                 return CandidateDecision::StageForApproval;
@@ -307,7 +323,28 @@ mod tests {
         );
 
         let decision = evaluate_candidate(&candidate, &config, true, None);
-        assert_eq!(decision, CandidateDecision::StageForApproval);
+        assert_eq!(decision, CandidateDecision::KeepCandidate);
+    }
+
+    #[test]
+    fn a_correction_is_learned_as_a_lesson_without_approval() {
+        let config = LearningConfig::default();
+        let candidate = fixture_candidate(
+            LearningScope::Project,
+            LearningArtifact::FailureLesson {
+                text: "the migration must run before the seed".into(),
+                importance: 0.8,
+            },
+            0.9,
+            VerificationEvidence {
+                user_corrected: true,
+                ..VerificationEvidence::default()
+            },
+        );
+        assert_eq!(
+            evaluate_candidate(&candidate, &config, true, None),
+            CandidateDecision::AutoApply
+        );
     }
 
     #[test]
@@ -337,7 +374,7 @@ mod tests {
         );
 
         let decision = evaluate_candidate(&candidate, &config, false, None); // untrusted project!
-        assert_eq!(decision, CandidateDecision::StageForApproval);
+        assert_eq!(decision, CandidateDecision::KeepCandidate);
     }
 
     #[test]
@@ -453,11 +490,11 @@ mod tests {
 
         let user_skill = fixture_skill_record(SkillOrigin::User, LearningScope::Project);
         let decision = evaluate_candidate(&candidate, &config, true, Some(&user_skill));
-        assert_eq!(decision, CandidateDecision::StageForApproval);
+        assert_eq!(decision, CandidateDecision::KeepCandidate);
     }
 
     #[test]
-    fn background_review_patch_without_target_skill_staged_for_approval() {
+    fn background_review_patch_without_target_skill_is_rejected() {
         let config = LearningConfig {
             shadow_mode: false,
             auto_apply_project: true,
@@ -484,11 +521,11 @@ mod tests {
         );
 
         let decision = evaluate_candidate(&candidate, &config, true, None);
-        assert_eq!(decision, CandidateDecision::StageForApproval);
+        assert_eq!(decision, CandidateDecision::Reject);
     }
 
     #[test]
-    fn background_review_support_file_scripts_staged_for_approval() {
+    fn background_review_support_file_scripts_are_kept_not_written() {
         let config = LearningConfig {
             shadow_mode: false,
             auto_apply_project: true,
@@ -517,7 +554,7 @@ mod tests {
         let learned_skill =
             fixture_skill_record(SkillOrigin::LearnedReview, LearningScope::Project);
         let decision = evaluate_candidate(&candidate, &config, true, Some(&learned_skill));
-        assert_eq!(decision, CandidateDecision::StageForApproval);
+        assert_eq!(decision, CandidateDecision::KeepCandidate);
     }
 
     #[test]
