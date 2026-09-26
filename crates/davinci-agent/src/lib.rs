@@ -401,6 +401,10 @@ pub struct Agent {
     pub tools: Vec<String>,
     pub tool_registry: Vec<String>,
     pub skills: Vec<Skill>,
+    /// Named worker profiles the `agent` tool can start, as (name,
+    /// description) in precedence-resolved order. The host fills it from
+    /// user, project and plugin agent directories; the tool schema lists it.
+    pub agent_profiles: Vec<(String, String)>,
     pub templates: Vec<PromptTemplate>,
     pub context_files: Vec<ContextFile>,
     pub session: Option<JsonlSession>,
@@ -554,6 +558,7 @@ impl Agent {
             tools: BUILTIN_TOOLS.iter().map(|t| t.to_string()).collect(),
             tool_registry: BUILTIN_TOOLS.iter().map(|t| t.to_string()).collect(),
             skills: Vec::new(),
+            agent_profiles: Vec::new(),
             templates: Vec::new(),
             context_files: Vec::new(),
             session: None,
@@ -2346,6 +2351,11 @@ impl Agent {
             .collect();
         if let Some(spec) = specs.iter_mut().find(|tool| tool.name == "mcp_read") {
             spec.description = self.tool_context.mcp.mcp_read_description();
+        }
+        if !self.agent_profiles.is_empty() {
+            if let Some(spec) = specs.iter_mut().find(|tool| tool.name == "agent") {
+                crate::subagent::describe_agent_profiles(spec, &self.agent_profiles);
+            }
         }
         specs.extend(
             self.tool_context

@@ -149,9 +149,26 @@ impl ActivePlugins {
     }
 
     /// MCP servers as `plugin_<plugin>_<server>` with plugin variables
-    /// expanded. Entries that do not parse are skipped.
+    /// expanded. Entries that do not parse are skipped; [`Self::diagnostics`]
+    /// names them.
     pub fn mcp_servers(&self) -> BTreeMap<String, davinci_mcp::ServerConfig> {
+        self.parsed_mcp_servers().0
+    }
+
+    /// Load failures and unparseable MCP entries, one line each.
+    pub fn diagnostics(&self) -> Vec<String> {
+        let mut out: Vec<String> = self
+            .errors
+            .iter()
+            .map(|(key, error)| format!("plugin {key} failed to load: {error}"))
+            .collect();
+        out.extend(self.parsed_mcp_servers().1);
+        out
+    }
+
+    fn parsed_mcp_servers(&self) -> (BTreeMap<String, davinci_mcp::ServerConfig>, Vec<String>) {
         let mut out = BTreeMap::new();
+        let mut errors = Vec::new();
         for active in &self.plugins {
             let vars = [
                 (
@@ -169,13 +186,19 @@ impl ActivePlugins {
             ];
             for (server, config) in &active.plugin.mcp_servers {
                 let expanded = expand_strings(config, &vars);
-                if let Ok(parsed) = serde_json::from_value::<davinci_mcp::ServerConfig>(expanded) {
-                    let name = format!("plugin_{}_{}", active.plugin.name, server);
-                    out.insert(name, parsed);
+                match serde_json::from_value::<davinci_mcp::ServerConfig>(expanded) {
+                    Ok(parsed) => {
+                        let name = format!("plugin_{}_{}", active.plugin.name, server);
+                        out.insert(name, parsed);
+                    }
+                    Err(error) => errors.push(format!(
+                        "plugin {} MCP server {server} skipped: {error}",
+                        active.plugin.name
+                    )),
                 }
             }
         }
-        out
+        (out, errors)
     }
 
     /// Approved hooks for one event, with the plugin that owns each.
@@ -316,33 +339,86 @@ impl EventResult {
 /// `(plugin name, text)` pairs of hook output.
 pub type PluginContexts = Vec<(String, String)>;
 
-/// `SessionStart` output for this process and cwd, computed once: resource
-/// discovery runs on every reload and prompt, a session starts once.
-pub fn session_start_context(agent_dir: &Path, cwd: &Path, session_id: &str) -> PluginContexts {
-    static CACHE: OnceLock<Mutex<BTreeMap<PathBuf, PluginContexts>>> = OnceLock::new();
+/// What `SessionStart` hooks produced: context for the model, and warnings
+/// (failed or timed-out hooks) for the user.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SessionStartOutput {
+    pub contexts: PluginContexts,
+    pub warnings: Vec<String>,
+}
+
+/// `SessionStart` output, computed once per cwd, session and set of
+/// approved hooks: resource discovery runs on every reload and prompt, a
+/// session starts once. A new session, or a plugin enabled or approved
+/// mid-session, changes the key and runs the hooks again. Warnings from a
+/// fresh run are also queued for [`take_notices`].
+pub fn session_start_context(
+    plugins: &ActivePlugins,
+    cwd: &Path,
+    session_id: &str,
+) -> SessionStartOutput {
+    type Key = (PathBuf, String, String);
+    static CACHE: OnceLock<Mutex<BTreeMap<Key, SessionStartOutput>>> = OnceLock::new();
+    let hooks = plugins.hooks_for(HookEvent::SessionStart);
+    if hooks.is_empty() {
+        return SessionStartOutput::default();
+    }
+    let fingerprint = hooks
+        .iter()
+        .map(|(active, _)| {
+            format!(
+                "{}@{}",
+                active.key,
+                active.plugin.hooks_digest.as_deref().unwrap_or_default()
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(",");
+    let key = (cwd.to_path_buf(), session_id.to_string(), fingerprint);
     let cache = CACHE.get_or_init(|| Mutex::new(BTreeMap::new()));
-    if let Some(found) = cache.lock().unwrap_or_else(|e| e.into_inner()).get(cwd) {
+    if let Some(found) = cache.lock().unwrap_or_else(|e| e.into_inner()).get(&key) {
         return found.clone();
     }
-    let plugins = active(agent_dir);
-    let contexts = if plugins.has_hooks(HookEvent::SessionStart) {
-        let input = HookInput {
-            session_id: session_id.to_string(),
-            cwd: cwd.to_path_buf(),
-            source: Some("startup".into()),
-            ..HookInput::default()
-        };
-        plugins
-            .run_event(HookEvent::SessionStart, Some("startup"), &input)
-            .contexts
-    } else {
-        Vec::new()
+    let input = HookInput {
+        session_id: session_id.to_string(),
+        cwd: cwd.to_path_buf(),
+        source: Some("startup".into()),
+        ..HookInput::default()
     };
+    let result = plugins.run_event(HookEvent::SessionStart, Some("startup"), &input);
+    let output = SessionStartOutput {
+        contexts: result.contexts,
+        warnings: result.warnings,
+    };
+    pending_notices()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .extend(output.warnings.iter().cloned());
     cache
         .lock()
         .unwrap_or_else(|e| e.into_inner())
-        .insert(cwd.to_path_buf(), contexts.clone());
-    contexts
+        .insert(key, output.clone());
+    output
+}
+
+fn pending_notices() -> &'static Mutex<Vec<String>> {
+    static PENDING: OnceLock<Mutex<Vec<String>>> = OnceLock::new();
+    PENDING.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+/// Plugin warnings not yet shown to the user: `SessionStart` hook failures
+/// since the last call. Each is returned once.
+pub fn take_notices() -> Vec<String> {
+    std::mem::take(&mut *pending_notices().lock().unwrap_or_else(|e| e.into_inner()))
+}
+
+/// Everything about the enabled plugins the user should hear at startup:
+/// plugins that failed to load, MCP entries that did not parse, and pending
+/// hook warnings.
+pub fn startup_warnings(agent_dir: &Path) -> Vec<String> {
+    let mut out = active(agent_dir).diagnostics();
+    out.extend(take_notices());
+    out
 }
 
 /// Session id most recently passed to a hook. The session file is created
@@ -549,6 +625,91 @@ mod tests {
         let plugins = active(&agent_dir);
         std::env::remove_var("DAVINCI_PLUGINS");
         assert!(plugins.errors.is_empty());
+    }
+
+    #[test]
+    fn load_failures_and_bad_mcp_entries_become_diagnostics() {
+        let dir = tempfile::tempdir().unwrap();
+        let _homes = FakeHomes::new(dir.path());
+        let agent_dir = dir.path().join("agent");
+        let root = dir.path().join("demo");
+        write(
+            &root.join(".claude-plugin/plugin.json"),
+            r#"{"name":"demo"}"#,
+        );
+        write(
+            &root.join(".mcp.json"),
+            r#"{"good":{"command":"node"},"bad":{"command":42}}"#,
+        );
+        install_fixture(&agent_dir, &root, false);
+        store::update(&agent_dir, |file| {
+            file.plugins.insert(
+                "ghost@mk".into(),
+                InstalledPlugin {
+                    origin: Origin::Claude,
+                    install_path: None,
+                    version: None,
+                    enabled: true,
+                    hooks_approved: None,
+                    installed_at: 0,
+                },
+            );
+            Ok(())
+        })
+        .unwrap();
+        let plugins = active(&agent_dir);
+        assert!(plugins.mcp_servers().contains_key("plugin_demo_good"));
+        let diagnostics = plugins.diagnostics();
+        assert_eq!(diagnostics.len(), 2, "{diagnostics:?}");
+        assert!(diagnostics[0].starts_with("plugin ghost@mk failed to load"));
+        assert!(diagnostics[1].starts_with("plugin demo MCP server bad skipped"));
+        let warnings = startup_warnings(&agent_dir);
+        assert!(warnings.iter().any(|line| line.contains("ghost@mk")));
+    }
+
+    #[test]
+    fn session_start_gets_the_session_id_reruns_on_change_and_reports_failures() {
+        if hooks::find_bash().is_none() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let _homes = FakeHomes::new(dir.path());
+        let agent_dir = dir.path().join("agent");
+        let cwd = dir.path().join("work");
+        std::fs::create_dir_all(&cwd).unwrap();
+        let root = dir.path().join("greeter");
+        write(
+            &root.join(".claude-plugin/plugin.json"),
+            r#"{"name":"greeter"}"#,
+        );
+        write(
+            &root.join("hooks/hooks.json"),
+            r#"{"hooks":{"SessionStart":[{"hooks":[
+                {"type":"command","command":"sed 's/^/got: /'"},
+                {"type":"command","command":"echo hook-broke >&2; exit 1"}
+            ]}]}}"#,
+        );
+        // Installed but not approved: nothing runs.
+        install_fixture(&agent_dir, &root, false);
+        let output = session_start_context(&active(&agent_dir), &cwd, "sess-1");
+        assert_eq!(output, SessionStartOutput::default());
+
+        // Approved mid-session: the same session now gets its context.
+        install_fixture(&agent_dir, &root, true);
+        let output = session_start_context(&active(&agent_dir), &cwd, "sess-1");
+        assert_eq!(output.contexts.len(), 1, "{output:?}");
+        assert!(output.contexts[0].1.contains("\"session_id\":\"sess-1\""));
+        assert!(output
+            .warnings
+            .iter()
+            .any(|line| line.contains("hook-broke")));
+        assert!(take_notices()
+            .iter()
+            .any(|line| line.contains("hook-broke")));
+
+        // A new session runs the hooks again with its own id.
+        let output = session_start_context(&active(&agent_dir), &cwd, "sess-2");
+        assert!(output.contexts[0].1.contains("\"session_id\":\"sess-2\""));
     }
 
     #[test]

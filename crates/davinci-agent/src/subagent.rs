@@ -128,6 +128,65 @@ pub fn tool_parameters() -> Value {
     })
 }
 
+/// Longest profile description kept in the `agent` tool schema.
+const PROFILE_DESCRIPTION_CHARS: usize = 160;
+/// Most profiles named in the schema; the rest are counted, not listed.
+const LISTED_PROFILES: usize = 32;
+
+/// Name the available agent profiles in the `agent` tool's description and
+/// its `agent` parameter, so the model can pick one without guessing.
+pub fn describe_agent_profiles(spec: &mut crate::AgentTool, profiles: &[(String, String)]) {
+    let mut listing = String::from(
+        "
+
+Available agent profiles (pass one as `agent`):",
+    );
+    for (name, description) in profiles.iter().take(LISTED_PROFILES) {
+        let description = description.split_whitespace().collect::<Vec<_>>().join(" ");
+        let mut short: String = description
+            .chars()
+            .take(PROFILE_DESCRIPTION_CHARS)
+            .collect();
+        if description.chars().count() > PROFILE_DESCRIPTION_CHARS {
+            short.push('…');
+        }
+        if short.is_empty() {
+            listing.push_str(&format!(
+                "
+- {name}"
+            ));
+        } else {
+            listing.push_str(&format!(
+                "
+- {name}: {short}"
+            ));
+        }
+    }
+    if profiles.len() > LISTED_PROFILES {
+        listing.push_str(&format!(
+            "
+- … and {} more",
+            profiles.len() - LISTED_PROFILES
+        ));
+    }
+    spec.description.push_str(&listing);
+    let names: Vec<&str> = profiles.iter().map(|(name, _)| name.as_str()).collect();
+    for pointer in [
+        "/properties/agent",
+        "/properties/tasks/items/properties/agent",
+    ] {
+        if let Some(Value::Object(field)) = spec.parameters.pointer_mut(pointer) {
+            field.insert(
+                "description".into(),
+                Value::String(format!(
+                    "Name of an agent profile. Available: {}",
+                    names.join(", ")
+                )),
+            );
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct SubagentRequest {
     pub prompt: String,
@@ -908,6 +967,31 @@ fn run_journaled_subagent(
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn agent_profiles_are_listed_in_the_agent_tool_schema() {
+        let mut agent = crate::Agent::new_builtin(crate::PromptProfile::Stable);
+        agent.tools = vec!["agent".into()];
+        let plain = agent.builtin_and_mcp_specs();
+        assert!(!plain[0].description.contains("Available agent profiles"));
+        agent.agent_profiles = vec![
+            ("reviewer".into(), "Reviews diffs\n for bugs".into()),
+            ("plugin-helper".into(), String::new()),
+        ];
+        let spec = agent.builtin_and_mcp_specs().remove(0);
+        assert!(spec
+            .description
+            .contains("\n- reviewer: Reviews diffs for bugs\n- plugin-helper"));
+        for pointer in [
+            "/properties/agent/description",
+            "/properties/tasks/items/properties/agent/description",
+        ] {
+            assert_eq!(
+                spec.parameters.pointer(pointer).and_then(Value::as_str),
+                Some("Name of an agent profile. Available: reviewer, plugin-helper"),
+            );
+        }
+    }
 
     #[test]
     fn f03_background_worker_task_authority_follows_lifetime() {

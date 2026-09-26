@@ -4430,6 +4430,7 @@ pub fn run(
     {
         let mut host = host.lock().map_err(|err| err.to_string())?;
         host.runtime_flag_values = crate::flag_values_json(parsed);
+        host.bind_native_session(agent.session.as_ref().map(|store| store.header.id.as_str()));
         host.emit(crate::extension_host::ExtensionEvent::ResourcesDiscover {
             cwd: cwd.display().to_string(),
             reason: "startup".into(),
@@ -5103,6 +5104,9 @@ fn opening_block(
         ..crate::startup::StartupNotices::default()
     };
     out.extend(startup_notice_entries(&notices));
+    out.extend(plugin_warning_entries(
+        davinci_coding_agent::plugins::startup_warnings(&agent_dir),
+    ));
 
     if !crate::settings::is_trusted(&stored, &agent.cwd, parsed.project_trust_override)
         && crate::trust::has_trust_requiring_project_resources(&agent.cwd)
@@ -5133,6 +5137,20 @@ fn opening_block(
     }
 
     out.extend(custom_messages(agent));
+    out
+}
+
+/// Plugin load failures, skipped MCP entries and hook warnings, shown like
+/// the other configuration warnings.
+fn plugin_warning_entries(warnings: Vec<String>) -> Vec<Entry> {
+    let mut out = Vec::new();
+    for warning in warnings {
+        out.push(Entry::Gap);
+        out.push(Entry::notice(
+            State::Attention,
+            &format!("Warning: {warning}"),
+        ));
+    }
     out
 }
 
@@ -5812,8 +5830,9 @@ fn apply_extension_action(
         ExtensionTab::Mcp => manager::mcp_action(&agent_dir, &files, action, key),
     };
     let changed = outcome.is_ok() && action != "info";
-    // Skills, commands and agents from plugins take effect now; hooks are
-    // read per prompt. MCP servers wait for the next session.
+    // Skills, commands, agents and SessionStart context from plugins take
+    // effect now; other hooks are read per prompt. MCP servers wait for the
+    // next session.
     if changed && tab != ExtensionTab::Mcp {
         crate::apply_discovered_resources(shell.parsed, shell.agent);
         shell.model.slash_commands = crate::interactive_slash_commands(shell.agent, shell.parsed);
@@ -5830,14 +5849,20 @@ fn apply_extension_action(
                 .replace("Start a new session or run /reload to load it.", "")
                 .trim()
                 .to_string();
-            if changed && tab == ExtensionTab::Plugins && action != "revoke" {
+            let mut text = if changed && tab == ExtensionTab::Plugins && action != "revoke" {
                 format!(
-                    "{text}\nSkills, commands and agents are updated now. MCP servers and \
-                     SessionStart hooks change in the next session."
+                    "{text}\nSkills, commands, agents and SessionStart hooks are updated now. \
+                     MCP servers change in the next session."
                 )
             } else {
                 text
+            };
+            if changed && tab == ExtensionTab::Plugins {
+                for warning in davinci_coding_agent::plugins::take_notices() {
+                    text.push_str(&format!("\nWarning: {warning}"));
+                }
             }
+            text
         }
         Err(err) => format!("Could not {action}: {err}"),
     };

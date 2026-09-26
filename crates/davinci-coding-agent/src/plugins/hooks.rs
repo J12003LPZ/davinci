@@ -519,7 +519,7 @@ fn build_command_with(
 /// Bash for hook scripts. On Windows only Git Bash (or an explicit path)
 /// qualifies: `System32\bash.exe` is the WSL launcher, which runs in another
 /// filesystem namespace.
-fn find_bash() -> Option<PathBuf> {
+pub(crate) fn find_bash() -> Option<PathBuf> {
     for var in ["DAVINCI_HOOK_BASH", "CLAUDE_CODE_GIT_BASH_PATH"] {
         if let Some(path) = std::env::var_os(var).map(PathBuf::from) {
             if path.is_file() {

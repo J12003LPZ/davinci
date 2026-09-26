@@ -560,7 +560,7 @@ pub fn extract_chunks(messages: &[MemoryMessage], max_chunk_chars: usize) -> Vec
             _ => continue,
         };
         let text = redact_secrets(message.content.trim());
-        if text.is_empty() {
+        if text.is_empty() || is_low_signal(&text) {
             continue;
         }
         let characters = text.chars().collect::<Vec<_>>();
@@ -579,6 +579,133 @@ pub fn extract_chunks(messages: &[MemoryMessage], max_chunk_chars: usize) -> Vec
         }
     }
     chunks
+}
+
+/// Words that carry no fact on their own: acknowledgements, pleasantries and
+/// go-aheads. A message made only of these ("OK", "Done.", "Sure, thanks!")
+/// is chatter; one more word ("build command is make zork") makes it a fact.
+const FILLER_WORDS: &[&str] = &[
+    "a",
+    "absolutely",
+    "ahead",
+    "alright",
+    "all",
+    "am",
+    "and",
+    "anything",
+    "are",
+    "awesome",
+    "be",
+    "bye",
+    "can",
+    "certainly",
+    "cheers",
+    "continue",
+    "cool",
+    "correct",
+    "did",
+    "do",
+    "done",
+    "else",
+    "exactly",
+    "fine",
+    "for",
+    "go",
+    "good",
+    "got",
+    "great",
+    "hello",
+    "help",
+    "hey",
+    "hi",
+    "i",
+    "ill",
+    "im",
+    "is",
+    "it",
+    "its",
+    "just",
+    "k",
+    "kk",
+    "let",
+    "lets",
+    "me",
+    "much",
+    "nice",
+    "no",
+    "nope",
+    "noted",
+    "now",
+    "np",
+    "of",
+    "ok",
+    "okay",
+    "on",
+    "perfect",
+    "please",
+    "proceed",
+    "right",
+    "so",
+    "sounds",
+    "sure",
+    "thank",
+    "thanks",
+    "thx",
+    "that",
+    "thats",
+    "the",
+    "this",
+    "to",
+    "ty",
+    "understood",
+    "very",
+    "we",
+    "will",
+    "with",
+    "works",
+    "wow",
+    "yeah",
+    "yep",
+    "yes",
+    "you",
+    "your",
+    // What a typographic apostrophe leaves behind: "I’ll" splits to "i", "ll".
+    "ll",
+    "m",
+    "re",
+    "s",
+    "ve",
+];
+
+/// A deterministic, conservative low-signal filter for indexing. Only short
+/// messages qualify, and only when every word is filler and nothing looks
+/// technical (digits, paths, identifiers, code). Anything longer, or with a
+/// single non-filler word, is indexed as before.
+pub fn is_low_signal(text: &str) -> bool {
+    let trimmed = text.trim();
+    if trimmed.chars().count() > 80 {
+        return false;
+    }
+    if trimmed.chars().any(|ch| {
+        ch.is_ascii_digit()
+            || matches!(
+                ch,
+                '/' | '\\' | '_' | '=' | '`' | '(' | '{' | '[' | '<' | '#' | '@' | '$'
+            )
+    }) {
+        return false;
+    }
+    let words = trimmed
+        .split(|ch: char| !(ch.is_alphanumeric() || ch == '\''))
+        .map(|word| word.replace('\'', "").to_lowercase())
+        .filter(|word| !word.is_empty())
+        .collect::<Vec<_>>();
+    if words.len() > 8 {
+        return false;
+    }
+    words
+        .iter()
+        .all(|word| FILLER_WORDS.contains(&word.as_str()))
 }
 
 /// A query tokenized once, scored against many records.
@@ -2274,6 +2401,55 @@ pub(crate) mod tests {
         assert_eq!(chunks.len(), 2);
         assert_eq!(chunks[0].kind, MemoryKind::Task);
         assert_eq!(chunks[1].kind, MemoryKind::Decision);
+    }
+
+    #[test]
+    fn acknowledgements_are_low_signal_and_short_facts_are_not() {
+        for chatter in [
+            "OK",
+            "Done.",
+            "Sure",
+            "Thanks!",
+            "ok, thanks",
+            "Sounds good, I’ll do that.",
+            "Yes please, go ahead",
+            "👍",
+        ] {
+            assert!(is_low_signal(chatter), "{chatter:?} should be skipped");
+        }
+        for fact in [
+            "build command is make zork",
+            "Use tabs",
+            "port 8080",
+            "run cargo test",
+            "Done: moved config to src/settings.rs",
+            "no, use sqlite",
+        ] {
+            assert!(!is_low_signal(fact), "{fact:?} should be indexed");
+        }
+    }
+
+    #[test]
+    fn chatter_is_not_indexed_but_short_facts_are() {
+        let chunks = extract_chunks(
+            &[
+                MemoryMessage {
+                    role: "user".into(),
+                    content: "build command is make zork".into(),
+                },
+                MemoryMessage {
+                    role: "assistant".into(),
+                    content: "OK".into(),
+                },
+                MemoryMessage {
+                    role: "user".into(),
+                    content: "Thanks".into(),
+                },
+            ],
+            4_000,
+        );
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0].text, "build command is make zork");
     }
 
     #[test]
