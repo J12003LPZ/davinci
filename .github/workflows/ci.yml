@@ -320,7 +320,9 @@ jobs:
 
   workspace-tests:
     needs: workspace-test-shards
-    if: always()
+    # Do not convert a concurrency-cancelled superseded push into a red
+    # aggregate check. Real shard failures still reach this job and fail below.
+    if: ${{ always() && !cancelled() }}
     runs-on: ubuntu-latest
     steps:
       - name: Require all workspace test shards

@@ -369,7 +369,14 @@ print(os.environ.get('DAVINCI_EVAL_PROMPT_MODEL_POLICY', 'missing'), file=sys.st
             prompt_profile: PromptProfile::Stable,
             prompt_model_policy_override: None,
             permission_mode: "read-only".into(),
-            timeout: Duration::from_millis(250),
+            // Windows hosted runners can spend noticeably longer starting
+            // Python even though stdin is already closed by Stdio::null().
+            // Keep the assertion about EOF semantics, not interpreter startup.
+            timeout: if cfg!(windows) {
+                Duration::from_secs(2)
+            } else {
+                Duration::from_millis(250)
+            },
             clean_agent_dir: dir.path().join("agent"),
             auth_source: None,
             allowed_env: BTreeMap::new(),

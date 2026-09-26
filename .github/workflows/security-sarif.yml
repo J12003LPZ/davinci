@@ -13,6 +13,9 @@ jobs:
       PI_OFFLINE: "1"
       DAVINCI_OFFLINE: "1"
       DAVINCI_SARIF_PYTHON: python
+      # Bypass rust-toolchain component auto-recovery in this Cargo-only job.
+      # The SARIF schema test does not require clippy or rustfmt.
+      RUSTUP_TOOLCHAIN: "1.83.0"
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -21,6 +24,6 @@ jobs:
       - name: Provision test validator
         run: python -m pip install -r scripts/security-sarif-requirements.txt
       - name: Use repository-pinned Rust
-        run: rustup show
+        run: rustup toolchain install 1.83.0 --profile minimal --no-self-update
       - name: Validate native exports against official schema offline
         run: cargo test -p davinci-coding-agent --lib security_sarif_official_schema --locked -- --ignored

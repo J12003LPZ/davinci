@@ -511,7 +511,18 @@ impl<'a> ChangeImpactAnalyzer<'a> {
         let index_res = self.repo.refresh();
         if let Ok(index) = index_res {
             for (file_path, repo_file) in &index.files {
-                for import in &repo_file.imports {
+                // Refresh structural evidence from the live source when
+                // possible. The repository index may legitimately retain a
+                // file entry while its parsed import list is stale during a
+                // just-created test/worktree snapshot.
+                let live_parse = fs::read_to_string(self.root.join(file_path))
+                    .ok()
+                    .and_then(|source| parse_source(file_path, &source).ok());
+                let imports = live_parse
+                    .as_ref()
+                    .map(|parsed| parsed.imports.as_slice())
+                    .unwrap_or(repo_file.imports.as_slice());
+                for import in imports {
                     let source = &import.specifier;
                     for target in files {
                         if import_matches_target(file_path, source, target) && file_path != target {
