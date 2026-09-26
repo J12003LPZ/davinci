@@ -1160,6 +1160,10 @@ mod tests {
 
     #[test]
     fn lsp_output_reaches_shared_governor_and_reset_revokes_it() {
+        // Other graph-hook tests temporarily mutate PI_GRAPH_* process
+        // variables. Serialize with their existing guard so this host is not
+        // misclassified as a graph worker while exercising local LSP.
+        let _env_lock = graph::worker_hooks::submit_test_guard();
         let root = tempfile::tempdir().unwrap();
         let agent = tempfile::tempdir().unwrap();
         std::fs::write(root.path().join("package.json"), "{}").unwrap();
