@@ -315,6 +315,15 @@ impl Agent {
         let mut turns_this_run = 0_u32;
         self.push_event(&mut events, AgentEvent::AgentStart);
         self.push_event(&mut events, AgentEvent::TurnStart);
+        self.push_event(
+            &mut events,
+            AgentEvent::MutationObservation {
+                schema_version: 1,
+                generation: self.mutation_verification_state().mutation_generation,
+                executed_leaf_operations: self.counters.executed_leaf_operations
+                    .load(std::sync::atomic::Ordering::Relaxed),
+            },
+        );
         if let Some(runtime) = &self.runtime {
             runtime.emit_observe(crate::runtime::RuntimeEvent::TurnStarted);
         }
@@ -455,7 +464,19 @@ impl Agent {
             self.stats.model_turns += 1;
             turns_this_run += 1;
             let model_started = std::time::Instant::now();
+            let observations = davinci_ai::provider_observation::ObservationScope::capture();
             let completion = self.complete_with_retry(&mut complete, &mut events);
+            let status = match &completion {
+                Ok((message, _, _, _)) => match message.stop_reason {
+                    Some(StopReason::Error) => "failed",
+                    Some(StopReason::Aborted) => "aborted",
+                    _ => "completed",
+                },
+                Err(_) => "failed",
+            };
+            for observation in observations.finish(status) {
+                self.push_event(&mut events, AgentEvent::ProviderObservation { observation });
+            }
             self.stats.model_wall_ms += model_started.elapsed().as_millis() as u64;
             let (assistant, stream_events, streamed_live, native_responses_resume) =
                 match completion {
@@ -2190,6 +2211,7 @@ impl Agent {
                         receipts.retain(|receipt| receipt.operation_id != id);
                     }
                 }
+                crate::stats::SharedCounters::add(&self.counters.executed_leaf_operations, 1);
                 let mut executed = match execute_tool_with(cwd, name, args, &context) {
                     Ok(result) => result,
                     Err(crate::tools::ToolError::Unknown(_)) => {
@@ -2872,6 +2894,15 @@ impl Agent {
         };
         self.emit_live(end.clone());
         events.push(end);
+        self.push_event(
+            &mut events,
+            AgentEvent::MutationObservation {
+                schema_version: 1,
+                generation: self.mutation_verification_state().mutation_generation,
+                executed_leaf_operations: self.counters.executed_leaf_operations
+                    .load(std::sync::atomic::Ordering::Relaxed),
+            },
+        );
         if let Some(runtime) = &self.runtime {
             runtime.emit_observe(crate::runtime::RuntimeEvent::PostToolUse {
                 call_id: id.to_string(),
@@ -6358,6 +6389,7 @@ mod operation_dispatch_tests {
 
         let snapshot = journal.snapshot().unwrap();
         assert_eq!(snapshot.operations.len(), 3);
+        assert_eq!(agent.counters.executed_leaf_operations.load(std::sync::atomic::Ordering::Relaxed), 2);
         let parent = snapshot
             .operations
             .iter()
@@ -6404,6 +6436,7 @@ mod operation_dispatch_tests {
             Some(true)
         );
         assert!(!workspace.path().join("denied.txt").exists());
+        assert_eq!(agent.counters.executed_leaf_operations.load(std::sync::atomic::Ordering::Relaxed), 0);
 
         let snapshot = journal.snapshot().unwrap();
         assert_eq!(snapshot.operations.len(), 1);
@@ -6522,6 +6555,7 @@ mod operation_dispatch_tests {
             _ => panic!("expected journal replay"),
         };
         assert!(replay.details.as_ref().unwrap()["replayed_from_operation_journal"] == true);
+        assert_eq!(agent.counters.executed_leaf_operations.load(std::sync::atomic::Ordering::Relaxed), 1);
         assert_eq!(
             replay.details.as_ref().unwrap()["_command_receipt"],
             receipt.clone()

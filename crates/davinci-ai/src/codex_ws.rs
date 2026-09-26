@@ -95,8 +95,10 @@ pub fn process_codex_websocket(
         map.insert("type".into(), Value::String("response.create".into()));
     }
     crate::wire_dump::write_current("wire", &outgoing);
+    let observation = crate::provider_observation::Attempt::start("websocket");
     let send = write_text_frame(&mut stream, &outgoing.to_string());
     if let Err(err) = send {
+        observation.finish("failed", None, None);
         release_live_socket(acquired.key, stream, false);
         return Err(err);
     }
@@ -111,11 +113,13 @@ pub fn process_codex_websocket(
     ) {
         Ok(read) => read,
         Err(err) => {
+            observation.finish("failed", None, None);
             release_live_socket(acquired.key, stream, false);
             return Err(err);
         }
     };
     if aborted {
+        observation.finish("aborted", None, message.usage.clone());
         // The socket is mid-response; nothing later can reuse it.
         release_live_socket(acquired.key, stream, false);
         return Ok(CodexWebsocketMessage {
@@ -148,6 +152,10 @@ pub fn process_codex_websocket(
         }
     }
     release_live_socket(acquired.key, stream, keep);
+    observation.finish(
+        if message.stop_reason == Some(StopReason::Error) { "failed" } else { "completed" },
+        None, message.usage.clone(),
+    );
     Ok(CodexWebsocketMessage {
         message,
         native_responses,

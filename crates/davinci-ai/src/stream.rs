@@ -571,6 +571,7 @@ pub fn live_complete_with(
     let body = request_body_with(model, messages, system, tools, options);
     let prepared = crate::responses_request::PreparedProviderRequest::new(body);
     let body = prepared.body();
+    observe_request(model, body);
     if crate::trace::enabled() {
         crate::trace::log(&format!(
             "prepared request segments={} prefix={} bytes={}",
@@ -612,8 +613,17 @@ pub fn live_complete_with(
     );
     let timeout_ms = options.timeout_ms.filter(|ms| *ms > 0);
     let compress_zstd = model.api == "openai-codex-responses";
-    let text = crate::provider_retry::retry_provider_request_controlled(
-        || send_provider_body(&url, &headers, body, timeout_ms, compress_zstd),
+    let (text, observation) = crate::provider_retry::retry_provider_request_controlled(
+        || {
+            let observation = crate::provider_observation::Attempt::start("http");
+            match send_provider_body(&url, &headers, body, timeout_ms, compress_zstd) {
+                Ok(text) => Ok((text, observation)),
+                Err(error) => {
+                    observation.finish("failed", error.status, None);
+                    Err(error)
+                }
+            }
+        },
         crate::provider_retry::ProviderRetryOptions {
             max_retries: options.max_retries.unwrap_or(0),
             max_retry_delay_ms: options.max_retry_delay_ms,
@@ -622,7 +632,23 @@ pub fn live_complete_with(
         |ms| std::thread::sleep(Duration::from_millis(ms)),
     )
     .map_err(|err| err.message)?;
-    Ok(parse_provider_response(model, &text))
+    let message = parse_provider_response(model, &text);
+    observation.finish(
+        if message.stop_reason == Some(StopReason::Error) { "failed" } else { "completed" },
+        None, message.usage.clone(),
+    );
+    Ok(message)
+}
+
+fn observe_request(model: &Model, body: &Value) {
+    use sha2::Digest;
+    let schema_hash = format!("{:x}", sha2::Sha256::digest(
+        serde_json::to_vec(&body.get("tools")).unwrap_or_default()
+    ));
+    let effort = body.pointer("/reasoning/effort").and_then(Value::as_str);
+    crate::provider_observation::begin_request(
+        "coding", &format!("{}/{}", model.provider, model.id), effort, &schema_hash,
+    );
 }
 
 /// Streaming complete: the events the provider sent, replayed after the fact.
@@ -724,6 +750,7 @@ fn live_complete_streaming_with_sink_envelope_inner(
     }
     let prepared = crate::responses_request::PreparedProviderRequest::new(body);
     let body = prepared.body();
+    observe_request(model, body);
     if crate::trace::enabled() {
         crate::trace::log(&format!(
             "prepared stream request segments={} prefix={} bytes={}",
@@ -802,8 +829,17 @@ fn live_complete_streaming_with_sink_envelope_inner(
     let timeout_ms = options.timeout_ms.filter(|ms| *ms > 0);
     let compress_zstd = model.api == "openai-codex-responses";
     crate::trace::log(&format!("sse post {}", crate::trace::redact_url(&url)));
-    let response = crate::provider_retry::retry_provider_request_controlled(
-        || send_provider_request(&url, &headers, body, timeout_ms, compress_zstd),
+    let (response, observation) = crate::provider_retry::retry_provider_request_controlled(
+        || {
+            let observation = crate::provider_observation::Attempt::start("http");
+            match send_provider_request(&url, &headers, body, timeout_ms, compress_zstd) {
+                Ok(response) => Ok((response, observation)),
+                Err(error) => {
+                    observation.finish("failed", error.status, None);
+                    Err(error)
+                }
+            }
+        },
         crate::provider_retry::ProviderRetryOptions {
             max_retries: options.max_retries.unwrap_or(0),
             max_retry_delay_ms: options.max_retry_delay_ms,
@@ -830,7 +866,8 @@ fn live_complete_streaming_with_sink_envelope_inner(
             crate::codex_usage::record(snapshot);
         }
     }
-    match crate::stream_decoder::decoder_for(model).filter(|_| incremental) {
+    let http_status = response.status();
+    let result = (|| match crate::stream_decoder::decoder_for(model).filter(|_| incremental) {
         Some(mut decoder) => {
             let (message, stream_events, native_output) = read_provider_stream(
                 response,
@@ -890,7 +927,17 @@ fn live_complete_streaming_with_sink_envelope_inner(
                 native_responses,
             })
         }
-    }
+    })();
+    let (status, usage) = match &result {
+        Ok(envelope) => (match envelope.message.stop_reason {
+            Some(StopReason::Error) => "failed",
+            Some(StopReason::Aborted) => "aborted",
+            _ => "completed",
+        }, envelope.message.usage.clone()),
+        Err(_) => ("failed", None),
+    };
+    observation.finish(status, Some(http_status), usage);
+    result
 }
 
 /// One raw provider exchange used by the explicit maintainer Codex probe.
@@ -3001,6 +3048,15 @@ mod tests {
 
     #[test]
     fn live_complete_retries_429_with_retry_after() {
+        retry_observation_fixture(false);
+    }
+
+    #[test]
+    fn streaming_retry_observations_match_actual_http_requests() {
+        retry_observation_fixture(true);
+    }
+
+    fn retry_observation_fixture(streaming: bool) {
         use std::io::{Read, Write};
         use std::net::TcpListener;
         use std::sync::atomic::{AtomicU32, Ordering};
@@ -3065,7 +3121,18 @@ mod tests {
             headers: Default::default(),
             source: "test".into(),
         };
-        let message = live_complete_with(
+        let observations = crate::provider_observation::ObservationScope::capture();
+        let complete = |model: &Model, messages: &[ChatMessage], auth: &ResolvedAuth,
+                        system: Option<&str>, tools: &[ToolSpec], options: &StreamOptions| {
+            if streaming {
+                live_complete_streaming_with_sink_envelope(
+                    model, messages, auth, system, tools, options, &mut |_| {},
+                ).map(|envelope| envelope.message)
+            } else {
+                live_complete_with(model, messages, auth, system, tools, options)
+            }
+        };
+        let message = complete(
             &model,
             &[ChatMessage::text("user", "hi")],
             &auth,
@@ -3079,6 +3146,12 @@ mod tests {
         )
         .unwrap();
         assert_eq!(hits.load(Ordering::SeqCst), 2);
+        let observations = observations.finish("completed");
+        assert_eq!(observations.iter().filter(|o| o.kind == "logical_start").count(), 1);
+        let starts: Vec<_> = observations.iter().filter(|o| o.kind == "attempt_start").collect();
+        assert_eq!(starts.len(), 2);
+        assert!(starts.iter().all(|o| o.transport.as_deref() == Some("http") && !o.schema_hash.is_empty()));
+        assert_eq!(observations.iter().filter(|o| o.kind == "attempt_end" && o.http_status == Some(429)).count(), 1);
         assert!(
             content_text(&assistant_to_chat(&message).content).contains("ok")
                 || message.content.iter().any(
