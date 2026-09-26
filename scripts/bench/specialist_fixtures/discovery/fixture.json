@@ -1,0 +1,39 @@
+{
+  "kind": "tool-discovery",
+  "offline": true,
+  "preference_required": false,
+  "queries": [
+    {
+      "expected": [
+        "lsp_definition"
+      ],
+      "mode": "family",
+      "query": "lsp"
+    },
+    {
+      "expected": [],
+      "mode": "exact",
+      "query": "browser_open"
+    }
+  ],
+  "registered": [
+    {
+      "authorized": true,
+      "family": "core",
+      "name": "read",
+      "schema": true
+    },
+    {
+      "authorized": true,
+      "family": "lsp",
+      "name": "lsp_definition",
+      "schema": true
+    },
+    {
+      "authorized": false,
+      "family": "browser",
+      "name": "browser_open",
+      "schema": true
+    }
+  ]
+}

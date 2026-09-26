@@ -227,14 +227,45 @@ def select_tasks(task_set, requested, large_manifest=None):
     if task_set != "legacy":
         if large_manifest is None:
             raise ValueError("large tasks require a frozen manifest")
+        validate_large_manifest(large_manifest)
         large = large_manifest.get("tasks")
-        if (not isinstance(large, list) or not large
-                or any(not isinstance(t, str) or Path(t).name != t
-                       or t in (".", "..") or t in LEGACY_TASKS for t in large)
-                or len(set(large)) != len(large)):
-            raise ValueError("invalid large task membership")
         members = large if task_set == "large" else members + large
     tasks = members if not requested or requested == ["all"] else requested
     if not tasks or any(t not in members for t in tasks) or len(set(tasks)) != len(tasks):
         raise ValueError("requested tasks must be unique members of the frozen task set")
     return list(tasks)
+
+
+def validate_large_manifest(manifest):
+    """Validate the frozen large-stratum contract before selecting tasks."""
+    if not isinstance(manifest, dict) or manifest.get("schema_version") != 1:
+        raise ValueError("invalid large fixture manifest")
+    if manifest.get("task_set") != "large":
+        raise ValueError("large fixture manifest has the wrong task set")
+    tasks = manifest.get("tasks")
+    if (not isinstance(tasks, list) or not tasks
+            or any(not isinstance(task, str) or Path(task).name != task
+                   or task in (".", "..") or task in LEGACY_TASKS for task in tasks)
+            or len(set(tasks)) != len(tasks)):
+        raise ValueError("invalid large task membership")
+    fixtures = manifest.get("fixtures")
+    if not isinstance(fixtures, dict) or set(fixtures) != set(tasks):
+        raise ValueError("large manifest fixtures do not match membership")
+    for task in tasks:
+        entry = fixtures[task]
+        if not isinstance(entry, dict) or entry.get("task_set") != "large":
+            raise ValueError("missing large fixture metadata: " + task)
+        allowed = entry.get("allowed")
+        if (not isinstance(allowed, list) or not allowed
+                or any(not isinstance(path, str) or Path(path).name in (".", "..")
+                       or Path(path).is_absolute() or ".." in Path(path).parts
+                       for path in allowed)):
+            raise ValueError("invalid large allowlist: " + task)
+        for field in ("public_hash", "reference_solution_hash", "hidden_grader_hash"):
+            value = entry.get(field)
+            if (not isinstance(value, str) or len(value) != 64
+                    or re.fullmatch(r"[0-9a-f]{64}", value) is None):
+                raise ValueError("invalid large fixture hash: " + task)
+        if not isinstance(entry.get("public_verification"), str) or not entry["public_verification"].strip():
+            raise ValueError("missing public verification: " + task)
+    return True

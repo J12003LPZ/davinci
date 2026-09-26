@@ -18,6 +18,7 @@ This is a maintainer tool, never a test: it starts real harnesses and spends
 model usage on both the davinci and the Codex CLI accounts.
 """
 import argparse
+import hashlib
 import json
 import os
 import re
@@ -32,7 +33,7 @@ from observations import activity
 from campaign import LEGACY_TASKS, COMPARABLE, fixture_manifest, schedule, task_success, manifest_errors, paired_metrics, file_hash, digest, metric
 from runner import (create_campaign, isolate_settings, controlled_environment, select_tasks,
                     execute, BASE_SETTINGS, agent_source, campaign_identity, stop_reason,
-                    pin_model_store, model_stop_reason)
+                    pin_model_store, model_stop_reason, validate_large_manifest)
 from codex_otel import Collector, request_metrics
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -332,9 +333,52 @@ def run_one(harness, tid, rep, campaign=None):
     return result
 
 
-def validate():
+def directory_hash(directory):
+    """Hash one generated fixture tree without exposing its contents."""
+    digest_value = hashlib.sha256()
+    directory = Path(directory).resolve()
+    for path in sorted(path for path in directory.rglob("*") if path.is_file()):
+        digest_value.update(path.relative_to(directory).as_posix().encode("utf-8"))
+        digest_value.update(b"\0")
+        digest_value.update(path.read_bytes())
+        digest_value.update(b"\0")
+    return digest_value.hexdigest()
+
+
+def validate_fixture_manifest(task_ids, large_manifest):
+    """Check generated task metadata and hashes before running graders."""
+    if large_manifest is None:
+        return []
+    validate_large_manifest(large_manifest)
+    errors = []
+    for tid in task_ids:
+        metadata = load(tid)
+        expected = large_manifest["fixtures"][tid]
+        for field in ("task_set", "allowed", "public_verification"):
+            if metadata.get(field) != expected.get(field):
+                errors.append(f"{tid}: metadata mismatch for {field}")
+        for directory, field in (("repo", "public_hash"), ("solution", "reference_solution_hash"),
+                                 ("hidden", "hidden_grader_hash")):
+            actual = directory_hash(Path(TASKS) / tid / directory)
+            if actual != expected.get(field):
+                errors.append(f"{tid}: {directory} hash does not match frozen manifest")
+        allowed = set(metadata.get("allowed", []))
+        repo = Path(TASKS) / tid / "repo"
+        missing = sorted(path for path in allowed if not (repo / path).is_file())
+        if missing:
+            errors.append(f"{tid}: allowlist paths missing from public repo: {missing}")
+    return errors
+
+
+def validate(task_set="legacy", large_manifest=None):
+    task_ids = select_tasks(task_set, ["all"], large_manifest)
+    manifest_errors = validate_fixture_manifest(task_ids, large_manifest) if task_set != "legacy" else []
+    if manifest_errors:
+        for error in manifest_errors:
+            print("FAIL " + error)
+        sys.exit(1)
     bad = 0
-    for tid in task_ids():
+    for tid in task_ids:
         d = os.path.join(RUNS, "_validate", tid)
         prepare(tid, d)
         before = grade(tid, d)
@@ -507,7 +551,11 @@ def main():
     ap.add_argument("--candidate")
     args = ap.parse_args()
     if args.mode == "validate":
-        validate()
+        large = json.loads(Path(args.large_manifest).read_text(encoding="utf-8")) if args.large_manifest else None
+        try:
+            validate(args.task_set, large)
+        except ValueError as error:
+            ap.error(str(error))
     elif args.mode == "report":
         report()
     elif args.mode == "gate":

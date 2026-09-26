@@ -1,0 +1,27 @@
+{
+  "fixtures": {
+    "browser": {
+      "fixture_hash": "cdfdae117ea5a17e42e623744c7491eb36571317f7fb890945130adff6067a6a",
+      "kind": "browser-availability",
+      "offline": true,
+      "path": "specialist_fixtures/browser/fixture.json",
+      "preference_required": false
+    },
+    "discovery": {
+      "fixture_hash": "33b7f1c7544ea049c3b8b931f31024cb05cbb7d4bb2e70da2cda956578f63e43",
+      "kind": "tool-discovery",
+      "offline": true,
+      "path": "specialist_fixtures/discovery/fixture.json",
+      "preference_required": false
+    },
+    "lsp": {
+      "fixture_hash": "b3d49f99a89e98134350733f9607fea89fd9116e59dcba650581717db123552f",
+      "kind": "lsp-availability",
+      "offline": true,
+      "path": "specialist_fixtures/lsp/fixture.json",
+      "preference_required": false
+    }
+  },
+  "preference_is_functional_requirement": false,
+  "schema_version": 1
+}

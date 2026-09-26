@@ -160,6 +160,24 @@ class RunnerTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             runner.select_tasks("legacy", ["t1-intervals", "t1-intervals"])
 
+    def test_large_selection_requires_frozen_metadata(self):
+        manifest = {
+            "schema_version": 1,
+            "task_set": "large",
+            "tasks": ["m-fixture"],
+            "fixtures": {"m-fixture": {
+                "task_set": "large", "allowed": ["main.py"],
+                "public_verification": "python -m pytest -q",
+                "public_hash": "a" * 64,
+                "reference_solution_hash": "b" * 64,
+                "hidden_grader_hash": "c" * 64,
+            }},
+        }
+        self.assertEqual(runner.select_tasks("large", ["all"], manifest), ["m-fixture"])
+        broken = dict(manifest, fixtures={})
+        with self.assertRaises(ValueError):
+            runner.select_tasks("large", ["all"], broken)
+
 
 if __name__ == "__main__":
     unittest.main()

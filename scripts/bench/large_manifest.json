@@ -1,0 +1,99 @@
+{
+  "fixtures": {
+    "m1-config-parser": {
+      "allowed": [
+        "config_parser.py",
+        "config_loader.py",
+        "config_cli.py",
+        "tests/test_public_config.py",
+        "README.md"
+      ],
+      "hidden_grader_hash": "389c08e374d89d4e32888d23fbac3e0a1ad1168ee96403068b6edfa1174f2981",
+      "public_hash": "b9fa3c0cdc3077378b413ebeea88475d8af05703882108be658d244358c53e05",
+      "public_verification": "python -m pytest -q tests/test_public_config.py",
+      "reference_solution_hash": "4f8a8dc4b07ef73a086bdd0ab2d75caf17e87042e4f8d3c40df35bc95c7e28aa",
+      "task_set": "large"
+    },
+    "m2-public-api-migration": {
+      "allowed": [
+        "userlib/core.py",
+        "userlib/exports.py",
+        "userlib/reports.py",
+        "userlib/notifications.py",
+        "userlib/cli_helpers.py",
+        "userlib/api.py",
+        "userlib/__init__.py",
+        "cli.py",
+        "README.md",
+        "tests/test_public_api.py"
+      ],
+      "hidden_grader_hash": "83cfed783d4fd31e11252887bd76be1ed236b639f86d4a666170dd7aa783f8aa",
+      "public_hash": "92453dc232b8903941a3c6b349ee0dd8157ee092dcc88c72d4626bf4e2bb8c2b",
+      "public_verification": "python -m pytest -q tests/test_public_api.py",
+      "reference_solution_hash": "c7ac5263ba7d26f975f635e835bafb97d004e4c82d60120fe992c2cde36a19b8",
+      "task_set": "large"
+    },
+    "m3-state-persistence": {
+      "allowed": [
+        "state_core/model.py",
+        "state_core/service.py",
+        "state_persistence/json_store.py",
+        "state_persistence/transaction.py",
+        "app.py",
+        "tests/test_public_state.py"
+      ],
+      "hidden_grader_hash": "6b21d18e846cf2edede7a1fd204bb5f085d2c20d7dba42da8da554b96a523a84",
+      "public_hash": "1131faf7fbbc2615f7794b0c451776b29cd591295630dbc1a7f8fb67deebe37a",
+      "public_verification": "python -m pytest -q tests/test_public_state.py",
+      "reference_solution_hash": "716de3c4eb424d8aada9754dfbad4087f94be0bf1aab2cf460809a20a0bfbdf7",
+      "task_set": "large"
+    },
+    "m4-cli-feature": {
+      "allowed": [
+        "inventory/config.py",
+        "inventory/args.py",
+        "inventory/domain.py",
+        "inventory/output.py",
+        "cli.py",
+        "tests/test_public_cli.py"
+      ],
+      "hidden_grader_hash": "aefab0bf2c6291f527acaaa2325a5e296d06ee0d31fe79dbee417b5bbdf020a4",
+      "public_hash": "7231ad359f8ad8b6c3a8c44515ff28d0d52961915206e27ff1853233f702d506",
+      "public_verification": "python -m pytest -q tests/test_public_cli.py",
+      "reference_solution_hash": "f11e48324df22dfc0b114a555d4fcbbf20253de62491f1809915321f3a6ca095",
+      "task_set": "large"
+    }
+  },
+  "generator": "scripts/bench/make_large_tasks.py",
+  "schema_version": 1,
+  "specialist_fixtures": {
+    "browser": {
+      "fixture_hash": "cdfdae117ea5a17e42e623744c7491eb36571317f7fb890945130adff6067a6a",
+      "kind": "browser-availability",
+      "offline": true,
+      "path": "specialist_fixtures/browser/fixture.json",
+      "preference_required": false
+    },
+    "discovery": {
+      "fixture_hash": "33b7f1c7544ea049c3b8b931f31024cb05cbb7d4bb2e70da2cda956578f63e43",
+      "kind": "tool-discovery",
+      "offline": true,
+      "path": "specialist_fixtures/discovery/fixture.json",
+      "preference_required": false
+    },
+    "lsp": {
+      "fixture_hash": "b3d49f99a89e98134350733f9607fea89fd9116e59dcba650581717db123552f",
+      "kind": "lsp-availability",
+      "offline": true,
+      "path": "specialist_fixtures/lsp/fixture.json",
+      "preference_required": false
+    }
+  },
+  "task_set": "large",
+  "tasks": [
+    "m1-config-parser",
+    "m2-public-api-migration",
+    "m3-state-persistence",
+    "m4-cli-feature"
+  ]
+}

@@ -42,6 +42,21 @@ reference success offline. Keep its output directory separate from live runs.
 `--help` lists the command options. Offline regression tests run through
 `python -m unittest discover -s scripts/bench/tests`.
 
+The larger stratum is generated separately so the legacy membership stays
+frozen. Run `python scripts/bench/make_large_tasks.py` once before the first
+model-behavior arm, review and retain `scripts/bench/large_manifest.json`, then
+validate it with:
+
+```text
+python scripts/bench/bench.py validate --task-set large --large-manifest scripts/bench/large_manifest.json
+```
+
+The manifest records each public allowlist, public verification command, and
+the hashes of the public starter, reference solution, and hidden grader. The
+offline discovery, LSP, and browser fixtures under
+`scripts/bench/specialist_fixtures/` describe availability and authorization;
+they do not make a specialist-tool preference a functional requirement.
+
 DaVinci uses a per-campaign agent directory containing only copied credentials
 and explicit settings. For a model absent from the executable's built-in catalog,
 pass `--model-store <existing-models-store.json>`. The runner pins only the exact
