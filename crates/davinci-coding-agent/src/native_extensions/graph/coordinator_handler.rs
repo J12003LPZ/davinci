@@ -319,7 +319,10 @@ mod tests {
             .unwrap();
         let id = &started["process"]["id"];
         let marker = dir.path().join("relative-script.ok");
-        let until = Instant::now() + Duration::from_secs(5);
+        // Full Windows workspace tests run many process-heavy tests in
+        // parallel. Wait for the managed child rather than assuming Node gets
+        // scheduled within five seconds, while keeping the regression bounded.
+        let until = Instant::now() + Duration::from_secs(30);
         loop {
             if marker.is_file() {
                 assert_eq!(
@@ -328,13 +331,28 @@ mod tests {
                 );
                 break;
             }
-            if Instant::now() >= until {
-                let status = worker.client().call("process_status", &json!({"id":id}));
+
+            let status = worker
+                .client()
+                .call("process_status", &json!({"id":id}))
+                .expect("managed process status");
+            let state = status
+                .details
+                .as_ref()
+                .and_then(|details| details["state"].as_str())
+                .unwrap_or("unknown");
+            if state == "exited" || Instant::now() >= until {
+                let output = worker
+                    .client()
+                    .call(
+                        "process_output",
+                        &json!({"id":id,"cursor":0,"maxBytes":16384}),
+                    );
                 panic!(
-                    "relative script did not run from canonical workspace; process status: {status:?}"
+                    "relative script did not run from canonical workspace; state={state}; status={status:?}; output={output:?}"
                 );
             }
-            std::thread::sleep(Duration::from_millis(10));
+            std::thread::sleep(Duration::from_millis(25));
         }
     }
 
