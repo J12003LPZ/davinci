@@ -1137,6 +1137,12 @@ impl Agent {
         tool_calls: Vec<(String, String, Value)>,
         events: &mut Vec<AgentEvent>,
     ) -> Vec<ChatMessage> {
+        // Provider history retains the original spelling and call ID. Every
+        // downstream decision uses this shared ingress interpretation.
+        let tool_calls: Vec<_> = tool_calls
+            .into_iter()
+            .map(|(id, name, args)| (id, self.canonical_tool_name(&name).to_owned(), args))
+            .collect();
         if tool_calls
             .iter()
             .any(|(_, name, _)| matches!(name.as_str(), "propose_plan" | "ask_user_question"))
@@ -1581,6 +1587,7 @@ impl Agent {
         depth: usize,
         origin: crate::ToolOperationOrigin,
     ) -> Preparation {
+        let name = self.canonical_tool_name(name);
         if let Some(raw) = args.get(davinci_ai::INVALID_ARGUMENTS_KEY) {
             let raw = raw.as_str().unwrap_or("<unavailable>");
             return Preparation::Immediate(crate::ToolResult {
@@ -1946,6 +1953,7 @@ impl Agent {
         args: &Value,
         depth: usize,
     ) -> crate::ToolResult {
+        let name = self.canonical_tool_name(name);
         let pending = self
             .pending_tool_operations
             .lock()
@@ -2586,6 +2594,7 @@ impl Agent {
         args: &Value,
         mut result: crate::ToolResult,
     ) -> (ChatMessage, Vec<AgentEvent>) {
+        let name = self.canonical_tool_name(name);
         let terminal_markers = ["denied", "cancelled"].map(|key| {
             (
                 key,
@@ -6691,6 +6700,150 @@ mod operation_dispatch_tests {
         assert_eq!(
             replay.details.as_ref().unwrap()["_command_receipt"],
             receipt.clone()
+        );
+    }
+}
+
+#[cfg(test)]
+mod tool_name_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn tool_name_direct_execution_hooks_mutations_and_replay() {
+        let root = tempfile::tempdir().unwrap();
+        let mut agent = Agent::new("alias dispatch");
+        agent.set_permission_mode(crate::PermissionMode::AlwaysApprove);
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let hook_seen = seen.clone();
+        agent.post_tool = Some(crate::PostToolHook(std::sync::Arc::new(
+            move |id, _, name, _, result| {
+                hook_seen
+                    .lock()
+                    .unwrap()
+                    .push((id.to_string(), name.to_string()));
+                result
+            },
+        )));
+        let args = json!({"path":"alias.txt", "content":"first"});
+        let mut events = Vec::new();
+        let result = agent.execute_tool_batch(
+            root.path(),
+            vec![("same-id".into(), "functions.write".into(), args.clone())],
+            &mut events,
+        );
+        assert_eq!(result[0].is_error, Some(false));
+        assert_eq!(
+            std::fs::read_to_string(root.path().join("alias.txt")).unwrap(),
+            "first"
+        );
+        assert_eq!(
+            *seen.lock().unwrap(),
+            vec![("same-id".into(), "write".into())]
+        );
+        assert_eq!(
+            agent
+                .mutation_verification
+                .lock()
+                .unwrap()
+                .mutation_generation,
+            1
+        );
+        // Round-trip the persisted ledger before a recovered canonical call.
+        let saved = serde_json::to_value(&*agent.tool_ledger.lock().unwrap()).unwrap();
+        *agent.tool_ledger.lock().unwrap() = serde_json::from_value(saved).unwrap();
+        // The mutating-tool replay policy still requires reconciliation.
+        std::fs::write(root.path().join("alias.txt"), "external change").unwrap();
+        let result = agent.execute_tool_batch(
+            root.path(),
+            vec![("same-id".into(), "write".into(), args)],
+            &mut events,
+        );
+        assert_eq!(result[0].is_error, Some(true));
+        assert!(format!("{:?}", result[0]).contains("Reconcile the tool state"));
+        assert_eq!(
+            std::fs::read_to_string(root.path().join("alias.txt")).unwrap(),
+            "external change"
+        );
+        assert_eq!(
+            agent
+                .mutation_verification
+                .lock()
+                .unwrap()
+                .mutation_generation,
+            1
+        );
+    }
+
+    #[test]
+    fn tool_name_denial_exact_shadow_and_serial_lane() {
+        let root = tempfile::tempdir().unwrap();
+        let mut agent = Agent::new("alias policy");
+        agent.set_permission_mode(crate::PermissionMode::ReadOnly);
+        let args = json!({"path":"never.txt","content":"denied"});
+        let denied = agent.prepare_tool_call(root.path(), "deny", "functions.write", &args, 0);
+        assert!(
+            matches!(denied, Preparation::Immediate(ref r) if r.is_error && r.details.as_ref().is_some_and(|d| d["denied"] == true))
+        );
+        assert!(!root.path().join("never.txt").exists());
+        agent.set_permission_mode(crate::PermissionMode::AlwaysApprove);
+        assert!(matches!(
+            agent.prepare_tool_call(root.path(), "serial", "functions.write", &args, 0),
+            Preparation::Ready {
+                lane: crate::scheduler::ToolLane::Serial
+            }
+        ));
+        agent.tool_registry.push("functions.read".into());
+        let shadow = agent.prepare_tool_call(
+            root.path(),
+            "shadow",
+            "functions.read",
+            &json!({"path":"never.txt"}),
+            0,
+        );
+        assert!(
+            matches!(shadow, Preparation::Immediate(ref r) if r.is_error && r.content.contains("Unknown tool"))
+        );
+        agent.tools.push("functions.read".into());
+        agent.pre_tool = Some(crate::PreToolHook(std::sync::Arc::new(|name, _| {
+            (name == "functions.read").then(|| "exact registration denied".into())
+        })));
+        let denied = agent.prepare_tool_call(
+            root.path(),
+            "exact-deny",
+            "functions.read",
+            &json!({"path":"never.txt"}),
+            0,
+        );
+        assert!(
+            matches!(denied, Preparation::Immediate(ref r) if r.is_error && r.content.contains("exact registration denied"))
+        );
+    }
+
+    #[test]
+    fn tool_name_batch_aliases_preserve_order_and_block_recursion() {
+        let root = tempfile::tempdir().unwrap();
+        let mut agent = Agent::new("alias batch");
+        agent.set_permission_mode(crate::PermissionMode::AlwaysApprove);
+        let result = agent.run_batch(root.path(), "batch-id", &json!({"operations":[
+            {"tool":"functions.write","args":{"path":"ordered.txt","content":"created"}},
+            {"tool":"functions.read","args":{"path":"ordered.txt"}},
+            {"tool":"functions.batch","args":{"operations":[{"tool":"write","args":{"path":"nested.txt","content":"bad"}}]}}
+        ]}));
+        let operations = &result.details.as_ref().unwrap()["operations"];
+        assert_eq!(operations[0]["status"], "ok");
+        assert_eq!(operations[1]["status"], "ok");
+        assert_eq!(operations[2]["status"], "error");
+        assert!(result.content.contains("created"));
+        assert!(result.content.contains("cannot run inside a batch"));
+        assert!(!root.path().join("nested.txt").exists());
+        assert_eq!(
+            agent
+                .mutation_verification
+                .lock()
+                .unwrap()
+                .mutation_generation,
+            1
         );
     }
 }

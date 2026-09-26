@@ -39,6 +39,7 @@ mod subagent;
 mod templates;
 pub mod todo;
 pub mod tool_ledger;
+mod tool_name;
 pub mod tools;
 mod transaction_verification;
 mod turn;

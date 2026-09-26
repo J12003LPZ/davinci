@@ -3795,3 +3795,46 @@ fn harness_rerun_preserves_context_and_stops_on_cancellation() {
     assert_eq!(harness_runs(&agent), 1);
     assert!(reminders(&agent).is_empty());
 }
+
+#[test]
+fn tool_name_scripted_aliases_need_no_recovery_request() {
+    for batched in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let mut agent = verifying_agent(dir.path());
+        agent.prompt("write and check");
+        let check = if cfg!(windows) {
+            "functions.powershell"
+        } else {
+            "functions.bash"
+        };
+        let edit_args =
+            serde_json::json!({"path":"changed.py", "content":"def f(x): return x * 2\n"});
+        let check_args =
+            serde_json::json!({"command":"python -c \"from changed import f; assert f(2) == 4\""});
+        let operations = if batched {
+            vec![(
+                "functions.batch",
+                serde_json::json!({"operations":[
+                    {"tool":"functions.write","args":edit_args},
+                    {"tool":check,"args":check_args}
+                ]}),
+            )]
+        } else {
+            vec![("functions.write", edit_args), (check, check_args)]
+        };
+        let mut script = scripted_tool_calls(operations);
+        let mut calls = 0;
+        let outcome = agent
+            .run_loop(|current| {
+                calls += 1;
+                script(current)
+            })
+            .unwrap();
+        assert_eq!(calls, if batched { 2 } else { 3 });
+        assert_eq!(harness_runs(&agent), 0);
+        assert!(reminders(&agent).is_empty());
+        assert_eq!(agent.completion_evidence(), CompletionEvidence::Verified);
+        assert!(tool_outcomes(&outcome).iter().all(|(_, error, _)| !error));
+        assert!(format!("{:?}", agent.messages).contains("functions."));
+    }
+}

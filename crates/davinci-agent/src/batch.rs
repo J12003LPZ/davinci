@@ -152,7 +152,13 @@ impl Agent {
         parent_operation_id: Option<crate::runtime::operations::OperationId>,
     ) -> ToolResult {
         let operations = match parse_operations(input) {
-            Ok(operations) => operations,
+            Ok(operations) => operations
+                .into_iter()
+                .map(|operation| Operation {
+                    tool: self.canonical_tool_name(&operation.tool).to_owned(),
+                    args: operation.args,
+                })
+                .collect::<Vec<_>>(),
             Err(message) => {
                 return ToolResult {
                     content: message,
