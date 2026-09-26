@@ -165,6 +165,86 @@ pub fn pan(model: &mut crate::davinci::model::Model, layout: &GraphLayout, dx: i
     }
 }
 
+/// Keys the command center owns before the composer sees them: Tab and
+/// Shift+Tab step the filter tabs while the agents have focus, Tab from the
+/// composer hands focus back, `i` focuses the composer and `?` toggles the
+/// key reference.
+pub fn handle_command_center_key(
+    model: &mut crate::davinci::model::Model,
+    key: crossterm::event::KeyEvent,
+) -> bool {
+    use crossterm::event::{KeyCode, KeyModifiers};
+    let plain = key.modifiers.is_empty();
+    let shifted = (key.modifiers - KeyModifiers::SHIFT).is_empty();
+    let agents_focused = !model.graph_canvas.input_focus;
+    match key.code {
+        KeyCode::Tab if plain && !agents_focused => {
+            if model.suggestions.is_some() {
+                return false;
+            }
+            model.graph_canvas.input_focus = false;
+            model.refresh_suggestions();
+        }
+        KeyCode::Tab | KeyCode::BackTab if agents_focused && shifted => {
+            let forward = key.code == KeyCode::Tab && plain;
+            step_filter(model, forward);
+        }
+        KeyCode::Char('i') if agents_focused && plain => {
+            model.graph_canvas.input_focus = true;
+            model.refresh_suggestions();
+        }
+        KeyCode::Char('?') if agents_focused && shifted => {
+            model.graph_canvas.show_help = !model.graph_canvas.show_help;
+            model.graph_canvas.inspector_scroll = 0;
+        }
+        _ => return false,
+    }
+    true
+}
+
+/// Move to the next (or previous) filter tab. A selection the new filter
+/// leaves out moves to the first agent it admits, in reading order.
+pub fn step_filter(model: &mut crate::davinci::model::Model, forward: bool) {
+    use crate::davinci::model::{GraphBucket, GraphFilter};
+    let Some(run) = model.graph_run.as_ref() else {
+        return;
+    };
+    let attention = run.bucket_count(GraphFilter::Only(GraphBucket::Attention)) > 0;
+    let filter = model.graph_canvas.filter.step(forward, attention);
+    model.graph_canvas.filter = filter;
+    model.graph_canvas.inspector_scroll = 0;
+    let admitted = |run: &GraphRunSheet, id: &str| {
+        run.tasks
+            .iter()
+            .find(|t| t.id == id)
+            .is_some_and(|t| filter.admits(run.bucket(t)))
+    };
+    let keeps = run
+        .selected_node_id
+        .as_deref()
+        .is_some_and(|id| admitted(run, id));
+    if keeps || filter == GraphFilter::All {
+        return;
+    }
+    let Some(layout) = super::graph_run::layout_for(model, model.height.saturating_sub(3)) else {
+        return;
+    };
+    let run = model.graph_run.as_mut().unwrap();
+    let mut nodes: Vec<_> = layout.nodes.iter().collect();
+    nodes.sort_by_key(|n| (n.row, n.col, n.task_index));
+    let first = nodes
+        .into_iter()
+        .flat_map(|n| n.members.iter())
+        .find(|id| admitted(run, id))
+        .cloned();
+    if let Some(id) = first {
+        model.graph_canvas.selected_group = None;
+        run.selected_index = run.tasks.iter().position(|t| t.id == id).unwrap_or(0);
+        run.selected_node_id = Some(id);
+        model.graph_canvas.follow_live = false;
+    }
+}
+
 pub fn handle_key(
     model: &mut crate::davinci::model::Model,
     key: crossterm::event::KeyEvent,
@@ -196,6 +276,7 @@ pub fn handle_key(
         .unwrap();
     match key.code {
         KeyCode::Char('g') => {
+            model.graph_canvas.show_help = false;
             model.graph_canvas.inspecting_goal = !model.graph_canvas.inspecting_goal;
             model.graph_canvas.inspector_scroll = 0;
         }
@@ -212,6 +293,7 @@ pub fn handle_key(
         }
         KeyCode::Up | KeyCode::Down | KeyCode::Left | KeyCode::Right => {
             model.graph_canvas.inspecting_goal = false;
+            model.graph_canvas.show_help = false;
             let direction = match key.code {
                 KeyCode::Up => NavDirection::Up,
                 KeyCode::Down => NavDirection::Down,
@@ -245,6 +327,11 @@ pub fn handle_key(
             model.graph_canvas.inspector_scroll = 0;
         }
         KeyCode::Esc => {
+            if model.graph_canvas.show_help {
+                model.graph_canvas.show_help = false;
+                model.graph_canvas.inspector_scroll = 0;
+                return true;
+            }
             if model.graph_canvas.inspecting_goal {
                 model.graph_canvas.inspecting_goal = false;
                 model.graph_canvas.inspector_scroll = 0;
@@ -306,47 +393,48 @@ pub fn move_selection(
     selected: Option<&str>,
     direction: NavDirection,
 ) -> Option<String> {
-    let Some((index, current)) = layout
-        .nodes
-        .iter()
-        .enumerate()
-        .find(|(_, n)| Some(n.id.as_str()) == selected)
-    else {
-        return layout.nodes.first().map(|n| n.id.clone());
+    move_selection_where(layout, selected, direction, |_| true)
+}
+
+/// Arrow keys follow the card grid: Left/Right step through reading order
+/// (wrapping between rows), Up/Down move to the nearest card on the closest
+/// row above or below. Cards `admit` rejects are skipped.
+pub fn move_selection_where(
+    layout: &GraphLayout,
+    selected: Option<&str>,
+    direction: NavDirection,
+    admit: impl Fn(&super::graph_layout::LayoutNode) -> bool,
+) -> Option<String> {
+    let mut order: Vec<_> = layout.nodes.iter().filter(|n| admit(n)).collect();
+    order.sort_by_key(|n| (n.row, n.col, n.task_index));
+    let Some(at) = order.iter().position(|n| Some(n.id.as_str()) == selected) else {
+        return order.first().map(|n| n.id.clone());
     };
-    let semantic: Vec<_> = layout
-        .edges
-        .iter()
-        .filter_map(|e| match direction {
-            NavDirection::Left if e.to == index => Some(e.from),
-            NavDirection::Right if e.from == index => Some(e.to),
-            _ => None,
-        })
-        .collect();
-    layout
-        .nodes
-        .iter()
-        .enumerate()
-        .filter(|(i, n)| {
-            if !semantic.is_empty() {
-                return semantic.contains(i);
-            }
-            match direction {
-                NavDirection::Left => n.depth < current.depth,
-                NavDirection::Right => n.depth > current.depth,
-                NavDirection::Up => n.depth == current.depth && n.rect.y < current.rect.y,
-                NavDirection::Down => n.depth == current.depth && n.rect.y > current.rect.y,
-            }
-        })
-        .min_by_key(|(_, n)| {
-            (
-                n.rect.x.abs_diff(current.rect.x) as u32 + n.rect.y.abs_diff(current.rect.y) as u32,
-                n.task_index,
-                &n.id,
-            )
-        })
-        .map(|(_, n)| n.id.clone())
-        .or_else(|| Some(current.id.clone()))
+    let current = order[at];
+    let centre = |n: &super::graph_layout::LayoutNode| n.rect.x as i32 + n.rect.width as i32 / 2;
+    let next = match direction {
+        NavDirection::Right => order.get(at + 1).copied(),
+        NavDirection::Left => at.checked_sub(1).map(|i| order[i]),
+        NavDirection::Down | NavDirection::Up => order
+            .iter()
+            .map(|n| n.row)
+            .filter(|&row| {
+                if direction == NavDirection::Down {
+                    row > current.row
+                } else {
+                    row < current.row
+                }
+            })
+            .min_by_key(|&row| row.abs_diff(current.row))
+            .and_then(|row| {
+                order
+                    .iter()
+                    .copied()
+                    .filter(|n| n.row == row)
+                    .min_by_key(|n| ((centre(n) - centre(current)).abs(), n.col))
+            }),
+    };
+    Some(next.unwrap_or(current).id.clone())
 }
 
 /// Fit the active bounding region when it fits; otherwise use the first active
@@ -379,7 +467,7 @@ pub fn viewport(
     let Some(first) = active
         .iter()
         .copied()
-        .min_by_key(|n| (n.rect.x, n.rect.y))
+        .min_by_key(|n| (n.rect.y, n.rect.x))
         .or_else(|| {
             layout
                 .nodes
@@ -395,10 +483,30 @@ pub fn viewport(
     } else {
         first.rect
     };
-    clamp(
+    let (x, y) = clamp(
         target.x as i32 - layout.canvas.width.saturating_sub(target.width) as i32 / 2,
         target.y as i32 - layout.canvas.height.saturating_sub(target.height) as i32 / 2,
-    )
+    );
+    (x, snap_to_row(layout, y, target))
+}
+
+/// A viewport top that starts on a card row, so the first visible cards show
+/// their titles rather than a cut through their middle. `keep` stays fully
+/// visible when it fits; the content's end still clamps the result.
+pub fn snap_to_row(layout: &GraphLayout, y: i32, keep: ratatui::layout::Rect) -> i32 {
+    let height = layout.canvas.height as i32;
+    let fits = |top: i32| top <= keep.y as i32 && keep.bottom() as i32 <= top + height;
+    let tops: std::collections::BTreeSet<i32> =
+        layout.nodes.iter().map(|n| n.rect.y as i32).collect();
+    let snapped = tops
+        .iter()
+        .copied()
+        .filter(|&top| top <= y && fits(top))
+        .max()
+        .or_else(|| tops.iter().copied().filter(|&top| fits(top)).min())
+        .unwrap_or(y);
+    let bottom = layout.content_height.saturating_sub(layout.canvas.height) as i32;
+    snapped.clamp(0, bottom.max(0))
 }
 
 pub fn select(
@@ -421,10 +529,17 @@ pub fn select(
         .min(node.rect.x as i32)
         .max(node.rect.right() as i32 - layout.canvas.width as i32)
         .max(0);
-    canvas.pan_y = y
+    let pan_y = y
         .min(node.rect.y as i32)
         .max(node.rect.bottom() as i32 - layout.canvas.height as i32)
         .max(0);
+    // Only a scroll the selection forced is snapped; a view the user already
+    // has stays exactly where it is.
+    canvas.pan_y = if pan_y == y {
+        y
+    } else {
+        snap_to_row(layout, pan_y, node.rect)
+    };
 }
 
 pub fn navigate(
@@ -457,7 +572,18 @@ pub fn navigate(
         .selected_group
         .as_deref()
         .or(run.selected_node_id.as_deref());
-    if let Some(id) = move_selection(layout, selected, direction) {
+    let filter = canvas.filter;
+    let admit = |node: &super::graph_layout::LayoutNode| {
+        node.members.iter().any(|id| {
+            run.tasks
+                .iter()
+                .find(|t| &t.id == id)
+                .is_some_and(|t| filter.admits(run.bucket(t)))
+        })
+    };
+    let target = move_selection_where(layout, selected, direction, admit)
+        .or_else(|| move_selection(layout, selected, direction));
+    if let Some(id) = target {
         select(run, canvas, layout, &id);
     }
     canvas.follow_live = false;
@@ -616,6 +742,148 @@ mod tests {
     }
 
     #[test]
+    fn command_center_buckets_follow_dependency_readiness() {
+        use crate::davinci::model::GraphBucket::*;
+        let run = fixtures::command_center_graph();
+        let buckets: Vec<_> = run.tasks.iter().map(|t| run.bucket(t)).collect();
+        assert_eq!(buckets, run.buckets(), "per-task and batch agree");
+        // t5 and t7 wait on the running t4; t6 waits on t5, not started.
+        assert_eq!(
+            buckets,
+            vec![Done, Done, Done, Working, Waiting, Inactive, Waiting]
+        );
+        let blueprint = fixtures::blueprint_graph();
+        let of = |id: &str| blueprint.bucket(blueprint.tasks.iter().find(|t| t.id == id).unwrap());
+        assert_eq!(of("failure"), Attention);
+        assert_eq!(of("blocked"), Attention);
+        assert_eq!(of("review"), Waiting);
+    }
+
+    #[test]
+    fn filter_step_from_a_tab_that_just_emptied_reaches_its_real_neighbours() {
+        use crate::davinci::model::{GraphBucket, GraphFilter};
+        let attention = GraphFilter::Only(GraphBucket::Attention);
+        // The last failure cleared while the Attention tab was showing.
+        assert_eq!(attention.step(true, false), GraphFilter::All);
+        assert_eq!(
+            attention.step(false, false),
+            GraphFilter::Only(GraphBucket::Inactive)
+        );
+        // While offered, Attention sits between Inactive and All.
+        let inactive = GraphFilter::Only(GraphBucket::Inactive);
+        assert_eq!(inactive.step(true, true), attention);
+        assert_eq!(inactive.step(true, false), GraphFilter::All);
+        assert_eq!(GraphFilter::All.step(false, true), attention);
+        // A full forward lap visits every offered tab once.
+        let mut tab = GraphFilter::All;
+        let mut seen = Vec::new();
+        for _ in 0..GraphFilter::ORDER.len() {
+            tab = tab.step(true, true);
+            seen.push(tab);
+        }
+        assert_eq!(seen.last(), Some(&GraphFilter::All));
+        assert_eq!(
+            seen.iter().collect::<std::collections::BTreeSet<_>>().len(),
+            GraphFilter::ORDER.len()
+        );
+    }
+
+    #[test]
+    fn tab_steps_filters_and_moves_selection_into_the_filter() {
+        use crate::davinci::{
+            app,
+            model::{GraphBucket, GraphFilter, Model, Screen},
+            theme::{ColorDepth, Theme},
+        };
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let mut model = Model::new(Theme::da_vinci(ColorDepth::TrueColor, true), 160, 44, false);
+        model.screen = Screen::GraphRun;
+        refresh(&mut model, fixtures::command_center_graph());
+        let press = |model: &mut Model, code, modifiers| {
+            app::handle_key(model, KeyEvent::new(code, modifiers));
+        };
+        let selected = |model: &Model| {
+            model
+                .graph_run
+                .as_ref()
+                .unwrap()
+                .selected_node_id
+                .clone()
+                .unwrap_or_default()
+        };
+        press(&mut model, KeyCode::Tab, KeyModifiers::NONE);
+        assert_eq!(
+            model.graph_canvas.filter,
+            GraphFilter::Only(GraphBucket::Working)
+        );
+        assert_eq!(selected(&model), "t4", "the writer already matches");
+        press(&mut model, KeyCode::Tab, KeyModifiers::NONE);
+        assert_eq!(
+            model.graph_canvas.filter,
+            GraphFilter::Only(GraphBucket::Done)
+        );
+        assert_eq!(selected(&model), "t1", "first Done agent in reading order");
+        press(&mut model, KeyCode::Right, KeyModifiers::NONE);
+        assert_eq!(selected(&model), "t2", "arrows stay inside the filter");
+        press(&mut model, KeyCode::Right, KeyModifiers::NONE);
+        press(&mut model, KeyCode::Right, KeyModifiers::NONE);
+        assert_eq!(selected(&model), "t3", "the last Done agent is the edge");
+        // No agent needs attention, so its tab is skipped both ways.
+        for _ in 0..3 {
+            press(&mut model, KeyCode::Tab, KeyModifiers::NONE);
+        }
+        assert_eq!(model.graph_canvas.filter, GraphFilter::All);
+        press(&mut model, KeyCode::BackTab, KeyModifiers::SHIFT);
+        assert_eq!(
+            model.graph_canvas.filter,
+            GraphFilter::Only(GraphBucket::Inactive)
+        );
+        assert!(
+            !model.graph_canvas.input_focus,
+            "Tab never steals the agents' focus"
+        );
+    }
+
+    #[test]
+    fn i_focuses_the_composer_and_tab_returns_to_the_agents() {
+        use crate::davinci::{
+            app,
+            model::{GraphFilter, Model, Screen},
+            theme::{ColorDepth, Theme},
+        };
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let mut model = Model::new(Theme::da_vinci(ColorDepth::TrueColor, true), 160, 44, false);
+        model.screen = Screen::GraphRun;
+        refresh(&mut model, fixtures::command_center_graph());
+        app::handle_key(
+            &mut model,
+            KeyEvent::new(KeyCode::Char('i'), KeyModifiers::NONE),
+        );
+        assert!(model.graph_canvas.input_focus);
+        app::handle_key(
+            &mut model,
+            KeyEvent::new(KeyCode::Char('p'), KeyModifiers::NONE),
+        );
+        assert_eq!(
+            model.composer.to_string(),
+            "p",
+            "typing reaches the composer"
+        );
+        app::handle_key(&mut model, KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        assert!(!model.graph_canvas.input_focus);
+        assert_eq!(
+            model.graph_canvas.filter,
+            GraphFilter::All,
+            "that Tab moved focus only"
+        );
+        app::handle_key(
+            &mut model,
+            KeyEvent::new(KeyCode::Char('?'), KeyModifiers::SHIFT),
+        );
+        assert!(model.graph_canvas.show_help);
+    }
+
+    #[test]
     fn graph_nav_semantic_neighbors_and_follow() {
         let mut run = fixtures::blueprint_graph();
         let mut canvas = GraphCanvasState::default();
@@ -624,14 +892,41 @@ mod tests {
             move_selection(&layout, Some("writer"), NavDirection::Left).as_deref(),
             Some("plan")
         );
+        // Grid: [classify, researchers], [plan, writer], [tests, review], …
         assert_eq!(
             move_selection(&layout, Some("writer"), NavDirection::Down).as_deref(),
-            Some("tests")
+            Some("review")
+        );
+        assert_eq!(
+            move_selection(&layout, Some("writer"), NavDirection::Right).as_deref(),
+            Some("tests"),
+            "Right continues in reading order onto the next row"
+        );
+        assert_eq!(
+            move_selection(&layout, Some("review"), NavDirection::Up).as_deref(),
+            Some("writer")
+        );
+        assert_eq!(
+            move_selection(&layout, Some("classify"), NavDirection::Left).as_deref(),
+            Some("classify"),
+            "the first card stays put"
         );
         navigate(&mut run, &mut canvas, &layout, NavDirection::Right);
         assert!(!canvas.follow_live);
         canvas.follow_live = true;
-        assert!(viewport(&layout, &run, &canvas).0 > 0);
+        // The grid wraps to the width, so following live work pans down to
+        // the running agents rather than sideways.
+        let short = layout_graph(&run, &canvas, 120, 16);
+        let (x, y) = viewport(&short, &run, &canvas);
+        assert_eq!(x, 0);
+        assert!(y > 0);
+        let active = short
+            .nodes
+            .iter()
+            .find(|n| run.tasks[n.task_index].state == State::Active)
+            .unwrap();
+        assert!(active.rect.y as i32 >= y);
+        assert!((active.rect.bottom() as i32) <= y + short.canvas.height as i32);
     }
 
     #[test]

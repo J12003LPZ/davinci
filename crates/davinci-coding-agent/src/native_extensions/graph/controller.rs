@@ -220,6 +220,34 @@ fn truncate(text: &str, max_chars: usize) -> String {
     text.chars().take(max_chars).collect()
 }
 
+/// Upper bound on the assistant text kept on a task for the live view. The
+/// snapshot is persisted on every checkpoint, so it must stay small.
+pub(crate) const LAST_MESSAGE_CHARS: usize = 600;
+
+/// The live view's copy of a worker's latest assistant text: whitespace runs
+/// collapse to one space and the result is capped at `LAST_MESSAGE_CHARS`
+/// chars. The cut falls on a grapheme boundary, so an emoji sequence or a
+/// combining mark is never split from its base.
+pub(crate) fn bounded_last_message(text: &str) -> String {
+    use unicode_segmentation::UnicodeSegmentation;
+    let collapsed = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    if collapsed.chars().count() <= LAST_MESSAGE_CHARS {
+        return collapsed;
+    }
+    let mut kept = String::new();
+    let mut chars = 0;
+    for grapheme in collapsed.graphemes(true) {
+        let count = grapheme.chars().count();
+        if chars + count > LAST_MESSAGE_CHARS - 1 {
+            break;
+        }
+        chars += count;
+        kept.push_str(grapheme);
+    }
+    kept.push('…');
+    kept
+}
+
 /// Outcome of delivering one goal (the whole request, or one milestone).
 enum Delivery {
     Ok,
@@ -1061,6 +1089,13 @@ impl GraphExecution {
                 effective_briefing,
                 capability_selection.tools.clone(),
             );
+            {
+                let mut run = self.run.lock().unwrap_or_else(|error| error.into_inner());
+                if let Some(entry) = run.tasks.iter_mut().find(|entry| entry.id == task_id) {
+                    entry.model = spec.model.clone();
+                    entry.last_message = None;
+                }
+            }
             // A retry after a timeout gets double time — but only when a
             // timeout was configured at all; 0 stays unlimited.
             if matches!(last_failure_class, Some(WorkerFailureClass::Timeout))
@@ -1152,7 +1187,7 @@ impl GraphExecution {
 
             let reported = Mutex::new(WorkerUsage::default());
             let result = {
-                let mut on_progress = |line: &str, usage: &WorkerUsage| {
+                let mut on_progress = |line: &str, usage: &WorkerUsage, message: Option<&str>| {
                     let delta = {
                         let mut reported =
                             reported.lock().unwrap_or_else(|error| error.into_inner());
@@ -1169,6 +1204,9 @@ impl GraphExecution {
                         run.ecosystem_stats.record_graph_cache_usage(role, &delta);
                         if let Some(task) = run.tasks.iter_mut().find(|entry| entry.id == task_id) {
                             task.last_activity = Some(line.to_string());
+                            if let Some(message) = message {
+                                task.last_message = Some(bounded_last_message(message));
+                            }
                         }
                         if let Some(record) = run
                             .continuation
@@ -4409,6 +4447,86 @@ mod tests {
     }
 
     #[test]
+    fn graph_live_view_records_worker_model_and_bounded_last_message() {
+        let dir = tempfile::tempdir().unwrap();
+        let runner: Arc<WorkerRunner> = Arc::new(|_spec, _abort, on_progress| {
+            let usage = WorkerUsage::default();
+            on_progress("read: src/lib.rs", &usage, None);
+            on_progress(
+                "turn 1 done",
+                &usage,
+                Some("Baseline   build\npassed on Rust 1.83.0."),
+            );
+            // A later progress event without text keeps the last message.
+            on_progress("bash: cargo test", &usage, None);
+            WorkerResult {
+                ok: false,
+                failure_reason: Some("stop after progress".to_string()),
+                ..WorkerResult::default()
+            }
+        });
+        let deps = ControllerDeps {
+            runner,
+            verify_exec: Arc::new(|_, _, _, _| (0, String::new(), 0)),
+            config: GraphConfig::default(),
+            session_model: Some("openai/gpt-live-view".into()),
+            session_thinking: None,
+            project_trusted: false,
+            on_update: Arc::new(|_, _| {}),
+            memory: None,
+            learning: None,
+            governor: None,
+            language_intelligence: None,
+            processes: None,
+            browser: None,
+            runtime: None,
+            permissions: None,
+            task_contract: None,
+        };
+        let options = RunOptions {
+            goal: "live view facts".into(),
+            cwd: dir.path().to_path_buf(),
+            forced: None,
+            dry_run: false,
+            abort: Arc::new(AtomicBool::new(false)),
+            resume_artifacts: HashMap::new(),
+            resume_run: None,
+        };
+        let run = run_graph(options, deps);
+        let task = run.tasks.first().expect("the classifier was launched");
+        assert_eq!(task.model.as_deref(), Some("openai/gpt-live-view"));
+        assert_eq!(
+            task.last_message.as_deref(),
+            Some("Baseline build passed on Rust 1.83.0.")
+        );
+        let shown = serde_json::to_value(task).unwrap();
+        assert_eq!(shown["model"], "openai/gpt-live-view");
+        assert_eq!(
+            shown["lastMessage"],
+            "Baseline build passed on Rust 1.83.0."
+        );
+    }
+
+    #[test]
+    fn bounded_last_message_collapses_whitespace_and_caps_length() {
+        assert_eq!(bounded_last_message("  a \n\t b  "), "a b");
+        let long = "界".repeat(LAST_MESSAGE_CHARS + 50);
+        let kept = bounded_last_message(&long);
+        assert_eq!(kept.chars().count(), LAST_MESSAGE_CHARS);
+        assert!(kept.ends_with('…'));
+        let exact = "x".repeat(LAST_MESSAGE_CHARS);
+        assert_eq!(bounded_last_message(&exact), exact);
+        // A family emoji (7 chars joined by ZWJ) straddling the cut is kept
+        // whole or dropped whole, never split.
+        let family = "👨\u{200d}👩\u{200d}👧\u{200d}👦";
+        let text = format!("{}{}{}", "x".repeat(LAST_MESSAGE_CHARS - 4), family, "tail");
+        let kept = bounded_last_message(&text);
+        assert!(kept.chars().count() <= LAST_MESSAGE_CHARS);
+        assert!(!kept.contains('\u{200d}'), "{kept}");
+        assert!(kept.ends_with("x…"), "{kept}");
+    }
+
+    #[test]
     fn graph_review_coverage_approval_impossible_when_one_chunk_is_omitted() {
         let dir = tempfile::tempdir().unwrap();
         let file_path = dir.path().join("code.rs");
@@ -4683,6 +4801,8 @@ mod tests {
                     started_at: None,
                     ended_at: None,
                     last_activity: None,
+                    last_message: None,
+                    model: None,
                     fingerprint: None,
                     mutation: None,
                     context_fingerprint: None,

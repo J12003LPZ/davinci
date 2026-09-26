@@ -418,7 +418,11 @@ pub fn worker_cache_profile(spec: &WorkerSpec) -> WorkerCacheProfile {
 }
 
 /// A worker runner: given a spec and an abort flag, produce a result.
-pub type WorkerRunner = dyn Fn(&WorkerSpec, &Arc<AtomicBool>, &mut dyn FnMut(&str, &WorkerUsage)) -> WorkerResult
+pub type WorkerRunner = dyn Fn(
+        &WorkerSpec,
+        &Arc<AtomicBool>,
+        &mut dyn FnMut(&str, &WorkerUsage, Option<&str>),
+    ) -> WorkerResult
     + Send
     + Sync;
 
@@ -473,7 +477,7 @@ fn configure_task_contract_env(command: &mut Command, spec: &WorkerSpec) -> Resu
 pub fn run_worker(
     spec: &WorkerSpec,
     abort: &Arc<AtomicBool>,
-    on_progress: &mut dyn FnMut(&str, &WorkerUsage),
+    on_progress: &mut dyn FnMut(&str, &WorkerUsage, Option<&str>),
 ) -> WorkerResult {
     let session_check = spec
         .worker_session
@@ -639,7 +643,9 @@ pub fn run_worker(
                         .activity
                         .clone()
                         .unwrap_or_else(|| format!("turn {}", state.usage.turns));
-                    on_progress(&activity, &state.usage);
+                    let message =
+                        (!state.final_text.is_empty()).then_some(state.final_text.as_str());
+                    on_progress(&activity, &state.usage, message);
                 }
             },
             |line| {
@@ -860,10 +866,10 @@ pub fn canned_artifact(expect: ArtifactKind) -> Artifact {
 pub fn run_dry_worker(
     spec: &WorkerSpec,
     _abort: &Arc<AtomicBool>,
-    on_progress: &mut dyn FnMut(&str, &WorkerUsage),
+    on_progress: &mut dyn FnMut(&str, &WorkerUsage, Option<&str>),
 ) -> WorkerResult {
     let usage = WorkerUsage::default();
-    on_progress(&format!("{}: dry-run", spec.task_id), &usage);
+    on_progress(&format!("{}: dry-run", spec.task_id), &usage, None);
     let artifact = canned_artifact(spec.expect);
     let _ = write_artifact(&spec.artifact_path, &artifact);
     WorkerResult {
@@ -1298,7 +1304,7 @@ mod tests {
         spec.tools = vec!["read".into(), "graph_submit".into()];
 
         let abort = Arc::new(AtomicBool::new(false));
-        let mut progress = |_: &str, _: &WorkerUsage| {};
+        let mut progress = |_: &str, _: &WorkerUsage, _: Option<&str>| {};
         let result = run_worker(&spec, &abort, &mut progress);
 
         assert!(!result.ok, "a child that never submitted must not be ok");
@@ -1386,7 +1392,7 @@ mod tests {
             )
             .unwrap();
         spec.worker_session = Some(binding);
-        let result = run_worker(&spec, &Arc::new(AtomicBool::new(false)), &mut |_, _| {});
+        let result = run_worker(&spec, &Arc::new(AtomicBool::new(false)), &mut |_, _, _| {});
         assert!(result.child_pid.is_some(), "{result:?}");
         if submit {
             assert!(result.ok, "{result:?}");

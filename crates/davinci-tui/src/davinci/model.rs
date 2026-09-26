@@ -1195,6 +1195,10 @@ pub struct GraphCanvasState {
     /// First-seen peer order, retained across snapshots of the same run.
     pub node_order: Vec<String>,
     pub list_scroll: Option<usize>,
+    /// Which agents the command center emphasises (Tab / Shift+Tab).
+    pub filter: GraphFilter,
+    /// `?` swaps the details panel for the key reference.
+    pub show_help: bool,
 }
 
 impl Default for GraphCanvasState {
@@ -1211,7 +1215,80 @@ impl Default for GraphCanvasState {
             inspecting_goal: false,
             node_order: Vec::new(),
             list_scroll: None,
+            filter: GraphFilter::All,
+            show_help: false,
         }
+    }
+}
+
+/// Where an agent stands, as the command center's filter tabs count it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum GraphBucket {
+    Working,
+    Done,
+    /// Next in line: every dependency is done or running.
+    Waiting,
+    /// Further out: a dependency has not started yet.
+    Inactive,
+    /// Failed, cancelled or blocked by an unavailable dependency.
+    Attention,
+}
+
+impl GraphBucket {
+    pub fn label(self) -> &'static str {
+        match self {
+            GraphBucket::Working => "Working",
+            GraphBucket::Done => "Done",
+            GraphBucket::Waiting => "Waiting",
+            GraphBucket::Inactive => "Inactive",
+            GraphBucket::Attention => "Attention",
+        }
+    }
+}
+
+/// The command center's filter tabs, in Tab order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default)]
+pub enum GraphFilter {
+    #[default]
+    All,
+    Only(GraphBucket),
+}
+
+impl GraphFilter {
+    pub const ORDER: [GraphFilter; 6] = [
+        GraphFilter::All,
+        GraphFilter::Only(GraphBucket::Working),
+        GraphFilter::Only(GraphBucket::Done),
+        GraphFilter::Only(GraphBucket::Waiting),
+        GraphFilter::Only(GraphBucket::Inactive),
+        GraphFilter::Only(GraphBucket::Attention),
+    ];
+
+    pub fn admits(self, bucket: GraphBucket) -> bool {
+        match self {
+            GraphFilter::All => true,
+            GraphFilter::Only(wanted) => wanted == bucket,
+        }
+    }
+
+    /// The next (or previous) tab. The Attention tab is only offered while
+    /// something needs attention, so an empty tab is never a stop.
+    pub fn step(self, forward: bool, attention: bool) -> Self {
+        // Walk the full order from this tab's own position, so a tab that
+        // just stopped being offered (Attention after the last failure
+        // cleared) still steps to its real neighbour.
+        let len = Self::ORDER.len();
+        let at = Self::ORDER.iter().position(|tab| *tab == self).unwrap_or(0);
+        (1..=len)
+            .map(|offset| {
+                if forward {
+                    Self::ORDER[(at + offset) % len]
+                } else {
+                    Self::ORDER[(at + len - offset) % len]
+                }
+            })
+            .find(|tab| attention || *tab != GraphFilter::Only(GraphBucket::Attention))
+            .unwrap_or(GraphFilter::All)
     }
 }
 
@@ -1243,6 +1320,18 @@ pub struct GraphTask {
     pub error: Option<String>,
     pub recent_tools: Vec<String>,
     pub public_contract: Option<String>,
+    /// Live-view facts from the run snapshot. Empty means not reported.
+    pub model: Option<String>,
+    /// `1.9M in · 11.6k out`.
+    pub tokens: String,
+    /// `23s ago`.
+    pub started: String,
+    /// `6m18s`; wall time so far for a running worker.
+    pub elapsed: String,
+    /// `$0.71`.
+    pub cost: String,
+    /// The worker's latest assistant text, already bounded by the controller.
+    pub last_message: Option<String>,
 }
 
 impl GraphTask {
@@ -1299,6 +1388,10 @@ pub struct GraphRunSheet {
     pub control_status: Option<String>,
     pub inspecting_node: bool,
     pub showing_diff: bool,
+    /// The run's working directory, shown as the command center's project.
+    pub project: String,
+    /// `0 of 2`: revision cycles used against the per-milestone limit.
+    pub revisions: String,
 }
 
 impl GraphRunSheet {
@@ -1309,6 +1402,60 @@ impl GraphRunSheet {
             "cancelled" => Some("CANCELLED"),
             _ => None,
         }
+    }
+
+    /// Filter bucket for one task. Presentation only: the persisted status is
+    /// never changed and a missing dependency is not treated as satisfied.
+    pub fn bucket(&self, task: &GraphTask) -> GraphBucket {
+        Self::classify(task, |id| {
+            self.tasks
+                .iter()
+                .find(|other| other.id == id)
+                .map(|t| t.state)
+        })
+    }
+
+    /// Every task's bucket, in task order, in one pass over the run. Frames
+    /// use this rather than `bucket` per card, which rescans the run.
+    pub fn buckets(&self) -> Vec<GraphBucket> {
+        let states: std::collections::HashMap<&str, State> = self
+            .tasks
+            .iter()
+            .map(|task| (task.id.as_str(), task.state))
+            .collect();
+        self.tasks
+            .iter()
+            .map(|task| Self::classify(task, |id| states.get(id).copied()))
+            .collect()
+    }
+
+    fn classify(task: &GraphTask, state_of: impl Fn(&str) -> Option<State>) -> GraphBucket {
+        match task.state {
+            State::Active => return GraphBucket::Working,
+            State::Done | State::Skipped => return GraphBucket::Done,
+            State::Failed | State::Attention => return GraphBucket::Attention,
+            _ => {}
+        }
+        if task.status == "cancelled" {
+            return GraphBucket::Attention;
+        }
+        // A dependency the snapshot does not list is not treated as satisfied.
+        let next_in_line = task.status == "ready"
+            || task.dependencies.iter().all(|dep| {
+                state_of(dep).is_some_and(|state| matches!(state, State::Done | State::Active))
+            });
+        if next_in_line {
+            GraphBucket::Waiting
+        } else {
+            GraphBucket::Inactive
+        }
+    }
+
+    pub fn bucket_count(&self, filter: GraphFilter) -> usize {
+        self.buckets()
+            .into_iter()
+            .filter(|&bucket| filter.admits(bucket))
+            .count()
     }
 
     pub fn can_resume(&self) -> bool {

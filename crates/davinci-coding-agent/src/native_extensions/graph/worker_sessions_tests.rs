@@ -43,7 +43,7 @@ fn worker_binding_rejects_missing_history_and_foreign_manifest() {
     let result = super::super::worker::run_worker(
         &spec,
         &std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
-        &mut |_, _| {},
+        &mut |_, _, _| {},
     );
     assert!(result.recovery_required);
     assert!(

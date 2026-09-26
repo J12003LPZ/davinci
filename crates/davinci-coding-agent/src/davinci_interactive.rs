@@ -7074,6 +7074,25 @@ fn graph_sheet(value: &serde_json::Value) -> Option<GraphRunSheet> {
             } else {
                 sheet_duration(now.saturating_sub(started))
             };
+            let started_label = if started == 0 {
+                String::new()
+            } else {
+                format!("{} ago", sheet_duration(now.saturating_sub(started)))
+            };
+            let tokens = if input == 0 && output == 0 {
+                String::new()
+            } else {
+                format!(
+                    "{} in · {} out",
+                    command_center_count(input),
+                    command_center_count(output)
+                )
+            };
+            let task_cost = if started == 0 && cost == 0.0 {
+                String::new()
+            } else {
+                format!("${cost:.2}")
+            };
             let usage = if started == 0 && input == 0 {
                 "—".into()
             } else {
@@ -7116,6 +7135,20 @@ fn graph_sheet(value: &serde_json::Value) -> Option<GraphRunSheet> {
                 })
                 .unwrap_or_default();
             GraphTask {
+                model: task
+                    .get("model")
+                    .and_then(serde_json::Value::as_str)
+                    .filter(|model| !model.trim().is_empty())
+                    .map(graph_public_text),
+                tokens,
+                started: started_label,
+                elapsed: time.clone(),
+                cost: task_cost,
+                last_message: task
+                    .get("lastMessage")
+                    .and_then(serde_json::Value::as_str)
+                    .filter(|text| !text.trim().is_empty())
+                    .map(graph_public_text),
                 title: graph_public_text(&focus),
                 branch: task
                     .get("branch")
@@ -7354,6 +7387,12 @@ fn graph_sheet(value: &serde_json::Value) -> Option<GraphRunSheet> {
             .get("controlStatus")
             .and_then(serde_json::Value::as_str)
             .map(String::from),
+        project: graph_public_text(&json_str(run, "cwd")),
+        revisions: format!(
+            "{} of {}",
+            number(&counters, "revisionCycles"),
+            number(&budgets, "maxRevisionCycles"),
+        ),
         ..Default::default()
     })
 }
@@ -7534,6 +7573,35 @@ mod graph_canvas_fact_tests {
     }
 
     #[test]
+    fn graph_command_center_facts_come_from_the_typed_snapshot() {
+        let mut run = snapshot();
+        run.cwd = "C:\\work\\project".into();
+        run.budgets.max_revision_cycles = 2;
+        run.counters.revision_cycles = 1;
+        run.tasks[0].model = Some("openai/gpt-live".into());
+        run.tasks[0].last_message = Some("Build passed; key apikey_ABCDEF123 must not leak".into());
+        let sheet = graph_sheet(&json!({"run": run})).unwrap();
+        assert_eq!(sheet.project, "C:\\work\\project");
+        assert_eq!(sheet.revisions, "1 of 2");
+        let writer = &sheet.tasks[0];
+        assert_eq!(writer.model.as_deref(), Some("openai/gpt-live"));
+        assert_eq!(writer.tokens, "1.2K in · 300 out");
+        assert_eq!(command_center_count(1_890_000), "1.89M");
+        assert_eq!(command_center_count(11_600), "11.6K");
+        assert_eq!(writer.cost, "$0.20");
+        assert_eq!(writer.elapsed, "1s");
+        assert!(writer.started.ends_with(" ago"), "{}", writer.started);
+        let message = writer.last_message.as_deref().unwrap();
+        assert!(message.starts_with("Build passed"), "{message}");
+        assert!(!message.contains("ABCDEF123"), "{message}");
+        // A worker that never started reports nothing rather than zeros.
+        let review = &sheet.tasks[1];
+        assert!(review.model.is_none() && review.last_message.is_none());
+        assert!(review.tokens.is_empty() && review.started.is_empty());
+        assert!(review.elapsed.is_empty() && review.cost.is_empty());
+    }
+
+    #[test]
     fn graph_canvas_facts_match_typed_snapshot_without_private_payloads() {
         let run = snapshot();
         let sheet = graph_sheet(&json!({"run": run})).unwrap();
@@ -7622,6 +7690,18 @@ mod graph_canvas_fact_tests {
 }
 
 /// `4s`, `1m52s`, `1h03m` for a span in milliseconds.
+/// `1.89M`, `11.6K`, `940`: token counts on the command center, to three
+/// significant figures so a large worker's growth stays visible.
+fn command_center_count(value: u64) -> String {
+    if value >= 1_000_000 {
+        format!("{:.2}M", value as f64 / 1_000_000.0)
+    } else if value >= 1_000 {
+        format!("{:.1}K", value as f64 / 1_000.0)
+    } else {
+        value.to_string()
+    }
+}
+
 fn sheet_duration(ms: u64) -> String {
     let seconds = ms / 1_000;
     if seconds < 60 {

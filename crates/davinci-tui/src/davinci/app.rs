@@ -673,12 +673,9 @@ pub fn handle_key(model: &mut Model, key: KeyEvent) -> Flow {
     }
     if model.screen == Screen::GraphRun
         && model.overlay.is_none()
-        && key.code == KeyCode::Tab
-        && key.modifiers.is_empty()
-        && !(model.graph_canvas.input_focus && model.suggestions.is_some())
+        && key.kind != KeyEventKind::Release
+        && super::views::graph_nav::handle_command_center_key(model, key)
     {
-        model.graph_canvas.input_focus = !model.graph_canvas.input_focus;
-        model.refresh_suggestions();
         return Flow::Continue;
     }
     let data = key_event_bytes(&key);
