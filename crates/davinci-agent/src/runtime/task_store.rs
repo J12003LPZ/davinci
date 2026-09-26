@@ -212,7 +212,24 @@ fn open_exclusive(path: &Path) -> Result<File, TaskError> {
         use std::os::windows::fs::OpenOptionsExt;
         options.share_mode(0);
     }
-    let file = options.open(path).map_err(persistence)?;
+    // ERROR_SHARING_VIOLATION / ERROR_LOCK_VIOLATION: another handle has the
+    // journal open. A scanner or indexer lets go within milliseconds, so the
+    // same bounded retry as the Unix handoff runs before reporting InUse.
+    const HANDOFF_RETRIES: usize = 10;
+    let mut attempt = 0;
+    let file = loop {
+        match options.open(path) {
+            Ok(file) => break file,
+            Err(error) if cfg!(windows) && matches!(error.raw_os_error(), Some(32 | 33)) => {
+                if attempt == HANDOFF_RETRIES {
+                    return Err(TaskError::InUse);
+                }
+                attempt += 1;
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            Err(error) => return Err(persistence(error)),
+        }
+    };
     #[cfg(unix)]
     {
         use std::os::unix::io::AsRawFd;
@@ -225,17 +242,23 @@ fn open_exclusive(path: &Path) -> Result<File, TaskError> {
         }
         const LOCK_EX: i32 = 2;
         const LOCK_NB: i32 = 4;
-        const HANDOFF_RETRIES: usize = 10;
-        for attempt in 0..=HANDOFF_RETRIES {
+        let mut waits = 0;
+        loop {
             // SAFETY: file owns a live descriptor; flock does not retain pointers.
             if unsafe { flock(file.as_raw_fd(), LOCK_EX | LOCK_NB) } == 0 {
                 break;
             }
             let error = std::io::Error::last_os_error();
-            if error.kind() != std::io::ErrorKind::WouldBlock || attempt == HANDOFF_RETRIES {
-                return Err(persistence(error));
+            match error.kind() {
+                // A signal is not contention: try again without spending a retry.
+                std::io::ErrorKind::Interrupted => continue,
+                std::io::ErrorKind::WouldBlock if waits < HANDOFF_RETRIES => {
+                    waits += 1;
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+                std::io::ErrorKind::WouldBlock => return Err(TaskError::InUse),
+                _ => return Err(persistence(error)),
             }
-            std::thread::sleep(std::time::Duration::from_millis(10));
         }
     }
     #[cfg(not(any(windows, unix)))]

@@ -6,12 +6,19 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use super::{
-    RuntimeDecision, RuntimeEventEnvelope, RuntimeHandle, RuntimeSubscriber, TaskRegistry,
-    TaskState,
+    RuntimeDecision, RuntimeEventEnvelope, RuntimeHandle, RuntimeSubscriber, TaskError,
+    TaskRegistry, TaskState,
 };
 use crate::runtime::operations::{digest_bytes, LegacyObservation, LegacySourceKind};
 
 const WORKER_IDENTITY: &str = "worker_runtime_identity";
+
+/// Activation error when another live handle (usually another DaVinci
+/// window) holds this session's single-writer task journal. Callers show it
+/// as is and match it by prefix: it is not corruption, so it never carries
+/// the "Runtime recovery required" prefix.
+pub const SESSION_IN_USE: &str =
+    "This session is in use by another DaVinci session. Close it there, or choose another session.";
 
 /// Cold restore only: callers must reuse an existing live session runtime instead.
 pub fn restore_session_runtime(
@@ -127,8 +134,12 @@ pub fn restore_session_runtime_with_legacy_recovery(
     let key = serde_json::to_string(&(source, &session.header.id))
         .map_err(|error| format!("session source key could not be encoded: {error}"))?;
     let (tasks, run_id) =
-        TaskRegistry::open_session_durable_with_legacy(&journal_path, &key, legacy_tasks)
-            .map_err(|error| format!("task journal could not be opened: {error}"))?;
+        TaskRegistry::open_session_durable_with_legacy(&journal_path, &key, legacy_tasks).map_err(
+            |error| match error {
+                TaskError::InUse => SESSION_IN_USE.to_string(),
+                error => format!("task journal could not be opened: {error}"),
+            },
+        )?;
     tasks
         .validate_operation_receipts()
         .map_err(|error| format!("task operation receipts could not be validated: {error}"))?;
