@@ -346,7 +346,7 @@ mod tests {
                     .client()
                     .call(
                         "process_output",
-                        &json!({"id":id,"cursor":0,"maxBytes":16384}),
+                        &json!({"id":id,"cursor":0,"limit":16384}),
                     );
                 panic!(
                     "relative script did not run from canonical workspace; state={state}; status={status:?}; output={output:?}"
