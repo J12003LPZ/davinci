@@ -4138,9 +4138,16 @@ pub fn perform(
             let trusted =
                 crate::settings::is_trusted(&settings, &agent.cwd, parsed.project_trust_override);
             Ok(Done::Said(
-                crate::agent_profiles::format_agent_profiles_status(&agent.cwd, None, trusted),
+                crate::agent_profiles::format_agent_profiles_status_with_plugins(
+                    &agent.cwd,
+                    None,
+                    trusted,
+                    davinci_coding_agent::plugins::active(&crate::default_agent_dir())
+                        .agent_profiles(),
+                ),
             ))
         }
+        SlashAction::Plugin(args) => Ok(Done::Said(crate::plugin_command_text(&args, &agent.cwd))),
         SlashAction::Tasks => {
             open_task_board_sheet(agent, model);
             Ok(Done::Opened)
@@ -9556,6 +9563,7 @@ fn run_stop_hooks(shell: &mut Shell<'_>) {
         shell.cwd,
         trusted,
     ));
+    davinci_coding_agent::plugins::run_session_end(&crate::default_agent_dir(), shell.cwd);
 }
 
 /// `/permissions` — the mode and every rule in force, by source; or, with a

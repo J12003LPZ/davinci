@@ -13,6 +13,7 @@ Commands:
   davinci update [source|self]   Update davinci, extensions, or model catalogs
   davinci list                      List installed extensions from settings
   davinci config [-l]               Open TUI to enable/disable package resources (Tab switches scope)
+  davinci plugin [help]             Claude Code / Codex plugins: browse, install, import, approve hooks
   davinci auth <command>            Print credentials or check provider readiness
   davinci server --listen unix:///path   Experimental protocol server
   davinci client --connect unix:///path  Experimental protocol client
