@@ -13,6 +13,7 @@ pub mod native_tools;
 pub mod optimization;
 pub mod package_source;
 pub mod permissions;
+pub mod plugins;
 pub mod project_config;
 pub mod prompt_host;
 pub mod runtime_host;

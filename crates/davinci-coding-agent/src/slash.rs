@@ -86,6 +86,11 @@ pub fn builtin_slash_commands() -> Vec<SlashCommand> {
             None,
         ),
         ("agents", "List custom agent profiles and status", None),
+        (
+            "plugin",
+            "Browse, install and manage Claude Code / Codex plugins",
+            Some("[list|browse|install|import|info|approve|enable|disable|marketplace]"),
+        ),
         ("tasks", "Execution checklist and live task board", None),
         (
             "graph",
@@ -139,6 +144,8 @@ pub enum SlashAction {
     ShowCost,
     ShowStatus,
     Agents,
+    /// `/plugin …`: the text after the command name.
+    Plugin(String),
     Tasks,
 }
 
@@ -220,6 +227,7 @@ pub fn parse_line(line: &str) -> SlashAction {
         "cost" => SlashAction::ShowCost,
         "status" => SlashAction::ShowStatus,
         "agents" => SlashAction::Agents,
+        "plugin" | "plugins" => SlashAction::Plugin(args.to_string()),
         "tasks" => SlashAction::Tasks,
         "help" => SlashAction::Status(
             builtin_slash_commands()

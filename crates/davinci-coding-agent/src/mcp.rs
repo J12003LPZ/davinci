@@ -2,6 +2,8 @@
 //!
 //! User agent-directory config, then a trusted project's `.davinci/mcp.json`.
 //! Legacy `.pi/mcp.json` is used only when no DaVinci project file exists.
+//! Enabled plugins' servers (`plugin_<plugin>_<server>`) are the base layer;
+//! a user or project entry with the same name wins.
 
 use std::path::Path;
 
@@ -13,7 +15,13 @@ pub fn load(agent_dir: &Path, cwd: &Path, trusted: bool) -> ConfigFile {
     {
         return davinci_mcp::load_path(Path::new(&path)).unwrap_or_default();
     }
-    let user = davinci_mcp::load_path(&agent_dir.join("mcp.json")).unwrap_or_default();
+    let plugins = ConfigFile {
+        mcp_servers: davinci_coding_agent::plugins::active(agent_dir).mcp_servers(),
+    };
+    let user = davinci_mcp::merge(
+        plugins,
+        davinci_mcp::load_path(&agent_dir.join("mcp.json")).unwrap_or_default(),
+    );
     if !trusted {
         return user;
     }

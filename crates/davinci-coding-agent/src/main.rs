@@ -361,6 +361,16 @@ fn run(raw: Vec<String>) -> Result<i32, String> {
     }
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     tools_manager::prepend_tools_bin_to_path();
+    if matches!(raw.first().map(String::as_str), Some("plugin" | "plugins")) {
+        let agent_dir = default_agent_dir();
+        packages::ensure_agent_dir(&agent_dir)?;
+        apply_http_proxy_settings(load_settings(&agent_dir).http_proxy.as_deref());
+        println!(
+            "{}",
+            davinci_coding_agent::plugins::command::run(&raw[1..], &agent_dir, &cwd)?
+        );
+        return Ok(0);
+    }
     if is_package_command(raw.first().map(String::as_str)) {
         let command = raw[0].as_str();
         if raw.iter().any(|a| a == "--help" || a == "-h") {
@@ -1980,7 +1990,12 @@ fn run_nested_subagent(
     let settings = load_merged_settings(&default_agent_dir(), cwd);
     let trusted = is_trusted(&settings, cwd, parsed.project_trust_override);
     let profile = if let Some(agent_name) = &req.agent {
-        let profiles = agent_profiles::discover_agent_profiles(cwd, None, trusted);
+        let profiles = agent_profiles::discover_agent_profiles_with_plugins(
+            cwd,
+            None,
+            trusted,
+            davinci_coding_agent::plugins::active(&default_agent_dir()).agent_profiles(),
+        );
         let found = profiles.into_iter().find(|p| p.name == *agent_name);
         match found {
             Some(p) => Some(p),
@@ -2218,6 +2233,8 @@ fn complete_prompt_with_host(
     let host = existing_host.unwrap_or_else(|| Arc::new(Mutex::new(loaded_extension_host(parsed))));
     attach_shared_tool_executor(agent, host.clone());
     agent.clear_ephemeral_context();
+    let plugin_hooks = Arc::new(davinci_coding_agent::plugins::active(&default_agent_dir()));
+    let plugin_hook_base = plugin_hook_input(agent);
     {
         let mut host = host.lock().unwrap_or_else(|err| err.into_inner());
         if fresh_host {
@@ -2259,6 +2276,10 @@ fn complete_prompt_with_host(
         } else {
             host.native_memory_inject(&prompt)
         };
+        let memory = join_turn_context(
+            memory,
+            run_plugin_prompt_hooks(&plugin_hooks, &plugin_hook_base, &prompt),
+        );
         match agent.turn_context_placement() {
             davinci_agent::turn_context::TurnContextPlacement::Appended => {
                 agent.commit_turn_context(memory);
@@ -2396,11 +2417,16 @@ fn complete_prompt_with_host(
     );
 
     let pre_hooks = user_hooks.clone();
+    let pre_plugin_hooks = plugin_hooks.clone();
+    let pre_plugin_base = plugin_hook_base.clone();
     agent.pre_tool = Some(davinci_agent::PreToolHook(Arc::new(move |name, args| {
         if std::env::var("DAVINCI_RUNTIME_HOOKS_V2").as_deref() == Ok("0") {
             if let Some(reason) = hooks::run_pre_tool(&pre_hooks, name, args) {
                 return Some(reason);
             }
+        }
+        if let Some(reason) = run_plugin_pre_tool(&pre_plugin_hooks, &pre_plugin_base, name, args) {
+            return Some(reason);
         }
         // A poisoned lock used to bail out of the closure with `None`, which
         // the agent reads as "not blocked": one panic anywhere holding this
@@ -2432,6 +2458,8 @@ fn complete_prompt_with_host(
     })));
     let post_host = host.clone();
     let post_hooks = user_hooks;
+    let post_plugin_hooks = plugin_hooks.clone();
+    let post_plugin_base = plugin_hook_base.clone();
     let session_path = agent.session.as_ref().map(|session| session.path.clone());
     agent.post_tool = Some(davinci_agent::PostToolHook(Arc::new(
         move |tool_call_id, _cwd, name, args, result| {
@@ -2453,6 +2481,11 @@ fn complete_prompt_with_host(
                 Some(tool_call_id),
                 Some(!result.is_error),
             );
+            let result = if denied {
+                result
+            } else {
+                run_plugin_post_tool(&post_plugin_hooks, &post_plugin_base, name, args, result)
+            };
             match post_host.lock() {
                 Ok(host) => host.native_after_tool(name, args, result),
                 Err(_) => result,
@@ -2675,6 +2708,11 @@ fn complete_prompt_with_host(
         .unwrap_or_default();
     agent.pre_tool = None;
     agent.post_tool = None;
+    run_plugin_observer_hooks(
+        &plugin_hooks,
+        &plugin_hook_base,
+        davinci_coding_agent::plugins::hooks::HookEvent::Stop,
+    );
     let mut session_failure = None;
     {
         let mut host = host.lock().unwrap_or_else(|err| err.into_inner());
@@ -4262,6 +4300,7 @@ fn run_stop_hooks_for(parsed: &Args, cwd: &Path) {
     let settings = load_merged_settings(&default_agent_dir(), cwd);
     let trusted = is_trusted(&settings, cwd, parsed.project_trust_override);
     hooks::run_stop(&hooks::load(&default_agent_dir(), cwd, trusted));
+    davinci_coding_agent::plugins::run_session_end(&default_agent_dir(), cwd);
 }
 
 fn emit_session_shutdown(parsed: &Args) {
@@ -6466,9 +6505,21 @@ fn handle_user_line(
         SlashAction::Agents => {
             let settings = load_merged_settings(&default_agent_dir(), &agent.cwd);
             let trusted = is_trusted(&settings, &agent.cwd, parsed.project_trust_override);
-            let text = agent_profiles::format_agent_profiles_status(&agent.cwd, None, trusted);
+            let text = agent_profiles::format_agent_profiles_status_with_plugins(
+                &agent.cwd,
+                None,
+                trusted,
+                davinci_coding_agent::plugins::active(&default_agent_dir()).agent_profiles(),
+            );
             session.chrome.transcript.push("agents", &text);
             session.chrome.status = "agents".into();
+            println!("{text}");
+            Ok(true)
+        }
+        SlashAction::Plugin(args) => {
+            let text = plugin_command_text(&args, &agent.cwd);
+            session.chrome.transcript.push("plugin", &text);
+            session.chrome.status = "plugin".into();
             println!("{text}");
             Ok(true)
         }
@@ -8009,6 +8060,130 @@ fn handle_custom_overlay_input(
     }
 }
 
+/// `/plugin …` in a session: the same commands as `davinci plugin …`.
+fn plugin_command_text(args: &str, cwd: &Path) -> String {
+    let words: Vec<String> = args.split_whitespace().map(str::to_string).collect();
+    match davinci_coding_agent::plugins::command::run(&words, &default_agent_dir(), cwd) {
+        Ok(text) => text,
+        Err(err) => format!("plugin: {err}"),
+    }
+}
+
+/// The session facts every plugin hook payload carries.
+fn plugin_hook_input(agent: &Agent) -> davinci_coding_agent::plugins::HookInput {
+    davinci_coding_agent::plugins::HookInput {
+        session_id: agent
+            .session
+            .as_ref()
+            .map(|store| store.header.id.clone())
+            .unwrap_or_default(),
+        transcript_path: agent.session.as_ref().map(|store| store.path.clone()),
+        cwd: agent.cwd.clone(),
+        ..Default::default()
+    }
+}
+
+fn report_plugin_warnings(result: &davinci_coding_agent::plugins::EventResult) {
+    for warning in &result.warnings {
+        eprintln!("[davinci-plugins] {warning}");
+    }
+}
+
+/// `UserPromptSubmit` plugin hooks: their output is extra turn context.
+fn run_plugin_prompt_hooks(
+    plugins: &davinci_coding_agent::plugins::ActivePlugins,
+    base: &davinci_coding_agent::plugins::HookInput,
+    prompt: &str,
+) -> Option<String> {
+    use davinci_coding_agent::plugins::hooks::HookEvent;
+    if !plugins.has_hooks(HookEvent::UserPromptSubmit) {
+        return None;
+    }
+    let mut input = base.clone();
+    input.prompt = Some(prompt.to_string());
+    let result = plugins.run_event(HookEvent::UserPromptSubmit, None, &input);
+    report_plugin_warnings(&result);
+    if let Some(reason) = &result.block {
+        // Blocking a prompt is not supported: report it instead of dropping it.
+        eprintln!("[davinci-plugins] UserPromptSubmit block ignored: {reason}");
+    }
+    result.joined_context()
+}
+
+fn join_turn_context(first: Option<String>, second: Option<String>) -> Option<String> {
+    match (first, second) {
+        (Some(first), Some(second)) => Some(format!("{first}\n\n{second}")),
+        (first, second) => first.or(second),
+    }
+}
+
+/// `PreToolUse` plugin hooks. `Some(reason)` blocks the call. An `allow`
+/// decision never bypasses the DaVinci permission gate.
+fn run_plugin_pre_tool(
+    plugins: &davinci_coding_agent::plugins::ActivePlugins,
+    base: &davinci_coding_agent::plugins::HookInput,
+    tool: &str,
+    args: &serde_json::Value,
+) -> Option<String> {
+    use davinci_coding_agent::plugins::hooks::{claude_tool_input, claude_tool_name, HookEvent};
+    if !plugins.has_hooks(HookEvent::PreToolUse) {
+        return None;
+    }
+    let claude_name = claude_tool_name(tool);
+    let mut input = base.clone();
+    input.tool_name = Some(claude_name.clone());
+    input.tool_input = Some(claude_tool_input(args));
+    let result = plugins.run_event(HookEvent::PreToolUse, Some(&claude_name), &input);
+    report_plugin_warnings(&result);
+    result.block
+}
+
+/// `PostToolUse` plugin hooks. Extra context or a block reason is appended
+/// to the tool result the model reads.
+fn run_plugin_post_tool(
+    plugins: &davinci_coding_agent::plugins::ActivePlugins,
+    base: &davinci_coding_agent::plugins::HookInput,
+    tool: &str,
+    args: &serde_json::Value,
+    mut result: davinci_agent::ToolResult,
+) -> davinci_agent::ToolResult {
+    use davinci_coding_agent::plugins::hooks::{claude_tool_input, claude_tool_name, HookEvent};
+    if !plugins.has_hooks(HookEvent::PostToolUse) {
+        return result;
+    }
+    let claude_name = claude_tool_name(tool);
+    let mut input = base.clone();
+    input.tool_name = Some(claude_name.clone());
+    input.tool_input = Some(claude_tool_input(args));
+    input.tool_response = Some(serde_json::json!({
+        "content": result.content,
+        "is_error": result.is_error,
+    }));
+    let outcome = plugins.run_event(HookEvent::PostToolUse, Some(&claude_name), &input);
+    report_plugin_warnings(&outcome);
+    if let Some(context) = outcome.joined_context() {
+        result.content.push_str("\n\n");
+        result.content.push_str(&context);
+    }
+    if let Some(reason) = outcome.block {
+        result.content.push_str(&format!(
+            "\n\n<plugin-hook-feedback>{reason}</plugin-hook-feedback>"
+        ));
+    }
+    result
+}
+
+/// `Stop` and `SessionEnd` plugin hooks run for their effect only.
+fn run_plugin_observer_hooks(
+    plugins: &davinci_coding_agent::plugins::ActivePlugins,
+    base: &davinci_coding_agent::plugins::HookInput,
+    event: davinci_coding_agent::plugins::hooks::HookEvent,
+) {
+    if plugins.has_hooks(event) {
+        report_plugin_warnings(&plugins.run_event(event, None, base));
+    }
+}
+
 fn apply_discovered_resources(parsed: &Args, agent: &mut Agent) {
     let settings = load_merged_settings_with_override(
         &default_agent_dir(),
@@ -8016,6 +8191,7 @@ fn apply_discovered_resources(parsed: &Args, agent: &mut Agent) {
         parsed.project_trust_override,
     );
     let trusted = is_trusted(&settings, &agent.cwd, parsed.project_trust_override);
+    let plugins = davinci_coding_agent::plugins::active(&default_agent_dir());
     if !parsed.no_skills {
         let mut roots: Vec<PathBuf> = parsed.skills.iter().map(PathBuf::from).collect();
         roots.push(default_agent_dir().join("skills"));
@@ -8033,6 +8209,9 @@ fn apply_discovered_resources(parsed: &Args, agent: &mut Agent) {
                 &agent.cwd,
             ));
         }
+        // Plugins last: lookups take the first match, so a user or project
+        // skill with the same name wins.
+        roots.extend(plugins.skill_files());
         agent.skills = discover_skills(&roots);
     }
     if !parsed.no_prompt_templates {
@@ -8052,9 +8231,28 @@ fn apply_discovered_resources(parsed: &Args, agent: &mut Agent) {
                 &agent.cwd,
             ));
         }
+        roots.extend(plugins.command_files());
         agent.templates = discover_prompt_templates(&roots);
     }
     agent.context_files = load_context_files(&agent.cwd, !parsed.no_context_files);
+    if !plugins.plugins.is_empty() {
+        let session_id = agent
+            .session
+            .as_ref()
+            .map(|store| store.header.id.clone())
+            .unwrap_or_default();
+        for (plugin, body) in davinci_coding_agent::plugins::session_start_context(
+            &default_agent_dir(),
+            &agent.cwd,
+            &session_id,
+        ) {
+            agent.context_files.push(davinci_agent::ContextFile {
+                path: PathBuf::from(format!("plugin:{plugin}")),
+                name: format!("plugin:{plugin} (SessionStart hook)"),
+                body,
+            });
+        }
+    }
 }
 
 fn sync_visual_verification_availability(agent: &mut Agent, host: &ExtensionHost) {

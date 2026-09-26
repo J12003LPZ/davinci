@@ -229,7 +229,21 @@ pub fn discover_agent_profiles(
     user_home: Option<&Path>,
     project_trusted: bool,
 ) -> Vec<AgentProfile> {
-    let mut profiles_by_name: BTreeMap<String, AgentProfile> = BTreeMap::new();
+    discover_agent_profiles_with_plugins(cwd, user_home, project_trusted, Vec::new())
+}
+
+/// [`discover_agent_profiles`] with plugin-provided profiles as the lowest
+/// layer: any user or project profile with the same name replaces them.
+pub fn discover_agent_profiles_with_plugins(
+    cwd: &Path,
+    user_home: Option<&Path>,
+    project_trusted: bool,
+    plugin_profiles: Vec<AgentProfile>,
+) -> Vec<AgentProfile> {
+    let mut profiles_by_name: BTreeMap<String, AgentProfile> = plugin_profiles
+        .into_iter()
+        .map(|profile| (profile.name.clone(), profile))
+        .collect();
 
     // 1. User global directory profiles
     let home = user_home.map(PathBuf::from).or_else(|| {
@@ -298,7 +312,19 @@ pub fn format_agent_profiles_status(
     user_home: Option<&Path>,
     project_trusted: bool,
 ) -> String {
-    let profiles = discover_agent_profiles(cwd, user_home, project_trusted);
+    format_agent_profiles_status_with_plugins(cwd, user_home, project_trusted, Vec::new())
+}
+
+pub fn format_agent_profiles_status_with_plugins(
+    cwd: &Path,
+    user_home: Option<&Path>,
+    project_trusted: bool,
+    plugin_profiles: Vec<AgentProfile>,
+) -> String {
+    let plugin_paths: std::collections::BTreeSet<PathBuf> =
+        plugin_profiles.iter().map(|p| p.path.clone()).collect();
+    let profiles =
+        discover_agent_profiles_with_plugins(cwd, user_home, project_trusted, plugin_profiles);
     if profiles.is_empty() {
         let mut msg =
             "No custom agent profiles found in .davinci/agents/ or ~/.davinci/agent/agents/.\n"
@@ -312,7 +338,13 @@ pub fn format_agent_profiles_status(
     let mut out = format!("Custom Agent Profiles ({} available):\n\n", profiles.len());
 
     for p in &profiles {
-        let source_label = if p.is_project { "project" } else { "user" };
+        let source_label = if p.is_project {
+            "project"
+        } else if plugin_paths.contains(&p.path) {
+            "plugin"
+        } else {
+            "user"
+        };
         let tools_display = if p.tools.is_empty() {
             "(none)".to_string()
         } else {
