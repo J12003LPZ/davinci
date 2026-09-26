@@ -9,6 +9,12 @@ pub(super) struct Store {
 }
 impl Store {
     pub fn open(root: &Path) -> Result<Self, String> {
+        // Resolve host-selected aliases (notably macOS /var -> /private/var)
+        // before the no-follow component walk. Descendants remain protected
+        // by Directory's handle-bound O_NOFOLLOW traversal.
+        let root = root
+            .canonicalize()
+            .map_err(|e| format!("transaction workspace: {e}"))?;
         let directory = Directory::open(&root.join(STORE_NAME), true)
             .map_err(|e| format!("transaction store: {e}"))?;
         // Recovery records are local state. Exclusive creation preserves any
