@@ -4163,7 +4163,7 @@ pub fn perform(
         }
         // Bare `/plugin` opens the manager; `/plugin <command>` stays text.
         SlashAction::Plugin(args) if args.trim().is_empty() => {
-            open_extensions_sheet(parsed, agent, model, None);
+            open_extensions_sheet(parsed, agent, model, None, false);
             Ok(Done::Opened)
         }
         SlashAction::Plugin(args) => Ok(Done::Said(crate::plugin_command_text(&args, &agent.cwd))),
@@ -5703,12 +5703,16 @@ fn extension_scope(
             Ok(path) => davinci_coding_agent::plugins::manager::McpFiles {
                 user: path.into(),
                 project: None,
+                include_plugins: false,
+                session_off: parsed.no_mcp,
             },
             Err(_) => davinci_coding_agent::plugins::manager::McpFiles {
                 user: agent_dir.join("mcp.json"),
                 project: trusted
                     .then(|| davinci_coding_agent::project_config::resolve(&agent.cwd, "mcp.json"))
                     .flatten(),
+                include_plugins: true,
+                session_off: parsed.no_mcp,
             },
         };
     (skill_roots, files)
@@ -5741,12 +5745,14 @@ fn extension_rows(
 }
 
 /// `/plugin` — installed plugins, skills and MCP servers. A rebuild keeps the
-/// open tab and each tab's selection.
+/// open tab and each tab's selection; `keep_armed` keeps a pending
+/// confirmation (the details shown before approving hooks).
 fn open_extensions_sheet(
     parsed: &crate::args::Args,
     agent: &Agent,
     model: &mut Model,
     notice: Option<String>,
+    keep_armed: bool,
 ) {
     use davinci_coding_agent::plugins::manager;
     let agent_dir = crate::default_agent_dir();
@@ -5771,7 +5777,7 @@ fn open_extensions_sheet(
         skills: extension_rows(manager::skill_rows(&agent.skills, &agent_dir, &skill_roots)),
         mcp: extension_rows(manager::mcp_rows(&agent_dir, &files, &live)),
         selected: previous.selected,
-        armed_delete: None,
+        armed: if keep_armed { previous.armed } else { None },
         notice,
     });
     if !reopening {
@@ -5809,13 +5815,29 @@ fn apply_extension_action(
         shell.model.corpus_total = shell.model.corpus.len();
     }
     let notice = match outcome {
-        Ok(text) => text
-            .replace("Start a new session or run /reload to load it.", "")
-            .trim()
-            .to_string(),
+        Ok(text) => {
+            let text = text
+                .replace("Start a new session or run /reload to load it.", "")
+                .trim()
+                .to_string();
+            if changed && tab == ExtensionTab::Plugins && action != "revoke" {
+                format!(
+                    "{text}\nSkills, commands and agents are updated now. MCP servers and \
+                     SessionStart hooks change in the next session."
+                )
+            } else {
+                text
+            }
+        }
         Err(err) => format!("Could not {action}: {err}"),
     };
-    open_extensions_sheet(shell.parsed, shell.agent, shell.model, Some(notice));
+    open_extensions_sheet(
+        shell.parsed,
+        shell.agent,
+        shell.model,
+        Some(notice),
+        action == "info",
+    );
     Next::Go
 }
 

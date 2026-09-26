@@ -44,22 +44,29 @@ select, and the hint row names only the keys the selected row allows:
 | enter | details | details | configuration |
 | `u` | update from its marketplace | – | – |
 | `e` | enable / disable | – | enable / disable (`"disabled": true`) |
-| `a` / `r` | approve / revoke hooks | – | – |
-| `d` `d` | uninstall | move to trash | remove from its `mcp.json` |
+| `a` then `y` | show the hook commands, then approve them | – | – |
+| `r` | revoke hooks | – | – |
+| `d` then `y` | uninstall | move to trash | remove from its `mcp.json` |
 
-Delete takes two presses on the same row; any other key cancels.
+Delete and hook approval wait for `y`; any other key cancels. A held `d` or
+`a` never confirms.
 
-- Plugin, skill and command changes apply at once. MCP changes apply in the
-  next session.
+- Plugin skills, commands and agents change at once. A plugin's MCP servers
+  and `SessionStart` hooks, and every MCP server change, apply in the next
+  session. `u` (update) runs git in the foreground, so the screen waits
+  for it.
 - Plugins adopted from Claude Code or Codex are updated there. Deleting one
   only stops DaVinci loading it.
 - Only skills in `~/.davinci/agent/skills/` and a trusted project's skill
   directory can be deleted. They are moved to
-  `~/.davinci/agent/trash/skills/`, so you can move them back. Skills from
-  plugins are managed through their plugin.
+  `~/.davinci/agent/trash/skills/`, so you can move them back. The move is
+  a rename: if it fails (a file in use, a project on another drive) nothing
+  is removed. A skill folder that holds other skills cannot be deleted from
+  here. Skills from plugins are managed through their plugin.
 - An MCP server is edited in the file that defines it: the user `mcp.json` or
   a trusted project's. Servers from plugins are managed through their
-  plugin. Editing rewrites the file as formatted JSON.
+  plugin. Editing rewrites the file as formatted JSON, through a symlink to
+  its target, keeping its permissions.
 
 ## Hooks need your approval
 

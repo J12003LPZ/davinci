@@ -1159,7 +1159,6 @@ fn is_picker(screen: Screen) -> bool {
             | Screen::Securitas
             | Screen::Agents
             | Screen::ContextInspector
-            | Screen::Extensions
     )
 }
 
@@ -1442,7 +1441,10 @@ fn screen_move(model: &mut Model, delta: isize) {
 }
 
 /// The `/plugin` manager's own keys: tabs, and the actions the selected row
-/// allows. Delete takes two presses on the same row; any other key disarms.
+/// allows. Delete and hook approval arm first and run only on `y`, a key
+/// that auto-repeat of the arming key cannot produce; any other key
+/// disarms. Arming approval also asks the host for the plugin's details, so
+/// the hook commands are on screen before `y`.
 fn handle_extensions_key(model: &mut Model, key: KeyEvent) -> Option<Flow> {
     let sheet = model.extension_manager.as_mut()?;
     let plain = key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT;
@@ -1460,24 +1462,22 @@ fn handle_extensions_key(model: &mut Model, key: KeyEvent) -> Option<Flow> {
         _ => {}
     }
     let row = sheet.current().cloned()?;
+    let armed = sheet.armed_here();
+    sheet.armed = None;
     let action = match key.code {
+        KeyCode::Char('y') if plain && armed.is_some() => armed.unwrap_or_default(),
         KeyCode::Char('u') if plain && row.can_update => "update",
         KeyCode::Char('e') if plain && row.can_toggle => "toggle",
-        KeyCode::Char('a') if plain && row.can_approve => "approve",
         KeyCode::Char('r') if plain && row.can_revoke => "revoke",
+        KeyCode::Char('a') if plain && row.can_approve => {
+            sheet.armed = Some((row.key.clone(), "approve"));
+            "info"
+        }
         KeyCode::Char('d') if plain && row.can_delete => {
-            if sheet.armed_delete.as_deref() == Some(row.key.as_str()) {
-                sheet.armed_delete = None;
-                "delete"
-            } else {
-                sheet.armed_delete = Some(row.key.clone());
-                return Some(Flow::Continue);
-            }
+            sheet.armed = Some((row.key, "delete"));
+            return Some(Flow::Continue);
         }
-        _ => {
-            sheet.armed_delete = None;
-            return None;
-        }
+        _ => return None,
     };
     Some(Flow::Choose(Choice::ExtensionAction {
         action,
@@ -3656,33 +3656,59 @@ mod extension_manager_tests {
         assert_eq!(m.screen, Screen::Agent);
     }
 
-    #[test]
-    fn delete_needs_two_presses_and_other_keys_disarm_it() {
-        let mut m = model();
-        assert!(chosen(press(&mut m, KeyCode::Char('d'))).is_none());
-        assert_eq!(
-            m.extension_manager
-                .as_ref()
-                .unwrap()
-                .armed_delete
-                .as_deref(),
-            Some("one@m")
-        );
-        press(&mut m, KeyCode::Char('x'));
-        assert!(m.extension_manager.as_ref().unwrap().armed_delete.is_none());
-        assert!(chosen(press(&mut m, KeyCode::Char('d'))).is_none());
-        press(&mut m, KeyCode::Down);
-        assert!(chosen(press(&mut m, KeyCode::Char('d'))).is_none());
-        let (action, _, key) = chosen(press(&mut m, KeyCode::Char('d'))).unwrap();
-        assert_eq!((action, key.as_str()), ("delete", "two@m"));
+    fn armed(m: &Model) -> Option<(String, &'static str)> {
+        m.extension_manager.as_ref().unwrap().armed.clone()
     }
 
     #[test]
-    fn keys_a_row_does_not_allow_do_nothing() {
+    fn delete_is_confirmed_only_by_y_and_other_keys_disarm_it() {
+        let mut m = model();
+        assert!(chosen(press(&mut m, KeyCode::Char('d'))).is_none());
+        assert_eq!(armed(&m), Some(("one@m".into(), "delete")));
+        // A held `d` (auto-repeat) never confirms.
+        assert!(chosen(press(&mut m, KeyCode::Char('d'))).is_none());
+        assert_eq!(armed(&m), Some(("one@m".into(), "delete")));
+        press(&mut m, KeyCode::Char('x'));
+        assert!(armed(&m).is_none());
+        // `y` with nothing armed does nothing.
+        assert!(chosen(press(&mut m, KeyCode::Char('y'))).is_none());
+        press(&mut m, KeyCode::Char('d'));
+        press(&mut m, KeyCode::Down);
+        assert!(armed(&m).is_none(), "moving away cancels");
+        press(&mut m, KeyCode::Char('d'));
+        let (action, _, key) = chosen(press(&mut m, KeyCode::Char('y'))).unwrap();
+        assert_eq!((action, key.as_str()), ("delete", "two@m"));
+        assert!(armed(&m).is_none());
+    }
+
+    #[test]
+    fn approving_hooks_shows_details_first_then_needs_y() {
+        let mut m = model();
+        m.extension_manager.as_mut().unwrap().plugins[0].can_approve = true;
+        let (action, _, key) = chosen(press(&mut m, KeyCode::Char('a'))).unwrap();
+        assert_eq!((action, key.as_str()), ("info", "one@m"));
+        assert_eq!(armed(&m), Some(("one@m".into(), "approve")));
+        assert!(chosen(press(&mut m, KeyCode::Char('a'))).unwrap().0 == "info");
+        let (action, _, _) = chosen(press(&mut m, KeyCode::Char('y'))).unwrap();
+        assert_eq!(action, "approve");
+    }
+
+    #[test]
+    fn keys_a_row_does_not_allow_do_nothing_and_pages_move_the_selection() {
         let mut m = model();
         assert!(chosen(press(&mut m, KeyCode::Char('u'))).is_none());
+        press(&mut m, KeyCode::PageDown);
+        assert_eq!(
+            m.extension_manager.as_ref().unwrap().current().unwrap().key,
+            "two@m"
+        );
+        press(&mut m, KeyCode::PageUp);
+        assert_eq!(
+            m.extension_manager.as_ref().unwrap().current().unwrap().key,
+            "one@m"
+        );
         press(&mut m, KeyCode::Right);
         assert!(chosen(press(&mut m, KeyCode::Char('d'))).is_none());
-        assert!(m.extension_manager.as_ref().unwrap().armed_delete.is_none());
+        assert!(armed(&m).is_none());
     }
 }

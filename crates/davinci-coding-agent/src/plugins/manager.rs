@@ -175,6 +175,17 @@ fn skill_target(path: &Path, roots: &[PathBuf]) -> PathBuf {
     }
 }
 
+/// The removable root a skill sits in, by its own path first so a symlinked
+/// skill file counts where it is listed, then by its resolved path.
+fn removable_root<'a>(path: &Path, raw: &'a [PathBuf], resolved: &'a [PathBuf]) -> Option<usize> {
+    raw.iter()
+        .position(|root| path.starts_with(root))
+        .or_else(|| {
+            let path = canonical_or_same(path);
+            resolved.iter().position(|root| path.starts_with(root))
+        })
+}
+
 /// `skills` are the skills the session discovered; `removable_roots` are the
 /// user and project skill directories whose contents the manager may move.
 pub fn skill_rows(
@@ -187,10 +198,11 @@ pub fn skill_rows(
         .iter()
         .map(|active| (active.key.clone(), canonical_or_same(&active.plugin.root)))
         .collect();
-    let roots: Vec<PathBuf> = removable_roots
+    let resolved: Vec<PathBuf> = removable_roots
         .iter()
         .map(|r| canonical_or_same(r))
         .collect();
+    let agent_dir = canonical_or_same(agent_dir);
     let mut rows: Vec<ManagedRow> = skills
         .iter()
         .map(|skill| {
@@ -207,15 +219,28 @@ pub fn skill_rows(
                 row.note = Some(format!(
                     "From plugin {plugin}. Manage it in the Plugins tab."
                 ));
-            } else if let Some(root) = roots.iter().find(|root| path.starts_with(root)) {
-                row.status = if root.starts_with(canonical_or_same(agent_dir)) {
+            } else if let Some(index) = removable_root(&skill.path, removable_roots, &resolved) {
+                row.status = if resolved[index].starts_with(&agent_dir) {
                     "user"
                 } else {
                     "project"
                 }
                 .into();
-                row.can_delete = true;
-                row.note = Some(skill_target(&path, &roots).display().to_string());
+                let target = skill_target(&skill.path, removable_roots);
+                // Moving a folder that other listed skills live in would take
+                // them along without saying so.
+                let shared = skills
+                    .iter()
+                    .any(|other| other.path != skill.path && other.path.starts_with(&target));
+                if shared {
+                    row.note = Some(format!(
+                        "{} also holds other skills; remove them from disk yourself.",
+                        target.display()
+                    ));
+                } else {
+                    row.can_delete = true;
+                    row.note = Some(target.display().to_string());
+                }
             } else {
                 row.status = "other".into();
                 row.note = Some(format!(
@@ -230,7 +255,8 @@ pub fn skill_rows(
     rows
 }
 
-/// Move a user or project skill to `<agent_dir>/trash/skills/`.
+/// Move a user or project skill to `<agent_dir>/trash/skills/`. Only a
+/// rename: if it fails (another drive, a file in use) nothing is touched.
 pub fn skill_action(
     skills: &[davinci_agent::Skill],
     agent_dir: &Path,
@@ -252,12 +278,8 @@ pub fn skill_action(
             row.note.as_deref().unwrap_or(key)
         )),
         "delete" if row.can_delete => {
-            let roots: Vec<PathBuf> = removable_roots
-                .iter()
-                .map(|r| canonical_or_same(r))
-                .collect();
-            let target = skill_target(&canonical_or_same(Path::new(key)), &roots);
-            if !roots
+            let target = skill_target(Path::new(key), removable_roots);
+            if !removable_roots
                 .iter()
                 .any(|root| target.starts_with(root) && &target != root)
             {
@@ -270,16 +292,13 @@ pub fn skill_action(
                 .and_then(|name| name.to_str())
                 .unwrap_or("skill");
             let dest = trash.join(format!("{name}-{}", store::now_ms()));
-            if std::fs::rename(&target, &dest).is_err() {
-                // Another volume: copy, then remove the original.
-                if target.is_dir() {
-                    super::marketplace::copy_tree(&target, &dest)?;
-                    std::fs::remove_dir_all(&target).map_err(|err| err.to_string())?;
-                } else {
-                    std::fs::copy(&target, &dest).map_err(|err| err.to_string())?;
-                    std::fs::remove_file(&target).map_err(|err| err.to_string())?;
-                }
-            }
+            std::fs::rename(&target, &dest).map_err(|err| {
+                format!(
+                    "could not move {} to the trash ({err}); nothing was removed. \
+                     Close programs using it, or delete it yourself if it is on another drive.",
+                    target.display()
+                )
+            })?;
             Ok(format!(
                 "Moved skill {} to {}. Move it back to restore it.",
                 row.title,
@@ -298,6 +317,10 @@ pub struct McpFiles {
     pub user: PathBuf,
     /// A trusted project's file; `None` when untrusted or absent.
     pub project: Option<PathBuf>,
+    /// Whether enabled plugins' servers load: not under `DAVINCI_MCP_CONFIG`.
+    pub include_plugins: bool,
+    /// `--no-mcp`: this session starts no server at all.
+    pub session_off: bool,
 }
 
 /// What the running session knows about a server.
@@ -326,8 +349,17 @@ fn read_servers(path: &Path) -> BTreeMap<String, Value> {
 /// Every configured server with the source that wins, as `mcp.rs` merges.
 fn mcp_sources(agent_dir: &Path, files: &McpFiles) -> BTreeMap<String, (McpSource, Value)> {
     let mut out = BTreeMap::new();
-    for active in super::active(agent_dir).plugins {
+    let plugins = if files.include_plugins {
+        super::active(agent_dir).plugins
+    } else {
+        Vec::new()
+    };
+    for active in plugins {
         for (server, config) in &active.plugin.mcp_servers {
+            // `ActivePlugins::mcp_servers` skips entries that do not parse.
+            if serde_json::from_value::<davinci_mcp::ServerConfig>(config.clone()).is_err() {
+                continue;
+            }
             out.insert(
                 format!("plugin_{}_{server}", active.plugin.name),
                 (McpSource::Plugin(active.key.clone()), config.clone()),
@@ -368,17 +400,18 @@ pub fn mcp_rows(agent_dir: &Path, files: &McpFiles, live: &[LiveServer]) -> Vec<
                 .get("disabled")
                 .and_then(Value::as_bool)
                 .unwrap_or(false);
-            let running = live.iter().find(|server| server.name == name);
+            // The file decides enabled/disabled; the session only says whether
+            // the server is running now.
+            let running = live
+                .iter()
+                .find(|server| server.name == name && server.status != "disabled");
             let (status, health) = match running {
                 _ if disabled => ("disabled".to_string(), Health::Off),
                 Some(server) if server.status == "connected" => {
                     (format!("connected · {} tools", server.tools), Health::Ok)
                 }
-                Some(server) if server.status == "disabled" => {
-                    ("disabled".to_string(), Health::Off)
-                }
                 Some(server) => (server.status.clone(), Health::Failed),
-                None => ("not started".to_string(), Health::Attention),
+                None => ("enabled · not running".to_string(), Health::Attention),
             };
             let mut notes = Vec::new();
             if let Some(error) = running.and_then(|server| server.error.clone()) {
@@ -394,7 +427,11 @@ pub fn mcp_rows(agent_dir: &Path, files: &McpFiles, live: &[LiveServer]) -> Vec<
                 McpSource::File(path) => (path.display().to_string(), true),
             };
             if running.is_none() && !disabled {
-                notes.push("Starts with the next DaVinci session.".into());
+                notes.push(if files.session_off {
+                    "MCP is off in this session (--no-mcp).".into()
+                } else {
+                    "Starts with the next DaVinci session.".to_string()
+                });
             }
             ManagedRow {
                 key: name.clone(),
@@ -423,7 +460,14 @@ fn edit_servers(
         .and_then(Value::as_object_mut)
         .ok_or_else(|| format!("{} has no mcpServers", path.display()))?;
     edit(servers)?;
-    store::write_json_atomic(path, &doc)
+    // Write through a symlink to the real file, and keep its permissions:
+    // `mcp.json` often holds secrets and may be linked from a dotfiles repo.
+    let real = manifest::canonical(path).map_err(|err| format!("{}: {err}", path.display()))?;
+    let permissions = std::fs::metadata(&real)
+        .map_err(|err| format!("{}: {err}", real.display()))?
+        .permissions();
+    store::write_json_atomic(&real, &doc)?;
+    std::fs::set_permissions(&real, permissions).map_err(|err| format!("{}: {err}", real.display()))
 }
 
 const MCP_RESTART: &str = "MCP servers change when the next DaVinci session starts.";
@@ -592,6 +636,36 @@ mod tests {
     }
 
     #[test]
+    fn a_skill_folder_holding_other_skills_is_not_deletable() {
+        let dir = tempfile::tempdir().unwrap();
+        let _homes = FakeHomes::new(dir.path());
+        let agent_dir = dir.path().join("agent");
+        let root = agent_dir.join("skills");
+        let pack = root.join("pack/SKILL.md");
+        let inner = root.join("pack/sub/SKILL.md");
+        let lone = root.join("lone.md");
+        write(&pack, "---\nname: pack\n---\n");
+        write(&inner, "---\nname: inner\n---\n");
+        write(&lone, "---\nname: lone\n---\n");
+        let skills = vec![
+            skill(&pack, "pack"),
+            skill(&inner, "inner"),
+            skill(&lone, "lone"),
+        ];
+        let roots = vec![root.clone()];
+        let rows = skill_rows(&skills, &agent_dir, &roots);
+        let by = |name: &str| rows.iter().find(|row| row.title == name).unwrap().clone();
+        assert!(!by("pack").can_delete);
+        assert!(by("pack").note.unwrap().contains("also holds other skills"));
+        assert!(skill_action(&skills, &agent_dir, &roots, "delete", &by("pack").key).is_err());
+        assert!(inner.exists());
+        // The nested skill and a flat file skill move on their own.
+        assert!(by("inner").can_delete);
+        skill_action(&skills, &agent_dir, &roots, "delete", &by("lone").key).unwrap();
+        assert!(!lone.exists() && root.exists());
+    }
+
+    #[test]
     fn mcp_rows_merge_sources_and_edit_only_their_own_file() {
         let dir = tempfile::tempdir().unwrap();
         let _homes = FakeHomes::new(dir.path());
@@ -609,8 +683,10 @@ mod tests {
         let files = McpFiles {
             user: user.clone(),
             project: Some(project.clone()),
+            include_plugins: true,
+            session_off: false,
         };
-        let live = vec![LiveServer {
+        let mut live = vec![LiveServer {
             name: "docs".into(),
             status: "connected".into(),
             tools: 3,
@@ -631,6 +707,26 @@ mod tests {
         mcp_action(&agent_dir, &files, "toggle", "docs").unwrap();
         let doc: Value = serde_json::from_str(&std::fs::read_to_string(&user).unwrap()).unwrap();
         assert!(doc["mcpServers"]["docs"].get("disabled").is_none());
+
+        // Disabled when the session started, enabled since: the file wins,
+        // so the row offers `disable`, not a second `enable`.
+        live[0].status = "disabled".into();
+        let rows = mcp_rows(&agent_dir, &files, &live);
+        assert_eq!(rows[0].status, "enabled · not running");
+        assert!(rows[0]
+            .note
+            .as_deref()
+            .unwrap()
+            .contains("next DaVinci session"));
+        let off = McpFiles {
+            session_off: true,
+            ..files.clone()
+        };
+        assert!(mcp_rows(&agent_dir, &off, &live)[0]
+            .note
+            .as_deref()
+            .unwrap()
+            .contains("--no-mcp"));
 
         // `shared` is the project's entry; deleting it leaves the user's.
         mcp_action(&agent_dir, &files, "delete", "shared").unwrap();

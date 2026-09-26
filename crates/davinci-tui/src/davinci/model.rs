@@ -1644,8 +1644,9 @@ pub struct ExtensionsSheet {
     pub mcp: Vec<ExtensionRow>,
     /// The selection of each tab, in `ExtensionTab::ALL` order.
     pub selected: [usize; 3],
-    /// The row key a first `d` armed; a second `d` on it deletes.
-    pub armed_delete: Option<String>,
+    /// A destructive or trusting action waiting for `y`: the row key and
+    /// `delete` or `approve`. Any other key cancels it.
+    pub armed: Option<(String, &'static str)>,
     /// The outcome of the last action.
     pub notice: Option<String>,
 }
@@ -1677,19 +1678,31 @@ impl ExtensionsSheet {
         self.current_rows().get(self.index())
     }
 
+    /// One step wraps around; a page stops at the first or last row.
     pub fn move_selection(&mut self, delta: isize) {
         let len = self.current_rows().len();
         if len == 0 {
             return;
         }
         let slot = self.tab.position();
-        self.selected[slot] = (self.index() as isize + delta).rem_euclid(len as isize) as usize;
-        self.armed_delete = None;
+        let target = self.index() as isize + delta;
+        self.selected[slot] = if delta.abs() == 1 {
+            target.rem_euclid(len as isize) as usize
+        } else {
+            target.clamp(0, len as isize - 1) as usize
+        };
+        self.armed = None;
     }
 
     pub fn switch_tab(&mut self, step: isize) {
         self.tab = self.tab.step(step);
-        self.armed_delete = None;
+        self.armed = None;
+    }
+
+    /// The action armed on the selected row, if any.
+    pub fn armed_here(&self) -> Option<&'static str> {
+        let (key, action) = self.armed.as_ref()?;
+        (self.current()?.key == *key).then_some(*action)
     }
 }
 

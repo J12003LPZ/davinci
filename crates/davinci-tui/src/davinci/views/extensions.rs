@@ -87,30 +87,44 @@ pub fn lines(model: &Model) -> Vec<Line<'static>> {
                 rows.extend(colored(section_detail(width, th, line), color));
             }
         }
-        if i == selected && sheet.armed_delete.as_deref() == Some(item.key.as_str()) {
-            rows.extend(colored(
-                section_detail(width, th, &delete_warning(sheet.tab, item)),
-                th.warning,
-            ));
+        if i == selected {
+            if let Some(action) = sheet.armed_here() {
+                rows.extend(colored(
+                    section_detail(width, th, &confirm_warning(sheet.tab, action, item)),
+                    th.warning,
+                ));
+            }
         }
     }
     rows
 }
 
-fn delete_warning(tab: ExtensionTab, item: &ExtensionRow) -> String {
+fn confirm_warning(tab: ExtensionTab, action: &str, item: &ExtensionRow) -> String {
+    if action == "approve" {
+        return format!(
+            "Press y to let the hooks of {} (listed above) run shell commands on this machine. \
+             Any other key cancels.",
+            item.title
+        );
+    }
     let what = match tab {
         ExtensionTab::Plugins => "uninstall this plugin",
-        ExtensionTab::Skills => "move this skill's folder to the DaVinci trash",
+        ExtensionTab::Skills => "move this skill to the DaVinci trash",
         ExtensionTab::Mcp => "remove this server from its mcp.json",
     };
-    format!(
-        "Press d again to {what} ({}). Any other key cancels.",
-        item.title
-    )
+    format!("Press y to {what} ({}). Any other key cancels.", item.title)
 }
 
 /// The keys the selected row allows, in the order the hint row shows them.
-pub fn row_hints(item: Option<&ExtensionRow>, armed: bool) -> Vec<&'static str> {
+/// While an action waits for confirmation only `y` does anything.
+pub fn row_hints(item: Option<&ExtensionRow>, armed: Option<&str>) -> Vec<&'static str> {
+    if let Some(action) = armed {
+        return vec![if action == "approve" {
+            "y approve hooks"
+        } else {
+            "y confirm delete"
+        }];
+    }
     let mut out = vec!["←→ tab", "↑↓ move"];
     let Some(item) = item else {
         return out;
@@ -133,11 +147,7 @@ pub fn row_hints(item: Option<&ExtensionRow>, armed: bool) -> Vec<&'static str> 
         out.push("r revoke hooks");
     }
     if item.can_delete {
-        out.push(if armed {
-            "d confirm delete"
-        } else {
-            "d delete"
-        });
+        out.push("d delete");
     }
     out
 }
@@ -147,8 +157,7 @@ pub fn chrome(model: &Model) -> SheetChrome {
     let (header, hints) = match &model.extension_manager {
         Some(sheet) => {
             let item = sheet.current();
-            let armed =
-                item.is_some_and(|item| sheet.armed_delete.as_deref() == Some(item.key.as_str()));
+            let armed = sheet.armed_here();
             (
                 format!(
                     "{} plugins · {} skills · {} MCP",
@@ -159,7 +168,7 @@ pub fn chrome(model: &Model) -> SheetChrome {
                 row_hints(item, armed),
             )
         }
-        None => (String::new(), row_hints(None, false)),
+        None => (String::new(), row_hints(None, None)),
     };
     SheetChrome {
         header_right: vec![span(header, th.muted)],
@@ -279,9 +288,18 @@ mod tests {
     #[test]
     fn armed_delete_warns_and_narrow_widths_stay_bounded() {
         let mut m = model(100);
-        m.extension_manager.as_mut().unwrap().armed_delete =
-            Some("superpowers@superpowers-marketplace".into());
-        assert!(text(&lines(&m)).contains("Press d again to uninstall this plugin"));
+        m.extension_manager.as_mut().unwrap().armed =
+            Some(("superpowers@superpowers-marketplace".into(), "delete"));
+        assert!(text(&lines(&m)).contains("Press y to uninstall this plugin"));
+        let hints: Vec<String> = chrome(&m)
+            .hints
+            .iter()
+            .flat_map(|h| h.iter().map(|s| s.content.to_string()))
+            .collect();
+        assert_eq!(hints, vec!["y confirm delete".to_string()]);
+        // Armed on a row that is not selected: nothing is shown.
+        m.extension_manager.as_mut().unwrap().armed = Some(("caveman@caveman".into(), "delete"));
+        assert!(!text(&lines(&m)).contains("Press y"));
         for width in [0, 1, 20, 40, 80, 120] {
             for row in lines(&model(width)) {
                 assert!(ui::run_width(&row.spans) <= width);
