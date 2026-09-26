@@ -123,13 +123,25 @@ impl DispatchPermit {
         name: &str,
         args: &Value,
     ) -> Result<(), &'static str> {
+        self.recheck_at(policy, revision, cwd, name, args, Instant::now())
+    }
+
+    fn recheck_at(
+        &self,
+        policy: &Arc<PermissionState>,
+        revision: Option<u64>,
+        cwd: &Path,
+        name: &str,
+        args: &Value,
+        now: Instant,
+    ) -> Result<(), &'static str> {
         let registry = self.registry.upgrade().ok_or("approval owner ended")?;
         let issued_policy = self.policy.upgrade().ok_or("approval policy ended")?;
         if !Arc::ptr_eq(&issued_policy, policy)
             || revision != Some(self.revision)
             || self.epoch == u64::MAX
             || registry.dispatch.epoch.load(Ordering::SeqCst) != self.epoch
-            || self.issued.elapsed() >= APPROVAL_TTL
+            || now.saturating_duration_since(self.issued) >= APPROVAL_TTL
             || self.digest != identity(cwd, name, args)
         {
             return Err("approval identity or freshness changed; request approval again");
@@ -187,7 +199,7 @@ mod tests {
         for changed in [
             "args", "cwd", "name", "owner", "revision", "revoked", "expired",
         ] {
-            let (registry, state, mut args, mut permit) = fixture();
+            let (registry, state, mut args, permit) = fixture();
             let other = Arc::new(PermissionState::new(PermissionPolicy::new(
                 PermissionMode::Ask,
             )));
@@ -197,9 +209,6 @@ mod tests {
             if changed == "revoked" {
                 registry.revoke_all();
             }
-            if changed == "expired" {
-                Arc::get_mut(&mut permit).unwrap().issued = Instant::now() - APPROVAL_TTL;
-            }
             let cwd = Path::new(if changed == "cwd" { "different" } else { "." });
             let name = if changed == "name" {
                 "process_stop"
@@ -208,10 +217,19 @@ mod tests {
             };
             let revision = Some(if changed == "revision" { 2 } else { 0 });
             let owner = if changed == "owner" { &other } else { &state };
-            assert!(
-                permit.consume(owner, revision, cwd, name, &args).is_err(),
-                "{changed}"
-            );
+            let result = if changed == "expired" {
+                permit.recheck_at(
+                    owner,
+                    revision,
+                    cwd,
+                    name,
+                    &args,
+                    permit.issued + APPROVAL_TTL,
+                )
+            } else {
+                permit.consume(owner, revision, cwd, name, &args)
+            };
+            assert!(result.is_err(), "{changed}");
         }
     }
 
