@@ -123,13 +123,28 @@ impl DispatchPermit {
         name: &str,
         args: &Value,
     ) -> Result<(), &'static str> {
+        self.recheck_at(policy, revision, cwd, name, args, Instant::now())
+    }
+
+    fn recheck_at(
+        &self,
+        policy: &Arc<PermissionState>,
+        revision: Option<u64>,
+        cwd: &Path,
+        name: &str,
+        args: &Value,
+        now: Instant,
+    ) -> Result<(), &'static str> {
         let registry = self.registry.upgrade().ok_or("approval owner ended")?;
         let issued_policy = self.policy.upgrade().ok_or("approval policy ended")?;
+        let fresh = now
+            .checked_duration_since(self.issued)
+            .is_some_and(|age| age < APPROVAL_TTL);
         if !Arc::ptr_eq(&issued_policy, policy)
             || revision != Some(self.revision)
             || self.epoch == u64::MAX
             || registry.dispatch.epoch.load(Ordering::SeqCst) != self.epoch
-            || self.issued.elapsed() >= APPROVAL_TTL
+            || !fresh
             || self.digest != identity(cwd, name, args)
         {
             return Err("approval identity or freshness changed; request approval again");
@@ -197,9 +212,6 @@ mod tests {
             if changed == "revoked" {
                 registry.revoke_all();
             }
-            if changed == "expired" {
-                Arc::get_mut(&mut permit).unwrap().issued = Instant::now() - APPROVAL_TTL;
-            }
             let cwd = Path::new(if changed == "cwd" { "different" } else { "." });
             let name = if changed == "name" {
                 "process_stop"
@@ -208,10 +220,18 @@ mod tests {
             };
             let revision = Some(if changed == "revision" { 2 } else { 0 });
             let owner = if changed == "owner" { &other } else { &state };
-            assert!(
-                permit.consume(owner, revision, cwd, name, &args).is_err(),
-                "{changed}"
-            );
+            let rejected = if changed == "expired" {
+                let expired_at = permit
+                    .issued
+                    .checked_add(APPROVAL_TTL)
+                    .expect("approval TTL fits in Instant");
+                permit
+                    .recheck_at(owner, revision, cwd, name, &args, expired_at)
+                    .is_err()
+            } else {
+                permit.consume(owner, revision, cwd, name, &args).is_err()
+            };
+            assert!(rejected, "{changed}");
         }
     }
 
