@@ -202,7 +202,7 @@ mod tests {
         for changed in [
             "args", "cwd", "name", "owner", "revision", "revoked", "expired",
         ] {
-            let (registry, state, mut args, mut permit) = fixture();
+            let (registry, state, mut args, permit) = fixture();
             let other = Arc::new(PermissionState::new(PermissionPolicy::new(
                 PermissionMode::Ask,
             )));
