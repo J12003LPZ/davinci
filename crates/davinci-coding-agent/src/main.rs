@@ -9424,9 +9424,7 @@ impl SessionCallUi<'_> {
             SessionCallUi::Chrome(chrome) => chrome.status = text.to_string(),
             SessionCallUi::Davinci(model) => {
                 model.transcript.push(Entry::Gap);
-                model
-                    .transcript
-                    .push(Entry::tool(State::Done, "instrumenta", text, None));
+                model.transcript.push(Entry::notice(State::Done, text));
             }
             SessionCallUi::Silent => {}
         }

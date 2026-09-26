@@ -125,8 +125,10 @@ pub fn catalog(model: &Model) -> Vec<Line<'static>> {
         })
         .max()
         .unwrap_or(0)
+        .saturating_add(indices.len().to_string().len().saturating_sub(1) as u16)
         .min(38)
         .min(model.width.saturating_sub(12));
+    let digits = indices.len().to_string().len();
     indices
         .iter()
         .enumerate()
@@ -138,7 +140,7 @@ pub fn catalog(model: &Model) -> Vec<Line<'static>> {
                 *index == model.catalog_index,
                 is_current_model(model, entry),
                 name_width,
-                ordinal + 1,
+                (ordinal + 1, digits),
             )
         })
         .collect()
@@ -146,84 +148,20 @@ pub fn catalog(model: &Model) -> Vec<Line<'static>> {
 
 /// Content-sized rounded panel, with the header fixed while the list scrolls.
 pub fn screen(model: &Model, height: usize) -> Vec<Line<'static>> {
-    picker_panel(model, height, true)
+    picker_panel(model, height)
 }
 
 /// Exact height of the full picker before terminal-height clipping.
 pub fn screen_height(model: &Model) -> usize {
-    // Match Claude Code's fixed-height model sheet at 120x40; longer DaVinci
-    // catalogs scroll instead of growing the panel upward.
+    // Claude Code's sheet is 16 rows for its five models. DaVinci catalogs
+    // are longer, so the sheet grows to show about ten before scrolling;
+    // capping at 16 left five rows and a fold marker for a ten-model list.
     (catalog(model).len() + 11)
-        .min(16)
+        .min(22)
         .min(usize::from(model.height.saturating_sub(4)).max(8))
 }
 
-/// Model argument completion shares the catalog presentation; its values and
-/// order still come from the autocomplete engine, including extension choices.
-pub fn suggestions(model: &Model) -> Option<Vec<Line<'static>>> {
-    let composer = model.composer.to_string();
-    if !composer
-        .strip_prefix("/model")
-        .is_some_and(|tail| tail.starts_with(char::is_whitespace))
-    {
-        return None;
-    }
-    let found = model.suggestions.as_ref()?;
-    if found.items.is_empty() {
-        return None;
-    }
-    let catalog = found
-        .items
-        .iter()
-        .map(|item| {
-            if let Some(entry) = model
-                .catalog
-                .iter()
-                .find(|entry| entry.name == item.label || entry.name == item.value)
-            {
-                return entry.clone();
-            }
-            let known = model
-                .models
-                .iter()
-                .find(|entry| entry.name == item.label || entry.name == item.value);
-            let (provider, id) = item
-                .value
-                .split_once('/')
-                .unwrap_or(("", item.value.as_str()));
-            crate::davinci::model::CatalogRow {
-                name: item.label.clone(),
-                provider: known
-                    .map(|entry| entry.provider.clone())
-                    .filter(|value| !value.is_empty())
-                    .unwrap_or_else(|| provider.trim().into()),
-                id: known
-                    .map(|entry| entry.id.clone())
-                    .filter(|value| !value.is_empty())
-                    .unwrap_or_else(|| id.trim().into()),
-                window: known.map(|entry| entry.window.clone()).unwrap_or_default(),
-                credential: Credential::Ready,
-                thinking: "none".into(),
-                ..Default::default()
-            }
-        })
-        .collect();
-    let picker = Model {
-        catalog,
-        catalog_index: model.suggestion_index,
-        section_offset: None,
-        section_notice: None,
-        catalog_query: String::new(),
-        ..model.clone()
-    };
-    let height = model
-        .suggestion_rows
-        .saturating_add(9)
-        .min(model.height.saturating_sub(5) as usize);
-    Some(picker_panel(&picker, height, false))
-}
-
-fn picker_panel(model: &Model, height: usize, echo: bool) -> Vec<Line<'static>> {
+fn picker_panel(model: &Model, height: usize) -> Vec<Line<'static>> {
     let th = &model.theme;
     let cc = th.cc();
     let entries = catalog(model);
@@ -238,15 +176,21 @@ fn picker_panel(model: &Model, height: usize, echo: bool) -> Vec<Line<'static>> 
     }
     let bounded = |spans| Line::from(ui::truncate_run(spans, model.width));
     let detail = |text: String, color| bounded(vec![span("   ", cc.inactive), span(text, color)]);
+    // A plain top rule: the effort already has its own row in the footer, so
+    // repeating it in the rule said the same thing twice (Claude Code
+    // `ui/19-model-picker`).
     let mut out = vec![
-        super::chrome::effort_rule(model),
+        bounded(vec![span(
+            "▔".repeat(usize::from(model.width)),
+            cc.permission,
+        )]),
         bounded(vec![
             span("   ", cc.inactive),
             ui::span_strong("Select model", cc.permission, th),
         ]),
     ];
     for text in ui::wrap(
-        "Switch between configured models. Your pick becomes the default for new sessions. Use /model <provider/model> for a specific configured model.",
+        "Switch between configured models. Your pick becomes the default for new sessions.",
         model.width.saturating_sub(3),
     )
     .into_iter()
@@ -306,11 +250,11 @@ fn picker_panel(model: &Model, height: usize, echo: bool) -> Vec<Line<'static>> 
     }
     footer.push(ui::blank());
     footer.push(detail(
-        if echo {
-            "Enter to confirm · ←/→ effort · Esc to cancel".into()
-        } else {
-            "↑↓ move · tab/↵ take · esc close".into()
-        },
+        picker_keys(
+            model.width.saturating_sub(3),
+            model.catalog_search || !model.catalog_query.is_empty(),
+        )
+        .into(),
         cc.inactive,
     ));
     // On short terminals preserve selection and action guidance before decoration.
@@ -321,13 +265,48 @@ fn picker_panel(model: &Model, height: usize, echo: bool) -> Vec<Line<'static>> 
         footer.push(hint);
     }
     let room = height.saturating_sub(out.len() + footer.len());
-    out.extend(ui::window(entries, room, anchor, th));
+    // Fold markers line up with the numbered rows instead of column zero.
+    out.extend(
+        ui::window(entries, room, anchor, th)
+            .into_iter()
+            .map(|row| {
+                if row.to_string().starts_with('…') {
+                    let mut spans = vec![span("     ", cc.inactive)];
+                    spans.extend(row.spans);
+                    bounded(spans)
+                } else {
+                    row
+                }
+            }),
+    );
     while out.len() + footer.len() < height {
         out.push(ui::blank());
     }
     out.extend(footer);
     out.truncate(height);
     out
+}
+
+/// The widest key legend that fits, so `Esc` is never the part cut off.
+fn picker_keys(room: u16, searching: bool) -> &'static str {
+    if searching {
+        return [
+            "Enter to set as default · Backspace to edit · Esc to cancel",
+            "Enter · Esc",
+        ]
+        .into_iter()
+        .find(|keys| text_width(keys) <= room)
+        .unwrap_or("Enter · Esc");
+    }
+    [
+        "Enter to set as default · s to use this session only · / to search · Esc to cancel",
+        "Enter set default · s this session · / search · Esc cancel",
+        "Enter default · s session · Esc cancel",
+        "Enter · Esc",
+    ]
+    .into_iter()
+    .find(|keys| text_width(keys) <= room)
+    .unwrap_or("Enter · Esc")
 }
 
 fn provider_label(provider: &str) -> &str {
@@ -351,9 +330,6 @@ fn model_description(entry: &crate::davinci::model::CatalogRow) -> String {
     let mut facts = vec![provider_label(&entry.provider).to_string()];
     if !entry.window.is_empty() {
         facts.push(format!("{} context", entry.window));
-    }
-    if !entry.reasoning_levels.is_empty() {
-        facts.push("Adjustable effort".into());
     }
     facts
         .into_iter()
@@ -388,7 +364,7 @@ fn catalog_row(
     focused: bool,
     current: bool,
     name_width: u16,
-    ordinal: usize,
+    (ordinal, digits): (usize, usize),
 ) -> Line<'static> {
     let th = &model.theme;
     let cc = th.cc();
@@ -397,7 +373,8 @@ fn catalog_row(
     } else {
         &entry.id
     };
-    let number = format!("{ordinal}. ");
+    // Right-aligned so `10.` does not push its name past the column.
+    let number = format!("{ordinal:>digits$}. ");
     let check = if current { " ✔" } else { "" };
     let fixed = text_width(&number).saturating_add(text_width(check));
     let clipped_name = ui::clip_ellipsis(name, name_width.saturating_sub(fixed));
@@ -519,6 +496,41 @@ mod tests {
     }
 
     #[test]
+    fn two_digit_numbers_keep_names_and_details_in_one_column() {
+        let mut m = model(120);
+        m.catalog = (1..=11)
+            .map(|n| crate::davinci::model::CatalogRow {
+                provider: "openai-codex".into(),
+                id: format!("model-{n}"),
+                window: "272k".into(),
+                credential: Credential::Ready,
+                ..Default::default()
+            })
+            .collect();
+        m.catalog_index = 0;
+        let rows: Vec<String> = catalog(&m).iter().map(Line::to_string).collect();
+        // Columns, not bytes: the focus glyph is multi-byte.
+        let column = |row: &str, needle: &str| row[..row.find(needle).unwrap()].chars().count();
+        let names: Vec<usize> = rows.iter().map(|row| column(row, "model-")).collect();
+        let details: Vec<usize> = rows.iter().map(|row| column(row, "OpenAI")).collect();
+        assert!(names.iter().all(|at| *at == names[0]), "{rows:#?}");
+        assert!(details.iter().all(|at| *at == details[0]), "{rows:#?}");
+        assert!(rows[0].contains(" 1. model-1"), "{}", rows[0]);
+        assert!(rows[10].contains("11. model-11"), "{}", rows[10]);
+    }
+
+    #[test]
+    fn the_key_legend_keeps_escape_at_every_width() {
+        for width in [40, 60, 80, 120] {
+            let mut m = model(width);
+            m.height = 40;
+            let drawn = text(&screen(&m, 24));
+            assert!(drawn.contains("Esc"), "{width}: {drawn}");
+            assert!(!drawn.contains("Adjustable effort"), "{width}: {drawn}");
+        }
+    }
+
+    #[test]
     fn picker_matches_reference_and_keeps_current_separate_from_focus() {
         let mut m = model(140);
         m.catalog = vec![
@@ -542,8 +554,9 @@ mod tests {
         for label in [
             "▔",
             "Select model",
-            "Enter to confirm",
-            "←/→ effort",
+            "Enter to set as default",
+            "s to use this session only",
+            "Esc to cancel",
             "OpenAI Codex",
             "gpt-6-astra",
             "gpt-5.6-luna",

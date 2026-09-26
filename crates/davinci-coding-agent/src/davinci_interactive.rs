@@ -921,11 +921,9 @@ impl Turn {
             *summary = None;
         }
         if let Some(rule) = remembered {
-            model.transcript.push(Entry::tool(
+            model.transcript.push(Entry::notice(
                 State::Done,
-                "instrumenta",
                 &format!("remembered {rule} · .pi/settings.json"),
-                None,
             ));
         }
     }
@@ -2253,7 +2251,14 @@ pub fn classify(line: &str) -> Sent {
     match crate::slash::parse_line(line) {
         SlashAction::Prompt(text) => Sent::Prompt(text),
         SlashAction::Quit => Sent::Quit,
-        SlashAction::Status(text) => Sent::Say(text),
+        // The transcript renders markdown, where bare lines merge into one
+        // paragraph; the legacy chrome prints the same text verbatim.
+        SlashAction::Status(text) => Sent::Say(
+            text.lines()
+                .map(|line| format!("- {line}"))
+                .collect::<Vec<_>>()
+                .join("\n"),
+        ),
         // Everything else — including /model, /settings, /hotkeys, /resume —
         // reaches `perform`, which opens the sheet each one designs
         // (screens 3a–6d) with live data behind it.
@@ -3861,6 +3866,12 @@ pub fn perform(
                 ),
             }))
         }
+        // Bare `/thinking` or `/effort`: the model picker opens on the
+        // current model, whose effort row adjusts with ←/→.
+        SlashAction::SetThinking(level) if level.trim().is_empty() => {
+            open_models_sheet(parsed, agent, model);
+            Ok(Done::Opened)
+        }
         SlashAction::SetThinking(level) => {
             let Some(parsed_level) = davinci_protocol::ThinkingLevel::parse(&level) else {
                 return Ok(Done::Note(format!("unknown thinking level {level}")));
@@ -4131,7 +4142,9 @@ pub fn perform(
             }
         }
         SlashAction::ShowCost => Ok(Done::Said(crate::format_session_cost(parsed, agent))),
-        SlashAction::ShowStatus => Ok(Done::Said(crate::format_session_status(parsed, agent))),
+        SlashAction::ShowStatus => Ok(Done::Said(status_as_list(&crate::format_session_status(
+            parsed, agent,
+        )))),
         SlashAction::Agents => {
             let settings =
                 crate::settings::load_merged_settings(&crate::default_agent_dir(), &agent.cwd);
@@ -4153,6 +4166,40 @@ pub fn perform(
             Ok(Done::Opened)
         }
     }
+}
+
+/// `format_session_status` is one `·`-joined line shared with print and RPC
+/// mode. In the shell it wrapped into an unlabeled run-on paragraph, so the
+/// leading fields get names and every field gets its own row.
+fn status_as_list(status: &str) -> String {
+    const LABELS: [&str; 5] = ["Model", "Permissions", "Mode", "Jobs", "MCP"];
+    let mut lines = status.lines();
+    let mut out: Vec<String> = lines
+        .next()
+        .unwrap_or_default()
+        .split(" · ")
+        .enumerate()
+        .map(|(index, field)| {
+            let value = field
+                .strip_suffix(" jobs")
+                .or_else(|| field.strip_suffix(" mcp"))
+                .unwrap_or(field);
+            match LABELS.get(index) {
+                Some(label) => format!("- **{label}** {value}"),
+                None if field.starts_with('$') => format!("- **Cost** {field}"),
+                None if field.len() == 8 && field.bytes().all(|b| b.is_ascii_hexdigit()) => {
+                    format!("- **Prompt hash** {field}")
+                }
+                None => format!("- {field}"),
+            }
+        })
+        .collect();
+    out.extend(
+        lines
+            .filter(|line| !line.trim().is_empty())
+            .map(|line| format!("- {}", line.trim())),
+    );
+    out.join("\n")
 }
 
 fn session_id(agent: &Agent) -> String {
@@ -4399,7 +4446,7 @@ pub fn run(
             model.transcript.push(Entry::Gap);
             model
                 .transcript
-                .push(Entry::tool(State::Attention, "instrumenta", warning, None));
+                .push(Entry::notice(State::Attention, warning));
         }
     }
 
@@ -4570,7 +4617,7 @@ pub fn run(
             if kind == "error" {
                 model
                     .transcript
-                    .push(Entry::tool(State::Attention, "instrumenta", &line, None));
+                    .push(Entry::notice(State::Attention, &line));
             } else {
                 model.transcript.push(Entry::prose(&line));
             }
@@ -5045,11 +5092,9 @@ fn opening_block(
         && crate::trust::has_trust_requiring_project_resources(&agent.cwd)
     {
         out.push(Entry::Gap);
-        out.push(Entry::tool(
+        out.push(Entry::notice(
             State::Attention,
-            "instrumenta",
             "this project is not trusted, so its .pi resources are ignored — /trust to decide",
-            None,
         ));
     }
 
@@ -5080,7 +5125,7 @@ fn startup_notice_entries(notices: &crate::startup::StartupNotices) -> Vec<Entry
     for (kind, line) in crate::startup::format_notices(notices) {
         out.push(Entry::Gap);
         if kind == "warning" || kind == "error" {
-            out.push(Entry::tool(State::Attention, "instrumenta", &line, None));
+            out.push(Entry::notice(State::Attention, &line));
         } else {
             out.push(Entry::prose(&line));
         }
@@ -5353,12 +5398,9 @@ pub fn apply_ui_calls(model: &mut Model, calls: &[serde_json::Value]) -> Option<
                 let message = field(call, "message");
                 if !message.trim().is_empty() {
                     model.transcript.push(Entry::Gap);
-                    model.transcript.push(Entry::tool(
-                        State::Attention,
-                        "instrumenta",
-                        message.trim(),
-                        None,
-                    ));
+                    model
+                        .transcript
+                        .push(Entry::notice(State::Attention, message.trim()));
                 }
             }
             Some("setEditorText") => model.replace_composer(field(call, "text")),
@@ -5738,9 +5780,10 @@ fn open_models_sheet(parsed: &crate::args::Args, agent: &Agent, model: &mut Mode
 }
 
 /// Keep only usable providers, with the active provider leading, and show
-/// newer featured models first within each provider. Focus the top row; the
-/// active model is marked independently by the view.
-fn order_catalog(catalog: &mut Vec<CatalogRow>, provider: &str, _model_id: &str) -> usize {
+/// newer featured models first within each provider. Focus the active model,
+/// so the effort row describes the model in use rather than whichever model
+/// sorts first; fall back to the top row when it is not in the list.
+fn order_catalog(catalog: &mut Vec<CatalogRow>, provider: &str, model_id: &str) -> usize {
     catalog.retain(|row| row.credential == Credential::Ready);
     catalog.sort_by_key(|row| {
         (
@@ -5750,7 +5793,10 @@ fn order_catalog(catalog: &mut Vec<CatalogRow>, provider: &str, _model_id: &str)
             davinci_tui::model_picker_rank(&row.id),
         )
     });
-    0
+    catalog
+        .iter()
+        .position(|row| row.provider == provider && row.id == model_id)
+        .unwrap_or(0)
 }
 
 fn apply_theme_setting(model: &mut Model, settings: &crate::settings::Settings) {
@@ -5913,8 +5959,36 @@ fn open_login_sheet(parsed: &crate::args::Args, model: &mut Model) {
 }
 
 /// A binding's action id, said in words: `cursorWordLeft` → `cursor word left`.
+/// An id ending in a bare verb (`davinci.grafo.toggle`, `app.session.new`)
+/// read as a column of "toggle" rows, so it names its subject too.
 fn humanize_action(action: &str) -> String {
-    let name = action.rsplit('.').next().unwrap_or(action);
+    let mut segments = action.rsplit('.');
+    let name = segments.next().unwrap_or(action);
+    if action == "app.session.tree" {
+        return "session tree".into();
+    }
+    // Only DaVinci and app actions: `tui.select.up` must stay "up".
+    let owned = action.starts_with("davinci.") || action.starts_with("app.");
+    if owned && !name.is_empty() && name.chars().all(|ch| ch.is_ascii_lowercase()) {
+        let surface = match segments.next().unwrap_or_default() {
+            "instrumenta" => "command palette",
+            "sessions" => "sessions",
+            "cogitator" => "model picker",
+            "plan" => "plan",
+            "grafo" => "graph",
+            "mensura" => "token governor",
+            "memoria" => "memory",
+            "codex" => "workspace",
+            "voice" => "voice input",
+            "tools" => "tool output",
+            other => other,
+        };
+        // Two-segment ids (`davinci.quit`) have no subject to name.
+        if matches!(surface, "davinci" | "app") {
+            return name.to_string();
+        }
+        return format!("{name} {surface}");
+    }
     let mut out = String::new();
     for ch in name.chars() {
         if ch.is_uppercase() {
@@ -7833,7 +7907,7 @@ impl Shell<'_> {
         self.model.transcript.push(Entry::Gap);
         self.model
             .transcript
-            .push(Entry::tool(State::Attention, "instrumenta", text, None));
+            .push(Entry::notice(State::Attention, text));
     }
 
     /// Re-read everything the workspace owns: git, the tree, the session
@@ -8951,12 +9025,10 @@ fn todo_command(shell: &mut Shell<'_>, arg: &str) -> Next {
         shell.model.plan.clear();
         shell.model.running = false;
         shell.model.transcript.push(Entry::Gap);
-        shell.model.transcript.push(Entry::tool(
-            State::Done,
-            "instrumenta",
-            "ledger cleared",
-            None,
-        ));
+        shell
+            .model
+            .transcript
+            .push(Entry::notice(State::Done, "ledger cleared"));
         return Next::Go;
     }
     if !arg.is_empty() {
@@ -8973,11 +9045,9 @@ fn todo_command(shell: &mut Shell<'_>, arg: &str) -> Next {
     shell.model.running = false;
     shell.model.transcript.push(Entry::Gap);
     if list.is_empty() {
-        shell.model.transcript.push(Entry::tool(
+        shell.model.transcript.push(Entry::notice(
             State::Queued,
-            "instrumenta",
             "no ledger · the model keeps one with the todo tool on longer tasks",
-            None,
         ));
         return Next::Go;
     }

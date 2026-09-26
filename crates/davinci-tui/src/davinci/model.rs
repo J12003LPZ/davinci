@@ -492,9 +492,14 @@ impl Hunk {
     }
 }
 
+/// The instrument that marks an [`Entry::notice`]. Distinct from
+/// `instrumenta`, which is also the fallback instrument of real tool calls.
+pub const NOTICE_INSTRUMENT: &str = "notice";
+
 /// A block in the transcript. Blocks are separated by one blank row; nothing
 /// inside a block is (design.md §3).
 #[derive(Debug, Clone)]
+
 pub enum Entry {
     Gap,
     User(String),
@@ -581,6 +586,12 @@ impl Entry {
             what: super::sanitize::terminal_safe(what).into_owned(),
             subject: super::sanitize::terminal_safe(subject).into_owned(),
         }
+    }
+
+    /// A host notice: a warning or confirmation from DaVinci itself, not a
+    /// tool call. Drawn as a wrapped `●` line rather than `● Tool(…)`.
+    pub fn notice(state: State, text: &str) -> Self {
+        Self::tool(state, NOTICE_INSTRUMENT, text, None)
     }
 
     pub fn tool(state: State, instrument: &str, target: &str, duration: Option<&str>) -> Self {
@@ -2535,6 +2546,15 @@ impl Model {
             return;
         }
         let text = self.composer.to_string();
+        // A command name followed only by whitespace has no argument yet.
+        // Completing `/mod` to `/model ` shows the argument hint and nothing
+        // else (Claude Code `shell/54-tab-mod`); values are offered once the
+        // user starts typing one, so Tab never pops a list open by itself.
+        if awaits_first_argument(&text) && self.command_has_argument_hint(&text) {
+            self.suggestions = None;
+            self.suggestion_index = 0;
+            return;
+        }
         let found = suggestions(SuggestionQuery {
             text: &text,
             commands: &self.slash_commands,
@@ -2551,6 +2571,20 @@ impl Model {
         // the cap.
         self.suggestions = found;
         self.suggestion_index = 0;
+    }
+
+    /// Whether the composer's `/command` draws an argument hint. Commands
+    /// without one keep their value list on a bare `/command `, since it is
+    /// then the only thing saying what the command takes.
+    fn command_has_argument_hint(&self, text: &str) -> bool {
+        let name = text
+            .trim_start_matches('/')
+            .split_whitespace()
+            .next()
+            .unwrap_or_default();
+        self.slash_commands
+            .iter()
+            .any(|spec| spec.name == name && spec.argument_hint.is_some())
     }
 
     /// The visible slice of the suggestion list: `suggestion_rows` around the
@@ -2608,8 +2642,9 @@ impl Model {
         self.composer.set_text(completed);
         let end = self.composer.editor().buffer.len();
         self.composer.editor_mut().cursor = end;
-        // What the composer now holds may itself be completable — `/model `
-        // offers the models — so ask again rather than closing blind.
+        // What the composer now holds may itself be completable (a path
+        // segment, an argument value), so ask again rather than closing
+        // blind. A bare `/command ` is deliberately left without a list.
         self.refresh_suggestions();
         true
     }
@@ -2857,6 +2892,21 @@ fn subsequence(needle: &str, haystack: &str) -> bool {
     needle
         .chars()
         .all(|wanted| chars.any(|candidate| candidate == wanted))
+}
+
+/// Whether `text` is a single-line `/command` followed only by whitespace, so
+/// no argument has been started yet.
+fn awaits_first_argument(text: &str) -> bool {
+    if text.contains('\n') {
+        return false;
+    }
+    let Some(rest) = text.strip_prefix('/') else {
+        return false;
+    };
+    match rest.find(char::is_whitespace) {
+        Some(split) => split > 0 && rest[split..].trim().is_empty(),
+        None => false,
+    }
 }
 
 /// Move a selection index by `delta`, wrapping at both ends.

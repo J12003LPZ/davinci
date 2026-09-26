@@ -28,6 +28,13 @@ pub fn builtin_slash_commands() -> Vec<SlashCommand> {
             "Set reasoning level",
             Some("<off|minimal|low|medium|high|xhigh|max>"),
         ),
+        // The composer rule advertises `/effort` on every screen; it was not a
+        // command, so following the hint printed "not a command".
+        (
+            "effort",
+            "Set reasoning effort (alias for /thinking)",
+            Some("<off|minimal|low|medium|high|xhigh|max>"),
+        ),
         ("tree", "Navigate session tree (switch branches)", None),
         (
             "export",
@@ -191,7 +198,7 @@ pub fn parse_line(line: &str) -> SlashAction {
         }),
         "model" if args.is_empty() => SlashAction::OpenModel,
         "model" => SlashAction::SetModel(args.to_string()),
-        "thinking" => SlashAction::SetThinking(args.to_string()),
+        "thinking" | "effort" => SlashAction::SetThinking(args.to_string()),
         "export" => SlashAction::Export(if args.is_empty() {
             None
         } else {
@@ -369,11 +376,14 @@ mod tests {
             .collect::<Vec<_>>();
         assert!(names.iter().any(|name| name == "thinking"));
 
+        assert!(names.iter().any(|name| name == "effort"));
         for level in ["off", "minimal", "low", "medium", "high", "xhigh", "max"] {
-            assert_eq!(
-                parse_line(&format!("/thinking {level}")),
-                SlashAction::SetThinking(level.into())
-            );
+            for command in ["thinking", "effort"] {
+                assert_eq!(
+                    parse_line(&format!("/{command} {level}")),
+                    SlashAction::SetThinking(level.into())
+                );
+            }
         }
     }
 
