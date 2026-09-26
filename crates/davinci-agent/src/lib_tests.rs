@@ -205,9 +205,17 @@ fn f03_session_reload_preserves_live_claim_and_writer_lease() {
     );
     assert!(!worker.cancellation_token.is_cancelled());
     let mut competing = Agent::new("fixture");
-    assert!(competing
+    let error = competing
         .load_from_session(JsonlSession::open(&path).unwrap())
-        .is_err());
+        .unwrap_err();
+    // A live second writer is not corruption: say where the session is and
+    // what to do, not "Runtime recovery required" with a raw OS error.
+    assert!(
+        error.starts_with(runtime::session::SESSION_IN_USE),
+        "{error}"
+    );
+    assert!(!error.contains("recovery required"), "{error}");
+    assert!(!error.contains("os error"), "{error}");
     assert!(competing.session.is_none());
     drop(worker);
     drop(agent);
@@ -221,6 +229,40 @@ fn f03_session_reload_preserves_live_claim_and_writer_lease() {
         .get_task(&id)
         .unwrap();
     assert_eq!(recovered.state, TaskState::Failed);
+}
+
+#[test]
+fn switching_to_a_session_held_elsewhere_keeps_the_current_one() {
+    let dir = tempfile::tempdir().unwrap();
+    let held = JsonlSession::create(dir.path(), "fixture", None).unwrap();
+    let held_path = held.path.clone();
+    let mut holder = Agent::new("fixture");
+    holder.load_from_session(held).unwrap();
+
+    let mut agent = Agent::new("fixture");
+    agent
+        .load_from_session(JsonlSession::create(dir.path(), "fixture", None).unwrap())
+        .unwrap();
+    let own_path = agent.session.as_ref().unwrap().path.clone();
+    let run = agent.runtime_for_session().unwrap().run_id;
+
+    let error = agent
+        .load_from_session(JsonlSession::open(&held_path).unwrap())
+        .unwrap_err();
+    assert!(
+        error.starts_with(runtime::session::SESSION_IN_USE),
+        "{error}"
+    );
+    assert!(error.contains(&held_path.display().to_string()), "{error}");
+    assert_eq!(agent.session.as_ref().unwrap().path, own_path);
+    assert_eq!(agent.runtime_for_session().unwrap().run_id, run);
+
+    // Once the holder lets go, the same switch succeeds.
+    drop(holder);
+    agent
+        .load_from_session(JsonlSession::open(&held_path).unwrap())
+        .unwrap();
+    assert_eq!(agent.session.as_ref().unwrap().path, held_path);
 }
 
 #[test]

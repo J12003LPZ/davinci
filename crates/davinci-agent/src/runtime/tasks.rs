@@ -240,6 +240,10 @@ pub enum TaskError {
     RunMismatch(TaskId),
     #[error("task persistence failed: {0}")]
     Persistence(String),
+    /// Another live process holds the single-writer lease on this journal.
+    /// Not corruption: nothing needs recovery once that process lets go.
+    #[error("task journal is held by another process")]
+    InUse,
     #[error("task revision exhausted: {0}")]
     RevisionOverflow(TaskId),
     #[error("task revision conflict: {0}")]

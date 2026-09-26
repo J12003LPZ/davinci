@@ -1248,6 +1248,14 @@ fn complete_simple_summarization(
     })
 }
 
+/// A reply that means the session runtime could not be activated: print
+/// mode stops and exits 1 on either a real recovery need or a session held
+/// by another DaVinci session.
+fn runtime_blocked(reply: &str) -> bool {
+    reply.starts_with("Runtime recovery required: ")
+        || reply.starts_with(davinci_agent::runtime::session::SESSION_IN_USE)
+}
+
 fn resolve_or_create_session(
     parsed: &Args,
     session_dir: &Path,
@@ -2365,7 +2373,11 @@ fn complete_prompt_with_host(
     }) {
         Ok(runtime) => runtime,
         Err(error) => {
-            let reply = format!("Runtime recovery required: {error}");
+            let reply = if error.starts_with(davinci_agent::runtime::session::SESSION_IN_USE) {
+                error
+            } else {
+                format!("Runtime recovery required: {error}")
+            };
             let end = AgentEvent::AgentEnd {
                 messages: vec![davinci_ai::ChatMessage::text("assistant", &reply)],
                 will_retry: false,
@@ -3146,7 +3158,7 @@ fn run_print(parsed: &Args, agent: &mut Agent) -> Result<i32, String> {
     for extra in &prepared.remaining_messages {
         if approval_required.is_some()
             || agent.ensure_session_persistence().is_err()
-            || last_reply.starts_with("Runtime recovery required: ")
+            || runtime_blocked(&last_reply)
         {
             break;
         }
@@ -3175,9 +3187,7 @@ fn run_print(parsed: &Args, agent: &mut Agent) -> Result<i32, String> {
     // A provider failure that the loop gave up on carries no error stop
     // reason of its own: it is the reply text. Report it as the failure it is.
     let (exit_code, error) = match error {
-        None if last_reply.starts_with("Provider error: ")
-            || last_reply.starts_with("Runtime recovery required: ") =>
-        {
+        None if last_reply.starts_with("Provider error: ") || runtime_blocked(&last_reply) => {
             (1, Some(last_reply.clone()))
         }
         other => (exit_code, other),
@@ -9598,7 +9608,9 @@ fn apply_session_calls(
                         }),
                 };
                 if let Err(error) = next.and_then(|next| agent.load_from_session(next)) {
-                    let error = if error.starts_with("Runtime recovery required:") {
+                    let error = if error.starts_with("Runtime recovery required:")
+                        || error.starts_with(davinci_agent::runtime::session::SESSION_IN_USE)
+                    {
                         error
                     } else {
                         format!("Runtime recovery required: {error}")

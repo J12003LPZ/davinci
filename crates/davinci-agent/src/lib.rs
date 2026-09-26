@@ -2918,7 +2918,13 @@ impl Agent {
                 RuntimeHandle::new(RunId::new(), AgentId::new(), RuntimeBus::new()),
                 &session,
             )
-            .map_err(|error| format!("Runtime recovery required: {error}"))?,
+            .map_err(|error| {
+                if error.starts_with(runtime::session::SESSION_IN_USE) {
+                    format!("{error} ({})", session.path.display())
+                } else {
+                    format!("Runtime recovery required: {error}")
+                }
+            })?,
         };
         let ledger_path = session.path.with_extension("tool-ledger.json");
         let legacy_observations =
