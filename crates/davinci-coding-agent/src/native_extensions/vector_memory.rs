@@ -1420,6 +1420,14 @@ impl VectorMemory {
         }
     }
 
+    /// Forget an earlier embedding failure, for when the server was just
+    /// started or the model just pulled.
+    pub fn clear_dense_offline(&self) {
+        if let Ok(mut guard) = self.dense_offline_until.lock() {
+            *guard = None;
+        }
+    }
+
     #[allow(dead_code)]
     pub fn stats(&self) -> VectorMemoryStats {
         VectorMemoryStats {
@@ -1987,7 +1995,7 @@ pub(crate) mod tests {
 
     /// Read one HTTP/1.1 request fully: the header block and then as many
     /// body bytes as `Content-Length` announces.
-    fn read_http_request(stream: &mut TcpStream) -> String {
+    pub(crate) fn read_http_request(stream: &mut TcpStream) -> String {
         let mut bytes = Vec::new();
         let mut chunk = [0_u8; 4096];
         let header_end = loop {

@@ -17,10 +17,30 @@ relevant parts back before each prompt. It is a native Rust extension
 
 Only `user` and `assistant` messages are indexed. Tool output is not.
 
+## Setting it up
+
+Run `/setup` in the project. It checks every feature that needs you to do
+something before it works, fixes what it can, and lists the rest:
+
+| Area | `/setup` does | You do |
+| --- | --- | --- |
+| Vector memory | Starts an installed local Ollama (`ollama serve`), pulls `embeddingModel` in the background, and embeds records that have no vector. | Install Ollama when it is missing. Fix `embeddingDimensions` when the model disagrees. |
+| .gitignore | Adds `/.davinci/vector-memory/` and `/.davinci/graph/` to the project's `.gitignore` inside a Git work tree. | Nothing. |
+| Project trust | Reports when project settings, hooks, skills or MCP servers are ignored because the project is not trusted. | Review them, then run `/setup trust`. Restart to load them. |
+| Plugin hooks | Lists enabled plugins whose hooks wait for approval. | `/plugin approve <name>`. |
+| Language servers | Detects Rust, TypeScript/JavaScript and Python projects and looks for their servers on `PATH` or in `node_modules/.bin`. | Install the server it names. Davinci never installs one. |
+| Project instructions | Looks for `AGENTS.md` or `CLAUDE.md`. | `/init`. |
+
+`/setup check` reports without changing anything. The model pull continues
+after the command returns, so run `/setup` again to follow it. Trust is never
+granted by `/setup` alone, because a trusted project can run its own hooks,
+extensions and MCP servers.
+
 ## Commands
 
 | Command | What it does |
 | --- | --- |
+| `/setup [check\|trust]` | Sets up vector memory and the other features above. |
 | `/memory-page [--no-open] [query]` | Writes `.davinci/vector-memory/memory-page.html` beside the records and opens it. |
 | `/memory-status` | Opens the memory sheet with record counts and configuration. |
 | `/memory-search <query>` | Runs the same search used before each prompt. |
