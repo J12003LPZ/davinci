@@ -19,9 +19,9 @@ use super::views::chrome::{self, Hint};
 use super::views::sheet::{self, Composer};
 use super::views::{
     agents, ask, codex, cogitator, compact, context_inspector, decision_modal, diff, disegno,
-    export, governor, grafo, graph_run, instrumenta, keys, login, mcp, memoria, mensura, officina,
-    opera, permissions, recovery, resume, rewind, secret_input, securitas, settings, startup,
-    task_board, transcript, tree, trust, vectors, workflows,
+    export, extensions, governor, grafo, graph_run, instrumenta, keys, login, mcp, memoria,
+    mensura, officina, opera, permissions, recovery, resume, rewind, secret_input, securitas,
+    settings, startup, task_board, transcript, tree, trust, vectors, workflows,
 };
 
 /// Secret value carried from the masked input overlay to the host.
@@ -293,7 +293,7 @@ fn command_panel_frame(
     }
     if matches!(
         model.screen,
-        Screen::TaskBoard | Screen::Agents | Screen::Mcp
+        Screen::TaskBoard | Screen::Agents | Screen::Mcp | Screen::Extensions
     ) {
         rows.push(Line::from(ui::span(
             "▔".repeat(usize::from(model.width)),
@@ -421,6 +421,7 @@ fn section_rows(model: &Model) -> Option<Vec<Line<'static>>> {
         Screen::TaskBoard => Some(task_board::lines(model)),
         Screen::Agents => Some(agents::lines(model)),
         Screen::ContextInspector => Some(context_inspector::lines(model)),
+        Screen::Extensions => Some(extensions::lines(model)),
         Screen::Keys => Some(keys::lines(model)),
         Screen::Agent => None,
     }
@@ -563,6 +564,7 @@ fn panel(
             | Screen::Securitas
             | Screen::Agents
             | Screen::ContextInspector
+            | Screen::Extensions
     );
     let anchor = model.section_offset.unwrap_or_else(|| {
         if picking {
@@ -988,6 +990,12 @@ fn handle_screen_key(model: &mut Model, key: KeyEvent, data: Option<&str>) -> Fl
         return Flow::Continue;
     }
 
+    if model.screen == Screen::Extensions && key.kind == KeyEventKind::Press {
+        if let Some(flow) = handle_extensions_key(model, key) {
+            return flow;
+        }
+    }
+
     // A sheet with a selection owns the arrows and enter.
     if action_matches(model, data, "tui.select.up") {
         screen_move(model, -1);
@@ -1151,6 +1159,7 @@ fn is_picker(screen: Screen) -> bool {
             | Screen::Securitas
             | Screen::Agents
             | Screen::ContextInspector
+            | Screen::Extensions
     )
 }
 
@@ -1407,6 +1416,11 @@ fn screen_move(model: &mut Model, delta: isize) {
                 s.selected_index = model.agents_index;
             }
         }
+        Screen::Extensions => {
+            if let Some(sheet) = model.extension_manager.as_mut() {
+                sheet.move_selection(delta);
+            }
+        }
         Screen::ContextInspector => {
             let len = model
                 .context_inspector
@@ -1425,6 +1439,60 @@ fn screen_move(model: &mut Model, delta: isize) {
             model.feature_scroll = model.feature_scroll.saturating_add_signed(delta).min(last);
         }
     }
+}
+
+/// The `/plugin` manager's own keys: tabs, and the actions the selected row
+/// allows. Delete takes two presses on the same row; any other key disarms.
+fn handle_extensions_key(model: &mut Model, key: KeyEvent) -> Option<Flow> {
+    let sheet = model.extension_manager.as_mut()?;
+    let plain = key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT;
+    match key.code {
+        KeyCode::Left | KeyCode::BackTab => {
+            sheet.switch_tab(-1);
+            model.section_offset = None;
+            return Some(Flow::Continue);
+        }
+        KeyCode::Right | KeyCode::Tab => {
+            sheet.switch_tab(1);
+            model.section_offset = None;
+            return Some(Flow::Continue);
+        }
+        _ => {}
+    }
+    let row = sheet.current().cloned()?;
+    let action = match key.code {
+        KeyCode::Char('u') if plain && row.can_update => "update",
+        KeyCode::Char('e') if plain && row.can_toggle => "toggle",
+        KeyCode::Char('a') if plain && row.can_approve => "approve",
+        KeyCode::Char('r') if plain && row.can_revoke => "revoke",
+        KeyCode::Char('d') if plain && row.can_delete => {
+            if sheet.armed_delete.as_deref() == Some(row.key.as_str()) {
+                sheet.armed_delete = None;
+                "delete"
+            } else {
+                sheet.armed_delete = Some(row.key.clone());
+                return Some(Flow::Continue);
+            }
+        }
+        _ => {
+            sheet.armed_delete = None;
+            return None;
+        }
+    };
+    Some(Flow::Choose(Choice::ExtensionAction {
+        action,
+        tab: sheet.tab,
+        key: row.key,
+    }))
+}
+
+fn extension_choice(model: &Model, action: &'static str) -> Option<Choice> {
+    let sheet = model.extension_manager.as_ref()?;
+    sheet.current().map(|row| Choice::ExtensionAction {
+        action,
+        tab: sheet.tab,
+        key: row.key.clone(),
+    })
 }
 
 /// What enter means on the open sheet, if it means anything.
@@ -1472,6 +1540,7 @@ fn screen_accept(model: &Model) -> Option<Choice> {
                 index: model.context_inspector_index % len,
             })
         }
+        Screen::Extensions => extension_choice(model, "info"),
         Screen::GraphRun => {
             let len = model.graph_run.as_ref().map(|s| s.tasks.len()).unwrap_or(0);
             (len > 0).then(|| Choice::GraphAction {
@@ -3511,5 +3580,109 @@ mod section_input_regressions {
         assert!(matches!(flow_enter, Flow::Continue));
         assert!(m.graph_run.as_ref().unwrap().inspecting_node);
         assert_eq!(&*m.composer, "my draft");
+    }
+}
+
+#[cfg(test)]
+mod extension_manager_tests {
+    use super::*;
+    use crate::davinci::model::{ExtensionRow, ExtensionTab, ExtensionsSheet};
+    use crate::davinci::theme::{ColorDepth, Theme};
+
+    fn press(model: &mut Model, code: KeyCode) -> Flow {
+        handle_key(model, KeyEvent::new(code, KeyModifiers::NONE))
+    }
+
+    fn model() -> Model {
+        let mut m = Model::new(
+            Theme::da_vinci(ColorDepth::TrueColor, false),
+            100,
+            30,
+            false,
+        );
+        m.screen = Screen::Extensions;
+        let row = |key: &str| ExtensionRow {
+            key: key.into(),
+            title: key.into(),
+            status: "enabled".into(),
+            can_toggle: true,
+            can_delete: true,
+            ..ExtensionRow::default()
+        };
+        m.extension_manager = Some(ExtensionsSheet {
+            plugins: vec![row("one@m"), row("two@m")],
+            skills: vec![ExtensionRow {
+                can_delete: false,
+                ..row("skill")
+            }],
+            ..ExtensionsSheet::default()
+        });
+        m
+    }
+
+    fn chosen(flow: Flow) -> Option<(&'static str, ExtensionTab, String)> {
+        match flow {
+            Flow::Choose(Choice::ExtensionAction { action, tab, key }) => Some((action, tab, key)),
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn arrows_and_tab_move_between_rows_and_tabs() {
+        let mut m = model();
+        press(&mut m, KeyCode::Down);
+        assert_eq!(
+            chosen(press(&mut m, KeyCode::Char('e'))).unwrap().2,
+            "two@m"
+        );
+        press(&mut m, KeyCode::Right);
+        assert_eq!(
+            m.extension_manager.as_ref().unwrap().tab,
+            ExtensionTab::Skills
+        );
+        press(&mut m, KeyCode::Tab);
+        press(&mut m, KeyCode::Tab);
+        assert_eq!(
+            m.extension_manager.as_ref().unwrap().tab,
+            ExtensionTab::Plugins
+        );
+        let (action, tab, key) = chosen(press(&mut m, KeyCode::Enter)).unwrap();
+        assert_eq!(
+            (action, tab, key.as_str()),
+            ("info", ExtensionTab::Plugins, "two@m")
+        );
+        // Esc still closes the sheet.
+        press(&mut m, KeyCode::Esc);
+        assert_eq!(m.screen, Screen::Agent);
+    }
+
+    #[test]
+    fn delete_needs_two_presses_and_other_keys_disarm_it() {
+        let mut m = model();
+        assert!(chosen(press(&mut m, KeyCode::Char('d'))).is_none());
+        assert_eq!(
+            m.extension_manager
+                .as_ref()
+                .unwrap()
+                .armed_delete
+                .as_deref(),
+            Some("one@m")
+        );
+        press(&mut m, KeyCode::Char('x'));
+        assert!(m.extension_manager.as_ref().unwrap().armed_delete.is_none());
+        assert!(chosen(press(&mut m, KeyCode::Char('d'))).is_none());
+        press(&mut m, KeyCode::Down);
+        assert!(chosen(press(&mut m, KeyCode::Char('d'))).is_none());
+        let (action, _, key) = chosen(press(&mut m, KeyCode::Char('d'))).unwrap();
+        assert_eq!((action, key.as_str()), ("delete", "two@m"));
+    }
+
+    #[test]
+    fn keys_a_row_does_not_allow_do_nothing() {
+        let mut m = model();
+        assert!(chosen(press(&mut m, KeyCode::Char('u'))).is_none());
+        press(&mut m, KeyCode::Right);
+        assert!(chosen(press(&mut m, KeyCode::Char('d'))).is_none());
+        assert!(m.extension_manager.as_ref().unwrap().armed_delete.is_none());
     }
 }

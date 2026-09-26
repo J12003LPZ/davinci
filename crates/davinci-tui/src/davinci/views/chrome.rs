@@ -891,6 +891,7 @@ fn screen_placeholder(screen: Screen) -> Option<&'static str> {
         Screen::TaskBoard => Some("/tasks"),
         Screen::Agents => Some("/agents"),
         Screen::ContextInspector => Some("/context"),
+        Screen::Extensions => Some("/plugin"),
         Screen::Recovery | Screen::Diff | Screen::Agent | Screen::Plan | Screen::Memoria => None,
     }
 }

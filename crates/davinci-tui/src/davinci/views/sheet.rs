@@ -15,9 +15,9 @@ use crate::davinci::theme::Theme;
 use crate::davinci::ui::{self, span};
 
 use super::{
-    agents, cogitator, compact, context_inspector, diff, export, governor, graph_run, keys, login,
-    mcp, officina, permissions, recovery, resume, securitas, settings, task_board, thinking, tree,
-    trust, vectors, workflows,
+    agents, cogitator, compact, context_inspector, diff, export, extensions, governor, graph_run,
+    keys, login, mcp, officina, permissions, recovery, resume, securitas, settings, task_board,
+    thinking, tree, trust, vectors, workflows,
 };
 
 /// What sits under a sheet.
@@ -127,6 +127,7 @@ pub fn chrome(model: &Model) -> Option<SheetChrome> {
         Screen::TaskBoard => task_board::chrome(model),
         Screen::Agents => agents::chrome(model),
         Screen::ContextInspector => context_inspector::chrome(model),
+        Screen::Extensions => extensions::chrome(model),
     };
     // These surfaces own the keyboard. A drawn-but-inert composer is misleading.
     if model.screen != Screen::GraphRun {
@@ -134,7 +135,8 @@ pub fn chrome(model: &Model) -> Option<SheetChrome> {
     }
     chrome.echo = None;
     chrome.escape = Some("esc close");
-    if model.screen == Screen::GraphRun {
+    // The manager names the keys the selected row allows.
+    if matches!(model.screen, Screen::GraphRun | Screen::Extensions) {
         return Some(chrome);
     }
     if model.screen == Screen::TaskBoard {
@@ -241,6 +243,7 @@ pub fn title(screen: Screen) -> &'static str {
         Screen::TaskBoard => "Background",
         Screen::Agents => "Agents",
         Screen::ContextInspector => "Context & Memory Inspector",
+        Screen::Extensions => "Plugins, skills and MCP servers",
     }
 }
 

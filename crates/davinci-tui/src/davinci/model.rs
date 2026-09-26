@@ -195,6 +195,8 @@ pub enum Screen {
     Agents,
     /// Context memory inspector (`/context`).
     ContextInspector,
+    /// Installed plugins, skills and MCP servers (`/plugin`).
+    Extensions,
 }
 
 /// An instrument summoned over the transcript, dismissed with esc.
@@ -289,6 +291,13 @@ pub enum Choice {
     ContextInspectorAction { action: &'static str, index: usize },
     /// An action on the `/graph` run sheet (`5a`).
     GraphAction { action: &'static str, index: usize },
+    /// An action on the `/plugin` manager: `update`, `toggle`, `approve`,
+    /// `revoke`, `delete` or `info`, on the row `key` of `tab`.
+    ExtensionAction {
+        action: &'static str,
+        tab: ExtensionTab,
+        key: String,
+    },
 }
 
 /// A block of rows an extension owns. Extensions get rows, not colours and
@@ -1575,6 +1584,115 @@ pub struct McpSheet {
     pub config_path: String,
 }
 
+/// Which list the `/plugin` manager shows.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum ExtensionTab {
+    #[default]
+    Plugins,
+    Skills,
+    Mcp,
+}
+
+impl ExtensionTab {
+    pub const ALL: [ExtensionTab; 3] = [Self::Plugins, Self::Skills, Self::Mcp];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Plugins => "Plugins",
+            Self::Skills => "Skills",
+            Self::Mcp => "MCP servers",
+        }
+    }
+
+    fn position(self) -> usize {
+        Self::ALL.iter().position(|tab| *tab == self).unwrap_or(0)
+    }
+
+    /// The tab `step` places away, wrapping at both ends.
+    pub fn step(self, step: isize) -> Self {
+        let len = Self::ALL.len() as isize;
+        Self::ALL[(self.position() as isize + step).rem_euclid(len) as usize]
+    }
+}
+
+/// One installed plugin, skill or MCP server in the `/plugin` manager. The
+/// `can_*` flags say which keys apply: the host decides, the view only shows.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ExtensionRow {
+    /// What the host acts on: a plugin key, a skill directory, a server name.
+    pub key: String,
+    pub title: String,
+    /// `enabled`, `disabled`, `connected`, …
+    pub status: String,
+    pub state: State,
+    pub detail: String,
+    /// A warning, an error or who manages the row.
+    pub note: Option<String>,
+    pub can_update: bool,
+    pub can_toggle: bool,
+    pub can_approve: bool,
+    pub can_revoke: bool,
+    pub can_delete: bool,
+}
+
+/// `/plugin` — installed plugins, skills and MCP servers, one tab each.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ExtensionsSheet {
+    pub tab: ExtensionTab,
+    pub plugins: Vec<ExtensionRow>,
+    pub skills: Vec<ExtensionRow>,
+    pub mcp: Vec<ExtensionRow>,
+    /// The selection of each tab, in `ExtensionTab::ALL` order.
+    pub selected: [usize; 3],
+    /// The row key a first `d` armed; a second `d` on it deletes.
+    pub armed_delete: Option<String>,
+    /// The outcome of the last action.
+    pub notice: Option<String>,
+}
+
+impl ExtensionsSheet {
+    pub fn rows(&self, tab: ExtensionTab) -> &[ExtensionRow] {
+        match tab {
+            ExtensionTab::Plugins => &self.plugins,
+            ExtensionTab::Skills => &self.skills,
+            ExtensionTab::Mcp => &self.mcp,
+        }
+    }
+
+    pub fn current_rows(&self) -> &[ExtensionRow] {
+        self.rows(self.tab)
+    }
+
+    /// The selection of the open tab, kept inside its rows.
+    pub fn index(&self) -> usize {
+        let len = self.current_rows().len();
+        if len == 0 {
+            0
+        } else {
+            self.selected[self.tab.position()] % len
+        }
+    }
+
+    pub fn current(&self) -> Option<&ExtensionRow> {
+        self.current_rows().get(self.index())
+    }
+
+    pub fn move_selection(&mut self, delta: isize) {
+        let len = self.current_rows().len();
+        if len == 0 {
+            return;
+        }
+        let slot = self.tab.position();
+        self.selected[slot] = (self.index() as isize + delta).rem_euclid(len as isize) as usize;
+        self.armed_delete = None;
+    }
+
+    pub fn switch_tab(&mut self, step: isize) {
+        self.tab = self.tab.step(step);
+        self.armed_delete = None;
+    }
+}
+
 /// One row of `/permissions`: a mode or a rule.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PermissionRow {
@@ -2092,6 +2210,8 @@ pub struct Model {
     pub diff_index: usize,
     /// `/mcp` — connected MCP servers.
     pub mcp: Option<McpSheet>,
+    /// `/plugin` — the plugin, skill and MCP manager.
+    pub extension_manager: Option<ExtensionsSheet>,
     /// `/permissions` — mode and rules.
     pub permission_rows: Vec<PermissionRow>,
     pub permission_index: usize,
@@ -2230,6 +2350,7 @@ impl Model {
             review: None,
             diff_index: 0,
             mcp: None,
+            extension_manager: None,
             permission_rows: Vec::new(),
             permission_index: 0,
             workflows: None,
@@ -2386,6 +2507,10 @@ impl Model {
             Screen::TaskBoard => self.feature_scroll,
             Screen::Agents => self.agents_index,
             Screen::ContextInspector => self.context_inspector_index,
+            Screen::Extensions => self
+                .extension_manager
+                .as_ref()
+                .map_or(0, |sheet| sheet.index()),
             _ => self.feature_scroll,
         }
     }
@@ -2428,6 +2553,7 @@ impl Model {
             Screen::Workflows => "opus",
             Screen::TaskBoard | Screen::Agents => "opera",
             Screen::ContextInspector => "memoria",
+            Screen::Extensions => "instrumenta",
         }
     }
 

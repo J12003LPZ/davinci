@@ -14,11 +14,12 @@ use davinci_agent::{
 };
 use davinci_tui::davinci::model::{
     Ask, AskKind, CatalogRow, Choice, Compaction, CorpusItem, Credential, Entry, ExportLedger,
-    FailedRun, Finding, GovernorCounter, GovernorSheet, GovernorStored, GraphRunSheet, GraphTask,
-    Hunk, HunkKind, KeymapGroup, McpServerRow, McpSheet, Model, ModelItem, Overlay, PermissionRow,
-    PickerItem, PlanStep, ProviderRow, ResumeRow, ReviewFile, ReviewSheet, Screen, SecurityScan,
-    SettingRow, Severity, Step, ThinkingRow, Tone, TreeNode, VectorIndex, WorkflowRow,
-    WorkflowsSheet, Working, WorkshopSheet,
+    ExtensionRow, ExtensionTab, ExtensionsSheet, FailedRun, Finding, GovernorCounter,
+    GovernorSheet, GovernorStored, GraphRunSheet, GraphTask, Hunk, HunkKind, KeymapGroup,
+    McpServerRow, McpSheet, Model, ModelItem, Overlay, PermissionRow, PickerItem, PlanStep,
+    ProviderRow, ResumeRow, ReviewFile, ReviewSheet, Screen, SecurityScan, SettingRow, Severity,
+    Step, ThinkingRow, Tone, TreeNode, VectorIndex, WorkflowRow, WorkflowsSheet, Working,
+    WorkshopSheet,
 };
 use davinci_tui::davinci::theme::State;
 
@@ -4160,6 +4161,11 @@ pub fn perform(
                 ),
             ))
         }
+        // Bare `/plugin` opens the manager; `/plugin <command>` stays text.
+        SlashAction::Plugin(args) if args.trim().is_empty() => {
+            open_extensions_sheet(parsed, agent, model, None);
+            Ok(Done::Opened)
+        }
         SlashAction::Plugin(args) => Ok(Done::Said(crate::plugin_command_text(&args, &agent.cwd))),
         SlashAction::Tasks => {
             open_task_board_sheet(agent, model);
@@ -5663,6 +5669,154 @@ fn open_mcp_sheet(agent: &Agent, model: &mut Model) {
             .to_string(),
     });
     open_sheet(model, Screen::Mcp);
+}
+
+/// Where `/plugin` may act: the skill directories whose contents it may move
+/// to the trash, and the `mcp.json` files the session merged.
+fn extension_scope(
+    parsed: &crate::args::Args,
+    agent: &Agent,
+) -> (
+    Vec<std::path::PathBuf>,
+    davinci_coding_agent::plugins::manager::McpFiles,
+) {
+    let agent_dir = crate::default_agent_dir();
+    let settings = davinci_coding_agent::settings::load_merged_settings_with_override(
+        &agent_dir,
+        &agent.cwd,
+        parsed.project_trust_override,
+    );
+    let trusted = davinci_coding_agent::settings::is_trusted(
+        &settings,
+        &agent.cwd,
+        parsed.project_trust_override,
+    );
+    let mut skill_roots = vec![agent_dir.join("skills")];
+    if trusted {
+        skill_roots.extend(davinci_coding_agent::project_config::all(
+            &agent.cwd, "skills",
+        ));
+    }
+    // A fixture or explicit config replaces every other file, as `mcp.rs` does.
+    let files =
+        match std::env::var("DAVINCI_MCP_CONFIG").or_else(|_| std::env::var("PI_MCP_CONFIG")) {
+            Ok(path) => davinci_coding_agent::plugins::manager::McpFiles {
+                user: path.into(),
+                project: None,
+            },
+            Err(_) => davinci_coding_agent::plugins::manager::McpFiles {
+                user: agent_dir.join("mcp.json"),
+                project: trusted
+                    .then(|| davinci_coding_agent::project_config::resolve(&agent.cwd, "mcp.json"))
+                    .flatten(),
+            },
+        };
+    (skill_roots, files)
+}
+
+fn extension_rows(
+    rows: Vec<davinci_coding_agent::plugins::manager::ManagedRow>,
+) -> Vec<ExtensionRow> {
+    use davinci_coding_agent::plugins::manager::Health;
+    rows.into_iter()
+        .map(|row| ExtensionRow {
+            key: row.key,
+            title: row.title,
+            status: row.status,
+            state: match row.health {
+                Health::Ok => State::Done,
+                Health::Off => State::Skipped,
+                Health::Attention => State::Attention,
+                Health::Failed => State::Failed,
+            },
+            detail: row.detail,
+            note: row.note,
+            can_update: row.can_update,
+            can_toggle: row.can_toggle,
+            can_approve: row.can_approve,
+            can_revoke: row.can_revoke,
+            can_delete: row.can_delete,
+        })
+        .collect()
+}
+
+/// `/plugin` — installed plugins, skills and MCP servers. A rebuild keeps the
+/// open tab and each tab's selection.
+fn open_extensions_sheet(
+    parsed: &crate::args::Args,
+    agent: &Agent,
+    model: &mut Model,
+    notice: Option<String>,
+) {
+    use davinci_coding_agent::plugins::manager;
+    let agent_dir = crate::default_agent_dir();
+    let (skill_roots, files) = extension_scope(parsed, agent);
+    let live: Vec<manager::LiveServer> = agent
+        .tool_context
+        .mcp
+        .rows()
+        .into_iter()
+        .map(|row| manager::LiveServer {
+            name: row.name,
+            status: row.status,
+            tools: row.tools,
+            error: row.error,
+        })
+        .collect();
+    let previous = model.extension_manager.take().unwrap_or_default();
+    let reopening = model.screen == Screen::Extensions;
+    model.extension_manager = Some(ExtensionsSheet {
+        tab: previous.tab,
+        plugins: extension_rows(manager::plugin_rows(&agent_dir)),
+        skills: extension_rows(manager::skill_rows(&agent.skills, &agent_dir, &skill_roots)),
+        mcp: extension_rows(manager::mcp_rows(&agent_dir, &files, &live)),
+        selected: previous.selected,
+        armed_delete: None,
+        notice,
+    });
+    if !reopening {
+        open_sheet(model, Screen::Extensions);
+    }
+}
+
+fn apply_extension_action(
+    shell: &mut Shell<'_>,
+    action: &'static str,
+    tab: ExtensionTab,
+    key: &str,
+) -> Next {
+    use davinci_coding_agent::plugins::manager;
+    let agent_dir = crate::default_agent_dir();
+    let (skill_roots, files) = extension_scope(shell.parsed, shell.agent);
+    let outcome = match tab {
+        ExtensionTab::Plugins => manager::plugin_action(&agent_dir, &shell.agent.cwd, action, key),
+        ExtensionTab::Skills => {
+            manager::skill_action(&shell.agent.skills, &agent_dir, &skill_roots, action, key)
+        }
+        ExtensionTab::Mcp => manager::mcp_action(&agent_dir, &files, action, key),
+    };
+    let changed = outcome.is_ok() && action != "info";
+    // Skills, commands and agents from plugins take effect now; hooks are
+    // read per prompt. MCP servers wait for the next session.
+    if changed && tab != ExtensionTab::Mcp {
+        crate::apply_discovered_resources(shell.parsed, shell.agent);
+        shell.model.slash_commands = crate::interactive_slash_commands(shell.agent, shell.parsed);
+        shell.model.corpus = corpus(
+            shell.agent,
+            &shell.model.slash_commands,
+            &shell.model.sessions,
+        );
+        shell.model.corpus_total = shell.model.corpus.len();
+    }
+    let notice = match outcome {
+        Ok(text) => text
+            .replace("Start a new session or run /reload to load it.", "")
+            .trim()
+            .to_string(),
+        Err(err) => format!("Could not {action}: {err}"),
+    };
+    open_extensions_sheet(shell.parsed, shell.agent, shell.model, Some(notice));
+    Next::Go
 }
 
 /// `3a` — models from authenticated providers in the live runtime snapshot.
@@ -8618,6 +8772,9 @@ fn on_choice(shell: &mut Shell<'_>, choice: Choice) -> Next {
             apply_context_inspector_action(shell, action, index)
         }
         Choice::GraphAction { action, index } => apply_graph_action(shell, action, index),
+        Choice::ExtensionAction { action, tab, key } => {
+            apply_extension_action(shell, action, tab, &key)
+        }
     }
 }
 

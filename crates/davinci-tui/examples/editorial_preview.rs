@@ -77,6 +77,8 @@ fn main() {
         ("tasks", "Task board", 100, 30, false),
         ("agents", "Agent activity", 100, 30, false),
         ("context", "Context inspector", 100, 30, false),
+        ("plugin", "Plugins, skills and MCP servers", 100, 30, false),
+        ("plugin", "Plugins — narrow", 40, 20, false),
         ("secret", "Masked credential dialog", 100, 30, false),
         ("ask", "Question dialog", 100, 30, false),
         ("3b", "Settings — narrow", 40, 12, false),

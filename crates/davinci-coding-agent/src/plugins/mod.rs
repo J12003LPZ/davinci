@@ -11,6 +11,7 @@
 pub mod command;
 pub mod external;
 pub mod hooks;
+pub mod manager;
 pub mod manifest;
 pub mod marketplace;
 pub mod store;

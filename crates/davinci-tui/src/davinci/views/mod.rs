@@ -15,6 +15,7 @@ pub mod decision_modal;
 pub mod diff;
 pub mod disegno;
 pub mod export;
+pub mod extensions;
 pub mod governor;
 pub mod grafo;
 pub mod graph_canvas;

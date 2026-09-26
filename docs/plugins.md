@@ -33,6 +33,34 @@ adding them. Installs are copied to `~/.davinci/agent/plugins/cache/`.
 Every command also works inside a session as `/plugin …`. Changes take effect
 in a new session or after `/reload`.
 
+## Managing what is installed
+
+In a session, `/plugin` with no arguments opens a manager with three tabs:
+Plugins, Skills and MCP servers. `←`/`→` (or Tab) switch tabs, `↑`/`↓`
+select, and the hint row names only the keys the selected row allows:
+
+| Key | Plugins | Skills | MCP servers |
+|---|---|---|---|
+| enter | details | details | configuration |
+| `u` | update from its marketplace | – | – |
+| `e` | enable / disable | – | enable / disable (`"disabled": true`) |
+| `a` / `r` | approve / revoke hooks | – | – |
+| `d` `d` | uninstall | move to trash | remove from its `mcp.json` |
+
+Delete takes two presses on the same row; any other key cancels.
+
+- Plugin, skill and command changes apply at once. MCP changes apply in the
+  next session.
+- Plugins adopted from Claude Code or Codex are updated there. Deleting one
+  only stops DaVinci loading it.
+- Only skills in `~/.davinci/agent/skills/` and a trusted project's skill
+  directory can be deleted. They are moved to
+  `~/.davinci/agent/trash/skills/`, so you can move them back. Skills from
+  plugins are managed through their plugin.
+- An MCP server is edited in the file that defines it: the user `mcp.json` or
+  a trusted project's. Servers from plugins are managed through their
+  plugin. Editing rewrites the file as formatted JSON.
+
 ## Hooks need your approval
 
 Hooks are shell commands that run on your machine. A plugin's hooks stay off
