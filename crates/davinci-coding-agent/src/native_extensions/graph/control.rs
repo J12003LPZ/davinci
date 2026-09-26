@@ -194,6 +194,7 @@ pub fn invalidate_descendants_for_retry(
                 task.started_at = None;
                 task.ended_at = None;
                 task.last_activity = None;
+                task.last_message = None;
                 task.fingerprint = None;
             } else {
                 task.status = super::types::TaskStatus::Pending;

@@ -93,7 +93,7 @@ fn attempt_fixture(cwd: &Path, previous: Option<GraphRun>, fail: bool) -> GraphR
                 input: 7,
                 ..Default::default()
             };
-            progress("fixture progress", &usage);
+            progress("fixture progress", &usage, None);
             // Progress writes are debounced. The completed attempt assertions
             // below verify that terminal persistence retains these tokens.
             std::fs::write(

@@ -2684,6 +2684,8 @@ mod tests {
                 started_at: Some(10),
                 ended_at: None,
                 last_activity: None,
+                last_message: None,
+                model: None,
                 fingerprint: None,
                 mutation: None,
                 context_fingerprint: None,

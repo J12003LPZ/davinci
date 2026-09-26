@@ -39,11 +39,18 @@ fn graph_keeps_the_conversation_draft_visible() {
 }
 
 #[test]
-fn graph_tab_moves_to_input_without_running_graph_shortcuts() {
+fn graph_i_moves_to_input_without_running_graph_shortcuts() {
     let mut m = model();
     m.screen = Screen::GraphRun;
     m.composer.set_text("Draft ");
+    // Tab belongs to the filter tabs while the agents have focus.
     key(&mut m, KeyCode::Tab);
+    assert!(!m.graph_canvas.input_focus);
+    assert_ne!(
+        m.graph_canvas.filter,
+        davinci_tui::davinci::model::GraphFilter::All
+    );
+    key(&mut m, KeyCode::Char('i'));
     for ch in "xpr".chars() {
         assert_eq!(key(&mut m, KeyCode::Char(ch)), app::Flow::Continue);
     }
@@ -58,7 +65,7 @@ fn graph_tab_moves_to_input_without_running_graph_shortcuts() {
 fn graph_input_submits_to_the_conversation_not_the_selected_worker() {
     let mut m = model();
     m.screen = Screen::GraphRun;
-    key(&mut m, KeyCode::Tab);
+    key(&mut m, KeyCode::Char('i'));
     m.composer.set_text("Explain the existing tests");
     assert_eq!(
         key(&mut m, KeyCode::Enter),
@@ -149,7 +156,7 @@ fn ctrl_o_expands_tool_output_instead_of_changing_models() {
 fn graph_input_accepts_multiline_paste_without_submitting() {
     let mut m = model();
     m.screen = Screen::GraphRun;
-    key(&mut m, KeyCode::Tab);
+    key(&mut m, KeyCode::Char('i'));
     m.paste("line one\r\nline two 👩‍💻");
     assert_eq!(m.composer.editor().get_text(), "line one\nline two 👩‍💻");
     assert!(m.graph_run.is_some());

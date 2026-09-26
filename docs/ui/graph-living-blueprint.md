@@ -1,7 +1,32 @@
-# Graph Run: Living Blueprint
+# Graph Run: Agent Command Center
 
-Interactive `/graph` uses a terminal-cell workflow canvas. `Grafo` remains the
-separate code/symbol dependency study.
+Interactive `/graph` opens the **Agent command center**: filter tabs, a flow of
+agent cards, and an agent-details panel, drawn on terminal cells. `Grafo`
+remains the separate code/symbol dependency study.
+
+```
+Agent command center                                             g-7f2a │ complex
+ Agents 7    Working 1    Done 3    Waiting 1    Inactive 2   tab/shift+tab filter · ? help
+──────────────────────────────────────────────────────────────────────────────────────
+Project:  C:\Users\sergi\Desktop\davinci        running · implement · 6m18s · $1.31 / $8.00
+Goal:     execute this plan docs\superpowers\plans\2026-09-24-feature.md
+
+  ┌──────────────────┐     ┌──────────────────┐     ┌──────────────────┐   │ Agent details · Enter to focus
+  │ ✓ planner (t1)   │  →  │ ✓ historian (t2) │  →  │ ✓ test-analyzer… │   │ ◉ t4 writer
+  │ Done             │     │ Done             │     │ Done             │   │ Status:     Working
+  └──────────────────┘     └──────────────────┘     └──────────────────┘   │ Model:      gpt-6-astra
+                                    │                        │             │ Current activity
+           ┌────────────────────────┴────────────────────────┘             │ ┌─────────────────────┐
+           ↓                                                               │ │ edit: src/writer.rs │
+  ╔══════════════════╗     ┌──────────────────┐     ┌──────────────────┐   │ └─────────────────────┘
+  ║ ◉ writer (t4)    ║  →  │ ○ reviewer (t5)  │  →  │ ○ executor (t6)  │   │ Next steps
+  ║ Working          ║     │ Waiting          │     │ Inactive         │   │ 1. Review changes (t5)
+  ╚══════════════════╝     └──────────────────┘     └──────────────────┘   │
+──────────────────────────────────────────────────────────────────────────────────────
+↑↓←→ select · Enter inspect · i message · p pause · x stop · … · ? help         esc close
+```
+
+(Abridged: real cards also carry the task and progress rows.)
 
 ## Choose models before starting
 
@@ -66,28 +91,50 @@ folds, using each worker model's context window. Structural delta folds can stil
 happen earlier to bound the event log. Disabling automatic compaction disables
 these automatic folds; explicit manual folding remains separate.
 
-Cards follow actual dependencies from left to right. `◉` and heavy borders mark
-active workers; `×` marks failure; `!` and a reason mark blocked work. Completed
-cards retain `✓`, queued cards retain `○`, and selection says `SELECTED` even
-without color. Known phases label lanes; unknown phases use numbered stages.
-Pending/ready descendants of failed or cancelled workers receive a blocked
-presentation without changing their persisted status.
+Cards read like text: left to right, then down, in dependency order. After a
+worker, its first dependent that became ready is placed next, so a chain stays
+on one row and reads `a → b → c`. Neighbours on a row are joined by a bare `→`.
+Every other dependency is an elbow route through the gap under the source row,
+ending in `↓` on the target's top border (or `↑` under a later card on the same
+row). Routes descending more than one row use the gutter left of the target
+column. A horizontal lane is shared only by routes that truly meet: one source
+fanning out, or one target joining. Routes with different sources *and*
+different targets never share a lane, so no line reads as a false bus. Where
+routes meet, the connector glyph is the junction they form (`┴ ┬ ├ ┤ ┼`).
+
+Each card shows `glyph role (id)`, the task, its progress, and a status line:
+**Working** (heavy border, `◉`), **Done** (`✓`), **Waiting** (`○`, every
+dependency done or running), **Inactive** (`○`, a dependency has not started),
+**Failed** (`×`), **Blocked** (`!`) or **Cancelled**. The selected card has a
+double border (`╔═╗`), which stays distinguishable without color. Pending/ready
+descendants of failed or cancelled workers receive a blocked presentation
+without changing their persisted status.
+
+The filter tabs count agents per bucket. **Attention** (failed, cancelled or
+blocked) appears only while something needs attention. A filter dims the other
+cards without moving them, arrow keys skip them, and a selection the filter
+excludes moves to the first agent it admits.
 
 | Input | Behavior |
 |---|---|
-| Arrows | Select real dependency neighbors; up/down traverses same-lane peers. In the narrow ledger, move through workers. |
-| Enter | Expand a completed summary, or toggle the selected worker's public details. |
-| Esc | Close inspection/diff context, then expanded groups, then the sheet. A selected worker remains individually visible. |
-| `f` | Explicitly restore follow and recenter on active work. |
+| Arrows | Left/Right step through reading order (wrapping between rows); Up/Down move to the nearest card on the row above/below. Cards outside the filter are skipped. In the narrow ledger, move through workers. |
+| Tab / Shift+Tab | Next / previous filter tab while the agents have focus. From the composer, Tab returns focus to the agents. |
+| `i` | Focus the composer. It messages the main conversation, which drives the run; it does not address workers directly. |
+| `?` | Toggle the key reference in the details panel. The hint row drops keys that do not fit, never `? help`. |
+| Enter | Expand a completed summary, or toggle the selected worker's extra details. |
+| Esc | Close help, inspection/diff context, then expanded groups, then the sheet. A selected worker remains individually visible. |
+| `f` | Explicitly restore follow and scroll to active work. |
 | `v` | Toggle Overview/Focus; focus emphasizes selected/active ancestry and descendants, without changing execution. |
 | `g` | Toggle the original prompt and worker progress in the inspector. PgUp/PgDn scroll it; Esc returns to worker activity. |
 | `p` / `x` / `r` / `d` | Preserve the existing pause/resume, stop, retry and diff action bridge. Synthetic summaries cannot become worker control targets. |
 | PgUp / PgDn | Page open details; otherwise pan vertically or page the narrow ledger. |
 | Left click | Select a visible card using its rendered geometry. |
-| Wheel / Shift-wheel | Pan vertically/horizontally where the terminal supports it. |
+| Wheel | Pan vertically. The flow wraps to the width, so it does not pan sideways. |
 
 Follow starts enabled. Manual selection, navigation and panning disable it;
-snapshot refresh does not turn it back on. When parallel active workers fit,
+snapshot refresh does not turn it back on. Follow and selection scrolls start the
+view on a card row, so visible cards never lose their titles, and `▲ more above`
+/ `▼ more below` mark cards beyond the visible canvas. When parallel active workers fit,
 follow includes them together; otherwise it anchors deterministically on the
 first active card in spatial order. All operations remain keyboard-accessible.
 
@@ -95,14 +142,15 @@ At least three quiet completed workers can fold only when phase, role, depth,
 incoming dependencies and outgoing dependents match. Selected, active, failed,
 blocked, cancelled, verification/review-relevant and public-contract-bearing
 workers do not auto-fold. Expansion survives ordinary refresh. New workers do
-not reorder first-seen peers; unchanged topology retains its geometry.
+not reorder first-seen peers: drawn cards keep their slot and column, and a
+route a newcomer needs can only add a lane, which moves later rows down.
 
 ## Responsive presentation
 
 | Available size | Presentation |
 |---|---|
-| Width ≥100 and usable graph body ≥16 rows | Full cards and a right inspector using one third of the width (36–72 columns) |
-| Width 72–99 (or a shorter wide body) | Canvas and bottom inspector |
+| Width ≥100 and usable graph body ≥16 rows | Full cards (three per row near 160 columns) and a right details panel using one third of the width (36–72 columns) |
+| Width 72–99 (or a shorter wide body) | Canvas and bottom details drawer |
 | Width 50–71 | Compact cards and bottom inspector |
 | Width <50 or graph body <12 rows | Bounded worker ledger with inspection and controls |
 
@@ -121,6 +169,20 @@ phase, blocked reason and verification outcomes from the graph snapshot.
 Artifact directories use the existing graph-store path helper. Owner, recent
 tools and public contract are displayed only when supplied; absent data is
 omitted. The TUI never opens graph persistence files.
+
+The details panel shows, when the snapshot reports them: status, task, project,
+branch, worktree, model, tokens, start time, elapsed time, the worker's own cost
+(the run's spend against its cap heads the command center) and revision cycles;
+then **Current activity**, **Last message** and **Next steps**. Sections are
+separated by a blank row when everything fits; a panel that would scroll anyway
+drops the separators first. Missing facts are omitted,
+never filled in. The controller records each worker's resolved model identity
+when it launches, and its latest assistant text (whitespace collapsed, capped at
+600 characters) on each progress event. Both persist in the run snapshot and
+pass the same redaction as goals. Next steps are the worker's unfinished
+downstream agents in run order, derived from the graph, not from the model's
+private plan. A worker without its own worktree shows the session branch only
+when the run's project is the session's working directory.
 
 Selecting a worker shows its current work and recent public transcript without
 requiring Enter. The host refreshes the selected worker's activity once per
@@ -149,7 +211,9 @@ public display fields. The inspector exposes execution facts, not model thoughts
 
 ## Offline preview
 
-Run the built CLI with `--davinci --screen blueprint --no-animation --offline`.
+Run the built CLI with `--davinci --screen command-center --no-animation --offline`
+for the reference layout (a planning chain, a join into the writer, a waiting
+reviewer and inactive agents), or `--screen blueprint` for the stress snapshot below.
 This uses the existing native fixture-screen loop, not a second UI runtime.
 The explicitly illustrative snapshot contains parallel active workers, failure,
 blocked work and three foldable researchers. Try 40, 80 and 120 columns at

@@ -1,15 +1,22 @@
-//! Read-only graph-run progress. Worker state is not keyboard focus;
-//! policies, artifacts and usage come from the actual run snapshot.
+//! The agent command center: a graph run as filter tabs, a flow of agent
+//! cards and a details panel. Worker state is not keyboard focus; policies,
+//! artifacts and usage come from the actual run snapshot.
 
 use super::graph_inspector::{inspector_lines, public_text};
 use super::graph_layout::{GraphLayout, GraphResponsiveMode};
 use super::sheet::{facts, hint, status_meter, Composer, SheetChrome};
 use crate::davinci::ui::{self, section_heading, section_state, span};
-use crate::davinci::{model::Model, theme::State};
-use ratatui::text::Line;
+use crate::davinci::{
+    model::{GraphBucket, GraphFilter, GraphRunSheet, Model},
+    theme::State,
+};
+use ratatui::style::{Modifier, Style};
+use ratatui::text::{Line, Span};
 
-pub const HEADER_ROWS: u16 = 3;
-const FOOTER_ROWS: u16 = 3;
+/// Filter tabs, rule, project, goal, and a note row (blank when quiet).
+pub const HEADER_ROWS: u16 = 5;
+/// The rule above the key hints.
+const FOOTER_ROWS: u16 = 1;
 
 /// A background run stays discoverable without opening its graph or stealing input.
 pub fn background_lines(model: &Model) -> Vec<Line<'static>> {
@@ -100,6 +107,136 @@ pub fn lines_in(model: &Model, height: u16) -> Vec<Line<'static>> {
     lines_with_layout(model, height, &layout)
 }
 
+/// `Agents 7  Working 1  Done 3  Waiting 1  Inactive 2` with the active
+/// filter as a chip, and the filter keys on the right.
+fn filter_tabs(model: &Model, run: &GraphRunSheet) -> Line<'static> {
+    let th = &model.theme;
+    let attention = run.bucket_count(GraphFilter::Only(GraphBucket::Attention)) > 0;
+    let mut spans = Vec::new();
+    for tab in GraphFilter::ORDER {
+        if tab == GraphFilter::Only(GraphBucket::Attention) && !attention {
+            continue;
+        }
+        let label = match tab {
+            GraphFilter::All => "Agents",
+            GraphFilter::Only(bucket) => bucket.label(),
+        };
+        let text = format!(" {label} {} ", run.bucket_count(tab));
+        if tab == model.graph_canvas.filter {
+            spans.push(Span::styled(
+                text,
+                Style::default()
+                    .fg(th.text)
+                    .add_modifier(Modifier::REVERSED | Modifier::BOLD),
+            ));
+        } else {
+            let color = match tab {
+                GraphFilter::Only(bucket @ GraphBucket::Attention) => {
+                    super::graph_canvas::bucket_color(th, bucket, None)
+                }
+                _ => th.muted,
+            };
+            spans.push(span(text, color));
+        }
+        spans.push(span("  ", th.muted));
+    }
+    let key = |text: &str| {
+        Span::styled(
+            text.to_string(),
+            Style::default().fg(th.text).add_modifier(Modifier::BOLD),
+        )
+    };
+    let right = vec![
+        key("tab/shift+tab"),
+        span(" filter · ", th.muted),
+        key("?"),
+        span(" help", th.muted),
+    ];
+    if ui::run_width(&spans) + ui::run_width(&right) + 2 <= model.width {
+        ui::spread(model.width, spans, right)
+    } else {
+        Line::from(ui::truncate_run(spans, model.width))
+    }
+}
+
+/// `Label:    value`, with an optional right-aligned run of facts that is
+/// dropped before the value is cut.
+fn header_fact(
+    model: &Model,
+    label: &str,
+    value: &str,
+    right: Vec<Span<'static>>,
+) -> Line<'static> {
+    let th = &model.theme;
+    let left = vec![
+        span(format!("{label:<10}"), th.muted),
+        span(public_text(value), th.text),
+    ];
+    let room = model
+        .width
+        .saturating_sub(ui::run_width(&right).saturating_add(2));
+    if right.is_empty() || ui::run_width(&left) > room {
+        return Line::from(ui::truncate_run(left, model.width));
+    }
+    ui::spread(model.width, left, right)
+}
+
+/// Run facts beside the project: outcome or lifecycle, phase, time and cost.
+fn run_summary(model: &Model, run: &GraphRunSheet) -> Vec<Span<'static>> {
+    let th = &model.theme;
+    let state = run.outcome().unwrap_or(&run.lifecycle);
+    let mut parts: Vec<String> = [state, run.phase.as_str(), run.elapsed.as_str()]
+        .into_iter()
+        .filter(|value| !value.is_empty())
+        .map(public_text)
+        .collect();
+    if !run.cost.is_empty() {
+        parts.push(if run.cost_cap.is_empty() {
+            run.cost.clone()
+        } else {
+            format!("{} / {}", run.cost, run.cost_cap)
+        });
+    }
+    parts.dedup();
+    let color = if run.outcome().is_some_and(|o| o != "COMPLETED") {
+        th.warning
+    } else {
+        th.muted
+    };
+    vec![span(parts.join(" · "), color)]
+}
+
+fn header(model: &Model, run: &GraphRunSheet, layout: &GraphLayout) -> Vec<Line<'static>> {
+    let th = &model.theme;
+    let note = layout
+        .issues
+        .first()
+        .or(run.control_status.as_ref())
+        .or(run.blocked_reason.as_ref());
+    vec![
+        filter_tabs(model, run),
+        Line::from(span("─".repeat(model.width as usize), th.border)),
+        header_fact(
+            model,
+            "Project:",
+            if run.project.is_empty() {
+                &model.cwd
+            } else {
+                &run.project
+            },
+            run_summary(model, run),
+        ),
+        header_fact(model, "Goal:", &run.goal, Vec::new()),
+        note.map(|note| {
+            Line::from(span(
+                ui::clip_ellipsis(&format!("! {}", public_text(note)), model.width),
+                th.warning,
+            ))
+        })
+        .unwrap_or_default(),
+    ]
+}
+
 pub fn lines_with_layout(model: &Model, height: u16, layout: &GraphLayout) -> Vec<Line<'static>> {
     let Some(run) = &model.graph_run else {
         return structured_lines(model);
@@ -107,53 +244,7 @@ pub fn lines_with_layout(model: &Model, height: u16, layout: &GraphLayout) -> Ve
     if layout.mode == super::graph_layout::GraphResponsiveMode::Structured {
         return structured_window(model, height, layout);
     }
-    let done = run.tasks.iter().filter(|t| t.state == State::Done).count();
-    let mut telemetry = vec![format!("{done}/{} tasks done", run.tasks.len())];
-    for (label, value) in [
-        ("Phase", &run.phase),
-        ("Elapsed", &run.elapsed),
-        ("Cost", &run.cost),
-        ("Cap", &run.cost_cap),
-        ("Revisions", &run.cycles),
-    ] {
-        if !value.is_empty() {
-            telemetry.push(format!("{label}: {value}"));
-        }
-    }
-    let mut rows = vec![
-        Line::from(ui::truncate_run(
-            vec![span(
-                public_text(&format!(
-                    "{} · {} · Follow {} · {:?}",
-                    run.goal,
-                    run.outcome().unwrap_or(&run.lifecycle),
-                    if model.graph_canvas.follow_live {
-                        "on"
-                    } else {
-                        "off"
-                    },
-                    model.graph_canvas.view_mode
-                )),
-                model.theme.primary,
-            )],
-            model.width,
-        )),
-        Line::from(ui::truncate_run(
-            vec![span(public_text(&telemetry.join(" · ")), model.theme.muted)],
-            model.width,
-        )),
-    ];
-    let note = layout
-        .issues
-        .first()
-        .map(String::as_str)
-        .or(run.control_status.as_deref())
-        .or(run.blocked_reason.as_deref())
-        .unwrap_or(&run.goal);
-    rows.push(Line::from(span(
-        ui::clip_ellipsis(&public_text(note), model.width),
-        model.theme.muted,
-    )));
+    let mut rows = header(model, run, layout);
     let mut cells = super::graph_canvas::Cells::new(
         model.width,
         height.saturating_sub(HEADER_ROWS + FOOTER_ROWS),
@@ -179,10 +270,10 @@ pub fn lines_with_layout(model: &Model, height: u16, layout: &GraphLayout) -> Ve
         ),
         layout.inspector,
     );
-    let rule = ratatui::style::Style::default().fg(model.theme.border);
+    let rule = Style::default().fg(model.theme.border);
     if layout.mode == GraphResponsiveMode::Full {
         for y in 0..layout.inspector.height {
-            cells.write(layout.inspector.x as i32 - 1, y as i32, "│", rule);
+            cells.write(layout.inspector.x as i32 - 2, y as i32, "│", rule);
         }
     } else {
         cells.write(
@@ -193,34 +284,67 @@ pub fn lines_with_layout(model: &Model, height: u16, layout: &GraphLayout) -> Ve
         );
     }
     rows.extend(cells.into_lines());
-    rows.extend(controls(model));
+    rows.push(Line::from(span(
+        "─".repeat(model.width as usize),
+        model.theme.border,
+    )));
     rows.truncate(height as usize);
     rows
 }
 
-fn controls(model: &Model) -> Vec<Line<'static>> {
-    let control = if model.graph_run.as_ref().is_some_and(|r| r.can_resume()) {
-        "s resume graph · r retry · d diff"
+/// The one-line key reference under the graph, sized to the width: trailing
+/// keys are dropped whole rather than cut, and `?` lists every key.
+fn control_hint(model: &Model) -> String {
+    if model.graph_canvas.input_focus {
+        return "Typing to main conversation · Enter send · Tab back to agents".into();
+    }
+    let resume = model.graph_run.as_ref().is_some_and(|r| r.can_resume());
+    let keys: &[&str] = if resume {
+        &[
+            "↑↓←→ select",
+            "Enter inspect",
+            "i message",
+            "s resume",
+            "r retry",
+            "d diff",
+            "f follow",
+            "g goal",
+        ]
     } else {
-        "p pause · x stop · r retry · d diff"
+        &[
+            "↑↓←→ select",
+            "Enter inspect",
+            "i message",
+            "p pause",
+            "x stop",
+            "r retry",
+            "f follow",
+            "d diff",
+            "g goal",
+        ]
     };
-    [
-        if model.graph_canvas.input_focus {
-            "Typing to main conversation · Enter send · Tab graph"
+    // Leave room for `esc close` on the same row, and always for `? help`,
+    // which lists every key the row had to drop.
+    const HELP: &str = " · ? help";
+    let room = (model.width.saturating_sub(12) as usize)
+        .saturating_sub(unicode_width::UnicodeWidthStr::width(HELP));
+    let mut text = String::new();
+    for key in keys {
+        let next = if text.is_empty() {
+            (*key).to_string()
         } else {
-            "↑↓←→ select · Enter inspect · Tab input"
-        },
-        control,
-        "v focus · g goal · f follow · PgUp/Dn",
-    ]
-    .into_iter()
-    .map(|text| {
-        Line::from(span(
-            ui::clip_ellipsis(text, model.width),
-            model.theme.muted,
-        ))
-    })
-    .collect()
+            format!("{text} · {key}")
+        };
+        if unicode_width::UnicodeWidthStr::width(next.as_str()) > room {
+            break;
+        }
+        text = next;
+    }
+    if text.is_empty() {
+        "? help".into()
+    } else {
+        text + HELP
+    }
 }
 
 /// A bounded, keyboard-complete ledger; details never push selection offscreen.
@@ -255,10 +379,6 @@ fn structured_window(model: &Model, height: u16, layout: &GraphLayout) -> Vec<Li
             })
             .collect();
         rows.extend(ui::window(tasks, room, anchor, &model.theme));
-        rows.push(Line::from(span(
-            ui::clip_ellipsis("↑↓ select · Enter details · Tab input", model.width),
-            model.theme.muted,
-        )));
         rows.truncate(height as usize);
         return rows;
     }
@@ -304,7 +424,10 @@ fn structured_window(model: &Model, height: u16, layout: &GraphLayout) -> Vec<Li
             .or_else(|| run.tasks.iter().position(|t| t.state == State::Active))
             .unwrap_or(0)
     });
-    let list_room = if run.inspecting_node || model.graph_canvas.inspecting_goal {
+    let list_room = if run.inspecting_node
+        || model.graph_canvas.inspecting_goal
+        || model.graph_canvas.show_help
+    {
         room.min(3)
     } else {
         room
@@ -341,7 +464,7 @@ fn structured_window(model: &Model, height: u16, layout: &GraphLayout) -> Vec<Li
     while rows.len() < HEADER_ROWS as usize + list_room {
         rows.push(Line::default());
     }
-    if run.inspecting_node || model.graph_canvas.inspecting_goal {
+    if run.inspecting_node || model.graph_canvas.inspecting_goal || model.graph_canvas.show_help {
         rows.extend(inspector_lines(
             model,
             selected,
@@ -352,7 +475,10 @@ fn structured_window(model: &Model, height: u16, layout: &GraphLayout) -> Vec<Li
     while rows.len() < height.saturating_sub(FOOTER_ROWS) as usize {
         rows.push(Line::default());
     }
-    rows.extend(controls(model));
+    rows.push(Line::from(span(
+        "─".repeat(model.width as usize),
+        model.theme.border,
+    )));
     rows.truncate(height as usize);
     rows
 }
@@ -512,16 +638,17 @@ pub fn chrome(model: &Model) -> SheetChrome {
                     &public_text(&run.cost_cap),
                 )
             }),
-        hints: vec![hint(
-            th,
-            if model.graph_canvas.input_focus {
-                "Message target: main conversation"
-            } else {
-                "Tab focuses the conversation input"
-            },
-        )],
+        hints: vec![hint(th, &control_hint(model))],
         escape: Some("esc close"),
-        composer: Composer::Prompt("Message the main conversation…"),
+        // The composer talks to the main conversation, which drives the run;
+        // it does not address workers directly.
+        composer: if model.width >= 100 {
+            Composer::Prompt(
+                "Message the main conversation, e.g. “adjust the plan”, “run tests”, “explain this error”…",
+            )
+        } else {
+            Composer::Prompt("Message the main conversation…")
+        },
         ..SheetChrome::default()
     }
 }
@@ -559,20 +686,30 @@ mod tests {
                 .collect::<Vec<_>>()
                 .join("\n")
         };
+        for word in ["blocked", "running", "↑↓←→ select", "? help"] {
+            assert!(text(&m).contains(word), "missing {word}: {}", text(&m));
+        }
+        // A narrow hint row keeps `? help`, which lists every dropped key.
+        let press = |m: &mut Model, code| {
+            crate::davinci::app::handle_key(m, KeyEvent::new(code, KeyModifiers::NONE));
+        };
+        press(&mut m, KeyCode::Char('?'));
+        m.height = 60;
         for word in [
-            "blocked",
-            "running",
-            "p pause",
-            "x stop",
-            "r retry",
-            "d diff",
-            "Enter inspect",
-            "f follow",
-            "v focus",
+            "pause or resume",
+            "stop the selected agent",
+            "retry the selected agent",
+            "diff of the run",
+            "follow live work",
+            "focus on the selection",
+            "next filter",
         ] {
             assert!(text(&m).contains(word), "missing {word}: {}", text(&m));
         }
-        crate::davinci::app::handle_key(&mut m, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        press(&mut m, KeyCode::Esc);
+        assert!(!m.graph_canvas.show_help);
+        m.height = 32;
+        press(&mut m, KeyCode::Enter);
         assert!(text(&m).contains("failed dependency"));
         for width in [0, 1, 20, 32, 40, 49, 50, 71, 72, 80, 119, 120] {
             for height in [0, 1, 4, 12, 24, 32, 40] {
@@ -634,7 +771,15 @@ mod tests {
         let run = m.graph_run.as_mut().unwrap();
         run.cost_cap.clear();
         assert!(chrome(&m).status_right.is_none());
-        assert!(text(&m).contains("tasks done"));
+        let run = m.graph_run.as_ref().unwrap();
+        let done = run.tasks.iter().filter(|t| t.state == State::Done).count();
+        let drawn = text(&m);
+        assert!(drawn.contains(&format!(" Done {done} ")), "{drawn}");
+        assert!(
+            drawn.contains(&format!(" Agents {} ", run.tasks.len())),
+            "{drawn}"
+        );
+        assert!(!drawn.contains("$0.00 / "), "no invented cap: {drawn}");
     }
     #[test]
     fn unavailable_and_narrow_runs_are_readable() {

@@ -225,7 +225,7 @@ pub fn title(screen: Screen) -> &'static str {
         Screen::Tree => "Session tree",
         Screen::Compact => "Compaction",
         Screen::Export => "Export session",
-        Screen::GraphRun => "Graph run",
+        Screen::GraphRun => "Agent command center",
         Screen::Vectors => "Vector memory",
         Screen::Governor => "Output governor",
         Screen::Securitas => "Security report",

@@ -1139,6 +1139,130 @@ pub fn blueprint_graph() -> GraphRunSheet {
     }
 }
 
+/// The agent command center reference (`docs/ui` mockup): a planning chain,
+/// a join into the writer, a waiting reviewer and two inactive agents.
+pub fn command_center_graph() -> GraphRunSheet {
+    let agent = |id: &str,
+                 role: &str,
+                 title: &str,
+                 artifact: &str,
+                 status: &str,
+                 state: State,
+                 deps: &[&str]| GraphTask {
+        id: id.into(),
+        role: role.into(),
+        title: title.into(),
+        artifact: artifact.into(),
+        status: status.into(),
+        state,
+        dependencies: deps.iter().map(|d| (*d).to_owned()).collect(),
+        policy: "read-only".into(),
+        ..Default::default()
+    };
+    let mut tasks = vec![
+        agent(
+            "t1",
+            "planner",
+            "Plan tasks & milestones",
+            "4/4 milestones",
+            "succeeded",
+            State::Done,
+            &[],
+        ),
+        agent(
+            "t2",
+            "historian",
+            "Sync with main remote",
+            "3 commits analyzed",
+            "succeeded",
+            State::Done,
+            &["t1"],
+        ),
+        agent(
+            "t3",
+            "test-analyzer",
+            "Compare DaVinci and Codex",
+            "12 issues checked",
+            "succeeded",
+            State::Done,
+            &["t2"],
+        ),
+        agent(
+            "t4",
+            "writer",
+            "Implement remaining work",
+            "C:\\...\\davinci\\src",
+            "running",
+            State::Active,
+            &["t2", "t3"],
+        ),
+        agent(
+            "t5",
+            "reviewer",
+            "Review changes",
+            "pending · waits on t4",
+            "pending",
+            State::Queued,
+            &["t4"],
+        ),
+        agent(
+            "t6",
+            "executor",
+            "Run tests & validate",
+            "0/8 checks",
+            "pending",
+            State::Queued,
+            &["t5"],
+        ),
+        agent(
+            "t7",
+            "integrator",
+            "Sync local with remote",
+            "Merge and push",
+            "pending",
+            State::Queued,
+            &["t4"],
+        ),
+    ];
+    let writer = &mut tasks[3];
+    writer.policy = "write-no-git-mutation".into();
+    writer.branch = Some("feature/superpowers".into());
+    writer.model = Some("gpt-6-astra".into());
+    writer.tokens = "1.89M in · 11.6K out".into();
+    writer.started = "23s ago".into();
+    writer.elapsed = "6m18s".into();
+    writer.cost = "$1.31".into();
+    writer.recent_tools = vec![
+        "Adding Rust telemetry before baseline build".into(),
+        "Implementing task: execute this plan".into(),
+        "edit: src/agents/writer.rs".into(),
+    ];
+    writer.artifact = "edit: src/agents/writer.rs".into();
+    writer.last_message = Some(
+        "The baseline release build passed: 201 crates compiled on Rust 1.83.0. Now \
+         implementing offline tests with duplicate/missing pairs, invalid claims, and \
+         fixture hashes."
+            .into(),
+    );
+    GraphRunSheet {
+        id: "g-7f2a".into(),
+        goal: "execute this plan docs\\superpowers\\plans\\2026-09-24-feature.md".into(),
+        project: "C:\\Users\\sergi\\Desktop\\davinci".into(),
+        phase: "implement".into(),
+        lifecycle: "running".into(),
+        mode: "complex".into(),
+        elapsed: "6m18s".into(),
+        cost: "$1.31".into(),
+        cost_cap: "$8.00".into(),
+        cost_fraction: 1.31 / 8.0,
+        revisions: "0 of 2".into(),
+        selected_node_id: Some("t4".into()),
+        selected_index: 3,
+        tasks,
+        ..Default::default()
+    }
+}
+
 pub fn graph_run_sheet() -> GraphRunSheet {
     let task = |id: &str, policy: &str, artifact: &str, usage: &str, state: State| GraphTask {
         id: id.into(),
@@ -2042,6 +2166,12 @@ pub fn dress_screen(model: &mut Model, id: &str) {
         "blueprint" => {
             sheet(model, Screen::GraphRun);
             model.graph_run = Some(blueprint_graph());
+        }
+        "command-center" => {
+            sheet(model, Screen::GraphRun);
+            let run = command_center_graph();
+            model.graph_canvas.node_order = run.tasks.iter().map(|t| t.id.clone()).collect();
+            model.graph_run = Some(run);
         }
         "5b" => sheet(model, Screen::Vectors),
         "5c" => sheet(model, Screen::Governor),

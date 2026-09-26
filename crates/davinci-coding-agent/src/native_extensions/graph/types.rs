@@ -509,6 +509,14 @@ pub struct GraphTaskState {
     /// Live view: last tool call or turn reported by the worker.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_activity: Option<String>,
+    /// Live view: the worker's latest assistant text, bounded to
+    /// `LAST_MESSAGE_CHARS`. Kept after the task ends.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_message: Option<String>,
+    /// Model identity the worker was launched with; `None` when the child
+    /// inherited an unresolved default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
     /// Replay compatibility fingerprint.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fingerprint: Option<ReplayFingerprint>,
@@ -551,6 +559,8 @@ impl GraphTaskState {
             started_at: None,
             ended_at: None,
             last_activity: None,
+            last_message: None,
+            model: None,
             fingerprint: None,
             mutation: None,
             context_fingerprint: None,
