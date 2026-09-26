@@ -1762,7 +1762,13 @@ impl Agent {
             if let Ok(mut ledger) = self.tool_ledger.lock() {
                 ledger.cancel_reservation(id);
             }
-            return immediate(reason, false);
+            // Marked so a post-tool hook can tell the call never ran; not a
+            // permission `denied`, which the ledger and reruns treat apart.
+            return Preparation::Immediate(crate::ToolResult {
+                content: reason,
+                is_error: true,
+                details: Some(serde_json::json!({ "preToolBlocked": true })),
+            });
         }
         if !self.tools.iter().any(|tool| tool == name) {
             let reason = format!("Unknown tool: {name}");
