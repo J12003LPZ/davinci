@@ -1802,7 +1802,7 @@ mod tests {
             .position(|row| row.contains("Select model"))
             .unwrap();
         assert!(conversation < title, "{rows:?}");
-        assert!(rows.last().unwrap().contains("Enter to confirm"));
+        assert!(rows.last().unwrap().contains("Enter to set as default"));
         assert!(!rows.iter().any(|row| row.contains('╰')));
     }
 
@@ -2703,6 +2703,7 @@ mod section_regressions {
             );
             model.slash_commands = vec![crate::autocomplete::SlashCommandSpec {
                 name: "model".into(),
+                argument_hint: Some("<provider/model>".into()),
                 ..Default::default()
             }];
             model.model_names = vec!["openai-codex / gpt-6-astra".into()];
@@ -2714,9 +2715,45 @@ mod section_regressions {
                 assert_eq!(model.composer.to_string(), "");
             } else {
                 assert_eq!(flow, Flow::Continue);
-                assert_eq!(model.composer.trim(), "/model");
+                assert_eq!(model.composer.to_string(), "/model ");
+                // Tab completes the name only: no argument list pops open.
+                assert!(model.suggestions.is_none(), "{input}: list opened");
+                // Starting an argument brings its values back.
+                handle_key(
+                    &mut model,
+                    KeyEvent::new(KeyCode::Char('g'), KeyModifiers::NONE),
+                );
+                assert!(model.suggestions.is_some(), "{input}: no values");
             }
         }
+    }
+
+    #[test]
+    fn enter_after_tab_completion_runs_the_command() {
+        let mut model = Model::new(
+            Theme::da_vinci(ColorDepth::TrueColor, false),
+            100,
+            32,
+            false,
+        );
+        model.slash_commands = vec![crate::autocomplete::SlashCommandSpec {
+            name: "model".into(),
+            argument_hint: Some("<provider/model>".into()),
+            ..Default::default()
+        }];
+        model.model_names = vec!["openai-codex / gpt-6-astra".into()];
+        model.composer.set_text("/mo");
+        model.refresh_suggestions();
+        handle_key(&mut model, KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        let flow = handle_key(
+            &mut model,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+        );
+        let Flow::Submit(sent) = flow else {
+            panic!("enter did not submit: {flow:?}");
+        };
+        assert_eq!(sent.trim(), "/model");
+        assert_eq!(model.composer.to_string(), "");
     }
 
     #[test]

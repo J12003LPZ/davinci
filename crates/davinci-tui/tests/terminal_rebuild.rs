@@ -217,11 +217,15 @@ fn rebuild_model_sheet_matches_reference_height() {
     fixtures::dress_screen(&mut m, "3a");
     m.screen = Screen::Models;
     m.overlay = None;
-    assert_eq!(views::cogitator::screen_height(&m), 16);
+    // Claude Code's sheet is 16 rows for five models; DaVinci's grows with
+    // the catalog up to 22 rows so a ten-model list is not folded to five.
+    let height = views::cogitator::screen_height(&m);
+    assert_eq!(height, (m.catalog.len() + 11).min(22));
     let rows = app::compose(&m, 40);
-    assert!(rows[24].to_string().contains("/effort"));
-    assert!(rows[25].to_string().contains("Select model"));
-    assert!(rows[39].to_string().contains("Enter to confirm"));
+    let top = 40 - height;
+    assert_eq!(rows[top].to_string(), "▔".repeat(120));
+    assert!(rows[top + 1].to_string().contains("Select model"));
+    assert!(rows[39].to_string().contains("Enter to set as default"));
 }
 
 #[test]

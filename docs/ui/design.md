@@ -22,6 +22,10 @@ Intentional differences from the captured reference:
 Enter runs the highlighted slash command, Tab only completes it, Enter on an
 `@` file suggestion inserts the path, `?` in an empty composer opens the
 shortcuts panel, and a leading `!` switches the composer into shell mode.
+Completing a command name leaves `/model  <provider/model>` with the argument
+hint and no list (Claude Code `shell/54-tab-mod`); argument values are offered
+once the first character of the argument is typed, in the ordinary completion
+list. Host notices render as a wrapped `●` line, never as `● Tool(…)`.
 `NO_COLOR`, narrow terminals, and the non-default themes remain supported.
 
 The editorial print notes below describe the optional `vox` theme. They are no
@@ -411,6 +415,6 @@ Open `/settings`, select **Theme**, and press Enter to switch between `dark` and
 
 `/model` lists only models from providers with usable credentials. Log in with `/login` to add a provider. The internal security scan control commands are omitted from slash-command discovery.
 
-Thinking levels are selected in `/model`: use Up/Down to highlight a model and Left/Right to adjust its supported reasoning level. Enter saves both; Escape cancels the pending selection. The choice is remembered per model. `/thinking` is removed from slash-command discovery; Tab reasoning-cycle shortcuts are disabled in the native UI.
+Thinking levels are selected in `/model`: use Up/Down to highlight a model and Left/Right to adjust its supported reasoning level. Enter saves both; Escape cancels the pending selection. The choice is remembered per model. `/thinking <level>` and its alias `/effort <level>` set the level directly; bare `/thinking` or `/effort` opens the `/model` picker on the current model. The picker focuses the active model, numbers rows right-aligned, and lists `Enter` (default), `s` (this session only), `/` (search) and `Esc`. Tab reasoning-cycle shortcuts are disabled in the native UI.
 
 `/init [focus]` starts a normal agent turn to inspect the repository and create or carefully update `AGENTS.md`, preserving existing instructions. It uses the active model and normal tool permissions. It does not target `CLAUDE.md`.

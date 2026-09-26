@@ -8,7 +8,7 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 
 use super::{markdown, studio};
-use crate::davinci::model::{Entry, HunkKind, Model};
+use crate::davinci::model::{Entry, HunkKind, Model, NOTICE_INSTRUMENT};
 use crate::davinci::theme::{glyph, State, Theme};
 use crate::davinci::ui::{
     blank, clip_ellipsis, detail_line, failure_line, indent, run_width, span, tool_line,
@@ -223,6 +223,16 @@ fn entry_lines(model: &Model, entry: &Entry, width: u16) -> Vec<Line<'static>> {
         // after a gap, as in claude code. The entry stays in the transcript
         // as the anchor the streaming prose is appended after.
         Entry::Agent(_) => Vec::new(),
+
+        Entry::Tool {
+            state,
+            instrument,
+            target,
+            output,
+            ..
+        } if instrument == NOTICE_INSTRUMENT && output.is_empty() => {
+            notice_lines(th, *state, target, width)
+        }
 
         Entry::Tool {
             state,
@@ -680,6 +690,31 @@ pub fn tool_state(verb: &str, failed: bool, skipped: bool) -> State {
     }
 }
 
+/// Host notices ([`Entry::notice`]) are not tool calls, so they are drawn as
+/// a wrapped `●` line rather than `● Tool(…)` clipped to one row.
+fn notice_lines(th: &Theme, state: State, text: &str, width: u16) -> Vec<Line<'static>> {
+    let cc = th.cc();
+    let (mark, color) = match state {
+        State::Attention | State::Failed => {
+            (if th.no_color { state.glyph() } else { "●" }, th.warning)
+        }
+        _ => ("●", cc.inactive),
+    };
+    let safe = crate::davinci::sanitize::terminal_safe(text);
+    crate::davinci::ui::wrap(safe.as_ref(), width.saturating_sub(2).max(1))
+        .into_iter()
+        .enumerate()
+        .map(|(index, row)| {
+            let lead = if index == 0 {
+                span(format!("{mark} "), color)
+            } else {
+                span("  ", color)
+            };
+            Line::from(truncate_run(vec![lead, span(row, th.text)], width))
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -702,6 +737,46 @@ mod tests {
             .iter()
             .map(|span| span.content.as_ref())
             .collect()
+    }
+
+    #[test]
+    fn host_notices_wrap_as_notices_instead_of_fake_tool_calls() {
+        let m = model(60);
+        let long = "Runtime recovery required: task journal could not be opened: task persistence failed: The process cannot access the file";
+        let entries = [Entry::notice(State::Attention, long)];
+        let rows: Vec<String> = lines(&m, &entries, 60).iter().map(text).collect();
+        let drawn = rows.join("\n");
+        assert!(!drawn.contains("Tool("), "{drawn}");
+        assert!(!drawn.contains('…'), "notice was clipped: {drawn}");
+        let words = drawn.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(words.contains("cannot access the file"), "{drawn}");
+        assert!(
+            rows.iter().any(|row| row.starts_with("● Runtime recovery")),
+            "{drawn}"
+        );
+        assert!(rows
+            .iter()
+            .all(|row| UnicodeWidthStr::width(row.as_str()) <= 60));
+    }
+
+    #[test]
+    fn real_tool_calls_on_the_default_instrument_keep_their_tool_line() {
+        // `instrumenta` is the fallback instrument of read, grep, web_fetch…
+        let m = model(80);
+        let entries = [Entry::tool(
+            State::Read,
+            "instrumenta",
+            "read src/main.rs",
+            None,
+        )];
+        let drawn = lines(&m, &entries, 80)
+            .iter()
+            .map(text)
+            .collect::<Vec<_>>()
+            .join("\n");
+        // Grouped as a read (`Read 1 file`), never drawn as a gray notice.
+        assert!(drawn.contains("Read"), "{drawn}");
+        assert!(!drawn.contains("● read src/main.rs"), "{drawn}");
     }
 
     #[test]

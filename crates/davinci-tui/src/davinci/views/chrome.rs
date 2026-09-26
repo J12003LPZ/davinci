@@ -900,9 +900,6 @@ fn screen_placeholder(screen: Screen) -> Option<&'static str> {
 /// selection reads without color (design.md §6). Nothing is drawn when there is
 /// nothing on offer.
 pub fn suggestions(model: &Model) -> Vec<Line<'static>> {
-    if let Some(rows) = super::cogitator::suggestions(model) {
-        return rows;
-    }
     let Some(found) = &model.suggestions else {
         return Vec::new();
     };
@@ -1227,26 +1224,54 @@ mod tests {
     }
 
     #[test]
-    fn model_arguments_use_the_model_picker_design() {
+    fn model_arguments_use_the_plain_completion_list() {
         let mut m = model(140);
         m.model_names = vec![
             "openai-codex / gpt-6-astra".into(),
             "openai-codex / gpt-5.6-luna".into(),
         ];
-        m.composer.set_text("/model ");
+        m.composer.set_text("/model gpt");
         m.refresh_suggestions();
         let rows = suggestions(&m);
         let drawn = rows.iter().map(text).collect::<Vec<_>>().join("\n");
-        for label in [
-            "Select model",
-            "OpenAI Codex",
-            "gpt-6-astra",
-            "gpt-5.6-luna",
-        ] {
+        for label in ["gpt-6-astra", "gpt-5.6-luna"] {
             assert!(drawn.contains(label), "{label}: {drawn}");
         }
-        assert!(!drawn.contains("COMPLETIONS"));
+        // The argument list is a completion list, not a second model picker
+        // with its own header and effort rule above the composer's.
+        for absent in ["Select model", "effort", "▔"] {
+            assert!(!drawn.contains(absent), "{absent}: {drawn}");
+        }
         assert_eq!(suggestions_height(&m) as usize, rows.len());
+    }
+
+    #[test]
+    fn a_completed_command_name_waits_for_its_argument() {
+        let mut m = model(140);
+        m.model_names = vec!["openai-codex / gpt-6-astra".into()];
+        m.thinking_levels = vec!["low".into(), "high".into()];
+        m.slash_commands = ["model", "thinking"]
+            .into_iter()
+            .map(|name| crate::autocomplete::SlashCommandSpec {
+                name: name.into(),
+                argument_hint: Some("<value>".into()),
+                ..Default::default()
+            })
+            .collect();
+        for text in ["/model ", "/model   ", "/thinking "] {
+            m.composer.set_text(text);
+            m.refresh_suggestions();
+            assert!(m.suggestions.is_none(), "{text:?} opened a list");
+            assert!(suggestions(&m).is_empty(), "{text:?} drew a list");
+        }
+        // No hint to show: the value list is the only discovery surface.
+        m.slash_commands[1].argument_hint = None;
+        m.composer.set_text("/thinking ");
+        m.refresh_suggestions();
+        assert!(m.suggestions.is_some(), "hintless command lost its values");
+        // A newline anywhere means it is not a bare command line.
+        m.composer.set_text("/model \n");
+        m.refresh_suggestions();
     }
 
     #[test]

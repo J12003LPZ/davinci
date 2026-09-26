@@ -459,7 +459,7 @@ fn argument_suggestions(
     }
     let pool = match command {
         "model" => models,
-        "thinking" => thinking_levels,
+        "thinking" | "effort" => thinking_levels,
         "login" => login_providers,
         _ => return None,
     };

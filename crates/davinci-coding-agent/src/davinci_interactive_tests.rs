@@ -661,6 +661,83 @@ fn hidden_reasoning_never_reaches_the_transcript() {
 }
 
 #[test]
+fn hotkey_rows_name_the_surface_they_toggle() {
+    assert_eq!(humanize_action("davinci.grafo.toggle"), "toggle graph");
+    assert_eq!(
+        humanize_action("davinci.tools.expand"),
+        "expand tool output"
+    );
+    assert_eq!(
+        humanize_action("davinci.cogitator.toggle"),
+        "toggle model picker"
+    );
+    assert_eq!(
+        humanize_action("tui.editor.cursorWordLeft"),
+        "cursor word left"
+    );
+    assert_eq!(humanize_action("app.thinking.toggle"), "toggle thinking");
+    assert_eq!(humanize_action("app.session.new"), "new session");
+    assert_eq!(
+        humanize_action("app.permissions.cycle"),
+        "cycle permissions"
+    );
+    assert_eq!(humanize_action("app.session.tree"), "session tree");
+    assert_eq!(humanize_action("tui.select.up"), "up");
+    assert_eq!(humanize_action("davinci.quit"), "quit");
+    assert_eq!(humanize_action("davinci.interrupt"), "interrupt");
+    assert_eq!(humanize_action("tui.input.submit"), "submit");
+}
+
+#[test]
+fn help_is_one_list_row_per_command_in_the_shell_only() {
+    let Sent::Say(text) = classify("/help") else {
+        panic!("help asked the model");
+    };
+    assert!(text.lines().all(|line| line.starts_with("- /")), "{text}");
+    assert!(text.contains("- /effort"), "{text}");
+    // The shared parser stays plain for the legacy chrome's println.
+    let crate::slash::SlashAction::Status(plain) = crate::slash::parse_line("/help") else {
+        panic!("help is not a status");
+    };
+    assert!(plain.lines().all(|line| line.starts_with('/')), "{plain}");
+}
+
+#[test]
+fn status_labels_match_the_real_formatter() {
+    let agent = davinci_agent::Agent::new("test");
+    let real = crate::format_session_status(&crate::args::Args::default(), &agent);
+    let list = status_as_list(&real);
+    let rows: Vec<&str> = list.lines().collect();
+    assert!(rows[0].starts_with("- **Model** "), "{list}");
+    assert!(rows[0].contains(&agent.model_id), "{list}");
+    assert!(
+        rows[3].starts_with("- **Jobs** ") && !rows[3].ends_with("jobs"),
+        "{list}"
+    );
+    assert!(
+        rows[4].starts_with("- **MCP** ") && !rows[4].ends_with("mcp"),
+        "{list}"
+    );
+}
+
+#[test]
+fn status_is_one_labeled_row_per_field() {
+    let list = status_as_list(
+        "openai-codex/gpt-5.6-luna · ask · act · 2 jobs · 0 mcp · input 0 · $0.0000 · 65c49c71\ngraph: idle",
+    );
+    let rows: Vec<&str> = list.lines().collect();
+    assert_eq!(rows[0], "- **Model** openai-codex/gpt-5.6-luna");
+    assert_eq!(rows[1], "- **Permissions** ask");
+    assert_eq!(rows[3], "- **Jobs** 2");
+    assert_eq!(rows[4], "- **MCP** 0");
+    assert_eq!(rows[5], "- input 0");
+    assert_eq!(rows[6], "- **Cost** $0.0000");
+    assert_eq!(rows[7], "- **Prompt hash** 65c49c71");
+    assert_eq!(rows.last(), Some(&"- graph: idle"));
+    assert!(rows.iter().all(|row| row.starts_with("- ")));
+}
+
+#[test]
 fn the_catalogue_opens_with_newer_models_before_the_current_older_model() {
     let row = |provider: &str, id: &str, ready: bool| CatalogRow {
         name: format!("{provider}/{id}"),
@@ -689,7 +766,10 @@ fn the_catalogue_opens_with_newer_models_before_the_current_older_model() {
         row("xai", "grok", false),
     ];
     let index = order_catalog(&mut catalog, "openai-codex", "gpt-5-mini");
-    assert_eq!(index, 0);
+    // Newer models still lead, but focus lands on the model in use.
+    assert_eq!(catalog[index].name, "openai-codex/gpt-5-mini");
+    let mut missing = catalog.clone();
+    assert_eq!(order_catalog(&mut missing, "openai-codex", "retired"), 0);
     let names: Vec<&str> = catalog.iter().map(|row| row.name.as_str()).collect();
     assert_eq!(
         names,
