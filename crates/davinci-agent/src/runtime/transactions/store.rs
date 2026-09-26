@@ -9,6 +9,14 @@ pub(super) struct Store {
 }
 impl Store {
     pub fn open(root: &Path) -> Result<Self, String> {
+        // Resolve only the host-selected workspace root (not the transaction
+        // directory itself) so macOS /var -> /private/var does not make the
+        // secure no-follow directory walk reject an otherwise valid root.
+        let root = match root.canonicalize() {
+            Ok(root) => root,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => root.to_path_buf(),
+            Err(error) => return Err(format!("transaction store: {error}")),
+        };
         let directory = Directory::open(&root.join(STORE_NAME), true)
             .map_err(|e| format!("transaction store: {e}"))?;
         // Recovery records are local state. Exclusive creation preserves any

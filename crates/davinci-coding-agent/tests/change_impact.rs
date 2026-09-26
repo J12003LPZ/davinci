@@ -9,7 +9,8 @@ use davinci_coding_agent::native_extensions::{
     language_intelligence::LanguageIntelligence,
     package_intelligence::PackageIntelligence,
     repo_intelligence::{
-        RepoIntelligence, SemanticLanguageProvider, SemanticOperation, SourceRange,
+        RepoIntelligence, RepoIntelligenceConfig, SemanticLanguageProvider, SemanticOperation,
+        SourceRange,
     },
     test_impact::TestImpact,
     NativeExtensionHost,
@@ -65,7 +66,18 @@ impl TestWorkspace {
     fn change_impact_with_config(&self, config: ChangeImpactConfig) -> ChangeImpact {
         let cache = CacheRuntime::default();
         let agent_dir = self.path().join(".davinci");
-        let repo = RepoIntelligence::new(self.path(), &agent_dir, Default::default());
+        // Impact tests exercise AST relationships, not persistence or watcher
+        // behavior. Keeping those disabled avoids self-generated workspace
+        // activity from making the structural fixture nondeterministic.
+        let repo = RepoIntelligence::new(
+            self.path(),
+            &agent_dir,
+            RepoIntelligenceConfig {
+                persist_index: false,
+                observe_changes: false,
+                ..Default::default()
+            },
+        );
         let test_impact =
             TestImpact::new(self.path(), repo.clone(), cache.clone(), Default::default());
         let package_intel = PackageIntelligence::with_root(self.path(), cache.clone());

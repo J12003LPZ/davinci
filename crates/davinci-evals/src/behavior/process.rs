@@ -369,7 +369,9 @@ print(os.environ.get('DAVINCI_EVAL_PROMPT_MODEL_POLICY', 'missing'), file=sys.st
             prompt_profile: PromptProfile::Stable,
             prompt_model_policy_override: None,
             permission_mode: "read-only".into(),
-            timeout: Duration::from_millis(250),
+            // The assertion is about EOF, not Python interpreter startup time.
+            // Windows CI can legitimately take longer than 250 ms to launch Python.
+            timeout: Duration::from_secs(2),
             clean_agent_dir: dir.path().join("agent"),
             auth_source: None,
             allowed_env: BTreeMap::new(),

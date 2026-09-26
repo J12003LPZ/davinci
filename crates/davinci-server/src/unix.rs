@@ -200,7 +200,7 @@ impl BoundUnixListener {
         let owned_dir = self
             .owned_bind_path
             .parent()
-            .map(|path| fs::remove_dir(path))
+            .map(fs::remove_dir)
             .transpose()
             .map_err(|err| ServerError::Io(err.to_string()))
             .map(|_| ());

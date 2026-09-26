@@ -1160,6 +1160,9 @@ mod tests {
 
     #[test]
     fn lsp_output_reaches_shared_governor_and_reset_revokes_it() {
+        // Graph-worker tests mutate PI_GRAPH_* process environment. Serialize
+        // this local-LSP test with them so it cannot be misrouted to parent RPC.
+        let _graph_env = graph::worker_hooks::submit_test_guard();
         let root = tempfile::tempdir().unwrap();
         let agent = tempfile::tempdir().unwrap();
         std::fs::write(root.path().join("package.json"), "{}").unwrap();

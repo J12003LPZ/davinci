@@ -319,7 +319,10 @@ mod tests {
             .unwrap();
         let id = &started["process"]["id"];
         let marker = dir.path().join("relative-script.ok");
-        let until = Instant::now() + Duration::from_secs(5);
+        // Process creation is already confirmed by process_start. Give heavily
+        // loaded Windows runners enough time to schedule Node and execute the
+        // relative entry point before declaring the cwd contract broken.
+        let until = Instant::now() + Duration::from_secs(15);
         loop {
             if marker.is_file() {
                 assert_eq!(
