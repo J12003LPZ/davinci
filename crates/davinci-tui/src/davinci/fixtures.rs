@@ -2188,7 +2188,79 @@ pub fn dress_screen(model: &mut Model, id: &str) {
             model.context = (58_000, 200_000);
         }
         "6d" => sheet(model, Screen::Diff),
+        "plugin" => {
+            sheet(model, Screen::Extensions);
+            model.extension_manager = Some(extension_manager());
+        }
         _ => {}
+    }
+}
+
+/// `/plugin` with sample rows: one plugin of each kind of state.
+pub fn extension_manager() -> crate::davinci::model::ExtensionsSheet {
+    use crate::davinci::model::{ExtensionRow, ExtensionsSheet};
+    use crate::davinci::theme::State;
+    let plugin = |key: &str, status: &str, state: State, detail: &str| ExtensionRow {
+        key: key.into(),
+        title: key.into(),
+        status: status.into(),
+        state,
+        detail: detail.into(),
+        can_toggle: true,
+        can_delete: true,
+        ..ExtensionRow::default()
+    };
+    ExtensionsSheet {
+        plugins: vec![
+            ExtensionRow {
+                can_update: true,
+                can_revoke: true,
+                ..plugin(
+                    "code-review@claude-plugins-official",
+                    "enabled",
+                    State::Done,
+                    "from davinci · v1.0.0 · 1 command · 1 agent · hooks approved",
+                )
+            },
+            ExtensionRow {
+                can_approve: true,
+                note: Some(
+                    "Adopted from Claude Code: update it in Claude Code. Delete only stops DaVinci loading it."
+                        .into(),
+                ),
+                ..plugin(
+                    "superpowers@superpowers-marketplace",
+                    "enabled",
+                    State::Attention,
+                    "from Claude Code · v6.2.0 · 14 skills · 1 hook · hooks need approval",
+                )
+            },
+            plugin(
+                "caveman@caveman",
+                "disabled",
+                State::Skipped,
+                "from Codex · v1.4.0 · 20 skills · no hooks",
+            ),
+        ],
+        skills: vec![ExtensionRow {
+            key: "skills/release-notes/SKILL.md".into(),
+            title: "release-notes".into(),
+            status: "user".into(),
+            detail: "Draft release notes from merged pull requests.".into(),
+            can_delete: true,
+            ..ExtensionRow::default()
+        }],
+        mcp: vec![ExtensionRow {
+            key: "docs".into(),
+            title: "docs".into(),
+            status: "connected · 4 tools".into(),
+            detail: "http · https://example.com/mcp · ~/.davinci/agent/mcp.json".into(),
+            can_toggle: true,
+            can_delete: true,
+            ..ExtensionRow::default()
+        }],
+        notice: Some("Enabled caveman@caveman.".into()),
+        ..ExtensionsSheet::default()
     }
 }
 

@@ -2068,6 +2068,12 @@ fn pre_tool_hook_blocks_before_execution() {
             None
         }
     })));
+    let seen = Arc::new(std::sync::Mutex::new(None));
+    let seen_post = seen.clone();
+    agent.post_tool = Some(PostToolHook(Arc::new(move |_, _, _, _, result| {
+        *seen_post.lock().unwrap() = result.details.clone();
+        result
+    })));
     agent.prompt("run");
     let events = agent
         .run_loop(|current| {
@@ -2114,6 +2120,11 @@ fn pre_tool_hook_blocks_before_execution() {
         .map(|message| content_text(&message.content))
         .unwrap_or_default();
     assert!(result.contains("blocked by extension"));
+    // The post hook learns the call never ran (plugins skip PostToolUse).
+    assert_eq!(
+        *seen.lock().unwrap(),
+        Some(serde_json::json!({ "preToolBlocked": true }))
+    );
 }
 
 #[test]

@@ -95,7 +95,7 @@ pub fn builtin_slash_commands() -> Vec<SlashCommand> {
         ("agents", "List custom agent profiles and status", None),
         (
             "plugin",
-            "Browse, install and manage Claude Code / Codex plugins",
+            "Manage plugins, skills and MCP servers; install Claude Code / Codex plugins",
             Some("[list|browse|install|import|info|approve|enable|disable|marketplace]"),
         ),
         ("tasks", "Execution checklist and live task board", None),

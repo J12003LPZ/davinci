@@ -2493,7 +2493,14 @@ fn complete_prompt_with_host(
                 Some(tool_call_id),
                 Some(!result.is_error),
             );
-            let result = if denied {
+            // Claude Code skips PostToolUse for a call a pre-tool hook blocked.
+            let pre_blocked = result
+                .details
+                .as_ref()
+                .and_then(|details| details.get("preToolBlocked"))
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false);
+            let result = if denied || pre_blocked {
                 result
             } else {
                 run_plugin_post_tool(&post_plugin_hooks, &post_plugin_base, name, args, result)

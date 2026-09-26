@@ -11,6 +11,7 @@
 pub mod command;
 pub mod external;
 pub mod hooks;
+pub mod manager;
 pub mod manifest;
 pub mod marketplace;
 pub mod store;
@@ -208,6 +209,9 @@ impl ActivePlugins {
         subject: Option<&str>,
         input: &HookInput,
     ) -> EventResult {
+        if !input.session_id.is_empty() {
+            *last_session_id().lock().unwrap_or_else(|e| e.into_inner()) = input.session_id.clone();
+        }
         let mut result = EventResult::default();
         for (active, hook) in self.hooks_for(event) {
             let matched = match event {
@@ -341,6 +345,14 @@ pub fn session_start_context(agent_dir: &Path, cwd: &Path, session_id: &str) -> 
     contexts
 }
 
+/// Session id most recently passed to a hook. The session file is created
+/// lazily, so `SessionEnd` (which runs with no agent at hand) reuses the id
+/// the turn hooks saw.
+fn last_session_id() -> &'static Mutex<String> {
+    static LAST: OnceLock<Mutex<String>> = OnceLock::new();
+    LAST.get_or_init(|| Mutex::new(String::new()))
+}
+
 /// `SessionEnd` hooks, run where the user's own `stop` hooks run.
 pub fn run_session_end(agent_dir: &Path, cwd: &Path) {
     let plugins = active(agent_dir);
@@ -348,6 +360,10 @@ pub fn run_session_end(agent_dir: &Path, cwd: &Path) {
         return;
     }
     let input = HookInput {
+        session_id: last_session_id()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone(),
         cwd: cwd.to_path_buf(),
         ..HookInput::default()
     };
