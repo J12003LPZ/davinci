@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", default)]
 pub struct LearningConfig {
     pub enabled: bool,
     pub background_review: bool,
@@ -13,6 +13,8 @@ pub struct LearningConfig {
     pub max_review_iterations: usize,
     pub auto_promote_verified_uses: u64,
     pub review_timeout_ms: u64,
+    /// Least time between two background model reviews.
+    pub min_review_interval_ms: u64,
 }
 
 impl Default for LearningConfig {
@@ -27,7 +29,8 @@ impl Default for LearningConfig {
             max_review_input_tokens: 12_000,
             max_review_iterations: 6,
             auto_promote_verified_uses: 2,
-            review_timeout_ms: 30_000,
+            review_timeout_ms: 120_000,
+            min_review_interval_ms: 180_000,
         }
     }
 }
@@ -48,6 +51,7 @@ mod tests {
         assert_eq!(config.max_review_input_tokens, 12_000);
         assert_eq!(config.max_review_iterations, 6);
         assert_eq!(config.auto_promote_verified_uses, 2);
-        assert_eq!(config.review_timeout_ms, 30_000);
+        assert_eq!(config.review_timeout_ms, 120_000);
+        assert_eq!(config.min_review_interval_ms, 180_000);
     }
 }

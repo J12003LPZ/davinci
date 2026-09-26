@@ -18,15 +18,18 @@ Davinci maintains a strict distinction between declarative facts and procedural 
 ## 2. Core Principles & Safety Model
 
 ### Fail-Open Asynchronous Loop
-- Background turn reviews execute on dedicated worker threads after vector memory indexing finishes.
-- Any background failure, parse error, or timeout is cleanly swallowed and recorded in local diagnostics; foreground agent execution is never blocked or failed by learning tasks.
-- If a new foreground turn begins while a background review is running, the active review is immediately cancelled via cooperative cancellation (`AtomicBool`).
+- After a turn that passes `should_review_evidence`, the interactive shell and RPC sessions start a model review on a background thread. The review runs this `davinci` as a print-mode child (`-p --no-session --no-extensions --no-skills --no-mcp --no-tools`) on the session's model, with `REVIEWER_SYSTEM_PROMPT` and the turn evidence (`reviewer.rs::execute_live_review`).
+- One review runs at a time, and reviews start at least `minReviewIntervalMs` apart (default 3 minutes). The evidence covers the last ten messages, so a turn skipped for spacing is mostly seen by the next review. A new turn does not cancel a running review.
+- The child runs with `PI_LEARNING_DISABLE_BACKGROUND=1` and `PI_MEMORY_ENABLED=0`, so it neither reviews itself nor indexes the review into vector memory.
+- Finished reviews are applied at the start of the next turn and by any `/learning-*` or `/skill-*` command. A review still running when the process exits is lost.
+- Print mode (`davinci -p`, graph workers) does not start model reviews. `PI_LEARNING_REVIEW_FIXTURE` still answers synchronously in every mode for tests.
+- Any background failure, parse error, or timeout (`reviewTimeoutMs`, default 2 minutes) is swallowed and recorded in diagnostics; `/learning-status` shows the last one. Foreground turns are never blocked or failed by learning.
 - Review can be completely disabled by setting `PI_LEARNING_DISABLE_BACKGROUND=1`.
 
 ### Automatic Learning by Default (Zero User Interaction Required)
 - **Automatic Application Enabled**: The system operates with `shadowMode = false`, `autoApplyProject = true`, and `autoApplyGlobal = true` by default. Proven procedural workflows and declarative facts are automatically persisted and activated without requiring manual `/learning-approve` commands or user prompts.
 - **Autonomous Auto-Promotion**:
-  - `auto_apply_project`: Enabled by default (`true`). When project tasks are verified, learned procedural workflows are automatically committed to `.pi/skills/<name>/SKILL.md`.
+  - `auto_apply_project`: Enabled by default (`true`). When project tasks are verified, learned procedural workflows are automatically committed to the project's Davinci-owned skill directory (see Storage Layout).
   - `auto_apply_global`: Enabled by default (`true`). Global skills and facts are automatically maintained without user intervention.
   - `auto_promote_verified_uses`: Skills that start as candidates are automatically promoted to `active` once verified in 2 independent successful executions without failures.
 - **Declarative vs. Procedural Verification**:
@@ -35,6 +38,13 @@ Davinci maintains a strict distinction between declarative facts and procedural 
 - **Read-Before-Write Hash Verification & Path Traversal Prevention**:
   - Patching existing skills checks that the current file content matches the expected hash before applying changes.
   - Rejects attempts to escape skill directories or overwrite user-authored / imported skills.
+- **Nothing waits for approval**: with the defaults, no candidate is staged for `/learning-approve`. What cannot be applied safely is kept as a `Candidate` (never used) or rejected:
+  - a procedure proposed in a turn the user corrected is kept; a memory or failure lesson from that turn is applied, because recording the correction is the point;
+  - a patch or support file for a user-authored or imported skill, or any `scripts/` file, is kept;
+  - a patch or support file for a skill that does not exist is rejected;
+  - a second `skill_create` for an active skill is kept (the reviewer is shown existing learned skills and asked to patch instead).
+  Staging for approval only happens when you opt into it with `shadowMode: true` or `autoApplyProject`/`autoApplyGlobal: false`.
+- **Use in later turns**: before each turn, learned skills (ledger status `active`, origin learned) that match the prompt are injected with the vector-memory block, up to 2 skills and 1,200 tokens (`LearningController::learned_skill_block`).
   - Maintains versioned history backups (up to 5 versions) under `<store>/history/<skill>/<version>.md`.
 
 ---
@@ -56,7 +66,7 @@ Davinci maintains a strict distinction between declarative facts and procedural 
   ├── Evaluate Candidate Artifact (SkillCreate / SkillPatch / Memory / FailureLesson)
   ├── Policy Evaluation:
   │     ├── Shadow Mode? ──► Persist as Candidate (candidates.jsonl)
-  │     ├── Untrusted / Unverified? ──► Stage For Approval (PendingApproval)
+  │     ├── Unverified / user-owned / corrected procedure? ──► Keep as Candidate
   │     └── Trusted & Verified & Auto-Apply? ──► Apply to SKILL.md & Ledger & Vector Memory
   └── Queue Progressive Disclosure Notice
 ```
@@ -66,7 +76,7 @@ Davinci maintains a strict distinction between declarative facts and procedural 
 ## 4. Storage Layout & Ownership
 
 The learning subsystem maintains stores at two scopes:
-- **Project Scope**: `<repo>/.pi/learning/` in the repository root.
+- **Project Scope**: `<agent_dir>/learning/projects/<repo-key>/`, where `<repo-key>` is the first 16 hex digits of the hash of the repository id. The repository cannot write there, so learned project skills need no project trust, and learning never adds trust-requiring files to the repository. A pre-existing in-repository store (`<repo>/.davinci/learning/` or `<repo>/.pi/learning/` whose `skills.jsonl` is not empty) keeps being used, together with its `<repo>/.davinci/skills/` directory.
 - **Global Scope**: `<agent_dir>/learning/` (e.g. `~/.pi/agent/learning/`).
 
 ### Directory Structure
@@ -83,7 +93,7 @@ The learning subsystem maintains stores at two scopes:
 
 ### Skills Directory
 Active procedural skills are persisted as standard skill directories containing `SKILL.md`:
-- Project skills: `<repo>/.pi/skills/<skill_name>/SKILL.md`
+- Project skills: `<agent_dir>/learning/projects/<repo-key>/skills/<skill_name>/SKILL.md`
 - Global skills: `<agent_dir>/skills/<skill_name>/SKILL.md`
 
 ### Autonomous Modification Boundaries
@@ -101,7 +111,7 @@ Active procedural skills are persisted as standard skill directories containing 
 | :--- | :--- |
 | `/learn [--global] <instruction>` | Distills a reusable procedure into a project or global skill in the foreground. Searches existing skills first to prefer patching over duplicates. |
 | `/learning-status` | Displays current learning configuration, shadow mode status, project trust, candidate stats, and active skills count. |
-| `/learning-pending` | Lists staged learning candidates awaiting human approval. |
+| `/learning-pending` | Lists candidates staged for approval. Empty with the default configuration. |
 | `/learning-approve <id\|all>` | Approves a staged candidate, activating the skill/memory and updating the ledger. |
 | `/learning-reject <id\|all>` | Rejects a staged candidate, marking it as dismissed. |
 | `/skill-list [query]` | Lists compact descriptors of known skills across project and global scopes with versions and usage counts. |
@@ -109,7 +119,6 @@ Active procedural skills are persisted as standard skill directories containing 
 
 ### Progressive Disclosure
 When background reviews stage candidates or activate skills, notifications are buffered and drained into the interactive transcript without corrupting the TUI screen:
-- `"learning · 1 pending candidate(s) awaiting approval (/learning-pending)"`
 - `"learning · skill activated: debug-sqlx"`
 
 ---
@@ -130,7 +139,8 @@ Learning configuration is specified under the `"learning"` key in settings:
     "maxReviewInputTokens": 12000,
     "maxReviewIterations": 6,
     "autoPromoteVerifiedUses": 2,
-    "reviewTimeoutMs": 30000
+    "reviewTimeoutMs": 120000,
+    "minReviewIntervalMs": 180000
   }
 }
 ```
@@ -139,7 +149,8 @@ Learning configuration is specified under the `"learning"` key in settings:
 - **Fail-open**: Learning failures never fail normal turns.
 - **Review disablement**: Setting `PI_LEARNING_DISABLE_BACKGROUND=1` immediately short-circuits background review execution.
 - **Fallback to lexical**: If Ollama or Qdrant are unavailable, skill retrieval cleanly falls back to lexical matching.
-- **Untrusted projects**: Projects that are explicitly untrusted receive no autonomous project writes.
+- **Untrusted projects**: Learned project skills live in the Davinci-owned store, so trust does not gate them. A legacy in-repository store in an untrusted project receives no autonomous project writes.
+- **Cost**: each review is one extra model call on the session's model, bounded by `maxReviewInputTokens`, only for turns that pass review gating and the interval.
 - **Self-improving autonomy**: Without user interaction, high-confidence memories and verified skills are automatically promoted and activated.
 
 ---

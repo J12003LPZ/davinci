@@ -539,7 +539,15 @@ impl ExtensionHost {
         self.native
             .lock()
             .ok()
-            .and_then(|native| native.memory_inject(query))
+            .and_then(|mut native| native.turn_context_inject(query))
+    }
+
+    /// Let this session's learning review turns with `model` in the
+    /// background. Only long-lived sessions (interactive, RPC) call this.
+    pub fn enable_live_learning(&self, cwd: &std::path::Path, model: Option<String>) {
+        if let Ok(mut native) = self.native.lock() {
+            native.learning.set_live_reviewer(cwd, model);
+        }
     }
 
     /// Index the current session snapshot after a settled turn. Errors are

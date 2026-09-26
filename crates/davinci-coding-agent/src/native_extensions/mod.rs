@@ -618,6 +618,29 @@ impl NativeExtensionHost {
             .after_tool(name, args, result)
     }
 
+    /// Everything retrieved for the turn: vector memory, then the learned
+    /// skills that fit the prompt. Background reviews that finished since the
+    /// last turn are applied first, so a skill learned a minute ago is used.
+    pub fn turn_context_inject(&mut self, query: &str) -> Option<String> {
+        self.poll_learning();
+        let memory = self.memory_inject(query);
+        let skills = self.learning.learned_skill_block(query);
+        match (memory, skills) {
+            (Some(memory), Some(skills)) => Some(format!("{memory}\n\n{skills}")),
+            (memory, skills) => memory.or(skills),
+        }
+    }
+
+    /// Apply finished background learning reviews and index any memories
+    /// they activated.
+    pub fn poll_learning(&mut self) {
+        let before = self.learning.stats.candidates_approved;
+        self.learning.apply_completed_reviews();
+        if self.learning.stats.candidates_approved != before {
+            self.sync_active_learning_memories();
+        }
+    }
+
     pub fn memory_inject(&self, query: &str) -> Option<String> {
         self.memory
             .lock()
@@ -853,6 +876,9 @@ impl NativeExtensionHost {
     }
 
     pub fn command(&mut self, name: &str, args: &str) -> Result<Option<Value>, String> {
+        if name.starts_with("learning") || name.starts_with("skill") {
+            self.poll_learning();
+        }
         match name {
             "repo-index-status" => Ok(Some(self.repo_intelligence.status())),
             "lsp-status" => Ok(Some(self.language_intelligence.status())),
