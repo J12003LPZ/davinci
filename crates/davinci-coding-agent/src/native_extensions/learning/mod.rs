@@ -30,6 +30,12 @@ use std::sync::{Arc, Mutex};
 
 use crate::native_extensions::vector_memory::content_hash;
 
+/// Learned skills injected into one turn, and the token budget they share.
+const LEARNED_SKILLS_PER_TURN: usize = 2;
+const LEARNED_SKILL_TOKENS: usize = 1_200;
+/// Reviewer diagnostics kept for `/learning-status`.
+const MAX_DIAGNOSTICS: usize = 50;
+
 #[derive(Debug, Clone)]
 pub struct LearningController {
     pub config: LearningConfig,
@@ -43,6 +49,48 @@ pub struct LearningController {
     pub read_set: Arc<Mutex<ReviewReadSet>>,
     pub project_trusted: bool,
     pub active_review: Option<ReviewRun>,
+    /// The project store and skills live under the agent directory, keyed by
+    /// repository, where the repository cannot write. Learned project skills
+    /// then need no project trust, and writing them never turns a project
+    /// with no config into one that asks for trust.
+    pub project_store_owned: bool,
+    /// Set when this session can run a model review in the background.
+    pub live: Option<LiveReviewSpec>,
+    /// The live review in flight. A new turn does not cancel it.
+    pub live_review: Option<ReviewRun>,
+    /// Reviews finished on the background thread, applied on the next call.
+    pub completed_reviews: Arc<Mutex<Vec<ReviewResult>>>,
+    pub last_live_review_ms: u64,
+    /// Test hook replacing the reviewer child.
+    pub review_runner: Option<ReviewRunner>,
+}
+
+type ReviewRunnerFn = dyn Fn(&LearningEvidence, &LearningConfig, &ReviewRun, &LiveReviewSpec) -> ReviewResult
+    + Send
+    + Sync;
+
+/// Runs one live review; `execute_live_review` unless a test replaces it.
+#[derive(Clone)]
+pub struct ReviewRunner(pub Arc<ReviewRunnerFn>);
+
+impl std::fmt::Debug for ReviewRunner {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("ReviewRunner")
+    }
+}
+
+/// `<agent_dir>/learning/projects/<key>`: the davinci-owned home of one
+/// repository's learned ledger and skills.
+fn owned_project_root(agent_dir: &Path, cwd: &Path) -> PathBuf {
+    let repo_id = crate::native_extensions::vector_memory::resolve_repo_id(cwd);
+    let key: String = content_hash(&repo_id).chars().take(16).collect();
+    agent_dir.join("learning").join("projects").join(key)
+}
+
+/// An in-repository learning store that already recorded skills keeps being
+/// used, so skills learned before the store moved stay active.
+fn legacy_store_in_use(root: &Path) -> bool {
+    std::fs::metadata(root.join("skills.jsonl")).is_ok_and(|meta| meta.len() > 0)
 }
 
 impl LearningController {
@@ -50,7 +98,7 @@ impl LearningController {
         let config = config.unwrap_or_default();
         let mut diagnostics = Vec::new();
 
-        let project_root = {
+        let legacy_project_root = {
             let davinci = cwd.join(".davinci").join("learning");
             if davinci.exists() {
                 davinci
@@ -63,6 +111,11 @@ impl LearningController {
                 }
             }
         };
+        let owned_root = agent_dir
+            .filter(|_| !legacy_store_in_use(&legacy_project_root))
+            .map(|dir| owned_project_root(dir, cwd));
+        let project_store_owned = owned_root.is_some();
+        let project_root = owned_root.clone().unwrap_or(legacy_project_root);
         let project_store = match LearningStore::open(project_root) {
             Ok(store) => store,
             Err(err) => {
@@ -103,7 +156,9 @@ impl LearningController {
             }
         };
 
-        let project_skills_dir = {
+        let project_skills_dir = if let Some(root) = &owned_root {
+            root.join("skills")
+        } else {
             let davinci = cwd.join(".davinci").join("skills");
             if davinci.exists() {
                 davinci
@@ -147,11 +202,120 @@ impl LearningController {
             read_set: Arc::new(Mutex::new(ReviewReadSet::new())),
             project_trusted: false,
             active_review: None,
+            project_store_owned,
+            live: None,
+            live_review: None,
+            completed_reviews: Arc::new(Mutex::new(Vec::new())),
+            last_live_review_ms: 0,
+            review_runner: None,
         }
     }
 
     pub fn set_project_trusted(&mut self, trusted: bool) {
         self.project_trusted = trusted;
+    }
+
+    /// Project skills may be written and used when the project is trusted, or
+    /// when they live in the davinci-owned store the repository cannot touch.
+    fn project_writable(&self) -> bool {
+        self.project_trusted || self.project_store_owned
+    }
+
+    /// Let this session review turns with a model in the background, on the
+    /// model it is using. Print-mode children never call this, so a graph
+    /// worker or a reviewer child does not review itself.
+    pub fn set_live_reviewer(&mut self, cwd: &Path, model: Option<String>) {
+        self.live = Some(LiveReviewSpec {
+            cwd: cwd.to_path_buf(),
+            model,
+            existing_skills: Vec::new(),
+        });
+    }
+
+    /// Learned skills the reviewer should patch rather than duplicate.
+    fn learned_skill_summaries(&self) -> Vec<(String, String)> {
+        let mut ledger = self.project_store.skills();
+        ledger.extend(self.global_store.skills());
+        let discovered = davinci_agent::discover_skills(&[
+            self.project_skills_dir.clone(),
+            self.global_skills_dir.clone(),
+        ]);
+        ledger
+            .iter()
+            .filter(|record| record.status == ArtifactStatus::Active)
+            .filter_map(|record| {
+                discovered
+                    .iter()
+                    .find(|skill| skill.name == record.name)
+                    .map(|skill| (skill.name.clone(), skill.description.clone()))
+            })
+            .collect()
+    }
+
+    /// Apply the reviews the background thread finished since the last call.
+    pub fn apply_completed_reviews(&mut self) {
+        let finished = std::mem::take(
+            &mut *self
+                .completed_reviews
+                .lock()
+                .unwrap_or_else(|e| e.into_inner()),
+        );
+        for result in finished {
+            self.apply_review_result(result);
+            self.stats.reviews_completed += 1;
+        }
+    }
+
+    /// Whether a background review is still running.
+    pub fn live_review_running(&self) -> bool {
+        self.live_review
+            .as_ref()
+            .is_some_and(|run| !run.is_finished())
+    }
+
+    /// Learned skills relevant to `query`, as a block for the turn context.
+    /// Only skills the learning system activated are injected; hand-written
+    /// skills already reach the model through the skill list.
+    pub fn learned_skill_block(&self, query: &str) -> Option<String> {
+        if !self.config.enabled || query.trim().is_empty() {
+            return None;
+        }
+        let mut ledger = self.project_store.skills();
+        ledger.extend(self.global_store.skills());
+        let learned = |name: &str| {
+            ledger.iter().any(|record| {
+                record.name == name
+                    && record.status == ArtifactStatus::Active
+                    && matches!(
+                        record.origin,
+                        SkillOrigin::LearnedReview | SkillOrigin::LearnedForeground
+                    )
+            })
+        };
+        let candidates = self.graph_skill_candidates(
+            query,
+            crate::native_extensions::graph::Role::Writer,
+            LEARNED_SKILLS_PER_TURN,
+            LEARNED_SKILL_TOKENS,
+        );
+        let blocks = candidates
+            .into_iter()
+            .filter(|candidate| learned(&candidate.name))
+            .map(|candidate| {
+                format!(
+                    "<learned-skill name=\"{}\" version=\"{}\">\n{}\n</learned-skill>",
+                    candidate.name,
+                    candidate.version,
+                    candidate.body.trim()
+                )
+            })
+            .collect::<Vec<_>>();
+        (!blocks.is_empty()).then(|| {
+            format!(
+                "Skills learned from earlier work in this project. Follow them when they apply; ignore them when they do not.\n{}",
+                blocks.join("\n")
+            )
+        })
     }
 
     pub fn cancel_active_review(&mut self) {
@@ -170,6 +334,7 @@ impl LearningController {
     }
 
     pub fn review_settled_turn(&mut self, evidence: LearningEvidence) -> Option<String> {
+        self.apply_completed_reviews();
         if !self.config.enabled || !self.config.background_review {
             return None;
         }
@@ -186,6 +351,14 @@ impl LearningController {
             return None;
         }
 
+        // A fixture answers at once and keeps tests deterministic; otherwise a
+        // session that can run a model reviews in the background.
+        if std::env::var_os("PI_LEARNING_REVIEW_FIXTURE").is_none() {
+            if let Some(spec) = self.live.clone() {
+                return self.dispatch_live_review(evidence, spec);
+            }
+        }
+
         self.stats.reviews_dispatched += 1;
 
         self.cancel_active_review();
@@ -196,7 +369,66 @@ impl LearningController {
         self.stats.reviews_started += 1;
 
         let result = execute_review(&evidence, &self.config, &run);
+        self.apply_review_result(result);
+        self.stats.reviews_completed += 1;
+        Some(run_id)
+    }
+
+    /// Start a model review of the turn on a background thread. One runs at a
+    /// time and they are spaced `min_review_interval_ms` apart; the evidence
+    /// carries the last ten messages, so a skipped turn is mostly seen by the
+    /// next review.
+    fn dispatch_live_review(
+        &mut self,
+        evidence: LearningEvidence,
+        mut spec: LiveReviewSpec,
+    ) -> Option<String> {
+        let now = now_ms();
+        if self.live_review_running()
+            || now.saturating_sub(self.last_live_review_ms) < self.config.min_review_interval_ms
+        {
+            self.stats.reviews_skipped += 1;
+            return None;
+        }
+        spec.existing_skills = self.learned_skill_summaries();
+        let run = ReviewRun::new(format!("rev-{}-{}", evidence.turn, now));
+        let run_id = run.id.clone();
+        self.live_review = Some(run.clone());
+        self.last_live_review_ms = now;
+        self.stats.reviews_dispatched += 1;
+        self.stats.reviews_started += 1;
+        let config = self.config.clone();
+        let completed = Arc::clone(&self.completed_reviews);
+        let runner = self.review_runner.clone();
+        let spawned = std::thread::Builder::new()
+            .name(format!("learning-review-{run_id}"))
+            .spawn(move || {
+                let result = match runner {
+                    Some(ReviewRunner(runner)) => runner(&evidence, &config, &run, &spec),
+                    None => execute_live_review(&evidence, &config, &run, &spec),
+                };
+                run.mark_finished();
+                completed
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .push(result);
+            });
+        if let Err(error) = spawned {
+            self.live_review = None;
+            self.diagnostics
+                .push(format!("learning review thread: {error}"));
+            return None;
+        }
+        Some(run_id)
+    }
+
+    fn apply_review_result(&mut self, result: ReviewResult) {
         self.diagnostics.extend(result.diagnostics);
+        if self.diagnostics.len() > MAX_DIAGNOSTICS {
+            let excess = self.diagnostics.len() - MAX_DIAGNOSTICS;
+            self.diagnostics.drain(..excess);
+        }
+        let project_writable = self.project_writable();
 
         for mut candidate in result.candidates {
             self.stats.candidates_created += 1;
@@ -210,29 +442,33 @@ impl LearningController {
             self.notifications
                 .push(format!("learning · candidate saved: {}", art_name));
 
-            // Task 16 Step 3: Prefer patch over duplicate skill
-            if let LearningArtifact::SkillCreate { name, .. } = &candidate.artifact {
-                let existing_active = self
-                    .project_store
-                    .skill(name)
-                    .or_else(|| self.global_store.skill(name));
-                if let Some(existing) = existing_active {
-                    if existing.status == ArtifactStatus::Active {
-                        candidate.status = ArtifactStatus::PendingApproval;
-                    }
-                }
-            }
+            // Task 16 Step 3: Prefer patch over duplicate skill. A second
+            // create of an active skill is kept as a candidate, never applied
+            // over the first and never left waiting on the user.
+            let duplicate_create =
+                if let LearningArtifact::SkillCreate { name, .. } = &candidate.artifact {
+                    self.project_store
+                        .skill(name)
+                        .or_else(|| self.global_store.skill(name))
+                        .is_some_and(|existing| existing.status == ArtifactStatus::Active)
+                } else {
+                    false
+                };
 
             let target_skill = match &candidate.artifact {
-                LearningArtifact::SkillPatch { name, .. } => self
+                LearningArtifact::SkillPatch { name, .. }
+                | LearningArtifact::SkillSupportFile { name, .. } => self
                     .project_store
                     .skill(name)
                     .or_else(|| self.global_store.skill(name)),
                 _ => None,
             };
 
-            let decision =
-                evaluate_candidate(&candidate, &self.config, self.project_trusted, target_skill);
+            let decision = if duplicate_create {
+                CandidateDecision::KeepCandidate
+            } else {
+                evaluate_candidate(&candidate, &self.config, project_writable, target_skill)
+            };
 
             match decision {
                 CandidateDecision::AutoApply => {
@@ -266,7 +502,7 @@ impl LearningController {
                                 global_skills_dir: &self.global_skills_dir,
                                 project_store: &mut self.project_store,
                                 global_store: &mut self.global_store,
-                                project_trusted: self.project_trusted,
+                                project_trusted: self.project_trusted || self.project_store_owned,
                                 auto_apply_global: self.config.auto_apply_global,
                                 origin: SkillWriteOrigin::BackgroundReview,
                                 read_set: &read_set_snapshot,
@@ -298,7 +534,7 @@ impl LearningController {
                                 global_skills_dir: &self.global_skills_dir,
                                 project_store: &mut self.project_store,
                                 global_store: &mut self.global_store,
-                                project_trusted: self.project_trusted,
+                                project_trusted: self.project_trusted || self.project_store_owned,
                                 auto_apply_global: self.config.auto_apply_global,
                                 origin: SkillWriteOrigin::BackgroundReview,
                                 read_set: &read_set_snapshot,
@@ -330,7 +566,7 @@ impl LearningController {
                                 global_skills_dir: &self.global_skills_dir,
                                 project_store: &mut self.project_store,
                                 global_store: &mut self.global_store,
-                                project_trusted: self.project_trusted,
+                                project_trusted: self.project_trusted || self.project_store_owned,
                                 auto_apply_global: self.config.auto_apply_global,
                                 origin: SkillWriteOrigin::BackgroundReview,
                                 read_set: &read_set_snapshot,
@@ -376,9 +612,6 @@ impl LearningController {
                 }
             }
         }
-
-        self.stats.reviews_completed += 1;
-        Some(run_id)
     }
 
     pub fn skill_list_tool(&self, cwd: &Path, args: &Value) -> Result<ToolResult, ToolError> {
@@ -622,7 +855,7 @@ impl LearningController {
             global_skills_dir: &self.global_skills_dir,
             project_store: &mut self.project_store,
             global_store: &mut self.global_store,
-            project_trusted: self.project_trusted,
+            project_trusted: self.project_trusted || self.project_store_owned,
             auto_apply_global: self.config.auto_apply_global,
             origin: SkillWriteOrigin::ForegroundUserDirected,
             read_set: &read_set_snapshot,
@@ -740,7 +973,18 @@ impl LearningController {
         json!({
             "enabled": self.config.enabled,
             "shadowMode": self.config.shadow_mode,
-            "activeReview": self.active_review.as_ref().map(|r| !r.is_finished()).unwrap_or(false),
+            "activeReview": self.active_review.as_ref().map(|r| !r.is_finished()).unwrap_or(false)
+                || self.live_review_running(),
+            "reviewer": match &self.live {
+                Some(spec) => json!({
+                    "mode": "background model review",
+                    "model": spec.model,
+                    "minIntervalMs": self.config.min_review_interval_ms,
+                }),
+                None => json!({"mode": "off in this process (print mode or no session)"}),
+            },
+            "projectSkillsDir": self.project_skills_dir,
+            "lastDiagnostic": self.diagnostics.last(),
             "project": {
                 "candidates": project_candidates,
                 "activeSkills": project_active,
@@ -850,7 +1094,7 @@ impl LearningController {
                         global_skills_dir: &self.global_skills_dir,
                         project_store: &mut self.project_store,
                         global_store: &mut self.global_store,
-                        project_trusted: self.project_trusted,
+                        project_trusted: self.project_trusted || self.project_store_owned,
                         auto_apply_global: true,
                         origin: SkillWriteOrigin::ForegroundUserDirected,
                         read_set: &read_set_snapshot,
@@ -877,7 +1121,7 @@ impl LearningController {
                         global_skills_dir: &self.global_skills_dir,
                         project_store: &mut self.project_store,
                         global_store: &mut self.global_store,
-                        project_trusted: self.project_trusted,
+                        project_trusted: self.project_trusted || self.project_store_owned,
                         auto_apply_global: true,
                         origin: SkillWriteOrigin::ForegroundUserDirected,
                         read_set: &read_set_snapshot,
@@ -906,7 +1150,7 @@ impl LearningController {
                         global_skills_dir: &self.global_skills_dir,
                         project_store: &mut self.project_store,
                         global_store: &mut self.global_store,
-                        project_trusted: self.project_trusted,
+                        project_trusted: self.project_trusted || self.project_store_owned,
                         auto_apply_global: true,
                         origin: SkillWriteOrigin::ForegroundUserDirected,
                         read_set: &read_set_snapshot,
@@ -1487,7 +1731,8 @@ mod tests {
                 .next()
                 .unwrap()
                 .status,
-            ArtifactStatus::PendingApproval
+            // Kept, not staged: nothing waits on the user.
+            ArtifactStatus::Candidate
         );
 
         // 2. Failed verification blocks write
@@ -1703,7 +1948,8 @@ mod tests {
         };
 
         controller.review_settled_turn(evidence);
-        // Because of user_corrected: true, it should NOT auto-apply, but be staged for approval
+        // Because of user_corrected: true, the procedure is not applied. It is
+        // kept as a candidate rather than waiting on the user.
         assert_eq!(controller.stats.skills_created, 0);
         assert!(!controller
             .project_skills_dir
@@ -1712,8 +1958,10 @@ mod tests {
             .exists());
 
         let pending = controller.pending_command();
-        assert_eq!(pending["pending"].as_array().unwrap().len(), 1);
-        assert_eq!(pending["pending"][0]["artifact"]["name"], "corrected-debug");
+        assert_eq!(pending["pending"].as_array().unwrap().len(), 0);
+        let kept = controller.project_store.candidates();
+        assert_eq!(kept.len(), 1);
+        assert_eq!(kept[0].status, ArtifactStatus::Candidate);
 
         std::env::remove_var("PI_LEARNING_REVIEW_FIXTURE");
     }
@@ -2014,5 +2262,135 @@ mod tests {
             .join("ghost-skill")
             .join("SKILL.md")
             .exists());
+    }
+
+    fn verified_evidence(turn: u64) -> LearningEvidence {
+        LearningEvidence {
+            session_id: "sess-live".into(),
+            repo_id: "repo-live".into(),
+            turn,
+            messages: vec![MemoryMessage {
+                role: "user".into(),
+                content: "Fix the flaky sqlx offline build".into(),
+            }],
+            tools: Vec::new(),
+            run_stats: davinci_agent::RunStats::default(),
+            verification: VerificationEvidence {
+                commands_ran: 2,
+                passed: true,
+                ..VerificationEvidence::default()
+            },
+        }
+    }
+
+    /// A reviewer standing in for the model child: waits for `gate`, then
+    /// proposes one verified skill.
+    fn skill_runner(gate: Arc<std::sync::Barrier>) -> ReviewRunner {
+        ReviewRunner(Arc::new(move |evidence, _, _, spec| {
+            gate.wait();
+            assert!(spec.model.as_deref() == Some("anthropic/test-model"));
+            parse_reviewer_output(
+                &format!(
+                    "Here is the review:\n```json\n{}\n```",
+                    json!({"candidates": [{
+                        "scope": "project",
+                        "confidence": 0.92,
+                        "rationale": "the offline build needs a prepared query cache",
+                        "artifact": {
+                            "kind": "skill_create",
+                            "name": "sqlx-offline-build",
+                            "description": "Build with SQLx offline mode",
+                            "body": "## When to Use\nSQLx offline builds fail.\n## Procedure\nRun cargo sqlx prepare.\n## Pitfalls\nStale cache.\n## Verification\ncargo build."
+                        }
+                    }]})
+                ),
+                evidence,
+                3,
+            )
+            .unwrap()
+        }))
+    }
+
+    #[test]
+    fn live_review_applies_a_skill_without_the_user_or_project_trust() {
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::remove_var("PI_LEARNING_REVIEW_FIXTURE");
+        let project = tempdir().unwrap();
+        let agent = tempdir().unwrap();
+        let mut controller = LearningController::new(project.path(), Some(agent.path()), None);
+        // An untrusted project: learned skills still apply, because they live
+        // in the agent directory, not in the repository.
+        controller.set_project_trusted(false);
+        assert!(controller.project_store_owned);
+        assert!(controller.project_skills_dir.starts_with(agent.path()));
+        let gate = Arc::new(std::sync::Barrier::new(2));
+        controller.review_runner = Some(skill_runner(Arc::clone(&gate)));
+        controller.set_live_reviewer(project.path(), Some("anthropic/test-model".into()));
+
+        let run = controller.review_settled_turn(verified_evidence(4));
+        assert!(run.is_some(), "a verified turn is reviewed");
+        // The review is still running: the turn returned without waiting,
+        // and a second turn neither cancels it nor starts another.
+        assert!(controller.live_review_running());
+        controller.cancel_active_review();
+        assert!(controller
+            .review_settled_turn(verified_evidence(6))
+            .is_none());
+        gate.wait();
+
+        let started = std::time::Instant::now();
+        while controller.completed_reviews.lock().unwrap().is_empty() {
+            assert!(started.elapsed() < std::time::Duration::from_secs(10));
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        controller.apply_completed_reviews();
+
+        let record = controller
+            .project_store
+            .skill("sqlx-offline-build")
+            .unwrap();
+        assert_eq!(record.status, ArtifactStatus::Active);
+        assert!(controller
+            .project_skills_dir
+            .join("sqlx-offline-build")
+            .join("SKILL.md")
+            .is_file());
+        assert!(!project.path().join(".davinci").join("skills").exists());
+        assert_eq!(controller.pending_command()["pending"], json!([]));
+
+        let block = controller
+            .learned_skill_block("sqlx offline build fails")
+            .expect("the learned skill is injected for a matching prompt");
+        assert!(block.contains("cargo sqlx prepare"), "{block}");
+        assert!(controller
+            .learned_skill_block("paint the logo blue")
+            .is_none());
+    }
+
+    #[test]
+    fn without_a_live_reviewer_nothing_is_spawned() {
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::remove_var("PI_LEARNING_REVIEW_FIXTURE");
+        let project = tempdir().unwrap();
+        let mut controller = LearningController::new(project.path(), None, None);
+        controller.review_settled_turn(verified_evidence(2));
+        assert!(!controller.live_review_running());
+        assert!(controller.project_store.candidates().is_empty());
+    }
+
+    #[test]
+    fn an_in_repo_store_with_skills_keeps_being_used() {
+        let project = tempdir().unwrap();
+        let agent = tempdir().unwrap();
+        let legacy = project.path().join(".davinci").join("learning");
+        std::fs::create_dir_all(&legacy).unwrap();
+        std::fs::write(legacy.join("skills.jsonl"), "{}\n").unwrap();
+        let controller = LearningController::new(project.path(), Some(agent.path()), None);
+        assert!(!controller.project_store_owned);
+
+        let empty = tempdir().unwrap();
+        std::fs::create_dir_all(empty.path().join(".davinci").join("learning")).unwrap();
+        let controller = LearningController::new(empty.path(), Some(agent.path()), None);
+        assert!(controller.project_store_owned);
     }
 }

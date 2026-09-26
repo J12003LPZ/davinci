@@ -1,4 +1,3 @@
-#[allow(dead_code)]
 pub const REVIEWER_SYSTEM_PROMPT: &str = r#"You are the Davinci Self-Improving Learning Reviewer.
 Your task is to analyze a completed agent turn and determine whether any durable, high-value knowledge was gained that should be preserved for future sessions.
 

@@ -2834,6 +2834,14 @@ fn complete_prompt_with_host(
                 verification,
             },
         );
+        // A session that outlives the turn reviews it with a model in the
+        // background. A one-shot print run (graph workers and the reviewer
+        // child among them) exits before a review could finish.
+        if !fresh_host && std::env::var_os("PI_GRAPH_ROLE").is_none() {
+            let model = (!agent.model_id.is_empty())
+                .then(|| format!("{}/{}", agent.provider, agent.model_id));
+            host.enable_live_learning(&agent.cwd, model);
+        }
         let _ = host.native_review_settled_turn(learning_evidence);
         if fresh_host {
             for notice in host.drain_learning_notifications() {
