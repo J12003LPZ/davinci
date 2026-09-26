@@ -239,7 +239,9 @@ pub fn describe(sources: &PermissionSources, policy: &PermissionPolicy) -> Vec<S
             rows.extend(list("allow (project)", &project.allow));
             rows.extend(list("deny (project)", &project.deny));
         }
-        None => rows.push("project rules ignored · the project is not trusted (/trust)".into()),
+        None => {
+            rows.push("project rules ignored · the project is not trusted (/setup trust)".into())
+        }
     }
     let session: Vec<String> = policy
         .session_allow

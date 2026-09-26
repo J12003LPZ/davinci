@@ -2385,6 +2385,16 @@ fn run_extension_command_inner(shell: &mut Shell<'_>, line: &str, setup: bool) -
                 }
                 shell.note(&line);
             }
+            // One row per area, in the order the command checked them, under
+            // the verdict — not the alphabetical key dump the generic rows give.
+            "setup" => {
+                let mut rows = serde_json::json!([value["summary"]]);
+                if let (Some(rows), Some(lines)) = (rows.as_array_mut(), value["lines"].as_array())
+                {
+                    rows.extend(lines.iter().cloned());
+                }
+                push_command_result(shell.model, &name, &rows);
+            }
             "security-scan" | "sec-resume" | "sec-status" => {
                 shell.model.security = Some(security_sheet(&value));
                 shell.model.security_index = 0;
@@ -5094,7 +5104,7 @@ fn opening_block(
         out.push(Entry::Gap);
         out.push(Entry::notice(
             State::Attention,
-            "this project is not trusted, so its .pi resources are ignored — /trust to decide",
+            "this project is not trusted, so its .pi resources are ignored — /setup trust to trust it",
         ));
     }
 

@@ -14,6 +14,7 @@ pub mod memory_page;
 pub mod package_intelligence;
 pub mod repo_intelligence;
 pub mod security_scan;
+pub mod setup;
 pub mod test_impact;
 pub mod token_governor;
 pub mod vector_memory;
@@ -168,6 +169,7 @@ pub const NATIVE_COMMANDS: &[&str] = &[
     "skill-list",
     "skill-view",
     "hook-status",
+    "setup",
 ];
 
 /// Metadata shared by the interactive and RPC command discovery surfaces.
@@ -320,6 +322,11 @@ pub fn command_specs() -> Vec<(&'static str, &'static str, Option<&'static str>)
             "hook-status",
             "Show deterministic hook and policy engine diagnostics, trust state, and telemetry.",
             None,
+        ),
+        (
+            "setup",
+            "Set up this workspace: vector memory, .gitignore, trust, plugin hooks and language servers.",
+            Some("[check|trust]"),
         ),
     ]
 }
@@ -937,6 +944,31 @@ impl NativeExtensionHost {
                     &self.agent_dir,
                     &cwd,
                 )))
+            }
+            "setup" => {
+                let mode = setup::parse_args(args)?;
+                let cwd = if self.cwd.as_os_str().is_empty() {
+                    std::env::current_dir().unwrap_or_default()
+                } else {
+                    self.cwd.clone()
+                };
+                let steps = if mode == setup::Mode::Trust {
+                    vec![setup::trust_project(&self.agent_dir, &cwd)]
+                } else {
+                    let apply = mode == setup::Mode::Apply;
+                    let lsp_enabled = self.language_intelligence.status()["enabled"]
+                        .as_bool()
+                        .unwrap_or(false);
+                    vec![
+                        setup::memory_step(&self.memory, apply),
+                        setup::gitignore_step(&cwd, apply),
+                        setup::trust_step(&self.agent_dir, &cwd),
+                        setup::plugins_step(&self.agent_dir),
+                        setup::language_step(&cwd, lsp_enabled),
+                        setup::instructions_step(&cwd),
+                    ]
+                };
+                Ok(Some(setup::report(mode, steps)))
             }
             name if name.starts_with("graph") => self.graph.command(name, args),
             name if name == "security-scan" || name.starts_with("sec-") => {
