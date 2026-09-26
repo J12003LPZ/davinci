@@ -190,3 +190,233 @@ fn switching_history_branches_rebuilds_state_before_manual_fold() {
     assert_eq!(state.goals.len(), 1);
     assert_eq!(state.goals[0].value, "new branch goal");
 }
+
+fn agent_in_mode(mode: ContextVmMode) -> Agent {
+    let mut agent = Agent::new("system");
+    agent.set_runtime(RuntimeHandle::new(
+        RunId::new(),
+        AgentId::new(),
+        RuntimeBus::new(),
+    ));
+    agent.set_context_vm_mode(mode);
+    agent
+}
+
+fn provider_tool_names(agent: &Agent) -> Vec<String> {
+    agent
+        .provider_tool_specs()
+        .into_iter()
+        .map(|tool| tool.name)
+        .collect()
+}
+
+/// Enough history that the hot window (20k tokens) pages older events out.
+fn long_history() -> Vec<ChatMessage> {
+    (0..4)
+        .map(|n| ChatMessage::text("user", format!("goal {n} {}", "x".repeat(40_000))))
+        .collect()
+}
+
+#[test]
+fn retrieve_context_is_offered_only_by_an_active_vm_that_folded_or_paged() {
+    for mode in [ContextVmMode::Off, ContextVmMode::Shadow] {
+        let mut agent = agent_in_mode(mode);
+        agent.expose_active_tools();
+        agent.messages = long_history();
+        let _ = agent.messages_for_provider();
+        assert!(!provider_tool_names(&agent).contains(&"retrieve_context".to_string()));
+    }
+
+    let mut agent = agent_in_mode(ContextVmMode::Active);
+    agent.messages = vec![ChatMessage::text("user", "short task")];
+    agent.prepared_context_image().unwrap();
+    assert!(!agent.context_vm_offers_retrieval(), "nothing paged yet");
+    assert!(!provider_tool_names(&agent).contains(&"retrieve_context".to_string()));
+
+    agent.compact(None);
+    assert!(agent.context_vm_offers_retrieval());
+    assert!(provider_tool_names(&agent).contains(&"retrieve_context".to_string()));
+
+    let mut paged = agent_in_mode(ContextVmMode::Active);
+    paged.messages = long_history();
+    paged.prepared_context_image().unwrap();
+    assert!(
+        paged.context_vm_offers_retrieval(),
+        "hot window paged events out"
+    );
+}
+
+#[test]
+fn folded_episode_placeholder_names_the_recovery_tool_and_page() {
+    let mut agent = agent_in_mode(ContextVmMode::Active);
+    agent.messages = vec![ChatMessage::text("user", "remember the build flags")];
+    assert!(agent.compact(None).compacted);
+    let root = agent.runtime.as_ref().unwrap().context_vm.root();
+    let episode = root
+        .episodes
+        .first()
+        .expect("fold records an episode")
+        .clone();
+    let image = agent.prepared_context_image().unwrap();
+    let placeholder = image
+        .entries
+        .iter()
+        .find(|entry| entry.category == "episode")
+        .expect("episode placeholder in the image");
+    assert!(placeholder.content.contains("retrieve_context"));
+    assert!(placeholder
+        .content
+        .contains(&format!("page={}", episode.id)));
+    let recovered = agent
+        .runtime
+        .as_ref()
+        .unwrap()
+        .context_vm
+        .retrieve(
+            &davinci_agent::runtime::context_vm::RetrieveContextRequest {
+                page: Some(episode.id.clone()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    assert!(recovered.content.contains("Context fold"));
+}
+
+#[test]
+fn active_fallbacks_are_recorded_in_manifest_and_status_and_noticed_once() {
+    let mut agent = Agent::new("s".repeat(2048));
+    agent.set_runtime(RuntimeHandle::new(
+        RunId::new(),
+        AgentId::new(),
+        RuntimeBus::new(),
+    ));
+    agent.set_context_vm_mode(ContextVmMode::Active);
+    agent.context_window = 4096;
+    agent.thinking_level = davinci_protocol::ThinkingLevel::High;
+    agent.set_provider_context_overhead_tokens(Some(1024));
+    agent.messages.push(ChatMessage::text("user", "hello"));
+
+    let legacy = agent.legacy_messages_for_provider_for_test();
+    assert_eq!(agent.messages_for_provider(), legacy, "legacy fallback");
+    let vm = agent.runtime.as_ref().unwrap().context_vm.clone();
+    assert_eq!(vm.failure_count(), 1);
+    assert_eq!(vm.recent_failures()[0].stage, "compile");
+    let notices = agent.take_context_vm_notices();
+    assert_eq!(notices.len(), 1, "{notices:?}");
+    assert!(notices[0].contains("compile failed"));
+
+    let manifest = agent.prepare_context_manifest("request", RunId::new(), 1, 1);
+    assert!(manifest
+        .entries
+        .iter()
+        .any(|entry| entry.id == "context_vm_budget" && entry.mandatory));
+    assert!(manifest.entries.iter().any(|entry| {
+        entry.id.starts_with("context_vm_failure_")
+            && entry
+                .selection_reason
+                .as_deref()
+                .is_some_and(|reason| reason.starts_with("compile: "))
+    }));
+
+    // A different failure is counted, but the session was already told once.
+    vm.record_failure("append_delta", "page store unavailable");
+    assert_eq!(vm.failure_count(), 2);
+    assert!(agent.take_context_vm_notices().is_empty());
+}
+
+#[test]
+fn compact_works_in_active_mode_before_the_first_prompt() {
+    let mut agent = Agent::new("system");
+    agent.set_context_vm_mode(ContextVmMode::Active);
+    agent.messages = vec![ChatMessage::text("user", "resume the earlier work")];
+    assert!(agent.runtime.is_none());
+    let result = agent.compact(None);
+    assert!(result.compacted, "{}", result.summary);
+    let vm = agent.runtime.as_ref().unwrap().context_vm.clone();
+    assert_eq!(vm.metrics().folds, 1);
+
+    // The next prompt's fresh handle keeps the folded state.
+    agent.set_runtime(RuntimeHandle::new(
+        RunId::new(),
+        AgentId::new(),
+        RuntimeBus::new(),
+    ));
+    let carried = &agent.runtime.as_ref().unwrap().context_vm;
+    assert!(carried.shares_state_with(&vm));
+    assert_eq!(carried.metrics().folds, 1);
+}
+
+#[test]
+fn context_vm_state_persists_across_prompt_handles_within_one_session() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut agent = agent_in_mode(ContextVmMode::Active);
+    agent.session =
+        Some(davinci_session::JsonlSession::create(directory.path(), "fixture", None).unwrap());
+    agent.set_runtime(RuntimeHandle::new(
+        RunId::new(),
+        AgentId::new(),
+        RuntimeBus::new(),
+    ));
+    let first = agent.runtime.as_ref().unwrap().context_vm.clone();
+    first.record_failure("compile", "first prompt failure");
+    agent.set_runtime(RuntimeHandle::new(
+        RunId::new(),
+        AgentId::new(),
+        RuntimeBus::new(),
+    ));
+    let second = agent.runtime.as_ref().unwrap().context_vm.clone();
+    assert!(second.shares_state_with(&first));
+    assert_eq!(second.failure_count(), 1);
+
+    agent.session =
+        Some(davinci_session::JsonlSession::create(directory.path(), "other", None).unwrap());
+    agent.set_runtime(RuntimeHandle::new(
+        RunId::new(),
+        AgentId::new(),
+        RuntimeBus::new(),
+    ));
+    let switched = &agent.runtime.as_ref().unwrap().context_vm;
+    assert!(
+        !switched.shares_state_with(&first),
+        "a new session starts a new VM"
+    );
+    assert_eq!(switched.failure_count(), 0);
+}
+
+#[test]
+fn shadow_mismatch_is_noticed_once_and_matching_views_stay_quiet() {
+    let mut agent = agent_in_mode(ContextVmMode::Shadow);
+    agent.messages = vec![ChatMessage::text("user", "small")];
+    let _ = agent.messages_for_provider();
+    assert!(agent.take_context_vm_notices().is_empty());
+
+    agent.messages = long_history();
+    let _ = agent.messages_for_provider();
+    let notices = agent.take_context_vm_notices();
+    assert_eq!(notices.len(), 1, "{notices:?}");
+    assert!(notices[0].contains("Context VM shadow"));
+    agent.messages.push(ChatMessage::text("user", "more"));
+    let _ = agent.messages_for_provider();
+    assert!(
+        agent.take_context_vm_notices().is_empty(),
+        "persisting mismatch"
+    );
+}
+
+#[test]
+fn automatic_fold_is_noticed_and_manual_fold_is_not() {
+    let mut agent = agent_in_mode(ContextVmMode::Active);
+    agent.messages = vec![ChatMessage::text("user", "task")];
+    agent.compact(None);
+    assert!(agent.take_context_vm_notices().is_empty());
+    agent
+        .fold_context(
+            davinci_agent::runtime::context_vm::FoldReason::WindowPressure,
+            None,
+        )
+        .unwrap();
+    let notices = agent.take_context_vm_notices();
+    assert_eq!(notices.len(), 1);
+    assert!(notices[0].contains("folded"));
+    assert!(notices[0].contains("retrieve_context"));
+}

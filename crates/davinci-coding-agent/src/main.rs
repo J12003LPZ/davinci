@@ -3198,6 +3198,10 @@ fn run_print(parsed: &Args, agent: &mut Agent) -> Result<i32, String> {
             }
         }
     }
+    // Stdout carries the reply; Context VM notices go to stderr.
+    for notice in agent.take_context_vm_notices() {
+        eprintln!("{notice}");
+    }
     let (exit_code, error) = print_text_exit(&all_events);
     // A provider failure that the loop gave up on carries no error stop
     // reason of its own: it is the reply text. Report it as the failure it is.
@@ -3841,6 +3845,7 @@ fn run_rpc_with_host(
                     .collect();
                 emit_extension_ui_requests(&remaining)?;
             }
+            emit_extension_ui_requests(&context_vm_notify_calls(&runtime.agent))?;
             for event in events {
                 output::write_raw_stdout_line(
                     &serde_json::to_string(&event).map_err(|err| err.to_string())?,
@@ -4030,6 +4035,16 @@ fn is_dialog_ui_call(call: &serde_json::Value) -> bool {
         call.get("op").and_then(|value| value.as_str()),
         Some("select" | "confirm" | "input" | "editor")
     )
+}
+
+/// Context VM notices (first failure, shadow mismatch, automatic fold) as
+/// RPC `notify` requests. Empty while nothing is worth reporting.
+fn context_vm_notify_calls(agent: &Agent) -> Vec<serde_json::Value> {
+    agent
+        .take_context_vm_notices()
+        .into_iter()
+        .map(|message| serde_json::json!({"op": "notify", "message": message, "type": "warning"}))
+        .collect()
 }
 
 fn emit_extension_ui_requests(calls: &[serde_json::Value]) -> Result<(), String> {
@@ -7555,6 +7570,10 @@ pub fn format_session_status(parsed: &Args, agent: &Agent) -> String {
         if let Some(diag) = &agent.prompt_session.transition_diagnostic {
             text.push_str(&format!(" · transition: {diag}"));
         }
+    }
+    if let Some(vm) = output::ContextVmStatusSummary::for_status(agent) {
+        text.push('\n');
+        text.push_str(&vm.status_line());
     }
     let cwd = std::env::current_dir().unwrap_or_default();
     if let Some(run) = crate::native_extensions::graph::active_run_snapshot(&cwd) {

@@ -59,8 +59,15 @@ remains backward compatible; Context VM artifact references use the existing
 output store rather than a second retention database.
 
 The read-only status projection reports mode, epoch, checkpoint/delta/episode
-counts, hot events, last fold reason, page-fault hits/misses, and a short prefix
-digest. To debug a discrepancy, switch to `shadow`, inspect the prepared
+counts, hot events, last fold reason, page-fault hits/misses, a short prefix
+digest, shadow missing-ref counts and recorded failures. It appears as a
+`context vm:` line in `/status` (text and davinci shell) and as `contextVm` in
+RPC `get_session_stats` whenever the mode is not `off`. The first VM failure or
+fallback in a session, a new shadow mismatch, and each automatic fold raise one
+notice (davinci transcript, RPC `notify`, stderr in print mode); matching
+shadow views stay quiet. `retrieve_context` is offered only in `active` after
+the VM has folded or paged events out, and each folded-episode placeholder
+names the tool and the page id to pass. To debug a discrepancy, switch to `shadow`, inspect the prepared
 manifest and missing user/tool references, inspect the ContextRoot/page refs,
 retrieve the exact source with `retrieve_context`, replay the session branch,
 and compare the legacy and VM provider views. Normal turns add no model call

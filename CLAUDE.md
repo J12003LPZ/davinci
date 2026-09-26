@@ -61,15 +61,27 @@ derived folds while retaining every authoritative `Agent::messages` entry and
 session event. Hidden thinking is never projected into pages or retrieval.
 
 Active-mode failures rebuild from the authoritative session branch; a missing
-mandatory policy blocks the request. `retrieve_context` is a bounded,
-read-only exact-recovery path for Context VM pages and sources. The existing
+mandatory policy blocks the request. Every VM failure or fallback (compile,
+`append_delta`, fold, fold proposal) is recorded on the VM, drained into the
+next prepared context manifest as `context_vm_failure_*` entries, counted in
+status, and raises one notice per session. `retrieve_context` is a bounded,
+read-only exact-recovery path for Context VM pages and sources; it is offered to
+the model only in `active` once the VM has folded or paged events out of its
+image (sticky), and folded-episode placeholders name the tool and the `page=`
+id to pass. `off`/`shadow` never expose it, so their tool catalog stays
+byte-identical. One `ContextVmRuntime` lives per conversation: `set_runtime`
+carries it (state, metrics, diagnostics) into each prompt's fresh
+`RuntimeHandle` while the bound session is unchanged, and an active `/compact`
+before the first prompt creates the runtime it needs. The existing
 `retrieve_output` contract and Token Governor output store remain unchanged.
 Context VM cache affinity is only an optimization: disabling provider caching
 must not change the logical ContextImage.
 
 For debugging, use `shadow`, inspect the prepared context manifest and Context
 VM status (`mode`, `epoch`, checkpoint, delta/episode/hot counts, fold reason,
-page-fault hits/misses, and prefix digest), compare missing user/tool refs, use
+page-fault hits/misses, prefix digest, shadow missing refs, failures — a
+`context vm:` line in `/status` and `contextVm` in RPC `get_session_stats`
+whenever the mode is not `off`), compare missing user/tool refs, use
 `retrieve_context`, then replay the session branch and compare legacy versus VM
 provider messages. Normal non-fold turns perform no extra model call for
 context maintenance.

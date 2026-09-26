@@ -2219,6 +2219,84 @@ fn status_text_not_automatically_appended_to_model_context() {
 }
 
 #[test]
+fn context_vm_status_reaches_status_and_rpc_stats_only_when_enabled() {
+    let mut agent = Agent::new("sys");
+    agent.set_context_vm_mode(davinci_agent::runtime::ContextVmMode::Off);
+    let parsed = Args::default();
+    assert!(!format_session_status(&parsed, &agent).contains("context vm"));
+    assert!(rpc::session_stats_for_agent(&agent, None)
+        .get("contextVm")
+        .is_none());
+
+    agent.set_runtime(davinci_agent::RuntimeHandle::new(
+        davinci_agent::RunId::new(),
+        davinci_agent::AgentId::new(),
+        davinci_agent::RuntimeBus::new(),
+    ));
+    agent.set_context_vm_mode(davinci_agent::runtime::ContextVmMode::Active);
+    agent.messages = vec![davinci_ai::ChatMessage::text("user", "fold me")];
+    assert!(agent.compact(None).compacted);
+    agent
+        .runtime
+        .as_ref()
+        .unwrap()
+        .context_vm
+        .record_failure("append_delta", "page store unavailable");
+
+    let status = format_session_status(&parsed, &agent);
+    let line = status
+        .lines()
+        .find(|line| line.starts_with("context vm: active"))
+        .unwrap_or_else(|| panic!("{status}"));
+    assert!(line.contains("epoch 1"), "{line}");
+    assert!(line.contains("0 deltas / 1 episodes"), "{line}");
+    assert!(line.contains("1 folds, last manual"), "{line}");
+    assert!(line.contains("page faults 0 hit / 0 miss"), "{line}");
+    assert!(
+        line.contains("1 failures, last append_delta: page store unavailable"),
+        "{line}"
+    );
+
+    let stats = rpc::session_stats_for_agent(&agent, None);
+    let vm = &stats["contextVm"];
+    assert_eq!(vm["mode"], "active");
+    assert_eq!(vm["episodeCount"], 1);
+    assert_eq!(vm["lastFoldReason"], "manual");
+    assert_eq!(vm["retrievalOffered"], true);
+    assert_eq!(vm["failureCount"], 1);
+    assert!(vm["checkpointId"].as_str().is_some());
+}
+
+#[test]
+fn context_vm_metrics_persist_across_prompts_without_a_session() {
+    let _env_lock = PROCESS_ENV_LOCK
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    let dir = tempfile::tempdir().unwrap();
+    let _config = EnvRestore::set("PI_CODING_AGENT_DIR", &dir.path().to_string_lossy());
+    let _current = EnvRestore::set("DAVINCI_CODING_AGENT_DIR", &dir.path().to_string_lossy());
+    let mut agent = Agent::new("offline Context VM fixture");
+    agent.cwd = dir.path().to_path_buf();
+    agent.set_context_vm_mode(davinci_agent::runtime::ContextVmMode::Active);
+    let parsed = Args {
+        offline: true,
+        no_extensions: true,
+        ..Args::default()
+    };
+    let host = Arc::new(Mutex::new(ExtensionHost::default()));
+    agent.prompt("first");
+    complete_prompt_with_host(&parsed, &mut agent, Some(host.clone()), false);
+    let first = agent.runtime.as_ref().unwrap().context_vm.clone();
+    let compiled = first.metrics().images_compiled;
+    assert!(compiled > 0);
+    agent.prompt("second");
+    complete_prompt_with_host(&parsed, &mut agent, Some(host), false);
+    let second = &agent.runtime.as_ref().unwrap().context_vm;
+    assert!(second.shares_state_with(&first));
+    assert!(second.metrics().images_compiled > compiled);
+}
+
+#[test]
 fn status_includes_behavior_telemetry_metrics_when_runs_exist() {
     davinci_telemetry::clear_behavior_telemetry();
     for _ in 0..5 {

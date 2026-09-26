@@ -98,7 +98,7 @@ impl ContextCompiler {
 
         for page in &request.root.episodes {
             let object = self.load_page(page)?;
-            let content = episode_descriptor(&object)?;
+            let content = episode_descriptor(&page.id, &object)?;
             let entry = page_entry(page, "episode", content, false);
             if used_tokens.saturating_add(entry.estimated_tokens) > optional_limit {
                 continue;
@@ -272,10 +272,20 @@ fn object_content(object: &ContextObject) -> Result<String, String> {
     serde_json::to_string(object).map_err(|error| format!("context page render failed: {error}"))
 }
 
-fn episode_descriptor(object: &ContextObject) -> Result<String, String> {
+/// How the model recovers a folded episode. It names the tool and the exact
+/// argument, so the placeholder is actionable without any prompt text.
+fn episode_recovery_hint(page_id: &str) -> String {
+    format!(
+        "call retrieve_context with page={page_id} for the full episode, \
+         or sourceRef=<one of source_refs> for an exact source"
+    )
+}
+
+fn episode_descriptor(page_id: &str, object: &ContextObject) -> Result<String, String> {
     let ContextObject::Episode(episode) = object else {
         return object_content(object);
     };
+    let recover = episode_recovery_hint(page_id);
     let mut title = truncate_utf8(&episode.title, 96);
     let mut outcome = truncate_utf8(&episode.outcome, 192);
     let mut source_refs = episode
@@ -298,12 +308,14 @@ fn episode_descriptor(object: &ContextObject) -> Result<String, String> {
             "outcome": &outcome,
             "source_refs": &source_refs,
             "artifact_refs": &artifact_refs,
+            "recover": &recover,
         });
         let rendered = serde_json::to_string(&value)
             .map_err(|error| format!("context episode render failed: {error}"))?;
         // Keep the descriptor bounded; the compiler accounts for its envelope. The
-        // complete Episode page remains available through retrieve_context.
-        if rendered.len() <= 512 {
+        // complete Episode page remains available through retrieve_context, and
+        // the recovery hint is never trimmed.
+        if rendered.len() <= 512 + recover.len() {
             return Ok(rendered);
         }
         if outcome.len() > 16 {
