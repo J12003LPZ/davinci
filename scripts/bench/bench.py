@@ -590,7 +590,8 @@ def compare(baseline, candidate, base_ref=None, repo=None):
         except (ValueError, KeyError) as error:
             provenance = {"verified": False, "reason": str(error)}
     promotion = (promotion_gates(parent_davinci, candidate_davinci, parent_manifest, candidate_manifest,
-                 paired["candidate_vs_parent"]["all_run_latency_uncertainty"], provenance)
+                 paired["candidate_vs_parent"]["all_run_latency_uncertainty"], provenance,
+                 baseline_campaign=parents, candidate_campaign=children)
                  if not errors else {"accepted": False, "integrity_errors": errors})
     result = {"baseline": summarize(parents), "candidate": summarize(children), "paired": paired,
               "baseline_strata": stratified_summary(parents), "candidate_strata": stratified_summary(children),

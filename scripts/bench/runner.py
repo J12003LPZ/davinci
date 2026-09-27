@@ -1,4 +1,4 @@
-"""Campaign setup boundaries. No model calls occur in this module."""
+"""Campaign setup, process-lifetime ownership, and measurement boundaries."""
 import json
 from pathlib import Path
 import shutil
@@ -18,6 +18,7 @@ from datetime import datetime, timezone
 from campaign import LEGACY_TASKS, digest, file_hash
 
 CLEAN_DIFF_HASH = hashlib.sha256(b"").hexdigest()
+_campaign_owner = None
 
 BASE_SETTINGS = {"decisionIntelligence": {"enabled": False},
     "compaction": {"enabled": True, "reserveTokens": 16384, "keepRecentTokens": 20000},
@@ -107,21 +108,21 @@ def tooling_preflight(engine=None, image=None):
               "python -m pytest --version; python3 -m pytest --version; "
               "pytest --version; git --version")
     command = ["bash", "-ec", script]
-    if engine:
-        command = [engine, "run", "--name", "davinci-bench-" + uuid.uuid4().hex,
-                   "--network", "none", "--read-only", "--tmpfs", "/tmp",
-                   "--cap-drop=ALL", "--security-opt=no-new-privileges", image, *command]
-    elif os.name == "nt":
-        # Windows native arms use the executable search path, not Bash emulation.
-        versions = []
-        for args in (["python", "-c", "import sys, pytest; print(sys.version); print(pytest.__version__)"],
-                     ["python", "-m", "pytest", "--version"], ["pytest", "--version"], ["git", "--version"]):
-            result = subprocess.run(args, capture_output=True, text=True, timeout=30)
-            if result.returncode:
-                raise ValueError("benchmark prerequisite failed: " + args[0])
-            versions.append(result.stdout.strip())
-        return {"available": True, "versions": versions}
-    result = execute(command, Path.cwd(), os.environ, 30)
+    if not engine and sys.platform != "linux":
+        raise ValueError("native benchmark lifecycle supervision requires Linux; use a configured container arm")
+    if not engine:
+        from native_supervisor import children_path_available
+        if not children_path_available():
+            raise ValueError("native benchmark requires /proc in its own PID namespace before any launch")
+    with tempfile.TemporaryDirectory(prefix="davinci-bench-preflight-") as temporary:
+        if engine:
+            command = [engine, "run", "--name", "davinci-bench-" + uuid.uuid4().hex,
+                       "--cidfile", str(Path(temporary) / "container.cid"),
+                       "--network", "none", "--read-only", "--tmpfs", "/tmp",
+                       "--cap-drop=ALL", "--security-opt=no-new-privileges", image, *command]
+        result = execute(command, Path.cwd(), os.environ, 30)
+    if result["exit"] == "unsupported_native_lifecycle":
+        raise ValueError("native benchmark process-tree ownership is unavailable; use a configured container arm")
     if result["exit"] != 0 or not result["cleanup_complete"]:
         raise ValueError("benchmark prerequisites missing: python, python3, pytest, git and bash are required")
     return {"available": True, "versions": result["stdout"].strip().splitlines()}
@@ -420,12 +421,19 @@ def _kill_process(process):
         process.kill()
 
 
-def execute(command, workdir, env, timeout):
-    """Measure until the child is reaped and any named container is removed."""
-    started_at = datetime.now(timezone.utc).isoformat()
-    started = time.perf_counter()
-    target = _container_target(command)
-    cleanup_complete = True
+def _container_creation_acknowledged(command, code):
+    if "--cidfile" not in command:
+        # A successful synchronous client exit also acknowledges completion.
+        # Abrupt/failed exits and timeouts need the daemon's explicit create ID.
+        return type(code) is int and code == 0
+    try:
+        cid = Path(command[command.index("--cidfile") + 1]).read_text(encoding="utf-8").strip()
+        return re.fullmatch(r"[0-9a-f]{64}", cid) is not None
+    except (OSError, ValueError, IndexError):
+        return False
+
+
+def _execute_container(command, workdir, env, timeout, target):
     try:
         process = subprocess.Popen(command, cwd=workdir, env=env,
             stdout=subprocess.PIPE, stderr=subprocess.PIPE,
@@ -433,38 +441,97 @@ def execute(command, workdir, env, timeout):
             start_new_session=os.name != "nt")
     except OSError as error:
         return {"exit": "launch_error", "stdout": "", "stderr": type(error).__name__,
-                "cleanup_complete": _remove_container(target),
-                "wall_s": time.perf_counter() - started, "started_at": started_at,
-                "finished_at": datetime.now(timezone.utc).isoformat()}
+                "cleanup_complete": _remove_container(target)}
     try:
         try:
             stdout, stderr = process.communicate(timeout=timeout)
             code = process.returncode
         except subprocess.TimeoutExpired:
             # Removing docker's client process alone leaves the container alive.
-            cleanup_complete = _remove_container(target)
+            _remove_container(target)
             _kill_process(process)
             stdout, stderr = process.communicate(timeout=10)
             # The client can still be submitting a create request during the
             # first removal. Check again after reaping it, before any grading.
-            cleanup_complete = _remove_container(target)
-            if target and "--cidfile" in command:
-                cidfile = Path(command[command.index("--cidfile") + 1])
-                if not cidfile.is_file() or not cidfile.read_text(encoding="utf-8").strip():
-                    # A create still pending in the daemon cannot be ruled out.
-                    cleanup_complete = False
             code = "timeout"
-        else:
-            cleanup_complete = _remove_container(target)
+        removed = _remove_container(target)
+        # This applies to abrupt client death as well as our own timeout. An
+        # absent name cannot rule out a create still pending in the daemon.
+        cleanup_complete = removed and _container_creation_acknowledged(command, code)
     except BaseException:
         _remove_container(target)
         _kill_process(process)
         process.communicate(timeout=10)
         raise
     return {"exit": code, "stdout": stdout, "stderr": stderr,
-            "cleanup_complete": cleanup_complete,
-            "wall_s": time.perf_counter() - started, "started_at": started_at,
-            "finished_at": datetime.now(timezone.utc).isoformat()}
+            "cleanup_complete": cleanup_complete}
+
+
+def _execute_native(command, workdir, env, timeout):
+    if sys.platform != "linux":
+        return {"exit": "unsupported_native_lifecycle", "stdout": "", "stderr":
+                "native benchmark lifecycle supervision requires Linux", "cleanup_complete": False}
+    with tempfile.TemporaryDirectory(prefix="davinci-bench-native-") as temporary:
+        report = Path(temporary) / "result.json"
+        supervised = [sys.executable, str(Path(__file__).with_name("native_supervisor.py")),
+                      "--report", str(report), "--timeout", str(timeout), "--", *command]
+        try:
+            process = subprocess.Popen(supervised, cwd=workdir, env=env,
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                encoding="utf-8", errors="replace", start_new_session=True)
+        except OSError as error:
+            return {"exit": "launch_error", "stdout": "", "stderr": type(error).__name__,
+                    "cleanup_complete": True}
+        try:
+            stdout, stderr = process.communicate(timeout=timeout + 15)
+        except subprocess.TimeoutExpired:
+            process.terminate()
+            try:
+                stdout, stderr = process.communicate(timeout=15)
+            except subprocess.TimeoutExpired:
+                _kill_process(process)
+                try:
+                    stdout, stderr = process.communicate(timeout=5)
+                except subprocess.TimeoutExpired:
+                    stdout, stderr = "", "native supervisor could not be reaped"
+            return {"exit": "supervisor_timeout", "stdout": stdout, "stderr": stderr,
+                    "cleanup_complete": False}
+        except BaseException:
+            # Give the owner a chance to reap its tree. Without its completed
+            # report, the persistent campaign record deliberately stays dirty.
+            process.terminate()
+            try:
+                process.communicate(timeout=15)
+            except subprocess.TimeoutExpired:
+                _kill_process(process)
+                process.communicate(timeout=5)
+            raise
+        try:
+            result = json.loads(report.read_text(encoding="utf-8"))
+            valid = (process.returncode == 0 and isinstance(result, dict)
+                     and result.get("schema_version") == 1
+                     and (type(result.get("exit")) is int or result.get("exit") in
+                          ("timeout", "interrupted", "launch_error", "unsupported_native_lifecycle")))
+        except (OSError, ValueError, TypeError):
+            result, valid = {}, False
+        return {"exit": result.get("exit", "supervisor_failed") if valid else "supervisor_failed",
+                "stdout": stdout, "stderr": stderr,
+                "cleanup_complete": valid and result.get("cleanup_complete") is True}
+
+
+def execute(command, workdir, env, timeout):
+    """Measure through proven process-tree/container cleanup before any grading."""
+    started_at = datetime.now(timezone.utc).isoformat()
+    started = time.perf_counter()
+    target = _container_target(command)
+    owner = _campaign_owner
+    token = owner.begin(target, workdir) if owner is not None else None
+    measured = (_execute_container(command, workdir, env, timeout, target) if target
+                else _execute_native(command, workdir, env, timeout))
+    if owner is not None and measured["cleanup_complete"] is True:
+        owner.complete(token)
+    return {**measured, "wall_s": time.perf_counter() - started,
+            "started_at": started_at, "finished_at": datetime.now(timezone.utc).isoformat()}
 
 
 def create_campaign(root, manifest):
@@ -491,16 +558,61 @@ def isolate_settings(source, target, settings):
     return {"directory": str(target.resolve()), "settings": settings}
 
 
-@contextmanager
-def campaign_lock(campaign):
-    """One cooperative live campaign per machine, across checkouts and accounts.
-
-    Kernel ownership releases on crash. Keep the lock inode: unlinking it would
-    allow two processes to lock different files with the same name.
-    """
+def _campaign_lock_path():
     system_temp = (Path(os.environ.get("SystemRoot", r"C:\Windows")) / "Temp"
                    if os.name == "nt" else Path("/tmp"))
-    path = system_temp / "davinci-benchmark-campaign.lock"
+    return system_temp / "davinci-benchmark-campaign.lock"
+
+
+class _CampaignOwner:
+    def __init__(self, lock, campaign):
+        self.lock = lock
+        self.record = {"schema_version": 1, "pid": os.getpid(),
+                       "campaign": str(Path(campaign).resolve()), "status": "active",
+                       "started_at": datetime.now(timezone.utc).isoformat(), "in_flight": []}
+        self.persist()
+
+    def persist(self):
+        self.lock.seek(0)
+        self.lock.truncate()
+        json.dump(self.record, self.lock)
+        self.lock.flush()
+        os.fsync(self.lock.fileno())
+
+    def begin(self, target, workdir):
+        if self.record["in_flight"]:
+            raise RuntimeError("benchmark campaign has unresolved process cleanup")
+        token = uuid.uuid4().hex
+        self.record["in_flight"] = [{"id": token, "workspace": str(Path(workdir).resolve()),
+                                     "container": target, "kind": "container" if target else "native",
+                                     "started_at": datetime.now(timezone.utc).isoformat()}]
+        # Persist intent before Popen, closing the crash window before recording
+        # a PID/CID. An unresolved intent is sufficient to block the next campaign.
+        self.persist()
+        return token
+
+    def complete(self, token):
+        if self.record["in_flight"][0]["id"] != token:
+            raise RuntimeError("benchmark lifecycle ownership changed")
+        self.record["in_flight"] = []
+        self.persist()
+
+    def finish(self):
+        if not self.record["in_flight"]:
+            self.record["status"] = "clean"
+            self.persist()
+
+
+@contextmanager
+def campaign_lock(campaign):
+    """Machine lock plus durable launch intent, which survives orchestrator death.
+
+    The kernel lock alone releases on a crash while workers/containers may live.
+    Never admit a new campaign over unresolved or corrupt ownership records.
+    Keep the inode: unlinking it could split concurrent kernel ownership.
+    """
+    global _campaign_owner
+    path = _campaign_lock_path()
     flags = os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0)
     try:
         descriptor = os.open(path, flags, 0o600)
@@ -520,14 +632,30 @@ def campaign_lock(campaign):
                 fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except OSError as error:
             raise RuntimeError("another benchmark campaign is active on this machine") from error
-        lock.seek(0)
-        lock.truncate()
-        json.dump({"pid": os.getpid(), "campaign": str(Path(campaign).resolve()),
-                   "started_at": datetime.now(timezone.utc).isoformat()}, lock)
-        lock.flush()
+        owner = None
         try:
-            yield {"scope": "machine", "mechanism": "kernel-file-lock"}
+            lock.seek(0)
+            previous = lock.read().strip()
+            if previous:
+                try:
+                    record = json.loads(previous)
+                    safe = (isinstance(record, dict) and record.get("schema_version") == 1
+                            and record.get("status") in ("active", "clean")
+                            and record.get("in_flight") == [])
+                except ValueError:
+                    safe = False
+                if not safe:
+                    raise RuntimeError("unresolved benchmark campaign ownership: " + str(path) +
+                                       "; reconcile prior workers and containers before a new campaign")
+            owner = _CampaignOwner(lock, campaign)
+            _campaign_owner = owner
+            yield {"scope": "machine", "mechanism": "kernel-lock-and-durable-launch-intent-v1"}
         finally:
+            if owner is not None:
+                try:
+                    owner.finish()
+                finally:
+                    _campaign_owner = None
             if os.name == "nt":
                 lock.seek(0)
                 msvcrt.locking(lock.fileno(), msvcrt.LK_UNLCK, 1)

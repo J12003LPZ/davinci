@@ -5,8 +5,8 @@ tasks and four larger tasks have public generators containing their graders and
 reference solutions. Calling those files `hidden` only describes when the local
 grader is copied. It does not make an independent holdout.
 
-Each run gets a fresh Git repository. Grading starts only after the child has
-been reaped and, for a container arm, the named container has been removed.
+Each run gets a fresh Git repository. Grading starts only after the native
+process tree has been reaped or the named container has been removed.
 A failed cleanup stops the campaign, retains an ungraded failed row, and never
 copies the hidden grader into a workspace that may still have a live writer.
 
@@ -18,6 +18,19 @@ read-only, capabilities are dropped, and no-new-privileges is set. Docker
 containers have unique names and a CID file outside the public workspace; the
 runner removes the actual named container on timeout and on normal exit, then
 checks that it is absent. Daemon errors do not establish successful cleanup.
+Every measured container and container preflight has a CID file. Missing,
+empty, or malformed creation acknowledgment blocks grading even if an abrupt
+client exit is followed by a transient `no such container` response: the
+daemon could still be processing the create request.
+
+Native runs use a dedicated Linux child subreaper, which kills and reaps all
+remaining descendants after the launcher exits, including detached or
+double-forked writers. It confirms that it has no children before reporting
+cleanup. `/proc` must expose the supervisor's own PID namespace so the owned
+child IDs can be used safely. If that proof is unavailable, the native arm is
+rejected before the benchmark command starts. Windows and macOS native arms
+are currently unsupported; they need an equivalent process lifetime owner.
+This process supervision does not add a security sandbox.
 
 **This is not a credential or independent hidden-grader boundary.** DaVinci and
 its tools can read the mounted `auth.json`. Bridge networking permits outbound
@@ -41,8 +54,8 @@ paths, and telemetry transport have a supported container configuration.
 ## Prerequisites and offline checks
 
 Use Python 3.11 or later for the runner. The grader's Python needs pytest.
-Native POSIX harnesses need `python`, `python3`, `pytest`, Git, and Bash on PATH;
-Windows native arms need `python`, `pytest`, and Git. The preflight actually
+Native Linux harnesses need `python`, `python3`, `pytest`, Git, and Bash on PATH,
+plus the process ownership support described above. The preflight actually
 imports pytest, executes the named commands, and records versions before any
 model call. Container checks run inside the resolved image with networking off.
 A missing Python/pytest command or failed cleanup rejects setup.
@@ -119,10 +132,21 @@ For a parent live run, supply `--parent-for <candidate-source-sha> --base-ref
 with no concurrent development, builds, or other model jobs. A kernel file lock
 in the machine's system temporary directory excludes another cooperating
 benchmark campaign across output directories and checkouts. It is held through
-setup and every run, releases on process exit/crash, and has no PID-file stale
-lock workaround. Do not delete its file while a process may own the lock. This
-lock cannot control unrelated programs or use of the same account on another
-machine. The comparison also checks campaign timestamp envelopes for overlap.
+setup and every run. Before each process launch, it also writes and fsyncs a
+durable ownership record. That record is cleared only after confirmed cleanup.
+An orchestrator crash releases the kernel lock but leaves its outstanding
+launch record, so a new campaign refuses to start over a surviving worker or
+possibly pending container. Failed cleanup also blocks another launch in the
+same campaign. Corrupt or older unrecognized lock records fail closed.
+
+There is no automatic stale-record override: an operator must reconcile prior
+workers and containers before resetting unresolved ownership while holding the
+kernel lock. If prior work cannot be accounted for, use a clean measurement
+host. Do not delete the lock file while a process may own it; doing so can split
+ownership across different inodes. This lock cannot control unrelated programs
+or use of the same account on another machine. The comparison checks the full
+campaign timestamp envelope, including all Codex control rows, for overlap;
+DaVinci performance metrics remain separate from the control arm.
 
 1. Commit the runner changes and build the immutable DaVinci checkpoint above.
    Set `BENCH_DAVINCI` to the copied native executable, or select container mode

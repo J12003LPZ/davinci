@@ -1,16 +1,23 @@
 """Offline runner boundary tests, using public synthetic files only."""
 import json
+import ctypes
+import os
 from pathlib import Path
 import sys
 import tempfile
 import unittest
 import subprocess
+import signal
+import time
 from unittest.mock import patch, MagicMock
 from types import SimpleNamespace
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import runner
 import bench
+import native_supervisor
+
+NATIVE_LIFETIME_AVAILABLE = sys.platform == "linux" and native_supervisor.children_path_available()
 
 
 class RunnerTests(unittest.TestCase):
@@ -132,6 +139,7 @@ class RunnerTests(unittest.TestCase):
                 with self.assertRaises(FileExistsError):
                     bench.run_one("davinci", "t1-intervals", 0)
 
+    @unittest.skipUnless(NATIVE_LIFETIME_AVAILABLE, "matching Linux /proc child ownership view required")
     def test_process_measurement_and_failure_are_preserved(self):
         result = runner.execute([sys.executable, "-c", "print('fixture'); raise SystemExit(7)"],
                                 Path.cwd(), {}, 10)
@@ -139,11 +147,101 @@ class RunnerTests(unittest.TestCase):
         self.assertEqual(result["stdout"].strip(), "fixture")
         self.assertGreater(result["wall_s"], 0)
         self.assertIn("+00:00", result["started_at"])
+        self.assertTrue(result["cleanup_complete"])
 
+    @unittest.skipUnless(NATIVE_LIFETIME_AVAILABLE, "matching Linux /proc child ownership view required")
     def test_timeout_is_preserved(self):
         result = runner.execute([sys.executable, "-c", "import time; time.sleep(10)"],
                                 Path.cwd(), {}, 0.02)
         self.assertEqual(result["exit"], "timeout")
+        self.assertTrue(result["cleanup_complete"])
+
+    @unittest.skipUnless(NATIVE_LIFETIME_AVAILABLE, "matching Linux /proc child ownership view required")
+    def test_successful_native_launcher_cannot_leave_detached_writers(self):
+        for detach in (False, True):
+            with self.subTest(detach=detach), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                marker, pidfile = root / "late-write", root / "child.pid"
+                child = ("import os,time; from pathlib import Path; "
+                         + ("pid=os.fork(); os._exit(0) if pid else os.setsid(); " if detach else "")
+                         + f"Path({str(pidfile)!r}).write_text(str(os.getpid())); time.sleep(.5); "
+                         + f"Path({str(marker)!r}).write_text('late')")
+                launcher = ("import subprocess,sys,time; from pathlib import Path; "
+                            f"p=subprocess.Popen([sys.executable,'-c',{child!r}], "
+                            "stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL); "
+                            f"path=Path({str(pidfile)!r}); deadline=time.monotonic()+3; "
+                            "\nwhile not path.exists() and time.monotonic()<deadline: time.sleep(.01)\n"
+                            "assert path.exists()")
+                result = runner.execute([sys.executable, "-c", launcher], root, dict(os.environ), 5)
+                self.assertEqual(result["exit"], 0, result)
+                self.assertTrue(result["cleanup_complete"], result)
+                self.assertFalse(marker.exists())
+                with self.assertRaises(ProcessLookupError):
+                    os.kill(int(pidfile.read_text()), 0)
+
+    def test_native_owner_refuses_to_launch_without_its_scoped_kernel_view(self):
+        with (patch.object(native_supervisor, "children_path_available", return_value=False),
+              patch.object(native_supervisor.subprocess, "Popen") as start):
+            result = native_supervisor.supervise(["unused"], 1)
+        self.assertFalse(result["cleanup_complete"])
+        self.assertEqual(result["exit"], "unsupported_native_lifecycle")
+        start.assert_not_called()
+
+    @unittest.skipIf(NATIVE_LIFETIME_AVAILABLE, "this environment supports native supervision")
+    def test_actual_unsupported_native_owner_never_runs_the_benchmark_command(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            marker = Path(tmp) / "should-not-run"
+            command = [sys.executable, "-c", f"from pathlib import Path; Path({str(marker)!r}).touch()"]
+            result = runner.execute(command, tmp, dict(os.environ), 1)
+            self.assertEqual(result["exit"], "unsupported_native_lifecycle", result)
+            self.assertFalse(result["cleanup_complete"])
+            self.assertFalse(marker.exists())
+
+    def test_native_preflight_checks_ownership_before_launch_or_dirty_intent(self):
+        with (patch.object(runner.sys, "platform", "linux"),
+              patch.object(native_supervisor, "children_path_available", return_value=False),
+              patch.object(runner, "execute") as start):
+            with self.assertRaisesRegex(ValueError, "PID namespace before any launch"):
+                runner.tooling_preflight()
+        start.assert_not_called()
+
+    def test_native_cleanup_proves_echild_and_only_signals_owned_children(self):
+        with (patch.object(native_supervisor.os, "waitpid", side_effect=[(0, 0), (123, 0), ChildProcessError]),
+              patch.object(native_supervisor.Path, "read_text", return_value="123"),
+              patch.object(native_supervisor.os, "kill") as kill,
+              patch.object(native_supervisor.time, "sleep")):
+            self.assertTrue(native_supervisor.reap_descendants())
+        kill.assert_called_once_with(123, signal.SIGKILL)
+        with (patch.object(native_supervisor.os, "waitpid", return_value=(0, 0)),
+              patch.object(native_supervisor.Path, "read_text", side_effect=OSError("unavailable")),
+              patch.object(native_supervisor.os, "kill") as kill):
+            self.assertFalse(native_supervisor.reap_descendants())
+        kill.assert_not_called()
+
+    def test_abrupt_native_supervisor_exit_has_no_cleanup_proof(self):
+        process = MagicMock(returncode=-9)
+        process.communicate.return_value = ("", "")
+        with patch.object(runner.subprocess, "Popen", return_value=process):
+            result = runner.execute(["unused"], Path.cwd(), {}, 1)
+        self.assertFalse(result["cleanup_complete"])
+        self.assertEqual(result["exit"], "supervisor_failed")
+
+    def test_native_supervisor_watchdog_preserves_ungraded_failure(self):
+        process = MagicMock(returncode=0)
+        process.communicate.side_effect = [subprocess.TimeoutExpired("supervisor", 16), ("partial", "")]
+        with patch.object(runner.subprocess, "Popen", return_value=process):
+            result = runner.execute(["unused"], Path.cwd(), {}, 1)
+        self.assertEqual(result["exit"], "supervisor_timeout")
+        self.assertEqual(result["stdout"], "partial")
+        self.assertFalse(result["cleanup_complete"])
+        process.terminate.assert_called_once()
+
+    def test_unsupported_native_lifecycle_does_not_launch_a_process(self):
+        with patch.object(runner.sys, "platform", "win32"), patch.object(runner.subprocess, "Popen") as start:
+            result = runner.execute(["unused"], Path.cwd(), {}, 1)
+        self.assertEqual(result["exit"], "unsupported_native_lifecycle")
+        self.assertFalse(result["cleanup_complete"])
+        start.assert_not_called()
 
     def test_container_timeout_removes_named_container_before_client_reap(self):
         events = []
@@ -154,15 +252,38 @@ class RunnerTests(unittest.TestCase):
                 raise subprocess.TimeoutExpired("docker", timeout)
             return "partial transcript", ""
         process.communicate.side_effect = communicate
-        with (patch.object(runner.subprocess, "Popen", return_value=process),
+        with (tempfile.TemporaryDirectory() as tmp,
+              patch.object(runner.subprocess, "Popen", return_value=process),
               patch.object(runner, "_remove_container", side_effect=lambda target: events.append(target) or True),
               patch.object(runner, "_kill_process", side_effect=lambda p: events.append("kill client"))):
-            result = runner.execute(["docker", "run", "--name", "davinci-bench-fixture", "image"],
+            cidfile = Path(tmp) / "container.cid"
+            cidfile.write_text("a" * 64)
+            result = runner.execute(["docker", "run", "--name", "davinci-bench-fixture",
+                                    "--cidfile", str(cidfile), "image"],
                                     Path.cwd(), {}, 0.01)
         self.assertEqual(events, ["communicate", ("docker", "davinci-bench-fixture"), "kill client", "communicate",
                                   ("docker", "davinci-bench-fixture")])
         self.assertEqual(result["exit"], "timeout")
         self.assertTrue(result["cleanup_complete"])
+
+    def test_container_client_death_needs_creation_acknowledgment_before_grading(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cidfile = Path(tmp) / "container.cid"
+            for code in (-9, 125, 0):
+                for content in (None, "", "invalid", "a" * 64):
+                    with self.subTest(code=code, content=content):
+                        if cidfile.exists():
+                            cidfile.unlink()
+                        if content is not None:
+                            cidfile.write_text(content)
+                        process = MagicMock(returncode=code)
+                        process.communicate.return_value = ("", "")
+                        with (patch.object(runner.subprocess, "Popen", return_value=process),
+                              patch.object(runner, "_remove_container", return_value=True)):
+                            result = runner.execute(["docker", "run", "--name", "davinci-bench-fixture",
+                                "--cidfile", str(cidfile), "image"], Path.cwd(), {}, 1)
+                        self.assertEqual(result["cleanup_complete"], content == "a" * 64)
+                        self.assertEqual(result["exit"], code)
 
     def test_container_cleanup_does_not_confuse_daemon_error_with_absence(self):
         for error, expected in (("Error: No such container: davinci-bench-fixture", True),
@@ -202,12 +323,128 @@ class RunnerTests(unittest.TestCase):
             self.assertIn("python3 -m pytest --version", command[-1])
 
     def test_machine_lock_excludes_other_campaign_directories_and_releases(self):
-        with runner.campaign_lock("campaign-a"):
-            with self.assertRaisesRegex(RuntimeError, "another benchmark campaign"):
+        with (tempfile.TemporaryDirectory() as tmp,
+              patch.object(runner, "_campaign_lock_path", return_value=Path(tmp) / "machine.lock")):
+            with runner.campaign_lock("campaign-a"):
+                with self.assertRaisesRegex(RuntimeError, "another benchmark campaign"):
+                    with runner.campaign_lock("campaign-b"):
+                        self.fail("overlapping campaign admitted")
+            with runner.campaign_lock("campaign-b") as record:
+                self.assertEqual(record["scope"], "machine")
+
+    def test_unproven_cleanup_blocks_another_launch_and_the_next_campaign(self):
+        with (tempfile.TemporaryDirectory() as tmp,
+              patch.object(runner, "_campaign_lock_path", return_value=Path(tmp) / "machine.lock"),
+              patch.object(runner, "_execute_native", return_value={"cleanup_complete": False})):
+            with runner.campaign_lock("campaign-a"):
+                self.assertFalse(runner.execute(["unused"], tmp, {}, 1)["cleanup_complete"])
+                with self.assertRaisesRegex(RuntimeError, "unresolved process cleanup"):
+                    runner.execute(["unused"], tmp, {}, 1)
+            with self.assertRaisesRegex(RuntimeError, "unresolved benchmark campaign ownership"):
                 with runner.campaign_lock("campaign-b"):
-                    self.fail("overlapping campaign admitted")
-        with runner.campaign_lock("campaign-b") as record:
-            self.assertEqual(record["scope"], "machine")
+                    self.fail("unproven cleanup admitted")
+
+    def test_proven_cleanup_clears_durable_launch_intent(self):
+        with (tempfile.TemporaryDirectory() as tmp,
+              patch.object(runner, "_campaign_lock_path", return_value=Path(tmp) / "machine.lock"),
+              patch.object(runner, "_execute_native", return_value={"cleanup_complete": True})):
+            lockfile = Path(tmp) / "machine.lock"
+            with runner.campaign_lock("campaign-a"):
+                self.assertTrue(runner.execute(["unused"], tmp, {}, 1)["cleanup_complete"])
+                self.assertEqual(json.loads(lockfile.read_text())["in_flight"], [])
+            self.assertEqual(json.loads(lockfile.read_text())["status"], "clean")
+            with runner.campaign_lock("campaign-b"):
+                pass
+
+    def test_corrupt_and_legacy_lock_ownership_cannot_be_treated_as_clean(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            lockfile = Path(tmp) / "machine.lock"
+            for record in ("{", '{"pid":123,"campaign":"legacy"}',
+                           '{"schema_version":1,"status":"clean","in_flight":[{}]}'):
+                lockfile.write_text(record)
+                with (self.subTest(record=record),
+                      patch.object(runner, "_campaign_lock_path", return_value=lockfile),
+                      self.assertRaisesRegex(RuntimeError, "unresolved benchmark campaign ownership")):
+                    with runner.campaign_lock("new-campaign"):
+                        self.fail("ambiguous ownership admitted")
+
+    def test_compare_passes_all_control_rows_to_overlap_gate(self):
+        def timed(harness, start, end):
+            return {"harness": harness, "task": "t1-intervals", "rep": 0, "pass": True,
+                    "wall_s": 1, "started_at": f"2026-09-27T00:{start}:00+00:00",
+                    "finished_at": f"2026-09-27T00:{end}:00+00:00"}
+        parent = [timed("davinci", "00", "01"), timed("codex", "01", "05")]
+        candidate = [timed("davinci", "03", "04"), timed("codex", "05", "06")]
+        with tempfile.TemporaryDirectory() as tmp:
+            roots = [Path(tmp) / name for name in ("parent", "candidate")]
+            for root in roots:
+                root.mkdir()
+                (root / "campaign.json").write_text("{}")
+            with (patch.object(bench, "load_rows", side_effect=[parent, candidate]),
+                  patch.object(bench, "campaign_errors", return_value=[]),
+                  patch.object(bench, "paired_report", return_value={"all_run_latency_uncertainty": {"method": "fixture"}}),
+                  patch.object(bench, "summarize", return_value={}),
+                  patch.object(bench, "stratified_summary", return_value={}),
+                  patch("builtins.print") as output):
+                self.assertEqual(bench.compare(*roots), 1)
+            result = json.loads(output.call_args.args[0])
+            self.assertEqual(result["promotion"]["rules"]["sequential_campaigns"]["status"], "fail")
+
+    @unittest.skipUnless(sys.platform == "linux", "Linux crash/reaping regression")
+    def test_orchestrator_crash_keeps_durable_launch_ownership(self):
+        libc = ctypes.CDLL(None)
+        prior = ctypes.c_int()
+        self.assertEqual(libc.prctl(37, ctypes.byref(prior), 0, 0, 0), 0)
+        self.assertEqual(libc.prctl(36, 1, 0, 0, 0), 0)
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                lockfile, ready = root / "machine.lock", root / "worker.json"
+                worker = ("import os,time,json; from pathlib import Path; "
+                          f"p=Path({str(ready)!r}); temporary=p.with_suffix('.tmp'); "
+                          "temporary.write_text(json.dumps(os.getpid())); temporary.replace(p); time.sleep(30)")
+                launcher = ("import os,sys,subprocess; from pathlib import Path; "
+                            f"sys.path.insert(0,{str(Path(runner.__file__).parent)!r}); import runner; "
+                            f"runner._campaign_lock_path=lambda:Path({str(lockfile)!r}); "
+                            "\ndef fixture_execute(command,workdir,env,timeout):\n"
+                            " p=subprocess.Popen(command,cwd=workdir,env=env,start_new_session=True,"
+                            "stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)\n"
+                            " p.wait(timeout=timeout)\n"
+                            " return {'cleanup_complete':True}\n"
+                            "runner._execute_native=fixture_execute\n"
+                            f"\nwith runner.campaign_lock({str(root / 'first')!r}):\n"
+                            f" runner.execute([sys.executable,'-c',{worker!r}],{str(root)!r},dict(os.environ),60)\n")
+                outer = subprocess.Popen([sys.executable, "-c", launcher], stdout=subprocess.PIPE,
+                                         stderr=subprocess.PIPE, start_new_session=True)
+                worker_pid = None
+                try:
+                    deadline = time.monotonic() + 5
+                    while not ready.exists() and outer.poll() is None and time.monotonic() < deadline:
+                        time.sleep(.01)
+                    self.assertTrue(ready.exists(), "fixture worker did not start")
+                    worker_pid = json.loads(ready.read_text())
+                    outer.kill()
+                    outer.communicate(timeout=3)
+                    os.kill(worker_pid, 0)
+                    with patch.object(runner, "_campaign_lock_path", return_value=lockfile):
+                        with self.assertRaisesRegex(RuntimeError, "unresolved benchmark campaign ownership"):
+                            with runner.campaign_lock(root / "second"):
+                                self.fail("orphan campaign overlap admitted")
+                    self.assertTrue(json.loads(lockfile.read_text())["in_flight"])
+                finally:
+                    if outer.poll() is None:
+                        outer.kill()
+                        outer.communicate(timeout=3)
+                    if worker_pid is not None:
+                        try:
+                            os.kill(worker_pid, signal.SIGKILL)
+                        except ProcessLookupError:
+                            pass
+                        # Reap the fixture child adopted after its orchestrator
+                        # was killed, leaving no orphan/zombie from this test.
+                        os.waitpid(worker_pid, 0)
+        finally:
+            libc.prctl(36, prior.value, 0, 0, 0)
 
     def test_source_identity_rejects_tracked_and_untracked_build_inputs(self):
         with tempfile.TemporaryDirectory() as tmp:

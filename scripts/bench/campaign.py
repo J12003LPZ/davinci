@@ -265,14 +265,20 @@ def serial_campaigns(baseline, candidate):
         return None
 
 
-def promotion_gates(baseline, candidate, baseline_manifest, candidate_manifest, uncertainty, provenance):
+def promotion_gates(baseline, candidate, baseline_manifest, candidate_manifest, uncertainty, provenance,
+                    *, baseline_campaign=None, candidate_campaign=None):
     """Expose each rule. One paired diagnostic window cannot certify promotion."""
     rules = {}
     def rule(name, passed, evidence):
         rules[name] = {"status": "unavailable" if passed is None else "pass" if passed else "fail",
                        "evidence": evidence}
     rule("committed_source_and_actual_merge_base", provenance.get("verified"), provenance)
-    rule("sequential_campaigns", serial_campaigns(baseline, candidate), "campaign timestamp envelopes must not overlap")
+    complete_campaigns = baseline_campaign is not None and candidate_campaign is not None
+    rule("sequential_campaigns", serial_campaigns(baseline_campaign, candidate_campaign)
+         if complete_campaigns else None,
+         {"scope": "complete campaign envelopes, including every Codex control row",
+          "parent_rows": len(baseline_campaign) if complete_campaigns else None,
+          "candidate_rows": len(candidate_campaign) if complete_campaigns else None})
     toolings = [manifest.get("tooling_preflight", {}).get("davinci")
                 for manifest in (baseline_manifest, candidate_manifest)]
     rule("usable_comparable_tooling", None if not all(toolings) else

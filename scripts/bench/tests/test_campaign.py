@@ -60,6 +60,22 @@ class CampaignTests(unittest.TestCase):
         self.assertEqual(rules["logical_request_reduction"]["status"], "unavailable")
         self.assertEqual(rules["two_independent_windows"]["status"], "unavailable")
 
+    def test_promotion_overlap_includes_codex_without_combining_arm_metrics(self):
+        def timed(harness, start, end):
+            return dict(row(harness), started_at=f"2026-09-27T00:{start}:00+00:00",
+                        finished_at=f"2026-09-27T00:{end}:00+00:00")
+        parent = [timed("davinci", "00", "01"), timed("codex", "01", "05")]
+        candidate = [timed("davinci", "03", "04"), timed("codex", "05", "06")]
+        parent[1]["pass"] = False
+        self.assertTrue(campaign.serial_campaigns(parent[:1], candidate[:1]))
+        report = campaign.promotion_gates(parent[:1], candidate[:1], {}, {}, {"method": "fixture"}, {},
+                                          baseline_campaign=parent, candidate_campaign=candidate)
+        self.assertEqual(report["rules"]["sequential_campaigns"]["status"], "fail")
+        self.assertEqual(report["rules"]["candidate_passes_at_least_parent"]["evidence"],
+                         {"parent": 1, "candidate": 1})
+        missing = campaign.promotion_gates(parent[:1], candidate[:1], {}, {}, {"method": "fixture"}, {})
+        self.assertEqual(missing["rules"]["sequential_campaigns"]["status"], "unavailable")
+
     def test_paired_report_includes_uncached_input_and_gate_counts(self):
         left = dict(row("davinci"), input_tokens=100, cached_tokens=80,
                     gate_reminders={"verification_required": 2})
