@@ -69,21 +69,21 @@
   "schema_version": 1,
   "specialist_fixtures": {
     "browser": {
-      "fixture_hash": "cdfdae117ea5a17e42e623744c7491eb36571317f7fb890945130adff6067a6a",
+      "fixture_hash": "11e9fe1667f51b9982e5e7d3e3c2b1f9670dd6de5170ed6d8c21cf30a9d2f018",
       "kind": "browser-availability",
       "offline": true,
       "path": "specialist_fixtures/browser/fixture.json",
       "preference_required": false
     },
     "discovery": {
-      "fixture_hash": "33b7f1c7544ea049c3b8b931f31024cb05cbb7d4bb2e70da2cda956578f63e43",
+      "fixture_hash": "60a3f4c22e780310ef96a693bfe0530a78a9b1523144008b814a74ab7a42d19c",
       "kind": "tool-discovery",
       "offline": true,
       "path": "specialist_fixtures/discovery/fixture.json",
       "preference_required": false
     },
     "lsp": {
-      "fixture_hash": "b3d49f99a89e98134350733f9607fea89fd9116e59dcba650581717db123552f",
+      "fixture_hash": "7e9f3369e54a16e2176a34904928958830c6462629d12b2ca6ed90490c3ebf92",
       "kind": "lsp-availability",
       "offline": true,
       "path": "specialist_fixtures/lsp/fixture.json",

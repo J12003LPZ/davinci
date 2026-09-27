@@ -46,6 +46,20 @@ class LargeFixtureTests(unittest.TestCase):
             self.assertTrue(entry["offline"])
             self.assertFalse(entry["preference_required"])
 
+    def test_generated_specialists_match_committed_bytes_and_both_manifests(self):
+        specialist_root = Path(self.temporary.name) / "specialists"
+        with patch.object(generator, "SPECIALIST_ROOT", specialist_root):
+            generated = generator.write_specialist_fixtures()
+        manifest = json.loads((ROOT / "specialist_fixtures" / "manifest.json").read_text(encoding="utf-8"))
+        large_manifest = json.loads((ROOT / "large_manifest.json").read_text(encoding="utf-8"))
+        self.assertEqual(generated, manifest["fixtures"])
+        self.assertEqual(generated, large_manifest["specialist_fixtures"])
+        for name, entry in generated.items():
+            content = (specialist_root / name / "fixture.json").read_bytes()
+            self.assertNotIn(b"\r\n", content)
+            self.assertEqual(content, (ROOT / entry["path"]).read_bytes())
+            self.assertEqual(generator.tree_hash(specialist_root / name), entry["fixture_hash"])
+
 
 if __name__ == "__main__":
     unittest.main()

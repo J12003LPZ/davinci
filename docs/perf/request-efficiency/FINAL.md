@@ -87,7 +87,9 @@ The current benchmark implementation makes the failure modes explicit:
   status are emitted. One paired diagnostic window cannot certify promotion.
 - Unit tests generate their own large fixtures in temporary directories. Tree
   hashes use a declared portable relative POSIX path order. The algorithm tag
-  and affected public-tree hashes changed; fixture contents did not. Earlier
+  and affected public-tree hashes changed; fixture contents did not. Specialist
+  JSON also uses explicit LF newlines, and both manifests now match the frozen
+  LF fixture bytes across checkouts. Earlier
   manifests remain attached to their historical evidence and are not rewritten.
 
 Usage, exact metric definitions, boundary limits, and the new checkpoint format
@@ -97,14 +99,17 @@ are documented in [the benchmark README](../../../scripts/bench/README.md).
 
 The original clean-checkout run reproduced the audit failure: 64 tests passed
 and the large-fixture metadata test errored because ignored generated tasks
-were absent. The corrected offline benchmark suite passes 80 tests with its own
+were absent. The corrected offline benchmark suite passes 81 tests with its own
 temporary fixtures. These are deterministic harness regressions, not model
 performance measurements. Current runtime regression evidence belongs to the
 runtime fixes and must not be inferred from old checkpoint prose.
 
-Docker is not installed and pytest is not present in the available execution
-environment, so no Docker smoke test or public/hidden fixture execution was
-performed for this correction. The offline unit suite needs neither and tests
+Pytest 8.3.5 was installed in an isolated host environment for fixture validation.
+All 12 broken starting fixtures fail their hidden grader, all 12 reference
+solutions pass it, and the reference workspaces pass 107 combined public and
+hidden tests. This is host-side offline fixture validation, not a measured model
+campaign or proof of a protected grading boundary. Docker is not installed, so
+no Docker smoke test was performed. The offline unit suite tests
 preflight rejection, cleanup ordering/failure, independent leakage flags,
 provenance, lock exclusion, report partitioning, promotion-rule failures, and
 cluster uncertainty. No live or paid campaign, historical rerun, native Windows
