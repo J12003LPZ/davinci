@@ -26,6 +26,8 @@ pub enum FileAction {
 pub struct Hunk {
     pub header: String,
     pub lines: Vec<HunkLine>,
+    /// The consumed context must end at the actual file boundary.
+    pub end_of_file: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -281,6 +283,9 @@ pub fn parse_codex_patch(input: &str) -> Result<ParsedPatch, String> {
                         hunk_lines.push(HunkLine::Remove(rest.to_string()));
                     } else if let Some(rest) = hl.strip_prefix(' ') {
                         hunk_lines.push(HunkLine::Context(rest.to_string()));
+                    } else if hl.is_empty() {
+                        // Codex permits an unprefixed blank line as empty context.
+                        hunk_lines.push(HunkLine::Context(String::new()));
                     } else {
                         return Err(format!(
                             "Malformed Update File `{path}`: hunk lines must start with `+`, `-`, or a space"
@@ -288,7 +293,8 @@ pub fn parse_codex_patch(input: &str) -> Result<ParsedPatch, String> {
                     }
                     i += 1;
                 }
-                if i < lines.len() && lines[i].starts_with("*** End of File") {
+                let end_of_file = i < lines.len() && lines[i] == "*** End of File";
+                if end_of_file {
                     i += 1;
                 }
                 if hunk_lines.is_empty() {
@@ -299,6 +305,7 @@ pub fn parse_codex_patch(input: &str) -> Result<ParsedPatch, String> {
                 hunks.push(Hunk {
                     header,
                     lines: hunk_lines,
+                    end_of_file,
                 });
             }
 
@@ -369,11 +376,18 @@ pub fn apply_hunks_to_content(original: &str, hunks: &[Hunk]) -> Result<String, 
             continue;
         }
 
-        // Find match position in file_lines: search from search_from first, then fallback
+        // EOF-constrained hunks may only match the final window. Ordinary
+        // hunks search from the preceding edit, then retain the legacy fallback.
         let pattern_len = match_pattern.len();
         let mut found_index = None;
         if file_lines.len() >= pattern_len {
-            for start in search_from..=(file_lines.len() - pattern_len) {
+            let last_start = file_lines.len() - pattern_len;
+            let first_start = if hunk.end_of_file {
+                last_start
+            } else {
+                search_from
+            };
+            for start in first_start..=last_start {
                 let window = &file_lines[start..start + pattern_len];
                 let matches = window
                     .iter()
@@ -384,7 +398,7 @@ pub fn apply_hunks_to_content(original: &str, hunks: &[Hunk]) -> Result<String, 
                     break;
                 }
             }
-            if found_index.is_none() && search_from > 0 {
+            if found_index.is_none() && search_from > 0 && !hunk.end_of_file {
                 let limit = search_from.min(file_lines.len().saturating_sub(pattern_len) + 1);
                 for start in 0..limit {
                     let window = &file_lines[start..start + pattern_len];
@@ -853,6 +867,52 @@ mod tests {
             updated,
             "fn a() {\n    return 10;\n}\n\nfn b() {\n    return 20;\n}\n"
         );
+    }
+
+    #[test]
+    fn blank_unprefixed_hunk_lines_are_context() {
+        let dir = tempdir().unwrap();
+        let target = dir.path().join("blank.txt");
+        fs::write(&target, "first\n\nold\n\nlast\n").unwrap();
+        let patch = "*** Begin Patch\n*** Update File: blank.txt\n@@\n first\n\n-old\n+new\n\n last\n*** End Patch";
+        execute_apply_patch(dir.path(), patch).unwrap();
+        assert_eq!(
+            fs::read_to_string(target).unwrap(),
+            "first\n\nnew\n\nlast\n"
+        );
+    }
+
+    #[test]
+    fn eof_marker_selects_the_tail_of_repeated_content() {
+        let dir = tempdir().unwrap();
+        let target = dir.path().join("repeated.txt");
+        let patch = "*** Begin Patch\n*** Update File: repeated.txt\n@@\n shared\n-old\n+new\n*** End of File\n*** End Patch";
+        for newline in ["\n", "\r\n"] {
+            for trailing in [false, true] {
+                let mut original = ["shared", "old", "middle", "shared", "old"].join(newline);
+                let mut expected = ["shared", "old", "middle", "shared", "new"].join(newline);
+                if trailing {
+                    original.push_str(newline);
+                    expected.push_str(newline);
+                }
+                fs::write(&target, original).unwrap();
+                execute_apply_patch(dir.path(), patch).unwrap();
+                assert_eq!(fs::read_to_string(&target).unwrap(), expected);
+            }
+        }
+    }
+
+    #[test]
+    fn eof_marker_rejects_a_non_tail_match_without_writes() {
+        let dir = tempdir().unwrap();
+        let target = dir.path().join("tail.txt");
+        fs::write(&target, "old\nuntouched tail\n").unwrap();
+        let patch = "*** Begin Patch\n*** Add File: staged.txt\n+must not commit\n*** Update File: tail.txt\n@@\n-old\n+new\n*** End of File\n*** End Patch";
+        assert!(execute_apply_patch(dir.path(), patch)
+            .unwrap_err()
+            .contains("Context mismatch"));
+        assert_eq!(fs::read_to_string(target).unwrap(), "old\nuntouched tail\n");
+        assert!(!dir.path().join("staged.txt").exists());
     }
 
     #[test]
