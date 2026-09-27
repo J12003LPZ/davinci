@@ -626,12 +626,15 @@ impl ResponsesDecoder {
         }
     }
 
-    /// Some providers send output only on the terminal event. The terminal
-    /// array is authoritative, including ordering and corrections to deltas.
+    /// Some providers send output only on the terminal event. A nonempty
+    /// terminal array is authoritative, including ordering and corrections to
+    /// deltas. An empty array is not: backends may omit already-streamed items
+    /// from the terminal event, so it must not erase completed output.
     fn reconcile_output(&mut self, response: Option<&Value>, out: &mut Vec<AssistantMessageEvent>) {
         let Some(output) = response
             .and_then(|response| response.get("output"))
             .and_then(Value::as_array)
+            .filter(|output| !output.is_empty())
         else {
             return;
         };
@@ -736,6 +739,12 @@ impl ResponsesDecoder {
         if stop_reason != StopReason::Stop {
             // Partial calls are presentation only. Never expose them to the
             // execution loop, even when max_output_tokens maps to Length.
+            // Record that they existed so the agent can ask for a retry.
+            if self.has_tool_call() {
+                self.message
+                    .extra
+                    .insert(crate::DROPPED_TOOL_CALLS_KEY.into(), Value::Bool(true));
+            }
             self.message
                 .content
                 .retain(|block| !matches!(block, ContentBlock::ToolCall { .. }));
@@ -1467,29 +1476,59 @@ data: {"type":"response.function_call_arguments.delta","output_index":0,"delta":
     }
 
     #[test]
-    fn empty_terminal_output_removes_provisional_and_finished_calls() {
-        for item_event in ["response.output_item.added", "response.output_item.done"] {
-            let mut decoder = ResponsesDecoder::new(&model());
-            let mut events = Vec::new();
-            decoder.feed(
-                &serde_json::json!({"type":item_event,"output_index":0,
-                "item":{"type":"custom_tool_call","id":"item","call_id":"call",
-                    "name":"apply_patch","input":"patch"}}),
-                &mut events,
-            );
-            decoder.feed(
-                &serde_json::json!({"type":"response.completed",
-                "response":{"id":"resp","status":"completed","output":[]}}),
-                &mut events,
-            );
-            let message = decoder.finish(&mut events);
-            assert_eq!(message.stop_reason, Some(StopReason::Stop), "{item_event}");
-            assert!(message.content.is_empty());
-            assert!(decoder.raw_items.is_empty());
-            assert!(!message
-                .extra
-                .contains_key(crate::RESPONSES_TOOL_WIRE_KINDS_KEY));
-        }
+    fn empty_terminal_output_rejects_provisional_calls() {
+        let mut decoder = ResponsesDecoder::new(&model());
+        let mut events = Vec::new();
+        decoder.feed(
+            &serde_json::json!({"type":"response.output_item.added","output_index":0,
+            "item":{"type":"custom_tool_call","id":"item","call_id":"call",
+                "name":"apply_patch","input":"patch"}}),
+            &mut events,
+        );
+        decoder.feed(
+            &serde_json::json!({"type":"response.completed",
+            "response":{"id":"resp","status":"completed","output":[]}}),
+            &mut events,
+        );
+        let message = decoder.finish(&mut events);
+        assert_eq!(message.stop_reason, Some(StopReason::Error));
+        assert!(!message
+            .content
+            .iter()
+            .any(|block| matches!(block, ContentBlock::ToolCall { .. })));
+    }
+
+    #[test]
+    fn empty_terminal_output_keeps_finished_streamed_calls() {
+        let mut decoder = ResponsesDecoder::new(&model());
+        let mut events = Vec::new();
+        decoder.feed(
+            &serde_json::json!({"type":"response.output_item.done","output_index":0,
+            "item":{"type":"custom_tool_call","id":"item","call_id":"call",
+                "name":"apply_patch","input":"patch"}}),
+            &mut events,
+        );
+        decoder.feed(
+            &serde_json::json!({"type":"response.completed",
+            "response":{"id":"resp","status":"completed","output":[]}}),
+            &mut events,
+        );
+        let message = decoder.finish(&mut events);
+        assert_eq!(message.stop_reason, Some(StopReason::ToolUse));
+        assert!(matches!(
+            message.content.as_slice(),
+            [ContentBlock::ToolCall { name, arguments, .. }]
+                if name == "apply_patch" && arguments["input"] == "patch"
+        ));
+        let call_id = match &message.content[0] {
+            ContentBlock::ToolCall { id, .. } => id.clone(),
+            _ => unreachable!(),
+        };
+        assert_eq!(
+            message.extra[crate::RESPONSES_TOOL_WIRE_KINDS_KEY][call_id.as_str()],
+            "custom"
+        );
+        assert_eq!(decoder.raw_items.len(), 1);
     }
 
     #[test]

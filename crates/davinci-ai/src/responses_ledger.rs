@@ -160,7 +160,9 @@ impl NativeResponsesOutput {
         let terminal_output = final_response
             .as_ref()
             .and_then(|response| response.get("output"))
-            .and_then(Value::as_array);
+            .and_then(Value::as_array)
+            // An empty terminal array does not override streamed items.
+            .filter(|items| !items.is_empty());
         let output_items = if let Some(items) = terminal_output {
             items.clone()
         } else {
@@ -546,7 +548,7 @@ mod tests {
     }
 
     #[test]
-    fn empty_terminal_output_replaces_finished_native_items() {
+    fn empty_terminal_output_keeps_finished_native_items() {
         let events = [
             serde_json::json!({"type":"response.output_item.done","output_index":0,
                 "item":{"type":"custom_tool_call","id":"item","call_id":"call",
@@ -555,7 +557,8 @@ mod tests {
                 "response":{"id":"resp","status":"completed","output":[]}}),
         ];
         let native = NativeResponsesOutput::from_events(&events).unwrap();
-        assert!(native.output_items.is_empty());
+        assert_eq!(native.output_items.len(), 1);
+        assert_eq!(native.output_items[0]["call_id"], "call");
     }
 
     #[test]

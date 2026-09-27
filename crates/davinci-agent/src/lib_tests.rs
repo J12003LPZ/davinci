@@ -1272,6 +1272,75 @@ fn scripted_batches(
     }
 }
 
+fn truncated_call_response(index: usize) -> davinci_ai::AssistantMessage {
+    let mut extra = serde_json::Map::new();
+    extra.insert(
+        davinci_ai::DROPPED_TOOL_CALLS_KEY.into(),
+        serde_json::Value::Bool(true),
+    );
+    davinci_ai::AssistantMessage {
+        extra,
+        id: format!("a{index}"),
+        role: "assistant".into(),
+        content: Vec::new(),
+        model: "fixture".into(),
+        usage: None,
+        stop_reason: Some(davinci_ai::StopReason::Length),
+        error_message: None,
+    }
+}
+
+#[test]
+fn output_limit_truncated_call_gets_one_corrective_turn() {
+    let mut agent = Agent::new(default_system_prompt());
+    agent.prompt("write a large file");
+    let mut calls = 0;
+    agent
+        .run_loop(|_current| {
+            calls += 1;
+            if calls == 1 {
+                return Ok(truncated_call_response(calls));
+            }
+            Ok(davinci_ai::AssistantMessage {
+                extra: Default::default(),
+                id: format!("a{calls}"),
+                role: "assistant".into(),
+                content: vec![davinci_ai::ContentBlock::Text {
+                    text: "done".into(),
+                }],
+                model: "fixture".into(),
+                usage: None,
+                stop_reason: Some(davinci_ai::StopReason::Stop),
+                error_message: None,
+            })
+        })
+        .unwrap();
+    assert_eq!(calls, 2, "the model must get a turn to retry smaller");
+    assert!(agent.messages.iter().any(|message| {
+        message.extra.get("davinciCapabilityReminder")
+            == Some(&serde_json::Value::String("output_truncated".into()))
+    }));
+    assert!(agent
+        .messages
+        .iter()
+        .all(|message| !message.extra.contains_key(davinci_ai::DROPPED_TOOL_CALLS_KEY)));
+    assert_eq!(agent.last_assistant_text().as_deref(), Some("done"));
+}
+
+#[test]
+fn repeated_output_limit_truncation_ends_the_run() {
+    let mut agent = Agent::new(default_system_prompt());
+    agent.prompt("write a large file");
+    let mut calls = 0;
+    agent
+        .run_loop(|_current| {
+            calls += 1;
+            Ok(truncated_call_response(calls))
+        })
+        .unwrap();
+    assert_eq!(calls, 3, "one initial request plus two bounded retries");
+}
+
 #[test]
 fn parallel_workers_in_one_message_overlap_and_answer_in_order() {
     use std::time::{Duration, Instant};

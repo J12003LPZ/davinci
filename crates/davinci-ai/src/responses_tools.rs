@@ -15,6 +15,9 @@ use crate::{ChatMessage, ToolSpec};
 pub const APPLY_PATCH_ROLLOUT_ENV: &str = "PI_CODEX_APPLY_PATCH";
 pub const RESPONSES_TOOL_WIRE_KIND_KEY: &str = "responsesToolWireKind";
 pub const RESPONSES_TOOL_WIRE_KINDS_KEY: &str = "responsesToolWireKinds";
+/// Set on an assistant message whose partial tool calls were withheld from
+/// execution because generation stopped early (for example at the output limit).
+pub const DROPPED_TOOL_CALLS_KEY: &str = "davinciDroppedToolCalls";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ResponsesToolWireKind {

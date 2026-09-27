@@ -88,10 +88,6 @@ fn rejected_terminal_patch_calls_never_reach_agent_execution() {
             json!({"type":"response.completed","response":{"status":"completed","output":[]}}),
         ],
         vec![
-            json!({"type":"response.output_item.done","output_index":0,"item":item}),
-            json!({"type":"response.completed","response":{"status":"completed","output":[]}}),
-        ],
-        vec![
             json!({"type":"response.incomplete","response":{"status":"completed",
             "incomplete_details":{"reason":"max_output_tokens"},"output":[item]}}),
         ],

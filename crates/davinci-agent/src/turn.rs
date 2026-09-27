@@ -11,6 +11,10 @@ use crate::tools::execute_tool_with;
 use crate::Agent;
 use crate::ToolExecutionMode;
 
+/// Corrective turns allowed per run after a tool call is cut off by the
+/// output token limit.
+const MAX_TRUNCATED_CALL_RETRIES: u32 = 2;
+
 /// What stage one decided about a call.
 pub(crate) enum Preparation {
     /// The call never runs; this is its result (a block, an unknown tool,
@@ -344,6 +348,7 @@ impl Agent {
         };
         let mut new_messages = prompt_messages.clone();
         let mut capability_completion_reminders = 0_u32;
+        let mut truncated_call_retries = 0_u32;
         let mut verification_reminded_generation = None;
         let mut turns_this_run = 0_u32;
         self.push_event(&mut events, AgentEvent::AgentStart);
@@ -547,6 +552,18 @@ impl Agent {
                     Ok(output) => output,
                     Err(err) => return Err(err),
                 };
+            // The decoder already drops partial calls on a length stop; the
+            // provider flag records that the model tried to call a tool.
+            let decoder_dropped_calls = assistant
+                .extra
+                .remove(davinci_ai::DROPPED_TOOL_CALLS_KEY)
+                .is_some_and(|value| value == Value::Bool(true));
+            let length_stop_dropped_calls = assistant.stop_reason == Some(StopReason::Length)
+                && (decoder_dropped_calls
+                    || assistant
+                        .content
+                        .iter()
+                        .any(|block| matches!(block, ContentBlock::ToolCall { .. })));
             if matches!(
                 assistant.stop_reason,
                 Some(StopReason::Error | StopReason::Aborted | StopReason::Length)
@@ -612,10 +629,29 @@ impl Agent {
                 },
             );
 
+            // A tool call cut off by the output limit executes nothing, but the
+            // model can recover with a smaller call. Bound the retries so a
+            // model that keeps overflowing still ends the run.
+            if length_stop_dropped_calls
+                && truncated_call_retries < MAX_TRUNCATED_CALL_RETRIES
+                && !self.abort_requested()
+            {
+                truncated_call_retries += 1;
+                self.queue_capability_reminder(
+                    "Your previous response hit the output token limit while writing a tool call, so the call was truncated and nothing was executed. Retry with smaller steps: split large patches or file writes into several smaller calls.",
+                    "output_truncated",
+                    &mut events,
+                    &mut new_messages,
+                );
+                continue;
+            }
+            let length_stop_ends_run =
+                assistant.stop_reason == Some(StopReason::Length) && length_stop_dropped_calls;
             if matches!(
                 assistant.stop_reason,
-                Some(StopReason::Error) | Some(StopReason::Aborted) | Some(StopReason::Length)
-            ) {
+                Some(StopReason::Error) | Some(StopReason::Aborted)
+            ) || length_stop_ends_run
+            {
                 if let Some(runtime) = &self.runtime {
                     if assistant.stop_reason == Some(StopReason::Error) {
                         runtime.mark_turn_failed();

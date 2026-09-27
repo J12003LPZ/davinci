@@ -33,6 +33,10 @@ use its `call` portion.
 SSE, WebSocket, and non-streaming Responses JSON share `ResponsesDecoder`.
 A nonempty terminal `output` array supplies the authoritative ordered output,
 including items that had no earlier deltas and corrections to partial output.
+An empty terminal array is not authoritative: items already finished through
+`response.output_item.done` are kept, because some backends omit streamed items
+from the terminal event. A call that was only added, never finished, is still
+rejected as unfinished.
 Native replay retains the full provider items, including opaque reasoning and
 unknown fields. Repeated terminal events do not create additional calls.
 
@@ -42,6 +46,13 @@ text can still be presented; token-limit termination keeps its `Length`
 classification. An unterminated Responses stream closes as an error and
 removes partial calls. The agent also refuses to execute tools on error,
 abort, or length termination.
+
+When a length stop withheld a partial tool call, the decoder marks the message
+(`davinciDroppedToolCalls`) and the agent loop, instead of ending the run,
+queues one corrective reminder (`output_truncated`) asking the model to retry
+in smaller steps. This is bounded to two corrective turns per run; after that a
+further truncated call ends the run. A length stop with only text continues to
+the ordinary completion checks.
 
 ## Regression coverage
 

@@ -214,14 +214,21 @@ fn noncompleted_patch_turns_never_execute_or_continue() {
         agent.cwd = dir.path().into();
         agent.tools = vec!["apply_patch".into()];
         agent.set_permission_mode(crate::PermissionMode::AlwaysApprove);
+        // Only an output-limit stop earns a bounded corrective turn; nothing
+        // from a noncompleted response ever executes.
+        let length_stop = decoded_patch(true, status).stop_reason == Some(StopReason::Length);
         let mut calls = 0;
         agent
             .run_loop(|_| {
                 calls += 1;
-                assert_eq!(calls, 1, "{status} must not execute tools and continue");
                 Ok(decoded_patch(true, status))
             })
             .unwrap();
+        if length_stop {
+            assert_eq!(calls, 3, "{status}: one request plus two bounded retries");
+        } else {
+            assert_eq!(calls, 1, "{status} must not execute tools and continue");
+        }
         assert!(!dir.path().join("unexpected.txt").exists());
         assert_eq!(agent.run_stats().tool_calls, 0);
     }
