@@ -23,6 +23,24 @@ fn truncate_chars(s: &str, max_chars: usize) -> String {
     }
 }
 
+/// Conversation messages keep their head and their tail: a user states the
+/// task first, and an assistant states what it concluded or changed last. A
+/// head-only cut drops exactly the outcome the reviewer promotes into memory.
+fn truncate_head_tail(s: &str, max_chars: usize) -> String {
+    let total = s.chars().count();
+    if total <= max_chars {
+        return s.to_string();
+    }
+    const MARKER: &str = "\n[…]\n";
+    let budget = max_chars.saturating_sub(MARKER.chars().count());
+    let head = budget / 3;
+    let tail = budget - head;
+    let mut out: String = s.chars().take(head).collect();
+    out.push_str(MARKER);
+    out.extend(s.chars().skip(total - tail));
+    out
+}
+
 pub struct BuildEvidenceInput<'a> {
     pub session_id: String,
     pub repo_id: String,
@@ -79,7 +97,7 @@ pub fn build_learning_evidence(input: BuildEvidenceInput<'_>) -> LearningEvidenc
 
     for m in &relevant_messages[start_idx..] {
         let content_redacted = redact_secrets(&m.content);
-        let content_truncated = truncate_chars(&content_redacted, MAX_MESSAGE_CHARS);
+        let content_truncated = truncate_head_tail(&content_redacted, MAX_MESSAGE_CHARS);
         if m.role == "user" {
             let lower = m.content.to_lowercase();
             if lower.contains("that's wrong")
@@ -269,6 +287,32 @@ mod tests {
             is_error: false,
             details: None,
         }
+    }
+
+    #[test]
+    fn long_message_keeps_its_conclusion_within_the_cap() {
+        let body = format!(
+            "Task: fix the parser.{}Result: src/auth.rs now rejects empty tokens.",
+            " detail".repeat(1_000)
+        );
+        let messages = vec![MemoryMessage {
+            role: "assistant".into(),
+            content: body,
+        }];
+        let evidence = build_learning_evidence(BuildEvidenceInput {
+            session_id: "sess-1".into(),
+            repo_id: "repo-1".into(),
+            turn: 1,
+            messages: &messages,
+            events: &[],
+            run_stats: davinci_agent::RunStats::default(),
+            verification: VerificationEvidence::default(),
+        });
+        let kept = &evidence.messages[0].content;
+        assert!(kept.chars().count() <= MAX_MESSAGE_CHARS);
+        assert!(kept.starts_with("Task: fix the parser."));
+        assert!(kept.ends_with("Result: src/auth.rs now rejects empty tokens."));
+        assert!(kept.contains("[…]"));
     }
 
     #[test]
