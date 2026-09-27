@@ -33,7 +33,7 @@ from observations import activity
 from campaign import LEGACY_TASKS, COMPARABLE, fixture_manifest, schedule, task_success, manifest_errors, paired_metrics, file_hash, digest, metric
 from runner import (create_campaign, isolate_settings, controlled_environment, select_tasks,
                     execute, BASE_SETTINGS, agent_source, campaign_identity, stop_reason,
-                    pin_model_store, model_stop_reason, validate_large_manifest)
+                    pin_model_store, model_stop_reason, validate_large_manifest, container_command)
 from codex_otel import Collector, request_metrics
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -95,7 +95,7 @@ def grade(tid, workdir):
         files += [os.path.relpath(os.path.join(base, n), hidden) for n in names]
     proc = subprocess.run(
         [sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider", *files],
-        cwd=workdir, capture_output=True, text=True, encoding="utf-8", timeout=120,
+        cwd=workdir, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=120,
     )
     tail = proc.stdout.strip().splitlines()[-1] if proc.stdout.strip() else ""
     passed = int(m.group(1)) if (m := re.search(r"(\d+) passed", tail)) else 0
@@ -267,6 +267,7 @@ def run_one(harness, tid, rep, campaign=None):
                 catalog = json.loads(Path(campaign["agent_dir"], "models-store.json").read_text(encoding="utf-8"))
                 if digest(catalog) != catalog_hash:
                     raise ValueError("model catalog changed during campaign")
+            args = container_command(args, workdir, env, campaign, harness)
         if collector:
             for value in collector.overrides():
                 args[-1:-1] = ["-c", value]
@@ -309,7 +310,8 @@ def run_one(harness, tid, rep, campaign=None):
         "tools": s["tools"], "changed": changed, "unrelated": unrelated,
         "transaction_leak": transaction_leak, "artifact_leak": transaction_leak,
         "started_at": measured["started_at"], "finished_at": measured["finished_at"],
-        "grading_isolation": "diagnostic-only",
+        "grading_isolation": (campaign.get("grading_isolation", {}).get(harness, "diagnostic-only")
+                               if campaign else "diagnostic-only"),
         "stop_reason": stopped,
     }
     for key in ("logical_requests", "provider_attempts", "prewarm_attempts", "jev_attempts",

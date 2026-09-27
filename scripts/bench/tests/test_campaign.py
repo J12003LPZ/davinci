@@ -17,6 +17,7 @@ def row(harness, rep=0):
             "fixture_hash": "frozen", "model": "fixed", "effort_policy": "medium",
             "service_tier": "default", "exit": 0, "grader_pass": True,
             "unrelated": [], "artifact_leak": False, "pass": True,
+            "grading_isolation": "diagnostic-only",
             "wall_s": 2.125, "binary_sha256": "binary-" + harness,
             "effective_settings": {"fixed": True}}
 
@@ -51,6 +52,7 @@ class CampaignTests(unittest.TestCase):
         rows = [row("davinci"), row("codex")]
         manifest = {key: rows[0][key] for key in ("schema_version", "campaign", "variant", *campaign.COMPARABLE)}
         manifest.update(tasks=["t1-intervals"], repetitions=[0], harnesses=["davinci", "codex"],
+                        grading_isolation={"davinci": "diagnostic-only", "codex": "diagnostic-only"},
                         identities={r["harness"]: {key: r[key] for key in ("binary_sha256", "effective_settings")}
                                     for r in rows})
         self.assertEqual(campaign.manifest_errors(manifest, rows), [])

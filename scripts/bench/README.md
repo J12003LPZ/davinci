@@ -2,10 +2,19 @@
 
 The legacy set is frozen to eight Python tasks, `t1-intervals` through
 `t8-calc`. Runs use fresh Git repositories. The agent receives the public
-starter and prompt; grading runs after process exit. Current execution is
-**diagnostic isolation only**: the host filesystem does not prevent an agent
-from finding private fixtures. These results cannot establish independent
-hidden-test acceptance or general parity.
+starter and prompt; grading runs after process exit. The default is
+**diagnostic isolation only**: the host filesystem does not
+prevent an agent from finding private fixtures. These results cannot establish
+independent hidden-test acceptance or general parity. Promotion campaigns can
+select the tested container boundary for a harness with
+`BENCH_<HARNESS>_GRADING_ISOLATION=container`, a pinned Docker image in
+`BENCH_CONTAINER_IMAGE`, and an immutable Linux executable in
+`BENCH_<HARNESS>_CONTAINER_BINARY`. The runner mounts only the public run tree
+and copied campaign agent directory, keeps the container root read-only, drops
+capabilities, and grades only after the process exits. It records the image ID
+and boundary per harness. If one harness remains diagnostic-only, the manifest
+and every row say so; those rows cannot support an independent hidden-test
+claim.
 
 ## Campaign setup
 
@@ -25,6 +34,9 @@ set `PYTHONUTF8=1` before invoking Python.
    `runner.source_identity` hashes tracked changes and untracked implementation
    files. Codex source provenance is explicitly unavailable; its executable
    hash and version are retained.
+   For a container arm, set `BENCH_DAVINCI_CONTAINER_BINARY` (or the matching
+   harness variable) to the copied Linux executable and provide its identity
+   sidecar; `BENCH_DAVINCI` is not used for that arm.
 3. Set `BENCH_RUNS` to a new, nonexistent directory. The runner refuses reuse.
    Optionally select `BENCH_CODEX`, `BENCH_MODEL` (default `gpt-6-luna`), and
    `BENCH_EFFORT` (default `medium`). Each campaign saves its frozen fixture

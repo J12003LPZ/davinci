@@ -158,7 +158,8 @@ class RunnerTests(unittest.TestCase):
     def test_environment_drops_inherited_product_overrides(self):
         inherited = {"PATH": "system", "DAVINCI_TOOL_SURFACE": "lean",
                      "PI_CODING_AGENT_DIR": "owner", "DAVINCI_MODEL": "wrong",
-                     "OPENAI_API_KEY": "synthetic-key", "PYTHONPATH": "hostile"}
+                     "OPENAI_API_KEY": "synthetic-key", "PYTHONPATH": "hostile",
+                     "BENCH_CONTAINER_IMAGE": "private-image"}
         result = runner.controlled_environment(inherited, Path("isolated").resolve())
         self.assertEqual(result["PATH"], "system")
         self.assertNotIn("DAVINCI_TOOL_SURFACE", result)
@@ -168,6 +169,46 @@ class RunnerTests(unittest.TestCase):
         self.assertEqual(result["DAVINCI_CODING_AGENT_DIR"],
                          str(Path("isolated").resolve()))
         self.assertEqual(result["PYTHONUTF8"], "1")
+
+    def test_grading_isolation_accepts_harness_override_and_rejects_unknown(self):
+        with patch.dict("os.environ", {"BENCH_GRADING_ISOLATION": "diagnostic-only",
+                                        "BENCH_DAVINCI_GRADING_ISOLATION": "container"}, clear=False):
+            self.assertEqual(runner.grading_isolation("davinci"), "container")
+            self.assertEqual(runner.grading_isolation("codex"), "diagnostic-only")
+        with patch.dict("os.environ", {"BENCH_GRADING_ISOLATION": "unsafe"}, clear=False):
+            with self.assertRaises(ValueError):
+                runner.grading_isolation("davinci")
+
+    def test_container_command_mounts_public_worktree_and_agent_only(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            workdir, agent, binary = root / "work", root / "agent", root / "davinci"
+            workdir.mkdir()
+            agent.mkdir()
+            binary.write_bytes(b"synthetic executable")
+            campaign = {
+                "grading_isolation": {"davinci": "container"},
+                "containers": {"davinci": {"image": "rust:fixture", "image_id": "sha256:fixture",
+                                             "network": "bridge"}},
+                "executables": {"davinci": str(binary)}, "agent_dir": str(agent),
+            }
+            env = {"PATH": "/usr/bin", "DAVINCI_CODING_AGENT_DIR": str(agent),
+                   "OPENAI_API_KEY": "must-not-forward"}
+            with (patch.object(runner, "_container_engine", return_value="docker"),
+                  patch.object(runner, "_container_image_id", return_value="sha256:fixture")):
+                command = runner.container_command([str(binary), "--mode", "json"],
+                                                    workdir, env, campaign, "davinci")
+            self.assertEqual(command[0:3], ["docker", "run", "--rm"])
+            self.assertIn("--read-only", command)
+            self.assertIn("--cap-drop=ALL", command)
+            self.assertIn("type=bind,source=" + str(workdir.resolve()) + ",target=/workspace", command)
+            self.assertIn("type=bind,source=" + str(agent.resolve()) + ",target=/agent,readonly", command)
+            self.assertIn("type=bind,source=" + str(binary.resolve()) + ",target=/opt/harness,readonly", command)
+            self.assertNotIn("OPENAI_API_KEY=must-not-forward", command)
+            self.assertIn("DAVINCI_CODING_AGENT_DIR=/agent", command)
+            self.assertIn("PI_CODING_AGENT_DIR=/agent", command)
+            self.assertNotIn("DAVINCI_CODING_AGENT_DIR=" + str(agent.resolve()), command)
+            self.assertEqual(command[-4:], ["rust:fixture", "/opt/harness", "--mode", "json"])
 
     def test_fixture_selection_is_explicit(self):
         self.assertEqual(runner.select_tasks("legacy", None), list(runner.LEGACY_TASKS))

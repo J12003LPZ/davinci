@@ -77,6 +77,7 @@ class StreamTelemetryTests(unittest.TestCase):
         rows = [campaign_row("davinci"), campaign_row("codex")]
         manifest = {key: rows[0][key] for key in ("schema_version", "campaign", "variant", *bench.COMPARABLE)}
         manifest.update(tasks=["t1-intervals"], repetitions=[0], harnesses=["davinci", "codex"],
+                        grading_isolation={"davinci": "diagnostic-only", "codex": "diagnostic-only"},
                         identities={r["harness"]: {key: r[key] for key in ("binary_sha256", "effective_settings")}
                                     for r in rows})
         with tempfile.TemporaryDirectory() as directory:

@@ -11,6 +11,7 @@ LEGACY_TASKS = (
     "t5-csv", "t6-bookings", "t7-cli", "t8-calc",
 )
 COMPARABLE = ("fixture_hash", "model", "effort_policy", "service_tier")
+GRADING_ISOLATIONS = ("diagnostic-only", "container")
 
 
 def digest(value):
@@ -91,6 +92,7 @@ def integrity_errors(rows, tasks, repetitions, harnesses=("davinci", "codex")):
     expected = {(h, t, r) for h in harnesses for t in tasks for r in repetitions}
     fixed = {field: rows[0].get(field) for field in COMPARABLE}
     per_harness = {}
+    per_harness_isolation = {}
     for row in rows:
         key = (row.get("harness"), row.get("task"), row.get("rep"))
         if (not isinstance(key[0], str) or not isinstance(key[1], str)
@@ -115,6 +117,12 @@ def integrity_errors(rows, tasks, repetitions, harnesses=("davinci", "codex")):
         previous = per_harness.setdefault(row.get("harness"), identity)
         if previous != identity:
             errors.append("binary/settings changed within harness")
+        isolation = row.get("grading_isolation")
+        if isolation not in GRADING_ISOLATIONS:
+            errors.append("invalid or missing grading isolation")
+        previous_isolation = per_harness_isolation.setdefault(row.get("harness"), isolation)
+        if previous_isolation != isolation:
+            errors.append("grading isolation changed within harness")
         wall = row.get("wall_s")
         if not isinstance(wall, (int, float)) or isinstance(wall, bool) or not math.isfinite(wall) or wall < 0:
             errors.append("invalid monotonic duration")
@@ -138,6 +146,11 @@ def manifest_errors(manifest, rows):
     identities = manifest.get("identities")
     if not isinstance(identities, dict):
         return ["missing manifest executable identities"]
+    isolations = manifest.get("grading_isolation")
+    if (not isinstance(isolations, dict)
+            or any(harness not in isolations for harness in manifest["harnesses"])
+            or any(isolations[harness] not in GRADING_ISOLATIONS for harness in manifest["harnesses"])):
+        return ["missing or invalid manifest grading isolation"]
     errors = integrity_errors(rows, manifest["tasks"], manifest["repetitions"], manifest["harnesses"])
     for row in rows:
         if not isinstance(row, dict):
@@ -146,6 +159,8 @@ def manifest_errors(manifest, rows):
             if manifest.get(field) is None or row.get(field) != manifest[field]:
                 errors.append("row differs from manifest: " + field)
         harness = row.get("harness")
+        if isinstance(harness, str) and row.get("grading_isolation") != isolations.get(harness):
+            errors.append("row differs from manifest: grading_isolation")
         identity = identities.get(harness) if isinstance(harness, str) else None
         if not isinstance(identity, dict) or not identity:
             errors.append("missing manifest harness identity")

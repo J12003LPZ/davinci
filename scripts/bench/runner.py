@@ -20,9 +20,78 @@ BASE_SETTINGS = {"decisionIntelligence": {"enabled": False},
     "effortPolicy": "fixed", "toolSurface": "full", "autoVerify": True,
     "promptProfile": "stable"}
 
+GRADING_ISOLATIONS = ("diagnostic-only", "container")
+_CONTAINER_ENV_KEYS = frozenset({
+    "LANG", "LC_ALL", "LC_CTYPE", "TERM", "USER", "PYTHONUTF8",
+    "PI_LEARNING_DISABLE_BACKGROUND",
+})
+
 
 def service_tier():
     return os.environ.get("BENCH_SERVICE_TIER", "default")
+
+
+def grading_isolation(harness=None):
+    """Resolve the boundary for one harness without accepting ambiguous values."""
+    specific = ("BENCH_" + harness.upper() + "_GRADING_ISOLATION") if harness else None
+    value = os.environ.get(specific) if specific else None
+    value = value or os.environ.get("BENCH_GRADING_ISOLATION", "diagnostic-only")
+    value = value.strip().lower()
+    if value not in GRADING_ISOLATIONS:
+        raise ValueError("grading isolation must be diagnostic-only or container")
+    return value
+
+
+def _container_engine():
+    selected = os.environ.get("BENCH_CONTAINER_ENGINE", "docker")
+    found = shutil.which(selected)
+    if found is None:
+        raise ValueError("missing container engine: " + selected)
+    return str(Path(found).resolve())
+
+
+def _container_image():
+    image = os.environ.get("BENCH_CONTAINER_IMAGE", "").strip()
+    if not image or any(character.isspace() for character in image):
+        raise ValueError("BENCH_CONTAINER_IMAGE must name one image")
+    return image
+
+
+def _container_image_id(engine, image):
+    result = subprocess.run([engine, "image", "inspect", "--format", "{{.Id}}", image],
+                            capture_output=True, text=True, timeout=30)
+    if result.returncode != 0 or not result.stdout.strip():
+        raise ValueError("container image is unavailable: " + image)
+    return result.stdout.strip()
+
+
+def _container_binary(harness):
+    variable = "BENCH_" + harness.upper() + "_CONTAINER_BINARY"
+    selected = os.environ.get(variable, "").strip()
+    if not selected:
+        raise ValueError(variable + " is required for container grading")
+    binary = Path(selected).expanduser().resolve()
+    if not binary.is_file() or binary.is_symlink():
+        raise ValueError(variable + " must select a regular file")
+    return str(binary)
+
+
+def _mount(source, target, read_only=False):
+    value = "type=bind,source=" + str(Path(source).resolve()) + ",target=" + target
+    if read_only:
+        value += ",readonly"
+    return value
+
+
+def _container_version(engine, image, binary):
+    command = [engine, "run", "--rm", "--network", "none", "--read-only",
+               "--tmpfs", "/tmp", "--cap-drop=ALL",
+               "--security-opt=no-new-privileges", "--mount", _mount(binary, "/opt/harness", True),
+               image, "/opt/harness", "--version"]
+    result = subprocess.run(command, capture_output=True, text=True, timeout=30)
+    if result.returncode != 0:
+        raise ValueError("container executable version check failed")
+    return result.stdout.strip()
 
 
 def stop_reason(stdout, stderr):
@@ -133,22 +202,38 @@ def checkpoint_identity(executable):
 
 def campaign_identity(root, variant, fixtures, harnesses, model, effort, settings, repo):
     """Pin executable bytes and configuration before any timed subprocess."""
-    executables, identities = {}, {}
+    executables, identities, containers, isolations = {}, {}, {}, {}
     source = source_identity(repo)
     for harness in harnesses:
-        selected = os.environ.get("BENCH_" + harness.upper(), harness)
-        found = shutil.which(selected)
-        if found is None:
-            raise ValueError("missing executable: " + harness)
-        executable = str(Path(found).resolve())
+        isolation = grading_isolation(harness)
+        isolations[harness] = isolation
+        if isolation == "container":
+            engine = _container_engine()
+            image = _container_image()
+            image_id = _container_image_id(engine, image)
+            network = os.environ.get("BENCH_CONTAINER_NETWORK", "bridge")
+            if network not in ("none", "bridge", "host"):
+                raise ValueError("unsupported container network")
+            executable = _container_binary(harness)
+            version = _container_version(engine, image, executable)
+            containers[harness] = {"image": image, "image_id": image_id,
+                                   "network": network,
+                                   "binary_target": "/opt/harness"}
+        else:
+            selected = os.environ.get("BENCH_" + harness.upper(), harness)
+            found = shutil.which(selected)
+            if found is None:
+                raise ValueError("missing executable: " + harness)
+            executable = str(Path(found).resolve())
+            version = subprocess.run([executable, "--version"], capture_output=True,
+                                     text=True, timeout=30, check=True).stdout.strip()
         if harness == "davinci" and Path(executable).is_relative_to(Path(repo).resolve()):
-            raise ValueError("BENCH_DAVINCI must be an immutable copy outside the repository")
+            raise ValueError("DaVinci executable must be an immutable copy outside the repository")
         executables[harness] = executable
-        version = subprocess.run([executable, "--version"], capture_output=True,
-                                 text=True, timeout=30, check=True).stdout.strip()
         identities[harness] = {
             "binary_sha256": file_hash(executable), "version": version,
             **(checkpoint_identity(executable) if harness == "davinci" else {"source_sha": None, "dirty_diff_hash": None}),
+            "grading_isolation": isolation,
             "effective_settings": settings if harness == "davinci" else {
                 "ignore_user_config": True, "effort": effort, "service_tier": service_tier(),
                 "telemetry": "local-sanitized-otlp-logs-and-traces"}}
@@ -156,9 +241,54 @@ def campaign_identity(root, variant, fixtures, harnesses, model, effort, setting
             "fixture_hash": fixtures["fixture_hash"], "model": model,
             "effort_policy": effort, "service_tier": service_tier(),
             "executables": executables, "identities": identities,
+            "grading_isolation": isolations, "containers": containers,
             "agent_dir": str((Path(root) / "_agent").resolve()),
             "os": platform.platform(), "cpu": platform.processor(), "python": sys.version,
             "runner_source": source, "resolved_model_identity": None}
+
+
+def container_command(command, workdir, env, campaign, harness):
+    """Run one harness with only the public worktree and copied agent mounted."""
+    if campaign.get("grading_isolation", {}).get(harness) != "container":
+        return command
+    config = campaign.get("containers", {}).get(harness)
+    if not isinstance(config, dict):
+        raise ValueError("container campaign is missing harness configuration")
+    engine = _container_engine()
+    image = config.get("image")
+    image_id = config.get("image_id")
+    if not isinstance(image, str) or not image or not isinstance(image_id, str) or not image_id:
+        raise ValueError("container campaign has invalid image identity")
+    if _container_image_id(engine, image) != image_id:
+        raise ValueError("container image changed during campaign")
+    binary = campaign["executables"].get(harness)
+    agent_dir = campaign.get("agent_dir")
+    if not isinstance(binary, str) or not Path(binary).is_file():
+        raise ValueError("container executable is unavailable")
+    if not isinstance(agent_dir, str) or not Path(agent_dir).is_dir():
+        raise ValueError("container agent directory is unavailable")
+    workdir = Path(workdir).resolve()
+    if not workdir.is_dir():
+        raise ValueError("container worktree is unavailable")
+    child_env = ["-e", "HOME=/root", "-e", "PWD=/workspace", "-e", "TMP=/tmp",
+                 "-e", "TEMP=/tmp", "-e", "TMPDIR=/tmp",
+                 "-e", "DAVINCI_CODING_AGENT_DIR=/agent",
+                 "-e", "PI_CODING_AGENT_DIR=/agent"]
+    for key in sorted(_CONTAINER_ENV_KEYS):
+        value = env.get(key)
+        if value is not None:
+            child_env.extend(["-e", key + "=" + str(value)])
+    network = config.get("network", "bridge")
+    if network not in ("none", "bridge", "host"):
+        raise ValueError("unsupported container network")
+    executable_args = list(command[1:])
+    return [engine, "run", "--rm", "--workdir", "/workspace", "--network", network,
+            "--read-only", "--tmpfs", "/tmp", "--tmpfs", "/root",
+            "--cap-drop=ALL", "--security-opt=no-new-privileges",
+            "--mount", _mount(workdir, "/workspace"),
+            "--mount", _mount(agent_dir, "/agent", True),
+            "--mount", _mount(binary, "/opt/harness", True),
+            *child_env, image, "/opt/harness", *executable_args]
 
 
 def execute(command, workdir, env, timeout):
@@ -221,7 +351,7 @@ def controlled_environment(inherited, agent_dir):
                 "OPENAI_PROJECT_ID", "ANTHROPIC_API_KEY", "PYTHONPATH",
                 "PYTHONSTARTUP", "PYTHONOPTIMIZE"}
     result = {key: value for key, value in inherited.items()
-              if not key.upper().startswith(("DAVINCI_", "PI_", "OTEL_"))
+              if not key.upper().startswith(("BENCH_", "DAVINCI_", "PI_", "OTEL_"))
               and key.upper() not in excluded}
     result.update({"DAVINCI_CODING_AGENT_DIR": str(Path(agent_dir).resolve()),
                    "PI_CODING_AGENT_DIR": str(Path(agent_dir).resolve()),
