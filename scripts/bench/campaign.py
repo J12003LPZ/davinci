@@ -3,6 +3,8 @@ import hashlib
 import json
 import math
 import statistics
+import random
+from datetime import datetime
 from pathlib import Path
 
 
@@ -76,6 +78,8 @@ def task_success(row):
     return (type(row.get("exit")) is int and row["exit"] == 0
             and row.get("grader_pass") is True
             and row.get("unrelated") == []
+            and row.get("cleanup_complete") is True
+            and row.get("transaction_leak") is False
             and row.get("artifact_leak") is False)
 
 
@@ -206,3 +210,120 @@ def paired_metrics(baseline, candidate):
             "total_delta": None if unavailable else sum(b - a for a, b in pairs),
         }
     return result
+
+
+def percentile(values, fraction):
+    ordered = sorted(values)
+    position = (len(ordered) - 1) * fraction
+    lower = int(position)
+    upper = min(lower + 1, len(ordered) - 1)
+    return ordered[lower] + (ordered[upper] - ordered[lower]) * (position - lower)
+
+
+def latency_uncertainty(baseline, candidate, samples=2000, seed=0):
+    """Paired task-cluster percentile bootstrap; repetitions stay in their task."""
+    paired_metrics(baseline, candidate)  # Reject duplicates and mismatched pairs.
+    left = {(row["task"], row["rep"]): row for row in baseline}
+    right = {(row["task"], row["rep"]): row for row in candidate}
+    tasks = sorted({key[0] for key in left})
+    groups = {task: [(left[key]["wall_s"], right[key]["wall_s"])
+                     for key in sorted(left) if key[0] == task] for task in tasks}
+    result = {"method": "paired task-cluster percentile bootstrap", "confidence": 0.95,
+              "resamples": samples, "seed": seed, "clusters": len(tasks),
+              "scope": "frozen task families; repeated runs are not independent tasks"}
+    if len(tasks) < 2 or any(a <= 0 or b < 0 for group in groups.values() for a, b in group):
+        return dict(result, available=False, reason="at least two tasks and positive baseline durations required")
+    rng = random.Random(seed)
+    ratios, deltas, tail_ratios, paired_ratios = [], [], [], []
+    for _ in range(samples):
+        pairs = [pair for task in rng.choices(tasks, k=len(tasks)) for pair in groups[task]]
+        a, b = zip(*pairs)
+        ratios.append(statistics.median(b) / statistics.median(a))
+        deltas.append(statistics.median(y - x for x, y in pairs))
+        tail_ratios.append(percentile(b, 0.9) / percentile(a, 0.9))
+        paired_ratios.append(statistics.median(y / x for x, y in pairs))
+    for field, values, null in (("ratio_of_medians", ratios, 1), ("median_paired_delta_s", deltas, 0),
+                                ("p90_ratio", tail_ratios, 1), ("median_paired_ratio", paired_ratios, 1)):
+        bounds = [percentile(values, 0.025), percentile(values, 0.975)]
+        result[field] = {"ci95": bounds, "includes_no_change": bounds[0] <= null <= bounds[1]}
+    return dict(result, available=True)
+
+
+def serial_campaigns(baseline, candidate):
+    """A campaign spans its entire schedule, including time between rows."""
+    try:
+        windows = []
+        for rows in (baseline, candidate):
+            starts = [datetime.fromisoformat(row["started_at"]) for row in rows]
+            ends = [datetime.fromisoformat(row["finished_at"]) for row in rows]
+            if not starts or any(start.tzinfo is None or end.tzinfo is None or end < start
+                                 for start, end in zip(starts, ends)):
+                return None
+            windows.append((min(starts), max(ends)))
+        return windows[0][1] <= windows[1][0] or windows[1][1] <= windows[0][0]
+    except (KeyError, ValueError, TypeError):
+        return None
+
+
+def promotion_gates(baseline, candidate, baseline_manifest, candidate_manifest, uncertainty, provenance):
+    """Expose each rule. One paired diagnostic window cannot certify promotion."""
+    rules = {}
+    def rule(name, passed, evidence):
+        rules[name] = {"status": "unavailable" if passed is None else "pass" if passed else "fail",
+                       "evidence": evidence}
+    rule("committed_source_and_actual_merge_base", provenance.get("verified"), provenance)
+    rule("sequential_campaigns", serial_campaigns(baseline, candidate), "campaign timestamp envelopes must not overlap")
+    toolings = [manifest.get("tooling_preflight", {}).get("davinci")
+                for manifest in (baseline_manifest, candidate_manifest)]
+    rule("usable_comparable_tooling", None if not all(toolings) else
+         all(entry.get("available") is True for entry in toolings) and toolings[0] == toolings[1], toolings)
+    protected = all(row.get("grading_assurance") == "independent-hidden-grader"
+                    for row in baseline + candidate)
+    rule("independent_grading_boundary", protected,
+         "current container and native arms are diagnostic; tools can read auth and public fixture generators")
+    memberships = [{(row["task"], row["rep"]) for row in rows} for rows in (baseline, candidate)]
+    repetitions = [{task: len({rep for tid, rep in membership if tid == task})
+                    for task in {tid for tid, _ in membership}} for membership in memberships]
+    rule("ten_repetitions_per_task", all(count >= 10 for arm in repetitions for count in arm.values()), repetitions)
+    rule("legacy_and_large_strata", all(set(LEGACY_TASKS).issubset(arm) and
+         len(set(arm) - set(LEGACY_TASKS)) >= 4 for arm in repetitions),
+         "all eight legacy and at least four frozen larger tasks are required")
+    rule("two_independent_windows", None, "this report evaluates one paired window; cross-window review is required")
+    rule("untouched_holdout", False, "bundled tasks, graders and solutions are public; fresh repetitions are not an untouched holdout")
+    rule("deterministic_regressions", None, "requires the affected code's test/eval evidence outside this performance report")
+    parent_passes = sum(row["pass"] for row in baseline)
+    child_passes = sum(row["pass"] for row in candidate)
+    rule("candidate_passes_at_least_parent", child_passes >= parent_passes,
+         {"parent": parent_passes, "candidate": child_passes})
+    prior = {(row["task"], row["rep"]): row for row in baseline}
+    regressions = [{"task": row["task"], "rep": row["rep"]} for row in candidate
+                   if prior[(row["task"], row["rep"])]["pass"] and not row["pass"]]
+    rule("every_correctness_regression_reviewed", not regressions,
+         {"unreviewed_parent_pass_candidate_fail": regressions})
+    a, b = [row["wall_s"] for row in baseline], [row["wall_s"] for row in candidate]
+    median_ratio = statistics.median(b) / statistics.median(a) if statistics.median(a) else None
+    p90_ratio = percentile(b, 0.9) / percentile(a, 0.9) if percentile(a, 0.9) else None
+    rule("median_at_least_ten_percent_faster", None if median_ratio is None else median_ratio <= 0.9,
+         {"candidate_divided_by_parent_medians": median_ratio, "maximum": 0.9})
+    rule("p90_regression_at_most_ten_percent", None if p90_ratio is None else p90_ratio <= 1.1,
+         {"candidate_divided_by_parent_p90": p90_ratio, "maximum": 1.1})
+    bounds = uncertainty.get("ratio_of_medians", {}).get("ci95")
+    rule("latency_improvement_with_uncertainty", None if not bounds else bounds[1] < 1,
+         {"ratio_of_medians_ci95": bounds, "method": uncertainty["method"]})
+    complete_requests = all(row.get("request_metrics_complete") is True for row in baseline + candidate)
+    for field, name in (("logical_requests", "logical_request_reduction"),
+                        ("requests_after_first_reminder", "gate_continuation_reduction")):
+        values = [[metric(row, field) for row in rows] for rows in (baseline, candidate)]
+        available = complete_requests and all(type(value) is int and value >= 0 for arm in values for value in arm)
+        totals = [sum(arm) for arm in values] if available else None
+        rule(name, totals[1] < totals[0] if totals else None,
+             {"totals_parent_candidate": totals, "complete_request_telemetry": complete_requests})
+    for field in ("uncached_input_tokens", "output_tokens"):
+        changes = {}
+        for task in repetitions[0]:
+            arms = [[metric(row, field) for row in rows if row["task"] == task] for rows in (baseline, candidate)]
+            changes[task] = ([sum(arm) for arm in arms] if all(type(v) is int and v >= 0 for arm in arms for v in arm) else None)
+        rule(field + "_no_task_regression", None if any(v is None for v in changes.values()) else
+             all(v[1] <= v[0] for v in changes.values()), {"totals_parent_candidate_by_task": changes})
+    return {"accepted": all(value["status"] == "pass" for value in rules.values()),
+            "scope": "one paired window; fail or unavailable rules block promotion", "rules": rules}

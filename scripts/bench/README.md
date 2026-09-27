@@ -1,131 +1,229 @@
 # DaVinci versus Codex CLI benchmark
 
-The legacy set is frozen to eight Python tasks, `t1-intervals` through
-`t8-calc`. Runs use fresh Git repositories. The agent receives the public
-starter and prompt; grading runs after process exit. The default is
-**diagnostic isolation only**: the host filesystem does not
-prevent an agent from finding private fixtures. These results cannot establish
-independent hidden-test acceptance or general parity. Promotion campaigns can
-select the tested container boundary for a harness with
-`BENCH_<HARNESS>_GRADING_ISOLATION=container`, a pinned Docker image in
-`BENCH_CONTAINER_IMAGE`, and an immutable Linux executable in
-`BENCH_<HARNESS>_CONTAINER_BINARY`. The runner mounts only the public run tree
-and copied campaign agent directory, keeps the container root read-only, drops
-capabilities, and grades only after the process exits. It records the image ID
-and boundary per harness. If one harness remains diagnostic-only, the manifest
-and every row say so; those rows cannot support an independent hidden-test
-claim.
+This harness produces **diagnostic screening evidence**. The eight legacy Python
+tasks and four larger tasks have public generators containing their graders and
+reference solutions. Calling those files `hidden` only describes when the local
+grader is copied. It does not make an independent holdout.
+
+Each run gets a fresh Git repository. Grading starts only after the child has
+been reaped and, for a container arm, the named container has been removed.
+A failed cleanup stops the campaign, retains an ungraded failed row, and never
+copies the hidden grader into a workspace that may still have a live writer.
+
+## Boundary and credential scope
+
+`BENCH_DAVINCI_GRADING_ISOLATION=container` limits host filesystem mounts to the
+public workspace, copied campaign agent directory, and executable. The root is
+read-only, capabilities are dropped, and no-new-privileges is set. Docker
+containers have unique names and a CID file outside the public workspace; the
+runner removes the actual named container on timeout and on normal exit, then
+checks that it is absent. Daemon errors do not establish successful cleanup.
+
+**This is not a credential or independent hidden-grader boundary.** DaVinci and
+its tools can read the mounted `auth.json`. Bridge networking permits outbound
+requests, including retrieval of public fixture generators. Read-only auth
+mounts prevent modification, not reading or exfiltration. Native Codex also has
+host and account access. Use a dedicated benchmark account and keep campaign
+directories and transcripts private. The copied auth file uses mode 0600 and
+its parent uses 0700 on systems that enforce POSIX modes; these permissions do
+not separate an agent from its tools. Credentials are excluded from structured
+identities, but an agent can put sensitive content in a transcript.
+
+Every new manifest records `promotion_eligible: false`; every arm records
+`grading_assurance: diagnostic-only`, credential exposure, and public fixture
+secrecy. A promotion comparison fails the independent-boundary and untouched-
+holdout rules. An independently protected evaluation needs new private fixtures,
+a provider credential broker outside the tool process, and an enforced network
+policy. Those facilities are not supplied by this harness. `host` networking
+is rejected. Codex container mode is rejected until its authentication, workspace
+paths, and telemetry transport have a supported container configuration.
+
+## Prerequisites and offline checks
+
+Use Python 3.11 or later for the runner. The grader's Python needs pytest.
+Native POSIX harnesses need `python`, `python3`, `pytest`, Git, and Bash on PATH;
+Windows native arms need `python`, `pytest`, and Git. The preflight actually
+imports pytest, executes the named commands, and records versions before any
+model call. Container checks run inside the resolved image with networking off.
+A missing Python/pytest command or failed cleanup rejects setup.
+
+Build the supplied image before a live container run:
+
+```sh
+docker build -f scripts/bench/Dockerfile -t davinci-bench-tools .
+```
+
+The Dockerfile includes Python, pytest, Git, Bash, certificates, and ripgrep.
+The runner resolves the built image to its immutable ID and launches that ID,
+then rejects a changed tag during the campaign. The image and native tooling
+versions remain separate in the manifest; do not infer tool parity from a
+shared model name.
+
+These commands are offline and do not consume model usage:
+
+```sh
+python -m unittest discover -s scripts/bench/tests -p 'test_*.py'
+python scripts/bench/make_tasks.py
+python scripts/bench/make_large_tasks.py
+BENCH_RUNS=/absolute/new/fixture-validation python scripts/bench/bench.py validate --task-set all --large-manifest scripts/bench/large_manifest.json
+```
+
+The unit suite generates its own temporary large fixtures and does not require
+ignored `tasks/m*` directories or pytest. The separate fixture validator requires
+pytest and checks that each broken starter fails and each reference passes.
+Generators overwrite their own generated fixtures: run them before freezing a
+campaign, never during one. `validate --task-set all` checks legacy and large
+membership without looking up legacy entries in the large-only manifest.
+
+Large manifests now declare `hash_order: relative-posix-codepoint-v1`. Public,
+reference, and grader trees are hashed in that portable relative-path order.
+The previous Windows Path sort order produced different hashes on Linux. Only
+the hash algorithm tag and affected public-tree hashes changed; fixture contents
+are unchanged. Older large manifests without the tag are explicitly rejected
+for new runs. Regenerate and freeze a new manifest, and retain the original
+manifest with its historical campaign rather than rewriting history.
+
+## Clean executable provenance
+
+New live campaigns require a clean committed runner checkout and schema 2
+checkpoint identities. Old schema 1 sidecars, null dirty hashes, dirty builds,
+missing source commits, and mismatched source trees or binary bytes are rejected.
+Codex source provenance is unavailable; its executable hash and version are
+recorded without inventing a source SHA.
+
+Build a DaVinci checkpoint from an already committed clean checkout:
+
+```sh
+python scripts/bench/runner.py --repo /absolute/source-checkout --output /absolute/new/checkpoint
+```
+
+This helper runs `cargo build --locked --release` in a fresh temporary target
+directory, verifies the source identity before and after the build, and copies
+the executable and adjacent `.identity.json` outside the repository. The sidecar
+records source commit/tree, the SHA-256 of empty diff bytes, `source_clean: true`,
+actual binary hash, build command, and timestamp. The runner verifies that the
+recorded commit/tree exists locally. This is reproducible source attribution,
+not a claim of bit-for-bit reproducibility or an external signed build attestation.
+
+Build the parent from the actual merge-base of the candidate and the declared
+PR target, not an arbitrary old ancestor. The offline comparison command verifies
+that relationship against Git objects using `--base-ref` and reports failure
+when the purported parent is older. Retain the resolved target SHA in the
+comparison output because a moving target branch may acquire a newer merge-base.
+For a parent live run, supply `--parent-for <candidate-source-sha> --base-ref
+<target-ref>` to perform the same check during setup before any model usage.
 
 ## Campaign setup
 
-Live runs spend account usage. Run one campaign at a time, with no concurrent
-development, builds, or other model jobs on the measurement host. On Windows,
-set `PYTHONUTF8=1` before invoking Python.
+**Live runs spend account usage.** Use one measurement host/account at a time,
+with no concurrent development, builds, or other model jobs. A kernel file lock
+in the machine's system temporary directory excludes another cooperating
+benchmark campaign across output directories and checkouts. It is held through
+setup and every run, releases on process exit/crash, and has no PID-file stale
+lock workaround. Do not delete its file while a process may own the lock. This
+lock cannot control unrelated programs or use of the same account on another
+machine. The comparison also checks campaign timestamp envelopes for overlap.
 
-1. Build the desired revision and retain its source SHA and dirty-diff hash.
-   Copy `davinci.exe` to a unique absolute directory outside the repository.
-   `BENCH_DAVINCI` must select that copy, not a mutable build output.
-2. Write an adjacent `davinci.exe.identity.json` containing `schema_version: 1`,
-   `binary_sha256`, `source_sha`, and `dirty_diff_hash`. Hash the copied bytes;
-   source identity must come from the verified build, not a later checkout. A
-   clean parent build may record `dirty_diff_hash: null`; candidate builds must
-   retain their actual dirty-tree digest.
-   The runner checks this sidecar and rechecks binary bytes before each run.
-   `runner.source_identity` hashes tracked changes and untracked implementation
-   files. Codex source provenance is explicitly unavailable; its executable
-   hash and version are retained.
-   For a container arm, set `BENCH_DAVINCI_CONTAINER_BINARY` (or the matching
-   harness variable) to the copied Linux executable and provide its identity
-   sidecar; `BENCH_DAVINCI` is not used for that arm.
-3. Set `BENCH_RUNS` to a new, nonexistent directory. The runner refuses reuse.
-   Optionally select `BENCH_CODEX`, `BENCH_MODEL` (default `gpt-6-luna`), and
-   `BENCH_EFFORT` (default `medium`). Each campaign saves its frozen fixture
-   manifest, schedule, identities, and effective settings before execution.
-4. Use the `run` command with `--harness davinci codex --task-set legacy
-   --reps 3 --order counterbalanced --order-seed 0 --variant B0`. This requests
-   48 rows. `--tasks` can select a subset for diagnosis; it does not change the
-   frozen membership. `large` and `all` require `--large-manifest`.
-5. Run `report` and `gate` against that `BENCH_RUNS`. The gate checks campaign
-   completeness and consistency, including failed rows. Passing it is **not
-   checkpoint acceptance**. Use `compare --baseline <parent-directory>
-   --candidate <candidate-directory>` for paired metrics and pass regressions.
+1. Commit the runner changes and build the immutable DaVinci checkpoint above.
+   Set `BENCH_DAVINCI` to the copied native executable, or select container mode
+   with `BENCH_DAVINCI_CONTAINER_BINARY` and
+   `BENCH_CONTAINER_IMAGE=davinci-bench-tools`. Container mode uses a copied Linux
+   executable. `BENCH_DAVINCI` is not used for that arm.
+2. Set `BENCH_RUNS` to a new, nonexistent output directory outside Git. Reuse is
+   rejected. Optionally set `BENCH_CODEX`, `BENCH_MODEL` (default `gpt-6-luna`),
+   `BENCH_EFFORT` (default `medium`), `BENCH_TIMEOUT`, and `BENCH_SERVICE_TIER`.
+3. Use `run --harness davinci codex --task-set legacy --reps 3 --order
+   counterbalanced --order-seed 0 --variant B0`. This requests 48 rows. The full
+   frozen set uses `--task-set all --large-manifest scripts/bench/large_manifest.json`
+   and requests 72 rows at three repetitions. Each campaign saves the full
+   schedule, fixtures, identities, effective settings, tooling preflight, lock
+   scope, and boundary limitations before execution.
+4. Run `report` and `gate` with the same `BENCH_RUNS`. `report` saves separate
+   arm, stratum, and per-task summaries. `gate` checks only completeness and
+   pinned row consistency, retaining failures. Its successful exit is explicitly
+   **not checkpoint acceptance**.
+5. Compare fresh parent and candidate campaigns offline:
 
-The unchanged `make_tasks.py` creates fixtures when absent; do not regenerate
-or edit fixtures during a campaign. `validate` checks starter failure and
-reference success offline. Keep its output directory separate from live runs.
-`--help` lists the command options. Offline regression tests run through
-`python -m unittest discover -s scripts/bench/tests`.
-
-The larger stratum is generated separately so the legacy membership stays
-frozen. Run `python scripts/bench/make_large_tasks.py` once before the first
-model-behavior arm, review and retain `scripts/bench/large_manifest.json`, then
-validate it with:
-
-```text
-python scripts/bench/bench.py validate --task-set large --large-manifest scripts/bench/large_manifest.json
+```sh
+python scripts/bench/bench.py compare --baseline /absolute/parent-campaign --candidate /absolute/candidate-campaign --base-ref origin/main
 ```
 
-The manifest records each public allowlist, public verification command, and
-the hashes of the public starter, reference solution, and hidden grader. The
-offline discovery, LSP, and browser fixtures under
-`scripts/bench/specialist_fixtures/` describe availability and authorization;
-they do not make a specialist-tool preference a functional requirement.
+`compare` prints per-rule pass/fail/unavailable states and exits nonzero unless
+all promotion rules pass. With the supplied diagnostic boundary and public
+fixtures it cannot certify promotion. One invocation evaluates one paired window;
+it marks two independent windows, deterministic code validation, and any missing
+telemetry as unestablished. A parent-only DaVinci campaign is valid: its absent
+Codex control is unavailable rather than an error or a fabricated comparison.
 
-DaVinci uses a per-campaign agent directory containing only copied credentials
-and explicit settings. For a model absent from the executable's built-in catalog,
-pass `--model-store <existing-models-store.json>`. The runner pins only the exact
-requested public Codex model record, records its hash, and rechecks it before
-each DaVinci run. Provider observations stop the campaign on a coding-model
-mismatch. Credentials are never included in manifests. Inherited
-product, provider, and OTEL overrides are stripped. `--settings` can supply an
-explicit experimental settings file. Codex uses `--ignore-user-config` and
-local, sanitized OTLP logs and traces configured through CLI overrides.
+DaVinci uses copied credentials and explicit settings. `--settings` selects an
+experimental configuration; defaults disable decision intelligence, use fixed
+effort, stable prompt profile, full tools, and automatic verification. For a
+model outside the binary's catalog, `--model-store` pins only the exact public
+Codex model record and rechecks its hash. Coding-model mismatch stops a run.
+Inherited product/provider/OTEL overrides are stripped. Codex uses
+`--ignore-user-config` and a local sanitized OTLP collector. Source cleanliness,
+binary bytes, fixture hashes, and the pinned model catalog are rechecked during
+the campaign.
 
-## Metric definitions
+## Metric definitions and acceptance
 
-- Wall time is monotonic process launch through exit, excluding grading and
-  subsequent parsing. Failed and timed-out runs remain in distributions.
-- Success requires exit zero, grader success, no unrelated changes, and no
-  transaction artifacts. Missing file-safety evidence cannot pass; inspection
-  failures are saved before the campaign stops.
-- Logical requests and provider attempts are distinct. Retries share logical
-  identity. Codex user turns are not request counts. Prewarm is reported
-  separately; missing or incomplete telemetry is flagged, never counted as zero.
-- Top-level tool calls, reported batch children, and actual leaf-tool dispatches
-  are separate. Leaf dispatches include failures and exclude batch wrappers,
-  pre-dispatch denials, and journal replay. They are not subprocess counts.
-- Post-reminder mutations count changes to DaVinci's completion-ledger generation,
-  not all filesystem writes. Gate reminders are grouped by reason; requests
-  after the first reminder and harness verification runs are also reported.
-- Input is provider-normalized total input, including cached input. Cache ratios
-  divide summed cached tokens by summed total tokens. First/later request groups
-  use deduplicated DaVinci terminal usage; mismatched request counts make them
-  unavailable. Codex's aggregate turn usage cannot supply those groups.
-- Reasoning counts are retained when reported and are included in the Responses
-  output total. Missing usage stays unavailable through paired reports.
-- Paired ratios mean candidate divided by baseline on matching task/repetition
-  rows. Missing pairs are rejected; missing metric values remain unavailable.
-  Screening reports do not yet provide promotion-grade confidence intervals.
+- **Wall time:** monotonic launch through process reaping and container cleanup.
+  Grading/parsing are excluded. All failures/timeouts stay in distributions;
+  paired both-successful rows are reported separately so an early failure is
+  visible rather than silently rewarded as a speedup.
+- **Task success:** integer exit zero, grader success, confirmed cleanup, no
+  unrelated changes, no transaction leak, and no detected forbidden artifact.
+  Missing evidence cannot pass. Cleanup and inspection failures are written as
+  failed rows before the campaign stops.
+- **Artifact versus transaction:** the transaction flag inspects actual
+  `.davinci-transactions` paths. The independent artifact scan checks reserved
+  hidden-grader names, credential files, harness artifact directories, and
+  symlinks before grading, including Git-ignored paths. It records paths and its
+  scan scope. False means no match in this bounded scan; it cannot establish no
+  network retrieval, memory contamination, or concealed content leak.
+- **Requests:** coding logical requests and actual provider attempts remain
+  distinct; retries share logical identity. Codex user turns are not request
+  counts. Prewarm and Jev are separate. No Jev observations means unavailable,
+  even if coding telemetry exists. Reports show available and complete row
+  denominators; incomplete request telemetry cannot pass request-reduction rules.
+- **Tokens:** input is normalized total input including cached input. Uncached
+  input is computed per row as `input_tokens - cached_tokens`; missing or invalid
+  operands remain unavailable. Cache ratio is summed cached divided by summed
+  total input. Output includes Responses reasoning; reasoning is separately
+  available only when reported. First/later cache ratios use deduplicated
+  terminal usage where available.
+- **Tools and reminders:** top-level calls, reported batch children, and actual
+  leaf dispatches remain separate. Reminder reasons, harness verification runs,
+  requests after the first reminder, and completion-ledger mutation generations
+  are reported; generations are not a census of filesystem writes.
+- **Pairs and uncertainty:** candidate divided by parent uses exact unique
+  task/repetition pairs. Bootstrap resamples whole task clusters, retaining all
+  repetitions together, with 2,000 deterministic resamples and a 95% percentile
+  interval. Reports distinguish ratio of medians, median paired ratio/delta,
+  and p90 ratio. A single task cannot establish cluster uncertainty. Twelve
+  public task families still support a narrow diagnostic conclusion.
 
-## Offline replay
+The per-window promotion report checks clean source/actual merge-base,
+sequential execution, usable comparable tools, boundary and holdout evidence,
+frozen legacy/large coverage, ten repetitions per task, independent windows,
+deterministic tests, aggregate correctness, every unreviewed parent-pass/candidate-
+fail pair, at least 10% lower median, at most 10% p90 regression, latency
+uncertainty, logical-request and reminder-continuation reductions, and per-task
+uncached/output token regressions. A missing rule is unavailable and blocks
+acceptance. Aggregate gains do not erase individual correctness regressions.
+
+## Offline replay and cache diagnosis
 
 The `davinci-coding-agent` example `bench_replay` drives the actual agent loop
-with recorded assistant responses and real tools in a fresh public repository.
-It constructs no live provider. Build that example and select an immutable copy
-with `replay.py --replay-binary`. Its other required options are `--recordings`,
-`--original-runs` (the historical path prefix to remap), and a fresh `--runs`.
+with recorded assistant responses and real tools in a fresh public repository,
+without a live provider. Build it and select an immutable copy with
+`replay.py --replay-binary`; also supply `--recordings`, `--original-runs` (the
+historical path prefix to remap), and a fresh `--runs`. Replay stops on divergent
+reminders, tool IDs/outcomes, or early completion. It evaluates harness behavior,
+not how a live model would react to changed prompts.
 
-Replay checks cumulative reminders and tool IDs/error outcomes before supplying
-each response. It stops when the candidate diverges or finishes early. Tool
-output bytes are not required to match because paths and timing vary. Results
-measure harness decisions, not how a model would react to changed prompts.
-The runner never loads hidden graders or reference solutions.
-
-## Opt-in cache diagnosis
-
-`cache_report.py` accepts an existing `DAVINCI_WIRE_DUMP` directory. It reports
-continuation and prefix changes plus first/later/all cache ratios. Missing usage
-is unavailable. Wire dumps contain full conversations and file contents; keep
-them outside Git. The controlled campaign environment deliberately removes
-inherited wire-dump settings, so collect diagnostic dumps in a separate direct
-DaVinci invocation, outside timed campaigns.
+`cache_report.py` reads an existing `DAVINCI_WIRE_DUMP` directory for continuation,
+prefix, and cache ratios. Missing usage remains unavailable. Wire dumps contain
+full conversations and file contents; keep them private and outside Git. Timed
+campaigns deliberately remove inherited wire-dump settings, so collect those
+separately from timing evidence.

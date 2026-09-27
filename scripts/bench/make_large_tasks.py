@@ -30,7 +30,8 @@ def write_text(base: Path, relative: str, value: str) -> None:
 
 def tree_hash(base: Path) -> str:
     digest = hashlib.sha256()
-    for path in sorted(p for p in base.rglob("*") if p.is_file()):
+    for path in sorted((p for p in base.rglob("*") if p.is_file()),
+                       key=lambda p: p.relative_to(base).as_posix()):
         relative = path.relative_to(base).as_posix()
         digest.update(relative.encode("utf-8"))
         digest.update(b"\0")
@@ -1072,6 +1073,7 @@ def main() -> None:
     specialists = write_specialist_fixtures()
     manifest = {
         "schema_version": 1,
+        "hash_order": "relative-posix-codepoint-v1",
         "task_set": "large",
         "generator": "scripts/bench/make_large_tasks.py",
         "tasks": [item["id"] for item in metadata],

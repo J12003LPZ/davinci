@@ -111,7 +111,7 @@ def activity(events):
         "provider_attempts": len(attempts) if available else None,
         "coding_provider_attempts": count(attempts, "coding"),
         "prewarm_attempts": count(attempts, "prewarm"),
-        "jev_attempts": count(attempts, "jev"),
+        "jev_attempts": count(attempts, "jev") if any(key[0] == "jev" for key in logical | ended) else None,
         "request_metrics_available": available,
         "request_metrics_complete": available and not unknown_outcome and logical == ended and attempts == attempts_ended
             and all((purpose, request) in logical for purpose, request, _ in attempts),

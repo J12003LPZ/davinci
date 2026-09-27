@@ -9,7 +9,7 @@
         "README.md"
       ],
       "hidden_grader_hash": "389c08e374d89d4e32888d23fbac3e0a1ad1168ee96403068b6edfa1174f2981",
-      "public_hash": "b9fa3c0cdc3077378b413ebeea88475d8af05703882108be658d244358c53e05",
+      "public_hash": "7ede4be44756ccb49e7732c0afbe74bb77fbf05b90753e0a3992e56c617310aa",
       "public_verification": "python -m pytest -q tests/test_public_config.py",
       "reference_solution_hash": "4f8a8dc4b07ef73a086bdd0ab2d75caf17e87042e4f8d3c40df35bc95c7e28aa",
       "task_set": "large"
@@ -28,9 +28,9 @@
         "tests/test_public_api.py"
       ],
       "hidden_grader_hash": "83cfed783d4fd31e11252887bd76be1ed236b639f86d4a666170dd7aa783f8aa",
-      "public_hash": "92453dc232b8903941a3c6b349ee0dd8157ee092dcc88c72d4626bf4e2bb8c2b",
+      "public_hash": "a29b472dd851b98ac58ace1b9b513c461db669ec11e1c6d6b962340a6fa0fc04",
       "public_verification": "python -m pytest -q tests/test_public_api.py",
-      "reference_solution_hash": "c7ac5263ba7d26f975f635e835bafb97d004e4c82d60120fe992c2cde36a19b8",
+      "reference_solution_hash": "7e139098f186888ecbd62f0e7bab73e0e9b7d615282da53bf9122a04778f7453",
       "task_set": "large"
     },
     "m3-state-persistence": {
@@ -65,6 +65,7 @@
     }
   },
   "generator": "scripts/bench/make_large_tasks.py",
+  "hash_order": "relative-posix-codepoint-v1",
   "schema_version": 1,
   "specialist_fixtures": {
     "browser": {

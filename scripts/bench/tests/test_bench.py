@@ -22,6 +22,48 @@ SPEC.loader.exec_module(bench)
 
 
 class StreamTelemetryTests(unittest.TestCase):
+    def test_uninstrumented_jev_is_unavailable_when_coding_telemetry_exists(self):
+        event = {"type": "provider_observation", "observation": {
+            "schema_version": 1, "logical_request_id": "coding", "purpose": "coding",
+            "kind": "logical_start", "status": "started"}}
+        stats = bench.parse_stream("davinci", json.dumps(event))
+        self.assertEqual(stats["logical_requests"], 1)
+        self.assertIsNone(stats["jev_attempts"])
+
+    def test_reports_separate_harnesses_strata_real_uncached_and_availability(self):
+        rows = [dict(campaign_row("davinci"), input_tokens=100, cached_tokens=90, requests=9,
+                     logical_requests=9, request_metrics_complete=True),
+                dict(campaign_row("codex"), input_tokens=300, cached_tokens=290, requests=6,
+                     logical_requests=6, request_metrics_complete=True),
+                dict(campaign_row("davinci"), task="m-fixture", wall_s=20, input_tokens=200,
+                     cached_tokens=150, requests=None, logical_requests=None, request_metrics_complete=False)]
+        summary = bench.summarize(rows)
+        self.assertEqual(summary["davinci"]["runs"], 2)
+        self.assertEqual(summary["davinci"]["uncached_input"], 60)
+        self.assertEqual(summary["codex"]["uncached_input"], 10)
+        self.assertIsNone(summary["davinci"]["median_logical_requests"])
+        self.assertEqual(summary["davinci"]["complete_request_telemetry_runs"], 1)
+        strata = bench.stratified_summary(rows)
+        self.assertEqual(strata["legacy"]["davinci"]["runs"], 1)
+        self.assertEqual(strata["legacy"]["codex"]["runs"], 1)
+        self.assertEqual(strata["large"]["davinci"]["runs"], 1)
+        self.assertNotIn("codex", strata["large"])
+
+    def test_missing_artifact_and_transaction_evidence_is_not_zero_leaks(self):
+        row = dict(campaign_row("davinci"), artifact_leak=None, transaction_leak=False)
+        summary = bench.summarize([row])["davinci"]
+        self.assertIsNone(summary["artifact_leak_runs"])
+        self.assertEqual(summary["transaction_leak_runs"], 0)
+
+    def test_both_successful_latency_is_separate_and_failed_runs_remain(self):
+        left = [dict(campaign_row("davinci", rep), task=task, wall_s=10)
+                for task in ("t1-intervals", "t2-duration") for rep in range(2)]
+        right = [dict(row, wall_s=5) for row in left]
+        right[0].update({"pass": False, "grader_pass": False, "wall_s": 1})
+        summary = bench.paired_report(left, right)
+        self.assertEqual(summary["all_runs"]["pairs"], 4)
+        self.assertEqual(summary["both_successful"]["pairs"], 3)
+
     def test_unknown_attempt_outcome_is_not_complete_telemetry(self):
         events = [{"type": "provider_observation", "observation": {
             "schema_version": 1, "logical_request_id": "r", "purpose": "coding",

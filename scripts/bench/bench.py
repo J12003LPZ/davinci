@@ -30,10 +30,13 @@ import time
 from pathlib import Path
 from contextlib import nullcontext
 from observations import activity
-from campaign import LEGACY_TASKS, COMPARABLE, fixture_manifest, schedule, task_success, manifest_errors, paired_metrics, file_hash, digest, metric
+from campaign import (LEGACY_TASKS, COMPARABLE, fixture_manifest, schedule, task_success,
+                      manifest_errors, paired_metrics, file_hash, digest, metric,
+                      latency_uncertainty, promotion_gates)
 from runner import (create_campaign, isolate_settings, controlled_environment, select_tasks,
                     execute, BASE_SETTINGS, agent_source, campaign_identity, stop_reason,
-                    pin_model_store, model_stop_reason, validate_large_manifest, container_command)
+                    pin_model_store, model_stop_reason, validate_large_manifest, container_command,
+                    campaign_lock, parent_identity, source_identity)
 from codex_otel import Collector, request_metrics
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -84,7 +87,7 @@ def prepare(tid, dest):
     git(dest, "config", "user.name", "bench")
     git(dest, "config", "core.autocrlf", "false")
     git(dest, "add", "-A")
-    git(dest, "commit", "-q", "-m", "fixture", "--no-verify")
+    git(dest, "commit", "-q", "-m", "fixture")
 
 
 def grade(tid, workdir):
@@ -125,6 +128,39 @@ def changed_files(workdir, ignore=True):
             if not ignore or not any(part in ignored for part in path.split("/")[:-1]):
                 paths.add(path)
     return sorted(paths)
+
+
+def forbidden_artifacts(workdir, tid):
+    """Inspect reserved grader/credential/artifact paths, including gitignored files.
+
+    A negative result is a bounded filesystem observation, not proof that a
+    network-visible public solution was never retrieved or remembered.
+    """
+    workdir = Path(workdir)
+    hidden = Path(TASKS) / tid / "hidden"
+    if not hidden.is_dir():
+        raise RuntimeError("cannot inventory reserved hidden-grader paths")
+    reserved = {path.relative_to(hidden).as_posix() for path in hidden.rglob("*") if path.is_file()}
+    forbidden_dirs = {"hidden", "solution", ".davinci-artifacts", ".bench-artifacts"}
+    credential_names = {"auth.json", "credentials.json"}
+    found, transactions = [], []
+    def walk_error(error):
+        raise error
+    for base, directories, names in os.walk(workdir, followlinks=False, onerror=walk_error):
+        directories[:] = [name for name in directories if name != ".git"]
+        for name in [*directories, *names]:
+            path = Path(base) / name
+            relative = path.relative_to(workdir).as_posix()
+            parts = Path(relative).parts
+            if ".davinci-transactions" in parts:
+                transactions.append(relative)
+            elif (path.is_symlink() or relative in reserved or name in credential_names
+                  or any(part in forbidden_dirs for part in parts)
+                  or ("artifacts" in parts and any(part in (".davinci", ".pi", ".codex") for part in parts))):
+                found.append(relative)
+    return {"artifact_leak": bool(found), "artifact_paths": sorted(set(found)),
+            "transaction_leak": bool(transactions), "transaction_paths": sorted(set(transactions)),
+            "artifact_scan_scope": "reserved grader, credential, harness artifact paths and symlinks; before grading"}
 
 
 def command(harness, prompt, workdir):
@@ -273,7 +309,8 @@ def run_one(harness, tid, rep, campaign=None):
                 args[-1:-1] = ["-c", value]
         measured = execute(args, workdir, env, TIMEOUT)
     code, stdout, stderr = measured["exit"], measured["stdout"], measured["stderr"]
-    stopped = stop_reason(stdout, stderr)
+    stopped = ("cleanup_failed" if measured.get("cleanup_complete") is not True else None)
+    stopped = stopped or stop_reason(stdout, stderr)
     if harness == "davinci":
         stopped = stopped or model_stop_reason(stdout, MODEL)
     wall = measured["wall_s"]
@@ -281,13 +318,18 @@ def run_one(harness, tid, rep, campaign=None):
         f.write(stdout)
     with open(workdir + ".stderr.txt", "w", encoding="utf-8") as f:
         f.write(stderr)
+    artifacts = {"artifact_leak": None, "transaction_leak": None,
+                 "artifact_paths": None, "transaction_paths": None, "artifact_scan_scope": None}
     try:
-        all_changed = changed_files(workdir, ignore=False)
+        if measured.get("cleanup_complete") is not True:
+            raise RuntimeError("cannot inspect a workspace while execution may still be active")
         changed = changed_files(workdir)
         unrelated = [p for p in changed if p not in spec["allowed"]]
-        transaction_leak = any(p.startswith(".davinci-transactions/") for p in all_changed)
+        artifacts = forbidden_artifacts(workdir, tid)
+        if artifacts["artifact_leak"]:
+            stopped = stopped or "forbidden_artifact"
     except (OSError, RuntimeError, subprocess.SubprocessError):
-        changed = unrelated = transaction_leak = None
+        changed = unrelated = None
         stopped = stopped or "change_inventory_failed"
     if stopped:
         ok, passed, failed, tail = False, 0, 0, "not run: " + stopped
@@ -308,10 +350,11 @@ def run_one(harness, tid, rep, campaign=None):
         "wall_s": wall, "input_tokens": s["input"], "cached_tokens": s["cached"],
         "output_tokens": s["output"], "tool_calls": s["tool_calls"], "requests": s["requests"],
         "tools": s["tools"], "changed": changed, "unrelated": unrelated,
-        "transaction_leak": transaction_leak, "artifact_leak": transaction_leak,
+        **artifacts, "cleanup_complete": measured.get("cleanup_complete"),
         "started_at": measured["started_at"], "finished_at": measured["finished_at"],
         "grading_isolation": (campaign.get("grading_isolation", {}).get(harness, "diagnostic-only")
                                if campaign else "diagnostic-only"),
+        "task_set": "legacy" if tid in LEGACY_TASKS else "large",
         "stop_reason": stopped,
     }
     for key in ("logical_requests", "provider_attempts", "prewarm_attempts", "jev_attempts",
@@ -343,7 +386,8 @@ def directory_hash(directory):
     """Hash one generated fixture tree without exposing its contents."""
     digest_value = hashlib.sha256()
     directory = Path(directory).resolve()
-    for path in sorted(path for path in directory.rglob("*") if path.is_file()):
+    for path in sorted((path for path in directory.rglob("*") if path.is_file()),
+                       key=lambda path: path.relative_to(directory).as_posix()):
         digest_value.update(path.relative_to(directory).as_posix().encode("utf-8"))
         digest_value.update(b"\0")
         digest_value.update(path.read_bytes())
@@ -359,6 +403,8 @@ def validate_fixture_manifest(task_ids, large_manifest):
     errors = []
     for tid in task_ids:
         metadata = load(tid)
+        if tid in LEGACY_TASKS:
+            continue
         expected = large_manifest["fixtures"][tid]
         for field in ("task_set", "allowed", "public_verification"):
             if metadata.get(field) != expected.get(field):
@@ -427,18 +473,27 @@ def summarize(rows):
             "total_wall_s": sum(r["wall_s"] for r in rs),
             "input_tokens": total_in,
             "cached_tokens": cached,
-            "uncached_input": total_in - cached if total_in is not None and cached is not None else None,
+            "uncached_input": aggregate_available(
+                [{"uncached": metric(row, "uncached_input_tokens")} for row in rs], "uncached"),
             "cache_ratio": cached / total_in if total_in and cached is not None else None,
             "output_tokens": aggregate_available(rs, "output_tokens"),
             "reasoning_tokens": aggregate_available(rs, "reasoning_tokens"),
-            "median_tool_calls": statistics.median(r.get("tool_calls", 0) for r in rs),
+            "median_tool_calls": aggregate_available(rs, "tool_calls", statistics.median),
             "median_requests": aggregate_available(rs, "requests", statistics.median),
+            "median_logical_requests": aggregate_available(rs, "logical_requests", statistics.median),
             "logical_requests": aggregate_available(rs, "logical_requests"),
             "provider_attempts": aggregate_available(rs, "provider_attempts"),
             "prewarm_attempts": aggregate_available(rs, "prewarm_attempts"),
+            "jev_attempts": aggregate_available(rs, "jev_attempts"),
             "auto_verify_runs": aggregate_available(rs, "auto_verify_runs"),
-            "unrelated_runs": sum(bool(r["unrelated"]) for r in rs),
-            "transaction_leak_runs": sum(bool(r.get("transaction_leak")) for r in rs),
+            "unrelated_runs": aggregate_available(rs, "unrelated", lambda values: sum(bool(v) for v in values)),
+            "transaction_leak_runs": aggregate_available(rs, "transaction_leak"),
+            "artifact_leak_runs": aggregate_available(rs, "artifact_leak"),
+            "cleanup_complete_runs": sum(row.get("cleanup_complete") is True for row in rs),
+            "telemetry_availability": {field: {"available_runs": sum(metric(row, field) is not None for row in rs),
+                                               "total_runs": len(rs)} for field in
+                ("logical_requests", "provider_attempts", "jev_attempts", "uncached_input_tokens", "reasoning_tokens")},
+            "complete_request_telemetry_runs": sum(row.get("request_metrics_complete") is True for row in rs),
         }
         for name in ("first", "later"):
             total = aggregate_available(rs, f"{name}_request_input_tokens")
@@ -469,7 +524,30 @@ def campaign_errors(root, rows):
     return manifest_errors(manifest, rows)
 
 
-def compare(baseline, candidate):
+def stratified_summary(rows):
+    return {name: summarize([row for row in rows if (row["task"] in LEGACY_TASKS) == (name == "legacy")])
+            for name in ("legacy", "large")}
+
+
+def paired_report(parent, candidate):
+    result = {"all_runs": paired_metrics(parent, candidate),
+              "all_run_latency_uncertainty": latency_uncertainty(parent, candidate)}
+    prior = {(row["task"], row["rep"]): row for row in parent}
+    both = [row for row in candidate if row["pass"] and prior[(row["task"], row["rep"])]["pass"]]
+    both_parent = [prior[(row["task"], row["rep"])] for row in both]
+    result["both_successful"] = paired_metrics(both_parent, both) if both else {"pairs": 0}
+    result["both_successful_latency_uncertainty"] = latency_uncertainty(both_parent, both) if both else None
+    result["strata"] = {}
+    for name in ("legacy", "large"):
+        a = [row for row in parent if (row["task"] in LEGACY_TASKS) == (name == "legacy")]
+        b = [row for row in candidate if (row["task"] in LEGACY_TASKS) == (name == "legacy")]
+        if a or b:
+            result["strata"][name] = {"paired": paired_metrics(a, b),
+                                      "latency_uncertainty": latency_uncertainty(a, b)}
+    return result
+
+
+def compare(baseline, candidate, base_ref=None, repo=None):
     parents = load_rows(str(Path(baseline) / "results.jsonl"))
     children = load_rows(str(Path(candidate) / "results.jsonl"))
     errors = campaign_errors(baseline, parents) + campaign_errors(candidate, children)
@@ -480,39 +558,73 @@ def compare(baseline, candidate):
     if errors:
         print(json.dumps({"integrity_errors": errors, "comparison_available": False}, indent=2))
         return 1
-    prior = {(r["task"], r["rep"]): r for r in parents if r["harness"] == "davinci"}
+    parent_manifest = json.loads((Path(baseline) / "campaign.json").read_text(encoding="utf-8"))
+    candidate_manifest = json.loads((Path(candidate) / "campaign.json").read_text(encoding="utf-8"))
+    parent_davinci = [row for row in parents if row["harness"] == "davinci"]
+    candidate_davinci = [row for row in children if row["harness"] == "davinci"]
+    prior = {(r["task"], r["rep"]): r for r in parent_davinci}
     regressions = [{"task": r["task"], "rep": r["rep"], "cause": "requires investigation"}
                    for r in children if r["harness"] == "davinci"
                    and prior.get((r["task"], r["rep"]), {}).get("pass") and not r["pass"]]
     paired = {}
     try:
-        paired["candidate_vs_parent"] = paired_metrics(
-            [r for r in parents if r["harness"] == "davinci"],
-            [r for r in children if r["harness"] == "davinci"])
+        paired["candidate_vs_parent"] = paired_report(parent_davinci, candidate_davinci)
         for name, rows in (("parent_vs_codex", parents), ("candidate_vs_codex", children)):
-            paired[name] = paired_metrics([r for r in rows if r["harness"] == "codex"],
-                                          [r for r in rows if r["harness"] == "davinci"])
+            if any(row["harness"] == "codex" for row in rows):
+                paired[name] = paired_report([r for r in rows if r["harness"] == "codex"],
+                                             [r for r in rows if r["harness"] == "davinci"])
+            else:
+                paired[name] = {"available": False, "reason": "this campaign has no Codex arm"}
     except ValueError as error:
         errors.append(str(error))
+    provenance = {"verified": None, "reason": "compare requires --base-ref for actual merge-base verification"}
+    if base_ref and parent_davinci and candidate_davinci:
+        try:
+            if any(row.get("source_clean") is not True for row in parent_davinci + candidate_davinci):
+                raise ValueError("clean committed build provenance is missing")
+            if any(manifest.get("runner_source", {}).get("source_clean") is not True
+                   for manifest in (parent_manifest, candidate_manifest)):
+                raise ValueError("clean committed runner provenance is missing")
+            provenance = {"verified": True, **parent_identity(repo or Path(HERE).parents[1],
+                candidate_davinci[0]["source_sha"], base_ref, parent_davinci[0]["source_sha"])}
+        except (ValueError, KeyError) as error:
+            provenance = {"verified": False, "reason": str(error)}
+    promotion = (promotion_gates(parent_davinci, candidate_davinci, parent_manifest, candidate_manifest,
+                 paired["candidate_vs_parent"]["all_run_latency_uncertainty"], provenance)
+                 if not errors else {"accepted": False, "integrity_errors": errors})
     result = {"baseline": summarize(parents), "candidate": summarize(children), "paired": paired,
+              "baseline_strata": stratified_summary(parents), "candidate_strata": stratified_summary(children),
+              "per_task": {task: {"baseline": summarize([r for r in parents if r["task"] == task]),
+                                  "candidate": summarize([r for r in children if r["task"] == task])}
+                           for task in sorted({r["task"] for r in parents + children})},
               "integrity_errors": errors, "parent_pass_candidate_fail": regressions,
+              "promotion": promotion,
               "scope": "diagnostic screening; no general parity claim",
-              "acceptance": "requires checkpoint review; exit zero establishes no integrity or observed pass regression"}
+              "acceptance": "every promotion rule must pass; unavailable evidence blocks promotion"}
     print(json.dumps(result, indent=2))
-    return 1 if errors or regressions else 0
+    return 0 if promotion["accepted"] else 1
 
 
 def report():
     rows = load_rows()
-    summary = summarize(rows)
+    errors = campaign_errors(RUNS, rows)
+    summary = {"arms": summarize(rows), "strata": stratified_summary(rows),
+               "per_task": {task: summarize([row for row in rows if row["task"] == task])
+                            for task in sorted({row["task"] for row in rows})},
+               "integrity_errors": errors, "scope": "diagnostic; no promotion acceptance"}
     with open(os.path.join(RUNS, "summary.json"), "w", encoding="utf-8") as f:
         json.dump(summary, f, indent=2)
-    for harness, s in summary.items():
-        print(f"{harness:8} pass={s['passes']}/{s['runs']} median_wall={s['median_wall_s']:.0f}s "
-              f"uncached_in={display(s['uncached_input'], ',')} cache_ratio={display(s['cache_ratio'], '.3f')} "
-              f"out={display(s['output_tokens'], ',')} tool_calls(median)={s['median_tool_calls']} "
-              f"requests(median)={s['median_requests']} unrelated={s['unrelated_runs']} "
-              f"txn_leak={s['transaction_leak_runs']}")
+    for stratum, arms in {"all": summary["arms"], **summary["strata"]}.items():
+        for harness, s in arms.items():
+            print(f"{stratum:6} {harness:8} pass={s['passes']}/{s['runs']} median_wall={s['median_wall_s']:.3f}s "
+                  f"p90_wall={s['p90_wall_s']:.3f}s uncached_in={display(s['uncached_input'], ',')} "
+                  f"cache_ratio={display(s['cache_ratio'], '.3f')} out={display(s['output_tokens'], ',')} "
+                  f"requests(median)={display(s['median_logical_requests'])} "
+                  f"request_telemetry_complete={s['complete_request_telemetry_runs']}/{s['runs']} "
+                  f"unrelated={display(s['unrelated_runs'])} txn_leak={display(s['transaction_leak_runs'])} "
+                  f"artifact_leak={display(s['artifact_leak_runs'])}")
+    if errors:
+        print("INVALID EVIDENCE: " + "; ".join(errors))
     print()
     for r in rows:
         print(f"{r['harness']:8} {r['task']:14} r{r['rep']} {'PASS' if r['pass'] else 'FAIL'} "
@@ -555,6 +667,8 @@ def main():
     ap.add_argument("--model-store", help="existing public model catalog to pin for DaVinci")
     ap.add_argument("--baseline")
     ap.add_argument("--candidate")
+    ap.add_argument("--base-ref", help="declared PR target ref used to verify the actual parent merge-base")
+    ap.add_argument("--parent-for", help="candidate source SHA when running a parent control; requires --base-ref")
     args = ap.parse_args()
     if args.mode == "validate":
         large = json.loads(Path(args.large_manifest).read_text(encoding="utf-8")) if args.large_manifest else None
@@ -569,36 +683,48 @@ def main():
     elif args.mode == "compare":
         if not args.baseline or not args.candidate:
             ap.error("compare requires --baseline and --candidate")
-        sys.exit(compare(args.baseline, args.candidate))
+        sys.exit(compare(args.baseline, args.candidate, args.base_ref))
     else:
         if args.reps < 1 or args.rep_start < 0:
             ap.error("reps must be positive and rep-start nonnegative")
-        large = json.loads(Path(args.large_manifest).read_text(encoding="utf-8")) if args.large_manifest else None
-        tids = select_tasks(args.task_set, args.tasks, large)
-        fixtures = fixture_manifest(TASKS, tids)
-        settings = json.loads(Path(args.settings).read_text(encoding="utf-8")) if args.settings else BASE_SETTINGS
-        manifest = campaign_identity(RUNS, args.variant, fixtures, args.harness,
-                                     MODEL, EFFORT, settings, Path(HERE).parents[1])
-        repetitions = list(range(args.rep_start, args.rep_start + args.reps))
-        order = (schedule(tids, repetitions, args.harness, args.order_seed)
-                 if args.order == "counterbalanced" else
-                 [(h, t, r) for r in repetitions for t in tids for h in args.harness])
-        manifest.update(tasks=tids, repetitions=repetitions, harnesses=args.harness,
-                        order=args.order, order_seed=args.order_seed, schedule=order)
-        pinned_models = pin_model_store(args.model_store, MODEL) if args.model_store else None
-        if pinned_models:
-            manifest["identities"]["davinci"]["model_catalog_hash"] = digest(pinned_models)
-        create_campaign(RUNS, manifest)
-        Path(RUNS, "fixtures.json").write_text(json.dumps(fixtures, indent=2), encoding="utf-8")
-        if "davinci" in args.harness:
-            isolate_settings(agent_source(), Path(manifest["agent_dir"]), settings)
+        with campaign_lock(RUNS) as lock:
+            large = json.loads(Path(args.large_manifest).read_text(encoding="utf-8")) if args.large_manifest else None
+            tids = select_tasks(args.task_set, args.tasks, large)
+            frozen_errors = validate_fixture_manifest(tids, large) if large else []
+            if frozen_errors:
+                raise ValueError("; ".join(frozen_errors))
+            fixtures = fixture_manifest(TASKS, tids)
+            settings = json.loads(Path(args.settings).read_text(encoding="utf-8")) if args.settings else BASE_SETTINGS
+            manifest = campaign_identity(RUNS, args.variant, fixtures, args.harness,
+                                         MODEL, EFFORT, settings, Path(HERE).parents[1])
+            if args.parent_for:
+                if not args.base_ref or "davinci" not in args.harness:
+                    ap.error("--parent-for requires --base-ref and a DaVinci arm")
+                manifest["parent_control"] = parent_identity(Path(HERE).parents[1], args.parent_for,
+                    args.base_ref, manifest["identities"]["davinci"]["source_sha"])
+            repetitions = list(range(args.rep_start, args.rep_start + args.reps))
+            order = (schedule(tids, repetitions, args.harness, args.order_seed)
+                     if args.order == "counterbalanced" else
+                     [(h, t, r) for r in repetitions for t in tids for h in args.harness])
+            manifest["campaign_lock"] = lock
+            manifest.update(tasks=tids, repetitions=repetitions, harnesses=args.harness,
+                            order=args.order, order_seed=args.order_seed, schedule=order)
+            pinned_models = pin_model_store(args.model_store, MODEL) if args.model_store else None
             if pinned_models:
-                Path(manifest["agent_dir"], "models-store.json").write_text(
-                    json.dumps(pinned_models, indent=2), encoding="utf-8")
-        for harness, tid, rep in order:
-            if fixture_manifest(TASKS, tids)["fixture_hash"] != manifest["fixture_hash"]:
-                raise ValueError("fixture changed during campaign")
-            run_one(harness, tid, rep, manifest)
+                manifest["identities"]["davinci"]["model_catalog_hash"] = digest(pinned_models)
+            create_campaign(RUNS, manifest)
+            Path(RUNS, "fixtures.json").write_text(json.dumps(fixtures, indent=2), encoding="utf-8")
+            if "davinci" in args.harness:
+                isolate_settings(agent_source(), Path(manifest["agent_dir"]), settings)
+                if pinned_models:
+                    Path(manifest["agent_dir"], "models-store.json").write_text(
+                        json.dumps(pinned_models, indent=2), encoding="utf-8")
+            for harness, tid, rep in order:
+                if source_identity(Path(HERE).parents[1]) != manifest["runner_source"]:
+                    raise ValueError("runner source changed during campaign")
+                if fixture_manifest(TASKS, tids)["fixture_hash"] != manifest["fixture_hash"]:
+                    raise ValueError("fixture changed during campaign")
+                run_one(harness, tid, rep, manifest)
 
 
 if __name__ == "__main__":

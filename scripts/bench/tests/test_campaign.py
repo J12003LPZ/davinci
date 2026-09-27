@@ -16,13 +16,50 @@ def row(harness, rep=0):
             "harness": harness, "task": "t1-intervals", "rep": rep,
             "fixture_hash": "frozen", "model": "fixed", "effort_policy": "medium",
             "service_tier": "default", "exit": 0, "grader_pass": True,
-            "unrelated": [], "artifact_leak": False, "pass": True,
+            "unrelated": [], "artifact_leak": False, "transaction_leak": False,
+            "cleanup_complete": True, "pass": True,
             "grading_isolation": "diagnostic-only",
             "wall_s": 2.125, "binary_sha256": "binary-" + harness,
             "effective_settings": {"fixed": True}}
 
 
 class CampaignTests(unittest.TestCase):
+    def test_cluster_uncertainty_is_reproducible_and_does_not_treat_repetitions_as_tasks(self):
+        left = [dict(row("davinci", rep), task=task, wall_s=10)
+                for task in ("t1-intervals", "t2-duration") for rep in range(4)]
+        right = [dict(value, wall_s=5 if value["task"] == "t1-intervals" else 20) for value in left]
+        result = campaign.latency_uncertainty(left, right, samples=200)
+        self.assertEqual(result, campaign.latency_uncertainty(left, right, samples=200))
+        self.assertEqual(result["clusters"], 2)
+        self.assertTrue(result["ratio_of_medians"]["includes_no_change"])
+        self.assertEqual(result["ratio_of_medians"]["ci95"], [0.5, 2.0])
+        self.assertFalse(campaign.latency_uncertainty(left[:4], right[:4], samples=200)["available"])
+
+    def test_campaign_overlap_uses_full_envelope_and_requires_timestamps(self):
+        def timed(start, end):
+            return dict(row("davinci"), started_at=f"2026-09-27T{start}:00+00:00", finished_at=f"2026-09-27T{end}:00+00:00")
+        self.assertFalse(campaign.serial_campaigns([timed("01:00", "01:10"), timed("03:00", "03:10")],
+                                                   [timed("02:00", "02:10")]))
+        self.assertTrue(campaign.serial_campaigns([timed("01:00", "01:10")], [timed("02:00", "02:10")]))
+        self.assertIsNone(campaign.serial_campaigns([row("davinci")], [row("davinci")]))
+
+    def test_promotion_rules_fail_quality_latency_and_missing_telemetry_independently(self):
+        left = [dict(row("davinci", rep), task=task, wall_s=100, input_tokens=100, cached_tokens=90, output_tokens=10)
+                for task in ("t1-intervals", "m-fixture") for rep in range(2)]
+        right = [dict(value, wall_s=95, input_tokens=90, cached_tokens=70) for value in left]
+        right[0].update({"pass": False, "grader_pass": False})
+        report = campaign.promotion_gates(left, right, {}, {}, campaign.latency_uncertainty(left, right, samples=100),
+                                          {"verified": False})
+        self.assertFalse(report["accepted"])
+        rules = report["rules"]
+        for name in ("candidate_passes_at_least_parent", "every_correctness_regression_reviewed",
+                     "median_at_least_ten_percent_faster", "untouched_holdout", "independent_grading_boundary",
+                     "uncached_input_tokens_no_task_regression"):
+            self.assertEqual(rules[name]["status"], "fail", name)
+        self.assertEqual(rules["p90_regression_at_most_ten_percent"]["status"], "pass")
+        self.assertEqual(rules["logical_request_reduction"]["status"], "unavailable")
+        self.assertEqual(rules["two_independent_windows"]["status"], "unavailable")
+
     def test_paired_report_includes_uncached_input_and_gate_counts(self):
         left = dict(row("davinci"), input_tokens=100, cached_tokens=80,
                     gate_reminders={"verification_required": 2})
@@ -88,6 +125,7 @@ class CampaignTests(unittest.TestCase):
     def test_failed_completion_cannot_pass(self):
         for changes in ({"exit": 1}, {"exit": "timeout"},
                         {"unrelated": ["outside.py"]}, {"artifact_leak": True},
+                        {"transaction_leak": True}, {"cleanup_complete": False},
                         {"grader_pass": False}):
             with self.subTest(changes=changes):
                 self.assertTrue(campaign.integrity_errors(

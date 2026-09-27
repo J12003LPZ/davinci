@@ -1,114 +1,119 @@
-# DaVinci request-efficiency implementation — scoped final report
+# Request-efficiency evidence correction
 
-Status: **implementation, isolated grading support, two promotion windows, and
-the fresh holdout execution are complete; the feature branch is ready for a
-pull request.** Task 16 (installing or replacing the executable used by the
-owner) was not authorized and was not performed.
+Status: **prior promotion claims withdrawn; no promotion or parity is established.**
+The September 27 audit found invalid controls, missing task tooling, incorrect
+aggregation, and an incomplete grading boundary. The previous version of this
+report must not be used to approve defaults or infer a performance improvement.
 
-The implementation is on branch perf/request-efficiency. It adds an explicit
-grading-isolation contract to the benchmark runner, records the isolation and
-executable identity in every campaign row, and rejects incomplete or mixed
-campaign manifests. DaVinci promotion runs use the tested container boundary;
-Codex remains diagnostic-only because the Windows Codex executable cannot be
-placed inside the current Linux container. No raw prompts, hidden tests,
-solutions, transcripts, credentials, binaries, or the downloaded plan are in
-the repository.
+## Evidence available for this correction
 
-## Frozen configuration
+The repository contains benchmark source, frozen public fixture definitions,
+and historical prose reports. It does not contain the raw Windows campaign
+rows, transcripts, binary checkpoints, or boundary probe referenced by the
+previous FINAL. Their recorded paths under
+`C:\Users\sergi\davinci-bench-evidence\request-efficiency\` are not available in
+this checkout. No historical aggregate, corrected token total, confidence
+interval, or per-stratum denominator has been reconstructed from rounded prose.
 
-| Item | Candidate | Parent control |
+The prior candidate source identifiers and dirty-tree builds are not a usable
+clean committed source attribution. The audit also identified the control as
+an older ancestor rather than the PR's actual merge-base. Binary hashes written
+in a report do not repair those provenance defects. The old combined
+"Candidate" rows mixed DaVinci and Codex while "Parent" was DaVinci only; that
+headline comparison is withdrawn in full.
+
+The previous "Uncached input" column was total input. Exact replacement values
+require the original per-row total and cached counts. Those data are unavailable
+here, so this correction deliberately supplies no replacement numbers. The
+claim that DaVinci request telemetry was unavailable is also withdrawn: the audit
+found candidate request observations, while parent request counts were missing.
+Candidate observations cannot establish reduction against an uninstrumented
+parent.
+
+## Promotion-rule disposition
+
+The numerical findings below are **audit-reported historical observations**, not
+newly recomputed campaign results. They explain rejection; they are not repaired
+performance evidence.
+
+| Rule | Required | Disposition of prior claim |
 | --- | --- | --- |
-| Executable | C:\Users\sergi\davinci-bench-evidence\request-efficiency\checkpoints\f1-linux-promotion-20260927\davinci | C:\Users\sergi\davinci-bench-evidence\request-efficiency\checkpoints\parent-linux-boundary-20260927\davinci |
-| SHA-256 | 4d06f7dd7f5d31f6d5f2d3e387d32e1d3a95d0aa917b658cbee55f08ecff7de4 | 47138c4701b8a294c632cf3e78ce164ea7ae782dd25641036bf9ecfe56f0475c |
-| Version | 1.0.71 | 1.0.71 |
-| Source identity | f8e10d5f4bf46a012788c632ebd762563491e600 | eb542dd03ce034dbb8033a0d289baa2b78b8aa55 |
-| Dirty-tree identity | 121f753d6482e8f95ff8036e5569cd59ac5f9b985ae44d5eaec1d424a001b498 | clean |
-| DaVinci grading | container | container |
-| Codex grading | diagnostic-only | not run |
+| Rebuildable candidate and valid parent | Clean committed candidate; parent at actual merge-base | **Fail.** Dirty/unavailable candidate attribution and an older parent control invalidate code-effect attribution. |
+| Usable task verification | Python and pytest available to each measured arm | **Fail.** The audit found missing Python/pytest in the DaVinci container and no gate-reminder exercise across the reviewed promotion rows. |
+| Median improvement | At least 10% lower median against parent DaVinci | **Fail.** Audit-reported improvements were 6.9%, 0.6%, and 5.0% for the two windows and rerun labelled holdout. |
+| Tail latency | At most 10% p90 regression | **Fail.** The audit reported 14.1% worse p90 in window 1. |
+| Aggregate correctness | Candidate passes at least as many as parent | **Fail in window 1.** Audit-reported DaVinci passes were 73 versus 74. |
+| Regression review | Inspect every parent-pass/candidate-fail pair | **Fail.** The audit identified 11 uninspected discordances. Aggregate passes do not explain them. |
+| Request and continuation reduction | Comparable complete request telemetry | **Unavailable.** Parent request telemetry cannot establish the required reduction; candidate metrics must be shown when available. |
+| Token evidence | Real uncached and output tokens by task/stratum | **Invalidated.** Total input was mislabeled uncached; exact corrected totals require absent raw rows. |
+| Uncertainty | Paired analysis respecting task clustering | **Not established.** The old report omitted intervals; the audit says the reviewed bootstrap intervals included no change. No interval is invented here. |
+| Independent windows | Sequential campaigns without competing measurement load | **Fail.** The audit found parent and candidate campaigns overlapping. |
+| Independent hidden grading | No live writer at grading; grader/answers inaccessible to tools | **Fail.** Timed-out containers survived the Docker client, auth was readable, and public generators expose graders and solutions over the network. |
+| Untouched holdout | New withheld cases with a protected boundary | **Fail.** Fresh repetitions of the same public task families are not an untouched holdout. |
+| Legacy and larger-task coverage | Separate results, full denominators, scoped conclusions | **Unavailable here.** The mixed headline table obscured strata. Raw evidence is required for an exact corrected table. |
+| Native Windows confirmation | The platform evidence required by the plan | **Not performed in the claimed promotion evidence.** No current platform confirmation is claimed. |
 
-The frozen fixture manifest hash is
-d8d0ecb6776b76b995c17472da9bca1883bd569b69db16f70fbe0fe66aa1b4fe and the
-model catalog hash is
-66da5cf76d3fe2e700e7ec64770091c8f500d9cd681cd93b31082e2679ec9e06. The
-container image was rust:1.83-bookworm, resolved as
-sha256:a45bf1f5d9af0a23b26703b3500d70af1abff7f984a7abef5a104b42c02a292b.
-The independent boundary probe at
-C:\Users\sergi\davinci-bench-evidence\request-efficiency\boundary-check-20260927.json
-confirmed public-fixture-only read/write access, read-only agent and binary
-mounts, a read-only root, dropped capabilities, no-new-privileges, and bridge
-networking.
+A campaign completeness check verifies row membership and identity. It does not
+make any failed or unavailable promotion rule pass. No general DaVinci-versus-
+Codex advantage follows from these historical campaigns.
 
-## Campaign evidence
+## Harness corrections
 
-All promotion rows used the frozen 12-task manifest and 10 repetitions. The
-fresh holdout used the same frozen task families for three repetitions because
-the plan contains no separate holdout manifest; it is a fresh execution, not
-an independent task-family generalization claim.
+The current benchmark implementation makes the failure modes explicit:
 
-| Campaign | Rows | Pass | Fail | Median wall | P90 wall | Nonzero/timeout | Unrelated | Transaction | Artifact |
-| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| Candidate promotion window 1 | 240 | 144 | 96 | 50.161 s | 90.349 s | 2 | 0 | 0 | 0 |
-| Parent promotion window 1 | 120 | 74 | 46 | 66.618 s | 94.937 s | 3 | 0 | 0 | 0 |
-| Candidate promotion window 2 | 240 | 141 | 99 | 51.479 s | 93.670 s | 1 | 1 | 0 | 0 |
-| Parent promotion window 2 | 120 | 71 | 49 | 64.439 s | 102.538 s | 1 | 0 | 0 | 0 |
-| Candidate fresh holdout | 72 | 44 | 28 | 53.735 s | 84.753 s | 0 | 0 | 0 | 0 |
-| Parent fresh holdout | 36 | 23 | 13 | 66.937 s | 96.268 s | 0 | 0 | 0 | 0 |
+- The supplied Dockerfile includes Python, pytest, Git, Bash, certificates, and
+  ripgrep. Preflight executes task command names in each arm and the grader
+  before any live usage; versions are recorded.
+- Container runs use unique names and CID files. The runner removes the actual
+  container, verifies its absence, and reaps the client. Failed cleanup records
+  an ungraded failure and stops before grader injection or workspace inspection.
+- Artifact scanning is separate from transaction scanning and includes reserved
+  grader/credential/artifact paths and symlinks, including ignored files. Its
+  bounded filesystem scope is recorded; it is not a proof of no data access.
+- Public fixture generators and readable agent credentials explicitly make both
+  supported native and container arms diagnostic. Promotion eligibility is
+  false. There is no claim of an independently protected hidden-test boundary.
+- Live runs require clean committed source identities and source trees that
+  exist locally. A checkpoint build helper records before/after source identity
+  and copied binary bytes. Offline comparison verifies the real merge-base of
+  candidate and declared PR target.
+- A machine-level kernel lock excludes competing cooperating benchmark campaigns;
+  timestamp-envelope checks detect overlap in imported comparisons.
+- Summaries separate harnesses, legacy/large strata, and tasks. Uncached input is
+  computed from per-row total minus cached. Missing metrics and incomplete
+  telemetry keep explicit denominators; uninstrumented Jev usage is unavailable.
+- Paired all-run and both-successful results are separate. Deterministic
+  task-cluster bootstrap intervals and each promotion rule's pass/fail/unavailable
+  status are emitted. One paired diagnostic window cannot certify promotion.
+- Unit tests generate their own large fixtures in temporary directories. Tree
+  hashes use a declared portable relative POSIX path order. The algorithm tag
+  and affected public-tree hashes changed; fixture contents did not. Earlier
+  manifests remain attached to their historical evidence and are not rewritten.
 
-The candidate promotion-window harness breakdown was:
+Usage, exact metric definitions, boundary limits, and the new checkpoint format
+are documented in [the benchmark README](../../../scripts/bench/README.md).
 
-| Window | Harness | Pass | Median wall | P90 wall | Uncached input | Cache ratio | Output |
-| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| 1 | DaVinci | 73/120 | 62.005 s | 108.324 s | 13,189,394 | 90.03% | 289,549 |
-| 1 | Codex | 71/120 | 40.652 s | 76.362 s | 23,479,143 | 95.20% | 183,358 |
-| 2 | DaVinci | 75/120 | 64.074 s | 99.954 s | 13,474,286 | 90.44% | 290,991 |
-| 2 | Codex | 66/120 | 37.492 s | 71.531 s | 21,184,587 | 94.73% | 170,709 |
+## Current verification and limits
 
-DaVinci logical/provider request telemetry was unavailable in these frozen
-rows; it is reported as unavailable rather than inferred. Codex request
-telemetry was recorded. The holdout had DaVinci 23/36 and Codex 21/36 for the
-candidate, and DaVinci 23/36 for the parent; all holdout rows were clean on
-process exit and boundary-leak checks.
+The original clean-checkout run reproduced the audit failure: 64 tests passed
+and the large-fixture metadata test errored because ignored generated tasks
+were absent. The corrected offline benchmark suite passes 80 tests with its own
+temporary fixtures. These are deterministic harness regressions, not model
+performance measurements. Current runtime regression evidence belongs to the
+runtime fixes and must not be inferred from old checkpoint prose.
 
-## Discrepancy review
+Docker is not installed and pytest is not present in the available execution
+environment, so no Docker smoke test or public/hidden fixture execution was
+performed for this correction. The offline unit suite needs neither and tests
+preflight rejection, cleanup ordering/failure, independent leakage flags,
+provenance, lock exclusion, report partitioning, promotion-rule failures, and
+cluster uncertainty. No live or paid campaign, historical rerun, native Windows
+promotion campaign, installation, CI change, or release promotion was performed.
 
-- Window 1 retained candidate t6-bookings exit 137 and t1-intervals timeout,
-  plus parent t6-bookings exit 137, m2-public-api-migration timeout, and
-  m3-state-persistence exit 143. The interrupted parent m3 row was repeated
-  with identical settings; the recovery exited normally but still failed its
-  grader, so the original row was not removed.
-- Window 2 retained candidate and parent t6-bookings exit 137. Candidate
-  Codex t7-cli repetition 7 exited normally and passed its public grader but
-  reported the generated string Don't don't, WORD word... alpha! as an
-  unrelated change, so it remains a failed row. There were no transaction or
-  artifact leaks.
-- The historical same-campaign t5-csv A/B remains visible in
-  docs/perf/request-efficiency/B0-csv-ab.md: baseline 2027a2a5… passed 9/10
-  with one failed repetition, while B0 f48278e9… passed 10/10. Per the
-  requested rule, the baseline failure is recorded as model variance rather
-  than attributed to B0.
-
-These retained failures are why the report makes no general “DaVinci is ahead”
-claim. The protected hidden-grader boundary is verified for DaVinci container
-runs; Codex diagnostic rows are useful comparison evidence but are not an
-independently protected Codex acceptance result.
-
-## Validation performed
-
-- python -m unittest discover -s scripts/bench/tests -p test_*.py: 65 passed.
-- Legacy and large fixture validation: every broken start failed for the
-  intended reason and every reference fixture passed its public and hidden
-  checks.
-- Candidate promotion completeness gate: 240 unique pinned rows.
-- Candidate holdout completeness gate: 72 unique pinned rows.
-- Direct manifest validation: zero errors for both promotion windows and both
-  holdout directories.
-- Independent container boundary smoke test: passed.
-- Earlier affected Rust validation: davinci-agent 1,100 passed;
-  davinci-ai 284 passed and 1 ignored; davinci-coding-agent 1,248 passed
-  and 16 ignored; release build passed.
-- git diff --check: passed. The repository-wide Rust format check remains
-  non-green because of pre-existing unrelated formatting differences.
-
-Raw campaign output and aggregate files remain outside git under
-C:\Users\sergi\davinci-bench-evidence\request-efficiency\campaigns.
-Hosted CI failures were ignored as requested.
+Historical [F1](F1.md), [P1](P1.md), and [L1](L1.md) are retained as historical
+records, with their acceptance claims superseded by this correction. In
+particular, prose that earlier described persistence, EOF behavior, empty-edit
+rejection, or family reachability as already verified is not evidence for the
+current implementation. Newly fixed behavior must be supported by current
+deterministic tests, and any later performance decision needs fresh, valid
+measurement evidence.

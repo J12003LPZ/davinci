@@ -3,6 +3,8 @@ import importlib.util
 import json
 from pathlib import Path
 import unittest
+import tempfile
+from unittest.mock import patch
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -12,6 +14,14 @@ SPEC.loader.exec_module(generator)
 
 
 class LargeFixtureTests(unittest.TestCase):
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary.cleanup)
+        self.task_root = Path(self.temporary.name) / "tasks"
+        with patch.object(generator, "TASK_ROOT", self.task_root):
+            for spec in generator.TASK_SPECS:
+                generator.write_task(spec)
+
     def test_manifest_is_explicit_and_matches_task_metadata(self):
         manifest = json.loads((ROOT / "large_manifest.json").read_text(encoding="utf-8"))
         self.assertEqual(manifest["task_set"], "large")
@@ -20,7 +30,7 @@ class LargeFixtureTests(unittest.TestCase):
             "m3-state-persistence", "m4-cli-feature",
         ])
         for task in manifest["tasks"]:
-            directory = ROOT / "tasks" / task
+            directory = self.task_root / task
             metadata = json.loads((directory / "task.json").read_text(encoding="utf-8"))
             entry = manifest["fixtures"][task]
             self.assertEqual(metadata["allowed"], entry["allowed"])

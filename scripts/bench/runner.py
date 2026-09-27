@@ -10,9 +10,14 @@ import hashlib
 import platform
 import re
 import sys
+import uuid
+import tempfile
+from contextlib import contextmanager
 from datetime import datetime, timezone
 
 from campaign import LEGACY_TASKS, digest, file_hash
+
+CLEAN_DIFF_HASH = hashlib.sha256(b"").hexdigest()
 
 BASE_SETTINGS = {"decisionIntelligence": {"enabled": False},
     "compaction": {"enabled": True, "reserveTokens": 16384, "keepRecentTokens": 20000},
@@ -84,14 +89,50 @@ def _mount(source, target, read_only=False):
 
 
 def _container_version(engine, image, binary):
-    command = [engine, "run", "--rm", "--network", "none", "--read-only",
+    command = [engine, "run", "--name", "davinci-bench-" + uuid.uuid4().hex,
+               "--network", "none", "--read-only",
                "--tmpfs", "/tmp", "--cap-drop=ALL",
                "--security-opt=no-new-privileges", "--mount", _mount(binary, "/opt/harness", True),
                image, "/opt/harness", "--version"]
-    result = subprocess.run(command, capture_output=True, text=True, timeout=30)
-    if result.returncode != 0:
+    result = execute(command, Path.cwd(), os.environ, 30)
+    if result["exit"] != 0 or not result["cleanup_complete"]:
         raise ValueError("container executable version check failed")
-    return result.stdout.strip()
+    return result["stdout"].strip()
+
+
+def tooling_preflight(engine=None, image=None):
+    """Exercise the exact command names used by fixtures before any model call."""
+    script = ("command -v python python3 pytest git bash >/dev/null; "
+              "python -c 'import sys, pytest; print(sys.version); print(pytest.__version__)'; "
+              "python -m pytest --version; python3 -m pytest --version; "
+              "pytest --version; git --version")
+    command = ["bash", "-ec", script]
+    if engine:
+        command = [engine, "run", "--name", "davinci-bench-" + uuid.uuid4().hex,
+                   "--network", "none", "--read-only", "--tmpfs", "/tmp",
+                   "--cap-drop=ALL", "--security-opt=no-new-privileges", image, *command]
+    elif os.name == "nt":
+        # Windows native arms use the executable search path, not Bash emulation.
+        versions = []
+        for args in (["python", "-c", "import sys, pytest; print(sys.version); print(pytest.__version__)"],
+                     ["python", "-m", "pytest", "--version"], ["pytest", "--version"], ["git", "--version"]):
+            result = subprocess.run(args, capture_output=True, text=True, timeout=30)
+            if result.returncode:
+                raise ValueError("benchmark prerequisite failed: " + args[0])
+            versions.append(result.stdout.strip())
+        return {"available": True, "versions": versions}
+    result = execute(command, Path.cwd(), os.environ, 30)
+    if result["exit"] != 0 or not result["cleanup_complete"]:
+        raise ValueError("benchmark prerequisites missing: python, python3, pytest, git and bash are required")
+    return {"available": True, "versions": result["stdout"].strip().splitlines()}
+
+
+def grader_preflight():
+    result = subprocess.run([sys.executable, "-m", "pytest", "--version"],
+                            capture_output=True, text=True, timeout=30)
+    if result.returncode:
+        raise ValueError("the benchmark grader's Python must have pytest installed")
+    return {"python": sys.version, "pytest": result.stdout.strip()}
 
 
 def stop_reason(stdout, stderr):
@@ -165,18 +206,15 @@ def source_identity(root):
     def git_bytes(*args):
         return subprocess.run(["git", *args], cwd=root, capture_output=True, check=True).stdout
     sha = git_bytes("rev-parse", "HEAD").decode().strip()
-    dirty = hashlib.sha256(git_bytes("diff", "HEAD", "--binary"))
-    # Include new implementation files that are not in git diff yet. Never scan
-    # owner configuration or credential directories.
-    paths = git_bytes("ls-files", "--others", "--exclude-standard", "-z", "--", "crates", "scripts/bench")
-    for name in sorted(paths.decode("utf-8").split("\0")):
-        if name:
-            dirty.update(name.encode())
-            dirty.update(file_hash(Path(root) / name).encode())
-    return {"source_sha": sha, "dirty_diff_hash": dirty.hexdigest()}
+    # Refuse dirty inputs instead of certifying a digest that cannot be rebuilt.
+    if git_bytes("status", "--porcelain=v1", "--untracked-files=all"):
+        raise ValueError("benchmark source must be a clean committed checkout")
+    tree = git_bytes("rev-parse", "HEAD^{tree}").decode().strip()
+    return {"source_sha": sha, "source_tree": tree, "source_clean": True,
+            "dirty_diff_hash": CLEAN_DIFF_HASH}
 
 
-def checkpoint_identity(executable):
+def checkpoint_identity(executable, repo):
     """Read build provenance bound to copied bytes; never infer it from current HEAD."""
     executable = Path(executable)
     sidecar = executable.with_suffix(executable.suffix + ".identity.json")
@@ -184,42 +222,90 @@ def checkpoint_identity(executable):
         identity = json.loads(sidecar.read_text(encoding="utf-8"))
     except (OSError, ValueError) as error:
         raise ValueError("missing or invalid checkpoint identity sidecar") from error
-    if not isinstance(identity, dict) or identity.get("schema_version") != 1:
-        raise ValueError("unsupported checkpoint identity")
-    for field, length in (("binary_sha256", 64), ("source_sha", 40), ("dirty_diff_hash", 64)):
+    if not isinstance(identity, dict) or identity.get("schema_version") != 2:
+        raise ValueError("checkpoint requires schema 2 clean committed build provenance")
+    for field, length in (("binary_sha256", 64), ("source_sha", 40), ("source_tree", 40), ("dirty_diff_hash", 64)):
         value = identity.get(field)
-        # A clean parent build has no diff bytes to hash. Preserve that
-        # recorded null instead of inventing a digest merely to satisfy the
-        # sidecar format; candidate builds still require their real digest.
-        if field == "dirty_diff_hash" and value is None:
-            continue
         if not isinstance(value, str) or re.fullmatch("[0-9a-f]{" + str(length) + "}", value) is None:
             raise ValueError("invalid checkpoint " + field)
     if identity["binary_sha256"] != file_hash(executable):
         raise ValueError("checkpoint binary changed after provenance was recorded")
-    return {field: identity[field] for field in ("source_sha", "dirty_diff_hash")}
+    if identity.get("source_clean") is not True or identity["dirty_diff_hash"] != CLEAN_DIFF_HASH:
+        raise ValueError("checkpoint was not built from clean committed source")
+    result = subprocess.run(["git", "rev-parse", "--verify", identity["source_sha"] + "^{tree}"],
+                            cwd=repo, capture_output=True, text=True)
+    if result.returncode or result.stdout.strip() != identity["source_tree"]:
+        raise ValueError("checkpoint source commit/tree is unavailable or mismatched")
+    return {field: identity[field] for field in
+            ("source_sha", "source_tree", "source_clean", "dirty_diff_hash")}
+
+
+def parent_identity(repo, candidate_sha, base_ref, parent_sha):
+    """Resolve the actual merge-base, never a supplied old ancestor as control."""
+    def resolve(ref):
+        result = subprocess.run(["git", "rev-parse", "--verify", "--end-of-options", ref + "^{commit}"],
+                                cwd=repo, capture_output=True, text=True)
+        if result.returncode:
+            raise ValueError("comparison revision is unavailable")
+        return result.stdout.strip()
+    candidate, base, parent = map(resolve, (candidate_sha, base_ref, parent_sha))
+    result = subprocess.run(["git", "merge-base", "--all", candidate, base],
+                            cwd=repo, capture_output=True, text=True)
+    merges = result.stdout.splitlines()
+    if result.returncode or len(merges) != 1 or merges[0] != parent:
+        raise ValueError("parent checkpoint must be the candidate's actual merge-base with the declared base")
+    return {"candidate_source_sha": candidate, "base_source_sha": base, "merge_base_sha": parent}
+
+
+def build_checkpoint(repo, destination):
+    """Build and freeze bytes with before/after source identity, without model calls."""
+    repo, destination = Path(repo).resolve(), Path(destination).resolve()
+    if destination.is_relative_to(repo) or destination.exists():
+        raise ValueError("checkpoint destination must be new and outside the repository")
+    before = source_identity(repo)
+    with tempfile.TemporaryDirectory(prefix="davinci-bench-build-") as target:
+        build = ["cargo", "build", "--locked", "--release", "-p", "davinci-coding-agent", "--bin", "davinci",
+                 "--target-dir", target]
+        subprocess.run(build, cwd=repo, check=True)
+        if source_identity(repo) != before:
+            raise ValueError("source changed during checkpoint build")
+        built = Path(target) / "release" / ("davinci.exe" if os.name == "nt" else "davinci")
+        destination.mkdir(parents=True, exist_ok=False)
+        binary = destination / built.name
+        shutil.copy2(built, binary)
+        identity = {"schema_version": 2, **before, "binary_sha256": file_hash(binary),
+                    "build_command": build[:-1] + ["<temporary-target>"],
+                    "built_at": datetime.now(timezone.utc).isoformat()}
+        binary.with_suffix(binary.suffix + ".identity.json").write_text(
+            json.dumps(identity, indent=2) + "\n", encoding="utf-8")
+    return binary
 
 
 def campaign_identity(root, variant, fixtures, harnesses, model, effort, settings, repo):
     """Pin executable bytes and configuration before any timed subprocess."""
-    executables, identities, containers, isolations = {}, {}, {}, {}
+    executables, identities, containers, isolations, tooling = {}, {}, {}, {}, {}
     source = source_identity(repo)
+    grader = grader_preflight()
     for harness in harnesses:
         isolation = grading_isolation(harness)
         isolations[harness] = isolation
         if isolation == "container":
+            if harness != "davinci":
+                raise ValueError("Codex container auth and telemetry are not configured; use diagnostic-only")
             engine = _container_engine()
             image = _container_image()
             image_id = _container_image_id(engine, image)
             network = os.environ.get("BENCH_CONTAINER_NETWORK", "bridge")
-            if network not in ("none", "bridge", "host"):
+            if network not in ("none", "bridge"):
                 raise ValueError("unsupported container network")
             executable = _container_binary(harness)
-            version = _container_version(engine, image, executable)
+            tooling[harness] = tooling_preflight(engine, image_id)
+            version = _container_version(engine, image_id, executable)
             containers[harness] = {"image": image, "image_id": image_id,
                                    "network": network,
                                    "binary_target": "/opt/harness"}
         else:
+            tooling[harness] = tooling_preflight()
             selected = os.environ.get("BENCH_" + harness.upper(), harness)
             found = shutil.which(selected)
             if found is None:
@@ -232,8 +318,11 @@ def campaign_identity(root, variant, fixtures, harnesses, model, effort, setting
         executables[harness] = executable
         identities[harness] = {
             "binary_sha256": file_hash(executable), "version": version,
-            **(checkpoint_identity(executable) if harness == "davinci" else {"source_sha": None, "dirty_diff_hash": None}),
+            **(checkpoint_identity(executable, repo) if harness == "davinci" else {"source_sha": None, "dirty_diff_hash": None}),
             "grading_isolation": isolation,
+            "grading_assurance": "diagnostic-only",
+            "credential_exposure": "readable-by-agent-process-and-tools",
+            "fixture_secrecy": "public-generators-contain-graders-and-solutions",
             "effective_settings": settings if harness == "davinci" else {
                 "ignore_user_config": True, "effort": effort, "service_tier": service_tier(),
                 "telemetry": "local-sanitized-otlp-logs-and-traces"}}
@@ -244,11 +333,13 @@ def campaign_identity(root, variant, fixtures, harnesses, model, effort, setting
             "grading_isolation": isolations, "containers": containers,
             "agent_dir": str((Path(root) / "_agent").resolve()),
             "os": platform.platform(), "cpu": platform.processor(), "python": sys.version,
-            "runner_source": source, "resolved_model_identity": None}
+            "tooling_preflight": tooling, "grader_preflight": grader,
+            "host": platform.node(), "runner_source": source, "resolved_model_identity": None,
+            "promotion_eligible": False}
 
 
 def container_command(command, workdir, env, campaign, harness):
-    """Run one harness with only the public worktree and copied agent mounted."""
+    """Limit host mounts. This is NOT a secret boundary from the agent's tools."""
     if campaign.get("grading_isolation", {}).get(harness) != "container":
         return command
     config = campaign.get("containers", {}).get(harness)
@@ -279,22 +370,62 @@ def container_command(command, workdir, env, campaign, harness):
         if value is not None:
             child_env.extend(["-e", key + "=" + str(value)])
     network = config.get("network", "bridge")
-    if network not in ("none", "bridge", "host"):
+    if network not in ("none", "bridge"):
         raise ValueError("unsupported container network")
     executable_args = list(command[1:])
-    return [engine, "run", "--rm", "--workdir", "/workspace", "--network", network,
+    return [engine, "run", "--name", "davinci-bench-" + uuid.uuid4().hex,
+            "--cidfile", str(workdir) + ".cid", "--workdir", "/workspace", "--network", network,
             "--read-only", "--tmpfs", "/tmp", "--tmpfs", "/root",
             "--cap-drop=ALL", "--security-opt=no-new-privileges",
             "--mount", _mount(workdir, "/workspace"),
             "--mount", _mount(agent_dir, "/agent", True),
             "--mount", _mount(binary, "/opt/harness", True),
-            *child_env, image, "/opt/harness", *executable_args]
+            *child_env, image_id, "/opt/harness", *executable_args]
+
+
+def _container_target(command):
+    if len(command) > 3 and command[1] == "run" and "--name" in command:
+        name = command[command.index("--name") + 1]
+        if name.startswith("davinci-bench-"):
+            return command[0], name
+    return None
+
+
+def _remove_container(target):
+    """Kill the actual container and confirm absence, including detached children."""
+    if target is None:
+        return True
+    engine, name = target
+    try:
+        subprocess.run([engine, "rm", "--force", name], capture_output=True, timeout=30)
+        inspected = subprocess.run([engine, "container", "inspect", name],
+                                   capture_output=True, text=True, timeout=10)
+        # An unreachable daemon is not evidence that the container is gone.
+        return (inspected.returncode != 0 and
+                "no such container" in inspected.stderr.lower())
+    except (OSError, subprocess.SubprocessError):
+        return False
+
+
+def _kill_process(process):
+    if os.name == "nt":
+        subprocess.run(["taskkill", "/PID", str(process.pid), "/T", "/F"],
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=10)
+    else:
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+    if process.poll() is None:
+        process.kill()
 
 
 def execute(command, workdir, env, timeout):
-    """Time launch through process exit; terminate descendants on timeout."""
+    """Measure until the child is reaped and any named container is removed."""
     started_at = datetime.now(timezone.utc).isoformat()
     started = time.perf_counter()
+    target = _container_target(command)
+    cleanup_complete = True
     try:
         process = subprocess.Popen(command, cwd=workdir, env=env,
             stdout=subprocess.PIPE, stderr=subprocess.PIPE,
@@ -302,22 +433,36 @@ def execute(command, workdir, env, timeout):
             start_new_session=os.name != "nt")
     except OSError as error:
         return {"exit": "launch_error", "stdout": "", "stderr": type(error).__name__,
+                "cleanup_complete": _remove_container(target),
                 "wall_s": time.perf_counter() - started, "started_at": started_at,
                 "finished_at": datetime.now(timezone.utc).isoformat()}
     try:
-        stdout, stderr = process.communicate(timeout=timeout)
-        code = process.returncode
-    except subprocess.TimeoutExpired:
-        if os.name == "nt":
-            subprocess.run(["taskkill", "/PID", str(process.pid), "/T", "/F"],
-                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=10)
+        try:
+            stdout, stderr = process.communicate(timeout=timeout)
+            code = process.returncode
+        except subprocess.TimeoutExpired:
+            # Removing docker's client process alone leaves the container alive.
+            cleanup_complete = _remove_container(target)
+            _kill_process(process)
+            stdout, stderr = process.communicate(timeout=10)
+            # The client can still be submitting a create request during the
+            # first removal. Check again after reaping it, before any grading.
+            cleanup_complete = _remove_container(target)
+            if target and "--cidfile" in command:
+                cidfile = Path(command[command.index("--cidfile") + 1])
+                if not cidfile.is_file() or not cidfile.read_text(encoding="utf-8").strip():
+                    # A create still pending in the daemon cannot be ruled out.
+                    cleanup_complete = False
+            code = "timeout"
         else:
-            os.killpg(process.pid, signal.SIGKILL)
-        if process.poll() is None:
-            process.kill()
-        stdout, stderr = process.communicate(timeout=10)
-        code = "timeout"
+            cleanup_complete = _remove_container(target)
+    except BaseException:
+        _remove_container(target)
+        _kill_process(process)
+        process.communicate(timeout=10)
+        raise
     return {"exit": code, "stdout": stdout, "stderr": stderr,
+            "cleanup_complete": cleanup_complete,
             "wall_s": time.perf_counter() - started, "started_at": started_at,
             "finished_at": datetime.now(timezone.utc).isoformat()}
 
@@ -325,24 +470,69 @@ def execute(command, workdir, env, timeout):
 def create_campaign(root, manifest):
     """Exclusive creation prevents appending new variants to historical rows."""
     root = Path(root)
-    root.mkdir(parents=True, exist_ok=False)
+    root.mkdir(parents=True, exist_ok=False, mode=0o700)
     (root / "campaign.json").write_text(
         json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
 
 
 def isolate_settings(source, target, settings):
-    """Copy credentials privately, never include their contents or hash in reports."""
+    """Restrict host permissions; tools in the same agent remain able to read auth."""
     source, target = Path(source), Path(target)
     auth = source / "auth.json"
     if not auth.is_file():
         raise ValueError("credential file is unavailable in the selected agent directory")
     if auth.is_symlink():
         raise ValueError("linked credential files require an explicit resolved source")
-    target.mkdir(parents=True, exist_ok=False)
+    target.mkdir(parents=True, exist_ok=False, mode=0o700)
     shutil.copyfile(auth, target / "auth.json")
+    (target / "auth.json").chmod(0o600)
     (target / "settings.json").write_text(
         json.dumps(settings, indent=2) + "\n", encoding="utf-8")
     return {"directory": str(target.resolve()), "settings": settings}
+
+
+@contextmanager
+def campaign_lock(campaign):
+    """One cooperative live campaign per machine, across checkouts and accounts.
+
+    Kernel ownership releases on crash. Keep the lock inode: unlinking it would
+    allow two processes to lock different files with the same name.
+    """
+    system_temp = (Path(os.environ.get("SystemRoot", r"C:\Windows")) / "Temp"
+                   if os.name == "nt" else Path("/tmp"))
+    path = system_temp / "davinci-benchmark-campaign.lock"
+    flags = os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(path, flags, 0o600)
+    except OSError as error:
+        raise RuntimeError("cannot acquire the machine benchmark campaign lock") from error
+    with os.fdopen(descriptor, "r+") as lock:
+        try:
+            if os.name == "nt":
+                import msvcrt
+                if path.stat().st_size == 0:
+                    lock.write(" ")
+                    lock.flush()
+                lock.seek(0)
+                msvcrt.locking(lock.fileno(), msvcrt.LK_NBLCK, 1)
+            else:
+                import fcntl
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError as error:
+            raise RuntimeError("another benchmark campaign is active on this machine") from error
+        lock.seek(0)
+        lock.truncate()
+        json.dump({"pid": os.getpid(), "campaign": str(Path(campaign).resolve()),
+                   "started_at": datetime.now(timezone.utc).isoformat()}, lock)
+        lock.flush()
+        try:
+            yield {"scope": "machine", "mechanism": "kernel-file-lock"}
+        finally:
+            if os.name == "nt":
+                lock.seek(0)
+                msvcrt.locking(lock.fileno(), msvcrt.LK_UNLCK, 1)
+            else:
+                fcntl.flock(lock, fcntl.LOCK_UN)
 
 
 def controlled_environment(inherited, agent_dir):
@@ -381,6 +571,8 @@ def validate_large_manifest(manifest):
         raise ValueError("invalid large fixture manifest")
     if manifest.get("task_set") != "large":
         raise ValueError("large fixture manifest has the wrong task set")
+    if manifest.get("hash_order") != "relative-posix-codepoint-v1":
+        raise ValueError("large manifest needs the portable relative-posix-codepoint-v1 hash order; regenerate before a new campaign")
     tasks = manifest.get("tasks")
     if (not isinstance(tasks, list) or not tasks
             or any(not isinstance(task, str) or Path(task).name != task
@@ -408,3 +600,12 @@ def validate_large_manifest(manifest):
         if not isinstance(entry.get("public_verification"), str) or not entry["public_verification"].strip():
             raise ValueError("missing public verification: " + task)
     return True
+
+
+if __name__ == "__main__":
+    import argparse
+    parser = argparse.ArgumentParser(description="Build an immutable clean-source DaVinci checkpoint (no model calls)")
+    parser.add_argument("--repo", required=True)
+    parser.add_argument("--output", required=True)
+    arguments = parser.parse_args()
+    print(build_checkpoint(arguments.repo, arguments.output))
