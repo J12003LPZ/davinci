@@ -65,8 +65,14 @@ The current benchmark implementation makes the failure modes explicit:
   ripgrep. Preflight executes task command names in each arm and the grader
   before any live usage; versions are recorded.
 - Container runs use unique names and CID files. The runner removes the actual
-  container, verifies its absence, and reaps the client. Failed cleanup records
-  an ungraded failure and stops before grader injection or workspace inspection.
+  container, verifies its absence, and reaps the client. Missing creation
+  identity after any abnormal client exit is unproven cleanup. Failed cleanup
+  records an ungraded failure and stops before grader injection or inspection.
+- Native execution requires a Linux child subreaper with a matching process
+  namespace view. It terminates and reaps owned descendants, including detached
+  children, before allowing grading. Unsupported hosts refuse before launch.
+  Windows and macOS native execution remain unavailable until an equivalent
+  lifetime owner is implemented.
 - Artifact scanning is separate from transaction scanning and includes reserved
   grader/credential/artifact paths and symlinks, including ignored files. Its
   bounded filesystem scope is recorded; it is not a proof of no data access.
@@ -77,8 +83,9 @@ The current benchmark implementation makes the failure modes explicit:
   exist locally. A checkpoint build helper records before/after source identity
   and copied binary bytes. Offline comparison verifies the real merge-base of
   candidate and declared PR target.
-- A machine-level kernel lock excludes competing cooperating benchmark campaigns;
-  timestamp-envelope checks detect overlap in imported comparisons.
+- A machine-level kernel lock and durable launch-intent marker exclude competing
+  cooperating campaigns, including after coordinator death with unproven cleanup.
+  Imported comparisons check timestamp envelopes across every arm, including Codex.
 - Summaries separate harnesses, legacy/large strata, and tasks. Uncached input is
   computed from per-row total minus cached. Missing metrics and incomplete
   telemetry keep explicit denominators; uninstrumented Jev usage is unavailable.
@@ -99,8 +106,9 @@ are documented in [the benchmark README](../../../scripts/bench/README.md).
 
 The original clean-checkout run reproduced the audit failure: 64 tests passed
 and the large-fixture metadata test errored because ignored generated tasks
-were absent. The corrected offline benchmark suite passes 81 tests with its own
-temporary fixtures. These are deterministic harness regressions, not model
+were absent. The final corrected offline benchmark suite runs 96 tests: 93
+pass and 3 native-process execution tests are skipped on this host. Tests create
+their own temporary fixtures. These are deterministic harness regressions, not model
 performance measurements. Current runtime regression evidence belongs to the
 runtime fixes and must not be inferred from old checkpoint prose.
 
@@ -109,7 +117,12 @@ All 12 broken starting fixtures fail their hidden grader, all 12 reference
 solutions pass it, and the reference workspaces pass 107 combined public and
 hidden tests. This is host-side offline fixture validation, not a measured model
 campaign or proof of a protected grading boundary. Docker is not installed, so
-no Docker smoke test was performed. The offline unit suite tests
+no Docker smoke test was performed. This host also exposes different process IDs
+to Python and `/proc`; the native owner therefore refuses execution. The three
+skips require actual matching-namespace process ownership. The real refusal and
+crash-lock regressions pass, while deterministic supervisor tests cover scoped
+child cleanup; no live containment success is claimed on this host.
+The offline unit suite tests
 preflight rejection, cleanup ordering/failure, independent leakage flags,
 provenance, lock exclusion, report partitioning, promotion-rule failures, and
 cluster uncertainty. No live or paid campaign, historical rerun, native Windows
