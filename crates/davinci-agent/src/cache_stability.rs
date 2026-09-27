@@ -241,6 +241,7 @@ mod tests {
                     ),
                 };
                 Ok(AssistantMessage {
+                    extra: Default::default(),
                     id: format!("a{step}"),
                     role: "assistant".into(),
                     content,

@@ -1533,6 +1533,7 @@ fn f01_noninteractive_fail_closed() {
                 calls += 1;
                 assert_eq!(calls, 1, "unresolved approval must stop further provider calls");
                 Ok(AssistantMessage {
+                    extra: Default::default(),
                     id: "fixture".into(), role: "assistant".into(),
                     content: vec![ContentBlock::ToolCall {
                         id: "write-1".into(), name: "write".into(),
@@ -3068,6 +3069,7 @@ fn bare_logout_without_stored_credentials_matches_ts() {
 #[test]
 fn print_mode_exits_nonzero_on_assistant_error() {
     let message = AssistantMessage {
+        extra: Default::default(),
         id: "m1".into(),
         role: "assistant".into(),
         content: vec![],
@@ -3088,6 +3090,7 @@ fn print_mode_exits_nonzero_on_assistant_error() {
         (1, Some("provider failure".into()))
     );
     let aborted = AssistantMessage {
+        extra: Default::default(),
         id: "m2".into(),
         role: "assistant".into(),
         content: vec![],
@@ -3110,8 +3113,24 @@ fn print_mode_exits_nonzero_on_assistant_error() {
 }
 
 #[test]
+fn print_mode_exits_nonzero_on_output_limit() {
+    let message: AssistantMessage = serde_json::from_value(serde_json::json!({
+        "id":"limited","role":"assistant","model":"fixture","content":[],"stopReason":"length"
+    })).unwrap();
+    let events = vec![AgentEvent::MessageUpdate {
+        message: std::sync::Arc::new(davinci_ai::ChatMessage::text("assistant", "")),
+        assistant_message_event: davinci_ai::AssistantMessageEvent::Done {
+            reason: StopReason::Length,
+            message,
+        },
+    }];
+    assert_eq!(print_text_exit(&events), (1, Some("Request reached the output token limit".into())));
+}
+
+#[test]
 fn print_json_event_strips_partial_and_adds_toolcall_ids() {
     let message = AssistantMessage {
+        extra: Default::default(),
         id: "m1".into(),
         role: "assistant".into(),
         content: vec![ContentBlock::ToolCall {
@@ -3143,6 +3162,7 @@ fn print_json_event_strips_partial_and_adds_toolcall_ids() {
 fn print_json_fast_path_matches_full_serialization_minus_partial() {
     use davinci_ai::AssistantMessageEvent as Ev;
     let partial = std::sync::Arc::new(AssistantMessage {
+        extra: Default::default(),
         id: "m1".into(),
         role: "assistant".into(),
         content: vec![ContentBlock::Text { text: "big".into() }],
@@ -3282,7 +3302,10 @@ fn prompt_profile_rollback_test() {
     let preview_agent = build_agent(&preview_args, &session_dir, &cwd).unwrap();
     let preview_manifest = preview_agent.prompt_manifest.as_ref().unwrap();
     assert_eq!(preview_manifest.profile, "preview");
-    assert_eq!(preview_manifest.profile_version, 3);
+    assert_eq!(
+        preview_manifest.profile_version,
+        davinci_agent::prompt::PREVIEW_PROMPT_VERSION
+    );
 
     let rollback_args = Args {
         prompt_profile: Some(davinci_agent::PromptProfile::LegacyV1),
@@ -3299,7 +3322,7 @@ fn prompt_profile_rollback_test() {
     );
 
     let status_preview = format_session_status(&preview_args, &preview_agent);
-    assert!(status_preview.contains("prompt: preview v3"));
+    assert!(status_preview.contains("prompt: preview v4"));
 
     let status_rollback = format_session_status(&rollback_args, &rollback_agent);
     assert!(status_rollback.contains("prompt: legacy-v1 v1"));
@@ -3430,4 +3453,86 @@ fn plugin_session_start_contexts_are_replaced_not_accumulated() {
         .map(|file| file.path.to_string_lossy().into_owned())
         .collect::<Vec<_>>();
     assert_eq!(paths, vec!["AGENTS.md".to_string()]);
+}
+
+#[test]
+fn print_verification_notice_is_a_separate_event_and_not_a_provider_error() {
+    let notice = AgentEvent::VerificationNotice {
+        status: davinci_agent::CompletionEvidence::Unverified,
+        generation: 1,
+        text: "Verification is incomplete".into(),
+    };
+    let event = to_json_print_event(&notice).unwrap();
+    assert_eq!(event["type"], "verification_notice");
+    assert_eq!(event["text"], "Verification is incomplete");
+    assert!(event.get("message").is_none());
+    assert_eq!(print_text_exit(&[notice]), (0, None));
+}
+
+#[test]
+fn provider_schema_budget_tracks_discovery_without_changing_request_one() {
+    use davinci_agent::runtime::{
+        context_vm::ContextVmMode, AgentId, CapabilitySource, RunId, RuntimeBus,
+        RuntimeCapability, RuntimeHandle,
+    };
+    let mut agent = Agent::new("schema budget fixture");
+    agent.tool_surface = davinci_agent::ToolSurface::Lean;
+    agent.turn_context_placement_override =
+        Some(davinci_agent::turn_context::TurnContextPlacement::Appended);
+    let runtime = RuntimeHandle::new(RunId::new(), AgentId::new(), RuntimeBus::new());
+    runtime.capability_registry.register(
+        RuntimeCapability::new(
+            "large_specialist",
+            CapabilitySource::Mcp,
+            davinci_agent::ToolClass::Read,
+            true,
+            &serde_json::json!({"type":"object", "description":"x".repeat(64_000)}),
+            None,
+        )
+        .with_family("fixture"),
+    );
+    agent.set_runtime(runtime);
+    agent.apply_extension_tools(&["large_specialist".into()]);
+    agent.freeze_tools_for_cache();
+    agent.set_context_vm_mode(ContextVmMode::Active);
+    agent.set_provider_output_limit(Some(1024));
+    agent.prompt("Inspect the public file");
+
+    let initial_schemas = provider_tools(&agent);
+    let initial_overhead = serde_json::to_vec(&initial_schemas).unwrap().len() as u64 + 128;
+    agent.set_provider_context_overhead_estimator(provider_tool_overhead_tokens);
+    assert_eq!(agent.provider_context_budget().tools, initial_overhead);
+    assert_eq!(provider_tools(&agent), initial_schemas);
+    agent.context_window = agent.provider_context_budget().reserved() + 16_000;
+    assert!(agent.prepared_context_image().is_ok());
+
+    let result = davinci_agent::execute_tool_with(
+        &agent.cwd,
+        "tool_search",
+        &serde_json::json!({"mode":"family", "query":"fixture"}),
+        &agent.tool_context,
+    )
+    .unwrap();
+    assert!(!result.is_error, "{}", result.content);
+    assert!(agent.is_tool_visible("large_specialist"));
+    let expanded_overhead = serde_json::to_vec(&provider_tools(&agent)).unwrap().len() as u64 + 128;
+    assert!(expanded_overhead > initial_overhead + 64_000);
+    assert_eq!(agent.provider_context_budget().tools, expanded_overhead);
+    assert!(agent.prepared_context_image().is_err());
+    let mut called = false;
+    let result = agent.run_loop(|_| {
+        called = true;
+        Err::<davinci_ai::AssistantMessage, _>("must not dispatch".into())
+    });
+    assert!(!called);
+    assert!(result.unwrap_err().contains("compilation token budget"));
+
+    // Explicit SDK/host scalar overrides retain their existing semantics.
+    agent.set_provider_context_overhead_tokens(Some(2048));
+    assert_eq!(agent.provider_context_budget().tools, 2048);
+    agent.set_provider_context_overhead_tokens(None);
+    assert_eq!(
+        agent.provider_context_budget().tools,
+        serde_json::to_vec(&agent.provider_tool_specs()).unwrap().len() as u64 + 128
+    );
 }

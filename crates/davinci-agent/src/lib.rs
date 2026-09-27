@@ -39,10 +39,13 @@ mod subagent;
 mod templates;
 pub mod todo;
 pub mod tool_ledger;
+mod tool_name;
 pub mod tools;
 mod transaction_verification;
 mod turn;
 pub mod turn_context;
+pub mod verification;
+mod verification_notice;
 pub mod web;
 
 pub use batch::{BATCH_MAX_OPERATIONS, VISIBLE_PER_OPERATION, VISIBLE_TOTAL};
@@ -301,6 +304,16 @@ pub struct MutationVerificationState {
     #[serde(default)]
     pub mutation_paths: Vec<PathBuf>,
     #[serde(default)]
+    pub covered_paths: Vec<PathBuf>,
+    #[serde(default)]
+    pub unknown_mutation_paths: bool,
+    #[serde(default)]
+    pub failed_verification_paths: Vec<PathBuf>,
+    #[serde(default)]
+    pub unscoped_verification_failure: bool,
+    #[serde(default)]
+    pub last_classification_reason: Option<String>,
+    #[serde(default)]
     pub latest_evidence: Option<VerificationEvidence>,
     #[serde(default)]
     pub last_verification: Option<LastVerification>,
@@ -323,6 +336,7 @@ pub struct LastVerification {
 #[serde(rename_all = "snake_case")]
 pub enum CompletionEvidence {
     Verified,
+    Partial,
     Unverified,
     VerificationFailed,
     NotRequired,
@@ -380,9 +394,17 @@ pub struct Agent {
     pub messages: Vec<ChatMessage>,
     pub thinking_level: ThinkingLevel,
     pub effort_policy: effort::EffortPolicy,
+    decision_effort_advice_enabled: bool,
+    decision_completion_advice_enabled: bool,
+    decision_tool_family_advice_enabled: bool,
+    decision_turn_advice: Option<decision::advice::TurnAdvice>,
+    decision_effort_advice: Option<ThinkingLevel>,
+    decision_advice_key: Option<decision::DecisionAdviceKey>,
     pub tool_surface: ToolSurface,
     /// Repeat the last verification call after later mutations at completion.
     pub auto_verify: bool,
+    /// Task 5 environment/guidance experiment; disabled pending promotion.
+    pub environment_context: bool,
     pub auto_compaction: bool,
     pub compaction: CompactionSettings,
     pub auto_retry: bool,
@@ -470,6 +492,10 @@ pub struct Agent {
     previous_plan_revision: Option<LivingPlan>,
     /// Whether the host has registered a backend capable of visual verification.
     visual_verification_available: bool,
+    runtime_environment: Option<prompt::environment::EnvironmentSnapshot>,
+    environment_key: Option<prompt::environment::EnvironmentKey>,
+    environment_capture: prompt::environment::EnvironmentCapture,
+    last_verification_notice: Option<(u64, CompletionEvidence)>,
     /// Typed lifecycle evidence for the currently prepared real user turn.
     capability_run_state: Arc<Mutex<prompt::CapabilityRunState>>,
     /// Mutation generations and verification evidence for the current run.
@@ -479,6 +505,10 @@ pub struct Agent {
     /// Bounded actual command evidence, populated only by built-in execution.
     command_receipts:
         Arc<Mutex<std::collections::VecDeque<runtime::evidence_store::ExecutionReceipt>>>,
+    verification_starts: Arc<Mutex<std::collections::BTreeMap<String, u64>>>,
+    shell_mutation_snapshots:
+        Arc<Mutex<std::collections::BTreeMap<String, verification::workspace::Snapshot>>>,
+    background_shell_jobs: Arc<Mutex<std::collections::BTreeSet<u32>>>,
     plan_storage_error: Option<String>,
     pending_bash_messages: Vec<ChatMessage>,
     pending_prompt_messages: Vec<ChatMessage>,
@@ -491,6 +521,8 @@ pub struct Agent {
     turn_state_pending: Option<String>,
     /// Host-supplied schema estimate, excluding the system prompt and messages.
     provider_context_overhead_tokens: Option<u64>,
+    /// Hosts with a changing provider schema measure the currently exposed set.
+    provider_context_overhead_estimator: Option<fn(&Agent) -> u64>,
     provider_output_limit: Option<u64>,
     prepared_context_image: Arc<Mutex<Option<PreparedContextImage>>>,
     prepared_context_generation: u64,
@@ -537,8 +569,16 @@ impl Agent {
             messages: Vec::new(),
             thinking_level: ThinkingLevel::Off,
             effort_policy: effort::EffortPolicy::default(),
+            decision_effort_advice_enabled: false,
+            decision_completion_advice_enabled: false,
+            decision_tool_family_advice_enabled: false,
+            decision_turn_advice: None,
+            decision_effort_advice: None,
+            decision_advice_key: None,
             tool_surface: ToolSurface::default(),
             auto_verify: true,
+            environment_context: std::env::var("PI_ENVIRONMENT_CONTEXT").ok().as_deref()
+                == Some("1"),
             auto_compaction: true,
             compaction: CompactionSettings::default(),
             auto_retry: true,
@@ -601,12 +641,19 @@ impl Agent {
             previous_execution_mode: None,
             previous_plan_revision: None,
             visual_verification_available: false,
+            runtime_environment: None,
+            environment_key: None,
+            environment_capture: prompt::environment::EnvironmentCapture::default(),
+            last_verification_notice: None,
             capability_run_state: Arc::new(Mutex::new(prompt::CapabilityRunState::default())),
             mutation_verification: Arc::new(Mutex::new(MutationVerificationState::default())),
             pending_transaction_verification: Arc::new(Mutex::new(
                 std::collections::BTreeMap::new(),
             )),
             command_receipts: Arc::new(Mutex::new(std::collections::VecDeque::new())),
+            verification_starts: Arc::new(Mutex::new(std::collections::BTreeMap::new())),
+            shell_mutation_snapshots: Arc::new(Mutex::new(std::collections::BTreeMap::new())),
+            background_shell_jobs: Arc::new(Mutex::new(std::collections::BTreeSet::new())),
             plan_storage_error: None,
             pending_bash_messages: Vec::new(),
             pending_prompt_messages: Vec::new(),
@@ -614,6 +661,7 @@ impl Agent {
             turn_context_placement_override: None,
             turn_state_pending: None,
             provider_context_overhead_tokens: None,
+            provider_context_overhead_estimator: None,
             provider_output_limit: None,
             prepared_context_image: Arc::new(Mutex::new(None)),
             prepared_context_generation: 0,
@@ -718,7 +766,33 @@ impl Agent {
     }
 
     pub fn set_decision_runtime(&mut self, runtime: Arc<decision::DecisionRuntime>) {
+        // Generations are local to a runtime. A distinct provider runtime may
+        // restart at the same number, so replacing it invalidates all advice.
+        self.clear_turn_decision();
         self.decision_runtime = Some(runtime);
+    }
+
+    pub fn set_decision_effort_advice_enabled(&mut self, enabled: bool) {
+        if self.decision_effort_advice_enabled != enabled {
+            self.clear_turn_decision();
+        }
+        self.decision_effort_advice_enabled = enabled;
+    }
+
+    pub fn decision_effort_advice_enabled(&self) -> bool {
+        self.decision_effort_advice_enabled
+    }
+
+    pub fn set_decision_effort_advice(&mut self, advice: Option<ThinkingLevel>) {
+        self.decision_effort_advice = advice;
+    }
+
+    pub fn set_decision_advice_key(&mut self, key: Option<decision::DecisionAdviceKey>) {
+        self.decision_advice_key = key;
+    }
+
+    pub fn take_decision_advice_key(&mut self) -> Option<decision::DecisionAdviceKey> {
+        self.decision_advice_key.take()
     }
 
     pub fn decision_runtime(&self) -> Option<Arc<decision::DecisionRuntime>> {
@@ -821,6 +895,14 @@ impl Agent {
             plan_approved: plan_revision.is_some() && plan.approved_revision == plan_revision,
             active_contract: self.active_contract().is_some(),
             visual_verification_available: self.visual_verification_available,
+            visual_verification_relevant: !self.environment_context
+                || self.capability_run_state().frontend.is_some()
+                || self.visual_verification_required()
+                || self
+                    .last_real_user_request
+                    .as_deref()
+                    .is_some_and(prompt::environment::visual_verification_requested),
+            environment: self.runtime_environment.clone(),
         }
     }
 
@@ -847,6 +929,7 @@ impl Agent {
 
     /// Classify whether the current run has evidence for its latest mutation.
     pub fn completion_evidence(&self) -> CompletionEvidence {
+        let background_running = self.refresh_background_shell_mutations();
         let state = self
             .mutation_verification
             .lock()
@@ -854,16 +937,26 @@ impl Agent {
         if state.mutation_generation == 0 {
             return CompletionEvidence::NotRequired;
         }
+        if state.unscoped_verification_failure || !state.failed_verification_paths.is_empty() {
+            return CompletionEvidence::VerificationFailed;
+        }
+        if background_running {
+            return CompletionEvidence::Unverified;
+        }
 
         match state.latest_evidence.as_ref() {
             Some(evidence) if evidence.generation == state.mutation_generation => {
                 if !evidence.succeeded {
                     CompletionEvidence::VerificationFailed
-                } else if matches!(
-                    evidence.coverage,
-                    VerificationCoverage::Targeted | VerificationCoverage::Broad
-                ) {
+                } else if state.verified_generation == Some(state.mutation_generation)
+                    && matches!(
+                        evidence.coverage,
+                        VerificationCoverage::Targeted | VerificationCoverage::Broad
+                    )
+                {
                     CompletionEvidence::Verified
+                } else if !state.covered_paths.is_empty() {
+                    CompletionEvidence::Partial
                 } else {
                     CompletionEvidence::Unverified
                 }
@@ -872,10 +965,55 @@ impl Agent {
         }
     }
 
+    /// Background shells can change source after returning a job handle. Only
+    /// the host-owned job state closes this interval; reading output is no pass.
+    pub(crate) fn refresh_background_shell_mutations(&self) -> bool {
+        let mut pending = self
+            .background_shell_jobs
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if pending.is_empty() {
+            return false;
+        }
+        let before = pending.len();
+        let jobs = self
+            .tool_context
+            .jobs
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        pending.retain(|id| jobs.get(*id).is_some_and(|job| job.status().is_running()));
+        let changed = before != pending.len();
+        let running = !pending.is_empty();
+        drop(jobs);
+        drop(pending);
+        if changed {
+            self.record_successful_mutation();
+        }
+        running
+    }
+
     /// Compatibility path for mutation sources that cannot yet provide a path.
     #[allow(dead_code)]
     pub(crate) fn record_successful_mutation(&self) {
         self.record_successful_mutation_paths(Vec::new());
+    }
+
+    /// Re-observing the same incomplete inventory is uncertainty, not another
+    /// observed edit. Coalesce it once all previous passing evidence is stale.
+    pub(crate) fn record_unknown_shell_scope(&self) {
+        let state = self
+            .mutation_verification
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if state.unknown_mutation_paths
+            && state.verified_generation.is_none()
+            && state.covered_paths.is_empty()
+            && state.latest_evidence.is_none()
+        {
+            return;
+        }
+        drop(state);
+        self.record_successful_mutation();
     }
 
     pub(crate) fn record_successful_mutation_paths(&self, paths: Vec<PathBuf>) {
@@ -887,7 +1025,11 @@ impl Agent {
             && state.last_verification_succeeded;
         if prior_was_verified {
             state.mutation_paths.clear();
+            state.unknown_mutation_paths = false;
         }
+        state.unknown_mutation_paths |= paths.is_empty();
+        state.covered_paths.clear();
+        state.last_classification_reason = None;
         state.mutation_generation = state.mutation_generation.saturating_add(1);
         for path in paths {
             if !state.mutation_paths.contains(&path) {
@@ -912,6 +1054,11 @@ impl Agent {
         let paths = state.mutation_paths.clone();
         state.verified_generation = Some(generation);
         state.last_verification_succeeded = succeeded;
+        if succeeded {
+            state.unknown_mutation_paths = false;
+            state.failed_verification_paths.clear();
+            state.unscoped_verification_failure = false;
+        }
         state.latest_evidence = Some(VerificationEvidence {
             generation,
             command: "legacy_explicit_verifier".into(),
@@ -944,6 +1091,7 @@ impl Agent {
         });
     }
 
+    #[cfg(test)]
     pub(crate) fn record_verification_command(&self, command: &str, succeeded: bool) {
         let mut state = self
             .mutation_verification
@@ -953,7 +1101,12 @@ impl Agent {
         let mutation_paths = state.mutation_paths.clone();
         let (coverage, verification_targets) =
             verification_coverage_for_command(command, &mutation_paths);
-        state.verified_generation = Some(generation);
+        state.verified_generation = (succeeded
+            && matches!(
+                coverage,
+                VerificationCoverage::Broad | VerificationCoverage::Targeted
+            ))
+        .then_some(generation);
         state.last_verification_succeeded = succeeded;
         state.latest_evidence = Some(VerificationEvidence {
             generation,
@@ -962,6 +1115,95 @@ impl Agent {
             mutation_paths,
             verification_targets,
             coverage,
+        });
+    }
+
+    pub(crate) fn record_verification_assessment(
+        &self,
+        generation: u64,
+        command: &str,
+        assessment: &verification::Assessment,
+        terminal: Option<bool>,
+    ) {
+        if self.refresh_background_shell_mutations() {
+            return;
+        }
+        let Some(succeeded) = terminal else {
+            return;
+        };
+        if !matches!(
+            assessment.kind,
+            verification::CheckKind::Suite | verification::CheckKind::TargetedScript
+        ) {
+            return;
+        }
+        let mut state = self
+            .mutation_verification
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        if generation != state.mutation_generation {
+            return;
+        }
+        if succeeded && assessment.covered.is_empty() && !assessment.full_workspace {
+            // An unrelated success cannot erase an applicable failure.
+            return;
+        }
+        if succeeded {
+            if assessment.full_workspace {
+                state.unknown_mutation_paths = false;
+                state.unscoped_verification_failure = false;
+                state.failed_verification_paths.clear();
+            } else {
+                state
+                    .failed_verification_paths
+                    .retain(|path| !assessment.covered.contains(path));
+            }
+            for path in &assessment.covered {
+                if state.mutation_paths.contains(path) && !state.covered_paths.contains(path) {
+                    state.covered_paths.push(path.clone());
+                }
+            }
+        } else {
+            // Retain independent passes, but revoke the failed scope until a
+            // fresh applicable check succeeds. An A-only pass cannot erase B.
+            state
+                .covered_paths
+                .retain(|path| !assessment.covered.contains(path));
+            state.unscoped_verification_failure |=
+                assessment.covered.is_empty() || assessment.full_workspace;
+            for path in &assessment.covered {
+                if !state.failed_verification_paths.contains(path) {
+                    state.failed_verification_paths.push(path.clone());
+                }
+            }
+        }
+        let complete = !state.unknown_mutation_paths
+            && !state.unscoped_verification_failure
+            && state.failed_verification_paths.is_empty()
+            && (!state.mutation_paths.is_empty() || assessment.full_workspace)
+            && state
+                .mutation_paths
+                .iter()
+                .all(|path| state.covered_paths.contains(path));
+        state.verified_generation = (succeeded && complete).then_some(generation);
+        state.last_verification_succeeded = succeeded;
+        state.latest_evidence = Some(VerificationEvidence {
+            generation,
+            command: command.into(),
+            succeeded,
+            mutation_paths: state.mutation_paths.clone(),
+            verification_targets: assessment
+                .covered
+                .iter()
+                .map(|p| p.display().to_string())
+                .collect(),
+            coverage: if assessment.full_workspace {
+                VerificationCoverage::Broad
+            } else if complete {
+                VerificationCoverage::Targeted
+            } else {
+                VerificationCoverage::Unknown
+            },
         });
     }
 
@@ -1062,6 +1304,14 @@ impl Agent {
             return;
         }
 
+        self.append_turn_context(memory);
+    }
+
+    pub(crate) fn append_turn_context(&mut self, memory: Option<String>) {
+        if self.turn_context_placement() != turn_context::TurnContextPlacement::Appended {
+            return;
+        }
+
         let previous = turn_context::TurnContextState::from_messages(&self.messages);
         let runtime_state = self.turn_state_pending.clone().unwrap_or_default();
         let plan = self.plan_turn_context();
@@ -1136,6 +1386,9 @@ impl Agent {
         user_text: &str,
     ) -> Result<prompt::PreparedTurnPrompt, String> {
         if !self.prompt_session.is_builtin() {
+            self.turn_state_pending = None;
+            self.runtime_environment = None;
+            self.environment_key = None;
             let no_capabilities = prompt::CapabilityDecision {
                 capabilities: Vec::new(),
                 reasons: Vec::new(),
@@ -1163,7 +1416,16 @@ impl Agent {
 
         let capabilities = prompt::route_capabilities(&router_input);
 
-        let runtime_state = self.runtime_prompt_state();
+        self.capture_runtime_environment(&davinci_session::utc_date_from_unix_ms(
+            davinci_session::now_ms(),
+        ));
+        let mut runtime_state = self.runtime_prompt_state();
+        runtime_state.visual_verification_relevant = !self.environment_context
+            || capabilities
+                .capabilities
+                .contains(&prompt::NativeBehaviorCapability::FrontendDesign)
+            || self.visual_verification_required()
+            || prompt::environment::visual_verification_requested(user_text);
         let permission_mode = runtime_state.permission_mode;
 
         let ctx = prompt::composer::PromptContext {
@@ -1208,6 +1470,7 @@ impl Agent {
             evidence: Vec::new(),
         };
         let mut last_runtime_state = None;
+        let mut visual_verification_relevant = false;
 
         for user_text in user_texts {
             let prepared = match self.prepare_builtin_prompt_for_user_turn(user_text) {
@@ -1224,6 +1487,7 @@ impl Agent {
             }
             union.reasons.extend(prepared.capabilities.reasons);
             union.evidence.extend(prepared.capabilities.evidence);
+            visual_verification_relevant |= prepared.runtime_state.visual_verification_relevant;
             last_runtime_state = Some(prepared.runtime_state);
             self.last_real_user_request = Some((*user_text).to_string());
         }
@@ -1236,7 +1500,13 @@ impl Agent {
                 prompt::NativeBehaviorCapability::CodeReview => 2,
             });
 
-        let runtime_state = last_runtime_state.expect("non-empty batch has runtime state");
+        let mut runtime_state = last_runtime_state.expect("non-empty batch has runtime state");
+        runtime_state.visual_verification_relevant = !self.environment_context
+            || union
+                .capabilities
+                .contains(&prompt::NativeBehaviorCapability::FrontendDesign)
+            || self.visual_verification_required()
+            || visual_verification_relevant;
         let permission_mode = self.permissions.lock().map(|p| p.mode).unwrap_or_default();
         let ctx = prompt::composer::PromptContext {
             provider: &self.provider,
@@ -1303,11 +1573,26 @@ impl Agent {
 
     /// The next request's effort; the configured level and prompt stay stable.
     pub fn request_thinking_level(&self) -> ThinkingLevel {
-        effort::request_level(
+        let advice = self
+            .decision_turn_advice
+            .as_ref()
+            .filter(|turn| {
+                self.decision_runtime.as_ref().is_some_and(|runtime| {
+                    runtime.is_enabled() && runtime.generation() == turn.task_key.generation
+                })
+            })
+            .filter(|turn| {
+                turn.effort_mutation_revision
+                    == Some(self.mutation_verification_state().mutation_generation)
+            })
+            .and(self.decision_effort_advice);
+        effort::resolve_request_effort(
             self.effort_policy,
             self.thinking_level,
             self.effort_signals(),
+            advice,
         )
+        .0
     }
 
     pub fn prompt_user_with(
@@ -1324,8 +1609,10 @@ impl Agent {
         text: &str,
         images: &[davinci_ai::MessageContent],
     ) -> ChatMessage {
+        self.clear_turn_decision();
         let message = self.prompt_with_origin(text, images, true);
         self.last_real_user_request = Some(text.to_string());
+        self.activate_relevant_tool_families(text);
         message
     }
 
@@ -1588,7 +1875,7 @@ impl Agent {
         provider_budget::ProviderContextBudget {
             window: self.context_window,
             system: provider_budget::text_token_ceiling(&self.provider_system_prompt()),
-            tools: self.provider_context_overhead_tokens.unwrap_or_else(|| {
+            tools: self.provider_context_overhead_tokens().unwrap_or_else(|| {
                 serde_json::to_vec(&self.provider_tool_specs())
                     .map_or(u64::MAX, |v| v.len() as u64 + 128)
             }),
@@ -1742,7 +2029,7 @@ impl Agent {
                 .map(|text| (text.len() as u64).div_ceil(4))
                 .unwrap_or(0)
             + (self.provider_system_prompt().len() as u64).div_ceil(4)
-            + self.provider_context_overhead_tokens.unwrap_or_else(|| {
+            + self.provider_context_overhead_tokens().unwrap_or_else(|| {
                 let specs = self.provider_tool_specs();
                 (serde_json::to_vec(&specs)
                     .expect("tool schemas are JSON")
@@ -1763,6 +2050,21 @@ impl Agent {
     /// `None` restores the builtin/MCP estimate.
     pub fn set_provider_context_overhead_tokens(&mut self, tokens: Option<u64>) {
         self.provider_context_overhead_tokens = tokens;
+        self.provider_context_overhead_estimator = None;
+    }
+
+    /// Measure the current provider schema whenever request context is admitted.
+    /// The estimator must only inspect tool metadata, without querying a context
+    /// budget or provider image. The scalar setter restores fixed estimates.
+    pub fn set_provider_context_overhead_estimator(&mut self, estimator: fn(&Agent) -> u64) {
+        self.provider_context_overhead_estimator = Some(estimator);
+        self.provider_context_overhead_tokens = None;
+    }
+
+    fn provider_context_overhead_tokens(&self) -> Option<u64> {
+        self.provider_context_overhead_estimator
+            .map(|estimate| estimate(self))
+            .or(self.provider_context_overhead_tokens)
     }
 
     /// Record host-owned request context that follows the mutable turn prompt.
@@ -1773,7 +2075,7 @@ impl Agent {
     /// Build the exact system prompt for the next provider request.
     pub fn provider_system_prompt(&self) -> String {
         let mut prompt = self.system_prompt.clone();
-        context::append_repository_context(&mut prompt, &self.context_files);
+        context::append_repository_context(&mut prompt, &self.context_files, &self.cwd);
         if let Some(suffix) = self.provider_system_prompt_suffix.as_deref() {
             if !prompt.is_empty() {
                 prompt.push_str("\n\n");
@@ -1822,7 +2124,7 @@ impl Agent {
         let provider_tool_schemas = serde_json::to_string(&self.provider_tool_schema_value())
             .expect("provider tool schemas are JSON");
         let tool_tokens = self
-            .provider_context_overhead_tokens
+            .provider_context_overhead_tokens()
             .unwrap_or_else(|| (provider_tool_schemas.len() as u64).div_ceil(4));
         entries.push(ContextManifestEntry::new(
             "tool_schemas",
@@ -2398,6 +2700,7 @@ impl Agent {
         self.messages.iter().rev().find_map(|message| {
             if message.role == "assistant"
                 && !message.extra.contains_key(HARNESS_VERIFICATION_FIELD)
+                && !message.extra.contains_key("davinciVerificationStatus")
             {
                 Some(content_text(&message.content))
             } else {
@@ -2447,7 +2750,32 @@ impl Agent {
 
     /// Synchronize the shared authorization view with the agent's active tool set.
     pub fn sync_tool_authorization(&self) {
-        let authorized: std::collections::BTreeSet<String> = self.tools.iter().cloned().collect();
+        let authorized: std::collections::BTreeSet<String> = {
+            let permissions = self
+                .permissions
+                .lock()
+                .unwrap_or_else(|err| err.into_inner());
+            self.tools
+                .iter()
+                .filter(|name| {
+                    // Tool-wide denials suppress disclosure as well as execution.
+                    // Scoped path/argument rules still run at ordinary dispatch.
+                    !permissions.deny.iter().any(|rule| {
+                        rule.tool_matches(name)
+                            && match &rule.specifier {
+                                Some(permission::RuleSpecifier::Wildcard) => true,
+                                Some(permission::RuleSpecifier::Subject(pattern)) => pattern == "*",
+                                Some(permission::RuleSpecifier::Parameter { .. }) => false,
+                                None => rule
+                                    .pattern
+                                    .as_deref()
+                                    .map_or(true, |pattern| pattern == "*"),
+                            }
+                    })
+                })
+                .cloned()
+                .collect()
+        };
         *self
             .tool_context
             .authorized_tools
@@ -2501,6 +2829,12 @@ impl Agent {
             for name in crate::tools::LEAN_TOOLS {
                 exposure.activate_authorized(name, authorized.contains(*name));
             }
+            drop(exposure);
+            // Registration may happen after the user prompt (for example MCP
+            // attachment). Relevance is additive and safe to apply again.
+            if let Some(request) = &self.last_real_user_request {
+                self.activate_relevant_tool_families(request);
+            }
             return;
         }
         self.expose_active_tools();
@@ -2533,6 +2867,61 @@ impl Agent {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .is_visible(name)
+    }
+
+    /// Add available family schemas without granting permission, clearing
+    /// denials, or hiding the core. Both discovery and optional advice use the
+    /// existing exposure state, so schema identity follows the effective set.
+    pub fn activate_tool_families(&self, families: &[String]) -> Vec<String> {
+        self.sync_tool_authorization();
+        let authorized = self
+            .tool_context
+            .authorized_tools
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        let selected = self
+            .tool_context
+            .discovery_capabilities()
+            .into_iter()
+            .filter(|capability| authorized.contains(&capability.name))
+            .filter(|capability| capability.schema.is_some())
+            .filter(|capability| {
+                capability
+                    .family
+                    .as_ref()
+                    .is_some_and(|family| families.contains(family))
+            })
+            .map(|capability| capability.name)
+            .collect::<std::collections::BTreeSet<_>>();
+        let mut exposure = self
+            .tool_context
+            .tool_exposure
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        for name in &selected {
+            exposure.activate_authorized(name, true);
+        }
+        selected.into_iter().collect()
+    }
+
+    /// Deterministic routing is limited to explicitly selected Lean roots on
+    /// cache-sensitive routes. Generic requests keep the initial core.
+    fn activate_relevant_tool_families(&self, request: &str) {
+        if self.tool_surface != ToolSurface::Lean
+            || self.turn_context_placement() != turn_context::TurnContextPlacement::Appended
+            || self
+                .runtime
+                .as_ref()
+                .is_some_and(|runtime| runtime.parent_agent_id.is_some())
+        {
+            return;
+        }
+        let families = crate::tools::relevant_tool_families(
+            request,
+            &self.tool_context.discovery_capabilities(),
+        );
+        self.activate_tool_families(&families);
     }
 
     pub fn visible_tool_names(&self) -> std::collections::BTreeSet<String> {
@@ -3065,6 +3454,10 @@ impl Agent {
         }
         let messages = messages_from_session(&session);
         if session_changed {
+            self.runtime_environment = None;
+            self.environment_key = None;
+            self.last_verification_notice = None;
+            self.turn_state_pending = None;
             if let Some(processes) = &self.tool_context.processes {
                 self.tool_context.processes = Some(processes.new_session()?);
             }
@@ -3337,7 +3730,10 @@ fn verification_coverage_for_command(
             .filter_map(|path| mutation_package(path))
             .collect::<std::collections::BTreeSet<_>>();
         let targets = vec![package.clone()];
-        if !changed_packages.is_empty()
+        if mutation_paths
+            .iter()
+            .all(|path| mutation_package(path).is_some())
+            && !changed_packages.is_empty()
             && changed_packages.iter().all(|changed| changed == &package)
         {
             return (VerificationCoverage::Targeted, targets);
@@ -3376,7 +3772,7 @@ fn path_scoped_coverage(
     if targets.is_empty() {
         return (VerificationCoverage::Broad, vec!["project".into()]);
     }
-    let covered = mutation_paths.iter().any(|path| {
+    let covered = mutation_paths.iter().all(|path| {
         let changed = path.to_string_lossy().replace('\\', "/");
         let stem = path
             .file_stem()
@@ -3485,7 +3881,11 @@ pub(crate) fn custom_message_from_session_entry(entry: &SessionEntry) -> Option<
     })
 }
 
-fn entry_to_chat(entry: &SessionEntry) -> Option<ChatMessage> {
+pub(crate) fn is_legacy_verification_notice(message: &ChatMessage) -> bool {
+    message.extra.contains_key("davinciVerificationStatus")
+}
+
+pub(crate) fn entry_to_chat(entry: &SessionEntry) -> Option<ChatMessage> {
     match entry.entry_type.as_str() {
         "compaction" => {
             let summary = entry.extra.get("summary")?.as_str()?;
@@ -3502,6 +3902,10 @@ fn entry_to_chat(entry: &SessionEntry) -> Option<ChatMessage> {
         }
         _ => None,
     }
+    // Older builds persisted harness notices as assistant messages. Keep the
+    // original journal intact, but exclude them at shared history conversion
+    // so reopening, tree navigation, and Context VM cannot replay them.
+    .filter(|message| !is_legacy_verification_notice(message))
 }
 
 fn messages_from_session(session: &JsonlSession) -> Vec<ChatMessage> {

@@ -216,6 +216,7 @@ mod tests {
                 }]
             };
             Ok(davinci_ai::AssistantMessage {
+                extra: Default::default(),
                 id: "fixture".into(),
                 role: "assistant".into(),
                 content,
@@ -307,6 +308,7 @@ mod tests {
                 }]
             };
             Ok(davinci_ai::AssistantMessage {
+                extra: Default::default(),
                 id: "fixture".into(),
                 role: "assistant".into(),
                 content,

@@ -33,7 +33,8 @@ impl CodexFeatureFlags {
             transport_pool: Self::env_bool("PI_CODEX_TRANSPORT_POOL", true),
             responses_ledger: Self::env_bool("PI_CODEX_RESPONSES_LEDGER", true),
             tool_call_ledger: Self::env_bool("PI_CODEX_TOOL_CALL_LEDGER", true),
-            apply_patch: Self::env_bool("PI_CODEX_APPLY_PATCH", true),
+            // Freeform remains an opt-in experiment until promotion evidence exists.
+            apply_patch: Self::env_bool("PI_CODEX_APPLY_PATCH", false),
             prewarming: Self::env_bool("PI_CODEX_PREWARMING", true),
             hot_tools: Self::env_bool("PI_CODEX_HOT_TOOLS", true),
             telemetry: Self::env_bool("PI_CODEX_TELEMETRY", true),
@@ -94,5 +95,46 @@ mod tests {
         assert!(enabled.transport_pool);
         assert!(enabled.apply_patch);
         assert!(enabled.responses_ledger);
+    }
+
+    #[test]
+    fn apply_patch_production_flag_requires_an_explicit_opt_in() {
+        const CHILD: &str = "DAVINCI_APPLY_PATCH_FLAG_TEST_CHILD";
+        if let Ok(expected) = std::env::var(CHILD) {
+            assert_eq!(
+                CodexFeatureFlags::from_env().apply_patch,
+                expected == "true"
+            );
+            return;
+        }
+        // Isolate process-global environment changes from parallel tests.
+        for (value, expected) in [
+            (None, false),
+            (Some("0"), false),
+            (Some("false"), false),
+            (Some("invalid"), false),
+            (Some(""), false),
+            (Some("1"), true),
+            (Some("true"), true),
+        ] {
+            let mut child = std::process::Command::new(std::env::current_exe().unwrap());
+            child
+                .args([
+                    "--exact",
+                    "codex_flags::tests::apply_patch_production_flag_requires_an_explicit_opt_in",
+                ])
+                .env(CHILD, expected.to_string())
+                .env_remove("PI_CODEX_APPLY_PATCH");
+            if let Some(value) = value {
+                child.env("PI_CODEX_APPLY_PATCH", value);
+            }
+            let output = child.output().unwrap();
+            assert!(
+                output.status.success(),
+                "flag {value:?}: {}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
     }
 }

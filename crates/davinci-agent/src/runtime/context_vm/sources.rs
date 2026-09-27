@@ -1,4 +1,4 @@
-use super::{events::event_from_message, ContextVmRuntime};
+use super::{events::event_from_session_entry, ContextVmRuntime};
 use std::{
     fs::File,
     io::{BufRead, BufReader},
@@ -74,10 +74,7 @@ impl ContextVmRuntime {
                 if entry.id != id {
                     continue;
                 }
-                let message =
-                    serde_json::from_value(entry.message.ok_or("context source has no message")?)
-                        .map_err(|_| "invalid context source message")?;
-                let event = event_from_message(&message, source_ref.into(), entry.seq)
+                let event = event_from_session_entry(&entry)
                     .ok_or("context source has no visible content")?;
                 if event.content_hash != expected {
                     return Err("context source integrity check failed".into());

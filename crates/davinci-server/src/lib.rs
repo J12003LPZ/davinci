@@ -592,6 +592,7 @@ impl PiServer {
                             })
                             .unwrap_or_else(|| format!("reply:{user_text}"));
                         Ok(AssistantMessage {
+                            extra: Default::default(),
                             id: davinci_agent::new_message_id(),
                             role: "assistant".into(),
                             content: vec![ContentBlock::Text { text: reply }],

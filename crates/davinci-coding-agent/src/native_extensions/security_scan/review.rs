@@ -541,6 +541,7 @@ mod tests {
                 }
             };
             Ok(AssistantMessage {
+                extra: Default::default(),
                 id: "fixture".into(),
                 role: "assistant".into(),
                 content: vec![content],
@@ -625,6 +626,7 @@ mod tests {
                 }
             };
             Ok(AssistantMessage {
+                extra: Default::default(),
                 id: "fixture".into(),
                 role: "assistant".into(),
                 content: vec![content],
@@ -730,6 +732,7 @@ mod tests {
                 .pop_front()
                 .ok_or("fixture exhausted")?;
             Ok(AssistantMessage {
+                extra: Default::default(),
                 id: "fixture".into(),
                 role: "assistant".into(),
                 content: serde_json::from_value(value).map_err(|_| "invalid fixture")?,
@@ -874,6 +877,7 @@ mod tests {
                     }
                 };
                 Ok(AssistantMessage {
+                    extra: Default::default(),
                     id: "fixture".into(),
                     role: "assistant".into(),
                     content: vec![content],
@@ -947,6 +951,7 @@ mod tests {
                 }
             };
             Ok(AssistantMessage {
+                extra: Default::default(),
                 id: "fixture".into(),
                 role: "assistant".into(),
                 content: vec![content],
@@ -1613,6 +1618,7 @@ mod tests {
                 }
             };
             Ok(AssistantMessage {
+                extra: Default::default(),
                 id: "fixture".into(),
                 role: "assistant".into(),
                 content: vec![content],
@@ -1677,6 +1683,7 @@ mod tests {
         std::fs::write(dir.path().join("sample.rs"), "fn main() {}\n").unwrap();
         let runner = SecurityWorkerRunner::new(|_| {
             Ok(AssistantMessage {
+                extra: Default::default(),
                 id: "fixture".into(),
                 role: "assistant".into(),
                 content: vec![ContentBlock::Text {
@@ -1763,6 +1770,7 @@ mod tests {
                 }
             };
             Ok(AssistantMessage {
+                extra: Default::default(),
                 id: "fixture".into(),
                 role: "assistant".into(),
                 content: vec![content],
@@ -1803,6 +1811,7 @@ mod tests {
                 }
             };
             Ok(AssistantMessage {
+                extra: Default::default(),
                 id: "fixture".into(),
                 role: "assistant".into(),
                 content: vec![content],
@@ -1935,6 +1944,7 @@ mod tests {
                     }
                 };
                 Ok(AssistantMessage {
+                    extra: Default::default(),
                     id: "fixture".into(),
                     role: "assistant".into(),
                     content: vec![content],

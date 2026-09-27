@@ -204,6 +204,7 @@ fn rich_result(is_error: bool) -> ToolResult {
 
 fn done_response() -> AssistantMessage {
     AssistantMessage {
+        extra: Default::default(),
         id: "publication-done".into(),
         role: "assistant".into(),
         content: vec![ContentBlock::Text {
@@ -673,6 +674,7 @@ fn post_tool_hook_failure_preserves_successful_raw_mutation_and_failed_presentat
             calls += 1;
             if calls == 1 {
                 Ok(AssistantMessage {
+                    extra: Default::default(),
                     id: "write-call".into(),
                     role: "assistant".into(),
                     content: vec![ContentBlock::ToolCall {
@@ -727,4 +729,63 @@ fn post_tool_hook_failure_preserves_successful_raw_mutation_and_failed_presentat
         .outbox
         .iter()
         .all(|item| item.state == OutboxState::Acknowledged));
+}
+
+#[test]
+fn recovered_custom_patch_result_retains_originating_wire_kind_after_reopen() {
+    let fixture = Fixture::new();
+    let arguments =
+        json!({"input":"*** Begin Patch\n*** Add File: result.txt\n+ok\n*** End Patch"});
+    let mut call = ChatMessage {
+        role: "assistant".into(),
+        content: vec![davinci_ai::MessageContent::ToolCall {
+            id: "recover-patch|item".into(),
+            name: "apply_patch".into(),
+            arguments: arguments.clone(),
+        }],
+        ..ChatMessage::default()
+    };
+    davinci_ai::set_wire_kind(
+        &mut call.extra,
+        "recover-patch|item",
+        davinci_ai::ResponsesToolWireKind::Custom,
+    );
+    let mut session = JsonlSession::open(&fixture.session_path).unwrap();
+    let mut entry = SessionEntry::message("assistant", Value::Null);
+    entry.message = Some(serde_json::to_value(call).unwrap());
+    session.append_entry(entry).unwrap();
+    drop(session);
+    fixture.complete_provider_call(
+        "recover-patch|item",
+        "apply_patch",
+        &arguments,
+        &rich_result(false),
+    );
+    let mut agent = fixture.agent();
+    agent
+        .run_loop(|agent| {
+            let result = agent
+                .messages
+                .iter()
+                .find(|message| message.tool_call_id.as_deref() == Some("recover-patch|item"))
+                .unwrap();
+            assert_eq!(
+                result.extra[davinci_ai::RESPONSES_TOOL_WIRE_KIND_KEY],
+                "custom"
+            );
+            let input = davinci_ai::openai_responses_input(&agent.messages);
+            assert_eq!(input[0]["type"], "custom_tool_call");
+            assert_eq!(input[1]["type"], "custom_tool_call_output");
+            Ok(done_response())
+        })
+        .unwrap();
+    drop(agent);
+    let session = JsonlSession::open(&fixture.session_path).unwrap();
+    let result = session
+        .entries
+        .iter()
+        .filter_map(|entry| entry.message.as_ref())
+        .find(|message| message["toolCallId"] == "recover-patch|item")
+        .unwrap();
+    assert_eq!(result[davinci_ai::RESPONSES_TOOL_WIRE_KIND_KEY], "custom");
 }

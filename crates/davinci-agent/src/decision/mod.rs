@@ -1,3 +1,4 @@
+pub mod advice;
 pub mod audit;
 pub mod calibration;
 pub mod policy;
@@ -24,6 +25,23 @@ const RATE_LIMIT_COOLDOWN: Duration = Duration::from_secs(30);
 const OVERLOAD_COOLDOWN: Duration = Duration::from_secs(10);
 const NETWORK_COOLDOWN: Duration = Duration::from_secs(30);
 
+/// Freshness material attached to a shadow decision. A result may be used only
+/// by the submission that created the same key.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DecisionAdviceKey {
+    pub request_id: String,
+    pub generation: u64,
+    pub evidence_revision: u64,
+    pub mutation_revision: u64,
+}
+
+#[derive(Debug, Clone)]
+pub struct ReadyDecision {
+    pub key: DecisionAdviceKey,
+    pub request: DecisionRequest,
+    pub response: DecisionResponse,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct HealthState {
     health: DecisionProviderHealth,
@@ -49,6 +67,7 @@ pub struct DecisionRuntime {
     audit: Arc<DecisionAuditLog>,
     shadow_busy: AtomicBool,
     provider_busy: Arc<AtomicBool>,
+    ready_shadow: Mutex<Option<ReadyDecision>>,
 }
 
 impl fmt::Debug for DecisionRuntime {
@@ -74,12 +93,21 @@ impl DecisionRuntime {
             audit: Arc::new(DecisionAuditLog::default()),
             shadow_busy: AtomicBool::new(false),
             provider_busy: Arc::new(AtomicBool::new(false)),
+            ready_shadow: Mutex::new(None),
         }
+    }
+
+    fn clear_ready_shadow(&self) {
+        *self
+            .ready_shadow
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
     }
 
     pub fn enable(&self) -> u64 {
         let generation = self.generation.fetch_add(1, Ordering::SeqCst) + 1;
         self.enabled.store(true, Ordering::SeqCst);
+        self.clear_ready_shadow();
         *self
             .health
             .lock()
@@ -97,6 +125,7 @@ impl DecisionRuntime {
     pub fn disable(&self) -> u64 {
         let generation = self.generation.fetch_add(1, Ordering::SeqCst) + 1;
         self.enabled.store(false, Ordering::SeqCst);
+        self.clear_ready_shadow();
         *self
             .health
             .lock()
@@ -114,6 +143,7 @@ impl DecisionRuntime {
             .write()
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = provider;
         let generation = self.generation.fetch_add(1, Ordering::SeqCst) + 1;
+        self.clear_ready_shadow();
         if self.enabled.load(Ordering::SeqCst) {
             *self
                 .health
@@ -186,6 +216,33 @@ impl DecisionRuntime {
         self: &Arc<Self>,
         prepare: impl FnOnce() -> DecisionRequest + Send + 'static,
     ) -> Result<(), DecisionError> {
+        self.enqueue_shadow_inner(move || (prepare(), None))
+    }
+
+    /// Enqueue a shadow decision and retain a successful response in a
+    /// one-element mailbox. The caller never waits for this result.
+    pub fn enqueue_shadow_with_result(
+        self: &Arc<Self>,
+        prepare: impl FnOnce() -> (DecisionRequest, DecisionAdviceKey) + Send + 'static,
+    ) -> Result<(), DecisionError> {
+        self.enqueue_shadow_inner(move || {
+            let (request, key) = prepare();
+            (request, Some(key))
+        })
+    }
+
+    /// Consume the newest successful shadow result, if one is ready.
+    pub fn take_ready_shadow(&self) -> Option<ReadyDecision> {
+        self.ready_shadow
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take()
+    }
+
+    fn enqueue_shadow_inner(
+        self: &Arc<Self>,
+        prepare: impl FnOnce() -> (DecisionRequest, Option<DecisionAdviceKey>) + Send + 'static,
+    ) -> Result<(), DecisionError> {
         if !self.is_enabled() {
             return Err(DecisionError::Disabled);
         }
@@ -209,8 +266,21 @@ impl DecisionRuntime {
                     }
                 }
                 let release = Release(runtime);
-                let request = prepare();
-                let _ = release.0.evaluate_generation(&request, generation, true);
+                let (request, key) = prepare();
+                if let Ok(response) = release.0.evaluate_generation(&request, generation, true) {
+                    if let Some(key) = key {
+                        *release
+                            .0
+                            .ready_shadow
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+                            Some(ReadyDecision {
+                                key,
+                                request,
+                                response,
+                            });
+                    }
+                }
             })
             .map_err(|_| {
                 self.shadow_busy.store(false, Ordering::Release);
@@ -441,6 +511,7 @@ mod tests {
     struct FixtureProvider {
         calls: AtomicUsize,
         response: Result<Vec<u8>, DecisionError>,
+        delay: std::time::Duration,
     }
 
     impl DecisionProvider for FixtureProvider {
@@ -458,6 +529,7 @@ mod tests {
             _budget: std::time::Duration,
         ) -> Result<super::response::DecisionResponse, DecisionError> {
             self.calls.fetch_add(1, Ordering::SeqCst);
+            std::thread::sleep(self.delay);
             let raw = self.response.clone()?;
             parse_and_validate_response(&raw, request)
         }
@@ -483,6 +555,7 @@ mod tests {
             response: Ok(
                 br#"{"answers":{"browser_relevant":{"type":"noul","noul":1.0}}}"#.to_vec(),
             ),
+            delay: std::time::Duration::ZERO,
         });
         let runtime = DecisionRuntime::new(provider.clone());
         assert_eq!(runtime.evaluate(&request()), Err(DecisionError::Disabled));
@@ -496,6 +569,7 @@ mod tests {
             response: Ok(
                 br#"{"answers":{"browser_relevant":{"type":"noul","noul":1.0}}}"#.to_vec(),
             ),
+            delay: std::time::Duration::ZERO,
         });
         let runtime = DecisionRuntime::new(provider);
         let generation = runtime.enable();
@@ -511,6 +585,7 @@ mod tests {
         let provider = std::sync::Arc::new(FixtureProvider {
             calls: AtomicUsize::new(0),
             response: Err(DecisionError::CredentialInvalid),
+            delay: std::time::Duration::ZERO,
         });
         let runtime = DecisionRuntime::new(provider.clone());
         runtime.enable();
@@ -576,5 +651,136 @@ mod tests {
             Some(DecisionAnswer::Noul { value }) if (*value - 0.9).abs() < 0.001
         ));
         assert!(HARD_DECISION_BUDGET.as_millis() <= 1500);
+    }
+
+    #[test]
+    fn disabled_shadow_admission_never_prepares_request() {
+        let runtime = std::sync::Arc::new(DecisionRuntime::new(std::sync::Arc::new(FixtureProvider {
+            calls: AtomicUsize::new(0), response: Err(DecisionError::CredentialInvalid),
+            delay: std::time::Duration::ZERO,
+        })));
+        assert_eq!(runtime.enqueue_shadow_with_result(|| panic!("disabled preparation ran")), Err(DecisionError::Disabled));
+    }
+
+    #[test]
+    fn blocked_request_preparation_is_off_submit_path_and_bounded_to_one_worker() {
+        let runtime = std::sync::Arc::new(DecisionRuntime::new(std::sync::Arc::new(FixtureProvider {
+            calls: AtomicUsize::new(0), response: Err(DecisionError::CredentialInvalid),
+            delay: std::time::Duration::ZERO,
+        })));
+        runtime.enable();
+        let (entered_tx, entered_rx) = std::sync::mpsc::sync_channel(1);
+        let (release_tx, release_rx) = std::sync::mpsc::sync_channel(1);
+        let key = advice_key("preparing", runtime.generation());
+        let started = std::time::Instant::now();
+        runtime.enqueue_shadow_with_result(move || {
+            entered_tx.send(()).unwrap();
+            release_rx.recv_timeout(std::time::Duration::from_secs(2)).unwrap();
+            (request(), key)
+        }).unwrap();
+        assert!(started.elapsed() < std::time::Duration::from_millis(100));
+        entered_rx.recv_timeout(std::time::Duration::from_secs(1)).unwrap();
+        assert_eq!(runtime.enqueue_shadow_with_result(|| panic!("busy preparation ran")), Err(DecisionError::Busy));
+        release_tx.send(()).unwrap();
+    }
+
+    fn wait_for_ready(runtime: &DecisionRuntime) -> Option<super::ReadyDecision> {
+        for _ in 0..500 {
+            if let Some(ready) = runtime.take_ready_shadow() {
+                return Some(ready);
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        None
+    }
+
+    fn advice_key(id: &str, generation: u64) -> super::DecisionAdviceKey {
+        super::DecisionAdviceKey {
+            request_id: id.to_owned(),
+            generation,
+            evidence_revision: 1,
+            mutation_revision: 2,
+        }
+    }
+
+    #[test]
+    fn shadow_admission_is_nonblocking_bounded_and_one_slot() {
+        let provider = std::sync::Arc::new(FixtureProvider {
+            calls: AtomicUsize::new(0),
+            response: Ok(
+                br#"{"answers":{"browser_relevant":{"type":"noul","noul":1.0}}}"#.to_vec(),
+            ),
+            delay: std::time::Duration::from_millis(100),
+        });
+        let runtime = std::sync::Arc::new(DecisionRuntime::new(provider.clone()));
+        let generation = runtime.enable();
+        let started = std::time::Instant::now();
+        runtime
+            .enqueue_shadow_with_result({
+                let key = advice_key("first", generation);
+                move || (request(), key)
+            })
+            .expect("first shadow admission");
+        assert!(started.elapsed() < std::time::Duration::from_millis(50));
+        assert_eq!(
+            runtime.enqueue_shadow_with_result({
+                let key = advice_key("busy", generation);
+                move || (request(), key)
+            }),
+            Err(DecisionError::Busy)
+        );
+
+        let first = wait_for_ready(&runtime).expect("first result");
+        assert_eq!(first.key.request_id, "first");
+        assert!(runtime.take_ready_shadow().is_none());
+
+        runtime
+            .enqueue_shadow_with_result({
+                let key = advice_key("second", generation);
+                move || (request(), key)
+            })
+            .expect("second shadow admission");
+        let second = wait_for_ready(&runtime).expect("second result");
+        assert_eq!(second.key.request_id, "second");
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn disabling_or_replacing_generation_discards_late_shadow_results() {
+        let provider = std::sync::Arc::new(FixtureProvider {
+            calls: AtomicUsize::new(0),
+            response: Ok(
+                br#"{"answers":{"browser_relevant":{"type":"noul","noul":1.0}}}"#.to_vec(),
+            ),
+            delay: std::time::Duration::from_millis(50),
+        });
+        let runtime = std::sync::Arc::new(DecisionRuntime::new(provider));
+        let generation = runtime.enable();
+        runtime
+            .enqueue_shadow_with_result({
+                let key = advice_key("late", generation);
+                move || (request(), key)
+            })
+            .expect("shadow admission");
+        runtime.disable();
+        std::thread::sleep(std::time::Duration::from_millis(80));
+        assert!(runtime.take_ready_shadow().is_none());
+
+        runtime.enable();
+        runtime
+            .enqueue_shadow_with_result({
+                let key = advice_key("replaced", runtime.generation());
+                move || (request(), key)
+            })
+            .expect("replacement shadow admission");
+        runtime.replace_provider(std::sync::Arc::new(FixtureProvider {
+            calls: AtomicUsize::new(0),
+            response: Ok(
+                br#"{"answers":{"browser_relevant":{"type":"noul","noul":1.0}}}"#.to_vec(),
+            ),
+            delay: std::time::Duration::ZERO,
+        }));
+        std::thread::sleep(std::time::Duration::from_millis(80));
+        assert!(runtime.take_ready_shadow().is_none());
     }
 }

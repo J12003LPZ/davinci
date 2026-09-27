@@ -25,6 +25,10 @@ pub struct DecisionAnswerTelemetry {
 #[serde(default)]
 pub struct DecisionTelemetrySnapshot {
     pub requests: u64,
+    pub ready_advice: u64,
+    pub stale_advice: u64,
+    pub effort_advice_applied: u64,
+    pub completion_advice_observed: u64,
     pub successes: u64,
     pub timeouts: u64,
     pub soft_deadline_misses: u64,
@@ -58,6 +62,19 @@ impl DecisionTelemetry {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .clone()
+    }
+
+    pub fn record_ready_advice(&self) {
+        self.with_snapshot(|snapshot| snapshot.ready_advice += 1);
+    }
+    pub fn record_stale_advice(&self) {
+        self.with_snapshot(|snapshot| snapshot.stale_advice += 1);
+    }
+    pub fn record_effort_advice_applied(&self) {
+        self.with_snapshot(|snapshot| snapshot.effort_advice_applied += 1);
+    }
+    pub fn record_completion_advice_observed(&self) {
+        self.with_snapshot(|snapshot| snapshot.completion_advice_observed += 1);
     }
 
     pub fn record_request(&self) {

@@ -428,6 +428,8 @@ impl ExtensionHost {
         for spec in self.native_tool_specs() {
             let class = tool_class(&spec.name);
             let read_only = matches!(class, ToolClass::Read | ToolClass::Network);
+            let family =
+                davinci_agent::runtime::capabilities::registered_discovery_family(&spec.name);
             capabilities.insert(
                 spec.name.clone(),
                 RuntimeCapability::new(
@@ -438,7 +440,8 @@ impl ExtensionHost {
                     &spec.parameters,
                     Some(env!("CARGO_PKG_VERSION").to_string()),
                 )
-                .with_description(spec.description),
+                .with_description(spec.description)
+                .with_family(family.unwrap_or_default()),
             );
         }
 
@@ -454,7 +457,14 @@ impl ExtensionHost {
                         &serde_json::json!({"type": "object"}),
                         None,
                     )
-                    .with_description(tool.description.clone()),
+                    .with_description(tool.description.clone())
+                    .with_family(
+                        davinci_agent::runtime::capabilities::registered_discovery_family(
+                            &tool.name,
+                        )
+                        .map(str::to_owned)
+                        .unwrap_or_else(|| format!("extension:{}", manifest.name)),
+                    ),
                 );
             }
         }
@@ -475,7 +485,13 @@ impl ExtensionHost {
                         &schema,
                         None,
                     )
-                    .with_description(tool.description.clone()),
+                    .with_description(tool.description.clone())
+                    .with_family(
+                        davinci_agent::runtime::capabilities::registered_discovery_family(
+                            &tool.name,
+                        )
+                        .unwrap_or_default(),
+                    ),
                 );
             }
         }
@@ -545,12 +561,6 @@ impl ExtensionHost {
             .lock()
             .unwrap_or_else(|error| error.into_inner())
             .record_pruning();
-    }
-
-    pub fn engineering_snapshots(
-        &self,
-    ) -> Option<crate::native_extensions::engineering_snapshot::EngineeringSnapshots> {
-        Some(self.native.try_lock().ok()?.engineering.clone())
     }
 
     pub fn native_after_tool(
@@ -1776,6 +1786,82 @@ mod tests {
             assert!(!registry.is_mutating(name));
         }
         assert!(registry.is_mutating("graph_run"));
+    }
+
+    #[test]
+    fn native_and_manifest_families_are_discoverable_through_real_registration() {
+        use davinci_agent::runtime::{AgentId, RunId, RuntimeBus, RuntimeHandle};
+        let mut host = ExtensionHost::default();
+        host.manifests.push(crate::extensions::ExtensionManifest {
+            name: "fixture".into(),
+            description: String::new(),
+            path: None,
+            tools: vec![crate::extensions::ExtensionTool {
+                name: "fixture_lookup".into(),
+                description: "Lookup fixture".into(),
+                command: None,
+                timeout_ms: None,
+            }],
+        });
+        let mut agent = davinci_agent::Agent::new("family registration");
+        agent.set_runtime(RuntimeHandle::new(
+            RunId::new(),
+            AgentId::new(),
+            RuntimeBus::new(),
+        ));
+        agent.tool_surface = davinci_agent::ToolSurface::Lean;
+        agent.turn_context_placement_override =
+            Some(davinci_agent::turn_context::TurnContextPlacement::Appended);
+        let registry = &agent.runtime.as_ref().unwrap().capability_registry;
+        host.register_with(registry);
+        let names = host
+            .capabilities()
+            .into_iter()
+            .map(|cap| cap.name)
+            .collect::<Vec<_>>();
+        agent.apply_extension_tools(&names);
+        agent.freeze_tools_for_cache();
+        for (family, name) in [
+            ("git", "git_branch_diff"),
+            ("browser", "browser_snapshot"),
+            ("lsp", "lsp_definition"),
+            ("package", "package_info"),
+            ("build", "build_targets"),
+            ("sec", "sec_scan_start"),
+            ("graph", "graph_run"),
+            ("tests", "test_impacted"),
+            ("impact", "impact_analyze"),
+            ("verification", "verification_plan"),
+            ("extension:fixture", "fixture_lookup"),
+        ] {
+            let capability = agent
+                .runtime
+                .as_ref()
+                .unwrap()
+                .capability_registry
+                .get(name)
+                .unwrap();
+            assert_eq!(capability.family.as_deref(), Some(family), "{name}");
+            assert!(!agent.is_tool_visible(name), "{name} starts deferred");
+            let result = davinci_agent::execute_tool_with(
+                Path::new("."),
+                "tool_search",
+                &serde_json::json!({"mode":"family", "query":family}),
+                &agent.tool_context,
+            )
+            .unwrap();
+            assert!(
+                result.details.unwrap()["activated"]
+                    .as_array()
+                    .unwrap()
+                    .contains(&serde_json::json!(name)),
+                "family {family}"
+            );
+            assert!(agent
+                .provider_tool_specs()
+                .iter()
+                .any(|tool| tool.name == name));
+        }
     }
 
     #[test]

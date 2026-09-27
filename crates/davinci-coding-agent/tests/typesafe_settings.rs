@@ -35,6 +35,34 @@ fn setting_defaults_off_and_malformed_values_fail_safe() {
 }
 
 #[test]
+fn decision_advice_subflags_require_existing_user_enablement() {
+    let defaults = Settings::default();
+    assert!(!defaults.decision_intelligence_enabled());
+    assert!(!defaults.decision_effort_advice_enabled());
+
+    let enabled: Settings = serde_json::from_value(serde_json::json!({
+        "decisionIntelligence": {
+            "enabled": true,
+            "effortAdvice": true,
+            "completionAdvice": true,
+            "toolFamilyAdvice": true
+        }
+    }))
+    .unwrap();
+    let intelligence = enabled.decision_intelligence.as_ref().unwrap();
+    assert!(enabled.decision_intelligence_enabled());
+    assert!(enabled.decision_effort_advice_enabled());
+    assert!(intelligence.completion_advice);
+    assert!(intelligence.tool_family_advice);
+
+    let disabled: Settings = serde_json::from_value(serde_json::json!({
+        "decisionIntelligence": { "enabled": false, "effortAdvice": true }
+    }))
+    .unwrap();
+    assert!(!disabled.decision_effort_advice_enabled());
+}
+
+#[test]
 fn project_settings_cannot_enable_a_user_disabled_feature() {
     let root = tempfile::tempdir().unwrap();
     let agent_dir = root.path().join("agent");
@@ -105,4 +133,40 @@ fn environment_key_precedes_stored_key_and_empty_override_is_explicit() {
         Some(value) => std::env::set_var("TYPESAFE_API_KEY", value),
         None => std::env::remove_var("TYPESAFE_API_KEY"),
     }
+}
+
+#[test]
+fn toggling_intelligence_preserves_every_saved_advice_choice() {
+    let mut settings: Settings = serde_json::from_value(serde_json::json!({
+        "decisionIntelligence": {"enabled":true, "effortAdvice":true, "completionAdvice":true, "toolFamilyAdvice":true}
+    })).unwrap();
+    for enabled in [false, true] {
+        settings.set_decision_intelligence_enabled(enabled);
+        let saved = settings.decision_intelligence.as_ref().unwrap();
+        assert_eq!(saved.enabled, enabled);
+        assert!(saved.effort_advice && saved.completion_advice && saved.tool_family_advice);
+        assert_eq!(settings.decision_effort_advice_enabled(), enabled);
+        assert_eq!(settings.decision_completion_advice_enabled(), enabled);
+        assert_eq!(settings.decision_tool_family_advice_enabled(), enabled);
+    }
+}
+
+#[test]
+fn project_cannot_enable_unconsented_advice_under_enabled_intelligence() {
+    let root = tempfile::tempdir().unwrap();
+    let agent_dir = root.path().join("agent");
+    let project = root.path().join("project");
+    fs::create_dir_all(&agent_dir).unwrap();
+    fs::create_dir_all(project.join(".pi")).unwrap();
+    fs::write(
+        agent_dir.join("settings.json"),
+        r#"{"defaultProjectTrust":"always","decisionIntelligence":{"enabled":true}}"#,
+    )
+    .unwrap();
+    fs::write(project.join(".pi/settings.json"), r#"{"decisionIntelligence":{"effortAdvice":true,"completionAdvice":true,"toolFamilyAdvice":true}}"#).unwrap();
+    let merged = load_merged_settings(&agent_dir, &project);
+    assert!(merged.decision_intelligence_enabled());
+    assert!(!merged.decision_effort_advice_enabled());
+    assert!(!merged.decision_completion_advice_enabled());
+    assert!(!merged.decision_tool_family_advice_enabled());
 }

@@ -117,10 +117,21 @@ pub struct NativeResponsesOutput {
     pub terminal_event_type: String,
 }
 
+/// Providers may omit an item status, but an explicit unfinished or malformed
+/// status must not establish either an executable call or a replay prefix.
+pub(crate) fn unfinished_tool_item(item: &Value) -> bool {
+    matches!(
+        item.get("type").and_then(Value::as_str),
+        Some("function_call" | "custom_tool_call")
+    ) && item
+        .get("status")
+        .is_some_and(|status| status.as_str() != Some("completed"))
+}
+
 impl NativeResponsesOutput {
     /// Extract a lossless terminal Responses output from raw SSE/WebSocket
-    /// event payloads. Failed/errored/unterminated streams are intentionally
-    /// not resumable.
+    /// event payloads. Failed, incomplete, or unterminated streams cannot
+    /// establish a native continuation prefix.
     pub fn from_events(events: &[Value]) -> Option<Self> {
         let terminal = events.iter().rev().find(|event| {
             matches!(
@@ -128,6 +139,17 @@ impl NativeResponsesOutput {
                 Some("response.completed" | "response.done" | "response.incomplete")
             )
         })?;
+        if terminal.get("type").and_then(Value::as_str) == Some("response.incomplete")
+            || terminal
+                .pointer("/response/status")
+                .and_then(Value::as_str)
+                .is_some_and(|status| status != "completed")
+            || terminal
+                .pointer("/response/error")
+                .is_some_and(|error| !error.is_null())
+        {
+            return None;
+        }
         let terminal_event_type = terminal.get("type")?.as_str()?.to_string();
         let final_response = terminal.get("response").cloned();
         let response_id = terminal
@@ -135,13 +157,44 @@ impl NativeResponsesOutput {
             .and_then(Value::as_str)
             .map(str::to_string);
 
-        let output_items = final_response
+        let terminal_output = final_response
             .as_ref()
             .and_then(|response| response.get("output"))
             .and_then(Value::as_array)
-            .filter(|items| !items.is_empty())
-            .cloned()
-            .unwrap_or_else(|| completed_output_items(events));
+            // An empty terminal array does not override streamed items.
+            .filter(|items| !items.is_empty());
+        let output_items = if let Some(items) = terminal_output {
+            items.clone()
+        } else {
+            let mut open_calls = std::collections::BTreeSet::new();
+            for event in events {
+                let index = event
+                    .get("output_index")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0);
+                match event.get("type").and_then(Value::as_str) {
+                    Some("response.output_item.added")
+                        if matches!(
+                            event.pointer("/item/type").and_then(Value::as_str),
+                            Some("function_call" | "custom_tool_call")
+                        ) =>
+                    {
+                        open_calls.insert(index);
+                    }
+                    Some("response.output_item.done") => {
+                        open_calls.remove(&index);
+                    }
+                    _ => {}
+                }
+            }
+            if !open_calls.is_empty() {
+                return None;
+            }
+            completed_output_items(events)
+        };
+        if output_items.iter().any(unfinished_tool_item) {
+            return None;
+        }
 
         Some(Self {
             response_id,
@@ -156,7 +209,7 @@ impl NativeResponsesOutput {
         let response = value.get("response").unwrap_or(value);
         let status = response.get("status").and_then(Value::as_str);
         let has_error = response.get("error").is_some_and(|error| !error.is_null());
-        if matches!(status, Some("failed" | "cancelled")) || has_error {
+        if !matches!(status, None | Some("completed")) || has_error {
             return None;
         }
         let output_items = response
@@ -164,6 +217,9 @@ impl NativeResponsesOutput {
             .and_then(Value::as_array)
             .cloned()
             .unwrap_or_default();
+        if output_items.iter().any(unfinished_tool_item) {
+            return None;
+        }
         if output_items.is_empty() && response.get("id").is_none() {
             return None;
         }
@@ -312,27 +368,28 @@ impl ResponsesLedger {
     /// Legacy session migration: replay generic ChatMessage list into a clean ResponsesLedger.
     pub fn from_messages(lineage_id: impl Into<String>, messages: &[ChatMessage]) -> Self {
         let mut ledger = Self::new(lineage_id);
-        for message in messages {
+        for (index, message) in messages.iter().enumerate() {
             if message.role == "toolResult" {
-                let call_id = message
-                    .tool_call_id
-                    .as_deref()
-                    .unwrap_or_default()
+                let raw_call_id = message.tool_call_id.as_deref().unwrap_or_default();
+                let call_id = raw_call_id
                     .split_once('|')
                     .map(|(c, _)| c)
-                    .unwrap_or(message.tool_call_id.as_deref().unwrap_or_default());
+                    .unwrap_or(raw_call_id);
+                let kind = crate::responses_tools::result_wire_kind(&messages[..index], message);
                 let output = content_text(&message.content);
-                // Check if this tool result was for a custom tool or function call
-                if message.tool_name.as_deref() == Some("apply_patch") {
-                    ledger.append_item(ResponsesItem::CustomToolCallOutput {
-                        call_id: call_id.to_string(),
-                        output,
-                    });
-                } else {
-                    ledger.append_item(ResponsesItem::FunctionCallOutput {
-                        call_id: call_id.to_string(),
-                        output,
-                    });
+                match kind {
+                    crate::responses_tools::ResponsesToolWireKind::Custom => {
+                        ledger.append_item(ResponsesItem::CustomToolCallOutput {
+                            call_id: call_id.to_string(),
+                            output,
+                        });
+                    }
+                    crate::responses_tools::ResponsesToolWireKind::Function => {
+                        ledger.append_item(ResponsesItem::FunctionCallOutput {
+                            call_id: call_id.to_string(),
+                            output,
+                        });
+                    }
                 }
                 continue;
             }
@@ -354,25 +411,33 @@ impl ResponsesLedger {
                     } = block
                     {
                         let call_id = id.split_once('|').map(|(c, _)| c).unwrap_or(id);
-                        if name == "apply_patch" {
-                            let input = arguments
-                                .get("input")
-                                .and_then(Value::as_str)
-                                .unwrap_or_default()
-                                .to_string();
-                            ledger.append_item(ResponsesItem::CustomToolCall {
-                                id: Some(id.clone()),
-                                call_id: call_id.to_string(),
-                                name: name.clone(),
-                                input,
-                            });
-                        } else {
-                            ledger.append_item(ResponsesItem::FunctionCall {
-                                id: Some(id.clone()),
-                                call_id: call_id.to_string(),
-                                name: name.clone(),
-                                arguments: arguments.to_string(),
-                            });
+                        let kind = crate::responses_tools::message_tool_wire_kind(
+                            message,
+                            Some(id),
+                            Some(name),
+                            &[],
+                        );
+                        match kind {
+                            crate::responses_tools::ResponsesToolWireKind::Custom => {
+                                let input =
+                                    crate::responses_tools::custom_tool_call_arguments(arguments)
+                                        .unwrap_or_default()
+                                        .to_string();
+                                ledger.append_item(ResponsesItem::CustomToolCall {
+                                    id: Some(id.clone()),
+                                    call_id: call_id.to_string(),
+                                    name: name.clone(),
+                                    input,
+                                });
+                            }
+                            crate::responses_tools::ResponsesToolWireKind::Function => {
+                                ledger.append_item(ResponsesItem::FunctionCall {
+                                    id: Some(id.clone()),
+                                    call_id: call_id.to_string(),
+                                    name: name.clone(),
+                                    arguments: arguments.to_string(),
+                                });
+                            }
                         }
                     }
                 }
@@ -480,6 +545,52 @@ mod tests {
             "output": []
         });
         assert!(NativeResponsesOutput::from_response_value(&response).is_none());
+    }
+
+    #[test]
+    fn empty_terminal_output_keeps_finished_native_items() {
+        let events = [
+            serde_json::json!({"type":"response.output_item.done","output_index":0,
+                "item":{"type":"custom_tool_call","id":"item","call_id":"call",
+                    "name":"apply_patch","input":"patch"}}),
+            serde_json::json!({"type":"response.completed",
+                "response":{"id":"resp","status":"completed","output":[]}}),
+        ];
+        let native = NativeResponsesOutput::from_events(&events).unwrap();
+        assert_eq!(native.output_items.len(), 1);
+        assert_eq!(native.output_items[0]["call_id"], "call");
+    }
+
+    #[test]
+    fn unfinished_tool_items_cannot_establish_native_continuation() {
+        for kind in ["function_call", "custom_tool_call"] {
+            for status in [
+                Value::Null,
+                "incomplete".into(),
+                "in_progress".into(),
+                "failed".into(),
+            ] {
+                let item = serde_json::json!({"type":kind,"id":"item","call_id":"call",
+                    "name":"apply_patch","status":status,"input":"patch","arguments":"{}"});
+                let response =
+                    serde_json::json!({"id":"resp","status":"completed","output":[item]});
+                assert!(
+                    NativeResponsesOutput::from_response_value(&response).is_none(),
+                    "{response}"
+                );
+                assert!(
+                    NativeResponsesOutput::from_events(&[
+                        serde_json::json!({"type":"response.completed","response":response})
+                    ])
+                    .is_none(),
+                    "{response}"
+                );
+                assert!(NativeResponsesOutput::from_events(&[
+                    serde_json::json!({"type":"response.output_item.done","output_index":0,"item":item}),
+                    serde_json::json!({"type":"response.completed","response":{"id":"resp","status":"completed"}}),
+                ]).is_none(), "{item}");
+            }
+        }
     }
 
     #[test]
@@ -610,19 +721,27 @@ mod tests {
 
     #[test]
     fn migrates_generic_messages_to_responses_items() {
-        let messages = vec![
-            ChatMessage::text("user", "What is 2+2?"),
-            ChatMessage {
-                role: "assistant".into(),
-                content: vec![MessageContent::ToolCall {
-                    id: "call_1|fc_1".into(),
-                    name: "apply_patch".into(),
-                    arguments: serde_json::json!({"input": "*** Begin Patch\n*** End Patch"}),
-                }],
-                ..Default::default()
-            },
-            ChatMessage::tool_result("call_1|fc_1", "apply_patch", "Applied patch", false),
-        ];
+        let mut assistant = ChatMessage {
+            role: "assistant".into(),
+            content: vec![MessageContent::ToolCall {
+                id: "call_1|fc_1".into(),
+                name: "apply_patch".into(),
+                arguments: serde_json::json!({"input": "*** Begin Patch\n*** End Patch"}),
+            }],
+            ..Default::default()
+        };
+        crate::responses_tools::set_wire_kind(
+            &mut assistant.extra,
+            "call_1|fc_1",
+            crate::responses_tools::ResponsesToolWireKind::Custom,
+        );
+        let mut result =
+            ChatMessage::tool_result("call_1|fc_1", "apply_patch", "Applied patch", false);
+        crate::responses_tools::set_single_wire_kind(
+            &mut result.extra,
+            crate::responses_tools::ResponsesToolWireKind::Custom,
+        );
+        let messages = vec![ChatMessage::text("user", "What is 2+2?"), assistant, result];
 
         let ledger = ResponsesLedger::from_messages("lin_migrated", &messages);
         assert_eq!(ledger.items.len(), 3);

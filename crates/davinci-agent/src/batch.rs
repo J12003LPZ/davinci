@@ -152,7 +152,13 @@ impl Agent {
         parent_operation_id: Option<crate::runtime::operations::OperationId>,
     ) -> ToolResult {
         let operations = match parse_operations(input) {
-            Ok(operations) => operations,
+            Ok(operations) => operations
+                .into_iter()
+                .map(|operation| Operation {
+                    tool: self.canonical_tool_name(&operation.tool).to_owned(),
+                    args: operation.args,
+                })
+                .collect::<Vec<_>>(),
             Err(message) => {
                 return ToolResult {
                     content: message,
@@ -235,31 +241,22 @@ impl Agent {
                         result = (hook.0)(&op_id, cwd, &tool, &args, result);
                     }
                     if !replayed {
-                        if matches!(
-                            tool.as_str(),
-                            "write" | "edit" | "apply_patch" | "notebook_edit"
-                        ) && !pre_hook_error
+                        if crate::tools::is_coordinated_mutation(&tool)
+                            && !pre_hook_error
                             && !result.is_error
                         {
                             agent.record_successful_mutation_paths(
                                 crate::turn::mutation_paths_from_tool(&tool, &args),
                             );
                         }
-                        if matches!(tool.as_str(), "bash" | "powershell" | "exec_command") {
-                            let command = args
-                                .get("command")
-                                .and_then(Value::as_str)
-                                .unwrap_or_default();
-                            if let Some(trustworthy) =
-                                crate::shell_policy::verification_outcome(command)
-                            {
-                                agent.remember_verification_call(&tool, &args, cwd);
-                                agent.record_verification_command(
-                                    command,
-                                    trustworthy && !pre_hook_error && !result.is_error,
-                                );
-                            }
-                        }
+                        agent.observe_shell_verification(
+                            &op_id,
+                            cwd,
+                            &tool,
+                            &args,
+                            &pre_hook_result,
+                            &result,
+                        );
                     }
                     let hook_vetoed = !pre_hook_error && result.is_error;
                     agent.record_receipt(

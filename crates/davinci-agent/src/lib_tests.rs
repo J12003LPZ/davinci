@@ -954,6 +954,7 @@ fn retry_aborted_provider_response_is_not_reported_as_success() {
                 return Err("overloaded_error".into());
             }
             Ok(davinci_ai::AssistantMessage {
+                extra: Default::default(),
                 id: "abort".into(),
                 role: "assistant".into(),
                 content: Vec::new(),
@@ -984,6 +985,7 @@ fn auto_retry_emits_ts_session_events() {
             calls += 1;
             if calls == 1 {
                 return Ok(AssistantMessage {
+                    extra: Default::default(),
                     id: "e1".into(),
                     role: "assistant".into(),
                     content: Vec::new(),
@@ -994,6 +996,7 @@ fn auto_retry_emits_ts_session_events() {
                 });
             }
             Ok(AssistantMessage {
+                extra: Default::default(),
                 id: "ok".into(),
                 role: "assistant".into(),
                 content: vec![ContentBlock::Text {
@@ -1029,6 +1032,7 @@ fn a_closure_that_streamed_live_is_recorded_but_not_resent_to_the_sink() {
     let events = agent
         .run_loop(|current| {
             let message = AssistantMessage {
+                extra: Default::default(),
                 id: "live".into(),
                 role: "assistant".into(),
                 content: vec![ContentBlock::Text {
@@ -1084,6 +1088,7 @@ fn a_closure_that_streamed_live_is_recorded_but_not_resent_to_the_sink() {
 fn stream_events_len(text: &str) -> usize {
     use davinci_ai::{AssistantMessage, ContentBlock, StopReason};
     davinci_ai::events_from_complete(&AssistantMessage {
+        extra: Default::default(),
         id: "n".into(),
         role: "assistant".into(),
         content: vec![ContentBlock::Text { text: text.into() }],
@@ -1108,6 +1113,7 @@ fn agent_loop_emits_ts_event_names_and_runs_tools() {
         .run_loop(|current| {
             if current.messages.iter().any(|m| m.role == "toolResult") {
                 return Ok(AssistantMessage {
+                    extra: Default::default(),
                     id: "a2".into(),
                     role: "assistant".into(),
                     content: vec![ContentBlock::Text {
@@ -1120,6 +1126,7 @@ fn agent_loop_emits_ts_event_names_and_runs_tools() {
                 });
             }
             Ok(AssistantMessage {
+                extra: Default::default(),
                 id: "a1".into(),
                 role: "assistant".into(),
                 content: vec![ContentBlock::ToolCall {
@@ -1172,6 +1179,7 @@ fn scripted_tool_calls(
         index += 1;
         match remaining.next() {
             Some((name, arguments)) => Ok(AssistantMessage {
+                extra: Default::default(),
                 id: format!("a{index}"),
                 role: "assistant".into(),
                 content: vec![ContentBlock::ToolCall {
@@ -1185,6 +1193,7 @@ fn scripted_tool_calls(
                 error_message: None,
             }),
             None => Ok(AssistantMessage {
+                extra: Default::default(),
                 id: format!("a{index}"),
                 role: "assistant".into(),
                 content: vec![ContentBlock::Text {
@@ -1230,6 +1239,7 @@ fn scripted_batches(
         index += 1;
         match remaining.next() {
             Some(calls) => Ok(AssistantMessage {
+                extra: Default::default(),
                 id: format!("a{index}"),
                 role: "assistant".into(),
                 content: calls
@@ -1247,6 +1257,7 @@ fn scripted_batches(
                 error_message: None,
             }),
             None => Ok(AssistantMessage {
+                extra: Default::default(),
                 id: format!("a{index}"),
                 role: "assistant".into(),
                 content: vec![ContentBlock::Text {
@@ -1259,6 +1270,75 @@ fn scripted_batches(
             }),
         }
     }
+}
+
+fn truncated_call_response(index: usize) -> davinci_ai::AssistantMessage {
+    let mut extra = serde_json::Map::new();
+    extra.insert(
+        davinci_ai::DROPPED_TOOL_CALLS_KEY.into(),
+        serde_json::Value::Bool(true),
+    );
+    davinci_ai::AssistantMessage {
+        extra,
+        id: format!("a{index}"),
+        role: "assistant".into(),
+        content: Vec::new(),
+        model: "fixture".into(),
+        usage: None,
+        stop_reason: Some(davinci_ai::StopReason::Length),
+        error_message: None,
+    }
+}
+
+#[test]
+fn output_limit_truncated_call_gets_one_corrective_turn() {
+    let mut agent = Agent::new(default_system_prompt());
+    agent.prompt("write a large file");
+    let mut calls = 0;
+    agent
+        .run_loop(|_current| {
+            calls += 1;
+            if calls == 1 {
+                return Ok(truncated_call_response(calls));
+            }
+            Ok(davinci_ai::AssistantMessage {
+                extra: Default::default(),
+                id: format!("a{calls}"),
+                role: "assistant".into(),
+                content: vec![davinci_ai::ContentBlock::Text {
+                    text: "done".into(),
+                }],
+                model: "fixture".into(),
+                usage: None,
+                stop_reason: Some(davinci_ai::StopReason::Stop),
+                error_message: None,
+            })
+        })
+        .unwrap();
+    assert_eq!(calls, 2, "the model must get a turn to retry smaller");
+    assert!(agent.messages.iter().any(|message| {
+        message.extra.get("davinciCapabilityReminder")
+            == Some(&serde_json::Value::String("output_truncated".into()))
+    }));
+    assert!(agent
+        .messages
+        .iter()
+        .all(|message| !message.extra.contains_key(davinci_ai::DROPPED_TOOL_CALLS_KEY)));
+    assert_eq!(agent.last_assistant_text().as_deref(), Some("done"));
+}
+
+#[test]
+fn repeated_output_limit_truncation_ends_the_run() {
+    let mut agent = Agent::new(default_system_prompt());
+    agent.prompt("write a large file");
+    let mut calls = 0;
+    agent
+        .run_loop(|_current| {
+            calls += 1;
+            Ok(truncated_call_response(calls))
+        })
+        .unwrap();
+    assert_eq!(calls, 3, "one initial request plus two bounded retries");
 }
 
 #[test]
@@ -1735,6 +1815,7 @@ fn event_sink_receives_events_as_run_loop_emits_them() {
     let events = agent
         .run_loop(|_| {
             Ok(AssistantMessage {
+                extra: Default::default(),
                 id: "a1".into(),
                 role: "assistant".into(),
                 content: vec![ContentBlock::Text { text: "ok".into() }],
@@ -1879,6 +1960,7 @@ fn custom_tool_executor_runs_unknown_builtin_names() {
         .run_loop(|current| {
             if current.messages.iter().any(|m| m.role == "toolResult") {
                 return Ok(AssistantMessage {
+                    extra: Default::default(),
                     id: "a2".into(),
                     role: "assistant".into(),
                     content: vec![ContentBlock::Text {
@@ -1891,6 +1973,7 @@ fn custom_tool_executor_runs_unknown_builtin_names() {
                 });
             }
             Ok(AssistantMessage {
+                extra: Default::default(),
                 id: "a1".into(),
                 role: "assistant".into(),
                 content: vec![ContentBlock::ToolCall {
@@ -2083,6 +2166,7 @@ fn pre_tool_hook_blocks_before_execution() {
                 .any(|message| message.role == "toolResult")
             {
                 return Ok(AssistantMessage {
+                    extra: Default::default(),
                     id: "a2".into(),
                     role: "assistant".into(),
                     content: vec![ContentBlock::Text {
@@ -2095,6 +2179,7 @@ fn pre_tool_hook_blocks_before_execution() {
                 });
             }
             Ok(AssistantMessage {
+                extra: Default::default(),
                 id: "a1".into(),
                 role: "assistant".into(),
                 content: vec![ContentBlock::ToolCall {
@@ -2302,6 +2387,7 @@ fn before_agent_start_custom_messages_are_emitted_in_current_turn_and_reload() {
     let events = agent
         .run_loop(|_| {
             Ok(AssistantMessage {
+                extra: Default::default(),
                 id: "assistant-1".into(),
                 role: "assistant".into(),
                 content: vec![ContentBlock::Text {
@@ -2674,6 +2760,410 @@ fn mutation_without_verification_requests_evidence() {
 }
 
 #[test]
+fn verification_generation_accumulates_only_fresh_applicable_coverage() {
+    let agent = Agent::new("x");
+    let a = PathBuf::from("a.py");
+    let b = PathBuf::from("b.py");
+    agent.record_successful_mutation_paths(vec![a.clone(), b.clone()]);
+    let assessment = |path| crate::verification::Assessment {
+        kind: crate::verification::CheckKind::TargetedScript,
+        covered: vec![path],
+        complete: false,
+        full_workspace: false,
+        reason: "test",
+    };
+    agent.record_verification_assessment(1, "check a", &assessment(a.clone()), None);
+    assert_eq!(agent.completion_evidence(), CompletionEvidence::Unverified);
+    agent.record_verification_assessment(1, "check a", &assessment(a.clone()), Some(true));
+    assert_eq!(agent.completion_evidence(), CompletionEvidence::Partial);
+    agent.record_verification_assessment(1, "check b", &assessment(b.clone()), Some(true));
+    assert_eq!(agent.completion_evidence(), CompletionEvidence::Verified);
+    agent.record_successful_mutation_paths(vec![a.clone()]);
+    agent.record_verification_assessment(1, "stale", &assessment(a.clone()), Some(true));
+    assert_eq!(agent.completion_evidence(), CompletionEvidence::Unverified);
+    agent.record_verification_assessment(2, "fresh", &assessment(a.clone()), Some(true));
+    assert_eq!(agent.completion_evidence(), CompletionEvidence::Verified);
+    agent.record_verification_assessment(2, "failure", &assessment(a), Some(false));
+    assert_eq!(
+        agent.completion_evidence(),
+        CompletionEvidence::VerificationFailed
+    );
+}
+
+#[test]
+fn partial_verification_preserves_outstanding_paths_after_mutation() {
+    let agent = Agent::new("x");
+    agent.record_successful_mutation_paths(vec![PathBuf::from("a.py"), PathBuf::from("b.py")]);
+    agent.record_verification_assessment(
+        1,
+        "check a",
+        &crate::verification::Assessment {
+            kind: crate::verification::CheckKind::TargetedScript,
+            covered: vec![PathBuf::from("a.py")],
+            complete: false,
+            full_workspace: false,
+            reason: "test",
+        },
+        Some(true),
+    );
+    agent.record_successful_mutation_paths(vec![PathBuf::from("c.py")]);
+    assert_eq!(agent.mutation_verification_state().mutation_paths.len(), 3);
+    assert!(agent.mutation_verification_state().covered_paths.is_empty());
+}
+
+#[test]
+fn unknown_mutation_paths_prevent_full_targeted_verification() {
+    let agent = Agent::new("x");
+    agent.record_successful_mutation_paths(vec![PathBuf::from("a.py")]);
+    agent.record_successful_mutation();
+    let assessment = crate::verification::Assessment {
+        kind: crate::verification::CheckKind::TargetedScript,
+        covered: vec![PathBuf::from("a.py")],
+        complete: true,
+        full_workspace: false,
+        reason: "test",
+    };
+    agent.record_verification_assessment(2, "check a", &assessment, Some(true));
+    assert_eq!(agent.completion_evidence(), CompletionEvidence::Partial);
+    agent.record_verification_assessment(2, "check a fails", &assessment, Some(false));
+    let unrelated = crate::verification::Assessment {
+        covered: vec![],
+        ..assessment
+    };
+    agent.record_verification_assessment(2, "unrelated success", &unrelated, Some(true));
+    assert_eq!(
+        agent.completion_evidence(),
+        CompletionEvidence::VerificationFailed
+    );
+}
+
+#[test]
+fn partial_success_preserves_a_failure_until_its_scope_passes() {
+    let agent = Agent::new("x");
+    let paths = [PathBuf::from("a.py"), PathBuf::from("b.py")];
+    agent.record_successful_mutation_paths(paths.to_vec());
+    let assessment = |path: &PathBuf| crate::verification::Assessment {
+        kind: crate::verification::CheckKind::TargetedScript,
+        covered: vec![path.clone()],
+        complete: false,
+        full_workspace: false,
+        reason: "test",
+    };
+    agent.record_verification_assessment(1, "b fails", &assessment(&paths[1]), Some(false));
+    agent.record_verification_assessment(1, "a passes", &assessment(&paths[0]), Some(true));
+    assert_eq!(
+        agent.completion_evidence(),
+        CompletionEvidence::VerificationFailed
+    );
+    agent.record_verification_assessment(1, "b passes", &assessment(&paths[1]), Some(true));
+    assert_eq!(agent.completion_evidence(), CompletionEvidence::Verified);
+}
+
+#[test]
+fn fresh_full_workspace_suite_recovers_unknown_mutations_and_unscoped_failures() {
+    let root = tempfile::tempdir().unwrap();
+    let agent = Agent::new("x");
+    agent.record_successful_mutation();
+    let suite = crate::verification::classify("bash", "pytest -q", root.path(), &[]);
+    agent.record_verification_assessment(1, "pytest", &suite, Some(false));
+    assert_eq!(
+        agent.completion_evidence(),
+        CompletionEvidence::VerificationFailed
+    );
+    agent.record_successful_mutation();
+    agent.record_verification_assessment(1, "stale pytest", &suite, Some(true));
+    assert!(agent.mutation_verification_state().unknown_mutation_paths);
+    agent.record_verification_assessment(2, "fresh pytest", &suite, Some(true));
+    assert_eq!(agent.completion_evidence(), CompletionEvidence::Verified);
+    assert!(!agent.mutation_verification_state().unknown_mutation_paths);
+}
+
+#[test]
+fn shell_edits_invalidate_an_earlier_check_generation() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut agent = verifying_agent(dir.path());
+    agent.prompt("write, verify, then modify through a script");
+    let script = scripted_tool_calls(vec![
+        (
+            "write",
+            serde_json::json!({"path":"a.txt", "content":"one"}),
+        ),
+        (
+            shell_tool(),
+            serde_json::json!({"command":"python -c \"from pathlib import Path; assert Path('a.txt').read_text() == 'one'\""}),
+        ),
+        (
+            shell_tool(),
+            serde_json::json!({"command":"python -c \"from pathlib import Path; Path('a.txt').write_text('two changed')\""}),
+        ),
+    ]);
+    agent.run_loop(script).unwrap();
+    assert_eq!(agent.mutation_verification_state().mutation_generation, 2);
+    assert_eq!(
+        agent.completion_evidence(),
+        CompletionEvidence::VerificationFailed
+    );
+    assert_eq!(harness_runs(&agent), 1);
+}
+
+#[test]
+fn source_edits_during_a_passing_check_cannot_verify_the_new_generation() {
+    let dir = tempfile::tempdir().unwrap();
+    let agent = verifying_agent(dir.path());
+    std::fs::write(dir.path().join("changed.py"), "x = 1").unwrap();
+    agent.record_successful_mutation_paths(vec![PathBuf::from("changed.py")]);
+    agent
+        .verification_starts
+        .lock()
+        .unwrap()
+        .insert("check".into(), 1);
+    agent.shell_mutation_snapshots.lock().unwrap().insert(
+        "check".into(),
+        crate::verification::workspace::Snapshot::capture(dir.path()),
+    );
+    std::fs::write(dir.path().join("changed.py"), "x = 'changed'").unwrap();
+    let result = ToolResult {
+        content: "passed".into(),
+        is_error: false,
+        details: Some(serde_json::json!({"exitCode":0})),
+    };
+    agent.observe_shell_verification(
+        "check",
+        dir.path(),
+        shell_tool(),
+        &serde_json::json!({"command":"pytest -q"}),
+        &result,
+        &result,
+    );
+    assert_eq!(agent.mutation_verification_state().mutation_generation, 2);
+    assert_eq!(agent.completion_evidence(), CompletionEvidence::Unverified);
+}
+
+#[test]
+fn exhausted_inventory_recovers_with_a_fresh_suite_but_rejects_edits_during_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let agent = verifying_agent(dir.path());
+    let paths = [PathBuf::from("changed.py")];
+    std::fs::write(dir.path().join(&paths[0]), "x = 1").unwrap();
+    agent.record_successful_mutation_paths(paths.to_vec());
+    let result = ToolResult {
+        content: "passed".into(),
+        is_error: false,
+        details: Some(serde_json::json!({"exitCode":0})),
+    };
+    let args = serde_json::json!({"command":"pytest -q"});
+    let snapshot = crate::verification::workspace::Snapshot::limited_for_test(dir.path(), &paths);
+    agent.record_shell_verification_start("suite", snapshot);
+    assert!(agent.mutation_verification_state().unknown_mutation_paths);
+    agent.observe_shell_verification("suite", dir.path(), shell_tool(), &args, &result, &result);
+    assert_eq!(agent.completion_evidence(), CompletionEvidence::Verified);
+
+    let snapshot = crate::verification::workspace::Snapshot::limited_for_test(dir.path(), &paths);
+    agent.record_shell_verification_start("editing-suite", snapshot);
+    std::fs::write(dir.path().join(&paths[0]), "x = 2").unwrap();
+    agent.observe_shell_verification(
+        "editing-suite",
+        dir.path(),
+        shell_tool(),
+        &args,
+        &result,
+        &result,
+    );
+    assert_eq!(agent.completion_evidence(), CompletionEvidence::Unverified);
+    let snapshot = crate::verification::workspace::Snapshot::limited_for_test(dir.path(), &paths);
+    agent.record_shell_verification_start("fresh-suite", snapshot);
+    agent.observe_shell_verification(
+        "fresh-suite",
+        dir.path(),
+        shell_tool(),
+        &args,
+        &result,
+        &result,
+    );
+    assert_eq!(agent.completion_evidence(), CompletionEvidence::Verified);
+}
+
+#[test]
+fn background_shell_invalidates_coverage_until_terminal_state_and_fresh_verification() {
+    use std::process::{Command, Stdio};
+    let dir = tempfile::tempdir().unwrap();
+    let agent = verifying_agent(dir.path());
+    std::fs::write(dir.path().join("changed.py"), "old").unwrap();
+    agent.record_successful_mutation_paths(vec![PathBuf::from("changed.py")]);
+    agent.record_verification_result(true);
+    let child = Command::new("python").args(["-c", "import sys; from pathlib import Path; sys.stdin.readline(); Path('changed.py').write_text('new')"])
+        .current_dir(dir.path()).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap();
+    let job_id = agent
+        .tool_context
+        .jobs
+        .lock()
+        .unwrap()
+        .register("background edit", child);
+    agent
+        .verification_starts
+        .lock()
+        .unwrap()
+        .insert("background".into(), 1);
+    let result = crate::jobs::started_result(job_id, 0, "background edit");
+    agent.observe_shell_verification(
+        "background",
+        dir.path(),
+        shell_tool(),
+        &serde_json::json!({"command":"python editor.py", "background":true}),
+        &result,
+        &result,
+    );
+    assert_eq!(agent.completion_evidence(), CompletionEvidence::Unverified);
+    let suite = crate::verification::classify("bash", "pytest -q", dir.path(), &[]);
+    let generation = agent.mutation_verification_state().mutation_generation;
+    agent.record_verification_assessment(generation, "pytest", &suite, Some(true));
+    assert_eq!(agent.completion_evidence(), CompletionEvidence::Unverified);
+    agent
+        .tool_context
+        .jobs
+        .lock()
+        .unwrap()
+        .write_stdin(job_id, "go\n")
+        .unwrap();
+    let result = crate::jobs::output_tool(
+        &agent.tool_context.jobs,
+        &serde_json::json!({"jobId":job_id, "wait":2}),
+        None,
+    )
+    .unwrap();
+    assert_eq!(result.details.unwrap()["exitCode"], 0);
+    assert_eq!(agent.completion_evidence(), CompletionEvidence::Unverified);
+    let generation = agent.mutation_verification_state().mutation_generation;
+    agent.record_verification_assessment(generation, "fresh pytest", &suite, Some(true));
+    assert_eq!(agent.completion_evidence(), CompletionEvidence::Verified);
+}
+
+#[test]
+fn oversized_workspace_keeps_automatic_verification_and_reminders_bounded() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut agent = verifying_agent(dir.path());
+    agent.prompt("verify then create a large artifact");
+    let mut calls = 0;
+    let mut script = scripted_tool_calls(vec![
+        (
+            "write",
+            serde_json::json!({"path":"a.txt", "content":"one"}),
+        ),
+        (
+            shell_tool(),
+            serde_json::json!({"command":"python -c \"from pathlib import Path; assert Path('a.txt').read_text() == 'one'\""}),
+        ),
+        (
+            shell_tool(),
+            serde_json::json!({"command":"python -c \"from pathlib import Path; Path('large.bin').open('wb').truncate(67108865)\""}),
+        ),
+    ]);
+    agent
+        .run_loop(|current| {
+            calls += 1;
+            assert!(
+                calls <= 5,
+                "automatic verification must not create a reminder loop"
+            );
+            script(current)
+        })
+        .unwrap();
+    assert_eq!(calls, 5);
+    assert_eq!(harness_runs(&agent), 1);
+    assert_eq!(reminders(&agent).len(), 1);
+    assert_eq!(agent.completion_evidence(), CompletionEvidence::Unverified);
+}
+
+#[test]
+fn passing_harness_verification_does_not_relabel_another_scopes_failure() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut agent = verifying_agent(dir.path());
+    std::fs::write(dir.path().join("a.txt"), "one").unwrap();
+    agent.record_successful_mutation_paths(vec![PathBuf::from("a.txt"), PathBuf::from("b.py")]);
+    let failed = crate::verification::Assessment {
+        kind: crate::verification::CheckKind::TargetedScript,
+        covered: vec![PathBuf::from("b.py")],
+        complete: false,
+        full_workspace: false,
+        reason: "test",
+    };
+    agent.record_verification_assessment(1, "check b", &failed, Some(false));
+    agent.remember_verification_call(shell_tool(), &serde_json::json!({"command":"python -c \"from pathlib import Path; assert Path('a.txt').read_text() == 'one'\""}), dir.path());
+    agent.record_successful_mutation_paths(vec![PathBuf::from("a.txt")]);
+    agent.prompt("finish");
+    agent.run_loop(scripted_tool_calls(Vec::new())).unwrap();
+    assert_eq!(harness_runs(&agent), 1);
+    let reminders = reminders(&agent);
+    assert_eq!(reminders.len(), 1);
+    assert!(
+        reminders[0].contains("failure remains unresolved"),
+        "{}",
+        reminders[0]
+    );
+    assert!(!reminders[0].contains("and it failed"), "{}", reminders[0]);
+    assert_eq!(
+        agent.completion_evidence(),
+        CompletionEvidence::VerificationFailed
+    );
+}
+
+#[test]
+fn overlapping_shell_mutations_record_all_paths_before_rejecting_stale_verification() {
+    let dir = tempfile::tempdir().unwrap();
+    let agent = verifying_agent(dir.path());
+    agent.record_shell_verification_start(
+        "a",
+        crate::verification::workspace::Snapshot::capture(dir.path()),
+    );
+    agent.record_shell_verification_start(
+        "b",
+        crate::verification::workspace::Snapshot::capture(dir.path()),
+    );
+    let result = ToolResult {
+        content: "ok".into(),
+        is_error: false,
+        details: Some(serde_json::json!({"exitCode":0})),
+    };
+    let args = serde_json::json!({"command":"python editor.py"});
+    std::fs::write(dir.path().join("a.py"), "one").unwrap();
+    agent.observe_shell_verification("a", dir.path(), shell_tool(), &args, &result, &result);
+    std::fs::write(dir.path().join("b.py"), "two").unwrap();
+    agent.observe_shell_verification("b", dir.path(), shell_tool(), &args, &result, &result);
+    let state = agent.mutation_verification_state();
+    assert!(state.mutation_paths.contains(&PathBuf::from("a.py")));
+    assert!(state.mutation_paths.contains(&PathBuf::from("b.py")));
+    let assessment = crate::verification::Assessment {
+        kind: crate::verification::CheckKind::TargetedScript,
+        covered: vec![PathBuf::from("a.py")],
+        complete: false,
+        full_workspace: false,
+        reason: "test",
+    };
+    agent.record_verification_assessment(
+        state.mutation_generation,
+        "check a",
+        &assessment,
+        Some(true),
+    );
+    assert_eq!(agent.completion_evidence(), CompletionEvidence::Partial);
+}
+
+#[test]
+fn unsupported_move_marker_does_not_create_mutation_targets() {
+    let patch = "*** Begin Patch\n*** Update File: old.py\n*** Move to: new.py\n@@\n-x\n+y\n*** Delete File: removed.py\n*** End Patch";
+    let error = crate::apply_patch::parse_codex_patch(patch).unwrap_err();
+    assert!(error.to_string().contains("Move to"), "{error}");
+
+    let paths = crate::turn::mutation_paths_from_tool(
+        "apply_patch",
+        &serde_json::json!({
+            "patch": patch
+        }),
+    );
+    assert!(paths.is_empty());
+}
+
+#[test]
 fn mutation_then_successful_verification_is_verified() {
     let agent = Agent::new("x");
 
@@ -2886,6 +3376,7 @@ fn batch_duplicate_mutating_calls_executes_once() {
         turn += 1;
         if turn == 1 {
             Ok(AssistantMessage {
+                extra: Default::default(),
                 id: "a1".into(),
                 role: "assistant".into(),
                 content: vec![
@@ -2907,6 +3398,7 @@ fn batch_duplicate_mutating_calls_executes_once() {
             })
         } else {
             Ok(AssistantMessage {
+                extra: Default::default(),
                 id: "a2".into(),
                 role: "assistant".into(),
                 content: vec![ContentBlock::Text {
@@ -3187,6 +3679,7 @@ fn mailbox_history_is_not_previous_real_user_evidence_for_capability_routing() {
     agent
         .run_loop(|_| {
             Ok(davinci_ai::AssistantMessage {
+                extra: Default::default(),
                 id: "mailbox-fixture".into(),
                 role: "assistant".into(),
                 content: vec![davinci_ai::ContentBlock::Text { text: "ok".into() }],
@@ -3328,7 +3821,7 @@ fn harness_reruns_the_last_verification_after_a_later_edit() {
         ),
         (
             shell_tool(),
-            serde_json::json!({"command": "cargo check --help"}),
+            serde_json::json!({"command": "python -c \"from pathlib import Path; assert Path('a.txt').read_text() in ('one', 'two')\""}),
         ),
         (
             "write",
@@ -3357,8 +3850,164 @@ fn harness_reruns_the_last_verification_after_a_later_edit() {
 }
 
 #[test]
+fn inline_check_finishes_without_extra_model_or_verifier_execution() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut agent = verifying_agent(dir.path());
+    agent.prompt("write and check");
+    let mut calls = 0;
+    let mut script = scripted_tool_calls(vec![
+        (
+            "write",
+            serde_json::json!({"path":"changed.py", "content":"def f(x): return x * 2\n"}),
+        ),
+        (
+            shell_tool(),
+            serde_json::json!({"command":"python -c \"from changed import f; assert f(2) == 4\""}),
+        ),
+    ]);
+    agent
+        .run_loop(|current| {
+            calls += 1;
+            script(current)
+        })
+        .unwrap();
+    assert_eq!(
+        calls,
+        3,
+        "{:?}; {:?}",
+        agent.mutation_verification_state(),
+        reminders(&agent)
+    );
+    assert_eq!(harness_runs(&agent), 0);
+    assert!(reminders(&agent).is_empty());
+    assert_eq!(agent.completion_evidence(), CompletionEvidence::Verified);
+}
+
+#[test]
+fn shell_verification_requires_original_terminal_status_and_fresh_dispatch() {
+    let dir = tempfile::tempdir().unwrap();
+    let agent = verifying_agent(dir.path());
+    agent.record_successful_mutation_paths(vec![PathBuf::from("a.py")]);
+    let args = serde_json::json!({"command":"pytest -q"});
+    for details in [
+        None,
+        Some(serde_json::json!({"jobId":"running"})),
+        Some(serde_json::json!({"exitCode":0,"cancelled":true})),
+    ] {
+        agent
+            .verification_starts
+            .lock()
+            .unwrap()
+            .insert("check".into(), 1);
+        let result = ToolResult {
+            content: "ok".into(),
+            is_error: false,
+            details,
+        };
+        agent.observe_shell_verification(
+            "check",
+            dir.path(),
+            shell_tool(),
+            &args,
+            &result,
+            &result,
+        );
+        assert_eq!(agent.completion_evidence(), CompletionEvidence::Unverified);
+    }
+    let result = ToolResult {
+        content: "ok".into(),
+        is_error: false,
+        details: Some(serde_json::json!({"exitCode":0})),
+    };
+    agent.observe_shell_verification("replay", dir.path(), shell_tool(), &args, &result, &result);
+    assert_eq!(agent.completion_evidence(), CompletionEvidence::Unverified);
+    agent
+        .verification_starts
+        .lock()
+        .unwrap()
+        .insert("check".into(), 1);
+    let veto = ToolResult {
+        is_error: true,
+        ..result.clone()
+    };
+    agent.observe_shell_verification("check", dir.path(), shell_tool(), &args, &result, &veto);
+    assert_eq!(agent.completion_evidence(), CompletionEvidence::Unverified);
+    agent
+        .verification_starts
+        .lock()
+        .unwrap()
+        .insert("check".into(), 1);
+    agent.observe_shell_verification("check", dir.path(), shell_tool(), &args, &result, &result);
+    assert_eq!(agent.completion_evidence(), CompletionEvidence::Verified);
+}
+
+#[test]
+fn batch_check_observes_generation_after_earlier_batch_mutation() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut agent = verifying_agent(dir.path());
+    agent.prompt("write and check together");
+    let mut calls = 0;
+    let mut script = scripted_tool_calls(vec![(
+        "batch",
+        serde_json::json!({"operations":[
+            {"tool":"write", "args":{"path":"changed.py", "content":"def f(x): return x * 2\n"}},
+            {"tool":shell_tool(), "args":{"command":"python -c \"from changed import f; assert f(2) == 4\""}}
+        ]}),
+    )]);
+    agent
+        .run_loop(|current| {
+            calls += 1;
+            script(current)
+        })
+        .unwrap();
+    assert_eq!(calls, 2, "{:?}", agent.mutation_verification_state());
+    assert_eq!(agent.completion_evidence(), CompletionEvidence::Verified);
+    assert_eq!(harness_runs(&agent), 0);
+}
+
+#[test]
+fn partial_check_discloses_unchecked_paths_without_another_model_turn() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut agent = verifying_agent(dir.path());
+    agent.prompt("edit two modules and check one");
+    let mut calls = 0;
+    let mut script = scripted_tool_calls(vec![
+        (
+            "write",
+            serde_json::json!({"path":"changed.py", "content":"def f(x): return x * 2\n"}),
+        ),
+        (
+            "write",
+            serde_json::json!({"path":"other.py", "content":"x = 1\n"}),
+        ),
+        (
+            shell_tool(),
+            serde_json::json!({"command":"python -c \"from changed import f; assert f(2) == 4\""}),
+        ),
+    ]);
+    let events = agent
+        .run_loop(|current| {
+            calls += 1;
+            script(current)
+        })
+        .unwrap();
+    assert_eq!(calls, 4);
+    assert_eq!(agent.completion_evidence(), CompletionEvidence::Partial);
+    assert_eq!(harness_runs(&agent), 0);
+    assert!(reminders(&agent).is_empty());
+    assert!(events.iter().any(|event| matches!(event,
+        crate::AgentEvent::VerificationNotice { status: CompletionEvidence::Partial, text, .. }
+            if text.contains("unchecked"))));
+    assert!(!agent
+        .messages
+        .iter()
+        .any(|message| message.extra.contains_key("davinciVerificationStatus")));
+}
+
+#[test]
 fn a_passing_rerun_that_misses_the_change_is_not_reported_as_failed() {
     let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("unrelated.py"), "value = 1\n").unwrap();
     let mut agent = verifying_agent(dir.path());
     agent.prompt("edit, verify, edit again");
     let mut model_calls = 0;
@@ -3369,7 +4018,7 @@ fn a_passing_rerun_that_misses_the_change_is_not_reported_as_failed() {
         ),
         (
             shell_tool(),
-            serde_json::json!({"command": "cargo test -p unrelated-crate --help"}),
+            serde_json::json!({"command": "python -c \"import unrelated; assert unrelated.value == 1\""}),
         ),
         (
             "write",
@@ -3554,4 +4203,47 @@ fn harness_rerun_preserves_context_and_stops_on_cancellation() {
     );
     assert_eq!(harness_runs(&agent), 1);
     assert!(reminders(&agent).is_empty());
+}
+
+#[test]
+fn tool_name_scripted_aliases_need_no_recovery_request() {
+    for batched in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let mut agent = verifying_agent(dir.path());
+        agent.prompt("write and check");
+        let check = if cfg!(windows) {
+            "functions.powershell"
+        } else {
+            "functions.bash"
+        };
+        let edit_args =
+            serde_json::json!({"path":"changed.py", "content":"def f(x): return x * 2\n"});
+        let check_args =
+            serde_json::json!({"command":"python -c \"from changed import f; assert f(2) == 4\""});
+        let operations = if batched {
+            vec![(
+                "functions.batch",
+                serde_json::json!({"operations":[
+                    {"tool":"functions.write","args":edit_args},
+                    {"tool":check,"args":check_args}
+                ]}),
+            )]
+        } else {
+            vec![("functions.write", edit_args), (check, check_args)]
+        };
+        let mut script = scripted_tool_calls(operations);
+        let mut calls = 0;
+        let outcome = agent
+            .run_loop(|current| {
+                calls += 1;
+                script(current)
+            })
+            .unwrap();
+        assert_eq!(calls, if batched { 2 } else { 3 });
+        assert_eq!(harness_runs(&agent), 0);
+        assert!(reminders(&agent).is_empty());
+        assert_eq!(agent.completion_evidence(), CompletionEvidence::Verified);
+        assert!(tool_outcomes(&outcome).iter().all(|(_, error, _)| !error));
+        assert!(format!("{:?}", agent.messages).contains("functions."));
+    }
 }

@@ -8,6 +8,10 @@ use davinci_agent::decision::risk::DecisionClass;
 use davinci_agent::runtime::contracts::redact_secrets;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use sha2::{Digest, Sha256};
+
+pub const MAX_REQUIREMENTS: usize = 8;
+pub const MAX_REQUIREMENT_CHARS: usize = 240;
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -138,6 +142,160 @@ impl DecisionMetadata {
     }
 }
 
+/// A bounded, deterministic projection of explicit user requirements. The
+/// wording has already passed the task redaction pipeline before it reaches
+/// this type; it is evidence for routing, never completion authority.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct RequirementLedger {
+    pub entries: Vec<RequirementRecord>,
+    pub truncated: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct RequirementRecord {
+    pub id: String,
+    pub wording: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RequirementEvidenceKind {
+    Check,
+    Observation,
+    Diff,
+    Comment,
+    Unavailable,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RequirementEvidence {
+    pub requirement_id: String,
+    pub kind: RequirementEvidenceKind,
+    pub current: bool,
+    pub passed: bool,
+    pub references: Vec<String>,
+}
+
+/// Completion remains deterministic: a complete ledger needs current,
+/// concrete evidence for every requirement. A provider judgment can add a
+/// reminder, but cannot turn stale, failed, missing, unavailable, or comment
+/// evidence into completion.
+pub fn deterministic_requirements_satisfied(
+    ledger: &RequirementLedger,
+    evidence: &[RequirementEvidence],
+) -> bool {
+    if !ledger.is_complete() {
+        return false;
+    }
+    ledger.entries.iter().all(|requirement| {
+        evidence.iter().any(|item| {
+            item.requirement_id == requirement.id
+                && item.current
+                && item.passed
+                && !item.references.is_empty()
+                && matches!(
+                    item.kind,
+                    RequirementEvidenceKind::Check
+                        | RequirementEvidenceKind::Observation
+                        | RequirementEvidenceKind::Diff
+                )
+        })
+    })
+}
+
+impl RequirementLedger {
+    pub fn from_task(task: &str) -> Self {
+        let mut entries = Vec::new();
+        let mut seen = BTreeSet::new();
+        let mut truncated = false;
+        for line in task.lines() {
+            for fragment in line.split(['.', '?', '!', ';']) {
+                let (fragment, is_bullet) = strip_requirement_marker(fragment);
+                let wording = fragment.split_whitespace().collect::<Vec<_>>().join(" ");
+                if wording.is_empty() || (!is_bullet && !looks_like_requirement(&wording)) {
+                    continue;
+                }
+                let normalized = wording.to_ascii_lowercase();
+                if !seen.insert(normalized) {
+                    continue;
+                }
+                if entries.len() >= MAX_REQUIREMENTS {
+                    truncated = true;
+                    continue;
+                }
+                let bounded = truncate_chars(&wording, MAX_REQUIREMENT_CHARS);
+                if bounded.chars().count() < wording.chars().count() {
+                    truncated = true;
+                }
+                entries.push(RequirementRecord {
+                    id: requirement_id(&wording),
+                    wording: bounded,
+                });
+            }
+        }
+        Self { entries, truncated }
+    }
+
+    pub fn is_complete(&self) -> bool {
+        !self.truncated && !self.entries.is_empty()
+    }
+}
+
+fn requirement_id(wording: &str) -> String {
+    let digest = Sha256::digest(wording.as_bytes());
+    let short = digest
+        .iter()
+        .take(6)
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    format!("req-{short}")
+}
+
+fn strip_requirement_marker(value: &str) -> (&str, bool) {
+    let trimmed = value.trim();
+    let without_bullet = trimmed
+        .strip_prefix('-')
+        .or_else(|| trimmed.strip_prefix('*'))
+        .or_else(|| trimmed.strip_prefix('•'))
+        .map(str::trim_start);
+    if let Some(value) = without_bullet {
+        return (value, true);
+    }
+    let bytes = trimmed.as_bytes();
+    let mut index = 0;
+    while index < bytes.len() && bytes[index].is_ascii_digit() {
+        index += 1;
+    }
+    if index > 0 && trimmed[index..].starts_with('.') {
+        return (trimmed[index + 1..].trim_start(), true);
+    }
+    (trimmed, false)
+}
+
+fn looks_like_requirement(value: &str) -> bool {
+    let lower = value.to_ascii_lowercase();
+    [
+        "must ",
+        "should ",
+        "need to ",
+        "required",
+        "requirement",
+        "ensure ",
+        "verify ",
+        "test ",
+        "preserve ",
+        "keep ",
+        "support ",
+        "without ",
+        "do not ",
+        "don't ",
+        "make sure ",
+    ]
+    .iter()
+    .any(|marker| lower.contains(marker))
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct DecisionState {
@@ -149,6 +307,8 @@ pub struct DecisionState {
     pub recent_file_kinds: Vec<String>,
     pub workspace_dirty: WorkspaceDirtyState,
     pub available_capabilities: AvailableCapabilities,
+    #[serde(default)]
+    pub requirements: RequirementLedger,
 }
 
 impl DecisionState {
@@ -157,12 +317,12 @@ impl DecisionState {
     }
 
     pub fn from_task_with_metadata(task: &str, metadata: DecisionMetadata) -> Self {
-        let task = truncate_chars(
-            &redact_paths(&redact_environment_assignments(&redact_secrets(
-                &suppress_pasted_bodies(task),
-            ))),
-            MAX_TASK_CHARS,
-        );
+        let redacted = redact_paths(&redact_environment_assignments(&redact_secrets(
+            &suppress_pasted_bodies(task),
+        )));
+        let task = truncate_chars(&redacted, MAX_TASK_CHARS);
+        let mut requirements = RequirementLedger::from_task(&task);
+        requirements.truncated |= task.len() < redacted.len();
         let mut state = Self {
             schema_version: 2,
             task,
@@ -172,6 +332,7 @@ impl DecisionState {
             recent_file_kinds: metadata.recent_file_kinds,
             workspace_dirty: metadata.workspace_dirty,
             available_capabilities: metadata.available_capabilities,
+            requirements,
         };
         state.refresh_task_signals();
         state.refresh_framework_signals();
@@ -185,6 +346,10 @@ impl DecisionState {
             state.task.pop();
             state.refresh_task_signals();
             state.refresh_framework_signals();
+            // Preserve requirement IDs/wording from the original bounded
+            // task, and disclose every later truncation instead of silently
+            // treating a shorter regenerated ledger as complete.
+            state.requirements.truncated = true;
         }
         state
     }
@@ -198,17 +363,53 @@ impl DecisionState {
         request_id: impl Into<String>,
         decision_class: DecisionClass,
     ) -> DecisionRequest {
+        self.request_selected(
+            request_id,
+            decision_class,
+            |_| true,
+            true,
+            &Default::default(),
+        )
+    }
+
+    /// Apply consent and purpose selection before enforcing the wire budget.
+    /// Disabled questions must not consume tokens or truncate the task.
+    pub(crate) fn request_selected(
+        &self,
+        request_id: impl Into<String>,
+        decision_class: DecisionClass,
+        selected: impl Fn(&str) -> bool,
+        include_requirements: bool,
+        additional_state: &serde_json::Map<String, Value>,
+    ) -> DecisionRequest {
         let request_id = request_id.into();
         let mut state = self.clone();
-        let mut request = DecisionRequest::new(
-            request_id.clone(),
-            decision_class,
-            state.to_value(),
-            "jev-latest",
-            questions(),
-        );
-        // Only a size failure is fixed by shortening the task. A malformed
-        // question must surface as-is, not strip the task to nothing.
+        let make_request = |state: &Self| {
+            let mut value = state.to_value();
+            if let Some(object) = value.as_object_mut() {
+                if !include_requirements {
+                    object.remove("requirements");
+                }
+                object.extend(additional_state.clone());
+            }
+            let empty_requirements = RequirementLedger::default();
+            let ledger = if include_requirements {
+                &state.requirements
+            } else {
+                &empty_requirements
+            };
+            let questions = questions(ledger).into_iter().filter(|(id, _)| selected(id));
+            DecisionRequest::new(
+                request_id.clone(),
+                decision_class,
+                value,
+                "jev-latest",
+                questions,
+            )
+        };
+        let mut request = make_request(&state);
+        // Only a size failure is fixed by shortening the task. Missing or
+        // malformed enabled questions are an explicit no-provider fallback.
         while request.validate_questions().is_ok()
             && request.validate_size().is_err()
             && !state.task.is_empty()
@@ -216,13 +417,11 @@ impl DecisionState {
             state.task.pop();
             state.refresh_task_signals();
             state.refresh_framework_signals();
-            request = DecisionRequest::new(
-                request_id.clone(),
-                decision_class,
-                state.to_value(),
-                "jev-latest",
-                questions(),
-            );
+            // Preserve requirement IDs/wording from the original bounded
+            // task, and disclose every later truncation instead of silently
+            // treating a shorter regenerated ledger as complete.
+            state.requirements.truncated = true;
+            request = make_request(&state);
         }
         request
     }
@@ -287,7 +486,7 @@ pub fn build_request_with_metadata(
 
 /// Question ids never reach the model, so each question carries its full
 /// meaning and names the state fields it should read.
-fn questions() -> BTreeMap<String, DecisionQuestion> {
+fn questions(requirements: &RequirementLedger) -> BTreeMap<String, DecisionQuestion> {
     let capability = |what: &str, field: &str, yes: &str| {
         DecisionQuestion::noul_with(
             format!(
@@ -388,7 +587,36 @@ fn questions() -> BTreeMap<String, DecisionQuestion> {
             ],
         ),
     );
+    for requirement in &requirements.entries {
+        questions.insert(
+            requirement_question_id(&requirement.id),
+            DecisionQuestion::choice(
+                format!(
+                    "Using only `completionEvidence` (current changed paths, verification status and the latest concrete check), classify whether this explicit user requirement is supported: `{}`. A general passing check does not prove a specific requirement. If the evidence is absent, truncated, stale or cannot establish this requirement, choose uncertain. Do not infer a passing check from a comment or an unavailable observation.",
+                    requirement.wording
+                ),
+                [
+                    (
+                        "supported".to_owned(),
+                        "A current, concrete check or observable directly supports the requirement.".to_owned(),
+                    ),
+                    (
+                        "possibly_missing".to_owned(),
+                        "The requirement may be unmet or the current evidence is insufficient.".to_owned(),
+                    ),
+                    (
+                        "uncertain".to_owned(),
+                        "The evidence is stale, unavailable, contradictory, or cannot identify the requirement.".to_owned(),
+                    ),
+                ],
+            ),
+        );
+    }
     questions
+}
+
+pub fn requirement_question_id(requirement_id: &str) -> String {
+    format!("requirement_{requirement_id}")
 }
 
 // Routing needs intent, not pasted source. Ordinary prose still undergoes
@@ -700,6 +928,61 @@ mod tests {
     }
 
     #[test]
+    fn disabled_requirement_questions_do_not_consume_the_task_budget() {
+        let task = (0..8)
+            .map(|index| format!("Must satisfy requirement {index}: {}.\n", "x".repeat(430)))
+            .collect::<String>();
+        let state = DecisionState::from_task(&task);
+        let request = state.request_selected(
+            "effort",
+            DecisionClass::Planning,
+            |id| matches!(id, "regression_risk" | "verification_scope"),
+            false,
+            &Default::default(),
+        );
+        assert_eq!(request.questions.len(), 2);
+        assert_eq!(request.state["task"], state.task);
+        assert!(request.state.get("requirements").is_none());
+        request.validate_size().unwrap();
+    }
+
+    #[test]
+    fn completion_wire_truncation_preserves_original_requirement_ids() {
+        let task = format!(
+            "Must preserve the API. {}\nMust preserve the last requirement.",
+            "x".repeat(3000)
+        );
+        let state = DecisionState::from_task(&task);
+        let additional = serde_json::Map::from_iter([(
+            "completionEvidence".into(),
+            serde_json::json!({"publicNotes": "e".repeat(8500)}),
+        )]);
+        let request = state.request_selected(
+            "completion",
+            DecisionClass::Planning,
+            |id| id.starts_with("requirement_"),
+            true,
+            &additional,
+        );
+        request.validate_size().unwrap();
+        let original_ids = state
+            .requirements
+            .entries
+            .iter()
+            .map(|entry| entry.id.as_str())
+            .collect::<Vec<_>>();
+        let current_ids = request.state["requirements"]["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|entry| entry["id"].as_str().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(current_ids, original_ids);
+        assert_eq!(request.state["requirements"]["truncated"], true);
+        assert!(request.state["task"].as_str().unwrap().len() < state.task.len());
+    }
+
+    #[test]
     fn task_is_capped_by_unicode_scalar_values() {
         let state = DecisionState::from_task(&"é".repeat(MAX_TASK_CHARS + 10));
         assert_eq!(state.task.chars().count(), MAX_TASK_CHARS);
@@ -732,5 +1015,214 @@ mod tests {
         assert!(!serialized.contains("src/login"));
         assert!(!serialized.contains("login.test"));
         assert!(!serialized.contains(".env"));
+    }
+
+    #[test]
+    fn requirement_ledger_keeps_redacted_explicit_items_with_stable_ids() {
+        let task =
+            "Must preserve the public API. Verify empty input.\n- Keep the caller input unchanged.";
+        let ledger = RequirementLedger::from_task(task);
+        assert_eq!(ledger.entries.len(), 3);
+        assert!(ledger.is_complete());
+        assert!(ledger.entries[0].id.starts_with("req-"));
+        assert_eq!(
+            ledger.entries[0].id,
+            RequirementLedger::from_task(task).entries[0].id
+        );
+        assert_eq!(ledger.entries[2].wording, "Keep the caller input unchanged");
+    }
+
+    #[test]
+    fn requirement_ledger_marks_overflow_instead_of_claiming_completeness() {
+        let task = (0..(MAX_REQUIREMENTS + 2))
+            .map(|index| format!("- Verify case {index}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let ledger = RequirementLedger::from_task(&task);
+        assert_eq!(ledger.entries.len(), MAX_REQUIREMENTS);
+        assert!(ledger.truncated);
+        assert!(!ledger.is_complete());
+    }
+
+    #[test]
+    fn requirement_ledger_is_inside_the_redacted_state_contract() {
+        let state = DecisionState::from_task(
+            "Must read C:\\Users\\sergi\\private.rs and use TOKEN=secret; verify it",
+        );
+        let serialized = serde_json::to_string(&state).unwrap();
+        assert!(serialized.contains("requirements"));
+        assert!(!serialized.contains("C:\\Users\\sergi\\private.rs"));
+        assert!(!serialized.contains("secret"));
+    }
+
+    #[test]
+    fn requirement_completion_cases_fail_closed_for_missing_or_bad_evidence() {
+        let ledger = RequirementLedger::from_task("Must preserve the API");
+        let id = ledger.entries[0].id.clone();
+        let good = RequirementEvidence {
+            requirement_id: id.clone(),
+            kind: RequirementEvidenceKind::Check,
+            current: true,
+            passed: true,
+            references: vec!["test:api-contract".into()],
+        };
+        assert!(deterministic_requirements_satisfied(
+            &ledger,
+            std::slice::from_ref(&good)
+        ));
+
+        for evidence in [
+            vec![],
+            vec![RequirementEvidence {
+                requirement_id: id.clone(),
+                kind: RequirementEvidenceKind::Check,
+                current: false,
+                passed: true,
+                references: vec!["test:old".into()],
+            }],
+            vec![RequirementEvidence {
+                requirement_id: id.clone(),
+                kind: RequirementEvidenceKind::Check,
+                current: true,
+                passed: false,
+                references: vec!["test:failed".into()],
+            }],
+            vec![RequirementEvidence {
+                requirement_id: id.clone(),
+                kind: RequirementEvidenceKind::Comment,
+                current: true,
+                passed: true,
+                references: vec!["comment:looks-good".into()],
+            }],
+            vec![RequirementEvidence {
+                requirement_id: id.clone(),
+                kind: RequirementEvidenceKind::Unavailable,
+                current: false,
+                passed: false,
+                references: vec![],
+            }],
+        ] {
+            assert!(!deterministic_requirements_satisfied(&ledger, &evidence));
+        }
+
+        let mut truncated = ledger.clone();
+        truncated.truncated = true;
+        assert!(!deterministic_requirements_satisfied(&truncated, &[good]));
+    }
+
+    #[test]
+    fn labeled_requirement_cases_keep_completion_authority_deterministic() {
+        let complete = RequirementLedger::from_task("Must preserve the API");
+        let complete_id = complete.entries[0].id.clone();
+        let evidence = |kind: RequirementEvidenceKind,
+                        current: bool,
+                        passed: bool,
+                        reference: &[&str]| RequirementEvidence {
+            requirement_id: complete_id.clone(),
+            kind,
+            current,
+            passed,
+            references: reference.iter().map(|value| (*value).to_owned()).collect(),
+        };
+        let cases = [
+            (
+                "complete-change",
+                complete.clone(),
+                vec![evidence(
+                    RequirementEvidenceKind::Check,
+                    true,
+                    true,
+                    &["test:api"],
+                )],
+                true,
+            ),
+            (
+                "omitted-requirement",
+                RequirementLedger::from_task("Must preserve the API\n- Verify empty input"),
+                vec![evidence(
+                    RequirementEvidenceKind::Check,
+                    true,
+                    true,
+                    &["test:api"],
+                )],
+                false,
+            ),
+            (
+                "incorrect-boundary-after-smoke-pass",
+                complete.clone(),
+                vec![evidence(
+                    RequirementEvidenceKind::Check,
+                    true,
+                    false,
+                    &["test:smoke-only"],
+                )],
+                false,
+            ),
+            (
+                "stale-diff",
+                complete.clone(),
+                vec![evidence(
+                    RequirementEvidenceKind::Diff,
+                    false,
+                    true,
+                    &["diff:old"],
+                )],
+                false,
+            ),
+            (
+                "failed-command",
+                complete.clone(),
+                vec![evidence(
+                    RequirementEvidenceKind::Check,
+                    true,
+                    false,
+                    &["cmd:exit-1"],
+                )],
+                false,
+            ),
+            (
+                "truncated-requirement-set",
+                RequirementLedger {
+                    entries: complete.entries.clone(),
+                    truncated: true,
+                },
+                vec![evidence(
+                    RequirementEvidenceKind::Check,
+                    true,
+                    true,
+                    &["test:api"],
+                )],
+                false,
+            ),
+            (
+                "misleading-diff-comment",
+                complete.clone(),
+                vec![evidence(
+                    RequirementEvidenceKind::Comment,
+                    true,
+                    true,
+                    &["comment:looks-good"],
+                )],
+                false,
+            ),
+            (
+                "unavailable-evidence",
+                complete,
+                vec![evidence(
+                    RequirementEvidenceKind::Unavailable,
+                    false,
+                    false,
+                    &[],
+                )],
+                false,
+            ),
+        ];
+        for (label, ledger, evidence, expected) in cases {
+            assert_eq!(
+                deterministic_requirements_satisfied(&ledger, &evidence),
+                expected,
+                "labeled requirement case {label}"
+            );
+        }
     }
 }

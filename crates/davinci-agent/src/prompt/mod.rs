@@ -7,6 +7,7 @@ pub mod coding;
 pub mod collaboration;
 pub mod composer;
 pub mod core;
+pub mod environment;
 pub mod manifest;
 pub mod model_policy;
 pub mod provider;
@@ -30,7 +31,8 @@ pub use capabilities::{
     MAX_CAPABILITY_COMPLETION_REMINDERS,
 };
 pub use coding::{
-    coding_change_quality_module, coding_exploration_module, coding_scope_discipline_module,
+    coding_change_quality_module, coding_exploration_module, coding_request_workflow_module,
+    coding_scope_discipline_module,
 };
 pub use collaboration::collaboration_user_intent_module;
 pub use composer::{
@@ -53,7 +55,7 @@ pub use session::{
 };
 pub use tool_strategy::tool_strategy_module;
 pub use turn::{compose_turn_prompt, PreparedTurnPrompt};
-pub use verification::verification_completion_module;
+pub use verification::{verification_completion_module, verification_requirement_checks_module};
 pub use version::{
     PromptProfile, LEGACY_PROMPT_VERSION, PREVIEW_PROMPT_VERSION, STABLE_PROMPT_VERSION,
 };

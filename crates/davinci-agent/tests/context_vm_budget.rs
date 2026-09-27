@@ -27,6 +27,70 @@ fn provider_budget_includes_every_reservation_before_selection() {
 }
 
 #[test]
+fn first_paging_reserves_the_new_retrieval_schema_before_admission() {
+    use davinci_agent::runtime::context_vm::{ContextVmConfig, ContextVmRuntime};
+
+    fn paging_agent() -> Agent {
+        let mut runtime = RuntimeHandle::new(RunId::new(), AgentId::new(), RuntimeBus::new());
+        runtime.context_vm = ContextVmRuntime::new(
+            ContextVmConfig {
+                hot_event_tokens: 64,
+                ..Default::default()
+            },
+            CacheRuntime::default(),
+        );
+        let mut agent = Agent::new("system authority");
+        agent.set_runtime(runtime);
+        agent.set_context_vm_mode(ContextVmMode::Active);
+        agent.set_provider_output_limit(Some(1024));
+        agent.set_provider_context_overhead_estimator(|agent| {
+            serde_json::to_vec(&agent.provider_tool_specs()).unwrap().len() as u64 + 128
+        });
+        agent.auto_compaction = false;
+        agent.messages = vec![
+            ChatMessage::text("assistant", "older public context ".repeat(200)),
+            ChatMessage::text("user", "Continue the task"),
+        ];
+        agent
+    }
+
+    // Establish the exact mandatory image size from the same public history.
+    // The older assistant context is outside the configured hot window.
+    let probe = paging_agent();
+    let initial = probe.provider_context_budget();
+    assert!(!probe.context_vm_offers_retrieval());
+    let image = probe.prepared_context_image().unwrap();
+    assert!(probe.context_vm_offers_retrieval());
+    let expanded = probe.provider_context_budget();
+    let schema_growth = expanded.tools - initial.tools;
+    assert!(schema_growth > 1);
+    assert!(expanded.reserved() + image.estimated_tokens <= expanded.window);
+
+    for dispatch in [false, true] {
+        let mut agent = paging_agent();
+        // Enough room before paging, but less than the newly advertised
+        // retrieval schema needs. The previous implementation admitted this.
+        agent.context_window = initial.reserved() + image.estimated_tokens + schema_growth / 2;
+        assert!(!agent.context_vm_offers_retrieval());
+        if dispatch {
+            let mut called = false;
+            let result = agent.run_loop(|_| {
+                called = true;
+                Err::<davinci_ai::AssistantMessage, _>("must not dispatch".into())
+            });
+            assert!(!called, "paging bypassed provider admission");
+            assert!(result.unwrap_err().contains("compilation token budget"));
+            assert_eq!(agent.run_stats().model_turns, 0);
+        } else {
+            let error = agent.prepared_context_image().unwrap_err();
+            assert!(error.contains("compilation token budget"));
+            assert!(agent.prepared_context_image().is_err(), "bad admission was cached");
+        }
+        assert!(agent.context_vm_offers_retrieval());
+    }
+}
+
+#[test]
 fn mandatory_pages_and_newest_event_respect_compile_budget() {
     let store = ContextObjectStore::new(CacheRuntime::default());
     let compiler = ContextCompiler::new(store.clone());

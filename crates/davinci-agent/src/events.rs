@@ -6,6 +6,24 @@ use serde_json::Value;
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub enum AgentEvent {
+    /// Harness display metadata; never an assistant message or provider input.
+    #[serde(rename = "verification_notice")]
+    VerificationNotice {
+        status: crate::CompletionEvidence,
+        generation: u64,
+        text: String,
+    },
+    /// Live diagnostic of the existing completion ledger, not a filesystem watcher.
+    #[serde(rename = "mutation_observation")]
+    MutationObservation {
+        schema_version: u32,
+        generation: u64,
+        executed_leaf_operations: u64,
+    },
+    #[serde(rename = "provider_observation")]
+    ProviderObservation {
+        observation: davinci_ai::provider_observation::ProviderAttemptObservation,
+    },
     #[serde(rename = "agent_start")]
     AgentStart,
     #[serde(rename = "agent_end")]
@@ -91,6 +109,9 @@ pub enum AgentEvent {
 impl AgentEvent {
     pub fn kind(&self) -> &'static str {
         match self {
+            Self::VerificationNotice { .. } => "verification_notice",
+            Self::MutationObservation { .. } => "mutation_observation",
+            Self::ProviderObservation { .. } => "provider_observation",
             Self::AgentStart => "agent_start",
             Self::AgentEnd { .. } => "agent_end",
             Self::TurnStart => "turn_start",

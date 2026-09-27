@@ -2,6 +2,7 @@ use std::path::{Path, PathBuf};
 
 use davinci_ai::{
     assistant_to_chat, AssistantMessage, ChatMessage, ContentBlock, MessageContent, StopReason,
+    RESPONSES_TOOL_WIRE_KINDS_KEY, RESPONSES_TOOL_WIRE_KIND_KEY,
 };
 use serde_json::Value;
 
@@ -9,6 +10,10 @@ use crate::events::AgentEvent;
 use crate::tools::execute_tool_with;
 use crate::Agent;
 use crate::ToolExecutionMode;
+
+/// Corrective turns allowed per run after a tool call is cut off by the
+/// output token limit.
+const MAX_TRUNCATED_CALL_RETRIES: u32 = 2;
 
 /// What stage one decided about a call.
 pub(crate) enum Preparation {
@@ -72,6 +77,7 @@ fn agent_call_may_write_shared(args: &Value, mode: crate::PermissionMode) -> boo
 /// What happened when the harness re-ran the last verification command.
 enum HarnessVerification {
     Passed,
+    Partial,
     Failed {
         output_tail: String,
     },
@@ -98,6 +104,7 @@ impl Agent {
             serde_json::json!({ "command": last.command })
         };
         let assistant = AssistantMessage {
+            extra: Default::default(),
             id: format!("davinci-verify-{call_token}"),
             role: "assistant".into(),
             content: vec![ContentBlock::ToolCall {
@@ -126,10 +133,12 @@ impl Agent {
         self.push_event(events, AgentEvent::MessageEnd { message: chat });
 
         let cwd = last.cwd.clone().unwrap_or_else(|| self.cwd.clone());
-        let results =
-            self.execute_tool_batch(&cwd, vec![(call_id, last.tool.clone(), arguments)], events);
+        let results = self.execute_tool_batch(
+            &cwd,
+            vec![(call_id.clone(), last.tool.clone(), arguments)],
+            events,
+        );
         let mut output_tail = String::new();
-        let mut rerun_failed = false;
         let mut rerun_denied = false;
         for mut result in results {
             let name = result.tool_name.clone().unwrap_or_default();
@@ -141,7 +150,6 @@ impl Agent {
                 .and_then(Value::as_bool)
                 .unwrap_or(false);
             rerun_denied |= denied;
-            rerun_failed |= !denied && result.is_error == Some(true);
             let text = davinci_ai::content_text(&result.content);
             let lines: Vec<&str> = text.lines().collect();
             output_tail = lines[lines.len().saturating_sub(30)..].join("\n");
@@ -160,13 +168,40 @@ impl Agent {
         // a passing run whose command does not cover the changed files is
         // unverified, not failed, and telling the model it failed sends it
         // chasing a failure that does not exist.
+        let rerun_failed = self
+            .command_receipts
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .find(|receipt| receipt.operation_id == call_id)
+            .map(|receipt| {
+                receipt.started
+                    && receipt.exit_code.is_some_and(|code| code != 0)
+                    && !receipt.timed_out
+                    && !receipt.cancelled
+                    && !receipt.killed
+                    && !receipt.permission_denied
+                    && !receipt.simulated
+                    && !receipt.hook_vetoed
+            })
+            .unwrap_or_else(|| {
+                // Legacy shell execution has no host receipt. The observer
+                // records evidence only for its original, trusted terminal
+                // status, and automatic reruns start without fresh evidence.
+                let state = self.mutation_verification_state();
+                state.latest_evidence.as_ref().is_some_and(|evidence| {
+                    evidence.generation == state.mutation_generation
+                        && evidence.command == last.command
+                        && !evidence.succeeded
+                })
+            });
         Ok(match self.completion_evidence() {
             _ if rerun_denied => HarnessVerification::Inconclusive,
             crate::CompletionEvidence::Verified => HarnessVerification::Passed,
-            crate::CompletionEvidence::VerificationFailed => {
+            crate::CompletionEvidence::Partial => HarnessVerification::Partial,
+            crate::CompletionEvidence::VerificationFailed if rerun_failed => {
                 HarnessVerification::Failed { output_tail }
             }
-            _ if rerun_failed => HarnessVerification::Failed { output_tail },
             _ => HarnessVerification::Inconclusive,
         })
     }
@@ -245,7 +280,7 @@ impl Agent {
             .collect();
         for (id, name) in dangling {
             // Keep this repair in memory; persistence is the failed boundary.
-            self.messages.push(tool_result_message(
+            let mut result = tool_result_message(
                 &id,
                 &name,
                 crate::ToolResult {
@@ -256,7 +291,9 @@ impl Agent {
                     details: None,
                 },
                 self.auto_resize_images,
-            ));
+            );
+            self.annotate_tool_result_wire_kind(&mut result);
+            self.messages.push(result);
         }
         self.is_streaming = false;
         self.flush_pending_bash_messages();
@@ -311,10 +348,22 @@ impl Agent {
         };
         let mut new_messages = prompt_messages.clone();
         let mut capability_completion_reminders = 0_u32;
+        let mut truncated_call_retries = 0_u32;
         let mut verification_reminded_generation = None;
         let mut turns_this_run = 0_u32;
         self.push_event(&mut events, AgentEvent::AgentStart);
         self.push_event(&mut events, AgentEvent::TurnStart);
+        self.push_event(
+            &mut events,
+            AgentEvent::MutationObservation {
+                schema_version: 1,
+                generation: self.mutation_verification_state().mutation_generation,
+                executed_leaf_operations: self
+                    .counters
+                    .executed_leaf_operations
+                    .load(std::sync::atomic::Ordering::Relaxed),
+            },
+        );
         if let Some(runtime) = &self.runtime {
             runtime.emit_observe(crate::runtime::RuntimeEvent::TurnStarted);
         }
@@ -366,6 +415,21 @@ impl Agent {
 
             self.inject_queued(&mut events, &mut new_messages, true);
             self.inject_job_notices(&mut events, &mut new_messages)?;
+
+            let environment_changed = self.refresh_runtime_environment_for_request();
+            if self.prompt_session.is_builtin()
+                && (environment_changed
+                    || crate::turn_context::TurnContextState::from_messages(&self.messages)
+                        .state_hash
+                        .is_none())
+            {
+                self.append_turn_context(None);
+            }
+
+            // Advice can expose additional schemas. Apply ready additions before
+            // context selection and its final admission gate; request 1 remains
+            // unchanged, and no reader fallback can bypass the updated budget.
+            self.poll_decision_advice(turns_this_run > 0);
 
             let active_context_vm = self.context_vm_mode() == crate::runtime::ContextVmMode::Active;
             // The legacy path prunes tool output before deciding whether to
@@ -429,6 +493,16 @@ impl Agent {
                 }
             }
 
+            // Compaction may have removed the last context snapshot. Restore
+            // the same turn state before compiling the next provider request.
+            if self.prompt_session.is_builtin()
+                && crate::turn_context::TurnContextState::from_messages(&self.messages)
+                    .state_hash
+                    .is_none()
+            {
+                self.append_turn_context(None);
+            }
+
             // Folding/rebuilding gets the first chance to recover. Every
             // active-VM dispatch requires an admitted image; a storage failure
             // must not bypass the budget through the legacy accessor fallback.
@@ -452,16 +526,66 @@ impl Agent {
             }
 
             self.ensure_session_persistence()?;
+            if turns_this_run > 0 {
+                self.enqueue_completion_advice();
+            }
+            self.record_decision_request_effort();
             self.stats.model_turns += 1;
             turns_this_run += 1;
             let model_started = std::time::Instant::now();
+            let observations = davinci_ai::provider_observation::ObservationScope::capture();
             let completion = self.complete_with_retry(&mut complete, &mut events);
+            let status = match &completion {
+                Ok((message, _, _, _)) => match message.stop_reason {
+                    Some(StopReason::Error) => "failed",
+                    Some(StopReason::Aborted) => "aborted",
+                    _ => "completed",
+                },
+                Err(_) => "failed",
+            };
+            for observation in observations.finish(status) {
+                self.push_event(&mut events, AgentEvent::ProviderObservation { observation });
+            }
             self.stats.model_wall_ms += model_started.elapsed().as_millis() as u64;
-            let (assistant, stream_events, streamed_live, native_responses_resume) =
+            let (mut assistant, stream_events, streamed_live, mut native_responses_resume) =
                 match completion {
                     Ok(output) => output,
                     Err(err) => return Err(err),
                 };
+            // The decoder already drops partial calls on a length stop; the
+            // provider flag records that the model tried to call a tool.
+            let decoder_dropped_calls = assistant
+                .extra
+                .remove(davinci_ai::DROPPED_TOOL_CALLS_KEY)
+                .is_some_and(|value| value == Value::Bool(true));
+            let length_stop_dropped_calls = assistant.stop_reason == Some(StopReason::Length)
+                && (decoder_dropped_calls
+                    || assistant
+                        .content
+                        .iter()
+                        .any(|block| matches!(block, ContentBlock::ToolCall { .. })));
+            if matches!(
+                assistant.stop_reason,
+                Some(StopReason::Error | StopReason::Aborted | StopReason::Length)
+            ) {
+                // Providers and SDK callbacks can retain partial calls even
+                // when generation failed. They are display data only: do not
+                // persist unmatched calls or establish a native continuation.
+                assistant
+                    .content
+                    .retain(|block| !matches!(block, ContentBlock::ToolCall { .. }));
+                for key in [
+                    RESPONSES_TOOL_WIRE_KINDS_KEY,
+                    davinci_ai::NATIVE_ITEMS_KEY,
+                    davinci_ai::NATIVE_MODEL_KEY,
+                ] {
+                    assistant.extra.remove(key);
+                }
+                native_responses_resume = None;
+            }
+            // A response that arrived during this provider request may inform
+            // later requests or the current completion observation. Never wait.
+            self.poll_decision_advice(true);
             let mut chat = assistant_to_chat(&assistant);
             if let Some(record) = &native_responses_resume {
                 davinci_ai::attach_native_items(
@@ -505,10 +629,29 @@ impl Agent {
                 },
             );
 
+            // A tool call cut off by the output limit executes nothing, but the
+            // model can recover with a smaller call. Bound the retries so a
+            // model that keeps overflowing still ends the run.
+            if length_stop_dropped_calls
+                && truncated_call_retries < MAX_TRUNCATED_CALL_RETRIES
+                && !self.abort_requested()
+            {
+                truncated_call_retries += 1;
+                self.queue_capability_reminder(
+                    "Your previous response hit the output token limit while writing a tool call, so the call was truncated and nothing was executed. Retry with smaller steps: split large patches or file writes into several smaller calls.",
+                    "output_truncated",
+                    &mut events,
+                    &mut new_messages,
+                );
+                continue;
+            }
+            let length_stop_ends_run =
+                assistant.stop_reason == Some(StopReason::Length) && length_stop_dropped_calls;
             if matches!(
                 assistant.stop_reason,
                 Some(StopReason::Error) | Some(StopReason::Aborted)
-            ) {
+            ) || length_stop_ends_run
+            {
                 if let Some(runtime) = &self.runtime {
                     if assistant.stop_reason == Some(StopReason::Error) {
                         runtime.mark_turn_failed();
@@ -580,17 +723,27 @@ impl Agent {
                 }
 
                 let completion_evidence = self.completion_evidence();
-                let mutation_generation = self.mutation_verification_state().mutation_generation;
+                let mutation_state = self.mutation_verification_state();
+                let mutation_generation = mutation_state.mutation_generation;
                 if matches!(
                     completion_evidence,
                     crate::CompletionEvidence::Unverified
                         | crate::CompletionEvidence::VerificationFailed
                 ) && verification_reminded_generation != Some(mutation_generation)
                 {
-                    verification_reminded_generation = Some(mutation_generation);
-                    let last = self.mutation_verification_state().last_verification;
+                    let failure_predates_change = mutation_state
+                        .latest_evidence
+                        .as_ref()
+                        .is_none_or(|evidence| evidence.generation != mutation_generation);
+                    let last = mutation_state.last_verification;
                     let rerun = match (&last, completion_evidence) {
-                        (Some(last), crate::CompletionEvidence::Unverified) if self.auto_verify => {
+                        (Some(last), evidence)
+                            if self.auto_verify
+                                && (evidence == crate::CompletionEvidence::Unverified
+                                    || (evidence
+                                        == crate::CompletionEvidence::VerificationFailed
+                                        && failure_predates_change)) =>
+                        {
                             Some(self.run_harness_verification(
                                 last,
                                 &mut events,
@@ -599,11 +752,16 @@ impl Agent {
                         }
                         _ => None,
                     };
+                    // A checker may itself modify files or uncover unknown
+                    // scope. Bound the reminder using the resulting generation
+                    // so that an inconclusive automatic rerun cannot loop.
+                    verification_reminded_generation =
+                        Some(self.mutation_verification_state().mutation_generation);
                     if self.abort_requested() {
                         continue;
                     }
                     match rerun {
-                        Some(HarnessVerification::Passed) => {}
+                        Some(HarnessVerification::Passed | HarnessVerification::Partial) => {}
                         Some(HarnessVerification::Failed { output_tail }) => {
                             let command = last.map(|last| last.command).unwrap_or_default();
                             let message = format!(
@@ -620,7 +778,7 @@ impl Agent {
                         Some(HarnessVerification::Inconclusive) | None => {
                             let message = match completion_evidence {
                                 crate::CompletionEvidence::VerificationFailed => {
-                                    "The latest verification command failed after a file change. Investigate the failure or report it explicitly before finalizing."
+                                    "A verification failure remains unresolved after your changes. Investigate the failing check or report it explicitly before finalizing."
                                 }
                                 _ => {
                                     "You changed files but have not completed a verification command. Run the narrowest appropriate test, check, or lint command before finalizing."
@@ -641,81 +799,27 @@ impl Agent {
             let had_tools = !tool_calls.is_empty();
             let mut tool_results = Vec::new();
             if had_tools {
-                if assistant.stop_reason == Some(StopReason::Length) {
-                    for (id, name, args) in &tool_calls {
-                        let result = ChatMessage::tool_result(
-                            id,
-                            name,
-                            "Tool call arguments were truncated by the output token limit",
-                            true,
-                        );
-                        self.push_event(
-                            &mut events,
-                            AgentEvent::ToolExecutionStart {
-                                tool_call_id: id.clone(),
-                                tool_name: name.clone(),
-                                args: args.clone(),
-                            },
-                        );
-                        self.push_event(
-                            &mut events,
-                            AgentEvent::ToolExecutionEnd {
-                                tool_call_id: id.clone(),
-                                tool_name: name.clone(),
-                                result: Value::String(
-                                    result
-                                        .content
-                                        .first()
-                                        .and_then(|c| match c {
-                                            MessageContent::Text { text } => Some(text.clone()),
-                                            _ => None,
-                                        })
-                                        .unwrap_or_default(),
-                                ),
-                                is_error: true,
-                                details: None,
-                            },
-                        );
-                        self.messages.push(result.clone());
-                        self.persist_chat(&result)?;
-                        new_messages.push(result.clone());
-                        self.push_event(
-                            &mut events,
-                            AgentEvent::MessageStart {
-                                message: result.clone(),
-                            },
-                        );
-                        self.push_event(
-                            &mut events,
-                            AgentEvent::MessageEnd {
-                                message: result.clone(),
-                            },
-                        );
-                        tool_results.push(result);
-                    }
-                } else {
-                    let cwd = self.cwd.clone();
-                    let messages = self.execute_tool_batch(&cwd, tool_calls, &mut events);
-                    for mut result in messages {
-                        let name = result.tool_name.clone().unwrap_or_default();
-                        self.after_tool(&name, &mut result);
-                        self.messages.push(result.clone());
-                        self.persist_chat(&result)?;
-                        new_messages.push(result.clone());
-                        self.push_event(
-                            &mut events,
-                            AgentEvent::MessageStart {
-                                message: result.clone(),
-                            },
-                        );
-                        self.push_event(
-                            &mut events,
-                            AgentEvent::MessageEnd {
-                                message: result.clone(),
-                            },
-                        );
-                        tool_results.push(result);
-                    }
+                let cwd = self.cwd.clone();
+                let messages = self.execute_tool_batch(&cwd, tool_calls, &mut events);
+                for mut result in messages {
+                    let name = result.tool_name.clone().unwrap_or_default();
+                    self.after_tool(&name, &mut result);
+                    self.messages.push(result.clone());
+                    self.persist_chat(&result)?;
+                    new_messages.push(result.clone());
+                    self.push_event(
+                        &mut events,
+                        AgentEvent::MessageStart {
+                            message: result.clone(),
+                        },
+                    );
+                    self.push_event(
+                        &mut events,
+                        AgentEvent::MessageEnd {
+                            message: result.clone(),
+                        },
+                    );
+                    tool_results.push(result);
                 }
             }
 
@@ -755,6 +859,7 @@ impl Agent {
                 continue;
             }
 
+            self.emit_verification_notice(&mut events);
             break;
         }
 
@@ -945,6 +1050,7 @@ impl Agent {
                 }
                 return Ok((
                     AssistantMessage {
+                        extra: Default::default(),
                         id: crate::new_message_id(),
                         role: "assistant".into(),
                         content: Vec::new(),
@@ -1091,6 +1197,12 @@ impl Agent {
         tool_calls: Vec<(String, String, Value)>,
         events: &mut Vec<AgentEvent>,
     ) -> Vec<ChatMessage> {
+        // Provider history retains the original spelling and call ID. Every
+        // downstream decision uses this shared ingress interpretation.
+        let tool_calls: Vec<_> = tool_calls
+            .into_iter()
+            .map(|(id, name, args)| (id, self.canonical_tool_name(&name).to_owned(), args))
+            .collect();
         if tool_calls
             .iter()
             .any(|(_, name, _)| matches!(name.as_str(), "propose_plan" | "ask_user_question"))
@@ -1535,6 +1647,7 @@ impl Agent {
         depth: usize,
         origin: crate::ToolOperationOrigin,
     ) -> Preparation {
+        let name = self.canonical_tool_name(name);
         if let Some(raw) = args.get(davinci_ai::INVALID_ARGUMENTS_KEY) {
             let raw = raw.as_str().unwrap_or("<unavailable>");
             return Preparation::Immediate(crate::ToolResult {
@@ -1900,6 +2013,7 @@ impl Agent {
         args: &Value,
         depth: usize,
     ) -> crate::ToolResult {
+        let name = self.canonical_tool_name(name);
         let pending = self
             .pending_tool_operations
             .lock()
@@ -2189,6 +2303,14 @@ impl Agent {
                     if let Ok(mut receipts) = self.command_receipts.lock() {
                         receipts.retain(|receipt| receipt.operation_id != id);
                     }
+                }
+                crate::stats::SharedCounters::add(&self.counters.executed_leaf_operations, 1);
+                if matches!(name, "bash" | "powershell" | "exec_command") {
+                    self.refresh_background_shell_mutations();
+                    let paths = self.mutation_verification_state().mutation_paths;
+                    let snapshot =
+                        crate::verification::workspace::Snapshot::capture_inputs(&self.cwd, &paths);
+                    self.record_shell_verification_start(id, snapshot);
                 }
                 let mut executed = match execute_tool_with(cwd, name, args, &context) {
                     Ok(result) => result,
@@ -2499,18 +2621,6 @@ impl Agent {
         if crate::tools::is_coordinated_mutation(name) && !outcome.is_error {
             crate::stats::SharedCounters::add(&self.counters.files_changed_count, 1);
         }
-        if matches!(name, "bash" | "powershell" | "exec_command") {
-            let cmd = args
-                .get("command")
-                .and_then(Value::as_str)
-                .unwrap_or_default();
-            if is_verification_command(cmd) {
-                crate::stats::SharedCounters::add(&self.counters.verification_commands_run, 1);
-                if outcome.is_error {
-                    crate::stats::SharedCounters::add(&self.counters.verification_failures, 1);
-                }
-            }
-        }
         outcome
     }
 
@@ -2544,6 +2654,7 @@ impl Agent {
         args: &Value,
         mut result: crate::ToolResult,
     ) -> (ChatMessage, Vec<AgentEvent>) {
+        let name = self.canonical_tool_name(name);
         let terminal_markers = ["denied", "cancelled"].map(|key| {
             (
                 key,
@@ -2615,19 +2726,7 @@ impl Agent {
             if crate::tools::is_coordinated_mutation(name) && !pre_hook_error && !result.is_error {
                 self.record_successful_mutation_paths(mutation_paths_from_tool(name, args));
             }
-            if matches!(name, "bash" | "powershell" | "exec_command") {
-                let cmd = args
-                    .get("command")
-                    .and_then(Value::as_str)
-                    .unwrap_or_default();
-                if let Some(trustworthy) = crate::shell_policy::verification_outcome(cmd) {
-                    self.remember_verification_call(name, args, cwd);
-                    self.record_verification_command(
-                        cmd,
-                        trustworthy && !pre_hook_error && !result.is_error,
-                    );
-                }
-            }
+            self.observe_shell_verification(id, cwd, name, args, &pre_hook_result, &result);
         }
         let hook_vetoed = !pre_hook_error && result.is_error;
         if !replayed {
@@ -2658,6 +2757,178 @@ impl Agent {
             self.cache_operation_presentation(id, result.clone());
         }
         self.emit_tool_result(id, name, args, result)
+    }
+
+    pub(crate) fn record_shell_verification_start(
+        &self,
+        id: &str,
+        snapshot: crate::verification::workspace::Snapshot,
+    ) {
+        // Unknown inventory invalidates old evidence before execution. A fresh
+        // unfiltered suite can recover that scope without an endless bump after
+        // each command in a large workspace.
+        if !snapshot.complete() {
+            self.record_unknown_shell_scope();
+        }
+        self.shell_mutation_snapshots
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(id.to_string(), snapshot);
+        let generation = self.mutation_verification_state().mutation_generation;
+        self.verification_starts
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(id.to_string(), generation);
+    }
+
+    pub(crate) fn observe_shell_verification(
+        &self,
+        id: &str,
+        cwd: &Path,
+        name: &str,
+        args: &Value,
+        original: &crate::ToolResult,
+        decorated: &crate::ToolResult,
+    ) {
+        let generation = self
+            .verification_starts
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(id);
+        let Some(generation) = generation else {
+            return;
+        };
+        let before = self
+            .shell_mutation_snapshots
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(id);
+        if let Some(job_id) = original
+            .details
+            .as_ref()
+            .and_then(|details| details.get("jobId"))
+            .and_then(Value::as_u64)
+        {
+            if let Ok(job_id) = u32::try_from(job_id) {
+                self.background_shell_jobs
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .insert(job_id);
+                self.record_successful_mutation();
+            }
+        }
+        self.refresh_background_shell_mutations();
+        let command = args
+            .get("command")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let state = self.mutation_verification_state();
+        let assessment = crate::verification::classify_in_workspace(
+            name,
+            command,
+            cwd,
+            &self.cwd,
+            &state.mutation_paths,
+        );
+        if let Some(before) = before {
+            let mut inputs = state.mutation_paths.clone();
+            inputs.extend(before.required_paths().iter().cloned());
+            inputs.sort();
+            inputs.dedup();
+            let after =
+                crate::verification::workspace::Snapshot::capture_inputs(&self.cwd, &inputs);
+            let changed = before.changes(&after);
+            if !changed.is_empty() {
+                self.record_successful_mutation_paths(changed);
+                return;
+            }
+            if (!before.complete() || !after.complete())
+                && !(assessment.full_workspace && before.required_inputs_observed(&after))
+            {
+                self.record_unknown_shell_scope();
+                return;
+            }
+        }
+        // Concurrent shell calls can share a starting generation. Always
+        // observe their edits first; only their verification credit is stale.
+        if generation != state.mutation_generation {
+            return;
+        }
+        {
+            let mut state = self
+                .mutation_verification
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            if state.mutation_generation == generation {
+                state.last_classification_reason = Some(assessment.reason.into());
+            }
+        }
+        if !matches!(
+            assessment.kind,
+            crate::verification::CheckKind::Suite | crate::verification::CheckKind::TargetedScript
+        ) {
+            return;
+        }
+        let receipt = self
+            .command_receipts
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .find(|receipt| receipt.operation_id == id)
+            .cloned();
+        let terminal = if original.is_error != decorated.is_error {
+            None
+        } else if let Some(receipt) = receipt {
+            if !receipt.started
+                || receipt.exit_code.is_none()
+                || receipt.timed_out
+                || receipt.cancelled
+                || receipt.killed
+                || receipt.permission_denied
+                || receipt.simulated
+                || receipt.hook_vetoed
+                || (original.is_error && receipt.exit_code == Some(0))
+            {
+                None
+            } else {
+                Some(receipt.is_passed() && !original.is_error)
+            }
+        } else {
+            original.details.as_ref().and_then(|details| {
+                if [
+                    "denied",
+                    "cancelled",
+                    "timed_out",
+                    "timeout",
+                    "not_dispatched",
+                    "pending",
+                    "background",
+                ]
+                .iter()
+                .any(|key| details.get(key).and_then(Value::as_bool) == Some(true))
+                {
+                    return None;
+                }
+                details
+                    .get("exitCode")
+                    .and_then(Value::as_i64)
+                    .and_then(|exit| {
+                        if exit == 0 && original.is_error {
+                            None
+                        } else {
+                            Some(exit == 0)
+                        }
+                    })
+            })
+        };
+        if let Some(passed) = terminal {
+            crate::stats::SharedCounters::add(&self.counters.verification_commands_run, 1);
+            if !passed {
+                crate::stats::SharedCounters::add(&self.counters.verification_failures, 1);
+            }
+            self.remember_verification_call(name, args, cwd);
+        }
+        self.record_verification_assessment(generation, command, &assessment, terminal);
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -2872,6 +3143,17 @@ impl Agent {
         };
         self.emit_live(end.clone());
         events.push(end);
+        self.push_event(
+            &mut events,
+            AgentEvent::MutationObservation {
+                schema_version: 1,
+                generation: self.mutation_verification_state().mutation_generation,
+                executed_leaf_operations: self
+                    .counters
+                    .executed_leaf_operations
+                    .load(std::sync::atomic::Ordering::Relaxed),
+            },
+        );
         if let Some(runtime) = &self.runtime {
             runtime.emit_observe(crate::runtime::RuntimeEvent::PostToolUse {
                 call_id: id.to_string(),
@@ -2879,10 +3161,18 @@ impl Agent {
                 is_error: result.is_error,
             });
         }
-        (
-            tool_result_message(id, name, result, self.auto_resize_images),
-            events,
-        )
+        let mut message = tool_result_message(id, name, result, self.auto_resize_images);
+        self.annotate_tool_result_wire_kind(&mut message);
+        (message, events)
+    }
+
+    fn annotate_tool_result_wire_kind(&self, result: &mut ChatMessage) {
+        let Some(call_id) = result.tool_call_id.as_deref() else {
+            return;
+        };
+        if let Some(kind) = davinci_ai::originating_tool_wire_kind(&self.messages, call_id) {
+            davinci_ai::set_single_wire_kind(&mut result.extra, kind);
+        }
     }
 
     /// The permission gate: `None` lets the call run, `Some(reason)` is the
@@ -3606,12 +3896,14 @@ impl Agent {
         };
 
         let recovered_message = (!is_batch_child && current_message.is_none()).then(|| {
-            tool_result_message(
+            let mut message = tool_result_message(
                 &ready.tool_call_id,
                 tool_name,
                 presentation.clone(),
                 self.auto_resize_images,
-            )
+            );
+            self.annotate_tool_result_wire_kind(&mut message);
+            message
         });
         let presentation_value = match &recovered_message {
             Some(message) => serde_json::to_value(message),
@@ -3870,7 +4162,12 @@ impl Agent {
                     message["stopReason"] = value;
                 }
             }
-            for key in [davinci_ai::NATIVE_ITEMS_KEY, davinci_ai::NATIVE_MODEL_KEY] {
+            for key in [
+                davinci_ai::NATIVE_ITEMS_KEY,
+                davinci_ai::NATIVE_MODEL_KEY,
+                RESPONSES_TOOL_WIRE_KINDS_KEY,
+                RESPONSES_TOOL_WIRE_KIND_KEY,
+            ] {
                 if let Some(value) = chat.extra.get(key) {
                     message[key] = value.clone();
                 }
@@ -4063,23 +4360,21 @@ pub(crate) fn mutation_paths_from_tool(name: &str, args: &Value) -> Vec<PathBuf>
             .or_else(|| args.get("input"))
             .and_then(Value::as_str)
         {
-            for line in patch.lines() {
-                for prefix in ["*** Update File: ", "*** Add File: ", "*** Delete File: "] {
-                    if let Some(path) = line.strip_prefix(prefix) {
-                        let path = PathBuf::from(path.trim());
-                        if !paths.contains(&path) {
-                            paths.push(path);
-                        }
+            if let Ok(parsed) = crate::apply_patch::parse_codex_patch(patch) {
+                for action in parsed.actions {
+                    let path = match action {
+                        crate::apply_patch::FileAction::Add { path, .. }
+                        | crate::apply_patch::FileAction::Update { path, .. }
+                        | crate::apply_patch::FileAction::Delete { path } => PathBuf::from(path),
+                    };
+                    if !paths.contains(&path) {
+                        paths.push(path);
                     }
                 }
             }
         }
     }
     paths
-}
-
-pub(crate) fn is_verification_command(cmd: &str) -> bool {
-    crate::shell_policy::verification_outcome(cmd).is_some()
 }
 
 #[cfg(test)]
@@ -4109,6 +4404,7 @@ mod tests {
 
     fn model_turn_read_call(turn: usize) -> davinci_ai::AssistantMessage {
         davinci_ai::AssistantMessage {
+            extra: Default::default(),
             id: format!("assistant-{turn}"),
             role: "assistant".into(),
             content: vec![davinci_ai::ContentBlock::ToolCall {
@@ -4184,6 +4480,7 @@ mod tests {
                     }
                 };
                 Ok(davinci_ai::AssistantMessage {
+                    extra: Default::default(),
                     id: format!("assistant-{turn}"),
                     role: "assistant".into(),
                     content: vec![content],
@@ -4901,6 +5198,7 @@ mod tests {
             .run_loop(|_| {
                 let first = turns.fetch_add(1, Ordering::SeqCst) == 0;
                 Ok(AssistantMessage {
+                    extra: Default::default(),
                     id: "fixture".into(),
                     role: "assistant".into(),
                     content: if first {
@@ -5073,6 +5371,7 @@ mod tests {
                 let count = called_clone.fetch_add(1, Ordering::SeqCst);
                 if count == 0 {
                     Ok(AssistantMessage {
+                        extra: Default::default(),
                         id: "msg_tool".into(),
                         role: "assistant".into(),
                         content: vec![ContentBlock::ToolCall {
@@ -5087,6 +5386,7 @@ mod tests {
                     })
                 } else {
                     Ok(AssistantMessage {
+                        extra: Default::default(),
                         id: "msg_end".into(),
                         role: "assistant".into(),
                         content: vec![ContentBlock::Text {
@@ -5131,6 +5431,7 @@ mod tests {
         let events = agent
             .run_loop(|_ag| {
                 Ok(AssistantMessage {
+                    extra: Default::default(),
                     id: "msg_plain".into(),
                     role: "assistant".into(),
                     content: vec![ContentBlock::Text {
@@ -5155,6 +5456,7 @@ mod tests {
         let mut agent = Agent::new("Test prompt");
         let _ = agent.run_loop(|_ag| {
             Ok(AssistantMessage {
+                extra: Default::default(),
                 id: "msg_1".into(),
                 role: "assistant".into(),
                 content: vec![ContentBlock::Text {
@@ -5207,6 +5509,7 @@ mod tests {
                 );
                 let call = calls_for_provider.fetch_add(1, Ordering::SeqCst);
                 Ok(AssistantMessage {
+                    extra: Default::default(),
                     id: format!("msg_{call}"),
                     role: "assistant".into(),
                     content: vec![ContentBlock::Text {
@@ -6358,6 +6661,13 @@ mod operation_dispatch_tests {
 
         let snapshot = journal.snapshot().unwrap();
         assert_eq!(snapshot.operations.len(), 3);
+        assert_eq!(
+            agent
+                .counters
+                .executed_leaf_operations
+                .load(std::sync::atomic::Ordering::Relaxed),
+            2
+        );
         let parent = snapshot
             .operations
             .iter()
@@ -6404,6 +6714,13 @@ mod operation_dispatch_tests {
             Some(true)
         );
         assert!(!workspace.path().join("denied.txt").exists());
+        assert_eq!(
+            agent
+                .counters
+                .executed_leaf_operations
+                .load(std::sync::atomic::Ordering::Relaxed),
+            0
+        );
 
         let snapshot = journal.snapshot().unwrap();
         assert_eq!(snapshot.operations.len(), 1);
@@ -6523,8 +6840,159 @@ mod operation_dispatch_tests {
         };
         assert!(replay.details.as_ref().unwrap()["replayed_from_operation_journal"] == true);
         assert_eq!(
+            agent
+                .counters
+                .executed_leaf_operations
+                .load(std::sync::atomic::Ordering::Relaxed),
+            1
+        );
+        assert_eq!(
             replay.details.as_ref().unwrap()["_command_receipt"],
             receipt.clone()
+        );
+    }
+}
+
+#[cfg(test)]
+mod tool_name_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn tool_name_direct_execution_hooks_mutations_and_replay() {
+        let root = tempfile::tempdir().unwrap();
+        let mut agent = Agent::new("alias dispatch");
+        agent.set_permission_mode(crate::PermissionMode::AlwaysApprove);
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let hook_seen = seen.clone();
+        agent.post_tool = Some(crate::PostToolHook(std::sync::Arc::new(
+            move |id, _, name, _, result| {
+                hook_seen
+                    .lock()
+                    .unwrap()
+                    .push((id.to_string(), name.to_string()));
+                result
+            },
+        )));
+        let args = json!({"path":"alias.txt", "content":"first"});
+        let mut events = Vec::new();
+        let result = agent.execute_tool_batch(
+            root.path(),
+            vec![("same-id".into(), "functions.write".into(), args.clone())],
+            &mut events,
+        );
+        assert_eq!(result[0].is_error, Some(false));
+        assert_eq!(
+            std::fs::read_to_string(root.path().join("alias.txt")).unwrap(),
+            "first"
+        );
+        assert_eq!(
+            *seen.lock().unwrap(),
+            vec![("same-id".into(), "write".into())]
+        );
+        assert_eq!(
+            agent
+                .mutation_verification
+                .lock()
+                .unwrap()
+                .mutation_generation,
+            1
+        );
+        // Round-trip the persisted ledger before a recovered canonical call.
+        let saved = serde_json::to_value(&*agent.tool_ledger.lock().unwrap()).unwrap();
+        *agent.tool_ledger.lock().unwrap() = serde_json::from_value(saved).unwrap();
+        // The mutating-tool replay policy still requires reconciliation.
+        std::fs::write(root.path().join("alias.txt"), "external change").unwrap();
+        let result = agent.execute_tool_batch(
+            root.path(),
+            vec![("same-id".into(), "write".into(), args)],
+            &mut events,
+        );
+        assert_eq!(result[0].is_error, Some(true));
+        assert!(format!("{:?}", result[0]).contains("Reconcile the tool state"));
+        assert_eq!(
+            std::fs::read_to_string(root.path().join("alias.txt")).unwrap(),
+            "external change"
+        );
+        assert_eq!(
+            agent
+                .mutation_verification
+                .lock()
+                .unwrap()
+                .mutation_generation,
+            1
+        );
+    }
+
+    #[test]
+    fn tool_name_denial_exact_shadow_and_serial_lane() {
+        let root = tempfile::tempdir().unwrap();
+        let mut agent = Agent::new("alias policy");
+        agent.set_permission_mode(crate::PermissionMode::ReadOnly);
+        let args = json!({"path":"never.txt","content":"denied"});
+        let denied = agent.prepare_tool_call(root.path(), "deny", "functions.write", &args, 0);
+        assert!(
+            matches!(denied, Preparation::Immediate(ref r) if r.is_error && r.details.as_ref().is_some_and(|d| d["denied"] == true))
+        );
+        assert!(!root.path().join("never.txt").exists());
+        agent.set_permission_mode(crate::PermissionMode::AlwaysApprove);
+        assert!(matches!(
+            agent.prepare_tool_call(root.path(), "serial", "functions.write", &args, 0),
+            Preparation::Ready {
+                lane: crate::scheduler::ToolLane::Serial
+            }
+        ));
+        agent.tool_registry.push("functions.read".into());
+        let shadow = agent.prepare_tool_call(
+            root.path(),
+            "shadow",
+            "functions.read",
+            &json!({"path":"never.txt"}),
+            0,
+        );
+        assert!(
+            matches!(shadow, Preparation::Immediate(ref r) if r.is_error && r.content.contains("Unknown tool"))
+        );
+        agent.tools.push("functions.read".into());
+        agent.pre_tool = Some(crate::PreToolHook(std::sync::Arc::new(|name, _| {
+            (name == "functions.read").then(|| "exact registration denied".into())
+        })));
+        let denied = agent.prepare_tool_call(
+            root.path(),
+            "exact-deny",
+            "functions.read",
+            &json!({"path":"never.txt"}),
+            0,
+        );
+        assert!(
+            matches!(denied, Preparation::Immediate(ref r) if r.is_error && r.content.contains("exact registration denied"))
+        );
+    }
+
+    #[test]
+    fn tool_name_batch_aliases_preserve_order_and_block_recursion() {
+        let root = tempfile::tempdir().unwrap();
+        let mut agent = Agent::new("alias batch");
+        agent.set_permission_mode(crate::PermissionMode::AlwaysApprove);
+        let result = agent.run_batch(root.path(), "batch-id", &json!({"operations":[
+            {"tool":"functions.write","args":{"path":"ordered.txt","content":"created"}},
+            {"tool":"functions.read","args":{"path":"ordered.txt"}},
+            {"tool":"functions.batch","args":{"operations":[{"tool":"write","args":{"path":"nested.txt","content":"bad"}}]}}
+        ]}));
+        let operations = &result.details.as_ref().unwrap()["operations"];
+        assert_eq!(operations[0]["status"], "ok");
+        assert_eq!(operations[1]["status"], "ok");
+        assert_eq!(operations[2]["status"], "error");
+        assert!(result.content.contains("created"));
+        assert!(result.content.contains("cannot run inside a batch"));
+        assert!(!root.path().join("nested.txt").exists());
+        assert_eq!(
+            agent
+                .mutation_verification
+                .lock()
+                .unwrap()
+                .mutation_generation,
+            1
         );
     }
 }

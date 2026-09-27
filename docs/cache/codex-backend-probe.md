@@ -10,25 +10,34 @@ davinci --codex-probe "$env:TEMP\codex-probe.json" --model gpt-5.6-luna
 
 ## Current evidence state
 
-The probe has **not been run for this implementation branch**. The connected development machine was offline while the branch was prepared, so no backend capability is recorded here as accepted.
+An authenticated probe was run on 2026-09-26 against `gpt-5.6-luna` using the
+G1 checkpoint binary. The capture was sanitized before retention: only case
+outcomes, cache counts, and header names were kept; turn-state/header values
+were not retained.
 
 Until a real authenticated run supplies evidence, features whose plan gate depends on the cases below must remain disabled by compatibility flags or explicit opt-in settings.
 
 | Probe case | Current result | Gates |
 | --- | --- | --- |
-| `baseline` | Not run | Basic route sanity |
-| `cache_warm` | Not run | Cache observation |
-| `cache_reuse` | Not run | Cache observation |
-| `prompt_cache_options` | Not run | Prompt cache options / TTL |
-| `explicit_breakpoint_without_instructions` | Not run | Stable bootstrap breakpoint |
-| `prewarm` | Not run | Prewarm |
-| `allowed_tools` | Not run | Allowed-tools request shape |
-| `additional_tools` | Not run | Late tool delivery |
-| `custom_grammar_tool` | Not run | Freeform `apply_patch` |
-| `assistant_phase` | Not run | Assistant phase replay validation |
-| `tool_choice_none` | Not run | Cache-sharing compaction |
-| `remote_compact` | Not run | Remote compaction decision |
-| `x-codex-*` headers | Not observed | Usage-window header names |
+| `baseline` | Accepted; cached 0, cache-write 0 | Basic route sanity |
+| `cache_warm` | Accepted; cached 0, cache-write 0 | Cache observation |
+| `cache_reuse` | Accepted; cached 0, cache-write 0 | Cache observation |
+| `prompt_cache_options` | Rejected HTTP 400 | Prompt cache options / TTL |
+| `explicit_breakpoint_without_instructions` | Rejected HTTP 400 | Stable bootstrap breakpoint |
+| `prewarm` | Rejected HTTP 400 | Prewarm |
+| `allowed_tools` | Accepted; cached 0, cache-write 0 | Allowed-tools request shape |
+| `additional_tools` | Rejected HTTP 400 | Late tool delivery |
+| `custom_grammar_tool` | Accepted; cached 0, cache-write 0 | Freeform `apply_patch` |
+| `assistant_phase` | Accepted; cached 0, cache-write 0 | Assistant phase replay validation |
+| `tool_choice_none` | Accepted; cached 0, cache-write 0 | Cache-sharing compaction |
+| `remote_compact` | Rejected HTTP 404 | Remote compaction decision |
+| `x-codex-*` headers | Names observed | Usage-window header names |
+
+The prewarm rejection is direct evidence against enabling that request shape
+for this backend. The accepted cache cases returned zero cached and zero
+cache-write tokens, so they do not justify a cache-option or breakpoint
+compatibility flag. The retained probe is at
+`C:\Users\sergi\davinci-bench-evidence\request-efficiency\probes\c1-codex-probe-20260926.json`.
 
 ## Recording a run
 

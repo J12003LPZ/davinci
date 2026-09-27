@@ -18,6 +18,22 @@ context remain available."
     }
 }
 
+/// Candidate-only requirement classifier and no-suite verification guidance.
+pub fn verification_requirement_checks_module() -> PromptModule {
+    PromptModule {
+        id: "verification.requirement-checks".to_string(),
+        version: 1,
+        cache_class: PromptCacheClass::Stable,
+        body: "\
+Before finishing, compare every explicit requirement with a concrete input or observable \
+condition. If the project has no test suite, verify with a short `python -c` or heredoc script \
+that imports the changed module and asserts on normal, boundary, and invalid inputs. Use the \
+same normal/boundary/invalid classifier for every route. Report the actual verification briefly \
+and leave any unverified condition explicit."
+            .to_string(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -26,5 +42,14 @@ mod tests {
     fn verification_policy_forbids_unverified_success_claims() {
         let text = verification_completion_module().body;
         assert!(text.contains("Do not claim a check passed unless you ran it"));
+    }
+
+    #[test]
+    fn candidate_checks_define_the_no_suite_classifier() {
+        let text = verification_requirement_checks_module().body;
+        assert!(text.contains("python -c"));
+        assert!(text.contains("heredoc script"));
+        assert!(text.contains("normal, boundary, and invalid inputs"));
+        assert!(text.contains("same normal/boundary/invalid classifier for every route"));
     }
 }

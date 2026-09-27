@@ -26,6 +26,8 @@ pub enum FileAction {
 pub struct Hunk {
     pub header: String,
     pub lines: Vec<HunkLine>,
+    /// The consumed context must end at the actual file boundary.
+    pub end_of_file: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -149,21 +151,36 @@ pub fn sanitize_relative_path(workspace_root: &Path, raw_path: &str) -> Result<P
 
 /// Checks if a line is a genuine Codex patch control header rather than file content.
 fn is_patch_control_header(line: &str) -> bool {
-    let trimmed = line.trim();
-    trimmed.starts_with("*** Begin Patch")
-        || trimmed.starts_with("*** Add File:")
-        || trimmed.starts_with("*** Update File:")
-        || trimmed.starts_with("*** Delete File:")
-        || trimmed.starts_with("*** End Patch")
+    line.starts_with("*** Begin Patch")
+        || line.starts_with("*** Add File:")
+        || line.starts_with("*** Update File:")
+        || line.starts_with("*** Delete File:")
+        || line.starts_with("*** End of File")
+        || line.starts_with("*** Move to:")
+        || is_end_patch_line(line)
+}
+
+fn is_end_patch_line(line: &str) -> bool {
+    matches!(line.trim(), "*** End Patch" | "*** End Patch ***")
+}
+
+fn parse_file_path(line: &str, marker: &str) -> Result<String, String> {
+    let path = line
+        .strip_prefix(marker)
+        .map(str::trim)
+        .filter(|path| !path.is_empty())
+        .ok_or_else(|| format!("Malformed patch: {marker} requires a file path"))?;
+    Ok(path.to_string())
 }
 
 /// Parses the full `apply_patch` input string according to the Codex grammar.
 pub fn parse_codex_patch(input: &str) -> Result<ParsedPatch, String> {
     let trimmed = input.trim();
-    if !trimmed.starts_with("*** Begin Patch") {
+    let lines: Vec<&str> = trimmed.lines().collect();
+    if lines.first().map(|line| line.trim()) != Some("*** Begin Patch") {
         return Err("Malformed patch: missing `*** Begin Patch` header".into());
     }
-    if !trimmed.ends_with("*** End Patch") && !trimmed.ends_with("*** End Patch ***") {
+    if !lines.last().is_some_and(|line| is_end_patch_line(line)) {
         return Err("Malformed patch: missing `*** End Patch` footer".into());
     }
 
@@ -171,85 +188,132 @@ pub fn parse_codex_patch(input: &str) -> Result<ParsedPatch, String> {
     hasher.update(trimmed.as_bytes());
     let raw_digest = format!("{:x}", hasher.finalize());
 
-    let lines: Vec<&str> = trimmed.lines().collect();
-    let mut i = 0;
-    while i < lines.len() && !lines[i].starts_with("*** Begin Patch") {
-        i += 1;
-    }
-    i += 1; // skip Begin Patch
+    let mut i = 1; // skip Begin Patch
+    let mut saw_footer = false;
 
     let mut actions = Vec::new();
 
     while i < lines.len() {
-        let line = lines[i].trim();
-        if line.starts_with("*** End Patch") {
+        let line = lines[i];
+        if is_end_patch_line(line) {
+            saw_footer = true;
+            i += 1;
             break;
         }
+        if line.starts_with("*** Move to:") {
+            return Err(
+                "Unsupported patch marker `*** Move to:`; use a delete plus an add instead"
+                    .into(),
+            );
+        }
+        if line.starts_with("*** End of File") {
+            return Err("Unexpected `*** End of File` marker outside a file hunk".into());
+        }
 
-        if let Some(rest) = line.strip_prefix("*** Add File:") {
-            let path = rest.trim().trim_matches('*').trim().to_string();
+        if line.starts_with("*** Add File:") {
+            let path = parse_file_path(line, "*** Add File:")?;
             i += 1;
             let mut content_lines = Vec::new();
-            while i < lines.len() && !is_patch_control_header(lines[i]) {
+            while i < lines.len()
+                && !is_patch_control_header(lines[i])
+                && !is_end_patch_line(lines[i])
+            {
                 let l = lines[i];
-                let body = if let Some(stripped) = l.strip_prefix('+') {
-                    stripped
-                } else {
-                    l
-                };
-                content_lines.push(body);
+                if !l.starts_with('+') {
+                    return Err(format!(
+                        "Malformed Add File `{path}`: each content line must start with `+`"
+                    ));
+                }
+                content_lines.push(&l[1..]);
+                i += 1;
+            }
+            if i < lines.len() && lines[i].starts_with("*** End of File") {
                 i += 1;
             }
             let mut content = content_lines.join("\n");
-            if !content.is_empty() && !content.ends_with('\n') {
+            if !content_lines.is_empty() {
                 content.push('\n');
             }
             actions.push(FileAction::Add { path, content });
             continue;
         }
 
-        if let Some(rest) = line.strip_prefix("*** Delete File:") {
-            let path = rest.trim().trim_matches('*').trim().to_string();
+        if line.starts_with("*** Delete File:") {
+            let path = parse_file_path(line, "*** Delete File:")?;
             i += 1;
+            if i < lines.len()
+                && !is_patch_control_header(lines[i])
+                && !is_end_patch_line(lines[i])
+            {
+                return Err(format!(
+                    "Malformed Delete File `{path}`: delete operations cannot contain hunk lines"
+                ));
+            }
             actions.push(FileAction::Delete { path });
             continue;
         }
 
-        if let Some(rest) = line.strip_prefix("*** Update File:") {
-            let path = rest.trim().trim_matches('*').trim().to_string();
+        if line.starts_with("*** Update File:") {
+            let path = parse_file_path(line, "*** Update File:")?;
             i += 1;
             let mut hunks = Vec::new();
 
-            while i < lines.len() && !is_patch_control_header(lines[i]) {
+            while i < lines.len()
+                && !is_patch_control_header(lines[i])
+                && !is_end_patch_line(lines[i])
+            {
                 let cur = lines[i];
-                if cur.trim().starts_with("@@") {
-                    let header = cur.trim().to_string();
-                    i += 1;
-                    let mut hunk_lines = Vec::new();
-                    while i < lines.len()
-                        && !lines[i].trim().starts_with("@@")
-                        && !is_patch_control_header(lines[i])
-                    {
-                        let hl = lines[i];
-                        if let Some(rest) = hl.strip_prefix('+') {
-                            hunk_lines.push(HunkLine::Add(rest.to_string()));
-                        } else if let Some(rest) = hl.strip_prefix('-') {
-                            hunk_lines.push(HunkLine::Remove(rest.to_string()));
-                        } else if let Some(rest) = hl.strip_prefix(' ') {
-                            hunk_lines.push(HunkLine::Context(rest.to_string()));
-                        } else {
-                            // Unprefixed line treated as context
-                            hunk_lines.push(HunkLine::Context(hl.to_string()));
-                        }
-                        i += 1;
+                if !cur.starts_with("@@") {
+                    return Err(format!(
+                        "Malformed Update File `{path}`: every hunk must begin with `@@`"
+                    ));
+                }
+                let header = cur.trim().to_string();
+                i += 1;
+                let mut hunk_lines = Vec::new();
+                while i < lines.len()
+                    && !lines[i].starts_with("@@")
+                    && !is_patch_control_header(lines[i])
+                    && !is_end_patch_line(lines[i])
+                {
+                    let hl = lines[i];
+                    if let Some(rest) = hl.strip_prefix('+') {
+                        hunk_lines.push(HunkLine::Add(rest.to_string()));
+                    } else if let Some(rest) = hl.strip_prefix('-') {
+                        hunk_lines.push(HunkLine::Remove(rest.to_string()));
+                    } else if let Some(rest) = hl.strip_prefix(' ') {
+                        hunk_lines.push(HunkLine::Context(rest.to_string()));
+                    } else if hl.is_empty() {
+                        // Codex permits an unprefixed blank line as empty context.
+                        hunk_lines.push(HunkLine::Context(String::new()));
+                    } else {
+                        return Err(format!(
+                            "Malformed Update File `{path}`: hunk lines must start with `+`, `-`, or a space"
+                        ));
                     }
-                    hunks.push(Hunk {
-                        header,
-                        lines: hunk_lines,
-                    });
-                } else {
                     i += 1;
                 }
+                let end_of_file = i < lines.len() && lines[i] == "*** End of File";
+                if end_of_file {
+                    i += 1;
+                }
+                if hunk_lines.is_empty() {
+                    return Err(format!(
+                        "Update File for `{path}` has an `@@` header but no hunk lines"
+                    ));
+                }
+                hunks.push(Hunk {
+                    header,
+                    lines: hunk_lines,
+                    end_of_file,
+                });
+            }
+
+            if i < lines.len() && lines[i].starts_with("*** Move to:") {
+                return Err(
+                    "Unsupported patch marker `*** Move to:`; use a delete plus an add instead"
+                        .into(),
+                );
             }
 
             if hunks.is_empty() {
@@ -259,9 +323,17 @@ pub fn parse_codex_patch(input: &str) -> Result<ParsedPatch, String> {
             continue;
         }
 
-        i += 1;
+        return Err(format!(
+            "Malformed patch: unexpected line `{line}`; expected Add, Update, or Delete File"
+        ));
     }
 
+    if !saw_footer {
+        return Err("Malformed patch: missing `*** End Patch` footer".into());
+    }
+    if i < lines.len() {
+        return Err("Malformed patch: content appears after `*** End Patch`".into());
+    }
     if actions.is_empty() {
         return Err("Patch contains no file operations".into());
     }
@@ -304,11 +376,18 @@ pub fn apply_hunks_to_content(original: &str, hunks: &[Hunk]) -> Result<String, 
             continue;
         }
 
-        // Find match position in file_lines: search from search_from first, then fallback
+        // EOF-constrained hunks may only match the final window. Ordinary
+        // hunks search from the preceding edit, then retain the legacy fallback.
         let pattern_len = match_pattern.len();
         let mut found_index = None;
         if file_lines.len() >= pattern_len {
-            for start in search_from..=(file_lines.len() - pattern_len) {
+            let last_start = file_lines.len() - pattern_len;
+            let first_start = if hunk.end_of_file {
+                last_start
+            } else {
+                search_from
+            };
+            for start in first_start..=last_start {
                 let window = &file_lines[start..start + pattern_len];
                 let matches = window
                     .iter()
@@ -319,7 +398,7 @@ pub fn apply_hunks_to_content(original: &str, hunks: &[Hunk]) -> Result<String, 
                     break;
                 }
             }
-            if found_index.is_none() && search_from > 0 {
+            if found_index.is_none() && search_from > 0 && !hunk.end_of_file {
                 let limit = search_from.min(file_lines.len().saturating_sub(pattern_len) + 1);
                 for start in 0..limit {
                     let window = &file_lines[start..start + pattern_len];
@@ -358,7 +437,7 @@ pub fn apply_hunks_to_content(original: &str, hunks: &[Hunk]) -> Result<String, 
     }
 
     let mut result = file_lines.join(line_sep);
-    if (had_trailing_newline || !result.is_empty()) && !result.ends_with('\n') {
+    if had_trailing_newline && !result.is_empty() && !result.ends_with(line_sep) {
         result.push_str(line_sep);
     }
     Ok(result)
@@ -788,6 +867,52 @@ mod tests {
             updated,
             "fn a() {\n    return 10;\n}\n\nfn b() {\n    return 20;\n}\n"
         );
+    }
+
+    #[test]
+    fn blank_unprefixed_hunk_lines_are_context() {
+        let dir = tempdir().unwrap();
+        let target = dir.path().join("blank.txt");
+        fs::write(&target, "first\n\nold\n\nlast\n").unwrap();
+        let patch = "*** Begin Patch\n*** Update File: blank.txt\n@@\n first\n\n-old\n+new\n\n last\n*** End Patch";
+        execute_apply_patch(dir.path(), patch).unwrap();
+        assert_eq!(
+            fs::read_to_string(target).unwrap(),
+            "first\n\nnew\n\nlast\n"
+        );
+    }
+
+    #[test]
+    fn eof_marker_selects_the_tail_of_repeated_content() {
+        let dir = tempdir().unwrap();
+        let target = dir.path().join("repeated.txt");
+        let patch = "*** Begin Patch\n*** Update File: repeated.txt\n@@\n shared\n-old\n+new\n*** End of File\n*** End Patch";
+        for newline in ["\n", "\r\n"] {
+            for trailing in [false, true] {
+                let mut original = ["shared", "old", "middle", "shared", "old"].join(newline);
+                let mut expected = ["shared", "old", "middle", "shared", "new"].join(newline);
+                if trailing {
+                    original.push_str(newline);
+                    expected.push_str(newline);
+                }
+                fs::write(&target, original).unwrap();
+                execute_apply_patch(dir.path(), patch).unwrap();
+                assert_eq!(fs::read_to_string(&target).unwrap(), expected);
+            }
+        }
+    }
+
+    #[test]
+    fn eof_marker_rejects_a_non_tail_match_without_writes() {
+        let dir = tempdir().unwrap();
+        let target = dir.path().join("tail.txt");
+        fs::write(&target, "old\nuntouched tail\n").unwrap();
+        let patch = "*** Begin Patch\n*** Add File: staged.txt\n+must not commit\n*** Update File: tail.txt\n@@\n-old\n+new\n*** End of File\n*** End Patch";
+        assert!(execute_apply_patch(dir.path(), patch)
+            .unwrap_err()
+            .contains("Context mismatch"));
+        assert_eq!(fs::read_to_string(target).unwrap(), "old\nuntouched tail\n");
+        assert!(!dir.path().join("staged.txt").exists());
     }
 
     #[test]

@@ -73,6 +73,7 @@ pub fn supports_incremental_stream(model: &Model) -> bool {
 /// An empty assistant message for `model`, the shape every decoder starts from.
 pub fn new_message(model: &Model) -> AssistantMessage {
     AssistantMessage {
+        extra: Default::default(),
         id: Uuid::new_v4().to_string(),
         role: "assistant".into(),
         content: Vec::new(),
@@ -221,6 +222,7 @@ pub struct ResponsesDecoder {
     message: AssistantMessage,
     partial_snapshot: PartialMessageSnapshot,
     slots: HashMap<u64, Slot>,
+    output_indices: HashMap<u64, usize>,
     started: bool,
     done: bool,
     pub raw_items: Vec<Value>,
@@ -235,6 +237,7 @@ impl ResponsesDecoder {
             partial_snapshot: PartialMessageSnapshot::new(&message),
             message,
             slots: HashMap::new(),
+            output_indices: HashMap::new(),
             started: false,
             done: false,
             raw_items: Vec::new(),
@@ -361,7 +364,22 @@ impl ResponsesDecoder {
             }
             _ => return None,
         };
+        if slot.kind == SlotKind::ToolCall {
+            crate::responses_tools::set_wire_kind(
+                &mut self.message.extra,
+                match &self.message.content[content_index] {
+                    ContentBlock::ToolCall { id, .. } => id,
+                    _ => unreachable!(),
+                },
+                if slot.custom_input {
+                    crate::ResponsesToolWireKind::Custom
+                } else {
+                    crate::ResponsesToolWireKind::Function
+                },
+            );
+        }
         let handle = slot.handle();
+        self.output_indices.insert(output_index, content_index);
         self.slots.insert(output_index, slot);
         Some(handle)
     }
@@ -518,6 +536,45 @@ impl ResponsesDecoder {
                 });
             }
             SlotKind::ToolCall => {
+                if let Some(item) = item {
+                    if let Some(ContentBlock::ToolCall { id, name, .. }) =
+                        self.message.content.get_mut(slot.content_index)
+                    {
+                        if item
+                            .get("call_id")
+                            .and_then(Value::as_str)
+                            .is_some_and(|id| !id.is_empty())
+                            || item
+                                .get("id")
+                                .and_then(Value::as_str)
+                                .is_some_and(|id| !id.is_empty())
+                        {
+                            if let Some(kinds) = self
+                                .message
+                                .extra
+                                .get_mut(crate::RESPONSES_TOOL_WIRE_KINDS_KEY)
+                                .and_then(Value::as_object_mut)
+                            {
+                                kinds.remove(id.as_str());
+                            }
+                            *id = tool_call_id(item);
+                        }
+                        *name = item
+                            .get("name")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default()
+                            .into();
+                        crate::responses_tools::set_wire_kind(
+                            &mut self.message.extra,
+                            id,
+                            if slot.custom_input {
+                                crate::ResponsesToolWireKind::Custom
+                            } else {
+                                crate::ResponsesToolWireKind::Function
+                            },
+                        );
+                    }
+                }
                 if slot.custom_input {
                     let input = item
                         .and_then(|item| item.get("input"))
@@ -569,6 +626,69 @@ impl ResponsesDecoder {
         }
     }
 
+    /// Some providers send output only on the terminal event. A nonempty
+    /// terminal array is authoritative, including ordering and corrections to
+    /// deltas. An empty array is not: backends may omit already-streamed items
+    /// from the terminal event, so it must not erase completed output.
+    fn reconcile_output(&mut self, response: Option<&Value>, out: &mut Vec<AssistantMessageEvent>) {
+        let Some(output) = response
+            .and_then(|response| response.get("output"))
+            .and_then(Value::as_array)
+            .filter(|output| !output.is_empty())
+        else {
+            return;
+        };
+        let mut ordered = Vec::new();
+        let mut kinds = serde_json::Map::new();
+        for (index, item) in output.iter().enumerate() {
+            let index = index as u64;
+            if !self.output_indices.contains_key(&index) {
+                self.create_slot(index, item, out);
+            }
+            self.close_slot(index, Some(item), out);
+            let Some(mut content) = normalize_output_item(item) else {
+                continue;
+            };
+            // Missing IDs are generated once by create_slot, never once per
+            // normalization pass.
+            if let ContentBlock::ToolCall { id, .. } = &mut content {
+                if item
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .is_empty()
+                    && item
+                        .get("call_id")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .is_empty()
+                {
+                    if let Some(ContentBlock::ToolCall { id: existing, .. }) = self
+                        .output_indices
+                        .get(&index)
+                        .and_then(|index| self.message.content.get(*index))
+                    {
+                        *id = existing.clone();
+                    }
+                }
+                crate::responses_tools::set_wire_kind(
+                    &mut kinds,
+                    id,
+                    if item["type"] == "custom_tool_call" {
+                        crate::ResponsesToolWireKind::Custom
+                    } else {
+                        crate::ResponsesToolWireKind::Function
+                    },
+                );
+            }
+            ordered.push(content);
+        }
+        self.slots.clear();
+        self.message.content = ordered;
+        self.message.extra = kinds;
+        self.raw_items = output.clone();
+    }
+
     fn has_tool_call(&self) -> bool {
         self.message
             .content
@@ -581,6 +701,13 @@ impl ResponsesDecoder {
             return;
         }
         self.start(out);
+        self.reconcile_output(response, out);
+        // A terminal output array can complete or replace provisional slots.
+        // Without one, only output_item.done establishes a finished call.
+        let unclosed_tool_call = self
+            .slots
+            .values()
+            .any(|slot| slot.kind == SlotKind::ToolCall);
         self.close_open_slots(out);
         if let Some(usage) = response.and_then(|response| response.get("usage")) {
             self.message.usage = Some(responses_usage(&self.model, usage));
@@ -591,7 +718,40 @@ impl ResponsesDecoder {
         let incomplete_reason = response
             .and_then(|response| response.pointer("/incomplete_details/reason"))
             .and_then(Value::as_str);
-        let (mut stop_reason, error_message) = map_stop_reason(status, incomplete_reason);
+        let (mut stop_reason, mut error_message) = map_stop_reason(status, incomplete_reason);
+        if let Some(error) = response
+            .and_then(|response| response.get("error"))
+            .filter(|error| !error.is_null())
+        {
+            stop_reason = StopReason::Error;
+            error_message = Some(codex_error_text(error));
+        }
+        if stop_reason == StopReason::Stop
+            && (unclosed_tool_call
+                || self
+                    .raw_items
+                    .iter()
+                    .any(crate::responses_ledger::unfinished_tool_item))
+        {
+            stop_reason = StopReason::Error;
+            error_message = Some("Response contains an unfinished tool call".into());
+        }
+        if stop_reason != StopReason::Stop {
+            // Partial calls are presentation only. Never expose them to the
+            // execution loop, even when max_output_tokens maps to Length.
+            // Record that they existed so the agent can ask for a retry.
+            if self.has_tool_call() {
+                self.message
+                    .extra
+                    .insert(crate::DROPPED_TOOL_CALLS_KEY.into(), Value::Bool(true));
+            }
+            self.message
+                .content
+                .retain(|block| !matches!(block, ContentBlock::ToolCall { .. }));
+            self.message
+                .extra
+                .remove(crate::RESPONSES_TOOL_WIRE_KINDS_KEY);
+        }
         if stop_reason == StopReason::Stop && self.has_tool_call() {
             stop_reason = StopReason::ToolUse;
         }
@@ -617,6 +777,12 @@ impl ResponsesDecoder {
         }
         self.start(out);
         self.close_open_slots(out);
+        self.message
+            .content
+            .retain(|block| !matches!(block, ContentBlock::ToolCall { .. }));
+        self.message
+            .extra
+            .remove(crate::RESPONSES_TOOL_WIRE_KINDS_KEY);
         self.message.stop_reason = Some(StopReason::Error);
         self.message.error_message = Some(message);
         self.done = true;
@@ -662,7 +828,11 @@ fn map_stop_reason(
     incomplete_reason: Option<&str>,
 ) -> (StopReason, Option<String>) {
     match status {
-        None | Some("completed") | Some("in_progress") | Some("queued") => (StopReason::Stop, None),
+        None | Some("completed") => (StopReason::Stop, None),
+        Some("in_progress" | "queued") => (
+            StopReason::Error,
+            Some("Response ended before completion".into()),
+        ),
         Some("incomplete") => match incomplete_reason {
             Some("max_output_tokens") => (StopReason::Length, None),
             Some(reason) => (
@@ -691,6 +861,58 @@ fn tool_call_id(item: &Value) -> String {
         (false, true) => call_id.to_string(),
         (true, false) => id.to_string(),
         (true, true) => Uuid::new_v4().to_string(),
+    }
+}
+
+fn normalize_output_item(item: &Value) -> Option<ContentBlock> {
+    if crate::responses_ledger::unfinished_tool_item(item) {
+        return None;
+    }
+    match item.get("type").and_then(Value::as_str)? {
+        "message" => Some(ContentBlock::Text {
+            text: item
+                .get("content")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(|part| {
+                    part.get("text")
+                        .or_else(|| part.get("refusal"))
+                        .and_then(Value::as_str)
+                })
+                .collect::<String>(),
+        }),
+        "reasoning" => {
+            let summary = join_texts(item.get("summary"), "text");
+            Some(ContentBlock::Thinking {
+                thinking: if summary.is_empty() {
+                    join_texts(item.get("content"), "text")
+                } else {
+                    summary
+                },
+                signature: None,
+                redacted: false,
+            })
+        }
+        kind @ ("function_call" | "custom_tool_call") => Some(ContentBlock::ToolCall {
+            id: tool_call_id(item),
+            name: item
+                .get("name")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .into(),
+            arguments: if kind == "custom_tool_call" {
+                serde_json::json!({"input": item.get("input").and_then(Value::as_str).unwrap_or_default()})
+            } else {
+                item.get("arguments")
+                    .map(|arguments| match arguments {
+                        Value::String(raw) => crate::final_tool_arguments(raw),
+                        other => other.clone(),
+                    })
+                    .unwrap_or_else(|| serde_json::json!({}))
+            },
+        }),
+        _ => None,
     }
 }
 
@@ -844,7 +1066,7 @@ impl StreamDecoder for ResponsesDecoder {
                 if let Some(item) = item {
                     self.raw_items.push(item.clone());
                 }
-                if !self.slots.contains_key(&output_index) {
+                if !self.output_indices.contains_key(&output_index) {
                     if let Some(item) = item {
                         self.create_slot(output_index, item, out);
                     }
@@ -852,15 +1074,24 @@ impl StreamDecoder for ResponsesDecoder {
                 self.close_slot(output_index, item, out);
             }
             "response.completed" | "response.done" | "response.incomplete" => {
-                let response = event.get("response").cloned();
-                if let Some(id) = response
-                    .as_ref()
-                    .and_then(|r| r.get("id"))
-                    .and_then(Value::as_str)
-                {
+                let mut response = event
+                    .get("response")
+                    .cloned()
+                    .unwrap_or_else(|| serde_json::json!({}));
+                if event_type == "response.incomplete" || response.get("status").is_none() {
+                    response["status"] = Value::String(
+                        if event_type == "response.incomplete" {
+                            "incomplete"
+                        } else {
+                            "completed"
+                        }
+                        .into(),
+                    );
+                }
+                if let Some(id) = response.get("id").and_then(Value::as_str) {
                     self.last_response_id = Some(id.to_string());
                 }
-                self.finalize(response.as_ref(), out);
+                self.finalize(Some(&response), out);
             }
             "response.failed" => {
                 let text = event
@@ -1208,6 +1439,215 @@ data: {"type":"response.function_call_arguments.delta","output_index":0,"delta":
 "#,
         );
         assert_eq!(message.stop_reason, Some(StopReason::Error));
+    }
+
+    #[test]
+    fn incomplete_event_overrides_missing_null_or_completed_nested_status() {
+        for status in [
+            None,
+            Some(Value::Null),
+            Some("completed".into()),
+            Some("incomplete".into()),
+        ] {
+            let mut response = serde_json::json!({
+                "id":"resp", "incomplete_details":{"reason":"max_output_tokens"},
+                "output":[{"type":"custom_tool_call","id":"item","call_id":"call",
+                    "name":"apply_patch","input":"patch"}]
+            });
+            if let Some(status) = status {
+                response["status"] = status;
+            }
+            let mut decoder = ResponsesDecoder::new(&model());
+            let mut events = Vec::new();
+            decoder.feed(
+                &serde_json::json!({"type":"response.incomplete","response":response}),
+                &mut events,
+            );
+            let message = decoder.finish(&mut events);
+            assert_eq!(message.stop_reason, Some(StopReason::Length), "{response}");
+            assert!(!message
+                .content
+                .iter()
+                .any(|block| matches!(block, ContentBlock::ToolCall { .. })));
+            assert!(!message
+                .extra
+                .contains_key(crate::RESPONSES_TOOL_WIRE_KINDS_KEY));
+        }
+    }
+
+    #[test]
+    fn empty_terminal_output_rejects_provisional_calls() {
+        let mut decoder = ResponsesDecoder::new(&model());
+        let mut events = Vec::new();
+        decoder.feed(
+            &serde_json::json!({"type":"response.output_item.added","output_index":0,
+            "item":{"type":"custom_tool_call","id":"item","call_id":"call",
+                "name":"apply_patch","input":"patch"}}),
+            &mut events,
+        );
+        decoder.feed(
+            &serde_json::json!({"type":"response.completed",
+            "response":{"id":"resp","status":"completed","output":[]}}),
+            &mut events,
+        );
+        let message = decoder.finish(&mut events);
+        assert_eq!(message.stop_reason, Some(StopReason::Error));
+        assert!(!message
+            .content
+            .iter()
+            .any(|block| matches!(block, ContentBlock::ToolCall { .. })));
+    }
+
+    #[test]
+    fn empty_terminal_output_keeps_finished_streamed_calls() {
+        let mut decoder = ResponsesDecoder::new(&model());
+        let mut events = Vec::new();
+        decoder.feed(
+            &serde_json::json!({"type":"response.output_item.done","output_index":0,
+            "item":{"type":"custom_tool_call","id":"item","call_id":"call",
+                "name":"apply_patch","input":"patch"}}),
+            &mut events,
+        );
+        decoder.feed(
+            &serde_json::json!({"type":"response.completed",
+            "response":{"id":"resp","status":"completed","output":[]}}),
+            &mut events,
+        );
+        let message = decoder.finish(&mut events);
+        assert_eq!(message.stop_reason, Some(StopReason::ToolUse));
+        assert!(matches!(
+            message.content.as_slice(),
+            [ContentBlock::ToolCall { name, arguments, .. }]
+                if name == "apply_patch" && arguments["input"] == "patch"
+        ));
+        let call_id = match &message.content[0] {
+            ContentBlock::ToolCall { id, .. } => id.clone(),
+            _ => unreachable!(),
+        };
+        assert_eq!(
+            message.extra[crate::RESPONSES_TOOL_WIRE_KINDS_KEY][call_id.as_str()],
+            "custom"
+        );
+        assert_eq!(decoder.raw_items.len(), 1);
+    }
+
+    #[test]
+    fn unclosed_tool_calls_require_authoritative_terminal_output() {
+        for kind in ["function_call", "custom_tool_call"] {
+            for status in [
+                Value::Null,
+                "incomplete".into(),
+                "in_progress".into(),
+                "failed".into(),
+                "completed".into(),
+            ] {
+                let item = serde_json::json!({"type":kind,"id":"item","call_id":"call",
+                    "name":"apply_patch","status":status,"input":"patch","arguments":"{}"});
+                let frames = [
+                    serde_json::json!({"type":"response.output_item.added","output_index":0,"item":item}),
+                    serde_json::json!({"type":"response.completed","response":{"id":"resp","status":"completed"}}),
+                ];
+                let mut decoder = ResponsesDecoder::new(&model());
+                let mut events = Vec::new();
+                for frame in &frames {
+                    decoder.feed(frame, &mut events);
+                }
+                let message = decoder.finish(&mut events);
+                assert_eq!(message.stop_reason, Some(StopReason::Error), "{item}");
+                assert!(!message
+                    .content
+                    .iter()
+                    .any(|block| matches!(block, ContentBlock::ToolCall { .. })));
+                assert!(crate::NativeResponsesOutput::from_events(&frames).is_none());
+            }
+        }
+    }
+
+    #[test]
+    fn unfinished_terminal_tool_items_never_become_executable() {
+        for kind in ["function_call", "custom_tool_call"] {
+            for status in [
+                Value::Null,
+                "incomplete".into(),
+                "in_progress".into(),
+                "failed".into(),
+            ] {
+                for include_output in [true, false] {
+                    let item = serde_json::json!({"type":kind,"id":"item","call_id":"call",
+                        "name":"apply_patch","status":status,"input":"patch","arguments":"{}"});
+                    let mut decoder = ResponsesDecoder::new(&model());
+                    let mut events = Vec::new();
+                    decoder.feed(
+                        &serde_json::json!({"type":"response.output_item.done",
+                        "output_index":0,"item":item}),
+                        &mut events,
+                    );
+                    let mut response = serde_json::json!({"id":"resp","status":"completed"});
+                    if include_output {
+                        response["output"] = serde_json::json!([item]);
+                    }
+                    decoder.feed(
+                        &serde_json::json!({"type":"response.completed","response":response}),
+                        &mut events,
+                    );
+                    let message = decoder.finish(&mut events);
+                    assert_eq!(
+                        message.stop_reason,
+                        Some(StopReason::Error),
+                        "{item}; output={include_output}"
+                    );
+                    assert!(!message
+                        .content
+                        .iter()
+                        .any(|block| matches!(block, ContentBlock::ToolCall { .. })));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn anonymous_call_id_is_stable_from_start_through_terminal_reconciliation() {
+        let mut decoder = ResponsesDecoder::new(&model());
+        let mut events = Vec::new();
+        let item =
+            serde_json::json!({"type":"custom_tool_call", "name":"apply_patch", "input":"patch"});
+        decoder.feed(&serde_json::json!({"type":"response.output_item.added", "output_index":0, "item":item}), &mut events);
+        let id = match &events.last().unwrap().message().content[0] {
+            ContentBlock::ToolCall { id, .. } => id.clone(),
+            other => panic!("{other:?}"),
+        };
+        decoder.feed(
+            &serde_json::json!({"type":"response.output_item.done", "output_index":0, "item":item}),
+            &mut events,
+        );
+        decoder.feed(&serde_json::json!({"type":"response.completed", "response":{"status":"completed", "output":[item]}}), &mut events);
+        let message = decoder.finish(&mut events);
+        assert!(
+            matches!(&message.content[0], ContentBlock::ToolCall { id: final_id, .. } if final_id == &id)
+        );
+        let kinds = message.extra[crate::RESPONSES_TOOL_WIRE_KINDS_KEY]
+            .as_object()
+            .unwrap();
+        assert_eq!(kinds.len(), 1);
+        assert_eq!(kinds[&id], "custom");
+    }
+
+    #[test]
+    fn final_call_identity_replaces_provisional_wire_metadata() {
+        let mut decoder = ResponsesDecoder::new(&model());
+        let mut events = Vec::new();
+        decoder.feed(&serde_json::json!({"type":"response.output_item.added", "output_index":0, "item":{"type":"custom_tool_call", "id":"item", "name":"apply_patch", "input":""}}), &mut events);
+        decoder.feed(&serde_json::json!({"type":"response.output_item.done", "output_index":0, "item":{"type":"custom_tool_call", "id":"item", "call_id":"call", "name":"apply_patch", "input":"patch"}}), &mut events);
+        decoder.feed(
+            &serde_json::json!({"type":"response.completed", "response":{"status":"completed"}}),
+            &mut events,
+        );
+        let message = decoder.finish(&mut events);
+        let kinds = message.extra[crate::RESPONSES_TOOL_WIRE_KINDS_KEY]
+            .as_object()
+            .unwrap();
+        assert_eq!(kinds.len(), 1);
+        assert_eq!(kinds["call|item"], "custom");
     }
 
     #[test]

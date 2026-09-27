@@ -19,6 +19,8 @@ use serde::{Deserialize, Serialize};
 /// `RunStats` by `Agent::run_stats`.
 #[derive(Debug, Default)]
 pub struct SharedCounters {
+    /// Leaf tool dispatches, including failures; excludes batch wrappers and journal replay.
+    pub executed_leaf_operations: AtomicU64,
     pub batch_operations: AtomicU64,
     pub subagents: AtomicU64,
     pub evidence_files: AtomicU64,

@@ -9,7 +9,7 @@ use crate::thinking::{
     clamp_thinking_budget_to_answer_room, google_thinking_budget, thinking_budget_for_level,
     ThinkingBudgets,
 };
-use crate::{ChatMessage, MessageContent, ToolSpec};
+use crate::{ChatMessage, MessageContent, StreamDecoder, ToolSpec};
 use davinci_protocol::{ThinkingLevel, Usage};
 use std::sync::{mpsc, Arc};
 use std::time::{Duration, Instant};
@@ -28,6 +28,10 @@ pub struct StreamOptions {
     pub session_id: Option<String>,
     pub cache_key: Option<String>,
     pub cache_retention: Option<String>,
+    /// Authentication context used by the capability-scoped Responses tool
+    /// resolver. `None` keeps direct request builders conservative (API-key
+    /// callers can opt into the public Responses profile explicitly).
+    pub responses_is_oauth: Option<bool>,
     /// Latest durable native Responses turn from this real conversation.
     /// It is validated against the current provider projection and stable
     /// model-visible request contract before use.
@@ -105,6 +109,9 @@ pub struct AssistantMessage {
     pub stop_reason: Option<StopReason>,
     #[serde(rename = "errorMessage", skip_serializing_if = "Option::is_none")]
     pub error_message: Option<String>,
+    /// Provider metadata preserved through streaming, history, and session reopen.
+    #[serde(default, flatten)]
+    pub extra: serde_json::Map<String, Value>,
 }
 
 /// Shares message snapshots across stream events and refreshes them at a
@@ -511,7 +518,7 @@ pub fn fixture_complete(
 }
 
 pub fn assistant_to_chat(message: &AssistantMessage) -> ChatMessage {
-    ChatMessage {
+    let mut chat = ChatMessage {
         role: "assistant".into(),
         content: message
             .content
@@ -539,7 +546,9 @@ pub fn assistant_to_chat(message: &AssistantMessage) -> ChatMessage {
             })
             .collect(),
         ..ChatMessage::default()
-    }
+    };
+    chat.extra = message.extra.clone();
+    chat
 }
 
 pub fn live_complete(
@@ -559,6 +568,12 @@ pub fn live_complete(
     )
 }
 
+fn options_with_auth_context(options: &StreamOptions, auth: &ResolvedAuth) -> StreamOptions {
+    let mut resolved = options.clone();
+    resolved.responses_is_oauth = Some(auth.source.eq_ignore_ascii_case("oauth"));
+    resolved
+}
+
 pub fn live_complete_with(
     model: &Model,
     messages: &[ChatMessage],
@@ -567,10 +582,12 @@ pub fn live_complete_with(
     tools: &[ToolSpec],
     options: &StreamOptions,
 ) -> Result<AssistantMessage, String> {
+    let options = options_with_auth_context(options, auth);
     refuse_unsupported_tools(&model.api, tools.len())?;
-    let body = request_body_with(model, messages, system, tools, options);
+    let body = request_body_with(model, messages, system, tools, &options);
     let prepared = crate::responses_request::PreparedProviderRequest::new(body);
     let body = prepared.body();
+    observe_request(model, body);
     if crate::trace::enabled() {
         crate::trace::log(&format!(
             "prepared request segments={} prefix={} bytes={}",
@@ -581,7 +598,7 @@ pub fn live_complete_with(
     }
     if model.api == "openai-codex-responses" {
         if let Some(token) = auth.api_key.as_deref() {
-            let codex_affinity_id = codex_responses_affinity_id(options);
+            let codex_affinity_id = codex_responses_affinity_id(&options);
             match crate::codex::try_codex_websocket_transport_with_affinity(
                 model,
                 body,
@@ -608,12 +625,21 @@ pub fn live_complete_with(
         model,
         options.session_id.as_deref(),
         options.install_telemetry,
-        &collect_request_headers(model, auth, options),
+        &collect_request_headers(model, auth, &options),
     );
     let timeout_ms = options.timeout_ms.filter(|ms| *ms > 0);
     let compress_zstd = model.api == "openai-codex-responses";
-    let text = crate::provider_retry::retry_provider_request_controlled(
-        || send_provider_body(&url, &headers, body, timeout_ms, compress_zstd),
+    let (text, observation) = crate::provider_retry::retry_provider_request_controlled(
+        || {
+            let observation = crate::provider_observation::Attempt::start("http");
+            match send_provider_body(&url, &headers, body, timeout_ms, compress_zstd) {
+                Ok(text) => Ok((text, observation)),
+                Err(error) => {
+                    observation.finish("failed", error.status, None);
+                    Err(error)
+                }
+            }
+        },
         crate::provider_retry::ProviderRetryOptions {
             max_retries: options.max_retries.unwrap_or(0),
             max_retry_delay_ms: options.max_retry_delay_ms,
@@ -622,7 +648,23 @@ pub fn live_complete_with(
         |ms| std::thread::sleep(Duration::from_millis(ms)),
     )
     .map_err(|err| err.message)?;
-    Ok(parse_provider_response(model, &text))
+    let message = parse_provider_response(model, &text);
+    observation.finish(
+        if message.stop_reason == Some(StopReason::Error) { "failed" } else { "completed" },
+        None, message.usage.clone(),
+    );
+    Ok(message)
+}
+
+fn observe_request(model: &Model, body: &Value) {
+    use sha2::Digest;
+    let schema_hash = format!("{:x}", sha2::Sha256::digest(
+        serde_json::to_vec(&body.get("tools")).unwrap_or_default()
+    ));
+    let effort = body.pointer("/reasoning/effort").and_then(Value::as_str);
+    crate::provider_observation::begin_request(
+        "coding", &format!("{}/{}", model.provider, model.id), effort, &schema_hash,
+    );
 }
 
 /// Streaming complete: the events the provider sent, replayed after the fact.
@@ -668,15 +710,16 @@ pub fn live_complete_streaming_with_sink_envelope(
     options: &StreamOptions,
     on_event: &mut dyn FnMut(&AssistantMessageEvent),
 ) -> Result<ProviderCompletionEnvelope, String> {
+    let options = options_with_auth_context(options, auth);
     let dump = crate::wire_dump::begin();
     if let Some(dump) = &dump {
         dump.write(
             "logical",
-            &request_body_with(model, messages, system, tools, options),
+            &request_body_with(model, messages, system, tools, &options),
         );
     }
     let result = live_complete_streaming_with_sink_envelope_inner(
-        model, messages, auth, system, tools, options, on_event,
+        model, messages, auth, system, tools, &options, on_event,
     );
     if let (Some(dump), Ok(envelope)) = (&dump, &result) {
         dump.write(
@@ -724,6 +767,7 @@ fn live_complete_streaming_with_sink_envelope_inner(
     }
     let prepared = crate::responses_request::PreparedProviderRequest::new(body);
     let body = prepared.body();
+    observe_request(model, body);
     if crate::trace::enabled() {
         crate::trace::log(&format!(
             "prepared stream request segments={} prefix={} bytes={}",
@@ -802,8 +846,17 @@ fn live_complete_streaming_with_sink_envelope_inner(
     let timeout_ms = options.timeout_ms.filter(|ms| *ms > 0);
     let compress_zstd = model.api == "openai-codex-responses";
     crate::trace::log(&format!("sse post {}", crate::trace::redact_url(&url)));
-    let response = crate::provider_retry::retry_provider_request_controlled(
-        || send_provider_request(&url, &headers, body, timeout_ms, compress_zstd),
+    let (response, observation) = crate::provider_retry::retry_provider_request_controlled(
+        || {
+            let observation = crate::provider_observation::Attempt::start("http");
+            match send_provider_request(&url, &headers, body, timeout_ms, compress_zstd) {
+                Ok(response) => Ok((response, observation)),
+                Err(error) => {
+                    observation.finish("failed", error.status, None);
+                    Err(error)
+                }
+            }
+        },
         crate::provider_retry::ProviderRetryOptions {
             max_retries: options.max_retries.unwrap_or(0),
             max_retry_delay_ms: options.max_retry_delay_ms,
@@ -830,7 +883,8 @@ fn live_complete_streaming_with_sink_envelope_inner(
             crate::codex_usage::record(snapshot);
         }
     }
-    match crate::stream_decoder::decoder_for(model).filter(|_| incremental) {
+    let http_status = response.status();
+    let result = (|| match crate::stream_decoder::decoder_for(model).filter(|_| incremental) {
         Some(mut decoder) => {
             let (message, stream_events, native_output) = read_provider_stream(
                 response,
@@ -890,7 +944,17 @@ fn live_complete_streaming_with_sink_envelope_inner(
                 native_responses,
             })
         }
-    }
+    })();
+    let (status, usage) = match &result {
+        Ok(envelope) => (match envelope.message.stop_reason {
+            Some(StopReason::Error) => "failed",
+            Some(StopReason::Aborted) => "aborted",
+            _ => "completed",
+        }, envelope.message.usage.clone()),
+        Err(_) => ("failed", None),
+    };
+    observation.finish(status, Some(http_status), usage);
+    result
 }
 
 /// One raw provider exchange used by the explicit maintainer Codex probe.
@@ -1251,11 +1315,38 @@ pub fn openai_responses_input_with(
     messages: &[ChatMessage],
     options: &ResponsesInputOptions<'_>,
 ) -> Vec<Value> {
+    openai_responses_input_with_prefix(messages, options, &[])
+}
+
+fn openai_responses_input_with_prefix(
+    messages: &[ChatMessage],
+    options: &ResponsesInputOptions<'_>,
+    native_prefix: &[Value],
+) -> Vec<Value> {
     let mut input = Vec::new();
-    for message in messages {
+    let mut call_kinds = std::collections::HashMap::new();
+    crate::responses_tools::record_native_call_wire_kinds(&mut call_kinds, native_prefix);
+    for (index, message) in messages.iter().enumerate() {
         if message.role == "toolResult" {
+            // The emitted call form determines the output kind. Seed suffixes
+            // beginning with results from their preserved native prefix.
+            let call_id = message.tool_call_id.as_deref().unwrap_or_default();
+            let kind = call_kinds
+                .get(crate::responses_tools::provider_call_id(call_id))
+                .copied()
+                .unwrap_or_else(|| {
+                    crate::responses_tools::result_wire_kind(&messages[..index], message)
+                });
+            let item_type = match kind {
+                crate::responses_tools::ResponsesToolWireKind::Custom => {
+                    "custom_tool_call_output"
+                }
+                crate::responses_tools::ResponsesToolWireKind::Function => {
+                    "function_call_output"
+                }
+            };
             input.push(serde_json::json!({
-                "type": "function_call_output",
+                "type": item_type,
                 "call_id": responses_call_id(message.tool_call_id.as_deref().unwrap_or_default()),
                 "output": content_text(&message.content),
             }));
@@ -1263,6 +1354,7 @@ pub fn openai_responses_input_with(
         }
         if message.role == "assistant" {
             if let Some(items) = native_items(message, options.native_items_model) {
+                crate::responses_tools::record_native_call_wire_kinds(&mut call_kinds, items);
                 input.extend(items.iter().cloned());
                 continue;
             }
@@ -1280,12 +1372,37 @@ pub fn openai_responses_input_with(
                     arguments,
                 } = block
                 {
-                    input.push(serde_json::json!({
-                        "type": "function_call",
-                        "call_id": responses_call_id(id),
-                        "name": name,
-                        "arguments": arguments.to_string(),
-                    }));
+                    let kind = crate::responses_tools::message_tool_wire_kind(
+                        message,
+                        Some(id),
+                        Some(name),
+                        options.custom_tools,
+                    );
+                    call_kinds.insert(crate::responses_tools::provider_call_id(id).into(), kind);
+                    match kind {
+                        crate::responses_tools::ResponsesToolWireKind::Custom => {
+                            let raw_input = crate::responses_tools::custom_tool_call_arguments(
+                                arguments,
+                            )
+                            .map(str::to_string)
+                            .or_else(|| arguments.as_str().map(str::to_string))
+                            .unwrap_or_else(|| arguments.to_string());
+                            input.push(serde_json::json!({
+                                "type": "custom_tool_call",
+                                "call_id": responses_call_id(id),
+                                "name": name,
+                                "input": raw_input,
+                            }));
+                        }
+                        crate::responses_tools::ResponsesToolWireKind::Function => {
+                            input.push(serde_json::json!({
+                                "type": "function_call",
+                                "call_id": responses_call_id(id),
+                                "name": name,
+                                "arguments": arguments.to_string(),
+                            }));
+                        }
+                    }
                 }
             }
             continue;
@@ -1366,10 +1483,17 @@ fn openai_responses_body_with_service_tier(
         trusted_system.is_some(),
     );
 
+    let resolved_tools = crate::responses_tools::resolve_responses_tools(
+        model,
+        model.base_url.as_deref(),
+        options.responses_is_oauth.unwrap_or(false),
+        tools,
+    );
+    let custom_tool_names = resolved_tools.custom_tool_name_refs();
     let model_key = format!("{}/{}", model.provider, model.id);
     let input_options = ResponsesInputOptions {
         native_items_model: Some(&model_key),
-        custom_tools: &[],
+        custom_tools: &custom_tool_names,
     };
     let mut input = openai_responses_input_with(messages, &input_options);
     if cache_plan.use_stable_bootstrap_breakpoint {
@@ -1465,26 +1589,8 @@ fn openai_responses_body_with_service_tier(
             }
         }
     }
-    if !tools.is_empty() {
-        let mut sorted_tools = tools.to_vec();
-        sorted_tools.sort_by(|a, b| a.name.cmp(&b.name));
-        body["tools"] = Value::Array(
-            sorted_tools
-                .iter()
-                .map(|tool| {
-                    let mut function = serde_json::json!({
-                        "type": "function",
-                        "name": tool.name,
-                        "description": tool.description,
-                        "parameters": tool.parameters,
-                    });
-                    if resolve_json_schema_strict_sampling(tool).unwrap_or(false) {
-                        function["strict"] = Value::Bool(true);
-                    }
-                    function
-                })
-                .collect(),
-        );
+    if !resolved_tools.tools.is_empty() {
+        body["tools"] = Value::Array(resolved_tools.wire_tools());
     }
     if model.reasoning {
         if let Some(level) = options
@@ -1542,14 +1648,24 @@ fn apply_native_responses_resume(
     }
 
     let mut input = resume.turn.full_native_replay_prefix();
+    let custom_tool_names = body
+        .get("tools")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|tool| tool["type"] == "custom")
+        .filter_map(|tool| tool.get("name").and_then(Value::as_str))
+        .collect::<Vec<_>>();
     let model_key = format!("{}/{}", model.provider, model.id);
-    input.extend(openai_responses_input_with(
+    let suffix = openai_responses_input_with_prefix(
         &messages[resume.resume_provider_message_count..],
         &ResponsesInputOptions {
             native_items_model: Some(&model_key),
-            custom_tools: &[],
+            custom_tools: &custom_tool_names,
         },
-    ));
+        &input,
+    );
+    input.extend(suffix);
     body["input"] = Value::Array(input);
     if crate::trace::enabled() {
         crate::trace::log(&format!(
@@ -2345,27 +2461,46 @@ fn usage_from_google_metadata(model: &Model, metadata: &Value) -> Usage {
     computed
 }
 
-fn parse_provider_response(model: &Model, raw: &str) -> AssistantMessage {
-    if raw.contains("data:") {
-        return fixture_complete(model, &[], raw);
-    }
-    let value: Value = serde_json::from_str(raw).unwrap_or(Value::Null);
+pub(crate) fn parse_provider_response(model: &Model, raw: &str) -> AssistantMessage {
+    let value: Value = match serde_json::from_str(raw) {
+        Ok(value) => value,
+        Err(_) if raw.lines().any(|line| line.starts_with("data:")) => {
+            return fixture_complete(model, &[], raw);
+        }
+        Err(_) => Value::Null,
+    };
     let mut content = Vec::new();
-    if let Some(text) = value
-        .pointer("/choices/0/message/content")
-        .and_then(Value::as_str)
-        .or_else(|| value.pointer("/content/0/text").and_then(Value::as_str))
-        .or_else(|| {
-            value
-                .pointer("/candidates/0/content/parts/0/text")
-                .and_then(Value::as_str)
-        })
-        .or_else(|| value.pointer("/output_text").and_then(Value::as_str))
+    let response = value.get("response").unwrap_or(&value);
+    if response.get("output").is_some_and(Value::is_array)
+        || (native_responses_api(model) && response.get("status").is_some())
     {
-        if !text.is_empty() {
-            content.push(ContentBlock::Text {
-                text: text.to_string(),
-            });
+        // Responses shares one normalizer across JSON, SSE, and WebSocket.
+        // In particular, a 200 response can still be incomplete or failed.
+        let mut decoder = crate::ResponsesDecoder::new(model);
+        let mut events = Vec::new();
+        decoder.feed(
+            &serde_json::json!({"type": "response.completed", "response": response}),
+            &mut events,
+        );
+        return decoder.finish(&mut events);
+    }
+    if content.is_empty() {
+        if let Some(text) = value
+            .pointer("/choices/0/message/content")
+            .and_then(Value::as_str)
+            .or_else(|| value.pointer("/content/0/text").and_then(Value::as_str))
+            .or_else(|| {
+                value
+                    .pointer("/candidates/0/content/parts/0/text")
+                    .and_then(Value::as_str)
+            })
+            .or_else(|| value.pointer("/output_text").and_then(Value::as_str))
+        {
+            if !text.is_empty() {
+                content.push(ContentBlock::Text {
+                    text: text.to_string(),
+                });
+            }
         }
     }
     if let Some(calls) = value
@@ -2514,6 +2649,7 @@ fn parse_provider_response(model: &Model, raw: &str) -> AssistantMessage {
     });
     if let Some(error) = error_message {
         return AssistantMessage {
+            extra: Default::default(),
             id: Uuid::new_v4().to_string(),
             role: "assistant".into(),
             content: Vec::new(),
@@ -2524,6 +2660,7 @@ fn parse_provider_response(model: &Model, raw: &str) -> AssistantMessage {
         };
     }
     AssistantMessage {
+        extra: Default::default(),
         id: Uuid::new_v4().to_string(),
         role: "assistant".into(),
         content,
@@ -2538,6 +2675,9 @@ fn parse_provider_response(model: &Model, raw: &str) -> AssistantMessage {
 mod tests {
     use super::*;
     use crate::catalog::load_builtin_models;
+    use std::sync::Mutex;
+
+    static REASONING_SUMMARY_ENV_LOCK: Mutex<()> = Mutex::new(());
 
     #[test]
     fn service_tier_maps_codex_names_to_wire_values() {
@@ -2674,6 +2814,46 @@ mod tests {
         assert_eq!(summary_from(Some("none")), None);
         assert_eq!(summary_from(Some("concise")), Some("concise"));
         assert_eq!(summary_from(None), Some("auto"));
+    }
+
+    #[test]
+    fn reasoning_summary_wire_controls_keep_medium_effort() {
+        let _guard = REASONING_SUMMARY_ENV_LOCK.lock().unwrap();
+        let previous = std::env::var("DAVINCI_REASONING_SUMMARY").ok();
+        let mut model = load_builtin_models()
+            .into_iter()
+            .find(|model| model.api == "openai-codex-responses")
+            .expect("codex responses model");
+        model.reasoning = true;
+        let options = StreamOptions {
+            thinking_level: Some(ThinkingLevel::Medium),
+            ..StreamOptions::default()
+        };
+
+        for (setting, expected_summary) in [
+            ("none", None),
+            ("auto", Some("auto")),
+            ("concise", Some("concise")),
+            ("detailed", Some("detailed")),
+        ] {
+            std::env::set_var("DAVINCI_REASONING_SUMMARY", setting);
+            let body = openai_responses_body(&model, &[], None, &[], &options);
+            assert_eq!(body["reasoning"]["effort"], "medium");
+            assert_eq!(
+                body["reasoning"].get("summary").and_then(Value::as_str),
+                expected_summary
+            );
+        }
+
+        model.reasoning = false;
+        std::env::set_var("DAVINCI_REASONING_SUMMARY", "detailed");
+        let body = openai_responses_body(&model, &[], None, &[], &options);
+        assert!(body.get("reasoning").is_none());
+
+        match previous {
+            Some(value) => std::env::set_var("DAVINCI_REASONING_SUMMARY", value),
+            None => std::env::remove_var("DAVINCI_REASONING_SUMMARY"),
+        }
     }
 
     #[test]
@@ -3001,6 +3181,15 @@ mod tests {
 
     #[test]
     fn live_complete_retries_429_with_retry_after() {
+        retry_observation_fixture(false);
+    }
+
+    #[test]
+    fn streaming_retry_observations_match_actual_http_requests() {
+        retry_observation_fixture(true);
+    }
+
+    fn retry_observation_fixture(streaming: bool) {
         use std::io::{Read, Write};
         use std::net::TcpListener;
         use std::sync::atomic::{AtomicU32, Ordering};
@@ -3065,7 +3254,18 @@ mod tests {
             headers: Default::default(),
             source: "test".into(),
         };
-        let message = live_complete_with(
+        let observations = crate::provider_observation::ObservationScope::capture();
+        let complete = |model: &Model, messages: &[ChatMessage], auth: &ResolvedAuth,
+                        system: Option<&str>, tools: &[ToolSpec], options: &StreamOptions| {
+            if streaming {
+                live_complete_streaming_with_sink_envelope(
+                    model, messages, auth, system, tools, options, &mut |_| {},
+                ).map(|envelope| envelope.message)
+            } else {
+                live_complete_with(model, messages, auth, system, tools, options)
+            }
+        };
+        let message = complete(
             &model,
             &[ChatMessage::text("user", "hi")],
             &auth,
@@ -3079,6 +3279,12 @@ mod tests {
         )
         .unwrap();
         assert_eq!(hits.load(Ordering::SeqCst), 2);
+        let observations = observations.finish("completed");
+        assert_eq!(observations.iter().filter(|o| o.kind == "logical_start").count(), 1);
+        let starts: Vec<_> = observations.iter().filter(|o| o.kind == "attempt_start").collect();
+        assert_eq!(starts.len(), 2);
+        assert!(starts.iter().all(|o| o.transport.as_deref() == Some("http") && !o.schema_hash.is_empty()));
+        assert_eq!(observations.iter().filter(|o| o.kind == "attempt_end" && o.http_status == Some(429)).count(), 1);
         assert!(
             content_text(&assistant_to_chat(&message).content).contains("ok")
                 || message.content.iter().any(
@@ -4357,6 +4563,45 @@ mod openai_cache_wire_tests {
             "function_call_output",
             "only the new tail follows the exact native replay prefix"
         );
+    }
+
+    #[test]
+    fn native_resume_result_only_suffix_uses_preserved_call_type() {
+        for custom in [false, true] {
+            let prefix = vec![serde_json::json!({
+                "type": if custom { "custom_tool_call" } else { "function_call" },
+                "id":"item", "call_id":"call", "name":"apply_patch", "input":"patch", "arguments":"{}"
+            })];
+            let mut result = ChatMessage::tool_result("call|item", "apply_patch", "ok", false);
+            // The durable prefix has authority over missing or stale annotations.
+            for annotated in [false, true] {
+                if annotated {
+                    crate::set_single_wire_kind(
+                        &mut result.extra,
+                        if custom {
+                            crate::ResponsesToolWireKind::Function
+                        } else {
+                            crate::ResponsesToolWireKind::Custom
+                        },
+                    );
+                }
+                let suffix = openai_responses_input_with_prefix(
+                    &[result.clone()],
+                    &ResponsesInputOptions::default(),
+                    &prefix,
+                );
+                assert_eq!(suffix.len(), 1);
+                assert_eq!(
+                    suffix[0]["type"],
+                    if custom {
+                        "custom_tool_call_output"
+                    } else {
+                        "function_call_output"
+                    }
+                );
+                assert_eq!(suffix[0]["call_id"], "call");
+            }
+        }
     }
 
     #[test]

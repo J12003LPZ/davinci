@@ -6,16 +6,18 @@ begin_patch: "*** Begin Patch" LF
 end_patch: "*** End Patch" LF?
 
 hunk: add_hunk | delete_hunk | update_hunk
-add_hunk: "*** Add File: " filename LF add_line+
+add_hunk: "*** Add File: " filename LF add_line* end_of_file?
 delete_hunk: "*** Delete File: " filename LF
-update_hunk: "*** Update File: " filename LF change+
+update_hunk: "*** Update File: " filename LF update_section+
+update_section: change_context change_line+ end_of_file?
 
-filename: /(.+)/
-add_line: "+" /(.*)/ LF -> line
+filename: LINE_TEXT
+add_line: "+" LINE_TEXT? LF -> line
+end_of_file: "*** End of File" LF
 
-change: change_context | change_line
-change_context: ("@@" | "@@ " /(.+)/) LF
-change_line: ("+" | "-" | " ") /(.*)/ LF
+change_context: ("@@" | "@@ " LINE_TEXT) LF
+change_line: ("+" | "-" | " ") LINE_TEXT? LF | LF
 
-%import common.LF
+LINE_TEXT: /[^\r\n]+/
+LF: /\r?\n/
 "#;

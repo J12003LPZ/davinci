@@ -170,7 +170,7 @@ mod tests {
         let stable = apply_astra_policy(PromptProfile::Stable, stable_v2_modules());
         let preview = apply_astra_policy(
             PromptProfile::Preview,
-            crate::prompt::bundle::preview_v3_modules(),
+            crate::prompt::bundle::preview_v4_modules(),
         );
 
         let stable_verification = stable

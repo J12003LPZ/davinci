@@ -166,6 +166,14 @@ fn parse_decision_intelligence<'de, D: serde::Deserializer<'de>>(
 #[serde(default, rename_all = "camelCase", deny_unknown_fields)]
 pub struct DecisionIntelligenceSettings {
     pub enabled: bool,
+    /// Allow ready current-turn Jev advice to raise later adaptive requests' effort.
+    pub effort_advice: bool,
+    /// Evaluate current public completion evidence in shadow mode. A calibrated
+    /// reminder policy is required before these observations can add requests.
+    pub completion_advice: bool,
+    /// Allow ready current-turn relevance advice to expose authorized tool
+    /// families after the first coding request.
+    pub tool_family_advice: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -1014,17 +1022,30 @@ fn enforce_decision_intelligence_user_boundary(
     global: &serde_json::Value,
     mut merged: serde_json::Value,
 ) -> serde_json::Value {
-    let user_enabled = global
-        .get("decisionIntelligence")
-        .and_then(|value| value.get("enabled"))
-        .and_then(serde_json::Value::as_bool)
-        .unwrap_or(false);
-    if !user_enabled {
-        if let Some(object) = merged.as_object_mut() {
-            object.insert(
-                "decisionIntelligence".to_owned(),
-                serde_json::json!({"enabled": false}),
-            );
+    // Project configuration can narrow every consented feature, never grant it.
+    // Intersect flags independently: enabling intelligence is not consent to
+    // effort changes, completion experiments, or expanded tool families.
+    if let Some(object) = merged.as_object_mut() {
+        let settings = object
+            .entry("decisionIntelligence")
+            .or_insert_with(|| serde_json::json!({}));
+        if !settings.is_object() {
+            *settings = serde_json::json!({});
+        }
+        for flag in [
+            "enabled",
+            "effortAdvice",
+            "completionAdvice",
+            "toolFamilyAdvice",
+        ] {
+            let consented = global
+                .get("decisionIntelligence")
+                .and_then(|value| value.get(flag))
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false);
+            if !consented {
+                settings[flag] = serde_json::Value::Bool(false);
+            }
         }
     }
     merged
@@ -1179,6 +1200,37 @@ impl Settings {
         self.decision_intelligence
             .as_ref()
             .is_some_and(|settings| settings.enabled)
+    }
+
+    pub fn decision_effort_advice_enabled(&self) -> bool {
+        self.decision_intelligence_enabled()
+            && self
+                .decision_intelligence
+                .as_ref()
+                .is_some_and(|settings| settings.effort_advice)
+    }
+
+    pub fn decision_completion_advice_enabled(&self) -> bool {
+        self.decision_intelligence_enabled()
+            && self
+                .decision_intelligence
+                .as_ref()
+                .is_some_and(|settings| settings.completion_advice)
+    }
+
+    pub fn decision_tool_family_advice_enabled(&self) -> bool {
+        self.decision_intelligence_enabled()
+            && self
+                .decision_intelligence
+                .as_ref()
+                .is_some_and(|settings| settings.tool_family_advice)
+    }
+
+    /// Toggle the parent consent without discarding the user's experiment choices.
+    pub fn set_decision_intelligence_enabled(&mut self, enabled: bool) {
+        self.decision_intelligence
+            .get_or_insert_with(Default::default)
+            .enabled = enabled;
     }
 
     pub fn compaction_enabled(&self) -> bool {

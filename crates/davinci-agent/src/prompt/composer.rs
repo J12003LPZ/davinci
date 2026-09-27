@@ -159,6 +159,8 @@ pub fn compose_with_mutations(
             plan_approved: false,
             active_contract: false,
             visual_verification_available: false,
+            visual_verification_relevant: true,
+            environment: None,
         },
     ));
 
@@ -254,7 +256,10 @@ mod tests {
         assert_eq!(stable.manifest.profile_version, 2);
 
         assert_eq!(preview.manifest.profile, "preview");
-        assert_eq!(preview.manifest.profile_version, 3);
+        assert_eq!(
+            preview.manifest.profile_version,
+            version::PREVIEW_PROMPT_VERSION
+        );
 
         assert_ne!(
             preview.manifest.stable_sha256, stable.manifest.stable_sha256,

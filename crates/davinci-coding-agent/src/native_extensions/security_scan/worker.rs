@@ -78,6 +78,7 @@ impl SecurityWorkerRunner {
                 .pop_front()
                 .ok_or("security fixture exhausted")?;
             Ok(AssistantMessage {
+                extra: Default::default(),
                 id: "offline-security-fixture".into(),
                 role: "assistant".into(),
                 content,
@@ -465,6 +466,7 @@ mod tests {
         let runner = SecurityWorkerRunner::new(move |request| {
             *slot.lock().unwrap() = Some((request.system.to_string(), request.messages[0].clone()));
             Ok(AssistantMessage {
+                extra: Default::default(),
                 id: "fixture".into(),
                 role: "assistant".into(),
                 content: vec![ContentBlock::Text {
@@ -516,6 +518,7 @@ mod tests {
         let runner = SecurityWorkerRunner::new(move |request| {
             *slot.lock().unwrap() = format!("{}{:?}", request.system, request.messages);
             Ok(AssistantMessage {
+                extra: Default::default(),
                 id: "fixture".into(),
                 role: "assistant".into(),
                 content: vec![ContentBlock::Text { text: "{}".into() }],
@@ -550,6 +553,7 @@ mod tests {
     fn security_worker_zero_usage_cannot_repeat_calls_past_token_budget() {
         let runner = SecurityWorkerRunner::new(|_| {
             Ok(AssistantMessage {
+                extra: Default::default(),
                 id: "fixture".into(),
                 role: "assistant".into(),
                 model: "fixture".into(),
@@ -622,6 +626,7 @@ mod tests {
             assert_eq!(request.messages.len(), 1);
             assert!(!request.system.contains("get_codex_"));
             Ok(AssistantMessage {
+                extra: Default::default(),
                 id: "fixture".into(),
                 role: "assistant".into(),
                 content: vec![ContentBlock::Text {
@@ -718,6 +723,7 @@ mod tests {
                 std::thread::sleep(std::time::Duration::from_millis(5));
             }
             Ok(AssistantMessage {
+                extra: Default::default(),
                 id: "fixture".into(),
                 role: "assistant".into(),
                 content: vec![ContentBlock::Text { text: "{}".into() }],

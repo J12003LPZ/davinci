@@ -14,6 +14,8 @@ use crate::jobs::JobBook;
 use crate::todo::TodoList;
 
 mod foreground;
+mod routing;
+pub(crate) use routing::relevant_tool_families;
 
 #[allow(dead_code)]
 pub fn decision_wait(interactive: bool, deferred: bool, cancelled: bool) -> &'static str {
@@ -136,24 +138,19 @@ pub const LEAN_TOOLS: &[&str] = &[
     "grep",
     "find",
     "ls",
-    "edit",
-    "write",
-    "apply_patch",
-    "bash",
-    "powershell",
     "exec_command",
     "write_stdin",
-    "job_output",
-    "job_kill",
+    "apply_patch",
     "batch",
-    "agent",
-    "todo",
+    "tool_search",
     "update_plan",
     "propose_plan",
     "ask_user_question",
-    "tool_search",
-    "web_search",
-    "web_fetch",
+    "agent",
+    "job_output",
+    "job_kill",
+    #[cfg(windows)]
+    "bash",
 ];
 
 /// What the built-in tools share across calls: the background jobs and the
@@ -250,6 +247,19 @@ impl ToolContext {
             .as_ref()
             .is_some_and(|flag| flag.load(std::sync::atomic::Ordering::SeqCst))
     }
+
+    /// Runtime-less hosts still know built-in and connected MCP schemas.
+    /// Native/JS extensions require the live registry that owns their schemas.
+    pub(crate) fn discovery_capabilities(&self) -> Vec<crate::runtime::RuntimeCapability> {
+        if let Some(runtime) = &self.runtime {
+            runtime.capability_registry.list()
+        } else {
+            crate::runtime::builtin_capabilities()
+                .into_iter()
+                .chain(self.mcp.capabilities())
+                .collect()
+        }
+    }
 }
 
 const DEFAULT_MAX_LINES: usize = 2000;
@@ -334,6 +344,7 @@ pub fn tool_specs() -> Vec<AgentTool> {
                     "path":{"type":"string","description":"Path to the file to edit (relative or absolute)"},
                     "edits":{
                         "type":"array",
+                        "minItems":1,
                         "description":"One or more targeted replacements. Each edit is matched against the original file, not incrementally.",
                         "items":{
                             "type":"object",
@@ -343,11 +354,9 @@ pub fn tool_specs() -> Vec<AgentTool> {
                             },
                             "required":["oldText","newText"]
                         }
-                    },
-                    "oldText":{"type":"string"},
-                    "newText":{"type":"string"}
+                    }
                 },
-                "required":["path"]
+                "required":["path","edits"]
             }),
         },
         AgentTool {
@@ -486,11 +495,14 @@ pub fn tool_specs() -> Vec<AgentTool> {
         },
         AgentTool {
             name: "tool_search".into(),
-            description: "Discover deferred tools and namespaces by keyword query.".into(),
+            description: "Discover deferred tools and namespaces by keyword, exact name, or explicit family. Search results are paginated and only authorized schemas can be activated.".into(),
             parameters: serde_json::json!({
                 "type": "object",
                 "properties": {
-                    "query": { "type": "string", "description": "Keyword query for tool discovery" }
+                    "query": { "type": "string", "description": "Keyword, exact tool name, or registered family id" },
+                    "mode": { "type": "string", "enum": ["search", "exact", "family"], "description": "Discovery mode; defaults to search" },
+                    "cursor": { "type": "string", "description": "Opaque numeric listing cursor returned by the previous page" },
+                    "limit": { "type": "integer", "minimum": 1, "maximum": 20, "description": "Number of names to display; defaults to 5" }
                 },
                 "required": ["query"]
             }),
@@ -970,6 +982,54 @@ fn ask_user_question_tool(
     }
 }
 
+const TOOL_SEARCH_DEFAULT_LIMIT: usize = 5;
+const TOOL_SEARCH_MAX_LIMIT: usize = 20;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ToolSearchMode {
+    Search,
+    Exact,
+    Family,
+}
+
+impl ToolSearchMode {
+    fn parse(value: Option<&str>) -> Result<Self, ToolError> {
+        match value.unwrap_or("search") {
+            "search" => Ok(Self::Search),
+            "exact" => Ok(Self::Exact),
+            "family" => Ok(Self::Family),
+            other => Err(ToolError::Failed(format!(
+                "unsupported tool_search mode `{other}`; expected search, exact, or family"
+            ))),
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Search => "search",
+            Self::Exact => "exact",
+            Self::Family => "family",
+        }
+    }
+}
+
+fn tool_search_usize(input: &Value, key: &str, default: usize) -> Result<usize, ToolError> {
+    let Some(value) = input.get(key) else {
+        return Ok(default);
+    };
+    if let Some(number) = value.as_u64() {
+        return usize::try_from(number)
+            .map_err(|_| ToolError::Failed(format!("tool_search {key} is too large")));
+    }
+    value
+        .as_str()
+        .ok_or_else(|| {
+            ToolError::Failed(format!("tool_search {key} must be a non-negative integer"))
+        })?
+        .parse::<usize>()
+        .map_err(|_| ToolError::Failed(format!("tool_search {key} must be a non-negative integer")))
+}
+
 fn tool_search_tool(
     input: &serde_json::Value,
     context: &ToolContext,
@@ -978,62 +1038,130 @@ fn tool_search_tool(
         .get("query")
         .and_then(Value::as_str)
         .unwrap_or_default()
-        .to_lowercase();
+        .trim()
+        .to_string();
+    let mode = ToolSearchMode::parse(input.get("mode").and_then(Value::as_str))?;
+    if query.is_empty() && !matches!(mode, ToolSearchMode::Search) {
+        return Err(ToolError::Failed(format!(
+            "tool_search {} mode requires a non-empty query",
+            mode.as_str()
+        )));
+    }
+    let requested_limit = tool_search_usize(input, "limit", TOOL_SEARCH_DEFAULT_LIMIT)?;
+    let limit = requested_limit.clamp(1, TOOL_SEARCH_MAX_LIMIT);
+    let cursor = tool_search_usize(input, "cursor", 0)?;
     let authorized = context
         .authorized_tools
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
         .clone();
-    let mut matches = Vec::new();
-    let mut activated = Vec::new();
+    let mut candidates = context
+        .discovery_capabilities()
+        .into_iter()
+        .map(|capability| (capability.name.clone(), capability))
+        .collect::<Vec<_>>();
+    candidates.sort_by(|left, right| left.0.cmp(&right.0));
+    candidates.dedup_by(|left, right| left.0 == right.0);
 
-    if let Some(runtime) = &context.runtime {
-        for capability in runtime.capability_registry.list() {
-            let searchable = format!(
-                "{} {} {}",
-                capability.name, capability.description, capability.source
-            )
-            .to_lowercase();
-            if !authorized.contains(&capability.name)
-                || (!query.is_empty() && !searchable.contains(&query))
-            {
-                continue;
+    let query_lower = query.to_lowercase();
+    let matching = candidates
+        .iter()
+        .filter(|(name, _capability)| authorized.contains(name))
+        .filter(|(name, capability)| match mode {
+            ToolSearchMode::Search => {
+                query_lower.is_empty()
+                    || format!(
+                        "{} {} {} {}",
+                        capability.name,
+                        capability.description,
+                        capability.source,
+                        capability.family.as_deref().unwrap_or_default(),
+                    )
+                    .to_lowercase()
+                    .contains(&query_lower)
+                    || name.to_lowercase().contains(&query_lower)
             }
-            matches.push(capability.name.clone());
-            if capability.schema.is_some()
-                && context
-                    .tool_exposure
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner())
-                    .activate_authorized(&capability.name, true)
-            {
-                activated.push(capability.name);
-            }
-            if matches.len() == 5 {
-                break;
-            }
-        }
+            ToolSearchMode::Exact => name == &query,
+            ToolSearchMode::Family => capability.family.as_deref() == Some(query.as_str()),
+        })
+        .collect::<Vec<_>>();
+    let total_matches = matching.len();
+    let display_start = cursor.min(total_matches);
+    let display_end = display_start.saturating_add(limit).min(total_matches);
+    let display = &matching[display_start..display_end];
+    let activation_candidates = if matches!(mode, ToolSearchMode::Family) {
+        &matching[..]
     } else {
-        matches = context
-            .mcp
-            .tool_names()
-            .into_iter()
-            .filter(|name| authorized.contains(name))
-            .filter(|name| query.is_empty() || name.to_lowercase().contains(&query))
-            .take(5)
-            .collect();
+        display
+    };
+    let mut exposure = context
+        .tool_exposure
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let mut activated = Vec::new();
+    for (name, capability) in activation_candidates {
+        if capability.schema.is_some() {
+            // The candidate list was authorized above.  Keep the activation
+            // idempotent while reporting all schema-bearing members selected
+            // by this request, including on a repeated family lookup.
+            exposure.activate_authorized(name, true);
+            activated.push(name.clone());
+        }
     }
+    let next_cursor = (display_end < total_matches).then(|| display_end.to_string());
+    let matches = display
+        .iter()
+        .map(|(name, _)| (*name).clone())
+        .collect::<Vec<_>>();
+    let families = display
+        .iter()
+        .filter_map(|(name, capability)| {
+            capability
+                .family
+                .as_ref()
+                .map(|family| ((*name).clone(), family.clone()))
+        })
+        .collect::<std::collections::BTreeMap<_, _>>();
     let content = if matches.is_empty() {
         format!("No tools found matching query `{query}`")
     } else {
-        format!("Found tools: {}", matches.join(", "))
+        let labels = display
+            .iter()
+            .map(|(name, capability)| {
+                let mut label = (*name).clone();
+                if let Some(family) = &capability.family {
+                    label.push_str(&format!(" (family: {family})"));
+                }
+                if capability.schema.is_none() {
+                    label.push_str(" [schema unavailable]");
+                }
+                label
+            })
+            .collect::<Vec<_>>();
+        let suffix = next_cursor
+            .as_deref()
+            .map(|cursor| format!("; more available at cursor {cursor}"))
+            .unwrap_or_default();
+        format!(
+            "Found {total_matches} tools; activated {} schemas: {}{suffix}",
+            activated.len(),
+            labels.join(", ")
+        )
     };
     Ok(ToolResult {
         content,
         is_error: false,
         details: Some(serde_json::json!({
+            "mode": mode.as_str(),
+            "query": query,
             "matches": matches,
+            "families": families,
             "activated": activated,
+            "matching_count": total_matches,
+            "activated_count": activated.len(),
+            "cursor": cursor.to_string(),
+            "next_cursor": next_cursor,
+            "limit": limit,
         })),
     })
 }
@@ -2195,6 +2323,15 @@ fn wait_shell_output(
     ))
 }
 
+pub(crate) fn resolve_powershell_executable(cwd: &Path) -> Result<PathBuf, ToolError> {
+    ["pwsh", "powershell"]
+        .into_iter()
+        .find_map(|program| crate::process_manager::resolve_native_executable(program, cwd).ok())
+        .ok_or_else(|| {
+            ToolError::Failed("PowerShell is not available and could not be launched".into())
+        })
+}
+
 fn powershell_tool(
     cwd: &Path,
     input: &serde_json::Value,
@@ -2214,16 +2351,7 @@ fn powershell_tool(
     let background = wants_background(input);
     if !background {
         if let Some(host) = &context.foreground_supervisor {
-            let executable = ["pwsh", "powershell"]
-                .into_iter()
-                .find_map(|program| {
-                    crate::process_manager::resolve_native_executable(program, cwd).ok()
-                })
-                .ok_or_else(|| {
-                    ToolError::Failed(
-                        "PowerShell is not available and could not be launched".into(),
-                    )
-                })?;
+            let executable = resolve_powershell_executable(cwd)?;
             let started_at_ms = crate::command_receipt::now();
             let config = foreground::config(
                 cwd,
