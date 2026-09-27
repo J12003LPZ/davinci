@@ -76,6 +76,14 @@ Task 16 (merge/install/replace the executable used by the owner) was not
 authorized and was not performed. No push, pull request, merge, or dependency
 change was made.
 
+If later authorized, the recommended promotion campaign is two separately
+pinned windows of 10 repetitions × 12 tasks × 2 harnesses (480 rows total),
+with the parent and candidate arms kept paired within each window and an
+untouched holdout graded afterward. The completed 72-row F1 screen consumed
+about 3,718 seconds of measured harness wall time, so a conservative serial
+budget for 480 rows is approximately 7 hours, plus setup and any symmetric
+infrastructure retries.
+
 The repository-wide `cargo fmt --all -- --check` remains non-green because of
 pre-existing unrelated formatting differences; the affected package tests,
 build, benchmark checks, and diff checks passed. The global pre-commit hook could
