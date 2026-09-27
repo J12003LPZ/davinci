@@ -360,6 +360,7 @@ class RunnerTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             lockfile = Path(tmp) / "machine.lock"
             for record in ("{", '{"pid":123,"campaign":"legacy"}',
+                           '{"schema_version":1,"status":"active","in_flight":[]}',
                            '{"schema_version":1,"status":"clean","in_flight":[{}]}'):
                 lockfile.write_text(record)
                 with (self.subTest(record=record),

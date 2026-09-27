@@ -640,7 +640,7 @@ def campaign_lock(campaign):
                 try:
                     record = json.loads(previous)
                     safe = (isinstance(record, dict) and record.get("schema_version") == 1
-                            and record.get("status") in ("active", "clean")
+                            and record.get("status") == "clean"
                             and record.get("in_flight") == [])
                 except ValueError:
                     safe = False

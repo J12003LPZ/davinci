@@ -137,7 +137,9 @@ durable ownership record. That record is cleared only after confirmed cleanup.
 An orchestrator crash releases the kernel lock but leaves its outstanding
 launch record, so a new campaign refuses to start over a surviving worker or
 possibly pending container. Failed cleanup also blocks another launch in the
-same campaign. Corrupt or older unrecognized lock records fail closed.
+same campaign. A crashed owner also stays unresolved between timed launches,
+when setup or grading subprocesses may still be active. Corrupt or older
+unrecognized lock records fail closed.
 
 There is no automatic stale-record override: an operator must reconcile prior
 workers and containers before resetting unresolved ownership while holding the
