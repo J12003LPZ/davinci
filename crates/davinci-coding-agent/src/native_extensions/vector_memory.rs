@@ -833,10 +833,7 @@ fn source_anchor_current(record: &MemoryRecord, cwd: &Path) -> bool {
     let Some(current) = source_state_hash_for_paths(cwd, &record.source_paths) else {
         return false;
     };
-    record
-        .source_state_hash
-        .as_ref()
-        .map_or(true, |expected| expected == &current)
+    record.source_state_hash.as_ref() == Some(&current)
 }
 
 fn record_matches_scope(
