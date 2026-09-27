@@ -1,9 +1,8 @@
 //! Bounded, ready-only decision intelligence for coding submissions.
 //!
-//! A turn submits a shadow request before the coding provider starts. The
-//! first request uses the deterministic effort policy. A successful result is
-//! consumed only at the next submission when its freshness key still matches;
-//! no coding request waits for or is rewritten by Jev.
+//! A submission enqueues bounded background work after installing the user
+//! message. The shared agent loop consumes current-turn results at request
+//! boundaries, so both print and interactive request 1 stay deterministic.
 
 use davinci_agent::decision::provider::DecisionError;
 use davinci_agent::decision::response::{DecisionAnswer, DecisionResponse};
@@ -14,7 +13,7 @@ use davinci_protocol::ThinkingLevel as ProtocolThinkingLevel;
 use serde_json::json;
 
 use crate::decision_state::{
-    build_request_with_metadata, requirement_question_id, DecisionMetadata, RequirementLedger,
+    requirement_question_id, DecisionMetadata, DecisionState, RequirementLedger,
 };
 
 #[derive(Debug, Clone)]
@@ -50,21 +49,7 @@ pub enum EffortAdviceOutcome {
     Absent(AdviceAbsence),
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum RequirementJudgment {
-    Supported,
-    PossiblyMissing,
-    Uncertain,
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub struct RequirementAdvice {
-    pub requirement_id: String,
-    pub judgment: RequirementJudgment,
-    pub confidence: f32,
-    pub evidence_references: Vec<String>,
-    pub key: DecisionAdviceKey,
-}
+pub use davinci_agent::decision::advice::{RequirementAdvice, RequirementJudgment};
 
 /// Map only validated requirement Choice answers. Evidence references remain
 /// empty until the host supplies concrete current checks; a provider answer
@@ -82,9 +67,7 @@ pub fn requirement_advice(
                 .answers
                 .get(&requirement_question_id(&requirement.id))?;
             let DecisionAnswer::Choice {
-                choice,
-                confidence,
-                ..
+                choice, confidence, ..
             } = answer
             else {
                 return None;
@@ -106,53 +89,40 @@ pub fn requirement_advice(
         .collect()
 }
 
-/// Admit one bounded shadow request and consume only a result that was already
-/// ready for the immediately preceding key. This function never waits.
+/// Admit work for the current real user turn. Call after `prompt_user_with`.
+/// Disabled paths never construct a request; enabled preparation runs on the
+/// runtime's single bounded worker, with no filesystem work on submission.
 pub fn prepare_turn_decision(agent: &mut Agent, snapshot: DecisionSnapshot) -> DecisionAdmission {
-    let runtime = agent.decision_runtime();
-    let previous_key = agent.take_decision_advice_key();
-    agent.set_decision_effort_advice(None);
-
-    if let (Some(runtime), Some(previous_key)) = (runtime.as_ref(), previous_key) {
-        if agent.decision_effort_advice_enabled() {
-            let deterministic = effort::request_level(
-                agent.effort_policy,
-                agent.thinking_level,
-                agent.effort_signals(),
-            );
-            if let EffortAdviceOutcome::Ready(level) =
-                try_effort_advice(runtime, &previous_key, agent.thinking_level, deterministic)
-            {
-                agent.set_decision_effort_advice(Some(level));
-            }
-        } else {
-            // Do not leave an old answer available if the user disabled its
-            // only consumer between turns.
-            let _ = runtime.take_ready_shadow();
-        }
-    }
-
-    let Some(runtime) = runtime else {
+    use davinci_agent::decision::advice::DecisionRequestFactory;
+    use std::sync::Arc;
+    let Some(runtime) = agent.decision_runtime() else {
+        agent.set_decision_effort_advice(None);
         return DecisionAdmission::Disabled;
     };
-    if !runtime.is_enabled() {
+    let features = agent.decision_advice_features();
+    if !runtime.is_enabled() || !features.any() {
+        agent.set_decision_effort_advice(None);
         return DecisionAdmission::Disabled;
     }
-
     let key = DecisionAdviceKey {
-        request_id: snapshot.request_id.clone(),
+        request_id: snapshot.request_id,
         generation: runtime.generation(),
         evidence_revision: snapshot.evidence_revision,
         mutation_revision: snapshot.mutation_revision,
     };
-    let mut request = build_request_with_metadata(
-        snapshot.request_id,
-        &snapshot.task,
-        snapshot.decision_class,
-        snapshot.metadata,
-    );
-    if let Some(state) = request.state.as_object_mut() {
-        state.insert(
+    let factory = DecisionRequestFactory(Arc::new(move |key, completion| {
+        let is_completion = completion.is_some();
+        let mut additional_state = serde_json::Map::new();
+        if let Some(completion) = completion {
+            // Evidence is a bounded projection of checks/paths already held
+            // by the host. Apply the same secret redactor as task context.
+            let encoded = serde_json::to_string(&completion).unwrap_or_default();
+            let redacted = davinci_agent::runtime::contracts::redact_secrets(&encoded);
+            let value = serde_json::from_str::<serde_json::Value>(&redacted)
+                .unwrap_or_else(|_| json!({"status": "unavailable"}));
+            additional_state.insert("completionEvidence".into(), value);
+        }
+        additional_state.insert(
             "__davinci_decision_key".to_owned(),
             json!({
                 "requestId": key.request_id,
@@ -161,13 +131,25 @@ pub fn prepare_turn_decision(agent: &mut Agent, snapshot: DecisionSnapshot) -> D
                 "mutationRevision": key.mutation_revision,
             }),
         );
-    }
-    let key_for_worker = key.clone();
-    match runtime.enqueue_shadow_with_result(move || (request, key_for_worker)) {
-        Ok(()) => {
-            agent.set_decision_advice_key(Some(key));
-            DecisionAdmission::Enqueued
-        }
+        DecisionState::from_task_with_metadata(&snapshot.task, snapshot.metadata.clone())
+            .request_selected(
+                key.request_id,
+                snapshot.decision_class,
+                |id| {
+                    if is_completion {
+                        features.completion && id.starts_with("requirement_")
+                    } else if matches!(id, "regression_risk" | "verification_scope") {
+                        features.effort
+                    } else {
+                        features.tool_families && id.ends_with("_relevant")
+                    }
+                },
+                is_completion,
+                &additional_state,
+            )
+    }));
+    match agent.prepare_decision_advice(key, factory) {
+        Ok(()) => DecisionAdmission::Enqueued,
         Err(error) => admission_for_error(error),
     }
 }
@@ -184,7 +166,8 @@ pub fn try_effort_advice(
     if !runtime.is_enabled() || ready.key != *key || ready.key.generation != runtime.generation() {
         return EffortAdviceOutcome::Absent(AdviceAbsence::Stale);
     }
-    if !request_carries_key(&ready.request.state, key) {
+    if ready.request.request_id != key.request_id || !request_carries_key(&ready.request.state, key)
+    {
         return EffortAdviceOutcome::Absent(AdviceAbsence::Stale);
     }
     let Some(recommended) = recommended_effort(&ready.response) else {

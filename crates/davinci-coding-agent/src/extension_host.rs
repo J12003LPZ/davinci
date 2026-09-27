@@ -563,12 +563,6 @@ impl ExtensionHost {
             .record_pruning();
     }
 
-    pub fn engineering_snapshots(
-        &self,
-    ) -> Option<crate::native_extensions::engineering_snapshot::EngineeringSnapshots> {
-        Some(self.native.try_lock().ok()?.engineering.clone())
-    }
-
     pub fn native_after_tool(
         &self,
         name: &str,

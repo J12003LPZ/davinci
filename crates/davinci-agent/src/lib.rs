@@ -391,6 +391,9 @@ pub struct Agent {
     pub thinking_level: ThinkingLevel,
     pub effort_policy: effort::EffortPolicy,
     decision_effort_advice_enabled: bool,
+    decision_completion_advice_enabled: bool,
+    decision_tool_family_advice_enabled: bool,
+    decision_turn_advice: Option<decision::advice::TurnAdvice>,
     decision_effort_advice: Option<ThinkingLevel>,
     decision_advice_key: Option<decision::DecisionAdviceKey>,
     pub tool_surface: ToolSurface,
@@ -558,6 +561,9 @@ impl Agent {
             thinking_level: ThinkingLevel::Off,
             effort_policy: effort::EffortPolicy::default(),
             decision_effort_advice_enabled: false,
+            decision_completion_advice_enabled: false,
+            decision_tool_family_advice_enabled: false,
+            decision_turn_advice: None,
             decision_effort_advice: None,
             decision_advice_key: None,
             tool_surface: ToolSurface::default(),
@@ -748,15 +754,17 @@ impl Agent {
     }
 
     pub fn set_decision_runtime(&mut self, runtime: Arc<decision::DecisionRuntime>) {
+        // Generations are local to a runtime. A distinct provider runtime may
+        // restart at the same number, so replacing it invalidates all advice.
+        self.clear_turn_decision();
         self.decision_runtime = Some(runtime);
     }
 
     pub fn set_decision_effort_advice_enabled(&mut self, enabled: bool) {
-        self.decision_effort_advice_enabled = enabled;
-        if !enabled {
-            self.decision_effort_advice = None;
-            self.decision_advice_key = None;
+        if self.decision_effort_advice_enabled != enabled {
+            self.clear_turn_decision();
         }
+        self.decision_effort_advice_enabled = enabled;
     }
 
     pub fn decision_effort_advice_enabled(&self) -> bool {
@@ -1469,11 +1477,24 @@ impl Agent {
 
     /// The next request's effort; the configured level and prompt stay stable.
     pub fn request_thinking_level(&self) -> ThinkingLevel {
+        let advice = self
+            .decision_turn_advice
+            .as_ref()
+            .filter(|turn| {
+                self.decision_runtime.as_ref().is_some_and(|runtime| {
+                    runtime.is_enabled() && runtime.generation() == turn.task_key.generation
+                })
+            })
+            .filter(|turn| {
+                turn.effort_mutation_revision
+                    == Some(self.mutation_verification_state().mutation_generation)
+            })
+            .and(self.decision_effort_advice);
         effort::resolve_request_effort(
             self.effort_policy,
             self.thinking_level,
             self.effort_signals(),
-            self.decision_effort_advice,
+            advice,
         )
         .0
     }
@@ -1492,6 +1513,7 @@ impl Agent {
         text: &str,
         images: &[davinci_ai::MessageContent],
     ) -> ChatMessage {
+        self.clear_turn_decision();
         let message = self.prompt_with_origin(text, images, true);
         self.last_real_user_request = Some(text.to_string());
         self.activate_relevant_tool_families(text);
@@ -1942,7 +1964,7 @@ impl Agent {
     /// Build the exact system prompt for the next provider request.
     pub fn provider_system_prompt(&self) -> String {
         let mut prompt = self.system_prompt.clone();
-        context::append_repository_context(&mut prompt, &self.context_files);
+        context::append_repository_context(&mut prompt, &self.context_files, &self.cwd);
         if let Some(suffix) = self.provider_system_prompt_suffix.as_deref() {
             if !prompt.is_empty() {
                 prompt.push_str("\n\n");

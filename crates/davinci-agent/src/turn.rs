@@ -486,6 +486,11 @@ impl Agent {
             }
 
             self.ensure_session_persistence()?;
+            self.poll_decision_advice(turns_this_run > 0);
+            if turns_this_run > 0 {
+                self.enqueue_completion_advice();
+            }
+            self.record_decision_request_effort();
             self.stats.model_turns += 1;
             turns_this_run += 1;
             let model_started = std::time::Instant::now();
@@ -508,6 +513,9 @@ impl Agent {
                     Ok(output) => output,
                     Err(err) => return Err(err),
                 };
+            // A response that arrived during this provider request may inform
+            // later requests or the current completion observation. Never wait.
+            self.poll_decision_advice(true);
             let mut chat = assistant_to_chat(&assistant);
             if let Some(record) = &native_responses_resume {
                 davinci_ai::attach_native_items(

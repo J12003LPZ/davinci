@@ -178,6 +178,11 @@ impl DecisionRequest {
 
     /// Checks every question against the API's shape rules.
     pub fn validate_questions(&self) -> Result<(), DecisionError> {
+        if self.questions.is_empty() {
+            return Err(DecisionError::InvalidRequest(
+                "decision request has no enabled questions".into(),
+            ));
+        }
         self.questions
             .iter()
             .try_for_each(|(question_id, question)| question.validate_shape(question_id))

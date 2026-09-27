@@ -764,6 +764,8 @@ fn build_agent(parsed: &Args, session_dir: &Path, cwd: &Path) -> Result<Agent, S
         .retain(|tool| !parsed.exclude_tools.contains(tool));
     agent.cwd = cwd.to_path_buf();
     agent.set_decision_effort_advice_enabled(settings.decision_effort_advice_enabled());
+    agent.set_decision_completion_advice_enabled(settings.decision_completion_advice_enabled());
+    agent.set_decision_tool_family_advice_enabled(settings.decision_tool_family_advice_enabled());
     if settings.decision_intelligence_enabled() {
         match AuthStorage::create()
             .map_err(|error| error.to_string())
@@ -3217,6 +3219,7 @@ fn run_print(parsed: &Args, agent: &mut Agent) -> Result<i32, String> {
                 PreparedInput::Completed(code) => return Ok(code),
                 PreparedInput::Handled => {}
                 PreparedInput::Ready { text, images } => {
+                    agent.prompt_user_with(&text, &images);
                     let _ = davinci_coding_agent::turn_decision::prepare_turn_decision(
                         agent,
                         davinci_coding_agent::turn_decision::DecisionSnapshot {
@@ -3225,10 +3228,9 @@ fn run_print(parsed: &Args, agent: &mut Agent) -> Result<i32, String> {
                             decision_class: davinci_agent::decision::risk::DecisionRisk::Planning,
                             metadata: davinci_coding_agent::decision_state::DecisionMetadata::default(),
                             evidence_revision: agent.messages.len() as u64,
-                            mutation_revision: agent.effort_signals().mutations,
+                            mutation_revision: agent.mutation_verification_state().mutation_generation,
                         },
                     );
-                    agent.prompt_user_with(&text, &images);
                     if json_mode {
                         write_prompt_manifest_json_event(agent)?;
                     }
@@ -3257,6 +3259,7 @@ fn run_print(parsed: &Args, agent: &mut Agent) -> Result<i32, String> {
             PreparedInput::Completed(code) => return Ok(code),
             PreparedInput::Handled => {}
             PreparedInput::Ready { text, images } => {
+                agent.prompt_user_with(&text, &images);
                 let _ = davinci_coding_agent::turn_decision::prepare_turn_decision(
                     agent,
                     davinci_coding_agent::turn_decision::DecisionSnapshot {
@@ -3265,10 +3268,9 @@ fn run_print(parsed: &Args, agent: &mut Agent) -> Result<i32, String> {
                         decision_class: davinci_agent::decision::risk::DecisionRisk::Planning,
                         metadata: davinci_coding_agent::decision_state::DecisionMetadata::default(),
                         evidence_revision: agent.messages.len() as u64,
-                        mutation_revision: agent.effort_signals().mutations,
+                        mutation_revision: agent.mutation_verification_state().mutation_generation,
                     },
                 );
-                agent.prompt_user_with(&text, &images);
                 if json_mode {
                     write_prompt_manifest_json_event(agent)?;
                 }
@@ -6296,6 +6298,7 @@ fn submit_user_message(
         return Ok(true);
     };
     session.chrome.transcript.push("user", &text);
+    agent.prompt_user_with(&text, &images);
     let _ = davinci_coding_agent::turn_decision::prepare_turn_decision(
         agent,
         davinci_coding_agent::turn_decision::DecisionSnapshot {
@@ -6304,10 +6307,9 @@ fn submit_user_message(
             decision_class: davinci_agent::decision::risk::DecisionRisk::Planning,
             metadata: davinci_coding_agent::decision_state::DecisionMetadata::default(),
             evidence_revision: agent.messages.len() as u64,
-            mutation_revision: agent.effort_signals().mutations,
+            mutation_revision: agent.mutation_verification_state().mutation_generation,
         },
     );
-    agent.prompt_user_with(&text, &images);
     // Inside the raw-mode TUI the turn runs on a worker thread so the
     // interface keeps painting (spinner, live tool lines, Esc interrupt).
     let streaming = with_active_panes(|panes| panes.cloned());
@@ -7114,10 +7116,7 @@ fn persist_interactive_setting(spec: &str) -> Result<(), String> {
         "steering-mode" => stored.steering_mode = Some(value.to_string()),
         "follow-up-mode" => stored.follow_up_mode = Some(value.to_string()),
         "decision-intelligence" => {
-            stored.decision_intelligence = Some(crate::settings::DecisionIntelligenceSettings {
-                enabled: value == "on",
-                ..Default::default()
-            });
+            stored.set_decision_intelligence_enabled(value == "on");
         }
         "transport" => stored.transport = Some(value.to_string()),
         "http-idle-timeout" => stored.http_idle_timeout_ms = parse_http_idle_timeout(value),
@@ -7162,6 +7161,9 @@ fn sync_agent_from_settings(agent: &mut Agent) {
     agent.transport = stored.transport.clone();
     agent.install_telemetry = stored.install_telemetry_enabled();
     agent.auto_retry = stored.retry_enabled();
+    agent.set_decision_effort_advice_enabled(stored.decision_effort_advice_enabled());
+    agent.set_decision_completion_advice_enabled(stored.decision_completion_advice_enabled());
+    agent.set_decision_tool_family_advice_enabled(stored.decision_tool_family_advice_enabled());
     if !stored.decision_intelligence_enabled() {
         agent.disable_decision_runtime();
     }

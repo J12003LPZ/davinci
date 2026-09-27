@@ -45,14 +45,34 @@ pub struct SelectedRootContext {
     pub ephemeral_messages: Vec<ChatMessage>,
 }
 
-pub(crate) fn append_repository_context(prompt: &mut String, files: &[ContextFile]) {
+pub(crate) fn append_repository_context(prompt: &mut String, files: &[ContextFile], cwd: &Path) {
     if files.is_empty() {
         return;
     }
 
+    // Target-specific loaders canonicalize nested paths. Resolve the root
+    // once, only when lexical stripping cannot preserve their relative scope.
+    let canonical_cwd = files
+        .iter()
+        .any(|file| file.path.strip_prefix(cwd).is_err())
+        .then(|| fs::canonicalize(cwd).ok())
+        .flatten();
     let mut unique_bodies: Vec<(&str, Vec<String>)> = Vec::new();
     for file in files {
-        let path = file.path.to_string_lossy().into_owned();
+        // Preserve nested instruction scope without making the checkout root
+        // part of the reusable provider prefix.
+        let path = file
+            .path
+            .strip_prefix(cwd)
+            .ok()
+            .or_else(|| {
+                canonical_cwd
+                    .as_ref()
+                    .and_then(|root| file.path.strip_prefix(root).ok())
+            })
+            .filter(|path| !path.as_os_str().is_empty())
+            .map(|path| path.to_string_lossy().replace('\\', "/"))
+            .unwrap_or_else(|| file.name.clone());
         if let Some((_, paths)) = unique_bodies
             .iter_mut()
             .find(|(body, _)| *body == file.body)
@@ -301,6 +321,85 @@ mod tests {
     }
 
     #[test]
+    fn checkout_roots_do_not_change_instruction_prefix_or_cache_identity() {
+        let prompt_at = |root: &str, body: &str| {
+            let mut prompt = "stable system".to_owned();
+            append_repository_context(
+                &mut prompt,
+                &[ContextFile {
+                    path: PathBuf::from(root).join("AGENTS.md"),
+                    name: "AGENTS.md".into(),
+                    body: body.into(),
+                }],
+                Path::new(root),
+            );
+            prompt
+        };
+        let first = prompt_at("/tmp/checkout-a", "same instructions");
+        let second = prompt_at("/work/checkout-b", "same instructions");
+        assert_eq!(first, second);
+        assert!(!first.contains("/tmp/checkout-a"));
+        assert_eq!(
+            crate::runtime::hash_system_prompt_with_manifest(&first, None),
+            crate::runtime::hash_system_prompt_with_manifest(&second, None)
+        );
+        assert_ne!(
+            first,
+            prompt_at("/work/checkout-b", "different instructions")
+        );
+    }
+
+    #[test]
+    fn stable_instruction_prefix_retains_nested_scope() {
+        let mut prompt = String::new();
+        append_repository_context(
+            &mut prompt,
+            &[ContextFile {
+                path: PathBuf::from("/checkout/src/AGENTS.md"),
+                name: "AGENTS.md".into(),
+                body: "instructions for src".into(),
+            }],
+            Path::new("/checkout"),
+        );
+        assert!(prompt.contains("src/AGENTS.md"));
+        assert!(!prompt.contains("/checkout"));
+    }
+
+    #[test]
+    fn relative_cwd_loader_preserves_nested_instruction_scope() {
+        let current = std::env::current_dir().unwrap();
+        let root = tempfile::tempdir_in(&current).unwrap();
+        fs::create_dir(root.path().join("src")).unwrap();
+        fs::write(root.path().join("AGENTS.md"), "root instructions").unwrap();
+        fs::write(root.path().join("src/AGENTS.md"), "nested instructions").unwrap();
+        fs::write(root.path().join("src/file.rs"), "").unwrap();
+        let cwd = root.path().strip_prefix(&current).unwrap();
+        let files = load_context_files_for_targets(cwd, true, &[PathBuf::from("src/file.rs")]);
+        let mut prompt = String::new();
+        append_repository_context(&mut prompt, &files, cwd);
+        assert!(prompt.contains("src/AGENTS.md"), "{prompt}");
+        assert!(prompt.contains("root instructions") && prompt.contains("nested instructions"));
+        assert!(!prompt.contains(root.path().to_str().unwrap()));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlink_cwd_loader_preserves_nested_instruction_scope() {
+        let root = tempfile::tempdir().unwrap();
+        let checkout = root.path().join("checkout");
+        fs::create_dir_all(checkout.join("src")).unwrap();
+        fs::write(checkout.join("src/AGENTS.md"), "nested instructions").unwrap();
+        fs::write(checkout.join("src/file.rs"), "").unwrap();
+        let link = root.path().join("linked-checkout");
+        std::os::unix::fs::symlink(&checkout, &link).unwrap();
+        let files = load_context_files_for_targets(&link, true, &[PathBuf::from("src/file.rs")]);
+        let mut prompt = String::new();
+        append_repository_context(&mut prompt, &files, &link);
+        assert!(prompt.contains("src/AGENTS.md"), "{prompt}");
+        assert!(!prompt.contains(root.path().to_str().unwrap()));
+    }
+
+    #[test]
     fn repository_prompt_retains_duplicate_provenance_without_duplicate_body() {
         let mut prompt = "base".to_string();
         append_repository_context(
@@ -317,6 +416,7 @@ mod tests {
                     body: "same instructions".into(),
                 },
             ],
+            Path::new("."),
         );
 
         assert_eq!(prompt.matches("same instructions").count(), 1);

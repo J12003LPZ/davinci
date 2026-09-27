@@ -35,6 +35,12 @@ impl DecisionProvider for FixtureProvider {
         _budget: Duration,
     ) -> Result<DecisionResponse, DecisionError> {
         self.calls.fetch_add(1, Ordering::SeqCst);
+        let completion = request.state.get("completionEvidence").is_some();
+        assert!(request
+            .questions
+            .keys()
+            .all(|id| id.starts_with("requirement_") == completion));
+        assert_eq!(request.state.get("requirements").is_some(), completion);
         let mut answers = Map::new();
         for (id, question) in &request.questions {
             let answer = match question.question_type {
@@ -97,37 +103,229 @@ fn missing_runtime_is_a_disabled_no_wait_path() {
     assert!(started.elapsed() < Duration::from_millis(50));
 }
 
-#[test]
-fn ready_shadow_advice_applies_only_when_constructing_a_later_request() {
+fn enabled_agent() -> (Agent, Arc<FixtureProvider>, Arc<DecisionRuntime>) {
     let provider = Arc::new(FixtureProvider {
         calls: AtomicUsize::new(0),
     });
     let runtime = Arc::new(DecisionRuntime::new(provider.clone()));
     runtime.enable();
-
     let mut agent = Agent::new("test system");
-    agent.set_decision_runtime(runtime);
+    agent.set_decision_runtime(runtime.clone());
     agent.set_decision_effort_advice_enabled(true);
     agent.thinking_level = ThinkingLevel::Medium;
     agent.effort_policy = EffortPolicy::Adaptive;
+    (agent, provider, runtime)
+}
 
-    let started = Instant::now();
+fn wait_for_success(runtime: &DecisionRuntime, count: u64) {
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while runtime.telemetry().snapshot().successes < count && Instant::now() < deadline {
+        std::thread::yield_now();
+    }
+    assert!(runtime.telemetry().snapshot().successes >= count);
+}
+
+fn poll_until_ready(agent: &mut Agent, runtime: &DecisionRuntime) {
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while runtime.telemetry().snapshot().ready_advice == 0 && Instant::now() < deadline {
+        agent.poll_decision_advice(true);
+        std::thread::yield_now();
+    }
+    assert_eq!(runtime.telemetry().snapshot().ready_advice, 1);
+}
+
+#[test]
+fn ready_same_turn_advice_never_changes_request_one() {
+    let (mut agent, _, runtime) = enabled_agent();
+    agent.prompt("Fix the parser");
     assert_eq!(
         prepare_turn_decision(&mut agent, snapshot("first", 1)),
         DecisionAdmission::Enqueued
     );
+    wait_for_success(&runtime, 1);
+    agent.poll_decision_advice(false);
     assert_eq!(agent.request_thinking_level(), ThinkingLevel::Low);
-    assert!(started.elapsed() < Duration::from_millis(100));
+    poll_until_ready(&mut agent, &runtime);
+    assert_eq!(agent.request_thinking_level(), ThinkingLevel::High);
+}
 
-    let deadline = Instant::now() + Duration::from_secs(1);
-    while provider.calls.load(Ordering::SeqCst) == 0 && Instant::now() < deadline {
-        std::thread::sleep(Duration::from_millis(1));
-    }
-    assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
-
+#[test]
+fn previous_user_turn_advice_cannot_change_the_next_submissions_first_request() {
+    let (mut agent, _, runtime) = enabled_agent();
+    agent.prompt("First task");
+    assert_eq!(
+        prepare_turn_decision(&mut agent, snapshot("first", 1)),
+        DecisionAdmission::Enqueued
+    );
+    wait_for_success(&runtime, 1);
+    // Wait only in the fixture so the previous answer is in the mailbox.
+    std::thread::sleep(Duration::from_millis(5));
+    agent.prompt("Second unrelated task");
     assert_eq!(
         prepare_turn_decision(&mut agent, snapshot("second", 2)),
         DecisionAdmission::Enqueued
     );
+    agent.poll_decision_advice(false);
+    assert_eq!(agent.request_thinking_level(), ThinkingLevel::Low);
+    assert!(agent.completion_advice().is_none());
+    assert_eq!(runtime.telemetry().snapshot().ready_advice, 0);
+}
+
+#[test]
+fn advice_for_a_different_current_key_is_rejected() {
+    for field in ["turn", "evidence", "mutation", "generation"] {
+        let (mut agent, _, runtime) = enabled_agent();
+        agent.prompt("Fix the parser");
+        assert_eq!(
+            prepare_turn_decision(&mut agent, snapshot("first", 1)),
+            DecisionAdmission::Enqueued
+        );
+        wait_for_success(&runtime, 1);
+        let mut current = davinci_agent::decision::DecisionAdviceKey {
+            request_id: "first".into(),
+            generation: runtime.generation(),
+            evidence_revision: 1,
+            mutation_revision: 0,
+        };
+        match field {
+            "turn" => current.request_id = "second".into(),
+            "evidence" => current.evidence_revision += 1,
+            "mutation" => current.mutation_revision += 1,
+            _ => current.generation += 1,
+        }
+        agent.set_decision_advice_key(Some(current));
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while runtime.telemetry().snapshot().stale_advice == 0 && Instant::now() < deadline {
+            agent.poll_decision_advice(true);
+            std::thread::yield_now();
+        }
+        assert_eq!(runtime.telemetry().snapshot().stale_advice, 1, "{field}");
+        assert_eq!(
+            agent.request_thinking_level(),
+            ThinkingLevel::Low,
+            "{field}"
+        );
+    }
+}
+
+#[test]
+fn disabling_runtime_invalidates_already_consumed_effort() {
+    let (mut agent, _, runtime) = enabled_agent();
+    agent.prompt("Fix parser");
+    prepare_turn_decision(&mut agent, snapshot("first", 1));
+    poll_until_ready(&mut agent, &runtime);
     assert_eq!(agent.request_thinking_level(), ThinkingLevel::High);
+    runtime.disable();
+    assert_eq!(agent.request_thinking_level(), ThinkingLevel::Low);
+}
+
+#[test]
+fn all_advice_subflags_off_makes_no_paid_shadow_request() {
+    let (mut agent, provider, _) = enabled_agent();
+    agent.set_decision_effort_advice_enabled(false);
+    agent.prompt("Fix parser");
+    assert_eq!(
+        prepare_turn_decision(&mut agent, snapshot("first", 1)),
+        DecisionAdmission::Disabled
+    );
+    assert_eq!(provider.calls.load(Ordering::SeqCst), 0);
+}
+
+fn coding_reply(
+    content: davinci_ai::ContentBlock,
+    stop_reason: davinci_ai::StopReason,
+) -> davinci_ai::AssistantMessage {
+    serde_json::from_value(json!({
+        "id": davinci_agent::new_message_id(), "role": "assistant", "model": "fixture",
+        "content": [content], "stopReason": stop_reason,
+    }))
+    .unwrap()
+}
+
+#[test]
+fn shared_print_loop_consumes_same_turn_advice_between_tool_rounds() {
+    use davinci_ai::{ContentBlock, StopReason};
+    let (mut agent, _, runtime) = enabled_agent();
+    let root = tempfile::tempdir().unwrap();
+    agent.cwd = root.path().to_owned();
+    agent.prompt("Inspect the parser");
+    prepare_turn_decision(&mut agent, snapshot("print", 1));
+    let mut observed = Vec::new();
+    let events = agent
+        .run_loop(|current| {
+            observed.push(current.request_thinking_level());
+            if observed.len() == 1 {
+                wait_for_success(&runtime, 1);
+                Ok(coding_reply(
+                    ContentBlock::ToolCall {
+                        id: "inspect".into(),
+                        name: "ls".into(),
+                        arguments: json!({"path":"."}),
+                    },
+                    StopReason::ToolUse,
+                ))
+            } else {
+                Ok(coding_reply(
+                    ContentBlock::Text {
+                        text: "Inspected.".into(),
+                    },
+                    StopReason::Stop,
+                ))
+            }
+        })
+        .unwrap();
+    assert!(!events.is_empty());
+    assert_eq!(observed, [ThinkingLevel::Low, ThinkingLevel::High]);
+}
+
+#[test]
+fn completion_shadow_consumes_fresh_evidence_without_an_extra_coding_request() {
+    use davinci_ai::{ContentBlock, StopReason};
+    let (mut agent, _, runtime) = enabled_agent();
+    let root = tempfile::tempdir().unwrap();
+    agent.cwd = root.path().to_owned();
+    agent.set_decision_effort_advice_enabled(false);
+    agent.set_decision_completion_advice_enabled(true);
+    agent.prompt("Must preserve the public API");
+    let mut submission = snapshot("completion", 1);
+    submission.task = "Must preserve the public API".into();
+    prepare_turn_decision(&mut agent, submission);
+    let mut turns = 0;
+    agent
+        .run_loop(|_| {
+            turns += 1;
+            if turns == 1 {
+                Ok(coding_reply(
+                    ContentBlock::ToolCall {
+                        id: "inspect".into(),
+                        name: "ls".into(),
+                        arguments: json!({"path":"."}),
+                    },
+                    StopReason::ToolUse,
+                ))
+            } else {
+                wait_for_success(&runtime, 1);
+                // Only fixture synchronization; the production consumer never waits.
+                std::thread::sleep(Duration::from_millis(5));
+                Ok(coding_reply(
+                    ContentBlock::Text {
+                        text: "Done.".into(),
+                    },
+                    StopReason::Stop,
+                ))
+            }
+        })
+        .unwrap();
+    assert_eq!(turns, 2);
+    let completion = agent
+        .completion_advice()
+        .expect("same-turn completion observation");
+    assert_eq!(completion.key.request_id, "completion");
+    assert_eq!(completion.requirements.len(), 1);
+    assert!(completion.requirements[0].evidence_references.is_empty());
+    assert_eq!(
+        completion.deterministic_evidence,
+        agent.completion_evidence()
+    );
+    assert_eq!(runtime.telemetry().snapshot().completion_advice_observed, 1);
 }
