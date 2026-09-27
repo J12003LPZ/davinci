@@ -604,6 +604,106 @@ mod tests {
     }
 
     #[test]
+    fn family_advice_is_admitted_with_its_actual_schemas_before_dispatch() {
+        use crate::runtime::{
+            context_vm::ContextVmMode, AgentId, CapabilitySource, RunId, RuntimeBus,
+            RuntimeCapability, RuntimeHandle,
+        };
+
+        for schema_bytes in [0, 64_000] {
+            let (mut agent, runtime, key) = pending_agent();
+            agent.decision_completion_advice_enabled = false;
+            agent.decision_tool_family_advice_enabled = true;
+            agent.auto_compaction = false;
+            agent.auto_verify = false;
+            agent.tool_surface = crate::ToolSurface::Lean;
+            agent.turn_context_placement_override =
+                Some(crate::turn_context::TurnContextPlacement::Appended);
+            agent.set_permission_mode(crate::PermissionMode::AlwaysApprove);
+            let root = tempfile::tempdir().unwrap();
+            std::fs::write(root.path().join("public.txt"), "public evidence").unwrap();
+            agent.cwd = root.path().into();
+            let host = RuntimeHandle::new(RunId::new(), AgentId::new(), RuntimeBus::new());
+            host.capability_registry.register(
+                RuntimeCapability::new(
+                    "browser_large",
+                    CapabilitySource::Mcp,
+                    crate::ToolClass::Read,
+                    true,
+                    &json!({"type":"object", "description":"x".repeat(schema_bytes)}),
+                    None,
+                )
+                .with_family("browser"),
+            );
+            agent.set_runtime(host);
+            agent.apply_extension_tools(&["browser_large".into()]);
+            agent.freeze_tools_for_cache();
+            agent.set_context_vm_mode(ContextVmMode::Active);
+            agent.set_provider_output_limit(Some(1024));
+            agent.set_provider_context_overhead_estimator(|agent| {
+                serde_json::to_vec(&agent.provider_tool_specs()).unwrap().len() as u64 + 128
+            });
+            agent.context_window = agent.provider_context_budget().reserved() + 16_000;
+            let initial_tools = agent.visible_tool_names();
+            let initial_budget = agent.provider_context_budget().tools;
+            let initial_effort = agent.request_thinking_level();
+
+            // Publish after the response-boundary poll, during the first tool
+            // round. Request 2 must account for these ready schema additions.
+            let mut ready = effort_ready(&key);
+            ready.request.questions = BTreeMap::from([(
+                "browser_relevant".into(),
+                DecisionQuestion::noul("browser relevance"),
+            )]);
+            ready.response.answers = BTreeMap::from([(
+                "browser_relevant".into(),
+                DecisionAnswer::Noul { value: 0.9 },
+            )]);
+            let ready_runtime = Arc::clone(&runtime);
+            agent.post_tool = Some(crate::PostToolHook(Arc::new(move |_, _, _, _, result| {
+                *ready_runtime.ready_shadow.lock().unwrap() = Some(ready.clone());
+                result
+            })));
+
+            let mut requests = 0;
+            let result = agent.run_loop(|current| {
+                requests += 1;
+                if requests == 1 {
+                    assert_eq!(current.visible_tool_names(), initial_tools);
+                    assert_eq!(current.provider_context_budget().tools, initial_budget);
+                    assert_eq!(current.request_thinking_level(), initial_effort);
+                } else {
+                    assert_eq!(schema_bytes, 0, "oversized schemas reached the provider");
+                    assert!(current.is_tool_visible("browser_large"));
+                    assert!(current.provider_context_budget().tools > initial_budget);
+                }
+                // The actual provider projection must be admitted, never the
+                // legacy reader fallback for an image rejected after the gate.
+                assert!(current.prepared_context_image().is_ok());
+                Ok(serde_json::from_value::<davinci_ai::AssistantMessage>(json!({
+                    "id":format!("response-{requests}"), "role":"assistant", "model":"fixture",
+                    "content": if requests == 1 {
+                        json!([{"type":"toolCall", "id":"read", "name":"read", "arguments":{"path":"public.txt"}}])
+                    } else {
+                        json!([{"type":"text", "text":"done"}])
+                    },
+                    "stopReason": if requests == 1 {"toolUse"} else {"stop"}
+                })).unwrap())
+            });
+            assert!(agent.is_tool_visible("browser_large"));
+            assert!(agent.provider_context_budget().tools > initial_budget);
+            if schema_bytes == 0 {
+                result.unwrap();
+                assert_eq!(requests, 2);
+            } else {
+                assert!(result.unwrap_err().contains("compilation token budget"));
+                assert_eq!(requests, 1);
+                assert_eq!(agent.run_stats().model_turns, 1);
+            }
+        }
+    }
+
+    #[test]
     fn labeled_completion_observations_never_replace_hard_evidence() {
         for label in ["failed", "stale", "partial", "unknown", "complete"] {
             let (mut agent, runtime, mut key) = pending_agent();

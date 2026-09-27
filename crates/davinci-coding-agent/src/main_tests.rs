@@ -3468,3 +3468,71 @@ fn print_verification_notice_is_a_separate_event_and_not_a_provider_error() {
     assert!(event.get("message").is_none());
     assert_eq!(print_text_exit(&[notice]), (0, None));
 }
+
+#[test]
+fn provider_schema_budget_tracks_discovery_without_changing_request_one() {
+    use davinci_agent::runtime::{
+        context_vm::ContextVmMode, AgentId, CapabilitySource, RunId, RuntimeBus,
+        RuntimeCapability, RuntimeHandle,
+    };
+    let mut agent = Agent::new("schema budget fixture");
+    agent.tool_surface = davinci_agent::ToolSurface::Lean;
+    agent.turn_context_placement_override =
+        Some(davinci_agent::turn_context::TurnContextPlacement::Appended);
+    let runtime = RuntimeHandle::new(RunId::new(), AgentId::new(), RuntimeBus::new());
+    runtime.capability_registry.register(
+        RuntimeCapability::new(
+            "large_specialist",
+            CapabilitySource::Mcp,
+            davinci_agent::ToolClass::Read,
+            true,
+            &serde_json::json!({"type":"object", "description":"x".repeat(64_000)}),
+            None,
+        )
+        .with_family("fixture"),
+    );
+    agent.set_runtime(runtime);
+    agent.apply_extension_tools(&["large_specialist".into()]);
+    agent.freeze_tools_for_cache();
+    agent.set_context_vm_mode(ContextVmMode::Active);
+    agent.set_provider_output_limit(Some(1024));
+    agent.prompt("Inspect the public file");
+
+    let initial_schemas = provider_tools(&agent);
+    let initial_overhead = serde_json::to_vec(&initial_schemas).unwrap().len() as u64 + 128;
+    agent.set_provider_context_overhead_estimator(provider_tool_overhead_tokens);
+    assert_eq!(agent.provider_context_budget().tools, initial_overhead);
+    assert_eq!(provider_tools(&agent), initial_schemas);
+    agent.context_window = agent.provider_context_budget().reserved() + 16_000;
+    assert!(agent.prepared_context_image().is_ok());
+
+    let result = davinci_agent::execute_tool_with(
+        &agent.cwd,
+        "tool_search",
+        &serde_json::json!({"mode":"family", "query":"fixture"}),
+        &agent.tool_context,
+    )
+    .unwrap();
+    assert!(!result.is_error, "{}", result.content);
+    assert!(agent.is_tool_visible("large_specialist"));
+    let expanded_overhead = serde_json::to_vec(&provider_tools(&agent)).unwrap().len() as u64 + 128;
+    assert!(expanded_overhead > initial_overhead + 64_000);
+    assert_eq!(agent.provider_context_budget().tools, expanded_overhead);
+    assert!(agent.prepared_context_image().is_err());
+    let mut called = false;
+    let result = agent.run_loop(|_| {
+        called = true;
+        Err::<davinci_ai::AssistantMessage, _>("must not dispatch".into())
+    });
+    assert!(!called);
+    assert!(result.unwrap_err().contains("compilation token budget"));
+
+    // Explicit SDK/host scalar overrides retain their existing semantics.
+    agent.set_provider_context_overhead_tokens(Some(2048));
+    assert_eq!(agent.provider_context_budget().tools, 2048);
+    agent.set_provider_context_overhead_tokens(None);
+    assert_eq!(
+        agent.provider_context_budget().tools,
+        serde_json::to_vec(&agent.provider_tool_specs()).unwrap().len() as u64 + 128
+    );
+}

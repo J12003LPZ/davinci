@@ -521,6 +521,8 @@ pub struct Agent {
     turn_state_pending: Option<String>,
     /// Host-supplied schema estimate, excluding the system prompt and messages.
     provider_context_overhead_tokens: Option<u64>,
+    /// Hosts with a changing provider schema measure the currently exposed set.
+    provider_context_overhead_estimator: Option<fn(&Agent) -> u64>,
     provider_output_limit: Option<u64>,
     prepared_context_image: Arc<Mutex<Option<PreparedContextImage>>>,
     prepared_context_generation: u64,
@@ -659,6 +661,7 @@ impl Agent {
             turn_context_placement_override: None,
             turn_state_pending: None,
             provider_context_overhead_tokens: None,
+            provider_context_overhead_estimator: None,
             provider_output_limit: None,
             prepared_context_image: Arc::new(Mutex::new(None)),
             prepared_context_generation: 0,
@@ -1872,7 +1875,7 @@ impl Agent {
         provider_budget::ProviderContextBudget {
             window: self.context_window,
             system: provider_budget::text_token_ceiling(&self.provider_system_prompt()),
-            tools: self.provider_context_overhead_tokens.unwrap_or_else(|| {
+            tools: self.provider_context_overhead_tokens().unwrap_or_else(|| {
                 serde_json::to_vec(&self.provider_tool_specs())
                     .map_or(u64::MAX, |v| v.len() as u64 + 128)
             }),
@@ -2026,7 +2029,7 @@ impl Agent {
                 .map(|text| (text.len() as u64).div_ceil(4))
                 .unwrap_or(0)
             + (self.provider_system_prompt().len() as u64).div_ceil(4)
-            + self.provider_context_overhead_tokens.unwrap_or_else(|| {
+            + self.provider_context_overhead_tokens().unwrap_or_else(|| {
                 let specs = self.provider_tool_specs();
                 (serde_json::to_vec(&specs)
                     .expect("tool schemas are JSON")
@@ -2047,6 +2050,21 @@ impl Agent {
     /// `None` restores the builtin/MCP estimate.
     pub fn set_provider_context_overhead_tokens(&mut self, tokens: Option<u64>) {
         self.provider_context_overhead_tokens = tokens;
+        self.provider_context_overhead_estimator = None;
+    }
+
+    /// Measure the current provider schema whenever request context is admitted.
+    /// The estimator must only inspect tool metadata, without querying a context
+    /// budget or provider image. The scalar setter restores fixed estimates.
+    pub fn set_provider_context_overhead_estimator(&mut self, estimator: fn(&Agent) -> u64) {
+        self.provider_context_overhead_estimator = Some(estimator);
+        self.provider_context_overhead_tokens = None;
+    }
+
+    fn provider_context_overhead_tokens(&self) -> Option<u64> {
+        self.provider_context_overhead_estimator
+            .map(|estimate| estimate(self))
+            .or(self.provider_context_overhead_tokens)
     }
 
     /// Record host-owned request context that follows the mutable turn prompt.
@@ -2106,7 +2124,7 @@ impl Agent {
         let provider_tool_schemas = serde_json::to_string(&self.provider_tool_schema_value())
             .expect("provider tool schemas are JSON");
         let tool_tokens = self
-            .provider_context_overhead_tokens
+            .provider_context_overhead_tokens()
             .unwrap_or_else(|| (provider_tool_schemas.len() as u64).div_ceil(4));
         entries.push(ContextManifestEntry::new(
             "tool_schemas",

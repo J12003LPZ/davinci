@@ -44,7 +44,7 @@ impl Agent {
             self.thinking_level,
             &self.thinking_budgets,
             self.provider_output_limit,
-            self.provider_context_overhead_tokens,
+            self.provider_context_overhead_tokens(),
             self.compaction.reserve_tokens,
             self.block_images,
             self.prepared_context_generation,

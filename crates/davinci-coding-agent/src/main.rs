@@ -2167,6 +2167,13 @@ fn provider_tools(agent: &Agent) -> Vec<ToolSpec> {
         .collect()
 }
 
+fn provider_tool_overhead_tokens(agent: &Agent) -> u64 {
+    serde_json::to_vec(&provider_tools(agent))
+        .expect("tool schemas are JSON")
+        .len() as u64
+        + 128
+}
+
 fn effective_provider_tool_schema_hash(
     model: &davinci_ai::Model,
     auth: &ResolvedAuth,
@@ -2558,12 +2565,7 @@ fn complete_prompt_with_host(
         })));
     }
     synchronize_provider_system_prompt(agent);
-    agent.set_provider_context_overhead_tokens(Some(
-        serde_json::to_vec(&provider_tools(agent))
-            .expect("tool schemas are JSON")
-            .len() as u64
-            + 128,
-    ));
+    agent.set_provider_context_overhead_estimator(provider_tool_overhead_tokens);
     agent.set_provider_output_limit(model.as_ref().map(|m| m.max_tokens));
     let mut context_visibility = (agent.stats.pruned_results, agent.stats.compactions);
     // Session calls settle after the loop. Hold the final terminal event until
