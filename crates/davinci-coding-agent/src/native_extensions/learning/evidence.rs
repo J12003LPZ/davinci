@@ -10,8 +10,8 @@ use crate::native_extensions::learning::types::{
 };
 use crate::native_extensions::vector_memory::{redact_secrets, MemoryMessage};
 
-const MAX_MESSAGE_CHARS: usize = 4_000;
-const MAX_MESSAGES_COUNT: usize = 10;
+const MAX_MESSAGE_CHARS: usize = 1_200;
+const MAX_MESSAGES_COUNT: usize = 6;
 const MAX_TOOL_ARGS_CHARS: usize = 1_000;
 const MAX_TOOL_RESULT_CHARS: usize = 2_000;
 
