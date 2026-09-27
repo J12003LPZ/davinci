@@ -3916,7 +3916,7 @@ fn partial_check_discloses_unchecked_paths_without_another_model_turn() {
             serde_json::json!({"command":"python -c \"from changed import f; assert f(2) == 4\""}),
         ),
     ]);
-    agent
+    let events = agent
         .run_loop(|current| {
             calls += 1;
             script(current)
@@ -3926,11 +3926,13 @@ fn partial_check_discloses_unchecked_paths_without_another_model_turn() {
     assert_eq!(agent.completion_evidence(), CompletionEvidence::Partial);
     assert_eq!(harness_runs(&agent), 0);
     assert!(reminders(&agent).is_empty());
-    assert!(agent
+    assert!(events.iter().any(|event| matches!(event,
+        crate::AgentEvent::VerificationNotice { status: CompletionEvidence::Partial, text, .. }
+            if text.contains("unchecked"))));
+    assert!(!agent
         .messages
         .iter()
-        .any(|message| message.extra.get("davinciVerificationStatus")
-            == Some(&serde_json::json!("partial"))));
+        .any(|message| message.extra.contains_key("davinciVerificationStatus")));
 }
 
 #[test]
