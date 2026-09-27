@@ -55,7 +55,10 @@ fn parser_rejects_malformed_or_unsupported_controls_before_execution() {
     let moved = "*** Begin Patch\n*** Move to: renamed.txt\n*** End Patch";
     let error = apply_patch::parse_codex_patch(moved).unwrap_err();
     assert!(error.contains("*** Move to:"), "{error}");
-    assert!(error.to_ascii_lowercase().contains("delete plus an add"), "{error}");
+    assert!(
+        error.to_ascii_lowercase().contains("delete plus an add"),
+        "{error}"
+    );
 
     let root = tempdir().unwrap();
     let result = execute_tool_with(
@@ -67,6 +70,75 @@ fn parser_rejects_malformed_or_unsupported_controls_before_execution() {
     .unwrap();
     assert!(result.is_error);
     assert!(!root.path().join("target.txt").exists());
+}
+
+#[test]
+fn rejected_terminal_patch_calls_never_reach_agent_execution() {
+    let model = davinci_ai::load_builtin_models()
+        .into_iter()
+        .find(|model| model.api == "openai-codex-responses")
+        .unwrap();
+    let item = json!({"type":"custom_tool_call","id":"item","call_id":"call",
+        "name":"apply_patch","input":"*** Begin Patch\n*** Add File: unsafe.txt\n+executed\n*** End Patch"});
+    let mut incomplete_item = item.clone();
+    incomplete_item["status"] = "incomplete".into();
+    let cases = [
+        vec![
+            json!({"type":"response.output_item.added","output_index":0,"item":item}),
+            json!({"type":"response.completed","response":{"status":"completed","output":[]}}),
+        ],
+        vec![
+            json!({"type":"response.output_item.done","output_index":0,"item":item}),
+            json!({"type":"response.completed","response":{"status":"completed","output":[]}}),
+        ],
+        vec![
+            json!({"type":"response.incomplete","response":{"status":"completed",
+            "incomplete_details":{"reason":"max_output_tokens"},"output":[item]}}),
+        ],
+        vec![
+            json!({"type":"response.incomplete","response":{"status":null,
+            "incomplete_details":{"reason":"max_output_tokens"},"output":[item]}}),
+        ],
+        vec![
+            json!({"type":"response.completed","response":{"status":"completed",
+            "output":[incomplete_item]}}),
+        ],
+    ];
+    for frames in cases {
+        let root = tempdir().unwrap();
+        let corpus = frames
+            .iter()
+            .map(|frame| format!("data: {frame}\n\n"))
+            .collect::<String>();
+        let decoded = davinci_ai::fixture_complete(&model, &[], &corpus);
+        let mut agent = davinci_agent::Agent::new("terminal safety regression");
+        agent.cwd = root.path().to_path_buf();
+        agent.set_permission_mode(davinci_agent::PermissionMode::AlwaysApprove);
+        agent.prompt_user_with("Apply the requested patch", &[]);
+        let mut requests = 0;
+        let events = agent
+            .run_loop(|_| {
+                requests += 1;
+                assert!(requests <= 2, "unexpected continuation: {corpus}");
+                Ok(if requests == 1 {
+                    decoded.clone()
+                } else {
+                    serde_json::from_value::<davinci_ai::AssistantMessage>(json!({
+                        "id":"done","role":"assistant","model":"fixture",
+                        "content":[{"type":"text","text":"done"}],"stopReason":"stop"
+                    }))
+                    .unwrap()
+                })
+            })
+            .unwrap();
+        assert!(!root.path().join("unsafe.txt").exists(), "{corpus}");
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, davinci_agent::AgentEvent::ToolExecutionStart { .. })),
+            "{corpus}"
+        );
+    }
 }
 
 #[test]

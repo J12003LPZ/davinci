@@ -117,6 +117,17 @@ pub struct NativeResponsesOutput {
     pub terminal_event_type: String,
 }
 
+/// Providers may omit an item status, but an explicit unfinished or malformed
+/// status must not establish either an executable call or a replay prefix.
+pub(crate) fn unfinished_tool_item(item: &Value) -> bool {
+    matches!(
+        item.get("type").and_then(Value::as_str),
+        Some("function_call" | "custom_tool_call")
+    ) && item
+        .get("status")
+        .is_some_and(|status| status.as_str() != Some("completed"))
+}
+
 impl NativeResponsesOutput {
     /// Extract a lossless terminal Responses output from raw SSE/WebSocket
     /// event payloads. Failed, incomplete, or unterminated streams cannot
@@ -150,9 +161,11 @@ impl NativeResponsesOutput {
             .as_ref()
             .and_then(|response| response.get("output"))
             .and_then(Value::as_array)
-            .filter(|items| !items.is_empty())
             .cloned()
             .unwrap_or_else(|| completed_output_items(events));
+        if output_items.iter().any(unfinished_tool_item) {
+            return None;
+        }
 
         Some(Self {
             response_id,
@@ -175,6 +188,9 @@ impl NativeResponsesOutput {
             .and_then(Value::as_array)
             .cloned()
             .unwrap_or_default();
+        if output_items.iter().any(unfinished_tool_item) {
+            return None;
+        }
         if output_items.is_empty() && response.get("id").is_none() {
             return None;
         }
@@ -374,11 +390,10 @@ impl ResponsesLedger {
                         );
                         match kind {
                             crate::responses_tools::ResponsesToolWireKind::Custom => {
-                                let input = crate::responses_tools::custom_tool_call_arguments(
-                                    arguments,
-                                )
-                                .unwrap_or_default()
-                                .to_string();
+                                let input =
+                                    crate::responses_tools::custom_tool_call_arguments(arguments)
+                                        .unwrap_or_default()
+                                        .to_string();
                                 ledger.append_item(ResponsesItem::CustomToolCall {
                                     id: Some(id.clone()),
                                     call_id: call_id.to_string(),
@@ -501,6 +516,51 @@ mod tests {
             "output": []
         });
         assert!(NativeResponsesOutput::from_response_value(&response).is_none());
+    }
+
+    #[test]
+    fn empty_terminal_output_replaces_finished_native_items() {
+        let events = [
+            serde_json::json!({"type":"response.output_item.done","output_index":0,
+                "item":{"type":"custom_tool_call","id":"item","call_id":"call",
+                    "name":"apply_patch","input":"patch"}}),
+            serde_json::json!({"type":"response.completed",
+                "response":{"id":"resp","status":"completed","output":[]}}),
+        ];
+        let native = NativeResponsesOutput::from_events(&events).unwrap();
+        assert!(native.output_items.is_empty());
+    }
+
+    #[test]
+    fn unfinished_tool_items_cannot_establish_native_continuation() {
+        for kind in ["function_call", "custom_tool_call"] {
+            for status in [
+                Value::Null,
+                "incomplete".into(),
+                "in_progress".into(),
+                "failed".into(),
+            ] {
+                let item = serde_json::json!({"type":kind,"id":"item","call_id":"call",
+                    "name":"apply_patch","status":status,"input":"patch","arguments":"{}"});
+                let response =
+                    serde_json::json!({"id":"resp","status":"completed","output":[item]});
+                assert!(
+                    NativeResponsesOutput::from_response_value(&response).is_none(),
+                    "{response}"
+                );
+                assert!(
+                    NativeResponsesOutput::from_events(&[
+                        serde_json::json!({"type":"response.completed","response":response})
+                    ])
+                    .is_none(),
+                    "{response}"
+                );
+                assert!(NativeResponsesOutput::from_events(&[
+                    serde_json::json!({"type":"response.output_item.done","output_index":0,"item":item}),
+                    serde_json::json!({"type":"response.completed","response":{"id":"resp","status":"completed"}}),
+                ]).is_none(), "{item}");
+            }
+        }
     }
 
     #[test]
@@ -645,16 +705,13 @@ mod tests {
             "call_1|fc_1",
             crate::responses_tools::ResponsesToolWireKind::Custom,
         );
-        let mut result = ChatMessage::tool_result("call_1|fc_1", "apply_patch", "Applied patch", false);
+        let mut result =
+            ChatMessage::tool_result("call_1|fc_1", "apply_patch", "Applied patch", false);
         crate::responses_tools::set_single_wire_kind(
             &mut result.extra,
             crate::responses_tools::ResponsesToolWireKind::Custom,
         );
-        let messages = vec![
-            ChatMessage::text("user", "What is 2+2?"),
-            assistant,
-            result,
-        ];
+        let messages = vec![ChatMessage::text("user", "What is 2+2?"), assistant, result];
 
         let ledger = ResponsesLedger::from_messages("lin_migrated", &messages);
         assert_eq!(ledger.items.len(), 3);

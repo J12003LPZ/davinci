@@ -234,7 +234,9 @@ fn decoder_normalizes_custom_call_input_without_losing_unicode_or_order() {
             "output_index": 1,
             "item": {"type": "function_call", "id": "item-function", "call_id": "function-1", "name": "read", "arguments": "{\"path\":\"Cargo.toml\"}"}
         }),
-        json!({"type": "response.completed", "response": {"id": "resp-1", "status": "completed", "output": []}}),
+        // An omitted output uses completed-item fallback. An explicit empty
+        // array would authoritatively remove both calls.
+        json!({"type": "response.completed", "response": {"id": "resp-1", "status": "completed"}}),
     ];
     let mut decoder = ResponsesDecoder::new(&model);
     let mut stream_events = Vec::new();
