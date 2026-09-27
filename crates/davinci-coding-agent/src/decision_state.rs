@@ -929,9 +929,16 @@ mod tests {
 
     #[test]
     fn disabled_requirement_questions_do_not_consume_the_task_budget() {
-        let task = (0..8)
-            .map(|index| format!("Must satisfy requirement {index}: {}.\n", "x".repeat(430)))
-            .collect::<String>();
+        let mut task = String::new();
+        for index in 0..8 {
+            use std::fmt::Write as _;
+            writeln!(
+                &mut task,
+                "Must satisfy requirement {index}: {}.",
+                "x".repeat(430)
+            )
+            .expect("writing to String cannot fail");
+        }
         let state = DecisionState::from_task(&task);
         let request = state.request_selected(
             "effort",

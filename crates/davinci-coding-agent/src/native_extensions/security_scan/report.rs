@@ -142,9 +142,17 @@ pub fn render(value: &Value, format: ReportFormat) -> Result<String, String> {
             let locations: Vec<_> = members.iter().flat_map(|member| member["claim"]["locations"].as_array().unwrap_or(&empty).iter().map(move |location| (*member, location))).map(|(member, location)| {
                 let path = location["path"].as_str().unwrap_or("");
                 let uri = if super::snapshot::relative_scope(path).is_ok() {
-                    path.bytes().map(|b| {
-                        if b.is_ascii_alphanumeric() || b"/-._~".contains(&b) { (b as char).to_string() } else { format!("%{b:02X}") }
-                    }).collect::<String>()
+                    let mut uri = String::with_capacity(path.len());
+                    for byte in path.bytes() {
+                        if byte.is_ascii_alphanumeric() || b"/-._~".contains(&byte) {
+                            uri.push(byte as char);
+                        } else {
+                            use std::fmt::Write as _;
+                            write!(&mut uri, "%{byte:02X}")
+                                .expect("writing to String cannot fail");
+                        }
+                    }
+                    uri
                 } else {
                     "omitted-invalid-path".into()
                 };
