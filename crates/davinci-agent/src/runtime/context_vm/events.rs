@@ -33,18 +33,19 @@ pub fn events_from_session_branch(
 ) -> Vec<ContextEvent> {
     davinci_session::branch_entries(entries, leaf_id)
         .into_iter()
-        .filter(|entry| {
-            matches!(
-                entry.entry_type.as_str(),
-                "message" | "custom_message" | "custom"
-            )
-        })
-        .filter_map(|entry| {
-            let value = entry.message.as_ref()?;
-            let message = serde_json::from_value::<ChatMessage>(value.clone()).ok()?;
-            event_from_message(&message, format!("session:{}", entry.id), entry.seq)
-        })
+        .filter_map(event_from_session_entry)
         .collect()
+}
+
+pub(super) fn event_from_session_entry(entry: &SessionEntry) -> Option<ContextEvent> {
+    let message = match entry.entry_type.as_str() {
+        "message" | "custom_message" => crate::entry_to_chat(entry)?,
+        // Older extensions may store a complete chat message in a custom
+        // entry. Metadata-only custom entries still have no provider content.
+        "custom" => serde_json::from_value(entry.message.as_ref()?.clone()).ok()?,
+        _ => return None,
+    };
+    event_from_message(&message, format!("session:{}", entry.id), entry.seq)
 }
 
 pub fn events_from_messages(messages: &[ChatMessage]) -> Vec<ContextEvent> {
@@ -71,6 +72,9 @@ pub(super) fn event_from_message(
     source_ref: String,
     seq: u64,
 ) -> Option<ContextEvent> {
+    if crate::is_legacy_verification_notice(message) {
+        return None;
+    }
     let visible_text = visible_text(message);
     if visible_text.is_empty() {
         return None;

@@ -3434,13 +3434,7 @@ impl Agent {
                     )
                 })?;
         }
-        // Older builds persisted harness notices as assistant messages. Keep
-        // the original journal intact, but do not replay those notices to the
-        // provider or let them replace the answer in copy/print consumers.
-        let messages = messages_from_session(&session)
-            .into_iter()
-            .filter(|message| !message.extra.contains_key("davinciVerificationStatus"))
-            .collect::<Vec<_>>();
+        let messages = messages_from_session(&session);
         if session_changed {
             self.runtime_environment = None;
             self.environment_key = None;
@@ -3869,7 +3863,11 @@ pub(crate) fn custom_message_from_session_entry(entry: &SessionEntry) -> Option<
     })
 }
 
-fn entry_to_chat(entry: &SessionEntry) -> Option<ChatMessage> {
+pub(crate) fn is_legacy_verification_notice(message: &ChatMessage) -> bool {
+    message.extra.contains_key("davinciVerificationStatus")
+}
+
+pub(crate) fn entry_to_chat(entry: &SessionEntry) -> Option<ChatMessage> {
     match entry.entry_type.as_str() {
         "compaction" => {
             let summary = entry.extra.get("summary")?.as_str()?;
@@ -3886,6 +3884,10 @@ fn entry_to_chat(entry: &SessionEntry) -> Option<ChatMessage> {
         }
         _ => None,
     }
+    // Older builds persisted harness notices as assistant messages. Keep the
+    // original journal intact, but exclude them at shared history conversion
+    // so reopening, tree navigation, and Context VM cannot replay them.
+    .filter(|message| !is_legacy_verification_notice(message))
 }
 
 fn messages_from_session(session: &JsonlSession) -> Vec<ChatMessage> {

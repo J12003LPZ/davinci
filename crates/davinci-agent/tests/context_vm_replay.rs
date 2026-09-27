@@ -117,6 +117,55 @@ fn branch_replay_follows_the_active_leaf_and_ignores_siblings() {
 }
 
 #[test]
+fn durable_custom_messages_replay_and_recover_the_same_content_as_transient_history() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut agent = davinci_agent::Agent::new("system");
+    agent.session =
+        Some(davinci_session::JsonlSession::create(directory.path(), "custom", None).unwrap());
+    agent.record_custom_message(&serde_json::json!({
+        "customType": "fixture.string",
+        "content": "Persisted string context",
+        "display": false,
+    }));
+    agent.record_custom_message(&serde_json::json!({
+        "customType": "fixture.blocks",
+        "content": [{"type":"text", "text":"Persisted block context"}],
+        "display": false,
+    }));
+    let session = agent.session.as_ref().unwrap();
+    assert!(session.entries.iter().all(|entry| entry.message.is_none()));
+    let transient = events_from_messages(&agent.messages);
+    let durable = events_from_session_branch(&session.entries, session.leaf_id.as_deref());
+    assert_eq!(durable.len(), 2);
+    for (transient, durable) in transient.iter().zip(&durable) {
+        assert_eq!(transient.visible_text, durable.visible_text);
+        assert_eq!(transient.content_hash, durable.content_hash);
+        assert_eq!(durable.kind, ContextEventKind::Custom);
+    }
+    let runtime = ContextVmRuntime::new(ContextVmConfig::default(), CacheRuntime::default());
+    runtime.bind_session_source(session.path.clone(), session.header.id.clone());
+    let image = runtime
+        .compile(&durable, &ContextPacket::empty(), 100_000)
+        .unwrap();
+    assert_eq!(runtime.resident_source_bytes(), 0);
+    for event in durable {
+        assert!(image.messages.iter().any(
+            |message| davinci_ai::content_text(&message.content).contains(&event.visible_text)
+        ));
+        assert_eq!(
+            runtime
+                .retrieve(&RetrieveContextRequest {
+                    source_ref: Some(event.source_ref),
+                    ..Default::default()
+                })
+                .unwrap()
+                .content,
+            event.visible_text
+        );
+    }
+}
+
+#[test]
 fn replay_is_repeatable_and_never_projects_thinking() {
     let messages = vec![
         ChatMessage::text("user", "visible request"),

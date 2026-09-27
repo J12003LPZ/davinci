@@ -41,6 +41,10 @@ fallback and late results do not rewrite a prepared turn.
 Environment data stays in the dynamic runtime section. Cache-sensitive routes
 append it to conversation context and retain byte-identical stable provider
 instructions. Other routes retain their existing system-prompt placement.
+Appended context uses the same durable custom-message decoding for ordinary
+history, active Context VM projection, and exact source recovery after resume.
+It remains dynamic context under the provider budget rather than becoming a
+stable instruction prefix.
 Custom replacement prompts receive no built-in environment or visual policy.
 Within this experiment, visual-backend guidance is conditional on visual task
 relevance or a visual verification requirement. The default retains the
@@ -63,4 +67,5 @@ Notices do not enter the assistant transcript, provider input, or persisted
 chat. Consequently final-answer and `/copy` selection continue to use the
 model's text. When reopening a session written by an older build, messages
 marked `davinciVerificationStatus` are omitted from active conversation
-history. The original session journal is preserved.
+history, including branch navigation and Context VM provider projection. The
+original session journal is preserved.

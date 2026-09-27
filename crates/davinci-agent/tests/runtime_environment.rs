@@ -2,6 +2,7 @@ use davinci_agent::prompt::environment::{
     capture_environment, ListingStatus, ToolShell, ENVIRONMENT_MAX_BYTES, ENVIRONMENT_SCAN_LIMIT,
 };
 use davinci_agent::prompt::manifest::estimate_tokens_from_str;
+use davinci_agent::runtime::context_vm::{ContextVmMode, RetrieveContextRequest};
 use davinci_agent::turn_context::TurnContextPlacement;
 use davinci_agent::{Agent, PromptProfile};
 use std::fs;
@@ -217,6 +218,104 @@ fn unchanged_snapshot_does_not_repeat_and_resume_reintroduces_removed_context() 
         .unwrap()
         .top_level_entries
         .contains(&"new-file".into()));
+}
+
+#[test]
+fn active_vm_preserves_saved_environment_context_and_exact_source_recovery() {
+    let dir = tempfile::tempdir().unwrap();
+    fs::write(dir.path().join("first-marker.py"), "").unwrap();
+    let session = davinci_session::JsonlSession::create(dir.path(), "environment", None).unwrap();
+    let path = session.path.clone();
+    let mut current = agent(dir.path(), TurnContextPlacement::Appended);
+    current.load_from_session(session).unwrap();
+    current.set_context_vm_mode(ContextVmMode::Active);
+    current.prompt_user_with("Inspect this workspace", &[]);
+    current.commit_turn_context(None);
+    let instructions = current.system_prompt.clone();
+    let stable = current
+        .prompt_manifest
+        .as_ref()
+        .unwrap()
+        .stable_sha256
+        .clone();
+    let image = current.prepared_context_image().unwrap();
+    let provider = serde_json::to_string(&image.messages).unwrap();
+    assert_eq!(provider.matches("<environment>").count(), 1);
+    assert_eq!(provider.matches("<runtime_state>").count(), 1);
+    assert_eq!(provider.matches("</runtime_state>").count(), 1);
+    assert!(provider.contains("first-marker.py"));
+    let snapshot_entry = image
+        .entries
+        .iter()
+        .find(|entry| entry.content.contains("<environment>"))
+        .unwrap();
+    assert!(!snapshot_entry.stable_for_cache);
+    assert!(
+        snapshot_entry.mandatory,
+        "the newest runtime context is budgeted as required"
+    );
+    let source_ref = snapshot_entry.source_ref.clone();
+    let recovered = current
+        .runtime
+        .as_ref()
+        .unwrap()
+        .context_vm
+        .retrieve(&RetrieveContextRequest {
+            source_ref: Some(source_ref.clone()),
+            ..Default::default()
+        })
+        .unwrap();
+    assert!(recovered.content.contains("first-marker.py"));
+    assert!(recovered.content.contains("<environment>"));
+    drop(current);
+
+    let mut resumed = agent(dir.path(), TurnContextPlacement::Appended);
+    resumed
+        .load_from_session(davinci_session::JsonlSession::open(&path).unwrap())
+        .unwrap();
+    resumed.set_context_vm_mode(ContextVmMode::Active);
+    let image = resumed.prepared_context_image().unwrap();
+    assert_eq!(
+        serde_json::to_string(&image.messages)
+            .unwrap()
+            .matches("<environment>")
+            .count(),
+        1
+    );
+    assert!(resumed
+        .runtime
+        .as_ref()
+        .unwrap()
+        .context_vm
+        .retrieve(&RetrieveContextRequest {
+            source_ref: Some(source_ref),
+            ..Default::default()
+        })
+        .unwrap()
+        .content
+        .contains("first-marker.py"));
+
+    fs::write(dir.path().join("second-marker.py"), "").unwrap();
+    resumed.prompt_user_with("Inspect this workspace again", &[]);
+    resumed.commit_turn_context(None);
+    let image = resumed.prepared_context_image().unwrap();
+    let latest = image
+        .entries
+        .iter()
+        .rev()
+        .find(|entry| entry.content.contains("<environment>"))
+        .unwrap();
+    assert!(latest.content.contains("second-marker.py"));
+    assert!(!latest.stable_for_cache);
+    assert_eq!(latest.content.matches("<runtime_state>").count(), 1);
+    assert_eq!(resumed.system_prompt, instructions);
+    assert_eq!(
+        resumed.prompt_manifest.as_ref().unwrap().stable_sha256,
+        stable
+    );
+    let before = image.messages.clone();
+    resumed.commit_turn_context(None);
+    assert_eq!(resumed.prepared_context_image().unwrap().messages, before);
 }
 
 #[test]

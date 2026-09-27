@@ -30,21 +30,17 @@ impl Agent {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use davinci_ai::{AssistantMessage, ContentBlock, StopReason};
+    use davinci_ai::AssistantMessage;
 
     fn reply(_: &Agent) -> Result<AssistantMessage, String> {
-        Ok(AssistantMessage {
-            extra: Default::default(),
-            id: "answer".into(),
-            role: "assistant".into(),
-            content: vec![ContentBlock::Text {
-                text: "The model's complete answer.".into(),
-            }],
-            model: "fixture".into(),
-            usage: None,
-            stop_reason: Some(StopReason::Stop),
-            error_message: None,
-        })
+        serde_json::from_value(serde_json::json!({
+            "id": "answer",
+            "role": "assistant",
+            "content": [{"type": "text", "text": "The model's complete answer."}],
+            "model": "fixture",
+            "stopReason": "stop",
+        }))
+        .map_err(|error| error.to_string())
     }
 
     #[test]
@@ -98,6 +94,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut old = Agent::new("test");
         old.session = Some(crate::JsonlSession::create(dir.path(), "old-notice", None).unwrap());
+        old.prompt_user_with("Update the parser", &[]);
         old.record_assistant("Saved model answer");
         let mut notice = davinci_ai::ChatMessage::text("assistant", "Legacy verification notice");
         notice.extra.insert(
@@ -114,11 +111,17 @@ mod tests {
             ))
             .unwrap();
         old.messages.push(notice);
+        assert!(
+            crate::runtime::context_vm::events_from_messages(&old.messages)
+                .iter()
+                .all(|event| !event.visible_text.contains("Legacy verification notice"))
+        );
         assert_eq!(
             old.last_assistant_text().as_deref(),
             Some("Saved model answer")
         );
         let path = old.session.as_ref().unwrap().path.clone();
+        let notice_id = old.session.as_ref().unwrap().leaf_id.clone().unwrap();
         drop(old);
         let mut resumed = Agent::new("test");
         resumed
@@ -131,6 +134,28 @@ mod tests {
         assert!(!serde_json::to_string(&resumed.messages_for_provider())
             .unwrap()
             .contains("Legacy verification notice"));
+        resumed.set_context_vm_mode(crate::runtime::context_vm::ContextVmMode::Active);
+        let image = resumed.prepared_context_image().unwrap();
+        let provider = serde_json::to_string(&image.messages).unwrap();
+        assert!(provider.contains("Saved model answer"));
+        assert!(!provider.contains("Legacy verification notice"));
+        resumed.set_context_vm_mode(crate::runtime::context_vm::ContextVmMode::Off);
+        resumed
+            .navigate_tree_entry(&notice_id, false, None, false, 16_384)
+            .unwrap();
+        assert_eq!(
+            resumed.last_assistant_text().as_deref(),
+            Some("Saved model answer")
+        );
+        assert!(!serde_json::to_string(&resumed.messages_for_provider())
+            .unwrap()
+            .contains("Legacy verification notice"));
+        resumed.set_context_vm_mode(crate::runtime::context_vm::ContextVmMode::Active);
+        assert!(
+            !serde_json::to_string(&resumed.prepared_context_image().unwrap().messages)
+                .unwrap()
+                .contains("Legacy verification notice")
+        );
         assert!(std::fs::read_to_string(path)
             .unwrap()
             .contains("Legacy verification notice"));
