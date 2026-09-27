@@ -2749,8 +2749,11 @@ fn complete_prompt_with_host(
         host.emit(ExtensionEvent::TurnEnd);
         host.emit(ExtensionEvent::AgentEnd);
         host.emit(ExtensionEvent::AgentSettled);
+        // Keep bounded conversation evidence for the learning reviewer, but do
+        // not persist raw user/assistant transcript chunks into vector memory.
+        // Durable memory is written only after the learning pipeline promotes
+        // a typed, high-confidence claim.
         let memory_messages = agent_memory_messages(agent);
-        let _ = host.native_index_messages(&memory_messages);
 
         let settings = load_merged_settings(&default_agent_dir(), &agent.cwd);
         let trusted = is_trusted(&settings, &agent.cwd, parsed.project_trust_override);
