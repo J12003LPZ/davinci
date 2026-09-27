@@ -5,7 +5,6 @@
 //! cannot make an otherwise healthy agent turn fail.
 
 use davinci_agent::runtime::context::{ContextItem, ContextRequest, ContextSource};
-use davinci_agent::runtime::events::AgentKind;
 use davinci_agent::{ToolError, ToolResult};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -837,7 +836,7 @@ fn source_anchor_current(record: &MemoryRecord, cwd: &Path) -> bool {
     record
         .source_state_hash
         .as_ref()
-        .is_none_or(|expected| expected == &current)
+        .map_or(true, |expected| expected == &current)
 }
 
 fn record_matches_scope(
@@ -1658,10 +1657,17 @@ impl VectorMemory {
                         agent_profile_name,
                         memory_scope,
                     )
-                    && matches!(record.kind, MemoryKind::Constraint | MemoryKind::Decision)
-                    && (record.source == "user"
-                        || record.source == "user_decision"
-                        || record.confidence.unwrap_or(0.0) >= 0.80)
+                    && match record.kind {
+                        MemoryKind::Constraint => {
+                            record.source == "user"
+                                || record.source == "user_decision"
+                                || record.confidence.unwrap_or(0.0) >= 0.80
+                        }
+                        MemoryKind::Decision => {
+                            record.source == "user" || record.source == "user_decision"
+                        }
+                        _ => false,
+                    }
                     && source_anchor_current(record, &self.cwd)
             })
             .collect::<Vec<_>>();
@@ -1751,7 +1757,12 @@ impl VectorMemory {
         if !self.config.enabled || !self.config.automatic_retrieval || query.trim().is_empty() {
             return Vec::new();
         }
-        let total_cap = token_cap.min(self.config.max_injected_tokens);
+        // Reserve a small fixed allowance for the enclosing data tags and
+        // per-line metadata so the rendered block remains inside the configured
+        // model-visible budget rather than merely fitting its raw claim text.
+        let total_cap = token_cap
+            .min(self.config.max_injected_tokens)
+            .saturating_sub(32);
         if total_cap == 0 {
             return Vec::new();
         }
@@ -1769,22 +1780,19 @@ impl VectorMemory {
             .iter()
             .map(|hit| hit.id.clone())
             .collect::<HashSet<_>>();
+        let mut recall_used = 0usize;
         for hit in self.automatic_recall_hits_scoped(query, agent_profile_name, memory_scope) {
             if seen_ids.contains(&hit.record.id) {
                 continue;
             }
             let text = redact_secrets(&hit.record.text);
             let estimated_tokens = (text.chars().count() + hit.record.id.len() + 8 + 3) / 4;
-            if estimated_tokens > recall_cap.saturating_sub(
-                results
-                    .iter()
-                    .skip_while(|existing| seen_ids.contains(&existing.id))
-                    .map(|existing| existing.estimated_tokens)
-                    .sum::<usize>(),
-            ) || estimated_tokens > total_cap.saturating_sub(used)
+            if estimated_tokens > recall_cap.saturating_sub(recall_used)
+                || estimated_tokens > total_cap.saturating_sub(used)
             {
                 continue;
             }
+            recall_used += estimated_tokens;
             used += estimated_tokens;
             seen_ids.insert(hit.record.id.clone());
             results.push(MemoryContextHit {
@@ -2761,13 +2769,74 @@ pub(crate) mod tests {
         memory
             .index_messages(&[MemoryMessage {
                 role: "user".into(),
-                content: "use the graph scheduler for lanes".into(),
+                content: "use graph_scheduler for lanes".into(),
             }])
             .unwrap();
-        assert!(memory.inject("graph scheduler lanes").is_none());
-        assert_eq!(memory.search("graph scheduler lanes", 5).len(), 1);
+        assert!(memory.inject("graph_scheduler lanes").is_none());
+        assert_eq!(memory.search("graph_scheduler lanes", 5).len(), 1);
         memory.config.automatic_retrieval = true;
-        assert!(memory.inject("graph scheduler lanes").is_some());
+        assert!(memory.inject("graph_scheduler lanes").is_some());
+    }
+
+    #[test]
+    fn automatic_retrieval_abstains_without_a_code_anchor() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut memory = VectorMemory::new(directory.path().to_path_buf());
+        memory.config.promotion = false;
+        memory.mark_dense_offline();
+        memory
+            .index_messages(&[MemoryMessage {
+                role: "assistant".into(),
+                content: "The language server freezes during initialization".into(),
+            }])
+            .unwrap();
+
+        assert_eq!(memory.search("language server initialization", 5).len(), 1);
+        assert!(memory.inject("language server initialization").is_none());
+    }
+
+    #[test]
+    fn high_confidence_constraints_are_pinned_without_query_similarity() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut memory = VectorMemory::new(directory.path().to_path_buf());
+        memory.mark_dense_offline();
+        memory
+            .index_learning_memory(
+                "Keep Rust 1.83 compatibility for this repository",
+                MemoryKind::Constraint,
+                1.0,
+                0.95,
+                "session",
+                1,
+                Some("verified"),
+            )
+            .unwrap();
+
+        let injected = memory.inject("refactor graph_scheduler").unwrap();
+        assert!(injected.contains("Rust 1.83"));
+    }
+
+    #[test]
+    fn stale_source_backed_constraints_are_not_auto_injected() {
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(directory.path().join("src")).unwrap();
+        std::fs::write(directory.path().join("src/auth.rs"), "v1").unwrap();
+        let mut memory = VectorMemory::new(directory.path().to_path_buf());
+        memory.mark_dense_offline();
+        memory
+            .index_learning_memory(
+                "Constraint: preserve src/auth.rs parser behavior",
+                MemoryKind::Constraint,
+                1.0,
+                0.95,
+                "session",
+                1,
+                Some("verified"),
+            )
+            .unwrap();
+        std::fs::write(directory.path().join("src/auth.rs"), "v2").unwrap();
+
+        assert!(memory.inject("refactor graph_scheduler").is_none());
     }
 
     #[test]
