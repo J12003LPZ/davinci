@@ -244,11 +244,11 @@ impl RequirementLedger {
 
 fn requirement_id(wording: &str) -> String {
     let digest = Sha256::digest(wording.as_bytes());
-    let short = digest
-        .iter()
-        .take(6)
-        .map(|byte| format!("{byte:02x}"))
-        .collect::<String>();
+    let mut short = String::with_capacity(12);
+    for byte in digest.iter().take(6) {
+        use std::fmt::Write as _;
+        write!(&mut short, "{byte:02x}").expect("writing to String cannot fail");
+    }
     format!("req-{short}")
 }
 

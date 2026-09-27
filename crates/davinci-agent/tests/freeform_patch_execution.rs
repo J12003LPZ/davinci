@@ -110,10 +110,12 @@ fn rejected_terminal_patch_calls_never_reach_agent_execution() {
     }
     for frames in cases {
         let root = tempdir().unwrap();
-        let corpus = frames
-            .iter()
-            .map(|frame| format!("data: {frame}\n\n"))
-            .collect::<String>();
+        let mut corpus = String::new();
+        for frame in &frames {
+            corpus.push_str("data: ");
+            corpus.push_str(&frame.to_string());
+            corpus.push_str("\n\n");
+        }
         let decoded = davinci_ai::fixture_complete(&model, &[], &corpus);
         let mut agent = davinci_agent::Agent::new("terminal safety regression");
         agent.cwd = root.path().to_path_buf();
