@@ -4,7 +4,7 @@ Status: **authorized implementation and local validation complete; promotion and
 installed delivery remain explicitly out of scope**.
 
 The work is on branch `perf/request-efficiency` at local commit
-`c5b969eb`. The final candidate executable is frozen outside the repository at
+`a14a1e54`. The final candidate executable is frozen outside the repository at
 `C:\Users\sergi\davinci-bench-evidence\request-efficiency\checkpoints\f1-final-20260926\davinci.exe`.
 Its SHA-256 is
 `a90e8fced7b173da1068dced65d62e067f422a6773df54ddfbe5d9c8472b570e`; its
