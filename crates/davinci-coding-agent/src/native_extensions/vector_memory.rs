@@ -1674,7 +1674,12 @@ impl VectorMemory {
             right_confidence
                 .partial_cmp(&left_confidence)
                 .unwrap_or(Ordering::Equal)
-                .then_with(|| right.importance.partial_cmp(&left.importance).unwrap_or(Ordering::Equal))
+                .then_with(|| {
+                    right
+                        .importance
+                        .partial_cmp(&left.importance)
+                        .unwrap_or(Ordering::Equal)
+                })
                 .then_with(|| right.created_at.cmp(&left.created_at))
                 .then_with(|| left.id.cmp(&right.id))
         });
