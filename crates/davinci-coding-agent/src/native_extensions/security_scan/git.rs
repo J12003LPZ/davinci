@@ -32,6 +32,31 @@ fn run(root: &Path, args: &[&str]) -> Result<Vec<u8>, String> {
     run_interruptible(root, args, &|| false)
 }
 
+/// A committed fixture repository for sibling-module tests.
+#[cfg(test)]
+pub(super) fn fixture_commit(root: &Path) {
+    if !root.join(".git").exists() {
+        run(root, &["init", "-q"]).unwrap();
+    }
+    run(root, &["add", "--all"]).unwrap();
+    run(
+        root,
+        &[
+            "-c",
+            "user.name=Fixture",
+            "-c",
+            "user.email=fixture@example.invalid",
+            "-c",
+            "commit.gpgsign=false",
+            "commit",
+            "--no-verify",
+            "-qm",
+            "fixture",
+        ],
+    )
+    .unwrap();
+}
+
 pub(super) fn run_interruptible(
     root: &Path,
     args: &[&str],

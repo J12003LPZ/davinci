@@ -543,11 +543,18 @@ pub fn review_briefing(input: &ReviewInput<'_>) -> String {
                 crate::native_extensions::ecosystem::verification::SecurityVerification::NotRequired => {
                     "- Security scan: not required for this change".to_string()
                 }
-                crate::native_extensions::ecosystem::verification::SecurityVerification::Passed { scan_id } => {
-                    format!("- Security scan: PASSED (scan ID: {scan_id})")
+                crate::native_extensions::ecosystem::verification::SecurityVerification::Passed { scan_id, note } => {
+                    match note {
+                        Some(note) => format!("- Security scan: PASSED (scan ID: {scan_id}); {note}"),
+                        None => format!("- Security scan: PASSED (scan ID: {scan_id})"),
+                    }
                 }
-                crate::native_extensions::ecosystem::verification::SecurityVerification::Failed { scan_id, blockers } => {
-                    format!("- Security scan: FAILED with {blockers} blocker(s) (scan ID: {scan_id})")
+                crate::native_extensions::ecosystem::verification::SecurityVerification::Failed { scan_id, blockers, details } => {
+                    let mut text = format!("- Security scan: FAILED with {blockers} blocker(s) (scan ID: {scan_id})");
+                    for detail in details {
+                        text.push_str(&format!("\n  - {detail}"));
+                    }
+                    text
                 }
                 crate::native_extensions::ecosystem::verification::SecurityVerification::Unavailable { reason } => {
                     format!("- Security scan: UNAVAILABLE ({reason})")
@@ -588,11 +595,19 @@ pub fn revision_notes_from(
     if let Some(crate::native_extensions::ecosystem::verification::SecurityVerification::Failed {
         scan_id,
         blockers,
+        details,
     }) = security
     {
-        notes.push(format!(
-            "Security verification failed: {blockers} blocker(s) found (scan ID: {scan_id}). Clean sensitive credentials, dangerous evaluations, or forbidden patterns before proceeding."
-        ));
+        let mut note = format!(
+            "Security verification failed: {blockers} blocker(s) found in lines this change added (scan ID: {scan_id}). Remove or fix each one before proceeding:"
+        );
+        if details.is_empty() {
+            note.push_str("\n- (no per-line detail was recorded; rerun the security gate)");
+        }
+        for detail in details {
+            note.push_str(&format!("\n- {detail}"));
+        }
+        notes.push(note);
     }
     if let Some(review) = review.filter(|review| review.verdict == Verdict::ChangesRequired) {
         for issue in &review.issues {
@@ -746,11 +761,13 @@ mod tests {
         let sec = crate::native_extensions::ecosystem::verification::SecurityVerification::Failed {
             scan_id: "scan-99".into(),
             blockers: 2,
+            details: vec!["src/auth.rs:3 secret.api-key - API-key-shaped credential".into()],
         };
         let notes = revision_notes_from(None, None, Some(&sec));
         assert!(notes.contains("Security verification failed"));
         assert!(notes.contains("2 blocker(s)"));
         assert!(notes.contains("scan-99"));
+        assert!(notes.contains("src/auth.rs:3 secret.api-key"));
     }
 
     #[test]

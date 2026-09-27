@@ -147,18 +147,6 @@ pub fn create_run_dir(cwd: &Path, run_id: &str) -> std::io::Result<()> {
     Ok(())
 }
 
-/// Delete the oldest runs beyond [`RETAINED_RUNS`]. Only runs whose persisted
-/// phase is terminal are touched: a live run — including one owned by another
-/// process — never is, whatever its age.
-#[allow(dead_code)]
-pub fn restored_worker_state(recorded: &str, live_identity_verified: bool) -> &str {
-    if recorded == "running" && !live_identity_verified {
-        "reconciliation_required"
-    } else {
-        recorded
-    }
-}
-
 #[allow(dead_code)]
 pub fn pin_run(cwd: &Path, run_id: &str) -> std::io::Result<()> {
     let pin_file = run_dir(cwd, run_id).join(".pinned");
@@ -185,6 +173,9 @@ pub fn read_ancestor_run(cwd: &Path, run_id: &str) -> Option<String> {
     fs::read_to_string(file).ok().map(|s| s.trim().to_string())
 }
 
+/// Delete the oldest runs beyond [`RETAINED_RUNS`]. Only runs whose persisted
+/// phase is terminal are touched: a live run — including one owned by another
+/// process — never is, whatever its age.
 fn prune_finished_runs(cwd: &Path) {
     let runs = list_runs(cwd);
     if runs.len() <= RETAINED_RUNS {
@@ -531,7 +522,8 @@ pub fn write_task_attempt(
     atomic_write(&path, &content)
 }
 
-#[allow(dead_code)]
+/// Test inspection of a persisted attempt record.
+#[cfg(test)]
 pub fn read_task_attempt(
     cwd: &Path,
     run_id: &str,
@@ -590,22 +582,6 @@ pub fn write_task_context_packet(
     let content = serde_json::to_vec_pretty(packet)
         .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
     atomic_write(&path, &content)
-}
-
-#[allow(dead_code)]
-pub fn read_task_context_packet(
-    cwd: &Path,
-    run_id: &str,
-    task_id: &str,
-) -> Option<crate::native_extensions::ecosystem::ContextPacket> {
-    if !is_safe_run_id(run_id) {
-        return None;
-    }
-    let path = run_dir(cwd, run_id)
-        .join("artifacts")
-        .join(format!("{task_id}.context.json"));
-    let raw = fs::read_to_string(path).ok()?;
-    serde_json::from_str(&raw).ok()
 }
 
 pub fn load_run(cwd: &Path, run_id: &str) -> Option<GraphRun> {
@@ -1213,16 +1189,6 @@ mod tests {
     }
 
     #[test]
-    fn f13_restart_never_resurrects_worker() {
-        assert_eq!(
-            restored_worker_state("running", false),
-            "reconciliation_required"
-        );
-        assert_eq!(restored_worker_state("succeeded", false), "succeeded");
-        assert_eq!(restored_worker_state("running", true), "running");
-    }
-
-    #[test]
     fn f13_crash_before_after_pause_commit() {
         let dir = tempdir().unwrap();
         let run_id = new_run_id();
@@ -1396,6 +1362,7 @@ mod tests {
             cache_write: 100,
             cost_usd: 0.045,
             turns: 1,
+            ..crate::native_extensions::graph::types::WorkerUsage::default()
         };
         task.status = crate::native_extensions::graph::types::TaskStatus::Failed;
         run.tasks.push(task);

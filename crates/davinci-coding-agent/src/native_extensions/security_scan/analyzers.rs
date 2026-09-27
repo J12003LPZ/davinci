@@ -41,6 +41,10 @@ impl AnalyzerOutcome {
     }
 }
 
+/// The host provisions the analyzer; settings only enable it.
+const NOT_PROVISIONED: &str = "cargo-audit is not provisioned: set DAVINCI_SECURITY_CARGO_AUDIT to an absolute cargo-audit executable and DAVINCI_SECURITY_ADVISORY_DB to a local RustSec advisory database";
+const EXECUTABLE_NOT_PROVISIONED: &str = "cargo-audit executable is not provisioned: DAVINCI_SECURITY_CARGO_AUDIT must name an absolute, existing cargo-audit file";
+
 pub fn host_plan_from_env() -> Option<Result<CargoAuditPlan, String>> {
     let executable = std::env::var_os("DAVINCI_SECURITY_CARGO_AUDIT")?;
     let database = std::env::var_os("DAVINCI_SECURITY_ADVISORY_DB")?;
@@ -86,7 +90,7 @@ fn cargo_audit_check(
         return limitation("snapshot has no Cargo.lock");
     };
     let plan = match host_plan_from_env() {
-        None => return limitation("cargo-audit executable is not provisioned"),
+        None => return limitation(NOT_PROVISIONED),
         Some(Err(reason)) => return limitation(&reason),
         Some(Ok(plan)) => plan,
     };
@@ -187,7 +191,7 @@ impl Drop for IsolatedDir {
 
 fn provisioned_executable(path: &Path, snapshot_root: &Path) -> Result<PathBuf, String> {
     if !path.is_absolute() || !path.is_file() {
-        return Err("cargo-audit executable is not provisioned".into());
+        return Err(EXECUTABLE_NOT_PROVISIONED.into());
     }
     let extension = path
         .extension()
@@ -346,6 +350,29 @@ mod tests {
     use std::fs;
     use std::time::SystemTime;
 
+    #[test]
+    fn security_analyzer_limitation_names_its_provisioning_variables() {
+        if std::env::var_os("DAVINCI_SECURITY_CARGO_AUDIT").is_some() {
+            return;
+        }
+        let mut snapshot = super::super::snapshot::Snapshot::default();
+        snapshot.files.insert(
+            "Cargo.lock".into(),
+            super::super::snapshot::SourceFile {
+                hash: String::new(),
+                text: "version = 3\n".into(),
+            },
+        );
+        let config = super::super::config::ScanConfig {
+            analyzers: vec!["cargo-audit".into()],
+            ..Default::default()
+        };
+        let check = cargo_audit_check(&config, Path::new("."), &snapshot, &|| false);
+        let reason = check["reason"].as_str().unwrap();
+        assert!(reason.contains("DAVINCI_SECURITY_CARGO_AUDIT"), "{reason}");
+        assert!(reason.contains("DAVINCI_SECURITY_ADVISORY_DB"), "{reason}");
+    }
+
     fn stub_source() -> &'static str {
         r#"
 fn main() {
@@ -465,7 +492,7 @@ fn main() {
         let outcome = audit_lockfile(&plan, &snapshot, &lock, &|| false);
         assert_eq!(
             outcome,
-            AnalyzerOutcome::Limitation("cargo-audit executable is not provisioned".into())
+            AnalyzerOutcome::Limitation(EXECUTABLE_NOT_PROVISIONED.into())
         );
         assert!(!dir.path().join("cargo-audit").exists());
         assert!(!dir.path().join("cargo-audit.exe").exists());

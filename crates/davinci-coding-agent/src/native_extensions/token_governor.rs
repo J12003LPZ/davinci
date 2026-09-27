@@ -987,11 +987,7 @@ impl Default for TokenGovernor {
 impl TokenGovernor {
     pub fn new(session_key: impl Into<String>, config: TokenGovernorConfig) -> Self {
         let session_key = session_key.into();
-        let store = config
-            .store_dir
-            .as_ref()
-            .map(|root| OutputStore::new(root.join("outputs").join(&session_key)))
-            .unwrap_or_else(|| OutputStore::for_session(&session_key));
+        let store = Self::store_for(&config, &session_key);
         Self {
             store,
             session_key,
@@ -1043,6 +1039,35 @@ impl TokenGovernor {
         let mut governor = Self::new(session_key, config);
         governor.store = store;
         governor
+    }
+
+    fn store_for(config: &TokenGovernorConfig, session_key: &str) -> OutputStore {
+        config
+            .store_dir
+            .as_ref()
+            .map(|root| {
+                OutputStore::new(root.join("outputs").join(sanitize_component(session_key)))
+            })
+            .unwrap_or_else(|| OutputStore::for_session(session_key))
+    }
+
+    /// Re-key the output store to `session_key`, the session this governor
+    /// now serves. The product host is built before the session is known, so
+    /// every session used to share one store: `/governor-reset` deleted other
+    /// open sessions' outputs and the stale sweep never saw a sibling. A
+    /// resumed session keeps its id, so ids it stored earlier still resolve.
+    /// Returns whether the key changed; a change starts fresh ledgers and
+    /// sweeps stale siblings (including the old shared `runtime` store).
+    pub fn bind_session(&mut self, session_key: &str) -> bool {
+        if session_key.is_empty() || self.session_key == session_key {
+            return false;
+        }
+        self.session_key = session_key.to_string();
+        self.store = Self::store_for(&self.config, session_key);
+        self.stored.clear();
+        self.session_start();
+        let _ = self.sweep_stale_outputs();
+        true
     }
 
     /// Drop other sessions' stored outputs that have aged past the retention
@@ -2143,6 +2168,61 @@ mod tests {
         assert!(!old.exists());
         assert!(fresh.exists());
         assert!(live.root().exists());
+    }
+
+    fn session_governor(root: &Path, session: &str) -> TokenGovernor {
+        let mut governor = TokenGovernor::new(
+            "ephemeral-test",
+            TokenGovernorConfig {
+                store_dir: Some(root.to_path_buf()),
+                ..tiny_thresholds()
+            },
+        );
+        assert!(governor.bind_session(session));
+        governor
+    }
+
+    #[test]
+    fn bound_sessions_do_not_share_an_output_store() {
+        let dir = tempdir().unwrap();
+        let mut first = session_governor(dir.path(), "session-a");
+        let mut second = session_governor(dir.path(), "session-b");
+        assert_ne!(first.store.root(), second.store.root());
+        let stored = first.store.save("only in session a").unwrap();
+        assert!(first.retrieve(&json!({"id": stored.id})).is_ok());
+        assert!(second.retrieve(&json!({"id": stored.id})).is_err());
+        // Rebinding the same id (a resumed session) keeps its store.
+        assert!(!first.bind_session("session-a"));
+        assert!(first.retrieve(&json!({"id": stored.id})).is_ok());
+    }
+
+    #[test]
+    fn reset_in_one_session_keeps_another_sessions_outputs() {
+        let dir = tempdir().unwrap();
+        let mut first = session_governor(dir.path(), "session-a");
+        let mut second = session_governor(dir.path(), "session-b");
+        let kept = second.store.save("session b output").unwrap();
+        first.store.save("session a output").unwrap();
+        first.reset();
+        assert!(!first.store.root().exists());
+        assert!(second.retrieve(&json!({"id": kept.id})).is_ok());
+    }
+
+    #[test]
+    fn binding_a_session_sweeps_a_stale_shared_runtime_store() {
+        let dir = tempdir().unwrap();
+        let legacy = dir.path().join("outputs").join("runtime");
+        fs::create_dir_all(&legacy).unwrap();
+        let file = legacy.join("out-000000000000.txt");
+        fs::write(&file, "x").unwrap();
+        fs::OpenOptions::new()
+            .write(true)
+            .open(&file)
+            .unwrap()
+            .set_modified(SystemTime::now() - Duration::from_secs(30 * 24 * 60 * 60))
+            .unwrap();
+        let _governor = session_governor(dir.path(), "session-a");
+        assert!(!legacy.exists());
     }
 
     #[test]

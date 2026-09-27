@@ -181,6 +181,20 @@ pub struct ExtensionHost {
     before_agent_start_system_prompt: Option<String>,
 }
 
+/// A per-process key for native state before (or without) a session.
+fn ephemeral_session_key() -> String {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_nanos())
+        .unwrap_or_default();
+    format!(
+        "ephemeral-{}-{nanos:x}-{}",
+        std::process::id(),
+        NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    )
+}
+
 impl ExtensionHost {
     pub fn load(agent_dir: &Path, names: &[String]) -> Self {
         let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
@@ -209,8 +223,10 @@ impl ExtensionHost {
             runtime_system_prompt: String::new(),
             unregistered_providers: Vec::new(),
             load_errors: Vec::new(),
+            // Unique until `bind_native_session` names the real session, so a
+            // `--no-session` run never shares a store with another process.
             native: Arc::new(Mutex::new(NativeExtensionHost::new_with_agent_dir(
-                "runtime",
+                ephemeral_session_key(),
                 cwd,
                 Some(agent_dir),
             ))),
@@ -483,7 +499,7 @@ impl ExtensionHost {
             native
                 .graph
                 .set_session_context(model, thinking, project_trusted);
-            native.learning.set_project_trusted(project_trusted);
+            native.learning().set_project_trusted(project_trusted);
         }
     }
 
@@ -499,6 +515,23 @@ impl ExtensionHost {
             .lock()
             .unwrap_or_else(|error| error.into_inner())
             .before_tool(name, args, state_hash)
+    }
+
+    /// Point session-scoped native state (the token governor's output store)
+    /// at `session_id`. `None` (`--no-session`) keeps the host's ephemeral key.
+    pub fn bind_native_session(&self, session_id: Option<&str>) {
+        let Some(session_id) = session_id.filter(|id| !id.is_empty()) else {
+            return;
+        };
+        let native = self
+            .native
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        native
+            .governor
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .bind_session(session_id);
     }
 
     /// Agent-level pruning/auto-compaction removed output from the model view.
@@ -545,8 +578,8 @@ impl ExtensionHost {
     /// Let this session's learning review turns with `model` in the
     /// background. Only long-lived sessions (interactive, RPC) call this.
     pub fn enable_live_learning(&self, cwd: &std::path::Path, model: Option<String>) {
-        if let Ok(mut native) = self.native.lock() {
-            native.learning.set_live_reviewer(cwd, model);
+        if let Ok(native) = self.native.lock() {
+            native.learning().set_live_reviewer(cwd, model);
         }
     }
 
@@ -594,6 +627,55 @@ impl ExtensionHost {
     pub fn set_project_trusted(&self, trusted: bool) {
         if let Ok(mut native) = self.native.lock() {
             native.set_learning_project_trusted(trusted);
+        }
+    }
+
+    /// Security transcript notices: a finished `/security-scan` (once) and
+    /// findings the session security watch reported.
+    pub fn drain_security_notices(&self) -> Vec<String> {
+        let security = match self.native.lock() {
+            Ok(native) => native.security.clone(),
+            Err(_) => return Vec::new(),
+        };
+        security.drain_notices()
+    }
+
+    /// Whether a settled turn may start a security watch review now.
+    pub fn security_watch_due(&self) -> bool {
+        self.native
+            .lock()
+            .is_ok_and(|native| native.security.watch_due())
+    }
+
+    /// Start the session security watch's background review when due. The
+    /// review runs on its own thread; the host lock is released first.
+    pub fn security_watch_settled_turn(&self) -> Result<bool, String> {
+        let security = self
+            .native
+            .lock()
+            .map_err(|err| err.to_string())?
+            .security
+            .clone();
+        security.watch_settled_turn()
+    }
+
+    /// Session start: resume this repository's interrupted scan, or say once
+    /// that it cannot resume.
+    pub fn resume_interrupted_security_scan(&self) -> Option<String> {
+        let mut security = self.native.lock().ok()?.security.clone();
+        security.resume_interrupted()
+    }
+
+    pub fn has_interrupted_security_scan(&self) -> bool {
+        self.native
+            .lock()
+            .is_ok_and(|native| native.security.has_interrupted_scan())
+    }
+
+    /// Session end: stop the explicit scan (it stays resumable) and the watch.
+    pub fn shutdown_security(&self) {
+        if let Ok(native) = self.native.lock() {
+            native.security.shutdown();
         }
     }
 
@@ -683,14 +765,11 @@ impl ExtensionHost {
         if !NATIVE_COMMANDS.iter().any(|command| *command == name) {
             return Ok(None);
         }
-        if matches!(
-            name,
-            "security-scan" | "sec-resume" | "sec-status" | "sec-report" | "sec-abort"
-        ) {
+        if matches!(name, "security-scan" | "sec-status" | "sec-report") {
             let security = {
                 let native = self.native.lock().map_err(|err| err.to_string())?;
                 (native.security.has_review()
-                    || matches!(name, "security-scan" | "sec-resume")
+                    || name == "security-scan"
                     || name == "sec-report" && !args.trim().is_empty())
                 .then(|| native.security.clone())
             };

@@ -1043,7 +1043,7 @@ pub fn session_stats_for_agent(agent: &Agent, model: Option<&Model>) -> Value {
         session.and_then(|item| item.leaf_id.as_deref()),
         model,
     );
-    serde_json::json!({
+    let mut stats_json = serde_json::json!({
         "sessionFile": session.map(|item| item.path.display().to_string()),
         "sessionId": session.map(|item| item.header.id.clone()).unwrap_or_default(),
         "userMessages": stats.user_messages,
@@ -1062,7 +1062,12 @@ pub fn session_stats_for_agent(agent: &Agent, model: Option<&Model>) -> Value {
         "contextUsage": context_usage,
         "runtime": agent.run_stats(),
         "openaiCache": openai_cache_status(agent, &stats),
-    })
+    });
+    // Present only while the Context VM is not `off`.
+    if let Some(vm) = crate::output::ContextVmStatusSummary::for_status(agent) {
+        stats_json["contextVm"] = serde_json::to_value(vm).unwrap_or(Value::Null);
+    }
+    stats_json
 }
 
 fn openai_cache_status(agent: &Agent, stats: &davinci_session::SessionUsageStats) -> Value {

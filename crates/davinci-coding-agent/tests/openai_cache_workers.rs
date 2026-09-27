@@ -150,6 +150,7 @@ fn streaming_and_final_worker_usage_are_counted_exactly_once() {
         cache_write: 10,
         cost_usd: 0.1,
         turns: 1,
+        ..WorkerUsage::default()
     };
     let final_usage = WorkerUsage {
         input: 175,
@@ -158,6 +159,7 @@ fn streaming_and_final_worker_usage_are_counted_exactly_once() {
         cache_write: 25,
         cost_usd: 0.25,
         turns: 2,
+        ..WorkerUsage::default()
     };
     let mut total = WorkerUsage::default();
     total.add(&WorkerUsage::delta(&first, &WorkerUsage::default()));

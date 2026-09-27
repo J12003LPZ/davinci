@@ -874,7 +874,6 @@ fn build_agent(parsed: &Args, session_dir: &Path, cwd: &Path) -> Result<Agent, S
         }
         run_nested_subagent(&parsed_for_worker, &cwd_for_worker, &mcp_for_worker, req)
     }));
-    apply_discovered_resources(parsed, &mut agent);
     if let Some(runtime) = worker_runtime {
         agent.set_runtime(runtime);
     }
@@ -884,6 +883,8 @@ fn build_agent(parsed: &Args, session_dir: &Path, cwd: &Path) -> Result<Agent, S
         // mode; davinci re-reads it to draw the rows.
         agent.restore_todos();
     }
+    // After the session: plugin SessionStart hooks receive its id.
+    apply_discovered_resources(parsed, &mut agent);
     startup_mark("session opened");
     agent.auto_compaction = settings.compaction_enabled();
     agent.auto_verify =
@@ -2167,6 +2168,12 @@ fn complete_prompt_with_host(
     existing_host: Option<Arc<Mutex<ExtensionHost>>>,
     stream_json: bool,
 ) -> (String, Vec<AgentEvent>) {
+    // A session switch (`/new`, `/resume`, fork, RPC) gives SessionStart hooks
+    // a new id; unchanged sessions hit the cache.
+    apply_plugin_session_start(
+        agent,
+        &davinci_coding_agent::plugins::active(&default_agent_dir()),
+    );
     let offline = parsed.offline
         || matches!(
             std::env::var("PI_OFFLINE").as_deref(),
@@ -2843,6 +2850,11 @@ fn complete_prompt_with_host(
             host.enable_live_learning(&agent.cwd, model);
         }
         let _ = host.native_review_settled_turn(learning_evidence);
+        // The session watches its own changes for security risks, like the
+        // learning reviewer: long-lived sessions only, in the background.
+        if !fresh_host {
+            security_watch_after_turn(parsed, agent, &host);
+        }
         if fresh_host {
             for notice in host.drain_learning_notifications() {
                 println!("{notice}");
@@ -3198,6 +3210,11 @@ fn run_print(parsed: &Args, agent: &mut Agent) -> Result<i32, String> {
             }
         }
     }
+    // Stdout carries the reply; Context VM notices go to stderr.
+    for notice in agent.take_context_vm_notices() {
+        eprintln!("{notice}");
+    }
+    print_plugin_notices();
     let (exit_code, error) = print_text_exit(&all_events);
     // A provider failure that the loop gave up on carries no error stop
     // reason of its own: it is the reply text. Report it as the failure it is.
@@ -3458,6 +3475,14 @@ fn run_rpc_with_host(
         .emit(ExtensionEvent::SessionStart);
     {
         let host = host.lock().unwrap_or_else(|err| err.into_inner());
+        if let Some(notice) = resume_security_scan_on_session_start(parsed, &runtime.agent, &host) {
+            emit_extension_ui_requests(&[
+                serde_json::json!({"op":"notify","message":notice,"type":"info"}),
+            ])?;
+        }
+    }
+    {
+        let host = host.lock().unwrap_or_else(|err| err.into_inner());
         for provider in host.registered_providers() {
             runtime
                 .models
@@ -3654,10 +3679,7 @@ fn run_rpc_with_host(
             let message = command.message.as_deref().unwrap_or("");
             if message.trim_start().starts_with('/') {
                 let (name, args) = parse_extension_command(message);
-                if matches!(
-                    name.as_str(),
-                    "security-scan" | "sec-resume" | "sec-status" | "sec-report" | "sec-abort"
-                ) {
+                if matches!(name.as_str(), "security-scan" | "sec-status" | "sec-report") {
                     let locked = host.lock().unwrap_or_else(|e| e.into_inner());
                     locked
                         .native
@@ -3666,7 +3688,7 @@ fn run_rpc_with_host(
                         .security
                         .set_review_storage(default_agent_dir());
                     let result = (|| {
-                        if matches!(name.as_str(), "security-scan" | "sec-resume") {
+                        if name == "security-scan" && security_scan_starts_work(&args) {
                             configure_security_review(parsed, &runtime.agent, &locked)?;
                         }
                         locked.execute_native_command(&name, &args)
@@ -3773,6 +3795,10 @@ fn run_rpc_with_host(
         let mut extras = runtime.take_events();
         {
             let mut host = host.lock().unwrap_or_else(|err| err.into_inner());
+            for notice in host.drain_security_notices() {
+                host.ui_calls
+                    .push(serde_json::json!({"op":"notify","message":notice,"type":"info"}));
+            }
             emit_extension_ui_requests(&std::mem::take(&mut host.ui_calls))?;
         }
         if is_prompt && response.success && runtime.prompt_needs_turn {
@@ -3841,6 +3867,7 @@ fn run_rpc_with_host(
                     .collect();
                 emit_extension_ui_requests(&remaining)?;
             }
+            emit_extension_ui_requests(&context_vm_notify_calls(&runtime.agent))?;
             for event in events {
                 output::write_raw_stdout_line(
                     &serde_json::to_string(&event).map_err(|err| err.to_string())?,
@@ -3863,7 +3890,7 @@ fn run_rpc_with_host(
     crate::js_host::clear_ui_waiter();
     {
         let locked = host.lock().unwrap_or_else(|e| e.into_inner());
-        let _ = locked.execute_native_command("sec-abort", "");
+        locked.shutdown_security();
     }
     emit_session_shutdown(parsed);
     *agent = runtime.agent;
@@ -4030,6 +4057,18 @@ fn is_dialog_ui_call(call: &serde_json::Value) -> bool {
         call.get("op").and_then(|value| value.as_str()),
         Some("select" | "confirm" | "input" | "editor")
     )
+}
+
+/// Context VM notices (first failure, shadow mismatch, automatic fold) as
+/// RPC `notify` requests. Empty while nothing is worth reporting.
+fn context_vm_notify_calls(agent: &Agent) -> Vec<serde_json::Value> {
+    agent
+        .take_context_vm_notices()
+        .into_iter()
+        // Plugin warnings (failed SessionStart hooks) ride the same drain.
+        .chain(davinci_coding_agent::plugins::take_notices())
+        .map(|message| serde_json::json!({"op": "notify", "message": message, "type": "warning"}))
+        .collect()
 }
 
 fn emit_extension_ui_requests(calls: &[serde_json::Value]) -> Result<(), String> {
@@ -6046,24 +6085,30 @@ fn prepare_user_input(
         } else {
             let mut host = loaded_extension_host(parsed);
             apply_graph_session_context(parsed, agent, &host);
-            if matches!(name.as_str(), "security-scan" | "sec-resume") {
-                let request = if name == "security-scan" {
-                    native_extensions::security_scan::command::ScanCommand::parse(&args)
-                } else {
-                    native_extensions::security_scan::command::ScanCommand::parse("")
-                };
+            if name == "security-scan" {
+                let request = native_extensions::security_scan::command::Invocation::parse(
+                    &args,
+                    native_extensions::security_scan::command::ScanMode::Standard,
+                );
                 let format = request
                     .as_ref()
-                    .map(|request| request.format)
+                    .map(|request| request.scan.format)
                     .unwrap_or(native_extensions::security_scan::command::ReportFormat::Terminal);
                 let outcome = (|| {
-                    request?;
+                    if request?.report {
+                        return host
+                            .execute_native_command(&name, &args)?
+                            .ok_or_else(|| "security report unavailable".to_string());
+                    }
                     configure_security_review(parsed, agent, &host)?;
                     let interrupt =
                         native_extensions::security_scan::interrupt::Interrupt::install()?;
                     let result = host
                         .execute_native_command(&name, &args)?
                         .ok_or("security command unavailable")?;
+                    if let Some(notice) = result["notice"].as_str() {
+                        eprintln!("{notice}");
+                    }
                     let security = host
                         .native
                         .lock()
@@ -7556,6 +7601,10 @@ pub fn format_session_status(parsed: &Args, agent: &Agent) -> String {
             text.push_str(&format!(" · transition: {diag}"));
         }
     }
+    if let Some(vm) = output::ContextVmStatusSummary::for_status(agent) {
+        text.push('\n');
+        text.push_str(&vm.status_line());
+    }
     let cwd = std::env::current_dir().unwrap_or_default();
     if let Some(run) = crate::native_extensions::graph::active_run_snapshot(&cwd) {
         let compact = run.ecosystem_stats.render_compact_lines();
@@ -7563,6 +7612,10 @@ pub fn format_session_status(parsed: &Args, agent: &Agent) -> String {
             text.push('\n');
             text.push_str(&compact.join("\n"));
         }
+    }
+    if let Some(line) = native_extensions::security_scan::watch_status_line() {
+        text.push('\n');
+        text.push_str(&line);
     }
     let behavior_runs = davinci_telemetry::get_behavior_telemetry();
     if !behavior_runs.is_empty() {
@@ -7810,10 +7863,7 @@ fn try_extension_slash(
     args: &str,
 ) -> Result<bool, String> {
     let mut host = loaded_extension_host(parsed);
-    let security_command = matches!(
-        name,
-        "security-scan" | "sec-resume" | "sec-status" | "sec-report" | "sec-abort"
-    );
+    let security_command = matches!(name, "security-scan" | "sec-status" | "sec-report");
     let session_key = agent
         .session
         .as_ref()
@@ -7829,13 +7879,13 @@ fn try_extension_slash(
                         .unwrap_or_else(|e| e.into_inner())
                         .security = controller.clone();
                 } else {
-                    let _ = controller.command("sec-abort", "");
+                    controller.shutdown();
                 }
             }
         });
     }
     apply_graph_session_context(parsed, agent, &host);
-    if matches!(name, "security-scan" | "sec-resume") {
+    if name == "security-scan" && security_scan_starts_work(args) {
         configure_security_review(parsed, agent, &host)?;
     }
     let result = host.execute_native_command(name, args);
@@ -8217,6 +8267,17 @@ fn apply_discovered_resources(parsed: &Args, agent: &mut Agent) {
     );
     let trusted = is_trusted(&settings, &agent.cwd, parsed.project_trust_override);
     let plugins = davinci_coding_agent::plugins::active(&default_agent_dir());
+    // What `run_nested_subagent` resolves, in the same precedence, so the
+    // `agent` tool schema names every profile a call can start.
+    agent.agent_profiles = agent_profiles::discover_agent_profiles_with_plugins(
+        &agent.cwd,
+        None,
+        trusted,
+        plugins.agent_profiles(),
+    )
+    .into_iter()
+    .map(|profile| (profile.name, profile.description))
+    .collect();
     if !parsed.no_skills {
         let mut roots: Vec<PathBuf> = parsed.skills.iter().map(PathBuf::from).collect();
         roots.push(default_agent_dir().join("skills"));
@@ -8260,23 +8321,62 @@ fn apply_discovered_resources(parsed: &Args, agent: &mut Agent) {
         agent.templates = discover_prompt_templates(&roots);
     }
     agent.context_files = load_context_files(&agent.cwd, !parsed.no_context_files);
-    if !plugins.plugins.is_empty() {
-        let session_id = agent
-            .session
-            .as_ref()
-            .map(|store| store.header.id.clone())
-            .unwrap_or_default();
-        for (plugin, body) in davinci_coding_agent::plugins::session_start_context(
-            &default_agent_dir(),
-            &agent.cwd,
-            &session_id,
-        ) {
-            agent.context_files.push(davinci_agent::ContextFile {
-                path: PathBuf::from(format!("plugin:{plugin}")),
-                name: format!("plugin:{plugin} (SessionStart hook)"),
-                body,
-            });
-        }
+    apply_plugin_session_start(agent, &plugins);
+}
+
+/// The id `SessionStart` hooks see: the session file's id, or one id for the
+/// life of this process when there is no session (`--no-session`), so hooks
+/// never receive an empty id.
+fn plugin_hook_session_id(agent: &Agent) -> String {
+    static EPHEMERAL: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    match agent.session.as_ref() {
+        Some(store) => store.header.id.clone(),
+        None => EPHEMERAL
+            .get_or_init(|| {
+                let nanos = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|elapsed| elapsed.as_nanos())
+                    .unwrap_or_default();
+                format!("ephemeral-{}-{nanos}", std::process::id())
+            })
+            .clone(),
+    }
+}
+
+/// Replace the `SessionStart` contexts in `agent.context_files` with those of
+/// the current session. The hooks run once per session (cached by id), so
+/// calling this before every prompt starts them after `/new`, `/resume`,
+/// fork or an RPC session switch without re-running them on ordinary turns.
+fn apply_plugin_session_start(
+    agent: &mut Agent,
+    plugins: &davinci_coding_agent::plugins::ActivePlugins,
+) {
+    agent
+        .context_files
+        .retain(|file| !file.path.to_string_lossy().starts_with("plugin:"));
+    if plugins.plugins.is_empty() {
+        return;
+    }
+    let session_id = plugin_hook_session_id(agent);
+    // Hook warnings are queued for the next notice drain
+    // (`plugins::take_notices`); only the contexts reach the model.
+    for (plugin, body) in
+        davinci_coding_agent::plugins::session_start_context(plugins, &agent.cwd, &session_id)
+            .contexts
+    {
+        agent.context_files.push(davinci_agent::ContextFile {
+            path: PathBuf::from(format!("plugin:{plugin}")),
+            name: format!("plugin:{plugin} (SessionStart hook)"),
+            body,
+        });
+    }
+}
+
+/// Print queued plugin warnings (failed `SessionStart` hooks) on stderr for
+/// modes without a transcript to show them in.
+fn print_plugin_notices() {
+    for warning in davinci_coding_agent::plugins::take_notices() {
+        eprintln!("Warning: {warning}");
     }
 }
 
@@ -8582,7 +8682,14 @@ fn execute_agent_language_tool(
     ))
 }
 
+/// The governor's output store belongs to the agent's current session; both
+/// executor attach paths run before every turn, so a session switch rebinds.
+fn bind_native_session(agent: &Agent, host: &ExtensionHost) {
+    host.bind_native_session(agent.session.as_ref().map(|store| store.header.id.as_str()));
+}
+
 fn attach_tool_executor(agent: &mut Agent, host: &ExtensionHost) {
+    bind_native_session(agent, host);
     bind_test_impact_context(agent, host);
     let language = bind_agent_language_intelligence(agent, host);
     let host = host.clone();
@@ -8601,6 +8708,7 @@ fn attach_tool_executor(agent: &mut Agent, host: &ExtensionHost) {
 fn attach_shared_tool_executor(agent: &mut Agent, host: Arc<Mutex<ExtensionHost>>) {
     let language = {
         let host = host.lock().unwrap_or_else(|error| error.into_inner());
+        bind_native_session(agent, &host);
         bind_test_impact_context(agent, &host);
         bind_agent_language_intelligence(agent, &host)
     };
@@ -8618,6 +8726,58 @@ fn attach_shared_tool_executor(agent: &mut Agent, host: Arc<Mutex<ExtensionHost>
             host.execute_js_or_manifest_tool_with_context(cwd, name, args, context)
         },
     ));
+}
+
+/// `/security-scan --report` and `--finding` only read results; everything
+/// else may start or resume a model review and needs provider admission.
+pub(crate) fn security_scan_starts_work(args: &str) -> bool {
+    native_extensions::security_scan::command::Invocation::parse(
+        args,
+        native_extensions::security_scan::command::ScanMode::Standard,
+    )
+    .map_or(true, |invocation| !invocation.report)
+}
+
+/// Session start (interactive, RPC): continue this repository's interrupted
+/// security scan in the background, or say once that it cannot continue.
+pub(crate) fn resume_security_scan_on_session_start(
+    parsed: &Args,
+    agent: &Agent,
+    host: &ExtensionHost,
+) -> Option<String> {
+    if std::env::var_os("PI_GRAPH_ROLE").is_some() {
+        return None;
+    }
+    // Cheap directory check first: most sessions have nothing to resume and
+    // must not pay for provider admission at startup.
+    native_security_storage(host);
+    if !host.has_interrupted_security_scan() {
+        return None;
+    }
+    if let Err(error) = configure_security_review(parsed, agent, host) {
+        return Some(format!(
+            "An interrupted security scan exists but cannot resume in this session: {error}"
+        ));
+    }
+    host.resume_interrupted_security_scan()
+}
+
+/// After a settled interactive/RPC turn: let the session security watch
+/// review changed working-tree state in the background when it is due.
+pub(crate) fn security_watch_after_turn(parsed: &Args, agent: &Agent, host: &ExtensionHost) {
+    if std::env::var_os("PI_GRAPH_ROLE").is_some() || !host.security_watch_due() {
+        return;
+    }
+    native_security_storage(host);
+    if configure_security_review(parsed, agent, host).is_ok() {
+        let _ = host.security_watch_settled_turn();
+    }
+}
+
+fn native_security_storage(host: &ExtensionHost) {
+    if let Ok(mut native) = host.native.lock() {
+        native.security.set_review_storage(default_agent_dir());
+    }
 }
 
 /// Hand the graph controller the session's model, thinking level, and trust
@@ -9058,6 +9218,12 @@ fn apply_startup_notices(
     );
     for (kind, line) in startup::format_notices(&notices) {
         session.chrome.transcript.push(&kind, &line);
+    }
+    for warning in davinci_coding_agent::plugins::startup_warnings(&default_agent_dir()) {
+        session
+            .chrome
+            .transcript
+            .push("warning", format!("Warning: {warning}"));
     }
 }
 

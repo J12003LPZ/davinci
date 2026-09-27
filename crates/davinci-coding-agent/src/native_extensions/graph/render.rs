@@ -107,6 +107,10 @@ pub fn parse_advanced_graph_command(args: &str) -> Result<Option<GraphAdvancedCo
     let Some(first) = command.first().cloned() else {
         return Ok(None);
     };
+    // `/graph verify the login flow` is a goal, not `verify` with junk.
+    if !subcommand_shape_matches(&first, &command[1..]) {
+        return Ok(None);
+    }
     if first == "diff" {
         Ok(Some(GraphAdvancedCommand::Diff {
             revision: parse_diff_args(trimmed)?,
@@ -253,6 +257,55 @@ pub fn parse_advanced_graph_command(args: &str) -> Result<Option<GraphAdvancedCo
         Ok(Some(GraphAdvancedCommand::Export { name, overwrite }))
     } else {
         Ok(None)
+    }
+}
+
+/// A node, run or graph name: one word, no prose.
+fn id_like(token: &str) -> bool {
+    !token.is_empty()
+        && token
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.' | ':' | '/'))
+}
+
+/// Whether the words after a subcommand name have that subcommand's shape.
+/// A bare subcommand is always the subcommand, so `/graph fork` still gets
+/// its usage error; anything else that does not fit is a goal.
+fn subcommand_shape_matches(first: &str, rest: &[String]) -> bool {
+    if rest.is_empty() {
+        return true;
+    }
+    let mut positional = Vec::new();
+    let mut tokens = rest.iter();
+    while let Some(token) = tokens.next() {
+        if token == "--revision" {
+            tokens.next();
+        } else if !token.starts_with("--") {
+            positional.push(token.as_str());
+        }
+    }
+    let all_ids = positional.iter().all(|token| id_like(token));
+    match first {
+        "diff" => rest.len() == 1 && rest[0].parse::<u64>().is_ok(),
+        "explain" | "dry-run" => rest.len() == 1 && id_like(&rest[0]),
+        "fork" => {
+            matches!(positional.len(), 1 | 2)
+                && all_ids
+                && positional.get(1).is_none_or(|strategy| {
+                    super::operations::ForkStrategy::parse(strategy).is_some()
+                })
+        }
+        "rewind" => positional.len() == 1 && all_ids,
+        "verify" => false,
+        "budget" => {
+            let positional = match positional.first() {
+                Some(&"set") => &positional[1..],
+                _ => &positional[..],
+            };
+            positional.len() != 1 && positional.len() <= 2 && all_ids
+        }
+        "export" => positional.len() <= 1,
+        _ => true,
     }
 }
 
@@ -921,7 +974,7 @@ mod tests {
             parse_advanced_graph_command("diff 3").unwrap(),
             Some(GraphAdvancedCommand::Diff { revision: Some(3) })
         );
-        assert!(parse_advanced_graph_command("diff abc").is_err());
+        assert!(parse_advanced_graph_command("diff abc").unwrap().is_none());
 
         assert_eq!(
             parse_advanced_graph_command("explain").unwrap(),
@@ -933,7 +986,9 @@ mod tests {
                 node_id: Some("writer-1".into())
             })
         );
-        assert!(parse_advanced_graph_command("explain writer-1 extra").is_err());
+        assert!(parse_advanced_graph_command("explain writer-1 extra")
+            .unwrap()
+            .is_none());
     }
 
     #[test]
@@ -1014,9 +1069,61 @@ mod tests {
             parse_advanced_graph_command("verify").unwrap(),
             Some(GraphAdvancedCommand::Verify)
         ));
-        assert!(parse_advanced_graph_command("fork writer-1 extra trailing").is_err());
-        assert!(parse_advanced_graph_command("rewind writer-1 extra").is_err());
+        assert!(parse_advanced_graph_command("fork writer-1 extra trailing")
+            .unwrap()
+            .is_none());
+        assert!(parse_advanced_graph_command("rewind writer-1 extra")
+            .unwrap()
+            .is_none());
         assert!(parse_advanced_graph_command("fork writer-1 --unknown").is_err());
         assert!(parse_advanced_graph_command("diffuse").unwrap().is_none());
+    }
+
+    #[test]
+    fn goals_that_start_with_a_subcommand_word_start_a_run() {
+        for goal in [
+            "verify the login flow",
+            "explain the retry policy in docs",
+            "diff two config loaders and merge them",
+            "fork the parser into two modules",
+            "rewind the migration when it fails",
+            "budget planning for the cost tracker",
+        ] {
+            assert!(
+                parse_advanced_graph_command(goal).unwrap().is_none(),
+                "{goal} must not be a subcommand"
+            );
+            let GraphCommand::Goal(parsed) = parse_graph_command(goal).unwrap() else {
+                panic!("{goal} must start a run");
+            };
+            assert_eq!(parsed.goal, goal);
+        }
+    }
+
+    #[test]
+    fn subcommands_with_their_argument_shape_stay_subcommands() {
+        assert!(matches!(
+            parse_advanced_graph_command("verify").unwrap(),
+            Some(GraphAdvancedCommand::Verify)
+        ));
+        assert!(matches!(
+            parse_advanced_graph_command("rewind implement-1 --authorize").unwrap(),
+            Some(GraphAdvancedCommand::Rewind { ref node_id, authorized: true }) if node_id == "implement-1"
+        ));
+        assert!(matches!(
+            parse_advanced_graph_command("fork plan-1 repair-minimal").unwrap(),
+            Some(GraphAdvancedCommand::Fork { .. })
+        ));
+        assert!(matches!(
+            parse_advanced_graph_command("explain review-1").unwrap(),
+            Some(GraphAdvancedCommand::Explain { .. })
+        ));
+        assert!(matches!(
+            parse_advanced_graph_command("diff 2").unwrap(),
+            Some(GraphAdvancedCommand::Diff { revision: Some(2) })
+        ));
+        // A bare subcommand keeps its usage error instead of becoming a goal.
+        assert!(parse_advanced_graph_command("fork").is_err());
+        assert!(parse_advanced_graph_command("rewind").is_err());
     }
 }

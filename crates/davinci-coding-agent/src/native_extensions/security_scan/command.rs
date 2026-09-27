@@ -66,6 +66,75 @@ fn validate_report_id(id: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// One `/security-scan` invocation: the scan request plus the session-level
+/// controls that never enter a checkpoint.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Invocation {
+    pub scan: ScanCommand,
+    /// `--new`: discard an interrupted scan instead of resuming it.
+    pub new: bool,
+    /// `--report`: show the current or latest report without starting a scan.
+    pub report: bool,
+    /// `--finding <id>`: show one finding of the current or latest report.
+    pub finding: Option<String>,
+    /// Whether anything beyond `--format` selects what to scan.
+    pub selects: bool,
+}
+
+impl Invocation {
+    pub fn parse(input: &str, default_mode: ScanMode) -> Result<Self, String> {
+        let mut new = false;
+        let mut report = false;
+        let mut finding = None;
+        let mut rest = Vec::new();
+        let mut selects = false;
+        let mut tokens = tokenize(input)?.into_iter();
+        let mut literal = false;
+        while let Some(token) = tokens.next() {
+            if literal {
+                selects = true;
+                rest.push(token);
+                continue;
+            }
+            match token.as_str() {
+                "--new" if !new => new = true,
+                "--report" if !report => report = true,
+                "--finding" if finding.is_none() => {
+                    let id = tokens.next().ok_or("--finding requires an identity")?;
+                    validate_report_id(&id)?;
+                    finding = Some(id);
+                }
+                "--new" | "--report" | "--finding" => {
+                    return Err(format!("repeated flag: {token}"));
+                }
+                "--format" => {
+                    rest.push(token);
+                    if let Some(value) = tokens.next() {
+                        rest.push(value);
+                    }
+                }
+                _ => {
+                    literal = token == "--";
+                    selects = true;
+                    rest.push(token);
+                }
+            }
+        }
+        if (report || finding.is_some()) && (new || selects) {
+            return Err(
+                "--report and --finding only show results; they do not start a scan".into(),
+            );
+        }
+        Ok(Self {
+            scan: ScanCommand::parse_tokens(rest, default_mode)?,
+            new,
+            report: report || finding.is_some(),
+            finding,
+            selects,
+        })
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Selection {
     Worktree,
@@ -89,7 +158,10 @@ impl ScanCommand {
     }
 
     pub fn parse_with_default(input: &str, default_mode: ScanMode) -> Result<Self, String> {
-        let tokens = tokenize(input)?;
+        Self::parse_tokens(tokenize(input)?, default_mode)
+    }
+
+    fn parse_tokens(tokens: Vec<String>, default_mode: ScanMode) -> Result<Self, String> {
         let mut result = Self {
             scopes: Vec::new(),
             mode: default_mode,
@@ -309,6 +381,32 @@ mod tests {
             "--scope --mode quick",
         ] {
             assert!(ScanCommand::parse(input).is_err(), "accepted {input}");
+        }
+    }
+
+    #[test]
+    fn security_scan_invocation_separates_session_controls_from_the_request() {
+        let plain = Invocation::parse("--format json", ScanMode::Standard).unwrap();
+        assert!(!plain.selects && !plain.new && !plain.report);
+        assert_eq!(plain.scan.format, ReportFormat::Json);
+        let fresh = Invocation::parse("--new --changed --mode quick", ScanMode::Standard).unwrap();
+        assert!(fresh.new && fresh.selects);
+        assert_eq!(fresh.scan.selection, Selection::Changed);
+        let finding = uuid::Uuid::new_v4().to_string();
+        let view = Invocation::parse(&format!("--finding {finding}"), ScanMode::Standard).unwrap();
+        assert!(view.report);
+        assert_eq!(view.finding.as_deref(), Some(finding.as_str()));
+        for invalid in [
+            "--new --new",
+            "--report --changed",
+            "--finding",
+            "--finding nope",
+            "--report --new",
+        ] {
+            assert!(
+                Invocation::parse(invalid, ScanMode::Standard).is_err(),
+                "{invalid}"
+            );
         }
     }
 

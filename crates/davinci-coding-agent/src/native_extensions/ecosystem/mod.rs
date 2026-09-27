@@ -440,7 +440,7 @@ mod tests {
         std::fs::create_dir_all(auth_file.parent().unwrap()).unwrap();
         std::fs::write(
             &auth_file,
-            "pub fn key() -> &'static str { \"sk-secret12345\" }\n",
+            "pub fn key() -> &'static str { \"sk-proj-4f9Qa2Lk8Zt3Vb7Nc1Xd6Rm0Hs\" }\n",
         )
         .unwrap();
 
@@ -497,7 +497,7 @@ mod tests {
             project_trusted: false,
             on_update: Arc::new(|_, _| {}),
             memory: Some(Arc::new(Mutex::new(memory))),
-            learning: Some(learning),
+            learning: Some(Arc::new(Mutex::new(learning))),
             governor: None,
             language_intelligence: None,
             processes: None,
@@ -532,66 +532,30 @@ mod tests {
         );
     }
 
-    /// Task 4 Step 7: ecosystem_loop_full_circle
-    /// Graph Run #1 -> verification -> learning persistence -> Graph Run #2 receives persisted learning -> Run #2 verification -> outcome ledger update.
-    #[test]
-    fn ecosystem_loop_full_circle() {
-        let dir = tempdir().unwrap();
-
-        // 1. Initial candidate skill persisted and approved (representing Run #1 outcome)
-        let skill_dir = dir
-            .path()
-            .join(".pi")
-            .join("skills")
-            .join("full-circle-skill");
-        std::fs::create_dir_all(&skill_dir).unwrap();
-        let content = "---\nname: full-circle-skill\ndescription: Full circle offline ecosystem integration skill\nroles: [writer]\n---\n# Full Circle\nFollow strict integration verification.\n";
-        let skill_file = skill_dir.join("SKILL.md");
-        std::fs::write(&skill_file, content).unwrap();
-
-        let mut learning =
-            crate::native_extensions::LearningController::new(dir.path(), None, None);
-        learning.set_project_trusted(true);
-        let record = SkillLedgerRecord {
-            skill_id: "skill-fc-01".into(),
-            name: "full-circle-skill".into(),
-            scope: LearningScope::Project,
-            origin: SkillOrigin::LearnedReview,
-            status: ArtifactStatus::Active,
-            path: skill_file,
-            content_hash: "hash-fc-01".into(),
-            version: 1,
-            success_count: 0,
-            failure_count: 0,
-            neutral_count: 0,
-            last_used_at_ms: None,
-            created_at_ms: 1000,
-            updated_at_ms: 1000,
-            applicability: crate::native_extensions::learning::types::SkillApplicability {
-                task_types: vec!["integration".into()],
-                ..Default::default()
-            },
-            pinned: false,
-        };
-        learning.project_store.upsert_skill(record).unwrap();
-
-        // 2. Graph Run #2 starts with this learning controller
-        let runner: Arc<WorkerRunner> = Arc::new(|spec, _abort, _on_progress| {
+    /// Worker fixture for the closed-loop tests: a trivial run whose writer
+    /// changes `src/lib.rs`.
+    fn full_circle_runner(cwd: PathBuf) -> Arc<WorkerRunner> {
+        Arc::new(move |spec, _abort, _on_progress| {
             let artifact = match spec.expect {
                 ArtifactKind::Classification => Artifact::Classification(Classification {
                     task_class: TaskClass::Trivial,
                     complexity: Complexity::Trivial,
-                    rationale: "full circle run 2".into(),
+                    rationale: "full circle".into(),
                     research_tasks: vec![],
                     milestones: None,
                 }),
-                ArtifactKind::PatchReport => Artifact::PatchReport(Box::new(PatchReport {
-                    changed_files: vec!["src/lib.rs".into()],
-                    summary: "applied full circle skill".into(),
-                    deviations: vec![],
-                    plan_invalidated: false,
-                    invalidation_reason: None,
-                })),
+                ArtifactKind::PatchReport => {
+                    let path = cwd.join("src").join("lib.rs");
+                    let previous = std::fs::read_to_string(&path).unwrap_or_default();
+                    std::fs::write(&path, format!("{previous}// integration\n")).unwrap();
+                    Artifact::PatchReport(Box::new(PatchReport {
+                        changed_files: vec!["src/lib.rs".into()],
+                        summary: "applied full circle integration".into(),
+                        deviations: vec![],
+                        plan_invalidated: false,
+                        invalidation_reason: None,
+                    }))
+                }
                 _ => Artifact::Review(Box::new(ReviewDecision {
                     verdict: Verdict::Approve,
                     issues: vec![],
@@ -604,15 +568,20 @@ mod tests {
                 artifact: Some(artifact),
                 ..WorkerResult::default()
             }
-        });
+        })
+    }
 
-        let memory = VectorMemory::new(dir.path().to_path_buf());
-        let deps = ControllerDeps {
-            runner,
+    fn full_circle_deps(
+        cwd: &Path,
+        memory: &Arc<Mutex<VectorMemory>>,
+        learning: &Arc<Mutex<crate::native_extensions::LearningController>>,
+    ) -> ControllerDeps {
+        ControllerDeps {
+            runner: full_circle_runner(cwd.to_path_buf()),
             verify_exec: Arc::new(|_, _, _, _| (0, "all tests pass".into(), 5)),
             config: GraphConfig {
                 verify_commands: vec![VerifyCommandSpec {
-                    command: "echo test".into(),
+                    command: "cargo test".into(),
                     name: "test".into(),
                     from_plan: false,
                 }],
@@ -622,8 +591,8 @@ mod tests {
             session_thinking: None,
             project_trusted: true,
             on_update: Arc::new(|_, _| {}),
-            memory: Some(Arc::new(Mutex::new(memory))),
-            learning: Some(learning),
+            memory: Some(Arc::clone(memory)),
+            learning: Some(Arc::clone(learning)),
             governor: None,
             language_intelligence: None,
             processes: None,
@@ -631,32 +600,230 @@ mod tests {
             runtime: None,
             permissions: None,
             task_contract: None,
-        };
+        }
+    }
 
-        let options = RunOptions {
-            goal: "full circle offline integration test with full-circle-skill".into(),
-            cwd: dir.path().to_path_buf(),
+    fn full_circle_options(cwd: &Path, goal: &str) -> RunOptions {
+        RunOptions {
+            goal: goal.into(),
+            cwd: cwd.to_path_buf(),
             forced: Some(Complexity::Trivial),
             dry_run: false,
             abort: Arc::new(AtomicBool::new(false)),
             resume_artifacts: HashMap::new(),
             resume_run: None,
+        }
+    }
+
+    fn full_circle_workspace() -> (tempfile::TempDir, PathBuf, PathBuf) {
+        let dir = tempdir().unwrap();
+        let cwd = dir.path().join("repo");
+        let agent_dir = dir.path().join("agent");
+        std::fs::create_dir_all(cwd.join("src")).unwrap();
+        std::fs::create_dir_all(&agent_dir).unwrap();
+        std::fs::write(cwd.join("src").join("lib.rs"), "pub fn lib() {}\n").unwrap();
+        (dir, cwd, agent_dir)
+    }
+
+    /// Task 4 Step 7: ecosystem_loop_full_circle
+    /// Graph Run #1 -> verification -> the graph itself persists a memory and
+    /// hands the run to the learning reviewer, which creates a project skill ->
+    /// Graph Run #2 receives both -> Run #2 outcome recorded on that exact version.
+    #[test]
+    fn ecosystem_loop_full_circle() {
+        use crate::native_extensions::learning::{parse_review_fixture, ReviewRunner};
+        let (_dir, cwd, agent_dir) = full_circle_workspace();
+
+        // The reviewer answers from a canned fixture on the background thread
+        // the live session uses; nothing is seeded into the stores.
+        let mut learning =
+            crate::native_extensions::LearningController::new(&cwd, Some(&agent_dir), None);
+        learning.set_live_reviewer(&cwd, None);
+        let reviewed_run = Arc::new(Mutex::new(None::<String>));
+        let seen = Arc::clone(&reviewed_run);
+        learning.review_runner = Some(ReviewRunner(Arc::new(
+            move |evidence, config, _run, _spec| {
+                *seen.lock().unwrap() = evidence.verification.graph_run_id.clone();
+                let fixture = json!({
+                    "candidates": [{
+                        "scope": "project",
+                        "confidence": 0.95,
+                        "rationale": "verified graph integration workflow",
+                        "artifact": {
+                            "kind": "skill_create",
+                            "name": "full-circle-skill",
+                            "description": "Full circle integration workflow for lib changes",
+                            "body": "---\nname: full-circle-skill\ndescription: Full circle integration workflow for lib changes\n---\n\nEdit src/lib.rs, then run cargo test.\n"
+                        }
+                    }]
+                })
+                .to_string();
+                parse_review_fixture(&fixture, evidence, config.max_candidates_per_review).unwrap()
+            },
+        )));
+        let learning = Arc::new(Mutex::new(learning));
+        let memory = VectorMemory::new(cwd.clone());
+        memory.mark_dense_offline();
+        let memory = Arc::new(Mutex::new(memory));
+
+        // Run #1: nothing learned yet.
+        let run1 = run_graph(
+            full_circle_options(&cwd, "add full circle integration to lib"),
+            full_circle_deps(&cwd, &memory, &learning),
+        );
+        assert_eq!(run1.phase, Phase::Done, "{:?}", run1.blocked_reason);
+        assert!(run1.tasks.iter().all(|task| task.skill_refs.is_empty()));
+
+        // The verified run left a high-confidence memory of what it did.
+        let memory_id = {
+            let memory = memory.lock().unwrap();
+            let record = memory
+                .records()
+                .iter()
+                .find(|record| {
+                    record.kind == MemoryKind::TaskResult && record.text.contains(&run1.run_id)
+                })
+                .expect("verified run memory")
+                .clone();
+            assert!(record.text.contains("src/lib.rs"));
+            assert!(record.text.contains("cargo test"));
+            record.id
         };
 
-        let run = run_graph(options, deps);
-
-        // 3. Run #2 succeeds cleanly
-        assert_eq!(run.phase, Phase::Done);
-        assert!(run.verification.as_ref().map(|v| v.passed).unwrap_or(false));
-
-        // 4. Learning controller state in project store updated with success
-        let reloaded_learning =
-            crate::native_extensions::LearningController::new(dir.path(), None, None);
-        let updated_skill = reloaded_learning
+        // ...and was submitted to the reviewer, which created a project skill.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while learning.lock().unwrap().live_review_running() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "review never finished"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        learning.lock().unwrap().apply_completed_reviews();
+        assert_eq!(
+            reviewed_run.lock().unwrap().as_deref(),
+            Some(run1.run_id.as_str())
+        );
+        let skill_v1 = learning
+            .lock()
+            .unwrap()
             .project_store
             .skill("full-circle-skill")
-            .expect("full-circle-skill must exist in store");
-        assert_eq!(updated_skill.success_count, 1);
+            .expect("reviewer created the skill from the graph run")
+            .clone();
+        assert_eq!(skill_v1.status, ArtifactStatus::Active);
+
+        // Run #2: a related goal receives the learned skill and memory.
+        let run2 = run_graph(
+            full_circle_options(&cwd, "full circle integration for lib"),
+            full_circle_deps(&cwd, &memory, &learning),
+        );
+        assert_eq!(run2.phase, Phase::Done, "{:?}", run2.blocked_reason);
+        assert!(run2.verification.as_ref().is_some_and(|v| v.passed));
+        let skill_ref = run2
+            .tasks
+            .iter()
+            .flat_map(|task| task.skill_refs.iter())
+            .find(|skill| skill.name == "full-circle-skill")
+            .expect("run 2 received the learned skill");
+        assert_eq!(skill_ref.version, u64::from(skill_v1.version));
+        assert_eq!(skill_ref.content_hash, skill_v1.content_hash);
+        assert!(run2
+            .tasks
+            .iter()
+            .any(|task| task.memory_refs.contains(&memory_id)));
+
+        // The outcome of run #2 is attributed to that exact version.
+        let reloaded =
+            crate::native_extensions::LearningController::new(&cwd, Some(&agent_dir), None);
+        let record = reloaded
+            .project_store
+            .skill_version("full-circle-skill", u64::from(skill_v1.version))
+            .expect("learned version persisted");
+        assert_eq!(
+            record.success_count + record.neutral_count + record.failure_count,
+            1
+        );
+        assert_eq!(record.failure_count, 0);
+    }
+
+    /// The host and the graph share one learning controller: a skill the host
+    /// learns after the graph was wired reaches graph workers, and graph
+    /// status shows the host's learning counters.
+    #[test]
+    fn graph_uses_the_host_learning_controller() {
+        let (_dir, cwd, agent_dir) = full_circle_workspace();
+        let host = crate::native_extensions::NativeExtensionHost::new_with_agent_dir(
+            "s",
+            &cwd,
+            Some(&agent_dir),
+        );
+        let shared = host.graph.learning.clone().expect("graph learning wired");
+        assert!(Arc::ptr_eq(&shared, &host.learning));
+        {
+            let mut learning = host.learning();
+            let skill_dir = learning.project_skills_dir.join("host-skill");
+            std::fs::create_dir_all(&skill_dir).unwrap();
+            let path = skill_dir.join("SKILL.md");
+            std::fs::write(
+                &path,
+                "---\nname: host-skill\ndescription: Host learned lib integration workflow\n---\n\nRun cargo test after lib edits.\n",
+            )
+            .unwrap();
+            learning
+                .project_store
+                .upsert_skill(SkillLedgerRecord {
+                    skill_id: "host-skill-1".into(),
+                    name: "host-skill".into(),
+                    scope: LearningScope::Project,
+                    origin: SkillOrigin::LearnedReview,
+                    status: ArtifactStatus::Active,
+                    path,
+                    content_hash: "hash-host-1".into(),
+                    version: 1,
+                    success_count: 0,
+                    failure_count: 0,
+                    neutral_count: 0,
+                    last_used_at_ms: None,
+                    created_at_ms: 1,
+                    updated_at_ms: 1,
+                    applicability: Default::default(),
+                    pinned: false,
+                })
+                .unwrap();
+            learning.stats.reviews_dispatched = 7;
+            learning.stats.reviews_skipped = 2;
+            learning.stats.candidates_approved = 3;
+        }
+
+        let memory = VectorMemory::new(cwd.clone());
+        memory.mark_dense_offline();
+        let memory = Arc::new(Mutex::new(memory));
+        let run = run_graph(
+            full_circle_options(&cwd, "host learned lib integration"),
+            full_circle_deps(&cwd, &memory, &shared),
+        );
+        assert_eq!(run.phase, Phase::Done, "{:?}", run.blocked_reason);
+        assert!(run
+            .tasks
+            .iter()
+            .flat_map(|task| task.skill_refs.iter())
+            .any(|skill| skill.name == "host-skill" && skill.content_hash == "hash-host-1"));
+
+        let host_stats = host.learning().stats.clone();
+        assert!(host_stats.reviews_dispatched >= 7);
+        assert_eq!(
+            run.ecosystem_stats.learning_reviews_dispatched,
+            host_stats.reviews_dispatched
+        );
+        assert_eq!(
+            run.ecosystem_stats.learning_reviews_skipped,
+            host_stats.reviews_skipped
+        );
+        assert_eq!(
+            run.ecosystem_stats.learned_artifacts_applied,
+            host_stats.candidates_approved
+        );
     }
 
     /// Task 4 Step 8: ecosystem_invariants_token_and_calls
@@ -806,7 +973,7 @@ mod tests {
             project_trusted: false,
             on_update: Arc::new(|_, _| {}),
             memory: Some(Arc::new(Mutex::new(memory))),
-            learning: Some(learning),
+            learning: Some(Arc::new(Mutex::new(learning))),
             governor: None,
             language_intelligence: None,
             processes: None,
@@ -956,11 +1123,9 @@ mod tests {
             project_trusted: false,
             on_update: Arc::new(|_, _| {}),
             memory: Some(Arc::new(Mutex::new(memory))),
-            learning: Some(crate::native_extensions::LearningController::new(
-                dir.path(),
-                None,
-                None,
-            )),
+            learning: Some(Arc::new(Mutex::new(
+                crate::native_extensions::LearningController::new(dir.path(), None, None),
+            ))),
             governor: None,
             language_intelligence: None,
             processes: None,
@@ -1039,7 +1204,7 @@ mod tests {
         std::fs::create_dir_all(auth_file.parent().unwrap()).unwrap();
         std::fs::write(
             &auth_file,
-            "pub fn key() -> &'static str { \"sk-secret12345\" }\n",
+            "pub fn key() -> &'static str { \"sk-proj-4f9Qa2Lk8Zt3Vb7Nc1Xd6Rm0Hs\" }\n",
         )
         .unwrap();
         let sec_runner: Arc<WorkerRunner> = Arc::new(|spec, _abort, _on_progress| {
@@ -1474,7 +1639,7 @@ mod tests {
             memory: Some(Arc::new(Mutex::new(VectorMemory::new(
                 dir.path().to_path_buf(),
             )))),
-            learning: Some(learning),
+            learning: Some(Arc::new(Mutex::new(learning))),
             governor: None,
             language_intelligence: None,
             processes: None,

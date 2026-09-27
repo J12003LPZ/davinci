@@ -193,6 +193,16 @@ impl DiscoveryAllocation {
     }
 }
 
+/// A mode's wall-clock ceiling. It persists across interruption: paused time
+/// counts, so an interrupted scan expires this long after it started.
+pub(super) fn wall_clock_limit(mode: ScanMode) -> std::time::Duration {
+    std::time::Duration::from_secs(match mode {
+        ScanMode::Quick => 300,
+        ScanMode::Standard => 1200,
+        ScanMode::Deep => 2700,
+    })
+}
+
 pub fn execute(
     root: &Path,
     command: &ScanCommand,
@@ -202,11 +212,7 @@ pub fn execute(
     store: Option<&super::store::Store>,
     captured: Option<Snapshot>,
 ) -> Result<Value, String> {
-    let limit = std::time::Duration::from_secs(match command.mode {
-        ScanMode::Quick => 300,
-        ScanMode::Standard => 1200,
-        ScanMode::Deep => 2700,
-    });
+    let limit = wall_clock_limit(command.mode);
     run.set_deadline(super::deadline::remaining(
         store,
         &run.status().scan_id,
@@ -1778,6 +1784,126 @@ mod tests {
         assert_eq!(report["coverageComplete"], true, "{report}");
     }
 
+    fn completing_runner() -> SecurityWorkerRunner {
+        SecurityWorkerRunner::new(|request| {
+            let content = if request.messages.len() == 1 {
+                ContentBlock::ToolCall {
+                    id: "read".into(),
+                    name: "sec_source_read".into(),
+                    arguments: json!({"path":"sample.rs","startLine":1,"endLine":1}),
+                }
+            } else {
+                ContentBlock::Text {
+                    text: if request.run.status().status == RunStatus::Mapping {
+                        fixture_map("sample.rs", "original bytes\n")
+                    } else {
+                        fixture_audit("original bytes\n")
+                    }
+                    .to_string(),
+                }
+            };
+            Ok(AssistantMessage {
+                id: "fixture".into(),
+                role: "assistant".into(),
+                content: vec![content],
+                model: "fixture".into(),
+                usage: None,
+                stop_reason: Some(StopReason::Stop),
+                error_message: None,
+            })
+        })
+    }
+
+    /// An interrupted scan left by an earlier session in `agent`.
+    fn interrupted_scan(dir: &Path, agent: &Path) -> String {
+        std::fs::write(dir.join("sample.rs"), "original bytes\n").unwrap();
+        let failing = SecurityWorkerRunner::new(|_| Err("fixture interruption".into()));
+        let mut first = SecurityScanController::new(dir.to_path_buf());
+        first.configure_review(failing, ScanConfig::default());
+        first.set_review_storage(agent.to_path_buf());
+        let start = first.command("security-scan", "").unwrap().unwrap();
+        first.wait_for_review();
+        start["scanId"].as_str().unwrap().to_string()
+    }
+
+    fn session(dir: &Path, agent: &Path, config: ScanConfig) -> SecurityScanController {
+        let mut controller = SecurityScanController::new(dir.to_path_buf());
+        controller.configure_review(completing_runner(), config);
+        controller.set_review_storage(agent.to_path_buf());
+        controller
+    }
+
+    #[test]
+    fn security_session_start_resumes_the_interrupted_scan() {
+        let dir = tempfile::tempdir().unwrap();
+        let agent = tempfile::tempdir().unwrap();
+        let id = interrupted_scan(dir.path(), agent.path());
+        let mut next = session(dir.path(), agent.path(), ScanConfig::default());
+        assert!(next.has_interrupted_scan());
+        let notice = next.resume_interrupted().unwrap();
+        assert!(
+            notice.contains(&id) && notice.contains("Resuming"),
+            "{notice}"
+        );
+        next.wait_for_review();
+        let report = next.command("security-scan", "--report").unwrap().unwrap();
+        assert_eq!(report["scanId"], id.as_str());
+        assert_eq!(report["generation"], 2, "{report}");
+        assert_eq!(report["coverageComplete"], true, "{report}");
+        let notices = next.drain_notices();
+        assert!(
+            notices.iter().any(|notice| notice.contains(&id)),
+            "{notices:?}"
+        );
+        assert!(
+            next.drain_notices().is_empty(),
+            "completion is announced once"
+        );
+        assert!(!next.has_interrupted_scan());
+    }
+
+    #[test]
+    fn security_scan_command_resumes_or_starts_over_with_new() {
+        let dir = tempfile::tempdir().unwrap();
+        let agent = tempfile::tempdir().unwrap();
+        let id = interrupted_scan(dir.path(), agent.path());
+        let mut next = session(dir.path(), agent.path(), ScanConfig::default());
+        let resumed = next.command("security-scan", "").unwrap().unwrap();
+        assert_eq!(resumed["scanId"], id.as_str());
+        assert!(resumed["notice"].as_str().unwrap().contains("Resumed"));
+        // While it runs, a bare /security-scan shows it instead of starting another.
+        let shown = next.command("security-scan", "").unwrap().unwrap();
+        assert_eq!(shown["scanId"], id.as_str());
+        next.wait_for_review();
+
+        let other = interrupted_scan(dir.path(), agent.path());
+        let mut fresh = session(dir.path(), agent.path(), ScanConfig::default());
+        let started = fresh.command("security-scan", "--new").unwrap().unwrap();
+        assert_ne!(started["scanId"], other.as_str());
+        assert!(started["notice"].as_str().unwrap().contains("Discarded"));
+        fresh.wait_for_review();
+        assert!(fresh.resume_interrupted().is_none());
+    }
+
+    #[test]
+    fn security_unresumable_scan_is_reported_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let agent = tempfile::tempdir().unwrap();
+        let id = interrupted_scan(dir.path(), agent.path());
+        let changed = ScanConfig {
+            validation_reserve_ratio: 0.5,
+            ..Default::default()
+        };
+        let mut next = session(dir.path(), agent.path(), changed);
+        let notice = next.resume_interrupted().unwrap();
+        assert!(
+            notice.contains(&id) && notice.contains("cannot be resumed"),
+            "{notice}"
+        );
+        assert!(next.resume_interrupted().is_none());
+        assert!(!next.has_interrupted_scan());
+    }
+
     #[test]
     fn security_resume_reuses_completed_map_without_new_provider_requests() {
         let root = tempfile::tempdir().unwrap();
@@ -2024,7 +2150,7 @@ mod tests {
     }
 
     #[test]
-    fn security_rpc_abort_marks_cancelled() {
+    fn security_rpc_session_end_stops_the_scan_and_keeps_it_resumable() {
         let exe = davinci_binary();
         assert!(
             exe.is_file(),
@@ -2062,7 +2188,14 @@ mod tests {
         )
         .unwrap();
         stdin.flush().unwrap();
-        std::thread::sleep(std::time::Duration::from_millis(400));
+        // Wait until the review holds at its first provider request, after
+        // its checkpoint is published.
+        let waiting = hold.with_file_name("waiting");
+        let started = std::time::Instant::now();
+        while !waiting.exists() && started.elapsed() < std::time::Duration::from_secs(30) {
+            std::thread::sleep(std::time::Duration::from_millis(25));
+        }
+        // There is no abort command: `/sec-abort` is not a command any more.
         writeln!(
             stdin,
             r#"{{"id":"2","type":"prompt","message":"/sec-abort"}}"#
@@ -2070,18 +2203,22 @@ mod tests {
         .unwrap();
         stdin.flush().unwrap();
         std::thread::sleep(std::time::Duration::from_millis(300));
-        writeln!(
-            stdin,
-            r#"{{"id":"3","type":"prompt","message":"/sec-report"}}"#
-        )
-        .unwrap();
+        // Ending the session stops the scan.
         drop(stdin);
         let output = child.wait_with_output().unwrap();
         let stdout = String::from_utf8_lossy(&output.stdout);
         assert!(
-            stdout.contains("cancelled") || stdout.contains("cancelling"),
+            !stdout.contains("cancelling"),
             "stdout={stdout} stderr={}",
             String::from_utf8_lossy(&output.stderr)
         );
+        // The stopped scan stays resumable for the next session.
+        let pending = super::super::store::interrupted_scans(agent.path(), root.path());
+        let stored: Vec<_> = walkdir::WalkDir::new(agent.path())
+            .into_iter()
+            .flatten()
+            .map(|entry| entry.path().display().to_string())
+            .collect();
+        assert_eq!(pending.len(), 1, "stdout={stdout} stored={stored:?}");
     }
 }

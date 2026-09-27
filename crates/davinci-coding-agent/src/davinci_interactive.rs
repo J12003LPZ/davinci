@@ -1765,6 +1765,7 @@ fn run_turn(
             .transcript
             .push(Entry::tool(State::Attention, "usage", &warning, None));
     }
+    push_context_vm_notices(agent, model);
 
     if interrupted {
         // The `6c` sheet: what the interrupted turn came to — what ran, what
@@ -1849,6 +1850,9 @@ fn run_turn(
     {
         let host_guard = host.lock().unwrap_or_else(|err| err.into_inner());
         for notice in host_guard.drain_learning_notifications() {
+            model.transcript.push(Entry::Detail(notice));
+        }
+        for notice in host_guard.drain_security_notices() {
             model.transcript.push(Entry::Detail(notice));
         }
     }
@@ -2308,17 +2312,14 @@ fn run_extension_command_inner(shell: &mut Shell<'_>, line: &str, setup: bool) -
         return Some(Next::Go);
     }
 
-    let outcome = if matches!(
-        name.as_str(),
-        "security-scan" | "sec-resume" | "sec-status" | "sec-report" | "sec-abort"
-    ) {
+    let outcome = if matches!(name.as_str(), "security-scan" | "sec-status" | "sec-report") {
         let host = shell
             .host
             .lock()
             .unwrap_or_else(|err| err.into_inner())
             .clone();
         crate::apply_graph_session_context(shell.parsed, shell.agent, &host);
-        let admission = if matches!(name.as_str(), "security-scan" | "sec-resume") {
+        let admission = if name == "security-scan" && crate::security_scan_starts_work(&args) {
             crate::configure_security_review(shell.parsed, shell.agent, &host)
         } else {
             Ok(())
@@ -2331,12 +2332,7 @@ fn run_extension_command_inner(shell: &mut Shell<'_>, line: &str, setup: bool) -
     } else {
         let mut host = shell.host.lock().unwrap_or_else(|err| err.into_inner());
         crate::apply_graph_session_context(shell.parsed, shell.agent, &host);
-        let admission = if matches!(name.as_str(), "security-scan" | "sec-resume") {
-            crate::configure_security_review(shell.parsed, shell.agent, &host)
-        } else {
-            Ok(())
-        };
-        match admission.and_then(|()| host.execute_native_command(&name, &args)) {
+        match host.execute_native_command(&name, &args) {
             Ok(Some(value)) => Some(Ok(value)),
             Err(err) => Some(Err(err)),
             Ok(None) => {
@@ -2396,7 +2392,25 @@ fn run_extension_command_inner(shell: &mut Shell<'_>, line: &str, setup: bool) -
                 }
                 push_command_result(shell.model, &name, &rows);
             }
-            "security-scan" | "sec-resume" | "sec-status" => {
+            "security-scan" if value["schemaVersion"] == 2 && value.get("findings").is_some() => {
+                // `--report` / `--finding`: the report, with the finding selected.
+                shell.model.security = Some(security_sheet(&value));
+                shell.model.security_index = value["selectedFindingId"]
+                    .as_str()
+                    .and_then(|id| {
+                        value["findings"].as_array().and_then(|findings| {
+                            findings
+                                .iter()
+                                .position(|finding| finding["findingId"].as_str() == Some(id))
+                        })
+                    })
+                    .unwrap_or(0);
+                open_sheet(shell.model, Screen::Securitas);
+            }
+            "security-scan" | "sec-status" => {
+                if let Some(notice) = value["notice"].as_str() {
+                    shell.note(notice);
+                }
                 shell.model.security = Some(security_sheet(&value));
                 shell.model.security_index = 0;
                 open_sheet(shell.model, Screen::Securitas);
@@ -4184,6 +4198,25 @@ pub fn perform(
     }
 }
 
+/// Context VM notices from the finished turn (first failure, shadow
+/// mismatch, automatic fold) and plugin warnings (failed SessionStart
+/// hooks). Nothing is pushed while all is well.
+fn push_context_vm_notices(agent: &Agent, model: &mut Model) {
+    let plugin_warnings = davinci_coding_agent::plugins::take_notices()
+        .into_iter()
+        .map(|warning| format!("Warning: {warning}"));
+    for notice in agent
+        .take_context_vm_notices()
+        .into_iter()
+        .chain(plugin_warnings)
+    {
+        model.transcript.push(Entry::Gap);
+        model
+            .transcript
+            .push(Entry::notice(State::Attention, &notice));
+    }
+}
+
 /// `format_session_status` is one `·`-joined line shared with print and RPC
 /// mode. In the shell it wrapped into an unlabeled run-on paragraph, so the
 /// leading fields get names and every field gets its own row.
@@ -4430,6 +4463,7 @@ pub fn run(
     {
         let mut host = host.lock().map_err(|err| err.to_string())?;
         host.runtime_flag_values = crate::flag_values_json(parsed);
+        host.bind_native_session(agent.session.as_ref().map(|store| store.header.id.as_str()));
         host.emit(crate::extension_host::ExtensionEvent::ResourcesDiscover {
             cwd: cwd.display().to_string(),
             reason: "startup".into(),
@@ -4442,6 +4476,14 @@ pub fn run(
     crate::start_catalog_refresh_async(parsed);
     for entry in opening_block(parsed, agent, migrated_auth_providers) {
         model.transcript.push(entry);
+    }
+    // Resume is a property of the session: an interrupted security scan of
+    // this repository continues (or is reported unresumable) on startup.
+    {
+        let host = host.lock().map_err(|err| err.to_string())?;
+        if let Some(notice) = crate::resume_security_scan_on_session_start(parsed, agent, &host) {
+            model.transcript.push(Entry::Detail(notice));
+        }
     }
     model.startup.found = opening_found(parsed, agent);
     crate::startup_mark("shell: opening block");
@@ -4669,6 +4711,18 @@ pub fn run(
                     model.security = Some(security_sheet(&value));
                     model.dirty = true;
                 }
+            }
+            // A finished `/security-scan` and security-watch findings reach the
+            // transcript without waiting for the next prompt.
+            let notices = host
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .drain_security_notices();
+            if !notices.is_empty() {
+                for notice in notices {
+                    model.transcript.push(Entry::Detail(notice));
+                }
+                model.dirty = true;
             }
         }
         voice.tick(&mut model, terminal.input_pending());
@@ -5069,7 +5123,7 @@ pub fn run(
 
     {
         let locked = host.lock().unwrap_or_else(|e| e.into_inner());
-        let _ = locked.execute_native_command("sec-abort", "");
+        locked.shutdown_security();
     }
     terminal.close().map_err(|err| err.to_string())?;
     // Anything shared code printed while the screen was ours, said now that
@@ -5103,6 +5157,9 @@ fn opening_block(
         ..crate::startup::StartupNotices::default()
     };
     out.extend(startup_notice_entries(&notices));
+    out.extend(plugin_warning_entries(
+        davinci_coding_agent::plugins::startup_warnings(&agent_dir),
+    ));
 
     if !crate::settings::is_trusted(&stored, &agent.cwd, parsed.project_trust_override)
         && crate::trust::has_trust_requiring_project_resources(&agent.cwd)
@@ -5133,6 +5190,20 @@ fn opening_block(
     }
 
     out.extend(custom_messages(agent));
+    out
+}
+
+/// Plugin load failures, skipped MCP entries and hook warnings, shown like
+/// the other configuration warnings.
+fn plugin_warning_entries(warnings: Vec<String>) -> Vec<Entry> {
+    let mut out = Vec::new();
+    for warning in warnings {
+        out.push(Entry::Gap);
+        out.push(Entry::notice(
+            State::Attention,
+            &format!("Warning: {warning}"),
+        ));
+    }
     out
 }
 
@@ -5812,8 +5883,9 @@ fn apply_extension_action(
         ExtensionTab::Mcp => manager::mcp_action(&agent_dir, &files, action, key),
     };
     let changed = outcome.is_ok() && action != "info";
-    // Skills, commands and agents from plugins take effect now; hooks are
-    // read per prompt. MCP servers wait for the next session.
+    // Skills, commands, agents and SessionStart context from plugins take
+    // effect now; other hooks are read per prompt. MCP servers wait for the
+    // next session.
     if changed && tab != ExtensionTab::Mcp {
         crate::apply_discovered_resources(shell.parsed, shell.agent);
         shell.model.slash_commands = crate::interactive_slash_commands(shell.agent, shell.parsed);
@@ -5830,14 +5902,20 @@ fn apply_extension_action(
                 .replace("Start a new session or run /reload to load it.", "")
                 .trim()
                 .to_string();
-            if changed && tab == ExtensionTab::Plugins && action != "revoke" {
+            let mut text = if changed && tab == ExtensionTab::Plugins && action != "revoke" {
                 format!(
-                    "{text}\nSkills, commands and agents are updated now. MCP servers and \
-                     SessionStart hooks change in the next session."
+                    "{text}\nSkills, commands, agents and SessionStart hooks are updated now. \
+                     MCP servers change in the next session."
                 )
             } else {
                 text
+            };
+            if changed && tab == ExtensionTab::Plugins {
+                for warning in davinci_coding_agent::plugins::take_notices() {
+                    text.push_str(&format!("\nWarning: {warning}"));
+                }
             }
+            text
         }
         Err(err) => format!("Could not {action}: {err}"),
     };
@@ -7000,7 +7078,7 @@ fn security_sheet(value: &serde_json::Value) -> SecurityScan {
             id: json_str(value, "scanId"),
             state: status.to_string(),
             report: format!(
-                "Experimental · {} · coverage {} · scan {} · /sec-status /sec-report /sec-abort",
+                "Experimental · {} · coverage {} · scan {} · /security-scan --report",
                 status,
                 if value["coverageComplete"] == true {
                     "complete"
@@ -7128,7 +7206,7 @@ fn security_sheet(value: &serde_json::Value) -> SecurityScan {
         report: if read_only {
             "Legacy v1 · read-only · not v2 confirmation · coverage incomplete".into()
         } else {
-            "report.md in the scan artifact · /sec-report".into()
+            "report.md in the scan artifact · /security-scan --report".into()
         },
         ..Default::default()
     }

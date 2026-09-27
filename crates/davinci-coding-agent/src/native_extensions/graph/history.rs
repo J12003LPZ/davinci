@@ -1,6 +1,5 @@
 //! Immutable graph history, attempt lineage, and checkpoint retention.
 
-use crate::native_extensions::graph::replay::{replay_compatible, ReplayFingerprint};
 use crate::native_extensions::graph::store::{atomic_write, is_safe_run_id, run_dir};
 use serde::{Deserialize, Serialize};
 use std::fs;
@@ -28,23 +27,10 @@ pub struct GraphHistoryEntry {
     pub timestamp: u64,
 }
 
-#[allow(dead_code)]
-pub fn exact_replay(
-    _old_status: &str,
-    _new_status: &str,
-    old_content: &str,
-    new_content: &str,
-    other_bindings_match: bool,
-) -> bool {
-    old_content == new_content && other_bindings_match
-}
-
-#[allow(dead_code)]
 pub fn history_dir(cwd: &Path, run_id: &str) -> PathBuf {
     run_dir(cwd, run_id).join("history")
 }
 
-#[allow(dead_code)]
 pub fn write_history_entry(cwd: &Path, entry: &GraphHistoryEntry) -> std::io::Result<()> {
     if !is_safe_run_id(&entry.run_id) || !is_safe_run_id(&entry.id) {
         return Err(std::io::Error::new(
@@ -56,16 +42,6 @@ pub fn write_history_entry(cwd: &Path, entry: &GraphHistoryEntry) -> std::io::Re
     let content = serde_json::to_vec_pretty(entry)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
     atomic_write(&path, &content)
-}
-
-#[allow(dead_code)]
-pub fn load_history_entry(cwd: &Path, run_id: &str, entry_id: &str) -> Option<GraphHistoryEntry> {
-    if !is_safe_run_id(run_id) || !is_safe_run_id(entry_id) {
-        return None;
-    }
-    let path = history_dir(cwd, run_id).join(format!("{entry_id}.json"));
-    let raw = fs::read_to_string(path).ok()?;
-    serde_json::from_str(&raw).ok()
 }
 
 #[allow(dead_code)]
@@ -106,18 +82,6 @@ pub fn list_history_entries(cwd: &Path, run_id: &str) -> Vec<GraphHistoryEntry> 
     list
 }
 
-#[allow(dead_code)]
-pub fn can_replay_task(
-    stored_fingerprint: Option<&ReplayFingerprint>,
-    current_fingerprint: &ReplayFingerprint,
-) -> bool {
-    match stored_fingerprint {
-        Some(stored) => replay_compatible(stored, current_fingerprint),
-        None => false,
-    }
-}
-
-#[allow(dead_code)]
 pub fn record_task_checkpoint(
     cwd: &Path,
     run_id: &str,
@@ -136,7 +100,6 @@ pub fn record_task_checkpoint(
     atomic_write(&path, checkpoint_id.as_bytes())
 }
 
-#[allow(dead_code)]
 pub fn get_task_checkpoint(cwd: &Path, run_id: &str, task_id: &str) -> Option<String> {
     if !is_safe_run_id(run_id) || !is_safe_run_id(task_id) {
         return None;
@@ -147,7 +110,6 @@ pub fn get_task_checkpoint(cwd: &Path, run_id: &str, task_id: &str) -> Option<St
     fs::read_to_string(path).ok().map(|s| s.trim().to_string())
 }
 
-#[allow(dead_code)]
 pub fn find_before_writer_checkpoint(
     cwd: &Path,
     run_id: &str,
@@ -168,7 +130,7 @@ pub fn find_before_writer_checkpoint(
 mod tests {
     use super::*;
     use crate::native_extensions::graph::replay::{
-        compute_repo_state_hash, incompatibility_reason,
+        compute_repo_state_hash, incompatibility_reason, replay_compatible, ReplayFingerprint,
     };
     use crate::native_extensions::graph::store::{create_run_dir, load_run, save_run};
     use crate::native_extensions::graph::types::{
@@ -253,32 +215,6 @@ mod tests {
     }
 
     #[test]
-    fn f14_replay_content_not_status() {
-        assert!(!exact_replay("dirty", "dirty", "bytes-a", "bytes-b", true));
-        assert!(exact_replay("dirty", "dirty", "bytes-a", "bytes-a", true));
-        assert!(!exact_replay("clean", "clean", "bytes-a", "bytes-a", false));
-    }
-
-    #[test]
-    fn f14_same_head_status_different_bytes() {
-        // Same status ("dirty" -> "dirty"), but different content bytes
-        assert!(!exact_replay(
-            "dirty",
-            "dirty",
-            "fn run() { 1 }",
-            "fn run() { 2 }",
-            true
-        ));
-        assert!(exact_replay(
-            "dirty",
-            "dirty",
-            "fn run() { 1 }",
-            "fn run() { 1 }",
-            true
-        ));
-    }
-
-    #[test]
     fn f14_same_size_nested_non_git_edit() {
         let dir = tempdir().unwrap();
         let nested_dir = dir.path().join("nested").join("sub");
@@ -297,16 +233,6 @@ mod tests {
             hash_a, hash_b,
             "Nested edit of identical size must yield a different repo state hash"
         );
-    }
-
-    #[test]
-    fn f14_missing_prior_fingerprint() {
-        let current_fp = sample_fingerprint();
-        assert!(
-            !can_replay_task(None, &current_fp),
-            "Missing prior fingerprint must force reexecution"
-        );
-        assert!(can_replay_task(Some(&current_fp), &current_fp));
     }
 
     #[test]
@@ -333,9 +259,6 @@ mod tests {
         // Write a corrupt history entry
         let corrupt_path = history_dir(dir.path(), run_id).join("entry-002.json");
         fs::write(&corrupt_path, "{ broken invalid json ...").unwrap();
-
-        // Reading corrupt entry returns None safely
-        assert!(load_history_entry(dir.path(), run_id, "entry-002").is_none());
 
         // list_history_entries skips corrupt entry and returns valid ones
         let entries = list_history_entries(dir.path(), run_id);

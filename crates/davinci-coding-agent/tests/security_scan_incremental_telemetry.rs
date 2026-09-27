@@ -7,13 +7,16 @@ fn security_scan_incremental_telemetry() {
     fs::write(tmp.path().join("one.rs"), "pub fn one() {}\n").unwrap();
     fs::write(tmp.path().join("two.rs"), "pub fn two() {}\n").unwrap();
     let files = vec!["one.rs".to_string(), "two.rs".to_string()];
+    let agent = tempfile::tempdir().unwrap();
     let mut controller = SecurityScanController::new(tmp.path().to_path_buf());
+    controller.set_review_storage(agent.path().to_path_buf());
 
     controller
         .verify_changed_surface(SecurityVerifyRequest {
             cwd: tmp.path(),
             changed_files: &files,
             graph_run_id: "cold",
+            diff: None,
         })
         .unwrap();
     let cold = controller.current().unwrap().coverage;
@@ -32,6 +35,7 @@ fn security_scan_incremental_telemetry() {
             cwd: tmp.path(),
             changed_files: &files,
             graph_run_id: "warm",
+            diff: None,
         })
         .unwrap();
     let warm = controller.current().unwrap().coverage;
@@ -51,6 +55,7 @@ fn security_scan_incremental_telemetry() {
             cwd: tmp.path(),
             changed_files: &files,
             graph_run_id: "changed",
+            diff: None,
         })
         .unwrap();
     let changed = controller.current().unwrap().coverage;

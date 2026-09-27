@@ -401,6 +401,10 @@ pub struct Agent {
     pub tools: Vec<String>,
     pub tool_registry: Vec<String>,
     pub skills: Vec<Skill>,
+    /// Named worker profiles the `agent` tool can start, as (name,
+    /// description) in precedence-resolved order. The host fills it from
+    /// user, project and plugin agent directories; the tool schema lists it.
+    pub agent_profiles: Vec<(String, String)>,
     pub templates: Vec<PromptTemplate>,
     pub context_files: Vec<ContextFile>,
     pub session: Option<JsonlSession>,
@@ -554,6 +558,7 @@ impl Agent {
             tools: BUILTIN_TOOLS.iter().map(|t| t.to_string()).collect(),
             tool_registry: BUILTIN_TOOLS.iter().map(|t| t.to_string()).collect(),
             skills: Vec::new(),
+            agent_profiles: Vec::new(),
             templates: Vec::new(),
             context_files: Vec::new(),
             session: None,
@@ -660,6 +665,18 @@ impl Agent {
 
     pub fn set_runtime(&mut self, mut runtime: RuntimeHandle) {
         runtime.ensure_conversation_identity_current();
+        // One Context VM per conversation. Hosts build a fresh handle for each
+        // prompt; the derived state, metrics and diagnostics of the handle it
+        // replaces carry over while the bound session is unchanged.
+        if let Some(previous) = &self.runtime {
+            let session_id = self.session.as_ref().map(|session| &session.header.id);
+            if !runtime.context_vm.shares_state_with(&previous.context_vm)
+                && previous.context_vm.bound_session_id().as_ref() == session_id
+            {
+                runtime.context_vm = previous.context_vm.clone();
+            }
+        }
+        runtime.context_vm.set_mode(self.context_vm_mode);
         self.tool_context
             .mcp
             .register_with(&runtime.capability_registry);
@@ -1648,11 +1665,45 @@ impl Agent {
                 self.record_context_vm_shadow(&legacy);
                 legacy
             }
-            ContextVmMode::Active => self
-                .prepared_context_image()
-                .map(|image| image.messages.clone())
-                .unwrap_or_else(|_| self.legacy_messages_for_provider()),
+            ContextVmMode::Active => match self.prepared_context_image() {
+                Ok(image) => image.messages.clone(),
+                Err(error) => {
+                    // The run loop blocks on this error; other readers get
+                    // the legacy view, and the fallback is recorded.
+                    self.record_context_vm_failure("compile", &error);
+                    self.legacy_messages_for_provider()
+                }
+            },
         }
+    }
+
+    /// Record a Context VM failure for `/status`, the prepared manifest and a
+    /// one-time notice. Without a runtime there is no VM to fail.
+    pub(crate) fn record_context_vm_failure(&self, stage: &str, reason: &str) {
+        if let Some(runtime) = &self.runtime {
+            runtime.context_vm.record_failure(stage, reason);
+        }
+    }
+
+    /// Context VM notices queued since the last call (first failure, shadow
+    /// mismatch, automatic fold), for the host to show once.
+    pub fn take_context_vm_notices(&self) -> Vec<String> {
+        self.runtime
+            .as_ref()
+            .map(|runtime| runtime.context_vm.take_notices())
+            .unwrap_or_default()
+    }
+
+    /// `retrieve_context` is offered only by an active VM that has folded or
+    /// paged events out of its image; `off` and `shadow` keep the legacy tool
+    /// catalog byte-identical.
+    pub fn context_vm_offers_retrieval(&self) -> bool {
+        self.context_vm_mode() == ContextVmMode::Active
+            && self.tools.iter().any(|tool| tool == "retrieve_context")
+            && self
+                .runtime
+                .as_ref()
+                .is_some_and(|runtime| runtime.context_vm.retrieval_offered())
     }
 
     /// The run's counters, complete.
@@ -1668,8 +1719,9 @@ impl Agent {
     /// tool schemas count too. This is a byte heuristic, not a tokenizer or upper bound.
     pub fn estimated_context_tokens(&self) -> u64 {
         if self.context_vm_mode() == ContextVmMode::Active {
-            if let Ok(image) = self.prepared_context_image() {
-                return self.context_vm_estimated_provider_tokens(&image);
+            match self.prepared_context_image() {
+                Ok(image) => return self.context_vm_estimated_provider_tokens(&image),
+                Err(error) => self.record_context_vm_failure("compile", &error),
             }
         }
         self.messages
@@ -1790,21 +1842,27 @@ impl Agent {
             match self.prepared_context_image() {
                 Ok(image) => Some(image),
                 Err(error) => {
-                    if error == runtime::context_vm::CONTEXT_BUDGET_EXCEEDED {
-                        entries.push(ContextManifestEntry::new(
-                            "context_vm_budget",
-                            "context_vm",
-                            ProvenanceKind::MandatoryPolicy,
-                            "agent::context_vm",
-                            ContextManifestEntry::hash_content(&error),
-                            0,
-                            false,
-                            Some(error),
-                            true,
-                            "unavailable",
-                            None,
-                        ));
-                    }
+                    // Budget rejection is a mandatory-policy violation that
+                    // blocks the request. Any other failure is recorded too.
+                    let budget = error == runtime::context_vm::CONTEXT_BUDGET_EXCEEDED;
+                    self.record_context_vm_failure("compile", &error);
+                    entries.push(ContextManifestEntry::new(
+                        if budget {
+                            "context_vm_budget"
+                        } else {
+                            "context_vm_compile"
+                        },
+                        "context_vm",
+                        ProvenanceKind::MandatoryPolicy,
+                        "agent::context_vm",
+                        ContextManifestEntry::hash_content(&error),
+                        0,
+                        false,
+                        Some(error),
+                        budget,
+                        "unavailable",
+                        None,
+                    ));
                     None
                 }
             }
@@ -1871,6 +1929,31 @@ impl Agent {
                     Some("conversation_history".into()),
                     false,
                     "fresh",
+                    None,
+                ));
+            }
+        }
+
+        // Every Context VM failure or fallback since the previous manifest.
+        if let Some(runtime) = &self.runtime {
+            for (index, failure) in runtime
+                .context_vm
+                .take_unreported_failures()
+                .into_iter()
+                .enumerate()
+            {
+                let reason = failure.render();
+                entries.push(ContextManifestEntry::new(
+                    format!("context_vm_failure_{index}"),
+                    "context_vm",
+                    ProvenanceKind::MandatoryPolicy,
+                    format!("agent::context_vm::{}", failure.stage),
+                    ContextManifestEntry::hash_content(&reason),
+                    0,
+                    false,
+                    Some(reason),
+                    false,
+                    "unavailable",
                     None,
                 ));
             }
@@ -2347,6 +2430,11 @@ impl Agent {
         if let Some(spec) = specs.iter_mut().find(|tool| tool.name == "mcp_read") {
             spec.description = self.tool_context.mcp.mcp_read_description();
         }
+        if !self.agent_profiles.is_empty() {
+            if let Some(spec) = specs.iter_mut().find(|tool| tool.name == "agent") {
+                crate::subagent::describe_agent_profiles(spec, &self.agent_profiles);
+            }
+        }
         specs.extend(
             self.tool_context
                 .mcp
@@ -2460,10 +2548,17 @@ impl Agent {
     pub fn provider_tool_specs(&self) -> Vec<AgentTool> {
         self.sync_tool_authorization();
         let visible = self.visible_tool_names();
+        let offer_retrieval = self.context_vm_offers_retrieval();
         let mut specs: Vec<AgentTool> = self
             .builtin_and_mcp_specs()
             .into_iter()
-            .filter(|tool| visible.contains(&tool.name))
+            .filter(|tool| {
+                if tool.name == "retrieve_context" {
+                    offer_retrieval
+                } else {
+                    visible.contains(&tool.name)
+                }
+            })
             .collect();
         let mut known: std::collections::BTreeSet<String> =
             specs.iter().map(|tool| tool.name.clone()).collect();
@@ -2473,6 +2568,7 @@ impl Agent {
                 if !visible.contains(&capability.name)
                     || known.contains(&capability.name)
                     || capability.schema.is_none()
+                    || capability.name == "retrieve_context"
                 {
                     continue;
                 }
@@ -2656,6 +2752,12 @@ impl Agent {
         reason: runtime::context_vm::FoldReason,
         custom_instructions: Option<&str>,
     ) -> Result<runtime::ContextRoot, String> {
+        // `/compact` may run before any prompt has built a runtime.
+        if self.runtime.is_none() {
+            let runtime = RuntimeHandle::new(RunId::new(), AgentId::new(), RuntimeBus::new())
+                .with_cache(self.tool_context.cache.clone());
+            self.set_runtime(runtime);
+        }
         let Some(runtime) = &self.runtime else {
             return Err("context VM runtime is unavailable".into());
         };
@@ -2673,11 +2775,21 @@ impl Agent {
                 &self.provider,
                 &self.model_id,
             )?;
-            let response = summarizer.summarize(&request).ok()?;
-            if compaction::get_summarization_failure(&response, "context fold").is_some() {
-                return None;
-            }
-            runtime::context_vm::parse_checkpoint_proposal(&response.text).ok()
+            // A failed proposal falls back to the deterministic checkpoint.
+            let proposal = summarizer.summarize(&request).and_then(|response| {
+                match compaction::get_summarization_failure(&response, "context fold") {
+                    Some(failure) => Err(failure),
+                    None => runtime::context_vm::parse_checkpoint_proposal(&response.text),
+                }
+            });
+            proposal
+                .map_err(|error| {
+                    runtime.context_vm.record_failure(
+                        "fold_proposal",
+                        format!("{error}; used the deterministic checkpoint"),
+                    )
+                })
+                .ok()
         });
         let root = runtime
             .context_vm
@@ -2705,6 +2817,14 @@ impl Agent {
             session
                 .append_entry(entry)
                 .map_err(|error| format!("context checkpoint persistence failed: {error}"))?;
+        }
+        if reason != runtime::context_vm::FoldReason::Manual {
+            runtime.context_vm.push_notice(format!(
+                "Context VM folded ({}): epoch {}, checkpoint ~{before_tokens} -> ~{after_tokens} \
+                 tokens. Folded episodes stay recoverable with retrieve_context.",
+                reason.as_str(),
+                root.epoch
+            ));
         }
         runtime.emit_observe(crate::RuntimeEvent::ContextVmFolded {
             epoch: root.epoch,

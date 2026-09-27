@@ -375,7 +375,9 @@ impl Agent {
                 self.invalidate_context_image();
                 let events = self.context_vm_events_for_runtime();
                 if let Some(runtime) = &self.runtime {
-                    let _ = runtime.context_vm.append_delta(&events);
+                    if let Err(error) = runtime.context_vm.append_delta(&events) {
+                        runtime.context_vm.record_failure("append_delta", error);
+                    }
                 }
                 self.prepared_context_image()
                     .map(|image| self.context_vm_estimated_provider_tokens(&image))
@@ -411,8 +413,9 @@ impl Agent {
                 });
                 if decision.is_some_and(|decision| decision.should_fold) {
                     if let Some(reason) = decision.and_then(|decision| decision.reason) {
-                        if self.fold_context(reason, None).is_ok() {
-                            self.stats.compactions += 1;
+                        match self.fold_context(reason, None) {
+                            Ok(_) => self.stats.compactions += 1,
+                            Err(error) => self.record_context_vm_failure("fold", &error),
                         }
                     }
                 }
@@ -431,6 +434,7 @@ impl Agent {
             // must not bypass the budget through the legacy accessor fallback.
             if active_context_vm {
                 if let Err(error) = self.prepared_context_image() {
+                    self.record_context_vm_failure("compile", &error);
                     return Err(format!(
                         "Request blocked: context compilation failed: {error}"
                     ));
