@@ -72,7 +72,22 @@ impl Agent {
         if let Some(prepared) = cache.as_ref().filter(|p| p.revision == revision) {
             return prepared.image.clone();
         }
-        let image = self.build_context_vm_image().map(Arc::new);
+        let initial_budget = self.provider_context_budget();
+        let mut image = self.build_context_vm_image();
+        // Paging may expose retrieve_context during compilation. Recompile once
+        // with that schema reserved, rather than caching the old admission under
+        // the new schema revision. Any further change must still fit in full.
+        if image.is_ok() && self.provider_context_budget() != initial_budget {
+            image = self.build_context_vm_image();
+        }
+        let final_budget = self.provider_context_budget();
+        if image.as_ref().is_ok_and(|image| {
+            final_budget.reserved() >= final_budget.window
+                || image.estimated_tokens > final_budget.working_set_budget()
+        }) {
+            image = Err(crate::runtime::context_vm::CONTEXT_BUDGET_EXCEEDED.into());
+        }
+        let image = image.map(Arc::new);
         *cache = Some(PreparedContextImage {
             revision: self.context_image_revision(),
             image: image.clone(),
