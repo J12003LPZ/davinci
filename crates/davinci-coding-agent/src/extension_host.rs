@@ -2116,7 +2116,7 @@ mod tests {
     }
 
     #[test]
-    fn settled_turn_indexes_memory_and_reviews_without_failing_foreground() {
+    fn explicit_memory_index_and_learning_review_do_not_fail_foreground() {
         let dir = tempfile::tempdir().unwrap();
         let host = ExtensionHost::load_with_cwd(dir.path(), &[], dir.path());
 

@@ -44,7 +44,7 @@ Davinci maintains a strict distinction between declarative facts and procedural 
   - a patch or support file for a skill that does not exist is rejected;
   - a second `skill_create` for an active skill is kept (the reviewer is shown existing learned skills and asked to patch instead).
   Staging for approval only happens when you opt into it with `shadowMode: true` or `autoApplyProject`/`autoApplyGlobal: false`.
-- **Use in later turns**: before each turn, learned skills (ledger status `active`, origin learned) that match the prompt are injected with the vector-memory block, up to 2 skills and 1,200 tokens (`LearningController::learned_skill_block`).
+- **Use in later turns**: before each turn, learned skills (ledger status `active`, origin learned) that match the prompt are injected beside precision-gated vector memory, up to 2 skills and 1,200 tokens (`LearningController::learned_skill_block`). Vector memory no longer persists raw settled-turn chat: learning promotes compact typed claims, pinned constraints are bounded, ordinary automatic recall requires a shared code anchor, a clear lead over the runner-up and an unchanged source file, and broader recall remains available through `memory_search` (details in `docs/vector-memory.md`).
   - Maintains versioned history backups (up to 5 versions) under `<store>/history/<skill>/<version>.md`.
 
 ---
