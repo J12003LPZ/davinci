@@ -457,6 +457,16 @@ pub struct WorkerUsage {
     pub cache_write: u64,
     pub cost_usd: f64,
     pub turns: u64,
+    /// The worker process's own token governor, reported at `graph_submit`.
+    /// The parent session's governor never sees a worker's tool output.
+    #[serde(default)]
+    pub governor_bytes_omitted: u64,
+    #[serde(default)]
+    pub governor_compressed_outputs: u64,
+    #[serde(default)]
+    pub governor_retrievals: u64,
+    #[serde(default)]
+    pub governor_prunings: u64,
 }
 
 impl WorkerUsage {
@@ -468,6 +478,18 @@ impl WorkerUsage {
             cache_write: current.cache_write.saturating_sub(previous.cache_write),
             cost_usd: (current.cost_usd - previous.cost_usd).max(0.0),
             turns: current.turns.saturating_sub(previous.turns),
+            governor_bytes_omitted: current
+                .governor_bytes_omitted
+                .saturating_sub(previous.governor_bytes_omitted),
+            governor_compressed_outputs: current
+                .governor_compressed_outputs
+                .saturating_sub(previous.governor_compressed_outputs),
+            governor_retrievals: current
+                .governor_retrievals
+                .saturating_sub(previous.governor_retrievals),
+            governor_prunings: current
+                .governor_prunings
+                .saturating_sub(previous.governor_prunings),
         }
     }
 
@@ -478,6 +500,22 @@ impl WorkerUsage {
         self.cache_write += other.cache_write;
         self.cost_usd += other.cost_usd;
         self.turns += other.turns;
+        self.governor_bytes_omitted += other.governor_bytes_omitted;
+        self.governor_compressed_outputs += other.governor_compressed_outputs;
+        self.governor_retrievals += other.governor_retrievals;
+        self.governor_prunings += other.governor_prunings;
+    }
+
+    /// Governor counters summed over `tasks`, the run's own governor totals.
+    pub fn governor_totals(tasks: &[GraphTaskState]) -> crate::native_extensions::GovernorStats {
+        let mut stats = crate::native_extensions::GovernorStats::default();
+        for usage in tasks.iter().map(|task| &task.usage) {
+            stats.bytes_withheld += usage.governor_bytes_omitted;
+            stats.compressed_outputs += usage.governor_compressed_outputs;
+            stats.retrievals += usage.governor_retrievals;
+            stats.prunings += usage.governor_prunings;
+        }
+        stats
     }
 }
 

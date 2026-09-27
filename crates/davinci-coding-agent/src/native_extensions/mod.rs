@@ -338,6 +338,9 @@ pub fn graph_worker_context() -> Option<GraphWorkerContext> {
 
 pub type SharedVectorMemory = Arc<Mutex<VectorMemory>>;
 pub type SharedTokenGovernor = Arc<Mutex<TokenGovernor>>;
+/// One learning controller per session, shared by the host and the graph so
+/// skills learned mid-session reach graph workers and the ledger has one writer.
+pub type SharedLearning = Arc<Mutex<LearningController>>;
 
 #[derive(Debug, Clone, Default)]
 pub struct NativeExtensionHost {
@@ -357,7 +360,10 @@ pub struct NativeExtensionHost {
     pub memory: SharedVectorMemory,
     pub graph: GraphController,
     pub security: SecurityScanController,
-    pub learning: LearningController,
+    pub learning: SharedLearning,
+    /// `candidates_approved` when learned memories were last synced into
+    /// vector memory; the graph applies reviews too.
+    learning_synced_approvals: u64,
     pub visual_snapshot: VisualSnapshotHost,
     /// Set by the native visual backend registration path when one exists.
     pub visual_verification_available: bool,
@@ -403,14 +409,18 @@ impl NativeExtensionHost {
         } else {
             None
         };
-        let learning = LearningController::new(cwd, agent_dir, learning_config);
+        let learning = Arc::new(Mutex::new(LearningController::new(
+            cwd,
+            agent_dir,
+            learning_config,
+        )));
         let memory = Arc::new(Mutex::new(VectorMemory::with_config(
             cwd.to_path_buf(),
             memory_config,
         )));
         let mut graph = GraphController::new(cwd.to_path_buf());
         graph.memory = Some(Arc::clone(&memory));
-        graph.learning = Some(learning.clone());
+        graph.learning = Some(Arc::clone(&learning));
         graph.governor = Some(Arc::clone(&governor));
         let visual_snapshot = VisualSnapshotHost::discover(cwd);
 
@@ -526,11 +536,19 @@ impl NativeExtensionHost {
                 None => SecurityScanController::new(cwd.to_path_buf()),
             },
             learning,
+            learning_synced_approvals: 0,
             visual_verification_available: visual_snapshot.is_available(),
             visual_snapshot,
             cwd: cwd.to_path_buf(),
             agent_dir: repo_agent_dir,
         }
+    }
+
+    /// The session's learning controller, shared with the graph.
+    pub fn learning(&self) -> std::sync::MutexGuard<'_, LearningController> {
+        self.learning
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
     }
 
     pub fn visual_verification_available(&self) -> bool {
@@ -612,7 +630,7 @@ impl NativeExtensionHost {
     pub fn turn_context_inject(&mut self, query: &str) -> Option<String> {
         self.poll_learning();
         let memory = self.memory_inject(query);
-        let skills = self.learning.learned_skill_block(query);
+        let skills = self.learning().learned_skill_block(query);
         // Findings the session security watch reported since the last turn.
         let watch = self.security.take_watch_injection();
         let blocks = [memory, skills, watch]
@@ -625,9 +643,12 @@ impl NativeExtensionHost {
     /// Apply finished background learning reviews and index any memories
     /// they activated.
     pub fn poll_learning(&mut self) {
-        let before = self.learning.stats.candidates_approved;
-        self.learning.apply_completed_reviews();
-        if self.learning.stats.candidates_approved != before {
+        let approved = {
+            let mut learning = self.learning();
+            learning.apply_completed_reviews();
+            learning.stats.candidates_approved
+        };
+        if approved != self.learning_synced_approvals {
             self.sync_active_learning_memories();
         }
     }
@@ -679,19 +700,26 @@ impl NativeExtensionHost {
         self.language_intelligence.shutdown();
         graph::abort_all_runs();
         self.security.shutdown();
-        self.learning.cancel_active_review();
+        self.learning().cancel_active_review();
     }
 
     pub fn sync_active_learning_memories(&mut self) {
         let mut to_sync = Vec::new();
-        for c in self.learning.project_store.candidates() {
-            if c.status == ArtifactStatus::Active {
-                to_sync.push(c.clone());
-            }
-        }
-        for c in self.learning.global_store.candidates() {
-            if c.status == ArtifactStatus::Active {
-                to_sync.push(c.clone());
+        {
+            // Release learning before locking memory; the graph takes them
+            // in the other order.
+            let shared = Arc::clone(&self.learning);
+            let learning = shared.lock().unwrap_or_else(|error| error.into_inner());
+            self.learning_synced_approvals = learning.stats.candidates_approved;
+            for c in learning
+                .project_store
+                .candidates()
+                .into_iter()
+                .chain(learning.global_store.candidates())
+            {
+                if c.status == ArtifactStatus::Active {
+                    to_sync.push(c);
+                }
             }
         }
 
@@ -748,13 +776,13 @@ impl NativeExtensionHost {
     }
 
     pub fn review_settled_turn(&mut self, evidence: LearningEvidence) -> Option<String> {
-        let result = self.learning.review_settled_turn(evidence);
+        let result = self.learning().review_settled_turn(evidence);
         self.sync_active_learning_memories();
         result
     }
 
     pub fn cancel_active_learning_review(&mut self) {
-        self.learning.cancel_active_review();
+        self.learning().cancel_active_review();
     }
 
     pub fn record_skill_outcome_for_content_hash(
@@ -764,16 +792,16 @@ impl NativeExtensionHost {
         outcome: SkillOutcome,
     ) {
         let _ = self
-            .learning
+            .learning()
             .record_skill_outcome_for_content_hash(name, content_hash, outcome);
     }
 
     pub fn set_learning_project_trusted(&mut self, trusted: bool) {
-        self.learning.set_project_trusted(trusted);
+        self.learning().set_project_trusted(trusted);
     }
 
     pub fn drain_learning_notifications(&mut self) -> Vec<String> {
-        self.learning.drain_notifications()
+        self.learning().drain_notifications()
     }
 
     pub fn execute_tool(
@@ -852,14 +880,14 @@ impl NativeExtensionHost {
                         None
                     }
                 };
-                self.learning.skill_list_tool_with_query_embedding(
+                self.learning().skill_list_tool_with_query_embedding(
                     _cwd,
                     args,
                     query_embedding.as_deref(),
                 )
             }
-            "skill_view" => self.learning.skill_view_tool(_cwd, args),
-            "skill_manage" => self.learning.skill_manage_tool(_cwd, args),
+            "skill_view" => self.learning().skill_view_tool(_cwd, args),
+            "skill_manage" => self.learning().skill_manage_tool(_cwd, args),
             name if name.starts_with("sec_") => self.security.execute_tool(name, args),
             "graph_status" | "graph_run" | GRAPH_SUBMIT_TOOL => self.graph.execute_tool(name, args),
             _ => Err(ToolError::Unknown(name.to_string())),
@@ -941,16 +969,16 @@ impl NativeExtensionHost {
                 governor.reset();
                 Ok(Some(governor.status()))
             }
-            "learning-status" => Ok(Some(self.learning.status_command())),
-            "learning-pending" => Ok(Some(self.learning.pending_command())),
+            "learning-status" => Ok(Some(self.learning().status_command())),
+            "learning-pending" => Ok(Some(self.learning().pending_command())),
             "learning-approve" => {
-                let res = self.learning.approve_command(args);
+                let res = self.learning().approve_command(args);
                 self.sync_active_learning_memories();
                 res.map(Some)
             }
-            "learning-reject" => self.learning.reject_command(args).map(Some),
-            "skill-list" => self.learning.skill_list_command(args).map(Some),
-            "skill-view" => self.learning.skill_view_command(args).map(Some),
+            "learning-reject" => self.learning().reject_command(args).map(Some),
+            "skill-list" => self.learning().skill_list_command(args).map(Some),
+            "skill-view" => self.learning().skill_view_command(args).map(Some),
             "hook-status" => {
                 let cwd = if self.cwd.as_os_str().is_empty() {
                     std::env::current_dir().unwrap_or_default()
@@ -1557,7 +1585,11 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let agent_dir = tempfile::tempdir().unwrap();
         let mut host = NativeExtensionHost {
-            learning: LearningController::new(root.path(), Some(agent_dir.path()), None),
+            learning: Arc::new(Mutex::new(LearningController::new(
+                root.path(),
+                Some(agent_dir.path()),
+                None,
+            ))),
             memory: Arc::new(Mutex::new(VectorMemory::with_config(
                 root.path().into(),
                 VectorMemoryConfig::default(),
@@ -1581,7 +1613,10 @@ mod tests {
             evidence: VerificationEvidence::default(),
             rationale: "reusable DB constraint".into(),
         };
-        host.learning.project_store.upsert_candidate(cand).unwrap();
+        host.learning()
+            .project_store
+            .upsert_candidate(cand)
+            .unwrap();
         host.sync_active_learning_memories();
 
         let search_res = host

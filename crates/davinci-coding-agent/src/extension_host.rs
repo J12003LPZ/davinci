@@ -499,7 +499,7 @@ impl ExtensionHost {
             native
                 .graph
                 .set_session_context(model, thinking, project_trusted);
-            native.learning.set_project_trusted(project_trusted);
+            native.learning().set_project_trusted(project_trusted);
         }
     }
 
@@ -578,8 +578,8 @@ impl ExtensionHost {
     /// Let this session's learning review turns with `model` in the
     /// background. Only long-lived sessions (interactive, RPC) call this.
     pub fn enable_live_learning(&self, cwd: &std::path::Path, model: Option<String>) {
-        if let Ok(mut native) = self.native.lock() {
-            native.learning.set_live_reviewer(cwd, model);
+        if let Ok(native) = self.native.lock() {
+            native.learning().set_live_reviewer(cwd, model);
         }
     }
 

@@ -81,7 +81,6 @@ impl EcosystemStats {
             && self.learned_artifacts_applied == 0
     }
 
-    #[allow(dead_code)]
     pub fn record_context_packet(
         &mut self,
         packet: &crate::native_extensions::ecosystem::ContextPacket,
@@ -97,7 +96,6 @@ impl EcosystemStats {
         }
     }
 
-    #[allow(dead_code)]
     pub fn record_governor(&mut self, stats: &crate::native_extensions::GovernorStats) {
         self.governor_bytes_omitted = stats.bytes_withheld;
         self.governor_retrievals = stats.retrievals;
@@ -106,7 +104,6 @@ impl EcosystemStats {
         self.prunings = stats.prunings;
     }
 
-    #[allow(dead_code)]
     pub fn record_worker_usage(
         &mut self,
         usage: &crate::native_extensions::graph::types::WorkerUsage,
@@ -116,7 +113,6 @@ impl EcosystemStats {
         self.graph_cost_usd += usage.cost_usd;
     }
 
-    #[allow(dead_code)]
     pub fn record_graph_cache_usage(
         &mut self,
         role: crate::native_extensions::graph::Role,
@@ -128,13 +124,11 @@ impl EcosystemStats {
             .add(&super::cache_affinity::RoleCacheStats::from_usage(usage));
     }
 
-    #[allow(dead_code)]
     pub fn record_security_gate(&mut self, triggered: bool, result: Option<String>) {
         self.security_gate_triggered = triggered;
         self.security_result = result;
     }
 
-    #[allow(dead_code)]
     pub fn record_learning_stats(
         &mut self,
         stats: &crate::native_extensions::learning::LearningStats,
@@ -408,6 +402,7 @@ mod tests {
             cache_write: 400,
             cost_usd: 0.05,
             turns: 2,
+            ..crate::native_extensions::graph::types::WorkerUsage::default()
         };
         stats.record_worker_usage(&worker_usage);
 
@@ -468,6 +463,7 @@ mod tests {
                 cache_write: 100,
                 cost_usd: 0.02,
                 turns: 1,
+                ..WorkerUsage::default()
             },
             started_at: Some(100),
             ended_at: Some(200),
@@ -491,6 +487,7 @@ mod tests {
             cache_write: 50,
             cost_usd: 0.01,
             turns: 1,
+            ..WorkerUsage::default()
         };
         stats.record_worker_usage(&live_usage);
 
