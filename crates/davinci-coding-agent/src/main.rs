@@ -874,7 +874,6 @@ fn build_agent(parsed: &Args, session_dir: &Path, cwd: &Path) -> Result<Agent, S
         }
         run_nested_subagent(&parsed_for_worker, &cwd_for_worker, &mcp_for_worker, req)
     }));
-    apply_discovered_resources(parsed, &mut agent);
     if let Some(runtime) = worker_runtime {
         agent.set_runtime(runtime);
     }
@@ -884,6 +883,8 @@ fn build_agent(parsed: &Args, session_dir: &Path, cwd: &Path) -> Result<Agent, S
         // mode; davinci re-reads it to draw the rows.
         agent.restore_todos();
     }
+    // After the session: plugin SessionStart hooks receive its id.
+    apply_discovered_resources(parsed, &mut agent);
     startup_mark("session opened");
     agent.auto_compaction = settings.compaction_enabled();
     agent.auto_verify =
@@ -8238,6 +8239,17 @@ fn apply_discovered_resources(parsed: &Args, agent: &mut Agent) {
     );
     let trusted = is_trusted(&settings, &agent.cwd, parsed.project_trust_override);
     let plugins = davinci_coding_agent::plugins::active(&default_agent_dir());
+    // What `run_nested_subagent` resolves, in the same precedence, so the
+    // `agent` tool schema names every profile a call can start.
+    agent.agent_profiles = agent_profiles::discover_agent_profiles_with_plugins(
+        &agent.cwd,
+        None,
+        trusted,
+        plugins.agent_profiles(),
+    )
+    .into_iter()
+    .map(|profile| (profile.name, profile.description))
+    .collect();
     if !parsed.no_skills {
         let mut roots: Vec<PathBuf> = parsed.skills.iter().map(PathBuf::from).collect();
         roots.push(default_agent_dir().join("skills"));
@@ -8287,11 +8299,12 @@ fn apply_discovered_resources(parsed: &Args, agent: &mut Agent) {
             .as_ref()
             .map(|store| store.header.id.clone())
             .unwrap_or_default();
-        for (plugin, body) in davinci_coding_agent::plugins::session_start_context(
-            &default_agent_dir(),
-            &agent.cwd,
-            &session_id,
-        ) {
+        // Hook warnings are queued for the next notice drain
+        // (`plugins::take_notices`); only the contexts reach the model.
+        for (plugin, body) in
+            davinci_coding_agent::plugins::session_start_context(&plugins, &agent.cwd, &session_id)
+                .contexts
+        {
             agent.context_files.push(davinci_agent::ContextFile {
                 path: PathBuf::from(format!("plugin:{plugin}")),
                 name: format!("plugin:{plugin} (SessionStart hook)"),
@@ -8603,7 +8616,14 @@ fn execute_agent_language_tool(
     ))
 }
 
+/// The governor's output store belongs to the agent's current session; both
+/// executor attach paths run before every turn, so a session switch rebinds.
+fn bind_native_session(agent: &Agent, host: &ExtensionHost) {
+    host.bind_native_session(agent.session.as_ref().map(|store| store.header.id.as_str()));
+}
+
 fn attach_tool_executor(agent: &mut Agent, host: &ExtensionHost) {
+    bind_native_session(agent, host);
     bind_test_impact_context(agent, host);
     let language = bind_agent_language_intelligence(agent, host);
     let host = host.clone();
@@ -8622,6 +8642,7 @@ fn attach_tool_executor(agent: &mut Agent, host: &ExtensionHost) {
 fn attach_shared_tool_executor(agent: &mut Agent, host: Arc<Mutex<ExtensionHost>>) {
     let language = {
         let host = host.lock().unwrap_or_else(|error| error.into_inner());
+        bind_native_session(agent, &host);
         bind_test_impact_context(agent, &host);
         bind_agent_language_intelligence(agent, &host)
     };
@@ -9131,6 +9152,12 @@ fn apply_startup_notices(
     );
     for (kind, line) in startup::format_notices(&notices) {
         session.chrome.transcript.push(&kind, &line);
+    }
+    for warning in davinci_coding_agent::plugins::startup_warnings(&default_agent_dir()) {
+        session
+            .chrome
+            .transcript
+            .push("warning", format!("Warning: {warning}"));
     }
 }
 

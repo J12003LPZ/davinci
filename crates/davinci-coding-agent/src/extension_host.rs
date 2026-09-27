@@ -181,6 +181,20 @@ pub struct ExtensionHost {
     before_agent_start_system_prompt: Option<String>,
 }
 
+/// A per-process key for native state before (or without) a session.
+fn ephemeral_session_key() -> String {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_nanos())
+        .unwrap_or_default();
+    format!(
+        "ephemeral-{}-{nanos:x}-{}",
+        std::process::id(),
+        NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    )
+}
+
 impl ExtensionHost {
     pub fn load(agent_dir: &Path, names: &[String]) -> Self {
         let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
@@ -209,8 +223,10 @@ impl ExtensionHost {
             runtime_system_prompt: String::new(),
             unregistered_providers: Vec::new(),
             load_errors: Vec::new(),
+            // Unique until `bind_native_session` names the real session, so a
+            // `--no-session` run never shares a store with another process.
             native: Arc::new(Mutex::new(NativeExtensionHost::new_with_agent_dir(
-                "runtime",
+                ephemeral_session_key(),
                 cwd,
                 Some(agent_dir),
             ))),
@@ -499,6 +515,23 @@ impl ExtensionHost {
             .lock()
             .unwrap_or_else(|error| error.into_inner())
             .before_tool(name, args, state_hash)
+    }
+
+    /// Point session-scoped native state (the token governor's output store)
+    /// at `session_id`. `None` (`--no-session`) keeps the host's ephemeral key.
+    pub fn bind_native_session(&self, session_id: Option<&str>) {
+        let Some(session_id) = session_id.filter(|id| !id.is_empty()) else {
+            return;
+        };
+        let native = self
+            .native
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        native
+            .governor
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .bind_session(session_id);
     }
 
     /// Agent-level pruning/auto-compaction removed output from the model view.

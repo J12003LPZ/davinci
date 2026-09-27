@@ -2498,6 +2498,73 @@ fn rebind_print_extensions_rediscovers_skills_and_emits_session_start() {
 }
 
 #[test]
+fn plugin_agents_reach_the_agent_tool_schema_below_user_profiles() {
+    let _env_lock = PROCESS_ENV_LOCK
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    let dir = tempfile::tempdir().unwrap();
+    let agent_dir = dir.path().join("agent");
+    let _agent_dir = EnvRestore::set("PI_CODING_AGENT_DIR", &agent_dir.to_string_lossy());
+    let _davinci_dir = EnvRestore::set("DAVINCI_CODING_AGENT_DIR", &agent_dir.to_string_lossy());
+    let home = dir.path().join("home");
+    let _userprofile = EnvRestore::set("USERPROFILE", &home.to_string_lossy());
+    let _home = EnvRestore::set("HOME", &home.to_string_lossy());
+    let plugin = dir.path().join("plug");
+    std::fs::create_dir_all(plugin.join(".claude-plugin")).unwrap();
+    std::fs::create_dir_all(plugin.join("agents")).unwrap();
+    std::fs::write(
+        plugin.join(".claude-plugin/plugin.json"),
+        r#"{"name":"plug"}"#,
+    )
+    .unwrap();
+    std::fs::write(
+        plugin.join("agents/helper.md"),
+        "---\nname: plug-helper\ndescription: from the plugin\n---\nHelp.",
+    )
+    .unwrap();
+    std::fs::write(
+        plugin.join("agents/shadowed.md"),
+        "---\nname: shared\ndescription: plugin version\n---\nPlugin.",
+    )
+    .unwrap();
+    let user_agents = home.join(".davinci").join("agent").join("agents");
+    std::fs::create_dir_all(&user_agents).unwrap();
+    std::fs::write(
+        user_agents.join("shared.md"),
+        "---\nname: shared\ndescription: user version\n---\nUser.",
+    )
+    .unwrap();
+    std::fs::create_dir_all(agent_dir.join("plugins")).unwrap();
+    std::fs::write(
+        agent_dir.join("plugins").join("installed.json"),
+        serde_json::json!({
+            "version": 1,
+            "plugins": {"plug@local": {"origin": "davinci", "installPath": plugin}}
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let mut agent = Agent::new("x");
+    agent.cwd = dir.path().to_path_buf();
+    apply_discovered_resources(&Args::default(), &mut agent);
+    let description = |name: &str| {
+        agent
+            .agent_profiles
+            .iter()
+            .find(|(profile, _)| profile == name)
+            .map(|(_, description)| description.clone())
+    };
+    assert_eq!(
+        description("plug-helper").as_deref(),
+        Some("from the plugin")
+    );
+    assert_eq!(description("shared").as_deref(), Some("user version"));
+    agent.tools = vec!["agent".into()];
+    let spec = agent.builtin_and_mcp_specs().remove(0);
+    assert!(spec.description.contains("plug-helper: from the plugin"));
+}
+
+#[test]
 fn show_loaded_resources_lists_context_skills_and_expands() {
     let _env_lock = PROCESS_ENV_LOCK
         .lock()
