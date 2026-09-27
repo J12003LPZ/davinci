@@ -17,7 +17,9 @@ Every subsystem boundary in the Davinci ecosystem operates under explicit, bound
 | **Token Governor** | **Graph Worker Execution** | Large compressible tool results are stored exactly, classified locally as log / JSON-array / search / plain text, and the smallest safe specialized-or-generic referenced view is delivered | `retrieve_output` preserved in worker allowlist; exact original recovery on demand; no model or network call for routing |
 | **Graph Execution** | **Security Scanner** | File mutations evaluated via `assess_change_risk` | High risk (`ChangeRisk::High`) or `always` mode triggers `verify_changed_surface` before review |
 | **Graph Verification** | **Learning System** | `VerificationBundle` derived deterministically from unit tests and security | Approval eligibility computed pure/deterministic; `record_skill_version_outcome` updates ledger |
+| **Graph Verification** | **Vector Memory + Learning Reviewer** | A verified run (commands ran, none failed) indexes a `TaskResult` memory of goal, changed files and passing commands, and submits the run as review evidence | Memory confidence 0.9; review runs on the session's shared controller, in the background, spaced by `minReviewIntervalMs` |
 | **Learning System** | **Future Graph Runs** | Verified procedural skills (`SKILL.md`) & high-confidence facts | Selected exact version `(name, version, content_hash)` injected into worker context |
+| **Graph Worker Governor** | **Graph Telemetry** | `graph_submit` writes the worker's governor stats beside its artifact; the parent folds them into `WorkerUsage` | Run totals are per-task sums; the parent session's governor is not reported |
 
 ### Responsibility boundaries
 

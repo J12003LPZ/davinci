@@ -1378,71 +1378,6 @@ pub struct SavedGraphSummary {
     pub is_project: bool,
 }
 
-pub fn list_saved_definitions(cwd: &Path) -> Vec<SavedGraphSummary> {
-    let mut summaries = Vec::new();
-    let mut seen_names = std::collections::HashSet::new();
-
-    // 1. Scan project graphs dir
-    let project_dir = project_graphs_dir(cwd);
-    if let Ok(entries) = std::fs::read_dir(&project_dir) {
-        for entry in entries.flatten() {
-            let p = entry.path();
-            if p.extension()
-                .map(|e| e == "yaml" || e == "yml")
-                .unwrap_or(false)
-            {
-                if let Some(stem) = p.file_stem().and_then(|s| s.to_str()) {
-                    if safe_graph_name(stem) {
-                        if let Ok(def) = load_saved_definition(&p) {
-                            let digest = compute_definition_digest(&def);
-                            summaries.push(SavedGraphSummary {
-                                name: stem.to_string(),
-                                description: def.description.clone(),
-                                digest,
-                                path: p.clone(),
-                                is_project: true,
-                            });
-                            seen_names.insert(stem.to_string());
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    // 2. Scan global graphs dir
-    if let Some(global_dir) = global_graphs_dir() {
-        if let Ok(entries) = std::fs::read_dir(&global_dir) {
-            for entry in entries.flatten() {
-                let p = entry.path();
-                if p.extension()
-                    .map(|e| e == "yaml" || e == "yml")
-                    .unwrap_or(false)
-                {
-                    if let Some(stem) = p.file_stem().and_then(|s| s.to_str()) {
-                        if safe_graph_name(stem) && !seen_names.contains(stem) {
-                            if let Ok(def) = load_saved_definition(&p) {
-                                let digest = compute_definition_digest(&def);
-                                summaries.push(SavedGraphSummary {
-                                    name: stem.to_string(),
-                                    description: def.description.clone(),
-                                    digest,
-                                    path: p.clone(),
-                                    is_project: false,
-                                });
-                                seen_names.insert(stem.to_string());
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    summaries.sort_by(|a, b| a.name.cmp(&b.name));
-    summaries
-}
-
 pub fn is_safe_param_name(name: &str) -> bool {
     !name.is_empty()
         && name
@@ -2266,9 +2201,6 @@ parameters:
 
         let resolved = resolve_and_load_graph_definition("shadow-pipe", workspace.path()).unwrap();
         assert_eq!(resolved.name, "shadow-pipe");
-
-        let list = list_saved_definitions(workspace.path());
-        assert!(list.iter().any(|s| s.name == "shadow-pipe" && s.is_project));
     }
 
     #[test]

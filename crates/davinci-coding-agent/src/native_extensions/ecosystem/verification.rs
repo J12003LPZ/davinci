@@ -125,61 +125,6 @@ impl VerificationBundle {
 
         true
     }
-
-    /// Normalize graph and security receipts into immutable ExecutionReceipt records.
-    #[allow(dead_code)]
-    pub fn to_execution_receipts(
-        &self,
-        task_id: Option<davinci_agent::runtime::ids::TaskId>,
-    ) -> Vec<davinci_agent::runtime::evidence_store::ExecutionReceipt> {
-        let mut receipts = Vec::new();
-
-        let graph_started = self.commands_ran > 0;
-        let graph_exit =
-            if self.commands_ran > 0 && self.deterministic_passed && self.commands_failed == 0 {
-                Some(0)
-            } else if self.commands_ran > 0 {
-                Some(1)
-            } else {
-                None
-            };
-
-        let (sec_started, sec_exit, sec_name) = match &self.security {
-            SecurityVerification::Passed { scan_id } => (true, Some(0), scan_id.clone()),
-            SecurityVerification::Failed { scan_id, .. } => (true, Some(1), scan_id.clone()),
-            SecurityVerification::Unavailable { reason } => {
-                (false, None, format!("unavailable: {reason}"))
-            }
-            SecurityVerification::NotRequired => (false, None, "none".into()),
-        };
-
-        receipts.push(davinci_agent::runtime::evidence_store::ExecutionReceipt {
-            receipt_id: davinci_agent::runtime::ids::EvidenceId::new(),
-            operation_id: format!(
-                "graph_verify_{}",
-                self.graph_run_id.as_deref().unwrap_or("none")
-            ),
-            task_id,
-            tool_name: "graph_verify".into(),
-            started: graph_started,
-            exit_code: graph_exit,
-            ..Default::default()
-        });
-
-        receipts.push(davinci_agent::runtime::evidence_store::ExecutionReceipt {
-            receipt_id: davinci_agent::runtime::ids::EvidenceId::new(),
-            operation_id: format!("sec_scan_{}", sec_name),
-            task_id,
-            tool_name: "security_scanner".into(),
-            argv: vec![sec_name],
-            started: sec_started,
-            exit_code: sec_exit,
-            requirement_id: Some("security".into()),
-            ..Default::default()
-        });
-
-        receipts
-    }
 }
 
 #[cfg(test)]
@@ -397,36 +342,5 @@ mod tests {
             SecurityPolicyMode::Always,
             &[]
         ));
-    }
-
-    #[test]
-    fn test_to_execution_receipts_skipped_and_unavailable() {
-        let bundle = VerificationBundle {
-            commands_ran: 0,
-            commands_failed: 0,
-            deterministic_passed: false,
-            security: SecurityVerification::Unavailable {
-                reason: "no scanner installed".into(),
-            },
-            changed_files: vec!["src/lib.rs".into()],
-            graph_run_id: None,
-            source_manifest_digest: None,
-        };
-
-        let receipts = bundle.to_execution_receipts(None);
-        assert_eq!(receipts.len(), 2);
-
-        let graph_rcpt = &receipts[0];
-        assert_eq!(graph_rcpt.tool_name, "graph_verify");
-        assert!(!graph_rcpt.started);
-        assert_eq!(graph_rcpt.exit_code, None);
-        assert!(!graph_rcpt.is_passed());
-
-        let sec_rcpt = &receipts[1];
-        assert_eq!(sec_rcpt.tool_name, "security_scanner");
-        assert!(!sec_rcpt.started);
-        assert_eq!(sec_rcpt.exit_code, None);
-        assert_eq!(sec_rcpt.requirement_id.as_deref(), Some("security"));
-        assert!(!sec_rcpt.is_passed());
     }
 }

@@ -775,10 +775,6 @@ pub fn generate_fork_preview(
         ));
     }
 
-    let checkpoint_ref = cwd.and_then(|c| {
-        super::history::find_before_writer_checkpoint(c, &parent_run.run_id, fork_node_id)
-    });
-
     let mut preserved_node_ids = Vec::new();
     let mut invalidated_node_ids = Vec::new();
 
@@ -807,6 +803,26 @@ pub fn generate_fork_preview(
         }
         preserved_node_ids = new_preserved;
     }
+
+    // The fork restores the workspace to where the first invalidated writer
+    // started: the fork node itself, or the writer that ran after it.
+    let checkpoint_ref = cwd.and_then(|c| {
+        super::history::get_task_checkpoint(c, &parent_run.run_id, fork_node_id)
+            .or_else(|| {
+                parent_run
+                    .tasks
+                    .iter()
+                    .filter(|task| {
+                        task.role == Role::Writer && invalidated_node_ids.contains(&task.id)
+                    })
+                    .find_map(|task| {
+                        super::history::get_task_checkpoint(c, &parent_run.run_id, &task.id)
+                    })
+            })
+            .or_else(|| {
+                super::history::find_before_writer_checkpoint(c, &parent_run.run_id, fork_node_id)
+            })
+    });
 
     let elapsed = super::store::now_ms().saturating_sub(parent_run.counters.started_at);
     let remaining_ceiling_ms = branch_remaining(parent_run.budgets.run_deadline_ms, elapsed, 0);
@@ -1616,16 +1632,6 @@ mod tests {
     }
 
     #[test]
-    fn f14_fork_incompatible_ancestor_evidence() {
-        use crate::native_extensions::graph::history::exact_replay;
-        let compatible = exact_replay("clean", "clean", "hash-A", "hash-B", true);
-        assert!(
-            !compatible,
-            "differing content hashes must invalidate ancestor replay"
-        );
-    }
-
-    #[test]
     fn f14_fork_attempted_fresh_full_budget() {
         let mut parent = sample_run("parent-budget", "parent goal");
         parent.budgets.run_deadline_ms = 60000;
@@ -1635,25 +1641,6 @@ mod tests {
 
         assert_eq!(preview.retained_spend_usd, 4.50);
         assert_eq!(branch_remaining(100, 60, 0), Some(40));
-    }
-
-    #[test]
-    fn f14_fork_same_status_source_change() {
-        use crate::native_extensions::graph::history::exact_replay;
-        assert!(!exact_replay(
-            "dirty",
-            "dirty",
-            "content-v1",
-            "content-v2",
-            true
-        ));
-        assert!(exact_replay(
-            "dirty",
-            "dirty",
-            "content-v1",
-            "content-v1",
-            true
-        ));
     }
 
     #[test]

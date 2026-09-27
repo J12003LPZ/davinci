@@ -111,7 +111,7 @@ pub struct ControllerDeps {
     pub project_trusted: bool,
     pub on_update: Arc<UpdateSink>,
     pub memory: Option<crate::native_extensions::SharedVectorMemory>,
-    pub learning: Option<crate::native_extensions::LearningController>,
+    pub learning: Option<crate::native_extensions::SharedLearning>,
     pub governor: Option<crate::native_extensions::SharedTokenGovernor>,
     pub language_intelligence:
         Option<crate::native_extensions::language_intelligence::LanguageIntelligence>,
@@ -266,7 +266,6 @@ pub fn graph_dispatch_allowed(
 pub struct GraphExecution {
     run: Mutex<GraphRun>,
     deps: ControllerDeps,
-    pub learning: Mutex<Option<crate::native_extensions::LearningController>>,
     options: RunOptions,
     /// Watched by every child process: the operator's abort, a budget abort,
     /// or a session shutdown all funnel here.
@@ -406,29 +405,22 @@ impl GraphExecution {
             return false;
         }
 
+        let learning_stats = self.learning_stats();
         let (mut snapshot, companion_result) = {
             let mut run = self.run.lock().unwrap_or_else(|error| error.into_inner());
             if matches!(run.phase, Phase::Done | Phase::Blocked | Phase::Cancelled) {
                 run.lifecycle = Some(GraphLifecycle::Stopped);
             }
             self.acknowledge_controls(&mut run);
-            let gov_stats = self.deps.governor.as_ref().map(|governor| {
-                governor
-                    .lock()
-                    .unwrap_or_else(|error| error.into_inner())
-                    .stats()
-            });
-            if let Some(ref gs) = gov_stats {
-                run.ecosystem_stats.governor_bytes_omitted = gs.bytes_withheld;
-                run.ecosystem_stats.governor_retrievals = gs.retrievals;
-                run.ecosystem_stats.prunings = gs.prunings;
+            if let Some(stats) = &learning_stats {
+                run.ecosystem_stats.record_learning_stats(stats);
             }
-            run.resource_snapshot = Some(
-                crate::native_extensions::ecosystem::ResourceSnapshot::collect(
-                    &run.tasks,
-                    gov_stats.as_ref(),
-                ),
-            );
+            // Workers are separate processes with their own governors; the
+            // run's totals are what they reported, not this session's.
+            let gov_stats = WorkerUsage::governor_totals(&run.tasks);
+            run.ecosystem_stats.record_governor(&gov_stats);
+            run.resource_snapshot =
+                Some(crate::native_extensions::ecosystem::ResourceSnapshot::collect(&run.tasks));
             let companion_result = persist_companions(&mut run);
             (run.clone(), companion_result)
         };
@@ -928,11 +920,14 @@ impl GraphExecution {
             failure_hint: None,
         };
         let capability_selection = {
+            // Lock order: learning, then memory. The host never holds memory
+            // while it takes learning.
             let guard = self
+                .deps
                 .learning
-                .lock()
-                .unwrap_or_else(|error| error.into_inner());
-            match (&self.deps.memory, guard.as_ref()) {
+                .as_ref()
+                .map(|learning| learning.lock().unwrap_or_else(|error| error.into_inner()));
+            match (&self.deps.memory, guard.as_deref()) {
                 (Some(memory), Some(learn)) => {
                     let memory = memory.lock().unwrap_or_else(|error| error.into_inner());
                     let context_query = retry_query.render();
@@ -972,16 +967,7 @@ impl GraphExecution {
                 t.memory_refs = context_packet.memory_refs.clone();
                 t.skill_refs = context_packet.skill_refs.clone();
             }
-            if !context_packet.is_empty() {
-                run.ecosystem_stats.memory_hits += context_packet.memory_refs.len() as u64;
-                run.ecosystem_stats.memory_injected_tokens += context_packet.memory_tokens as u64;
-                run.ecosystem_stats.skill_candidates_considered +=
-                    context_packet.skill_candidates_considered as u64;
-                run.ecosystem_stats.skills_injected += context_packet.skill_refs.len() as u64;
-                run.ecosystem_stats.skill_injected_tokens += context_packet.skill_tokens as u64;
-                run.ecosystem_stats.context_packet_tokens += context_packet.estimated_tokens as u64;
-                run.ecosystem_stats.context_fingerprint = Some(context_packet.fingerprint.clone());
-            }
+            run.ecosystem_stats.record_context_packet(&context_packet);
         }
         if !context_packet.is_empty()
             && !self.checkpoint_with(None, |run| {
@@ -993,6 +979,10 @@ impl GraphExecution {
                 )
             })
         {
+            return None;
+        }
+
+        if role == Role::Writer && !self.record_writer_checkpoint(&task_id) {
             return None;
         }
 
@@ -1198,9 +1188,7 @@ impl GraphExecution {
                     self.add_usage(&task_id, &delta);
                     {
                         let mut run = self.run.lock().unwrap_or_else(|error| error.into_inner());
-                        run.ecosystem_stats.graph_cost_usd += delta.cost_usd;
-                        run.ecosystem_stats.cache_read_tokens += delta.cache_read;
-                        run.ecosystem_stats.cache_write_tokens += delta.cache_write;
+                        run.ecosystem_stats.record_worker_usage(&delta);
                         run.ecosystem_stats.record_graph_cache_usage(role, &delta);
                         if let Some(task) = run.tasks.iter_mut().find(|entry| entry.id == task_id) {
                             task.last_activity = Some(line.to_string());
@@ -1278,9 +1266,7 @@ impl GraphExecution {
             self.add_usage(&task_id, &trailing);
             {
                 let mut run = self.run.lock().unwrap_or_else(|error| error.into_inner());
-                run.ecosystem_stats.graph_cost_usd += trailing.cost_usd;
-                run.ecosystem_stats.cache_read_tokens += trailing.cache_read;
-                run.ecosystem_stats.cache_write_tokens += trailing.cache_write;
+                run.ecosystem_stats.record_worker_usage(&trailing);
                 run.ecosystem_stats
                     .record_graph_cache_usage(role, &trailing);
             }
@@ -1449,10 +1435,11 @@ impl GraphExecution {
                 break;
             }
             let guard = self
+                .deps
                 .learning
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            retry_context_delta = match (&self.deps.memory, guard.as_ref()) {
+                .as_ref()
+                .map(|learning| learning.lock().unwrap_or_else(|error| error.into_inner()));
+            retry_context_delta = match (&self.deps.memory, guard.as_deref()) {
                 (Some(memory), Some(learning)) => {
                     let memory = memory.lock().unwrap_or_else(|error| error.into_inner());
                     build_retry_context_delta(
@@ -1573,14 +1560,11 @@ impl GraphExecution {
     }
 
     pub fn record_skill_outcomes(&self, run: &GraphRun) {
+        use crate::native_extensions::learning::types::SkillOutcome;
         if self.persistence_failure().is_some() {
             return;
         }
         let Some(ref verification) = run.verification else {
-            return;
-        };
-        let mut guard = self.learning.lock().unwrap_or_else(|e| e.into_inner());
-        let Some(learning) = guard.as_mut() else {
             return;
         };
 
@@ -1591,7 +1575,7 @@ impl GraphExecution {
             .flat_map(|mutation| mutation.files.iter().map(|file| file.path.clone()))
             .collect();
         let bundle = verification.to_bundle(
-            changed_files,
+            changed_files.clone(),
             Some(run.run_id.clone()),
             crate::native_extensions::ecosystem::verification::SecurityVerification::NotRequired,
         );
@@ -1602,51 +1586,177 @@ impl GraphExecution {
             )
             && run.phase == Phase::Done
         {
-            crate::native_extensions::learning::types::SkillOutcome::VerifiedSuccess
+            SkillOutcome::VerifiedSuccess
         } else if bundle.commands_ran > 0
             && (!bundle.deterministic_passed || bundle.commands_failed > 0)
         {
-            crate::native_extensions::learning::types::SkillOutcome::VerifiedFailure
+            SkillOutcome::VerifiedFailure
         } else {
-            crate::native_extensions::learning::types::SkillOutcome::Neutral
+            SkillOutcome::Neutral
         };
 
-        let mut usage = std::collections::BTreeMap::new();
-        for task in &run.tasks {
-            for s in &task.skill_refs {
-                let key = (s.name.clone(), s.version, s.content_hash.clone());
-                let exact_record = learning
-                    .project_store
-                    .skill_version(&s.name, s.version)
-                    .or_else(|| learning.global_store.skill_version(&s.name, s.version))
-                    .filter(|record| record.content_hash == s.content_hash)
-                    .cloned();
-                let relevant = exact_record
-                    .as_ref()
-                    .is_some_and(|record| Self::skill_scope_relevant(record, task, &run.goal));
-                usage
-                    .entry(key)
-                    .and_modify(|seen_relevant| *seen_relevant |= relevant)
-                    .or_insert(relevant);
+        if let Some(shared) = self.deps.learning.as_ref() {
+            let mut learning = shared.lock().unwrap_or_else(|e| e.into_inner());
+            let mut usage = std::collections::BTreeMap::new();
+            for task in &run.tasks {
+                for s in &task.skill_refs {
+                    let key = (s.name.clone(), s.version, s.content_hash.clone());
+                    let exact_record = learning
+                        .project_store
+                        .skill_version(&s.name, s.version)
+                        .or_else(|| learning.global_store.skill_version(&s.name, s.version))
+                        .filter(|record| record.content_hash == s.content_hash)
+                        .cloned();
+                    let relevant = exact_record
+                        .as_ref()
+                        .is_some_and(|record| Self::skill_scope_relevant(record, task, &run.goal));
+                    usage
+                        .entry(key)
+                        .and_modify(|seen_relevant| *seen_relevant |= relevant)
+                        .or_insert(relevant);
+                }
+            }
+            for ((name, version, content_hash), relevant) in usage {
+                let version_ref = crate::native_extensions::learning::types::SkillVersionRef {
+                    name,
+                    version,
+                    content_hash,
+                };
+                let signal = Self::skill_usage_signal(outcome, relevant);
+                let _ = learning.record_skill_usage_outcome(&version_ref, signal);
             }
         }
-        for ((name, version, content_hash), relevant) in usage {
-            let version_ref = crate::native_extensions::learning::types::SkillVersionRef {
-                name,
-                version,
-                content_hash,
-            };
-            let signal = Self::skill_usage_signal(outcome, relevant);
-            let _ = learning.record_skill_usage_outcome(&version_ref, signal);
+
+        if outcome == SkillOutcome::VerifiedSuccess && bundle.commands_failed == 0 && !run.dry_run {
+            self.learn_from_verified_run(run, verification, &changed_files, &bundle);
         }
-        {
-            let mut run_mut = self.run.lock().unwrap_or_else(|e| e.into_inner());
-            run_mut.ecosystem_stats.learning_reviews_dispatched = learning.stats.reviews_dispatched;
-            run_mut.ecosystem_stats.learning_reviews_skipped = learning.stats.reviews_skipped;
-            run_mut.ecosystem_stats.learned_artifacts_applied = learning.stats.candidates_approved;
+        if self.deps.learning.is_some() || self.deps.memory.is_some() {
+            self.checkpoint(Some("learning recorded"));
         }
     }
+
+    /// Closed-loop graph learning. A verified run leaves a high-confidence
+    /// memory of the goal, the files it changed and the checks that passed,
+    /// and goes to the learning reviewer as evidence so it can create or
+    /// patch a project skill (in the background when the session can run a
+    /// model, synchronously under `PI_LEARNING_REVIEW_FIXTURE`).
+    fn learn_from_verified_run(
+        &self,
+        run: &GraphRun,
+        verification: &VerificationResult,
+        changed_files: &[String],
+        bundle: &crate::native_extensions::ecosystem::verification::VerificationBundle,
+    ) {
+        let mut files: Vec<&str> = changed_files.iter().map(String::as_str).collect();
+        files.sort_unstable();
+        files.dedup();
+        let passed: Vec<&str> = verification
+            .commands
+            .iter()
+            .filter(|command| !command.skipped && command.exit_code == 0)
+            .map(|command| command.command.as_str())
+            .collect();
+        let summary = format!(
+            "Verified graph run {} completed: {}. Changed files: {}. Verification passed: {}.",
+            run.run_id,
+            run.goal.trim(),
+            if files.is_empty() {
+                "none".to_string()
+            } else {
+                files.join(", ")
+            },
+            passed.join("; ")
+        );
+        let session_id = format!("graph:{}", run.run_id);
+
+        if let Some(memory) = self.deps.memory.as_ref() {
+            let _ = memory
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .index_learning_memory(
+                    &summary,
+                    crate::native_extensions::vector_memory::MemoryKind::TaskResult,
+                    VERIFIED_RUN_MEMORY_IMPORTANCE,
+                    VERIFIED_RUN_MEMORY_CONFIDENCE,
+                    &session_id,
+                    0,
+                    Some(&run.run_id),
+                );
+        }
+
+        let Some(shared) = self.deps.learning.as_ref() else {
+            return;
+        };
+        let evidence = crate::native_extensions::learning::types::LearningEvidence {
+            session_id,
+            repo_id: crate::native_extensions::vector_memory::resolve_repo_id(Path::new(&run.cwd)),
+            turn: 0,
+            messages: vec![
+                crate::native_extensions::vector_memory::MemoryMessage {
+                    role: "user".into(),
+                    content: run.goal.clone(),
+                },
+                crate::native_extensions::vector_memory::MemoryMessage {
+                    role: "assistant".into(),
+                    content: summary,
+                },
+            ],
+            tools: verification
+                .commands
+                .iter()
+                .filter(|command| !command.skipped)
+                .map(
+                    |command| crate::native_extensions::learning::types::ToolEvidence {
+                        name: "bash".into(),
+                        is_error: command.exit_code != 0,
+                        args_summary: command.command.clone(),
+                        result_summary: format!("exit {}", command.exit_code),
+                        permission_denied: false,
+                    },
+                )
+                .collect(),
+            run_stats: davinci_agent::RunStats::default(),
+            verification:
+                crate::native_extensions::learning::evidence::verification_evidence_from_bundle(
+                    bundle,
+                ),
+        };
+        let _ = shared
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .review_settled_turn(evidence);
+    }
+
+    /// Name the workspace state a writer starts from before it may mutate it.
+    /// `/graph rewind` and `/graph fork` restore to this checkpoint using the
+    /// before-bytes of the worker's task-owned effect report.
+    fn record_writer_checkpoint(&self, task_id: &str) -> bool {
+        let run_id = self.snapshot().run_id;
+        let cwd = self.options.cwd.clone();
+        let state = super::replay::compute_repo_state_hash(&cwd);
+        let short: String = state.chars().take(16).collect();
+        let checkpoint = format!("pre-{task_id}-{short}");
+        self.checkpoint_with(Some(&format!("{task_id}: writer checkpoint")), |_| {
+            super::history::record_task_checkpoint(&cwd, &run_id, task_id, &checkpoint)
+        })
+    }
+
+    /// Learning counters come from the session's controller, so graph status
+    /// shows the same numbers as the host. Read before the run lock is taken.
+    fn learning_stats(&self) -> Option<crate::native_extensions::learning::LearningStats> {
+        self.deps.learning.as_ref().map(|learning| {
+            learning
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .stats
+                .clone()
+        })
+    }
 }
+
+/// A verified graph run's memory clears the 0.80 persistence bar.
+const VERIFIED_RUN_MEMORY_IMPORTANCE: f32 = 0.8;
+const VERIFIED_RUN_MEMORY_CONFIDENCE: f32 = 0.9;
 
 /// Mirror the operator's abort into the execution flag so children stop even
 /// while no output is arriving.
@@ -1857,11 +1967,9 @@ fn run_graph_internal(
         Arc::clone(&finished),
     );
 
-    let learning = Mutex::new(deps.learning.clone());
     let execution = Arc::new(GraphExecution {
         run: Mutex::new(run),
         deps,
-        learning,
         options,
         exec_abort,
         budget_abort_reason: Mutex::new(None),
@@ -3327,15 +3435,17 @@ fn deliver_goal(
                 .unwrap_or_else(|error| error.into_inner());
             run.verification_bundle = Some(bundle.clone());
             if should_scan {
-                run.ecosystem_stats.security_gate_triggered = true;
-                run.ecosystem_stats.security_result = Some(match &security_verification {
-                    SecurityVerification::Passed { .. } => "passed".to_string(),
-                    SecurityVerification::Failed { .. } => "failed".to_string(),
-                    SecurityVerification::Unavailable { reason } => {
-                        format!("unavailable: {reason}")
-                    }
-                    SecurityVerification::NotRequired => "not_required".to_string(),
-                });
+                run.ecosystem_stats.record_security_gate(
+                    true,
+                    Some(match &security_verification {
+                        SecurityVerification::Passed { .. } => "passed".to_string(),
+                        SecurityVerification::Failed { .. } => "failed".to_string(),
+                        SecurityVerification::Unavailable { reason } => {
+                            format!("unavailable: {reason}")
+                        }
+                        SecurityVerification::NotRequired => "not_required".to_string(),
+                    }),
+                );
             }
         }
 
@@ -4735,6 +4845,7 @@ mod tests {
             }
         });
 
+        let learning = Arc::new(Mutex::new(learning));
         let deps = ControllerDeps {
             runner,
             verify_exec,
@@ -4751,7 +4862,7 @@ mod tests {
             project_trusted: true,
             on_update: Arc::new(|_, _| {}),
             memory: None,
-            learning: Some(learning),
+            learning: Some(Arc::clone(&learning)),
             governor: None,
             language_intelligence: None,
             processes: None,
@@ -4847,7 +4958,6 @@ mod tests {
                 control_history: Vec::new(),
                 continuation: None,
             }),
-            learning: Mutex::new(deps.learning.clone()),
             deps,
             options,
             exec_abort: Arc::new(AtomicBool::new(false)),
@@ -4863,8 +4973,7 @@ mod tests {
         let snapshot = execution.snapshot();
         execution.record_skill_outcomes(&snapshot);
 
-        let guard = execution.learning.lock().unwrap();
-        let updated_learning = guard.as_ref().unwrap();
+        let updated_learning = learning.lock().unwrap();
         let record = updated_learning
             .project_store
             .skill_version("fix-skill", 1)
@@ -5355,6 +5464,7 @@ mod tests {
         let mut learning =
             crate::native_extensions::LearningController::new(&cwd, Some(&agent_dir), None);
         learning.set_project_trusted(true);
+        let learning = Arc::new(Mutex::new(learning));
 
         let mut vector_mem = crate::native_extensions::VectorMemory::new(cwd.clone());
         vector_mem.mark_dense_offline();
@@ -5369,7 +5479,7 @@ mod tests {
             project_trusted: true,
             on_update: Arc::new(|_, _| {}),
             memory: Some(Arc::new(Mutex::new(vector_mem.clone()))),
-            learning: Some(learning.clone()),
+            learning: Some(Arc::clone(&learning)),
             governor: None,
             language_intelligence: None,
             processes: None,
@@ -5444,21 +5554,30 @@ mod tests {
                     &bundle1,
                 ),
         };
-        learning.review_settled_turn(evidence1);
+        learning.lock().unwrap().review_settled_turn(evidence1);
         std::env::remove_var("PI_LEARNING_REVIEW_FIXTURE");
 
         // Applicability is deliberately conservative for legacy records. Declare
         // the learned skill's relevance before asserting positive graph credit.
         let mut learned_skill = learning
+            .lock()
+            .unwrap()
             .project_store
             .skill("database-migration")
             .expect("database-migration skill must exist in store")
             .clone();
         learned_skill.applicability.task_types = vec!["database".into()];
-        learning.project_store.upsert_skill(learned_skill).unwrap();
+        learning
+            .lock()
+            .unwrap()
+            .project_store
+            .upsert_skill(learned_skill)
+            .unwrap();
 
         // Assert persistence after Run #1
         let skill_v1 = learning
+            .lock()
+            .unwrap()
             .project_store
             .skill("database-migration")
             .expect("database-migration skill must exist in store")
@@ -5479,7 +5598,7 @@ mod tests {
             project_trusted: true,
             on_update: Arc::new(|_, _| {}),
             memory: Some(Arc::new(Mutex::new(vector_mem.clone()))),
-            learning: Some(learning.clone()),
+            learning: Some(Arc::clone(&learning)),
             governor: None,
             language_intelligence: None,
             processes: None,
@@ -6117,7 +6236,6 @@ mod tests {
                 permissions: None,
                 task_contract: None,
             },
-            learning: Mutex::new(None),
             options: RunOptions {
                 goal: "test".into(),
                 cwd: dir.path().to_path_buf(),
@@ -6232,7 +6350,6 @@ mod tests {
                 permissions: None,
                 task_contract: None,
             },
-            learning: Mutex::new(None),
             options: RunOptions {
                 goal: "test".into(),
                 cwd: dir.path().to_path_buf(),
@@ -6326,7 +6443,6 @@ mod tests {
                 permissions: None,
                 task_contract: None,
             },
-            learning: Mutex::new(None),
             options: RunOptions {
                 goal: "test".into(),
                 cwd: dir.path().to_path_buf(),
@@ -6441,7 +6557,6 @@ mod tests {
                 continuation: None,
             }),
             deps,
-            learning: Mutex::new(None),
             options,
             exec_abort: Arc::new(AtomicBool::new(false)),
             budget_abort_reason: Mutex::new(None),
@@ -6526,7 +6641,6 @@ mod tests {
                 permissions: None,
                 task_contract: None,
             },
-            learning: Mutex::new(None),
             options: RunOptions {
                 goal: "test".into(),
                 cwd: dir.path().to_path_buf(),
@@ -6549,5 +6663,190 @@ mod tests {
         // checkpoint calls on_update outside run lock
         execution.checkpoint(Some("test update"));
         assert!(update_called.load(Ordering::SeqCst));
+    }
+
+    /// A trivial-run worker fixture: the writer changes `src/lib.rs` and, like
+    /// a real worker child, reports the task-owned effect with its bytes.
+    fn trivial_writer_runner(cwd: PathBuf, reported: WorkerUsage) -> Arc<WorkerRunner> {
+        Arc::new(move |spec, _, _| {
+            let artifact = match spec.expect {
+                ArtifactKind::Classification => Artifact::Classification(Classification {
+                    task_class: TaskClass::Trivial,
+                    complexity: Complexity::Trivial,
+                    rationale: "fixture".into(),
+                    research_tasks: vec![],
+                    milestones: None,
+                }),
+                ArtifactKind::PatchReport => {
+                    let path = cwd.join("src").join("lib.rs");
+                    let before = std::fs::read(&path).unwrap();
+                    let after = b"pub fn answer() -> u32 { 42 }\n".to_vec();
+                    std::fs::write(&path, &after).unwrap();
+                    let mut effect = davinci_agent::runtime::effects::OwnedFileEffect::new(
+                        "write-call",
+                        davinci_agent::AgentId::new(),
+                        1,
+                        "src/lib.rs",
+                        davinci_agent::runtime::effects::FileEffectKind::Modified,
+                        davinci_agent::TaskId::new(),
+                    );
+                    effect.before_blob =
+                        Some(davinci_agent::runtime::checkpoints::compute_sha256(&before));
+                    effect.after_blob =
+                        Some(davinci_agent::runtime::checkpoints::compute_sha256(&after));
+                    davinci_agent::runtime::effects::append_effect_report(
+                        &spec.artifact_path.with_extension("effects.jsonl"),
+                        &effect,
+                        Some(&before),
+                        Some(&after),
+                    )
+                    .unwrap();
+                    Artifact::PatchReport(Box::new(PatchReport {
+                        changed_files: vec!["src/lib.rs".into()],
+                        summary: "answer is 42".into(),
+                        deviations: vec![],
+                        plan_invalidated: false,
+                        invalidation_reason: None,
+                    }))
+                }
+                _ => Artifact::Review(Box::new(ReviewDecision {
+                    verdict: Verdict::Approve,
+                    issues: vec![],
+                    notes: "ok".into(),
+                    reviewed_chunk_ids: vec![],
+                })),
+            };
+            WorkerResult {
+                ok: true,
+                artifact: Some(artifact),
+                usage: reported,
+                ..WorkerResult::default()
+            }
+        })
+    }
+
+    fn fixture_deps(runner: Arc<WorkerRunner>) -> ControllerDeps {
+        ControllerDeps {
+            runner,
+            verify_exec: Arc::new(|_, _, _, _| (0, "ok".into(), 1)),
+            config: GraphConfig {
+                verify_commands: vec![VerifyCommandSpec {
+                    name: "fixture-test".into(),
+                    command: "fixture-test".into(),
+                    from_plan: false,
+                }],
+                ..Default::default()
+            },
+            session_model: None,
+            session_thinking: None,
+            project_trusted: true,
+            on_update: Arc::new(|_, _| {}),
+            memory: None,
+            learning: None,
+            governor: None,
+            language_intelligence: None,
+            processes: None,
+            browser: None,
+            runtime: None,
+            permissions: None,
+            task_contract: None,
+        }
+    }
+
+    fn trivial_options(cwd: &Path, goal: &str) -> RunOptions {
+        RunOptions {
+            goal: goal.into(),
+            cwd: cwd.to_path_buf(),
+            forced: Some(Complexity::Trivial),
+            dry_run: false,
+            abort: Arc::new(AtomicBool::new(false)),
+            resume_artifacts: HashMap::new(),
+            resume_run: None,
+        }
+    }
+
+    #[test]
+    fn writer_run_records_checkpoint_and_rewinds_through_graph_command() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("src").join("lib.rs");
+        std::fs::create_dir_all(source.parent().unwrap()).unwrap();
+        std::fs::write(&source, "pub fn answer() -> u32 { 0 }\n").unwrap();
+
+        let runner = trivial_writer_runner(dir.path().to_path_buf(), WorkerUsage::default());
+        let run = run_graph(
+            trivial_options(dir.path(), "make the answer 42"),
+            fixture_deps(runner),
+        );
+        assert_eq!(run.phase, Phase::Done, "{:?}", run.blocked_reason);
+        let writer = run
+            .tasks
+            .iter()
+            .find(|task| task.role == Role::Writer)
+            .expect("writer task")
+            .id
+            .clone();
+        let checkpoint =
+            super::super::history::get_task_checkpoint(dir.path(), &run.run_id, &writer)
+                .expect("writer checkpoint recorded before mutation");
+        assert!(checkpoint.starts_with(&format!("pre-{writer}-")));
+
+        let graph = super::super::GraphController::new(dir.path().to_path_buf());
+        let preview = graph.rewind_command(&writer, false).unwrap();
+        assert_eq!(preview.checkpoint_id.as_deref(), Some(checkpoint.as_str()));
+        let fork = graph.fork_command(&writer, None, false).unwrap();
+        assert_eq!(fork.checkpoint_ref.as_deref(), Some(checkpoint.as_str()));
+
+        let applied = graph.rewind_command(&writer, true).expect("rewind applies");
+        assert!(applied.applied);
+        assert_eq!(
+            std::fs::read_to_string(&source).unwrap(),
+            "pub fn answer() -> u32 { 0 }\n"
+        );
+    }
+
+    #[test]
+    fn graph_governor_telemetry_comes_from_worker_reports() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("src").join("lib.rs");
+        std::fs::create_dir_all(source.parent().unwrap()).unwrap();
+        std::fs::write(&source, "pub fn answer() -> u32 { 0 }\n").unwrap();
+
+        // The session's own governor has unrelated activity; the run must not
+        // report it.
+        let mut session = crate::native_extensions::TokenGovernor::with_store(
+            "session",
+            crate::native_extensions::TokenGovernorConfig::default(),
+            crate::native_extensions::token_governor::OutputStore::new(dir.path().join("gov")),
+        );
+        for _ in 0..5 {
+            session.record_pruning();
+        }
+
+        let reported = WorkerUsage {
+            governor_bytes_omitted: 4_096,
+            governor_compressed_outputs: 2,
+            governor_retrievals: 1,
+            governor_prunings: 1,
+            ..WorkerUsage::default()
+        };
+        let mut deps = fixture_deps(trivial_writer_runner(dir.path().to_path_buf(), reported));
+        deps.governor = Some(Arc::new(Mutex::new(session)));
+        let run = run_graph(trivial_options(dir.path(), "make the answer 42"), deps);
+        assert_eq!(run.phase, Phase::Done, "{:?}", run.blocked_reason);
+
+        let workers = run
+            .tasks
+            .iter()
+            .filter(|task| task.usage.governor_retrievals > 0)
+            .count() as u64;
+        assert!(workers >= 2, "classifier and writer report: {workers}");
+        assert_eq!(run.ecosystem_stats.governor_bytes_omitted, 4_096 * workers);
+        assert_eq!(run.ecosystem_stats.governor_compressed_outputs, 2 * workers);
+        assert_eq!(run.ecosystem_stats.governor_retrievals, workers);
+        assert_eq!(run.ecosystem_stats.prunings, workers);
+        let snapshot = run.resource_snapshot.expect("resource snapshot");
+        assert_eq!(snapshot.governor_bytes_omitted, 4_096 * workers);
+        assert_eq!(snapshot.governor_retrievals, workers);
+        assert_eq!(snapshot.prunings, workers);
     }
 }

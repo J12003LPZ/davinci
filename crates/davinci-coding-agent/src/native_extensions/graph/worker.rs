@@ -549,6 +549,7 @@ pub fn run_worker(
     // Each worker attempt owns one report. Remove a prior attempt so a retry
     // cannot accidentally combine effects from different checkpoints.
     let _ = fs::remove_file(&effect_report_path);
+    let _ = fs::remove_file(governor_report_path(&spec.artifact_path));
     // A parent graph worker may itself have inherited PI_GRAPH_CACHE_KEY.
     // Never pass that ambient partition through. Only a concrete resolved
     // model profile may install a new worker-specific affinity key.
@@ -685,12 +686,46 @@ pub fn run_worker(
     finish_worker(spec, outcome, state, &stderr)
 }
 
+/// Where a worker's `graph_submit` leaves its token governor counters.
+pub fn governor_report_path(artifact_path: &Path) -> PathBuf {
+    artifact_path.with_extension("governor.json")
+}
+
+/// Written by the worker process when its artifact is accepted.
+pub fn write_governor_report(
+    artifact_path: &Path,
+    stats: &crate::native_extensions::GovernorStats,
+) -> std::io::Result<()> {
+    let bytes = serde_json::to_vec(stats)
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+    fs::write(governor_report_path(artifact_path), bytes)
+}
+
+/// Fold the worker's governor report into its usage; a worker that never
+/// submitted reports nothing.
+fn apply_governor_report(artifact_path: &Path, usage: &mut WorkerUsage) {
+    let Some(stats) = fs::read(governor_report_path(artifact_path))
+        .ok()
+        .and_then(|bytes| {
+            serde_json::from_slice::<crate::native_extensions::GovernorStats>(&bytes).ok()
+        })
+    else {
+        return;
+    };
+    usage.governor_bytes_omitted = stats.bytes_withheld;
+    usage.governor_compressed_outputs = stats.compressed_outputs;
+    usage.governor_retrievals = stats.retrievals;
+    usage.governor_prunings = stats.prunings;
+}
+
 fn finish_worker(
     spec: &WorkerSpec,
     outcome: super::process::ChildOutcome,
     state: WorkerEventState,
     stderr: &str,
 ) -> WorkerResult {
+    let mut usage = state.usage;
+    apply_governor_report(&spec.artifact_path, &mut usage);
     let stderr_tail: String = {
         let count = stderr.chars().count();
         stderr
@@ -704,7 +739,7 @@ fn finish_worker(
         artifact: None,
         final_text: state.final_text.clone(),
         stderr: stderr_tail,
-        usage: state.usage,
+        usage,
         timed_out: outcome.timed_out,
         run_deadline_exceeded: outcome.run_deadline_exceeded,
         recovery_required: state.recovery_error.is_some(),
@@ -1490,5 +1525,31 @@ mod tests {
             davinci_ai::cache::effective_prompt_cache_key(&simulated_options),
             Some(key.as_str())
         );
+    }
+
+    #[test]
+    fn governor_report_written_at_submit_folds_into_worker_usage() {
+        let dir = tempfile::tempdir().unwrap();
+        let artifact = dir.path().join("implement-1.json");
+        let mut usage = WorkerUsage::default();
+        apply_governor_report(&artifact, &mut usage);
+        assert_eq!(usage, WorkerUsage::default(), "no report, no counters");
+
+        write_governor_report(
+            &artifact,
+            &crate::native_extensions::GovernorStats {
+                bytes_withheld: 900,
+                retrievals: 3,
+                compressed_outputs: 4,
+                prunings: 2,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        apply_governor_report(&artifact, &mut usage);
+        assert_eq!(usage.governor_bytes_omitted, 900);
+        assert_eq!(usage.governor_retrievals, 3);
+        assert_eq!(usage.governor_compressed_outputs, 4);
+        assert_eq!(usage.governor_prunings, 2);
     }
 }

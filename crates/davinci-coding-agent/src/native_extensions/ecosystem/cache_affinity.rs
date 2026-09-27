@@ -3,7 +3,6 @@
 use crate::native_extensions::graph::Role;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::collections::BTreeMap;
 
 /// Provider-reported token counters for one Graph role. These values are kept
 /// separate from local cache identity diagnostics so a stable hash is never
@@ -83,20 +82,6 @@ impl CacheObservation {
     }
 }
 
-#[allow(dead_code)]
-pub fn aggregate_role_cache_stats(
-    observations: &[CacheObservation],
-) -> BTreeMap<Role, RoleCacheStats> {
-    let mut totals = BTreeMap::new();
-    for observation in observations {
-        totals
-            .entry(observation.role)
-            .or_insert_with(RoleCacheStats::default)
-            .add(&observation.provider_usage);
-    }
-    totals
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GraphCacheIdentity<'a> {
     pub repo_id: &'a str,
@@ -158,57 +143,6 @@ pub fn derive_worker_cache_key(
         system_contract_hash: &system_contract_hash,
     };
     graph_worker_cache_key(&identity)
-}
-
-/// Adapter: convert a graph worker's execution inputs into the universal `CacheIdentity`
-/// from `davinci_agent::runtime::cache`. This preserves the existing `derive_worker_cache_key`
-/// output behavior through an adapter until the full cutover to universal keys.
-#[allow(dead_code)]
-#[allow(clippy::too_many_arguments)]
-pub fn graph_worker_to_universal_cache_identity(
-    provider: &str,
-    model: Option<&str>,
-    repo_id: &str,
-    graph_version: u32,
-    role: Role,
-    tools: &[String],
-    system_prompt: &str,
-    expect: crate::native_extensions::graph::ArtifactKind,
-    context_item_hashes: Vec<String>,
-) -> davinci_agent::CacheIdentity {
-    use davinci_agent::runtime::cache::hash_system_prompt;
-    use sha2::{Digest, Sha256};
-
-    let registry = davinci_agent::RuntimeCapabilityRegistry::with_builtins();
-    let tool_schema_hash = registry.hash_tool_capabilities(tools);
-
-    let mut contract_hasher = Sha256::new();
-    contract_hasher.update(system_prompt.as_bytes());
-    contract_hasher.update(b"\n--contract--\n");
-    let contract_str = format!(
-        "{}",
-        crate::native_extensions::graph::validate::artifact_contract(expect)
-    );
-    contract_hasher.update(contract_str.as_bytes());
-    let contract_hash = format!("{:x}", contract_hasher.finalize());
-
-    let mut repo_hasher = Sha256::new();
-    repo_hasher.update(repo_id.as_bytes());
-    repo_hasher.update(b"\n");
-    repo_hasher.update(graph_version.to_string().as_bytes());
-    let repo_hash = format!("{:x}", repo_hasher.finalize());
-
-    davinci_agent::CacheIdentity {
-        provider: provider.to_string(),
-        model_id: model.unwrap_or("default").to_string(),
-        system_prompt_hash: hash_system_prompt(system_prompt),
-        tool_schema_hash,
-        permission_surface_hash: repo_hash,
-        context_item_hashes,
-        agent_profile_hash: None,
-        contract_hash: Some(contract_hash),
-        role: Some(role.as_str().to_string()),
-    }
 }
 
 #[cfg(test)]
@@ -318,56 +252,6 @@ mod tests {
         assert_ne!(k1, k_diff_model);
     }
 
-    #[test]
-    fn universal_cache_identity_adapter_stable_on_retry_and_invalidates_on_change() {
-        use crate::native_extensions::graph::ArtifactKind;
-        let tools = vec!["read".into(), "grep".into()];
-        let id1 = super::graph_worker_to_universal_cache_identity(
-            "openai",
-            Some("gpt-4o"),
-            "my-repo",
-            1,
-            Role::Researcher,
-            &tools,
-            "system prompt",
-            ArtifactKind::Evidence,
-            vec![],
-        );
-        let id2 = super::graph_worker_to_universal_cache_identity(
-            "openai",
-            Some("gpt-4o"),
-            "my-repo",
-            1,
-            Role::Researcher,
-            &tools,
-            "system prompt",
-            ArtifactKind::Evidence,
-            vec![],
-        );
-        // Same inputs → same key (retry stable)
-        assert_eq!(id1.cache_key(), id2.cache_key());
-        assert!(id1.cache_key().starts_with("ci-researcher-"));
-
-        // Changed model → different key (intentional invalidation)
-        let id_diff = super::graph_worker_to_universal_cache_identity(
-            "openai",
-            Some("claude-opus-4-5"),
-            "my-repo",
-            1,
-            Role::Researcher,
-            &tools,
-            "system prompt",
-            ArtifactKind::Evidence,
-            vec![],
-        );
-        assert_ne!(id1.cache_key(), id_diff.cache_key());
-        let diff_reasons = id_diff.diff(&id1);
-        assert!(
-            diff_reasons.contains(&davinci_agent::CacheMissReason::ModelChanged),
-            "Diff must report ModelChanged"
-        );
-    }
-
     fn sample_universal_identity() -> davinci_agent::CacheIdentity {
         davinci_agent::CacheIdentity {
             provider: "fixture".into(),
@@ -380,61 +264,6 @@ mod tests {
             contract_hash: None,
             role: Some(Role::Researcher.as_str().into()),
         }
-    }
-
-    #[test]
-    fn graph_cache_stats_aggregate_provider_usage_by_role() {
-        use crate::native_extensions::graph::WorkerUsage;
-
-        let identity = sample_universal_identity();
-        let observations = [
-            CacheObservation::new(
-                Role::Researcher,
-                &WorkerUsage {
-                    input: 100,
-                    cache_read: 40,
-                    cache_write: 5,
-                    turns: 1,
-                    ..WorkerUsage::default()
-                },
-                identity.clone(),
-                None,
-            ),
-            CacheObservation::new(
-                Role::Researcher,
-                &WorkerUsage {
-                    input: 80,
-                    cache_read: 20,
-                    cache_write: 3,
-                    turns: 2,
-                    ..WorkerUsage::default()
-                },
-                identity.clone(),
-                Some(&identity),
-            ),
-            CacheObservation::new(
-                Role::Writer,
-                &WorkerUsage {
-                    input: 50,
-                    cache_read: 0,
-                    cache_write: 10,
-                    turns: 1,
-                    ..WorkerUsage::default()
-                },
-                identity,
-                None,
-            ),
-        ];
-        let totals = aggregate_role_cache_stats(&observations);
-        assert_eq!(totals[&Role::Researcher].input_tokens, 180);
-        assert_eq!(totals[&Role::Researcher].cache_read_tokens, 60);
-        assert_eq!(totals[&Role::Researcher].cache_write_tokens, 8);
-        assert_eq!(totals[&Role::Researcher].turns, 3);
-        assert_eq!(totals[&Role::Writer].cache_write_tokens, 10);
-        let ratio = totals[&Role::Researcher]
-            .provider_cache_read_ratio()
-            .expect("provider input was reported");
-        assert!((ratio - (60.0 / 248.0)).abs() < 1e-9);
     }
 
     #[test]

@@ -36,10 +36,9 @@ pub struct ResourceSnapshot {
 }
 
 impl ResourceSnapshot {
-    pub fn collect(
-        tasks: &[crate::native_extensions::graph::GraphTaskState],
-        governor_stats: Option<&crate::native_extensions::GovernorStats>,
-    ) -> Self {
+    /// Totals over the run's tasks, including the governor counters each
+    /// worker process reported for itself.
+    pub fn collect(tasks: &[crate::native_extensions::graph::GraphTaskState]) -> Self {
         let mut cost_usd = 0.0;
         let mut input_tokens = 0;
         let mut output_tokens = 0;
@@ -54,9 +53,12 @@ impl ResourceSnapshot {
             cache_write_tokens += task.usage.cache_write;
         }
 
-        let (governor_bytes_omitted, governor_retrievals, prunings) = governor_stats
-            .map(|g| (g.bytes_withheld, g.retrievals, g.prunings))
-            .unwrap_or((0, 0, 0));
+        let governor = crate::native_extensions::graph::WorkerUsage::governor_totals(tasks);
+        let (governor_bytes_omitted, governor_retrievals, prunings) = (
+            governor.bytes_withheld,
+            governor.retrievals,
+            governor.prunings,
+        );
 
         Self {
             cost_usd,
@@ -89,9 +91,8 @@ mod tests {
     }
 
     #[test]
-    fn test_resource_snapshot_collect_aggregates_usage_and_governor() {
+    fn test_resource_snapshot_collect_aggregates_worker_usage_and_governor() {
         use crate::native_extensions::graph::{ArtifactKind, GraphTaskState, Role, WorkerUsage};
-        use crate::native_extensions::GovernorStats;
 
         let mut t1 =
             GraphTaskState::new("t1", Role::Researcher, ArtifactKind::Evidence, vec![], None);
@@ -102,6 +103,9 @@ mod tests {
             cache_write: 50,
             cost_usd: 0.05,
             turns: 2,
+            governor_bytes_omitted: 10_000,
+            governor_retrievals: 2,
+            ..WorkerUsage::default()
         };
 
         let mut t2 =
@@ -113,19 +117,12 @@ mod tests {
             cache_write: 150,
             cost_usd: 0.10,
             turns: 3,
+            governor_bytes_omitted: 2_500,
+            governor_compressed_outputs: 3,
+            ..WorkerUsage::default()
         };
 
-        let gov_stats = GovernorStats {
-            bytes_withheld: 12_500,
-            retrievals: 2,
-            compressed_outputs: 3,
-            deduplicated_reads: 1,
-            blocked_calls: 0,
-            prunings: 0,
-            content_routing: Default::default(),
-        };
-
-        let snapshot = ResourceSnapshot::collect(&[t1, t2], Some(&gov_stats));
+        let snapshot = ResourceSnapshot::collect(&[t1, t2]);
         assert_eq!(snapshot.input_tokens, 3000);
         assert_eq!(snapshot.output_tokens, 750);
         assert_eq!(snapshot.cache_read_tokens, 1200);

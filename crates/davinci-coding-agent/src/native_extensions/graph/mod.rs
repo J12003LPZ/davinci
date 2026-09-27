@@ -358,7 +358,7 @@ pub struct GraphController {
     session_role_models: Option<std::collections::BTreeMap<Role, String>>,
     project_trusted: bool,
     pub memory: Option<crate::native_extensions::SharedVectorMemory>,
-    pub learning: Option<crate::native_extensions::LearningController>,
+    pub learning: Option<crate::native_extensions::SharedLearning>,
     pub governor: Option<crate::native_extensions::SharedTokenGovernor>,
     pub language_intelligence:
         Option<crate::native_extensions::language_intelligence::LanguageIntelligence>,
@@ -993,6 +993,15 @@ impl GraphController {
                     )
                 })?;
                 let message = context.submit(args).map_err(ToolError::Failed)?;
+                // The parent aggregates this worker's governor counters into
+                // the run; it cannot see this process's governor otherwise.
+                if let Some(governor) = &self.governor {
+                    let stats = governor
+                        .lock()
+                        .unwrap_or_else(|error| error.into_inner())
+                        .stats();
+                    let _ = worker::write_governor_report(&context.artifact_path, &stats);
+                }
                 Ok(ToolResult {
                     content: message,
                     is_error: false,
