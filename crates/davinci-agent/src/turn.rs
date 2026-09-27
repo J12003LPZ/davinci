@@ -2,6 +2,7 @@ use std::path::{Path, PathBuf};
 
 use davinci_ai::{
     assistant_to_chat, AssistantMessage, ChatMessage, ContentBlock, MessageContent, StopReason,
+    RESPONSES_TOOL_WIRE_KIND_KEY, RESPONSES_TOOL_WIRE_KINDS_KEY,
 };
 use serde_json::Value;
 
@@ -665,7 +666,7 @@ impl Agent {
             if had_tools {
                 if assistant.stop_reason == Some(StopReason::Length) {
                     for (id, name, args) in &tool_calls {
-                        let result = ChatMessage::tool_result(
+                        let mut result = ChatMessage::tool_result(
                             id,
                             name,
                             "Tool call arguments were truncated by the output token limit",
@@ -698,6 +699,7 @@ impl Agent {
                                 details: None,
                             },
                         );
+                        self.annotate_tool_result_wire_kind(&mut result);
                         self.messages.push(result.clone());
                         self.persist_chat(&result)?;
                         new_messages.push(result.clone());
@@ -3032,10 +3034,28 @@ impl Agent {
                 is_error: result.is_error,
             });
         }
-        (
-            tool_result_message(id, name, result, self.auto_resize_images),
-            events,
-        )
+        let mut message = tool_result_message(id, name, result, self.auto_resize_images);
+        self.annotate_tool_result_wire_kind(&mut message);
+        (message, events)
+    }
+
+    fn annotate_tool_result_wire_kind(&self, result: &mut ChatMessage) {
+        let Some(call_id) = result.tool_call_id.as_deref() else {
+            return;
+        };
+        let Some(kind) = self.messages.iter().rev().find_map(|message| {
+            message
+                .extra
+                .get(RESPONSES_TOOL_WIRE_KINDS_KEY)
+                .and_then(Value::as_object)
+                .and_then(|kinds| kinds.get(call_id))
+                .cloned()
+        }) else {
+            return;
+        };
+        result
+            .extra
+            .insert(RESPONSES_TOOL_WIRE_KIND_KEY.into(), kind);
     }
 
     /// The permission gate: `None` lets the call run, `Some(reason)` is the
@@ -4216,18 +4236,15 @@ pub(crate) fn mutation_paths_from_tool(name: &str, args: &Value) -> Vec<PathBuf>
             .or_else(|| args.get("input"))
             .and_then(Value::as_str)
         {
-            for line in patch.lines() {
-                for prefix in [
-                    "*** Update File: ",
-                    "*** Add File: ",
-                    "*** Delete File: ",
-                    "*** Move to: ",
-                ] {
-                    if let Some(path) = line.strip_prefix(prefix) {
-                        let path = PathBuf::from(path.trim());
-                        if !paths.contains(&path) {
-                            paths.push(path);
-                        }
+            if let Ok(parsed) = crate::apply_patch::parse_codex_patch(patch) {
+                for action in parsed.actions {
+                    let path = match action {
+                        crate::apply_patch::FileAction::Add { path, .. }
+                        | crate::apply_patch::FileAction::Update { path, .. }
+                        | crate::apply_patch::FileAction::Delete { path } => PathBuf::from(path),
+                    };
+                    if !paths.contains(&path) {
+                        paths.push(path);
                     }
                 }
             }

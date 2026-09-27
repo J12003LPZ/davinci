@@ -83,6 +83,38 @@ fn mcp_large_catalog_uses_progressive_schema_exposure() {
         .map(|tool| tool.name)
         .collect::<Vec<_>>();
     assert_eq!(visible_mcp, vec![target.to_string()]);
+
+    let page = execute_tool_with(
+        Path::new("."),
+        "tool_search",
+        &json!({"query": "catalog_tool_", "limit": 20}),
+        &agent.tool_context,
+    )
+    .unwrap();
+    let page_details = page.details.as_ref().unwrap();
+    assert_eq!(page_details["matching_count"], 200);
+    assert_eq!(page_details["matches"].as_array().unwrap().len(), 20);
+    assert_eq!(page_details["activated"].as_array().unwrap().len(), 20);
+    assert_eq!(page_details["next_cursor"], "20");
+
+    let next_page = execute_tool_with(
+        Path::new("."),
+        "tool_search",
+        &json!({
+            "query": "catalog_tool_",
+            "cursor": page_details["next_cursor"].as_str().unwrap(),
+            "limit": 20
+        }),
+        &agent.tool_context,
+    )
+    .unwrap();
+    assert_eq!(
+        next_page.details.as_ref().unwrap()["matches"]
+            .as_array()
+            .unwrap()
+            .len(),
+        20
+    );
 }
 
 #[test]
@@ -131,4 +163,40 @@ fn tool_search_cannot_activate_denied_mcp_tool() {
         .provider_tool_specs()
         .iter()
         .any(|tool| tool.name == denied));
+}
+
+#[test]
+fn runtime_less_search_keeps_mcp_fallback_available() {
+    let body = json!({
+        "initialize": {
+            "protocolVersion": "2025-03-26",
+            "capabilities": {"tools": {}},
+            "serverInfo": {"name": "fixture", "version": "0"}
+        },
+        "tools/list": {
+            "tools": [{
+                "name": "lookup",
+                "description": "read-only fallback fixture",
+                "inputSchema": {"type": "object"}
+            }]
+        },
+        "resources/list": {"resources": []}
+    })
+    .to_string();
+    let (dir, config) = http_fixture(&body);
+    let registry = McpRegistry::connect(&config, dir.path());
+    let mut agent = Agent::new("runtime-less");
+    agent.attach_mcp(registry);
+
+    let result = execute_tool_with(
+        Path::new("."),
+        "tool_search",
+        &json!({"mode": "exact", "query": "mcp__memory__lookup"}),
+        &agent.tool_context,
+    )
+    .unwrap();
+    let details = result.details.as_ref().unwrap();
+    assert_eq!(details["matching_count"], 1);
+    assert_eq!(details["matches"], json!(["mcp__memory__lookup"]));
+    assert!(details["activated"].as_array().unwrap().is_empty());
 }

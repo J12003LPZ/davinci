@@ -106,25 +106,32 @@ fix and passes after the fix."
     }
 }
 
-/// The candidate modules for Preview v3.
-pub fn preview_v3_modules() -> Vec<PromptModule> {
+/// The candidate modules for the G1 Preview v4 prompt experiment.
+pub fn preview_v4_modules() -> Vec<PromptModule> {
     vec![
         crate::prompt::core::core_identity_module(),
         crate::prompt::core::core_autonomy_module(),
         crate::prompt::coding::coding_exploration_module(),
         crate::prompt::coding::coding_scope_discipline_module(),
         crate::prompt::coding::coding_change_quality_module(),
+        crate::prompt::coding::coding_request_workflow_module(),
         crate::prompt::collaboration::collaboration_user_intent_module(),
         preview_verification_module(),
+        crate::prompt::verification::verification_requirement_checks_module(),
     ]
 }
 
-/// The candidate Preview prompt bundle (v3), behaviorally distinct from Stable.
+/// Compatibility name for callers that used the pre-G1 candidate constructor.
+pub fn preview_v3_modules() -> Vec<PromptModule> {
+    preview_v4_modules()
+}
+
+/// The candidate Preview prompt bundle (v4), behaviorally distinct from Stable.
 pub fn preview_bundle() -> PromptBundle {
     PromptBundle {
         id: "preview",
         version: PREVIEW_PROMPT_VERSION,
-        modules: preview_v3_modules(),
+        modules: preview_v4_modules(),
     }
 }
 
@@ -223,6 +230,40 @@ mod tests {
             stable_hash, preview_hash,
             "Preview candidate must change prompt hash from stable"
         );
+
+        let stable_text = stable.stable_text();
+        let preview_text = preview.stable_text();
+        assert!(!stable_text.contains("Read named files and applicable project instructions"));
+        assert!(preview_text.contains("Read named files and applicable project instructions"));
+        assert!(preview_text.contains("normal, boundary, and invalid inputs"));
+    }
+
+    #[test]
+    fn g1_preview_guidance_survives_generic_and_provider_composition() {
+        let generic = PromptContext {
+            provider: "custom",
+            model_id: "custom-model",
+            permission_mode: crate::permission::PermissionMode::Ask,
+            plan_active: false,
+        };
+        let openai = PromptContext {
+            provider: "openai-codex",
+            model_id: "gpt-5.6-sol",
+            permission_mode: crate::permission::PermissionMode::Ask,
+            plan_active: false,
+        };
+
+        let generic_prompt = preview_bundle().compose(&generic);
+        let openai_prompt = preview_bundle().compose(&openai);
+
+        for prompt in [&generic_prompt, &openai_prompt] {
+            assert_eq!(prompt.manifest.profile, "preview");
+            assert_eq!(prompt.manifest.profile_version, PREVIEW_PROMPT_VERSION);
+            assert!(prompt
+                .text
+                .contains("same normal/boundary/invalid classifier for every route"));
+        }
+        assert!(openai_prompt.text.contains("OpenAI model guidance:"));
     }
 
     #[test]
@@ -231,15 +272,15 @@ mod tests {
         let preview = preview_bundle();
 
         let desc = PromptCandidateDescriptor::new(
-            "preview-v3-eval",
-            "Preview V3 Evaluation",
-            "Candidate with reproducer evidence requirement",
+            "preview-v4-eval",
+            "Preview V4 G1 Evaluation",
+            "Candidate with workflow, requirement, and reproducer evidence guidance",
             &stable,
             &preview,
         )
         .expect("candidate descriptor must be created when bundles differ");
 
-        assert_eq!(desc.candidate_id, "preview-v3-eval");
+        assert_eq!(desc.candidate_id, "preview-v4-eval");
         assert_eq!(desc.base_profile, PromptProfile::Stable);
         assert_eq!(desc.candidate_profile, PromptProfile::Preview);
         assert_eq!(desc.base_bundle_hash, stable.stable_sha256());

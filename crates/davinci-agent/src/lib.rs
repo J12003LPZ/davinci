@@ -389,6 +389,9 @@ pub struct Agent {
     pub messages: Vec<ChatMessage>,
     pub thinking_level: ThinkingLevel,
     pub effort_policy: effort::EffortPolicy,
+    decision_effort_advice_enabled: bool,
+    decision_effort_advice: Option<ThinkingLevel>,
+    decision_advice_key: Option<decision::DecisionAdviceKey>,
     pub tool_surface: ToolSurface,
     /// Repeat the last verification call after later mutations at completion.
     pub auto_verify: bool,
@@ -547,6 +550,9 @@ impl Agent {
             messages: Vec::new(),
             thinking_level: ThinkingLevel::Off,
             effort_policy: effort::EffortPolicy::default(),
+            decision_effort_advice_enabled: false,
+            decision_effort_advice: None,
+            decision_advice_key: None,
             tool_surface: ToolSurface::default(),
             auto_verify: true,
             auto_compaction: true,
@@ -730,6 +736,30 @@ impl Agent {
 
     pub fn set_decision_runtime(&mut self, runtime: Arc<decision::DecisionRuntime>) {
         self.decision_runtime = Some(runtime);
+    }
+
+    pub fn set_decision_effort_advice_enabled(&mut self, enabled: bool) {
+        self.decision_effort_advice_enabled = enabled;
+        if !enabled {
+            self.decision_effort_advice = None;
+            self.decision_advice_key = None;
+        }
+    }
+
+    pub fn decision_effort_advice_enabled(&self) -> bool {
+        self.decision_effort_advice_enabled
+    }
+
+    pub fn set_decision_effort_advice(&mut self, advice: Option<ThinkingLevel>) {
+        self.decision_effort_advice = advice;
+    }
+
+    pub fn set_decision_advice_key(&mut self, key: Option<decision::DecisionAdviceKey>) {
+        self.decision_advice_key = key;
+    }
+
+    pub fn take_decision_advice_key(&mut self) -> Option<decision::DecisionAdviceKey> {
+        self.decision_advice_key.take()
     }
 
     pub fn decision_runtime(&self) -> Option<Arc<decision::DecisionRuntime>> {
@@ -1390,11 +1420,13 @@ impl Agent {
 
     /// The next request's effort; the configured level and prompt stay stable.
     pub fn request_thinking_level(&self) -> ThinkingLevel {
-        effort::request_level(
+        effort::resolve_request_effort(
             self.effort_policy,
             self.thinking_level,
             self.effort_signals(),
+            self.decision_effort_advice,
         )
+        .0
     }
 
     pub fn prompt_user_with(

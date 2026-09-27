@@ -38,15 +38,19 @@ fn empty_provider_credential_fails_without_a_coding_turn_dependency() {
 }
 
 #[test]
-fn decision_state_request_has_the_eight_v1_questions_and_bounded_wire_size() {
+fn decision_state_request_has_the_v1_questions_and_bounded_wire_size() {
     let request = DecisionState::from_task("fix a browser test change").request(
         "request",
         davinci_agent::decision::risk::DecisionRisk::Planning,
     );
-    assert_eq!(request.questions.len(), 8);
+    assert_eq!(request.questions.len(), 9);
     assert!(request.questions.contains_key("browser_relevant"));
     assert!(request.questions.contains_key("verification_scope"));
     assert!(request.questions.contains_key("regression_risk"));
+    assert!(request
+        .questions
+        .keys()
+        .any(|key| key.starts_with("requirement_req-")));
     assert!(request.validate_size().is_ok());
 }
 

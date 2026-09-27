@@ -2749,14 +2749,18 @@ fn unknown_mutation_paths_prevent_full_targeted_verification() {
 }
 
 #[test]
-fn renamed_and_deleted_patch_paths_remain_outstanding() {
+fn unsupported_move_marker_does_not_create_mutation_targets() {
+    let patch = "*** Begin Patch\n*** Update File: old.py\n*** Move to: new.py\n@@\n-x\n+y\n*** Delete File: removed.py\n*** End Patch";
+    let error = crate::apply_patch::parse_codex_patch(patch).unwrap_err();
+    assert!(error.to_string().contains("Move to"), "{error}");
+
     let paths = crate::turn::mutation_paths_from_tool(
         "apply_patch",
         &serde_json::json!({
-            "patch": "*** Begin Patch\n*** Update File: old.py\n*** Move to: new.py\n@@\n-x\n+y\n*** Delete File: removed.py\n*** End Patch"
+            "patch": patch
         }),
     );
-    assert_eq!(paths, ["old.py", "new.py", "removed.py"].map(PathBuf::from));
+    assert!(paths.is_empty());
 }
 
 #[test]

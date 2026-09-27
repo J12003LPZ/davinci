@@ -12,6 +12,14 @@ import bench
 
 
 class RunnerTests(unittest.TestCase):
+    def test_codex_priority_tier_is_an_explicit_benchmark_arm(self):
+        with patch.object(bench, "SERVICE_TIER", "fast"):
+            command = bench.command("codex", "prompt", "workdir")
+            self.assertIn('service_tier="fast"', command)
+        with patch.object(bench, "SERVICE_TIER", "default"):
+            command = bench.command("codex", "prompt", "workdir")
+            self.assertNotIn('service_tier="fast"', command)
+
     def test_pin_model_store_selects_exact_public_profile(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "models-store.json"
@@ -69,6 +77,16 @@ class RunnerTests(unittest.TestCase):
             binary.write_bytes(b"changed")
             with self.assertRaises(ValueError):
                 runner.checkpoint_identity(binary)
+
+    def test_checkpoint_identity_allows_recorded_clean_parent(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            binary = Path(temporary) / "parent.exe"
+            binary.write_bytes(b"public parent executable")
+            identity = {"schema_version": 1, "binary_sha256": runner.file_hash(binary),
+                        "source_sha": "c" * 40, "dirty_diff_hash": None}
+            binary.with_suffix(".exe.identity.json").write_text(json.dumps(identity))
+            self.assertEqual(runner.checkpoint_identity(binary),
+                             {"source_sha": "c" * 40, "dirty_diff_hash": None})
 
     def test_credentials_and_limits_stop_but_model_prose_does_not(self):
         for text, expected in [("Usage limit reached", "usage_limit"),

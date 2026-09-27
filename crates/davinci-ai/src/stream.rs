@@ -28,6 +28,10 @@ pub struct StreamOptions {
     pub session_id: Option<String>,
     pub cache_key: Option<String>,
     pub cache_retention: Option<String>,
+    /// Authentication context used by the capability-scoped Responses tool
+    /// resolver. `None` keeps direct request builders conservative (API-key
+    /// callers can opt into the public Responses profile explicitly).
+    pub responses_is_oauth: Option<bool>,
     /// Latest durable native Responses turn from this real conversation.
     /// It is validated against the current provider projection and stable
     /// model-visible request contract before use.
@@ -511,7 +515,7 @@ pub fn fixture_complete(
 }
 
 pub fn assistant_to_chat(message: &AssistantMessage) -> ChatMessage {
-    ChatMessage {
+    let mut chat = ChatMessage {
         role: "assistant".into(),
         content: message
             .content
@@ -539,7 +543,25 @@ pub fn assistant_to_chat(message: &AssistantMessage) -> ChatMessage {
             })
             .collect(),
         ..ChatMessage::default()
+    };
+    for block in &message.content {
+        if let ContentBlock::ToolCall {
+            id,
+            name,
+            arguments,
+        } = block
+        {
+            let kind = if name == "apply_patch"
+                && crate::responses_tools::custom_tool_call_arguments(arguments).is_some()
+            {
+                crate::responses_tools::ResponsesToolWireKind::Custom
+            } else {
+                crate::responses_tools::ResponsesToolWireKind::Function
+            };
+            crate::responses_tools::set_wire_kind(&mut chat.extra, id, kind);
+        }
     }
+    chat
 }
 
 pub fn live_complete(
@@ -559,6 +581,12 @@ pub fn live_complete(
     )
 }
 
+fn options_with_auth_context(options: &StreamOptions, auth: &ResolvedAuth) -> StreamOptions {
+    let mut resolved = options.clone();
+    resolved.responses_is_oauth = Some(auth.source.eq_ignore_ascii_case("oauth"));
+    resolved
+}
+
 pub fn live_complete_with(
     model: &Model,
     messages: &[ChatMessage],
@@ -567,8 +595,9 @@ pub fn live_complete_with(
     tools: &[ToolSpec],
     options: &StreamOptions,
 ) -> Result<AssistantMessage, String> {
+    let options = options_with_auth_context(options, auth);
     refuse_unsupported_tools(&model.api, tools.len())?;
-    let body = request_body_with(model, messages, system, tools, options);
+    let body = request_body_with(model, messages, system, tools, &options);
     let prepared = crate::responses_request::PreparedProviderRequest::new(body);
     let body = prepared.body();
     observe_request(model, body);
@@ -582,7 +611,7 @@ pub fn live_complete_with(
     }
     if model.api == "openai-codex-responses" {
         if let Some(token) = auth.api_key.as_deref() {
-            let codex_affinity_id = codex_responses_affinity_id(options);
+            let codex_affinity_id = codex_responses_affinity_id(&options);
             match crate::codex::try_codex_websocket_transport_with_affinity(
                 model,
                 body,
@@ -609,7 +638,7 @@ pub fn live_complete_with(
         model,
         options.session_id.as_deref(),
         options.install_telemetry,
-        &collect_request_headers(model, auth, options),
+        &collect_request_headers(model, auth, &options),
     );
     let timeout_ms = options.timeout_ms.filter(|ms| *ms > 0);
     let compress_zstd = model.api == "openai-codex-responses";
@@ -694,15 +723,16 @@ pub fn live_complete_streaming_with_sink_envelope(
     options: &StreamOptions,
     on_event: &mut dyn FnMut(&AssistantMessageEvent),
 ) -> Result<ProviderCompletionEnvelope, String> {
+    let options = options_with_auth_context(options, auth);
     let dump = crate::wire_dump::begin();
     if let Some(dump) = &dump {
         dump.write(
             "logical",
-            &request_body_with(model, messages, system, tools, options),
+            &request_body_with(model, messages, system, tools, &options),
         );
     }
     let result = live_complete_streaming_with_sink_envelope_inner(
-        model, messages, auth, system, tools, options, on_event,
+        model, messages, auth, system, tools, &options, on_event,
     );
     if let (Some(dump), Ok(envelope)) = (&dump, &result) {
         dump.write(
@@ -1301,8 +1331,22 @@ pub fn openai_responses_input_with(
     let mut input = Vec::new();
     for message in messages {
         if message.role == "toolResult" {
+            let kind = crate::responses_tools::message_tool_wire_kind(
+                message,
+                message.tool_call_id.as_deref(),
+                message.tool_name.as_deref(),
+                options.custom_tools,
+            );
+            let item_type = match kind {
+                crate::responses_tools::ResponsesToolWireKind::Custom => {
+                    "custom_tool_call_output"
+                }
+                crate::responses_tools::ResponsesToolWireKind::Function => {
+                    "function_call_output"
+                }
+            };
             input.push(serde_json::json!({
-                "type": "function_call_output",
+                "type": item_type,
                 "call_id": responses_call_id(message.tool_call_id.as_deref().unwrap_or_default()),
                 "output": content_text(&message.content),
             }));
@@ -1327,12 +1371,36 @@ pub fn openai_responses_input_with(
                     arguments,
                 } = block
                 {
-                    input.push(serde_json::json!({
-                        "type": "function_call",
-                        "call_id": responses_call_id(id),
-                        "name": name,
-                        "arguments": arguments.to_string(),
-                    }));
+                    let kind = crate::responses_tools::message_tool_wire_kind(
+                        message,
+                        Some(id),
+                        Some(name),
+                        options.custom_tools,
+                    );
+                    match kind {
+                        crate::responses_tools::ResponsesToolWireKind::Custom => {
+                            let raw_input = crate::responses_tools::custom_tool_call_arguments(
+                                arguments,
+                            )
+                            .map(str::to_string)
+                            .or_else(|| arguments.as_str().map(str::to_string))
+                            .unwrap_or_else(|| arguments.to_string());
+                            input.push(serde_json::json!({
+                                "type": "custom_tool_call",
+                                "call_id": responses_call_id(id),
+                                "name": name,
+                                "input": raw_input,
+                            }));
+                        }
+                        crate::responses_tools::ResponsesToolWireKind::Function => {
+                            input.push(serde_json::json!({
+                                "type": "function_call",
+                                "call_id": responses_call_id(id),
+                                "name": name,
+                                "arguments": arguments.to_string(),
+                            }));
+                        }
+                    }
                 }
             }
             continue;
@@ -1413,10 +1481,17 @@ fn openai_responses_body_with_service_tier(
         trusted_system.is_some(),
     );
 
+    let resolved_tools = crate::responses_tools::resolve_responses_tools(
+        model,
+        model.base_url.as_deref(),
+        options.responses_is_oauth.unwrap_or(false),
+        tools,
+    );
+    let custom_tool_names = resolved_tools.custom_tool_name_refs();
     let model_key = format!("{}/{}", model.provider, model.id);
     let input_options = ResponsesInputOptions {
         native_items_model: Some(&model_key),
-        custom_tools: &[],
+        custom_tools: &custom_tool_names,
     };
     let mut input = openai_responses_input_with(messages, &input_options);
     if cache_plan.use_stable_bootstrap_breakpoint {
@@ -1512,26 +1587,8 @@ fn openai_responses_body_with_service_tier(
             }
         }
     }
-    if !tools.is_empty() {
-        let mut sorted_tools = tools.to_vec();
-        sorted_tools.sort_by(|a, b| a.name.cmp(&b.name));
-        body["tools"] = Value::Array(
-            sorted_tools
-                .iter()
-                .map(|tool| {
-                    let mut function = serde_json::json!({
-                        "type": "function",
-                        "name": tool.name,
-                        "description": tool.description,
-                        "parameters": tool.parameters,
-                    });
-                    if resolve_json_schema_strict_sampling(tool).unwrap_or(false) {
-                        function["strict"] = Value::Bool(true);
-                    }
-                    function
-                })
-                .collect(),
-        );
+    if !resolved_tools.tools.is_empty() {
+        body["tools"] = Value::Array(resolved_tools.wire_tools());
     }
     if model.reasoning {
         if let Some(level) = options
@@ -1589,12 +1646,20 @@ fn apply_native_responses_resume(
     }
 
     let mut input = resume.turn.full_native_replay_prefix();
+    let custom_tool_names = body
+        .get("tools")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|tool| tool["type"] == "custom")
+        .filter_map(|tool| tool.get("name").and_then(Value::as_str))
+        .collect::<Vec<_>>();
     let model_key = format!("{}/{}", model.provider, model.id);
     input.extend(openai_responses_input_with(
         &messages[resume.resume_provider_message_count..],
         &ResponsesInputOptions {
             native_items_model: Some(&model_key),
-            custom_tools: &[],
+            custom_tools: &custom_tool_names,
         },
     ));
     body["input"] = Value::Array(input);
@@ -2398,21 +2463,93 @@ fn parse_provider_response(model: &Model, raw: &str) -> AssistantMessage {
     }
     let value: Value = serde_json::from_str(raw).unwrap_or(Value::Null);
     let mut content = Vec::new();
-    if let Some(text) = value
-        .pointer("/choices/0/message/content")
-        .and_then(Value::as_str)
-        .or_else(|| value.pointer("/content/0/text").and_then(Value::as_str))
-        .or_else(|| {
-            value
-                .pointer("/candidates/0/content/parts/0/text")
-                .and_then(Value::as_str)
-        })
-        .or_else(|| value.pointer("/output_text").and_then(Value::as_str))
-    {
-        if !text.is_empty() {
-            content.push(ContentBlock::Text {
-                text: text.to_string(),
-            });
+    let responses_output = value
+        .get("output")
+        .or_else(|| value.pointer("/response/output"))
+        .and_then(Value::as_array);
+    if let Some(output) = responses_output {
+        for item in output {
+            match item.get("type").and_then(Value::as_str) {
+                Some("message") => {
+                    if let Some(parts) = item.get("content").and_then(Value::as_array) {
+                        for part in parts {
+                            if let Some(text) = part
+                                .get("text")
+                                .or_else(|| part.get("refusal"))
+                                .and_then(Value::as_str)
+                            {
+                                content.push(ContentBlock::Text {
+                                    text: text.to_string(),
+                                });
+                            }
+                        }
+                    }
+                }
+                Some("function_call") => {
+                    let id = item
+                        .get("call_id")
+                        .and_then(Value::as_str)
+                        .or_else(|| item.get("id").and_then(Value::as_str))
+                        .unwrap_or_default()
+                        .to_string();
+                    let name = item
+                        .get("name")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_string();
+                    let arguments = item
+                        .get("arguments")
+                        .and_then(Value::as_str)
+                        .map(crate::final_tool_arguments)
+                        .unwrap_or_else(|| item.get("arguments").cloned().unwrap_or_else(|| {
+                            Value::Object(Default::default())
+                        }));
+                    content.push(ContentBlock::ToolCall {
+                        id,
+                        name,
+                        arguments,
+                    });
+                }
+                Some("custom_tool_call") => {
+                    let id = item
+                        .get("call_id")
+                        .and_then(Value::as_str)
+                        .or_else(|| item.get("id").and_then(Value::as_str))
+                        .unwrap_or_default()
+                        .to_string();
+                    content.push(ContentBlock::ToolCall {
+                        id,
+                        name: item
+                            .get("name")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default()
+                            .to_string(),
+                        arguments: serde_json::json!({
+                            "input": item.get("input").and_then(Value::as_str).unwrap_or_default()
+                        }),
+                    });
+                }
+                _ => {}
+            }
+        }
+    }
+    if content.is_empty() {
+        if let Some(text) = value
+            .pointer("/choices/0/message/content")
+            .and_then(Value::as_str)
+            .or_else(|| value.pointer("/content/0/text").and_then(Value::as_str))
+            .or_else(|| {
+                value
+                    .pointer("/candidates/0/content/parts/0/text")
+                    .and_then(Value::as_str)
+            })
+            .or_else(|| value.pointer("/output_text").and_then(Value::as_str))
+        {
+            if !text.is_empty() {
+                content.push(ContentBlock::Text {
+                    text: text.to_string(),
+                });
+            }
         }
     }
     if let Some(calls) = value
@@ -2585,6 +2722,9 @@ fn parse_provider_response(model: &Model, raw: &str) -> AssistantMessage {
 mod tests {
     use super::*;
     use crate::catalog::load_builtin_models;
+    use std::sync::Mutex;
+
+    static REASONING_SUMMARY_ENV_LOCK: Mutex<()> = Mutex::new(());
 
     #[test]
     fn service_tier_maps_codex_names_to_wire_values() {
@@ -2721,6 +2861,46 @@ mod tests {
         assert_eq!(summary_from(Some("none")), None);
         assert_eq!(summary_from(Some("concise")), Some("concise"));
         assert_eq!(summary_from(None), Some("auto"));
+    }
+
+    #[test]
+    fn reasoning_summary_wire_controls_keep_medium_effort() {
+        let _guard = REASONING_SUMMARY_ENV_LOCK.lock().unwrap();
+        let previous = std::env::var("DAVINCI_REASONING_SUMMARY").ok();
+        let mut model = load_builtin_models()
+            .into_iter()
+            .find(|model| model.api == "openai-codex-responses")
+            .expect("codex responses model");
+        model.reasoning = true;
+        let options = StreamOptions {
+            thinking_level: Some(ThinkingLevel::Medium),
+            ..StreamOptions::default()
+        };
+
+        for (setting, expected_summary) in [
+            ("none", None),
+            ("auto", Some("auto")),
+            ("concise", Some("concise")),
+            ("detailed", Some("detailed")),
+        ] {
+            std::env::set_var("DAVINCI_REASONING_SUMMARY", setting);
+            let body = openai_responses_body(&model, &[], None, &[], &options);
+            assert_eq!(body["reasoning"]["effort"], "medium");
+            assert_eq!(
+                body["reasoning"].get("summary").and_then(Value::as_str),
+                expected_summary
+            );
+        }
+
+        model.reasoning = false;
+        std::env::set_var("DAVINCI_REASONING_SUMMARY", "detailed");
+        let body = openai_responses_body(&model, &[], None, &[], &options);
+        assert!(body.get("reasoning").is_none());
+
+        match previous {
+            Some(value) => std::env::set_var("DAVINCI_REASONING_SUMMARY", value),
+            None => std::env::remove_var("DAVINCI_REASONING_SUMMARY"),
+        }
     }
 
     #[test]

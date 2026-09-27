@@ -43,6 +43,24 @@ Match the prevailing style, error-handling conventions, and architecture of the 
     }
 }
 
+/// Candidate-only workflow guidance for the request-efficiency prompt experiment.
+pub fn coding_request_workflow_module() -> PromptModule {
+    PromptModule {
+        id: "coding.request-workflow".to_string(),
+        version: 1,
+        cache_class: PromptCacheClass::Stable,
+        body: "\
+Read named files and applicable project instructions directly. Batch independent reads in one \
+response when you already know what you need. Make one coherent minimal patch that covers the \
+request. When inputs are already known and ordering is guaranteed, include the smallest meaningful \
+verification in the same response. Inspect failures instead of treating them as noise. Before \
+finishing, compare every explicit requirement with a concrete input or observable condition. \
+Report the changes and actual verification briefly. Do not stop at an arbitrary request count; \
+stop when the requested outcome and its evidence are complete."
+            .to_string(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -59,5 +77,14 @@ mod tests {
         let text = coding_scope_discipline_module().body;
         assert!(text.contains("Do not refactor unrelated code"));
         assert!(text.contains("minimum coherent change"));
+    }
+
+    #[test]
+    fn candidate_workflow_requires_direct_reads_and_requirement_comparison() {
+        let text = coding_request_workflow_module().body;
+        assert!(text.contains("Read named files and applicable project instructions directly"));
+        assert!(text.contains("Make one coherent minimal patch"));
+        assert!(text.contains("compare every explicit requirement"));
+        assert!(text.contains("Do not stop at an arbitrary request count"));
     }
 }

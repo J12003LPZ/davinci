@@ -314,25 +314,31 @@ impl ResponsesLedger {
         let mut ledger = Self::new(lineage_id);
         for message in messages {
             if message.role == "toolResult" {
-                let call_id = message
-                    .tool_call_id
-                    .as_deref()
-                    .unwrap_or_default()
+                let raw_call_id = message.tool_call_id.as_deref().unwrap_or_default();
+                let call_id = raw_call_id
                     .split_once('|')
                     .map(|(c, _)| c)
-                    .unwrap_or(message.tool_call_id.as_deref().unwrap_or_default());
+                    .unwrap_or(raw_call_id);
+                let kind = crate::responses_tools::message_tool_wire_kind(
+                    message,
+                    Some(raw_call_id),
+                    message.tool_name.as_deref(),
+                    &[],
+                );
                 let output = content_text(&message.content);
-                // Check if this tool result was for a custom tool or function call
-                if message.tool_name.as_deref() == Some("apply_patch") {
-                    ledger.append_item(ResponsesItem::CustomToolCallOutput {
-                        call_id: call_id.to_string(),
-                        output,
-                    });
-                } else {
-                    ledger.append_item(ResponsesItem::FunctionCallOutput {
-                        call_id: call_id.to_string(),
-                        output,
-                    });
+                match kind {
+                    crate::responses_tools::ResponsesToolWireKind::Custom => {
+                        ledger.append_item(ResponsesItem::CustomToolCallOutput {
+                            call_id: call_id.to_string(),
+                            output,
+                        });
+                    }
+                    crate::responses_tools::ResponsesToolWireKind::Function => {
+                        ledger.append_item(ResponsesItem::FunctionCallOutput {
+                            call_id: call_id.to_string(),
+                            output,
+                        });
+                    }
                 }
                 continue;
             }
@@ -354,25 +360,34 @@ impl ResponsesLedger {
                     } = block
                     {
                         let call_id = id.split_once('|').map(|(c, _)| c).unwrap_or(id);
-                        if name == "apply_patch" {
-                            let input = arguments
-                                .get("input")
-                                .and_then(Value::as_str)
+                        let kind = crate::responses_tools::message_tool_wire_kind(
+                            message,
+                            Some(id),
+                            Some(name),
+                            &[],
+                        );
+                        match kind {
+                            crate::responses_tools::ResponsesToolWireKind::Custom => {
+                                let input = crate::responses_tools::custom_tool_call_arguments(
+                                    arguments,
+                                )
                                 .unwrap_or_default()
                                 .to_string();
-                            ledger.append_item(ResponsesItem::CustomToolCall {
-                                id: Some(id.clone()),
-                                call_id: call_id.to_string(),
-                                name: name.clone(),
-                                input,
-                            });
-                        } else {
-                            ledger.append_item(ResponsesItem::FunctionCall {
-                                id: Some(id.clone()),
-                                call_id: call_id.to_string(),
-                                name: name.clone(),
-                                arguments: arguments.to_string(),
-                            });
+                                ledger.append_item(ResponsesItem::CustomToolCall {
+                                    id: Some(id.clone()),
+                                    call_id: call_id.to_string(),
+                                    name: name.clone(),
+                                    input,
+                                });
+                            }
+                            crate::responses_tools::ResponsesToolWireKind::Function => {
+                                ledger.append_item(ResponsesItem::FunctionCall {
+                                    id: Some(id.clone()),
+                                    call_id: call_id.to_string(),
+                                    name: name.clone(),
+                                    arguments: arguments.to_string(),
+                                });
+                            }
                         }
                     }
                 }
@@ -610,18 +625,29 @@ mod tests {
 
     #[test]
     fn migrates_generic_messages_to_responses_items() {
+        let mut assistant = ChatMessage {
+            role: "assistant".into(),
+            content: vec![MessageContent::ToolCall {
+                id: "call_1|fc_1".into(),
+                name: "apply_patch".into(),
+                arguments: serde_json::json!({"input": "*** Begin Patch\n*** End Patch"}),
+            }],
+            ..Default::default()
+        };
+        crate::responses_tools::set_wire_kind(
+            &mut assistant.extra,
+            "call_1|fc_1",
+            crate::responses_tools::ResponsesToolWireKind::Custom,
+        );
+        let mut result = ChatMessage::tool_result("call_1|fc_1", "apply_patch", "Applied patch", false);
+        crate::responses_tools::set_single_wire_kind(
+            &mut result.extra,
+            crate::responses_tools::ResponsesToolWireKind::Custom,
+        );
         let messages = vec![
             ChatMessage::text("user", "What is 2+2?"),
-            ChatMessage {
-                role: "assistant".into(),
-                content: vec![MessageContent::ToolCall {
-                    id: "call_1|fc_1".into(),
-                    name: "apply_patch".into(),
-                    arguments: serde_json::json!({"input": "*** Begin Patch\n*** End Patch"}),
-                }],
-                ..Default::default()
-            },
-            ChatMessage::tool_result("call_1|fc_1", "apply_patch", "Applied patch", false),
+            assistant,
+            result,
         ];
 
         let ledger = ResponsesLedger::from_messages("lin_migrated", &messages);

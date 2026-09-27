@@ -3282,7 +3282,10 @@ fn prompt_profile_rollback_test() {
     let preview_agent = build_agent(&preview_args, &session_dir, &cwd).unwrap();
     let preview_manifest = preview_agent.prompt_manifest.as_ref().unwrap();
     assert_eq!(preview_manifest.profile, "preview");
-    assert_eq!(preview_manifest.profile_version, 3);
+    assert_eq!(
+        preview_manifest.profile_version,
+        davinci_agent::prompt::PREVIEW_PROMPT_VERSION
+    );
 
     let rollback_args = Args {
         prompt_profile: Some(davinci_agent::PromptProfile::LegacyV1),
@@ -3299,7 +3302,7 @@ fn prompt_profile_rollback_test() {
     );
 
     let status_preview = format_session_status(&preview_args, &preview_agent);
-    assert!(status_preview.contains("prompt: preview v3"));
+    assert!(status_preview.contains("prompt: preview v4"));
 
     let status_rollback = format_session_status(&rollback_args, &rollback_agent);
     assert!(status_rollback.contains("prompt: legacy-v1 v1"));

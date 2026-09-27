@@ -18,7 +18,9 @@ set `PYTHONUTF8=1` before invoking Python.
    `BENCH_DAVINCI` must select that copy, not a mutable build output.
 2. Write an adjacent `davinci.exe.identity.json` containing `schema_version: 1`,
    `binary_sha256`, `source_sha`, and `dirty_diff_hash`. Hash the copied bytes;
-   source identity must come from the verified build, not a later checkout.
+   source identity must come from the verified build, not a later checkout. A
+   clean parent build may record `dirty_diff_hash: null`; candidate builds must
+   retain their actual dirty-tree digest.
    The runner checks this sidecar and rechecks binary bytes before each run.
    `runner.source_identity` hashes tracked changes and untracked implementation
    files. Codex source provenance is explicitly unavailable; its executable

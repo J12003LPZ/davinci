@@ -186,16 +186,19 @@ pub fn hash_system_prompt(prompt: &str) -> String {
     format!("{:x}", h.finalize())
 }
 
-/// Compute a SHA-256 hash of a system prompt, preferring stable_sha256 from manifest if available.
+/// Compute a SHA-256 hash of the effective provider instructions.
+///
+/// The manifest's stable hash describes the reusable prompt modules, but it
+/// does not include provider suffixes, repository context, or session
+/// appends. Those bytes are part of the request prefix and therefore must be
+/// included in the cache identity. Keep the manifest parameter for callers
+/// that still pass the prompt composition metadata; it is intentionally only
+/// diagnostic here.
 pub fn hash_system_prompt_with_manifest(
     prompt: &str,
-    manifest: Option<&crate::prompt::manifest::PromptManifest>,
+    _manifest: Option<&crate::prompt::manifest::PromptManifest>,
 ) -> String {
-    if let Some(m) = manifest {
-        m.stable_sha256.clone()
-    } else {
-        hash_system_prompt(prompt)
-    }
+    hash_system_prompt(prompt)
 }
 
 #[cfg(test)]
@@ -283,5 +286,43 @@ mod tests {
         let h1 = hash_tool_names(&["read", "write", "edit"]);
         let h2 = hash_tool_names(&["edit", "read", "write"]);
         assert_eq!(h1, h2);
+    }
+
+    #[test]
+    fn effective_prompt_hash_includes_session_append_even_with_manifest() {
+        let manifest = crate::prompt::manifest::PromptManifest::from_parts(
+            "test",
+            1,
+            &[],
+            "stable instructions",
+            "stable instructions",
+        );
+        let effective = "stable instructions\n\nprovider session append";
+        let hashed = hash_system_prompt_with_manifest(effective, Some(&manifest));
+        assert_eq!(hashed, hash_system_prompt(effective));
+        assert_ne!(hashed, manifest.stable_sha256);
+    }
+
+    #[test]
+    fn effective_prompt_hash_preserves_provider_visible_project_paths() {
+        let first = "<project_context><project_instructions paths=[\"C:/one\"]>same</project_instructions></project_context>";
+        let second = "<project_context><project_instructions paths=[\"C:/two\"]>same</project_instructions></project_context>";
+        assert_ne!(hash_system_prompt(first), hash_system_prompt(second));
+    }
+
+    #[test]
+    fn cache_identity_excludes_transient_run_metadata_but_keeps_context_lineage() {
+        let first = sample_identity();
+        let mut equivalent = first.clone();
+        // Cwd/date/run identifiers are not CacheIdentity fields, so an
+        // equivalent fresh process has the same key.
+        assert_eq!(first.cache_key(), equivalent.cache_key());
+
+        equivalent.context_item_hashes = vec!["ctxvm-folded-root".into()];
+        assert_ne!(first.cache_key(), equivalent.cache_key());
+        assert_eq!(
+            equivalent.diff(&first),
+            vec![CacheMissReason::ContextChanged]
+        );
     }
 }

@@ -241,10 +241,8 @@ impl Agent {
                         result = (hook.0)(&op_id, cwd, &tool, &args, result);
                     }
                     if !replayed {
-                        if matches!(
-                            tool.as_str(),
-                            "write" | "edit" | "apply_patch" | "notebook_edit"
-                        ) && !pre_hook_error
+                        if crate::tools::is_coordinated_mutation(&tool)
+                            && !pre_hook_error
                             && !result.is_error
                         {
                             agent.record_successful_mutation_paths(

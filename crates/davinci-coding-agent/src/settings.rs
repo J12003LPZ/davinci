@@ -166,6 +166,13 @@ fn parse_decision_intelligence<'de, D: serde::Deserializer<'de>>(
 #[serde(default, rename_all = "camelCase", deny_unknown_fields)]
 pub struct DecisionIntelligenceSettings {
     pub enabled: bool,
+    /// Allow a ready Jev result to raise an adaptive request's effort.
+    pub effort_advice: bool,
+    /// Reserved for the bounded completion-advice experiment; shadow-only by
+    /// default until independently calibrated.
+    pub completion_advice: bool,
+    /// Reserved for the optional pre-request family-routing experiment.
+    pub tool_family_advice: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -1179,6 +1186,14 @@ impl Settings {
         self.decision_intelligence
             .as_ref()
             .is_some_and(|settings| settings.enabled)
+    }
+
+    pub fn decision_effort_advice_enabled(&self) -> bool {
+        self.decision_intelligence_enabled()
+            && self
+                .decision_intelligence
+                .as_ref()
+                .is_some_and(|settings| settings.effort_advice)
     }
 
     pub fn compaction_enabled(&self) -> bool {

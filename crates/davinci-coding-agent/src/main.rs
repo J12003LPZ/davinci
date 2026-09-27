@@ -762,6 +762,7 @@ fn build_agent(parsed: &Args, session_dir: &Path, cwd: &Path) -> Result<Agent, S
         .tools
         .retain(|tool| !parsed.exclude_tools.contains(tool));
     agent.cwd = cwd.to_path_buf();
+    agent.set_decision_effort_advice_enabled(settings.decision_effort_advice_enabled());
     if settings.decision_intelligence_enabled() {
         match AuthStorage::create()
             .map_err(|error| error.to_string())
@@ -1208,6 +1209,7 @@ fn complete_simple_summarization(
             None
         },
         thinking_budgets,
+        responses_is_oauth: None,
         timeout_ms,
         max_retries,
         max_retry_delay_ms,
@@ -2162,6 +2164,31 @@ fn provider_tools(agent: &Agent) -> Vec<ToolSpec> {
         .collect()
 }
 
+fn effective_provider_tool_schema_hash(
+    model: &davinci_ai::Model,
+    auth: &ResolvedAuth,
+    tools: &[ToolSpec],
+) -> String {
+    if matches!(
+        model.api.as_str(),
+        "openai-responses" | "openai-codex-responses" | "azure-openai-responses"
+    ) {
+        return davinci_ai::resolve_responses_tools(
+            model,
+            model.base_url.as_deref(),
+            auth.source.eq_ignore_ascii_case("oauth"),
+            tools,
+        )
+        .schema_digest;
+    }
+
+    // Non-Responses adapters currently derive their wire tool schemas from
+    // ToolSpec. Include the complete serialized contract, including strict
+    // constrained-sampling metadata, rather than hashing only tool names.
+    let serialized = serde_json::to_value(tools).expect("tool schemas are JSON");
+    davinci_agent::runtime::compute_schema_hash(&serialized)
+}
+
 fn complete_prompt_with_host(
     parsed: &Args,
     agent: &mut Agent,
@@ -2602,15 +2629,53 @@ fn complete_prompt_with_host(
                         });
                     };
                     let provider_messages = current.messages_for_provider();
+                    let request_tools = provider_tools(current);
+                    let cache_key = std::env::var("PI_GRAPH_CACHE_KEY")
+                        .ok()
+                        .filter(|s| !s.is_empty())
+                        .or_else(|| {
+                            Some(
+                                davinci_agent::CacheIdentity {
+                                    provider: model.provider.clone(),
+                                    model_id: model.id.clone(),
+                                    system_prompt_hash:
+                                        davinci_agent::hash_system_prompt_with_manifest(
+                                            &system,
+                                            current.prompt_manifest.as_ref(),
+                                        ),
+                                    tool_schema_hash: effective_provider_tool_schema_hash(
+                                        model,
+                                        auth,
+                                        &request_tools,
+                                    ),
+                                    permission_surface_hash: davinci_agent::hash_tool_names(
+                                        &current
+                                            .visible_tool_names()
+                                            .iter()
+                                            .map(String::as_str)
+                                            .collect::<Vec<_>>(),
+                                    ),
+                                    context_item_hashes: current
+                                        .context_vm_cache_affinity()
+                                        .into_iter()
+                                        .collect(),
+                                    agent_profile_hash: None,
+                                    contract_hash: None,
+                                    role: Some("root".into()),
+                                }
+                                .cache_key(),
+                            )
+                        });
                     let result = live_complete_streaming_with_sink_envelope(
                         model,
                         &provider_messages,
                         auth,
                         Some(&system),
-                        &provider_tools(current),
+                        &request_tools,
                         &StreamOptions {
                             thinking_level: Some(current.request_thinking_level()),
                             thinking_budgets: current.thinking_budgets.clone(),
+                            responses_is_oauth: None,
                             timeout_ms: current.provider_timeout_ms,
                             max_retries: current.provider_max_retries,
                             max_retry_delay_ms: Some(current.provider_max_retry_delay_ms),
@@ -2619,23 +2684,7 @@ fn complete_prompt_with_host(
                                 .websocket_connect_timeout_ms,
                             transport: current.transport.clone(),
                             session_id: Some(transport_session.id.clone()),
-                            cache_key: std::env::var("PI_GRAPH_CACHE_KEY")
-                                .ok()
-                                .filter(|s| !s.is_empty())
-                                .or_else(|| Some(davinci_agent::CacheIdentity {
-                                    provider: model.provider.clone(),
-                                    model_id: model.id.clone(),
-                                    system_prompt_hash: davinci_agent::hash_system_prompt_with_manifest(&system, current.prompt_manifest.as_ref()),
-                                    tool_schema_hash: current.provider_tool_schema_identity(),
-                                    permission_surface_hash: davinci_agent::hash_tool_names(&current.visible_tool_names().iter().map(String::as_str).collect::<Vec<_>>()),
-                                    context_item_hashes: current
-                                        .context_vm_cache_affinity()
-                                        .into_iter()
-                                        .collect(),
-                                    agent_profile_hash: None,
-                                    contract_hash: None,
-                                    role: Some("root".into()),
-                                }.cache_key())),
+                            cache_key,
                             cache_retention: None,
                             native_responses_resume:
                                 current.native_responses_resume_record(),
@@ -3167,6 +3216,17 @@ fn run_print(parsed: &Args, agent: &mut Agent) -> Result<i32, String> {
                 PreparedInput::Completed(code) => return Ok(code),
                 PreparedInput::Handled => {}
                 PreparedInput::Ready { text, images } => {
+                    let _ = davinci_coding_agent::turn_decision::prepare_turn_decision(
+                        agent,
+                        davinci_coding_agent::turn_decision::DecisionSnapshot {
+                            request_id: davinci_agent::new_message_id(),
+                            task: text.clone(),
+                            decision_class: davinci_agent::decision::risk::DecisionRisk::Planning,
+                            metadata: davinci_coding_agent::decision_state::DecisionMetadata::default(),
+                            evidence_revision: agent.messages.len() as u64,
+                            mutation_revision: agent.effort_signals().mutations,
+                        },
+                    );
                     agent.prompt_user_with(&text, &images);
                     if json_mode {
                         write_prompt_manifest_json_event(agent)?;
@@ -3196,6 +3256,17 @@ fn run_print(parsed: &Args, agent: &mut Agent) -> Result<i32, String> {
             PreparedInput::Completed(code) => return Ok(code),
             PreparedInput::Handled => {}
             PreparedInput::Ready { text, images } => {
+                let _ = davinci_coding_agent::turn_decision::prepare_turn_decision(
+                    agent,
+                    davinci_coding_agent::turn_decision::DecisionSnapshot {
+                        request_id: davinci_agent::new_message_id(),
+                        task: text.clone(),
+                        decision_class: davinci_agent::decision::risk::DecisionRisk::Planning,
+                        metadata: davinci_coding_agent::decision_state::DecisionMetadata::default(),
+                        evidence_revision: agent.messages.len() as u64,
+                        mutation_revision: agent.effort_signals().mutations,
+                    },
+                );
                 agent.prompt_user_with(&text, &images);
                 if json_mode {
                     write_prompt_manifest_json_event(agent)?;
@@ -6214,6 +6285,17 @@ fn submit_user_message(
         return Ok(true);
     };
     session.chrome.transcript.push("user", &text);
+    let _ = davinci_coding_agent::turn_decision::prepare_turn_decision(
+        agent,
+        davinci_coding_agent::turn_decision::DecisionSnapshot {
+            request_id: davinci_agent::new_message_id(),
+            task: text.clone(),
+            decision_class: davinci_agent::decision::risk::DecisionRisk::Planning,
+            metadata: davinci_coding_agent::decision_state::DecisionMetadata::default(),
+            evidence_revision: agent.messages.len() as u64,
+            mutation_revision: agent.effort_signals().mutations,
+        },
+    );
     agent.prompt_user_with(&text, &images);
     // Inside the raw-mode TUI the turn runs on a worker thread so the
     // interface keeps painting (spinner, live tool lines, Esc interrupt).
@@ -7017,6 +7099,7 @@ fn persist_interactive_setting(spec: &str) -> Result<(), String> {
         "decision-intelligence" => {
             stored.decision_intelligence = Some(crate::settings::DecisionIntelligenceSettings {
                 enabled: value == "on",
+                ..Default::default()
             });
         }
         "transport" => stored.transport = Some(value.to_string()),

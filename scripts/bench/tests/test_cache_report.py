@@ -25,6 +25,24 @@ class CacheReportTests(unittest.TestCase):
             self.assertIn("all: input unavailable", output.getvalue())
             self.assertIn("first: input 100, cached 80 (80.0%)", output.getvalue())
             self.assertIn("later: input unavailable", output.getvalue())
+            self.assertIn("first_request_zero_cached=no", output.getvalue())
+
+    def test_request_fingerprints_cover_body_and_cache_sensitive_components(self):
+        body = {
+            "input": [{"role": "user", "content": "hello"}],
+            "tools": [{"name": "read", "parameters": {"type": "object"}}],
+            "instructions": "stable",
+        }
+        fingerprints = cache_report.request_fingerprints(body, {"input": body["input"]})
+        self.assertEqual(set(fingerprints), {"body", "wire", "instructions", "tools", "input"})
+        self.assertTrue(all(len(value) == 16 for value in fingerprints.values() if value != "-"))
+        reordered = {"tools": body["tools"], "instructions": "stable", "input": body["input"]}
+        self.assertEqual(fingerprints["body"], cache_report.request_fingerprints(reordered)["body"])
+
+    def test_first_request_zero_cached_state_is_explicit(self):
+        self.assertEqual(cache_report.first_request_cache_state([(100, 0), (100, 50)]), "yes")
+        self.assertEqual(cache_report.first_request_cache_state([(100, 1)]), "no")
+        self.assertEqual(cache_report.first_request_cache_state([(None, None)]), "unavailable")
 
 
 if __name__ == "__main__":

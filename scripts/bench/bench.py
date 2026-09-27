@@ -41,6 +41,7 @@ TASKS = os.path.join(HERE, "tasks")
 RUNS = os.environ.get("BENCH_RUNS", os.path.join(HERE, "runs"))
 MODEL = os.environ.get("BENCH_MODEL", "gpt-6-luna")
 EFFORT = os.environ.get("BENCH_EFFORT", "medium")
+SERVICE_TIER = os.environ.get("BENCH_SERVICE_TIER", "default")
 TIMEOUT = int(os.environ.get("BENCH_TIMEOUT", "900"))
 IGNORED = ("__pycache__", ".pytest_cache", ".git/", ".pi/", ".davinci/", ".codex/",
            ".davinci-transactions/", ".serena/")
@@ -135,12 +136,15 @@ def command(harness, prompt, workdir):
         ]
     # --ignore-user-config drops a user's service_tier = "fast" (priority
     # processing davinci does not use), a max effort and MCP servers; auth is kept.
-    return [
+    args = [
         os.environ.get("BENCH_CODEX", "codex"), "exec", "--json", "--ephemeral",
         "--ignore-user-config", "--skip-git-repo-check",
         "--dangerously-bypass-approvals-and-sandbox",
         "-m", MODEL, "-c", f'model_reasoning_effort="{EFFORT}"', "-C", workdir, prompt,
     ]
+    if SERVICE_TIER != "default":
+        args[args.index("-C"):args.index("-C")] = ["-c", f'service_tier="{SERVICE_TIER}"']
+    return args
 
 
 def parse_stream(harness, stdout):

@@ -21,6 +21,10 @@ BASE_SETTINGS = {"decisionIntelligence": {"enabled": False},
     "promptProfile": "stable"}
 
 
+def service_tier():
+    return os.environ.get("BENCH_SERVICE_TIER", "default")
+
+
 def stop_reason(stdout, stderr):
     errors = [stderr]
     for line in stdout.splitlines():
@@ -115,6 +119,11 @@ def checkpoint_identity(executable):
         raise ValueError("unsupported checkpoint identity")
     for field, length in (("binary_sha256", 64), ("source_sha", 40), ("dirty_diff_hash", 64)):
         value = identity.get(field)
+        # A clean parent build has no diff bytes to hash. Preserve that
+        # recorded null instead of inventing a digest merely to satisfy the
+        # sidecar format; candidate builds still require their real digest.
+        if field == "dirty_diff_hash" and value is None:
+            continue
         if not isinstance(value, str) or re.fullmatch("[0-9a-f]{" + str(length) + "}", value) is None:
             raise ValueError("invalid checkpoint " + field)
     if identity["binary_sha256"] != file_hash(executable):
@@ -141,11 +150,11 @@ def campaign_identity(root, variant, fixtures, harnesses, model, effort, setting
             "binary_sha256": file_hash(executable), "version": version,
             **(checkpoint_identity(executable) if harness == "davinci" else {"source_sha": None, "dirty_diff_hash": None}),
             "effective_settings": settings if harness == "davinci" else {
-                "ignore_user_config": True, "effort": effort, "service_tier": "default",
+                "ignore_user_config": True, "effort": effort, "service_tier": service_tier(),
                 "telemetry": "local-sanitized-otlp-logs-and-traces"}}
     return {"schema_version": 2, "campaign": Path(root).name, "variant": variant,
             "fixture_hash": fixtures["fixture_hash"], "model": model,
-            "effort_policy": effort, "service_tier": "default",
+            "effort_policy": effort, "service_tier": service_tier(),
             "executables": executables, "identities": identities,
             "agent_dir": str((Path(root) / "_agent").resolve()),
             "os": platform.platform(), "cpu": platform.processor(), "python": sys.version,

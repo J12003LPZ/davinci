@@ -8584,32 +8584,30 @@ fn submit_prompt(shell: &mut Shell<'_>, text: &str, images: &[davinci_ai::Messag
         .try_lock()
         .ok()
         .and_then(|host| host.engineering_snapshots());
-    if let Some(runtime) = shell.agent.decision_runtime() {
-        let cwd = shell.cwd.to_path_buf();
-        let task = expanded.clone();
-        let _ = runtime.enqueue_shadow_with(move || {
-            // A prior turn's observation is reusable only after freshness/root
-            // validation. New-turn invalidation or a concurrent scan yields
-            // unknown facts; neither causes work on the submit thread.
-            if let Some(snapshot) = snapshots.and_then(|facts| facts.peek_current(&cwd)) {
-                metadata.apply_snapshot(
-                    snapshot.workspace_dirty,
-                    snapshot.index.files.keys().map(String::as_str),
-                    snapshot
-                        .metadata
-                        .packages
-                        .iter()
-                        .flat_map(|p| p.dependencies.iter().map(String::as_str)),
-                );
-            }
-            davinci_coding_agent::decision_state::build_request_with_metadata(
-                davinci_agent::new_message_id(),
-                &task,
-                davinci_agent::decision::risk::DecisionRisk::Planning,
-                metadata,
-            )
-        });
+    if let Some(snapshot) = snapshots.and_then(|facts| facts.peek_current(shell.cwd)) {
+        metadata.apply_snapshot(
+            snapshot.workspace_dirty,
+            snapshot.index.files.keys().map(String::as_str),
+            snapshot
+                .metadata
+                .packages
+                .iter()
+                .flat_map(|p| p.dependencies.iter().map(String::as_str)),
+        );
     }
+    let evidence_revision = shell.agent.messages.len() as u64;
+    let mutation_revision = shell.agent.effort_signals().mutations;
+    let _ = davinci_coding_agent::turn_decision::prepare_turn_decision(
+        &mut shell.agent,
+        davinci_coding_agent::turn_decision::DecisionSnapshot {
+            request_id: davinci_agent::new_message_id(),
+            task: expanded.clone(),
+            decision_class: davinci_agent::decision::risk::DecisionRisk::Planning,
+            metadata,
+            evidence_revision,
+            mutation_revision,
+        },
+    );
     if let Some(runtime) = shell.agent.decision_runtime() {
         if let Some(health) = runtime.take_health_transition() {
             if let Some(notice) = decision_health_notice(health) {
@@ -9168,8 +9166,12 @@ fn enable_typesafe_with_key(
 
     let dir = crate::default_agent_dir();
     let mut settings = crate::settings::load_settings(&dir);
-    settings.decision_intelligence =
-        Some(crate::settings::DecisionIntelligenceSettings { enabled: true });
+    settings.decision_intelligence = Some(
+        crate::settings::DecisionIntelligenceSettings {
+            enabled: true,
+            ..Default::default()
+        },
+    );
     if let Err(error) = crate::settings::save_settings(&dir, &settings) {
         if persist_credential {
             let rollback = match previous.as_ref() {

@@ -35,6 +35,34 @@ fn setting_defaults_off_and_malformed_values_fail_safe() {
 }
 
 #[test]
+fn decision_advice_subflags_require_existing_user_enablement() {
+    let defaults = Settings::default();
+    assert!(!defaults.decision_intelligence_enabled());
+    assert!(!defaults.decision_effort_advice_enabled());
+
+    let enabled: Settings = serde_json::from_value(serde_json::json!({
+        "decisionIntelligence": {
+            "enabled": true,
+            "effortAdvice": true,
+            "completionAdvice": true,
+            "toolFamilyAdvice": true
+        }
+    }))
+    .unwrap();
+    let intelligence = enabled.decision_intelligence.as_ref().unwrap();
+    assert!(enabled.decision_intelligence_enabled());
+    assert!(enabled.decision_effort_advice_enabled());
+    assert!(intelligence.completion_advice);
+    assert!(intelligence.tool_family_advice);
+
+    let disabled: Settings = serde_json::from_value(serde_json::json!({
+        "decisionIntelligence": { "enabled": false, "effortAdvice": true }
+    }))
+    .unwrap();
+    assert!(!disabled.decision_effort_advice_enabled());
+}
+
+#[test]
 fn project_settings_cannot_enable_a_user_disabled_feature() {
     let root = tempfile::tempdir().unwrap();
     let agent_dir = root.path().join("agent");

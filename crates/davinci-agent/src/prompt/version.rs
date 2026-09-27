@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 
 pub const LEGACY_PROMPT_VERSION: u32 = 1;
 pub const STABLE_PROMPT_VERSION: u32 = 2;
-pub const PREVIEW_PROMPT_VERSION: u32 = 3;
+pub const PREVIEW_PROMPT_VERSION: u32 = 4;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]

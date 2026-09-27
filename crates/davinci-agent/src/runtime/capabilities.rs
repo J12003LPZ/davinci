@@ -319,6 +319,10 @@ pub struct RuntimeCapability {
     pub version: Option<String>,
     #[serde(default)]
     pub description: String,
+    /// Optional explicit discovery family.  Family search never infers a
+    /// family from a tool-name prefix; adapters must register this metadata.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub family: Option<String>,
     #[serde(default)]
     pub schema: Option<serde_json::Value>,
     #[serde(default)]
@@ -352,6 +356,7 @@ impl RuntimeCapability {
             schema_hash: compute_schema_hash(schema),
             version,
             description: String::new(),
+            family: None,
             schema: Some(schema.clone()),
             declared_effects,
             concurrency_policy,
@@ -380,6 +385,7 @@ impl RuntimeCapability {
             schema_hash: schema_hash.into(),
             version,
             description: String::new(),
+            family: None,
             schema: None,
             declared_effects,
             concurrency_policy,
@@ -390,6 +396,13 @@ impl RuntimeCapability {
 
     pub fn with_description(mut self, description: impl Into<String>) -> Self {
         self.description = description.into();
+        self
+    }
+
+    /// Associate this capability with an explicit discovery family.
+    pub fn with_family(mut self, family: impl Into<String>) -> Self {
+        let family = family.into();
+        self.family = (!family.trim().is_empty()).then_some(family);
         self
     }
 
@@ -454,7 +467,7 @@ pub fn builtin_capabilities() -> Vec<RuntimeCapability> {
         .map(|tool| {
             let class = tool_class(&tool.name);
             let read_only = matches!(class, ToolClass::Read | ToolClass::Network);
-            RuntimeCapability::new(
+            let capability = RuntimeCapability::new(
                 tool.name,
                 CapabilitySource::Builtin,
                 class,
@@ -462,9 +475,64 @@ pub fn builtin_capabilities() -> Vec<RuntimeCapability> {
                 &tool.parameters,
                 Some(format!("builtin-{}", env!("CARGO_PKG_VERSION"))),
             )
-            .with_description(tool.description)
+            .with_description(tool.description);
+            match builtin_discovery_family(&capability.name) {
+                Some(family) => capability.with_family(family),
+                None => capability,
+            }
         })
         .collect()
+}
+
+/// Families are registered metadata for the built-in adapter set.  Search
+/// consumes `RuntimeCapability::family`; the name groups here are only the
+/// one-time registration mapping and are not used as discovery authority.
+fn builtin_discovery_family(name: &str) -> Option<&'static str> {
+    match name {
+        "browser_open"
+        | "browser_snapshot"
+        | "browser_click"
+        | "browser_type"
+        | "browser_select"
+        | "browser_console"
+        | "browser_network"
+        | "browser_accessibility"
+        | "browser_screenshot"
+        | "browser_close"
+        | "web_search"
+        | "web_fetch" => Some("browser"),
+        "code_definition"
+        | "code_references"
+        | "code_outline"
+        | "code_diagnostics"
+        | "code_call_hierarchy"
+        | "code_rename_preview"
+        | "lsp_definition"
+        | "lsp_references"
+        | "lsp_hover"
+        | "lsp_document_symbols"
+        | "lsp_workspace_symbols"
+        | "lsp_implementations"
+        | "lsp_type_definition"
+        | "lsp_diagnostics" => Some("lsp"),
+        "git_symbol_history"
+        | "git_related_commits"
+        | "git_changed_symbols"
+        | "git_branch_diff"
+        | "git_blame_symbol"
+        | "git_commit_context"
+        | "git_conflict_explain" => Some("git"),
+        "package_info" | "package_exports" | "package_symbol" | "package_dependents"
+        | "package_why" | "workspace_packages" => Some("package"),
+        "build_targets" | "build_dependencies" | "build_affected" | "build_command" => {
+            Some("build")
+        }
+        "process_start" | "process_status" | "process_output" | "process_write"
+        | "process_stop" | "process_list" => Some("process"),
+        "security_scanner" | "security_scan" | "security_audit" => Some("sec"),
+        "graph_submit" | "graph_verify" | "graph_status" => Some("graph"),
+        _ => None,
+    }
 }
 
 /// Thread-safe registry containing all active runtime capabilities.
@@ -779,6 +847,18 @@ mod tests {
         assert!(!registry.is_read_only("write"));
         assert!(registry.is_mutating("write"));
         assert!(!registry.is_mutating("read"));
+        assert_eq!(
+            registry
+                .get("web_search")
+                .and_then(|capability| capability.family),
+            Some("browser".to_string())
+        );
+        assert_eq!(
+            registry
+                .get("code_outline")
+                .and_then(|capability| capability.family),
+            Some("lsp".to_string())
+        );
 
         // Unknown capability defaults to mutating
         assert!(!registry.is_read_only("unregistered_custom_tool"));
