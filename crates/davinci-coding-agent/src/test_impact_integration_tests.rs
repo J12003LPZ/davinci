@@ -35,6 +35,7 @@ pub(super) fn call(agent: &mut Agent, name: &str, args: Value) -> (Value, Value,
             });
             sent = true;
             Ok(AssistantMessage {
+                extra: Default::default(),
                 id: format!("response-{name}"),
                 role: "assistant".into(),
                 content,

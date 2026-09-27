@@ -48,6 +48,7 @@ pub fn fetch_deferred(
     ) {
         return DeferredFetchResult {
             message: AssistantMessage {
+                extra: Default::default(),
                 id: handle.id.clone(),
                 role: "assistant".into(),
                 content: Vec::new(),
@@ -79,6 +80,7 @@ pub fn fetch_deferred(
     if reply == "pending" || reply.is_empty() {
         return DeferredFetchResult {
             message: AssistantMessage {
+                extra: Default::default(),
                 id: handle.id.clone(),
                 role: "assistant".into(),
                 content: Vec::new(),
@@ -98,6 +100,7 @@ pub fn fetch_deferred(
                 .unwrap_or_else(|| handle.clone());
             return DeferredFetchResult {
                 message: AssistantMessage {
+                    extra: Default::default(),
                     id: handle.id.clone(),
                     role: "assistant".into(),
                     content: Vec::new(),
@@ -155,6 +158,7 @@ pub fn cancel_deferred(model: &Model, handle: &DeferredHandle) -> Result<(), Str
 fn ready_text(model: &Model, handle: &DeferredHandle, text: &str) -> DeferredFetchResult {
     DeferredFetchResult {
         message: AssistantMessage {
+            extra: Default::default(),
             id: handle.id.clone(),
             role: "assistant".into(),
             content: vec![ContentBlock::Text {
@@ -172,6 +176,7 @@ fn ready_text(model: &Model, handle: &DeferredHandle, text: &str) -> DeferredFet
 fn error_result(model: &Model, error: String) -> DeferredFetchResult {
     DeferredFetchResult {
         message: AssistantMessage {
+            extra: Default::default(),
             id: String::new(),
             role: "assistant".into(),
             content: Vec::new(),

@@ -39,6 +39,8 @@ fn tools() -> Vec<ToolSpec> {
 
 #[test]
 fn supported_body_has_one_custom_patch_and_function_fallback_for_other_tools() {
+    let previous = std::env::var_os(davinci_ai::APPLY_PATCH_ROLLOUT_ENV);
+    std::env::set_var(davinci_ai::APPLY_PATCH_ROLLOUT_ENV, "1");
     let model = codex_model();
     let body = request_body_with(
         &model,
@@ -88,6 +90,26 @@ fn supported_body_has_one_custom_patch_and_function_fallback_for_other_tools() {
         )
     };
     assert_eq!(proxy["tools"][1]["type"], "function");
+    std::env::set_var(davinci_ai::APPLY_PATCH_ROLLOUT_ENV, "0");
+    let rollback = request_body_with(
+        &model,
+        &[],
+        None,
+        &tools(),
+        &StreamOptions {
+            responses_is_oauth: Some(true),
+            ..StreamOptions::default()
+        },
+    );
+    assert!(rollback["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|tool| tool["type"] == "function"));
+    match previous {
+        Some(value) => std::env::set_var(davinci_ai::APPLY_PATCH_ROLLOUT_ENV, value),
+        None => std::env::remove_var(davinci_ai::APPLY_PATCH_ROLLOUT_ENV),
+    }
 }
 
 #[test]
@@ -234,4 +256,73 @@ fn decoder_normalizes_custom_call_input_without_losing_unicode_or_order() {
     ));
     let chat = assistant_to_chat(&message);
     assert_eq!(chat.extra["responsesToolWireKinds"]["custom-1|item-custom"], "custom");
+}
+
+#[test]
+fn originating_call_controls_results_even_when_result_metadata_is_wrong_or_missing() {
+    for custom in [false, true] {
+        let mut call = ChatMessage {
+            role: "assistant".into(),
+            content: vec![MessageContent::ToolCall {
+                id: "call|item".into(),
+                name: "apply_patch".into(),
+                arguments: json!({"input":"patch"}),
+            }],
+            ..ChatMessage::default()
+        };
+        let kind = if custom {
+            ResponsesToolWireKind::Custom
+        } else {
+            ResponsesToolWireKind::Function
+        };
+        set_wire_kind(&mut call.extra, "call|item", kind);
+        for wrong_metadata in [false, true] {
+            let mut result = ChatMessage::tool_result("call", "apply_patch", "ok", false);
+            if wrong_metadata {
+                davinci_ai::set_single_wire_kind(
+                    &mut result.extra,
+                    if custom {
+                        ResponsesToolWireKind::Function
+                    } else {
+                        ResponsesToolWireKind::Custom
+                    },
+                );
+            }
+            let history = vec![call.clone(), result];
+            let input = openai_responses_input_with(&history, &ResponsesInputOptions::default());
+            let expected = if custom {
+                "custom_tool_call_output"
+            } else {
+                "function_call_output"
+            };
+            assert_eq!(input[1]["type"], expected);
+            assert_eq!(
+                ResponsesLedger::from_messages("lineage", &history).full_replay()[1]["type"],
+                expected
+            );
+        }
+    }
+}
+
+#[test]
+fn older_native_custom_call_repairs_missing_metadata_across_model_projection() {
+    let mut call = ChatMessage {
+        role: "assistant".into(),
+        content: vec![MessageContent::ToolCall {
+            id: "call|item".into(), name: "apply_patch".into(), arguments: json!({"input":"patch"}),
+        }],
+        ..ChatMessage::default()
+    };
+    davinci_ai::attach_native_items(&mut call, &[json!({"type":"custom_tool_call", "id":"item", "call_id":"call", "name":"apply_patch", "input":"patch"})], "original/model");
+    let mut result = ChatMessage::tool_result("call|item", "apply_patch", "ok", false);
+    davinci_ai::set_single_wire_kind(&mut result.extra, ResponsesToolWireKind::Function);
+    let messages = [call, result];
+    for model in [Some("original/model"), Some("other/model"), None] {
+        let input = openai_responses_input_with(&messages, &ResponsesInputOptions { native_items_model:model, custom_tools:&[] });
+        assert_eq!(input[0]["type"], "custom_tool_call");
+        assert_eq!(input[1]["type"], "custom_tool_call_output");
+    }
+    let replay = ResponsesLedger::from_messages("old-native", &messages).full_replay();
+    assert_eq!(replay[0]["type"], "custom_tool_call");
+    assert_eq!(replay[1]["type"], "custom_tool_call_output");
 }

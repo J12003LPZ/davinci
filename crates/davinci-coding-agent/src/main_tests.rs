@@ -1533,6 +1533,7 @@ fn f01_noninteractive_fail_closed() {
                 calls += 1;
                 assert_eq!(calls, 1, "unresolved approval must stop further provider calls");
                 Ok(AssistantMessage {
+                    extra: Default::default(),
                     id: "fixture".into(), role: "assistant".into(),
                     content: vec![ContentBlock::ToolCall {
                         id: "write-1".into(), name: "write".into(),
@@ -3068,6 +3069,7 @@ fn bare_logout_without_stored_credentials_matches_ts() {
 #[test]
 fn print_mode_exits_nonzero_on_assistant_error() {
     let message = AssistantMessage {
+        extra: Default::default(),
         id: "m1".into(),
         role: "assistant".into(),
         content: vec![],
@@ -3088,6 +3090,7 @@ fn print_mode_exits_nonzero_on_assistant_error() {
         (1, Some("provider failure".into()))
     );
     let aborted = AssistantMessage {
+        extra: Default::default(),
         id: "m2".into(),
         role: "assistant".into(),
         content: vec![],
@@ -3112,6 +3115,7 @@ fn print_mode_exits_nonzero_on_assistant_error() {
 #[test]
 fn print_json_event_strips_partial_and_adds_toolcall_ids() {
     let message = AssistantMessage {
+        extra: Default::default(),
         id: "m1".into(),
         role: "assistant".into(),
         content: vec![ContentBlock::ToolCall {
@@ -3143,6 +3147,7 @@ fn print_json_event_strips_partial_and_adds_toolcall_ids() {
 fn print_json_fast_path_matches_full_serialization_minus_partial() {
     use davinci_ai::AssistantMessageEvent as Ev;
     let partial = std::sync::Arc::new(AssistantMessage {
+        extra: Default::default(),
         id: "m1".into(),
         role: "assistant".into(),
         content: vec![ContentBlock::Text { text: "big".into() }],

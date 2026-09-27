@@ -501,6 +501,7 @@ fn switching_to_plan_from_always_approve_blocks_real_tool_permissions() {
 
 fn partial(text: &str) -> std::sync::Arc<davinci_ai::AssistantMessage> {
     std::sync::Arc::new(davinci_ai::AssistantMessage {
+        extra: Default::default(),
         id: "m".into(),
         role: "assistant".into(),
         content: vec![davinci_ai::ContentBlock::Text { text: text.into() }],

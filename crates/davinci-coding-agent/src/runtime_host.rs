@@ -1136,6 +1136,7 @@ mod tests {
             .run_loop(|_| {
                 let spawn = std::mem::replace(&mut first, false);
                 Ok(davinci_ai::AssistantMessage {
+                    extra: Default::default(),
                     id: "fixture".into(),
                     role: "assistant".into(),
                     model: "fixture".into(),

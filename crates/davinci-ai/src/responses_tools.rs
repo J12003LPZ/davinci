@@ -64,9 +64,8 @@ impl ResolvedResponsesTools {
     }
 }
 
-/// Resolve the production rollout using the process flag.  An absent flag is
-/// enabled so supported Codex backends exercise the new contract by default;
-/// explicit false-like values are a safe rollback to JSON function tools.
+/// Resolve the experimental rollout using the process flag. Freeform is
+/// opt-in; an absent or unrecognized value retains JSON function tools.
 pub fn resolve_responses_tools(
     model: &Model,
     base_url: Option<&str>,
@@ -120,13 +119,16 @@ pub fn resolve_responses_tools_with_preference(
 }
 
 pub fn rollout_enabled_from_env() -> bool {
-    match std::env::var(APPLY_PATCH_ROLLOUT_ENV) {
-        Ok(value) => !matches!(
+    rollout_enabled(std::env::var(APPLY_PATCH_ROLLOUT_ENV).ok().as_deref())
+}
+
+fn rollout_enabled(value: Option<&str>) -> bool {
+    value.is_some_and(|value| {
+        matches!(
             value.trim().to_ascii_lowercase().as_str(),
-            "0" | "false" | "off" | "no" | "disabled" | "disable"
-        ),
-        Err(_) => true,
-    }
+            "1" | "true" | "on" | "yes" | "enabled" | "enable"
+        )
+    })
 }
 
 pub fn function_tool_value(tool: &ToolSpec) -> Value {
@@ -211,8 +213,8 @@ fn explicit_wire_kind(message: &ChatMessage, call_id: Option<&str>) -> Option<Re
 }
 
 /// Determine the wire kind for one historical call.  Explicit persisted
-/// metadata always wins; the name/rollout fallback exists only for transcripts
-/// written before metadata was introduced.
+/// metadata wins, followed by the original native item type. Legacy
+/// transcripts without either retain their JSON function representation.
 pub fn message_tool_wire_kind(
     message: &ChatMessage,
     call_id: Option<&str>,
@@ -222,11 +224,95 @@ pub fn message_tool_wire_kind(
     if let Some(kind) = explicit_wire_kind(message, call_id) {
         return kind;
     }
+    if let Some(call_id) = call_id {
+        if let Some(kind) = message
+            .extra
+            .get(crate::NATIVE_ITEMS_KEY)
+            .and_then(Value::as_array)
+            .and_then(|items| native_call_wire_kind(items, call_id))
+        {
+            return kind;
+        }
+    }
     // A transcript without metadata predates the freeform rollout.  Keep its
     // original JSON-function representation; the current request's tool
     // visibility must never rewrite historical call/result pairs.
     let _ = tool_name;
     ResponsesToolWireKind::Function
+}
+
+/// Match the provider call ID, including historical IDs stored as call|item.
+pub(crate) fn provider_call_id(id: &str) -> &str {
+    id.split_once('|').map(|(call, _)| call).unwrap_or(id)
+}
+
+pub(crate) fn native_call_wire_kind(
+    items: &[Value],
+    call_id: &str,
+) -> Option<ResponsesToolWireKind> {
+    items.iter().rev().find_map(|item| {
+        let id = item.get("call_id").or_else(|| item.get("id"))?.as_str()?;
+        if provider_call_id(id) != provider_call_id(call_id) {
+            return None;
+        }
+        match item.get("type")?.as_str()? {
+            "function_call" => Some(ResponsesToolWireKind::Function),
+            "custom_tool_call" => Some(ResponsesToolWireKind::Custom),
+            _ => None,
+        }
+    })
+}
+
+pub(crate) fn record_native_call_wire_kinds(
+    kinds: &mut std::collections::HashMap<String, ResponsesToolWireKind>,
+    items: &[Value],
+) {
+    for item in items {
+        let kind = match item.get("type").and_then(Value::as_str) {
+            Some("function_call") => ResponsesToolWireKind::Function,
+            Some("custom_tool_call") => ResponsesToolWireKind::Custom,
+            _ => continue,
+        };
+        if let Some(id) = item
+            .get("call_id")
+            .or_else(|| item.get("id"))
+            .and_then(Value::as_str)
+        {
+            kinds.insert(provider_call_id(id).into(), kind);
+        }
+    }
+}
+
+/// Resolve a result from the call that introduced it, including native-only
+/// history. Result annotations are a cache, never authority over a call.
+pub fn originating_tool_wire_kind(
+    messages: &[ChatMessage],
+    call_id: &str,
+) -> Option<ResponsesToolWireKind> {
+    messages.iter().rev().filter(|message| message.role == "assistant").find_map(|message| {
+        if let Some(crate::MessageContent::ToolCall { id, name, .. }) = message.content.iter().find(|block| {
+            matches!(block, crate::MessageContent::ToolCall { id, .. } if provider_call_id(id) == provider_call_id(call_id))
+        }) {
+            return Some(message_tool_wire_kind(message, Some(id), Some(name), &[]));
+        }
+        message.extra.get(crate::NATIVE_ITEMS_KEY).and_then(Value::as_array)
+            .and_then(|items| native_call_wire_kind(items, call_id))
+    })
+}
+
+pub(crate) fn result_wire_kind(
+    messages: &[ChatMessage],
+    result: &ChatMessage,
+) -> ResponsesToolWireKind {
+    originating_tool_wire_kind(messages, result.tool_call_id.as_deref().unwrap_or_default())
+        .unwrap_or_else(|| {
+            message_tool_wire_kind(
+                result,
+                result.tool_call_id.as_deref(),
+                result.tool_name.as_deref(),
+                &[],
+            )
+        })
 }
 
 pub fn custom_tool_call_arguments(arguments: &Value) -> Option<&str> {
@@ -276,6 +362,24 @@ mod tests {
                 constrained_sampling: None,
             },
         ]
+    }
+
+    #[test]
+    fn freeform_rollout_is_explicit_opt_in() {
+        for value in [
+            None,
+            Some(""),
+            Some("0"),
+            Some("false"),
+            Some("OFF"),
+            Some("no"),
+            Some("invalid"),
+        ] {
+            assert!(!rollout_enabled(value), "{value:?}");
+        }
+        for value in ["1", "true", " ON ", "yes", "enabled"] {
+            assert!(rollout_enabled(Some(value)), "{value}");
+        }
     }
 
     #[test]

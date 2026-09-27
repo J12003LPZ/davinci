@@ -954,6 +954,7 @@ fn retry_aborted_provider_response_is_not_reported_as_success() {
                 return Err("overloaded_error".into());
             }
             Ok(davinci_ai::AssistantMessage {
+                extra: Default::default(),
                 id: "abort".into(),
                 role: "assistant".into(),
                 content: Vec::new(),
@@ -984,6 +985,7 @@ fn auto_retry_emits_ts_session_events() {
             calls += 1;
             if calls == 1 {
                 return Ok(AssistantMessage {
+                    extra: Default::default(),
                     id: "e1".into(),
                     role: "assistant".into(),
                     content: Vec::new(),
@@ -994,6 +996,7 @@ fn auto_retry_emits_ts_session_events() {
                 });
             }
             Ok(AssistantMessage {
+                extra: Default::default(),
                 id: "ok".into(),
                 role: "assistant".into(),
                 content: vec![ContentBlock::Text {
@@ -1029,6 +1032,7 @@ fn a_closure_that_streamed_live_is_recorded_but_not_resent_to_the_sink() {
     let events = agent
         .run_loop(|current| {
             let message = AssistantMessage {
+                extra: Default::default(),
                 id: "live".into(),
                 role: "assistant".into(),
                 content: vec![ContentBlock::Text {
@@ -1084,6 +1088,7 @@ fn a_closure_that_streamed_live_is_recorded_but_not_resent_to_the_sink() {
 fn stream_events_len(text: &str) -> usize {
     use davinci_ai::{AssistantMessage, ContentBlock, StopReason};
     davinci_ai::events_from_complete(&AssistantMessage {
+        extra: Default::default(),
         id: "n".into(),
         role: "assistant".into(),
         content: vec![ContentBlock::Text { text: text.into() }],
@@ -1108,6 +1113,7 @@ fn agent_loop_emits_ts_event_names_and_runs_tools() {
         .run_loop(|current| {
             if current.messages.iter().any(|m| m.role == "toolResult") {
                 return Ok(AssistantMessage {
+                    extra: Default::default(),
                     id: "a2".into(),
                     role: "assistant".into(),
                     content: vec![ContentBlock::Text {
@@ -1120,6 +1126,7 @@ fn agent_loop_emits_ts_event_names_and_runs_tools() {
                 });
             }
             Ok(AssistantMessage {
+                extra: Default::default(),
                 id: "a1".into(),
                 role: "assistant".into(),
                 content: vec![ContentBlock::ToolCall {
@@ -1172,6 +1179,7 @@ fn scripted_tool_calls(
         index += 1;
         match remaining.next() {
             Some((name, arguments)) => Ok(AssistantMessage {
+                extra: Default::default(),
                 id: format!("a{index}"),
                 role: "assistant".into(),
                 content: vec![ContentBlock::ToolCall {
@@ -1185,6 +1193,7 @@ fn scripted_tool_calls(
                 error_message: None,
             }),
             None => Ok(AssistantMessage {
+                extra: Default::default(),
                 id: format!("a{index}"),
                 role: "assistant".into(),
                 content: vec![ContentBlock::Text {
@@ -1230,6 +1239,7 @@ fn scripted_batches(
         index += 1;
         match remaining.next() {
             Some(calls) => Ok(AssistantMessage {
+                extra: Default::default(),
                 id: format!("a{index}"),
                 role: "assistant".into(),
                 content: calls
@@ -1247,6 +1257,7 @@ fn scripted_batches(
                 error_message: None,
             }),
             None => Ok(AssistantMessage {
+                extra: Default::default(),
                 id: format!("a{index}"),
                 role: "assistant".into(),
                 content: vec![ContentBlock::Text {
@@ -1735,6 +1746,7 @@ fn event_sink_receives_events_as_run_loop_emits_them() {
     let events = agent
         .run_loop(|_| {
             Ok(AssistantMessage {
+                extra: Default::default(),
                 id: "a1".into(),
                 role: "assistant".into(),
                 content: vec![ContentBlock::Text { text: "ok".into() }],
@@ -1879,6 +1891,7 @@ fn custom_tool_executor_runs_unknown_builtin_names() {
         .run_loop(|current| {
             if current.messages.iter().any(|m| m.role == "toolResult") {
                 return Ok(AssistantMessage {
+                    extra: Default::default(),
                     id: "a2".into(),
                     role: "assistant".into(),
                     content: vec![ContentBlock::Text {
@@ -1891,6 +1904,7 @@ fn custom_tool_executor_runs_unknown_builtin_names() {
                 });
             }
             Ok(AssistantMessage {
+                extra: Default::default(),
                 id: "a1".into(),
                 role: "assistant".into(),
                 content: vec![ContentBlock::ToolCall {
@@ -2083,6 +2097,7 @@ fn pre_tool_hook_blocks_before_execution() {
                 .any(|message| message.role == "toolResult")
             {
                 return Ok(AssistantMessage {
+                    extra: Default::default(),
                     id: "a2".into(),
                     role: "assistant".into(),
                     content: vec![ContentBlock::Text {
@@ -2095,6 +2110,7 @@ fn pre_tool_hook_blocks_before_execution() {
                 });
             }
             Ok(AssistantMessage {
+                extra: Default::default(),
                 id: "a1".into(),
                 role: "assistant".into(),
                 content: vec![ContentBlock::ToolCall {
@@ -2302,6 +2318,7 @@ fn before_agent_start_custom_messages_are_emitted_in_current_turn_and_reload() {
     let events = agent
         .run_loop(|_| {
             Ok(AssistantMessage {
+                extra: Default::default(),
                 id: "assistant-1".into(),
                 role: "assistant".into(),
                 content: vec![ContentBlock::Text {
@@ -2976,6 +2993,7 @@ fn batch_duplicate_mutating_calls_executes_once() {
         turn += 1;
         if turn == 1 {
             Ok(AssistantMessage {
+                extra: Default::default(),
                 id: "a1".into(),
                 role: "assistant".into(),
                 content: vec![
@@ -2997,6 +3015,7 @@ fn batch_duplicate_mutating_calls_executes_once() {
             })
         } else {
             Ok(AssistantMessage {
+                extra: Default::default(),
                 id: "a2".into(),
                 role: "assistant".into(),
                 content: vec![ContentBlock::Text {
@@ -3277,6 +3296,7 @@ fn mailbox_history_is_not_previous_real_user_evidence_for_capability_routing() {
     agent
         .run_loop(|_| {
             Ok(davinci_ai::AssistantMessage {
+                extra: Default::default(),
                 id: "mailbox-fixture".into(),
                 role: "assistant".into(),
                 content: vec![davinci_ai::ContentBlock::Text { text: "ok".into() }],

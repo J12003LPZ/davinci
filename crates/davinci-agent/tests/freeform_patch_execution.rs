@@ -72,7 +72,29 @@ fn parser_rejects_malformed_or_unsupported_controls_before_execution() {
 #[test]
 fn decoded_freeform_and_json_apply_patch_share_targets_and_transaction_effects() {
     let patch = "*** Begin Patch\n*** Update File: a.txt\n@@\n-old\n+new\n*** Add File: b.txt\n+β\n*** End Patch";
-    let json_input = json!({"input": patch});
+    let decode = |custom: bool| {
+        let model = davinci_ai::load_builtin_models()
+            .into_iter()
+            .find(|model| model.api == "openai-codex-responses")
+            .unwrap();
+        let item = if custom {
+            json!({"type":"custom_tool_call", "id":"patch-item", "call_id":"patch-call", "name":"apply_patch", "input":patch})
+        } else {
+            json!({"type":"function_call", "id":"patch-item", "call_id":"patch-call", "name":"apply_patch", "arguments":json!({"input":patch}).to_string()})
+        };
+        let terminal = json!({"type":"response.completed", "response":{"status":"completed", "output":[item]}});
+        let message = davinci_ai::fixture_complete(&model, &[], &format!("data: {terminal}\n\n"));
+        let chat = davinci_ai::assistant_to_chat(&message);
+        assert_eq!(
+            chat.extra[davinci_ai::RESPONSES_TOOL_WIRE_KINDS_KEY]["patch-call|patch-item"],
+            if custom { "custom" } else { "function" }
+        );
+        match &message.content[0] {
+            davinci_ai::ContentBlock::ToolCall { arguments, .. } => arguments.clone(),
+            other => panic!("expected decoded patch call, got {other:?}"),
+        }
+    };
+    let json_input = decode(false);
     let targets = extract_tool_targets("apply_patch", &json_input);
     assert_eq!(targets, vec!["a.txt", "b.txt"]);
 
@@ -89,7 +111,8 @@ fn decoded_freeform_and_json_apply_patch_share_targets_and_transaction_effects()
 
     let freeform_root = tempdir().unwrap();
     fs::write(freeform_root.path().join("a.txt"), "old\n").unwrap();
-    let decoded_input = json!({"input": patch.to_string()});
+    let decoded_input = decode(true);
+    assert_eq!(extract_tool_targets("apply_patch", &decoded_input), targets);
     let decoded_result = execute_tool_with(
         freeform_root.path(),
         "apply_patch",
@@ -147,6 +170,7 @@ fn edit_schema_exposes_only_the_required_new_shape_while_legacy_parser_remains_u
     assert!(required.iter().any(|value| value == "edits"));
     assert!(edit.parameters["properties"].get("oldText").is_none());
     assert!(edit.parameters["properties"].get("newText").is_none());
+    assert_eq!(edit.parameters["properties"]["edits"]["minItems"], 1);
     let item_required = edit.parameters["properties"]["edits"]["items"]["required"]
         .as_array()
         .unwrap();

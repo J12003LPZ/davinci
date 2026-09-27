@@ -778,6 +778,7 @@ pub fn run_js_stream_simple(
     let value = result.result.unwrap_or(Value::Null);
     if let Some(text) = value.as_str() {
         return Ok(davinci_ai::AssistantMessage {
+            extra: Default::default(),
             id: davinci_agent::new_message_id(),
             role: "assistant".into(),
             content: vec![davinci_ai::ContentBlock::Text {
@@ -810,6 +811,7 @@ pub fn run_js_stream_simple(
         })
         .unwrap_or_default();
     Ok(davinci_ai::AssistantMessage {
+        extra: Default::default(),
         id: davinci_agent::new_message_id(),
         role: "assistant".into(),
         content: vec![davinci_ai::ContentBlock::Text { text }],

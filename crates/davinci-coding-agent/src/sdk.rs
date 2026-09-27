@@ -1125,6 +1125,7 @@ mod tests {
         session
             .prompt_and_run("hi", |_| {
                 Ok(AssistantMessage {
+                    extra: Default::default(),
                     id: "a1".into(),
                     role: "assistant".into(),
                     content: vec![ContentBlock::Text { text: "ok".into() }],
@@ -1227,6 +1228,7 @@ mod tests {
     fn sdk_queued_steer_and_follow_up_prepare_each_user_turn_before_provider() {
         fn assistant(id: &str) -> davinci_ai::AssistantMessage {
             davinci_ai::AssistantMessage {
+                extra: Default::default(),
                 id: id.into(),
                 role: "assistant".into(),
                 content: vec![davinci_ai::ContentBlock::Text { text: "ok".into() }],
@@ -1315,6 +1317,7 @@ mod tests {
     fn sdk_default_all_queued_turns_union_capabilities_for_one_provider_request() {
         fn assistant(id: &str) -> davinci_ai::AssistantMessage {
             davinci_ai::AssistantMessage {
+                extra: Default::default(),
                 id: id.into(),
                 role: "assistant".into(),
                 content: vec![davinci_ai::ContentBlock::Text { text: "ok".into() }],

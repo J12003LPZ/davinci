@@ -166,10 +166,10 @@ pub use responses_request::{
     WireTrustClass, WIRE_MANIFEST_VERSION,
 };
 pub use responses_tools::{
-    message_tool_wire_kind, resolve_responses_tools, resolve_responses_tools_with_preference,
-    rollout_enabled_from_env, set_single_wire_kind, set_wire_kind, ResponsesToolWireKind,
-    ResolvedResponsesTools, APPLY_PATCH_ROLLOUT_ENV, RESPONSES_TOOL_WIRE_KIND_KEY,
-    RESPONSES_TOOL_WIRE_KINDS_KEY,
+    message_tool_wire_kind, originating_tool_wire_kind, resolve_responses_tools,
+    resolve_responses_tools_with_preference, rollout_enabled_from_env, set_single_wire_kind,
+    set_wire_kind, ResolvedResponsesTools, ResponsesToolWireKind, APPLY_PATCH_ROLLOUT_ENV,
+    RESPONSES_TOOL_WIRE_KINDS_KEY, RESPONSES_TOOL_WIRE_KIND_KEY,
 };
 pub use retry::{is_retryable_assistant_error, is_retryable_error_text};
 pub use shell::{

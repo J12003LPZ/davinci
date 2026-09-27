@@ -460,6 +460,7 @@ mod tests {
 
     fn reply(content: ContentBlock) -> Result<AssistantMessage, String> {
         Ok(AssistantMessage {
+            extra: Default::default(),
             id: "fixture".into(),
             role: "assistant".into(),
             content: vec![content],

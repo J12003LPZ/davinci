@@ -241,6 +241,7 @@ where
 
 pub fn fixture_complete(text: &str) -> AssistantMessage {
     AssistantMessage {
+        extra: Default::default(),
         id: davinci_agent::new_message_id(),
         role: "assistant".into(),
         content: vec![ContentBlock::Text {

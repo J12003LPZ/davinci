@@ -616,6 +616,7 @@ fn offline_stub_message(current: &Agent, last_user: usize) -> AssistantMessage {
         ),
     };
     AssistantMessage {
+        extra: Default::default(),
         id: davinci_agent::new_message_id(),
         role: "assistant".into(),
         content,

@@ -9,7 +9,7 @@ use crate::thinking::{
     clamp_thinking_budget_to_answer_room, google_thinking_budget, thinking_budget_for_level,
     ThinkingBudgets,
 };
-use crate::{ChatMessage, MessageContent, ToolSpec};
+use crate::{ChatMessage, MessageContent, StreamDecoder, ToolSpec};
 use davinci_protocol::{ThinkingLevel, Usage};
 use std::sync::{mpsc, Arc};
 use std::time::{Duration, Instant};
@@ -109,6 +109,9 @@ pub struct AssistantMessage {
     pub stop_reason: Option<StopReason>,
     #[serde(rename = "errorMessage", skip_serializing_if = "Option::is_none")]
     pub error_message: Option<String>,
+    /// Provider metadata preserved through streaming, history, and session reopen.
+    #[serde(default, flatten)]
+    pub extra: serde_json::Map<String, Value>,
 }
 
 /// Shares message snapshots across stream events and refreshes them at a
@@ -544,23 +547,7 @@ pub fn assistant_to_chat(message: &AssistantMessage) -> ChatMessage {
             .collect(),
         ..ChatMessage::default()
     };
-    for block in &message.content {
-        if let ContentBlock::ToolCall {
-            id,
-            name,
-            arguments,
-        } = block
-        {
-            let kind = if name == "apply_patch"
-                && crate::responses_tools::custom_tool_call_arguments(arguments).is_some()
-            {
-                crate::responses_tools::ResponsesToolWireKind::Custom
-            } else {
-                crate::responses_tools::ResponsesToolWireKind::Function
-            };
-            crate::responses_tools::set_wire_kind(&mut chat.extra, id, kind);
-        }
-    }
+    chat.extra = message.extra.clone();
     chat
 }
 
@@ -1328,15 +1315,28 @@ pub fn openai_responses_input_with(
     messages: &[ChatMessage],
     options: &ResponsesInputOptions<'_>,
 ) -> Vec<Value> {
+    openai_responses_input_with_prefix(messages, options, &[])
+}
+
+fn openai_responses_input_with_prefix(
+    messages: &[ChatMessage],
+    options: &ResponsesInputOptions<'_>,
+    native_prefix: &[Value],
+) -> Vec<Value> {
     let mut input = Vec::new();
-    for message in messages {
+    let mut call_kinds = std::collections::HashMap::new();
+    crate::responses_tools::record_native_call_wire_kinds(&mut call_kinds, native_prefix);
+    for (index, message) in messages.iter().enumerate() {
         if message.role == "toolResult" {
-            let kind = crate::responses_tools::message_tool_wire_kind(
-                message,
-                message.tool_call_id.as_deref(),
-                message.tool_name.as_deref(),
-                options.custom_tools,
-            );
+            // The emitted call form determines the output kind. Seed suffixes
+            // beginning with results from their preserved native prefix.
+            let call_id = message.tool_call_id.as_deref().unwrap_or_default();
+            let kind = call_kinds
+                .get(crate::responses_tools::provider_call_id(call_id))
+                .copied()
+                .unwrap_or_else(|| {
+                    crate::responses_tools::result_wire_kind(&messages[..index], message)
+                });
             let item_type = match kind {
                 crate::responses_tools::ResponsesToolWireKind::Custom => {
                     "custom_tool_call_output"
@@ -1354,6 +1354,7 @@ pub fn openai_responses_input_with(
         }
         if message.role == "assistant" {
             if let Some(items) = native_items(message, options.native_items_model) {
+                crate::responses_tools::record_native_call_wire_kinds(&mut call_kinds, items);
                 input.extend(items.iter().cloned());
                 continue;
             }
@@ -1377,6 +1378,7 @@ pub fn openai_responses_input_with(
                         Some(name),
                         options.custom_tools,
                     );
+                    call_kinds.insert(crate::responses_tools::provider_call_id(id).into(), kind);
                     match kind {
                         crate::responses_tools::ResponsesToolWireKind::Custom => {
                             let raw_input = crate::responses_tools::custom_tool_call_arguments(
@@ -1655,13 +1657,15 @@ fn apply_native_responses_resume(
         .filter_map(|tool| tool.get("name").and_then(Value::as_str))
         .collect::<Vec<_>>();
     let model_key = format!("{}/{}", model.provider, model.id);
-    input.extend(openai_responses_input_with(
+    let suffix = openai_responses_input_with_prefix(
         &messages[resume.resume_provider_message_count..],
         &ResponsesInputOptions {
             native_items_model: Some(&model_key),
             custom_tools: &custom_tool_names,
         },
-    ));
+        &input,
+    );
+    input.extend(suffix);
     body["input"] = Value::Array(input);
     if crate::trace::enabled() {
         crate::trace::log(&format!(
@@ -2457,81 +2461,28 @@ fn usage_from_google_metadata(model: &Model, metadata: &Value) -> Usage {
     computed
 }
 
-fn parse_provider_response(model: &Model, raw: &str) -> AssistantMessage {
-    if raw.contains("data:") {
-        return fixture_complete(model, &[], raw);
-    }
-    let value: Value = serde_json::from_str(raw).unwrap_or(Value::Null);
-    let mut content = Vec::new();
-    let responses_output = value
-        .get("output")
-        .or_else(|| value.pointer("/response/output"))
-        .and_then(Value::as_array);
-    if let Some(output) = responses_output {
-        for item in output {
-            match item.get("type").and_then(Value::as_str) {
-                Some("message") => {
-                    if let Some(parts) = item.get("content").and_then(Value::as_array) {
-                        for part in parts {
-                            if let Some(text) = part
-                                .get("text")
-                                .or_else(|| part.get("refusal"))
-                                .and_then(Value::as_str)
-                            {
-                                content.push(ContentBlock::Text {
-                                    text: text.to_string(),
-                                });
-                            }
-                        }
-                    }
-                }
-                Some("function_call") => {
-                    let id = item
-                        .get("call_id")
-                        .and_then(Value::as_str)
-                        .or_else(|| item.get("id").and_then(Value::as_str))
-                        .unwrap_or_default()
-                        .to_string();
-                    let name = item
-                        .get("name")
-                        .and_then(Value::as_str)
-                        .unwrap_or_default()
-                        .to_string();
-                    let arguments = item
-                        .get("arguments")
-                        .and_then(Value::as_str)
-                        .map(crate::final_tool_arguments)
-                        .unwrap_or_else(|| item.get("arguments").cloned().unwrap_or_else(|| {
-                            Value::Object(Default::default())
-                        }));
-                    content.push(ContentBlock::ToolCall {
-                        id,
-                        name,
-                        arguments,
-                    });
-                }
-                Some("custom_tool_call") => {
-                    let id = item
-                        .get("call_id")
-                        .and_then(Value::as_str)
-                        .or_else(|| item.get("id").and_then(Value::as_str))
-                        .unwrap_or_default()
-                        .to_string();
-                    content.push(ContentBlock::ToolCall {
-                        id,
-                        name: item
-                            .get("name")
-                            .and_then(Value::as_str)
-                            .unwrap_or_default()
-                            .to_string(),
-                        arguments: serde_json::json!({
-                            "input": item.get("input").and_then(Value::as_str).unwrap_or_default()
-                        }),
-                    });
-                }
-                _ => {}
-            }
+pub(crate) fn parse_provider_response(model: &Model, raw: &str) -> AssistantMessage {
+    let value: Value = match serde_json::from_str(raw) {
+        Ok(value) => value,
+        Err(_) if raw.lines().any(|line| line.starts_with("data:")) => {
+            return fixture_complete(model, &[], raw);
         }
+        Err(_) => Value::Null,
+    };
+    let mut content = Vec::new();
+    let response = value.get("response").unwrap_or(&value);
+    if response.get("output").is_some_and(Value::is_array)
+        || (native_responses_api(model) && response.get("status").is_some())
+    {
+        // Responses shares one normalizer across JSON, SSE, and WebSocket.
+        // In particular, a 200 response can still be incomplete or failed.
+        let mut decoder = crate::ResponsesDecoder::new(model);
+        let mut events = Vec::new();
+        decoder.feed(
+            &serde_json::json!({"type": "response.completed", "response": response}),
+            &mut events,
+        );
+        return decoder.finish(&mut events);
     }
     if content.is_empty() {
         if let Some(text) = value
@@ -2698,6 +2649,7 @@ fn parse_provider_response(model: &Model, raw: &str) -> AssistantMessage {
     });
     if let Some(error) = error_message {
         return AssistantMessage {
+            extra: Default::default(),
             id: Uuid::new_v4().to_string(),
             role: "assistant".into(),
             content: Vec::new(),
@@ -2708,6 +2660,7 @@ fn parse_provider_response(model: &Model, raw: &str) -> AssistantMessage {
         };
     }
     AssistantMessage {
+        extra: Default::default(),
         id: Uuid::new_v4().to_string(),
         role: "assistant".into(),
         content,
@@ -4610,6 +4563,45 @@ mod openai_cache_wire_tests {
             "function_call_output",
             "only the new tail follows the exact native replay prefix"
         );
+    }
+
+    #[test]
+    fn native_resume_result_only_suffix_uses_preserved_call_type() {
+        for custom in [false, true] {
+            let prefix = vec![serde_json::json!({
+                "type": if custom { "custom_tool_call" } else { "function_call" },
+                "id":"item", "call_id":"call", "name":"apply_patch", "input":"patch", "arguments":"{}"
+            })];
+            let mut result = ChatMessage::tool_result("call|item", "apply_patch", "ok", false);
+            // The durable prefix has authority over missing or stale annotations.
+            for annotated in [false, true] {
+                if annotated {
+                    crate::set_single_wire_kind(
+                        &mut result.extra,
+                        if custom {
+                            crate::ResponsesToolWireKind::Function
+                        } else {
+                            crate::ResponsesToolWireKind::Custom
+                        },
+                    );
+                }
+                let suffix = openai_responses_input_with_prefix(
+                    &[result.clone()],
+                    &ResponsesInputOptions::default(),
+                    &prefix,
+                );
+                assert_eq!(suffix.len(), 1);
+                assert_eq!(
+                    suffix[0]["type"],
+                    if custom {
+                        "custom_tool_call_output"
+                    } else {
+                        "function_call_output"
+                    }
+                );
+                assert_eq!(suffix[0]["call_id"], "call");
+            }
+        }
     }
 
     #[test]

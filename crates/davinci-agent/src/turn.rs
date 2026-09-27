@@ -100,6 +100,7 @@ impl Agent {
             serde_json::json!({ "command": last.command })
         };
         let assistant = AssistantMessage {
+            extra: Default::default(),
             id: format!("davinci-verify-{call_token}"),
             role: "assistant".into(),
             content: vec![ContentBlock::ToolCall {
@@ -245,7 +246,7 @@ impl Agent {
             .collect();
         for (id, name) in dangling {
             // Keep this repair in memory; persistence is the failed boundary.
-            self.messages.push(tool_result_message(
+            let mut result = tool_result_message(
                 &id,
                 &name,
                 crate::ToolResult {
@@ -256,7 +257,9 @@ impl Agent {
                     details: None,
                 },
                 self.auto_resize_images,
-            ));
+            );
+            self.annotate_tool_result_wire_kind(&mut result);
+            self.messages.push(result);
         }
         self.is_streaming = false;
         self.flush_pending_bash_messages();
@@ -530,7 +533,7 @@ impl Agent {
 
             if matches!(
                 assistant.stop_reason,
-                Some(StopReason::Error) | Some(StopReason::Aborted)
+                Some(StopReason::Error) | Some(StopReason::Aborted) | Some(StopReason::Length)
             ) {
                 if let Some(runtime) = &self.runtime {
                     if assistant.stop_reason == Some(StopReason::Error) {
@@ -993,6 +996,7 @@ impl Agent {
                 }
                 return Ok((
                     AssistantMessage {
+                        extra: Default::default(),
                         id: crate::new_message_id(),
                         role: "assistant".into(),
                         content: Vec::new(),
@@ -3043,19 +3047,9 @@ impl Agent {
         let Some(call_id) = result.tool_call_id.as_deref() else {
             return;
         };
-        let Some(kind) = self.messages.iter().rev().find_map(|message| {
-            message
-                .extra
-                .get(RESPONSES_TOOL_WIRE_KINDS_KEY)
-                .and_then(Value::as_object)
-                .and_then(|kinds| kinds.get(call_id))
-                .cloned()
-        }) else {
-            return;
-        };
-        result
-            .extra
-            .insert(RESPONSES_TOOL_WIRE_KIND_KEY.into(), kind);
+        if let Some(kind) = davinci_ai::originating_tool_wire_kind(&self.messages, call_id) {
+            davinci_ai::set_single_wire_kind(&mut result.extra, kind);
+        }
     }
 
     /// The permission gate: `None` lets the call run, `Some(reason)` is the
@@ -3779,12 +3773,14 @@ impl Agent {
         };
 
         let recovered_message = (!is_batch_child && current_message.is_none()).then(|| {
-            tool_result_message(
+            let mut message = tool_result_message(
                 &ready.tool_call_id,
                 tool_name,
                 presentation.clone(),
                 self.auto_resize_images,
-            )
+            );
+            self.annotate_tool_result_wire_kind(&mut message);
+            message
         });
         let presentation_value = match &recovered_message {
             Some(message) => serde_json::to_value(message),
@@ -4043,7 +4039,12 @@ impl Agent {
                     message["stopReason"] = value;
                 }
             }
-            for key in [davinci_ai::NATIVE_ITEMS_KEY, davinci_ai::NATIVE_MODEL_KEY] {
+            for key in [
+                davinci_ai::NATIVE_ITEMS_KEY,
+                davinci_ai::NATIVE_MODEL_KEY,
+                RESPONSES_TOOL_WIRE_KINDS_KEY,
+                RESPONSES_TOOL_WIRE_KIND_KEY,
+            ] {
                 if let Some(value) = chat.extra.get(key) {
                     message[key] = value.clone();
                 }
@@ -4280,6 +4281,7 @@ mod tests {
 
     fn model_turn_read_call(turn: usize) -> davinci_ai::AssistantMessage {
         davinci_ai::AssistantMessage {
+            extra: Default::default(),
             id: format!("assistant-{turn}"),
             role: "assistant".into(),
             content: vec![davinci_ai::ContentBlock::ToolCall {
@@ -4355,6 +4357,7 @@ mod tests {
                     }
                 };
                 Ok(davinci_ai::AssistantMessage {
+                    extra: Default::default(),
                     id: format!("assistant-{turn}"),
                     role: "assistant".into(),
                     content: vec![content],
@@ -5072,6 +5075,7 @@ mod tests {
             .run_loop(|_| {
                 let first = turns.fetch_add(1, Ordering::SeqCst) == 0;
                 Ok(AssistantMessage {
+                    extra: Default::default(),
                     id: "fixture".into(),
                     role: "assistant".into(),
                     content: if first {
@@ -5244,6 +5248,7 @@ mod tests {
                 let count = called_clone.fetch_add(1, Ordering::SeqCst);
                 if count == 0 {
                     Ok(AssistantMessage {
+                        extra: Default::default(),
                         id: "msg_tool".into(),
                         role: "assistant".into(),
                         content: vec![ContentBlock::ToolCall {
@@ -5258,6 +5263,7 @@ mod tests {
                     })
                 } else {
                     Ok(AssistantMessage {
+                        extra: Default::default(),
                         id: "msg_end".into(),
                         role: "assistant".into(),
                         content: vec![ContentBlock::Text {
@@ -5302,6 +5308,7 @@ mod tests {
         let events = agent
             .run_loop(|_ag| {
                 Ok(AssistantMessage {
+                    extra: Default::default(),
                     id: "msg_plain".into(),
                     role: "assistant".into(),
                     content: vec![ContentBlock::Text {
@@ -5326,6 +5333,7 @@ mod tests {
         let mut agent = Agent::new("Test prompt");
         let _ = agent.run_loop(|_ag| {
             Ok(AssistantMessage {
+                extra: Default::default(),
                 id: "msg_1".into(),
                 role: "assistant".into(),
                 content: vec![ContentBlock::Text {
@@ -5378,6 +5386,7 @@ mod tests {
                 );
                 let call = calls_for_provider.fetch_add(1, Ordering::SeqCst);
                 Ok(AssistantMessage {
+                    extra: Default::default(),
                     id: format!("msg_{call}"),
                     role: "assistant".into(),
                     content: vec![ContentBlock::Text {

@@ -119,8 +119,8 @@ pub struct NativeResponsesOutput {
 
 impl NativeResponsesOutput {
     /// Extract a lossless terminal Responses output from raw SSE/WebSocket
-    /// event payloads. Failed/errored/unterminated streams are intentionally
-    /// not resumable.
+    /// event payloads. Failed, incomplete, or unterminated streams cannot
+    /// establish a native continuation prefix.
     pub fn from_events(events: &[Value]) -> Option<Self> {
         let terminal = events.iter().rev().find(|event| {
             matches!(
@@ -128,6 +128,17 @@ impl NativeResponsesOutput {
                 Some("response.completed" | "response.done" | "response.incomplete")
             )
         })?;
+        if terminal.get("type").and_then(Value::as_str) == Some("response.incomplete")
+            || terminal
+                .pointer("/response/status")
+                .and_then(Value::as_str)
+                .is_some_and(|status| status != "completed")
+            || terminal
+                .pointer("/response/error")
+                .is_some_and(|error| !error.is_null())
+        {
+            return None;
+        }
         let terminal_event_type = terminal.get("type")?.as_str()?.to_string();
         let final_response = terminal.get("response").cloned();
         let response_id = terminal
@@ -156,7 +167,7 @@ impl NativeResponsesOutput {
         let response = value.get("response").unwrap_or(value);
         let status = response.get("status").and_then(Value::as_str);
         let has_error = response.get("error").is_some_and(|error| !error.is_null());
-        if matches!(status, Some("failed" | "cancelled")) || has_error {
+        if !matches!(status, None | Some("completed")) || has_error {
             return None;
         }
         let output_items = response
@@ -312,19 +323,14 @@ impl ResponsesLedger {
     /// Legacy session migration: replay generic ChatMessage list into a clean ResponsesLedger.
     pub fn from_messages(lineage_id: impl Into<String>, messages: &[ChatMessage]) -> Self {
         let mut ledger = Self::new(lineage_id);
-        for message in messages {
+        for (index, message) in messages.iter().enumerate() {
             if message.role == "toolResult" {
                 let raw_call_id = message.tool_call_id.as_deref().unwrap_or_default();
                 let call_id = raw_call_id
                     .split_once('|')
                     .map(|(c, _)| c)
                     .unwrap_or(raw_call_id);
-                let kind = crate::responses_tools::message_tool_wire_kind(
-                    message,
-                    Some(raw_call_id),
-                    message.tool_name.as_deref(),
-                    &[],
-                );
+                let kind = crate::responses_tools::result_wire_kind(&messages[..index], message);
                 let output = content_text(&message.content);
                 match kind {
                     crate::responses_tools::ResponsesToolWireKind::Custom => {

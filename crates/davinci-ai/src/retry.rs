@@ -106,6 +106,7 @@ mod tests {
 
     fn error_message(text: &str) -> AssistantMessage {
         AssistantMessage {
+            extra: Default::default(),
             id: "t".into(),
             role: "assistant".into(),
             content: Vec::new(),
@@ -146,6 +147,7 @@ mod tests {
             "429 quota exceeded"
         )));
         assert!(!is_retryable_assistant_error(&AssistantMessage {
+            extra: Default::default(),
             id: "t".into(),
             role: "assistant".into(),
             content: Vec::new(),

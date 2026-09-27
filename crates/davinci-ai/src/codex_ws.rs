@@ -1059,9 +1059,152 @@ mod tests {
     }
 
     fn frame(fin: bool, opcode: u8, payload: &[u8]) -> Vec<u8> {
-        let mut out = vec![(if fin { 0x80 } else { 0 }) | opcode, payload.len() as u8];
+        let mut out = vec![(if fin { 0x80 } else { 0 }) | opcode];
+        if payload.len() < 126 {
+            out.push(payload.len() as u8);
+        } else if payload.len() <= u16::MAX as usize {
+            out.push(126);
+            out.extend_from_slice(&(payload.len() as u16).to_be_bytes());
+        } else {
+            out.push(127);
+            out.extend_from_slice(&(payload.len() as u64).to_be_bytes());
+        }
         out.extend_from_slice(payload);
         out
+    }
+
+    fn decode_wire_events(events: &[Value]) -> AssistantMessage {
+        let mut wire = Vec::new();
+        for event in events {
+            let bytes = serde_json::to_vec(event).unwrap();
+            // Fragment frames across UTF-8 byte boundaries as the wire permits.
+            let split = bytes.len() / 2;
+            wire.extend(frame(false, OPCODE_TEXT, &bytes[..split]));
+            wire.extend(frame(true, 0, &bytes[split..]));
+        }
+        read_codex_events(
+            &mut WsStream::for_test(wire),
+            Some(1000),
+            &mut false,
+            &mut ResponsesDecoder::new(&codex_model()),
+            None,
+            &mut |_| {},
+        )
+        .unwrap()
+        .1
+    }
+
+    fn mixed_output() -> Value {
+        let patch =
+            "*** Begin Patch\n*** Add File: π.txt\n+data: quotes \" and \\ slashes\n*** End Patch";
+        serde_json::json!([
+            {"type":"reasoning", "id":"rs_1", "summary":[{"type":"summary_text", "text":"Check the patch"}], "encrypted_content":"opaque"},
+            {"type":"message", "id":"msg_1", "content":[{"type":"output_text", "text":"Applying both.", "annotations":[{"future":true}]}]},
+            {"type":"function_call", "id":"fc_1", "call_id":"function-1", "name":"apply_patch", "arguments":serde_json::json!({"input":patch}).to_string()},
+            {"type":"custom_tool_call", "id":"ct_1", "call_id":"custom-1", "name":"apply_patch", "input":patch},
+            {"type":"message", "id":"msg_2", "content":[{"type":"output_text", "text":"Done."}]}
+        ])
+    }
+
+    #[test]
+    fn sse_websocket_and_nonstreaming_share_terminal_output_normalization() {
+        let response = serde_json::json!({"id":"resp_parity", "status":"completed", "output":mixed_output(), "usage":{"input_tokens":17, "output_tokens":9}});
+        let terminal = serde_json::json!({"type":"response.completed", "response":response});
+        let nonstreaming =
+            crate::stream::parse_provider_response(&codex_model(), &response.to_string());
+        let expected = crate::assistant_to_chat(&nonstreaming);
+        assert_eq!(nonstreaming.stop_reason, Some(crate::StopReason::ToolUse));
+        assert_eq!(expected.content.len(), 5);
+        assert_eq!(
+            expected.extra[crate::RESPONSES_TOOL_WIRE_KINDS_KEY]["function-1|fc_1"],
+            "function"
+        );
+        assert_eq!(
+            expected.extra[crate::RESPONSES_TOOL_WIRE_KINDS_KEY]["custom-1|ct_1"],
+            "custom"
+        );
+        for terminal_only in [true, false] {
+            let mut events = Vec::new();
+            if !terminal_only {
+                for (index, item) in response["output"].as_array().unwrap().iter().enumerate() {
+                    // The final response corrects stale item/delta content.
+                    let mut prior = item.clone();
+                    if prior["type"] == "message" {
+                        prior["content"][0]["text"] = Value::String("partial".into());
+                    }
+                    events.push(serde_json::json!({"type":"response.output_item.added", "output_index":index, "item":prior}));
+                    events.push(serde_json::json!({"type":"response.output_item.done", "output_index":index, "item":prior}));
+                }
+            }
+            events.push(terminal.clone());
+            events.push(terminal.clone());
+            let corpus = events
+                .iter()
+                .map(|event| format!("data: {event}\n\n"))
+                .collect::<String>();
+            let sse = crate::fixture_complete(&codex_model(), &[], &corpus);
+            let websocket = decode_wire_events(&events);
+            for actual in [&sse, &websocket] {
+                assert_eq!(crate::assistant_to_chat(actual), expected);
+                assert_eq!(actual.usage, nonstreaming.usage);
+                assert_eq!(actual.stop_reason, nonstreaming.stop_reason);
+            }
+            let native = crate::NativeResponsesOutput::from_events(&events).unwrap();
+            assert_eq!(
+                native.output_items,
+                response["output"].as_array().unwrap().clone()
+            );
+        }
+    }
+
+    #[test]
+    fn aborting_after_a_tool_item_does_not_return_an_executable_call() {
+        let item = serde_json::json!({"type":"custom_tool_call", "id":"item", "call_id":"call", "name":"apply_patch", "input":"patch"});
+        let event = serde_json::json!({"type":"response.output_item.done", "output_index":0, "item":item});
+        let wire = frame(true, OPCODE_TEXT, &serde_json::to_vec(&event).unwrap());
+        let abort = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (_, message, aborted) = read_codex_events(
+            &mut WsStream::for_test(wire), Some(1000), &mut false,
+            &mut ResponsesDecoder::new(&codex_model()), Some(&abort), &mut |event| {
+                if matches!(event, AssistantMessageEvent::ToolcallEnd { .. }) {
+                    abort.store(true, std::sync::atomic::Ordering::Relaxed);
+                }
+            },
+        ).unwrap();
+        assert!(aborted);
+        assert_eq!(message.stop_reason, Some(StopReason::Aborted));
+        assert!(message.content.is_empty());
+        let truncated = crate::fixture_complete(&codex_model(), &[], &format!("data: {event}\n\n"));
+        assert_eq!(truncated.stop_reason, Some(StopReason::Error));
+        assert!(truncated.content.is_empty());
+    }
+
+    #[test]
+    fn incomplete_responses_never_expose_executable_calls_on_any_transport() {
+        for status in ["incomplete", "failed", "cancelled", "in_progress", "queued"] {
+            let response = serde_json::json!({"id":"resp_partial", "status":status, "incomplete_details":{"reason":"max_output_tokens"}, "output":mixed_output()});
+            let event = serde_json::json!({"type":"response.completed", "response":response});
+            let messages = [
+                crate::stream::parse_provider_response(&codex_model(), &response.to_string()),
+                crate::fixture_complete(&codex_model(), &[], &format!("data: {event}\n\n")),
+                decode_wire_events(&[event.clone()]),
+            ];
+            for message in &messages {
+                assert!(
+                    !message
+                        .content
+                        .iter()
+                        .any(|block| matches!(block, crate::ContentBlock::ToolCall { .. })),
+                    "{status}"
+                );
+                assert!(matches!(
+                    message.stop_reason,
+                    Some(crate::StopReason::Length | crate::StopReason::Error)
+                ));
+            }
+            assert!(crate::NativeResponsesOutput::from_response_value(&response).is_none());
+            assert!(crate::NativeResponsesOutput::from_events(&[event]).is_none());
+        }
     }
 
     #[test]
