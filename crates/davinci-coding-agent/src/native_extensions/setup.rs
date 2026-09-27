@@ -20,7 +20,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 /// Local state Davinci writes under the workspace that should never be
-/// committed: conversation-derived memory records and graph run journals.
+/// committed: learned durable memory records and graph run journals.
 pub const IGNORED_STATE: &[&str] = &[".davinci/vector-memory/", ".davinci/graph/"];
 /// Records embedded per batch after a pull; the memory lock is released
 /// between batches so a turn is never held behind the whole backlog.
