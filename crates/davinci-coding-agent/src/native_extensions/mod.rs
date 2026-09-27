@@ -395,9 +395,23 @@ impl NativeExtensionHost {
             ),
             None => davinci_agent::runtime::cache::CacheRuntime::default(),
         };
-        let governor_config = agent_dir
+        let mut governor_config = agent_dir
             .map(|dir| TokenGovernorConfig::from_file(&dir.join("token-governor.json")))
             .unwrap_or_else(TokenGovernorConfig::from_env);
+        // Stored outputs belong to this host's agent dir, not whatever
+        // `USERPROFILE` says: a host started for another agent dir (tests,
+        // `PI_CODING_AGENT_DIR`) must not write into the user's real store.
+        // An explicit governor-dir override still wins.
+        let governor_dir_override = std::env::var_os("DAVINCI_TOKEN_GOVERNOR_DIR")
+            .or_else(|| std::env::var_os("PI_TOKEN_GOVERNOR_DIR"))
+            .is_some();
+        if let (Some(dir), None, false) = (
+            agent_dir,
+            governor_config.store_dir.as_ref(),
+            governor_dir_override,
+        ) {
+            governor_config.store_dir = Some(dir.join("token-governor"));
+        }
         let memory_config = agent_dir
             .map(|dir| VectorMemoryConfig::from_file(&dir.join("vector-memory.json")))
             .unwrap_or_else(VectorMemoryConfig::from_env);
@@ -1288,6 +1302,18 @@ mod tests {
             .unwrap(),
         )
         .unwrap();
+
+        let host_default_dir = NativeExtensionHost::new_with_agent_dir(
+            "governor-home",
+            root.path(),
+            Some(root.path()),
+        );
+        // A host for another agent dir keeps its outputs there, never in the
+        // user's real `~/.davinci` store.
+        assert_eq!(
+            host_default_dir.governor.lock().unwrap().config.store_dir,
+            Some(root.path().join("token-governor"))
+        );
 
         let mut host = NativeExtensionHost::new_with_agent_dir(
             "lsp-governor",
