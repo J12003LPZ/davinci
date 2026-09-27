@@ -3231,9 +3231,12 @@ fn run_print(parsed: &Args, agent: &mut Agent) -> Result<i32, String> {
                             request_id: davinci_agent::new_message_id(),
                             task: text.clone(),
                             decision_class: davinci_agent::decision::risk::DecisionRisk::Planning,
-                            metadata: davinci_coding_agent::decision_state::DecisionMetadata::default(),
+                            metadata:
+                                davinci_coding_agent::decision_state::DecisionMetadata::default(),
                             evidence_revision: agent.messages.len() as u64,
-                            mutation_revision: agent.mutation_verification_state().mutation_generation,
+                            mutation_revision: agent
+                                .mutation_verification_state()
+                                .mutation_generation,
                         },
                     );
                     if json_mode {
@@ -3475,8 +3478,15 @@ fn print_text_exit(events: &[AgentEvent]) -> (i32, Option<String>) {
         let message = assistant_message_event.message();
         match message.stop_reason {
             Some(StopReason::Length) => {
-                return (1, Some(message.error_message.clone().unwrap_or_else(||
-                    "Request reached the output token limit".into())));
+                return (
+                    1,
+                    Some(
+                        message
+                            .error_message
+                            .clone()
+                            .unwrap_or_else(|| "Request reached the output token limit".into()),
+                    ),
+                );
             }
             Some(StopReason::Error) | Some(StopReason::Aborted) => {
                 let label = if message.stop_reason == Some(StopReason::Aborted) {

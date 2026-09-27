@@ -97,7 +97,11 @@ fn syntax(name: &str, source: &str) -> Option<SyntaxFacts> {
     }
     let mut command = Command::new(&interpreter);
     command.args(["-I", "-S", "-c", include_str!("verification/python_ast.py")]);
-    let facts = inspect_command(command, source, Duration::from_millis(250))?;
+    #[cfg(windows)]
+    let inspection_budget = Duration::from_secs(1);
+    #[cfg(not(windows))]
+    let inspection_budget = Duration::from_millis(250);
+    let facts = inspect_command(command, source, inspection_budget)?;
     let mut cache = cache.lock().ok()?;
     cache_insert(&mut cache, identity, source.to_string(), facts.clone());
     Some(facts)

@@ -52,14 +52,13 @@ pub struct ResolvedResponsesTools {
 
 impl ResolvedResponsesTools {
     pub fn custom_tool_name_refs(&self) -> Vec<&str> {
-        self.custom_tool_names
-            .iter()
-            .map(String::as_str)
-            .collect()
+        self.custom_tool_names.iter().map(String::as_str).collect()
     }
 
     pub fn is_custom(&self, name: &str) -> bool {
-        self.custom_tool_names.iter().any(|candidate| candidate == name)
+        self.custom_tool_names
+            .iter()
+            .any(|candidate| candidate == name)
     }
 
     pub fn wire_tools(&self) -> Vec<Value> {
@@ -173,23 +172,20 @@ pub fn set_wire_kind(extra: &mut Map<String, Value>, call_id: &str, kind: Respon
         .and_then(|value| value.as_object().cloned())
         .unwrap_or_default();
     kinds.insert(call_id.to_string(), Value::String(kind.as_str().into()));
-    extra.insert(
-        RESPONSES_TOOL_WIRE_KINDS_KEY.into(),
-        Value::Object(kinds),
-    );
+    extra.insert(RESPONSES_TOOL_WIRE_KINDS_KEY.into(), Value::Object(kinds));
 }
 
-pub fn set_single_wire_kind(
-    extra: &mut Map<String, Value>,
-    kind: ResponsesToolWireKind,
-) {
+pub fn set_single_wire_kind(extra: &mut Map<String, Value>, kind: ResponsesToolWireKind) {
     extra.insert(
         RESPONSES_TOOL_WIRE_KIND_KEY.into(),
         Value::String(kind.as_str().into()),
     );
 }
 
-fn explicit_wire_kind(message: &ChatMessage, call_id: Option<&str>) -> Option<ResponsesToolWireKind> {
+fn explicit_wire_kind(
+    message: &ChatMessage,
+    call_id: Option<&str>,
+) -> Option<ResponsesToolWireKind> {
     if let Some(kinds) = message
         .extra
         .get(RESPONSES_TOOL_WIRE_KINDS_KEY)
@@ -395,24 +391,76 @@ mod tests {
             true,
         );
         assert_eq!(resolved.custom_tool_names, vec!["apply_patch"]);
-        assert_eq!(resolved.tools.iter().filter(|tool| tool["name"] == "apply_patch").count(), 1);
-        assert_eq!(resolved.tools.iter().filter(|tool| tool["type"] == "function" && tool["name"] == "apply_patch").count(), 0);
-        assert_eq!(resolved.tools.iter().filter(|tool| tool["type"] == "custom").count(), 1);
+        assert_eq!(
+            resolved
+                .tools
+                .iter()
+                .filter(|tool| tool["name"] == "apply_patch")
+                .count(),
+            1
+        );
+        assert_eq!(
+            resolved
+                .tools
+                .iter()
+                .filter(|tool| tool["type"] == "function" && tool["name"] == "apply_patch")
+                .count(),
+            0
+        );
+        assert_eq!(
+            resolved
+                .tools
+                .iter()
+                .filter(|tool| tool["type"] == "custom")
+                .count(),
+            1
+        );
     }
 
     #[test]
     fn unsupported_or_disabled_context_stays_functional() {
         let cases = [
-            (model("openai-codex-responses", "openai-codex", None), Some("https://proxy.test/backend-api"), true),
-            (model("azure-openai-responses", "azure", None), Some("https://api.openai.com/v1"), false),
-            (model("openai-responses", "other", None), Some("https://api.openai.com/v1"), false),
-            (model("openai-codex-responses", "openai-codex", None), Some("not a url"), true),
+            (
+                model("openai-codex-responses", "openai-codex", None),
+                Some("https://proxy.test/backend-api"),
+                true,
+            ),
+            (
+                model("azure-openai-responses", "azure", None),
+                Some("https://api.openai.com/v1"),
+                false,
+            ),
+            (
+                model("openai-responses", "other", None),
+                Some("https://api.openai.com/v1"),
+                false,
+            ),
+            (
+                model("openai-codex-responses", "openai-codex", None),
+                Some("not a url"),
+                true,
+            ),
         ];
         for (model, url, oauth) in cases {
-            let resolved = resolve_responses_tools_with_preference(&model, url, oauth, &tools(), true);
+            let resolved =
+                resolve_responses_tools_with_preference(&model, url, oauth, &tools(), true);
             assert!(resolved.custom_tool_names.is_empty());
-            assert_eq!(resolved.tools.iter().filter(|tool| tool["name"] == "apply_patch").count(), 1);
-            assert_eq!(resolved.tools.iter().find(|tool| tool["name"] == "apply_patch").unwrap()["type"], "function");
+            assert_eq!(
+                resolved
+                    .tools
+                    .iter()
+                    .filter(|tool| tool["name"] == "apply_patch")
+                    .count(),
+                1
+            );
+            assert_eq!(
+                resolved
+                    .tools
+                    .iter()
+                    .find(|tool| tool["name"] == "apply_patch")
+                    .unwrap()["type"],
+                "function"
+            );
         }
         let disabled = resolve_responses_tools_with_preference(
             &model("openai-codex-responses", "openai-codex", None),
@@ -422,7 +470,14 @@ mod tests {
             false,
         );
         assert!(disabled.custom_tool_names.is_empty());
-        assert_eq!(disabled.tools.iter().find(|tool| tool["name"] == "apply_patch").unwrap()["type"], "function");
+        assert_eq!(
+            disabled
+                .tools
+                .iter()
+                .find(|tool| tool["name"] == "apply_patch")
+                .unwrap()["type"],
+            "function"
+        );
     }
 
     #[test]
@@ -430,8 +485,7 @@ mod tests {
         let model = model("openai-codex-responses", "openai-codex", None);
         let url = Some("https://chatgpt.com/backend-api");
         let custom = resolve_responses_tools_with_preference(&model, url, true, &tools(), true);
-        let functions =
-            resolve_responses_tools_with_preference(&model, url, true, &tools(), false);
+        let functions = resolve_responses_tools_with_preference(&model, url, true, &tools(), false);
         assert_ne!(
             custom.schema_digest, functions.schema_digest,
             "cache identity must follow the actual wire tool kind and grammar"
@@ -447,7 +501,11 @@ mod tests {
     #[test]
     fn explicit_wire_kind_overrides_legacy_name_fallback() {
         let mut message = ChatMessage::tool_result("call|item", "apply_patch", "ok", false);
-        set_wire_kind(&mut message.extra, "call|item", ResponsesToolWireKind::Function);
+        set_wire_kind(
+            &mut message.extra,
+            "call|item",
+            ResponsesToolWireKind::Function,
+        );
         assert_eq!(
             message_tool_wire_kind(&message, Some("call|item"), Some("apply_patch"), &[]),
             ResponsesToolWireKind::Function

@@ -8583,7 +8583,10 @@ fn submit_prompt(shell: &mut Shell<'_>, text: &str, images: &[davinci_ai::Messag
     );
     shell.agent.prompt_user_with(&expanded, &images);
     let evidence_revision = shell.agent.messages.len() as u64;
-    let mutation_revision = shell.agent.mutation_verification_state().mutation_generation;
+    let mutation_revision = shell
+        .agent
+        .mutation_verification_state()
+        .mutation_generation;
     let _ = davinci_coding_agent::turn_decision::prepare_turn_decision(
         &mut shell.agent,
         davinci_coding_agent::turn_decision::DecisionSnapshot {

@@ -3116,7 +3116,8 @@ fn print_mode_exits_nonzero_on_assistant_error() {
 fn print_mode_exits_nonzero_on_output_limit() {
     let message: AssistantMessage = serde_json::from_value(serde_json::json!({
         "id":"limited","role":"assistant","model":"fixture","content":[],"stopReason":"length"
-    })).unwrap();
+    }))
+    .unwrap();
     let events = vec![AgentEvent::MessageUpdate {
         message: std::sync::Arc::new(davinci_ai::ChatMessage::text("assistant", "")),
         assistant_message_event: davinci_ai::AssistantMessageEvent::Done {
@@ -3124,7 +3125,10 @@ fn print_mode_exits_nonzero_on_output_limit() {
             message,
         },
     }];
-    assert_eq!(print_text_exit(&events), (1, Some("Request reached the output token limit".into())));
+    assert_eq!(
+        print_text_exit(&events),
+        (1, Some("Request reached the output token limit".into()))
+    );
 }
 
 #[test]
@@ -3472,8 +3476,8 @@ fn print_verification_notice_is_a_separate_event_and_not_a_provider_error() {
 #[test]
 fn provider_schema_budget_tracks_discovery_without_changing_request_one() {
     use davinci_agent::runtime::{
-        context_vm::ContextVmMode, AgentId, CapabilitySource, RunId, RuntimeBus,
-        RuntimeCapability, RuntimeHandle,
+        context_vm::ContextVmMode, AgentId, CapabilitySource, RunId, RuntimeBus, RuntimeCapability,
+        RuntimeHandle,
     };
     let mut agent = Agent::new("schema budget fixture");
     agent.tool_surface = davinci_agent::ToolSurface::Lean;
@@ -3533,6 +3537,9 @@ fn provider_schema_budget_tracks_discovery_without_changing_request_one() {
     agent.set_provider_context_overhead_tokens(None);
     assert_eq!(
         agent.provider_context_budget().tools,
-        serde_json::to_vec(&agent.provider_tool_specs()).unwrap().len() as u64 + 128
+        serde_json::to_vec(&agent.provider_tool_specs())
+            .unwrap()
+            .len() as u64
+            + 128
     );
 }

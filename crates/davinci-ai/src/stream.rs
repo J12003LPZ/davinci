@@ -650,20 +650,29 @@ pub fn live_complete_with(
     .map_err(|err| err.message)?;
     let message = parse_provider_response(model, &text);
     observation.finish(
-        if message.stop_reason == Some(StopReason::Error) { "failed" } else { "completed" },
-        None, message.usage.clone(),
+        if message.stop_reason == Some(StopReason::Error) {
+            "failed"
+        } else {
+            "completed"
+        },
+        None,
+        message.usage.clone(),
     );
     Ok(message)
 }
 
 fn observe_request(model: &Model, body: &Value) {
     use sha2::Digest;
-    let schema_hash = format!("{:x}", sha2::Sha256::digest(
-        serde_json::to_vec(&body.get("tools")).unwrap_or_default()
-    ));
+    let schema_hash = format!(
+        "{:x}",
+        sha2::Sha256::digest(serde_json::to_vec(&body.get("tools")).unwrap_or_default())
+    );
     let effort = body.pointer("/reasoning/effort").and_then(Value::as_str);
     crate::provider_observation::begin_request(
-        "coding", &format!("{}/{}", model.provider, model.id), effort, &schema_hash,
+        "coding",
+        &format!("{}/{}", model.provider, model.id),
+        effort,
+        &schema_hash,
     );
 }
 
@@ -946,11 +955,14 @@ fn live_complete_streaming_with_sink_envelope_inner(
         }
     })();
     let (status, usage) = match &result {
-        Ok(envelope) => (match envelope.message.stop_reason {
-            Some(StopReason::Error) => "failed",
-            Some(StopReason::Aborted) => "aborted",
-            _ => "completed",
-        }, envelope.message.usage.clone()),
+        Ok(envelope) => (
+            match envelope.message.stop_reason {
+                Some(StopReason::Error) => "failed",
+                Some(StopReason::Aborted) => "aborted",
+                _ => "completed",
+            },
+            envelope.message.usage.clone(),
+        ),
         Err(_) => ("failed", None),
     };
     observation.finish(status, Some(http_status), usage);
@@ -1338,12 +1350,8 @@ fn openai_responses_input_with_prefix(
                     crate::responses_tools::result_wire_kind(&messages[..index], message)
                 });
             let item_type = match kind {
-                crate::responses_tools::ResponsesToolWireKind::Custom => {
-                    "custom_tool_call_output"
-                }
-                crate::responses_tools::ResponsesToolWireKind::Function => {
-                    "function_call_output"
-                }
+                crate::responses_tools::ResponsesToolWireKind::Custom => "custom_tool_call_output",
+                crate::responses_tools::ResponsesToolWireKind::Function => "function_call_output",
             };
             input.push(serde_json::json!({
                 "type": item_type,
@@ -1381,12 +1389,11 @@ fn openai_responses_input_with_prefix(
                     call_kinds.insert(crate::responses_tools::provider_call_id(id).into(), kind);
                     match kind {
                         crate::responses_tools::ResponsesToolWireKind::Custom => {
-                            let raw_input = crate::responses_tools::custom_tool_call_arguments(
-                                arguments,
-                            )
-                            .map(str::to_string)
-                            .or_else(|| arguments.as_str().map(str::to_string))
-                            .unwrap_or_else(|| arguments.to_string());
+                            let raw_input =
+                                crate::responses_tools::custom_tool_call_arguments(arguments)
+                                    .map(str::to_string)
+                                    .or_else(|| arguments.as_str().map(str::to_string))
+                                    .unwrap_or_else(|| arguments.to_string());
                             input.push(serde_json::json!({
                                 "type": "custom_tool_call",
                                 "call_id": responses_call_id(id),
@@ -3255,12 +3262,23 @@ mod tests {
             source: "test".into(),
         };
         let observations = crate::provider_observation::ObservationScope::capture();
-        let complete = |model: &Model, messages: &[ChatMessage], auth: &ResolvedAuth,
-                        system: Option<&str>, tools: &[ToolSpec], options: &StreamOptions| {
+        let complete = |model: &Model,
+                        messages: &[ChatMessage],
+                        auth: &ResolvedAuth,
+                        system: Option<&str>,
+                        tools: &[ToolSpec],
+                        options: &StreamOptions| {
             if streaming {
                 live_complete_streaming_with_sink_envelope(
-                    model, messages, auth, system, tools, options, &mut |_| {},
-                ).map(|envelope| envelope.message)
+                    model,
+                    messages,
+                    auth,
+                    system,
+                    tools,
+                    options,
+                    &mut |_| {},
+                )
+                .map(|envelope| envelope.message)
             } else {
                 live_complete_with(model, messages, auth, system, tools, options)
             }
@@ -3280,11 +3298,28 @@ mod tests {
         .unwrap();
         assert_eq!(hits.load(Ordering::SeqCst), 2);
         let observations = observations.finish("completed");
-        assert_eq!(observations.iter().filter(|o| o.kind == "logical_start").count(), 1);
-        let starts: Vec<_> = observations.iter().filter(|o| o.kind == "attempt_start").collect();
+        assert_eq!(
+            observations
+                .iter()
+                .filter(|o| o.kind == "logical_start")
+                .count(),
+            1
+        );
+        let starts: Vec<_> = observations
+            .iter()
+            .filter(|o| o.kind == "attempt_start")
+            .collect();
         assert_eq!(starts.len(), 2);
-        assert!(starts.iter().all(|o| o.transport.as_deref() == Some("http") && !o.schema_hash.is_empty()));
-        assert_eq!(observations.iter().filter(|o| o.kind == "attempt_end" && o.http_status == Some(429)).count(), 1);
+        assert!(starts
+            .iter()
+            .all(|o| o.transport.as_deref() == Some("http") && !o.schema_hash.is_empty()));
+        assert_eq!(
+            observations
+                .iter()
+                .filter(|o| o.kind == "attempt_end" && o.http_status == Some(429))
+                .count(),
+            1
+        );
         assert!(
             content_text(&assistant_to_chat(&message).content).contains("ok")
                 || message.content.iter().any(

@@ -20,8 +20,9 @@ pub use discovery::{
 };
 pub use errors::{JsonlDecodeError, SessionError};
 pub use jsonl_repo::{
-    expected_session_path, jsonl_session_directory_name, session_file_name, utc_date_from_unix_ms, validate_session_id,
-    JsonlCreateOptions, JsonlSessionInfo, JsonlSessionRepo, JsonlStoredSession,
+    expected_session_path, jsonl_session_directory_name, session_file_name, utc_date_from_unix_ms,
+    validate_session_id, JsonlCreateOptions, JsonlSessionInfo, JsonlSessionRepo,
+    JsonlStoredSession,
 };
 pub use repo::{
     assistant_message_entry, compaction_entry, custom_entry, operation_started, user_message_entry,

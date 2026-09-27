@@ -821,9 +821,7 @@ fn normalize_anchor_token(raw: &str) -> &str {
     token
         .rsplit_once(':')
         .filter(|(head, suffix)| {
-            !head.is_empty()
-                && !suffix.is_empty()
-                && suffix.chars().all(|ch| ch.is_ascii_digit())
+            !head.is_empty() && !suffix.is_empty() && suffix.chars().all(|ch| ch.is_ascii_digit())
         })
         .map_or(token, |(head, _)| head)
 }
@@ -968,13 +966,19 @@ fn infer_source_paths(cwd: &Path, text: &str) -> Vec<String> {
         .split_whitespace()
         .filter_map(|token| {
             let token = token.trim_matches(|ch: char| {
-                matches!(ch, '`' | '"' | '\'' | '(' | ')' | '[' | ']' | '{' | '}' | ',' | ';')
+                matches!(
+                    ch,
+                    '`' | '"' | '\'' | '(' | ')' | '[' | ']' | '{' | '}' | ',' | ';'
+                )
             });
             let token = token
                 .rsplit_once(':')
                 .filter(|(_, suffix)| suffix.chars().all(|ch| ch.is_ascii_digit()))
                 .map_or(token, |(path, _)| path);
-            let normalized = token.replace('\\', "/").trim_start_matches("./").to_string();
+            let normalized = token
+                .replace('\\', "/")
+                .trim_start_matches("./")
+                .to_string();
             if normalized.is_empty()
                 || normalized.starts_with('/')
                 || normalized.contains("://")
@@ -1520,12 +1524,7 @@ impl VectorMemory {
             .filter(|record| {
                 !self.tombstones.contains(&record.id)
                     && !self.supersessions.contains_key(&record.id)
-                    && record_matches_scope(
-                        record,
-                        &self.repo_id,
-                        agent_profile_name,
-                        memory_scope,
-                    )
+                    && record_matches_scope(record, &self.repo_id, agent_profile_name, memory_scope)
             })
             .collect();
 
@@ -1748,12 +1747,7 @@ impl VectorMemory {
             .filter(|record| {
                 !self.tombstones.contains(&record.id)
                     && !self.supersessions.contains_key(&record.id)
-                    && record_matches_scope(
-                        record,
-                        &self.repo_id,
-                        agent_profile_name,
-                        memory_scope,
-                    )
+                    && record_matches_scope(record, &self.repo_id, agent_profile_name, memory_scope)
                     && match record.kind {
                         MemoryKind::Constraint => {
                             record.source == "user"
@@ -1801,7 +1795,10 @@ impl VectorMemory {
             results.push(MemoryContextHit {
                 id: record.id.clone(),
                 text,
-                score: record.confidence.unwrap_or(record.importance).clamp(0.0, 1.0),
+                score: record
+                    .confidence
+                    .unwrap_or(record.importance)
+                    .clamp(0.0, 1.0),
                 estimated_tokens,
             });
             if results.len() >= PINNED_MEMORY_LIMIT {
@@ -1873,7 +1870,10 @@ impl VectorMemory {
         let pinned_cap = PINNED_MEMORY_TOKEN_CAP.min(total_cap);
         let mut results =
             self.pinned_context_hits_scoped(pinned_cap, agent_profile_name, memory_scope);
-        let mut used = results.iter().map(|hit| hit.estimated_tokens).sum::<usize>();
+        let mut used = results
+            .iter()
+            .map(|hit| hit.estimated_tokens)
+            .sum::<usize>();
         let recall_cap = AUTO_RECALL_TOKEN_CAP.min(total_cap.saturating_sub(used));
         if recall_cap == 0 {
             return results;
@@ -1984,12 +1984,8 @@ impl VectorMemory {
     /// recall requires a current code anchor and an unambiguous top match.
     /// Broader semantic recall remains available through `memory_search`.
     pub fn inject(&self, query: &str) -> Option<String> {
-        let hits = self.automatic_context_hits_scoped(
-            query,
-            self.config.max_injected_tokens,
-            None,
-            None,
-        );
+        let hits =
+            self.automatic_context_hits_scoped(query, self.config.max_injected_tokens, None, None);
         if hits.is_empty() {
             return None;
         }
@@ -2346,7 +2342,9 @@ impl VectorMemory {
     ) -> Result<String, ToolError> {
         let text_redacted = compact_durable_claim(text);
         if text_redacted.is_empty() {
-            return Err(ToolError::Failed("memory claim is empty after normalization".into()));
+            return Err(ToolError::Failed(
+                "memory claim is empty after normalization".into(),
+            ));
         }
         let hash = content_hash(&text_redacted);
         if !self.known.insert(known_key(kind, &hash)) {
@@ -3235,8 +3233,14 @@ pub(crate) mod tests {
                 }
             }
         }
-        assert_eq!(correct_hits, expected_hits, "anchored prompts must recall their claim");
-        assert_eq!(correct_silence, silent_cases, "unanchored prompts must stay silent");
+        assert_eq!(
+            correct_hits, expected_hits,
+            "anchored prompts must recall their claim"
+        );
+        assert_eq!(
+            correct_silence, silent_cases,
+            "unanchored prompts must stay silent"
+        );
     }
 
     #[test]

@@ -655,32 +655,48 @@ mod tests {
 
     #[test]
     fn disabled_shadow_admission_never_prepares_request() {
-        let runtime = std::sync::Arc::new(DecisionRuntime::new(std::sync::Arc::new(FixtureProvider {
-            calls: AtomicUsize::new(0), response: Err(DecisionError::CredentialInvalid),
-            delay: std::time::Duration::ZERO,
-        })));
-        assert_eq!(runtime.enqueue_shadow_with_result(|| panic!("disabled preparation ran")), Err(DecisionError::Disabled));
+        let runtime =
+            std::sync::Arc::new(DecisionRuntime::new(std::sync::Arc::new(FixtureProvider {
+                calls: AtomicUsize::new(0),
+                response: Err(DecisionError::CredentialInvalid),
+                delay: std::time::Duration::ZERO,
+            })));
+        assert_eq!(
+            runtime.enqueue_shadow_with_result(|| panic!("disabled preparation ran")),
+            Err(DecisionError::Disabled)
+        );
     }
 
     #[test]
     fn blocked_request_preparation_is_off_submit_path_and_bounded_to_one_worker() {
-        let runtime = std::sync::Arc::new(DecisionRuntime::new(std::sync::Arc::new(FixtureProvider {
-            calls: AtomicUsize::new(0), response: Err(DecisionError::CredentialInvalid),
-            delay: std::time::Duration::ZERO,
-        })));
+        let runtime =
+            std::sync::Arc::new(DecisionRuntime::new(std::sync::Arc::new(FixtureProvider {
+                calls: AtomicUsize::new(0),
+                response: Err(DecisionError::CredentialInvalid),
+                delay: std::time::Duration::ZERO,
+            })));
         runtime.enable();
         let (entered_tx, entered_rx) = std::sync::mpsc::sync_channel(1);
         let (release_tx, release_rx) = std::sync::mpsc::sync_channel(1);
         let key = advice_key("preparing", runtime.generation());
         let started = std::time::Instant::now();
-        runtime.enqueue_shadow_with_result(move || {
-            entered_tx.send(()).unwrap();
-            release_rx.recv_timeout(std::time::Duration::from_secs(2)).unwrap();
-            (request(), key)
-        }).unwrap();
+        runtime
+            .enqueue_shadow_with_result(move || {
+                entered_tx.send(()).unwrap();
+                release_rx
+                    .recv_timeout(std::time::Duration::from_secs(2))
+                    .unwrap();
+                (request(), key)
+            })
+            .unwrap();
         assert!(started.elapsed() < std::time::Duration::from_millis(100));
-        entered_rx.recv_timeout(std::time::Duration::from_secs(1)).unwrap();
-        assert_eq!(runtime.enqueue_shadow_with_result(|| panic!("busy preparation ran")), Err(DecisionError::Busy));
+        entered_rx
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .unwrap();
+        assert_eq!(
+            runtime.enqueue_shadow_with_result(|| panic!("busy preparation ran")),
+            Err(DecisionError::Busy)
+        );
         release_tx.send(()).unwrap();
     }
 

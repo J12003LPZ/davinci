@@ -641,7 +641,10 @@ mod tests {
             agent.set_context_vm_mode(ContextVmMode::Active);
             agent.set_provider_output_limit(Some(1024));
             agent.set_provider_context_overhead_estimator(|agent| {
-                serde_json::to_vec(&agent.provider_tool_specs()).unwrap().len() as u64 + 128
+                serde_json::to_vec(&agent.provider_tool_specs())
+                    .unwrap()
+                    .len() as u64
+                    + 128
             });
             agent.context_window = agent.provider_context_budget().reserved() + 16_000;
             let initial_tools = agent.visible_tool_names();

@@ -1320,10 +1320,9 @@ fn output_limit_truncated_call_gets_one_corrective_turn() {
         message.extra.get("davinciCapabilityReminder")
             == Some(&serde_json::Value::String("output_truncated".into()))
     }));
-    assert!(agent
-        .messages
-        .iter()
-        .all(|message| !message.extra.contains_key(davinci_ai::DROPPED_TOOL_CALLS_KEY)));
+    assert!(agent.messages.iter().all(|message| !message
+        .extra
+        .contains_key(davinci_ai::DROPPED_TOOL_CALLS_KEY)));
     assert_eq!(agent.last_assistant_text().as_deref(), Some("done"));
 }
 

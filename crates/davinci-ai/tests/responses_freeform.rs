@@ -1,9 +1,9 @@
 use davinci_ai::responses_ledger::{ResponsesItem, ResponsesLedger};
 use davinci_ai::{
     assistant_to_chat, load_builtin_models, openai_responses_input_with, request_body_with,
-    set_wire_kind, ChatMessage, ContentBlock, MessageContent, ResponsesInputOptions,
-    ResponsesToolWireKind, StopReason, StreamDecoder, StreamOptions, ToolSpec,
-    ResponsesDecoder,
+    set_wire_kind, ChatMessage, ContentBlock, MessageContent, ResponsesDecoder,
+    ResponsesInputOptions, ResponsesToolWireKind, StopReason, StreamDecoder, StreamOptions,
+    ToolSpec,
 };
 use serde_json::json;
 
@@ -114,7 +114,8 @@ fn supported_body_has_one_custom_patch_and_function_fallback_for_other_tools() {
 
 #[test]
 fn custom_history_round_trips_lossless_input_and_output() {
-    let raw_patch = "*** Begin Patch\n*** Update File: src/π.rs\n@@\n-\"old\"\\\\\n+\"new\"\n*** End Patch";
+    let raw_patch =
+        "*** Begin Patch\n*** Update File: src/π.rs\n@@\n-\"old\"\\\\\n+\"new\"\n*** End Patch";
     let mut assistant = ChatMessage {
         role: "assistant".into(),
         content: vec![MessageContent::ToolCall {
@@ -148,8 +149,14 @@ fn custom_history_round_trips_lossless_input_and_output() {
     assert_eq!(input[1]["call_id"], "call-1");
 
     let ledger = ResponsesLedger::from_messages("lineage", &[assistant, result]);
-    assert!(matches!(ledger.items[0], ResponsesItem::CustomToolCall { .. }));
-    assert!(matches!(ledger.items[1], ResponsesItem::CustomToolCallOutput { .. }));
+    assert!(matches!(
+        ledger.items[0],
+        ResponsesItem::CustomToolCall { .. }
+    ));
+    assert!(matches!(
+        ledger.items[1],
+        ResponsesItem::CustomToolCallOutput { .. }
+    ));
 }
 
 #[test]
@@ -177,7 +184,10 @@ fn explicit_function_metadata_survives_apply_patch_name() {
     );
     assert_eq!(input[0]["type"], "function_call");
     let ledger = ResponsesLedger::from_messages("lineage", &[assistant]);
-    assert!(matches!(ledger.items[0], ResponsesItem::FunctionCall { .. }));
+    assert!(matches!(
+        ledger.items[0],
+        ResponsesItem::FunctionCall { .. }
+    ));
 }
 
 #[test]
@@ -202,14 +212,21 @@ fn historical_function_defaults_are_not_rewritten_by_current_custom_visibility()
     assert_eq!(input[0]["type"], "function_call");
     assert_eq!(input[1]["type"], "function_call_output");
     let ledger = ResponsesLedger::from_messages("lineage", &[assistant, result]);
-    assert!(matches!(ledger.items[0], ResponsesItem::FunctionCall { .. }));
-    assert!(matches!(ledger.items[1], ResponsesItem::FunctionCallOutput { .. }));
+    assert!(matches!(
+        ledger.items[0],
+        ResponsesItem::FunctionCall { .. }
+    ));
+    assert!(matches!(
+        ledger.items[1],
+        ResponsesItem::FunctionCallOutput { .. }
+    ));
 }
 
 #[test]
 fn decoder_normalizes_custom_call_input_without_losing_unicode_or_order() {
     let model = codex_model();
-    let raw_patch = "*** Begin Patch\n*** Add File: src/π.rs\n+quotes: \\\" / \\\\ \\n+*** End Patch";
+    let raw_patch =
+        "*** Begin Patch\n*** Add File: src/π.rs\n+quotes: \\\" / \\\\ \\n+*** End Patch";
     let events = [
         json!({
             "type": "response.output_item.added",
@@ -257,7 +274,10 @@ fn decoder_normalizes_custom_call_input_without_losing_unicode_or_order() {
             if name == "read" && arguments["path"] == "Cargo.toml"
     ));
     let chat = assistant_to_chat(&message);
-    assert_eq!(chat.extra["responsesToolWireKinds"]["custom-1|item-custom"], "custom");
+    assert_eq!(
+        chat.extra["responsesToolWireKinds"]["custom-1|item-custom"],
+        "custom"
+    );
 }
 
 #[test]
@@ -311,16 +331,30 @@ fn older_native_custom_call_repairs_missing_metadata_across_model_projection() {
     let mut call = ChatMessage {
         role: "assistant".into(),
         content: vec![MessageContent::ToolCall {
-            id: "call|item".into(), name: "apply_patch".into(), arguments: json!({"input":"patch"}),
+            id: "call|item".into(),
+            name: "apply_patch".into(),
+            arguments: json!({"input":"patch"}),
         }],
         ..ChatMessage::default()
     };
-    davinci_ai::attach_native_items(&mut call, &[json!({"type":"custom_tool_call", "id":"item", "call_id":"call", "name":"apply_patch", "input":"patch"})], "original/model");
+    davinci_ai::attach_native_items(
+        &mut call,
+        &[
+            json!({"type":"custom_tool_call", "id":"item", "call_id":"call", "name":"apply_patch", "input":"patch"}),
+        ],
+        "original/model",
+    );
     let mut result = ChatMessage::tool_result("call|item", "apply_patch", "ok", false);
     davinci_ai::set_single_wire_kind(&mut result.extra, ResponsesToolWireKind::Function);
     let messages = [call, result];
     for model in [Some("original/model"), Some("other/model"), None] {
-        let input = openai_responses_input_with(&messages, &ResponsesInputOptions { native_items_model:model, custom_tools:&[] });
+        let input = openai_responses_input_with(
+            &messages,
+            &ResponsesInputOptions {
+                native_items_model: model,
+                custom_tools: &[],
+            },
+        );
         assert_eq!(input[0]["type"], "custom_tool_call");
         assert_eq!(input[1]["type"], "custom_tool_call_output");
     }

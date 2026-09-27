@@ -35,12 +35,14 @@ struct State {
 impl State {
     fn record(&mut self, mut event: ProviderAttemptObservation) {
         event.elapsed_ms = self.started.elapsed().as_secs_f64() * 1000.0;
-        if self.events.len() < 4096 {
-            self.events.push(event);
-        } else if self.events.len() == 4096 {
-            event.kind = "telemetry_overflow".into();
-            event.status = "unknown".into();
-            self.events.push(event);
+        match self.events.len().cmp(&4096) {
+            std::cmp::Ordering::Less => self.events.push(event),
+            std::cmp::Ordering::Equal => {
+                event.kind = "telemetry_overflow".into();
+                event.status = "unknown".into();
+                self.events.push(event);
+            }
+            std::cmp::Ordering::Greater => {}
         }
     }
 }

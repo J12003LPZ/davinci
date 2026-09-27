@@ -60,6 +60,7 @@ mod shell;
 mod stream;
 #[doc(hidden)]
 pub use stream::{openai_responses_input, openai_responses_input_with};
+pub mod provider_observation;
 mod stream_decoder;
 mod stream_decoder_anthropic;
 mod stream_decoder_completions;
@@ -67,7 +68,6 @@ mod stream_reader;
 mod thinking;
 pub mod trace;
 pub mod wire_dump;
-pub mod provider_observation;
 
 pub use apply_patch_grammar::APPLY_PATCH_LARK;
 pub use attribution::{is_install_telemetry_enabled, merge_provider_attribution_headers};

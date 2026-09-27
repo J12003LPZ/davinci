@@ -153,8 +153,13 @@ pub fn process_codex_websocket(
     }
     release_live_socket(acquired.key, stream, keep);
     observation.finish(
-        if message.stop_reason == Some(StopReason::Error) { "failed" } else { "completed" },
-        None, message.usage.clone(),
+        if message.stop_reason == Some(StopReason::Error) {
+            "failed"
+        } else {
+            "completed"
+        },
+        None,
+        message.usage.clone(),
     );
     Ok(CodexWebsocketMessage {
         message,
@@ -1160,17 +1165,23 @@ mod tests {
     #[test]
     fn aborting_after_a_tool_item_does_not_return_an_executable_call() {
         let item = serde_json::json!({"type":"custom_tool_call", "id":"item", "call_id":"call", "name":"apply_patch", "input":"patch"});
-        let event = serde_json::json!({"type":"response.output_item.done", "output_index":0, "item":item});
+        let event =
+            serde_json::json!({"type":"response.output_item.done", "output_index":0, "item":item});
         let wire = frame(true, OPCODE_TEXT, &serde_json::to_vec(&event).unwrap());
         let abort = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let (_, message, aborted) = read_codex_events(
-            &mut WsStream::for_test(wire), Some(1000), &mut false,
-            &mut ResponsesDecoder::new(&codex_model()), Some(&abort), &mut |event| {
+            &mut WsStream::for_test(wire),
+            Some(1000),
+            &mut false,
+            &mut ResponsesDecoder::new(&codex_model()),
+            Some(&abort),
+            &mut |event| {
                 if matches!(event, AssistantMessageEvent::ToolcallEnd { .. }) {
                     abort.store(true, std::sync::atomic::Ordering::Relaxed);
                 }
             },
-        ).unwrap();
+        )
+        .unwrap();
         assert!(aborted);
         assert_eq!(message.stop_reason, Some(StopReason::Aborted));
         assert!(message.content.is_empty());

@@ -5,7 +5,6 @@ pub mod args;
 pub mod completion_delivery;
 pub mod decision_providers;
 pub mod decision_state;
-pub mod turn_decision;
 pub mod hooks;
 pub mod interaction_testing;
 pub mod interactive_tui;
@@ -24,6 +23,7 @@ pub mod self_update;
 pub mod semantic;
 pub mod settings;
 pub mod trust;
+pub mod turn_decision;
 
 pub use sdk::{
     create_agent_session, AgentSession, CreateAgentSessionOptions, CreateAgentSessionResult,

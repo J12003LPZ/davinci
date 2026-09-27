@@ -202,8 +202,7 @@ pub fn parse_codex_patch(input: &str) -> Result<ParsedPatch, String> {
         }
         if line.starts_with("*** Move to:") {
             return Err(
-                "Unsupported patch marker `*** Move to:`; use a delete plus an add instead"
-                    .into(),
+                "Unsupported patch marker `*** Move to:`; use a delete plus an add instead".into(),
             );
         }
         if line.starts_with("*** End of File") {
@@ -241,9 +240,7 @@ pub fn parse_codex_patch(input: &str) -> Result<ParsedPatch, String> {
         if line.starts_with("*** Delete File:") {
             let path = parse_file_path(line, "*** Delete File:")?;
             i += 1;
-            if i < lines.len()
-                && !is_patch_control_header(lines[i])
-                && !is_end_patch_line(lines[i])
+            if i < lines.len() && !is_patch_control_header(lines[i]) && !is_end_patch_line(lines[i])
             {
                 return Err(format!(
                     "Malformed Delete File `{path}`: delete operations cannot contain hunk lines"

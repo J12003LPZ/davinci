@@ -44,7 +44,10 @@ fn first_paging_reserves_the_new_retrieval_schema_before_admission() {
         agent.set_context_vm_mode(ContextVmMode::Active);
         agent.set_provider_output_limit(Some(1024));
         agent.set_provider_context_overhead_estimator(|agent| {
-            serde_json::to_vec(&agent.provider_tool_specs()).unwrap().len() as u64 + 128
+            serde_json::to_vec(&agent.provider_tool_specs())
+                .unwrap()
+                .len() as u64
+                + 128
         });
         agent.auto_compaction = false;
         agent.messages = vec![
@@ -84,7 +87,10 @@ fn first_paging_reserves_the_new_retrieval_schema_before_admission() {
         } else {
             let error = agent.prepared_context_image().unwrap_err();
             assert!(error.contains("compilation token budget"));
-            assert!(agent.prepared_context_image().is_err(), "bad admission was cached");
+            assert!(
+                agent.prepared_context_image().is_err(),
+                "bad admission was cached"
+            );
         }
         assert!(agent.context_vm_offers_retrieval());
     }

@@ -61,8 +61,9 @@ flow. Unsupported syntax can be exercised by a normal suite instead.
 
 The isolated helper receives JSON source on stdin under `-I -S`. Source is capped
 at 64 KiB, output at 16 KiB, and cached syntax facts at 128 entries keyed by source
-and interpreter identity. A timed-out helper is killed and reaped after its
-250 ms budget; timeout results are not cached. Path resolution and successful
+and interpreter identity. A timed-out helper is killed and reaped after a
+250 ms budget on Unix or a 1 s budget on Windows, where process startup is
+materially slower; timeout results are not cached. Path resolution and successful
 verification evidence are never cached with syntax facts.
 
 Regression cases live in `test_python_ast.py`, `inline_verification.rs`, the
