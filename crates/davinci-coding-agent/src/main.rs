@@ -2168,6 +2168,12 @@ fn complete_prompt_with_host(
     existing_host: Option<Arc<Mutex<ExtensionHost>>>,
     stream_json: bool,
 ) -> (String, Vec<AgentEvent>) {
+    // A session switch (`/new`, `/resume`, fork, RPC) gives SessionStart hooks
+    // a new id; unchanged sessions hit the cache.
+    apply_plugin_session_start(
+        agent,
+        &davinci_coding_agent::plugins::active(&default_agent_dir()),
+    );
     let offline = parsed.offline
         || matches!(
             std::env::var("PI_OFFLINE").as_deref(),
@@ -3208,6 +3214,7 @@ fn run_print(parsed: &Args, agent: &mut Agent) -> Result<i32, String> {
     for notice in agent.take_context_vm_notices() {
         eprintln!("{notice}");
     }
+    print_plugin_notices();
     let (exit_code, error) = print_text_exit(&all_events);
     // A provider failure that the loop gave up on carries no error stop
     // reason of its own: it is the reply text. Report it as the failure it is.
@@ -4058,6 +4065,8 @@ fn context_vm_notify_calls(agent: &Agent) -> Vec<serde_json::Value> {
     agent
         .take_context_vm_notices()
         .into_iter()
+        // Plugin warnings (failed SessionStart hooks) ride the same drain.
+        .chain(davinci_coding_agent::plugins::take_notices())
         .map(|message| serde_json::json!({"op": "notify", "message": message, "type": "warning"}))
         .collect()
 }
@@ -8312,24 +8321,62 @@ fn apply_discovered_resources(parsed: &Args, agent: &mut Agent) {
         agent.templates = discover_prompt_templates(&roots);
     }
     agent.context_files = load_context_files(&agent.cwd, !parsed.no_context_files);
-    if !plugins.plugins.is_empty() {
-        let session_id = agent
-            .session
-            .as_ref()
-            .map(|store| store.header.id.clone())
-            .unwrap_or_default();
-        // Hook warnings are queued for the next notice drain
-        // (`plugins::take_notices`); only the contexts reach the model.
-        for (plugin, body) in
-            davinci_coding_agent::plugins::session_start_context(&plugins, &agent.cwd, &session_id)
-                .contexts
-        {
-            agent.context_files.push(davinci_agent::ContextFile {
-                path: PathBuf::from(format!("plugin:{plugin}")),
-                name: format!("plugin:{plugin} (SessionStart hook)"),
-                body,
-            });
-        }
+    apply_plugin_session_start(agent, &plugins);
+}
+
+/// The id `SessionStart` hooks see: the session file's id, or one id for the
+/// life of this process when there is no session (`--no-session`), so hooks
+/// never receive an empty id.
+fn plugin_hook_session_id(agent: &Agent) -> String {
+    static EPHEMERAL: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    match agent.session.as_ref() {
+        Some(store) => store.header.id.clone(),
+        None => EPHEMERAL
+            .get_or_init(|| {
+                let nanos = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|elapsed| elapsed.as_nanos())
+                    .unwrap_or_default();
+                format!("ephemeral-{}-{nanos}", std::process::id())
+            })
+            .clone(),
+    }
+}
+
+/// Replace the `SessionStart` contexts in `agent.context_files` with those of
+/// the current session. The hooks run once per session (cached by id), so
+/// calling this before every prompt starts them after `/new`, `/resume`,
+/// fork or an RPC session switch without re-running them on ordinary turns.
+fn apply_plugin_session_start(
+    agent: &mut Agent,
+    plugins: &davinci_coding_agent::plugins::ActivePlugins,
+) {
+    agent
+        .context_files
+        .retain(|file| !file.path.to_string_lossy().starts_with("plugin:"));
+    if plugins.plugins.is_empty() {
+        return;
+    }
+    let session_id = plugin_hook_session_id(agent);
+    // Hook warnings are queued for the next notice drain
+    // (`plugins::take_notices`); only the contexts reach the model.
+    for (plugin, body) in
+        davinci_coding_agent::plugins::session_start_context(plugins, &agent.cwd, &session_id)
+            .contexts
+    {
+        agent.context_files.push(davinci_agent::ContextFile {
+            path: PathBuf::from(format!("plugin:{plugin}")),
+            name: format!("plugin:{plugin} (SessionStart hook)"),
+            body,
+        });
+    }
+}
+
+/// Print queued plugin warnings (failed `SessionStart` hooks) on stderr for
+/// modes without a transcript to show them in.
+fn print_plugin_notices() {
+    for warning in davinci_coding_agent::plugins::take_notices() {
+        eprintln!("Warning: {warning}");
     }
 }
 

@@ -3397,3 +3397,37 @@ fn json_prompt_manifest_event_exposes_identity_without_prompt_text() {
     assert_eq!(event["promptManifest"]["profile"], "preview");
     assert!(!event.to_string().contains(&agent.system_prompt));
 }
+
+#[test]
+fn sessionless_plugin_hooks_get_a_stable_nonempty_session_id() {
+    let agent = Agent::new("x");
+    assert!(agent.session.is_none());
+    let first = plugin_hook_session_id(&agent);
+    assert!(first.starts_with("ephemeral-"), "{first}");
+    assert_eq!(first, plugin_hook_session_id(&Agent::new("y")));
+}
+
+#[test]
+fn plugin_session_start_contexts_are_replaced_not_accumulated() {
+    let mut agent = Agent::new("x");
+    agent.context_files.push(davinci_agent::ContextFile {
+        path: PathBuf::from("plugin:stale"),
+        name: "plugin:stale (SessionStart hook)".into(),
+        body: "old session".into(),
+    });
+    agent.context_files.push(davinci_agent::ContextFile {
+        path: PathBuf::from("AGENTS.md"),
+        name: "AGENTS.md".into(),
+        body: "keep".into(),
+    });
+    apply_plugin_session_start(
+        &mut agent,
+        &davinci_coding_agent::plugins::ActivePlugins::default(),
+    );
+    let paths = agent
+        .context_files
+        .iter()
+        .map(|file| file.path.to_string_lossy().into_owned())
+        .collect::<Vec<_>>();
+    assert_eq!(paths, vec!["AGENTS.md".to_string()]);
+}

@@ -4198,13 +4198,18 @@ pub fn perform(
     }
 }
 
-/// `format_session_status` is one `·`-joined line shared with print and RPC
-/// mode. In the shell it wrapped into an unlabeled run-on paragraph, so the
-/// leading fields get names and every field gets its own row.
 /// Context VM notices from the finished turn (first failure, shadow
-/// mismatch, automatic fold). Nothing is pushed while all is well.
+/// mismatch, automatic fold) and plugin warnings (failed SessionStart
+/// hooks). Nothing is pushed while all is well.
 fn push_context_vm_notices(agent: &Agent, model: &mut Model) {
-    for notice in agent.take_context_vm_notices() {
+    let plugin_warnings = davinci_coding_agent::plugins::take_notices()
+        .into_iter()
+        .map(|warning| format!("Warning: {warning}"));
+    for notice in agent
+        .take_context_vm_notices()
+        .into_iter()
+        .chain(plugin_warnings)
+    {
         model.transcript.push(Entry::Gap);
         model
             .transcript
@@ -4212,6 +4217,9 @@ fn push_context_vm_notices(agent: &Agent, model: &mut Model) {
     }
 }
 
+/// `format_session_status` is one `·`-joined line shared with print and RPC
+/// mode. In the shell it wrapped into an unlabeled run-on paragraph, so the
+/// leading fields get names and every field gets its own row.
 fn status_as_list(status: &str) -> String {
     const LABELS: [&str; 5] = ["Model", "Permissions", "Mode", "Jobs", "MCP"];
     let mut lines = status.lines();
