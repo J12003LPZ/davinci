@@ -45,6 +45,7 @@ mod transaction_verification;
 mod turn;
 pub mod turn_context;
 pub mod verification;
+mod verification_notice;
 pub mod web;
 
 pub use batch::{BATCH_MAX_OPERATIONS, VISIBLE_PER_OPERATION, VISIBLE_TOTAL};
@@ -395,6 +396,8 @@ pub struct Agent {
     pub tool_surface: ToolSurface,
     /// Repeat the last verification call after later mutations at completion.
     pub auto_verify: bool,
+    /// Task 5 environment/guidance experiment; disabled pending promotion.
+    pub environment_context: bool,
     pub auto_compaction: bool,
     pub compaction: CompactionSettings,
     pub auto_retry: bool,
@@ -482,6 +485,10 @@ pub struct Agent {
     previous_plan_revision: Option<LivingPlan>,
     /// Whether the host has registered a backend capable of visual verification.
     visual_verification_available: bool,
+    runtime_environment: Option<prompt::environment::EnvironmentSnapshot>,
+    environment_key: Option<prompt::environment::EnvironmentKey>,
+    environment_capture: prompt::environment::EnvironmentCapture,
+    last_verification_notice: Option<(u64, CompletionEvidence)>,
     /// Typed lifecycle evidence for the currently prepared real user turn.
     capability_run_state: Arc<Mutex<prompt::CapabilityRunState>>,
     /// Mutation generations and verification evidence for the current run.
@@ -555,6 +562,8 @@ impl Agent {
             decision_advice_key: None,
             tool_surface: ToolSurface::default(),
             auto_verify: true,
+            environment_context: std::env::var("PI_ENVIRONMENT_CONTEXT").ok().as_deref()
+                == Some("1"),
             auto_compaction: true,
             compaction: CompactionSettings::default(),
             auto_retry: true,
@@ -617,6 +626,10 @@ impl Agent {
             previous_execution_mode: None,
             previous_plan_revision: None,
             visual_verification_available: false,
+            runtime_environment: None,
+            environment_key: None,
+            environment_capture: prompt::environment::EnvironmentCapture::default(),
+            last_verification_notice: None,
             capability_run_state: Arc::new(Mutex::new(prompt::CapabilityRunState::default())),
             mutation_verification: Arc::new(Mutex::new(MutationVerificationState::default())),
             pending_transaction_verification: Arc::new(Mutex::new(
@@ -862,6 +875,14 @@ impl Agent {
             plan_approved: plan_revision.is_some() && plan.approved_revision == plan_revision,
             active_contract: self.active_contract().is_some(),
             visual_verification_available: self.visual_verification_available,
+            visual_verification_relevant: !self.environment_context
+                || self.capability_run_state().frontend.is_some()
+                || self.visual_verification_required()
+                || self
+                    .last_real_user_request
+                    .as_deref()
+                    .is_some_and(prompt::environment::visual_verification_requested),
+            environment: self.runtime_environment.clone(),
         }
     }
 
@@ -1179,6 +1200,14 @@ impl Agent {
             return;
         }
 
+        self.append_turn_context(memory);
+    }
+
+    pub(crate) fn append_turn_context(&mut self, memory: Option<String>) {
+        if self.turn_context_placement() != turn_context::TurnContextPlacement::Appended {
+            return;
+        }
+
         let previous = turn_context::TurnContextState::from_messages(&self.messages);
         let runtime_state = self.turn_state_pending.clone().unwrap_or_default();
         let plan = self.plan_turn_context();
@@ -1253,6 +1282,9 @@ impl Agent {
         user_text: &str,
     ) -> Result<prompt::PreparedTurnPrompt, String> {
         if !self.prompt_session.is_builtin() {
+            self.turn_state_pending = None;
+            self.runtime_environment = None;
+            self.environment_key = None;
             let no_capabilities = prompt::CapabilityDecision {
                 capabilities: Vec::new(),
                 reasons: Vec::new(),
@@ -1280,7 +1312,16 @@ impl Agent {
 
         let capabilities = prompt::route_capabilities(&router_input);
 
-        let runtime_state = self.runtime_prompt_state();
+        self.capture_runtime_environment(&davinci_session::utc_date_from_unix_ms(
+            davinci_session::now_ms(),
+        ));
+        let mut runtime_state = self.runtime_prompt_state();
+        runtime_state.visual_verification_relevant = !self.environment_context
+            || capabilities
+                .capabilities
+                .contains(&prompt::NativeBehaviorCapability::FrontendDesign)
+            || self.visual_verification_required()
+            || prompt::environment::visual_verification_requested(user_text);
         let permission_mode = runtime_state.permission_mode;
 
         let ctx = prompt::composer::PromptContext {
@@ -1325,6 +1366,7 @@ impl Agent {
             evidence: Vec::new(),
         };
         let mut last_runtime_state = None;
+        let mut visual_verification_relevant = false;
 
         for user_text in user_texts {
             let prepared = match self.prepare_builtin_prompt_for_user_turn(user_text) {
@@ -1341,6 +1383,7 @@ impl Agent {
             }
             union.reasons.extend(prepared.capabilities.reasons);
             union.evidence.extend(prepared.capabilities.evidence);
+            visual_verification_relevant |= prepared.runtime_state.visual_verification_relevant;
             last_runtime_state = Some(prepared.runtime_state);
             self.last_real_user_request = Some((*user_text).to_string());
         }
@@ -1353,7 +1396,13 @@ impl Agent {
                 prompt::NativeBehaviorCapability::CodeReview => 2,
             });
 
-        let runtime_state = last_runtime_state.expect("non-empty batch has runtime state");
+        let mut runtime_state = last_runtime_state.expect("non-empty batch has runtime state");
+        runtime_state.visual_verification_relevant = !self.environment_context
+            || union
+                .capabilities
+                .contains(&prompt::NativeBehaviorCapability::FrontendDesign)
+            || self.visual_verification_required()
+            || visual_verification_relevant;
         let permission_mode = self.permissions.lock().map(|p| p.mode).unwrap_or_default();
         let ctx = prompt::composer::PromptContext {
             provider: &self.provider,
@@ -2518,6 +2567,7 @@ impl Agent {
         self.messages.iter().rev().find_map(|message| {
             if message.role == "assistant"
                 && !message.extra.contains_key(HARNESS_VERIFICATION_FIELD)
+                && !message.extra.contains_key("davinciVerificationStatus")
             {
                 Some(content_text(&message.content))
             } else {
@@ -3269,8 +3319,18 @@ impl Agent {
                     )
                 })?;
         }
-        let messages = messages_from_session(&session);
+        // Older builds persisted harness notices as assistant messages. Keep
+        // the original journal intact, but do not replay those notices to the
+        // provider or let them replace the answer in copy/print consumers.
+        let messages = messages_from_session(&session)
+            .into_iter()
+            .filter(|message| !message.extra.contains_key("davinciVerificationStatus"))
+            .collect::<Vec<_>>();
         if session_changed {
+            self.runtime_environment = None;
+            self.environment_key = None;
+            self.last_verification_notice = None;
+            self.turn_state_pending = None;
             if let Some(processes) = &self.tool_context.processes {
                 self.tool_context.processes = Some(processes.new_session()?);
             }

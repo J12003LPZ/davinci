@@ -1197,6 +1197,10 @@ fn apply(model: &mut Model, turn: &mut Turn, event: &AgentEvent) {
             }
         }
 
+        AgentEvent::VerificationNotice { text, .. } => {
+            model.transcript.push(Entry::notice(State::Attention, text));
+        }
+
         AgentEvent::MessageStart { message } if message.role == "assistant" => {
             turn.begin_message(model);
         }

@@ -12,6 +12,10 @@ pub struct RuntimePromptState {
     pub active_contract: bool,
     #[serde(default)]
     pub visual_verification_available: bool,
+    #[serde(default)]
+    pub visual_verification_relevant: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub environment: Option<crate::prompt::environment::EnvironmentSnapshot>,
 }
 
 pub fn runtime_state_text(state: &RuntimePromptState) -> String {
@@ -47,21 +51,27 @@ pub fn runtime_state_text(state: &RuntimePromptState) -> String {
         lines.push("Active task contract: in effect.".to_string());
     }
 
-    lines.push(format!(
-        "Visual verification backend: {}.",
+    if state.visual_verification_relevant {
+        lines.push(format!(
+            "Visual verification backend: {}.",
+            if state.visual_verification_available {
+                "available"
+            } else {
+                "unavailable"
+            }
+        ));
         if state.visual_verification_available {
-            "available"
+            lines.push("Use `visual_snapshot` when visual inspection is required.".to_string());
         } else {
-            "unavailable"
-        }
-    ));
-    if state.visual_verification_available {
-        lines.push("Use `visual_snapshot` when visual inspection is required.".to_string());
-    } else {
-        lines.push(
+            lines.push(
             "Visual inspection is unavailable; do not claim to have visually verified a result."
                 .to_string(),
         );
+        }
+    }
+
+    if let Some(environment) = &state.environment {
+        lines.push(environment.render());
     }
 
     format!("<runtime_state>\n{}\n</runtime_state>", lines.join("\n"))
@@ -70,7 +80,7 @@ pub fn runtime_state_text(state: &RuntimePromptState) -> String {
 pub fn runtime_state_module(state: &RuntimePromptState) -> PromptModule {
     PromptModule {
         id: "runtime.state".to_string(),
-        version: 1,
+        version: 2,
         cache_class: PromptCacheClass::Dynamic,
         body: runtime_state_text(state),
     }
@@ -89,6 +99,8 @@ mod tests {
             plan_approved: false,
             active_contract: false,
             visual_verification_available: false,
+            visual_verification_relevant: true,
+            environment: None,
         });
 
         assert!(text.contains("Plan Mode"));
@@ -114,6 +126,8 @@ mod tests {
                 plan_approved: true,
                 active_contract: true,
                 visual_verification_available: true,
+                visual_verification_relevant: true,
+                environment: None,
             };
             let text1 = runtime_state_text(&state);
             let text2 = runtime_state_text(&state);
@@ -138,6 +152,8 @@ mod tests {
             plan_approved: false,
             active_contract: true,
             visual_verification_available: false,
+            visual_verification_relevant: true,
+            environment: None,
         };
         let text = runtime_state_text(&state);
         assert!(estimate_tokens_from_str(&text) <= 500);

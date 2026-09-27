@@ -7,6 +7,7 @@ pub mod coding;
 pub mod collaboration;
 pub mod composer;
 pub mod core;
+pub mod environment;
 pub mod manifest;
 pub mod model_policy;
 pub mod provider;

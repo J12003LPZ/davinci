@@ -3439,3 +3439,17 @@ fn plugin_session_start_contexts_are_replaced_not_accumulated() {
         .collect::<Vec<_>>();
     assert_eq!(paths, vec!["AGENTS.md".to_string()]);
 }
+
+#[test]
+fn print_verification_notice_is_a_separate_event_and_not_a_provider_error() {
+    let notice = AgentEvent::VerificationNotice {
+        status: davinci_agent::CompletionEvidence::Unverified,
+        generation: 1,
+        text: "Verification is incomplete".into(),
+    };
+    let event = to_json_print_event(&notice).unwrap();
+    assert_eq!(event["type"], "verification_notice");
+    assert_eq!(event["text"], "Verification is incomplete");
+    assert!(event.get("message").is_none());
+    assert_eq!(print_text_exit(&[notice]), (0, None));
+}

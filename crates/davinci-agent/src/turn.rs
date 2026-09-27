@@ -381,6 +381,16 @@ impl Agent {
             self.inject_queued(&mut events, &mut new_messages, true);
             self.inject_job_notices(&mut events, &mut new_messages)?;
 
+            let environment_changed = self.refresh_runtime_environment_for_request();
+            if self.prompt_session.is_builtin()
+                && (environment_changed
+                    || crate::turn_context::TurnContextState::from_messages(&self.messages)
+                        .state_hash
+                        .is_none())
+            {
+                self.append_turn_context(None);
+            }
+
             let active_context_vm = self.context_vm_mode() == crate::runtime::ContextVmMode::Active;
             // The legacy path prunes tool output before deciding whether to
             // summarize. Active Context VM keeps Agent.messages untouched and
@@ -441,6 +451,16 @@ impl Agent {
                 {
                     self.stats.compactions += 1;
                 }
+            }
+
+            // Compaction may have removed the last context snapshot. Restore
+            // the same turn state before compiling the next provider request.
+            if self.prompt_session.is_builtin()
+                && crate::turn_context::TurnContextState::from_messages(&self.messages)
+                    .state_hash
+                    .is_none()
+            {
+                self.append_turn_context(None);
             }
 
             // Folding/rebuilding gets the first chance to recover. Every
@@ -782,30 +802,7 @@ impl Agent {
                 continue;
             }
 
-            let status = self.completion_evidence();
-            let notice = match status {
-                crate::CompletionEvidence::Partial => Some("Verification is partial: passing checks cover some changes; other changed paths remain unchecked."),
-                crate::CompletionEvidence::Unverified => Some("Verification is incomplete: no applicable completed check confirms the latest changes."),
-                crate::CompletionEvidence::VerificationFailed => Some("Verification failed after the latest changes; the failure remains unresolved."),
-                _ => None,
-            };
-            if let Some(text) = notice {
-                let mut message = ChatMessage::text("assistant", text);
-                message.extra.insert(
-                    "davinciVerificationStatus".into(),
-                    serde_json::json!(status),
-                );
-                self.messages.push(message.clone());
-                self.persist_chat(&message)?;
-                new_messages.push(message.clone());
-                self.push_event(
-                    &mut events,
-                    AgentEvent::MessageStart {
-                        message: message.clone(),
-                    },
-                );
-                self.push_event(&mut events, AgentEvent::MessageEnd { message });
-            }
+            self.emit_verification_notice(&mut events);
             break;
         }
 

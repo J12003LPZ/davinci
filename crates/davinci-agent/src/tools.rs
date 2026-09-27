@@ -2323,6 +2323,15 @@ fn wait_shell_output(
     ))
 }
 
+pub(crate) fn resolve_powershell_executable(cwd: &Path) -> Result<PathBuf, ToolError> {
+    ["pwsh", "powershell"]
+        .into_iter()
+        .find_map(|program| crate::process_manager::resolve_native_executable(program, cwd).ok())
+        .ok_or_else(|| {
+            ToolError::Failed("PowerShell is not available and could not be launched".into())
+        })
+}
+
 fn powershell_tool(
     cwd: &Path,
     input: &serde_json::Value,
@@ -2342,16 +2351,7 @@ fn powershell_tool(
     let background = wants_background(input);
     if !background {
         if let Some(host) = &context.foreground_supervisor {
-            let executable = ["pwsh", "powershell"]
-                .into_iter()
-                .find_map(|program| {
-                    crate::process_manager::resolve_native_executable(program, cwd).ok()
-                })
-                .ok_or_else(|| {
-                    ToolError::Failed(
-                        "PowerShell is not available and could not be launched".into(),
-                    )
-                })?;
+            let executable = resolve_powershell_executable(cwd)?;
             let started_at_ms = crate::command_receipt::now();
             let config = foreground::config(
                 cwd,

@@ -3283,6 +3283,13 @@ fn run_print(parsed: &Args, agent: &mut Agent) -> Result<i32, String> {
         }
     }
     // Stdout carries the reply; Context VM notices go to stderr.
+    if !json_mode {
+        for event in &all_events {
+            if let AgentEvent::VerificationNotice { text, .. } = event {
+                eprintln!("{text}");
+            }
+        }
+    }
     for notice in agent.take_context_vm_notices() {
         eprintln!("{notice}");
     }
@@ -4721,6 +4728,9 @@ fn apply_stream_event(
     pushed_assistant: &mut bool,
 ) {
     match event {
+        AgentEvent::VerificationNotice { text, .. } => {
+            session.chrome.transcript.push("system", text.clone());
+        }
         AgentEvent::ToolExecutionStart {
             tool_name, args, ..
         } => {
@@ -6344,6 +6354,12 @@ fn submit_user_message(
             refresh_chrome_footer(session, agent);
             session.chrome.editor.handle_input("");
             println!("{reply}");
+            for event in &events {
+                if let AgentEvent::VerificationNotice { text, .. } = event {
+                    session.chrome.transcript.push("system", text.clone());
+                    eprintln!("{text}");
+                }
+            }
         }
     }
     Ok(true)

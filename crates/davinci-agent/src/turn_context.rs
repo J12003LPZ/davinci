@@ -69,6 +69,7 @@ impl TurnContextState {
 }
 
 pub struct TurnContextInput<'a> {
+    /// Already-rendered dynamic prompt sections, including the runtime tag.
     pub runtime_state: &'a str,
     pub plan_mode_appendix: Option<&'a str>,
     pub living_plan: Option<(u64, &'a str)>,
@@ -87,10 +88,7 @@ pub fn render_turn_context(
 
     let mut sections = Vec::new();
     if state_changed && !input.runtime_state.trim().is_empty() {
-        sections.push(format!(
-            "<runtime_state>\n{}\n</runtime_state>",
-            input.runtime_state.trim()
-        ));
+        sections.push(input.runtime_state.trim().to_string());
     }
     if state_changed {
         match input.plan_mode_appendix {
@@ -157,7 +155,10 @@ mod tests {
     fn first_turn_states_runtime_state() {
         let (text, state) = render_turn_context(
             &TurnContextState::default(),
-            &input("Permission mode: Ask.", None),
+            &input(
+                "<runtime_state>\nPermission mode: Ask.\n</runtime_state>",
+                None,
+            ),
         )
         .unwrap();
         assert!(text.contains("<runtime_state>\nPermission mode: Ask.\n</runtime_state>"));

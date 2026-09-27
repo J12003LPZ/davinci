@@ -56,6 +56,12 @@ fn utc_iso_dashed(ms: u64) -> String {
     format!("{year:04}-{month:02}-{day:02}T{hour:02}-{minute:02}-{second:02}-{milli:03}Z")
 }
 
+/// UTC calendar date using the same conversion as session filenames.
+pub fn utc_date_from_unix_ms(ms: u64) -> String {
+    let (year, month, day, ..) = unix_ms_to_utc(ms);
+    format!("{year:04}-{month:02}-{day:02}")
+}
+
 fn unix_ms_to_utc(ms: u64) -> (i32, u32, u32, u32, u32, u32, u32) {
     let day_ms = 86_400_000u64;
     let days = (ms / day_ms) as i64;
@@ -725,6 +731,21 @@ mod tests {
             jsonl_session_directory_name("/tmp/workspace/project"),
             "--tmp-workspace-project--"
         );
+    }
+
+    #[test]
+    fn utc_date_uses_calendar_boundaries_and_leap_days() {
+        for (ms, expected) in [
+            (0, "1970-01-01"),
+            (86_399_999, "1970-01-01"),
+            (86_400_000, "1970-01-02"),
+            (951_782_400_000, "2000-02-29"),
+            (1_767_225_599_999, "2025-12-31"),
+            (1_767_225_600_000, "2026-01-01"),
+        ] {
+            assert_eq!(utc_date_from_unix_ms(ms), expected);
+            assert!(session_file_name(ms, "date").starts_with(expected));
+        }
     }
 
     #[test]

@@ -159,6 +159,8 @@ pub fn compose_with_mutations(
             plan_approved: false,
             active_contract: false,
             visual_verification_available: false,
+            visual_verification_relevant: true,
+            environment: None,
         },
     ));
 

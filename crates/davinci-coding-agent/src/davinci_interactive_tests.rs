@@ -2242,6 +2242,40 @@ fn an_empty_reply_is_not_pushed() {
 }
 
 #[test]
+fn verification_notice_is_displayed_separately_from_assistant_prose() {
+    let mut m = model();
+    let mut turn = Turn::default();
+    apply(
+        &mut m,
+        &mut turn,
+        &AgentEvent::MessageEnd {
+            message: assistant("The complete answer"),
+        },
+    );
+    apply(
+        &mut m,
+        &mut turn,
+        &AgentEvent::VerificationNotice {
+            status: davinci_agent::CompletionEvidence::Unverified,
+            generation: 1,
+            text: "Verification is incomplete".into(),
+        },
+    );
+    let prose = m
+        .transcript
+        .iter()
+        .filter_map(|entry| match entry {
+            Entry::Prose(text) => Some(text.as_str()),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(prose, ["The complete answer"]);
+    assert!(
+        matches!(m.transcript.last(), Some(Entry::Tool { state: State::Attention, target, .. }) if target == "Verification is incomplete")
+    );
+}
+
+#[test]
 fn a_plain_line_is_a_prompt_and_slash_quit_leaves() {
     assert!(
         matches!(classify("explain the runtime"), Sent::Prompt(text) if text == "explain the runtime")
