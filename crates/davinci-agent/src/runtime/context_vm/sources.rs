@@ -19,6 +19,15 @@ impl ContextVmRuntime {
             .unwrap_or_else(|e| e.into_inner()) = Some(SessionSource { path, id });
     }
 
+    /// The session this VM reads authoritative sources from, if any.
+    pub fn bound_session_id(&self) -> Option<String> {
+        self.session_source
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+            .map(|source| source.id.clone())
+    }
+
     /// Retained event text only; excludes small source metadata and page cache.
     pub fn resident_source_bytes(&self) -> usize {
         self.source_contents

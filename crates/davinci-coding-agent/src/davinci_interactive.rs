@@ -1765,6 +1765,7 @@ fn run_turn(
             .transcript
             .push(Entry::tool(State::Attention, "usage", &warning, None));
     }
+    push_context_vm_notices(agent, model);
 
     if interrupted {
         // The `6c` sheet: what the interrupted turn came to — what ran, what
@@ -4200,6 +4201,17 @@ pub fn perform(
 /// `format_session_status` is one `·`-joined line shared with print and RPC
 /// mode. In the shell it wrapped into an unlabeled run-on paragraph, so the
 /// leading fields get names and every field gets its own row.
+/// Context VM notices from the finished turn (first failure, shadow
+/// mismatch, automatic fold). Nothing is pushed while all is well.
+fn push_context_vm_notices(agent: &Agent, model: &mut Model) {
+    for notice in agent.take_context_vm_notices() {
+        model.transcript.push(Entry::Gap);
+        model
+            .transcript
+            .push(Entry::notice(State::Attention, &notice));
+    }
+}
+
 fn status_as_list(status: &str) -> String {
     const LABELS: [&str; 5] = ["Model", "Permissions", "Mode", "Jobs", "MCP"];
     let mut lines = status.lines();

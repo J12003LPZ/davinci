@@ -1,4 +1,5 @@
 mod compiler;
+mod diagnostics;
 mod events;
 mod fold;
 mod metrics;
@@ -13,6 +14,7 @@ pub(crate) const CONTEXT_BUDGET_EXCEEDED: &str =
     "mandatory context exceeds the compilation token budget";
 
 pub use compiler::{ContextCompileRequest, ContextCompiler};
+pub use diagnostics::ContextVmFailure;
 pub use events::{
     events_from_messages, events_from_session_branch, ContextEvent, ContextEventKind,
 };
@@ -59,6 +61,7 @@ pub struct ContextVmRuntime {
     pub(crate) source_contents: Arc<RwLock<HashMap<String, String>>>,
     session_source: Arc<RwLock<Option<sources::SessionSource>>>,
     metrics: Arc<RwLock<ContextVmMetrics>>,
+    diagnostics: Arc<RwLock<diagnostics::ContextVmDiagnostics>>,
 }
 
 impl std::fmt::Debug for ContextVmRuntime {
@@ -81,6 +84,7 @@ impl ContextVmRuntime {
             source_contents: Arc::new(RwLock::new(HashMap::new())),
             session_source: Arc::new(RwLock::new(None)),
             metrics,
+            diagnostics: Arc::default(),
         }
     }
 
@@ -90,6 +94,11 @@ impl ContextVmRuntime {
 
     pub fn set_mode(&mut self, mode: ContextVmMode) {
         self.config.mode = mode;
+    }
+
+    /// True when both handles are the same live VM (clones share all state).
+    pub fn shares_state_with(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.state, &other.state)
     }
 
     pub fn root(&self) -> ContextRoot {
@@ -241,6 +250,16 @@ impl ContextVmRuntime {
             broker_packet,
             max_tokens,
         })?;
+        // Events outside the image, or folded episodes, are only reachable
+        // through exact recovery from here on.
+        let hot_in_image = image
+            .entries
+            .iter()
+            .filter(|entry| entry.category.starts_with("hot_"))
+            .count();
+        if !root.episodes.is_empty() || hot_in_image < events.len() {
+            self.mark_retrieval_offered();
+        }
         let stable_context_digest = stable_context_digest(&image);
         let prefix_changed = {
             let mut state = self
@@ -403,6 +422,7 @@ impl ContextVmRuntime {
             guard.last_fold_reason = Some(reason.as_str().into());
             guard.last_fold_tokens = Some((before_tokens, after_tokens));
         }
+        self.mark_retrieval_offered();
         self.bump_metrics(|metrics| {
             metrics.folds = metrics.folds.saturating_add(1);
             metrics.tokens_before_fold = metrics.tokens_before_fold.saturating_add(before_tokens);
@@ -444,6 +464,7 @@ impl ContextVmRuntime {
                 .prefix_churn
                 .saturating_add(u64::from(comparison.prefix_changed));
         });
+        self.note_shadow_comparison(comparison);
     }
 
     pub fn cache_affinity(&self) -> String {

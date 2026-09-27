@@ -197,7 +197,8 @@ impl ContextManifestSummary {
     }
 }
 
-#[allow(dead_code)]
+/// Context VM state for `/status` and RPC `get_session_stats`. Read-only:
+/// building it never compiles an image or touches the VM's metrics.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ContextVmStatusSummary {
@@ -208,13 +209,24 @@ pub struct ContextVmStatusSummary {
     pub episode_count: usize,
     pub hot_event_count: usize,
     pub last_fold_reason: Option<String>,
+    pub folds: u64,
     pub page_fault_hits: u64,
     pub page_fault_misses: u64,
     pub prefix_digest: Option<String>,
+    pub shadow_missing_user_refs: u64,
+    pub shadow_missing_tool_refs: u64,
+    pub retrieval_offered: bool,
+    pub failure_count: u64,
+    pub recent_failures: Vec<String>,
 }
 
-#[allow(dead_code)]
 impl ContextVmStatusSummary {
+    /// `None` while the VM is `off`, so legacy status output is unchanged.
+    pub fn for_status(agent: &davinci_agent::Agent) -> Option<Self> {
+        (agent.context_vm_mode() != davinci_agent::runtime::ContextVmMode::Off)
+            .then(|| Self::from_agent(agent))
+    }
+
     pub fn from_agent(agent: &davinci_agent::Agent) -> Self {
         let mode = match agent.context_vm_mode() {
             davinci_agent::runtime::ContextVmMode::Off => "off",
@@ -231,13 +243,20 @@ impl ContextVmStatusSummary {
                 episode_count: 0,
                 hot_event_count: 0,
                 last_fold_reason: None,
+                folds: 0,
                 page_fault_hits: 0,
                 page_fault_misses: 0,
                 prefix_digest: None,
+                shadow_missing_user_refs: 0,
+                shadow_missing_tool_refs: 0,
+                retrieval_offered: false,
+                failure_count: 0,
+                recent_failures: Vec::new(),
             };
         };
-        let root = runtime.context_vm.root();
-        let metrics = runtime.context_vm.metrics();
+        let vm = &runtime.context_vm;
+        let root = vm.root();
+        let metrics = vm.metrics();
         Self {
             mode,
             epoch: root.epoch,
@@ -245,16 +264,72 @@ impl ContextVmStatusSummary {
             delta_count: root.deltas.len(),
             episode_count: root.episodes.len(),
             hot_event_count: root.hot_event_refs.len(),
-            last_fold_reason: runtime.context_vm.last_fold_reason(),
+            last_fold_reason: vm.last_fold_reason(),
+            folds: metrics.folds,
             page_fault_hits: metrics.page_fault_hits,
             page_fault_misses: metrics.page_fault_misses,
-            prefix_digest: runtime
-                .context_vm
+            prefix_digest: vm
                 .prefix_digest()
                 .map(|digest| digest.chars().take(12).collect()),
+            shadow_missing_user_refs: metrics.shadow_missing_user_refs,
+            shadow_missing_tool_refs: metrics.shadow_missing_tool_refs,
+            retrieval_offered: agent.context_vm_offers_retrieval(),
+            failure_count: vm.failure_count(),
+            recent_failures: vm
+                .recent_failures()
+                .iter()
+                .map(|failure| failure.render())
+                .collect(),
         }
     }
 
+    /// One `/status` line; the davinci shell renders it as a list item.
+    pub fn status_line(&self) -> String {
+        let checkpoint = self
+            .checkpoint_id
+            .as_deref()
+            .map(|id| {
+                id.rsplit(':')
+                    .next()
+                    .unwrap_or(id)
+                    .chars()
+                    .take(12)
+                    .collect()
+            })
+            .unwrap_or_else(|| "none".to_string());
+        let mut line = format!(
+            "context vm: {} · epoch {} · checkpoint {checkpoint} · {} deltas / {} episodes / {} hot · \
+             page faults {} hit / {} miss",
+            self.mode,
+            self.epoch,
+            self.delta_count,
+            self.episode_count,
+            self.hot_event_count,
+            self.page_fault_hits,
+            self.page_fault_misses,
+        );
+        if let Some(reason) = &self.last_fold_reason {
+            line.push_str(&format!(" · {} folds, last {reason}", self.folds));
+        }
+        if let Some(digest) = &self.prefix_digest {
+            line.push_str(&format!(" · prefix {digest}"));
+        }
+        if self.mode == "shadow" {
+            line.push_str(&format!(
+                " · shadow missing {} user / {} tool refs",
+                self.shadow_missing_user_refs, self.shadow_missing_tool_refs
+            ));
+        }
+        if self.failure_count > 0 {
+            line.push_str(&format!(" · {} failures", self.failure_count));
+            if let Some(last) = self.recent_failures.last() {
+                line.push_str(&format!(", last {last}"));
+            }
+        }
+        line
+    }
+
+    #[allow(dead_code)]
     pub fn to_json_string(&self) -> Result<String, serde_json::Error> {
         serde_json::to_string_pretty(self)
     }
