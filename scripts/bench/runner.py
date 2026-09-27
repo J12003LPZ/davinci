@@ -108,8 +108,22 @@ def tooling_preflight(engine=None, image=None):
               "python -m pytest --version; python3 -m pytest --version; "
               "pytest --version; git --version")
     command = ["bash", "-ec", script]
+    if not engine and sys.platform == "win32":
+        # Native Windows runs use a Job Object. Check the names fixtures use,
+        # resolved from PATH exactly as the agent will resolve them; Windows
+        # Python installs usually provide `python` but not `python3`.
+        missing = [name for name in ("python", "git", "bash") if shutil.which(name) is None]
+        if missing:
+            raise ValueError("benchmark prerequisites missing: " + ", ".join(missing))
+        result = execute([shutil.which("python"), "-c",
+                          "import sys, pytest; print(sys.version); print(pytest.__version__)"],
+                         Path.cwd(), os.environ, 30)
+        if result["exit"] != 0 or not result["cleanup_complete"]:
+            raise ValueError("benchmark prerequisites missing: `python` on PATH must have pytest")
+        return {"available": True, "versions": result["stdout"].strip().splitlines(),
+                "lifecycle": "windows-job-object"}
     if not engine and sys.platform != "linux":
-        raise ValueError("native benchmark lifecycle supervision requires Linux; use a configured container arm")
+        raise ValueError("native benchmark lifecycle supervision requires Linux or Windows; use a configured container arm")
     if not engine:
         from native_supervisor import children_path_available
         if not children_path_available():
@@ -468,6 +482,14 @@ def _execute_container(command, workdir, env, timeout, target):
 
 
 def _execute_native(command, workdir, env, timeout):
+    if sys.platform == "win32":
+        import windows_job
+        try:
+            return windows_job.run(command, workdir, env, timeout)
+        except OSError as error:
+            return {"exit": "unsupported_native_lifecycle", "stdout": "",
+                    "stderr": f"Windows job object unavailable: {error}",
+                    "cleanup_complete": False}
     if sys.platform != "linux":
         return {"exit": "unsupported_native_lifecycle", "stdout": "", "stderr":
                 "native benchmark lifecycle supervision requires Linux", "cleanup_complete": False}
@@ -573,9 +595,18 @@ class _CampaignOwner:
         self.persist()
 
     def persist(self):
+        # Overwrite in place and only then shorten the file. Truncating first
+        # would leave an empty file after a crash mid-write, which the next
+        # campaign would read as a clean record. A torn overwrite is invalid
+        # JSON instead, which is treated as unresolved ownership.
+        data = json.dumps(self.record)
+        self.lock.seek(0, os.SEEK_END)
+        previous = self.lock.tell()
         self.lock.seek(0)
-        self.lock.truncate()
-        json.dump(self.record, self.lock)
+        self.lock.write(data.ljust(previous))
+        self.lock.flush()
+        os.fsync(self.lock.fileno())
+        self.lock.truncate(len(data))
         self.lock.flush()
         os.fsync(self.lock.fileno())
 
@@ -584,7 +615,9 @@ class _CampaignOwner:
             raise RuntimeError("benchmark campaign has unresolved process cleanup")
         token = uuid.uuid4().hex
         self.record["in_flight"] = [{"id": token, "workspace": str(Path(workdir).resolve()),
-                                     "container": target, "kind": "container" if target else "native",
+                                     "container": target,
+                                     "kind": ("container" if target else
+                                              "windows-job" if os.name == "nt" else "native"),
                                      "started_at": datetime.now(timezone.utc).isoformat()}]
         # Persist intent before Popen, closing the crash window before recording
         # a PID/CID. An unresolved intent is sufficient to block the next campaign.
@@ -601,6 +634,68 @@ class _CampaignOwner:
         if not self.record["in_flight"]:
             self.record["status"] = "clean"
             self.persist()
+
+
+_WINDOWS_LOCK_OFFSET = 1 << 20
+
+
+def _pid_alive(pid):
+    if type(pid) is not int or pid <= 0:
+        return True  # Unknown owner: never assume it is gone.
+    if os.name == "nt":
+        import ctypes
+        from ctypes import wintypes
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.OpenProcess.restype = wintypes.HANDLE
+        handle = kernel32.OpenProcess(0x1000, False, pid)  # QUERY_LIMITED_INFORMATION
+        if not handle:
+            # Access denied means some process has this PID; only a missing
+            # process (ERROR_INVALID_PARAMETER) proves the owner is gone.
+            return ctypes.get_last_error() != 87
+        try:
+            code = wintypes.DWORD()
+            if not kernel32.GetExitCodeProcess(handle, ctypes.byref(code)):
+                return True
+            return code.value == 259  # STILL_ACTIVE
+        finally:
+            kernel32.CloseHandle(handle)
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except OSError:
+        return True
+    return True
+
+
+def _reconcile_abandoned(record):
+    """Clear a dead orchestrator's record only when its work is proven gone.
+
+    A container is proven gone by force removal plus a "no such container"
+    inspection. A Windows native run is proven gone by its kill-on-close Job
+    Object: the kernel killed the tree when the dead owner's handle closed.
+    Linux native runs and unreadable records still need an operator.
+    """
+    if not isinstance(record, dict) or record.get("schema_version") != 1:
+        return False
+    in_flight = record.get("in_flight")
+    if not isinstance(in_flight, list) or _pid_alive(record.get("pid")):
+        return False
+    for entry in in_flight:
+        if not isinstance(entry, dict):
+            return False
+        kind = entry.get("kind")
+        if kind == "container":
+            target = entry.get("container")
+            if not (isinstance(target, list) and len(target) == 2
+                    and all(isinstance(part, str) and part for part in target)
+                    and target[1].startswith("davinci-bench-")):
+                return False
+            if not _remove_container(tuple(target)):
+                return False
+        elif kind != "windows-job":
+            return False
+    return True
 
 
 @contextmanager
@@ -622,10 +717,9 @@ def campaign_lock(campaign):
         try:
             if os.name == "nt":
                 import msvcrt
-                if path.stat().st_size == 0:
-                    lock.write(" ")
-                    lock.flush()
-                lock.seek(0)
+                # Lock one byte far past the record, so the record itself stays
+                # readable by operators and tests while the lock is held.
+                lock.seek(_WINDOWS_LOCK_OFFSET)
                 msvcrt.locking(lock.fileno(), msvcrt.LK_NBLCK, 1)
             else:
                 import fcntl
@@ -643,8 +737,8 @@ def campaign_lock(campaign):
                             and record.get("status") == "clean"
                             and record.get("in_flight") == [])
                 except ValueError:
-                    safe = False
-                if not safe:
+                    record, safe = None, False
+                if not safe and not _reconcile_abandoned(record):
                     raise RuntimeError("unresolved benchmark campaign ownership: " + str(path) +
                                        "; reconcile prior workers and containers before a new campaign")
             owner = _CampaignOwner(lock, campaign)
@@ -657,7 +751,7 @@ def campaign_lock(campaign):
                 finally:
                     _campaign_owner = None
             if os.name == "nt":
-                lock.seek(0)
+                lock.seek(_WINDOWS_LOCK_OFFSET)
                 msvcrt.locking(lock.fileno(), msvcrt.LK_UNLCK, 1)
             else:
                 fcntl.flock(lock, fcntl.LOCK_UN)

@@ -72,6 +72,15 @@ def git(cwd, *args):
     return subprocess.run(["git", *args], cwd=cwd, capture_output=True, text=True, encoding="utf-8")
 
 
+def checked_git(cwd, *args):
+    result = git(cwd, *args)
+    if result.returncode != 0:
+        detail = (result.stderr or result.stdout).strip().splitlines()
+        raise RuntimeError(f"fixture setup failed: git {args[0]}: "
+                           f"{detail[-1] if detail else 'exit ' + str(result.returncode)}")
+    return result
+
+
 def _force_remove(func, path, _exc):
     os.chmod(path, 0o700)
     func(path)
@@ -82,12 +91,20 @@ def prepare(tid, dest):
         shutil.rmtree(dest, onexc=_force_remove)
     os.makedirs(dest)
     copy_tree(os.path.join(TASKS, tid, "repo"), dest)
-    git(dest, "init", "-q")
-    git(dest, "config", "user.email", "bench@example.invalid")
-    git(dest, "config", "user.name", "bench")
-    git(dest, "config", "core.autocrlf", "false")
-    git(dest, "add", "-A")
-    git(dest, "commit", "-q", "-m", "fixture")
+    # The fixture baseline must not depend on the operator's global git
+    # configuration: global hooks (for example secret scanners) could block
+    # the commit and leave every starter file untracked, which would later be
+    # misreported as unrelated agent changes.
+    checked_git(dest, "init", "-q")
+    hooks = os.path.join(dest, ".git", "bench-no-hooks")
+    os.makedirs(hooks, exist_ok=True)
+    checked_git(dest, "config", "core.hooksPath", hooks)
+    checked_git(dest, "config", "user.email", "bench@example.invalid")
+    checked_git(dest, "config", "user.name", "bench")
+    checked_git(dest, "config", "core.autocrlf", "false")
+    checked_git(dest, "config", "commit.gpgsign", "false")
+    checked_git(dest, "add", "-A")
+    checked_git(dest, "commit", "-q", "--no-verify", "-m", "fixture")
 
 
 def grade(tid, workdir):

@@ -17,7 +17,9 @@ import runner
 import bench
 import native_supervisor
 
-NATIVE_LIFETIME_AVAILABLE = sys.platform == "linux" and native_supervisor.children_path_available()
+NATIVE_LIFETIME_AVAILABLE = (sys.platform == "win32"
+                             or (sys.platform == "linux"
+                                 and native_supervisor.children_path_available()))
 
 
 class RunnerTests(unittest.TestCase):
@@ -156,7 +158,8 @@ class RunnerTests(unittest.TestCase):
         self.assertEqual(result["exit"], "timeout")
         self.assertTrue(result["cleanup_complete"])
 
-    @unittest.skipUnless(NATIVE_LIFETIME_AVAILABLE, "matching Linux /proc child ownership view required")
+    @unittest.skipUnless(NATIVE_LIFETIME_AVAILABLE and sys.platform == "linux",
+                         "fork/setsid fixture; test_windows_job covers Windows descendants")
     def test_successful_native_launcher_cannot_leave_detached_writers(self):
         for detach in (False, True):
             with self.subTest(detach=detach), tempfile.TemporaryDirectory() as tmp:
@@ -205,6 +208,7 @@ class RunnerTests(unittest.TestCase):
                 runner.tooling_preflight()
         start.assert_not_called()
 
+    @unittest.skipUnless(sys.platform == "linux", "waitpid/WNOHANG reaping is Linux-only")
     def test_native_cleanup_proves_echild_and_only_signals_owned_children(self):
         with (patch.object(native_supervisor.os, "waitpid", side_effect=[(0, 0), (123, 0), ChildProcessError]),
               patch.object(native_supervisor.Path, "read_text", return_value="123"),
@@ -221,7 +225,8 @@ class RunnerTests(unittest.TestCase):
     def test_abrupt_native_supervisor_exit_has_no_cleanup_proof(self):
         process = MagicMock(returncode=-9)
         process.communicate.return_value = ("", "")
-        with patch.object(runner.subprocess, "Popen", return_value=process):
+        with (patch.object(runner.sys, "platform", "linux"),
+              patch.object(runner.subprocess, "Popen", return_value=process)):
             result = runner.execute(["unused"], Path.cwd(), {}, 1)
         self.assertFalse(result["cleanup_complete"])
         self.assertEqual(result["exit"], "supervisor_failed")
@@ -229,7 +234,8 @@ class RunnerTests(unittest.TestCase):
     def test_native_supervisor_watchdog_preserves_ungraded_failure(self):
         process = MagicMock(returncode=0)
         process.communicate.side_effect = [subprocess.TimeoutExpired("supervisor", 16), ("partial", "")]
-        with patch.object(runner.subprocess, "Popen", return_value=process):
+        with (patch.object(runner.sys, "platform", "linux"),
+              patch.object(runner.subprocess, "Popen", return_value=process)):
             result = runner.execute(["unused"], Path.cwd(), {}, 1)
         self.assertEqual(result["exit"], "supervisor_timeout")
         self.assertEqual(result["stdout"], "partial")
@@ -237,7 +243,7 @@ class RunnerTests(unittest.TestCase):
         process.terminate.assert_called_once()
 
     def test_unsupported_native_lifecycle_does_not_launch_a_process(self):
-        with patch.object(runner.sys, "platform", "win32"), patch.object(runner.subprocess, "Popen") as start:
+        with patch.object(runner.sys, "platform", "darwin"), patch.object(runner.subprocess, "Popen") as start:
             result = runner.execute(["unused"], Path.cwd(), {}, 1)
         self.assertEqual(result["exit"], "unsupported_native_lifecycle")
         self.assertFalse(result["cleanup_complete"])
@@ -368,6 +374,73 @@ class RunnerTests(unittest.TestCase):
                       self.assertRaisesRegex(RuntimeError, "unresolved benchmark campaign ownership")):
                     with runner.campaign_lock("new-campaign"):
                         self.fail("ambiguous ownership admitted")
+
+    def test_dead_owner_is_reconciled_only_when_its_work_is_proven_gone(self):
+        def record(kind, container=None):
+            return json.dumps({"schema_version": 1, "pid": 424242, "status": "active",
+                               "in_flight": [{"id": "x", "kind": kind, "container": container}]})
+        cases = [
+            (record("windows-job"), False, None, True),
+            (record("windows-job"), True, None, False),   # owner still alive
+            (record("native"), False, None, False),       # Linux native needs an operator
+            (record("container", ["docker", "davinci-bench-abc"]), False, True, True),
+            (record("container", ["docker", "davinci-bench-abc"]), False, False, False),
+            (record("container", ["docker", "other-name"]), False, True, False),
+            (json.dumps({"schema_version": 1, "pid": 424242, "status": "active",
+                         "in_flight": []}), False, None, True),
+        ]
+        with tempfile.TemporaryDirectory() as tmp:
+            lockfile = Path(tmp) / "machine.lock"
+            for text, alive, removed, admitted in cases:
+                lockfile.write_text(text)
+                with (self.subTest(text=text, alive=alive, removed=removed),
+                      patch.object(runner, "_campaign_lock_path", return_value=lockfile),
+                      patch.object(runner, "_pid_alive", return_value=alive),
+                      patch.object(runner, "_remove_container", return_value=removed) as remove):
+                    if admitted:
+                        with runner.campaign_lock("next"):
+                            pass
+                        self.assertEqual(json.loads(lockfile.read_text())["status"], "clean")
+                    else:
+                        with self.assertRaisesRegex(RuntimeError, "unresolved benchmark campaign ownership"):
+                            with runner.campaign_lock("next"):
+                                self.fail("unproven ownership admitted")
+                    if removed is not None and "davinci-bench-" in text:
+                        remove.assert_called_once_with(("docker", "davinci-bench-abc"))
+
+    def test_fixture_baseline_ignores_operator_git_hooks_and_reports_git_failures(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "tasks" / "t0" / "repo").mkdir(parents=True)
+            (root / "tasks" / "t0" / "repo" / "app.py").write_text("x = 1\n")
+            hooks = root / "global-hooks"
+            hooks.mkdir()
+            (hooks / "pre-commit").write_text("#!/bin/sh\nexit 1\n", newline="\n")
+            (hooks / "pre-commit").chmod(0o755)
+            global_config = root / "gitconfig"
+            global_config.write_text(f"[core]\n\thooksPath = {hooks.as_posix()}\n")
+            env = {**os.environ, "GIT_CONFIG_GLOBAL": str(global_config)}
+            with (patch.object(bench, "TASKS", str(root / "tasks")),
+                  patch.dict(os.environ, env)):
+                bench.prepare("t0", str(root / "work"))
+                self.assertFalse(bench.changed_files(str(root / "work")))
+                log = bench.git(str(root / "work"), "log", "--oneline")
+                self.assertEqual(len(log.stdout.splitlines()), 1)
+                with patch.object(bench, "git", return_value=SimpleNamespace(
+                        returncode=128, stdout="", stderr="fatal: boom")):
+                    with self.assertRaisesRegex(RuntimeError, "fixture setup failed: git init: fatal: boom"):
+                        bench.prepare("t0", str(root / "work2"))
+
+    def test_lock_record_stays_valid_json_when_it_shrinks(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            lockfile = Path(tmp) / "machine.lock"
+            with patch.object(runner, "_campaign_lock_path", return_value=lockfile):
+                with runner.campaign_lock("campaign-" + "x" * 400):
+                    self.assertEqual(json.loads(lockfile.read_text())["status"], "active")
+                with runner.campaign_lock("b"):
+                    pass
+            self.assertEqual(json.loads(lockfile.read_text())["campaign"],
+                             str(Path("b").resolve()))
 
     def test_compare_passes_all_control_rows_to_overlap_gate(self):
         def timed(harness, start, end):

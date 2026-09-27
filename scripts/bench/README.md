@@ -28,9 +28,18 @@ remaining descendants after the launcher exits, including detached or
 double-forked writers. It confirms that it has no children before reporting
 cleanup. `/proc` must expose the supervisor's own PID namespace so the owned
 child IDs can be used safely. If that proof is unavailable, the native arm is
-rejected before the benchmark command starts. Windows and macOS native arms
-are currently unsupported; they need an equivalent process lifetime owner.
-This process supervision does not add a security sandbox.
+rejected before the benchmark command starts.
+
+Native Windows runs use `windows_job.py`: the command starts suspended, is
+assigned to a new Job Object with `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`, and only
+then resumes, so every descendant belongs to the job. After exit or timeout the
+runner terminates the whole job and reports cleanup only when the kernel shows
+zero active processes in it. If the orchestrator dies, the job handle closes
+and the kernel kills the tree. Output goes to temporary files rather than pipes,
+so a descendant holding an inherited handle cannot stall the measured exit.
+This makes a native Windows DaVinci-versus-Codex campaign possible again.
+macOS native arms remain unsupported. This process supervision does not add a
+security sandbox.
 
 **This is not a credential or independent hidden-grader boundary.** DaVinci and
 its tools can read the mounted `auth.json`. Bridge networking permits outbound
@@ -55,7 +64,12 @@ paths, and telemetry transport have a supported container configuration.
 
 Use Python 3.11 or later for the runner. The grader's Python needs pytest.
 Native Linux harnesses need `python`, `python3`, `pytest`, Git, and Bash on PATH,
-plus the process ownership support described above. The preflight actually
+plus the process ownership support described above. Native Windows harnesses
+need `python` (with pytest importable), Git, and Bash on PATH; `python3` is not
+required because standard Windows Python installs do not provide it.
+Fixture repositories are committed with `--no-verify` and a repository-local
+empty `core.hooksPath`, so operator-wide git hooks cannot alter the baseline;
+any failing git setup command stops the run instead of being ignored. The preflight actually
 imports pytest, executes the named commands, and records versions before any
 model call. Container checks run inside the resolved image with networking off.
 A missing Python/pytest command or failed cleanup rejects setup.
@@ -141,10 +155,18 @@ same campaign. A crashed owner also stays unresolved between timed launches,
 when setup or grading subprocesses may still be active. Corrupt or older
 unrecognized lock records fail closed.
 
-There is no automatic stale-record override: an operator must reconcile prior
-workers and containers before resetting unresolved ownership while holding the
-kernel lock. If prior work cannot be accounted for, use a clean measurement
-host. Do not delete the lock file while a process may own it; doing so can split
+A record left by a dead orchestrator is reconciled automatically only when its
+work is proven gone: the owner PID must no longer exist, every in-flight
+container must be force-removed and confirmed absent, and every in-flight native
+Windows run is covered by its kill-on-close Job Object (the kernel killed the
+tree when the dead owner's handle closed). A live owner, a Linux native run, or
+an unreadable record still fails closed; then an operator must reconcile prior
+workers before resetting ownership while holding the kernel lock. If prior work
+cannot be accounted for, use a clean measurement host. The record is rewritten
+in place and shortened only afterwards, so a crash mid-write leaves invalid
+JSON (which fails closed), never an empty file that would read as clean. On
+Windows the kernel lock covers a byte far past the record, so the record stays
+readable while a campaign runs. Do not delete the lock file while a process may own it; doing so can split
 ownership across different inodes. This lock cannot control unrelated programs
 or use of the same account on another machine. The comparison checks the full
 campaign timestamp envelope, including all Codex control rows, for overlap;

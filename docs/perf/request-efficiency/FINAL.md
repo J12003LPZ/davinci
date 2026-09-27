@@ -68,11 +68,12 @@ The current benchmark implementation makes the failure modes explicit:
   container, verifies its absence, and reaps the client. Missing creation
   identity after any abnormal client exit is unproven cleanup. Failed cleanup
   records an ungraded failure and stops before grader injection or inspection.
-- Native execution requires a Linux child subreaper with a matching process
+- Native Linux execution requires a child subreaper with a matching process
   namespace view. It terminates and reaps owned descendants, including detached
-  children, before allowing grading. Unsupported hosts refuse before launch.
-  Windows and macOS native execution remain unavailable until an equivalent
-  lifetime owner is implemented.
+  children, before allowing grading. Native Windows execution starts the
+  command suspended inside a kill-on-close Job Object, terminates the whole job
+  after exit or timeout, and reports cleanup only when the job has zero active
+  processes. macOS and other hosts refuse before launch.
 - Artifact scanning is separate from transaction scanning and includes reserved
   grader/credential/artifact paths and symlinks, including ignored files. Its
   bounded filesystem scope is recorded; it is not a proof of no data access.
@@ -106,8 +107,11 @@ are documented in [the benchmark README](../../../scripts/bench/README.md).
 
 The original clean-checkout run reproduced the audit failure: 64 tests passed
 and the large-fixture metadata test errored because ignored generated tasks
-were absent. The final corrected offline benchmark suite runs 96 tests: 93
-pass and 3 native-process execution tests are skipped on this host. Tests create
+were absent. The corrected offline benchmark suite now runs 103 tests. On a
+native Windows 11 host with Python 3.13, 99 pass and 4 Linux-only tests (fork,
+`waitpid`, subreaper and `/proc` ownership) are skipped; the Windows Job Object
+tests run there instead. The counts on a Linux host differ because the
+Windows-only tests are skipped there. Tests create
 their own temporary fixtures. These are deterministic harness regressions, not model
 performance measurements. Current runtime regression evidence belongs to the
 runtime fixes and must not be inferred from old checkpoint prose.
