@@ -3113,6 +3113,21 @@ fn print_mode_exits_nonzero_on_assistant_error() {
 }
 
 #[test]
+fn print_mode_exits_nonzero_on_output_limit() {
+    let message: AssistantMessage = serde_json::from_value(serde_json::json!({
+        "id":"limited","role":"assistant","model":"fixture","content":[],"stopReason":"length"
+    })).unwrap();
+    let events = vec![AgentEvent::MessageUpdate {
+        message: std::sync::Arc::new(davinci_ai::ChatMessage::text("assistant", "")),
+        assistant_message_event: davinci_ai::AssistantMessageEvent::Done {
+            reason: StopReason::Length,
+            message,
+        },
+    }];
+    assert_eq!(print_text_exit(&events), (1, Some("Request reached the output token limit".into())));
+}
+
+#[test]
 fn print_json_event_strips_partial_and_adds_toolcall_ids() {
     let message = AssistantMessage {
         extra: Default::default(),

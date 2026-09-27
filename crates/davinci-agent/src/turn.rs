@@ -2,7 +2,7 @@ use std::path::{Path, PathBuf};
 
 use davinci_ai::{
     assistant_to_chat, AssistantMessage, ChatMessage, ContentBlock, MessageContent, StopReason,
-    RESPONSES_TOOL_WIRE_KIND_KEY, RESPONSES_TOOL_WIRE_KINDS_KEY,
+    RESPONSES_TOOL_WIRE_KINDS_KEY, RESPONSES_TOOL_WIRE_KIND_KEY,
 };
 use serde_json::Value;
 
@@ -508,11 +508,30 @@ impl Agent {
                 self.push_event(&mut events, AgentEvent::ProviderObservation { observation });
             }
             self.stats.model_wall_ms += model_started.elapsed().as_millis() as u64;
-            let (assistant, stream_events, streamed_live, native_responses_resume) =
+            let (mut assistant, stream_events, streamed_live, mut native_responses_resume) =
                 match completion {
                     Ok(output) => output,
                     Err(err) => return Err(err),
                 };
+            if matches!(
+                assistant.stop_reason,
+                Some(StopReason::Error | StopReason::Aborted | StopReason::Length)
+            ) {
+                // Providers and SDK callbacks can retain partial calls even
+                // when generation failed. They are display data only: do not
+                // persist unmatched calls or establish a native continuation.
+                assistant
+                    .content
+                    .retain(|block| !matches!(block, ContentBlock::ToolCall { .. }));
+                for key in [
+                    RESPONSES_TOOL_WIRE_KINDS_KEY,
+                    davinci_ai::NATIVE_ITEMS_KEY,
+                    davinci_ai::NATIVE_MODEL_KEY,
+                ] {
+                    assistant.extra.remove(key);
+                }
+                native_responses_resume = None;
+            }
             // A response that arrived during this provider request may inform
             // later requests or the current completion observation. Never wait.
             self.poll_decision_advice(true);
@@ -695,82 +714,27 @@ impl Agent {
             let had_tools = !tool_calls.is_empty();
             let mut tool_results = Vec::new();
             if had_tools {
-                if assistant.stop_reason == Some(StopReason::Length) {
-                    for (id, name, args) in &tool_calls {
-                        let mut result = ChatMessage::tool_result(
-                            id,
-                            name,
-                            "Tool call arguments were truncated by the output token limit",
-                            true,
-                        );
-                        self.push_event(
-                            &mut events,
-                            AgentEvent::ToolExecutionStart {
-                                tool_call_id: id.clone(),
-                                tool_name: name.clone(),
-                                args: args.clone(),
-                            },
-                        );
-                        self.push_event(
-                            &mut events,
-                            AgentEvent::ToolExecutionEnd {
-                                tool_call_id: id.clone(),
-                                tool_name: name.clone(),
-                                result: Value::String(
-                                    result
-                                        .content
-                                        .first()
-                                        .and_then(|c| match c {
-                                            MessageContent::Text { text } => Some(text.clone()),
-                                            _ => None,
-                                        })
-                                        .unwrap_or_default(),
-                                ),
-                                is_error: true,
-                                details: None,
-                            },
-                        );
-                        self.annotate_tool_result_wire_kind(&mut result);
-                        self.messages.push(result.clone());
-                        self.persist_chat(&result)?;
-                        new_messages.push(result.clone());
-                        self.push_event(
-                            &mut events,
-                            AgentEvent::MessageStart {
-                                message: result.clone(),
-                            },
-                        );
-                        self.push_event(
-                            &mut events,
-                            AgentEvent::MessageEnd {
-                                message: result.clone(),
-                            },
-                        );
-                        tool_results.push(result);
-                    }
-                } else {
-                    let cwd = self.cwd.clone();
-                    let messages = self.execute_tool_batch(&cwd, tool_calls, &mut events);
-                    for mut result in messages {
-                        let name = result.tool_name.clone().unwrap_or_default();
-                        self.after_tool(&name, &mut result);
-                        self.messages.push(result.clone());
-                        self.persist_chat(&result)?;
-                        new_messages.push(result.clone());
-                        self.push_event(
-                            &mut events,
-                            AgentEvent::MessageStart {
-                                message: result.clone(),
-                            },
-                        );
-                        self.push_event(
-                            &mut events,
-                            AgentEvent::MessageEnd {
-                                message: result.clone(),
-                            },
-                        );
-                        tool_results.push(result);
-                    }
+                let cwd = self.cwd.clone();
+                let messages = self.execute_tool_batch(&cwd, tool_calls, &mut events);
+                for mut result in messages {
+                    let name = result.tool_name.clone().unwrap_or_default();
+                    self.after_tool(&name, &mut result);
+                    self.messages.push(result.clone());
+                    self.persist_chat(&result)?;
+                    new_messages.push(result.clone());
+                    self.push_event(
+                        &mut events,
+                        AgentEvent::MessageStart {
+                            message: result.clone(),
+                        },
+                    );
+                    self.push_event(
+                        &mut events,
+                        AgentEvent::MessageEnd {
+                            message: result.clone(),
+                        },
+                    );
+                    tool_results.push(result);
                 }
             }
 

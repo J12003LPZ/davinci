@@ -82,7 +82,7 @@ fn rejected_terminal_patch_calls_never_reach_agent_execution() {
         "name":"apply_patch","input":"*** Begin Patch\n*** Add File: unsafe.txt\n+executed\n*** End Patch"});
     let mut incomplete_item = item.clone();
     incomplete_item["status"] = "incomplete".into();
-    let cases = [
+    let mut cases = vec![
         vec![
             json!({"type":"response.output_item.added","output_index":0,"item":item}),
             json!({"type":"response.completed","response":{"status":"completed","output":[]}}),
@@ -104,6 +104,14 @@ fn rejected_terminal_patch_calls_never_reach_agent_execution() {
             "output":[incomplete_item]}}),
         ],
     ];
+    for status in ["incomplete", "in_progress", "failed", "completed"] {
+        let mut open_item = item.clone();
+        open_item["status"] = status.into();
+        cases.push(vec![
+            json!({"type":"response.output_item.added","output_index":0,"item":open_item}),
+            json!({"type":"response.completed","response":{"status":"completed"}}),
+        ]);
+    }
     for frames in cases {
         let root = tempdir().unwrap();
         let corpus = frames
@@ -138,6 +146,51 @@ fn rejected_terminal_patch_calls_never_reach_agent_execution() {
                 .any(|event| matches!(event, davinci_agent::AgentEvent::ToolExecutionStart { .. })),
             "{corpus}"
         );
+    }
+}
+
+#[test]
+fn rejected_provider_calls_are_absent_from_saved_history_and_execution() {
+    for status in ["length", "error", "aborted"] {
+        let root = tempdir().unwrap();
+        let mut agent = davinci_agent::Agent::new("provider boundary regression");
+        agent.cwd = root.path().to_path_buf();
+        agent.set_permission_mode(davinci_agent::PermissionMode::AlwaysApprove);
+        agent.session =
+            Some(davinci_session::JsonlSession::create(root.path(), status, None).unwrap());
+        let session_path = agent.session.as_ref().unwrap().path.clone();
+        agent.prompt_user_with("Write the requested file", &[]);
+        let response: davinci_ai::AssistantMessage = serde_json::from_value(json!({
+            "id":"partial","role":"assistant","model":"fixture","stopReason":status,
+            "content":[{"type":"text","text":"Partial explanation"},
+                {"type":"toolCall","id":"pending","name":"write",
+                    "arguments":{"path":"unsafe.txt","content":"executed"}}],
+            "responsesToolWireKinds":{"pending":"function"}
+        }))
+        .unwrap();
+        let events = agent.run_loop(|_| Ok(response.clone())).unwrap();
+        assert!(!root.path().join("unsafe.txt").exists());
+        assert!(!events
+            .iter()
+            .any(|event| matches!(event, davinci_agent::AgentEvent::ToolExecutionStart { .. })));
+        let mut reopened = davinci_agent::Agent::new("reopened");
+        reopened
+            .load_from_session(davinci_session::JsonlSession::open(&session_path).unwrap())
+            .unwrap();
+        for messages in [&agent.messages, &reopened.messages] {
+            assert!(
+                !messages
+                    .iter()
+                    .flat_map(|message| &message.content)
+                    .any(|block| matches!(block, davinci_ai::MessageContent::ToolCall { .. })),
+                "{status}"
+            );
+            assert!(!messages.iter().any(|message| message
+                .extra
+                .contains_key(davinci_ai::RESPONSES_TOOL_WIRE_KINDS_KEY)));
+            assert!(messages.iter().any(|message| message.role == "assistant"
+                && davinci_ai::content_text(&message.content).contains("Partial explanation")));
+        }
     }
 }
 

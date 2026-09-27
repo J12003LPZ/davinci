@@ -699,6 +699,12 @@ impl ResponsesDecoder {
         }
         self.start(out);
         self.reconcile_output(response, out);
+        // A terminal output array can complete or replace provisional slots.
+        // Without one, only output_item.done establishes a finished call.
+        let unclosed_tool_call = self
+            .slots
+            .values()
+            .any(|slot| slot.kind == SlotKind::ToolCall);
         self.close_open_slots(out);
         if let Some(usage) = response.and_then(|response| response.get("usage")) {
             self.message.usage = Some(responses_usage(&self.model, usage));
@@ -718,10 +724,11 @@ impl ResponsesDecoder {
             error_message = Some(codex_error_text(error));
         }
         if stop_reason == StopReason::Stop
-            && self
-                .raw_items
-                .iter()
-                .any(crate::responses_ledger::unfinished_tool_item)
+            && (unclosed_tool_call
+                || self
+                    .raw_items
+                    .iter()
+                    .any(crate::responses_ledger::unfinished_tool_item))
         {
             stop_reason = StopReason::Error;
             error_message = Some("Response contains an unfinished tool call".into());
@@ -1482,6 +1489,38 @@ data: {"type":"response.function_call_arguments.delta","output_index":0,"delta":
             assert!(!message
                 .extra
                 .contains_key(crate::RESPONSES_TOOL_WIRE_KINDS_KEY));
+        }
+    }
+
+    #[test]
+    fn unclosed_tool_calls_require_authoritative_terminal_output() {
+        for kind in ["function_call", "custom_tool_call"] {
+            for status in [
+                Value::Null,
+                "incomplete".into(),
+                "in_progress".into(),
+                "failed".into(),
+                "completed".into(),
+            ] {
+                let item = serde_json::json!({"type":kind,"id":"item","call_id":"call",
+                    "name":"apply_patch","status":status,"input":"patch","arguments":"{}"});
+                let frames = [
+                    serde_json::json!({"type":"response.output_item.added","output_index":0,"item":item}),
+                    serde_json::json!({"type":"response.completed","response":{"id":"resp","status":"completed"}}),
+                ];
+                let mut decoder = ResponsesDecoder::new(&model());
+                let mut events = Vec::new();
+                for frame in &frames {
+                    decoder.feed(frame, &mut events);
+                }
+                let message = decoder.finish(&mut events);
+                assert_eq!(message.stop_reason, Some(StopReason::Error), "{item}");
+                assert!(!message
+                    .content
+                    .iter()
+                    .any(|block| matches!(block, ContentBlock::ToolCall { .. })));
+                assert!(crate::NativeResponsesOutput::from_events(&frames).is_none());
+            }
         }
     }
 

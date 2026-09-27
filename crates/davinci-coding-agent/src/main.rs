@@ -3469,6 +3469,10 @@ fn print_text_exit(events: &[AgentEvent]) -> (i32, Option<String>) {
         };
         let message = assistant_message_event.message();
         match message.stop_reason {
+            Some(StopReason::Length) => {
+                return (1, Some(message.error_message.clone().unwrap_or_else(||
+                    "Request reached the output token limit".into())));
+            }
             Some(StopReason::Error) | Some(StopReason::Aborted) => {
                 let label = if message.stop_reason == Some(StopReason::Aborted) {
                     "aborted"

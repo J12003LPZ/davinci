@@ -34,6 +34,7 @@ mod tests {
 
     fn reply(_: &Agent) -> Result<AssistantMessage, String> {
         Ok(AssistantMessage {
+            extra: Default::default(),
             id: "answer".into(),
             role: "assistant".into(),
             content: vec![ContentBlock::Text {

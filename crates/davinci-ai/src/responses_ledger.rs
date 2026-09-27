@@ -157,12 +157,39 @@ impl NativeResponsesOutput {
             .and_then(Value::as_str)
             .map(str::to_string);
 
-        let output_items = final_response
+        let terminal_output = final_response
             .as_ref()
             .and_then(|response| response.get("output"))
-            .and_then(Value::as_array)
-            .cloned()
-            .unwrap_or_else(|| completed_output_items(events));
+            .and_then(Value::as_array);
+        let output_items = if let Some(items) = terminal_output {
+            items.clone()
+        } else {
+            let mut open_calls = std::collections::BTreeSet::new();
+            for event in events {
+                let index = event
+                    .get("output_index")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0);
+                match event.get("type").and_then(Value::as_str) {
+                    Some("response.output_item.added")
+                        if matches!(
+                            event.pointer("/item/type").and_then(Value::as_str),
+                            Some("function_call" | "custom_tool_call")
+                        ) =>
+                    {
+                        open_calls.insert(index);
+                    }
+                    Some("response.output_item.done") => {
+                        open_calls.remove(&index);
+                    }
+                    _ => {}
+                }
+            }
+            if !open_calls.is_empty() {
+                return None;
+            }
+            completed_output_items(events)
+        };
         if output_items.iter().any(unfinished_tool_item) {
             return None;
         }
