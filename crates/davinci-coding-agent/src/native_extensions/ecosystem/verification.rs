@@ -21,9 +21,23 @@ impl Default for SecurityPolicyMode {
 #[serde(tag = "status", rename_all = "camelCase")]
 pub enum SecurityVerification {
     NotRequired,
-    Passed { scan_id: String },
-    Failed { scan_id: String, blockers: usize },
-    Unavailable { reason: String },
+    Passed {
+        scan_id: String,
+        /// What the gate could not inspect (deletions, binary or excluded
+        /// paths) or reported below the failure threshold. Never silent.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        note: Option<String>,
+    },
+    Failed {
+        scan_id: String,
+        blockers: usize,
+        /// One `path:line rule - message` row per blocker, for the writer.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        details: Vec<String>,
+    },
+    Unavailable {
+        reason: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -95,7 +109,10 @@ impl VerificationBundle {
                     SecurityVerification::NotRequired => true,
                     SecurityVerification::Passed { .. } => true,
                     SecurityVerification::Failed { .. } => false,
-                    SecurityVerification::Unavailable { .. } => true, // fail-open with warning in risk mode
+                    // Risk mode runs the gate only for changes the classifier
+                    // marked high-risk, so an unavailable scanner there fails
+                    // closed like the mandatory modes.
+                    SecurityVerification::Unavailable { .. } => false,
                 },
                 SecurityPolicyMode::Always => match &self.security {
                     SecurityVerification::Passed { .. } => true,
@@ -145,7 +162,7 @@ impl VerificationBundle {
             };
 
         let (sec_started, sec_exit, sec_name) = match &self.security {
-            SecurityVerification::Passed { scan_id } => (true, Some(0), scan_id.clone()),
+            SecurityVerification::Passed { scan_id, .. } => (true, Some(0), scan_id.clone()),
             SecurityVerification::Failed { scan_id, .. } => (true, Some(1), scan_id.clone()),
             SecurityVerification::Unavailable { reason } => {
                 (false, None, format!("unavailable: {reason}"))
@@ -225,6 +242,7 @@ mod tests {
             security: SecurityVerification::Failed {
                 scan_id: "scan-1".into(),
                 blockers: 1,
+                details: vec![],
             },
             changed_files: vec!["src/auth.rs".into()],
             graph_run_id: Some("run-1".into()),
@@ -249,8 +267,8 @@ mod tests {
             graph_run_id: Some("run-1".into()),
             source_manifest_digest: None,
         };
-        // Risk mode fails open on unavailable scanner
-        assert!(bundle.approval_eligible(SecurityPolicyMode::Risk));
+        // Risk mode scans only high-risk changes; an unavailable scanner fails closed
+        assert!(!bundle.approval_eligible(SecurityPolicyMode::Risk));
         // Always mode fails closed on unavailable scanner
         assert!(!bundle.approval_eligible(SecurityPolicyMode::Always));
         // Off mode is eligible
@@ -265,6 +283,7 @@ mod tests {
             deterministic_passed: true,
             security: SecurityVerification::Passed {
                 scan_id: "scan-ok".into(),
+                note: None,
             },
             changed_files: vec!["src/main.rs".into()],
             graph_run_id: Some("run-1".into()),
@@ -288,8 +307,8 @@ mod tests {
             graph_run_id: Some("run-1".into()),
             source_manifest_digest: None,
         };
-        // Standard risk mode without contract requirement permits unavailable security
-        assert!(bundle.approval_eligible(SecurityPolicyMode::Risk));
+        // Risk mode only scans high-risk changes, so unavailable security fails closed
+        assert!(!bundle.approval_eligible(SecurityPolicyMode::Risk));
 
         // When a contract explicitly requires security, unavailable security MUST fail closed
         let contract = davinci_agent::runtime::contracts::TaskContract::new(

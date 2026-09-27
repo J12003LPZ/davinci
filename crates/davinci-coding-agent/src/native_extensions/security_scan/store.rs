@@ -60,9 +60,7 @@ impl CheckpointBinding {
         Ok(Self {
             budget_schema_version: 3,
             record_identity_version: super::identity::VERSION,
-            policy_sha256: super::sha256_hex(
-                &serde_json::to_vec(config).map_err(|_| "cannot bind scan policy")?,
-            ),
+            policy_sha256: super::sha256_hex(&config.binding_bytes()?),
             methodology_sha256: super::sha256_hex(
                 &serde_json::to_vec(&super::skills::manifest())
                     .map_err(|_| "cannot bind scan methodology")?,
@@ -103,7 +101,64 @@ struct CheckpointBundle {
     checkpoint: Checkpoint,
 }
 
+/// Scans of `root` that stopped before a sealed report and were not
+/// discarded, newest first. Only the directory names are trusted here; every
+/// candidate is reopened through `Store::open` before it is used.
+pub(super) fn interrupted_scans(agent_dir: &Path, root: &Path) -> Vec<String> {
+    scan_directories(agent_dir, root, true)
+}
+
+/// Every scan of `root` with a checkpoint (`interrupted_only` keeps the ones
+/// without a sealed report that were not discarded), newest first.
+pub(super) fn scan_directories(
+    agent_dir: &Path,
+    root: &Path,
+    interrupted_only: bool,
+) -> Vec<String> {
+    let (Ok(root), Ok(agent_dir)) = (root.canonicalize(), agent_dir.canonicalize()) else {
+        return Vec::new();
+    };
+    let repo = agent_dir
+        .join("security-scans")
+        .join(super::sha256_hex(root.to_string_lossy().as_bytes()));
+    let Ok(entries) = fs::read_dir(&repo) else {
+        return Vec::new();
+    };
+    let mut found = entries
+        .flatten()
+        .take(4096)
+        .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_dir()))
+        .filter_map(|entry| {
+            let name = entry.file_name().to_str()?.to_string();
+            let canonical = uuid::Uuid::parse_str(&name).ok()?.to_string() == name;
+            let dir = entry.path();
+            let checkpoint =
+                dir.join("checkpoint.bundle.json").exists() || dir.join("checkpoint.json").exists();
+            let sealed = (1..=16).any(|g| dir.join(format!("seal-{g}.json")).exists());
+            let interrupted = !sealed && !dir.join("discarded").exists();
+            (canonical && checkpoint && (interrupted || !interrupted_only)).then(|| {
+                let modified = fs::metadata(dir.join("active.lock"))
+                    .or_else(|_| entry.metadata())
+                    .and_then(|meta| meta.modified())
+                    .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+                (modified, name)
+            })
+        })
+        .collect::<Vec<_>>();
+    found.sort_by(|a, b| b.cmp(a));
+    found.into_iter().map(|(_, name)| name).collect()
+}
+
 impl Store {
+    /// Retire an interrupted scan so neither session start nor `/security-scan`
+    /// offers to resume it again. Its evidence stays until retention sweeps it.
+    pub fn discard(&self, reason: &str) -> Result<(), String> {
+        if self.directory.join("discarded").exists() {
+            return Ok(());
+        }
+        self.publish("discarded", reason.as_bytes())
+    }
+
     pub fn open(agent_dir: &Path, root: &Path, id: &str, create: bool) -> Result<Self, String> {
         let parsed = uuid::Uuid::parse_str(id).map_err(|_| "invalid scan identity")?;
         if parsed.to_string() != id {

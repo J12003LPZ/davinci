@@ -9,7 +9,7 @@ use std::path::{Component, Path};
 use uuid::Uuid;
 
 pub const SCANNER_SCHEMA_VERSION: u32 = 2;
-pub const METHODOLOGY_VERSION: &str = "native-security-2";
+pub const METHODOLOGY_VERSION: &str = "native-security-3";
 const MAX_CAPTURED_REPORT_BYTES: usize = 8 * 1024 * 1024;
 const MAX_CAPTURE_BYTES: usize = 64 * 1024 * 1024;
 

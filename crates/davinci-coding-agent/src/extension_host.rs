@@ -597,6 +597,55 @@ impl ExtensionHost {
         }
     }
 
+    /// Security transcript notices: a finished `/security-scan` (once) and
+    /// findings the session security watch reported.
+    pub fn drain_security_notices(&self) -> Vec<String> {
+        let security = match self.native.lock() {
+            Ok(native) => native.security.clone(),
+            Err(_) => return Vec::new(),
+        };
+        security.drain_notices()
+    }
+
+    /// Whether a settled turn may start a security watch review now.
+    pub fn security_watch_due(&self) -> bool {
+        self.native
+            .lock()
+            .is_ok_and(|native| native.security.watch_due())
+    }
+
+    /// Start the session security watch's background review when due. The
+    /// review runs on its own thread; the host lock is released first.
+    pub fn security_watch_settled_turn(&self) -> Result<bool, String> {
+        let security = self
+            .native
+            .lock()
+            .map_err(|err| err.to_string())?
+            .security
+            .clone();
+        security.watch_settled_turn()
+    }
+
+    /// Session start: resume this repository's interrupted scan, or say once
+    /// that it cannot resume.
+    pub fn resume_interrupted_security_scan(&self) -> Option<String> {
+        let mut security = self.native.lock().ok()?.security.clone();
+        security.resume_interrupted()
+    }
+
+    pub fn has_interrupted_security_scan(&self) -> bool {
+        self.native
+            .lock()
+            .is_ok_and(|native| native.security.has_interrupted_scan())
+    }
+
+    /// Session end: stop the explicit scan (it stays resumable) and the watch.
+    pub fn shutdown_security(&self) {
+        if let Ok(native) = self.native.lock() {
+            native.security.shutdown();
+        }
+    }
+
     pub fn drain_learning_notifications(&self) -> Vec<String> {
         self.native
             .lock()
@@ -683,14 +732,11 @@ impl ExtensionHost {
         if !NATIVE_COMMANDS.iter().any(|command| *command == name) {
             return Ok(None);
         }
-        if matches!(
-            name,
-            "security-scan" | "sec-resume" | "sec-status" | "sec-report" | "sec-abort"
-        ) {
+        if matches!(name, "security-scan" | "sec-status" | "sec-report") {
             let security = {
                 let native = self.native.lock().map_err(|err| err.to_string())?;
                 (native.security.has_review()
-                    || matches!(name, "security-scan" | "sec-resume")
+                    || name == "security-scan"
                     || name == "sec-report" && !args.trim().is_empty())
                 .then(|| native.security.clone())
             };

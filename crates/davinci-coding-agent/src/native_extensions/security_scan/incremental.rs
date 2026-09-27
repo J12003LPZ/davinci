@@ -147,6 +147,8 @@ mod tests {
                 files_rescanned: 0,
                 cache_read_errors: 0,
                 cache_write_errors: 0,
+                files_deleted: 0,
+                skipped: Vec::new(),
             },
         }
     }

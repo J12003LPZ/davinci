@@ -440,7 +440,7 @@ mod tests {
         std::fs::create_dir_all(auth_file.parent().unwrap()).unwrap();
         std::fs::write(
             &auth_file,
-            "pub fn key() -> &'static str { \"sk-secret12345\" }\n",
+            "pub fn key() -> &'static str { \"sk-proj-4f9Qa2Lk8Zt3Vb7Nc1Xd6Rm0Hs\" }\n",
         )
         .unwrap();
 
@@ -1039,7 +1039,7 @@ mod tests {
         std::fs::create_dir_all(auth_file.parent().unwrap()).unwrap();
         std::fs::write(
             &auth_file,
-            "pub fn key() -> &'static str { \"sk-secret12345\" }\n",
+            "pub fn key() -> &'static str { \"sk-proj-4f9Qa2Lk8Zt3Vb7Nc1Xd6Rm0Hs\" }\n",
         )
         .unwrap();
         let sec_runner: Arc<WorkerRunner> = Arc::new(|spec, _abort, _on_progress| {

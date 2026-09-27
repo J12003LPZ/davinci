@@ -158,10 +158,11 @@ pub const NATIVE_COMMANDS: &[&str] = &[
     "graph-view",
     "graph-abort",
     "security-scan",
-    "sec-resume",
+    // Internal views the security sheet and RPC polling read. Deliberately
+    // omitted from `command_specs`: `/security-scan` is the one public
+    // security command; resume is session-level and there is no abort.
     "sec-status",
     "sec-report",
-    "sec-abort",
     "learning-status",
     "learning-pending",
     "learning-approve",
@@ -229,28 +230,8 @@ pub fn command_specs() -> Vec<(&'static str, &'static str, Option<&'static str>)
         ),
         (
             "security-scan",
-            "Start an experimental source-grounded security review.",
-            Some("[path] [--mode quick|standard|deep] [--format terminal|json|sarif]"),
-        ),
-        (
-            "sec-resume",
-            "Resume an interrupted security review.",
-            Some("<scanId>"),
-        ),
-        (
-            "sec-status",
-            "Show the active security review status.",
-            Some("[scanId]"),
-        ),
-        (
-            "sec-report",
-            "Show the current security review report.",
-            Some("[scanId]"),
-        ),
-        (
-            "sec-abort",
-            "Cancel the active security review.",
-            Some("[scanId]"),
+            "Review this repository for security risks; resumes an interrupted scan and shows the running one.",
+            Some("[path] [--changed|--diff base..head] [--mode quick|standard|deep] [--format terminal|json|sarif] [--new] [--report] [--finding <id>]"),
         ),
         (
             "memory-status",
@@ -536,7 +517,14 @@ impl NativeExtensionHost {
             governor,
             memory,
             graph,
-            security: SecurityScanController::new(cwd.to_path_buf()),
+            security: match agent_dir {
+                Some(dir) => SecurityScanController::with_settings(
+                    cwd.to_path_buf(),
+                    dir.to_path_buf(),
+                    crate::settings::is_trusted(&merged_settings, cwd, None),
+                ),
+                None => SecurityScanController::new(cwd.to_path_buf()),
+            },
             learning,
             visual_verification_available: visual_snapshot.is_available(),
             visual_snapshot,
@@ -625,10 +613,13 @@ impl NativeExtensionHost {
         self.poll_learning();
         let memory = self.memory_inject(query);
         let skills = self.learning.learned_skill_block(query);
-        match (memory, skills) {
-            (Some(memory), Some(skills)) => Some(format!("{memory}\n\n{skills}")),
-            (memory, skills) => memory.or(skills),
-        }
+        // Findings the session security watch reported since the last turn.
+        let watch = self.security.take_watch_injection();
+        let blocks = [memory, skills, watch]
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>();
+        (!blocks.is_empty()).then(|| blocks.join("\n\n"))
     }
 
     /// Apply finished background learning reviews and index any memories
@@ -687,7 +678,7 @@ impl NativeExtensionHost {
         }
         self.language_intelligence.shutdown();
         graph::abort_all_runs();
-        self.security.abort_review();
+        self.security.shutdown();
         self.learning.cancel_active_review();
     }
 
@@ -1147,7 +1138,14 @@ mod tests {
             .into_iter()
             .map(|(name, _, _)| name)
             .collect();
-        let internal_graph = ["graph-resume", "graph-status", "graph-view", "graph-abort"];
+        let internal_graph = [
+            "graph-resume",
+            "graph-status",
+            "graph-view",
+            "graph-abort",
+            "sec-status",
+            "sec-report",
+        ];
         for name in NATIVE_COMMANDS {
             if internal_graph.contains(name) {
                 continue;
@@ -1464,9 +1462,18 @@ mod tests {
     fn public_native_commands_have_discoverable_metadata() {
         let specs = command_specs();
         assert!(specs.iter().any(|(name, _, _)| *name == "security-scan"));
-        for public in ["sec-status", "sec-report", "sec-abort", "sec-resume"] {
-            assert!(specs.iter().any(|(name, _, _)| *name == public));
-            assert!(NATIVE_COMMANDS.contains(&public));
+        // `/security-scan` is the only public security command.
+        for internal in ["sec-status", "sec-report", "sec-abort", "sec-resume"] {
+            assert!(
+                !specs.iter().any(|(name, _, _)| *name == internal),
+                "{internal} must not be advertised"
+            );
+        }
+        for removed in ["sec-abort", "sec-resume"] {
+            assert!(
+                !NATIVE_COMMANDS.contains(&removed),
+                "{removed} is not a command"
+            );
         }
         for (name, description, _) in specs {
             assert!(NATIVE_COMMANDS.contains(&name));

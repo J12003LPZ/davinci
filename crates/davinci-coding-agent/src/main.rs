@@ -2843,6 +2843,11 @@ fn complete_prompt_with_host(
             host.enable_live_learning(&agent.cwd, model);
         }
         let _ = host.native_review_settled_turn(learning_evidence);
+        // The session watches its own changes for security risks, like the
+        // learning reviewer: long-lived sessions only, in the background.
+        if !fresh_host {
+            security_watch_after_turn(parsed, agent, &host);
+        }
         if fresh_host {
             for notice in host.drain_learning_notifications() {
                 println!("{notice}");
@@ -3458,6 +3463,14 @@ fn run_rpc_with_host(
         .emit(ExtensionEvent::SessionStart);
     {
         let host = host.lock().unwrap_or_else(|err| err.into_inner());
+        if let Some(notice) = resume_security_scan_on_session_start(parsed, &runtime.agent, &host) {
+            emit_extension_ui_requests(&[
+                serde_json::json!({"op":"notify","message":notice,"type":"info"}),
+            ])?;
+        }
+    }
+    {
+        let host = host.lock().unwrap_or_else(|err| err.into_inner());
         for provider in host.registered_providers() {
             runtime
                 .models
@@ -3654,10 +3667,7 @@ fn run_rpc_with_host(
             let message = command.message.as_deref().unwrap_or("");
             if message.trim_start().starts_with('/') {
                 let (name, args) = parse_extension_command(message);
-                if matches!(
-                    name.as_str(),
-                    "security-scan" | "sec-resume" | "sec-status" | "sec-report" | "sec-abort"
-                ) {
+                if matches!(name.as_str(), "security-scan" | "sec-status" | "sec-report") {
                     let locked = host.lock().unwrap_or_else(|e| e.into_inner());
                     locked
                         .native
@@ -3666,7 +3676,7 @@ fn run_rpc_with_host(
                         .security
                         .set_review_storage(default_agent_dir());
                     let result = (|| {
-                        if matches!(name.as_str(), "security-scan" | "sec-resume") {
+                        if name == "security-scan" && security_scan_starts_work(&args) {
                             configure_security_review(parsed, &runtime.agent, &locked)?;
                         }
                         locked.execute_native_command(&name, &args)
@@ -3773,6 +3783,10 @@ fn run_rpc_with_host(
         let mut extras = runtime.take_events();
         {
             let mut host = host.lock().unwrap_or_else(|err| err.into_inner());
+            for notice in host.drain_security_notices() {
+                host.ui_calls
+                    .push(serde_json::json!({"op":"notify","message":notice,"type":"info"}));
+            }
             emit_extension_ui_requests(&std::mem::take(&mut host.ui_calls))?;
         }
         if is_prompt && response.success && runtime.prompt_needs_turn {
@@ -3863,7 +3877,7 @@ fn run_rpc_with_host(
     crate::js_host::clear_ui_waiter();
     {
         let locked = host.lock().unwrap_or_else(|e| e.into_inner());
-        let _ = locked.execute_native_command("sec-abort", "");
+        locked.shutdown_security();
     }
     emit_session_shutdown(parsed);
     *agent = runtime.agent;
@@ -6046,24 +6060,30 @@ fn prepare_user_input(
         } else {
             let mut host = loaded_extension_host(parsed);
             apply_graph_session_context(parsed, agent, &host);
-            if matches!(name.as_str(), "security-scan" | "sec-resume") {
-                let request = if name == "security-scan" {
-                    native_extensions::security_scan::command::ScanCommand::parse(&args)
-                } else {
-                    native_extensions::security_scan::command::ScanCommand::parse("")
-                };
+            if name == "security-scan" {
+                let request = native_extensions::security_scan::command::Invocation::parse(
+                    &args,
+                    native_extensions::security_scan::command::ScanMode::Standard,
+                );
                 let format = request
                     .as_ref()
-                    .map(|request| request.format)
+                    .map(|request| request.scan.format)
                     .unwrap_or(native_extensions::security_scan::command::ReportFormat::Terminal);
                 let outcome = (|| {
-                    request?;
+                    if request?.report {
+                        return host
+                            .execute_native_command(&name, &args)?
+                            .ok_or_else(|| "security report unavailable".to_string());
+                    }
                     configure_security_review(parsed, agent, &host)?;
                     let interrupt =
                         native_extensions::security_scan::interrupt::Interrupt::install()?;
                     let result = host
                         .execute_native_command(&name, &args)?
                         .ok_or("security command unavailable")?;
+                    if let Some(notice) = result["notice"].as_str() {
+                        eprintln!("{notice}");
+                    }
                     let security = host
                         .native
                         .lock()
@@ -7564,6 +7584,10 @@ pub fn format_session_status(parsed: &Args, agent: &Agent) -> String {
             text.push_str(&compact.join("\n"));
         }
     }
+    if let Some(line) = native_extensions::security_scan::watch_status_line() {
+        text.push('\n');
+        text.push_str(&line);
+    }
     let behavior_runs = davinci_telemetry::get_behavior_telemetry();
     if !behavior_runs.is_empty() {
         let profile_filter = agent
@@ -7810,10 +7834,7 @@ fn try_extension_slash(
     args: &str,
 ) -> Result<bool, String> {
     let mut host = loaded_extension_host(parsed);
-    let security_command = matches!(
-        name,
-        "security-scan" | "sec-resume" | "sec-status" | "sec-report" | "sec-abort"
-    );
+    let security_command = matches!(name, "security-scan" | "sec-status" | "sec-report");
     let session_key = agent
         .session
         .as_ref()
@@ -7829,13 +7850,13 @@ fn try_extension_slash(
                         .unwrap_or_else(|e| e.into_inner())
                         .security = controller.clone();
                 } else {
-                    let _ = controller.command("sec-abort", "");
+                    controller.shutdown();
                 }
             }
         });
     }
     apply_graph_session_context(parsed, agent, &host);
-    if matches!(name, "security-scan" | "sec-resume") {
+    if name == "security-scan" && security_scan_starts_work(args) {
         configure_security_review(parsed, agent, &host)?;
     }
     let result = host.execute_native_command(name, args);
@@ -8618,6 +8639,58 @@ fn attach_shared_tool_executor(agent: &mut Agent, host: Arc<Mutex<ExtensionHost>
             host.execute_js_or_manifest_tool_with_context(cwd, name, args, context)
         },
     ));
+}
+
+/// `/security-scan --report` and `--finding` only read results; everything
+/// else may start or resume a model review and needs provider admission.
+pub(crate) fn security_scan_starts_work(args: &str) -> bool {
+    native_extensions::security_scan::command::Invocation::parse(
+        args,
+        native_extensions::security_scan::command::ScanMode::Standard,
+    )
+    .map_or(true, |invocation| !invocation.report)
+}
+
+/// Session start (interactive, RPC): continue this repository's interrupted
+/// security scan in the background, or say once that it cannot continue.
+pub(crate) fn resume_security_scan_on_session_start(
+    parsed: &Args,
+    agent: &Agent,
+    host: &ExtensionHost,
+) -> Option<String> {
+    if std::env::var_os("PI_GRAPH_ROLE").is_some() {
+        return None;
+    }
+    // Cheap directory check first: most sessions have nothing to resume and
+    // must not pay for provider admission at startup.
+    native_security_storage(host);
+    if !host.has_interrupted_security_scan() {
+        return None;
+    }
+    if let Err(error) = configure_security_review(parsed, agent, host) {
+        return Some(format!(
+            "An interrupted security scan exists but cannot resume in this session: {error}"
+        ));
+    }
+    host.resume_interrupted_security_scan()
+}
+
+/// After a settled interactive/RPC turn: let the session security watch
+/// review changed working-tree state in the background when it is due.
+pub(crate) fn security_watch_after_turn(parsed: &Args, agent: &Agent, host: &ExtensionHost) {
+    if std::env::var_os("PI_GRAPH_ROLE").is_some() || !host.security_watch_due() {
+        return;
+    }
+    native_security_storage(host);
+    if configure_security_review(parsed, agent, host).is_ok() {
+        let _ = host.security_watch_settled_turn();
+    }
+}
+
+fn native_security_storage(host: &ExtensionHost) {
+    if let Ok(mut native) = host.native.lock() {
+        native.security.set_review_storage(default_agent_dir());
+    }
 }
 
 /// Hand the graph controller the session's model, thinking level, and trust

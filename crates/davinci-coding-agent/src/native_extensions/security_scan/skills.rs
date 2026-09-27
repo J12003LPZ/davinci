@@ -1,7 +1,7 @@
 //! Explicit native methodology. Never discovers project skills or profiles.
 //! Source-skill text is not copied; treatments are native-authored contracts.
 
-pub const METHODOLOGY_VERSION: &str = "native-security-2";
+pub const METHODOLOGY_VERSION: &str = "native-security-3";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SkillTreatment {
@@ -103,7 +103,9 @@ pub const PHASES: &[(&str, &str)] = &[
 pub(super) fn for_role(role: Option<&str>) -> String {
     let selected: &[&str] = match role {
         Some("coordinator-mapping") => &["reconnaissance", "reporting"],
-        Some("independent-audit") => &["reconnaissance", "discovery", "attack-paths", "reporting"],
+        // Discovery proposes candidates; severity calibration and the attack
+        // path belong to the independent counterreview that judges them.
+        Some("independent-audit") => &["reconnaissance", "discovery", "reporting"],
         Some("independent-counterreview" | "independent-reconciliation") => {
             &["validation", "attack-paths", "reporting"]
         }
@@ -154,6 +156,9 @@ mod tests {
         assert!(!mapping.contains("counterargument review"));
         assert!(audit.contains("discovery"));
         assert!(!audit.contains("counterargument review"));
+        assert!(!audit.contains("attack paths and severity"));
+        assert!(validation.contains("attack paths and severity"));
+        assert!(audit.contains("including files deleted"));
         assert!(validation.contains("counterargument review"));
         assert!(!validation.contains("reconnaissance"));
         assert_eq!(validation, for_role(Some("independent-reconciliation")));

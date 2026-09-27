@@ -11,7 +11,9 @@ the supplied snapshot tools. Do not assume a configuration is deployed.
 
 Map the shipped product and its callers before searching for weaknesses. Identify
 authentication and authorization boundaries, filesystem and process boundaries,
-external inputs, persistence, and privileged AI tools where present. SECURITY.md
+external inputs, persistence, and privileged AI tools where present. Record the
+attacker capabilities and security-relevant failure modes the architecture
+actually supports, keeping hypotheses apart from established facts. SECURITY.md
 describes claimed policy; compare it with implementation. A missing policy is an
 unknown, not authorization to invent one. Distinguish source read from analysis.
 

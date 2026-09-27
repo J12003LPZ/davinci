@@ -2321,11 +2321,13 @@ fn drive_compiled_saved_graph(
                 .map(|f| f.path.clone())
                 .collect();
             let mut sec_controller =
-                crate::native_extensions::SecurityScanController::new(cwd.clone());
+                crate::native_extensions::SecurityScanController::for_workspace(cwd.clone());
+            let graph_diff = cumulative_delta.diff();
             let req = crate::native_extensions::SecurityVerifyRequest {
                 cwd: &cwd,
                 changed_files: &changed_files,
                 graph_run_id: &run_id,
+                diff: Some(graph_diff.as_str()),
             };
             let outcome = match sec_controller.verify_changed_surface(req) {
                 Ok(sec) => sec,
@@ -3269,11 +3271,15 @@ fn deliver_goal(
             }
             let run_id = execution.snapshot().run_id;
             let mut sec_controller =
-                crate::native_extensions::SecurityScanController::new(cwd.clone());
+                crate::native_extensions::SecurityScanController::for_workspace(cwd.clone());
+            // Judge only what this graph added; files named by the patch but
+            // absent from the delta are judged whole.
+            let graph_diff = cumulative_delta.diff();
             let req = crate::native_extensions::SecurityVerifyRequest {
                 cwd: &cwd,
                 changed_files: &changed_files,
                 graph_run_id: &run_id,
+                diff: (!cumulative_delta.files.is_empty()).then_some(graph_diff.as_str()),
             };
             let outcome = match sec_controller.verify_changed_surface(req) {
                 Ok(sec) => sec,
@@ -4918,7 +4924,7 @@ mod tests {
                 ArtifactKind::PatchReport => {
                     std::fs::write(
                         &auth_file_clone,
-                        "pub fn key() -> &'static str { \"sk-secret12345\" }\n",
+                        "pub fn key() -> &'static str { \"sk-proj-4f9Qa2Lk8Zt3Vb7Nc1Xd6Rm0Hs\" }\n",
                     )
                     .unwrap();
                     Artifact::PatchReport(Box::new(PatchReport {
@@ -5180,7 +5186,7 @@ mod tests {
                 ArtifactKind::PatchReport => {
                     std::fs::write(
                         &auth_file_clone,
-                        "pub fn key() -> &'static str { \"sk-secret12345\" }\n",
+                        "pub fn key() -> &'static str { \"sk-proj-4f9Qa2Lk8Zt3Vb7Nc1Xd6Rm0Hs\" }\n",
                     )
                     .unwrap();
                     Artifact::PatchReport(Box::new(PatchReport {

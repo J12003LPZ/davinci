@@ -26,6 +26,7 @@ mod conflict_capture;
 pub mod controller;
 mod deadline;
 mod feedback;
+mod gate;
 mod git;
 mod grouping;
 mod identity;
@@ -39,6 +40,7 @@ mod redaction;
 pub mod report;
 mod report_contract;
 mod report_envelope;
+mod retention;
 pub mod review;
 mod root_cause;
 pub mod skills;
@@ -50,6 +52,7 @@ pub mod types;
 pub mod usage;
 pub mod validation;
 mod validation_budget;
+mod watch;
 pub mod worker;
 mod worker_cache;
 
@@ -60,12 +63,17 @@ pub use incremental::{
 };
 
 pub use config::ScanConfig;
+pub use watch::status_line as watch_status_line;
 
 #[derive(Debug, Clone)]
 pub struct SecurityVerifyRequest<'a> {
     pub cwd: &'a Path,
     pub changed_files: &'a [String],
     pub graph_run_id: &'a str,
+    /// Unified diff of the change (the graph's mutation delta or `git diff`).
+    /// When present only the lines it adds are judged, so text that predates
+    /// the change never blocks it.
+    pub diff: Option<&'a str>,
 }
 
 const SECURITY_SCHEMA_VERSION: u32 = 1;
@@ -124,6 +132,16 @@ pub enum FindingSeverity {
 }
 
 impl FindingSeverity {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Critical => "critical",
+            Self::High => "high",
+            Self::Medium => "medium",
+            Self::Low => "low",
+            Self::Informational => "informational",
+        }
+    }
+
     fn rank(self) -> u8 {
         match self {
             Self::Critical => 5,
@@ -188,6 +206,12 @@ pub struct SecurityCoverage {
     pub cache_read_errors: usize,
     #[serde(default)]
     pub cache_write_errors: usize,
+    /// Changed paths that no longer exist; nothing remains to scan in them.
+    #[serde(default)]
+    pub files_deleted: usize,
+    /// `path: reason` for every requested path that was not scanned.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub skipped: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -449,6 +473,22 @@ pub struct SecurityScanController {
     review_agent_dir: Option<PathBuf>,
     incremental_cache: IncrementalSecurityCache,
     incremental_cache_repo: Option<String>,
+    /// Invalid `securityScan` settings: the graph gate fails closed on them.
+    config_error: Option<String>,
+    watch: watch::SecurityWatch,
+    /// `scanId/generation` whose completion notice was already shown.
+    announced: std::sync::Arc<std::sync::Mutex<Option<String>>>,
+}
+
+enum Interrupted {
+    Resumable {
+        id: String,
+        request: command::ScanCommand,
+    },
+    Stale {
+        id: String,
+        reason: String,
+    },
 }
 
 impl Default for SecurityScanController {
@@ -471,13 +511,55 @@ impl SecurityScanController {
             review_agent_dir: None,
             incremental_cache: IncrementalSecurityCache::new(),
             incremental_cache_repo: None,
+            config_error: None,
+            watch: watch::SecurityWatch::default(),
+            announced: Default::default(),
         }
     }
 
+    /// A controller whose file policy, failure policy, watch and storage come
+    /// from `securityScan` settings (trusted projects may only narrow them).
+    pub fn with_settings(cwd: PathBuf, agent_dir: PathBuf, trusted: bool) -> Self {
+        let mut controller = Self::new(cwd.clone());
+        controller.review_agent_dir = Some(agent_dir.clone());
+        match crate::settings::load_security_scan_config(&agent_dir, &cwd, trusted) {
+            Ok(config) => controller.apply_config(config),
+            Err(error) => controller.config_error = Some(error),
+        }
+        controller
+    }
+
+    /// The controller the graph security gate uses: the session's agent
+    /// directory, never the reviewed repository, holds its artifacts.
+    pub fn for_workspace(cwd: PathBuf) -> Self {
+        // Unit tests never touch the real agent directory.
+        let agent_dir = if cfg!(test) {
+            std::env::temp_dir().join("davinci-security-scan-tests")
+        } else {
+            davinci_session::default_agent_dir()
+        };
+        let settings = crate::settings::load_merged_settings(&agent_dir, &cwd);
+        let trusted = crate::settings::is_trusted(&settings, &cwd, None);
+        Self::with_settings(cwd, agent_dir, trusted)
+    }
+
+    fn apply_config(&mut self, config: ScanConfig) {
+        self.config = config.file_policy();
+        self.watch.configure(&config.watch);
+        self.review_config = config;
+        self.config_error = None;
+    }
+
+    /// Scan artifacts always live under an agent directory, outside the
+    /// reviewed repository.
     fn artifact_agent_dir(&self) -> PathBuf {
-        self.review_agent_dir
-            .clone()
-            .unwrap_or_else(|| self.cwd.join(".davinci"))
+        if let Some(dir) = &self.review_agent_dir {
+            return dir.clone();
+        }
+        if cfg!(test) {
+            return std::env::temp_dir().join("davinci-security-scan-tests");
+        }
+        davinci_session::default_agent_dir()
     }
 
     fn prepare_incremental_cache(&mut self, repo_id: &str) {
@@ -556,6 +638,8 @@ impl SecurityScanController {
                         files_rescanned: 0,
                         cache_read_errors: 0,
                         cache_write_errors: 0,
+                        files_deleted: 0,
+                        skipped: Vec::new(),
                     },
                 },
             );
@@ -616,6 +700,8 @@ impl SecurityScanController {
                 files_rescanned: 0,
                 cache_read_errors: 0,
                 cache_write_errors: 0,
+                files_deleted: 0,
+                skipped: Vec::new(),
             },
             candidates: Vec::new(),
             findings: Vec::new(),
@@ -849,7 +935,7 @@ impl SecurityScanController {
 
     pub fn configure_review(&mut self, runner: worker::SecurityWorkerRunner, config: ScanConfig) {
         self.runner = Some(runner);
-        self.review_config = config;
+        self.apply_config(config);
     }
 
     pub fn set_review_storage(&mut self, agent_dir: PathBuf) {
@@ -882,65 +968,380 @@ impl SecurityScanController {
         let _ = self.wait_for_review();
     }
 
-    pub fn command(&mut self, name: &str, args: &str) -> Result<Option<Value>, String> {
-        match name {
-            "security-scan" => {
-                let request = command::ScanCommand::parse_with_default(
-                    args,
-                    self.review_config.default_mode,
+    /// Start a new model review of `request` in this session.
+    fn start_review(&mut self, request: command::ScanCommand) -> Result<Value, String> {
+        self.review_config.admit(self.runner.is_some())?;
+        let runner = self.runner.clone().ok_or("security provider unavailable")?;
+        let root = self.cwd.clone();
+        let config = self.review_config.clone();
+        let report = self.report.clone();
+        let agent_dir = self.review_agent_dir.clone();
+        let run = self.review.start(move |run| {
+            let result = (|| {
+                let store = agent_dir
+                    .as_ref()
+                    .map(|dir| {
+                        store::Store::open(dir, &git::root(&root), &run.status().scan_id, true)
+                    })
+                    .transpose()?;
+                if let Some(store) = &store {
+                    run.set_generation(store.next_generation()?)?;
+                }
+                let mut value = review::execute(
+                    &root,
+                    &request,
+                    &config,
+                    &runner,
+                    &run,
+                    store.as_ref(),
+                    None,
                 )?;
-                self.review_config.admit(self.runner.is_some())?;
-                let runner = self.runner.clone().ok_or("security provider unavailable")?;
-                let root = self.cwd.clone();
-                let config = self.review_config.clone();
-                let report = self.report.clone();
-                let agent_dir = self.review_agent_dir.clone();
-                let run = self.review.start(move |run| {
-                    let result = (|| {
-                        let store = agent_dir
-                            .as_ref()
-                            .map(|dir| {
-                                store::Store::open(
-                                    dir,
-                                    &git::root(&root),
-                                    &run.status().scan_id,
-                                    true,
-                                )
-                            })
-                            .transpose()?;
-                        if let Some(store) = &store {
-                            run.set_generation(store.next_generation()?)?;
-                        }
-                        let mut value = review::execute(
-                            &root,
-                            &request,
-                            &config,
-                            &runner,
-                            &run,
-                            store.as_ref(),
-                            None,
-                        )?;
-                        report::sanitize(&mut value);
-                        run.begin_publication()?;
-                        if let Some(store) = &store {
-                            store.complete(&value, run.status().generation)?;
-                        }
-                        Ok::<_, String>(value)
-                    })();
-                    match result {
-                        Ok(mut value) => {
-                            report::sanitize(&mut value);
-                            let complete = value["coverageComplete"].as_bool().unwrap_or(false);
-                            *report.lock().unwrap_or_else(|e| e.into_inner()) = Some(value);
-                            run.finish(Ok(complete));
-                        }
-                        Err(error) => run.finish(Err(error)),
-                    }
-                })?;
-                Ok(Some(
-                    serde_json::to_value(run.status()).map_err(|e| e.to_string())?,
+                report::sanitize(&mut value);
+                run.begin_publication()?;
+                if let Some(store) = &store {
+                    store.complete(&value, run.status().generation)?;
+                }
+                Ok::<_, String>(value)
+            })();
+            match result {
+                Ok(mut value) => {
+                    report::sanitize(&mut value);
+                    let complete = value["coverageComplete"].as_bool().unwrap_or(false);
+                    *report.lock().unwrap_or_else(|e| e.into_inner()) = Some(value);
+                    run.finish(Ok(complete));
+                }
+                Err(error) => run.finish(Err(error)),
+            }
+        })?;
+        serde_json::to_value(run.status()).map_err(|e| e.to_string())
+    }
+
+    /// Continue an interrupted scan from its immutable checkpoint.
+    fn resume_review(&mut self, id: String) -> Result<Value, String> {
+        if uuid::Uuid::parse_str(&id)
+            .map_err(|_| "invalid scan identity")?
+            .to_string()
+            != id
+        {
+            return Err("invalid scan identity".into());
+        }
+        self.review_config.admit(self.runner.is_some())?;
+        let runner = self.runner.clone().ok_or("security provider unavailable")?;
+        let config = self.review_config.clone();
+        let agent_dir = self
+            .review_agent_dir
+            .clone()
+            .ok_or("security checkpoint storage unavailable")?;
+        let root = self.cwd.clone();
+        let report = self.report.clone();
+        let run = self.review.start_generation(id, 0, move |run| {
+            let result = (|| {
+                let store = store::Store::open(
+                    &agent_dir,
+                    &git::root(&root),
+                    &run.status().scan_id,
+                    false,
+                )?;
+                if store.has_sealed_report() {
+                    store.latest_report()?;
+                    return Err("sealed security reviews are immutable; start a new scan".into());
+                }
+                let checkpoint = store.load(config.checkpoint_byte_limit())?;
+                checkpoint.validate_resume(&config)?;
+                run.set_generation(store.next_generation()?)?;
+                let mut value = review::execute(
+                    &root,
+                    &checkpoint.request,
+                    &config,
+                    &runner,
+                    &run,
+                    Some(&store),
+                    Some(checkpoint.snapshot),
+                )?;
+                report::sanitize(&mut value);
+                run.begin_publication()?;
+                store.complete(&value, run.status().generation)?;
+                Ok::<_, String>(value)
+            })();
+            match result {
+                Ok(value) => {
+                    let complete = value["coverageComplete"].as_bool().unwrap_or(false);
+                    *report.lock().unwrap_or_else(|e| e.into_inner()) = Some(value);
+                    run.finish(Ok(complete));
+                }
+                Err(error) => run.finish(Err(error)),
+            }
+        })?;
+        serde_json::to_value(run.status()).map_err(|e| e.to_string())
+    }
+
+    /// The newest interrupted scan of this repository, and whether it can
+    /// continue under the current policy, methodology and wall-clock deadline.
+    fn probe_interrupted(&self) -> Option<Interrupted> {
+        let agent_dir = self.review_agent_dir.as_ref()?;
+        let root = git::root(&self.cwd);
+        for id in store::interrupted_scans(agent_dir, &root) {
+            // A scan another live session holds is not ours to resume.
+            let Ok(store) = store::Store::open(agent_dir, &root, &id, false) else {
+                continue;
+            };
+            let verdict = store
+                .load(self.review_config.checkpoint_byte_limit())
+                .and_then(|checkpoint| {
+                    checkpoint.validate_resume(&self.review_config)?;
+                    deadline::remaining(
+                        Some(&store),
+                        &id,
+                        review::wall_clock_limit(checkpoint.request.mode),
+                        true,
+                    )?;
+                    Ok(checkpoint.request)
+                });
+            return Some(match verdict {
+                Ok(request) => Interrupted::Resumable { id, request },
+                Err(reason) => Interrupted::Stale { id, reason },
+            });
+        }
+        None
+    }
+
+    fn discard_interrupted(&self, id: &str, reason: &str) {
+        if let Some(agent_dir) = &self.review_agent_dir {
+            if let Ok(store) = store::Store::open(agent_dir, &git::root(&self.cwd), id, false) {
+                let _ = store.discard(reason);
+            }
+        }
+    }
+
+    fn sweep_retention(&self) {
+        if let Some(agent_dir) = &self.review_agent_dir {
+            retention::sweep(
+                agent_dir,
+                self.review_config.retention_days,
+                SystemTime::now(),
+            );
+        }
+    }
+
+    /// Session start: continue this repository's interrupted scan, or say once
+    /// that it cannot continue. Returns the notice for the transcript.
+    pub fn resume_interrupted(&mut self) -> Option<String> {
+        if self
+            .review
+            .status()
+            .is_some_and(|run| !run.status.terminal())
+        {
+            return None;
+        }
+        match self.probe_interrupted()? {
+            Interrupted::Resumable { id, .. } => Some(match self.resume_review(id.clone()) {
+                Ok(_) => format!(
+                    "Resuming the interrupted security scan {id} in the background; /security-scan shows its progress."
+                ),
+                Err(error) => format!("The interrupted security scan {id} could not resume: {error}"),
+            }),
+            Interrupted::Stale { id, reason } => {
+                self.discard_interrupted(&id, &reason);
+                Some(format!(
+                    "The interrupted security scan {id} cannot be resumed ({reason}); the next /security-scan starts a new one."
                 ))
             }
+        }
+    }
+
+    /// Whether this repository has an interrupted scan left to consider.
+    pub fn has_interrupted_scan(&self) -> bool {
+        self.review_agent_dir.as_ref().is_some_and(|agent_dir| {
+            !store::interrupted_scans(agent_dir, &git::root(&self.cwd)).is_empty()
+        })
+    }
+
+    fn report_view(&self, finding: Option<&str>) -> Result<Value, String> {
+        if let Some(progress) = self.review.status() {
+            let report = self.report.lock().unwrap_or_else(|e| e.into_inner());
+            return report::select_finding(
+                report
+                    .as_ref()
+                    .filter(|value| {
+                        value["scanId"] == progress.scan_id
+                            && value["generation"] == progress.generation
+                    })
+                    .cloned()
+                    .or_else(|| self.review.partial_report())
+                    .unwrap_or(serde_json::to_value(progress).map_err(|e| e.to_string())?),
+                finding,
+            );
+        }
+        // Otherwise the newest stored report of this repository that holds it.
+        if let Some(agent_dir) = &self.review_agent_dir {
+            let root = git::root(&self.cwd);
+            for id in store::scan_directories(agent_dir, &root, false)
+                .into_iter()
+                .take(10)
+            {
+                let Ok(store) = store::Store::open(agent_dir, &root, &id, false) else {
+                    continue;
+                };
+                let Ok(report) = store.available_report() else {
+                    continue;
+                };
+                if let Ok(view) = report::select_finding(report, finding) {
+                    return Ok(view);
+                }
+            }
+        }
+        Err(match finding {
+            Some(_) => "that finding is not in a recent security report of this repository".into(),
+            None => "no security report is available yet; run /security-scan".into(),
+        })
+    }
+
+    fn scan_command(&mut self, args: &str) -> Result<Value, String> {
+        let invocation = command::Invocation::parse(args, self.review_config.default_mode)?;
+        if invocation.report {
+            return self.report_view(invocation.finding.as_deref());
+        }
+        if let Some(progress) = self
+            .review
+            .status()
+            .filter(|progress| !progress.status.terminal())
+        {
+            if invocation.selects || invocation.new {
+                return Err(format!(
+                    "security scan {} is already running; /security-scan shows its progress",
+                    progress.scan_id
+                ));
+            }
+            let mut value = serde_json::to_value(progress).map_err(|e| e.to_string())?;
+            value["notice"] = json!("A security scan is already running; showing its progress.");
+            return Ok(value);
+        }
+        self.sweep_retention();
+        let mut notice = None;
+        match self.probe_interrupted() {
+            Some(Interrupted::Resumable { id, request }) if !invocation.new => {
+                let mut matching = request.clone();
+                matching.format = invocation.scan.format;
+                if !invocation.selects || matching == invocation.scan {
+                    self.review_config.admit(self.runner.is_some())?;
+                    let mut value = self.resume_review(id.clone())?;
+                    value["notice"] = json!(format!(
+                        "Resumed the interrupted security scan {id}; /security-scan --new starts over instead."
+                    ));
+                    return Ok(value);
+                }
+                self.discard_interrupted(&id, "a different scan was requested");
+                notice = Some(format!(
+                    "Discarded the interrupted security scan {id}: a different scan was requested."
+                ));
+            }
+            Some(Interrupted::Resumable { id, .. }) => {
+                self.discard_interrupted(&id, "--new");
+                notice = Some(format!(
+                    "Discarded the interrupted security scan {id} (--new)."
+                ));
+            }
+            Some(Interrupted::Stale { id, reason }) => {
+                self.discard_interrupted(&id, &reason);
+                notice = Some(format!(
+                    "The interrupted security scan {id} cannot be resumed ({reason}); starting a new scan."
+                ));
+            }
+            None => {}
+        }
+        let mut value = self.start_review(invocation.scan)?;
+        if let Some(notice) = notice {
+            value["notice"] = json!(notice);
+        }
+        Ok(value)
+    }
+
+    /// Transcript notices: a finished explicit scan (once) and watch findings.
+    pub fn drain_notices(&self) -> Vec<String> {
+        let mut notices = Vec::new();
+        if let Some(progress) = self
+            .review
+            .status()
+            .filter(|progress| progress.status.terminal())
+        {
+            let key = format!("{}/{}", progress.scan_id, progress.generation);
+            let mut announced = self.announced.lock().unwrap_or_else(|e| e.into_inner());
+            if announced.as_deref() != Some(key.as_str()) {
+                *announced = Some(key);
+                notices.push(self.completion_notice(&progress));
+            }
+        }
+        self.watch.poll(&self.review_config);
+        notices.extend(self.watch.take_notices());
+        notices
+    }
+
+    fn completion_notice(&self, progress: &types::RunProgress) -> String {
+        let report = self.report.lock().unwrap_or_else(|e| e.into_inner());
+        let report = report
+            .as_ref()
+            .filter(|value| value["scanId"] == progress.scan_id);
+        let status = serde_json::to_value(progress.status)
+            .ok()
+            .and_then(|value| value.as_str().map(str::to_string))
+            .unwrap_or_default();
+        let Some(report) = report else {
+            let reason = progress
+                .limitations
+                .last()
+                .map(|reason| format!(": {reason}"))
+                .unwrap_or_default();
+            return format!(
+                "Security scan {} {status}{reason}. It stays resumable while its deadline allows; /security-scan continues it.",
+                progress.scan_id
+            );
+        };
+        let findings = report["findings"].as_array().map_or(0, Vec::len);
+        let blocking = watch::policy_findings(report, &self.review_config).len();
+        format!(
+            "Security scan {} {status}: {findings} finding(s), {blocking} at or above the failure policy; coverage {}. /security-scan --report shows the report.",
+            progress.scan_id,
+            if report["coverageComplete"] == true { "complete" } else { "partial" }
+        )
+    }
+
+    /// Context for the next turn: watch findings, bounded and untrusted.
+    pub fn take_watch_injection(&self) -> Option<String> {
+        self.watch.poll(&self.review_config);
+        self.watch.take_injection()
+    }
+
+    /// After a settled interactive/RPC turn: start a watch review if due.
+    pub fn watch_settled_turn(&self) -> Result<bool, String> {
+        let runner = self.runner.clone().ok_or("security provider unavailable")?;
+        self.review_config.admit(true)?;
+        let explicit = self
+            .review
+            .status()
+            .is_some_and(|run| !run.status.terminal());
+        self.watch
+            .dispatch(&self.cwd, &runner, &self.review_config, explicit)
+    }
+
+    pub fn watch_due(&self) -> bool {
+        self.watch.due(now_ms())
+    }
+
+    pub fn watch_status(&self) -> Value {
+        self.watch.status()
+    }
+
+    /// Session end: the explicit scan stops (its checkpoint stays resumable)
+    /// and the watch stops.
+    pub fn shutdown(&self) {
+        self.abort_review();
+        self.watch.stop();
+    }
+
+    pub fn command(&mut self, name: &str, args: &str) -> Result<Option<Value>, String> {
+        match name {
+            "security-scan" => self.scan_command(args).map(Some),
+            // Internal: the checkpoint resume the session-level flow uses.
             "sec-resume" => {
                 let id = if args.trim().is_empty() {
                     self.review
@@ -950,74 +1351,16 @@ impl SecurityScanController {
                 } else {
                     args.trim().to_string()
                 };
-                if uuid::Uuid::parse_str(&id)
-                    .map_err(|_| "invalid scan identity")?
-                    .to_string()
-                    != id
-                {
-                    return Err("invalid scan identity".into());
-                }
-                self.review_config.admit(self.runner.is_some())?;
-                let runner = self.runner.clone().ok_or("security provider unavailable")?;
-                let config = self.review_config.clone();
-                let agent_dir = self
-                    .review_agent_dir
-                    .clone()
-                    .ok_or("security checkpoint storage unavailable")?;
-                let root = self.cwd.clone();
-                let report = self.report.clone();
-                let run = self.review.start_generation(id, 0, move |run| {
-                    let result = (|| {
-                        let store = store::Store::open(
-                            &agent_dir,
-                            &git::root(&root),
-                            &run.status().scan_id,
-                            false,
-                        )?;
-                        if store.has_sealed_report() {
-                            store.latest_report()?;
-                            return Err(
-                                "sealed security reviews are immutable; start a new scan".into()
-                            );
-                        }
-                        let checkpoint = store.load(config.checkpoint_byte_limit())?;
-                        checkpoint.validate_resume(&config)?;
-                        run.set_generation(store.next_generation()?)?;
-                        let mut value = review::execute(
-                            &root,
-                            &checkpoint.request,
-                            &config,
-                            &runner,
-                            &run,
-                            Some(&store),
-                            Some(checkpoint.snapshot),
-                        )?;
-                        report::sanitize(&mut value);
-                        run.begin_publication()?;
-                        store.complete(&value, run.status().generation)?;
-                        Ok::<_, String>(value)
-                    })();
-                    match result {
-                        Ok(value) => {
-                            let complete = value["coverageComplete"].as_bool().unwrap_or(false);
-                            *report.lock().unwrap_or_else(|e| e.into_inner()) = Some(value);
-                            run.finish(Ok(complete));
-                        }
-                        Err(error) => run.finish(Err(error)),
-                    }
-                })?;
-                Ok(Some(
-                    serde_json::to_value(run.status()).map_err(|e| e.to_string())?,
-                ))
+                self.resume_review(id).map(Some)
             }
             "sec-status" if self.review.status().is_some() => {
                 let progress = self.review.status().unwrap();
                 if !args.trim().is_empty() && args.trim() != progress.scan_id {
                     return Err("scan identity does not match this session".into());
                 }
-                Ok(Some(
-                    serde_json::to_value(progress).map_err(|err| err.to_string())?,
-                ))
+                let mut value = serde_json::to_value(progress).map_err(|err| err.to_string())?;
+                value["watch"] = self.watch.status();
+                Ok(Some(value))
             }
             "sec-abort" if self.review.status().is_some() => {
                 let id = (!args.trim().is_empty()).then_some(args.trim());
@@ -1038,19 +1381,7 @@ impl SecurityScanController {
                 {
                     return Err("scan identity does not match this session".into());
                 }
-                let report = self.report.lock().unwrap_or_else(|e| e.into_inner());
-                Ok(Some(report::select_finding(
-                    report
-                        .as_ref()
-                        .filter(|value| {
-                            value["scanId"] == progress.scan_id
-                                && value["generation"] == progress.generation
-                        })
-                        .cloned()
-                        .or_else(|| self.review.partial_report())
-                        .unwrap_or(serde_json::to_value(progress).map_err(|e| e.to_string())?),
-                    request.finding_id.as_deref(),
-                )?))
+                self.report_view(request.finding_id.as_deref()).map(Some)
             }
             "sec-report" if !args.trim().is_empty() => {
                 let request = command::ReportCommand::parse(args)?;
@@ -1089,6 +1420,9 @@ impl SecurityScanController {
         &mut self,
         request: SecurityVerifyRequest<'_>,
     ) -> Result<SecurityVerification, String> {
+        if let Some(error) = &self.config_error {
+            return Err(format!("security gate settings are invalid: {error}"));
+        }
         self.cwd = request.cwd.to_path_buf();
         let repo_id = repo_id(&self.cwd);
         self.prepare_incremental_cache(&repo_id);
@@ -1105,33 +1439,66 @@ impl SecurityScanController {
         } else {
             format!("{base_id}-{sanitized_run}")
         };
+        let changes = request.diff.map(gate::parse_diff);
 
+        let mut requested = request
+            .changed_files
+            .iter()
+            .map(|file| file.replace('\\', "/"))
+            .collect::<Vec<_>>();
+        requested.sort();
+        requested.dedup();
         let mut files_to_scan = Vec::new();
-        for file in request.changed_files {
-            let rel = Path::new(file);
-            let Ok(norm) = normalize_relative_path(rel) else {
-                continue;
+        let mut deleted = 0usize;
+        // Text the gate could not read: coverage is incomplete, never a pass.
+        let mut unscanned = Vec::new();
+        // Inspected by name only (binary or excluded by policy); visible in the verdict.
+        let mut uninspected = Vec::new();
+        for file in &requested {
+            let norm = match normalize_relative_path(Path::new(file)) {
+                Ok(norm) => norm,
+                Err(reason) => {
+                    unscanned.push(format!("{file}: {reason}"));
+                    continue;
+                }
             };
-            if is_ignored(&norm, &self.config) {
+            let key = norm.to_string_lossy().replace('\\', "/");
+            let full = request.cwd.join(&norm);
+            let marked_deleted = changes
+                .as_ref()
+                .and_then(|changes| changes.get(&key))
+                .is_some_and(|change| change.deleted);
+            if marked_deleted || fs::symlink_metadata(&full).is_err() {
+                deleted += 1;
                 continue;
             }
-            let full = request.cwd.join(&norm);
-            if full.is_file() {
-                files_to_scan.push(norm);
+            if is_ignored(&norm, &self.config) {
+                uninspected.push(format!("{key}: excluded by scan policy"));
+                continue;
+            }
+            match fs::symlink_metadata(&full) {
+                Ok(meta) if meta.is_file() => {}
+                _ => {
+                    unscanned.push(format!("{key}: not a regular file"));
+                    continue;
+                }
+            }
+            match read_scan_file(&self.cwd, &norm, &self.config) {
+                Ok(_) => files_to_scan.push(norm),
+                Err(ToolError::Failed(reason)) if reason == "binary file" => {
+                    uninspected.push(format!("{key}: binary"));
+                }
+                Err(ToolError::Failed(reason)) if reason == "file exceeds scan limit" => {
+                    unscanned.push(format!(
+                        "{key}: exceeds the {} byte scan limit (securityScan.maxFileBytes)",
+                        self.config.max_file_bytes
+                    ));
+                }
+                Err(error) => unscanned.push(format!("{key}: unreadable ({error})")),
             }
         }
-        files_to_scan.sort();
-        files_to_scan.dedup();
 
-        let scope_digest = sha256_hex(
-            files_to_scan
-                .iter()
-                .map(|path| path.to_string_lossy().into_owned())
-                .collect::<Vec<_>>()
-                .join("\n")
-                .as_bytes(),
-        );
-
+        let scope_digest = sha256_hex(requested.join("\n").as_bytes());
         let mut scan = SecurityScan {
             manifest: SecurityScanManifest {
                 scan_id: scan_id.clone(),
@@ -1158,6 +1525,8 @@ impl SecurityScanController {
                 files_rescanned: 0,
                 cache_read_errors: 0,
                 cache_write_errors: 0,
+                files_deleted: 0,
+                skipped: Vec::new(),
             },
             candidates: Vec::new(),
             findings: Vec::new(),
@@ -1165,6 +1534,23 @@ impl SecurityScanController {
 
         self.scan_files_incrementally(&files_to_scan, &mut scan);
         self.apply_incremental_telemetry(&mut scan);
+        // Only lines the change added are judged. A file the diff does not
+        // describe line by line (binary, oversized, absent) is judged whole.
+        if let Some(changes) = &changes {
+            let judged = |file: &str, line: usize| {
+                changes
+                    .get(file)
+                    .and_then(|change| change.added.as_ref())
+                    .is_none_or(|added| added.contains(&line))
+            };
+            scan.findings
+                .retain(|finding| judged(&finding.file, finding.line));
+            scan.candidates
+                .retain(|candidate| judged(&candidate.file, candidate.line));
+        }
+        scan.coverage.files_deleted = deleted;
+        scan.coverage.files_skipped += unscanned.len() + uninspected.len();
+        scan.coverage.skipped = unscanned.iter().chain(&uninspected).cloned().collect();
         scan.coverage.candidate_count = scan.candidates.len();
         scan.coverage.finding_count = scan.findings.len();
 
@@ -1190,17 +1576,72 @@ impl SecurityScanController {
         self.artifact = Some(artifact);
         self.current = Some(scan.clone());
 
-        let blockers = scan
+        let threshold = config::severity_rank(&self.review_config.fail_on.minimum_severity);
+        let (blocking, advisory): (Vec<_>, Vec<_>) = scan
             .findings
             .iter()
             .filter(|finding| !finding.false_positive)
-            .count();
-
-        if blockers > 0 {
-            Ok(SecurityVerification::Failed { scan_id, blockers })
-        } else {
-            Ok(SecurityVerification::Passed { scan_id })
+            .partition(|finding| config::severity_rank(finding.severity.as_str()) >= threshold);
+        let row = |finding: &&SecurityFinding| {
+            format!(
+                "{}:{} {} ({}) - {}",
+                finding.file,
+                finding.line,
+                finding.rule_id,
+                finding.severity.as_str(),
+                finding.message
+            )
+        };
+        if !blocking.is_empty() {
+            let mut details: Vec<String> = blocking.iter().map(row).collect();
+            details.extend(
+                unscanned
+                    .iter()
+                    .map(|reason| format!("not scanned: {reason}")),
+            );
+            return Ok(SecurityVerification::Failed {
+                scan_id,
+                blockers: blocking.len(),
+                details,
+            });
         }
+        if !unscanned.is_empty() {
+            return Ok(SecurityVerification::Unavailable {
+                reason: format!(
+                    "incomplete security coverage (scan {scan_id}): {} changed file(s) could not be scanned: {}",
+                    unscanned.len(),
+                    unscanned.join("; ")
+                ),
+            });
+        }
+        if requested.is_empty() {
+            return Ok(SecurityVerification::Unavailable {
+                reason: "no changed files were supplied to the security gate".into(),
+            });
+        }
+        let mut note = Vec::new();
+        if deleted > 0 {
+            note.push(format!("{deleted} deleted file(s) had nothing to scan"));
+        }
+        if !uninspected.is_empty() {
+            note.push(format!("not inspected: {}", uninspected.join("; ")));
+        }
+        if !advisory.is_empty() {
+            note.push(format!(
+                "below the {} failure threshold: {}",
+                self.review_config.fail_on.minimum_severity,
+                advisory
+                    .iter()
+                    .take(10)
+                    .map(row)
+                    .collect::<Vec<_>>()
+                    .join("; ")
+            ));
+        }
+        Ok(SecurityVerification::Passed {
+            scan_id,
+            note: (!note.is_empty()).then(|| note.join("; ")),
+        })
     }
 }
 
@@ -1290,70 +1731,38 @@ fn scan_file_bytes(
         .coverage
         .bytes_scanned
         .saturating_add(bytes.len() as u64);
-    for (rule_id, severity, needle, message) in [
-        (
-            "secret.private-key",
-            FindingSeverity::Critical,
-            "BEGIN PRIVATE KEY",
-            "Private key material appears in repository content",
-        ),
-        (
-            "secret.api-key",
-            FindingSeverity::High,
-            "sk-",
-            "API-key-shaped secret appears in repository content",
-        ),
-        (
-            "command.eval",
-            FindingSeverity::Medium,
-            "eval(",
-            "Dynamic evaluation can execute untrusted input",
-        ),
-        (
-            "command.shell",
-            FindingSeverity::Medium,
-            "shell=True",
-            "Shell execution with interpolation requires validation",
-        ),
-    ] {
-        for (index, line) in text.lines().enumerate() {
-            let line_no = index + 1;
-            if !line.contains(needle) {
-                continue;
-            }
-            let file = relative.to_string_lossy().replace('\\', "/");
-            let evidence = redact_evidence(line);
-            let id = format!(
-                "{}-{}",
-                rule_id,
-                &sha256_hex(format!("{file}:{line_no}:{evidence}").as_bytes())[..12]
-            );
-            if scan.findings.iter().any(|finding| finding.id == id) {
-                continue;
-            }
-            scan.candidates.push(SecurityCandidate {
-                id: id.clone(),
-                rule_id: rule_id.into(),
-                file: file.clone(),
-                line: line_no,
-                reason: message.into(),
-                validated: false,
-                disposition: None,
-                validation_reason: None,
-                attack_path: None,
-            });
-            scan.findings.push(SecurityFinding {
-                id,
-                rule_id: rule_id.into(),
-                severity,
-                file,
-                line: line_no,
-                message: message.into(),
-                evidence,
-                validated: false,
-                false_positive: false,
-            });
+    let file = relative.to_string_lossy().replace('\\', "/");
+    for hit in gate::detect(&text) {
+        let id = format!(
+            "{}-{}",
+            hit.rule_id,
+            &sha256_hex(format!("{file}:{}:{}", hit.line, hit.evidence).as_bytes())[..12]
+        );
+        if scan.findings.iter().any(|finding| finding.id == id) {
+            continue;
         }
+        scan.candidates.push(SecurityCandidate {
+            id: id.clone(),
+            rule_id: hit.rule_id.into(),
+            file: file.clone(),
+            line: hit.line,
+            reason: hit.message.into(),
+            validated: false,
+            disposition: None,
+            validation_reason: None,
+            attack_path: None,
+        });
+        scan.findings.push(SecurityFinding {
+            id,
+            rule_id: hit.rule_id.into(),
+            severity: hit.severity,
+            file: file.clone(),
+            line: hit.line,
+            message: hit.message.into(),
+            evidence: hit.evidence,
+            validated: false,
+            false_positive: false,
+        });
     }
     Ok(())
 }
@@ -1610,6 +2019,12 @@ mod tests {
     use super::*;
     use tempfile::tempdir;
 
+    fn test_agent(controller: &mut SecurityScanController) -> tempfile::TempDir {
+        let agent = tempdir().unwrap();
+        controller.set_review_storage(agent.path().to_path_buf());
+        agent
+    }
+
     #[test]
     fn scan_id_includes_a_nonce_for_same_millisecond_starts() {
         let first = format_scan_id("repo-abc", 42, 1);
@@ -1632,12 +2047,17 @@ mod tests {
     #[test]
     fn local_scan_finds_redacted_secret_without_network() {
         let dir = tempdir().unwrap();
-        fs::write(dir.path().join("sample.txt"), "token=sk-super-secret\n").unwrap();
+        fs::write(
+            dir.path().join("sample.txt"),
+            "token=sk-proj-4f9Qa2Lk8Zt3Vb7Nc1Xd6Rm0Hs\n",
+        )
+        .unwrap();
         let mut controller = SecurityScanController::new(dir.path().to_path_buf());
+        let _agent = test_agent(&mut controller);
         let scan = controller.start(None).unwrap();
         assert!(!scan.manifest.allow_network);
         assert_eq!(scan.findings.len(), 1);
-        assert!(!scan.findings[0].evidence.contains("sk-super-secret"));
+        assert!(!scan.findings[0].evidence.contains("4f9Qa2Lk8Zt3"));
         assert!(controller
             .complete()
             .unwrap()
@@ -1651,6 +2071,7 @@ mod tests {
         let dir = tempdir().unwrap();
         fs::write(dir.path().join("sample.txt"), "no secrets here\n").unwrap();
         let mut controller = SecurityScanController::new(dir.path().to_path_buf());
+        let _agent = test_agent(&mut controller);
         let scan = controller.start(None).unwrap();
         let root = controller.artifact.as_ref().unwrap().root().to_path_buf();
 
@@ -1675,6 +2096,7 @@ mod tests {
         let dir = tempdir().unwrap();
         fs::write(dir.path().join("sample.txt"), "no secrets here\n").unwrap();
         let mut controller = SecurityScanController::new(dir.path().to_path_buf());
+        let _agent = test_agent(&mut controller);
         controller.start(None).unwrap();
         let args = json!({
             "file": "sample.txt",
@@ -1709,6 +2131,7 @@ mod tests {
         let dir = tempdir().unwrap();
         fs::write(dir.path().join("sample.txt"), "no secrets here\n").unwrap();
         let mut controller = SecurityScanController::new(dir.path().to_path_buf());
+        let _agent = test_agent(&mut controller);
         controller.start(None).unwrap();
         let completed = controller.complete().unwrap();
         assert!(completed.manifest.sealed_at.is_some());
@@ -1739,6 +2162,7 @@ mod tests {
         let dir = tempdir().unwrap();
         fs::write(dir.path().join("sample.txt"), "no secrets here\n").unwrap();
         let mut controller = SecurityScanController::new(dir.path().to_path_buf());
+        let _agent = test_agent(&mut controller);
         controller.start(None).unwrap();
         controller
             .execute_tool(
@@ -1767,8 +2191,13 @@ mod tests {
     #[test]
     fn deep_scan_is_an_explicit_stateful_operation() {
         let dir = tempdir().unwrap();
-        fs::write(dir.path().join("sample.txt"), "token=sk-secret\n").unwrap();
+        fs::write(
+            dir.path().join("sample.txt"),
+            "token=sk-proj-4f9Qa2Lk8Zt3Vb7Nc1Xd6Rm0Hs\n",
+        )
+        .unwrap();
         let mut controller = SecurityScanController::new(dir.path().to_path_buf());
+        let _agent = test_agent(&mut controller);
         controller.start(Some("sample.txt")).unwrap();
         let before = controller.current().unwrap().findings.len();
         fs::write(dir.path().join("new.txt"), "eval(input)\n").unwrap();
@@ -1823,6 +2252,8 @@ mod tests {
                 files_rescanned: 0,
                 cache_read_errors: 0,
                 cache_write_errors: 0,
+                files_deleted: 0,
+                skipped: Vec::new(),
             },
             candidates: vec![],
             findings: vec![SecurityFinding {
@@ -1851,20 +2282,24 @@ mod tests {
         fs::create_dir_all(auth_file.parent().unwrap()).unwrap();
         fs::write(
             &auth_file,
-            "pub fn key() -> &'static str { \"sk-secret12345\" }\n",
+            "pub fn key() -> &'static str { \"sk-proj-4f9Qa2Lk8Zt3Vb7Nc1Xd6Rm0Hs\" }\n",
         )
         .unwrap();
 
         let mut controller = SecurityScanController::new(tmp.path().to_path_buf());
+        let _agent = test_agent(&mut controller);
         let request = SecurityVerifyRequest {
             cwd: tmp.path(),
             changed_files: &["src/auth.rs".to_string()],
             graph_run_id: "run-test-1",
+            diff: None,
         };
 
         let result = controller.verify_changed_surface(request).unwrap();
         match result {
-            SecurityVerification::Failed { scan_id, blockers } => {
+            SecurityVerification::Failed {
+                scan_id, blockers, ..
+            } => {
                 assert!(scan_id.starts_with("scan-"));
                 assert!(blockers > 0);
             }
@@ -1880,15 +2315,17 @@ mod tests {
         fs::write(&clean_file, "pub fn render() { println!(\"Hello\"); }\n").unwrap();
 
         let mut controller = SecurityScanController::new(tmp.path().to_path_buf());
+        let _agent = test_agent(&mut controller);
         let request = SecurityVerifyRequest {
             cwd: tmp.path(),
             changed_files: &["src/ui.rs".to_string()],
             graph_run_id: "run-test-2",
+            diff: None,
         };
 
         let result = controller.verify_changed_surface(request).unwrap();
         match result {
-            SecurityVerification::Passed { scan_id } => {
+            SecurityVerification::Passed { scan_id, .. } => {
                 assert!(scan_id.starts_with("scan-"));
             }
             other => panic!("expected Passed, got {other:?}"),
@@ -1902,12 +2339,14 @@ mod tests {
         fs::write(tmp.path().join("two.rs"), "pub fn two() {}\n").unwrap();
         let files = vec!["one.rs".to_string(), "two.rs".to_string()];
         let mut controller = SecurityScanController::new(tmp.path().to_path_buf());
+        let _agent = test_agent(&mut controller);
 
         controller
             .verify_changed_surface(SecurityVerifyRequest {
                 cwd: tmp.path(),
                 changed_files: &files,
                 graph_run_id: "cold",
+                diff: None,
             })
             .unwrap();
         let first = controller.current().unwrap();
@@ -1918,6 +2357,7 @@ mod tests {
                 cwd: tmp.path(),
                 changed_files: &files,
                 graph_run_id: "warm",
+                diff: None,
             })
             .unwrap();
         let second = controller.current().unwrap();
@@ -1941,20 +2381,24 @@ mod tests {
         let files = vec!["one.rs".to_string()];
 
         let mut first_controller = SecurityScanController::new(tmp.path().to_path_buf());
+        let _first_agent = test_agent(&mut first_controller);
         first_controller
             .verify_changed_surface(SecurityVerifyRequest {
                 cwd: tmp.path(),
                 changed_files: &files,
                 graph_run_id: "first-process",
+                diff: None,
             })
             .unwrap();
 
         let mut second_controller = SecurityScanController::new(tmp.path().to_path_buf());
+        let _second_agent = test_agent(&mut second_controller);
         second_controller
             .verify_changed_surface(SecurityVerifyRequest {
                 cwd: tmp.path(),
                 changed_files: &files,
                 graph_run_id: "second-process",
+                diff: None,
             })
             .unwrap();
         let second = second_controller.current().unwrap();
@@ -1971,11 +2415,13 @@ mod tests {
         fs::write(tmp.path().join("two.rs"), "pub fn two() {}\n").unwrap();
         let files = vec!["one.rs".to_string(), "two.rs".to_string()];
         let mut controller = SecurityScanController::new(tmp.path().to_path_buf());
+        let _agent = test_agent(&mut controller);
         controller
             .verify_changed_surface(SecurityVerifyRequest {
                 cwd: tmp.path(),
                 changed_files: &files,
                 graph_run_id: "before-change",
+                diff: None,
             })
             .unwrap();
 
@@ -1985,6 +2431,7 @@ mod tests {
                 cwd: tmp.path(),
                 changed_files: &files,
                 graph_run_id: "after-change",
+                diff: None,
             })
             .unwrap();
         let scan = controller.current().unwrap();
@@ -2007,15 +2454,17 @@ mod tests {
         fs::create_dir_all(auth_file.parent().unwrap()).unwrap();
         fs::write(
             &auth_file,
-            "pub fn key() -> &'static str { \"sk-secret12345\" }\n",
+            "pub fn key() -> &'static str { \"sk-proj-4f9Qa2Lk8Zt3Vb7Nc1Xd6Rm0Hs\" }\n",
         )
         .unwrap();
         let mut controller = SecurityScanController::new(tmp.path().to_path_buf());
+        let _agent = test_agent(&mut controller);
         let result = controller
             .verify_changed_surface(SecurityVerifyRequest {
                 cwd: tmp.path(),
                 changed_files: &["src/auth.rs".to_string()],
                 graph_run_id: "run-gate",
+                diff: None,
             })
             .unwrap();
         match &result {
@@ -2044,5 +2493,160 @@ mod tests {
             "incomplete AI scan must not clear a mandatory security gate"
         );
         assert!(!bundle.approval_eligible(SecurityPolicyMode::Risk));
+    }
+
+    fn gate(
+        controller: &mut SecurityScanController,
+        root: &Path,
+        files: &[&str],
+        diff: Option<&str>,
+    ) -> SecurityVerification {
+        let files: Vec<String> = files.iter().map(|file| file.to_string()).collect();
+        controller
+            .verify_changed_surface(SecurityVerifyRequest {
+                cwd: root,
+                changed_files: &files,
+                graph_run_id: "gate",
+                diff,
+            })
+            .unwrap()
+    }
+
+    const KEY: &str = "sk-proj-4f9Qa2Lk8Zt3Vb7Nc1Xd6Rm0Hs";
+
+    #[test]
+    fn security_gate_judges_only_added_lines_and_names_each_blocker() {
+        let tmp = tempdir().unwrap();
+        fs::create_dir_all(tmp.path().join("src")).unwrap();
+        // A pre-existing credential on line 1; the change adds line 2 only.
+        fs::write(
+            tmp.path().join("src/config.rs"),
+            format!("const OLD: &str = \"{KEY}\";\nfn task_retrieval() {{}}\n"),
+        )
+        .unwrap();
+        let mut controller = SecurityScanController::new(tmp.path().to_path_buf());
+        let _agent = test_agent(&mut controller);
+        let diff = "diff --git a/src/config.rs b/src/config.rs\n--- a/src/config.rs\n+++ b/src/config.rs\n@@ -1,1 +1,2 @@\n const OLD\n+fn task_retrieval() {}\n";
+        assert!(matches!(
+            gate(&mut controller, tmp.path(), &["src/config.rs"], Some(diff)),
+            SecurityVerification::Passed { note: None, .. }
+        ));
+        // Now the change adds the credential itself.
+        let diff = "diff --git a/src/config.rs b/src/config.rs\nnew file mode 100644\n--- /dev/null\n+++ b/src/config.rs\n@@ -0,0 +1,2 @@\n+const OLD\n+fn task_retrieval() {}\n";
+        match gate(&mut controller, tmp.path(), &["src/config.rs"], Some(diff)) {
+            SecurityVerification::Failed {
+                blockers, details, ..
+            } => {
+                assert_eq!(blockers, 1);
+                assert!(
+                    details[0].starts_with("src/config.rs:1 secret.api-key (high)"),
+                    "{details:?}"
+                );
+                assert!(!details[0].contains("4f9Qa2Lk8Zt3"));
+            }
+            other => panic!("expected Failed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn security_gate_respects_the_failure_severity_threshold() {
+        let tmp = tempdir().unwrap();
+        fs::write(tmp.path().join("run.py"), "value = eval(user_input)\n").unwrap();
+        let mut controller = SecurityScanController::new(tmp.path().to_path_buf());
+        let _agent = test_agent(&mut controller);
+        match gate(&mut controller, tmp.path(), &["run.py"], None) {
+            SecurityVerification::Passed {
+                note: Some(note), ..
+            } => assert!(note.contains("command.eval"), "{note}"),
+            other => panic!("medium must not block at the high default: {other:?}"),
+        }
+        controller.review_config.fail_on.minimum_severity = "medium".into();
+        assert!(matches!(
+            gate(&mut controller, tmp.path(), &["run.py"], None),
+            SecurityVerification::Failed { blockers: 1, .. }
+        ));
+    }
+
+    #[test]
+    fn security_gate_makes_incomplete_coverage_visible() {
+        let tmp = tempdir().unwrap();
+        fs::write(tmp.path().join("big.rs"), "x".repeat(64)).unwrap();
+        fs::write(tmp.path().join("logo.png"), [0u8, 1, 2, 3]).unwrap();
+        let mut controller = SecurityScanController::new(tmp.path().to_path_buf());
+        let _agent = test_agent(&mut controller);
+        controller.config.max_file_bytes = 16;
+        match gate(&mut controller, tmp.path(), &["big.rs"], None) {
+            SecurityVerification::Unavailable { reason } => {
+                assert!(reason.contains("big.rs"), "{reason}");
+                assert!(reason.contains("securityScan.maxFileBytes"), "{reason}");
+            }
+            other => panic!("an unscanned text file must not pass: {other:?}"),
+        }
+        match gate(&mut controller, tmp.path(), &["gone.rs", "logo.png"], None) {
+            SecurityVerification::Passed {
+                note: Some(note), ..
+            } => {
+                assert!(note.contains("1 deleted"), "{note}");
+                assert!(note.contains("logo.png: binary"), "{note}");
+            }
+            other => panic!("deletions and binaries are counted, not hidden: {other:?}"),
+        }
+        assert_eq!(controller.current().unwrap().coverage.files_deleted, 1);
+        assert!(matches!(
+            gate(&mut controller, tmp.path(), &[], None),
+            SecurityVerification::Unavailable { .. }
+        ));
+    }
+
+    #[test]
+    fn security_gate_artifacts_never_land_in_the_repository() {
+        let tmp = tempdir().unwrap();
+        fs::write(tmp.path().join("a.rs"), "fn a() {}\n").unwrap();
+        let mut controller = SecurityScanController::new(tmp.path().to_path_buf());
+        let agent = test_agent(&mut controller);
+        gate(&mut controller, tmp.path(), &["a.rs"], None);
+        assert!(!tmp.path().join(".davinci").exists());
+        assert!(agent.path().join("security-scans").is_dir());
+    }
+
+    #[test]
+    fn security_scan_settings_load_file_policy_and_fail_closed_when_invalid() {
+        let tmp = tempdir().unwrap();
+        let agent = tempdir().unwrap();
+        fs::write(
+            agent.path().join("settings.json"),
+            r#"{"securityScan":{"maxFileBytes":4096,"includeHidden":false,"failOn":{"classifications":["confirmed"],"minimumSeverity":"medium"},"watch":{"enabled":false}}}"#,
+        )
+        .unwrap();
+        let controller = SecurityScanController::with_settings(
+            tmp.path().to_path_buf(),
+            agent.path().to_path_buf(),
+            false,
+        );
+        assert_eq!(controller.config.max_file_bytes, 4096);
+        assert!(!controller.config.include_hidden);
+        assert!(!controller.config.allow_network);
+        assert_eq!(controller.review_config.fail_on.minimum_severity, "medium");
+        assert_eq!(controller.watch_status()["enabled"], false);
+
+        fs::write(
+            agent.path().join("settings.json"),
+            r#"{"securityScan":{"toolNetwork":"allow"}}"#,
+        )
+        .unwrap();
+        let mut invalid = SecurityScanController::with_settings(
+            tmp.path().to_path_buf(),
+            agent.path().to_path_buf(),
+            false,
+        );
+        let files = vec!["a.rs".to_string()];
+        assert!(invalid
+            .verify_changed_surface(SecurityVerifyRequest {
+                cwd: tmp.path(),
+                changed_files: &files,
+                graph_run_id: "invalid",
+                diff: None,
+            })
+            .is_err());
     }
 }

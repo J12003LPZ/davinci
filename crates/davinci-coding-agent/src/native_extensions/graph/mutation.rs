@@ -114,6 +114,10 @@ fn is_transaction_journal(path: &str) -> bool {
         ".pi/operations/",
         ".davinci/vector-memory/",
         ".pi/vector-memory/",
+        // Security scan artifacts belong to the agent directory; an older
+        // build could leave them in the repository. Never a graph mutation.
+        ".davinci/security-scans/",
+        ".pi/security-scans/",
     ]
     .iter()
     .any(|prefix| path.starts_with(prefix))

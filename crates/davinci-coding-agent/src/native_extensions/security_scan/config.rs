@@ -22,6 +22,28 @@ pub struct ScanConfig {
     pub index_into_memory: bool,
     pub supporting_reads: bool,
     pub fail_on: FailOn,
+    /// Whether dot-directories and dot-files are scanned by the deterministic
+    /// graph gate and the legacy scan tools. A project can only turn it off.
+    pub include_hidden: bool,
+    /// The session security watch: a background changed-surface review after
+    /// settled turns. Not part of a scan's checkpoint policy binding.
+    pub watch: WatchConfig,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default, rename_all = "camelCase", deny_unknown_fields)]
+pub struct WatchConfig {
+    pub enabled: bool,
+    pub min_interval_ms: u64,
+}
+
+impl Default for WatchConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            min_interval_ms: 600_000,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -87,11 +109,33 @@ impl Default for ScanConfig {
             index_into_memory: false,
             supporting_reads: true,
             fail_on: FailOn::default(),
+            include_hidden: true,
+            watch: WatchConfig::default(),
         }
     }
 }
 
 impl ScanConfig {
+    /// The deterministic scanner's file policy, from the same settings block.
+    /// Network access stays off: `toolNetwork` only accepts `deny`.
+    pub fn file_policy(&self) -> super::super::SecurityScanConfig {
+        super::super::SecurityScanConfig {
+            allow_network: self.tool_network != "deny",
+            max_file_bytes: self.max_file_bytes,
+            include_hidden: self.include_hidden,
+        }
+    }
+
+    /// The settings a checkpoint binds. The watch is session behaviour, so
+    /// changing it never makes an interrupted scan unresumable.
+    pub(super) fn binding_bytes(&self) -> Result<Vec<u8>, String> {
+        let mut value = serde_json::to_value(self).map_err(|_| "cannot bind scan policy")?;
+        if let Some(fields) = value.as_object_mut() {
+            fields.remove("watch");
+        }
+        serde_json::to_vec(&value).map_err(|_| "cannot bind scan policy".into())
+    }
+
     /// JSON escaping plus bounded metadata, capped by the archive reader policy.
     pub(super) fn checkpoint_byte_limit(&self) -> u64 {
         self.max_snapshot_bytes
@@ -134,6 +178,15 @@ impl ScanConfig {
         project.validate()?;
         Ok(Self {
             supporting_reads: self.supporting_reads && project.supporting_reads,
+            include_hidden: self.include_hidden && project.include_hidden,
+            watch: WatchConfig {
+                enabled: self.watch.enabled && project.watch.enabled,
+                min_interval_ms: self
+                    .watch
+                    .min_interval_ms
+                    .max(project.watch.min_interval_ms),
+            },
+            retention_days: self.retention_days.min(project.retention_days),
             max_concurrency: self.max_concurrency.min(project.max_concurrency),
             max_file_bytes: self.max_file_bytes.min(project.max_file_bytes),
             max_policy_bytes: self.max_policy_bytes.min(project.max_policy_bytes),
@@ -188,6 +241,8 @@ impl ScanConfig {
             return Err("unsupported or duplicate security analyzer".into());
         }
         if !(1..=4).contains(&self.max_concurrency)
+            || !(1..=3650).contains(&self.retention_days)
+            || self.watch.min_interval_ms > 7 * 24 * 60 * 60 * 1000
             || self.max_file_bytes == 0
             || self.max_policy_bytes == 0
             || self.max_inventory_entries == 0
@@ -310,6 +365,44 @@ mod tests {
             };
             assert!(config.validate().is_err());
         }
+    }
+
+    #[test]
+    fn security_scan_watch_and_file_policy_narrow_without_breaking_resume() {
+        let parent = ScanConfig::default();
+        let project = ScanConfig {
+            include_hidden: false,
+            retention_days: 7,
+            watch: WatchConfig {
+                enabled: false,
+                min_interval_ms: 1,
+            },
+            ..Default::default()
+        };
+        let merged = parent.narrow_with(&project).unwrap();
+        assert!(!merged.include_hidden);
+        assert!(!merged.watch.enabled);
+        assert_eq!(merged.watch.min_interval_ms, 600_000);
+        assert_eq!(merged.retention_days, 7);
+        assert!(!merged.file_policy().include_hidden);
+        // The watch is session behaviour: it never changes a checkpoint binding.
+        let quieter = ScanConfig {
+            watch: WatchConfig {
+                enabled: false,
+                min_interval_ms: 5,
+            },
+            ..Default::default()
+        };
+        assert_eq!(
+            parent.binding_bytes().unwrap(),
+            quieter.binding_bytes().unwrap()
+        );
+        assert!(ScanConfig {
+            retention_days: 0,
+            ..Default::default()
+        }
+        .validate()
+        .is_err());
     }
 
     #[test]
