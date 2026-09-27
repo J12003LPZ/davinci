@@ -7,7 +7,8 @@ use std::time::{Duration, Instant};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct FileStamp {
-    len: u64,
+    // A dangling symlink and a present empty target have different identities.
+    len: Option<u64>,
     digest: [u8; 32],
     readonly: bool,
     link: Option<PathBuf>,
@@ -216,7 +217,7 @@ fn stamp(
         }
     }
     Ok(Some(FileStamp {
-        len: target.as_ref().map_or(0, |metadata| metadata.len()),
+        len: target.as_ref().map(|metadata| metadata.len()),
         digest: digest.finalize().into(),
         readonly: target
             .as_ref()
@@ -323,6 +324,16 @@ mod tests {
         assert!(deleted
             .changes(&Snapshot::capture_inputs(&workspace, &paths))
             .is_empty());
+        std::fs::write(&target, "").unwrap();
+        let empty = Snapshot::capture_inputs(&workspace, &paths);
+        assert!(empty.complete());
+        assert!(deleted.required_inputs_observed(&empty));
+        assert_eq!(deleted.changes(&empty), paths);
+        std::fs::remove_file(&target).unwrap();
+        let empty_deleted = Snapshot::capture_inputs(&workspace, &paths);
+        assert!(empty_deleted.complete());
+        assert!(empty.required_inputs_observed(&empty_deleted));
+        assert_eq!(empty.changes(&empty_deleted), paths);
         std::fs::remove_file(&alias).unwrap();
         std::os::unix::fs::symlink("alias.py", &alias).unwrap();
         let cycle = Snapshot::capture_inputs(&workspace, &paths);
