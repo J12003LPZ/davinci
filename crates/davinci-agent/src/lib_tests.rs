@@ -2700,6 +2700,7 @@ fn verification_generation_accumulates_only_fresh_applicable_coverage() {
         kind: crate::verification::CheckKind::TargetedScript,
         covered: vec![path],
         complete: false,
+        full_workspace: false,
         reason: "test",
     };
     agent.record_verification_assessment(1, "check a", &assessment(a.clone()), None);
@@ -2731,6 +2732,7 @@ fn partial_verification_preserves_outstanding_paths_after_mutation() {
             kind: crate::verification::CheckKind::TargetedScript,
             covered: vec![PathBuf::from("a.py")],
             complete: false,
+            full_workspace: false,
             reason: "test",
         },
         Some(true),
@@ -2749,6 +2751,7 @@ fn unknown_mutation_paths_prevent_full_targeted_verification() {
         kind: crate::verification::CheckKind::TargetedScript,
         covered: vec![PathBuf::from("a.py")],
         complete: true,
+        full_workspace: false,
         reason: "test",
     };
     agent.record_verification_assessment(2, "check a", &assessment, Some(true));
@@ -2763,6 +2766,317 @@ fn unknown_mutation_paths_prevent_full_targeted_verification() {
         agent.completion_evidence(),
         CompletionEvidence::VerificationFailed
     );
+}
+
+#[test]
+fn partial_success_preserves_a_failure_until_its_scope_passes() {
+    let agent = Agent::new("x");
+    let paths = [PathBuf::from("a.py"), PathBuf::from("b.py")];
+    agent.record_successful_mutation_paths(paths.to_vec());
+    let assessment = |path: &PathBuf| crate::verification::Assessment {
+        kind: crate::verification::CheckKind::TargetedScript,
+        covered: vec![path.clone()],
+        complete: false,
+        full_workspace: false,
+        reason: "test",
+    };
+    agent.record_verification_assessment(1, "b fails", &assessment(&paths[1]), Some(false));
+    agent.record_verification_assessment(1, "a passes", &assessment(&paths[0]), Some(true));
+    assert_eq!(
+        agent.completion_evidence(),
+        CompletionEvidence::VerificationFailed
+    );
+    agent.record_verification_assessment(1, "b passes", &assessment(&paths[1]), Some(true));
+    assert_eq!(agent.completion_evidence(), CompletionEvidence::Verified);
+}
+
+#[test]
+fn fresh_full_workspace_suite_recovers_unknown_mutations_and_unscoped_failures() {
+    let root = tempfile::tempdir().unwrap();
+    let agent = Agent::new("x");
+    agent.record_successful_mutation();
+    let suite = crate::verification::classify("bash", "pytest -q", root.path(), &[]);
+    agent.record_verification_assessment(1, "pytest", &suite, Some(false));
+    assert_eq!(
+        agent.completion_evidence(),
+        CompletionEvidence::VerificationFailed
+    );
+    agent.record_successful_mutation();
+    agent.record_verification_assessment(1, "stale pytest", &suite, Some(true));
+    assert!(agent.mutation_verification_state().unknown_mutation_paths);
+    agent.record_verification_assessment(2, "fresh pytest", &suite, Some(true));
+    assert_eq!(agent.completion_evidence(), CompletionEvidence::Verified);
+    assert!(!agent.mutation_verification_state().unknown_mutation_paths);
+}
+
+#[test]
+fn shell_edits_invalidate_an_earlier_check_generation() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut agent = verifying_agent(dir.path());
+    agent.prompt("write, verify, then modify through a script");
+    let script = scripted_tool_calls(vec![
+        (
+            "write",
+            serde_json::json!({"path":"a.txt", "content":"one"}),
+        ),
+        (
+            shell_tool(),
+            serde_json::json!({"command":"python -c \"from pathlib import Path; assert Path('a.txt').read_text() == 'one'\""}),
+        ),
+        (
+            shell_tool(),
+            serde_json::json!({"command":"python -c \"from pathlib import Path; Path('a.txt').write_text('two changed')\""}),
+        ),
+    ]);
+    agent.run_loop(script).unwrap();
+    assert_eq!(agent.mutation_verification_state().mutation_generation, 2);
+    assert_eq!(
+        agent.completion_evidence(),
+        CompletionEvidence::VerificationFailed
+    );
+    assert_eq!(harness_runs(&agent), 1);
+}
+
+#[test]
+fn source_edits_during_a_passing_check_cannot_verify_the_new_generation() {
+    let dir = tempfile::tempdir().unwrap();
+    let agent = verifying_agent(dir.path());
+    std::fs::write(dir.path().join("changed.py"), "x = 1").unwrap();
+    agent.record_successful_mutation_paths(vec![PathBuf::from("changed.py")]);
+    agent
+        .verification_starts
+        .lock()
+        .unwrap()
+        .insert("check".into(), 1);
+    agent.shell_mutation_snapshots.lock().unwrap().insert(
+        "check".into(),
+        crate::verification::workspace::Snapshot::capture(dir.path()),
+    );
+    std::fs::write(dir.path().join("changed.py"), "x = 'changed'").unwrap();
+    let result = ToolResult {
+        content: "passed".into(),
+        is_error: false,
+        details: Some(serde_json::json!({"exitCode":0})),
+    };
+    agent.observe_shell_verification(
+        "check",
+        dir.path(),
+        shell_tool(),
+        &serde_json::json!({"command":"pytest -q"}),
+        &result,
+        &result,
+    );
+    assert_eq!(agent.mutation_verification_state().mutation_generation, 2);
+    assert_eq!(agent.completion_evidence(), CompletionEvidence::Unverified);
+}
+
+#[test]
+fn exhausted_inventory_recovers_with_a_fresh_suite_but_rejects_edits_during_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let agent = verifying_agent(dir.path());
+    let paths = [PathBuf::from("changed.py")];
+    std::fs::write(dir.path().join(&paths[0]), "x = 1").unwrap();
+    agent.record_successful_mutation_paths(paths.to_vec());
+    let result = ToolResult {
+        content: "passed".into(),
+        is_error: false,
+        details: Some(serde_json::json!({"exitCode":0})),
+    };
+    let args = serde_json::json!({"command":"pytest -q"});
+    let snapshot = crate::verification::workspace::Snapshot::limited_for_test(dir.path(), &paths);
+    agent.record_shell_verification_start("suite", snapshot);
+    assert!(agent.mutation_verification_state().unknown_mutation_paths);
+    agent.observe_shell_verification("suite", dir.path(), shell_tool(), &args, &result, &result);
+    assert_eq!(agent.completion_evidence(), CompletionEvidence::Verified);
+
+    let snapshot = crate::verification::workspace::Snapshot::limited_for_test(dir.path(), &paths);
+    agent.record_shell_verification_start("editing-suite", snapshot);
+    std::fs::write(dir.path().join(&paths[0]), "x = 2").unwrap();
+    agent.observe_shell_verification(
+        "editing-suite",
+        dir.path(),
+        shell_tool(),
+        &args,
+        &result,
+        &result,
+    );
+    assert_eq!(agent.completion_evidence(), CompletionEvidence::Unverified);
+    let snapshot = crate::verification::workspace::Snapshot::limited_for_test(dir.path(), &paths);
+    agent.record_shell_verification_start("fresh-suite", snapshot);
+    agent.observe_shell_verification(
+        "fresh-suite",
+        dir.path(),
+        shell_tool(),
+        &args,
+        &result,
+        &result,
+    );
+    assert_eq!(agent.completion_evidence(), CompletionEvidence::Verified);
+}
+
+#[test]
+fn background_shell_invalidates_coverage_until_terminal_state_and_fresh_verification() {
+    use std::process::{Command, Stdio};
+    let dir = tempfile::tempdir().unwrap();
+    let agent = verifying_agent(dir.path());
+    std::fs::write(dir.path().join("changed.py"), "old").unwrap();
+    agent.record_successful_mutation_paths(vec![PathBuf::from("changed.py")]);
+    agent.record_verification_result(true);
+    let child = Command::new("python").args(["-c", "import sys; from pathlib import Path; sys.stdin.readline(); Path('changed.py').write_text('new')"])
+        .current_dir(dir.path()).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap();
+    let job_id = agent
+        .tool_context
+        .jobs
+        .lock()
+        .unwrap()
+        .register("background edit", child);
+    agent
+        .verification_starts
+        .lock()
+        .unwrap()
+        .insert("background".into(), 1);
+    let result = crate::jobs::started_result(job_id, 0, "background edit");
+    agent.observe_shell_verification(
+        "background",
+        dir.path(),
+        shell_tool(),
+        &serde_json::json!({"command":"python editor.py", "background":true}),
+        &result,
+        &result,
+    );
+    assert_eq!(agent.completion_evidence(), CompletionEvidence::Unverified);
+    let suite = crate::verification::classify("bash", "pytest -q", dir.path(), &[]);
+    let generation = agent.mutation_verification_state().mutation_generation;
+    agent.record_verification_assessment(generation, "pytest", &suite, Some(true));
+    assert_eq!(agent.completion_evidence(), CompletionEvidence::Unverified);
+    agent
+        .tool_context
+        .jobs
+        .lock()
+        .unwrap()
+        .write_stdin(job_id, "go\n")
+        .unwrap();
+    let result = crate::jobs::output_tool(
+        &agent.tool_context.jobs,
+        &serde_json::json!({"jobId":job_id, "wait":2}),
+        None,
+    )
+    .unwrap();
+    assert_eq!(result.details.unwrap()["exitCode"], 0);
+    assert_eq!(agent.completion_evidence(), CompletionEvidence::Unverified);
+    let generation = agent.mutation_verification_state().mutation_generation;
+    agent.record_verification_assessment(generation, "fresh pytest", &suite, Some(true));
+    assert_eq!(agent.completion_evidence(), CompletionEvidence::Verified);
+}
+
+#[test]
+fn oversized_workspace_keeps_automatic_verification_and_reminders_bounded() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut agent = verifying_agent(dir.path());
+    agent.prompt("verify then create a large artifact");
+    let mut calls = 0;
+    let mut script = scripted_tool_calls(vec![
+        (
+            "write",
+            serde_json::json!({"path":"a.txt", "content":"one"}),
+        ),
+        (
+            shell_tool(),
+            serde_json::json!({"command":"python -c \"from pathlib import Path; assert Path('a.txt').read_text() == 'one'\""}),
+        ),
+        (
+            shell_tool(),
+            serde_json::json!({"command":"python -c \"from pathlib import Path; Path('large.bin').open('wb').truncate(67108865)\""}),
+        ),
+    ]);
+    agent
+        .run_loop(|current| {
+            calls += 1;
+            assert!(
+                calls <= 5,
+                "automatic verification must not create a reminder loop"
+            );
+            script(current)
+        })
+        .unwrap();
+    assert_eq!(calls, 5);
+    assert_eq!(harness_runs(&agent), 1);
+    assert_eq!(reminders(&agent).len(), 1);
+    assert_eq!(agent.completion_evidence(), CompletionEvidence::Unverified);
+}
+
+#[test]
+fn passing_harness_verification_does_not_relabel_another_scopes_failure() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut agent = verifying_agent(dir.path());
+    std::fs::write(dir.path().join("a.txt"), "one").unwrap();
+    agent.record_successful_mutation_paths(vec![PathBuf::from("a.txt"), PathBuf::from("b.py")]);
+    let failed = crate::verification::Assessment {
+        kind: crate::verification::CheckKind::TargetedScript,
+        covered: vec![PathBuf::from("b.py")],
+        complete: false,
+        full_workspace: false,
+        reason: "test",
+    };
+    agent.record_verification_assessment(1, "check b", &failed, Some(false));
+    agent.remember_verification_call(shell_tool(), &serde_json::json!({"command":"python -c \"from pathlib import Path; assert Path('a.txt').read_text() == 'one'\""}), dir.path());
+    agent.record_successful_mutation_paths(vec![PathBuf::from("a.txt")]);
+    agent.prompt("finish");
+    agent.run_loop(scripted_tool_calls(Vec::new())).unwrap();
+    assert_eq!(harness_runs(&agent), 1);
+    let reminders = reminders(&agent);
+    assert_eq!(reminders.len(), 1);
+    assert!(
+        reminders[0].contains("failure remains unresolved"),
+        "{}",
+        reminders[0]
+    );
+    assert!(!reminders[0].contains("and it failed"), "{}", reminders[0]);
+    assert_eq!(
+        agent.completion_evidence(),
+        CompletionEvidence::VerificationFailed
+    );
+}
+
+#[test]
+fn overlapping_shell_mutations_record_all_paths_before_rejecting_stale_verification() {
+    let dir = tempfile::tempdir().unwrap();
+    let agent = verifying_agent(dir.path());
+    agent.record_shell_verification_start(
+        "a",
+        crate::verification::workspace::Snapshot::capture(dir.path()),
+    );
+    agent.record_shell_verification_start(
+        "b",
+        crate::verification::workspace::Snapshot::capture(dir.path()),
+    );
+    let result = ToolResult {
+        content: "ok".into(),
+        is_error: false,
+        details: Some(serde_json::json!({"exitCode":0})),
+    };
+    let args = serde_json::json!({"command":"python editor.py"});
+    std::fs::write(dir.path().join("a.py"), "one").unwrap();
+    agent.observe_shell_verification("a", dir.path(), shell_tool(), &args, &result, &result);
+    std::fs::write(dir.path().join("b.py"), "two").unwrap();
+    agent.observe_shell_verification("b", dir.path(), shell_tool(), &args, &result, &result);
+    let state = agent.mutation_verification_state();
+    assert!(state.mutation_paths.contains(&PathBuf::from("a.py")));
+    assert!(state.mutation_paths.contains(&PathBuf::from("b.py")));
+    let assessment = crate::verification::Assessment {
+        kind: crate::verification::CheckKind::TargetedScript,
+        covered: vec![PathBuf::from("a.py")],
+        complete: false,
+        full_workspace: false,
+        reason: "test",
+    };
+    agent.record_verification_assessment(
+        state.mutation_generation,
+        "check a",
+        &assessment,
+        Some(true),
+    );
+    assert_eq!(agent.completion_evidence(), CompletionEvidence::Partial);
 }
 
 #[test]

@@ -1,4 +1,5 @@
 //! Conservative verification classification; never grants execution authority.
+pub(crate) mod workspace;
 use std::collections::{BTreeSet, VecDeque};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
@@ -19,6 +20,8 @@ pub struct Assessment {
     pub kind: CheckKind,
     pub covered: Vec<PathBuf>,
     pub complete: bool,
+    /// An unfiltered suite at the workspace root can cover unnamed mutations.
+    pub full_workspace: bool,
     pub reason: &'static str,
 }
 
@@ -28,12 +31,13 @@ impl Assessment {
             kind: CheckKind::Unknown,
             covered: Vec::new(),
             complete: false,
+            full_workspace: false,
             reason,
         }
     }
 }
 
-#[derive(Clone, serde::Deserialize)]
+#[derive(Debug, Clone, serde::Deserialize)]
 struct SyntaxFacts {
     checked_modules: Vec<String>,
     checked_files: Vec<String>,
@@ -92,8 +96,28 @@ fn syntax(name: &str, source: &str) -> Option<SyntaxFacts> {
         return Some(facts.clone());
     }
     let mut command = Command::new(&interpreter);
+    command.args(["-I", "-S", "-c", include_str!("verification/python_ast.py")]);
+    let facts = inspect_command(command, source, Duration::from_millis(250))?;
+    let mut cache = cache.lock().ok()?;
+    cache_insert(&mut cache, identity, source.to_string(), facts.clone());
+    Some(facts)
+}
+
+fn cache_insert(
+    cache: &mut SyntaxCache,
+    identity: InterpreterIdentity,
+    source: String,
+    facts: SyntaxFacts,
+) {
+    cache.retain(|(key, text, _)| key != &identity || text != &source);
+    if cache.len() >= 128 {
+        cache.pop_front();
+    }
+    cache.push_back((identity, source, facts));
+}
+
+fn inspect_command(mut command: Command, source: &str, budget: Duration) -> Option<SyntaxFacts> {
     command
-        .args(["-I", "-S", "-c", include_str!("verification/python_ast.py")])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null());
@@ -115,9 +139,7 @@ fn syntax(name: &str, source: &str) -> Option<SyntaxFacts> {
     let status = loop {
         match child.try_wait() {
             Ok(Some(status)) => break Some(status),
-            Ok(None) if started.elapsed() < Duration::from_millis(250) => {
-                std::thread::sleep(Duration::from_millis(2))
-            }
+            Ok(None) if started.elapsed() < budget => std::thread::sleep(Duration::from_millis(2)),
             _ => {
                 let _ = child.kill();
                 let _ = child.wait();
@@ -130,17 +152,11 @@ fn syntax(name: &str, source: &str) -> Option<SyntaxFacts> {
     if !status.is_some_and(|s| s.success()) || written.is_none() || bytes.len() > 16384 {
         return None;
     }
-    let facts: SyntaxFacts = serde_json::from_slice(&bytes).ok()?;
-    let mut cache = cache.lock().ok()?;
-    if cache.len() >= 128 {
-        cache.pop_front();
-    }
-    cache.push_back((identity, source.into(), facts.clone()));
-    Some(facts)
+    serde_json::from_slice(&bytes).ok()
 }
 
 /// Split only literal AND chains. Other unquoted shell control is inconclusive.
-fn segments(command: &str) -> Option<Vec<String>> {
+fn segments(command: &str, posix: bool) -> Option<Vec<String>> {
     let mut result = Vec::new();
     let mut text = String::new();
     let mut quote = None;
@@ -149,8 +165,12 @@ fn segments(command: &str) -> Option<Vec<String>> {
         if let Some(q) = quote {
             text.push(ch);
             if ch == q {
-                quote = None;
-            } else if q == '"' && matches!(ch, '$' | '`' | '\\') {
+                if !posix && chars.next_if_eq(&q).is_some() {
+                    text.push(q);
+                } else {
+                    quote = None;
+                }
+            } else if q == '"' && (matches!(ch, '$' | '`') || (posix && ch == '\\')) {
                 return None;
             }
             continue;
@@ -160,13 +180,13 @@ fn segments(command: &str) -> Option<Vec<String>> {
                 quote = Some(ch);
                 text.push(ch);
             }
-            '&' if chars.next_if_eq(&'&').is_some() => {
+            '&' if posix && chars.next_if_eq(&'&').is_some() => {
                 if text.trim().is_empty() {
                     return None;
                 }
                 result.push(std::mem::take(&mut text));
             }
-            '&' | '|' | ';' | '\n' | '\r' | '$' | '`' | '<' | '>' | '(' | ')' => return None,
+            '&' | '|' | ';' | '\n' | '\r' | '$' | '`' | '<' | '>' | '(' | ')' | '#' => return None,
             _ => text.push(ch),
         }
     }
@@ -177,26 +197,88 @@ fn segments(command: &str) -> Option<Vec<String>> {
     Some(result)
 }
 
-fn normalized(root: &Path, path: &Path) -> Option<PathBuf> {
+fn literal_words(command: &str, posix: bool) -> Option<Vec<String>> {
+    if posix {
+        return crate::shell_policy::literal_shell_words(command);
+    }
+    // PowerShell uses backticks for escaping, doubled quotes inside quoted
+    // strings, and literal backslashes in Windows paths. Its 5.1 grammar does
+    // not support &&; segments deliberately rejects all PS command chains.
+    let mut words = Vec::new();
+    let mut word = String::new();
+    let mut quote = None;
+    let mut started = false;
+    let mut chars = command.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if let Some(q) = quote {
+            if ch == q {
+                if chars.next_if_eq(&q).is_some() {
+                    word.push(q);
+                } else {
+                    quote = None;
+                }
+            } else if q == '"' && matches!(ch, '$' | '`') {
+                return None;
+            } else {
+                word.push(ch);
+            }
+            continue;
+        }
+        match ch {
+            '\'' | '"' => {
+                quote = Some(ch);
+                started = true;
+            }
+            '$' | '`' | '(' | ')' | '{' | '}' | '<' | '>' | ';' | '|' | '&' | '@' | '#' => {
+                return None
+            }
+            ch if ch.is_whitespace() => {
+                if started {
+                    words.push(std::mem::take(&mut word));
+                    started = false;
+                }
+            }
+            _ => {
+                word.push(ch);
+                started = true;
+            }
+        }
+    }
+    if quote.is_some() {
+        return None;
+    }
+    if started {
+        words.push(word);
+    }
+    Some(words)
+}
+
+pub(crate) fn normalized(root: &Path, path: &Path) -> Option<PathBuf> {
     let path = if path.is_absolute() {
         path.to_path_buf()
     } else {
         root.join(path)
     };
-    let mut parts = PathBuf::new();
-    for part in path.components() {
-        match part {
-            std::path::Component::ParentDir => {
-                if !parts.pop() {
-                    return None;
-                }
+    // Deleted/new paths still inherit the identity of their nearest existing
+    // ancestor. This also resolves symlinked cwd and Windows short/case aliases.
+    // Resolve before removing `..`: a symlink's parent can differ from the
+    // lexical parent of the link itself.
+    let mut ancestor = path.as_path();
+    let mut suffix = Vec::new();
+    let identity = loop {
+        if let Ok(mut identity) = std::fs::canonicalize(ancestor) {
+            for name in suffix.into_iter().rev() {
+                identity.push(name);
             }
-            std::path::Component::CurDir => {}
-            _ => parts.push(part.as_os_str()),
+            break identity;
         }
-    }
-    let identity = std::fs::canonicalize(&parts).unwrap_or(parts);
-    Some(crate::permission::strip_verbatim_prefix(&identity))
+        suffix.push(ancestor.file_name()?.to_os_string());
+        ancestor = ancestor.parent()?;
+    };
+    let identity = crate::permission::strip_verbatim_prefix(&identity);
+    #[cfg(windows)]
+    let identity = PathBuf::from(identity.to_string_lossy().to_lowercase());
+    Some(identity)
 }
 
 fn module_paths(root: &Path, module: &str) -> Vec<PathBuf> {
@@ -206,49 +288,138 @@ fn module_paths(root: &Path, module: &str) -> Vec<PathBuf> {
     {
         return Vec::new();
     }
-    let base = module.replace('.', "/");
-    [format!("{base}.py"), format!("{base}/__init__.py")]
-        .iter()
-        .map(|name| root.join(name))
-        .filter(|path| path.is_file())
-        .collect()
+    let mut directory = root.to_path_buf();
+    let mut parts = module.split('.').peekable();
+    while let Some(part) = parts.next() {
+        let package = directory.join(part);
+        let init = package.join("__init__.py");
+        let source = directory.join(format!("{part}.py"));
+        // FileFinder chooses regular packages before same-named source files.
+        // A source module also shadows a namespace directory and cannot have a
+        // submodule. Do not credit both sides of such a basename collision.
+        if init.is_file() {
+            if parts.peek().is_none() {
+                return vec![init];
+            }
+        } else if source.is_file() {
+            return if parts.peek().is_none() {
+                vec![source]
+            } else {
+                Vec::new()
+            };
+        } else if !package.is_dir() {
+            return Vec::new();
+        }
+        directory = package;
+    }
+    Vec::new()
 }
 
-fn exempt(path: &Path) -> bool {
-    let name = path
-        .file_name()
-        .and_then(|v| v.to_str())
-        .unwrap_or_default();
-    matches!(
-        path.extension().and_then(|v| v.to_str()),
-        Some("md" | "rst" | "txt")
-    ) || name.starts_with("test_")
-        || name.ends_with("_test.py")
-        || path.components().any(|part| {
+fn exempt(workspace: &Path, path: &Path) -> bool {
+    normalized(workspace, path)
+        .and_then(|path| {
+            path.strip_prefix(normalized(workspace, Path::new("."))?)
+                .ok()
+                .map(Path::to_path_buf)
+        })
+        .is_some_and(|relative| {
             matches!(
-                part.as_os_str().to_str(),
-                Some("tests" | "fixtures" | "docs")
-            )
+                relative.extension().and_then(|v| v.to_str()),
+                Some("md" | "rst")
+            ) || (relative.starts_with("docs") && relative.extension().is_some_and(|v| v == "txt"))
         })
 }
 
 pub fn classify(tool: &str, command: &str, cwd: &Path, paths: &[PathBuf]) -> Assessment {
+    classify_in_workspace(tool, command, cwd, cwd, paths)
+}
+
+fn python_name(name: &str) -> bool {
+    let name = Path::new(name)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or(name);
+    let name = name.strip_suffix(".exe").unwrap_or(name);
+    let Some(version) = name.strip_prefix("python") else {
+        return false;
+    };
+    version.is_empty()
+        || version
+            .split('.')
+            .all(|part| !part.is_empty() && part.bytes().all(|b| b.is_ascii_digit()))
+}
+
+fn unfiltered_suite(words: &[String]) -> bool {
+    let args = match words {
+        [python, module, runner, rest @ ..]
+            if python_name(python) && module == "-m" && runner == "pytest" =>
+        {
+            rest
+        }
+        [runner, rest @ ..] if runner == "pytest" || runner == "pytest.exe" => rest,
+        [runner, action, rest @ ..]
+            if runner == "cargo" && matches!(action.as_str(), "test" | "check" | "clippy") =>
+        {
+            rest
+        }
+        [runner, action, rest @ ..]
+            if matches!(runner.as_str(), "npm" | "pnpm" | "yarn") && action == "test" =>
+        {
+            rest
+        }
+        [runner, action, target, rest @ ..]
+            if runner == "go" && action == "test" && target == "./..." =>
+        {
+            rest
+        }
+        _ => return false,
+    };
+    args.iter().all(|arg| {
+        matches!(
+            arg.as_str(),
+            "-q" | "--quiet"
+                | "-v"
+                | "-vv"
+                | "--verbose"
+                | "--offline"
+                | "--locked"
+                | "--workspace"
+                | "--all-targets"
+                | "--all-features"
+                | "--release"
+        )
+    })
+}
+
+pub(crate) fn classify_in_workspace(
+    tool: &str,
+    command: &str,
+    cwd: &Path,
+    workspace: &Path,
+    paths: &[PathBuf],
+) -> Assessment {
     if command.len() > 65536 {
         return Assessment::unknown("source_limit");
     }
     let posix = tool == "bash" || (tool == "exec_command" && !cfg!(windows));
     let command = if posix {
-        command.trim().strip_prefix("set -eu\n").unwrap_or(command.trim())
-    } else { command.trim() };
+        command
+            .trim()
+            .strip_prefix("set -eu\n")
+            .unwrap_or(command.trim())
+    } else {
+        command.trim()
+    };
     let mut source = None;
     let mut header = command;
-    if let Some((head, body)) = command.split_once('\n') {
+    if let Some((head, body)) = command
+        .split_once('\n')
+        .filter(|(head, _)| head.contains("<<"))
+    {
         if !posix {
             return Assessment::unknown("unsupported_shell");
         }
-        let Some((prefix, marker)) = head.rsplit_once("<<") else {
-            return Assessment::unknown("shell_control");
-        };
+        let (prefix, marker) = head.rsplit_once("<<").unwrap();
         let marker = marker.trim();
         let Some(marker) = marker.strip_prefix('\'').and_then(|s| s.strip_suffix('\'')) else {
             return Assessment::unknown("unquoted_heredoc");
@@ -269,17 +440,24 @@ pub fn classify(tool: &str, command: &str, cwd: &Path, paths: &[PathBuf]) -> Ass
         source = Some(body);
         header = prefix;
     }
-    let Some(parts) = segments(header) else {
+    let Some(parts) = segments(header, posix) else {
         return Assessment::unknown("masked_status");
     };
-    let mut directory = cwd.to_path_buf();
+    let Some(mut directory) = normalized(cwd, Path::new(".")) else {
+        return Assessment::unknown("cwd");
+    };
+    let workspace =
+        normalized(workspace, Path::new(".")).unwrap_or_else(|| workspace.to_path_buf());
     let mut covered = BTreeSet::new();
     let mut kind = CheckKind::Unknown;
+    let mut full_workspace = false;
     for (index, part) in parts.iter().enumerate() {
-        let Some(words) = crate::shell_policy::literal_shell_words(part.trim()) else {
+        let Some(words) = literal_words(part.trim(), posix) else {
             return Assessment::unknown("nonliteral_command");
         };
-        if words.is_empty() { return Assessment::unknown("empty_command"); }
+        if words.is_empty() {
+            return Assessment::unknown("empty_command");
+        }
         if words.len() == 2 && words[0] == "cd" && index == 0 {
             let Some(path) = normalized(cwd, Path::new(&words[1])) else {
                 return Assessment::unknown("cwd");
@@ -305,10 +483,7 @@ pub fn classify(tool: &str, command: &str, cwd: &Path, paths: &[PathBuf]) -> Ass
         }) {
             return Assessment::unknown("noop_option");
         }
-        let python = matches!(
-            words[0].as_str(),
-            "python" | "python3" | "python.exe" | "python3.exe"
-        );
+        let python = python_name(&words[0]);
         if python && std::env::var_os("PYTHONOPTIMIZE").is_some_and(|v| !v.is_empty() && v != "0") {
             return Assessment::unknown("assertions_disabled");
         }
@@ -335,7 +510,7 @@ pub fn classify(tool: &str, command: &str, cwd: &Path, paths: &[PathBuf]) -> Ass
             for target in targets.clone().into_iter().take(32) {
                 if !paths
                     .iter()
-                    .any(|path| normalized(cwd, path) == normalized(cwd, &target))
+                    .any(|path| normalized(&workspace, path) == normalized(&directory, &target))
                 {
                     continue;
                 }
@@ -355,7 +530,7 @@ pub fn classify(tool: &str, command: &str, cwd: &Path, paths: &[PathBuf]) -> Ass
             for path in paths {
                 if targets
                     .iter()
-                    .any(|target| normalized(&directory, target) == normalized(cwd, path))
+                    .any(|target| normalized(&directory, target) == normalized(&workspace, path))
                 {
                     covered.insert(path.clone());
                 }
@@ -371,15 +546,25 @@ pub fn classify(tool: &str, command: &str, cwd: &Path, paths: &[PathBuf]) -> Ass
             if kind == CheckKind::Unknown {
                 kind = CheckKind::SyntaxOnly;
             }
-        } else if crate::shell_policy::verification_outcome(part.trim()) == Some(true) {
+        } else if crate::shell_policy::verification_outcome(&{
+            let mut suite_words = words.clone();
+            if python {
+                suite_words[0] = "python".into();
+            }
+            suite_words.join(" ")
+        }) == Some(true)
+        {
+            let suite = words.join(" ");
+            full_workspace |= directory == workspace && unfiltered_suite(&words);
             for path in paths {
-                if let Some(relative) = normalized(cwd, path)
+                if let Some(relative) = normalized(&workspace, path)
                     .and_then(|path| path.strip_prefix(&directory).ok().map(Path::to_path_buf))
                 {
-                    if matches!(
-                        crate::verification_coverage_for_command(part.trim(), &[relative]).0,
-                        crate::VerificationCoverage::Broad | crate::VerificationCoverage::Targeted
-                    ) {
+                    let coverage = crate::verification_coverage_for_command(&suite, &[relative]).0;
+                    if coverage == crate::VerificationCoverage::Targeted
+                        || (coverage == crate::VerificationCoverage::Broad
+                            && unfiltered_suite(&words))
+                    {
                         covered.insert(path.clone());
                     }
                 }
@@ -390,13 +575,115 @@ pub fn classify(tool: &str, command: &str, cwd: &Path, paths: &[PathBuf]) -> Ass
         }
     }
     if !covered.is_empty() {
-        covered.extend(paths.iter().filter(|path| exempt(path)).cloned());
+        covered.extend(
+            paths
+                .iter()
+                .filter(|path| exempt(&workspace, path))
+                .cloned(),
+        );
     }
     let complete = !paths.is_empty() && covered.len() == paths.len();
     Assessment {
         kind,
         covered: covered.into_iter().collect(),
         complete,
+        full_workspace,
         reason: "classified",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn versioned_python_and_powershell_paths_are_literal() {
+        for name in ["python", "python3", "python3.11", "python3.13.exe"] {
+            assert!(python_name(name));
+        }
+        for name in ["python-wrapper", "python3.", "python..3", "python3.bad"] {
+            assert!(!python_name(name));
+        }
+        assert_eq!(
+            literal_words(r"pytest 'tests\test_file.py'", false).unwrap(),
+            ["pytest", "tests\\test_file.py"]
+        );
+    }
+
+    #[test]
+    fn syntax_cache_is_bounded_and_replaces_duplicates() {
+        let mut cache = SyntaxCache::new();
+        let identity = (PathBuf::from("python"), 1, std::time::UNIX_EPOCH);
+        let facts = SyntaxFacts {
+            checked_modules: Vec::new(),
+            checked_files: Vec::new(),
+            imports: Vec::new(),
+        };
+        for index in 0..256 {
+            cache_insert(
+                &mut cache,
+                identity.clone(),
+                index.to_string(),
+                facts.clone(),
+            );
+        }
+        assert_eq!(cache.len(), 128);
+        assert_eq!(cache.front().unwrap().1, "128");
+        cache_insert(&mut cache, identity, "255".into(), facts);
+        assert_eq!(cache.len(), 128);
+    }
+
+    #[test]
+    fn helper_timeout_kills_and_reaps_and_does_not_poison_later_inspection() {
+        let python = interpreter("python").expect("Python is required for verification tests");
+        let mut command = Command::new(&python);
+        command.args(["-I", "-S", "-c", "import time; time.sleep(30)"]);
+        let start = Instant::now();
+        assert!(inspect_command(command, "assert True", Duration::from_millis(25)).is_none());
+        assert!(start.elapsed() < Duration::from_secs(2));
+        assert!(syntax("python", "import changed; assert changed.f(1) == 2").is_some());
+    }
+
+    #[test]
+    fn helper_response_and_source_bounds_are_enforced() {
+        assert!(syntax("python", &"x".repeat(65_537)).is_none());
+        let mut command = Command::new(interpreter("python").unwrap());
+        command.args(["-I", "-S", "-c", "print('x' * 16385)"]);
+        assert!(inspect_command(command, "", Duration::from_millis(250)).is_none());
+    }
+
+    #[test]
+    fn subdirectory_suite_cannot_clear_workspace_unknown_scope() {
+        let root = tempfile::tempdir().unwrap();
+        let sub = root.path().join("sub");
+        std::fs::create_dir(&sub).unwrap();
+        let result = classify_in_workspace(
+            "bash",
+            "pytest -q",
+            &sub,
+            root.path(),
+            &[PathBuf::from("sub/a.py")],
+        );
+        assert!(result.complete);
+        assert!(!result.full_workspace);
+    }
+
+    #[test]
+    fn module_resolution_does_not_credit_shadowed_source_or_submodules() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir(root.path().join("pkg")).unwrap();
+        std::fs::write(root.path().join("pkg/__init__.py"), "").unwrap();
+        std::fs::write(root.path().join("pkg.py"), "").unwrap();
+        assert_eq!(
+            module_paths(root.path(), "pkg"),
+            [root.path().join("pkg/__init__.py")]
+        );
+        std::fs::remove_file(root.path().join("pkg/__init__.py")).unwrap();
+        std::fs::write(root.path().join("pkg/child.py"), "").unwrap();
+        assert_eq!(
+            module_paths(root.path(), "pkg"),
+            [root.path().join("pkg.py")]
+        );
+        assert!(module_paths(root.path(), "pkg.child").is_empty());
     }
 }

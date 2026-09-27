@@ -308,6 +308,10 @@ pub struct MutationVerificationState {
     #[serde(default)]
     pub unknown_mutation_paths: bool,
     #[serde(default)]
+    pub failed_verification_paths: Vec<PathBuf>,
+    #[serde(default)]
+    pub unscoped_verification_failure: bool,
+    #[serde(default)]
     pub last_classification_reason: Option<String>,
     #[serde(default)]
     pub latest_evidence: Option<VerificationEvidence>,
@@ -502,6 +506,9 @@ pub struct Agent {
     command_receipts:
         Arc<Mutex<std::collections::VecDeque<runtime::evidence_store::ExecutionReceipt>>>,
     verification_starts: Arc<Mutex<std::collections::BTreeMap<String, u64>>>,
+    shell_mutation_snapshots:
+        Arc<Mutex<std::collections::BTreeMap<String, verification::workspace::Snapshot>>>,
+    background_shell_jobs: Arc<Mutex<std::collections::BTreeSet<u32>>>,
     plan_storage_error: Option<String>,
     pending_bash_messages: Vec<ChatMessage>,
     pending_prompt_messages: Vec<ChatMessage>,
@@ -643,6 +650,8 @@ impl Agent {
             )),
             command_receipts: Arc::new(Mutex::new(std::collections::VecDeque::new())),
             verification_starts: Arc::new(Mutex::new(std::collections::BTreeMap::new())),
+            shell_mutation_snapshots: Arc::new(Mutex::new(std::collections::BTreeMap::new())),
+            background_shell_jobs: Arc::new(Mutex::new(std::collections::BTreeSet::new())),
             plan_storage_error: None,
             pending_bash_messages: Vec::new(),
             pending_prompt_messages: Vec::new(),
@@ -917,12 +926,19 @@ impl Agent {
 
     /// Classify whether the current run has evidence for its latest mutation.
     pub fn completion_evidence(&self) -> CompletionEvidence {
+        let background_running = self.refresh_background_shell_mutations();
         let state = self
             .mutation_verification
             .lock()
             .unwrap_or_else(|err| err.into_inner());
         if state.mutation_generation == 0 {
             return CompletionEvidence::NotRequired;
+        }
+        if state.unscoped_verification_failure || !state.failed_verification_paths.is_empty() {
+            return CompletionEvidence::VerificationFailed;
+        }
+        if background_running {
+            return CompletionEvidence::Unverified;
         }
 
         match state.latest_evidence.as_ref() {
@@ -946,10 +962,55 @@ impl Agent {
         }
     }
 
+    /// Background shells can change source after returning a job handle. Only
+    /// the host-owned job state closes this interval; reading output is no pass.
+    pub(crate) fn refresh_background_shell_mutations(&self) -> bool {
+        let mut pending = self
+            .background_shell_jobs
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if pending.is_empty() {
+            return false;
+        }
+        let before = pending.len();
+        let jobs = self
+            .tool_context
+            .jobs
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        pending.retain(|id| jobs.get(*id).is_some_and(|job| job.status().is_running()));
+        let changed = before != pending.len();
+        let running = !pending.is_empty();
+        drop(jobs);
+        drop(pending);
+        if changed {
+            self.record_successful_mutation();
+        }
+        running
+    }
+
     /// Compatibility path for mutation sources that cannot yet provide a path.
     #[allow(dead_code)]
     pub(crate) fn record_successful_mutation(&self) {
         self.record_successful_mutation_paths(Vec::new());
+    }
+
+    /// Re-observing the same incomplete inventory is uncertainty, not another
+    /// observed edit. Coalesce it once all previous passing evidence is stale.
+    pub(crate) fn record_unknown_shell_scope(&self) {
+        let state = self
+            .mutation_verification
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if state.unknown_mutation_paths
+            && state.verified_generation.is_none()
+            && state.covered_paths.is_empty()
+            && state.latest_evidence.is_none()
+        {
+            return;
+        }
+        drop(state);
+        self.record_successful_mutation();
     }
 
     pub(crate) fn record_successful_mutation_paths(&self, paths: Vec<PathBuf>) {
@@ -990,6 +1051,11 @@ impl Agent {
         let paths = state.mutation_paths.clone();
         state.verified_generation = Some(generation);
         state.last_verification_succeeded = succeeded;
+        if succeeded {
+            state.unknown_mutation_paths = false;
+            state.failed_verification_paths.clear();
+            state.unscoped_verification_failure = false;
+        }
         state.latest_evidence = Some(VerificationEvidence {
             generation,
             command: "legacy_explicit_verifier".into(),
@@ -1056,6 +1122,9 @@ impl Agent {
         assessment: &verification::Assessment,
         terminal: Option<bool>,
     ) {
+        if self.refresh_background_shell_mutations() {
+            return;
+        }
         let Some(succeeded) = terminal else {
             return;
         };
@@ -1072,21 +1141,43 @@ impl Agent {
         if generation != state.mutation_generation {
             return;
         }
-        if succeeded && assessment.covered.is_empty() {
+        if succeeded && assessment.covered.is_empty() && !assessment.full_workspace {
             // An unrelated success cannot erase an applicable failure.
             return;
         }
         if succeeded {
+            if assessment.full_workspace {
+                state.unknown_mutation_paths = false;
+                state.unscoped_verification_failure = false;
+                state.failed_verification_paths.clear();
+            } else {
+                state
+                    .failed_verification_paths
+                    .retain(|path| !assessment.covered.contains(path));
+            }
             for path in &assessment.covered {
                 if state.mutation_paths.contains(path) && !state.covered_paths.contains(path) {
                     state.covered_paths.push(path.clone());
                 }
             }
         } else {
-            state.covered_paths.clear();
+            // Retain independent passes, but revoke the failed scope until a
+            // fresh applicable check succeeds. An A-only pass cannot erase B.
+            state
+                .covered_paths
+                .retain(|path| !assessment.covered.contains(path));
+            state.unscoped_verification_failure |=
+                assessment.covered.is_empty() || assessment.full_workspace;
+            for path in &assessment.covered {
+                if !state.failed_verification_paths.contains(path) {
+                    state.failed_verification_paths.push(path.clone());
+                }
+            }
         }
         let complete = !state.unknown_mutation_paths
-            && !state.mutation_paths.is_empty()
+            && !state.unscoped_verification_failure
+            && state.failed_verification_paths.is_empty()
+            && (!state.mutation_paths.is_empty() || assessment.full_workspace)
             && state
                 .mutation_paths
                 .iter()
@@ -1103,7 +1194,9 @@ impl Agent {
                 .iter()
                 .map(|p| p.display().to_string())
                 .collect(),
-            coverage: if complete {
+            coverage: if assessment.full_workspace {
+                VerificationCoverage::Broad
+            } else if complete {
                 VerificationCoverage::Targeted
             } else {
                 VerificationCoverage::Unknown

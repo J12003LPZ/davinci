@@ -129,8 +129,11 @@ impl Agent {
         self.push_event(events, AgentEvent::MessageEnd { message: chat });
 
         let cwd = last.cwd.clone().unwrap_or_else(|| self.cwd.clone());
-        let results =
-            self.execute_tool_batch(&cwd, vec![(call_id, last.tool.clone(), arguments)], events);
+        let results = self.execute_tool_batch(
+            &cwd,
+            vec![(call_id.clone(), last.tool.clone(), arguments)],
+            events,
+        );
         let mut output_tail = String::new();
         let mut rerun_denied = false;
         for mut result in results {
@@ -161,11 +164,38 @@ impl Agent {
         // a passing run whose command does not cover the changed files is
         // unverified, not failed, and telling the model it failed sends it
         // chasing a failure that does not exist.
+        let rerun_failed = self
+            .command_receipts
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .find(|receipt| receipt.operation_id == call_id)
+            .map(|receipt| {
+                receipt.started
+                    && receipt.exit_code.is_some_and(|code| code != 0)
+                    && !receipt.timed_out
+                    && !receipt.cancelled
+                    && !receipt.killed
+                    && !receipt.permission_denied
+                    && !receipt.simulated
+                    && !receipt.hook_vetoed
+            })
+            .unwrap_or_else(|| {
+                // Legacy shell execution has no host receipt. The observer
+                // records evidence only for its original, trusted terminal
+                // status, and automatic reruns start without fresh evidence.
+                let state = self.mutation_verification_state();
+                state.latest_evidence.as_ref().is_some_and(|evidence| {
+                    evidence.generation == state.mutation_generation
+                        && evidence.command == last.command
+                        && !evidence.succeeded
+                })
+            });
         Ok(match self.completion_evidence() {
             _ if rerun_denied => HarnessVerification::Inconclusive,
             crate::CompletionEvidence::Verified => HarnessVerification::Passed,
             crate::CompletionEvidence::Partial => HarnessVerification::Partial,
-            crate::CompletionEvidence::VerificationFailed => {
+            crate::CompletionEvidence::VerificationFailed if rerun_failed => {
                 HarnessVerification::Failed { output_tail }
             }
             _ => HarnessVerification::Inconclusive,
@@ -653,17 +683,27 @@ impl Agent {
                 }
 
                 let completion_evidence = self.completion_evidence();
-                let mutation_generation = self.mutation_verification_state().mutation_generation;
+                let mutation_state = self.mutation_verification_state();
+                let mutation_generation = mutation_state.mutation_generation;
                 if matches!(
                     completion_evidence,
                     crate::CompletionEvidence::Unverified
                         | crate::CompletionEvidence::VerificationFailed
                 ) && verification_reminded_generation != Some(mutation_generation)
                 {
-                    verification_reminded_generation = Some(mutation_generation);
-                    let last = self.mutation_verification_state().last_verification;
+                    let failure_predates_change = mutation_state
+                        .latest_evidence
+                        .as_ref()
+                        .is_none_or(|evidence| evidence.generation != mutation_generation);
+                    let last = mutation_state.last_verification;
                     let rerun = match (&last, completion_evidence) {
-                        (Some(last), crate::CompletionEvidence::Unverified) if self.auto_verify => {
+                        (Some(last), evidence)
+                            if self.auto_verify
+                                && (evidence == crate::CompletionEvidence::Unverified
+                                    || (evidence
+                                        == crate::CompletionEvidence::VerificationFailed
+                                        && failure_predates_change)) =>
+                        {
                             Some(self.run_harness_verification(
                                 last,
                                 &mut events,
@@ -672,6 +712,11 @@ impl Agent {
                         }
                         _ => None,
                     };
+                    // A checker may itself modify files or uncover unknown
+                    // scope. Bound the reminder using the resulting generation
+                    // so that an inconclusive automatic rerun cannot loop.
+                    verification_reminded_generation =
+                        Some(self.mutation_verification_state().mutation_generation);
                     if self.abort_requested() {
                         continue;
                     }
@@ -693,7 +738,7 @@ impl Agent {
                         Some(HarnessVerification::Inconclusive) | None => {
                             let message = match completion_evidence {
                                 crate::CompletionEvidence::VerificationFailed => {
-                                    "The latest verification command failed after a file change. Investigate the failure or report it explicitly before finalizing."
+                                    "A verification failure remains unresolved after your changes. Investigate the failing check or report it explicitly before finalizing."
                                 }
                                 _ => {
                                     "You changed files but have not completed a verification command. Run the narrowest appropriate test, check, or lint command before finalizing."
@@ -2221,11 +2266,11 @@ impl Agent {
                 }
                 crate::stats::SharedCounters::add(&self.counters.executed_leaf_operations, 1);
                 if matches!(name, "bash" | "powershell" | "exec_command") {
-                    let generation = self.mutation_verification_state().mutation_generation;
-                    self.verification_starts
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner())
-                        .insert(id.to_string(), generation);
+                    self.refresh_background_shell_mutations();
+                    let paths = self.mutation_verification_state().mutation_paths;
+                    let snapshot =
+                        crate::verification::workspace::Snapshot::capture_inputs(&self.cwd, &paths);
+                    self.record_shell_verification_start(id, snapshot);
                 }
                 let mut executed = match execute_tool_with(cwd, name, args, &context) {
                     Ok(result) => result,
@@ -2674,6 +2719,28 @@ impl Agent {
         self.emit_tool_result(id, name, args, result)
     }
 
+    pub(crate) fn record_shell_verification_start(
+        &self,
+        id: &str,
+        snapshot: crate::verification::workspace::Snapshot,
+    ) {
+        // Unknown inventory invalidates old evidence before execution. A fresh
+        // unfiltered suite can recover that scope without an endless bump after
+        // each command in a large workspace.
+        if !snapshot.complete() {
+            self.record_unknown_shell_scope();
+        }
+        self.shell_mutation_snapshots
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(id.to_string(), snapshot);
+        let generation = self.mutation_verification_state().mutation_generation;
+        self.verification_starts
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(id.to_string(), generation);
+    }
+
     pub(crate) fn observe_shell_verification(
         &self,
         id: &str,
@@ -2691,15 +2758,62 @@ impl Agent {
         let Some(generation) = generation else {
             return;
         };
+        let before = self
+            .shell_mutation_snapshots
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(id);
+        if let Some(job_id) = original
+            .details
+            .as_ref()
+            .and_then(|details| details.get("jobId"))
+            .and_then(Value::as_u64)
+        {
+            if let Ok(job_id) = u32::try_from(job_id) {
+                self.background_shell_jobs
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .insert(job_id);
+                self.record_successful_mutation();
+            }
+        }
+        self.refresh_background_shell_mutations();
         let command = args
             .get("command")
             .and_then(Value::as_str)
             .unwrap_or_default();
         let state = self.mutation_verification_state();
+        let assessment = crate::verification::classify_in_workspace(
+            name,
+            command,
+            cwd,
+            &self.cwd,
+            &state.mutation_paths,
+        );
+        if let Some(before) = before {
+            let mut inputs = state.mutation_paths.clone();
+            inputs.extend(before.required_paths().iter().cloned());
+            inputs.sort();
+            inputs.dedup();
+            let after =
+                crate::verification::workspace::Snapshot::capture_inputs(&self.cwd, &inputs);
+            let changed = before.changes(&after);
+            if !changed.is_empty() {
+                self.record_successful_mutation_paths(changed);
+                return;
+            }
+            if (!before.complete() || !after.complete())
+                && !(assessment.full_workspace && before.required_inputs_observed(&after))
+            {
+                self.record_unknown_shell_scope();
+                return;
+            }
+        }
+        // Concurrent shell calls can share a starting generation. Always
+        // observe their edits first; only their verification credit is stale.
         if generation != state.mutation_generation {
             return;
         }
-        let assessment = crate::verification::classify(name, command, cwd, &state.mutation_paths);
         {
             let mut state = self
                 .mutation_verification
