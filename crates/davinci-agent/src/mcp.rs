@@ -135,6 +135,24 @@ impl McpRegistry {
             .into_iter()
             .map(|tool| {
                 let is_read_only = read_only.contains(&tool.name);
+                // Resolve the namespace from the handshake route, never from
+                // a model-supplied name or a substring during discovery.
+                let family = self.resolve_tool(&tool.name).map(|(server, name)| {
+                    crate::runtime::capabilities::registered_discovery_family(&name)
+                        .or_else(|| match server.as_str() {
+                            "git" | "github" | "gitlab" => Some("git"),
+                            "browser" | "playwright" | "puppeteer" => Some("browser"),
+                            "lsp" | "language-server" => Some("lsp"),
+                            "package" => Some("package"),
+                            "build" => Some("build"),
+                            "process" => Some("process"),
+                            "graph" => Some("graph"),
+                            "sec" | "security" => Some("sec"),
+                            _ => None,
+                        })
+                        .map(str::to_owned)
+                        .unwrap_or_else(|| format!("mcp:{server}"))
+                });
                 RuntimeCapability::new(
                     tool.name,
                     CapabilitySource::Mcp,
@@ -148,6 +166,7 @@ impl McpRegistry {
                     None,
                 )
                 .with_description(tool.description)
+                .with_family(family.unwrap_or_default())
             })
             .collect()
     }

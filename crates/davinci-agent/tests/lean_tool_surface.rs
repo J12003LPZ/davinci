@@ -67,6 +67,130 @@ fn lean_surface_exposes_core_and_defers_specialists() {
             "specialist or legacy tool leaked: {name}"
         );
     }
+    assert_eq!(visible.contains("bash"), cfg!(windows));
+}
+
+#[test]
+fn relevant_prompt_adds_families_before_request_without_hiding_previous_tools() {
+    let mut agent = lean_agent();
+    let names = vec!["history_lookup".into(), "browser_lookup".into()];
+    agent
+        .runtime
+        .as_ref()
+        .unwrap()
+        .capability_registry
+        .register_all([
+            specialist_capability("history_lookup", "git"),
+            specialist_capability("browser_lookup", "browser"),
+        ]);
+    agent.apply_extension_tools(&names);
+    let core = agent.visible_tool_names();
+    let before = agent.provider_tool_schema_identity();
+    agent.prompt("Inspect the git commit history");
+    assert!(agent.is_tool_visible("history_lookup"));
+    assert!(!agent.is_tool_visible("browser_lookup"));
+    assert!(core.is_subset(&agent.visible_tool_names()));
+    let after = agent.provider_tool_schema_identity();
+    assert_ne!(before, after);
+    agent.prompt("Fix the parser and its tests");
+    agent.freeze_tools_for_cache();
+    assert_eq!(agent.provider_tool_schema_identity(), after);
+
+    // A late adapter still receives the same additive, authorized routing.
+    agent
+        .runtime
+        .as_ref()
+        .unwrap()
+        .capability_registry
+        .register(specialist_capability("browser_late", "browser"));
+    agent.apply_extension_tools(&["browser_late".into()]);
+    agent.prompt("Take a browser screenshot");
+    assert!(agent.is_tool_visible("browser_late"));
+}
+
+#[test]
+fn family_activation_preserves_tool_denials_and_scoped_dispatch_rules() {
+    use davinci_agent::{PermissionRule, PermissionVerdict};
+    let mut agent = lean_agent();
+    let names = [
+        "git_allowed",
+        "git_denied",
+        "git_not_active",
+        "git_no_schema",
+    ];
+    agent
+        .runtime
+        .as_ref()
+        .unwrap()
+        .capability_registry
+        .register_all(names.iter().map(|name| specialist_capability(name, "git")));
+    agent
+        .runtime
+        .as_ref()
+        .unwrap()
+        .capability_registry
+        .register(
+            RuntimeCapability::with_raw_hash(
+                "git_no_schema",
+                CapabilitySource::Mcp,
+                ToolClass::Read,
+                true,
+                "missing",
+                None,
+            )
+            .with_family("git"),
+        );
+    agent.apply_extension_tools(&names.map(str::to_owned));
+    agent.tools.retain(|name| name != "git_not_active");
+    {
+        let mut policy = agent.permissions.lock().unwrap();
+        policy.deny.push(PermissionRule::bare("git_denied"));
+        policy
+            .deny
+            .push(PermissionRule::parameter("git_allowed", "action", "delete"));
+    }
+    assert_eq!(
+        agent.activate_tool_families(&["git".into(), "unknown".into()]),
+        vec!["git_allowed"]
+    );
+    for name in &names[1..] {
+        assert!(!agent.is_tool_visible(name));
+    }
+    let result = execute_tool_with(
+        Path::new("."),
+        "tool_search",
+        &json!({"mode":"family", "query":"git"}),
+        &agent.tool_context,
+    )
+    .unwrap();
+    assert_eq!(
+        result.details.as_ref().unwrap()["activated"],
+        json!(["git_allowed"])
+    );
+    assert!(matches!(
+        agent.permissions.lock().unwrap().decide(
+            "test",
+            "git_allowed",
+            &json!({"action":"delete"}),
+            Path::new(".")
+        ),
+        PermissionVerdict::Deny { .. }
+    ));
+}
+
+#[test]
+fn deterministic_family_routing_does_not_change_nested_worker_policies() {
+    let mut agent = lean_agent();
+    let runtime = RuntimeHandle::new(RunId::new(), AgentId::new(), RuntimeBus::new())
+        .with_parent(AgentId::new());
+    runtime
+        .capability_registry
+        .register(specialist_capability("browser_nested", "browser"));
+    agent.set_runtime(runtime);
+    agent.apply_extension_tools(&["browser_nested".into()]);
+    agent.prompt("Use the browser");
+    agent.freeze_tools_for_cache();
+    assert!(!agent.is_tool_visible("browser_nested"));
 }
 
 #[test]
@@ -101,6 +225,11 @@ fn family_discovery_activates_all_members_and_pages_names() {
     assert_eq!(details["activated_count"], 10);
     assert_eq!(details["matches"].as_array().unwrap().len(), 5);
     assert_eq!(details["next_cursor"], "5");
+    assert!(first
+        .content
+        .contains("Found 10 tools; activated 10 schemas"));
+    assert!(first.content.contains("family: fixture-lsp"));
+    assert!(first.content.contains("more available at cursor 5"));
     assert!(names.iter().all(|name| agent.is_tool_visible(name)));
 
     let repeat = execute_tool_with(
@@ -218,6 +347,9 @@ fn family_discovery_separates_authorization_from_schema_availability() {
     let details = result.details.as_ref().unwrap();
     assert_eq!(details["matching_count"], 2);
     assert_eq!(details["activated_count"], 1);
+    assert!(result
+        .content
+        .contains("family_schema_less (family: fixture-family) [schema unavailable]"));
     assert!(agent.is_tool_visible("family_allowed"));
     assert!(!agent.is_tool_visible("family_schema_less"));
     assert!(!agent.is_tool_visible("family_denied"));

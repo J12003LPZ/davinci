@@ -14,6 +14,8 @@ use crate::jobs::JobBook;
 use crate::todo::TodoList;
 
 mod foreground;
+mod routing;
+pub(crate) use routing::relevant_tool_families;
 
 #[allow(dead_code)]
 pub fn decision_wait(interactive: bool, deferred: bool, cancelled: bool) -> &'static str {
@@ -147,6 +149,7 @@ pub const LEAN_TOOLS: &[&str] = &[
     "agent",
     "job_output",
     "job_kill",
+    #[cfg(windows)]
     "bash",
 ];
 
@@ -244,6 +247,19 @@ impl ToolContext {
             .as_ref()
             .is_some_and(|flag| flag.load(std::sync::atomic::Ordering::SeqCst))
     }
+
+    /// Runtime-less hosts still know built-in and connected MCP schemas.
+    /// Native/JS extensions require the live registry that owns their schemas.
+    pub(crate) fn discovery_capabilities(&self) -> Vec<crate::runtime::RuntimeCapability> {
+        if let Some(runtime) = &self.runtime {
+            runtime.capability_registry.list()
+        } else {
+            crate::runtime::builtin_capabilities()
+                .into_iter()
+                .chain(self.mcp.capabilities())
+                .collect()
+        }
+    }
 }
 
 const DEFAULT_MAX_LINES: usize = 2000;
@@ -328,6 +344,7 @@ pub fn tool_specs() -> Vec<AgentTool> {
                     "path":{"type":"string","description":"Path to the file to edit (relative or absolute)"},
                     "edits":{
                         "type":"array",
+                        "minItems":1,
                         "description":"One or more targeted replacements. Each edit is matched against the original file, not incrementally.",
                         "items":{
                             "type":"object",
@@ -1038,21 +1055,11 @@ fn tool_search_tool(
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
         .clone();
-    let mut candidates = if let Some(runtime) = &context.runtime {
-        runtime
-            .capability_registry
-            .list()
-            .into_iter()
-            .map(|capability| (capability.name.clone(), Some(capability)))
-            .collect::<Vec<_>>()
-    } else {
-        context
-            .mcp
-            .tool_names()
-            .into_iter()
-            .map(|name| (name, None))
-            .collect::<Vec<_>>()
-    };
+    let mut candidates = context
+        .discovery_capabilities()
+        .into_iter()
+        .map(|capability| (capability.name.clone(), capability))
+        .collect::<Vec<_>>();
     candidates.sort_by(|left, right| left.0.cmp(&right.0));
     candidates.dedup_by(|left, right| left.0 == right.0);
 
@@ -1063,23 +1070,19 @@ fn tool_search_tool(
         .filter(|(name, capability)| match mode {
             ToolSearchMode::Search => {
                 query_lower.is_empty()
-                    || capability.as_ref().is_some_and(|capability| {
-                        format!(
-                            "{} {} {}",
-                            capability.name, capability.description, capability.source
-                        )
-                        .to_lowercase()
-                        .contains(&query_lower)
-                    })
+                    || format!(
+                        "{} {} {} {}",
+                        capability.name,
+                        capability.description,
+                        capability.source,
+                        capability.family.as_deref().unwrap_or_default(),
+                    )
+                    .to_lowercase()
+                    .contains(&query_lower)
                     || name.to_lowercase().contains(&query_lower)
             }
             ToolSearchMode::Exact => name == &query,
-            ToolSearchMode::Family => {
-                capability
-                    .as_ref()
-                    .and_then(|capability| capability.family.as_deref())
-                    == Some(query.as_str())
-            }
+            ToolSearchMode::Family => capability.family.as_deref() == Some(query.as_str()),
         })
         .collect::<Vec<_>>();
     let total_matches = matching.len();
@@ -1097,10 +1100,7 @@ fn tool_search_tool(
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     let mut activated = Vec::new();
     for (name, capability) in activation_candidates {
-        if capability
-            .as_ref()
-            .is_some_and(|capability| capability.schema.is_some())
-        {
+        if capability.schema.is_some() {
             // The candidate list was authorized above.  Keep the activation
             // idempotent while reporting all schema-bearing members selected
             // by this request, including on a repeated family lookup.
@@ -1113,14 +1113,40 @@ fn tool_search_tool(
         .iter()
         .map(|(name, _)| (*name).clone())
         .collect::<Vec<_>>();
+    let families = display
+        .iter()
+        .filter_map(|(name, capability)| {
+            capability
+                .family
+                .as_ref()
+                .map(|family| ((*name).clone(), family.clone()))
+        })
+        .collect::<std::collections::BTreeMap<_, _>>();
     let content = if matches.is_empty() {
         format!("No tools found matching query `{query}`")
     } else {
+        let labels = display
+            .iter()
+            .map(|(name, capability)| {
+                let mut label = (*name).clone();
+                if let Some(family) = &capability.family {
+                    label.push_str(&format!(" (family: {family})"));
+                }
+                if capability.schema.is_none() {
+                    label.push_str(" [schema unavailable]");
+                }
+                label
+            })
+            .collect::<Vec<_>>();
         let suffix = next_cursor
             .as_deref()
             .map(|cursor| format!("; more available at cursor {cursor}"))
             .unwrap_or_default();
-        format!("Found tools: {}{suffix}", matches.join(", "))
+        format!(
+            "Found {total_matches} tools; activated {} schemas: {}{suffix}",
+            activated.len(),
+            labels.join(", ")
+        )
     };
     Ok(ToolResult {
         content,
@@ -1129,6 +1155,7 @@ fn tool_search_tool(
             "mode": mode.as_str(),
             "query": query,
             "matches": matches,
+            "families": families,
             "activated": activated,
             "matching_count": total_matches,
             "activated_count": activated.len(),

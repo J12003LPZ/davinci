@@ -476,7 +476,7 @@ pub fn builtin_capabilities() -> Vec<RuntimeCapability> {
                 Some(format!("builtin-{}", env!("CARGO_PKG_VERSION"))),
             )
             .with_description(tool.description);
-            match builtin_discovery_family(&capability.name) {
+            match registered_discovery_family(&capability.name) {
                 Some(family) => capability.with_family(family),
                 None => capability,
             }
@@ -484,10 +484,11 @@ pub fn builtin_capabilities() -> Vec<RuntimeCapability> {
         .collect()
 }
 
-/// Families are registered metadata for the built-in adapter set.  Search
+/// Families are registered metadata for the known adapter set. Search
 /// consumes `RuntimeCapability::family`; the name groups here are only the
 /// one-time registration mapping and are not used as discovery authority.
-fn builtin_discovery_family(name: &str) -> Option<&'static str> {
+/// Extension and MCP adapters use this same table when installing schemas.
+pub fn registered_discovery_family(name: &str) -> Option<&'static str> {
     match name {
         "browser_open"
         | "browser_snapshot"
@@ -499,6 +500,7 @@ fn builtin_discovery_family(name: &str) -> Option<&'static str> {
         | "browser_accessibility"
         | "browser_screenshot"
         | "browser_close"
+        | "visual_snapshot"
         | "web_search"
         | "web_fetch" => Some("browser"),
         "code_definition"
@@ -529,8 +531,37 @@ fn builtin_discovery_family(name: &str) -> Option<&'static str> {
         }
         "process_start" | "process_status" | "process_output" | "process_write"
         | "process_stop" | "process_list" => Some("process"),
-        "security_scanner" | "security_scan" | "security_audit" => Some("sec"),
-        "graph_submit" | "graph_verify" | "graph_status" => Some("graph"),
+        "security_scanner"
+        | "security_scan"
+        | "security_audit"
+        | "sec_scan_start"
+        | "sec_scan_context"
+        | "sec_scan_progress"
+        | "sec_scan_draft"
+        | "sec_scan_complete"
+        | "sec_scan_cancel"
+        | "sec_candidates_record"
+        | "sec_candidates_list"
+        | "sec_candidates_validate"
+        | "sec_candidates_attack_path"
+        | "sec_scope_files"
+        | "sec_policy_resolve"
+        | "sec_tracking_validate"
+        | "sec_deep_scan" => Some("sec"),
+        "graph_submit" | "graph_verify" | "graph_status" | "graph_run" => Some("graph"),
+        "test_related" | "test_impacted" | "test_plan" => Some("tests"),
+        "impact_analyze" => Some("impact"),
+        "verification_plan" => Some("verification"),
+        "repo_map"
+        | "symbol_search"
+        | "file_symbols"
+        | "file_dependencies"
+        | "symbol_relationships"
+        | "related_files"
+        | "code_query" => Some("repo"),
+        "workspace_checkpoint" | "workspace_diff" | "workspace_restore" => Some("workspace"),
+        "memory_search" => Some("memory"),
+        "skill_list" | "skill_view" | "skill_manage" => Some("skills"),
         _ => None,
     }
 }

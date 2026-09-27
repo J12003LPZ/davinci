@@ -1445,6 +1445,7 @@ impl Agent {
     ) -> ChatMessage {
         let message = self.prompt_with_origin(text, images, true);
         self.last_real_user_request = Some(text.to_string());
+        self.activate_relevant_tool_families(text);
         message
     }
 
@@ -2566,7 +2567,32 @@ impl Agent {
 
     /// Synchronize the shared authorization view with the agent's active tool set.
     pub fn sync_tool_authorization(&self) {
-        let authorized: std::collections::BTreeSet<String> = self.tools.iter().cloned().collect();
+        let authorized: std::collections::BTreeSet<String> = {
+            let permissions = self
+                .permissions
+                .lock()
+                .unwrap_or_else(|err| err.into_inner());
+            self.tools
+                .iter()
+                .filter(|name| {
+                    // Tool-wide denials suppress disclosure as well as execution.
+                    // Scoped path/argument rules still run at ordinary dispatch.
+                    !permissions.deny.iter().any(|rule| {
+                        rule.tool_matches(name)
+                            && match &rule.specifier {
+                                Some(permission::RuleSpecifier::Wildcard) => true,
+                                Some(permission::RuleSpecifier::Subject(pattern)) => pattern == "*",
+                                Some(permission::RuleSpecifier::Parameter { .. }) => false,
+                                None => rule
+                                    .pattern
+                                    .as_deref()
+                                    .map_or(true, |pattern| pattern == "*"),
+                            }
+                    })
+                })
+                .cloned()
+                .collect()
+        };
         *self
             .tool_context
             .authorized_tools
@@ -2620,6 +2646,12 @@ impl Agent {
             for name in crate::tools::LEAN_TOOLS {
                 exposure.activate_authorized(name, authorized.contains(*name));
             }
+            drop(exposure);
+            // Registration may happen after the user prompt (for example MCP
+            // attachment). Relevance is additive and safe to apply again.
+            if let Some(request) = &self.last_real_user_request {
+                self.activate_relevant_tool_families(request);
+            }
             return;
         }
         self.expose_active_tools();
@@ -2652,6 +2684,61 @@ impl Agent {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .is_visible(name)
+    }
+
+    /// Add available family schemas without granting permission, clearing
+    /// denials, or hiding the core. Both discovery and optional advice use the
+    /// existing exposure state, so schema identity follows the effective set.
+    pub fn activate_tool_families(&self, families: &[String]) -> Vec<String> {
+        self.sync_tool_authorization();
+        let authorized = self
+            .tool_context
+            .authorized_tools
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        let selected = self
+            .tool_context
+            .discovery_capabilities()
+            .into_iter()
+            .filter(|capability| authorized.contains(&capability.name))
+            .filter(|capability| capability.schema.is_some())
+            .filter(|capability| {
+                capability
+                    .family
+                    .as_ref()
+                    .is_some_and(|family| families.contains(family))
+            })
+            .map(|capability| capability.name)
+            .collect::<std::collections::BTreeSet<_>>();
+        let mut exposure = self
+            .tool_context
+            .tool_exposure
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        for name in &selected {
+            exposure.activate_authorized(name, true);
+        }
+        selected.into_iter().collect()
+    }
+
+    /// Deterministic routing is limited to explicitly selected Lean roots on
+    /// cache-sensitive routes. Generic requests keep the initial core.
+    fn activate_relevant_tool_families(&self, request: &str) {
+        if self.tool_surface != ToolSurface::Lean
+            || self.turn_context_placement() != turn_context::TurnContextPlacement::Appended
+            || self
+                .runtime
+                .as_ref()
+                .is_some_and(|runtime| runtime.parent_agent_id.is_some())
+        {
+            return;
+        }
+        let families = crate::tools::relevant_tool_families(
+            request,
+            &self.tool_context.discovery_capabilities(),
+        );
+        self.activate_tool_families(&families);
     }
 
     pub fn visible_tool_names(&self) -> std::collections::BTreeSet<String> {
