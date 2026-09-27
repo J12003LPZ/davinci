@@ -544,7 +544,12 @@ impl Agent {
                 Err(_) => "failed",
             };
             for observation in observations.finish(status) {
-                self.push_event(&mut events, AgentEvent::ProviderObservation { observation });
+                self.push_event(
+                    &mut events,
+                    AgentEvent::ProviderObservation {
+                        observation: Box::new(observation),
+                    },
+                );
             }
             self.stats.model_wall_ms += model_started.elapsed().as_millis() as u64;
             let (mut assistant, stream_events, streamed_live, mut native_responses_resume) =
@@ -2842,8 +2847,8 @@ impl Agent {
                 self.record_successful_mutation_paths(changed);
                 return;
             }
-            if (!before.complete() || !after.complete())
-                && !(assessment.full_workspace && before.required_inputs_observed(&after))
+            if !(before.complete() && after.complete()
+                || assessment.full_workspace && before.required_inputs_observed(&after))
             {
                 self.record_unknown_shell_scope();
                 return;

@@ -22,7 +22,7 @@ pub enum AgentEvent {
     },
     #[serde(rename = "provider_observation")]
     ProviderObservation {
-        observation: davinci_ai::provider_observation::ProviderAttemptObservation,
+        observation: Box<davinci_ai::provider_observation::ProviderAttemptObservation>,
     },
     #[serde(rename = "agent_start")]
     AgentStart,

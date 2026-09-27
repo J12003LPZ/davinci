@@ -139,7 +139,7 @@ impl McpRegistry {
                 // a model-supplied name or a substring during discovery.
                 let family = self.resolve_tool(&tool.name).map(|(server, name)| {
                     crate::runtime::capabilities::registered_discovery_family(&name)
-                        .or_else(|| match server.as_str() {
+                        .or(match server.as_str() {
                             "git" | "github" | "gitlab" => Some("git"),
                             "browser" | "playwright" | "puppeteer" => Some("browser"),
                             "lsp" | "language-server" => Some("lsp"),

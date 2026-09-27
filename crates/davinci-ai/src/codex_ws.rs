@@ -1143,10 +1143,12 @@ mod tests {
             }
             events.push(terminal.clone());
             events.push(terminal.clone());
-            let corpus = events
-                .iter()
-                .map(|event| format!("data: {event}\n\n"))
-                .collect::<String>();
+            let mut corpus = String::new();
+            for event in &events {
+                corpus.push_str("data: ");
+                corpus.push_str(&event.to_string());
+                corpus.push_str("\n\n");
+            }
             let sse = crate::fixture_complete(&codex_model(), &[], &corpus);
             let websocket = decode_wire_events(&events);
             for actual in [&sse, &websocket] {
