@@ -178,8 +178,15 @@ pub fn should_compact(
     context_window: u64,
     settings: &CompactionSettings,
 ) -> bool {
+    compaction_threshold(context_window, settings).is_some_and(|limit| context_tokens > limit)
+}
+
+/// The context size above which [`should_compact`] fires, or `None` when
+/// compaction is off. `/context` draws the rest of the window as the
+/// autocompact buffer.
+pub fn compaction_threshold(context_window: u64, settings: &CompactionSettings) -> Option<u64> {
     if !settings.enabled {
-        return false;
+        return None;
     }
     let capacity_threshold = context_window.saturating_sub(settings.reserve_tokens);
     let requested_threshold = match settings.threshold {
@@ -193,10 +200,11 @@ pub fn should_compact(
     let minimum_threshold = settings
         .keep_recent_tokens
         .saturating_add(settings.reserve_tokens);
-    let effective_threshold = requested_threshold
-        .max(minimum_threshold)
-        .min(capacity_threshold);
-    context_tokens > effective_threshold
+    Some(
+        requested_threshold
+            .max(minimum_threshold)
+            .min(capacity_threshold),
+    )
 }
 
 fn is_cut_point_message(message: &ChatMessage) -> bool {

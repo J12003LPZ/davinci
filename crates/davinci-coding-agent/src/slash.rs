@@ -68,6 +68,11 @@ pub fn builtin_slash_commands() -> Vec<SlashCommand> {
         ("logout", "Remove provider authentication", None),
         ("new", "Start a new session", None),
         ("compact", "Manually compact the session context", None),
+        (
+            "context",
+            "Visualize current context usage as a colored grid",
+            Some("[inspect]"),
+        ),
         ("resume", "Resume a different session", None),
         (
             "reload",
@@ -160,6 +165,9 @@ pub enum SlashAction {
     Mcp,
     ShowCost,
     ShowStatus,
+    /// `/context`: the window by category; `/context inspect` opens the
+    /// prepared-manifest inspector.
+    Context(String),
     Agents(String),
     Workflow(String),
     /// `/plugin …`: the text after the command name.
@@ -244,6 +252,7 @@ pub fn parse_line(line: &str) -> SlashAction {
         "mcp" => SlashAction::Mcp,
         "cost" => SlashAction::ShowCost,
         "status" => SlashAction::ShowStatus,
+        "context" => SlashAction::Context(args.to_string()),
         "workflow" | "workflows" => SlashAction::Workflow(args.to_string()),
         "agents" => SlashAction::Agents(args.to_string()),
         "plugin" | "plugins" => SlashAction::Plugin(args.to_string()),
@@ -397,6 +406,20 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn context_command_is_advertised_and_parsed() {
+        assert!(builtin_slash_commands().iter().any(|c| c.name == "context"));
+        assert_eq!(parse_line("/context"), SlashAction::Context(String::new()));
+        assert_eq!(
+            parse_line("/context inspect"),
+            SlashAction::Context("inspect".into())
+        );
+        assert_eq!(
+            parse_line("/contextual"),
+            SlashAction::Prompt("/contextual".into())
+        );
     }
 
     #[test]

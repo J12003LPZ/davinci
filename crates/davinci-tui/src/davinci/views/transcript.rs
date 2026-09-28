@@ -346,6 +346,8 @@ fn entry_lines(model: &Model, entry: &Entry, width: u16) -> Vec<Line<'static>> {
             rows
         }
 
+        Entry::ContextUsage(view) => super::context_usage::lines(th, view, width),
+
         Entry::Done { verb, seconds } => {
             let cc = th.cc();
             vec![Line::from(vec![

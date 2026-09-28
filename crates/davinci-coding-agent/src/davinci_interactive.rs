@@ -4287,6 +4287,20 @@ pub fn perform(
             open_task_board_sheet(agent, model);
             Ok(Done::Opened)
         }
+        SlashAction::Context(args) => match args.as_str() {
+            "" => {
+                push_context_usage(agent, model);
+                Ok(Done::Opened)
+            }
+            "inspect" | "manifest" => {
+                open_context_inspector_sheet(agent, model);
+                Ok(Done::Opened)
+            }
+            _ => Ok(Done::Note(
+                "usage: /context — usage by category · /context inspect — the prepared manifest"
+                    .into(),
+            )),
+        },
     }
 }
 
@@ -8626,11 +8640,6 @@ fn on_line(shell: &mut Shell<'_>, line: &str) -> Next {
                 return agents_command(shell, rest.trim());
             }
         }
-        if let Some(rest) = line.trim().strip_prefix("/context") {
-            if rest.is_empty() || rest.starts_with(char::is_whitespace) {
-                return context_inspector_command(shell, rest.trim());
-            }
-        }
         if let Some(rest) = line.trim().strip_prefix("/workflow") {
             if rest.is_empty() || rest.starts_with(char::is_whitespace) {
                 return workflow_command(shell, rest.trim());
@@ -9898,9 +9907,22 @@ fn open_context_inspector_sheet(agent: &davinci_agent::Agent, model: &mut Model)
     open_sheet(model, Screen::ContextInspector);
 }
 
-fn context_inspector_command(shell: &mut Shell<'_>, _arg: &str) -> Next {
-    open_context_inspector_sheet(shell.agent, shell.model);
-    Next::Go
+/// `/context`: the window by category, hanging from the command line the
+/// composer echoed, as in Claude Code. The turn anchor the composer pushed
+/// after it is dropped; nothing streams into this block.
+fn push_context_usage(agent: &Agent, model: &mut Model) {
+    let anchor = model
+        .transcript
+        .iter()
+        .rposition(|entry| !matches!(entry, Entry::Agent(_) | Entry::Gap));
+    match anchor {
+        Some(index) if matches!(model.transcript[index], Entry::User(_)) => {
+            model.transcript.truncate(index + 1);
+        }
+        _ => model.transcript.push(Entry::Gap),
+    }
+    let view = crate::davinci_surfaces::context_usage_view(&agent.context_usage());
+    model.transcript.push(Entry::ContextUsage(view));
 }
 
 fn apply_context_inspector_action(shell: &mut Shell<'_>, action: &str, index: usize) -> Next {

@@ -15,6 +15,7 @@ mod branch;
 pub mod command_receipt;
 mod compaction;
 mod context;
+pub mod context_usage;
 mod edit_diff;
 pub mod effort;
 mod events;
@@ -59,8 +60,8 @@ pub use branch::{
 pub use compaction::{
     branch_summary_context_message, build_history_prompt, calculate_context_tokens,
     compact_messages, compact_messages_with, compact_messages_with_options,
-    compaction_context_message, compute_file_lists, convert_to_llm, env_summarizer,
-    estimate_context_tokens, estimate_tokens, extract_file_ops, find_cut_point,
+    compaction_context_message, compaction_threshold, compute_file_lists, convert_to_llm,
+    env_summarizer, estimate_context_tokens, estimate_tokens, extract_file_ops, find_cut_point,
     format_file_operations, generate_summary_with_usage, get_summarization_failure,
     serialize_conversation, should_compact, CompactionDetails, CompactionResult,
     CompactionSettings, CompactionThreshold, CutPointResult, FileOperations, SummarizeRequest,

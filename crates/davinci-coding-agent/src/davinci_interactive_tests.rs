@@ -3458,6 +3458,48 @@ mod terminal_rebuild_host_contracts {
 }
 
 #[test]
+fn context_hangs_the_usage_grid_from_the_echoed_command() {
+    let mut agent = Agent::new("sys");
+    agent.context_window = 200_000;
+    let mut m = model();
+    m.transcript.push(Entry::Gap);
+    m.transcript.push(Entry::user("/context"));
+    m.transcript.push(Entry::Gap);
+    m.transcript.push(Entry::agent("davinci"));
+    let done = perform(
+        &crate::args::Args::default(),
+        &mut agent,
+        &mut m,
+        crate::slash::SlashAction::Context(String::new()),
+    )
+    .expect("context renders");
+    assert!(matches!(done, Done::Opened));
+    let n = m.transcript.len();
+    assert!(matches!(&m.transcript[n - 2], Entry::User(text) if text == "/context"));
+    let Some(Entry::ContextUsage(view)) = m.transcript.last() else {
+        panic!("expected the usage block");
+    };
+    assert_eq!(view.window, 200_000);
+    assert_eq!(view.used(), agent.estimated_context_tokens());
+    assert!(view.buffer > 0);
+}
+
+#[test]
+fn context_inspect_opens_the_manifest_sheet() {
+    let mut agent = Agent::new("sys");
+    let mut m = model();
+    let done = perform(
+        &crate::args::Args::default(),
+        &mut agent,
+        &mut m,
+        crate::slash::SlashAction::Context("inspect".into()),
+    )
+    .expect("inspector opens");
+    assert!(matches!(done, Done::Opened));
+    assert!(m.context_inspector.is_some());
+}
+
+#[test]
 fn team_wake_text_drains_teammate_reports_into_one_prompt() {
     use davinci_agent::runtime::{AgentId, RunId, RuntimeBus, RuntimeHandle};
     let mut agent = davinci_agent::Agent::new_builtin(davinci_agent::PromptProfile::Stable);

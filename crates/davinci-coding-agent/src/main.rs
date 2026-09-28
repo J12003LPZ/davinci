@@ -6890,6 +6890,15 @@ fn handle_user_line(
             println!("{text}");
             Ok(true)
         }
+        SlashAction::Context(_) => {
+            let view = davinci_surfaces::context_usage_view(&agent.context_usage());
+            let text =
+                davinci_tui::davinci::views::context_usage::plain_lines(&view, 100).join("\n");
+            session.chrome.transcript.push("context", &text);
+            session.chrome.status = "context".into();
+            println!("{text}");
+            Ok(true)
+        }
         SlashAction::Tasks => {
             let tasks = if let Some(runtime) = &agent.runtime {
                 davinci_surfaces::task_board(runtime)
