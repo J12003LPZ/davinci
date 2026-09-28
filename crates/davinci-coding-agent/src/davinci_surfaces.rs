@@ -614,6 +614,78 @@ pub fn freshness_label(has_provenance: bool, fingerprint_matches: bool) -> &'sta
     }
 }
 
+/// What `/context` draws, from the agent's per-category estimate.
+pub fn context_usage_view(
+    usage: &davinci_agent::context_usage::ContextUsage,
+) -> davinci_tui::davinci::model::ContextUsageView {
+    use davinci_tui::davinci::model::{
+        ContextCategory, ContextKind, ContextSection, ContextUsageView,
+    };
+
+    let category = |kind, label: &str, tokens| ContextCategory {
+        kind,
+        label: label.into(),
+        tokens,
+    };
+    let mut categories = vec![
+        category(
+            ContextKind::SystemPrompt,
+            "System prompt",
+            usage.system_prompt,
+        ),
+        category(ContextKind::SystemTools, "System tools", usage.system_tools),
+    ];
+    if !usage.mcp_tools.is_empty() {
+        categories.push(category(
+            ContextKind::McpTools,
+            "MCP tools",
+            usage.mcp_tokens(),
+        ));
+    }
+    if !usage.custom_agents.is_empty() {
+        categories.push(category(
+            ContextKind::CustomAgents,
+            "Custom agents",
+            usage.custom_agent_tokens(),
+        ));
+    }
+    if !usage.memory_files.is_empty() {
+        categories.push(category(
+            ContextKind::MemoryFiles,
+            "Memory files",
+            usage.memory_tokens(),
+        ));
+    }
+    categories.push(category(ContextKind::Messages, "Messages", usage.messages));
+
+    let items = |list: &[davinci_agent::context_usage::ContextUsageItem]| {
+        list.iter()
+            .map(|item| (item.name.clone(), item.tokens))
+            .collect::<Vec<_>>()
+    };
+    let section = |title: &str, command: Option<&str>, items| ContextSection {
+        title: title.into(),
+        command: command.map(str::to_string),
+        items,
+    };
+    ContextUsageView {
+        model: usage.model.clone(),
+        window: usage.context_window,
+        categories,
+        free: usage.free(),
+        buffer: usage.autocompact_buffer,
+        sections: vec![
+            section("MCP tools", Some("/mcp"), items(&usage.mcp_tools)),
+            section(
+                "Custom agents",
+                Some("/agents"),
+                items(&usage.custom_agents),
+            ),
+            section("Memory files", None, items(&usage.memory_files)),
+        ],
+    }
+}
+
 /// Builds the ContextInspectorSheet from a prepared context manifest and optional overlay.
 pub fn context_inspector_sheet_from_manifest(
     manifest: &davinci_agent::runtime::PreparedContextManifest,

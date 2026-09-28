@@ -563,6 +563,9 @@ pub enum Entry {
         verb: String,
         seconds: u64,
     },
+    /// `/context`: the window as a grid of cells beside a per-category
+    /// legend, hanging from the command's elbow as in Claude Code.
+    ContextUsage(ContextUsageView),
 }
 
 impl Entry {
@@ -1820,7 +1823,51 @@ pub struct AgentsSheet {
     pub selected_index: usize,
 }
 
-/// A row in the context memory inspector sheet (`/context`).
+/// What one `/context` category is, for its glyph colour.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ContextKind {
+    SystemPrompt,
+    SystemTools,
+    McpTools,
+    CustomAgents,
+    MemoryFiles,
+    Messages,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ContextCategory {
+    pub kind: ContextKind,
+    pub label: String,
+    pub tokens: u64,
+}
+
+/// A list under the grid: `MCP tools · /mcp` and its members.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ContextSection {
+    pub title: String,
+    pub command: Option<String>,
+    pub items: Vec<(String, u64)>,
+}
+
+/// Everything `/context` draws, already measured.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ContextUsageView {
+    pub model: String,
+    pub window: u64,
+    /// Used categories in grid order.
+    pub categories: Vec<ContextCategory>,
+    pub free: u64,
+    pub buffer: u64,
+    pub sections: Vec<ContextSection>,
+}
+
+impl ContextUsageView {
+    pub fn used(&self) -> u64 {
+        self.categories.iter().map(|category| category.tokens).sum()
+    }
+}
+
+/// A row in the context memory inspector sheet (`/context inspect`).
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct ContextInspectorRow {
     pub item_id: String,
