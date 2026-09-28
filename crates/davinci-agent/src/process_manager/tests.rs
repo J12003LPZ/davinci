@@ -145,7 +145,7 @@ fn process_worker_workspace_isolation_preserves_parent_shutdown_and_reuse() {
     assert!(other
         .execute(other_dir.path(), "process_list", &json!({}), None, None)
         .is_err());
-    let until = Instant::now() + Duration::from_secs(5);
+    let until = Instant::now() + FIXTURE_TIMEOUT;
     while session
         .tool_context
         .jobs
@@ -642,8 +642,13 @@ fn browser_dev_server_rejects_evidence_after_authority_changes_during_callback()
     }
 }
 
+/// Bound for fixture processes (`node`, shells) to start, exit or react.
+/// Every wait returns as soon as its condition holds; the bound only has to
+/// outlast a loaded windows-latest runner, where 5 s was not enough.
+const FIXTURE_TIMEOUT: Duration = Duration::from_secs(30);
+
 fn wait_for(mut condition: impl FnMut() -> bool) {
-    let until = Instant::now() + Duration::from_secs(5);
+    let until = Instant::now() + FIXTURE_TIMEOUT;
     while !condition() {
         assert!(Instant::now() < until, "process fixture timed out");
         std::thread::sleep(Duration::from_millis(10));
@@ -935,7 +940,7 @@ fn process_bounded_restart_records_attempts_and_declared_ports() {
     assert_eq!(
         manager
             .owner
-            .wait(id as u32, Duration::from_secs(5))
+            .wait(id as u32, FIXTURE_TIMEOUT)
             .unwrap()
             .unwrap()
             .code,
@@ -1132,11 +1137,7 @@ fn process_retries_never_replay_one_call_approval_or_successful_exit() {
         let id = result.details.unwrap()["process"]["id"].as_u64().unwrap() as u32;
         let owner = &agent.tool_context.processes.as_ref().unwrap().owner;
         assert_eq!(
-            owner
-                .wait(id, Duration::from_secs(5))
-                .unwrap()
-                .unwrap()
-                .code,
+            owner.wait(id, FIXTURE_TIMEOUT).unwrap().unwrap().code,
             Some(code)
         );
         assert_eq!(owner.snapshot(id).unwrap().restart["attempts"], 0);
@@ -1162,11 +1163,7 @@ fn process_windows_npm_uses_node_entrypoint_with_literal_arguments() {
         )
         .unwrap();
     let id = result.details.unwrap()["process"]["id"].as_u64().unwrap() as u32;
-    let exit = manager
-        .owner
-        .wait(id, Duration::from_secs(10))
-        .unwrap()
-        .unwrap();
+    let exit = manager.owner.wait(id, FIXTURE_TIMEOUT).unwrap().unwrap();
     assert_eq!(
         exit.code,
         Some(0),
