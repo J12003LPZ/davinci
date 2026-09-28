@@ -897,12 +897,14 @@ mod tests {
 
     #[test]
     fn a_hook_that_ignores_large_stdin_still_times_out() {
+        // Windows: `ping` runs about 30 s and never reads stdin, like
+        // `sleep 30`; PowerShell is avoided in these tests (see `shell_hook`).
         let command = if cfg!(windows) {
             vec![
-                "powershell".to_string(),
-                "-NoProfile".to_string(),
-                "-Command".to_string(),
-                "Start-Sleep -Seconds 30".to_string(),
+                "ping".to_string(),
+                "-n".to_string(),
+                "31".to_string(),
+                "127.0.0.1".to_string(),
             ]
         } else {
             vec!["sh".to_string(), "-c".to_string(), "sleep 30".to_string()]
@@ -1054,9 +1056,24 @@ mod tests {
         let previous_v2 = std::env::var_os("DAVINCI_RUNTIME_HOOKS_V2");
         std::env::remove_var("PI_HOOKS_DRY_RUN");
         std::env::set_var("DAVINCI_RUNTIME_HOOKS_V2", "1");
+        // Windows: cmd, not PowerShell (see `shell_hook`). The payload is
+        // captured once, then matched like the sh branch; `.` stands for the
+        // quote so no quoting has to survive Rust's argument escaping.
+        let capture_dir = tempfile::tempdir().unwrap();
         let command = if cfg!(windows) {
-            vec!["powershell".into(), "-NoProfile".into(), "-NonInteractive".into(), "-Command".into(),
-                "$p = [Console]::In.ReadToEnd() | ConvertFrom-Json; if ($p.event.kind -eq 'task_completed' -and $p.event.success -eq $true) { Write-Output 'legacy completion denied'; exit 1 }; exit 0".into()]
+            let payload = capture_dir.path().join("payload.json");
+            let payload = payload.to_string_lossy();
+            assert!(
+                !payload.contains(' '),
+                "payload path has a space: {payload}"
+            );
+            vec![
+                "cmd".into(),
+                "/C".into(),
+                format!(
+                    "more > {payload} & findstr /R kind.:.task_completed {payload} >nul && findstr /R success.:true {payload} >nul && (echo legacy completion denied& exit /b 1) & exit /b 0"
+                ),
+            ]
         } else {
             vec!["sh".into(), "-c".into(),
                 r#"payload=$(cat); case "$payload" in *'"kind":"task_completed"'*) case "$payload" in *'"success":true'*) echo 'legacy completion denied'; exit 1;; esac;; esac; exit 0"#.into()]
