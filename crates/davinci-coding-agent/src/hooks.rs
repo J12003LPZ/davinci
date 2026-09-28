@@ -807,8 +807,11 @@ mod tests {
             vec![
                 "powershell".into(),
                 "-NoProfile".into(),
+                "-NonInteractive".into(),
                 "-Command".into(),
-                format!("$input | Out-File -Encoding utf8 '{capture}'; exit {code}"),
+                format!(
+                    "[Console]::In.ReadToEnd() | Out-File -Encoding utf8 '{capture}'; exit {code}"
+                ),
             ]
         } else {
             vec![
@@ -839,7 +842,9 @@ mod tests {
 
     #[test]
     fn an_untrusted_project_file_is_ignored() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         std::env::remove_var("PI_HOOKS_CONFIG");
         let dir = tempfile::tempdir().unwrap();
         let agent = dir.path().join("agent");
@@ -861,7 +866,9 @@ mod tests {
 
     #[test]
     fn pi_hooks_config_wins() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("h.json");
         std::fs::write(&path, r#"{"stop":[["true"]]}"#).unwrap();
@@ -912,7 +919,9 @@ mod tests {
 
     #[test]
     fn a_failing_pre_tool_hook_blocks_and_gets_the_call_on_stdin() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         std::env::remove_var("PI_HOOKS_DRY_RUN");
         let dir = tempfile::tempdir().unwrap();
         let capture = dir.path().join("seen.json");
@@ -941,7 +950,9 @@ mod tests {
 
     #[test]
     fn dry_run_skips_every_hook() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         std::env::set_var("PI_HOOKS_DRY_RUN", "1");
         let hooks = HooksFile {
             pre_tool: vec![vec!["definitely-not-a-program".into()]],
@@ -995,7 +1006,9 @@ mod tests {
 
     #[test]
     fn trusted_project_loads_new_hook_vectors() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         std::env::remove_var("PI_HOOKS_CONFIG");
         let dir = tempfile::tempdir().unwrap();
         let agent = dir.path().join("agent");
@@ -1024,14 +1037,16 @@ mod tests {
 
     #[test]
     fn f03_legacy_completion_hook_can_still_deny_by_payload() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let previous_dry_run = std::env::var_os("PI_HOOKS_DRY_RUN");
         let previous_v2 = std::env::var_os("DAVINCI_RUNTIME_HOOKS_V2");
         std::env::remove_var("PI_HOOKS_DRY_RUN");
         std::env::set_var("DAVINCI_RUNTIME_HOOKS_V2", "1");
         let command = if cfg!(windows) {
-            vec!["powershell".into(), "-NoProfile".into(), "-Command".into(),
-                "$p = $input | ConvertFrom-Json; if ($p.event.kind -eq 'task_completed' -and $p.event.success -eq $true) { Write-Output 'legacy completion denied'; exit 1 }; exit 0".into()]
+            vec!["powershell".into(), "-NoProfile".into(), "-NonInteractive".into(), "-Command".into(),
+                "$p = [Console]::In.ReadToEnd() | ConvertFrom-Json; if ($p.event.kind -eq 'task_completed' -and $p.event.success -eq $true) { Write-Output 'legacy completion denied'; exit 1 }; exit 0".into()]
         } else {
             vec!["sh".into(), "-c".into(),
                 r#"payload=$(cat); case "$payload" in *'"kind":"task_completed"'*) case "$payload" in *'"success":true'*) echo 'legacy completion denied'; exit 1;; esac;; esac; exit 0"#.into()]
@@ -1069,7 +1084,9 @@ mod tests {
 
     #[test]
     fn f03_completion_proposal_preserves_legacy_hook_payload() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let previous_dry_run = std::env::var_os("PI_HOOKS_DRY_RUN");
         std::env::remove_var("PI_HOOKS_DRY_RUN");
         let dir = tempfile::tempdir().unwrap();
@@ -1111,7 +1128,9 @@ mod tests {
 
     #[test]
     fn new_event_dispatch_and_stdin_payload() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         std::env::remove_var("PI_HOOKS_DRY_RUN");
         let dir = tempfile::tempdir().unwrap();
         let capture = dir.path().join("envelope_seen.json");
@@ -1156,7 +1175,9 @@ mod tests {
         use crate::runtime_host::HooksRuntimeSubscriber;
         use davinci_agent::{RuntimeDecision, RuntimeSubscriber};
 
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         std::env::remove_var("PI_HOOKS_DRY_RUN");
         std::env::remove_var("DAVINCI_RUNTIME_HOOKS_V2");
         let dir = tempfile::tempdir().unwrap();

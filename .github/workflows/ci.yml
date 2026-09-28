@@ -237,6 +237,7 @@ jobs:
 
   quality:
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     env:
       CARGO_INCREMENTAL: "0"
     steps:
@@ -247,15 +248,21 @@ jobs:
         run: cargo fmt --check
       - name: Clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
-      - name: Release credential fixture exclusion
-        shell: bash
-        run: |
-          set -euo pipefail
-          cargo build --release -p davinci-coding-agent --bin davinci
-          if strings target/release/davinci | grep -Eq 'PI_OAUTH_FIXTURE|PI_OAUTH_REFRESH_URL|PI_OAUTH_TOKEN_URL|PI_MCP_FIXTURE|PI_SECURITY_SCAN_FIXTURE|PI_SECURITY_SCAN_HOLD'; then
-            echo "credential-affecting test fixture hook leaked into release binary" >&2
-            exit 1
-          fi
+
+  # Separate from `quality` so each gets a fresh runner. Stacking the clippy
+  # build, a release build and these debug test builds on one runner starved
+  # it until GitHub reported "The hosted runner lost communication with the
+  # server" during Behavioral contracts. The release credential check lives
+  # in the ubuntu davinci-coding-agent workspace shard.
+  contracts:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      CARGO_INCREMENTAL: "0"
+    steps:
+      - uses: actions/checkout@v4
+      - name: Use repository-pinned Rust
+        run: rustup show
       - name: Prompt contracts
         run: |
           cargo test -p davinci-agent prompt::
@@ -268,6 +275,23 @@ jobs:
         run: cargo test -p davinci-coding-agent ecosystem_invariants_ -- --nocapture
       - name: Runtime migration baseline
         run: cargo test -p davinci-coding-agent runtime_migration_preserves_ecosystem_baseline -- --nocapture
+
+  python-tests:
+    name: python-tests (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Benchmark harness
+        run: python -m unittest discover -s scripts/bench/tests -p "test_*.py"
+      - name: Inline verification Python checker
+        run: python -m unittest discover -s crates/davinci-agent/src/verification -p "test_python_ast.py"
 
   workspace-test-shards:
     name: workspace-test (${{ matrix.os }}, ${{ matrix.package }})
@@ -316,7 +340,10 @@ jobs:
         run: |
           set -euo pipefail
           cargo build --release -p davinci-coding-agent --bin davinci --locked
-          ! strings target/release/davinci | grep -E "PI_OAUTH_FIXTURE|PI_OAUTH_REFRESH_URL|PI_OAUTH_TOKEN_URL|PI_MCP_FIXTURE|PI_SECURITY_SCAN_FIXTURE"
+          if strings target/release/davinci | grep -Eq 'PI_OAUTH_FIXTURE|PI_OAUTH_REFRESH_URL|PI_OAUTH_TOKEN_URL|PI_MCP_FIXTURE|PI_SECURITY_SCAN_FIXTURE|PI_SECURITY_SCAN_HOLD'; then
+            echo "credential-affecting test fixture hook leaked into release binary" >&2
+            exit 1
+          fi
 
   workspace-tests:
     needs: workspace-test-shards
