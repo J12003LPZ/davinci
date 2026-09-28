@@ -6,13 +6,15 @@ This document establishes the architecture, boundaries, and routing policy for m
 
 ## 1. Orchestration Modes Overview
 
+See [Agent teams](agent-teams.md) for flags, lifecycle, commands, and limitations.
+
 Davinci provides five distinct execution modes, each tailored to a specific operational scale, autonomy model, and reliability contract:
 
 | Mode | Entry Point / Tool | Autonomy & Lifespan | Context Model | Isolation & Mutation Boundary |
 | :--- | :--- | :--- | :--- | :--- |
 | **Normal Agent** | CLI, `/act`, interactive turn | Synchronous foreground turn loop | Monolithic conversation history with Token Governor compression and turn compaction | Shared workspace, synchronous in-turn mutation barriers |
-| **One-Shot Subagent** | `agent` tool (`mode: "oneshot"` or `"background"`) | Bounded ephemeral worker | Isolated throw-away context; returns compact summary string (capped at 50 KB) | Scoped tool allowlist; read-only default; worktree lease optional |
-| **Agent Teams** | `agent` (`mode: "teammate"`), `/team`, `task_*`, `agent_message` | Multi-agent collaborative session | Per-agent scoped context, peer mailboxes, event-driven wakeup dispatch | Shared runtime task board; atomic task claiming; message passing |
+| **One-Shot Subagent** | `agent` tool (`mode: "oneshot"`) | Bounded ephemeral worker | Isolated throw-away context; returns compact summary string (capped at 50 KB) | Scoped tool allowlist; read-only default; worktree lease optional |
+| **Agent Teams** | `agent` (`mode: "teammate"`), `/agents`, `task_*`, `agent_message` | Multi-agent collaborative session | Per-agent scoped context, peer mailboxes, mailbox condition-variable wakeup and idle interactive lead auto-wake | Shared runtime task board; atomic task claiming; message passing |
 | **Workflows** | `workflow_run`, `workflow_status`, `/workflow` | Multi-phase repeatable DAG pipeline | Phased execution; intermediate artifacts stored outside model context in Governor-backed store | Worktree isolation required for parallel writers; join policies (All, Any, Quorum); retry budgets |
 | **Graph** | `graph_run`, `/graph <goal>` | Deterministic multi-stage engineering graph | Isolated worker child processes (`--no-session --no-extensions --no-skills`); bounded 2,500 token context packets | Rigid deterministic pipeline (`classify -> investigate -> plan -> implement -> verify -> review`), revision loops, security audits, review coverage |
 
@@ -63,7 +65,7 @@ When an agent or operator determines how to approach a task, the runtime enforce
 
 2. **One-Shot Subagent (`agent`)**:
    - **When to use**: Bounded independent research, reading large files/documentation, or exploring codebases where broad searches would pollute the primary agent context.
-   - **Invariants**: Cannot mutate the repository unless explicitly granted mutating tools and worktree isolation. Output is strictly bounded to 50 KB.
+   - **Invariants**: Cannot mutate the repository unless explicitly granted mutating tools and worktree isolation. Output is bounded to 50 KiB plus preserved-worktree metadata. Fan-out accepts 8 tasks per call and runs 4 at once. Background mode returns immediately and delivers one labeled completion report to the lead; print mode rejects asynchronous workers.
 
 3. **Persistent Agent Teams (`mode: teammate`)**:
    - **When to use**: Multi-perspective interactive collaboration (e.g., Architect designing while Reviewer critiques and Tester writes specs), shared task assignment boards, and asynchronous agent-to-agent messaging.
@@ -71,7 +73,7 @@ When an agent or operator determines how to approach a task, the runtime enforce
 
 4. **Dynamic General Workflows (`workflow_run`, `/workflow`)**:
    - **When to use**: Repeatable, structured multi-phase orchestration pipelines with intermediate data handoffs (e.g., triage -> analyze -> synthesize report).
-   - **Invariants**: Declared as deterministic DAGs (`WorkflowSpec`); validated prior to execution; supports fan-out/fan-in joins (`All`, `Any`, `Quorum`); intermediate artifacts are stored in Rust (`WorkflowStateStore`) and never dumped into model context.
+   - **Invariants**: Declared as deterministic DAGs (`WorkflowSpec`); validated prior to execution; supports fan-out/fan-in joins (`All`, `Any`, `Quorum`); intermediate artifacts are stored in Rust (`WorkflowStateStore`) and referenced by later phases; synchronous runs return bounded final outputs. `/workflow` supports list, status, and cancel; launch with `workflow_run`. Workers inherit the parent model and tool ceiling. `max_turns` and `deadline_ms` are enforced; `max_cost_usd` is rejected until cost accounting is supported.
 
 5. **Deterministic Graph Engineering (`/graph`, `graph_run`)**:
    - **When to use**: Automated codebase modifications requiring strict structural guarantees, independent verification commands, reviewer coverage tracking, security scans, and deterministic revision loops.
@@ -100,17 +102,17 @@ A critical failure mode of multi-agent LLM systems is **context accumulation**, 
 
 - **Rust-Owned Artifact Store**: The workflow engine stores all intermediate phase outputs in `WorkflowStateStore`.
 - **Digest Referencing**: Worker prompts receive references or digests (`governor://` or artifact URIs) rather than raw blobs.
-- **Size Bounds**: Artifacts exceeding 64 KB are automatically spilled to Token Governor-backed overflow storage; a 1 MB artifact produces `< 200` bytes of reference metadata in worker prompts.
+- **Size Bounds**: Artifacts exceeding 32 KiB are automatically spilled to Token Governor-backed overflow storage; a 1 MB artifact produces `< 200` bytes of reference metadata in worker prompts.
 
 ### 3.3 Mutation Ownership and Worktree Leases
 
 To guarantee that parallel agents do not corrupt working trees or produce race conditions:
 
-- **Single Writer Invariant**: In any shared workspace, at most one mutating agent may execute at any given time.
+- **Single Writer Invariant**: Shared-workspace worker turns with writing permission hold the session team writer mutex. Background writers require a worktree. The foreground lead is not covered by this worker mutex; coordinate its edits through the task board.
 - **Worktree Leases**: Multiple parallel mutating workers (in workflows or teams) are permitted **only** if each worker acquires an isolated `WorktreeLease` (`isolation: "worktree"`).
 - **Lease Cleanup**: Clean leases are released upon successful task completion; failed or dirty worktrees are preserved for operator inspection.
 
 ### 3.4 Permission Ceilings and Project Trust
 
-- **No Privilege Escalation**: Subagents, team workers, and workflow phases inherit the parent session's `PermissionMode`. A session in `ReadOnly` mode rejects any workflow or agent task that requests mutating tools.
+- **No Privilege Escalation**: Subagents, team workers, and workflow phases inherit the parent session's `PermissionMode`. A session in `ReadOnly` mode rejects mutating workflows and removes mutating tools from scoped agent requests. Shared workers default to read-only; an allowed profile may grant more within the parent permission ceiling.
 - **Untrusted Projects**: In an untrusted checkout, project-level workflows (`.davinci/workflows/*.json`) and custom agent profiles cannot be loaded or executed until the user explicitly runs `/trust`.

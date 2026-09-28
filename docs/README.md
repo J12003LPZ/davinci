@@ -11,6 +11,7 @@ Native capability guides: [repository intelligence](repo-intelligence.md),
 [test impact](test-impact.md),
 [managed processes](process-manager.md), [transactional edits](transactional-edits.md),
 and [browser verification](browser-verification.md).
+Agent orchestration: [agent teams](agent-teams.md) and [runtime routing](runtime-orchestration.md).
 Context and routing: [Context VM](context-vm.md), [Jev](decision-intelligence.md),
 and [hardening measurements](context-vm-jev-measurements.md).
 OpenAI provider operations: [cache and Responses efficiency](openai-efficiency.md).
