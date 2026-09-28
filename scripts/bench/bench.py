@@ -158,6 +158,12 @@ def forbidden_artifacts(workdir, tid):
     if not hidden.is_dir():
         raise RuntimeError("cannot inventory reserved hidden-grader paths")
     reserved = {path.relative_to(hidden).as_posix() for path in hidden.rglob("*") if path.is_file()}
+    # A hidden grader file that also ships in the public repo (t8's
+    # test_calc.py) is the starter file, not a leak: grading copies the hidden
+    # version over it. Reserving it failed every harness on t8.
+    public = Path(TASKS) / tid / "repo"
+    if public.is_dir():
+        reserved -= {path.relative_to(public).as_posix() for path in public.rglob("*") if path.is_file()}
     forbidden_dirs = {"hidden", "solution", ".davinci-artifacts", ".bench-artifacts"}
     credential_names = {"auth.json", "credentials.json"}
     found, transactions = [], []

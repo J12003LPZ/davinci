@@ -568,6 +568,27 @@ class RunnerTests(unittest.TestCase):
                 self.assertFalse(result["transaction_leak"])
                 self.assertEqual(result["artifact_paths"], ["test_private.py"])
 
+    def test_hidden_file_shipped_in_the_public_repo_is_not_an_artifact(self):
+        # Regression: t8 ships test_calc.py publicly and in hidden/, so the
+        # untouched starter file stopped every campaign as forbidden_artifact.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            work, tasks = root / "work", root / "tasks"
+            work.mkdir()
+            hidden, public = tasks / "synthetic" / "hidden", tasks / "synthetic" / "repo"
+            hidden.mkdir(parents=True)
+            public.mkdir(parents=True)
+            (hidden / "test_calc.py").write_text("hidden version")
+            (hidden / "test_hidden_calc.py").write_text("private")
+            (public / "test_calc.py").write_text("public version")
+            (work / "test_calc.py").write_text("agent edited the starter tests")
+            with patch.object(bench, "TASKS", str(tasks)):
+                result = bench.forbidden_artifacts(work, "synthetic")
+                self.assertFalse(result["artifact_leak"], result)
+                (work / "test_hidden_calc.py").write_text("copied before grading")
+                result = bench.forbidden_artifacts(work, "synthetic")
+                self.assertEqual(result["artifact_paths"], ["test_hidden_calc.py"])
+
     def test_existing_campaign_is_never_reused(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp) / "campaign"
