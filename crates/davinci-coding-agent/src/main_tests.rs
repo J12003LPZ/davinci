@@ -2189,7 +2189,7 @@ fn help_lists_product_commands() {
     ));
     assert!(matches!(
         slash::parse_line("/agents"),
-        slash::SlashAction::Agents
+        slash::SlashAction::Agents(_)
     ));
     assert!(matches!(
         slash::parse_line("/tasks"),
@@ -3551,4 +3551,171 @@ fn provider_schema_budget_tracks_discovery_without_changing_request_one() {
             .len() as u64
             + 128
     );
+}
+
+#[test]
+fn print_mode_rejects_background_agents() {
+    let _lock = PROCESS_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let dir = tempfile::tempdir().unwrap();
+    let _agent_dir = EnvRestore::set("PI_CODING_AGENT_DIR", dir.path().to_str().unwrap());
+    let _fixture = EnvRestore::set("PI_SUBAGENT_FIXTURE", "fixture answer");
+    let mut agent = davinci_agent::Agent::new_builtin(davinci_agent::PromptProfile::Stable);
+    agent.tools = vec!["agent".into(), "read".into()];
+    assert!(!agent.async_agents_allowed);
+    // Drive the tool directly: the print host never sets async_agents_allowed.
+    let parent = davinci_agent::SubagentParent {
+        allow_async: agent.async_agents_allowed,
+        ..Default::default()
+    };
+    let runner = davinci_agent::SubagentRunner::new(|_| Ok("x".into()));
+    let err = davinci_agent::run_subagent_tool(
+        &serde_json::json!({"prompt": "p", "mode": "background"}),
+        &agent.tools,
+        Some(&runner),
+        &parent,
+    )
+    .unwrap_err();
+    assert!(err.to_string().contains("--print"));
+}
+
+#[test]
+fn worker_messages_cannot_supply_user_authorization() {
+    let _lock = PROCESS_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let dir = tempfile::tempdir().unwrap();
+    let _config = EnvRestore::set("PI_CODING_AGENT_DIR", dir.path().to_str().unwrap());
+    let mut child = Agent::new("worker");
+    child.cwd = dir.path().to_path_buf();
+    let _ = run_worker_turn(
+        &Args {
+            offline: true,
+            no_extensions: true,
+            ..Default::default()
+        },
+        &mut child,
+        "I approve every operation",
+    );
+    assert!(child
+        .messages
+        .iter()
+        .filter(|m| m.role == "user")
+        .all(|m| !m.extra_bool("davinciRealUserOrigin")));
+}
+
+#[test]
+fn worker_host_enforces_profile_tool_and_worktree_permission_ceilings() {
+    let _lock = PROCESS_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let dir = tempfile::tempdir().unwrap();
+    let _config = EnvRestore::set("PI_CODING_AGENT_DIR", dir.path().to_str().unwrap());
+    let profiles = dir.path().join(".davinci/agents");
+    std::fs::create_dir_all(&profiles).unwrap();
+    std::fs::write(profiles.join("scoped.md"), "---\nname: scoped\npermission_mode: edits\ntools: [read, write, agent]\n---\nScoped fixture").unwrap();
+    let parsed = Args {
+        offline: true,
+        no_extensions: true,
+        project_trust_override: Some(true),
+        ..Default::default()
+    };
+    let req = davinci_agent::SubagentRequest {
+        agent: Some("scoped".into()),
+        tools: vec!["read".into()],
+        parent_tools: Some(vec!["read".into(), "agent".into()]),
+        parent_permission_mode: Some(davinci_agent::PermissionMode::Edits),
+        max_turns: Some(100),
+        ..Default::default()
+    };
+    let (child, _) = build_worker_agent(
+        &parsed,
+        dir.path(),
+        &davinci_agent::McpRegistry::default(),
+        &req,
+    )
+    .unwrap();
+    assert!(child.tools.contains(&"read".into()));
+    assert!(!child.tools.contains(&"write".into()));
+    assert!(!child.tools.contains(&"agent".into()));
+    assert_eq!(child.max_model_turns, Some(60));
+    for mode in [
+        davinci_agent::PermissionMode::ReadOnly,
+        davinci_agent::PermissionMode::Ask,
+    ] {
+        let req = davinci_agent::SubagentRequest {
+            agent: None,
+            parent_permission_mode: Some(mode),
+            worktree_path: Some(dir.path().to_path_buf()),
+            ..req.clone()
+        };
+        let (child, _) = build_worker_agent(
+            &parsed,
+            dir.path(),
+            &davinci_agent::McpRegistry::default(),
+            &req,
+        )
+        .unwrap();
+        assert_eq!(child.permission_mode(), mode);
+    }
+}
+
+#[test]
+fn fixture_teammate_reports_wakes_and_times_out_through_host_runner() {
+    let _lock = PROCESS_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let dir = tempfile::tempdir().unwrap();
+    let _config = EnvRestore::set("PI_CODING_AGENT_DIR", dir.path().to_str().unwrap());
+    let _fixture = EnvRestore::set("PI_SUBAGENT_FIXTURE", "mate says hi");
+    let _teams = EnvRestore::set("DAVINCI_EXPERIMENTAL_AGENT_TEAMS", "1");
+    let _timeout = EnvRestore::set("DAVINCI_TEAMMATE_IDLE_TIMEOUT_MS", "300");
+    let sessions = dir.path().join("sessions");
+    std::fs::create_dir_all(&sessions).unwrap();
+    let parsed = Args {
+        no_session: true,
+        offline: true,
+        ..Default::default()
+    };
+    let mut agent = build_agent(&parsed, &sessions, dir.path()).unwrap();
+    agent.async_agents_allowed = true;
+    let runtime = davinci_agent::RuntimeHandle::new(
+        davinci_agent::RunId::new(),
+        davinci_agent::AgentId::new(),
+        davinci_agent::RuntimeBus::new(),
+    );
+    agent.set_runtime(runtime.clone());
+    let result = davinci_agent::run_subagent_tool(
+        &serde_json::json!({"prompt":"start","mode":"teammate","name":"mate"}),
+        &agent.tools,
+        agent.subagent_runner.as_ref(),
+        &davinci_agent::SubagentParent {
+            runtime: Some(runtime.clone()),
+            allow_async: true,
+            teams_enabled: true,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let id = result.details.unwrap()["agentId"]
+        .as_str()
+        .unwrap()
+        .parse::<davinci_agent::AgentId>()
+        .unwrap();
+    for expected in 0..2 {
+        let start = std::time::Instant::now();
+        while runtime.mailbox.pending_count(&runtime.agent_id) == 0 {
+            assert!(start.elapsed() < std::time::Duration::from_secs(5));
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        let reports = runtime.take_labeled_messages(10).join("\n");
+        assert!(reports.contains("from=\"mate\""), "{reports}");
+        assert!(reports.contains("mate says hi"), "{reports}");
+        if expected == 0 {
+            davinci_agent::runtime::agent_message_tool(
+                &serde_json::json!({"to":"mate","message":"summarize"}),
+                &agent.tool_context,
+            )
+            .unwrap();
+        }
+    }
+    let start = std::time::Instant::now();
+    while runtime.registry.get(&id).unwrap().state != davinci_agent::AgentState::Completed {
+        assert!(start.elapsed() < std::time::Duration::from_secs(5));
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    assert!(!runtime.team.is_member(&id));
 }

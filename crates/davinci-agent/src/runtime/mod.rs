@@ -124,9 +124,9 @@ pub use tools_task::{
 pub use workflow::{
     find_saved_workflow, is_mutating_tool, is_mutating_tool_with_registry,
     save_workflow_to_project, validate_workflow, validate_workflow_with_capabilities,
-    validate_workflow_with_permissions, workflow_run_tool, workflow_status_tool,
-    workflow_tool_specs, PhaseExecutionState, PhaseStatus, WorkflowArtifact,
-    WorkflowExecutionError, WorkflowExecutionState, WorkflowExecutor, WorkflowJoin,
+    validate_workflow_with_permissions, workflow_run_tool, workflow_run_tool_with_parent,
+    workflow_status_tool, workflow_tool_specs, PhaseExecutionState, PhaseStatus, WorkflowArtifact,
+    WorkflowExecutionError, WorkflowExecutionState, WorkflowExecutor, WorkflowJoin, WorkflowLaunch,
     WorkflowPhaseSpec, WorkflowSpec, WorkflowStateError, WorkflowStateStore, WorkflowStatus,
     WorkflowValidationError, WorkflowWorkerSpec,
 };

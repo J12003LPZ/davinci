@@ -2755,10 +2755,13 @@ fn the_palette_lists_every_command_the_composer_completes() {
     assert!(names.contains(&"/cost"), "{names:?}");
     assert!(names.contains(&"/status"), "{names:?}");
     assert!(names.contains(&"/agents"), "{names:?}");
-    assert!(names.contains(&"/workflow"), "{names:?}");
-    assert!(names.contains(&"/workflows"), "{names:?}");
-    assert!(names.contains(&"/workflow-stop"), "{names:?}");
-    assert!(names.contains(&"/workflow-resume"), "{names:?}");
+    assert_eq!(
+        names.contains(&"/workflow"),
+        davinci_agent::tools::workflow_tools_enabled()
+    );
+    assert!(!names.contains(&"/workflows"), "{names:?}");
+    assert!(!names.contains(&"/workflow-stop"), "{names:?}");
+    assert!(!names.contains(&"/workflow-resume"), "{names:?}");
 }
 
 #[test]
@@ -3452,4 +3455,26 @@ mod terminal_rebuild_host_contracts {
         assert!(graph_command_opens_view("graph-view", ""));
         assert!(!graph_command_opens_view("model", ""));
     }
+}
+
+#[test]
+fn team_wake_text_drains_teammate_reports_into_one_prompt() {
+    use davinci_agent::runtime::{AgentId, RunId, RuntimeBus, RuntimeHandle};
+    let mut agent = davinci_agent::Agent::new_builtin(davinci_agent::PromptProfile::Stable);
+    let lead = RuntimeHandle::new(RunId::new(), AgentId::new(), RuntimeBus::new());
+    lead.ensure_lead_registered("p", "m", std::path::Path::new("."));
+    agent.set_runtime(lead.clone());
+    assert!(team_wake_text(&agent).is_none());
+    lead.mailbox
+        .send(davinci_agent::runtime::AgentMessage::new(
+            lead.run_id,
+            lead.agent_id,
+            lead.agent_id,
+            "status: completed\n\nfound the bug",
+        ))
+        .unwrap();
+    let text = team_wake_text(&agent).unwrap();
+    assert!(text.contains("found the bug"));
+    assert!(text.contains("<agent-message"));
+    assert!(team_wake_text(&agent).is_none());
 }

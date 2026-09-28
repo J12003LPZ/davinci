@@ -88,15 +88,9 @@ impl TeamRoster {
 
     /// Stop every worker of this session (session switch or shutdown).
     pub fn shutdown_all(&self) {
-        let root = self
-            .inner
-            .root
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .take();
-        if let Some(root) = root {
-            root.cancel();
-        }
+        // Keep the cancelled root: late admissions must not resurrect a
+        // session that has been replaced. A new session owns a new roster.
+        self.session_token().cancel();
         self.inner
             .members
             .write()
@@ -111,6 +105,24 @@ impl TeamRoster {
             .shared_write
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    pub fn shared_write_guard_until_cancelled(
+        &self,
+        token: &CancellationToken,
+    ) -> Option<MutexGuard<'_, ()>> {
+        loop {
+            if token.is_cancelled() {
+                return None;
+            }
+            match self.inner.shared_write.try_lock() {
+                Ok(guard) => return Some(guard),
+                Err(std::sync::TryLockError::Poisoned(error)) => return Some(error.into_inner()),
+                Err(std::sync::TryLockError::WouldBlock) => {
+                    std::thread::sleep(Duration::from_millis(10))
+                }
+            }
+        }
     }
 }
 
@@ -140,7 +152,9 @@ pub fn format_agent_message(msg: &AgentMessage, sender: Option<(&str, AgentKind)
     let (name, kind) = sender
         .map(|(name, kind)| (attribute(name), kind_label(kind)))
         .unwrap_or_else(|| ("unknown".to_string(), "unknown"));
-    let body = msg.content.replace("</agent-message>", "<\\/agent-message>");
+    let body = msg
+        .content
+        .replace("</agent-message>", "<\\/agent-message>");
     format!(
         "<agent-message from=\"{name}\" agent_id=\"{}\" kind=\"{kind}\">\n{body}\n</agent-message>",
         msg.from
@@ -216,7 +230,11 @@ fn cap_body(text: &str) -> String {
 
 /// Post one finished turn to the lead. Failures to deliver are recorded on
 /// the worker's registry record instead of being dropped silently.
-pub fn report_to_lead(worker: &RuntimeHandle, outcome: &Result<String, String>, extra: Option<&str>) {
+pub fn report_to_lead(
+    worker: &RuntimeHandle,
+    outcome: &Result<String, String>,
+    extra: Option<&str>,
+) {
     let Some(lead) = worker.parent_agent_id else {
         return;
     };
@@ -256,18 +274,15 @@ pub fn finish_agent(registry: &RuntimeRegistry, id: AgentId, success: bool) {
 
 fn stop_requested(worker: &RuntimeHandle) -> bool {
     worker.cancellation_token.is_cancelled()
-        || worker
-            .registry
-            .get(&worker.agent_id)
-            .is_some_and(|record| {
-                matches!(
-                    record.state,
-                    AgentState::Stopping
-                        | AgentState::Completed
-                        | AgentState::Failed
-                        | AgentState::Cancelled
-                )
-            })
+        || worker.registry.get(&worker.agent_id).is_some_and(|record| {
+            matches!(
+                record.state,
+                AgentState::Stopping
+                    | AgentState::Completed
+                    | AgentState::Failed
+                    | AgentState::Cancelled
+            )
+        })
 }
 
 /// Drive a persistent teammate: run a turn, report it, go idle, wake on the
@@ -287,6 +302,9 @@ where
     let mut prompt = first_prompt.to_string();
     let mut failures = 0_u32;
     loop {
+        if stop_requested(worker) {
+            return TeammateExit::Stopped;
+        }
         let outcome = turn(&prompt);
         report_to_lead(worker, &outcome, None);
         match &outcome {
@@ -355,6 +373,7 @@ mod tests {
         roster.shutdown_all();
         assert!(token_b.is_cancelled());
         assert!(!roster.is_member(&b));
+        assert!(roster.admit(AgentId::new()).is_cancelled());
     }
 
     #[test]
@@ -364,6 +383,15 @@ mod tests {
         let member = roster.admit(AgentId::new());
         turn.cancel();
         assert!(!member.is_cancelled());
+    }
+
+    #[test]
+    fn cancelled_writer_does_not_wait_for_the_shared_workspace() {
+        let roster = TeamRoster::default();
+        let _guard = roster.shared_write_guard();
+        let token = CancellationToken::new();
+        token.cancel();
+        assert!(roster.shared_write_guard_until_cancelled(&token).is_none());
     }
 
     #[test]
@@ -406,7 +434,12 @@ mod tests {
             })
             .unwrap();
         lead.mailbox
-            .send(AgentMessage::new(lead.run_id, worker, lead.agent_id, "found it"))
+            .send(AgentMessage::new(
+                lead.run_id,
+                worker,
+                lead.agent_id,
+                "found it",
+            ))
             .unwrap();
         let texts = lead.take_labeled_messages(10);
         assert_eq!(texts.len(), 1);
@@ -421,7 +454,10 @@ mod tests {
         lead.mailbox
             .send_steer(lead.agent_id, generation, "focus on auth".into(), false)
             .unwrap();
-        assert_eq!(lead.take_labeled_messages(10), vec!["focus on auth".to_string()]);
+        assert_eq!(
+            lead.take_labeled_messages(10),
+            vec!["focus on auth".to_string()]
+        );
     }
     fn team_pair() -> (crate::runtime::RuntimeHandle, crate::runtime::RuntimeHandle) {
         use crate::runtime::{RuntimeBus, RuntimeHandle};
@@ -466,8 +502,15 @@ mod tests {
             }
             lead_for_thread.send_message(mate, "second task").unwrap();
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-            while lead_for_thread.mailbox.pending_count(&lead_for_thread.agent_id) < 2 {
-                assert!(std::time::Instant::now() < deadline, "second report missing");
+            while lead_for_thread
+                .mailbox
+                .pending_count(&lead_for_thread.agent_id)
+                < 2
+            {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "second report missing"
+                );
                 std::thread::sleep(std::time::Duration::from_millis(10));
             }
             lead_for_thread.team.cancel(&mate);
@@ -527,12 +570,9 @@ mod tests {
                 lead_for_thread.send_message(mate, "retry").unwrap();
             }
         });
-        let exit = run_teammate_loop(
-            &worker,
-            "task",
-            std::time::Duration::from_secs(30),
-            |_| Err("provider down".into()),
-        );
+        let exit = run_teammate_loop(&worker, "task", std::time::Duration::from_secs(30), |_| {
+            Err("provider down".into())
+        });
         nudger.join().unwrap();
         assert!(matches!(exit, TeammateExit::Failed(ref e) if e.contains("provider down")));
         assert_eq!(lead.take_labeled_messages(10).len(), 3);
@@ -541,11 +581,58 @@ mod tests {
     #[test]
     fn report_body_is_capped() {
         let (lead, worker) = team_pair();
-        report_to_lead(&worker, &Ok("x".repeat(REPORT_BODY_CAP * 2)), Some("worktree: /tmp/wt"));
+        report_to_lead(
+            &worker,
+            &Ok("x".repeat(REPORT_BODY_CAP * 2)),
+            Some("worktree: /tmp/wt"),
+        );
         let texts = lead.take_labeled_messages(10);
         assert_eq!(texts.len(), 1);
         assert!(texts[0].len() < crate::runtime::mailbox::MAX_MESSAGE_SIZE + 512);
         assert!(texts[0].contains("… truncated"));
         assert!(texts[0].contains("worktree: /tmp/wt"));
+    }
+    #[test]
+    fn user_steering_wakes_an_idle_teammate_as_plain_text() {
+        let (lead, worker) = team_pair();
+        let mate = worker.agent_id;
+        let lead_for_thread = lead.clone();
+        let driver = std::thread::spawn(move || {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            while lead_for_thread.registry.get(&mate).unwrap().state != AgentState::Idle {
+                assert!(std::time::Instant::now() < deadline, "never went idle");
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            let generation = lead_for_thread.registry.get_generation(&mate);
+            lead_for_thread
+                .mailbox
+                .send_steer(mate, generation, "summarize in one line".into(), false)
+                .unwrap();
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            while lead_for_thread
+                .mailbox
+                .pending_count(&lead_for_thread.agent_id)
+                < 2
+            {
+                assert!(std::time::Instant::now() < deadline, "no second report");
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            lead_for_thread.team.cancel(&mate);
+        });
+        let mut prompts = Vec::new();
+        run_teammate_loop(
+            &worker,
+            "start",
+            std::time::Duration::from_secs(30),
+            |prompt| {
+                prompts.push(prompt.to_string());
+                Ok("ok".into())
+            },
+        );
+        driver.join().unwrap();
+        assert_eq!(
+            prompts,
+            vec!["start".to_string(), "summarize in one line".to_string()]
+        );
     }
 }

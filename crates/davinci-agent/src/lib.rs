@@ -104,9 +104,9 @@ pub use skills::{
 };
 pub use stats::{RunStats, SharedCounters};
 pub use subagent::{
-    scoped_tools, scoped_tools_with_policy, scoped_tools_with_registry, AgentSpawnMode,
-    SubagentParent, SubagentRequest, SubagentRunner, DEFAULT_SUBAGENT_TOOLS, PLAN_MODE_APPENDIX,
-    PLAN_MODE_DENIAL,
+    run_tool as run_subagent_tool, scoped_tools, scoped_tools_with_policy,
+    scoped_tools_with_registry, AgentSpawnMode, SubagentParent, SubagentRequest, SubagentRunner,
+    DEFAULT_SUBAGENT_TOOLS, PLAN_MODE_APPENDIX, PLAN_MODE_DENIAL,
 };
 pub use templates::{
     discover_prompt_templates, expand_prompt_template, parse_command_args, parse_frontmatter,
@@ -456,6 +456,8 @@ pub struct Agent {
     /// (`todo.rs`), shared with the tool thread and the shell.
     pub tool_context: ToolContext,
     pub summarizer: Option<Summarizer>,
+    /// Whether the host can keep asynchronous workers alive.
+    pub async_agents_allowed: bool,
     pub subagent_runner: Option<crate::subagent::SubagentRunner>,
     pub block_images: bool,
     pub auto_resize_images: bool,
@@ -620,6 +622,7 @@ impl Agent {
             tool_context: ToolContext::default(),
             summarizer: None,
             subagent_runner: None,
+            async_agents_allowed: false,
             block_images: false,
             auto_resize_images: true,
             retry_aborted: false,
@@ -740,6 +743,12 @@ impl Agent {
             self.abort_signal = Some(runtime.cancellation_token.as_atomic_bool());
         }
         self.tool_context.cache = runtime.cache.clone();
+        if let Some(previous) = &self.runtime {
+            if previous.run_id != runtime.run_id {
+                // A new conversation: the old team has nobody to report to.
+                previous.team.shutdown_all();
+            }
+        }
         self.tool_context.runtime = Some(runtime.clone());
         self.runtime_session = self.session.as_ref().and_then(|session| {
             let source = std::fs::canonicalize(&session.path).ok()?;

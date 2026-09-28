@@ -2165,29 +2165,16 @@ pub fn corpus(
     ));
     items.push(CorpusItem::new(
         "/agents",
-        "custom agent profiles · list and status",
+        "agent profiles and live team · msg <name> <text> | stop <name>",
         "command",
     ));
-    items.push(CorpusItem::new(
-        "/workflow",
-        "run deterministic workflow · /workflow <goal>",
-        "command",
-    ));
-    items.push(CorpusItem::new(
-        "/workflows",
-        "list active agent workflows",
-        "command",
-    ));
-    items.push(CorpusItem::new(
-        "/workflow-stop",
-        "stop a running workflow · /workflow-stop <id>",
-        "command",
-    ));
-    items.push(CorpusItem::new(
-        "/workflow-resume",
-        "resume a paused workflow · /workflow-resume <id>",
-        "command",
-    ));
+    if davinci_agent::tools::workflow_tools_enabled() {
+        items.push(CorpusItem::new(
+            "/workflow",
+            "workflow runs · list | status <id> | cancel <id>",
+            "command",
+        ));
+    }
 
     for tool in &agent.tools {
         items.push(CorpusItem::new(tool, &tool_summary(tool), "tool"));
@@ -4174,20 +4161,19 @@ pub fn perform(
         SlashAction::ShowStatus => Ok(Done::Said(status_as_list(&crate::format_session_status(
             parsed, agent,
         )))),
-        SlashAction::Agents => {
+        SlashAction::Workflow(args) => Ok(Done::Said(workflow_command_text(agent, &args))),
+        SlashAction::Agents(args) => {
             let settings =
                 crate::settings::load_merged_settings(&crate::default_agent_dir(), &agent.cwd);
             let trusted =
                 crate::settings::is_trusted(&settings, &agent.cwd, parsed.project_trust_override);
-            Ok(Done::Said(
-                crate::agent_profiles::format_agent_profiles_status_with_plugins(
-                    &agent.cwd,
-                    None,
-                    trusted,
-                    davinci_coding_agent::plugins::active(&crate::default_agent_dir())
-                        .agent_profiles(),
-                ),
-            ))
+            let profiles = crate::agent_profiles::format_agent_profiles_status_with_plugins(
+                &agent.cwd,
+                None,
+                trusted,
+                davinci_coding_agent::plugins::active(&crate::default_agent_dir()).agent_profiles(),
+            );
+            Ok(Done::Said(team_command_text(agent, profiles, &args)))
         }
         // Bare `/plugin` opens the manager; `/plugin <command>` stays text.
         SlashAction::Plugin(args) if args.trim().is_empty() => {
@@ -4659,6 +4645,7 @@ pub fn run(
         }
     }
 
+    let mut team_mail_since: Option<Instant> = None;
     let result = loop {
         let _ = terminal.reacquire();
         if last_tick.elapsed() >= davinci_tui::davinci::runtime::TICK {
@@ -4693,6 +4680,55 @@ pub fn run(
             model.corpus = corpus(agent, &model.slash_commands, &model.sessions);
             model.corpus_total = model.corpus.len();
             model.dirty = true;
+        }
+        // Reports from teammates wake an idle lead, like a finished job
+        // would in Claude Code. Debounce so simultaneous reports share one
+        // turn; never interrupt typing or an open sheet.
+        let pending_team_mail = team_autowake_enabled()
+            && !model.running
+            && model.screen == Screen::Agent
+            && model.composer.editor().get_text().trim().is_empty()
+            && agent
+                .tool_context
+                .runtime
+                .as_ref()
+                .is_some_and(|rt| rt.mailbox.pending_count(&rt.agent_id) > 0);
+        if !pending_team_mail {
+            team_mail_since = None;
+        } else if team_mail_since.get_or_insert_with(Instant::now).elapsed()
+            >= Duration::from_millis(750)
+        {
+            team_mail_since = None;
+            if let Some(text) = team_wake_text(agent) {
+                let mut shell = Shell {
+                    voice: &mut voice,
+                    parsed,
+                    agent,
+                    model: &mut model,
+                    terminal: &mut terminal,
+                    host: &host,
+                    pending: &mut pending,
+                    cwd: &cwd,
+                    dresser: &dresser,
+                    images: &mut attached_images,
+                };
+                shell.model.transcript.push(Entry::Gap);
+                shell
+                    .model
+                    .transcript
+                    .push(Entry::notice(State::Attention, "team update"));
+                shell.model.transcript.push(Entry::Gap);
+                shell.model.transcript.push(Entry::agent("davinci"));
+                shell.model.running = true;
+                shell.agent.prompt_with(&text, &[]);
+                match run_turns(&mut shell) {
+                    Next::Go => {}
+                    Next::Leave => break Ok(0),
+                    Next::Fail(err) => break Err(err),
+                }
+                shell.redress();
+                model.dirty = true;
+            }
         }
         for notices in startup_checks.try_iter() {
             model.transcript.extend(startup_notice_entries(&notices));
@@ -9451,7 +9487,12 @@ fn open_agents_sheet(agent: &Agent, model: &mut Model) {
     open_sheet(model, Screen::Agents);
 }
 
-fn agents_command(shell: &mut Shell<'_>, _arg: &str) -> Next {
+fn agents_command(shell: &mut Shell<'_>, arg: &str) -> Next {
+    if !arg.trim().is_empty() {
+        let text = team_command_text(shell.agent, String::new(), arg);
+        shell.say(&text);
+        return Next::Go;
+    }
     open_agents_sheet(shell.agent, shell.model);
     Next::Go
 }
@@ -9732,59 +9773,10 @@ fn apply_graph_action(shell: &mut Shell<'_>, action: &str, index: usize) -> Next
     Next::Go
 }
 
-fn workflow_command(shell: &mut Shell<'_>, goal: &str) -> Next {
-    let goal = goal.trim();
-    if goal.is_empty() {
-        open_workflows_sheet(shell.agent, shell.model);
-        return Next::Go;
-    }
-
-    let trusted = shell
-        .agent
-        .runtime
-        .as_ref()
-        .is_some_and(|r| r.project_trusted);
-    match davinci_agent::find_saved_workflow(&shell.agent.cwd, goal, trusted) {
-        Ok(spec) => {
-            if let Some(runtime) = &shell.agent.runtime {
-                if let Some(exec) = &runtime.workflow_executor {
-                    match exec.execute_background(spec) {
-                        Ok(wf_id) => {
-                            shell.model.running = false;
-                            shell.model.transcript.push(Entry::Gap);
-                            shell.model.transcript.push(Entry::tool(
-                                State::Done,
-                                "opus",
-                                &format!("workflow '{}' ({}) started in background", goal, wf_id),
-                                None,
-                            ));
-                            return Next::Go;
-                        }
-                        Err(err) => {
-                            shell.note(&format!("failed to start workflow: {err}"));
-                            return Next::Go;
-                        }
-                    }
-                }
-            }
-            shell.note("runtime workflow executor not available");
-            Next::Go
-        }
-        Err(err) => {
-            if err.contains("requires project trust") {
-                shell.note(&err);
-                return Next::Go;
-            }
-            submit_prompt(
-                shell,
-                &format!(
-                    "Create and execute a deterministic workflow using workflow_run for the following goal:\n{}",
-                    goal
-                ),
-                &[],
-            )
-        }
-    }
+fn workflow_command(shell: &mut Shell<'_>, args: &str) -> Next {
+    let text = workflow_command_text(shell.agent, args);
+    shell.say(&text);
+    Next::Go
 }
 
 fn workflow_stop_command(shell: &mut Shell<'_>, id_str: &str) -> Next {
@@ -10012,3 +10004,142 @@ fn refresh_context(model: &mut Model, agent: &Agent) {
 #[cfg(test)]
 #[path = "davinci_interactive_tests.rs"]
 mod tests;
+
+/// `/agents` with no args: profiles plus the live team. `msg` and `stop`
+/// act on a member by name. Steering retains its plain text, but delegated
+/// turns cannot approve user-only actions on behalf of the lead.
+pub(crate) fn team_command_text(agent: &Agent, profiles_text: String, args: &str) -> String {
+    let Some(runtime) = agent.tool_context.runtime.as_ref() else {
+        return profiles_text;
+    };
+    let mut words = args.split_whitespace();
+    match words.next() {
+        None => {
+            let members = runtime.registry.get_by_run(&runtime.run_id);
+            let live: Vec<String> = members
+                .iter()
+                .filter(|record| record.id != runtime.agent_id)
+                .map(|record| {
+                    format!(
+                        "  {} · {:?} · {:?} · {} pending{}",
+                        record.name,
+                        record.kind,
+                        record.state,
+                        runtime.mailbox.pending_count(&record.id),
+                        record
+                            .failure_reason
+                            .as_deref()
+                            .map(|reason| format!(" · {reason}"))
+                            .unwrap_or_default()
+                    )
+                })
+                .collect();
+            if live.is_empty() {
+                profiles_text
+            } else {
+                format!("{profiles_text}\n\nLive agents:\n{}", live.join("\n"))
+            }
+        }
+        Some("stop") => {
+            let Some(name) = words.next() else {
+                return "usage: /agents stop <name>".into();
+            };
+            match davinci_agent::runtime::resolve_agent(runtime, name) {
+                Ok(id) => {
+                    let _ = runtime
+                        .registry
+                        .transition(id, davinci_agent::AgentState::Stopping);
+                    runtime.team.cancel(&id);
+                    format!("stopping {name}")
+                }
+                Err(error) => error,
+            }
+        }
+        Some("msg") => {
+            let Some(name) = words.next() else {
+                return "usage: /agents msg <name> <text>".into();
+            };
+            let text: Vec<&str> = words.collect();
+            if text.is_empty() {
+                return "usage: /agents msg <name> <text>".into();
+            }
+            match davinci_agent::runtime::resolve_agent(runtime, name) {
+                Ok(id) => {
+                    // User steering: an unregistered sender id, delivered to
+                    // the teammate as plain user text (see
+                    // take_labeled_messages), and it wakes an idle teammate.
+                    let generation = runtime.registry.get_generation(&id);
+                    match runtime
+                        .mailbox
+                        .send_steer(id, generation, text.join(" "), false)
+                    {
+                        Ok(receipt) if receipt.state == "rejected" => format!(
+                            "{name} did not accept the message ({})",
+                            receipt.reason.unwrap_or_else(|| "rejected".into())
+                        ),
+                        Ok(_) => format!("sent to {name}"),
+                        Err(error) => error.to_string(),
+                    }
+                }
+                Err(error) => error,
+            }
+        }
+        Some(other) => format!("unknown /agents subcommand '{other}'; use msg or stop"),
+    }
+}
+
+/// Teammate and background reports waiting for an idle lead, as one prompt.
+pub fn team_wake_text(agent: &Agent) -> Option<String> {
+    let runtime = agent.tool_context.runtime.as_ref()?;
+    if runtime.mailbox.pending_count(&runtime.agent_id) == 0 {
+        return None;
+    }
+    let messages = runtime.take_labeled_messages(20);
+    (!messages.is_empty()).then(|| messages.join("\n\n"))
+}
+
+fn team_autowake_enabled() -> bool {
+    std::env::var("DAVINCI_AGENT_TEAMS_AUTOWAKE").as_deref() != Ok("0")
+}
+
+pub(crate) fn workflow_command_text(agent: &Agent, args: &str) -> String {
+    if !davinci_agent::tools::workflow_tools_enabled() {
+        return "workflow tools are disabled".into();
+    }
+    let Some(executor) = agent
+        .tool_context
+        .runtime
+        .as_ref()
+        .and_then(|rt| rt.workflow_executor.clone())
+    else {
+        return "workflows are not available in this session".into();
+    };
+    let mut words = args.split_whitespace();
+    match (words.next(), words.next()) {
+        (None, _) | (Some("list"), None) => {
+            let runs = executor.list_workflows();
+            if runs.is_empty() {
+                return "no workflow runs in this session".into();
+            }
+            runs.iter()
+                .map(|w| format!("{} · {} · {:?}", w.id, w.name, w.status))
+                .collect::<Vec<_>>()
+                .join("\n")
+        }
+        (Some("status"), Some(id)) => match id.parse::<davinci_agent::runtime::WorkflowId>() {
+            Ok(id) => executor
+                .get_state(&id)
+                .map(|state| serde_json::to_string_pretty(&state).unwrap_or_default())
+                .unwrap_or_else(|| format!("workflow {id} not found")),
+            Err(_) => format!("invalid workflow id '{id}'"),
+        },
+        (Some("cancel"), Some(id)) => match id.parse::<davinci_agent::runtime::WorkflowId>() {
+            Ok(id) => match executor.cancel(&id) {
+                Ok(()) => format!("cancelled workflow {id}"),
+                Err(error) => error.to_string(),
+            },
+            Err(_) => format!("invalid workflow id '{id}'"),
+        },
+        _ => "usage: /workflow [status <id> | cancel <id>]".into(),
+    }
+}

@@ -67,7 +67,6 @@ pub enum MailboxWait {
     TimedOut,
 }
 
-
 /// Maps delivery/application/rejection booleans to canonical steering state string.
 pub fn steering_state(delivered: bool, applied: bool, rejected: bool) -> &'static str {
     if rejected {
@@ -130,7 +129,6 @@ pub struct AgentMailbox {
     seq: Arc<AtomicU64>,
     /// Bumped and broadcast on every enqueue so idle agents can block.
     signal: Arc<(Mutex<u64>, Condvar)>,
-
 }
 
 impl AgentMailbox {
@@ -1039,8 +1037,7 @@ mod tests {
                 .unwrap();
         });
         let started = std::time::Instant::now();
-        let outcome =
-            mailbox.wait_for_pending(&to, std::time::Duration::from_secs(5), &|| false);
+        let outcome = mailbox.wait_for_pending(&to, std::time::Duration::from_secs(5), &|| false);
         handle.join().unwrap();
         assert_eq!(outcome, MailboxWait::Ready);
         assert!(started.elapsed() < std::time::Duration::from_secs(2));
@@ -1052,7 +1049,12 @@ mod tests {
         let mailbox = AgentMailbox::new();
         let to = AgentId::new();
         mailbox
-            .send(AgentMessage::new(RunId::new(), AgentId::new(), to, "queued"))
+            .send(AgentMessage::new(
+                RunId::new(),
+                AgentId::new(),
+                to,
+                "queued",
+            ))
             .unwrap();
         assert_eq!(
             mailbox.wait_for_pending(&to, std::time::Duration::from_millis(10), &|| false),

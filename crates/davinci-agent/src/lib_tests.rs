@@ -4248,3 +4248,18 @@ fn tool_name_scripted_aliases_need_no_recovery_request() {
         assert!(format!("{:?}", agent.messages).contains("functions."));
     }
 }
+
+#[test]
+fn switching_runs_shuts_down_the_previous_team() {
+    use crate::runtime::{AgentId, RunId, RuntimeBus, RuntimeHandle};
+    let mut agent = crate::Agent::new_builtin(crate::PromptProfile::Stable);
+    let first = RuntimeHandle::new(RunId::new(), AgentId::new(), RuntimeBus::new());
+    let token = first.team.admit(AgentId::new());
+    agent.set_runtime(first);
+    agent.set_runtime(RuntimeHandle::new(
+        RunId::new(),
+        AgentId::new(),
+        RuntimeBus::new(),
+    ));
+    assert!(token.is_cancelled());
+}

@@ -147,6 +147,28 @@ pub fn configure_session_workflow_with_legacy_recovery(
                 )?;
         }
     }
+    if runtime.worktree_manager.is_none() {
+        let cwd = session
+            .map(|s| std::path::PathBuf::from(&s.header.cwd))
+            .or_else(|| std::env::current_dir().ok());
+        if let Some(cwd) = cwd {
+            if let Ok(output) = std::process::Command::new("git")
+                .current_dir(cwd)
+                .args(["rev-parse", "--show-toplevel"])
+                .output()
+            {
+                if output.status.success() {
+                    let root = String::from_utf8_lossy(&output.stdout).trim().to_string();
+                    let manager = davinci_agent::runtime::WorktreeManager::new(
+                        root,
+                        std::env::temp_dir().join("davinci").join("worktrees"),
+                    )
+                    .with_bus(runtime.bus.clone());
+                    runtime = runtime.with_worktree_manager(manager);
+                }
+            }
+        }
+    }
     let executor = Arc::new(davinci_agent::WorkflowExecutor::new(
         runtime.clone(),
         store,
@@ -1098,6 +1120,7 @@ mod tests {
         }
         let dir = tempdir().unwrap();
         let mut agent = davinci_agent::Agent::new("fixture");
+        agent.async_agents_allowed = true;
         agent.session =
             Some(davinci_session::JsonlSession::create(dir.path(), "fixture", None).unwrap());
         let prepare = |agent: &davinci_agent::Agent, bus| {
@@ -1784,7 +1807,13 @@ mod tests {
         let lead_id = davinci_agent::AgentId::new();
         let handle = davinci_agent::RuntimeHandle::new(run_id, lead_id, bus);
 
-        let executor = davinci_agent::WorkflowExecutor::new(handle, store.clone(), None);
+        let executor = davinci_agent::WorkflowExecutor::new(
+            handle,
+            store.clone(),
+            Some(davinci_agent::SubagentRunner::new(|_| {
+                Ok("analyzed fixture".into())
+            })),
+        );
 
         let wf_id = davinci_agent::WorkflowId::new();
         let spec_json = r#"{

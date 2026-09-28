@@ -1,10 +1,8 @@
 //! Model tools for persistent agent status, messaging, and stopping.
 
 use serde_json::{json, Value};
-use std::str::FromStr;
 
 use super::events::AgentState;
-use super::ids::AgentId;
 use crate::tools::{AgentTool, ToolContext, ToolError, ToolResult};
 
 pub fn agent_tool_specs() -> Vec<AgentTool> {
@@ -17,7 +15,7 @@ pub fn agent_tool_specs() -> Vec<AgentTool> {
                 "properties": {
                     "agent_id": {
                         "type": "string",
-                        "description": "Optional agent ID (UUID) to inspect. If omitted, returns all agents in the run."
+                        "description": "Optional agent name or ID (UUID) to inspect. If omitted, returns all agents in the run."
                     }
                 }
             }),
@@ -30,7 +28,7 @@ pub fn agent_tool_specs() -> Vec<AgentTool> {
                 "properties": {
                     "to": {
                         "type": "string",
-                        "description": "Recipient agent ID (UUID)."
+                        "description": "Recipient agent name (as given at spawn) or agent ID (UUID)."
                     },
                     "message": {
                         "type": "string",
@@ -48,7 +46,7 @@ pub fn agent_tool_specs() -> Vec<AgentTool> {
                 "properties": {
                     "agent_id": {
                         "type": "string",
-                        "description": "Agent ID (UUID) to stop."
+                        "description": "Agent name or ID (UUID) to stop."
                     },
                     "reason": {
                         "type": "string",
@@ -68,8 +66,7 @@ pub fn agent_status_tool(input: &Value, context: &ToolContext) -> Result<ToolRes
         .ok_or_else(|| ToolError::Failed("Runtime subsystem not initialized".into()))?;
 
     if let Some(aid_str) = input.get("agent_id").and_then(Value::as_str) {
-        let aid = AgentId::from_str(aid_str.trim())
-            .map_err(|e| ToolError::Failed(format!("Invalid agent_id '{aid_str}': {e}")))?;
+        let aid = super::team::resolve_agent(runtime, aid_str).map_err(ToolError::Failed)?;
 
         let record = runtime
             .registry
@@ -89,6 +86,8 @@ pub fn agent_status_tool(input: &Value, context: &ToolContext) -> Result<ToolRes
             "started_ms": record.started_ms,
             "updated_ms": record.updated_ms,
             "pending_messages": pending_messages,
+            "failure_reason": record.failure_reason,
+            "worktree": record.worktree.as_ref().map(|p| p.display().to_string()),
         });
 
         Ok(ToolResult {
@@ -133,8 +132,7 @@ pub fn agent_message_tool(input: &Value, context: &ToolContext) -> Result<ToolRe
         .and_then(Value::as_str)
         .ok_or_else(|| ToolError::Failed("Missing required field 'to'".into()))?;
 
-    let to = AgentId::from_str(to_str.trim())
-        .map_err(|e| ToolError::Failed(format!("Invalid recipient agent_id '{to_str}': {e}")))?;
+    let to = super::team::resolve_agent(runtime, to_str).map_err(ToolError::Failed)?;
 
     let message = input
         .get("message")
@@ -187,8 +185,7 @@ pub fn agent_stop_tool(input: &Value, context: &ToolContext) -> Result<ToolResul
         .and_then(Value::as_str)
         .ok_or_else(|| ToolError::Failed("Missing required field 'agent_id'".into()))?;
 
-    let aid = AgentId::from_str(aid_str.trim())
-        .map_err(|e| ToolError::Failed(format!("Invalid agent_id '{aid_str}': {e}")))?;
+    let aid = super::team::resolve_agent(runtime, aid_str).map_err(ToolError::Failed)?;
 
     let reason = input.get("reason").and_then(Value::as_str);
 
@@ -197,6 +194,8 @@ pub fn agent_stop_tool(input: &Value, context: &ToolContext) -> Result<ToolResul
         .registry
         .transition(aid, AgentState::Stopping)
         .map_err(|e| ToolError::Failed(format!("Failed to stop agent '{aid}': {e}")))?;
+
+    let cancelled = runtime.team.cancel(&aid);
 
     // 2. Kill associated process tree if background jobs exist
     let killed_jobs = if let Ok(mut jobs) = context.jobs.lock() {
@@ -217,6 +216,7 @@ pub fn agent_stop_tool(input: &Value, context: &ToolContext) -> Result<ToolResul
         "status": status,
         "reason": reason,
         "killed_jobs": killed_jobs,
+        "cancelled": cancelled,
     });
 
     Ok(ToolResult {
@@ -228,6 +228,7 @@ pub fn agent_stop_tool(input: &Value, context: &ToolContext) -> Result<ToolResul
 
 #[cfg(test)]
 mod tests {
+    use super::super::ids::AgentId;
     use super::*;
     use crate::runtime::bus::RuntimeBus;
     use crate::runtime::events::{AgentKind, AgentRecord};
@@ -329,5 +330,76 @@ mod tests {
         assert!(!stop_res.is_error);
         let rec2_stopped = rt.registry.get(&agent2).unwrap();
         assert_eq!(rec2_stopped.state, AgentState::Stopping);
+    }
+    #[test]
+    fn agent_message_accepts_names_and_rejects_unknown_recipients() {
+        let run_id = RunId::new();
+        let lead = AgentId::new();
+        let context = make_test_context(run_id, lead);
+        let rt = context.runtime.as_ref().unwrap();
+        rt.ensure_lead_registered("p", "m", std::path::Path::new("."));
+        let mate = AgentId::new();
+        rt.registry
+            .register_agent(AgentRecord {
+                id: mate,
+                run_id,
+                parent: Some(lead),
+                kind: AgentKind::Teammate,
+                name: "reviewer".into(),
+                provider: String::new(),
+                model_id: String::new(),
+                cwd: PathBuf::from("."),
+                state: AgentState::Starting,
+                task_id: None,
+                worktree: None,
+                started_ms: 0,
+                updated_ms: 0,
+                failure_reason: None,
+            })
+            .unwrap();
+        rt.registry.transition(mate, AgentState::Running).unwrap();
+
+        let ok = agent_message_tool(&json!({"to": "reviewer", "message": "hi"}), &context).unwrap();
+        assert!(!ok.is_error);
+        assert_eq!(rt.mailbox.pending_count(&mate), 1);
+
+        let err = agent_message_tool(
+            &json!({"to": AgentId::new().to_string(), "message": "hi"}),
+            &context,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("not found"));
+    }
+
+    #[test]
+    fn agent_stop_cancels_the_worker_token() {
+        let run_id = RunId::new();
+        let lead = AgentId::new();
+        let context = make_test_context(run_id, lead);
+        let rt = context.runtime.as_ref().unwrap();
+        let mate = AgentId::new();
+        rt.registry
+            .register_agent(AgentRecord {
+                id: mate,
+                run_id,
+                parent: Some(lead),
+                kind: AgentKind::Teammate,
+                name: "worker".into(),
+                provider: String::new(),
+                model_id: String::new(),
+                cwd: PathBuf::from("."),
+                state: AgentState::Starting,
+                task_id: None,
+                worktree: None,
+                started_ms: 0,
+                updated_ms: 0,
+                failure_reason: None,
+            })
+            .unwrap();
+        rt.registry.transition(mate, AgentState::Running).unwrap();
+        let token = rt.team.admit(mate);
+        agent_stop_tool(&json!({"agent_id": "worker"}), &context).unwrap();
+        assert!(token.is_cancelled());
+        assert_eq!(rt.registry.get(&mate).unwrap().state, AgentState::Stopping);
     }
 }

@@ -7,8 +7,8 @@ use serde_json::Value;
 use std::path::{Path, PathBuf};
 
 use super::executor::WorkflowStatus;
-use super::spec::WorkflowSpec;
-use super::validate::validate_workflow;
+use super::spec::{WorkflowLaunch, WorkflowSpec};
+use super::validate::validate_workflow_with_capabilities;
 use crate::runtime::ids::WorkflowId;
 use crate::runtime::workflow::WorkflowExecutor;
 use crate::runtime::workflow::WorkflowStateStore;
@@ -151,6 +151,15 @@ pub fn workflow_run_tool(
     input: &Value,
     context: &ToolContext,
 ) -> Result<ToolResult, ToolError> {
+    workflow_run_tool_with_parent(cwd, input, context, WorkflowLaunch::default())
+}
+
+pub fn workflow_run_tool_with_parent(
+    cwd: &Path,
+    input: &Value,
+    context: &ToolContext,
+    launch: WorkflowLaunch,
+) -> Result<ToolResult, ToolError> {
     let runtime = context
         .runtime
         .as_ref()
@@ -176,7 +185,18 @@ pub fn workflow_run_tool(
         ));
     };
 
-    validate_workflow(&spec).map_err(|e| ToolError::Failed(e.to_string()))?;
+    validate_workflow_with_capabilities(
+        &spec,
+        launch.parent_permission_mode,
+        &[],
+        &runtime.capability_registry,
+    )
+    .map_err(|e| ToolError::Failed(e.to_string()))?;
+    if spec.max_cost_usd.is_some() {
+        return Err(ToolError::Failed(
+            "max_cost_usd is not enforced yet; remove it from the spec".into(),
+        ));
+    }
 
     let mut saved_path_info = None;
     if let Some(save_name) = save_as {
@@ -193,9 +213,9 @@ pub fn workflow_run_tool(
         }
     };
 
-    if background {
+    if background && launch.report_to_lead {
         let wf_id = executor
-            .execute_background(spec.clone())
+            .execute_background_with(spec.clone(), launch)
             .map_err(|e| ToolError::Failed(e.to_string()))?;
 
         let resp = serde_json::json!({
@@ -213,10 +233,39 @@ pub fn workflow_run_tool(
         })
     } else {
         let state = executor
-            .execute(spec)
+            .execute_with(spec.clone(), launch)
             .map_err(|e| ToolError::Failed(e.to_string()))?;
 
         let mut val = serde_json::to_value(&state).unwrap();
+        let mut remaining = 32 * 1024;
+        let mut outputs = Vec::new();
+        for phase in &spec.phases {
+            if spec.phases.iter().any(|p| p.depends_on.contains(&phase.id)) {
+                continue;
+            }
+            for artifact in executor.store.list_phase_artifacts(state.id, &phase.id) {
+                let output = artifact
+                    .value
+                    .get("output")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned)
+                    .unwrap_or_else(|| artifact.to_reference_summary().to_string());
+                let mut end = output.len().min(8192).min(remaining);
+                while !output.is_char_boundary(end) {
+                    end -= 1;
+                }
+                remaining -= end;
+                if end > 0 {
+                    outputs.push(output[..end].to_string());
+                }
+            }
+        }
+        val["final_outputs"] = serde_json::json!(outputs);
+        if background {
+            val["note"] = serde_json::json!(
+                "ran synchronously: background workflows need an interactive or RPC session"
+            );
+        }
         if let Some(saved) = saved_path_info {
             val["saved_to"] = serde_json::Value::String(saved);
         }
@@ -306,10 +355,15 @@ mod tests {
     fn setup_context(trusted: bool) -> (ToolContext, tempfile::TempDir) {
         let dir = tempfile::tempdir().unwrap();
         let bus = RuntimeBus::new();
-        let runtime =
-            RuntimeHandle::new(RunId::new(), AgentId::new(), bus).with_project_trusted(trusted);
+        let runtime = RuntimeHandle::new(RunId::new(), AgentId::new(), bus)
+            .with_project_trusted(trusted)
+            .with_worktree_manager(super::super::test_worktree_manager(dir.path()));
         let store = WorkflowStateStore::new();
-        let executor = std::sync::Arc::new(WorkflowExecutor::new(runtime.clone(), store, None));
+        let executor = std::sync::Arc::new(WorkflowExecutor::new(
+            runtime.clone(),
+            store,
+            Some(crate::SubagentRunner::new(|_| Ok("fixture result".into()))),
+        ));
         let runtime = runtime.with_workflow_executor(executor);
 
         let context = ToolContext {
@@ -379,5 +433,18 @@ mod tests {
         let load_input = serde_json::json!({ "name": "saved" });
         let err2 = workflow_run_tool(dir.path(), &load_input, &context).unwrap_err();
         assert!(err2.to_string().contains("requires project trust"));
+    }
+    #[test]
+    fn max_cost_usd_is_rejected_until_supported() {
+        let (context, dir) = setup_context(true);
+        let mut spec: Value = serde_json::from_str(VALID_3_PHASE_WORKFLOW_JSON).unwrap();
+        spec["max_cost_usd"] = serde_json::json!(1.5);
+        let err = workflow_run_tool(
+            dir.path(),
+            &serde_json::json!({"spec": spec, "background": false}),
+            &context,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("max_cost_usd"));
     }
 }
