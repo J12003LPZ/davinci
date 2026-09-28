@@ -1555,13 +1555,17 @@ impl ModelRuntimeKey {
             ),
             cwd: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
             env_hash: hasher.finish(),
-            files: vec![
-                stamp(davinci_ai::models_store_path(&agent_dir)),
-                stamp(models_json_path(&agent_dir)),
-                stamp(crate::settings::settings_path(&agent_dir)),
-                stamp(davinci_ai::default_auth_path()),
-                stamp(agent_dir.join("extensions")),
-            ],
+            files: [
+                davinci_ai::models_store_path(&agent_dir),
+                models_json_path(&agent_dir),
+                crate::settings::settings_path(&agent_dir),
+                davinci_ai::default_auth_path(),
+                agent_dir.join("extensions"),
+            ]
+            .into_iter()
+            .chain(davinci_ai::codex_model_source_paths(&agent_dir))
+            .map(stamp)
+            .collect(),
         }
     }
 
@@ -1626,6 +1630,8 @@ fn build_model_runtime(parsed: &Args) -> ModelRuntimeSnapshot {
     for entry in store.providers.values() {
         models = davinci_ai::merge_models(&models, &entry.models);
     }
+    // Codex models discovered live or by Codex CLI; models.json still wins.
+    models = davinci_ai::overlay_codex_models(&models, &agent_dir);
     let config = ModelConfig::load(&models_json_path(&agent_dir));
     let mut composition_errors = std::collections::BTreeMap::new();
     models = match apply_models_config(&models, &config) {
@@ -2392,15 +2398,7 @@ fn complete_prompt_with_host(
             Ok("1") | Ok("true") | Ok("yes")
         );
     let models = available_models(parsed);
-    let model = find_model(&models, &agent.provider, &agent.model_id)
-        .cloned()
-        .or_else(|| {
-            models
-                .iter()
-                .find(|m| m.provider == agent.provider)
-                .cloned()
-        })
-        .or_else(|| models.first().cloned());
+    let model = model_resolver::model_for_request(&models, &agent.provider, &agent.model_id);
     let mut storage = AuthStorage::create().ok();
     if let (Some(storage), Some(key)) = (storage.as_mut(), parsed.api_key.as_deref()) {
         storage.set_runtime_override(&agent.provider, key);

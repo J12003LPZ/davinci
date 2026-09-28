@@ -219,13 +219,12 @@ impl RpcRuntime {
         });
     }
 
-    fn current_model(&self) -> Option<&Model> {
-        find_model(&self.models, &self.agent.provider, &self.agent.model_id).or_else(|| {
-            self.models
-                .iter()
-                .find(|model| model.provider == self.agent.provider)
-                .or_else(|| self.models.first())
-        })
+    fn current_model(&self) -> Option<Model> {
+        crate::model_resolver::model_for_request(
+            &self.models,
+            &self.agent.provider,
+            &self.agent.model_id,
+        )
     }
 
     fn model_json(model: &Model) -> Value {
@@ -365,7 +364,7 @@ pub fn handle_rpc(runtime: &mut RpcRuntime, command: RpcCommand) -> RpcResponse 
             id,
             &kind,
             Some(serde_json::json!({
-                "model": runtime.current_model().map(RpcRuntime::model_json),
+                "model": runtime.current_model().as_ref().map(RpcRuntime::model_json),
                 "thinkingLevel": runtime.agent.thinking_level,
                 "isStreaming": runtime.agent.is_streaming,
                 "isCompacting": runtime.agent.is_compacting,
@@ -508,6 +507,7 @@ pub fn handle_rpc(runtime: &mut RpcRuntime, command: RpcCommand) -> RpcResponse 
         }
         "get_available_thinking_levels" => {
             let model = runtime.current_model();
+            let model = model.as_ref();
             ok(
                 id,
                 &kind,
@@ -565,7 +565,10 @@ pub fn handle_rpc(runtime: &mut RpcRuntime, command: RpcCommand) -> RpcResponse 
             Some(serde_json::json!({ "models": runtime.models })),
         ),
         "cycle_thinking_level" => {
-            match cycle_thinking_level(runtime.current_model(), runtime.agent.thinking_level) {
+            match cycle_thinking_level(
+                runtime.current_model().as_ref(),
+                runtime.agent.thinking_level,
+            ) {
                 Some(next) => {
                     runtime.agent.thinking_level = next;
                     ok(id, &kind, Some(serde_json::json!({ "level": next })))
@@ -1031,7 +1034,7 @@ fn switch_session(runtime: &mut RpcRuntime, session_path: Option<&str>) -> Resul
 }
 
 pub fn session_stats_json(runtime: &RpcRuntime) -> Value {
-    session_stats_for_agent(&runtime.agent, runtime.current_model())
+    session_stats_for_agent(&runtime.agent, runtime.current_model().as_ref())
 }
 
 pub fn session_stats_for_agent(agent: &Agent, model: Option<&Model>) -> Value {
