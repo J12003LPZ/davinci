@@ -269,6 +269,23 @@ jobs:
       - name: Runtime migration baseline
         run: cargo test -p davinci-coding-agent runtime_migration_preserves_ecosystem_baseline -- --nocapture
 
+  python-tests:
+    name: python-tests (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Benchmark harness
+        run: python -m unittest discover -s scripts/bench/tests -p "test_*.py"
+      - name: Inline verification Python checker
+        run: python -m unittest discover -s crates/davinci-agent/src/verification -p "test_python_ast.py"
+
   workspace-test-shards:
     name: workspace-test (${{ matrix.os }}, ${{ matrix.package }})
     strategy:

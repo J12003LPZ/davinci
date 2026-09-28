@@ -3326,7 +3326,10 @@ fn prompt_profile_rollback_test() {
     );
 
     let status_preview = format_session_status(&preview_args, &preview_agent);
-    assert!(status_preview.contains("prompt: preview v4"));
+    assert!(status_preview.contains(&format!(
+        "prompt: preview v{}",
+        davinci_agent::prompt::PREVIEW_PROMPT_VERSION
+    )));
 
     let status_rollback = format_session_status(&rollback_args, &rollback_agent);
     assert!(status_rollback.contains("prompt: legacy-v1 v1"));
@@ -3413,7 +3416,10 @@ fn json_mode_and_status_expose_safe_prompt_metadata() {
     preview_agent.prompt_session.transition_diagnostic =
         Some("Prompt hash transition on resume".into());
     let preview_status = format_session_status(&parsed, &preview_agent);
-    assert!(preview_status.contains("prompt: preview v4 [cand-99]"));
+    assert!(preview_status.contains(&format!(
+        "prompt: preview v{} [cand-99]",
+        davinci_agent::prompt::PREVIEW_PROMPT_VERSION
+    )));
     assert!(preview_status.contains("transition: Prompt hash transition on resume"));
     assert!(!preview_status.contains(&preview_agent.system_prompt));
 }
