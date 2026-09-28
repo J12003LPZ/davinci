@@ -604,16 +604,7 @@ pub fn run_tool(
             })
             .unwrap_or_else(|| {
                 let cwd = std::env::current_dir().unwrap_or_default();
-                let repo_root = std::process::Command::new("git")
-                    .args(["rev-parse", "--show-toplevel"])
-                    .current_dir(&cwd)
-                    .output()
-                    .ok()
-                    .filter(|out| out.status.success())
-                    .map(|out| {
-                        std::path::PathBuf::from(String::from_utf8_lossy(&out.stdout).trim())
-                    })
-                    .unwrap_or(cwd);
+                let repo_root = crate::runtime::worktree::git_toplevel(&cwd).unwrap_or(cwd);
                 let wt_root = std::env::temp_dir().join("davinci").join("worktrees");
                 let mut m = WorktreeManager::new(repo_root, wt_root);
                 if let Some(rt) = &parent.runtime {
@@ -855,23 +846,12 @@ pub fn run_tool(
                         }
                     }
                     if let Some(worker) = &req_clone.runtime {
-                        // Teammates report every turn from their loop; a
-                        // background worker reports its single result here.
-                        // Also report terminal failures: host construction or
-                        // a panic can fail before the teammate loop starts.
-                        if req_clone.mode == AgentSpawnMode::Background || outcome.is_err() {
-                            crate::runtime::team::report_to_lead(
-                                worker,
-                                &outcome,
-                                preserved.as_deref(),
-                            );
-                        } else if let Some(note) = preserved.as_deref() {
-                            crate::runtime::team::report_to_lead(
-                                worker,
-                                &Ok(note.to_string()),
-                                None,
-                            );
-                        }
+                        report_async_outcome(
+                            worker,
+                            req_clone.mode,
+                            &outcome,
+                            preserved.as_deref(),
+                        );
                     }
                     if let Some(rt) = &rt_clone {
                         crate::runtime::team::finish_agent(&rt.registry, cid, outcome.is_ok());
@@ -971,7 +951,8 @@ pub fn run_tool(
             ToolError::Failed(match &worktree_note {
                 Some(note) => format!(
                     "{error}\nworktree kept: {} (branch {})",
-                    note["path"], note["branch"]
+                    note["path"].as_str().unwrap_or_default(),
+                    note["branch"].as_str().unwrap_or_default()
                 ),
                 None => error,
             })
@@ -1075,7 +1056,8 @@ pub fn run_tool(
         if let Some(note) = &notes[index] {
             body.push_str(&format!(
                 "\n\nworktree kept: {} (branch {}). Review and merge manually.",
-                note["path"], note["branch"]
+                note["path"].as_str().unwrap_or_default(),
+                note["branch"].as_str().unwrap_or_default()
             ));
         }
         sections.push(format!("## {} — {title}\n{body}", index + 1));
@@ -1097,6 +1079,41 @@ pub fn run_tool(
             "agentIds": requests.iter().filter_map(|r| r.runtime_agent_id).map(|id| id.to_string()).collect::<Vec<_>>(),
         })),
     })
+}
+
+/// The lead hears once how an async worker ended.
+///
+/// A background worker reports its single result. A teammate has already
+/// reported every turn from its loop, so its exit is one `stopped` notice
+/// (the host's exit note, or the error it left on). A teammate that failed
+/// before its loop ran (host construction, a panic) never reported, so its
+/// failure is reported as a failure, not as a departure.
+fn report_async_outcome(
+    worker: &RuntimeHandle,
+    mode: AgentSpawnMode,
+    outcome: &Result<String, String>,
+    worktree_note: Option<&str>,
+) {
+    use crate::runtime::team::{report_status_to_lead, report_to_lead};
+    match mode {
+        AgentSpawnMode::Background | AgentSpawnMode::Oneshot => {
+            report_to_lead(worker, outcome, worktree_note)
+        }
+        AgentSpawnMode::Teammate => {
+            let reported = worker.team.report_count(&worker.agent_id) > 0;
+            match outcome {
+                Err(_) if !reported => report_to_lead(worker, outcome, worktree_note),
+                Ok(note) | Err(note) => {
+                    let body = if note.trim().is_empty() {
+                        "left the team"
+                    } else {
+                        note.as_str()
+                    };
+                    report_status_to_lead(worker, "stopped", body, worktree_note)
+                }
+            }
+        }
+    }
 }
 
 fn run_journaled_subagent(
@@ -1728,6 +1745,39 @@ mod tests {
         assert!(executed.load(std::sync::atomic::Ordering::SeqCst));
         let record_after = handle.registry.get(&aid).expect("record exists");
         assert_eq!(record_after.state, AgentState::Completed);
+    }
+
+    #[test]
+    fn fan_out_worktree_notes_name_paths_verbatim() {
+        let repo = init_subagent_temp_git_repo();
+        let worktrees = tempfile::tempdir().unwrap();
+        let manager = WorktreeManager::new(repo.path(), worktrees.path());
+        let runner = SubagentRunner::new(|req| {
+            std::fs::write(req.worktree_path.as_ref().unwrap().join("kept.txt"), "x").unwrap();
+            Ok("edited".into())
+        });
+        let result = run_tool(
+            &json!({"tasks": [
+                {"prompt": "a", "isolation": "worktree", "tools": ["write"]},
+                {"prompt": "b", "isolation": "worktree", "tools": ["write"]}
+            ]}),
+            &["write".into()],
+            Some(&runner),
+            &SubagentParent {
+                worktree_manager: Some(manager),
+                permission_mode: Some(PermissionMode::Edits),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let details = result.details.unwrap();
+        for note in details["worktrees"].as_array().unwrap() {
+            let path = note["path"].as_str().unwrap();
+            // A JSON-rendered value would be quoted (and doubled backslashes
+            // on Windows); the reader must see the path it can open.
+            assert!(result.content.contains(&format!("worktree kept: {path} (branch")));
+            assert!(!result.content.contains(&format!("\"{path}")));
+        }
     }
 
     fn init_subagent_temp_git_repo() -> tempfile::TempDir {

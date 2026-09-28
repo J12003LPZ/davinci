@@ -37,7 +37,7 @@ pub mod task_store;
 pub mod task_transport;
 pub mod tasks;
 pub mod team;
-pub use team::{format_agent_message, resolve_agent, TeamRoster};
+pub use team::{format_agent_message, resolve_agent, resolve_worker, TeamRoster};
 pub mod tools_agent;
 pub mod tools_task;
 pub mod workflow;
@@ -130,6 +130,7 @@ pub use workflow::{
     WorkflowPhaseSpec, WorkflowSpec, WorkflowStateError, WorkflowStateStore, WorkflowStatus,
     WorkflowValidationError, WorkflowWorkerSpec,
 };
+pub use workflow::{WorkflowSettings, WorkflowSizeGuideline};
 pub use worktree::{has_uncommitted_changes, WorktreeError, WorktreeLease, WorktreeManager};
 
 /// Handle held by an executing Agent or worker to participate in the shared runtime.
@@ -341,6 +342,11 @@ impl RuntimeHandle {
         self.registry = previous.registry.clone();
         self.mailbox = previous.mailbox.clone();
         self.team = previous.team.clone();
+        // One executor per conversation: its runs (and their state for
+        // `/workflow` list/status/cancel) outlive the turn that started them.
+        if previous.workflow_executor.is_some() {
+            self.workflow_executor = previous.workflow_executor.clone();
+        }
         self.task_registry = previous.task_registry.clone();
         self.operations = previous.operations.clone();
         self.progress_watchdog = previous.progress_watchdog.clone();

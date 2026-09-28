@@ -894,9 +894,13 @@ fn build_agent(parsed: &Args, session_dir: &Path, cwd: &Path) -> Result<Agent, S
                     timeout,
                     |prompt| Ok(format!("{answer} [{}]", prompt.len())),
                 );
+                let note = davinci_agent::runtime::team::teammate_exit_note(
+                    req.instance_name.as_deref().unwrap_or("teammate"),
+                    &exit,
+                );
                 return match exit {
-                    davinci_agent::runtime::team::TeammateExit::Failed(error) => Err(error),
-                    _ => Ok(String::new()),
+                    davinci_agent::runtime::team::TeammateExit::Failed(_) => Err(note),
+                    _ => Ok(note),
                 };
             }
             return Ok(answer);
@@ -1032,6 +1036,18 @@ fn build_agent(parsed: &Args, session_dir: &Path, cwd: &Path) -> Result<Agent, S
         agent.expose_active_tools();
     } else {
         agent.sync_tool_authorization();
+    }
+    // Feature switches apply everywhere; an explicit `--tools` list or a
+    // graph worker's contract decides its own tools.
+    davinci_agent::tools::set_orchestration_settings(settings.agent_teams, settings.dynamic_workflows);
+    if graph_worker.is_none() && !explicit_tool_selection {
+        apply_orchestration_settings(&mut agent, &settings);
+    } else {
+        agent.workflow_settings = settings.workflow_settings(
+            std::env::var("DAVINCI_WORKFLOW_MAX_CONCURRENT_AGENTS")
+                .ok()
+                .as_deref(),
+        );
     }
     if let Some(coord) = davinci_agent::runtime::task_transport::TaskCoordinatorClient::from_env() {
         if graph_worker.is_some() {
@@ -2151,13 +2167,11 @@ fn build_worker_agent(
         davinci_agent::PermissionMode::parse(&profile.permission_mode)
             .unwrap_or(davinci_agent::PermissionMode::ReadOnly)
     } else if req.worktree_path.is_some() {
-        match req.parent_permission_mode {
-            Some(davinci_agent::PermissionMode::ReadOnly) | None => {
-                davinci_agent::PermissionMode::ReadOnly
-            }
-            Some(davinci_agent::PermissionMode::Ask) => davinci_agent::PermissionMode::Ask,
-            _ => davinci_agent::PermissionMode::Edits,
-        }
+        // A worktree lease is its own checkout: nothing reaches the user's
+        // tree until they merge the branch, and a child has no approver, so
+        // `Ask` could only deny. Plan Mode (or an unknown parent) stays
+        // read-only; every other parent mode edits inside the lease.
+        worktree_child_mode(req.parent_permission_mode)
     } else {
         davinci_agent::PermissionMode::ReadOnly
     };
@@ -2216,6 +2230,18 @@ fn build_worker_agent(
     Ok((child, shared_writer))
 }
 
+/// Permission mode for a worker that runs in its own worktree lease.
+fn worktree_child_mode(
+    parent: Option<davinci_agent::PermissionMode>,
+) -> davinci_agent::PermissionMode {
+    match parent {
+        Some(davinci_agent::PermissionMode::ReadOnly) | None => {
+            davinci_agent::PermissionMode::ReadOnly
+        }
+        Some(_) => davinci_agent::PermissionMode::Edits,
+    }
+}
+
 fn run_worker_turn(parsed: &Args, child: &mut Agent, prompt: &str) -> Result<String, String> {
     // Delegated prompts and teammate messages cannot authorize user-only actions.
     child.prompt_with(prompt, &[]);
@@ -2260,14 +2286,19 @@ fn run_nested_subagent(
             .runtime
             .as_ref()
             .ok_or("a teammate needs the parent runtime")?;
-        return match davinci_agent::runtime::team::run_teammate_loop(
+        let exit = davinci_agent::runtime::team::run_teammate_loop(
             runtime,
             &req.prompt,
             teammate_idle_timeout(),
             &mut turn,
-        ) {
-            davinci_agent::runtime::team::TeammateExit::Failed(error) => Err(error),
-            _ => Ok(String::new()),
+        );
+        let note = davinci_agent::runtime::team::teammate_exit_note(
+            req.instance_name.as_deref().unwrap_or("teammate"),
+            &exit,
+        );
+        return match exit {
+            davinci_agent::runtime::team::TeammateExit::Failed(_) => Err(note),
+            _ => Ok(note),
         };
     }
     turn(&req.prompt)
@@ -2510,8 +2541,12 @@ fn complete_prompt_with_host(
         runtime_bus.clone(),
     )
     .with_cache(agent.tool_context.cache.clone());
+    // Leases belong to the repository, not to the directory davinci was
+    // launched from (a subdirectory would lease the wrong tree).
+    let lease_root = davinci_agent::runtime::worktree::git_toplevel(&agent.cwd)
+        .unwrap_or_else(|| agent.cwd.clone());
     let wt_mgr =
-        davinci_agent::WorktreeManager::new(&agent.cwd, default_agent_dir().join("worktrees"))
+        davinci_agent::WorktreeManager::new(lease_root, default_agent_dir().join("worktrees"))
             .with_bus(runtime_bus.clone());
     runtime_handle = runtime_handle.with_worktree_manager(wt_mgr);
     runtime_handle = runtime_handle.with_project_trusted(trusted);
@@ -2531,7 +2566,7 @@ fn complete_prompt_with_host(
     runtime_handle = match runtime_host::configure_session_workflow(
         runtime_handle,
         agent.session.as_ref(),
-        agent.runtime_for_session(),
+        agent.runtime_for_next_prompt(),
         wf_store,
         agent.subagent_runner.clone(),
     )
@@ -7294,14 +7329,41 @@ fn persist_interactive_setting(spec: &str) -> Result<(), String> {
         "output-padding" => stored.output_pad = value.parse().ok(),
         "clear-on-shrink" => stored.clear_on_shrink = Some(value == "true"),
         "terminal-progress" => stored.show_terminal_progress = Some(value == "true"),
+        "dynamic-workflows" => stored.dynamic_workflows = Some(value == "true"),
+        "workflow-size" => {
+            stored.workflow_size_guideline =
+                davinci_agent::runtime::WorkflowSizeGuideline::parse(value)
+                    .map(|size| size.as_str().to_string());
+        }
+        "workflow-max-concurrent-agents" => {
+            stored.workflow_max_concurrent_agents = value
+                .parse::<u64>()
+                .ok()
+                .filter(|count| (1..=256).contains(count));
+        }
+        "agent-teams" => stored.agent_teams = Some(value == "true"),
         _ => {}
     }
     save_settings(&dir, &stored)?;
     Ok(())
 }
 
+/// Agent teams, dynamic workflows and workflow sizing from settings, applied
+/// to a lead agent: the feature switches, the sizing it launches with, and
+/// the tools those features bring.
+fn apply_orchestration_settings(agent: &mut Agent, settings: &settings::Settings) {
+    davinci_agent::tools::set_orchestration_settings(settings.agent_teams, settings.dynamic_workflows);
+    agent.workflow_settings = settings.workflow_settings(
+        std::env::var("DAVINCI_WORKFLOW_MAX_CONCURRENT_AGENTS")
+            .ok()
+            .as_deref(),
+    );
+    agent.sync_orchestration_tools();
+}
+
 fn sync_agent_from_settings(agent: &mut Agent) {
     let stored = load_merged_settings(&default_agent_dir(), &agent.cwd);
+    apply_orchestration_settings(agent, &stored);
     agent.auto_compaction = stored.compaction_enabled();
     agent.auto_verify =
         stored.auto_verify_enabled(std::env::var("DAVINCI_AUTO_VERIFY").ok().as_deref());

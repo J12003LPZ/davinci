@@ -228,17 +228,49 @@ pub(crate) fn is_coordinated_mutation(name: &str) -> bool {
     )
 }
 
+/// Settings-file values for the experimental orchestration features
+/// (`agentTeams`, `dynamicWorkflows`): 0 = unset, 1 = off, 2 = on. The host
+/// sets them from settings; an explicit environment variable still wins, as
+/// Claude Code's `CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS` does.
+static TEAMS_SETTING: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+static WORKFLOWS_SETTING: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+fn encode_setting(value: Option<bool>) -> u8 {
+    match value {
+        None => 0,
+        Some(false) => 1,
+        Some(true) => 2,
+    }
+}
+
+/// Record the `agentTeams` / `dynamicWorkflows` settings for this process.
+pub fn set_orchestration_settings(agent_teams: Option<bool>, dynamic_workflows: Option<bool>) {
+    use std::sync::atomic::Ordering;
+    TEAMS_SETTING.store(encode_setting(agent_teams), Ordering::SeqCst);
+    WORKFLOWS_SETTING.store(encode_setting(dynamic_workflows), Ordering::SeqCst);
+}
+
+fn flag(env: Option<String>, setting: &std::sync::atomic::AtomicU8) -> bool {
+    match env {
+        Some(value) => value == "1" || value.eq_ignore_ascii_case("true"),
+        None => setting.load(std::sync::atomic::Ordering::SeqCst) == 2,
+    }
+}
+
 pub fn team_tools_enabled() -> bool {
-    std::env::var("DAVINCI_EXPERIMENTAL_AGENT_TEAMS")
-        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-        .unwrap_or(false)
+    flag(
+        std::env::var("DAVINCI_EXPERIMENTAL_AGENT_TEAMS").ok(),
+        &TEAMS_SETTING,
+    )
 }
 
 pub fn workflow_tools_enabled() -> bool {
-    std::env::var("DAVINCI_EXPERIMENTAL_WORKFLOWS")
-        .or_else(|_| std::env::var("DAVINCI_RUNTIME_WORKFLOWS"))
-        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-        .unwrap_or(false)
+    flag(
+        std::env::var("DAVINCI_EXPERIMENTAL_WORKFLOWS")
+            .or_else(|_| std::env::var("DAVINCI_RUNTIME_WORKFLOWS"))
+            .ok(),
+        &WORKFLOWS_SETTING,
+    )
 }
 
 impl ToolContext {

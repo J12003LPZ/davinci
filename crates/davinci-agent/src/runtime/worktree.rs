@@ -10,6 +10,22 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use super::bus::RuntimeBus;
+
+/// The repository top-level containing `path`, or `None` outside a git
+/// checkout. Worktree leases must be rooted here: rooting them at a
+/// subdirectory the user launched from produced leases of the wrong tree.
+pub fn git_toplevel(path: &Path) -> Option<PathBuf> {
+    let output = Command::new("git")
+        .args(["rev-parse", "--show-toplevel"])
+        .current_dir(path)
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let root = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    (!root.is_empty()).then(|| PathBuf::from(root))
+}
 use super::events::{RuntimeEvent, RuntimeEventEnvelope};
 use super::ids::{AgentId, RunId};
 
@@ -385,6 +401,20 @@ mod tests {
             self.events.lock().unwrap().push(event.payload.clone());
             RuntimeDecision::Continue
         }
+    }
+
+    #[test]
+    fn git_toplevel_resolves_a_subdirectory_to_the_repository_root() {
+        let repo = init_temp_git_repo();
+        let nested = repo.path().join("crates").join("inner");
+        std::fs::create_dir_all(&nested).unwrap();
+        let root = git_toplevel(&nested).expect("inside a checkout");
+        assert_eq!(
+            std::fs::canonicalize(root).unwrap(),
+            std::fs::canonicalize(repo.path()).unwrap()
+        );
+        let outside = tempdir().unwrap();
+        assert!(git_toplevel(outside.path()).is_none());
     }
 
     fn init_temp_git_repo() -> tempfile::TempDir {

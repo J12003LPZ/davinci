@@ -260,7 +260,12 @@ impl WorkflowExecutor {
             ));
         }
         let wf_id = WorkflowId::new();
-        let wf_token = self.runtime.cancellation_token.child_token();
+        // A synchronous run belongs to the turn that called it: Esc stops it.
+        let wf_token = launch
+            .turn_token
+            .as_ref()
+            .unwrap_or(&self.runtime.cancellation_token)
+            .child_token();
         self.launches.write().unwrap().insert(wf_id, launch.clone());
         self.init_workflow_state(&spec, wf_id, wf_token.clone());
         self.run_phases(spec, wf_id, wf_token)
@@ -291,7 +296,11 @@ impl WorkflowExecutor {
             ));
         }
         let wf_id = WorkflowId::new();
-        let wf_token = self.runtime.cancellation_token.child_token();
+        // A background run outlives the turn that started it, like a
+        // background agent: it descends from the session's team token, so
+        // Esc on the lead leaves it running while `/workflow cancel` and a
+        // session switch still stop it.
+        let wf_token = self.runtime.team.session_token().child_token();
         self.launches.write().unwrap().insert(wf_id, launch.clone());
         self.init_workflow_state(&spec, wf_id, wf_token.clone());
 
@@ -894,13 +903,26 @@ impl WorkflowExecutor {
         // Execute workers using scheduler or runner
         let mut successful_workers: Vec<AgentId> = Vec::new();
         let mut failed_workers: Vec<AgentId> = Vec::new();
-        let limit = self
+        let requested = self
             .specs
             .read()
             .ok()
             .and_then(|specs| specs.get(wf_id).map(|s| s.max_parallel_agents))
-            .unwrap_or(1)
-            .clamp(1, 8);
+            .unwrap_or(1);
+        // The spec asks; the session ceiling (`workflowMaxConcurrentAgents`)
+        // decides. A launch without one uses the default ceiling.
+        let ceiling = self
+            .launches
+            .read()
+            .ok()
+            .and_then(|launches| launches.get(wf_id).and_then(|l| l.max_concurrent_agents))
+            .unwrap_or(super::limits::DEFAULT_MAX_CONCURRENT_AGENTS);
+        let limit = super::limits::WorkflowSettings {
+            max_concurrent_agents: ceiling,
+            ..super::limits::WorkflowSettings::default()
+        }
+        .concurrency_for(requested)
+        .min(phase.workers.len().max(1));
         let phase_token = wf_token.child_token();
         let successes = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let queue = std::sync::Mutex::new(worker_tasks.into_iter());
@@ -1588,6 +1610,123 @@ mod tests {
             err.to_string().to_lowercase().contains("read-only")
                 || err.to_string().to_lowercase().contains("permission")
         );
+    }
+
+    fn wait_until_cancelled_runner() -> SubagentRunner {
+        SubagentRunner::new(|req| {
+            let token = req.cancellation_token.clone().unwrap();
+            let start = std::time::Instant::now();
+            while !token.is_cancelled() {
+                if start.elapsed() > std::time::Duration::from_secs(5) {
+                    return Ok("never cancelled".into());
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            Err("cancelled".into())
+        })
+    }
+
+    fn wait_for_status(
+        executor: &WorkflowExecutor,
+        id: &WorkflowId,
+        wanted: impl Fn(&WorkflowStatus) -> bool,
+    ) -> WorkflowStatus {
+        let start = std::time::Instant::now();
+        loop {
+            let status = executor.get_state(id).unwrap().status;
+            if wanted(&status) || start.elapsed() > std::time::Duration::from_secs(8) {
+                return status;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+
+    #[test]
+    fn the_session_ceiling_bounds_phase_concurrency() {
+        let running = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let peak = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (r, p) = (running.clone(), peak.clone());
+        let runner = SubagentRunner::new(move |_| {
+            let now = r.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+            p.fetch_max(now, std::sync::atomic::Ordering::SeqCst);
+            std::thread::sleep(std::time::Duration::from_millis(60));
+            r.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+            Ok("ok".into())
+        });
+        let (executor, _tmp) = setup_executor(Some(runner));
+        let mut spec = two_worker_phase(None, &["read"]);
+        let template = spec.phases[0].workers[0].clone();
+        spec.phases[0].workers = (0..6)
+            .map(|index| WorkflowWorkerSpec {
+                id: format!("w{index}"),
+                ..template.clone()
+            })
+            .collect();
+        spec.max_parallel_agents = 6;
+        spec.max_total_agents = 6;
+        let state = executor
+            .execute_with(
+                spec,
+                WorkflowLaunch {
+                    max_concurrent_agents: Some(2),
+                    ..WorkflowLaunch::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(state.status, WorkflowStatus::Completed);
+        assert_eq!(peak.load(std::sync::atomic::Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn a_background_workflow_survives_the_lead_turn_being_interrupted() {
+        let (executor, _tmp) = setup_executor(Some(wait_until_cancelled_runner()));
+        let id = executor
+            .execute_background(two_worker_phase(None, &["read"]))
+            .unwrap();
+        // Esc on the lead cancels the turn's runtime token.
+        executor.runtime.cancellation_token.cancel();
+        std::thread::sleep(std::time::Duration::from_millis(150));
+        assert_eq!(
+            executor.get_state(&id).unwrap().status,
+            WorkflowStatus::Running,
+            "Esc must not stop a background workflow"
+        );
+        executor.cancel(&id).unwrap();
+        let status = wait_for_status(&executor, &id, |s| *s != WorkflowStatus::Running);
+        assert_eq!(status, WorkflowStatus::Cancelled);
+    }
+
+    #[test]
+    fn a_session_switch_stops_background_workflows() {
+        let (executor, _tmp) = setup_executor(Some(wait_until_cancelled_runner()));
+        let id = executor
+            .execute_background(two_worker_phase(None, &["read"]))
+            .unwrap();
+        executor.runtime.team.shutdown_all();
+        let status = wait_for_status(&executor, &id, |s| *s != WorkflowStatus::Running);
+        assert_ne!(status, WorkflowStatus::Running);
+        assert_ne!(status, WorkflowStatus::Completed);
+    }
+
+    #[test]
+    fn a_synchronous_workflow_stops_with_the_calling_turn() {
+        let (executor, _tmp) = setup_executor(Some(wait_until_cancelled_runner()));
+        let turn = CancellationToken::new();
+        let canceller = turn.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            canceller.cancel();
+        });
+        let started = std::time::Instant::now();
+        let result = executor.execute_with(
+            two_worker_phase(None, &["read"]),
+            WorkflowLaunch {
+                turn_token: Some(turn),
+                ..WorkflowLaunch::default()
+            },
+        );
+        assert_eq!(result.unwrap_err(), WorkflowExecutionError::Cancelled);
+        assert!(started.elapsed() < std::time::Duration::from_secs(3));
     }
 
     #[test]

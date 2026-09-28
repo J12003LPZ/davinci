@@ -2169,11 +2169,20 @@ pub fn corpus(
         "command",
     ));
     if davinci_agent::tools::workflow_tools_enabled() {
-        items.push(CorpusItem::new(
-            "/workflow",
-            "workflow runs · list | status <id> | cancel <id>",
-            "command",
-        ));
+        for (name, summary) in [
+            (
+                "/workflow",
+                "run a saved workflow or a goal · /workflow <name|goal>",
+            ),
+            ("/workflows", "workflow runs · phases, agents and progress"),
+            ("/workflow-stop", "stop a running workflow · /workflow-stop <id>"),
+            (
+                "/workflow-resume",
+                "resume a paused workflow · /workflow-resume <id>",
+            ),
+        ] {
+            items.push(CorpusItem::new(name, summary, "command"));
+        }
     }
 
     for tool in &agent.tools {
@@ -9773,10 +9782,89 @@ fn apply_graph_action(shell: &mut Shell<'_>, action: &str, index: usize) -> Next
     Next::Go
 }
 
+/// `/workflow` — bare: the runs view. `list|status <id>|cancel <id>`: text
+/// answers. A saved workflow's name runs it in the background; anything else
+/// is a goal the model turns into a workflow.
 fn workflow_command(shell: &mut Shell<'_>, args: &str) -> Next {
-    let text = workflow_command_text(shell.agent, args);
-    shell.say(&text);
-    Next::Go
+    let args = args.trim();
+    match workflow_route(args) {
+        WorkflowRoute::Sheet => {
+            open_workflows_sheet(shell.agent, shell.model);
+            Next::Go
+        }
+        WorkflowRoute::Text => {
+            let text = workflow_command_text(shell.agent, args);
+            shell.say(&text);
+            Next::Go
+        }
+        WorkflowRoute::Run => run_workflow_command(shell, args),
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum WorkflowRoute {
+    Sheet,
+    Text,
+    Run,
+}
+
+pub(crate) fn workflow_route(args: &str) -> WorkflowRoute {
+    match args.split_whitespace().next() {
+        None => WorkflowRoute::Sheet,
+        Some("list" | "status" | "cancel") => WorkflowRoute::Text,
+        Some(_) => WorkflowRoute::Run,
+    }
+}
+
+fn run_workflow_command(shell: &mut Shell<'_>, goal: &str) -> Next {
+    if !davinci_agent::tools::workflow_tools_enabled() {
+        shell.note("dynamic workflows are off; turn them on in /settings (Dynamic workflows)");
+        return Next::Go;
+    }
+    let trusted = shell
+        .agent
+        .runtime
+        .as_ref()
+        .is_some_and(|runtime| runtime.project_trusted);
+    match davinci_agent::find_saved_workflow(&shell.agent.cwd, goal, trusted) {
+        Ok(spec) => {
+            let executor = shell
+                .agent
+                .runtime
+                .as_ref()
+                .and_then(|runtime| runtime.workflow_executor.clone());
+            let Some(executor) = executor else {
+                shell.note("the workflow runner is not ready yet; send a prompt first");
+                return Next::Go;
+            };
+            let launch = shell.agent.workflow_launch(true);
+            match executor.execute_background_with(spec, launch) {
+                Ok(id) => {
+                    shell.model.running = false;
+                    shell.model.transcript.push(Entry::Gap);
+                    shell.model.transcript.push(Entry::tool(
+                        State::Active,
+                        "opus",
+                        &format!("workflow {goal} · running in background · /workflows ({id})"),
+                        None,
+                    ));
+                }
+                Err(error) => shell.note(&format!("failed to start workflow: {error}")),
+            }
+            Next::Go
+        }
+        Err(error) if error.contains("requires project trust") => {
+            shell.note(&error);
+            Next::Go
+        }
+        Err(_) => submit_prompt(
+            shell,
+            &format!(
+                "Create and run a workflow with workflow_run for this goal:\n{goal}"
+            ),
+            &[],
+        ),
+    }
 }
 
 fn workflow_stop_command(shell: &mut Shell<'_>, id_str: &str) -> Next {
@@ -10044,7 +10132,7 @@ pub(crate) fn team_command_text(agent: &Agent, profiles_text: String, args: &str
             let Some(name) = words.next() else {
                 return "usage: /agents stop <name>".into();
             };
-            match davinci_agent::runtime::resolve_agent(runtime, name) {
+            match davinci_agent::runtime::resolve_worker(runtime, name) {
                 Ok(id) => {
                     let _ = runtime
                         .registry

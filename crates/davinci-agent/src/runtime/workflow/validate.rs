@@ -69,9 +69,9 @@ pub enum WorkflowValidationError {
     MissingPhaseDependency { phase: String, dependency: String },
     #[error("dependency cycle detected involving phase: {0}")]
     DependencyCycle(String),
-    #[error("max_parallel_agents must be between 1 and 8 (found {0})")]
+    #[error("max_parallel_agents must be between 1 and 256 (found {0})")]
     InvalidMaxParallelAgents(usize),
-    #[error("max_total_agents must be between 1 and 64 (found {0})")]
+    #[error("max_total_agents must be between 1 and 1000 (found {0})")]
     InvalidMaxTotalAgents(usize),
     #[error("total workers count ({total}) exceeds max_total_agents ({max})")]
     TotalWorkersExceedsCap { total: usize, max: usize },
@@ -157,12 +157,14 @@ pub fn validate_workflow_with_capabilities(
     if spec.phases.is_empty() {
         return Err(WorkflowValidationError::NoPhases);
     }
-    if spec.max_parallel_agents < 1 || spec.max_parallel_agents > 8 {
+    if spec.max_parallel_agents < 1
+        || spec.max_parallel_agents > super::limits::MAX_CONCURRENT_AGENTS_CAP
+    {
         return Err(WorkflowValidationError::InvalidMaxParallelAgents(
             spec.max_parallel_agents,
         ));
     }
-    if spec.max_total_agents < 1 || spec.max_total_agents > 64 {
+    if spec.max_total_agents < 1 || spec.max_total_agents > super::limits::MAX_TOTAL_AGENTS_CAP {
         return Err(WorkflowValidationError::InvalidMaxTotalAgents(
             spec.max_total_agents,
         ));

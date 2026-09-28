@@ -3634,24 +3634,38 @@ fn worker_host_enforces_profile_tool_and_worktree_permission_ceilings() {
     assert!(!child.tools.contains(&"write".into()));
     assert!(!child.tools.contains(&"agent".into()));
     assert_eq!(child.max_model_turns, Some(60));
-    for mode in [
-        davinci_agent::PermissionMode::ReadOnly,
-        davinci_agent::PermissionMode::Ask,
+    // Plan Mode keeps a worktree worker read-only. Every other parent mode,
+    // including the default Manual mode, edits inside the isolated lease: the
+    // child has no approver, so `Ask` there could only deny every write.
+    for (parent, expected) in [
+        (
+            davinci_agent::PermissionMode::ReadOnly,
+            davinci_agent::PermissionMode::ReadOnly,
+        ),
+        (
+            davinci_agent::PermissionMode::Ask,
+            davinci_agent::PermissionMode::Edits,
+        ),
+        (
+            davinci_agent::PermissionMode::Edits,
+            davinci_agent::PermissionMode::Edits,
+        ),
     ] {
         let req = davinci_agent::SubagentRequest {
             agent: None,
-            parent_permission_mode: Some(mode),
+            parent_permission_mode: Some(parent),
             worktree_path: Some(dir.path().to_path_buf()),
             ..req.clone()
         };
-        let (child, _) = build_worker_agent(
+        let (child, shared_writer) = build_worker_agent(
             &parsed,
             dir.path(),
             &davinci_agent::McpRegistry::default(),
             &req,
         )
         .unwrap();
-        assert_eq!(child.permission_mode(), mode);
+        assert_eq!(child.permission_mode(), expected, "parent {parent:?}");
+        assert!(!shared_writer, "a worktree worker never holds the shared lock");
     }
 }
 

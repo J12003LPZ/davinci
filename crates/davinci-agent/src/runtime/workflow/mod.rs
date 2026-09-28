@@ -1,6 +1,7 @@
 //! Deterministic general workflow engine for Davinci.
 
 pub mod executor;
+pub mod limits;
 pub mod spec;
 pub mod state;
 pub mod tools;
@@ -9,6 +10,10 @@ pub mod validate;
 pub use executor::{
     PhaseExecutionState, PhaseStatus, WorkflowExecutionError, WorkflowExecutionState,
     WorkflowExecutor, WorkflowStatus,
+};
+pub use limits::{
+    WorkflowSettings, WorkflowSizeGuideline, DEFAULT_MAX_CONCURRENT_AGENTS,
+    MAX_CONCURRENT_AGENTS_CAP, MAX_TOTAL_AGENTS_CAP,
 };
 pub use spec::{WorkflowJoin, WorkflowLaunch, WorkflowPhaseSpec, WorkflowSpec, WorkflowWorkerSpec};
 pub use state::{WorkflowArtifact, WorkflowStateError, WorkflowStateStore};

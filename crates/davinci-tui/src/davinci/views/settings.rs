@@ -53,7 +53,11 @@ pub fn group_rank(key: &str) -> usize {
         | "default-project-trust"
         | "double-escape-action"
         | "tree-filter-mode"
-        | "model-thinking" => 3,
+        | "model-thinking"
+        | "dynamic-workflows"
+        | "workflow-size"
+        | "workflow-max-concurrent-agents"
+        | "agent-teams" => 3,
         "transport" | "http-idle-timeout" | "cache-miss-notices" => 4,
         _ => 5,
     }

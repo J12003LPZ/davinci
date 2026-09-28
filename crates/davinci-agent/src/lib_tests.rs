@@ -4263,3 +4263,56 @@ fn switching_runs_shuts_down_the_previous_team() {
     ));
     assert!(token.is_cancelled());
 }
+
+#[test]
+fn a_session_less_conversation_continues_its_runtime_and_team() {
+    use crate::runtime::{AgentId, RunId, RuntimeBus, RuntimeHandle};
+    let mut agent = crate::Agent::new_builtin(crate::PromptProfile::Stable);
+    assert!(agent.session.is_none());
+    assert!(agent.runtime_for_next_prompt().is_none());
+    let first = RuntimeHandle::new(RunId::new(), AgentId::new(), RuntimeBus::new());
+    let teammate = first.team.admit(AgentId::new());
+    agent.set_runtime(first.clone());
+    let previous = agent
+        .runtime_for_next_prompt()
+        .expect("--no-session keeps the previous prompt's runtime");
+    assert_eq!(previous.run_id, first.run_id);
+    // The host builds the next prompt's handle from it, as main.rs does.
+    let next = RuntimeHandle::new(RunId::new(), AgentId::new(), RuntimeBus::new())
+        .with_session_state_from(previous);
+    assert_eq!(next.run_id, first.run_id);
+    agent.set_runtime(next);
+    assert!(
+        !teammate.is_cancelled(),
+        "the next prompt must not shut the team down"
+    );
+}
+
+#[test]
+fn a_nested_worker_runtime_is_not_continued_as_a_conversation() {
+    use crate::runtime::{AgentId, RunId, RuntimeBus, RuntimeHandle};
+    let mut agent = crate::Agent::new_builtin(crate::PromptProfile::Stable);
+    let mut worker = RuntimeHandle::new(RunId::new(), AgentId::new(), RuntimeBus::new());
+    worker.parent_agent_id = Some(AgentId::new());
+    agent.set_runtime(worker);
+    assert!(agent.runtime_for_next_prompt().is_none());
+}
+
+#[test]
+fn a_resumed_conversation_recovers_the_users_delegation_refusal() {
+    let user = |text: &str| {
+        let mut message = davinci_ai::ChatMessage::text("user", text);
+        message
+            .extra
+            .insert("davinciRealUserOrigin".into(), serde_json::Value::Bool(true));
+        message
+    };
+    let relayed = davinci_ai::ChatMessage::text("user", "you can use subagents again");
+    let refused = [user("fix it. no subagents please"), relayed.clone()];
+    assert!(super::delegation_forbidden_from_messages(&refused));
+    let reversed = [
+        user("fix it. no subagents please"),
+        user("you can use subagents again"),
+    ];
+    assert!(!super::delegation_forbidden_from_messages(&reversed));
+}

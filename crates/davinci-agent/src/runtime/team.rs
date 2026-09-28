@@ -30,6 +30,8 @@ struct RosterInner {
     root: Mutex<Option<CancellationToken>>,
     members: RwLock<HashMap<AgentId, CancellationToken>>,
     shared_write: Mutex<()>,
+    /// Reports each worker has delivered to the lead.
+    reports: Mutex<HashMap<AgentId, u64>>,
 }
 
 impl TeamRoster {
@@ -76,6 +78,32 @@ impl TeamRoster {
             .write()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .remove(agent_id);
+        self.inner
+            .reports
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(agent_id);
+    }
+
+    fn note_report(&self, agent_id: AgentId) {
+        *self
+            .inner
+            .reports
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .entry(agent_id)
+            .or_default() += 1;
+    }
+
+    /// How many reports this worker has delivered to the lead.
+    pub fn report_count(&self, agent_id: &AgentId) -> u64 {
+        self.inner
+            .reports
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(agent_id)
+            .copied()
+            .unwrap_or(0)
     }
 
     pub fn is_member(&self, agent_id: &AgentId) -> bool {
@@ -193,6 +221,26 @@ pub fn resolve_agent(runtime: &RuntimeHandle, reference: &str) -> Result<AgentId
     }
 }
 
+/// Resolve an agent that may be stopped: a worker, never the lead and never
+/// the caller itself. `agent_message` may still address the lead by name.
+pub fn resolve_worker(runtime: &RuntimeHandle, reference: &str) -> Result<AgentId, String> {
+    let id = resolve_agent(runtime, reference)?;
+    if id == runtime.agent_id {
+        return Err("An agent cannot stop itself; finish your turn instead".into());
+    }
+    if runtime
+        .registry
+        .get(&id)
+        .is_some_and(|record| record.kind == AgentKind::Main)
+    {
+        return Err(format!(
+            "'{}' is the lead; only its workers can be stopped",
+            reference.trim()
+        ));
+    }
+    Ok(id)
+}
+
 use std::time::Duration;
 
 use super::mailbox::MailboxWait;
@@ -235,22 +283,44 @@ pub fn report_to_lead(
     outcome: &Result<String, String>,
     extra: Option<&str>,
 ) {
-    let Some(lead) = worker.parent_agent_id else {
-        return;
-    };
     let (status, body) = match outcome {
         Ok(text) => ("completed", text.as_str()),
         Err(error) => ("failed", error.as_str()),
+    };
+    report_status_to_lead(worker, status, body, extra);
+}
+
+/// Post a report with an explicit status (`completed`, `failed`, `stopped`).
+pub fn report_status_to_lead(
+    worker: &RuntimeHandle,
+    status: &str,
+    body: &str,
+    extra: Option<&str>,
+) {
+    let Some(lead) = worker.parent_agent_id else {
+        return;
     };
     let mut content = format!("status: {status}\n\n{}", cap_body(body));
     if let Some(extra) = extra {
         content.push_str("\n\n");
         content.push_str(extra);
     }
-    if let Err(error) = worker.send_message(lead, content) {
-        worker
+    match worker.send_message(lead, content) {
+        Ok(_) => worker.team.note_report(worker.agent_id),
+        Err(error) => worker
             .registry
-            .set_failure_reason(worker.agent_id, format!("report to lead failed: {error}"));
+            .set_failure_reason(worker.agent_id, format!("report to lead failed: {error}")),
+    }
+}
+
+/// Why a teammate left, as the lead should read it.
+pub fn teammate_exit_note(name: &str, exit: &TeammateExit) -> String {
+    match exit {
+        TeammateExit::Stopped => format!("{name} left the team: stopped"),
+        TeammateExit::IdleTimeout => format!("{name} left the team: idle timeout"),
+        TeammateExit::Failed(error) => {
+            format!("{name} left the team after repeated failures: {error}")
+        }
     }
 }
 

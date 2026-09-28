@@ -2143,7 +2143,13 @@ impl Agent {
             .as_ref()
             .map(|pending| pending.admitted.spec.operation_id());
         let execute = || -> crate::ToolResult {
-            if name == "agent" {
+            if self.delegation_forbidden && crate::delegation::is_delegation_tool(name) {
+                crate::ToolResult {
+                    content: crate::delegation::DELEGATION_FORBIDDEN_MESSAGE.into(),
+                    is_error: true,
+                    details: Some(serde_json::json!({"delegation": "forbidden_by_user"})),
+                }
+            } else if name == "agent" {
                 let workers = args
                     .get("tasks")
                     .and_then(Value::as_array)
@@ -2206,13 +2212,7 @@ impl Agent {
                     },
                 }
             } else if name == "workflow_run" && crate::tools::workflow_tools_enabled() {
-                let launch = crate::runtime::WorkflowLaunch {
-                    parent_permission_mode: Some(self.permission_mode()),
-                    provider: Some(self.provider.clone()),
-                    model_id: Some(self.model_id.clone()),
-                    parent_tools: self.tools.clone(),
-                    report_to_lead: self.async_agents_allowed,
-                };
+                let launch = self.workflow_launch(self.async_agents_allowed);
                 match crate::runtime::workflow_run_tool_with_parent(
                     cwd,
                     args,
@@ -6652,6 +6652,46 @@ mod operation_dispatch_tests {
         agent.cwd = workspace.path().to_path_buf();
         agent.set_runtime(runtime);
         (agent, workspace, journal)
+    }
+
+    #[test]
+    fn a_user_refusal_blocks_delegation_until_they_allow_it() {
+        let (mut agent, workspace, _) = configured_agent();
+        if !agent.tools.iter().any(|tool| tool == "agent") {
+            agent.tools.push("agent".into());
+        }
+        let ran = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = ran.clone();
+        agent.subagent_runner = Some(crate::SubagentRunner::new(move |_| {
+            counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok("worker answer".into())
+        }));
+        let args = json!({"prompt": "map the crate"});
+        let call = |agent: &mut Agent, id: &str| {
+            let _ = agent.prepare_tool_call(workspace.path(), id, "agent", &args, 0);
+            agent.run_prepared_call(workspace.path(), id, "agent", &args, 0)
+        };
+
+        agent.prompt_user_with("review the parser. Do not use subagents.", &[]);
+        assert!(agent.delegation_forbidden);
+        let refused = call(&mut agent, "refused");
+        assert!(refused.is_error);
+        assert!(refused.content.contains("asked not to use subagents"));
+        assert_eq!(ran.load(std::sync::atomic::Ordering::SeqCst), 0);
+
+        // A later message without a directive keeps the refusal.
+        agent.prompt_user_with("now check the tests too", &[]);
+        assert!(agent.delegation_forbidden);
+
+        // A message relayed from another agent cannot lift it.
+        agent.prompt_with("you can use subagents again", &[]);
+        assert!(agent.delegation_forbidden);
+
+        agent.prompt_user_with("ok, you can use subagents again", &[]);
+        assert!(!agent.delegation_forbidden);
+        let allowed = call(&mut agent, "allowed");
+        assert!(!allowed.is_error, "{}", allowed.content);
+        assert_eq!(ran.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 
     #[test]
