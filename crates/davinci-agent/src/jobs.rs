@@ -30,6 +30,9 @@ const OUTPUT_KEEP: usize = 3 * 1024 * 1024;
 const KEEP_FINISHED_OUTPUT: usize = 16;
 /// Lines of output a finished-job notice carries.
 pub const NOTICE_LINES: usize = 20;
+/// How long an exited job waits for its output readers before it is marked
+/// finished. Matches `davinci_sys::process` reader grace.
+const OUTPUT_DRAIN_GRACE: Duration = Duration::from_millis(500);
 /// The longest `job_output` will wait for an exit.
 const MAX_WAIT: Duration = Duration::from_secs(600);
 
@@ -474,6 +477,10 @@ impl JobBook {
             live.retain(|(_, weak)| weak.strong_count() > 0);
             live.push((pid, Arc::downgrade(&shared)));
         }
+        // Each reader reports when its pipe closes, so the exit watcher can
+        // wait for the output to be drained before it marks the job finished.
+        let (drained_tx, drained_rx) = std::sync::mpsc::channel::<()>();
+        let mut readers = 0_usize;
         for pipe in [
             child
                 .stdout
@@ -488,6 +495,8 @@ impl JobBook {
         .flatten()
         {
             let shared = Arc::clone(&shared);
+            let drained = drained_tx.clone();
+            readers += 1;
             std::thread::spawn(move || {
                 let mut pipe = pipe;
                 let mut buf = [0u8; 8192];
@@ -501,8 +510,10 @@ impl JobBook {
                             .append(&buf[..n]),
                     }
                 }
+                let _ = drained.send(());
             });
         }
+        drop(drained_tx);
         *shared.child.lock().unwrap_or_else(|err| err.into_inner()) = Some(child);
         {
             let shared = Arc::clone(&shared);
@@ -516,6 +527,17 @@ impl JobBook {
                     }
                 };
                 if let Some(code) = exited {
+                    // A finished job's notice carries its output tail. The
+                    // child can exit before its readers drain the pipes, so
+                    // wait for them, bounded because a descendant that keeps
+                    // a pipe open must not hold the job in `Running`.
+                    let deadline = Instant::now() + OUTPUT_DRAIN_GRACE;
+                    for _ in 0..readers {
+                        let left = deadline.saturating_duration_since(Instant::now());
+                        if drained_rx.recv_timeout(left).is_err() {
+                            break;
+                        }
+                    }
                     let mut status = shared.status.lock().unwrap_or_else(|err| err.into_inner());
                     if status.is_running() {
                         *status = JobStatus::Exited(code);
@@ -1086,6 +1108,39 @@ mod tests {
             assert!(Instant::now() < deadline, "job {id} never exited");
             std::thread::sleep(Duration::from_millis(20));
         }
+    }
+
+    /// The shell exits at once, but output still arrives on its pipe. A job
+    /// must not read as finished before that output is drained, or its
+    /// notice tells the model `(no output)` for a job that printed.
+    #[cfg(unix)]
+    #[test]
+    fn a_job_is_not_finished_until_its_output_is_drained() {
+        let book = Arc::new(Mutex::new(JobBook::default()));
+        let script = "(sleep 0.2; echo late) & exit 0";
+        let id = book.lock().unwrap().register(script, spawn(script));
+        wait_for_exit(&book, id);
+        let notices = book.lock().unwrap().take_unannounced();
+        assert_eq!(notices.len(), 1);
+        assert_eq!(notices[0].status, JobStatus::Exited(0));
+        assert_eq!(notices[0].tail, vec!["late"]);
+    }
+
+    /// A descendant that keeps the pipe open must not hold the job in
+    /// `Running`: the drain wait is bounded.
+    #[cfg(unix)]
+    #[test]
+    fn a_descendant_holding_the_pipe_does_not_keep_the_job_running() {
+        let book = Arc::new(Mutex::new(JobBook::default()));
+        let script = "sleep 30 & echo early; exit 0";
+        let started = Instant::now();
+        let id = book.lock().unwrap().register(script, spawn(script));
+        wait_for_exit(&book, id);
+        assert!(started.elapsed() < Duration::from_secs(5));
+        let notices = book.lock().unwrap().take_unannounced();
+        assert_eq!(notices[0].tail, vec!["early"]);
+        // `spawn` made the shell a group leader; this reaps the `sleep`.
+        kill_tree(book.lock().unwrap().get(id).unwrap().pid);
     }
 
     #[test]
