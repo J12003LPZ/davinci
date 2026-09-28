@@ -11,6 +11,7 @@ pub mod cogitator;
 pub mod compact;
 pub mod completion;
 pub mod context_inspector;
+pub mod context_usage;
 pub mod decision_modal;
 pub mod diff;
 pub mod disegno;

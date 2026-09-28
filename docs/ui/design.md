@@ -26,6 +26,18 @@ Completing a command name leaves `/model  <provider/model>` with the argument
 hint and no list (Claude Code `shell/54-tab-mod`); argument values are offered
 once the first character of the argument is typed, in the ordinary completion
 list. Host notices render as a wrapped `●` line, never as `● Tool(…)`.
+
+`/context` follows Claude Code's command of the same name: under the echoed
+`❯ /context` it hangs `⎿  Context Usage`, a ten-by-ten grid of the window (`⛁`
+full, `⛀` partial, `⛶` free, `⛝` the autocompact buffer filling from the end)
+beside a legend with the model, the used/total tokens and each category —
+system prompt, system tools, MCP tools, custom agents, memory files
+(repository context files), messages — then the members of the MCP, agent and
+memory categories. Figures come from `Agent::context_usage()` and add up to the
+same estimate that drives pruning and compaction. Below 72 columns the legend
+moves under the grid. There is no skills category: DaVinci loads skill bodies
+on demand, so they are not in the window. The prepared-manifest inspector
+sheet that used to answer `/context` is `/context inspect`.
 `NO_COLOR`, narrow terminals, and the non-default themes remain supported.
 
 The editorial print notes below describe the optional `vox` theme. They are no
