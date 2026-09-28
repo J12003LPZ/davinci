@@ -3024,9 +3024,11 @@ fn background_shell_invalidates_coverage_until_terminal_state_and_fresh_verifica
         .unwrap()
         .write_stdin(job_id, "go\n")
         .unwrap();
+    // `wait` returns as soon as the job exits; the bound only has to outlast
+    // Python startup on a loaded Windows runner, where 2 s was not enough.
     let result = crate::jobs::output_tool(
         &agent.tool_context.jobs,
-        &serde_json::json!({"jobId":job_id, "wait":2}),
+        &serde_json::json!({"jobId":job_id, "wait":30}),
         None,
     )
     .unwrap();
