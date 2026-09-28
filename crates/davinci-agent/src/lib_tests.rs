@@ -4302,9 +4302,10 @@ fn a_nested_worker_runtime_is_not_continued_as_a_conversation() {
 fn a_resumed_conversation_recovers_the_users_delegation_refusal() {
     let user = |text: &str| {
         let mut message = davinci_ai::ChatMessage::text("user", text);
-        message
-            .extra
-            .insert("davinciRealUserOrigin".into(), serde_json::Value::Bool(true));
+        message.extra.insert(
+            "davinciRealUserOrigin".into(),
+            serde_json::Value::Bool(true),
+        );
         message
     };
     let relayed = davinci_ai::ChatMessage::text("user", "you can use subagents again");

@@ -19,8 +19,7 @@ use davinci_tui::davinci::model::{
     McpServerRow, McpSheet, Model, ModelItem, Overlay, PermissionRow, PickerItem, PlanStep,
     ProviderRow, ResumeRow, ReviewFile, ReviewSheet, Screen, SecurityScan, SettingRow, Severity,
     Step, SubagentRow, SubagentRowState, ThinkingRow, Tone, TreeNode, VectorIndex, WorkflowRow,
-    WorkflowsSheet, Working,
-    WorkshopSheet,
+    WorkflowsSheet, Working, WorkshopSheet,
 };
 use davinci_tui::davinci::theme::State;
 
@@ -2266,7 +2265,10 @@ pub fn corpus(
                 "run a saved workflow or a goal · /workflow <name|goal>",
             ),
             ("/workflows", "workflow runs · phases, agents and progress"),
-            ("/workflow-stop", "stop a running workflow · /workflow-stop <id>"),
+            (
+                "/workflow-stop",
+                "stop a running workflow · /workflow-stop <id>",
+            ),
             (
                 "/workflow-resume",
                 "resume a paused workflow · /workflow-resume <id>",
@@ -9562,7 +9564,9 @@ fn workflow_agent_row(
         _ => "pending",
     };
     let detail = match status {
-        "failed" | "cancelled" => record.as_ref().and_then(|record| record.failure_reason.clone()),
+        "failed" | "cancelled" => record
+            .as_ref()
+            .and_then(|record| record.failure_reason.clone()),
         "completed" => executor
             .store
             .list_phase_artifacts(run.id, phase)
@@ -9616,15 +9620,17 @@ pub(crate) fn workflow_rows(agent: &Agent) -> Vec<WorkflowRow> {
             let phase_rows: Vec<davinci_tui::davinci::model::WorkflowPhaseRow> = order
                 .iter()
                 .filter_map(|id| run.phases.get(id).map(|state| (id, state)))
-                .map(|(id, state)| davinci_tui::davinci::model::WorkflowPhaseRow {
-                    id: id.clone(),
-                    status: format!("{:?}", state.status).to_lowercase(),
-                    agents: state
-                        .worker_agent_ids
-                        .iter()
-                        .map(|agent| workflow_agent_row(runtime, executor, &run, id, agent))
-                        .collect(),
-                })
+                .map(
+                    |(id, state)| davinci_tui::davinci::model::WorkflowPhaseRow {
+                        id: id.clone(),
+                        status: format!("{:?}", state.status).to_lowercase(),
+                        agents: state
+                            .worker_agent_ids
+                            .iter()
+                            .map(|agent| workflow_agent_row(runtime, executor, &run, id, agent))
+                            .collect(),
+                    },
+                )
                 .collect();
             WorkflowRow {
                 id: run.id.to_string(),
@@ -9686,7 +9692,9 @@ fn apply_workflow_action(shell: &mut Shell<'_>, action: &str) -> Next {
             Some(davinci_agent::runtime::WorkflowStatus::Paused) => {
                 executor.resume(&run_id).map(|_| "resumed".to_string())
             }
-            _ => executor.pause(&run_id).map(|_| "paused: no new agents start".to_string()),
+            _ => executor
+                .pause(&run_id)
+                .map(|_| "paused: no new agents start".to_string()),
         }
         .map_err(|error| error.to_string()),
         "stop_agent" => match agent_id {
@@ -10109,9 +10117,7 @@ fn run_workflow_command(shell: &mut Shell<'_>, goal: &str) -> Next {
         }
         Err(_) => submit_prompt(
             shell,
-            &format!(
-                "Create and run a workflow with workflow_run for this goal:\n{goal}"
-            ),
+            &format!("Create and run a workflow with workflow_run for this goal:\n{goal}"),
             &[],
         ),
     }

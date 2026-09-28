@@ -3521,9 +3521,21 @@ fn delegated_workers_draw_live_under_their_agent_call() {
             elapsed_ms: 3_000,
         },
     };
-    apply(&mut m, &mut turn, &progress(0, SubagentProgressState::Running, 1, &["Read(a.rs)"]));
-    apply(&mut m, &mut turn, &progress(1, SubagentProgressState::Running, 0, &[]));
-    apply(&mut m, &mut turn, &progress(0, SubagentProgressState::Done, 4, &["Read(b.rs)"]));
+    apply(
+        &mut m,
+        &mut turn,
+        &progress(0, SubagentProgressState::Running, 1, &["Read(a.rs)"]),
+    );
+    apply(
+        &mut m,
+        &mut turn,
+        &progress(1, SubagentProgressState::Running, 0, &[]),
+    );
+    apply(
+        &mut m,
+        &mut turn,
+        &progress(0, SubagentProgressState::Done, 4, &["Read(b.rs)"]),
+    );
     let Entry::Subagents(rows) = &m.transcript[call_row + 1] else {
         panic!("no worker block under the call: {:?}", m.transcript);
     };
@@ -3553,18 +3565,28 @@ fn delegated_workers_draw_live_under_their_agent_call() {
     );
     assert!(matches!(
         &m.transcript[call_row],
-        Entry::Tool { duration: Some(_), .. }
+        Entry::Tool {
+            duration: Some(_),
+            ..
+        }
     ));
     // A report after the call ended has nowhere to go and changes nothing.
     let before = m.transcript.len();
-    apply(&mut m, &mut turn, &progress(1, SubagentProgressState::Done, 2, &[]));
+    apply(
+        &mut m,
+        &mut turn,
+        &progress(1, SubagentProgressState::Done, 2, &[]),
+    );
     assert_eq!(m.transcript.len(), before);
 }
 
 #[test]
 fn agent_calls_are_named_like_claude_code() {
     assert_eq!(
-        target_of("agent", &serde_json::json!({"description": "map auth", "prompt": "x"})),
+        target_of(
+            "agent",
+            &serde_json::json!({"description": "map auth", "prompt": "x"})
+        ),
         "agent map auth"
     );
     assert_eq!(
@@ -3585,7 +3607,9 @@ fn agent_calls_are_named_like_claude_code() {
 
 #[test]
 fn background_counts_include_live_workers_only() {
-    use davinci_agent::{AgentId, AgentKind, AgentRecord, AgentState, RunId, RuntimeBus, RuntimeHandle};
+    use davinci_agent::{
+        AgentId, AgentKind, AgentRecord, AgentState, RunId, RuntimeBus, RuntimeHandle,
+    };
     let mut agent = davinci_agent::Agent::new_builtin(davinci_agent::PromptProfile::Stable);
     let runtime = RuntimeHandle::new(RunId::new(), AgentId::new(), RuntimeBus::new());
     let register = |kind, finished: bool| {
@@ -3609,9 +3633,15 @@ fn background_counts_include_live_workers_only() {
                 failure_reason: None,
             })
             .unwrap();
-        runtime.registry.transition(id, AgentState::Running).unwrap();
+        runtime
+            .registry
+            .transition(id, AgentState::Running)
+            .unwrap();
         if finished {
-            runtime.registry.transition(id, AgentState::Completed).unwrap();
+            runtime
+                .registry
+                .transition(id, AgentState::Completed)
+                .unwrap();
         }
     };
     register(AgentKind::Background, false);
@@ -3637,7 +3667,10 @@ fn the_workflows_view_lists_phases_in_order_with_agents_and_results() {
             if req.instance_name.as_deref() == Some("flaky") {
                 Err("provider down".into())
             } else {
-                Ok(format!("answer from {}", req.instance_name.clone().unwrap_or_default()))
+                Ok(format!(
+                    "answer from {}",
+                    req.instance_name.clone().unwrap_or_default()
+                ))
             }
         })),
     ));
@@ -3658,7 +3691,10 @@ fn the_workflows_view_lists_phases_in_order_with_agents_and_results() {
     assert_eq!(rows.len(), 1);
     let run = &rows[0];
     assert_eq!(
-        run.phase_rows.iter().map(|phase| phase.id.as_str()).collect::<Vec<_>>(),
+        run.phase_rows
+            .iter()
+            .map(|phase| phase.id.as_str())
+            .collect::<Vec<_>>(),
         vec!["zeta-first", "alpha-second"],
         "spec order, not map order"
     );
@@ -3667,8 +3703,14 @@ fn the_workflows_view_lists_phases_in_order_with_agents_and_results() {
     assert_eq!(reader.status, "completed");
     assert_eq!(reader.detail.as_deref(), Some("answer from reader"));
     let second = &run.phase_rows[1].agents;
-    assert!(second.iter().any(|agent| agent.label == "good" && agent.status == "completed"));
-    assert!(!run.elapsed.ends_with("ms"), "human elapsed: {}", run.elapsed);
+    assert!(second
+        .iter()
+        .any(|agent| agent.label == "good" && agent.status == "completed"));
+    assert!(
+        !run.elapsed.ends_with("ms"),
+        "human elapsed: {}",
+        run.elapsed
+    );
 
     let mut m = model();
     open_workflows_sheet(&agent, &mut m);

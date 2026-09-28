@@ -1925,7 +1925,9 @@ impl WorkflowsSheet {
         {
             self.selected_index = index;
         } else {
-            self.selected_index = self.selected_index.min(self.workflows.len().saturating_sub(1));
+            self.selected_index = self
+                .selected_index
+                .min(self.workflows.len().saturating_sub(1));
             if self.level != WorkflowLevel::Runs && run_id.is_some() {
                 self.level = WorkflowLevel::Runs;
             }

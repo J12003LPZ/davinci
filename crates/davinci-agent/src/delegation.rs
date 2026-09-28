@@ -109,13 +109,13 @@ pub fn delegation_forbidden_after<'a>(
     initial: bool,
     user_texts: impl IntoIterator<Item = &'a str>,
 ) -> bool {
-    user_texts
-        .into_iter()
-        .fold(initial, |forbidden, text| match delegation_directive(text) {
+    user_texts.into_iter().fold(initial, |forbidden, text| {
+        match delegation_directive(text) {
             Some(DelegationDirective::Forbid) => true,
             Some(DelegationDirective::Allow) => false,
             None => forbidden,
-        })
+        }
+    })
 }
 
 /// The tool result a delegation call gets while the user has forbidden it.

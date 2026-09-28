@@ -217,7 +217,10 @@ pub fn call_summary(tool_name: &str, args: &Value) -> String {
                     .map_or(0, Vec::len)
             ),
         ),
-        other => (other, first(&["path", "pattern", "query", "command", "url"])),
+        other => (
+            other,
+            first(&["path", "pattern", "query", "command", "url"]),
+        ),
     };
     if argument.is_empty() {
         name.to_string()

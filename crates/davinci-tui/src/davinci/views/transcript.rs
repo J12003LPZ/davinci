@@ -467,7 +467,11 @@ fn subagent_lines(model: &Model, rows: &[SubagentRow], width: u16) -> Vec<Line<'
     let mut out = Vec::new();
     for (index, row) in rows.iter().enumerate() {
         let last = index + 1 == rows.len();
-        let (branch, rail) = if last { ("└─", "   ") } else { ("├─", "│  ") };
+        let (branch, rail) = if last {
+            ("└─", "   ")
+        } else {
+            ("├─", "│  ")
+        };
         let failed = row.state == SubagentRowState::Failed;
         let stats = subagent_stats(row, false);
         let label = if row.label.is_empty() {
@@ -932,10 +936,18 @@ mod tests {
         let m = model(100);
         let rows = drawn(
             &m,
-            vec![worker("map auth", SubagentRowState::Done, 7, &["Read(a.rs)"])],
+            vec![worker(
+                "map auth",
+                SubagentRowState::Done,
+                7,
+                &["Read(a.rs)"],
+            )],
         );
         assert_eq!(rows.len(), 1);
-        assert!(rows[0].ends_with("Done (7 tool uses · 23.4k tokens · 41s)"), "{rows:?}");
+        assert!(
+            rows[0].ends_with("Done (7 tool uses · 23.4k tokens · 41s)"),
+            "{rows:?}"
+        );
         let background = drawn(
             &m,
             vec![worker("scan", SubagentRowState::Background, 0, &[])],
@@ -961,13 +973,16 @@ mod tests {
         assert!(rows[4].contains("└─ tests"));
         assert!(rows[5].ends_with("⎿  Initializing…"));
         for width in [0u16, 10, 40] {
-            for row in entry_lines(&model(width), &Entry::Subagents(vec![worker(
-                "a very long worker label that will not fit",
-                SubagentRowState::Running,
-                3,
-                &["Read(some/very/long/path/that/goes/on/and/on.rs)"],
-            )]), width)
-            {
+            for row in entry_lines(
+                &model(width),
+                &Entry::Subagents(vec![worker(
+                    "a very long worker label that will not fit",
+                    SubagentRowState::Running,
+                    3,
+                    &["Read(some/very/long/path/that/goes/on/and/on.rs)"],
+                )]),
+                width,
+            ) {
                 assert!(run_width(&row.spans) <= width);
             }
         }

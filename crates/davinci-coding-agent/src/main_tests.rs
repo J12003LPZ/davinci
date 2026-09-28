@@ -3665,7 +3665,10 @@ fn worker_host_enforces_profile_tool_and_worktree_permission_ceilings() {
         )
         .unwrap();
         assert_eq!(child.permission_mode(), expected, "parent {parent:?}");
-        assert!(!shared_writer, "a worktree worker never holds the shared lock");
+        assert!(
+            !shared_writer,
+            "a worktree worker never holds the shared lock"
+        );
     }
 }
 

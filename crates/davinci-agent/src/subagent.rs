@@ -1836,7 +1836,9 @@ mod tests {
             let path = note["path"].as_str().unwrap();
             // A JSON-rendered value would be quoted (and doubled backslashes
             // on Windows); the reader must see the path it can open.
-            assert!(result.content.contains(&format!("worktree kept: {path} (branch")));
+            assert!(result
+                .content
+                .contains(&format!("worktree kept: {path} (branch")));
             assert!(!result.content.contains(&format!("\"{path}")));
         }
     }
@@ -1891,7 +1893,12 @@ mod tests {
         )
         .unwrap();
         let start = std::time::Instant::now();
-        while !seen.lock().unwrap().iter().any(|(_, _, state)| *state == P::Done) {
+        while !seen
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|(_, _, state)| *state == P::Done)
+        {
             assert!(start.elapsed() < std::time::Duration::from_secs(5));
             std::thread::sleep(std::time::Duration::from_millis(10));
         }

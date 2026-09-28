@@ -99,8 +99,8 @@ impl WorkflowSettings {
         let from_env = env_concurrency
             .and_then(|raw| raw.trim().parse::<u64>().ok())
             .filter(|value| (1..=MAX_CONCURRENT_AGENTS_CAP as u64).contains(value));
-        let from_setting =
-            max_concurrent_agents.filter(|value| (1..=MAX_CONCURRENT_AGENTS_CAP as u64).contains(value));
+        let from_setting = max_concurrent_agents
+            .filter(|value| (1..=MAX_CONCURRENT_AGENTS_CAP as u64).contains(value));
         Self {
             size_guideline: parsed_guideline.unwrap_or_default(),
             size_guideline_explicit: parsed_guideline.is_some(),
@@ -140,7 +140,11 @@ impl WorkflowSettings {
     /// Effective concurrency for one run: the spec's request, bounded by the
     /// session ceiling.
     pub fn concurrency_for(&self, requested: usize) -> usize {
-        requested.clamp(1, self.max_concurrent_agents.clamp(1, MAX_CONCURRENT_AGENTS_CAP))
+        requested.clamp(
+            1,
+            self.max_concurrent_agents
+                .clamp(1, MAX_CONCURRENT_AGENTS_CAP),
+        )
     }
 }
 

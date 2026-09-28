@@ -1818,7 +1818,10 @@ mod tests {
         assert_eq!(status, WorkflowStatus::Failed);
         let record = executor.runtime.registry.get(&agent).unwrap();
         assert_eq!(record.state, AgentState::Failed);
-        assert!(!executor.cancel_agent(&agent), "a finished agent cannot be stopped");
+        assert!(
+            !executor.cancel_agent(&agent),
+            "a finished agent cannot be stopped"
+        );
     }
 
     #[test]

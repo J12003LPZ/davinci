@@ -46,7 +46,10 @@ fn orchestration_tools_follow_the_feature_settings() {
         .iter()
         .chain(davinci_agent::WORKFLOW_TOOLS)
     {
-        assert!(names.iter().any(|name| name == tool), "{tool} missing: {names:?}");
+        assert!(
+            names.iter().any(|name| name == tool),
+            "{tool} missing: {names:?}"
+        );
     }
 
     // Turning one family off again removes only that family.

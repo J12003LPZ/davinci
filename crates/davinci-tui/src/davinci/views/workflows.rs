@@ -239,21 +239,27 @@ fn agents(model: &Model, sheet: &WorkflowsSheet) -> Vec<Line<'static>> {
 fn agent_detail(model: &Model, sheet: &WorkflowsSheet) -> Vec<Line<'static>> {
     let th = &model.theme;
     let width = model.width;
-    let (Some(run), Some(phase), Some(agent)) = (sheet.run(), sheet.phase(), sheet.agent())
-    else {
+    let (Some(run), Some(phase), Some(agent)) = (sheet.run(), sheet.phase(), sheet.agent()) else {
         return Vec::new();
     };
     let mut rows = section_state(
         width,
         th,
         state(&agent.status),
-        &format!("{} › {} › {} · {}", run.name, phase.id, agent.label, agent.status),
+        &format!(
+            "{} › {} › {} · {}",
+            run.name, phase.id, agent.label, agent.status
+        ),
     );
     let stats = agent_stats(agent);
     if !stats.is_empty() {
         rows.extend(section_detail(width, th, &stats));
     }
-    rows.extend(section_detail(width, th, &format!("agent {}", agent.agent_id)));
+    rows.extend(section_detail(
+        width,
+        th,
+        &format!("agent {}", agent.agent_id),
+    ));
     if !agent.recent.is_empty() {
         rows.extend(section_detail(width, th, "Recent calls"));
         let calls: Vec<&String> = if sheet.expanded {
@@ -265,8 +271,16 @@ fn agent_detail(model: &Model, sheet: &WorkflowsSheet) -> Vec<Line<'static>> {
             rows.extend(section_detail(width, th, &format!("  {call}")));
         }
     }
-    if let Some(detail) = agent.detail.as_deref().filter(|text| !text.trim().is_empty()) {
-        let heading = if agent.status == "failed" { "Error" } else { "Result" };
+    if let Some(detail) = agent
+        .detail
+        .as_deref()
+        .filter(|text| !text.trim().is_empty())
+    {
+        let heading = if agent.status == "failed" {
+            "Error"
+        } else {
+            "Result"
+        };
         rows.extend(section_detail(width, th, heading));
         let lines: Vec<&str> = detail.lines().collect();
         let shown = if sheet.expanded {
@@ -389,7 +403,10 @@ mod tests {
             detail: Some(if status == "failed" {
                 "provider down".into()
             } else {
-                (1..=20).map(|n| format!("finding {n}")).collect::<Vec<_>>().join("\n")
+                (1..=20)
+                    .map(|n| format!("finding {n}"))
+                    .collect::<Vec<_>>()
+                    .join("\n")
             }),
         }
     }
@@ -422,10 +439,7 @@ mod tests {
                     WorkflowPhaseRow {
                         id: "review".into(),
                         status: "paused".into(),
-                        agents: vec![
-                            agent("security", "running", 3),
-                            agent("perf", "failed", 1),
-                        ],
+                        agents: vec![agent("security", "running", 3), agent("perf", "failed", 1)],
                     },
                 ],
             }],

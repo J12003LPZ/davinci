@@ -1039,7 +1039,10 @@ fn build_agent(parsed: &Args, session_dir: &Path, cwd: &Path) -> Result<Agent, S
     }
     // Feature switches apply everywhere; an explicit `--tools` list or a
     // graph worker's contract decides its own tools.
-    davinci_agent::tools::set_orchestration_settings(settings.agent_teams, settings.dynamic_workflows);
+    davinci_agent::tools::set_orchestration_settings(
+        settings.agent_teams,
+        settings.dynamic_workflows,
+    );
     if graph_worker.is_none() && !explicit_tool_selection {
         apply_orchestration_settings(&mut agent, &settings);
     } else {
@@ -7358,7 +7361,10 @@ fn persist_interactive_setting(spec: &str) -> Result<(), String> {
 /// to a lead agent: the feature switches, the sizing it launches with, and
 /// the tools those features bring.
 fn apply_orchestration_settings(agent: &mut Agent, settings: &settings::Settings) {
-    davinci_agent::tools::set_orchestration_settings(settings.agent_teams, settings.dynamic_workflows);
+    davinci_agent::tools::set_orchestration_settings(
+        settings.agent_teams,
+        settings.dynamic_workflows,
+    );
     agent.workflow_settings = settings.workflow_settings(
         std::env::var("DAVINCI_WORKFLOW_MAX_CONCURRENT_AGENTS")
             .ok()
