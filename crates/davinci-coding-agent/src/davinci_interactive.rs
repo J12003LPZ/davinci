@@ -8588,7 +8588,7 @@ fn submit_prompt(shell: &mut Shell<'_>, text: &str, images: &[davinci_ai::Messag
         .mutation_verification_state()
         .mutation_generation;
     let _ = davinci_coding_agent::turn_decision::prepare_turn_decision(
-        &mut shell.agent,
+        shell.agent,
         davinci_coding_agent::turn_decision::DecisionSnapshot {
             request_id: davinci_agent::new_message_id(),
             task: expanded.clone(),
