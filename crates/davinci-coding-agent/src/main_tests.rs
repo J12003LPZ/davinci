@@ -3372,6 +3372,9 @@ fn status_includes_astra_model_policy_identity() {
 
 #[test]
 fn json_mode_and_status_expose_safe_prompt_metadata() {
+    let _env_lock = PROCESS_ENV_LOCK
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
     let dir = tempfile::tempdir().unwrap();
     let session_dir = dir.path().join("sessions");
     let cwd = dir.path().join("cwd");
