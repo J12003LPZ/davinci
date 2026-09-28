@@ -2,7 +2,7 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Condvar, Mutex, RwLock};
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -52,6 +52,21 @@ impl AgentMessage {
 
 pub const MAX_MESSAGE_SIZE: usize = 65_536;
 pub const MAX_QUEUE_CAPACITY: usize = 1_000;
+
+/// Longest single condvar wait; `stop` is re-checked at least this often.
+const WAIT_SLICE: std::time::Duration = std::time::Duration::from_millis(100);
+
+/// Why [`AgentMailbox::wait_for_pending`] returned.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MailboxWait {
+    /// At least one message is queued for the agent.
+    Ready,
+    /// The caller's stop predicate became true.
+    Stopped,
+    /// Nothing arrived before the timeout.
+    TimedOut,
+}
+
 
 /// Maps delivery/application/rejection booleans to canonical steering state string.
 pub fn steering_state(delivered: bool, applied: bool, rejected: bool) -> &'static str {
@@ -113,9 +128,54 @@ pub struct AgentMailbox {
     registry: Option<RuntimeRegistry>,
     bus: Option<RuntimeBus>,
     seq: Arc<AtomicU64>,
+    /// Bumped and broadcast on every enqueue so idle agents can block.
+    signal: Arc<(Mutex<u64>, Condvar)>,
+
 }
 
 impl AgentMailbox {
+    fn notify_waiters(&self) {
+        let (lock, cvar) = &*self.signal;
+        let mut generation = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        *generation = generation.wrapping_add(1);
+        cvar.notify_all();
+    }
+
+    /// Block until a message is queued for `agent_id`, `stop()` returns true,
+    /// or `timeout` elapses. `stop` is polled at least every 100 ms so a
+    /// cancelled agent never sleeps through its own shutdown.
+    pub fn wait_for_pending(
+        &self,
+        agent_id: &AgentId,
+        timeout: std::time::Duration,
+        stop: &dyn Fn() -> bool,
+    ) -> MailboxWait {
+        let deadline = std::time::Instant::now() + timeout;
+        let (lock, cvar) = &*self.signal;
+        loop {
+            if self.pending_count(agent_id) > 0 {
+                return MailboxWait::Ready;
+            }
+            if stop() {
+                return MailboxWait::Stopped;
+            }
+            let now = std::time::Instant::now();
+            if now >= deadline {
+                return MailboxWait::TimedOut;
+            }
+            let slice = WAIT_SLICE.min(deadline - now);
+            let guard = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            // Re-check under the lock: a send between the check above and
+            // this wait would otherwise be missed for one slice.
+            if self.pending_count(agent_id) > 0 {
+                return MailboxWait::Ready;
+            }
+            let _ = cvar
+                .wait_timeout(guard, slice)
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+        }
+    }
+
     pub fn new() -> Self {
         Self {
             queues: Arc::new(RwLock::new(HashMap::new())),
@@ -125,6 +185,7 @@ impl AgentMailbox {
             registry: None,
             bus: None,
             seq: Arc::new(AtomicU64::new(0)),
+            signal: Arc::new((Mutex::new(0), Condvar::new())),
         }
     }
 
@@ -137,6 +198,7 @@ impl AgentMailbox {
             registry: Some(registry),
             bus: Some(bus),
             seq: Arc::new(AtomicU64::new(0)),
+            signal: Arc::new((Mutex::new(0), Condvar::new())),
         }
     }
 
@@ -231,6 +293,7 @@ impl AgentMailbox {
             }
             q.push_back(message.clone());
         }
+        self.notify_waiters();
 
         // Record initial steering receipt as queued
         if let Ok(mut receipts) = self.steering_receipts.write() {
@@ -370,6 +433,7 @@ impl AgentMailbox {
             }
             q.push_back(msg.clone());
         }
+        self.notify_waiters();
 
         let receipt = SteeringReceipt {
             message_id: msg_id,
@@ -572,6 +636,8 @@ impl AgentMailbox {
         for msg in remaining {
             queues.entry(msg.to).or_default().push_back(msg);
         }
+        drop(queues);
+        self.notify_waiters();
     }
 }
 
@@ -958,5 +1024,55 @@ mod tests {
         assert_eq!(steering_state(false, false, false), "queued");
         let msg = AgentMessage::new(RunId::new(), AgentId::new(), AgentId::new(), steering_text);
         assert_eq!(msg.content, steering_text);
+    }
+    #[test]
+    fn wait_for_pending_wakes_when_a_message_arrives() {
+        let mailbox = AgentMailbox::new();
+        let run = RunId::new();
+        let from = AgentId::new();
+        let to = AgentId::new();
+        let sender = mailbox.clone();
+        let handle = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            sender
+                .send(AgentMessage::new(run, from, to, "hello"))
+                .unwrap();
+        });
+        let started = std::time::Instant::now();
+        let outcome =
+            mailbox.wait_for_pending(&to, std::time::Duration::from_secs(5), &|| false);
+        handle.join().unwrap();
+        assert_eq!(outcome, MailboxWait::Ready);
+        assert!(started.elapsed() < std::time::Duration::from_secs(2));
+        assert_eq!(mailbox.pending_count(&to), 1);
+    }
+
+    #[test]
+    fn wait_for_pending_returns_immediately_when_already_pending() {
+        let mailbox = AgentMailbox::new();
+        let to = AgentId::new();
+        mailbox
+            .send(AgentMessage::new(RunId::new(), AgentId::new(), to, "queued"))
+            .unwrap();
+        assert_eq!(
+            mailbox.wait_for_pending(&to, std::time::Duration::from_millis(10), &|| false),
+            MailboxWait::Ready
+        );
+    }
+
+    #[test]
+    fn wait_for_pending_honours_stop_and_timeout() {
+        let mailbox = AgentMailbox::new();
+        let to = AgentId::new();
+        assert_eq!(
+            mailbox.wait_for_pending(&to, std::time::Duration::from_secs(5), &|| true),
+            MailboxWait::Stopped
+        );
+        let started = std::time::Instant::now();
+        assert_eq!(
+            mailbox.wait_for_pending(&to, std::time::Duration::from_millis(150), &|| false),
+            MailboxWait::TimedOut
+        );
+        assert!(started.elapsed() >= std::time::Duration::from_millis(150));
     }
 }
