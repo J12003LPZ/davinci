@@ -219,8 +219,22 @@ impl EnvironmentCapture {
     pub(crate) fn capture(&self, cwd: &Path, tools: &[String], date: &str) -> EnvironmentSnapshot {
         let owned_cwd = cwd.to_path_buf();
         let owned_tools = tools.to_vec();
+        let fallback_shells = tools
+            .iter()
+            .filter(|tool| {
+                matches!(
+                    tool.as_str(),
+                    "exec_command" | "bash" | "shell" | "powershell"
+                )
+            })
+            .cloned()
+            .map(|tool| ToolShell {
+                tool,
+                executable: None,
+            })
+            .collect::<Vec<_>>();
         let owned_date = date.to_string();
-        self.run(cwd, date, move || {
+        let mut snapshot = self.run(cwd, date, move || {
             let custom_shell = std::env::var("PI_SHELL")
                 .ok()
                 .filter(|value| !value.is_empty());
@@ -266,7 +280,16 @@ impl EnvironmentCapture {
                     .map(|path| path.to_string_lossy().into_owned())
             });
             snapshot
-        })
+        });
+        if snapshot.tool_shells.is_empty()
+            && matches!(
+                snapshot.listing_status,
+                ListingStatus::TimedOut | ListingStatus::ProbeBusy | ListingStatus::Unavailable
+            )
+        {
+            snapshot.tool_shells = fallback_shells;
+        }
+        snapshot
     }
 
     fn run(
