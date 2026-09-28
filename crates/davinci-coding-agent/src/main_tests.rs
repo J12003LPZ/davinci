@@ -3733,3 +3733,44 @@ fn fixture_teammate_reports_wakes_and_times_out_through_host_runner() {
     }
     assert!(!runtime.team.is_member(&id));
 }
+
+#[test]
+fn worker_host_feeds_its_own_events_into_the_leads_progress() {
+    let _lock = PROCESS_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let dir = tempfile::tempdir().unwrap();
+    let _config = EnvRestore::set("PI_CODING_AGENT_DIR", dir.path().to_str().unwrap());
+    let parsed = Args {
+        offline: true,
+        no_extensions: true,
+        ..Default::default()
+    };
+    let reporter = davinci_agent::subagent_progress::ProgressReporter::new(
+        "call",
+        davinci_agent::EventSink(std::sync::Arc::new(|_| {})),
+        "a1",
+        "map auth",
+        (0, 1),
+        "oneshot",
+    );
+    let req = davinci_agent::SubagentRequest {
+        tools: vec!["read".into()],
+        progress: Some(reporter.clone()),
+        ..Default::default()
+    };
+    let (child, _) = build_worker_agent(
+        &parsed,
+        dir.path(),
+        &davinci_agent::McpRegistry::default(),
+        &req,
+    )
+    .unwrap();
+    let sink = child.event_sink.expect("the worker reports its progress");
+    (sink.0)(&davinci_agent::AgentEvent::ToolExecutionStart {
+        tool_call_id: "t".into(),
+        tool_name: "grep".into(),
+        args: serde_json::json!({"pattern": "auth"}),
+    });
+    let snapshot = reporter.snapshot();
+    assert_eq!(snapshot.tool_uses, 1);
+    assert_eq!(snapshot.recent, vec!["Search(\"auth\")".to_string()]);
+}

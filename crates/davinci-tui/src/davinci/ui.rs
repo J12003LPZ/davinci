@@ -565,6 +565,7 @@ fn tool_caption<'a>(instrument: &'a str, target: &'a str) -> (&'a str, &'a str) 
             "search" | "find" => "Search",
             "fetch" => "Fetch",
             "mcp" => "MCP",
+            "agent" => "Agent",
             _ => "",
         };
         if !name.is_empty() {

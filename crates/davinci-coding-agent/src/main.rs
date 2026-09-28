@@ -2225,6 +2225,12 @@ fn build_worker_agent(
             child.context_window = max_tokens as u64;
         }
     }
+    // The worker's own tool calls and token use feed the lead's transcript.
+    if let Some(progress) = req.progress.clone() {
+        child.event_sink = Some(davinci_agent::EventSink(Arc::new(move |event| {
+            progress.observe(event)
+        })));
+    }
     let shared_writer = req.worktree_path.is_none()
         && !matches!(child_mode, davinci_agent::PermissionMode::ReadOnly);
     Ok((child, shared_writer))

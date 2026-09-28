@@ -213,6 +213,9 @@ Available agent profiles (pass one as `agent`):",
 
 #[derive(Debug, Clone, Default)]
 pub struct SubagentRequest {
+    /// Live progress for the lead's transcript; the host feeds it the
+    /// worker's own events.
+    pub progress: Option<crate::subagent_progress::ProgressReporter>,
     /// Model-turn ceiling for this worker.
     pub max_turns: Option<usize>,
     pub prompt: String,
@@ -326,6 +329,10 @@ pub fn scoped_tools(requested: Option<&[String]>, parent: &[String]) -> Vec<Stri
 /// What the worker inherits from the parent turn.
 #[derive(Debug, Clone, Default)]
 pub struct SubagentParent {
+    /// The lead's event sink and the `agent` call being run, so worker
+    /// progress can be drawn under that call.
+    pub event_sink: Option<crate::EventSink>,
+    pub tool_call_id: Option<String>,
     /// The host keeps running after this turn (interactive / RPC), so
     /// background and teammate workers have somewhere to report.
     pub allow_async: bool,
@@ -488,6 +495,28 @@ fn task_spec(input: &Value) -> Result<TaskSpec, ToolError> {
     })
 }
 
+/// The name a worker's row carries: its description, instance name, profile,
+/// or the start of its prompt.
+fn progress_label(spec: &TaskSpec) -> String {
+    let base = spec
+        .description
+        .clone()
+        .filter(|text| !text.trim().is_empty())
+        .or_else(|| spec.name.clone())
+        .unwrap_or_else(|| {
+            let prompt = spec.prompt.lines().next().unwrap_or("").trim();
+            let mut clipped: String = prompt.chars().take(48).collect();
+            if prompt.chars().count() > 48 {
+                clipped.push('…');
+            }
+            clipped
+        });
+    match &spec.agent {
+        Some(profile) if !base.starts_with(profile.as_str()) => format!("{profile}: {base}"),
+        _ => base,
+    }
+}
+
 fn cap_output(mut content: String, cap: usize) -> String {
     if content.len() > cap {
         // Back off to a char boundary: `truncate` panics inside a multibyte
@@ -623,7 +652,8 @@ pub fn run_tool(
     );
     let mut requests: Vec<SubagentRequest> = Vec::with_capacity(specs.len());
     let mut leases: Vec<Option<WorktreeLease>> = Vec::with_capacity(specs.len());
-    for spec in &specs {
+    let total = specs.len();
+    for (position, spec) in specs.iter().enumerate() {
         let child_agent_id = AgentId::new();
         // Async workers outlive the lead's turn: their token comes from the
         // session roster, so Esc on the lead does not kill them, while
@@ -743,7 +773,19 @@ pub fn run_tool(
             .map(|runtime| runtime.for_worker(child_agent_id, child_token.clone()))
             .transpose()
             .map_err(ToolError::Failed)?;
+        let progress = match (&parent.event_sink, &parent.tool_call_id) {
+            (Some(sink), Some(call)) => Some(crate::subagent_progress::ProgressReporter::new(
+                call.clone(),
+                sink.clone(),
+                child_agent_id.to_string(),
+                progress_label(spec),
+                (position, total),
+                spec.mode.to_string(),
+            )),
+            _ => None,
+        };
         requests.push(SubagentRequest {
+            progress,
             max_turns: None,
             prompt: spec.prompt.clone(),
             tools: scoped,
@@ -809,6 +851,11 @@ pub fn run_tool(
         vec![None; requests.len()]
     };
 
+    for request in &requests {
+        if let Some(progress) = &request.progress {
+            progress.started();
+        }
+    }
     let any_async = requests.iter().any(|r| r.mode != AgentSpawnMode::Oneshot);
     if any_async {
         let mut launched_ids = Vec::new();
@@ -832,6 +879,9 @@ pub fn run_tool(
                     }
                     let outcome =
                         run_journaled_subagent(&req_clone, &runner_clone, operation.as_ref());
+                    if let Some(progress) = &req_clone.progress {
+                        progress.finish(outcome.is_ok());
+                    }
                     let mut preserved = None;
                     if let (Some(mgr), Some(lease)) = (wt_mgr_clone, lease_opt) {
                         let keep = outcome.is_err() || mgr.is_dirty(&lease);
@@ -878,6 +928,9 @@ pub fn run_tool(
                 return Err(ToolError::Failed(
                     "background agent thread exited before launch".into(),
                 ));
+            }
+            if let Some(progress) = &req.progress {
+                progress.backgrounded();
             }
             launched_ids.push(cid);
         }
@@ -928,6 +981,9 @@ pub fn run_tool(
         rollback.commit();
         let aid = requests[0].runtime_agent_id.unwrap_or_default();
         let outcome = run_journaled_subagent(&requests[0], runner, child_operations[0].as_ref());
+        if let Some(progress) = &requests[0].progress {
+            progress.finish(outcome.is_ok());
+        }
         if let Some(rt) = &parent.runtime {
             let next = match &outcome {
                 Ok(_) => AgentState::Completed,
@@ -1005,6 +1061,11 @@ pub fn run_tool(
         parent_abort.as_deref(),
         |_| {},
     );
+    for (index, request) in requests.iter().enumerate() {
+        if let Some(progress) = &request.progress {
+            progress.finish(matches!(outcomes.get(index), Some(Ok(_))));
+        }
+    }
     if let Some(rt) = &parent.runtime {
         for (index, req) in requests.iter().enumerate() {
             if let Some(aid) = req.runtime_agent_id {
@@ -1778,6 +1839,67 @@ mod tests {
             assert!(result.content.contains(&format!("worktree kept: {path} (branch")));
             assert!(!result.content.contains(&format!("\"{path}")));
         }
+    }
+
+    #[test]
+    fn workers_report_progress_under_the_parent_call() {
+        use crate::subagent_progress::SubagentProgressState as P;
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let store = seen.clone();
+        let sink = crate::EventSink(Arc::new(move |event: &crate::AgentEvent| {
+            if let crate::AgentEvent::SubagentProgress {
+                tool_call_id,
+                progress,
+            } = event
+            {
+                store
+                    .lock()
+                    .unwrap()
+                    .push((tool_call_id.clone(), progress.index, progress.state));
+            }
+        }));
+        let runner = SubagentRunner::new(|req| {
+            if req.prompt == "b" {
+                Err("down".into())
+            } else {
+                Ok("ok".into())
+            }
+        });
+        let mut parent = parent_with_runtime(PermissionMode::Ask);
+        parent.event_sink = Some(sink);
+        parent.tool_call_id = Some("call-7".into());
+        run_tool(
+            &json!({"tasks": [{"prompt": "a", "description": "first"}, {"prompt": "b"}]}),
+            &["read".into()],
+            Some(&runner),
+            &parent,
+        )
+        .unwrap();
+        let events = seen.lock().unwrap().clone();
+        assert!(events.iter().all(|(call, _, _)| call == "call-7"));
+        assert!(events.contains(&("call-7".into(), 0, P::Running)));
+        assert!(events.contains(&("call-7".into(), 1, P::Running)));
+        assert!(events.contains(&("call-7".into(), 0, P::Done)));
+        assert!(events.contains(&("call-7".into(), 1, P::Failed)));
+
+        seen.lock().unwrap().clear();
+        run_tool(
+            &json!({"prompt": "c", "mode": "background"}),
+            &["read".into()],
+            Some(&runner),
+            &parent,
+        )
+        .unwrap();
+        let start = std::time::Instant::now();
+        while !seen.lock().unwrap().iter().any(|(_, _, state)| *state == P::Done) {
+            assert!(start.elapsed() < std::time::Duration::from_secs(5));
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(seen
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|(_, _, state)| *state == P::Background));
     }
 
     fn init_subagent_temp_git_repo() -> tempfile::TempDir {

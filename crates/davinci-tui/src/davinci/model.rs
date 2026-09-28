@@ -563,6 +563,31 @@ pub enum Entry {
         verb: String,
         seconds: u64,
     },
+    /// Live workers of the `agent` call on the row above: their recent tool
+    /// calls while they run, `Done (7 tool uses · 23.4k tokens · 41s)` once
+    /// finished, as a `├─` tree when several run at once (claude code).
+    Subagents(Vec<SubagentRow>),
+}
+
+/// One delegated worker's progress, as drawn under its `agent` call.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct SubagentRow {
+    pub label: String,
+    pub state: SubagentRowState,
+    pub tool_uses: u64,
+    pub tokens: u64,
+    /// Newest last: `Read(src/lib.rs)`.
+    pub recent: Vec<String>,
+    pub elapsed_secs: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SubagentRowState {
+    #[default]
+    Running,
+    Background,
+    Done,
+    Failed,
 }
 
 impl Entry {
@@ -2114,6 +2139,10 @@ pub struct Model {
     pub show_tool_output: bool,
     /// Background jobs still running, for the status bar's `· 2 jobs`.
     pub jobs_running: usize,
+    /// Background agents and teammates still alive (not finished).
+    pub agents_running: usize,
+    /// Workflow runs still running.
+    pub workflows_running: usize,
     /// `Δn +a -d` for the status bar.
     pub changes: (u32, u32, u32),
     /// `(used, cap)` in tokens.
@@ -2298,6 +2327,8 @@ impl Model {
             permission_mode: "ask".into(),
             show_tool_output: false,
             jobs_running: 0,
+            agents_running: 0,
+            workflows_running: 0,
             changes: (0, 0, 0),
             context: (0, 200_000),
             startup: Startup::default(),

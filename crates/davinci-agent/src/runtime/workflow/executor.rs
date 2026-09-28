@@ -97,6 +97,9 @@ pub struct WorkflowExecutor {
     tokens: Arc<RwLock<HashMap<WorkflowId, CancellationToken>>>,
     specs: Arc<RwLock<HashMap<WorkflowId, WorkflowSpec>>>,
     launches: Arc<RwLock<HashMap<WorkflowId, WorkflowLaunch>>>,
+    /// Each worker's live activity (tool uses, tokens, recent calls) for
+    /// the workflows view.
+    progress: Arc<RwLock<HashMap<AgentId, crate::subagent_progress::ProgressReporter>>>,
 }
 
 impl WorkflowExecutor {
@@ -113,7 +116,19 @@ impl WorkflowExecutor {
             tokens: Arc::new(RwLock::new(HashMap::new())),
             specs: Arc::new(RwLock::new(HashMap::new())),
             launches: Arc::new(RwLock::new(HashMap::new())),
+            progress: Arc::new(RwLock::new(HashMap::new())),
         }
+    }
+
+    /// A worker's activity so far, for the workflows view.
+    pub fn agent_progress(
+        &self,
+        agent: &AgentId,
+    ) -> Option<crate::subagent_progress::SubagentProgress> {
+        self.progress
+            .read()
+            .ok()
+            .and_then(|map| map.get(agent).map(|reporter| reporter.snapshot()))
     }
 
     /// Retrieve the current execution state of a workflow.
@@ -609,6 +624,19 @@ impl WorkflowExecutor {
         if let Some(lease) = &lease {
             self.runtime.registry.set_worktree(aid, lease.path.clone());
         }
+        // The view reads snapshots; nothing listens to the events themselves.
+        let reporter = crate::subagent_progress::ProgressReporter::new(
+            format!("workflow:{wf_id}"),
+            crate::EventSink(Arc::new(|_| {})),
+            aid.to_string(),
+            worker.id.clone(),
+            (0, 1),
+            "workflow",
+        );
+        reporter.started();
+        if let Ok(mut map) = self.progress.write() {
+            map.insert(aid, reporter.clone());
+        }
         let mut result = (|| {
             let effective_prompt = if !artifact_context.is_empty() {
                 format!(
@@ -621,6 +649,7 @@ impl WorkflowExecutor {
 
             let child_token = phase_token.child_token();
             let req = SubagentRequest {
+                progress: Some(reporter.clone()),
                 max_turns: worker.max_turns,
                 parent_tools: Some(
                     if launch.parent_tools.is_empty() && launch.parent_permission_mode.is_none() {
@@ -746,6 +775,7 @@ impl WorkflowExecutor {
 
             outcome
         })();
+        reporter.finish(result.is_ok());
         if let (Some(manager), Some(lease)) = (&self.runtime.worktree_manager, &lease) {
             let cleanup = if result.is_ok() && !manager.is_dirty(lease) {
                 manager

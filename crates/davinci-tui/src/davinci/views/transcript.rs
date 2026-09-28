@@ -8,7 +8,9 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 
 use super::{markdown, studio};
-use crate::davinci::model::{Entry, HunkKind, Model, NOTICE_INSTRUMENT};
+use crate::davinci::model::{
+    Entry, HunkKind, Model, SubagentRow, SubagentRowState, NOTICE_INSTRUMENT,
+};
 use crate::davinci::theme::{glyph, State, Theme};
 use crate::davinci::ui::{
     blank, clip_ellipsis, detail_line, failure_line, indent, run_width, span, tool_line,
@@ -252,6 +254,12 @@ fn entry_lines(model: &Model, entry: &Entry, width: u16) -> Vec<Line<'static>> {
                 model.tick,
                 model.running,
             )];
+            // A delegation's workers draw their own block below; its answer
+            // stays behind `ctrl+t` like any other tool output.
+            let delegated = target.starts_with("agent ") && *state != State::Failed;
+            if delegated && !model.show_tool_output {
+                return rows;
+            }
             if let Some(summary) = summary.as_deref().filter(|s| !s.is_empty()) {
                 rows.push(tool_result(th, summary, width));
             } else if !model.show_tool_output && *state != State::Failed {
@@ -268,6 +276,8 @@ fn entry_lines(model: &Model, entry: &Entry, width: u16) -> Vec<Line<'static>> {
             ));
             rows
         }
+
+        Entry::Subagents(rows) => subagent_lines(model, rows, width),
 
         Entry::Detail(text) => vec![detail_line(th, text)],
 
@@ -347,6 +357,148 @@ fn entry_lines(model: &Model, entry: &Entry, width: u16) -> Vec<Line<'static>> {
             ])]
         }
     }
+}
+
+/// Recent calls shown for a lone running worker; `ctrl+t` shows more.
+const SUBAGENT_RECENT: usize = 3;
+const SUBAGENT_RECENT_EXPANDED: usize = 8;
+/// Continuation under the elbow: the elbow's width in spaces.
+const ELBOW_GAP: &str = "     ";
+
+fn compact_tokens(tokens: u64) -> String {
+    if tokens >= 1_000_000 {
+        format!("{:.1}m", tokens as f64 / 1_000_000.0)
+    } else if tokens >= 1_000 {
+        format!("{:.1}k", tokens as f64 / 1_000.0)
+    } else {
+        tokens.to_string()
+    }
+}
+
+fn compact_elapsed(seconds: u64) -> String {
+    if seconds >= 60 {
+        format!("{}m {}s", seconds / 60, seconds % 60)
+    } else {
+        format!("{seconds}s")
+    }
+}
+
+/// `7 tool uses · 23.4k tokens · 41s`, leaving out what is still zero.
+fn subagent_stats(row: &SubagentRow, with_time: bool) -> String {
+    let mut parts = Vec::new();
+    if row.tool_uses > 0 {
+        parts.push(if row.tool_uses == 1 {
+            "1 tool use".to_string()
+        } else {
+            format!("{} tool uses", row.tool_uses)
+        });
+    }
+    if row.tokens > 0 {
+        parts.push(format!("{} tokens", compact_tokens(row.tokens)));
+    }
+    if with_time && row.elapsed_secs > 0 {
+        parts.push(compact_elapsed(row.elapsed_secs));
+    }
+    parts.join(" · ")
+}
+
+fn subagent_outcome(row: &SubagentRow) -> String {
+    let stats = subagent_stats(row, true);
+    let word = match row.state {
+        SubagentRowState::Done => "Done",
+        SubagentRowState::Failed => "Failed",
+        SubagentRowState::Background => return "Running in background · /agents".into(),
+        SubagentRowState::Running => return "Initializing…".into(),
+    };
+    if stats.is_empty() {
+        word.to_string()
+    } else {
+        format!("{word} ({stats})")
+    }
+}
+
+fn subagent_lines(model: &Model, rows: &[SubagentRow], width: u16) -> Vec<Line<'static>> {
+    let th = &model.theme;
+    let cc = th.cc();
+    let line = |text: String, failed: bool| {
+        Line::from(truncate_run(
+            vec![span(
+                clip_ellipsis(&text, width),
+                if failed { cc.error } else { cc.inactive },
+            )],
+            width,
+        ))
+    };
+    if let [row] = rows {
+        let failed = row.state == SubagentRowState::Failed;
+        if row.state != SubagentRowState::Running || row.recent.is_empty() {
+            return vec![line(format!("{ELBOW}{}", subagent_outcome(row)), failed)];
+        }
+        let cap = if model.show_tool_output {
+            SUBAGENT_RECENT_EXPANDED
+        } else {
+            SUBAGENT_RECENT
+        };
+        let shown: Vec<&String> = row.recent.iter().rev().take(cap).rev().collect();
+        let mut out: Vec<Line<'static>> = shown
+            .iter()
+            .enumerate()
+            .map(|(index, call)| {
+                let lead = if index == 0 { ELBOW } else { ELBOW_GAP };
+                line(format!("{lead}{call}"), false)
+            })
+            .collect();
+        let hidden = row.tool_uses.saturating_sub(shown.len() as u64);
+        if hidden > 0 {
+            let more = if hidden == 1 {
+                "+1 more tool use".to_string()
+            } else {
+                format!("+{hidden} more tool uses")
+            };
+            let hint = if model.show_tool_output {
+                ""
+            } else {
+                " (ctrl+t to expand)"
+            };
+            out.push(line(format!("{ELBOW_GAP}{more}{hint}"), false));
+        }
+        return out;
+    }
+    let mut out = Vec::new();
+    for (index, row) in rows.iter().enumerate() {
+        let last = index + 1 == rows.len();
+        let (branch, rail) = if last { ("└─", "   ") } else { ("├─", "│  ") };
+        let failed = row.state == SubagentRowState::Failed;
+        let stats = subagent_stats(row, false);
+        let label = if row.label.is_empty() {
+            format!("task {}", index + 1)
+        } else {
+            row.label.clone()
+        };
+        let head = if stats.is_empty() {
+            label
+        } else {
+            format!("{label} · {stats}")
+        };
+        let spans = vec![
+            span(format!("   {branch} "), cc.inactive),
+            span(
+                clip_ellipsis(&head, width.saturating_sub(6)),
+                if failed { cc.error } else { th.text },
+            ),
+        ];
+        out.push(Line::from(truncate_run(spans, width)));
+        let detail = match row.state {
+            SubagentRowState::Running => row
+                .recent
+                .last()
+                .cloned()
+                .unwrap_or_else(|| "Initializing…".into()),
+            _ => subagent_outcome(row),
+        };
+        out.push(line(format!("   {rail}⎿  {detail}"), failed));
+    }
+    out
 }
 
 fn tool_result(theme: &Theme, text: &str, width: u16) -> Line<'static> {
@@ -737,6 +889,88 @@ mod tests {
             .iter()
             .map(|span| span.content.as_ref())
             .collect()
+    }
+
+    fn worker(label: &str, state: SubagentRowState, uses: u64, recent: &[&str]) -> SubagentRow {
+        SubagentRow {
+            label: label.into(),
+            state,
+            tool_uses: uses,
+            tokens: 23_400,
+            recent: recent.iter().map(|call| call.to_string()).collect(),
+            elapsed_secs: 41,
+        }
+    }
+
+    fn drawn(model: &Model, rows: Vec<SubagentRow>) -> Vec<String> {
+        entry_lines(model, &Entry::Subagents(rows), model.width)
+            .iter()
+            .map(text)
+            .collect()
+    }
+
+    #[test]
+    fn a_running_worker_shows_its_latest_calls_and_the_rest_as_a_count() {
+        let m = model(100);
+        let rows = drawn(
+            &m,
+            vec![worker(
+                "map auth",
+                SubagentRowState::Running,
+                7,
+                &["Read(a.rs)", "Search(\"auth\")", "Read(b.rs)", "Read(c.rs)"],
+            )],
+        );
+        assert_eq!(rows.len(), 4, "{rows:?}");
+        assert!(rows[0].contains("⎿") && rows[0].ends_with("Search(\"auth\")"));
+        assert!(rows[2].ends_with("Read(c.rs)"));
+        assert!(rows[3].contains("+4 more tool uses (ctrl+t to expand)"));
+    }
+
+    #[test]
+    fn a_finished_worker_collapses_to_done_with_its_totals() {
+        let m = model(100);
+        let rows = drawn(
+            &m,
+            vec![worker("map auth", SubagentRowState::Done, 7, &["Read(a.rs)"])],
+        );
+        assert_eq!(rows.len(), 1);
+        assert!(rows[0].ends_with("Done (7 tool uses · 23.4k tokens · 41s)"), "{rows:?}");
+        let background = drawn(
+            &m,
+            vec![worker("scan", SubagentRowState::Background, 0, &[])],
+        );
+        assert!(background[0].contains("Running in background"));
+    }
+
+    #[test]
+    fn parallel_workers_draw_as_a_tree() {
+        let m = model(100);
+        let rows = drawn(
+            &m,
+            vec![
+                worker("map auth", SubagentRowState::Running, 2, &["Read(a.rs)"]),
+                worker("map db", SubagentRowState::Done, 5, &["Read(d.rs)"]),
+                worker("tests", SubagentRowState::Running, 0, &[]),
+            ],
+        );
+        assert_eq!(rows.len(), 6, "{rows:?}");
+        assert!(rows[0].contains("├─ map auth · 2 tool uses · 23.4k tokens"));
+        assert!(rows[1].contains("│  ⎿  Read(a.rs)"));
+        assert!(rows[3].contains("│  ⎿  Done (5 tool uses"));
+        assert!(rows[4].contains("└─ tests"));
+        assert!(rows[5].ends_with("⎿  Initializing…"));
+        for width in [0u16, 10, 40] {
+            for row in entry_lines(&model(width), &Entry::Subagents(vec![worker(
+                "a very long worker label that will not fit",
+                SubagentRowState::Running,
+                3,
+                &["Read(some/very/long/path/that/goes/on/and/on.rs)"],
+            )]), width)
+            {
+                assert!(run_width(&row.spans) <= width);
+            }
+        }
     }
 
     #[test]

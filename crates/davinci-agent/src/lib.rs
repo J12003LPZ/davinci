@@ -6,6 +6,7 @@ pub mod cache_stability;
 pub mod decision;
 pub mod decisions;
 pub mod delegation;
+pub mod subagent_progress;
 mod permission_state;
 pub mod process_manager;
 pub use permission_state::PermissionState;

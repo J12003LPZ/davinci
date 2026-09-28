@@ -24,6 +24,14 @@ pub enum AgentEvent {
     ProviderObservation {
         observation: Box<davinci_ai::provider_observation::ProviderAttemptObservation>,
     },
+    /// A delegated worker's live progress, keyed by the lead's `agent` call.
+    /// Davinci-only; hosts that do not draw it may ignore it.
+    #[serde(rename = "subagent_progress")]
+    SubagentProgress {
+        #[serde(rename = "toolCallId")]
+        tool_call_id: String,
+        progress: crate::subagent_progress::SubagentProgress,
+    },
     #[serde(rename = "agent_start")]
     AgentStart,
     #[serde(rename = "agent_end")]
@@ -112,6 +120,7 @@ impl AgentEvent {
             Self::VerificationNotice { .. } => "verification_notice",
             Self::MutationObservation { .. } => "mutation_observation",
             Self::ProviderObservation { .. } => "provider_observation",
+            Self::SubagentProgress { .. } => "subagent_progress",
             Self::AgentStart => "agent_start",
             Self::AgentEnd { .. } => "agent_end",
             Self::TurnStart => "turn_start",

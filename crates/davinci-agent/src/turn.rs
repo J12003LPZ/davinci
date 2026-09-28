@@ -2174,6 +2174,8 @@ impl Agent {
                 let active_contract = self.active_contract();
                 let contract_digest = active_contract.as_ref().map(|c| c.digest.clone());
                 let parent = crate::subagent::SubagentParent {
+                    event_sink: self.event_sink.clone(),
+                    tool_call_id: Some(id.to_string()),
                     allow_async: self.async_agents_allowed,
                     teams_enabled: crate::tools::team_tools_enabled(),
                     provider: Some(self.provider.clone()),
