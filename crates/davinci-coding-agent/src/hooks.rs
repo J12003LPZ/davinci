@@ -801,19 +801,27 @@ mod tests {
     static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     /// A hook that exits with `code` after echoing its stdin to a file.
+    ///
+    /// Windows uses `cmd` + `more`, not PowerShell: on windows-latest the
+    /// first PowerShell launched as the test binary starts sometimes never
+    /// exits, and the hook protocol, not the shell, is under test. `more`
+    /// wraps lines at 65535 characters, so payloads must stay below that.
     fn shell_hook(code: i32, capture: &Path) -> Vec<String> {
-        let capture = capture.to_string_lossy().replace('\\', "/");
         if cfg!(windows) {
+            let capture = capture.to_string_lossy();
+            // Rust escapes quotes in a way cmd does not undo, so the path is
+            // passed unquoted and must not contain spaces.
+            assert!(
+                !capture.contains(' '),
+                "capture path has a space: {capture}"
+            );
             vec![
-                "powershell".into(),
-                "-NoProfile".into(),
-                "-NonInteractive".into(),
-                "-Command".into(),
-                format!(
-                    "[Console]::In.ReadToEnd() | Out-File -Encoding utf8 '{capture}'; exit {code}"
-                ),
+                "cmd".into(),
+                "/C".into(),
+                format!("more > {capture} & exit /b {code}"),
             ]
         } else {
+            let capture = capture.to_string_lossy();
             vec![
                 "sh".into(),
                 "-c".into(),
@@ -925,7 +933,9 @@ mod tests {
         std::env::remove_var("PI_HOOKS_DRY_RUN");
         let dir = tempfile::tempdir().unwrap();
         let capture = dir.path().join("seen.json");
-        let big = "x".repeat(64 * 1024);
+        // Far above a pipe buffer, below the 65535-character line limit of
+        // the Windows `more` capture in `shell_hook`.
+        let big = "x".repeat(60 * 1024);
         let args = serde_json::json!({ "path": "notes.md", "content": big });
         let hooks = HooksFile {
             pre_tool: vec![shell_hook(3, &capture)],
@@ -939,7 +949,7 @@ mod tests {
         assert_eq!(seen["kind"], "preTool");
         assert_eq!(seen["tool"], "write");
         assert_eq!(seen["args"]["path"], "notes.md");
-        assert_eq!(seen["args"]["content"].as_str().unwrap().len(), 64 * 1024);
+        assert_eq!(seen["args"]["content"].as_str().unwrap().len(), 60 * 1024);
 
         let passing = HooksFile {
             pre_tool: vec![shell_hook(0, &capture)],
