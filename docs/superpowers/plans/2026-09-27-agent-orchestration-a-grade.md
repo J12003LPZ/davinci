@@ -2669,7 +2669,7 @@ Expected: all green. A cross-crate contract changed (`SubagentRequest`, `Runtime
 | Cost rejected | `max_cost_usd_is_rejected_until_supported` |
 | `/agents`, `/workflow` | `slash::tests::agents_takes_subcommands`, `slash::tests::workflow_command_parses_subcommands` |
 
-- [ ] **Step 3: Deliver the binary the user runs** (per repo CLAUDE.md "Deliver changes to the executable")
+- [x] **Step 3: Deliver the binary the user runs** (per repo CLAUDE.md "Deliver changes to the executable")
 
 ```powershell
 Get-Command davinci -All
@@ -2682,7 +2682,7 @@ davinci --version
 
 Expected: both hashes equal. If the copy fails because a running session holds the file, stop and report it; do not kill the session.
 
-- [ ] **Step 4: Live smoke test (manual, needs provider credentials; mark UNVERIFIED if skipped)**
+- [x] **Step 4: Live smoke test — UNVERIFIED (skipped as permitted)**
 
 In a scratch git repo, run `DAVINCI_EXPERIMENTAL_AGENT_TEAMS=1 davinci` and ask: "Spawn two teammates named ux and arch to review README.md from their angle, then synthesize." Check: two reports arrive as team updates without typing; `/agents` lists both as Idle; `/agents msg ux summarize in one line` produces a third report; `/agents stop ux` moves it to Completed/Cancelled; Esc during the lead's turn leaves `arch` alive.
 
@@ -2758,3 +2758,23 @@ the user's explicit request; local validation was not waived.
 The local Git hook cannot launch its WSL `/bin/bash`. Commits use the scoped
 `git -c core.hooksPath=NUL commit` override after the Rust checks; no persistent
 hook configuration was changed. No dependencies or version numbers changed.
+
+
+### Release delivery evidence
+
+- Rebased cleanly onto `origin/main` at `cc11bcfd`.
+- Post-rebase format and diff checks, workspace/all-target clippy with warnings
+  denied, and full tests passed again: **3,603 passed, 36 ignored, 9 filtered**.
+- Offline optimized release build succeeded (201 crates, 6m 57s).
+- Built source revision: `df39206cd84388aade1dfa14d8f56928c3c23b4d`. Subsequent delivery commits only update
+  this evidence document.
+- Installed executable: `C:\Users\sergi\.cargo\bin\davinci.exe`.
+- Verified recoverable backup: `C:\Users\sergi\.cargo\bin\davinci.exe.bak-agent-orchestration-20260928-010957-598969`.
+- Release and installed SHA-256 both:
+  `205f8f06f9fc07328ee4ddd9181e1fb419a135ca383a0b41c701c13ea18c8e83`.
+- Installed `davinci --version`: `1.0.71`.
+- Installation used a verified sibling file and atomic replacement after
+  verifying the backup; no running sessions were killed.
+
+Restart existing DaVinci sessions to load this executable. Agent teams remain
+opt-in with `DAVINCI_EXPERIMENTAL_AGENT_TEAMS=1`.
