@@ -6,7 +6,7 @@ This document establishes the architecture, boundaries, and routing policy for m
 
 ## 1. Orchestration Modes Overview
 
-See [Agent teams](agent-teams.md) for flags, lifecycle, commands, and limitations.
+See [Subagents, agent teams and workflows](agent-teams.md) for settings, the "don't use subagents" rule, the progress display, lifecycle, commands, and limitations.
 
 Davinci provides five distinct execution modes, each tailored to a specific operational scale, autonomy model, and reliability contract:
 
@@ -15,7 +15,7 @@ Davinci provides five distinct execution modes, each tailored to a specific oper
 | **Normal Agent** | CLI, `/act`, interactive turn | Synchronous foreground turn loop | Monolithic conversation history with Token Governor compression and turn compaction | Shared workspace, synchronous in-turn mutation barriers |
 | **One-Shot Subagent** | `agent` tool (`mode: "oneshot"`) | Bounded ephemeral worker | Isolated throw-away context; returns compact summary string (capped at 50 KB) | Scoped tool allowlist; read-only default; worktree lease optional |
 | **Agent Teams** | `agent` (`mode: "teammate"`), `/agents`, `task_*`, `agent_message` | Multi-agent collaborative session | Per-agent scoped context, peer mailboxes, mailbox condition-variable wakeup and idle interactive lead auto-wake | Shared runtime task board; atomic task claiming; message passing |
-| **Workflows** | `workflow_run`, `workflow_status`, `/workflow` | Multi-phase repeatable DAG pipeline | Phased execution; intermediate artifacts stored outside model context in Governor-backed store | Worktree isolation required for parallel writers; join policies (All, Any, Quorum); retry budgets |
+| **Workflows** | `workflow_run`, `workflow_status`, `/workflow`, `/workflows` | Multi-phase repeatable DAG pipeline | Phased execution; intermediate artifacts stored outside model context in Governor-backed store | Worktree isolation required for parallel writers; join policies (All, Any, Quorum); retry budgets |
 | **Graph** | `graph_run`, `/graph <goal>` | Deterministic multi-stage engineering graph | Isolated worker child processes (`--no-session --no-extensions --no-skills`); bounded 2,500 token context packets | Rigid deterministic pipeline (`classify -> investigate -> plan -> implement -> verify -> review`), revision loops, security audits, review coverage |
 
 ---
