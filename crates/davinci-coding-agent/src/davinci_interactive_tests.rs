@@ -3621,3 +3621,66 @@ fn background_counts_include_live_workers_only() {
     agent.set_runtime(runtime);
     assert_eq!(background_counts(&agent), (2, 0));
 }
+
+#[test]
+fn the_workflows_view_lists_phases_in_order_with_agents_and_results() {
+    let mut agent = davinci_agent::Agent::new_builtin(davinci_agent::PromptProfile::Stable);
+    let runtime = davinci_agent::RuntimeHandle::new(
+        davinci_agent::RunId::new(),
+        davinci_agent::AgentId::new(),
+        davinci_agent::RuntimeBus::new(),
+    );
+    let executor = std::sync::Arc::new(davinci_agent::WorkflowExecutor::new(
+        runtime.clone(),
+        davinci_agent::WorkflowStateStore::new(),
+        Some(davinci_agent::SubagentRunner::new(|req| {
+            if req.instance_name.as_deref() == Some("flaky") {
+                Err("provider down".into())
+            } else {
+                Ok(format!("answer from {}", req.instance_name.clone().unwrap_or_default()))
+            }
+        })),
+    ));
+    agent.runtime = Some(runtime.with_workflow_executor(executor.clone()));
+    let spec: davinci_agent::WorkflowSpec = serde_json::from_value(serde_json::json!({
+        "schema_version": 1, "name": "audit", "max_parallel_agents": 2, "max_total_agents": 3,
+        "phases": [
+            {"id": "zeta-first", "join": "all", "workers": [
+                {"id": "reader", "prompt": "read", "tools": ["read"]}]},
+            {"id": "alpha-second", "depends_on": ["zeta-first"], "join": "any", "workers": [
+                {"id": "good", "prompt": "check", "tools": ["read"]},
+                {"id": "flaky", "prompt": "check", "tools": ["read"]}]}
+        ]
+    }))
+    .unwrap();
+    let _ = executor.execute(spec);
+    let rows = workflow_rows(&agent);
+    assert_eq!(rows.len(), 1);
+    let run = &rows[0];
+    assert_eq!(
+        run.phase_rows.iter().map(|phase| phase.id.as_str()).collect::<Vec<_>>(),
+        vec!["zeta-first", "alpha-second"],
+        "spec order, not map order"
+    );
+    let reader = &run.phase_rows[0].agents[0];
+    assert_eq!(reader.label, "reader");
+    assert_eq!(reader.status, "completed");
+    assert_eq!(reader.detail.as_deref(), Some("answer from reader"));
+    let second = &run.phase_rows[1].agents;
+    assert!(second.iter().any(|agent| agent.label == "good" && agent.status == "completed"));
+    assert!(!run.elapsed.ends_with("ms"), "human elapsed: {}", run.elapsed);
+
+    let mut m = model();
+    open_workflows_sheet(&agent, &mut m);
+    let sheet = m.workflows.as_mut().unwrap();
+    sheet.drill_in();
+    sheet.move_selection(1);
+    sheet.drill_in();
+    assert_eq!(sheet.phase().unwrap().id, "alpha-second");
+    // Reopening while open keeps the place.
+    open_workflows_sheet(&agent, &mut m);
+    assert_eq!(
+        m.workflows.as_ref().unwrap().level,
+        davinci_tui::davinci::model::WorkflowLevel::Agents
+    );
+}

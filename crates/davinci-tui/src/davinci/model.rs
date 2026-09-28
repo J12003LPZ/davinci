@@ -287,6 +287,9 @@ pub enum Choice {
     Permission(usize),
     /// An action on the `/agents` panel.
     AgentAction { action: &'static str, index: usize },
+    /// An action on the `/workflows` view, on its current selection:
+    /// `pause` (toggles), `stop` (the run) or `stop_agent`.
+    WorkflowAction { action: &'static str },
     /// An action on the `/context` panel.
     ContextInspectorAction { action: &'static str, index: usize },
     /// An action on the `/graph` run sheet (`5a`).
@@ -1745,7 +1748,7 @@ pub struct PermissionRow {
 }
 
 /// One workflow row in `/workflows`.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct WorkflowRow {
     pub id: String,
     pub name: String,
@@ -1754,6 +1757,43 @@ pub struct WorkflowRow {
     pub started_ms: i64,
     pub elapsed: String,
     pub error: Option<String>,
+    /// Each phase with its agents, in spec order, for the drill-down.
+    pub phase_rows: Vec<WorkflowPhaseRow>,
+}
+
+/// A phase of a run: its agents with their counts, tokens and time.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct WorkflowPhaseRow {
+    pub id: String,
+    pub status: String,
+    pub agents: Vec<WorkflowAgentRow>,
+}
+
+/// One workflow agent: what it is doing, has done, and came back with.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct WorkflowAgentRow {
+    pub agent_id: String,
+    pub label: String,
+    /// `running`, `completed`, `failed`, `cancelled` or `pending`.
+    pub status: String,
+    pub tool_uses: u64,
+    pub tokens: u64,
+    pub elapsed_secs: u64,
+    /// Newest last: `Read(src/lib.rs)`.
+    pub recent: Vec<String>,
+    /// The agent's result, or why it failed.
+    pub detail: Option<String>,
+}
+
+/// Where the `/workflows` view is: the run list, one run's phases, one
+/// phase's agents, or one agent's detail (claude code's progress view).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum WorkflowLevel {
+    #[default]
+    Runs,
+    Phases,
+    Agents,
+    Agent,
 }
 
 /// `/workflows` — tracked multi-phase agent workflows.
@@ -1761,6 +1801,149 @@ pub struct WorkflowRow {
 pub struct WorkflowsSheet {
     pub workflows: Vec<WorkflowRow>,
     pub selected_index: usize,
+    pub level: WorkflowLevel,
+    pub phase_index: usize,
+    pub agent_index: usize,
+    /// Agent status shown in the agents list; `None` shows all (`f` cycles).
+    pub filter: Option<String>,
+    /// The agent detail shows its result and calls in full (`enter`).
+    pub expanded: bool,
+    /// What the last `p`/`x` did, shown above the view.
+    pub notice: Option<String>,
+}
+
+impl WorkflowsSheet {
+    pub fn run(&self) -> Option<&WorkflowRow> {
+        self.workflows.get(self.selected_index)
+    }
+
+    pub fn phase(&self) -> Option<&WorkflowPhaseRow> {
+        self.run()?.phase_rows.get(self.phase_index)
+    }
+
+    /// The selected phase's agents after the status filter.
+    pub fn visible_agents(&self) -> Vec<&WorkflowAgentRow> {
+        self.phase()
+            .map(|phase| {
+                phase
+                    .agents
+                    .iter()
+                    .filter(|agent| {
+                        self.filter
+                            .as_deref()
+                            .is_none_or(|status| agent.status == status)
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    pub fn agent(&self) -> Option<&WorkflowAgentRow> {
+        self.visible_agents().get(self.agent_index).copied()
+    }
+
+    /// Rows at the current level, for selection bounds.
+    pub fn level_len(&self) -> usize {
+        match self.level {
+            WorkflowLevel::Runs => self.workflows.len(),
+            WorkflowLevel::Phases => self.run().map_or(0, |run| run.phase_rows.len()),
+            WorkflowLevel::Agents | WorkflowLevel::Agent => self.visible_agents().len(),
+        }
+    }
+
+    fn index_mut(&mut self) -> &mut usize {
+        match self.level {
+            WorkflowLevel::Runs => &mut self.selected_index,
+            WorkflowLevel::Phases => &mut self.phase_index,
+            WorkflowLevel::Agents | WorkflowLevel::Agent => &mut self.agent_index,
+        }
+    }
+
+    /// `↑`/`↓`: move within the current level, clamped.
+    pub fn move_selection(&mut self, delta: isize) {
+        let len = self.level_len();
+        if len == 0 {
+            return;
+        }
+        let index = self.index_mut();
+        *index = index.saturating_add_signed(delta).min(len - 1);
+    }
+
+    /// `enter`/`→`: into the selected phase, agent, or expand the detail.
+    pub fn drill_in(&mut self) {
+        if self.level_len() == 0 {
+            return;
+        }
+        match self.level {
+            WorkflowLevel::Runs => {
+                self.level = WorkflowLevel::Phases;
+                self.phase_index = 0;
+            }
+            WorkflowLevel::Phases => {
+                self.level = WorkflowLevel::Agents;
+                self.agent_index = 0;
+                self.filter = None;
+            }
+            WorkflowLevel::Agents => {
+                self.level = WorkflowLevel::Agent;
+                self.expanded = false;
+            }
+            WorkflowLevel::Agent => self.expanded = !self.expanded,
+        }
+    }
+
+    /// `esc`/`←`: back out one level. False at the run list: close the sheet.
+    pub fn back_out(&mut self) -> bool {
+        self.level = match self.level {
+            WorkflowLevel::Runs => return false,
+            WorkflowLevel::Phases => WorkflowLevel::Runs,
+            WorkflowLevel::Agents => WorkflowLevel::Phases,
+            WorkflowLevel::Agent => WorkflowLevel::Agents,
+        };
+        true
+    }
+
+    /// `f`: all → running → completed → failed → all.
+    pub fn cycle_filter(&mut self) {
+        self.filter = match self.filter.as_deref() {
+            None => Some("running".into()),
+            Some("running") => Some("completed".into()),
+            Some("completed") => Some("failed".into()),
+            _ => None,
+        };
+        self.agent_index = 0;
+    }
+
+    /// Keep the view on the same run, phase and agent when rows refresh.
+    pub fn refresh(&mut self, workflows: Vec<WorkflowRow>) {
+        let run_id = self.run().map(|run| run.id.clone());
+        let agent_id = self.agent().map(|agent| agent.agent_id.clone());
+        self.workflows = workflows;
+        if let Some(index) = run_id
+            .as_ref()
+            .and_then(|id| self.workflows.iter().position(|run| &run.id == id))
+        {
+            self.selected_index = index;
+        } else {
+            self.selected_index = self.selected_index.min(self.workflows.len().saturating_sub(1));
+            if self.level != WorkflowLevel::Runs && run_id.is_some() {
+                self.level = WorkflowLevel::Runs;
+            }
+        }
+        let phases = self.run().map_or(0, |run| run.phase_rows.len());
+        self.phase_index = self.phase_index.min(phases.saturating_sub(1));
+        if let Some(index) = agent_id.as_ref().and_then(|id| {
+            self.visible_agents()
+                .iter()
+                .position(|agent| &agent.agent_id == id)
+        }) {
+            self.agent_index = index;
+        } else {
+            self.agent_index = self
+                .agent_index
+                .min(self.visible_agents().len().saturating_sub(1));
+        }
+    }
 }
 
 /// One execution task row on the live task board.

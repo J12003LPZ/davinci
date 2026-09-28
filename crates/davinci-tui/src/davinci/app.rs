@@ -891,6 +891,59 @@ fn handle_global_key(model: &mut Model, data: &str) -> Option<Flow> {
     None
 }
 
+/// `/workflows` keys, as claude code's progress view: `↑↓` select, `enter`/`→`
+/// drill in (and expand an agent's detail), `esc`/`←` back out, `j`/`k`
+/// scroll, `f` filter agents by status, `p` pause or resume the run, `x` stop
+/// the selected agent (or the run above the agent level). `None` lets the
+/// sheet's own handling run: `esc` at the run list closes it.
+fn handle_workflows_key(model: &mut Model, key: KeyEvent, data: Option<&str>) -> Option<Flow> {
+    use super::model::WorkflowLevel;
+    let cancel = action_matches(model, data, "tui.select.cancel");
+    let up = action_matches(model, data, "tui.select.up");
+    let down = action_matches(model, data, "tui.select.down");
+    let confirm = action_matches(model, data, "tui.select.confirm");
+    let plain = key.modifiers.is_empty();
+    let sheet = model.workflows.as_mut()?;
+    if cancel || (plain && key.code == KeyCode::Left) {
+        if sheet.back_out() {
+            model.feature_scroll = 0;
+            return Some(Flow::Continue);
+        }
+        return if cancel { None } else { Some(Flow::Continue) };
+    }
+    if up || down {
+        sheet.move_selection(if up { -1 } else { 1 });
+        return Some(Flow::Continue);
+    }
+    if confirm || (plain && key.code == KeyCode::Right) {
+        sheet.drill_in();
+        model.feature_scroll = 0;
+        return Some(Flow::Continue);
+    }
+    if !plain {
+        return None;
+    }
+    match key.code {
+        KeyCode::Char('j') => model.feature_scroll = model.feature_scroll.saturating_add(1),
+        KeyCode::Char('k') => model.feature_scroll = model.feature_scroll.saturating_sub(1),
+        KeyCode::Char('f') if sheet.level == WorkflowLevel::Agents => sheet.cycle_filter(),
+        KeyCode::Char('p') if sheet.run().is_some() => {
+            return Some(Flow::Choose(Choice::WorkflowAction { action: "pause" }));
+        }
+        KeyCode::Char('x') if sheet.run().is_some() => {
+            let action = match sheet.level {
+                WorkflowLevel::Agents | WorkflowLevel::Agent if sheet.agent().is_some() => {
+                    "stop_agent"
+                }
+                _ => "stop",
+            };
+            return Some(Flow::Choose(Choice::WorkflowAction { action }));
+        }
+        _ => return None,
+    }
+    Some(Flow::Continue)
+}
+
 fn handle_screen_key(model: &mut Model, key: KeyEvent, data: Option<&str>) -> Flow {
     if model.screen == Screen::GraphRun && super::views::graph_nav::handle_key(model, key) {
         return Flow::Continue;
@@ -906,6 +959,11 @@ fn handle_screen_key(model: &mut Model, key: KeyEvent, data: Option<&str>) -> Fl
 
     if model.screen == Screen::Settings {
         return settings::handle_key(model, key);
+    }
+    if model.screen == Screen::Workflows && key.kind == KeyEventKind::Press {
+        if let Some(flow) = handle_workflows_key(model, key, data) {
+            return flow;
+        }
     }
     if model.screen == Screen::Models && key.modifiers.is_empty() {
         if key.code == KeyCode::Char('/') && !model.catalog_search {
@@ -3710,5 +3768,90 @@ mod extension_manager_tests {
         press(&mut m, KeyCode::Right);
         assert!(chosen(press(&mut m, KeyCode::Char('d'))).is_none());
         assert!(armed(&m).is_none());
+    }
+}
+
+#[cfg(test)]
+mod workflows_view_keys {
+    use super::*;
+    use crate::davinci::model::{
+        WorkflowAgentRow, WorkflowLevel, WorkflowPhaseRow, WorkflowRow, WorkflowsSheet,
+    };
+    use crate::davinci::theme::{ColorDepth, Theme};
+
+    fn press(model: &mut Model, code: KeyCode) -> Flow {
+        handle_key(model, KeyEvent::new(code, KeyModifiers::NONE))
+    }
+
+    fn model() -> Model {
+        let mut m = Model::new(
+            Theme::da_vinci(ColorDepth::TrueColor, false),
+            100,
+            30,
+            false,
+        );
+        let agent = |label: &str| WorkflowAgentRow {
+            agent_id: format!("id-{label}"),
+            label: label.into(),
+            status: "running".into(),
+            ..WorkflowAgentRow::default()
+        };
+        m.workflows = Some(WorkflowsSheet {
+            workflows: vec![WorkflowRow {
+                id: "run-1".into(),
+                name: "audit".into(),
+                status: "running".into(),
+                phase_rows: vec![WorkflowPhaseRow {
+                    id: "scan".into(),
+                    status: "running".into(),
+                    agents: vec![agent("a"), agent("b")],
+                }],
+                ..WorkflowRow::default()
+            }],
+            ..WorkflowsSheet::default()
+        });
+        m.screen = Screen::Workflows;
+        m
+    }
+
+    fn level(m: &Model) -> WorkflowLevel {
+        m.workflows.as_ref().unwrap().level
+    }
+
+    #[test]
+    fn keys_drill_in_back_out_and_act_on_the_selection() {
+        let mut m = model();
+        assert_eq!(
+            press(&mut m, KeyCode::Char('p')),
+            Flow::Choose(Choice::WorkflowAction { action: "pause" })
+        );
+        assert_eq!(
+            press(&mut m, KeyCode::Char('x')),
+            Flow::Choose(Choice::WorkflowAction { action: "stop" })
+        );
+        press(&mut m, KeyCode::Enter);
+        assert_eq!(level(&m), WorkflowLevel::Phases);
+        press(&mut m, KeyCode::Right);
+        assert_eq!(level(&m), WorkflowLevel::Agents);
+        press(&mut m, KeyCode::Down);
+        assert_eq!(m.workflows.as_ref().unwrap().agent_index, 1);
+        assert_eq!(
+            press(&mut m, KeyCode::Char('x')),
+            Flow::Choose(Choice::WorkflowAction {
+                action: "stop_agent"
+            })
+        );
+        press(&mut m, KeyCode::Char('f'));
+        assert_eq!(
+            m.workflows.as_ref().unwrap().filter.as_deref(),
+            Some("running")
+        );
+        press(&mut m, KeyCode::Left);
+        assert_eq!(level(&m), WorkflowLevel::Phases);
+        press(&mut m, KeyCode::Esc);
+        assert_eq!(level(&m), WorkflowLevel::Runs);
+        assert_eq!(m.screen, Screen::Workflows);
+        press(&mut m, KeyCode::Esc);
+        assert_ne!(m.screen, Screen::Workflows, "esc at the run list closes");
     }
 }
