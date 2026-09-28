@@ -2005,6 +2005,17 @@ fn apply_max_model_turns(agent: &mut Agent, settings: &settings::Settings) {
     }
 }
 
+/// An in-process worker (`agent`, fan-out, teammates, workflow tasks) compacts at the
+/// user's configured point, like the session and the `--print` graph workers
+/// that `build_agent` configures. It needs the model summarizer too: without
+/// one, compaction falls back to a mechanical transcript dump, which can save
+/// little and leave the worker over its threshold.
+fn apply_worker_compaction(parsed: &Args, settings: &settings::Settings, child: &mut Agent) {
+    child.auto_compaction = settings.compaction_enabled();
+    child.compaction = settings.compaction_settings();
+    child.summarizer = Some(live_compaction_summarizer(parsed, child));
+}
+
 fn new_worker_agent(system_prompt: impl Into<String>) -> Agent {
     let mut agent = Agent::new(system_prompt);
     agent.max_model_turns = Some(60);
@@ -2228,6 +2239,7 @@ fn build_worker_agent(
             child.context_window = max_tokens as u64;
         }
     }
+    apply_worker_compaction(parsed, &settings, &mut child);
     // The worker's own tool calls and token use feed the lead's transcript.
     if let Some(progress) = req.progress.clone() {
         child.event_sink = Some(davinci_agent::EventSink(Arc::new(move |event| {

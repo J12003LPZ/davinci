@@ -164,6 +164,29 @@ fn main_model_turn_setting_overrides_the_default_and_keeps_zero() {
 }
 
 #[test]
+fn in_process_workers_compact_at_the_configured_threshold_with_a_summary() {
+    let mut settings = super::settings::Settings::default();
+    super::settings::set_compaction_threshold(&mut settings, "50%").unwrap();
+    let mut child = super::new_worker_agent("worker");
+    assert_eq!(child.compaction.threshold, None);
+    assert!(child.summarizer.is_none());
+
+    super::apply_worker_compaction(&Args::default(), &settings, &mut child);
+
+    assert_eq!(
+        child.compaction.threshold,
+        Some(davinci_agent::CompactionThreshold::Percent(50))
+    );
+    assert_eq!(child.compaction, settings.compaction_settings());
+    assert!(child.auto_compaction);
+    assert!(child.summarizer.is_some());
+
+    settings.auto_compact = Some(false);
+    super::apply_worker_compaction(&Args::default(), &settings, &mut child);
+    assert!(!child.auto_compaction);
+}
+
+#[test]
 fn worker_agents_use_the_lower_model_turn_default() {
     let worker = super::new_worker_agent("worker turn limit fixture");
     assert_eq!(worker.max_model_turns, Some(60));

@@ -2099,13 +2099,27 @@ impl Agent {
                 .map(|text| (text.len() as u64).div_ceil(4))
                 .unwrap_or(0)
             + (self.provider_system_prompt().len() as u64).div_ceil(4)
-            + self.provider_context_overhead_tokens().unwrap_or_else(|| {
-                let specs = self.provider_tool_specs();
-                (serde_json::to_vec(&specs)
-                    .expect("tool schemas are JSON")
-                    .len() as u64)
-                    .div_ceil(4)
-            })
+            + self.estimated_tool_schema_tokens()
+    }
+
+    /// Tool schemas on the same four-bytes-a-token scale as the rest of
+    /// [`Self::estimated_context_tokens`]. A host estimator measures the byte
+    /// ceiling the admission budget charges ([`Self::provider_context_budget`]);
+    /// counted as tokens here it made the schemas weigh four times their size
+    /// and auto-compaction fire well before the configured threshold. An
+    /// explicit scalar override is already in tokens.
+    pub(crate) fn estimated_tool_schema_tokens(&self) -> u64 {
+        match (
+            self.provider_context_overhead_estimator,
+            self.provider_context_overhead_tokens,
+        ) {
+            (Some(estimate), _) => estimate(self).div_ceil(4),
+            (None, Some(tokens)) => tokens,
+            (None, None) => (serde_json::to_vec(&self.provider_tool_specs())
+                .expect("tool schemas are JSON")
+                .len() as u64)
+                .div_ceil(4),
+        }
     }
 
     fn context_vm_estimated_provider_tokens(&self, image: &runtime::ContextImage) -> u64 {

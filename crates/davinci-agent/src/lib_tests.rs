@@ -752,6 +752,29 @@ fn context_budget_counts_system_and_active_tool_schemas() {
 }
 
 #[test]
+fn a_host_schema_estimator_counts_tools_like_the_rest_of_the_estimate() {
+    // Hosts register a byte-ceiling estimator for admission; the compaction
+    // estimate must still weigh the schemas at four bytes a token.
+    let mut agent = Agent::new("");
+    let schema_bytes = serde_json::to_vec(&agent.provider_tool_specs())
+        .unwrap()
+        .len() as u64;
+    let heuristic = agent.estimated_context_tokens();
+    agent.set_provider_context_overhead_estimator(|agent| {
+        serde_json::to_vec(&agent.provider_tool_specs())
+            .unwrap()
+            .len() as u64
+            + 128
+    });
+    assert_eq!(
+        agent.estimated_context_tokens(),
+        heuristic - schema_bytes.div_ceil(4) + (schema_bytes + 128).div_ceil(4)
+    );
+    // The admission budget keeps its conservative byte ceiling.
+    assert_eq!(agent.provider_context_budget().tools, schema_bytes + 128);
+}
+
+#[test]
 fn context_budget_counts_only_provider_visible_tool_schemas() {
     let agent = Agent::new("");
     let provider_schema_tokens = (serde_json::to_vec(&agent.provider_tool_specs())
