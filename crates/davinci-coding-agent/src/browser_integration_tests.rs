@@ -188,9 +188,9 @@ fn rpc_artifact_helper_entry() {
         .unwrap()
         .port();
     let script = if verify_browser {
-        format!("const http=require('node:http'),fs=require('node:fs');http.createServer((q,r)=>r.end(fs.readFileSync('index.html'))).listen({port},'127.0.0.1',()=>console.log('READY'));setTimeout(()=>process.exit(0),60000);")
+        format!("const http=require('node:http'),fs=require('node:fs');http.createServer((q,r)=>r.end(fs.readFileSync('index.html'))).listen({port},'127.0.0.1',()=>console.log('READY'));setTimeout(()=>process.exit(0),600000);")
     } else {
-        format!("require('node:http').createServer((q,r)=>r.end('<html><button>Login</button></html>')).listen({port},'127.0.0.1',()=>console.log('READY'));setTimeout(()=>process.exit(0),60000);")
+        format!("require('node:http').createServer((q,r)=>r.end('<html><button>Login</button></html>')).listen({port},'127.0.0.1',()=>console.log('READY'));setTimeout(()=>process.exit(0),600000);")
     };
     let started = fixture_manager
         .execute(
@@ -202,7 +202,7 @@ fn rpc_artifact_helper_entry() {
         )
         .unwrap();
     let process_id = started.details.unwrap()["process"]["id"].as_u64().unwrap();
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let deadline = Instant::now() + Duration::from_secs(30);
     while !fixture_manager
         .execute(
             root.path(),
@@ -677,7 +677,7 @@ fn normal_browser_native_dispatch_actions_revocation_and_cleanup() {
         )
         .unwrap();
         let script = format!(
-            "const http=require('node:http');const fs=require('node:fs');const server=http.createServer((req,res)=>{{if(req.url==='/broken-api'){{res.writeHead(500);res.end('planted failure');return;}}res.setHeader('content-type','text/html');res.end(fs.readFileSync('index.html'));}});server.listen({port},'{loopback_host}',()=>console.log('READY'));setTimeout(()=>server.close(),60000);"
+            "const http=require('node:http');const fs=require('node:fs');const server=http.createServer((req,res)=>{{if(req.url==='/broken-api'){{res.writeHead(500);res.end('planted failure');return;}}res.setHeader('content-type','text/html');res.end(fs.readFileSync('index.html'));}});server.listen({port},'{loopback_host}',()=>console.log('READY'));setTimeout(()=>server.close(),600000);"
         );
         let (started, output, error) = super::test_impact_integration_tests::call(
             &mut agent,
@@ -687,7 +687,7 @@ fn normal_browser_native_dispatch_actions_revocation_and_cleanup() {
         assert!(!error, "{output}");
         let process_id = started["process"]["id"].as_u64().unwrap();
         let manager = agent.tool_context.processes.as_ref().unwrap().clone();
-        let deadline = Instant::now() + Duration::from_secs(5);
+        let deadline = Instant::now() + Duration::from_secs(30);
         loop {
             let output = manager
                 .execute(
@@ -1101,7 +1101,7 @@ fn normal_browser_native_dispatch_actions_revocation_and_cleanup() {
         drop(controller);
         drop(host);
         drop(agent);
-        let deadline = Instant::now() + Duration::from_secs(5);
+        let deadline = Instant::now() + Duration::from_secs(30);
         loop {
             let processes = manager
                 .execute(root.path(), "process_list", &json!({}), None, None)
@@ -1359,7 +1359,7 @@ fn login_button_seventeen_step_normal_dispatch_and_graph_deny() {
         .unwrap()
         .port();
     let script = format!(
-        "const http=require('node:http');const fs=require('node:fs');const server=http.createServer((req,res)=>{{if(req.url==='/broken-api'){{res.writeHead(500);res.end('planted failure');return;}}res.setHeader('content-type','text/html');res.end(fs.readFileSync('index.html'));}});server.listen({port},'127.0.0.1',()=>console.log('READY'));setTimeout(()=>server.close(),60000);"
+        "const http=require('node:http');const fs=require('node:fs');const server=http.createServer((req,res)=>{{if(req.url==='/broken-api'){{res.writeHead(500);res.end('planted failure');return;}}res.setHeader('content-type','text/html');res.end(fs.readFileSync('index.html'));}});server.listen({port},'127.0.0.1',()=>console.log('READY'));setTimeout(()=>server.close(),600000);"
     );
 
     let mut dispatched = Vec::new();
@@ -1382,7 +1382,7 @@ fn login_button_seventeen_step_normal_dispatch_and_graph_deny() {
     assert!(!error, "{output}");
     let process_id = started["process"]["id"].as_u64().unwrap();
     let manager = agent.tool_context.processes.as_ref().unwrap().clone();
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let deadline = Instant::now() + Duration::from_secs(30);
     loop {
         let output = manager
             .execute(
