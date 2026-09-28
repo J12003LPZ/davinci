@@ -3413,7 +3413,7 @@ fn json_mode_and_status_expose_safe_prompt_metadata() {
     preview_agent.prompt_session.transition_diagnostic =
         Some("Prompt hash transition on resume".into());
     let preview_status = format_session_status(&parsed, &preview_agent);
-    assert!(preview_status.contains("prompt: preview v3 [cand-99]"));
+    assert!(preview_status.contains("prompt: preview v4 [cand-99]"));
     assert!(preview_status.contains("transition: Prompt hash transition on resume"));
     assert!(!preview_status.contains(&preview_agent.system_prompt));
 }
