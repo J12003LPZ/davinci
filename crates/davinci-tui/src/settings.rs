@@ -160,6 +160,14 @@ pub struct InteractiveSettingsConfig {
     pub terminal_progress: bool,
     pub warnings_anthropic_extra_usage: bool,
     pub model_thinking_summary: String,
+    /// `dynamicWorkflows`: the model may orchestrate subagents with `workflow_run`.
+    pub dynamic_workflows: bool,
+    /// `workflowSizeGuideline`: unrestricted | small | medium | large.
+    pub workflow_size: String,
+    /// `workflowMaxConcurrentAgents`, as text.
+    pub workflow_max_concurrent: String,
+    /// `agentTeams`: persistent teammates with messaging and a task board.
+    pub agent_teams: bool,
 }
 
 impl Default for InteractiveSettingsConfig {
@@ -201,6 +209,10 @@ impl Default for InteractiveSettingsConfig {
             terminal_progress: true,
             warnings_anthropic_extra_usage: true,
             model_thinking_summary: "none".into(),
+            dynamic_workflows: false,
+            workflow_size: "medium".into(),
+            workflow_max_concurrent: "16".into(),
+            agent_teams: false,
         }
     }
 }
@@ -549,6 +561,49 @@ pub fn interactive_settings_list(config: &InteractiveSettingsConfig) -> Settings
                 "Share anonymous usage data",
                 "Opt-in analytics data sharing",
                 config.enable_analytics,
+            ),
+            bool_item(
+                "dynamic-workflows",
+                "Dynamic workflows",
+                "Let the model orchestrate many subagents in phases with workflow_run (DAVINCI_EXPERIMENTAL_WORKFLOWS overrides)",
+                config.dynamic_workflows,
+            ),
+            SettingItem {
+                id: "workflow-size".into(),
+                label: "Dynamic workflow size".into(),
+                description: Some(
+                    "How many agents the model aims for in a workflow: small < 5, medium < 10 (default), large < 50, unrestricted sizes to the task"
+                        .into(),
+                ),
+                current_value: config.workflow_size.clone(),
+                values: vec![
+                    "unrestricted".into(),
+                    "small".into(),
+                    "medium".into(),
+                    "large".into(),
+                ],
+            },
+            SettingItem {
+                id: "workflow-max-concurrent-agents".into(),
+                label: "Workflow concurrent agents".into(),
+                description: Some(
+                    "Most workflow agents running at once (default 16; DAVINCI_WORKFLOW_MAX_CONCURRENT_AGENTS overrides, 1-256)"
+                        .into(),
+                ),
+                current_value: config.workflow_max_concurrent.clone(),
+                values: vec![
+                    "4".into(),
+                    "8".into(),
+                    "16".into(),
+                    "32".into(),
+                    "64".into(),
+                ],
+            },
+            bool_item(
+                "agent-teams",
+                "Agent teams",
+                "Let the model start persistent teammates that message each other and share a task board (DAVINCI_EXPERIMENTAL_AGENT_TEAMS overrides)",
+                config.agent_teams,
             ),
         ],
         12,

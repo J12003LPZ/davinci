@@ -58,6 +58,24 @@ pub struct RuntimeRegistry {
 }
 
 impl RuntimeRegistry {
+    pub fn set_worktree(&self, id: AgentId, path: std::path::PathBuf) {
+        if let Ok(mut records) = self.records.write() {
+            if let Some(record) = records.get_mut(&id) {
+                record.cwd = path.clone();
+                record.worktree = Some(path);
+            }
+        }
+    }
+
+    /// Record why an agent is unhealthy without changing its state.
+    pub fn set_failure_reason(&self, id: AgentId, reason: impl Into<String>) {
+        if let Ok(mut records) = self.records.write() {
+            if let Some(record) = records.get_mut(&id) {
+                record.failure_reason = Some(reason.into());
+            }
+        }
+    }
+
     pub fn new() -> Self {
         Self {
             records: Arc::new(RwLock::new(HashMap::new())),

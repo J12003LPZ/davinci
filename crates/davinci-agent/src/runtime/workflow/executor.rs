@@ -10,7 +10,9 @@ use std::sync::{Arc, RwLock};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use super::spec::{WorkflowJoin, WorkflowSpec};
+use super::spec::{
+    WorkflowJoin, WorkflowLaunch, WorkflowPhaseSpec, WorkflowSpec, WorkflowWorkerSpec,
+};
 use super::state::WorkflowStateStore;
 use super::validate::{validate_workflow_with_capabilities, WorkflowValidationError};
 use crate::runtime::cancellation::CancellationToken;
@@ -94,6 +96,12 @@ pub struct WorkflowExecutor {
     executions: Arc<RwLock<HashMap<WorkflowId, WorkflowExecutionState>>>,
     tokens: Arc<RwLock<HashMap<WorkflowId, CancellationToken>>>,
     specs: Arc<RwLock<HashMap<WorkflowId, WorkflowSpec>>>,
+    launches: Arc<RwLock<HashMap<WorkflowId, WorkflowLaunch>>>,
+    /// Each worker's live activity (tool uses, tokens, recent calls) for
+    /// the workflows view.
+    progress: Arc<RwLock<HashMap<AgentId, crate::subagent_progress::ProgressReporter>>>,
+    /// Each running worker's own token, so one agent can be stopped.
+    agent_tokens: Arc<RwLock<HashMap<AgentId, CancellationToken>>>,
 }
 
 impl WorkflowExecutor {
@@ -109,7 +117,66 @@ impl WorkflowExecutor {
             executions: Arc::new(RwLock::new(HashMap::new())),
             tokens: Arc::new(RwLock::new(HashMap::new())),
             specs: Arc::new(RwLock::new(HashMap::new())),
+            launches: Arc::new(RwLock::new(HashMap::new())),
+            progress: Arc::new(RwLock::new(HashMap::new())),
+            agent_tokens: Arc::new(RwLock::new(HashMap::new())),
         }
+    }
+
+    /// Stop one running worker. It counts as failed, so a relaunch reruns it
+    /// (Claude Code: stopping a single agent counts as failing). Returns
+    /// false when that worker is not running.
+    pub fn cancel_agent(&self, agent: &AgentId) -> bool {
+        let token = self
+            .agent_tokens
+            .read()
+            .ok()
+            .and_then(|tokens| tokens.get(agent).cloned());
+        match token {
+            Some(token) => {
+                self.runtime
+                    .registry
+                    .set_failure_reason(*agent, "stopped from the workflows view");
+                token.cancel();
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// A run's phase ids in spec order (its state keeps them in a map).
+    pub fn phase_order(&self, wf_id: &WorkflowId) -> Vec<String> {
+        self.specs
+            .read()
+            .ok()
+            .and_then(|specs| {
+                specs
+                    .get(wf_id)
+                    .map(|spec| spec.phases.iter().map(|phase| phase.id.clone()).collect())
+            })
+            .unwrap_or_default()
+    }
+
+    /// While a run is paused no new worker starts; running ones continue.
+    fn wait_while_paused(&self, wf_id: &WorkflowId, token: &CancellationToken) {
+        while !token.is_cancelled()
+            && self
+                .get_state(wf_id)
+                .is_some_and(|state| state.status == WorkflowStatus::Paused)
+        {
+            std::thread::sleep(std::time::Duration::from_millis(25));
+        }
+    }
+
+    /// A worker's activity so far, for the workflows view.
+    pub fn agent_progress(
+        &self,
+        agent: &AgentId,
+    ) -> Option<crate::subagent_progress::SubagentProgress> {
+        self.progress
+            .read()
+            .ok()
+            .and_then(|map| map.get(agent).map(|reporter| reporter.snapshot()))
     }
 
     /// Retrieve the current execution state of a workflow.
@@ -236,9 +303,33 @@ impl WorkflowExecutor {
         &self,
         spec: WorkflowSpec,
     ) -> Result<WorkflowExecutionState, WorkflowExecutionError> {
-        validate_workflow_with_capabilities(&spec, None, &[], &self.runtime.capability_registry)?;
+        self.execute_with(spec, WorkflowLaunch::default())
+    }
+
+    pub fn execute_with(
+        &self,
+        spec: WorkflowSpec,
+        launch: WorkflowLaunch,
+    ) -> Result<WorkflowExecutionState, WorkflowExecutionError> {
+        validate_workflow_with_capabilities(
+            &spec,
+            launch.parent_permission_mode,
+            &[],
+            &self.runtime.capability_registry,
+        )?;
+        if spec.max_cost_usd.is_some() {
+            return Err(WorkflowExecutionError::ExecutionError(
+                "max_cost_usd is not enforced yet; remove it from the spec".into(),
+            ));
+        }
         let wf_id = WorkflowId::new();
-        let wf_token = self.runtime.cancellation_token.child_token();
+        // A synchronous run belongs to the turn that called it: Esc stops it.
+        let wf_token = launch
+            .turn_token
+            .as_ref()
+            .unwrap_or(&self.runtime.cancellation_token)
+            .child_token();
+        self.launches.write().unwrap().insert(wf_id, launch.clone());
         self.init_workflow_state(&spec, wf_id, wf_token.clone());
         self.run_phases(spec, wf_id, wf_token)
     }
@@ -248,16 +339,43 @@ impl WorkflowExecutor {
         &self,
         spec: WorkflowSpec,
     ) -> Result<WorkflowId, WorkflowExecutionError> {
-        validate_workflow_with_capabilities(&spec, None, &[], &self.runtime.capability_registry)?;
+        self.execute_background_with(spec, WorkflowLaunch::default())
+    }
+
+    pub fn execute_background_with(
+        &self,
+        spec: WorkflowSpec,
+        launch: WorkflowLaunch,
+    ) -> Result<WorkflowId, WorkflowExecutionError> {
+        validate_workflow_with_capabilities(
+            &spec,
+            launch.parent_permission_mode,
+            &[],
+            &self.runtime.capability_registry,
+        )?;
+        if spec.max_cost_usd.is_some() {
+            return Err(WorkflowExecutionError::ExecutionError(
+                "max_cost_usd is not enforced yet; remove it from the spec".into(),
+            ));
+        }
         let wf_id = WorkflowId::new();
-        let wf_token = self.runtime.cancellation_token.child_token();
+        // A background run outlives the turn that started it, like a
+        // background agent: it descends from the session's team token, so
+        // Esc on the lead leaves it running while `/workflow cancel` and a
+        // session switch still stop it.
+        let wf_token = self.runtime.team.session_token().child_token();
+        self.launches.write().unwrap().insert(wf_id, launch.clone());
         self.init_workflow_state(&spec, wf_id, wf_token.clone());
 
         let this = self.clone();
         std::thread::Builder::new()
             .name(format!("wf-{}", wf_id))
             .spawn(move || {
-                let _ = this.run_phases(spec, wf_id, wf_token);
+                let name = spec.name.clone();
+                let outcome = this.run_phases(spec, wf_id, wf_token);
+                if launch.report_to_lead {
+                    this.report_completion(wf_id, &name, &outcome);
+                }
             })
             .map_err(|e| WorkflowExecutionError::ExecutionError(e.to_string()))?;
 
@@ -392,10 +510,35 @@ impl WorkflowExecutor {
         wf_token: CancellationToken,
         mut completed_phase_ids: HashSet<String>,
     ) -> Result<WorkflowExecutionState, WorkflowExecutionError> {
+        let started = std::time::Instant::now();
+        let finished = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        struct Finish(Arc<std::sync::atomic::AtomicBool>);
+        impl Drop for Finish {
+            fn drop(&mut self) {
+                self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+        let _finish = Finish(finished.clone());
+        if let Some(ms) = spec.deadline_ms {
+            let token = wf_token.clone();
+            std::thread::Builder::new()
+                .name(format!("wf-deadline-{wf_id}"))
+                .spawn(move || {
+                    while !finished.load(std::sync::atomic::Ordering::SeqCst)
+                        && !token.is_cancelled()
+                    {
+                        if started.elapsed() >= std::time::Duration::from_millis(ms) {
+                            token.cancel();
+                            break;
+                        }
+                        std::thread::sleep(std::time::Duration::from_millis(10));
+                    }
+                })
+                .map_err(|e| WorkflowExecutionError::ExecutionError(e.to_string()))?;
+        }
         while completed_phase_ids.len() < spec.phases.len() {
             if wf_token.is_cancelled() {
-                self.cancel(&wf_id)?;
-                return Err(WorkflowExecutionError::Cancelled);
+                return Err(self.cancelled_error(&wf_id, &spec, started));
             }
 
             let ready_phases: Vec<_> = spec
@@ -418,9 +561,9 @@ impl WorkflowExecutor {
             }
 
             for phase in ready_phases {
+                self.wait_while_paused(&wf_id, &wf_token);
                 if wf_token.is_cancelled() {
-                    self.cancel(&wf_id)?;
-                    return Err(WorkflowExecutionError::Cancelled);
+                    return Err(self.cancelled_error(&wf_id, &spec, started));
                 }
 
                 self.runtime
@@ -438,7 +581,14 @@ impl WorkflowExecutor {
                     }
                 }
 
-                let phase_success = self.execute_phase(&wf_id, &phase, &wf_token)?;
+                let phase_success =
+                    self.execute_phase(&wf_id, &phase, &wf_token)
+                        .inspect_err(|error| {
+                            self.fail_workflow(&wf_id, &error.to_string());
+                        })?;
+                if wf_token.is_cancelled() {
+                    return Err(self.cancelled_error(&wf_id, &spec, started));
+                }
                 if !phase_success {
                     let err_msg = format!("Phase '{}' failed join requirements", phase.id);
                     self.fail_workflow(&wf_id, &err_msg);
@@ -487,6 +637,287 @@ impl WorkflowExecutor {
         });
     }
 
+    fn run_workflow_worker(
+        &self,
+        wf_id: &WorkflowId,
+        phase: &WorkflowPhaseSpec,
+        artifact_context: &str,
+        identities: (AgentId, TaskId),
+        worker: &WorkflowWorkerSpec,
+        phase_token: &CancellationToken,
+    ) -> Result<String, String> {
+        let (aid, tid) = identities;
+        let launch = self
+            .launches
+            .read()
+            .unwrap()
+            .get(wf_id)
+            .cloned()
+            .unwrap_or_default();
+        let operation_adapter = self.runtime.child_operation_adapter();
+        let lease = if worker.isolation.as_deref() == Some("worktree") {
+            let manager = self
+                .runtime
+                .worktree_manager
+                .clone()
+                .ok_or("worktree isolation requested but no worktree manager is configured")?;
+            Some(
+                manager
+                    .create_lease(self.runtime.run_id, aid, None)
+                    .map_err(|e| format!("worktree isolation failed: {e}"))?,
+            )
+        } else {
+            None
+        };
+
+        if let Some(lease) = &lease {
+            self.runtime.registry.set_worktree(aid, lease.path.clone());
+        }
+        // The view reads snapshots; nothing listens to the events themselves.
+        let reporter = crate::subagent_progress::ProgressReporter::new(
+            format!("workflow:{wf_id}"),
+            crate::EventSink(Arc::new(|_| {})),
+            aid.to_string(),
+            worker.id.clone(),
+            (0, 1),
+            "workflow",
+        );
+        reporter.started();
+        if let Ok(mut map) = self.progress.write() {
+            map.insert(aid, reporter.clone());
+        }
+        let agent_token = phase_token.child_token();
+        if let Ok(mut tokens) = self.agent_tokens.write() {
+            tokens.insert(aid, agent_token.clone());
+        }
+        let mut result = (|| {
+            let effective_prompt = if !artifact_context.is_empty() {
+                format!(
+                    "{}\n\n[Context from previous phases]:\n{}",
+                    worker.prompt, artifact_context
+                )
+            } else {
+                worker.prompt.clone()
+            };
+
+            let child_token = agent_token.clone();
+            let req = SubagentRequest {
+                progress: Some(reporter.clone()),
+                max_turns: worker.max_turns,
+                parent_tools: Some(
+                    if launch.parent_tools.is_empty() && launch.parent_permission_mode.is_none() {
+                        worker.tools.clone()
+                    } else {
+                        launch.parent_tools.clone()
+                    },
+                ),
+                prompt: effective_prompt,
+                tools: crate::subagent::scoped_tools_with_registry(
+                    Some(&worker.tools),
+                    if launch.parent_tools.is_empty() && launch.parent_permission_mode.is_none() {
+                        &worker.tools
+                    } else {
+                        &launch.parent_tools
+                    },
+                    lease.is_some(),
+                    &self.runtime.capability_registry,
+                ),
+                description: Some(worker.id.clone()),
+                provider: launch.provider.clone(),
+                model_id: launch.model_id.clone(),
+                abort: Some(phase_token.as_atomic_bool()),
+                cancellation_token: Some(child_token.clone()),
+                agent: worker.agent_profile.clone(),
+                mode: crate::subagent::AgentSpawnMode::Oneshot,
+                model_override: worker.model.clone(),
+                isolation: worker.isolation.clone(),
+                instance_name: Some(worker.id.clone()),
+                runtime_agent_id: Some(aid),
+                runtime: Some(self.runtime.for_worker(aid, Some(child_token))?),
+                parent_permission_mode: launch.parent_permission_mode,
+                worktree_path: lease.as_ref().map(|l| l.path.clone()),
+                contract_digest: None,
+                active_contract: None,
+            };
+
+            let retry_limit = worker.retry_budget.unwrap_or(0);
+            let mut attempt = 0;
+            let mut outcome: Result<String, String> = Err("no runner configured".into());
+
+            while attempt <= retry_limit {
+                if phase_token.is_cancelled() {
+                    outcome = Err("cancelled: workflow or phase joined".into());
+                    break;
+                }
+                if agent_token.is_cancelled() {
+                    outcome = Err("stopped from the workflows view".into());
+                    break;
+                }
+                let operation = operation_adapter.as_ref().map(|adapter| {
+                    let mut child = ChildExecutionContext::new(
+                        format!(
+                            "workflow:{wf_id}:{}:{}:attempt-{}",
+                            phase.id,
+                            worker.id,
+                            attempt + 1
+                        ),
+                        &self.runtime,
+                        Some(aid),
+                    );
+                    child.task_id = Some(tid);
+                    child.workflow_id = Some(*wf_id);
+                    child.host = "workflow_executor".to_owned();
+                    let payload = serde_json::json!({
+                        "workflow_id": wf_id,
+                        "phase_id": phase.id,
+                        "worker_id": worker.id,
+                        "attempt": attempt + 1,
+                        "tools": worker.tools,
+                        "model": worker.model,
+                        "prompt_digest": crate::runtime::operations::PayloadDigest::of_bytes(req.prompt.as_bytes()),
+                    });
+                    adapter
+                        .start(ChildExecutionKind::WorkflowPhase, child, payload)
+                });
+                let operation = match operation {
+                    Some(Ok(operation)) => Some(operation),
+                    Some(Err(error)) => {
+                        return Err(format!(
+                            "workflow child launch was not durably admitted: {error}"
+                        ))
+                    }
+                    None => None,
+                };
+                let run = || match &self.runner {
+                    Some(r) => {
+                        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| r.run(&req)))
+                            .unwrap_or_else(|_| Err("workflow worker panicked".into()))
+                        {
+                            Ok(result) => crate::tools::ToolResult {
+                                content: result,
+                                is_error: false,
+                                details: None,
+                            },
+                            Err(error) => crate::tools::ToolResult {
+                                content: error,
+                                is_error: true,
+                                details: None,
+                            },
+                        }
+                    }
+                    None => crate::tools::ToolResult {
+                        content: "workflow runner is not configured".into(),
+                        is_error: true,
+                        details: None,
+                    },
+                };
+                let result = match operation.as_ref() {
+                    Some(operation) => operation
+                        .execute(phase_token.is_cancelled(), || Ok(()), run)
+                        .map_err(|error| error.to_string()),
+                    None => Ok(run()),
+                };
+                outcome = result.and_then(|result| {
+                    if result.is_error {
+                        Err(result.content)
+                    } else {
+                        Ok(result.content)
+                    }
+                });
+                if outcome.is_ok() {
+                    break;
+                }
+                attempt += 1;
+            }
+
+            outcome
+        })();
+        if let Ok(mut tokens) = self.agent_tokens.write() {
+            tokens.remove(&aid);
+        }
+        reporter.finish(result.is_ok());
+        if let (Some(manager), Some(lease)) = (&self.runtime.worktree_manager, &lease) {
+            let cleanup = if result.is_ok() && !manager.is_dirty(lease) {
+                manager
+                    .release_lease(lease, false)
+                    .map_err(|e| e.to_string())
+            } else {
+                Err("preserved for review".into())
+            };
+            if let Err(reason) = cleanup {
+                let note = format!(
+                    "\n\nworktree kept: {} (branch {}) — {reason}",
+                    lease.path.display(),
+                    lease.branch
+                );
+                result = result.map(|text| text + &note).map_err(|text| text + &note);
+            }
+        }
+        result
+    }
+
+    fn cancelled_error(
+        &self,
+        id: &WorkflowId,
+        spec: &WorkflowSpec,
+        started: std::time::Instant,
+    ) -> WorkflowExecutionError {
+        if let Some(ms) = spec
+            .deadline_ms
+            .filter(|ms| started.elapsed() >= std::time::Duration::from_millis(*ms))
+        {
+            let error = format!("workflow deadline of {ms} ms exceeded");
+            self.fail_workflow(id, &error);
+            WorkflowExecutionError::ExecutionError(error)
+        } else {
+            let _ = self.cancel(id);
+            WorkflowExecutionError::Cancelled
+        }
+    }
+
+    fn report_completion(
+        &self,
+        id: WorkflowId,
+        name: &str,
+        outcome: &Result<WorkflowExecutionState, WorkflowExecutionError>,
+    ) {
+        self.runtime
+            .ensure_lead_registered("", "", std::path::Path::new("."));
+        let sender = AgentId::new();
+        let record = AgentRecord {
+            id: sender,
+            run_id: self.runtime.run_id,
+            parent: Some(self.runtime.agent_id),
+            kind: AgentKind::WorkflowWorker,
+            name: format!("workflow:{name}"),
+            provider: String::new(),
+            model_id: String::new(),
+            cwd: std::env::current_dir().unwrap_or_default(),
+            state: AgentState::Running,
+            task_id: None,
+            worktree: None,
+            started_ms: now_ms(),
+            updated_ms: now_ms(),
+            failure_reason: None,
+        };
+        let _ = self.runtime.registry.register_agent(record);
+        let content = match outcome { Ok(state) => format!("status: completed\n\nworkflow '{name}' ({id}) {:?}. Use workflow_status for artifacts.", state.status), Err(error) => format!("status: failed\n\nworkflow '{name}' ({id}) failed: {error}") };
+        let _ = self.runtime.mailbox.send(crate::runtime::AgentMessage::new(
+            self.runtime.run_id,
+            sender,
+            self.runtime.agent_id,
+            content,
+        ));
+        let _ = self.runtime.registry.transition(
+            sender,
+            if outcome.is_ok() {
+                AgentState::Completed
+            } else {
+                AgentState::Failed
+            },
+        );
+    }
+
     fn execute_phase(
         &self,
         wf_id: &WorkflowId,
@@ -526,13 +957,7 @@ impl WorkflowExecutor {
                 cwd: std::env::current_dir().unwrap_or_default(),
                 state: AgentState::Running,
                 task_id: None,
-                worktree: worker.isolation.as_ref().and_then(|iso| {
-                    if iso == "worktree" {
-                        Some(std::path::PathBuf::from("worktree"))
-                    } else {
-                        None
-                    }
-                }),
+                worktree: None,
                 started_ms: now,
                 updated_ms: now,
                 failure_reason: None,
@@ -555,157 +980,132 @@ impl WorkflowExecutor {
             worker_tasks.push((aid, tid, worker.clone()));
         }
 
+        if let Some(state) = self
+            .executions
+            .write()
+            .unwrap()
+            .get_mut(wf_id)
+            .and_then(|s| s.phases.get_mut(&phase.id))
+        {
+            state.worker_agent_ids = worker_agent_ids;
+            state.task_ids = worker_tasks.iter().map(|(_, tid, _)| *tid).collect();
+        }
         // Execute workers using scheduler or runner
         let mut successful_workers: Vec<AgentId> = Vec::new();
         let mut failed_workers: Vec<AgentId> = Vec::new();
-        let operation_adapter = self.runtime.child_operation_adapter();
-
-        for (aid, tid, worker) in worker_tasks {
-            if wf_token.is_cancelled() {
-                let _ = self.runtime.registry.transition(aid, AgentState::Cancelled);
-                let _ = self.runtime.task_registry.cancel_task(tid);
-                failed_workers.push(aid);
-                continue;
-            }
-
-            let effective_prompt = if !artifact_context.is_empty() {
-                format!(
-                    "{}\n\n[Context from previous phases]:\n{}",
-                    worker.prompt, artifact_context
-                )
-            } else {
-                worker.prompt.clone()
-            };
-
-            let child_token = wf_token.child_token();
-            let req = SubagentRequest {
-                prompt: effective_prompt,
-                tools: worker.tools.clone(),
-                description: Some(worker.id.clone()),
-                provider: None,
-                model_id: None,
-                abort: Some(wf_token.as_atomic_bool()),
-                cancellation_token: Some(child_token.clone()),
-                agent: worker.agent_profile.clone(),
-                mode: crate::subagent::AgentSpawnMode::Oneshot,
-                model_override: worker.model.clone(),
-                isolation: worker.isolation.clone(),
-                instance_name: Some(worker.id.clone()),
-                runtime_agent_id: Some(aid),
-                runtime: Some(
-                    self.runtime
-                        .for_worker(aid, Some(child_token))
-                        .map_err(WorkflowExecutionError::ExecutionError)?,
-                ),
-                parent_permission_mode: None,
-                worktree_path: None,
-                contract_digest: None,
-                active_contract: None,
-            };
-
-            let retry_limit = worker.retry_budget.unwrap_or(0);
-            let mut attempt = 0;
-            let mut outcome: Result<String, String> = Err("no runner configured".into());
-
-            while attempt <= retry_limit {
-                let operation = operation_adapter.as_ref().map(|adapter| {
-                    let mut child = ChildExecutionContext::new(
-                        format!(
-                            "workflow:{wf_id}:{}:{}:attempt-{}",
-                            phase.id,
-                            worker.id,
-                            attempt + 1
-                        ),
-                        &self.runtime,
-                        Some(aid),
-                    );
-                    child.task_id = Some(tid);
-                    child.workflow_id = Some(*wf_id);
-                    child.host = "workflow_executor".to_owned();
-                    let payload = serde_json::json!({
-                        "workflow_id": wf_id,
-                        "phase_id": phase.id,
-                        "worker_id": worker.id,
-                        "attempt": attempt + 1,
-                        "tools": worker.tools,
-                        "model": worker.model,
-                        "prompt_digest": crate::runtime::operations::PayloadDigest::of_bytes(req.prompt.as_bytes()),
-                    });
-                    adapter
-                        .start(ChildExecutionKind::WorkflowPhase, child, payload)
-                });
-                let operation = match operation {
-                    Some(Ok(operation)) => Some(operation),
-                    Some(Err(error)) => {
-                        return Err(WorkflowExecutionError::ExecutionError(format!(
-                            "workflow child launch was not durably admitted: {error}"
-                        )))
-                    }
-                    None => None,
-                };
-                let run = || match &self.runner {
-                    Some(r) => match r.run(&req) {
-                        Ok(result) => crate::tools::ToolResult {
-                            content: result,
-                            is_error: false,
-                            details: None,
-                        },
-                        Err(error) => crate::tools::ToolResult {
-                            content: error,
-                            is_error: true,
-                            details: None,
-                        },
-                    },
-                    None => crate::tools::ToolResult {
-                        content: format!("completed {}", worker.id),
-                        is_error: false,
-                        details: None,
-                    },
-                };
-                let result = match operation.as_ref() {
-                    Some(operation) => operation
-                        .execute(wf_token.is_cancelled(), || Ok(()), run)
-                        .map_err(|error| error.to_string()),
-                    None => Ok(run()),
-                };
-                outcome = result.and_then(|result| {
-                    if result.is_error {
-                        Err(result.content)
+        let requested = self
+            .specs
+            .read()
+            .ok()
+            .and_then(|specs| specs.get(wf_id).map(|s| s.max_parallel_agents))
+            .unwrap_or(1);
+        // The spec asks; the session ceiling (`workflowMaxConcurrentAgents`)
+        // decides. A launch without one uses the default ceiling.
+        let ceiling = self
+            .launches
+            .read()
+            .ok()
+            .and_then(|launches| launches.get(wf_id).and_then(|l| l.max_concurrent_agents))
+            .unwrap_or(super::limits::DEFAULT_MAX_CONCURRENT_AGENTS);
+        let limit = super::limits::WorkflowSettings {
+            max_concurrent_agents: ceiling,
+            ..super::limits::WorkflowSettings::default()
+        }
+        .concurrency_for(requested)
+        .min(phase.workers.len().max(1));
+        let phase_token = wf_token.child_token();
+        let successes = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let queue = std::sync::Mutex::new(worker_tasks.into_iter());
+        let out = std::sync::Mutex::new(Vec::new());
+        std::thread::scope(|scope| {
+            let mut handles = Vec::new();
+            for _ in 0..limit {
+                handles.push(scope.spawn(|| loop {
+                    self.wait_while_paused(wf_id, &phase_token);
+                    let next = queue.lock().unwrap_or_else(|p| p.into_inner()).next();
+                    let Some((aid, tid, worker)) = next else {
+                        break;
+                    };
+                    let result = if phase_token.is_cancelled() {
+                        Err("cancelled: phase already joined or workflow cancelled".to_string())
                     } else {
-                        Ok(result.content)
+                        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                            self.run_workflow_worker(
+                                wf_id,
+                                phase,
+                                &artifact_context,
+                                (aid, tid),
+                                &worker,
+                                &phase_token,
+                            )
+                        }))
+                        .unwrap_or_else(|_| Err("workflow worker panicked".into()))
+                    };
+                    if result.is_ok() {
+                        let done = successes.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+                        let joined_early = match phase.join {
+                            WorkflowJoin::Any => done >= 1,
+                            WorkflowJoin::Quorum { required } => done >= required,
+                            WorkflowJoin::All => false,
+                        };
+                        if joined_early {
+                            phase_token.cancel();
+                        }
                     }
-                });
-                if outcome.is_ok() {
-                    break;
-                }
-                attempt += 1;
+                    out.lock().unwrap_or_else(|p| p.into_inner()).push((
+                        aid,
+                        tid,
+                        worker.id.clone(),
+                        result,
+                    ));
+                }));
             }
-
+            for handle in handles {
+                let _ = handle.join();
+            }
+        });
+        let mut results = out.into_inner().unwrap_or_else(|p| p.into_inner());
+        results.sort_by_key(|(_, _, id, _)| {
+            phase
+                .workers
+                .iter()
+                .position(|w| &w.id == id)
+                .unwrap_or(usize::MAX)
+        });
+        let joined_early = match phase.join {
+            WorkflowJoin::Any => successes.load(std::sync::atomic::Ordering::SeqCst) > 0,
+            WorkflowJoin::Quorum { required } => {
+                successes.load(std::sync::atomic::Ordering::SeqCst) >= required
+            }
+            WorkflowJoin::All => false,
+        };
+        for (aid, tid, worker_id, outcome) in results {
             match outcome {
-                Ok(result_text) => {
+                Ok(output) => {
                     let _ = self.runtime.registry.transition(aid, AgentState::Completed);
                     let _ = self.runtime.task_registry.complete_task(tid, None);
                     successful_workers.push(aid);
-
-                    // Store artifact
-                    let val = serde_json::json!({
-                        "worker": worker.id,
-                        "output": result_text,
-                    });
-                    let _ = self.store.put_artifact(*wf_id, &phase.id, aid, val, None);
+                    self.store
+                        .put_artifact(
+                            *wf_id,
+                            &phase.id,
+                            aid,
+                            serde_json::json!({"worker": worker_id, "output": output}),
+                            None,
+                        )
+                        .map_err(|e| WorkflowExecutionError::ExecutionError(e.to_string()))?;
                 }
-                Err(err) => {
-                    let _ = self.runtime.registry.transition(aid, AgentState::Failed);
-                    let _ = self.runtime.task_registry.fail_task(tid, Some(err));
+                Err(error) => {
+                    self.runtime.registry.set_failure_reason(aid, &error);
+                    if joined_early || wf_token.is_cancelled() {
+                        let _ = self.runtime.registry.transition(aid, AgentState::Cancelled);
+                        let _ = self.runtime.task_registry.cancel_task(tid);
+                    } else {
+                        let _ = self.runtime.registry.transition(aid, AgentState::Failed);
+                        let _ = self.runtime.task_registry.fail_task(tid, Some(error));
+                    }
                     failed_workers.push(aid);
                 }
-            }
-
-            // Early exit on Any or Quorum if possible
-            match phase.join {
-                WorkflowJoin::Any if !successful_workers.is_empty() => break,
-                WorkflowJoin::Quorum { required } if successful_workers.len() >= required => break,
-                _ => {}
             }
         }
 
@@ -744,8 +1144,16 @@ mod tests {
         let bus = crate::runtime::RuntimeBus::default();
         let handle = RuntimeHandle::new(crate::runtime::RunId::new(), AgentId::new(), bus);
         let tmp = tempdir().unwrap();
+        let handle = handle.with_worktree_manager(super::super::test_worktree_manager(tmp.path()));
         let store = WorkflowStateStore::with_options(32 * 1024, tmp.path().to_path_buf());
-        (WorkflowExecutor::new(handle, store, runner), tmp)
+        (
+            WorkflowExecutor::new(
+                handle,
+                store,
+                runner.or_else(|| Some(SubagentRunner::new(|_| Ok("fixture result".into())))),
+            ),
+            tmp,
+        )
     }
 
     #[test]
@@ -959,7 +1367,7 @@ mod tests {
         let wf_id = executor.execute_background(spec).unwrap();
         // Give background thread a moment to finish execution
         let mut completed = false;
-        for _ in 0..50 {
+        for _ in 0..500 {
             if let Some(st) = executor.get_state(&wf_id) {
                 if st.status == WorkflowStatus::Completed {
                     completed = true;
@@ -1102,5 +1510,421 @@ mod tests {
             "resume should succeed with validated fingerprint"
         );
         assert_eq!(res.unwrap().status, WorkflowStatus::Completed);
+    }
+    fn two_worker_phase(isolation: Option<&str>, tools: &[&str]) -> WorkflowSpec {
+        let worker = |id: &str| WorkflowWorkerSpec {
+            id: id.into(),
+            prompt: format!("do {id}"),
+            agent_profile: None,
+            model: None,
+            tools: tools.iter().map(|t| t.to_string()).collect(),
+            isolation: isolation.map(str::to_string),
+            max_turns: Some(7),
+            retry_budget: None,
+        };
+        WorkflowSpec {
+            schema_version: 1,
+            name: "pair".into(),
+            max_parallel_agents: 2,
+            max_total_agents: 2,
+            max_cost_usd: None,
+            deadline_ms: None,
+            phases: vec![WorkflowPhaseSpec {
+                id: "p".into(),
+                depends_on: vec![],
+                workers: vec![worker("a"), worker("b")],
+                join: WorkflowJoin::All,
+            }],
+        }
+    }
+
+    #[test]
+    fn phase_workers_run_concurrently() {
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let b = barrier.clone();
+        let runner = SubagentRunner::new(move |_| {
+            // Deadlocks (and the test times out) if workers run one by one.
+            b.wait();
+            Ok("ok".into())
+        });
+        let (executor, _tmp) = setup_executor(Some(runner));
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(executor.execute(two_worker_phase(None, &["read"])));
+        });
+        let state = rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("workers ran sequentially")
+            .unwrap();
+        assert_eq!(state.status, WorkflowStatus::Completed);
+    }
+
+    #[test]
+    fn workers_inherit_parent_model_and_max_turns() {
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let s = seen.clone();
+        let runner = SubagentRunner::new(move |req| {
+            s.lock().unwrap().push((
+                req.provider.clone(),
+                req.model_id.clone(),
+                req.max_turns,
+                req.parent_permission_mode,
+            ));
+            Ok("ok".into())
+        });
+        let (executor, _tmp) = setup_executor(Some(runner));
+        executor
+            .execute_with(
+                two_worker_phase(None, &["read"]),
+                WorkflowLaunch {
+                    parent_permission_mode: Some(crate::PermissionMode::Ask),
+                    provider: Some("anthropic".into()),
+                    model_id: Some("claude-opus-5-5".into()),
+                    ..WorkflowLaunch::default()
+                },
+            )
+            .unwrap();
+        for (provider, model, turns, mode) in seen.lock().unwrap().iter() {
+            assert_eq!(provider.as_deref(), Some("anthropic"));
+            assert_eq!(model.as_deref(), Some("claude-opus-5-5"));
+            assert_eq!(*turns, Some(7));
+            assert_eq!(*mode, Some(crate::PermissionMode::Ask));
+        }
+    }
+
+    #[test]
+    fn workflow_without_runner_fails_instead_of_fabricating_results() {
+        let (mut executor, _tmp) = setup_executor(None);
+        executor.runner = None;
+        assert!(executor.execute(two_worker_phase(None, &["read"])).is_err());
+        assert!(executor
+            .executions
+            .read()
+            .unwrap()
+            .values()
+            .all(|state| state.status == WorkflowStatus::Failed));
+    }
+
+    #[test]
+    fn empty_parent_tool_ceiling_is_enforced() {
+        let (executor, _tmp) = setup_executor(Some(SubagentRunner::new(|req| {
+            assert!(req.tools.is_empty());
+            assert_eq!(req.parent_tools, Some(Vec::new()));
+            Ok("scoped".into())
+        })));
+        executor
+            .execute_with(
+                two_worker_phase(None, &["read"]),
+                WorkflowLaunch {
+                    parent_permission_mode: Some(crate::PermissionMode::Ask),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn background_workflow_reports_preserved_real_worktrees() {
+        let paths = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let capture = paths.clone();
+        let (executor, _tmp) = setup_executor(Some(SubagentRunner::new(move |req| {
+            let path = req.worktree_path.as_ref().unwrap();
+            assert!(path.join(".git").is_file());
+            assert!(req.tools.iter().any(|tool| tool == "write"));
+            std::fs::write(path.join("result.txt"), "worker output").unwrap();
+            capture.lock().unwrap().push(path.clone());
+            Ok("edited".into())
+        })));
+        let id = executor
+            .execute_background_with(
+                two_worker_phase(Some("worktree"), &["write"]),
+                WorkflowLaunch {
+                    parent_permission_mode: Some(crate::PermissionMode::Edits),
+                    parent_tools: vec!["write".into()],
+                    report_to_lead: true,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        let started = std::time::Instant::now();
+        while executor
+            .runtime
+            .mailbox
+            .pending_count(&executor.runtime.agent_id)
+            == 0
+        {
+            assert!(started.elapsed() < std::time::Duration::from_secs(10));
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        let reports = executor.runtime.take_labeled_messages(10).join("\n");
+        assert!(reports.contains("kind=\"workflow_worker\""));
+        assert!(reports.contains("status: completed"));
+        let paths = paths.lock().unwrap();
+        assert_eq!(paths.len(), 2);
+        assert_ne!(paths[0], paths[1]);
+        let state = executor.get_state(&id).unwrap();
+        for phase in state.phases.values() {
+            let outputs = executor
+                .store
+                .list_phase_artifacts(id, &phase.id)
+                .iter()
+                .map(|artifact| artifact.value.to_string())
+                .collect::<Vec<_>>()
+                .join("\n");
+            for agent in &phase.worker_agent_ids {
+                let path = executor
+                    .runtime
+                    .registry
+                    .get(agent)
+                    .unwrap()
+                    .worktree
+                    .unwrap();
+                assert!(path.join("result.txt").exists());
+                assert!(outputs.contains("worktree kept"));
+            }
+        }
+    }
+
+    #[test]
+    fn plan_mode_parent_rejects_mutating_workflows() {
+        let (executor, _tmp) = setup_executor(Some(SubagentRunner::new(|_| Ok("x".into()))));
+        let err = executor
+            .execute_with(
+                two_worker_phase(Some("worktree"), &["read", "write"]),
+                WorkflowLaunch {
+                    parent_permission_mode: Some(crate::PermissionMode::ReadOnly),
+                    ..WorkflowLaunch::default()
+                },
+            )
+            .unwrap_err();
+        assert!(
+            err.to_string().to_lowercase().contains("read-only")
+                || err.to_string().to_lowercase().contains("permission")
+        );
+    }
+
+    fn wait_until_cancelled_runner() -> SubagentRunner {
+        SubagentRunner::new(|req| {
+            let token = req.cancellation_token.clone().unwrap();
+            let start = std::time::Instant::now();
+            while !token.is_cancelled() {
+                if start.elapsed() > std::time::Duration::from_secs(5) {
+                    return Ok("never cancelled".into());
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            Err("cancelled".into())
+        })
+    }
+
+    fn wait_for_status(
+        executor: &WorkflowExecutor,
+        id: &WorkflowId,
+        wanted: impl Fn(&WorkflowStatus) -> bool,
+    ) -> WorkflowStatus {
+        let start = std::time::Instant::now();
+        loop {
+            let status = executor.get_state(id).unwrap().status;
+            if wanted(&status) || start.elapsed() > std::time::Duration::from_secs(8) {
+                return status;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+
+    #[test]
+    fn the_session_ceiling_bounds_phase_concurrency() {
+        let running = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let peak = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (r, p) = (running.clone(), peak.clone());
+        let runner = SubagentRunner::new(move |_| {
+            let now = r.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+            p.fetch_max(now, std::sync::atomic::Ordering::SeqCst);
+            std::thread::sleep(std::time::Duration::from_millis(60));
+            r.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+            Ok("ok".into())
+        });
+        let (executor, _tmp) = setup_executor(Some(runner));
+        let mut spec = two_worker_phase(None, &["read"]);
+        let template = spec.phases[0].workers[0].clone();
+        spec.phases[0].workers = (0..6)
+            .map(|index| WorkflowWorkerSpec {
+                id: format!("w{index}"),
+                ..template.clone()
+            })
+            .collect();
+        spec.max_parallel_agents = 6;
+        spec.max_total_agents = 6;
+        let state = executor
+            .execute_with(
+                spec,
+                WorkflowLaunch {
+                    max_concurrent_agents: Some(2),
+                    ..WorkflowLaunch::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(state.status, WorkflowStatus::Completed);
+        assert_eq!(peak.load(std::sync::atomic::Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn a_paused_run_starts_no_new_agents_until_resumed() {
+        let started = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let count = started.clone();
+        let runner = SubagentRunner::new(move |_| {
+            count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            std::thread::sleep(std::time::Duration::from_millis(80));
+            Ok("ok".into())
+        });
+        let (executor, _tmp) = setup_executor(Some(runner));
+        let mut spec = two_worker_phase(None, &["read"]);
+        spec.max_parallel_agents = 1;
+        let id = executor.execute_background(spec).unwrap();
+        let start = std::time::Instant::now();
+        while started.load(std::sync::atomic::Ordering::SeqCst) == 0 {
+            assert!(start.elapsed() < std::time::Duration::from_secs(5));
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        executor.pause(&id).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(250));
+        assert_eq!(started.load(std::sync::atomic::Ordering::SeqCst), 1);
+        executor.resume(&id).unwrap();
+        let status = wait_for_status(&executor, &id, |s| *s == WorkflowStatus::Completed);
+        assert_eq!(status, WorkflowStatus::Completed);
+        assert_eq!(started.load(std::sync::atomic::Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn one_agent_can_be_stopped_and_counts_as_failed() {
+        let (executor, _tmp) = setup_executor(Some(wait_until_cancelled_runner()));
+        let mut spec = two_worker_phase(None, &["read"]);
+        spec.phases[0].workers.truncate(1);
+        spec.max_total_agents = 1;
+        let id = executor.execute_background(spec).unwrap();
+        let start = std::time::Instant::now();
+        let agent = loop {
+            let running = executor
+                .get_state(&id)
+                .and_then(|state| state.phases.values().next().cloned())
+                .and_then(|phase| phase.worker_agent_ids.first().copied());
+            if let Some(agent) = running.filter(|agent| executor.cancel_agent(agent)) {
+                break agent;
+            }
+            assert!(start.elapsed() < std::time::Duration::from_secs(5));
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        };
+        let status = wait_for_status(&executor, &id, |s| *s != WorkflowStatus::Running);
+        assert_eq!(status, WorkflowStatus::Failed);
+        let record = executor.runtime.registry.get(&agent).unwrap();
+        assert_eq!(record.state, AgentState::Failed);
+        assert!(
+            !executor.cancel_agent(&agent),
+            "a finished agent cannot be stopped"
+        );
+    }
+
+    #[test]
+    fn a_background_workflow_survives_the_lead_turn_being_interrupted() {
+        let (executor, _tmp) = setup_executor(Some(wait_until_cancelled_runner()));
+        let id = executor
+            .execute_background(two_worker_phase(None, &["read"]))
+            .unwrap();
+        // Esc on the lead cancels the turn's runtime token.
+        executor.runtime.cancellation_token.cancel();
+        std::thread::sleep(std::time::Duration::from_millis(150));
+        assert_eq!(
+            executor.get_state(&id).unwrap().status,
+            WorkflowStatus::Running,
+            "Esc must not stop a background workflow"
+        );
+        executor.cancel(&id).unwrap();
+        let status = wait_for_status(&executor, &id, |s| *s != WorkflowStatus::Running);
+        assert_eq!(status, WorkflowStatus::Cancelled);
+    }
+
+    #[test]
+    fn a_session_switch_stops_background_workflows() {
+        let (executor, _tmp) = setup_executor(Some(wait_until_cancelled_runner()));
+        let id = executor
+            .execute_background(two_worker_phase(None, &["read"]))
+            .unwrap();
+        executor.runtime.team.shutdown_all();
+        let status = wait_for_status(&executor, &id, |s| *s != WorkflowStatus::Running);
+        assert_ne!(status, WorkflowStatus::Running);
+        assert_ne!(status, WorkflowStatus::Completed);
+    }
+
+    #[test]
+    fn a_synchronous_workflow_stops_with_the_calling_turn() {
+        let (executor, _tmp) = setup_executor(Some(wait_until_cancelled_runner()));
+        let turn = CancellationToken::new();
+        let canceller = turn.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            canceller.cancel();
+        });
+        let started = std::time::Instant::now();
+        let result = executor.execute_with(
+            two_worker_phase(None, &["read"]),
+            WorkflowLaunch {
+                turn_token: Some(turn),
+                ..WorkflowLaunch::default()
+            },
+        );
+        assert_eq!(result.unwrap_err(), WorkflowExecutionError::Cancelled);
+        assert!(started.elapsed() < std::time::Duration::from_secs(3));
+    }
+
+    #[test]
+    fn deadline_cancels_a_running_workflow() {
+        let runner = SubagentRunner::new(|req| {
+            let token = req.cancellation_token.clone().unwrap();
+            let start = std::time::Instant::now();
+            while !token.is_cancelled() {
+                assert!(start.elapsed() < std::time::Duration::from_secs(5));
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            Err("cancelled".into())
+        });
+        let (executor, _tmp) = setup_executor(Some(runner));
+        let mut spec = two_worker_phase(None, &["read"]);
+        spec.deadline_ms = Some(150);
+        let started = std::time::Instant::now();
+        let result = executor.execute(spec);
+        assert!(result.is_err());
+        assert!(started.elapsed() < std::time::Duration::from_secs(3));
+    }
+
+    #[test]
+    fn early_any_join_cancels_the_rest() {
+        let runner = SubagentRunner::new(|req| {
+            if req.instance_name.as_deref() == Some("a") {
+                return Ok("fast".into());
+            }
+            let token = req.cancellation_token.clone().unwrap();
+            let start = std::time::Instant::now();
+            while !token.is_cancelled() {
+                assert!(
+                    start.elapsed() < std::time::Duration::from_secs(5),
+                    "never cancelled"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            Err("cancelled".into())
+        });
+        let (executor, _tmp) = setup_executor(Some(runner));
+        let mut spec = two_worker_phase(None, &["read"]);
+        spec.phases[0].join = WorkflowJoin::Any;
+        let state = executor.execute(spec).unwrap();
+        assert_eq!(state.status, WorkflowStatus::Completed);
+        let unfinished = executor
+            .runtime
+            .registry
+            .get_by_run(&executor.runtime.run_id)
+            .into_iter()
+            .filter(|r| matches!(r.state, AgentState::Running | AgentState::Starting))
+            .count();
+        assert_eq!(unfinished, 0);
     }
 }

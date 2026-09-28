@@ -5,8 +5,10 @@ pub mod approval;
 pub mod cache_stability;
 pub mod decision;
 pub mod decisions;
+pub mod delegation;
 mod permission_state;
 pub mod process_manager;
+pub mod subagent_progress;
 pub use permission_state::PermissionState;
 mod batch;
 mod branch;
@@ -105,9 +107,9 @@ pub use skills::{
 };
 pub use stats::{RunStats, SharedCounters};
 pub use subagent::{
-    scoped_tools, scoped_tools_with_policy, scoped_tools_with_registry, AgentSpawnMode,
-    SubagentParent, SubagentRequest, SubagentRunner, DEFAULT_SUBAGENT_TOOLS, PLAN_MODE_APPENDIX,
-    PLAN_MODE_DENIAL,
+    run_tool as run_subagent_tool, scoped_tools, scoped_tools_with_policy,
+    scoped_tools_with_registry, AgentSpawnMode, SubagentParent, SubagentRequest, SubagentRunner,
+    DEFAULT_SUBAGENT_TOOLS, PLAN_MODE_APPENDIX, PLAN_MODE_DENIAL,
 };
 pub use templates::{
     discover_prompt_templates, expand_prompt_template, parse_command_args, parse_frontmatter,
@@ -193,6 +195,19 @@ impl std::fmt::Debug for PostToolHook {
         f.write_str("PostToolHook")
     }
 }
+
+/// Tools that come with agent teams (`agentTeams`).
+pub const TEAM_TOOLS: &[&str] = &[
+    "agent_status",
+    "agent_message",
+    "agent_stop",
+    "task_create",
+    "task_update",
+    "task_list",
+    "task_get",
+];
+/// Tools that come with dynamic workflows (`dynamicWorkflows`).
+pub const WORKFLOW_TOOLS: &[&str] = &["workflow_run", "workflow_status"];
 
 /// Live agent-loop subscriber matching TS `AgentSession.subscribe`.
 #[derive(Clone)]
@@ -457,6 +472,14 @@ pub struct Agent {
     /// (`todo.rs`), shared with the tool thread and the shell.
     pub tool_context: ToolContext,
     pub summarizer: Option<Summarizer>,
+    /// Whether the host can keep asynchronous workers alive.
+    pub async_agents_allowed: bool,
+    /// Dynamic workflow sizing (`workflowSizeGuideline`,
+    /// `workflowMaxConcurrentAgents`), set by the host from settings.
+    pub workflow_settings: crate::runtime::WorkflowSettings,
+    /// The user told this conversation not to use subagents; `agent` and
+    /// `workflow_run` calls are refused until they allow it again.
+    pub delegation_forbidden: bool,
     pub subagent_runner: Option<crate::subagent::SubagentRunner>,
     pub block_images: bool,
     pub auto_resize_images: bool,
@@ -621,6 +644,9 @@ impl Agent {
             tool_context: ToolContext::default(),
             summarizer: None,
             subagent_runner: None,
+            async_agents_allowed: false,
+            workflow_settings: crate::runtime::WorkflowSettings::default(),
+            delegation_forbidden: false,
             block_images: false,
             auto_resize_images: true,
             retry_aborted: false,
@@ -741,6 +767,12 @@ impl Agent {
             self.abort_signal = Some(runtime.cancellation_token.as_atomic_bool());
         }
         self.tool_context.cache = runtime.cache.clone();
+        if let Some(previous) = &self.runtime {
+            if previous.run_id != runtime.run_id {
+                // A new conversation: the old team has nobody to report to.
+                previous.team.shutdown_all();
+            }
+        }
         self.tool_context.runtime = Some(runtime.clone());
         self.runtime_session = self.session.as_ref().and_then(|session| {
             let source = std::fs::canonicalize(&session.path).ok()?;
@@ -843,6 +875,41 @@ impl Agent {
                 && runtime.session_id.as_deref() == Some(id.as_str())
                 && runtime.run_id == *run_id
         })
+    }
+
+    /// What this conversation contributes to a workflow it launches: its
+    /// permission ceiling, model, tools and sizing. `report_to_lead` is set
+    /// for background runs whose host can deliver the report.
+    pub fn workflow_launch(&self, report_to_lead: bool) -> crate::runtime::WorkflowLaunch {
+        crate::runtime::WorkflowLaunch {
+            parent_permission_mode: Some(self.permission_mode()),
+            provider: Some(self.provider.clone()),
+            model_id: Some(self.model_id.clone()),
+            parent_tools: self.tools.clone(),
+            report_to_lead,
+            turn_token: self
+                .runtime
+                .as_ref()
+                .map(|runtime| runtime.cancellation_token.clone()),
+            max_concurrent_agents: Some(self.workflow_settings.max_concurrent_agents),
+            large_workflow_threshold: Some(self.workflow_settings.large_workflow_threshold()),
+        }
+    }
+
+    /// The runtime the next prompt continues. A bound session continues its
+    /// own runtime. A session-less conversation (`--no-session`) continues
+    /// the previous prompt's runtime, so the run id, mailbox and team survive
+    /// between prompts: without it every prompt looked like a new
+    /// conversation and `set_runtime` shut the team down. A graph or nested
+    /// worker (whose runtime has a parent) is excluded; its host rebinds it
+    /// through `with_worker_state_from` instead.
+    pub fn runtime_for_next_prompt(&self) -> Option<&RuntimeHandle> {
+        if self.session.is_some() {
+            return self.runtime_for_session();
+        }
+        self.runtime
+            .as_ref()
+            .filter(|runtime| runtime.parent_agent_id.is_none())
     }
 
     pub fn register_context_source(&mut self, source: Arc<dyn crate::runtime::ContextSource>) {
@@ -1612,6 +1679,8 @@ impl Agent {
     ) -> ChatMessage {
         self.clear_turn_decision();
         let message = self.prompt_with_origin(text, images, true);
+        self.delegation_forbidden =
+            crate::delegation::delegation_forbidden_after(self.delegation_forbidden, [text]);
         self.last_real_user_request = Some(text.to_string());
         self.activate_relevant_tool_families(text);
         message
@@ -2030,13 +2099,27 @@ impl Agent {
                 .map(|text| (text.len() as u64).div_ceil(4))
                 .unwrap_or(0)
             + (self.provider_system_prompt().len() as u64).div_ceil(4)
-            + self.provider_context_overhead_tokens().unwrap_or_else(|| {
-                let specs = self.provider_tool_specs();
-                (serde_json::to_vec(&specs)
-                    .expect("tool schemas are JSON")
-                    .len() as u64)
-                    .div_ceil(4)
-            })
+            + self.estimated_tool_schema_tokens()
+    }
+
+    /// Tool schemas on the same four-bytes-a-token scale as the rest of
+    /// [`Self::estimated_context_tokens`]. A host estimator measures the byte
+    /// ceiling the admission budget charges ([`Self::provider_context_budget`]);
+    /// counted as tokens here it made the schemas weigh four times their size
+    /// and auto-compaction fire well before the configured threshold. An
+    /// explicit scalar override is already in tokens.
+    pub(crate) fn estimated_tool_schema_tokens(&self) -> u64 {
+        match (
+            self.provider_context_overhead_estimator,
+            self.provider_context_overhead_tokens,
+        ) {
+            (Some(estimate), _) => estimate(self).div_ceil(4),
+            (None, Some(tokens)) => tokens,
+            (None, None) => (serde_json::to_vec(&self.provider_tool_specs())
+                .expect("tool schemas are JSON")
+                .len() as u64)
+                .div_ceil(4),
+        }
     }
 
     fn context_vm_estimated_provider_tokens(&self, image: &runtime::ContextImage) -> u64 {
@@ -2739,6 +2822,11 @@ impl Agent {
                 crate::subagent::describe_agent_profiles(spec, &self.agent_profiles);
             }
         }
+        if let Some(spec) = specs.iter_mut().find(|tool| tool.name == "workflow_run") {
+            spec.description.push(' ');
+            spec.description
+                .push_str(&self.workflow_settings.tool_guidance());
+        }
         specs.extend(
             self.tool_context
                 .mcp
@@ -3115,6 +3203,52 @@ impl Agent {
         }
     }
 
+    /// Offer the orchestration tools that match the enabled features.
+    ///
+    /// `agent_*` and `task_*` come with agent teams, `workflow_*` with dynamic
+    /// workflows. They are not built-in defaults, so without this a lead with
+    /// the feature turned on never saw them. Only a lead that may delegate
+    /// (`agent` is active) is changed: workers, graph children and explicit
+    /// `--tools` lists without `agent` keep exactly what they were given.
+    pub fn sync_orchestration_tools(&mut self) {
+        if !self.tools.iter().any(|name| name == "agent") {
+            return;
+        }
+        let groups = [
+            (TEAM_TOOLS, crate::tools::team_tools_enabled()),
+            (WORKFLOW_TOOLS, crate::tools::workflow_tools_enabled()),
+        ];
+        for (names, enabled) in groups {
+            for name in names {
+                let name = name.to_string();
+                if enabled {
+                    if !self.tool_registry.contains(&name) {
+                        self.tool_registry.push(name.clone());
+                    }
+                    if !self.tools.contains(&name) {
+                        self.tools.push(name);
+                    }
+                } else {
+                    self.tools.retain(|tool| tool != &name);
+                    self.tool_registry.retain(|tool| tool != &name);
+                }
+            }
+        }
+        self.sync_tool_authorization();
+        let mut exposure = self
+            .tool_context
+            .tool_exposure
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        for (names, enabled) in groups {
+            if enabled {
+                for name in names {
+                    exposure.activate_authorized(name, true);
+                }
+            }
+        }
+    }
+
     pub fn apply_extension_tools(&mut self, names: &[String]) {
         for name in names {
             if !self.tool_registry.contains(name) {
@@ -3464,6 +3598,7 @@ impl Agent {
             }
         }
         self.last_real_user_request = last_real_user_request_from_messages(&messages);
+        self.delegation_forbidden = delegation_forbidden_from_messages(&messages);
         self.reset_session_approvals();
         self.messages = messages;
         self.pending_prompt_messages.clear();
@@ -3984,6 +4119,27 @@ impl From<AssistantMessage> for CompleteOutput {
 /// job finished.
 pub const JOB_NOTICE_TYPE: &str = "backgroundJob";
 const REAL_USER_ORIGIN_FIELD: &str = "davinciRealUserOrigin";
+
+/// Replay the user's own messages to recover "don't use subagents" after a
+/// resume. Agent messages and harness notices are not the user speaking.
+fn delegation_forbidden_from_messages(messages: &[ChatMessage]) -> bool {
+    let texts: Vec<String> = messages
+        .iter()
+        .filter(|message| message.role == "user" && message.extra_bool(REAL_USER_ORIGIN_FIELD))
+        .map(|message| {
+            message
+                .content
+                .iter()
+                .filter_map(|part| match part {
+                    davinci_ai::MessageContent::Text { text } => Some(text.as_str()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+        })
+        .collect();
+    crate::delegation::delegation_forbidden_after(false, texts.iter().map(String::as_str))
+}
 /// Marks the assistant tool call the harness issues when it re-runs the last
 /// verification command. It carries no text and is never the model's reply.
 pub const HARNESS_VERIFICATION_FIELD: &str = "davinciHarnessVerification";

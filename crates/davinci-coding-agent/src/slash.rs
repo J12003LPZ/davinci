@@ -97,7 +97,16 @@ pub fn builtin_slash_commands() -> Vec<SlashCommand> {
             "Leave Plan Mode without implicitly approving a plan",
             None,
         ),
-        ("agents", "List custom agent profiles and status", None),
+        (
+            "workflow",
+            "Workflow runs: list, status <id>, cancel <id>",
+            Some("[status <id>|cancel <id>]"),
+        ),
+        (
+            "agents",
+            "Agent profiles and live team",
+            Some("[msg <name> <text>|stop <name>]"),
+        ),
         (
             "plugin",
             "Manage plugins, skills and MCP servers; install Claude Code / Codex plugins",
@@ -113,6 +122,7 @@ pub fn builtin_slash_commands() -> Vec<SlashCommand> {
         ("quit", "Quit DaVinci", None),
     ]
     .into_iter()
+    .filter(|(name, _, _)| *name != "workflow" || davinci_agent::tools::workflow_tools_enabled())
     .map(|(name, description, hint)| SlashCommand {
         name: name.into(),
         description: description.into(),
@@ -158,7 +168,8 @@ pub enum SlashAction {
     /// `/context`: the window by category; `/context inspect` opens the
     /// prepared-manifest inspector.
     Context(String),
-    Agents,
+    Agents(String),
+    Workflow(String),
     /// `/plugin …`: the text after the command name.
     Plugin(String),
     Tasks,
@@ -242,7 +253,8 @@ pub fn parse_line(line: &str) -> SlashAction {
         "cost" => SlashAction::ShowCost,
         "status" => SlashAction::ShowStatus,
         "context" => SlashAction::Context(args.to_string()),
-        "agents" => SlashAction::Agents,
+        "workflow" | "workflows" => SlashAction::Workflow(args.to_string()),
+        "agents" => SlashAction::Agents(args.to_string()),
         "plugin" | "plugins" => SlashAction::Plugin(args.to_string()),
         "tasks" => SlashAction::Tasks,
         "help" => SlashAction::Status(
@@ -457,6 +469,35 @@ mod tests {
                 .filter(|c| c.name == "config")
                 .count(),
             1
+        );
+    }
+    #[test]
+    fn agents_takes_subcommands() {
+        assert_eq!(parse_line("/agents"), SlashAction::Agents(String::new()));
+        assert_eq!(
+            parse_line("/agents msg mate look at x"),
+            SlashAction::Agents("msg mate look at x".into())
+        );
+        assert_eq!(
+            parse_line("/agents stop mate"),
+            SlashAction::Agents("stop mate".into())
+        );
+    }
+    #[test]
+    fn workflow_command_parses_subcommands() {
+        assert_eq!(
+            parse_line("/workflow"),
+            SlashAction::Workflow(String::new())
+        );
+        assert_eq!(
+            parse_line("/workflow cancel abc"),
+            SlashAction::Workflow("cancel abc".into())
+        );
+        assert_eq!(
+            builtin_slash_commands()
+                .iter()
+                .any(|c| c.name == "workflow"),
+            davinci_agent::tools::workflow_tools_enabled()
         );
     }
 }

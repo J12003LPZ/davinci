@@ -105,14 +105,7 @@ impl Agent {
         let spec_tokens = |tool: &crate::AgentTool| {
             tokens_of(serde_json::to_vec(tool).map_or(0, |bytes| bytes.len()))
         };
-        let schema_total = tokens_of(
-            serde_json::to_vec(&specs)
-                .map(|bytes| bytes.len())
-                .unwrap_or(0),
-        );
-        let tools_total = self
-            .provider_context_overhead_tokens()
-            .unwrap_or(schema_total);
+        let tools_total = self.estimated_tool_schema_tokens();
         let mut mcp_tools: Vec<ContextUsageItem> = specs
             .iter()
             .filter(|tool| tool.name.starts_with("mcp__"))

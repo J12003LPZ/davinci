@@ -147,11 +147,30 @@ pub fn configure_session_workflow_with_legacy_recovery(
                 )?;
         }
     }
-    let executor = Arc::new(davinci_agent::WorkflowExecutor::new(
-        runtime.clone(),
-        store,
-        runner,
-    ));
+    if runtime.worktree_manager.is_none() {
+        let cwd = session
+            .map(|s| std::path::PathBuf::from(&s.header.cwd))
+            .or_else(|| std::env::current_dir().ok());
+        if let Some(root) = cwd.and_then(|cwd| davinci_agent::runtime::worktree::git_toplevel(&cwd))
+        {
+            let manager = davinci_agent::runtime::WorktreeManager::new(
+                root,
+                std::env::temp_dir().join("davinci").join("worktrees"),
+            )
+            .with_bus(runtime.bus.clone());
+            runtime = runtime.with_worktree_manager(manager);
+        }
+    }
+    // The conversation's executor carries over (see
+    // `RuntimeHandle::with_session_state_from`); a new one is built only for
+    // a new conversation, so a background run stays listable and cancellable.
+    let executor = runtime.workflow_executor.clone().unwrap_or_else(|| {
+        Arc::new(davinci_agent::WorkflowExecutor::new(
+            runtime.clone(),
+            store,
+            runner,
+        ))
+    });
     Ok(runtime.with_workflow_executor(executor))
 }
 
@@ -937,6 +956,35 @@ mod tests {
     }
 
     #[test]
+    fn a_conversation_keeps_one_workflow_executor_across_prompts() {
+        // Each prompt builds a fresh handle; a background workflow started in
+        // one prompt must stay listable and cancellable in the next.
+        let dir = tempfile::tempdir().unwrap();
+        let store =
+            || davinci_agent::WorkflowStateStore::with_options(1024, dir.path().join("artifacts"));
+        let fresh = || {
+            davinci_agent::RuntimeHandle::new(
+                davinci_agent::RunId::new(),
+                davinci_agent::AgentId::new(),
+                davinci_agent::RuntimeBus::new(),
+            )
+        };
+        let first = configure_session_workflow(fresh(), None, None, store(), None).unwrap();
+        let second =
+            configure_session_workflow(fresh(), None, Some(&first), store(), None).unwrap();
+        assert!(Arc::ptr_eq(
+            first.workflow_executor.as_ref().unwrap(),
+            second.workflow_executor.as_ref().unwrap()
+        ));
+        assert_eq!(second.run_id, first.run_id);
+        let unrelated = configure_session_workflow(fresh(), None, None, store(), None).unwrap();
+        assert!(!Arc::ptr_eq(
+            first.workflow_executor.as_ref().unwrap(),
+            unrelated.workflow_executor.as_ref().unwrap()
+        ));
+    }
+
+    #[test]
     fn f03_same_session_turn_retains_tasks_and_lineage() {
         for switch_session in [false, true] {
             let dir = tempfile::tempdir().unwrap();
@@ -1098,6 +1146,7 @@ mod tests {
         }
         let dir = tempdir().unwrap();
         let mut agent = davinci_agent::Agent::new("fixture");
+        agent.async_agents_allowed = true;
         agent.session =
             Some(davinci_session::JsonlSession::create(dir.path(), "fixture", None).unwrap());
         let prepare = |agent: &davinci_agent::Agent, bus| {
@@ -1784,7 +1833,13 @@ mod tests {
         let lead_id = davinci_agent::AgentId::new();
         let handle = davinci_agent::RuntimeHandle::new(run_id, lead_id, bus);
 
-        let executor = davinci_agent::WorkflowExecutor::new(handle, store.clone(), None);
+        let executor = davinci_agent::WorkflowExecutor::new(
+            handle,
+            store.clone(),
+            Some(davinci_agent::SubagentRunner::new(|_| {
+                Ok("analyzed fixture".into())
+            })),
+        );
 
         let wf_id = davinci_agent::WorkflowId::new();
         let spec_json = r#"{

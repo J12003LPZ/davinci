@@ -45,6 +45,15 @@ const MUTATION_TOOLS: &[&str] = &[
     "agent",
 ];
 
+/// Tools every teammate gets so it can talk to the team and work the board.
+pub const TEAMMATE_TOOLS: &[&str] = &[
+    "agent_status",
+    "agent_message",
+    "task_list",
+    "task_get",
+    "task_update",
+];
+
 pub const SUBAGENT_OUTPUT_CAP: usize = 50 * 1024;
 
 /// Fan-out limits, from the reference extension
@@ -86,6 +95,21 @@ impl std::str::FromStr for AgentSpawnMode {
 }
 
 pub fn tool_parameters() -> Value {
+    tool_parameters_for(crate::tools::team_tools_enabled())
+}
+
+pub fn tool_parameters_for(teams_enabled: bool) -> Value {
+    let modes: Vec<&str> = if teams_enabled {
+        vec!["oneshot", "background", "teammate"]
+    } else {
+        vec!["oneshot", "background"]
+    };
+    let mode_description = if teams_enabled {
+        "Spawn mode: 'oneshot' (wait for the answer, default), 'background' (runs on; its result arrives later as an <agent-message>), or 'teammate' (persistent collaborator that idles between messages and reports every turn)"
+    } else {
+        "Spawn mode: 'oneshot' (wait for the answer, default) or 'background' (runs on; its result arrives later as an <agent-message>)"
+    };
+
     serde_json::json!({
         "type": "object",
         "properties": {
@@ -95,8 +119,8 @@ pub fn tool_parameters() -> Value {
             "agent": {"type": "string", "description": "Name of an agent profile from .davinci/agents/*.md or ~/.davinci/agent/agents/*.md"},
             "mode": {
                 "type": "string",
-                "enum": ["oneshot", "background", "teammate"],
-                "description": "Spawn mode: 'oneshot' (synchronous wait, default), 'background' (async worker), or 'teammate' (persistent collaborator)"
+                "enum": modes,
+                "description": mode_description
             },
             "model": {"type": "string", "description": "Optional model override in provider/model format"},
             "isolation": {
@@ -116,7 +140,7 @@ pub fn tool_parameters() -> Value {
                         "description": {"type": "string"},
                         "tools": {"type": "array", "items": {"type": "string"}},
                         "agent": {"type": "string"},
-                        "mode": {"type": "string", "enum": ["oneshot", "background", "teammate"]},
+                        "mode": {"type": "string", "enum": modes},
                         "model": {"type": "string"},
                         "isolation": {"type": "string", "enum": ["shared", "worktree"]},
                         "name": {"type": "string"}
@@ -189,8 +213,15 @@ Available agent profiles (pass one as `agent`):",
 
 #[derive(Debug, Clone, Default)]
 pub struct SubagentRequest {
+    /// Live progress for the lead's transcript; the host feeds it the
+    /// worker's own events.
+    pub progress: Option<crate::subagent_progress::ProgressReporter>,
+    /// Model-turn ceiling for this worker.
+    pub max_turns: Option<usize>,
     pub prompt: String,
     pub tools: Vec<String>,
+    /// Host-only ceiling for tools supplied by a named profile.
+    pub parent_tools: Option<Vec<String>>,
     pub description: Option<String>,
     /// The parent's current provider and model, so the worker follows a
     /// `/model` change or a restored session rather than the launch flags.
@@ -298,6 +329,16 @@ pub fn scoped_tools(requested: Option<&[String]>, parent: &[String]) -> Vec<Stri
 /// What the worker inherits from the parent turn.
 #[derive(Debug, Clone, Default)]
 pub struct SubagentParent {
+    /// The lead's event sink and the `agent` call being run, so worker
+    /// progress can be drawn under that call.
+    pub event_sink: Option<crate::EventSink>,
+    pub tool_call_id: Option<String>,
+    /// The host keeps running after this turn (interactive / RPC), so
+    /// background and teammate workers have somewhere to report.
+    pub allow_async: bool,
+    /// `DAVINCI_EXPERIMENTAL_AGENT_TEAMS` was set when the tool list was built.
+    pub teams_enabled: bool,
+
     pub provider: Option<String>,
     pub model_id: Option<String>,
     pub abort: Option<Arc<std::sync::atomic::AtomicBool>>,
@@ -325,6 +366,7 @@ struct TaskSpec {
 /// Rolls back workers that have not begun execution if preparing a batch fails.
 struct LaunchRollback<'a> {
     registry: Option<&'a RuntimeRegistry>,
+    team: Option<&'a crate::runtime::TeamRoster>,
     agents: Vec<AgentId>,
     leases: Vec<(WorktreeManager, WorktreeLease)>,
     operations: Vec<(AgentId, AgentOperationHandle)>,
@@ -332,9 +374,13 @@ struct LaunchRollback<'a> {
 }
 
 impl<'a> LaunchRollback<'a> {
-    fn new(registry: Option<&'a RuntimeRegistry>) -> Self {
+    fn new(
+        registry: Option<&'a RuntimeRegistry>,
+        team: Option<&'a crate::runtime::TeamRoster>,
+    ) -> Self {
         Self {
             registry,
+            team,
             agents: Vec::new(),
             leases: Vec::new(),
             operations: Vec::new(),
@@ -378,6 +424,10 @@ impl Drop for LaunchRollback<'_> {
         }
         if let Some(registry) = self.registry {
             for agent_id in &self.agents {
+                if let Some(team) = self.team {
+                    team.cancel(agent_id);
+                    team.forget(agent_id);
+                }
                 let _ = registry.transition(*agent_id, AgentState::Failed);
             }
         }
@@ -412,11 +462,15 @@ fn task_spec(input: &Value) -> Result<TaskSpec, ToolError> {
         .get("agent")
         .and_then(Value::as_str)
         .map(str::to_string);
-    let mode = input
-        .get("mode")
-        .and_then(Value::as_str)
-        .and_then(|s| s.parse::<AgentSpawnMode>().ok())
-        .unwrap_or(AgentSpawnMode::Oneshot);
+    let mode = match input.get("mode") {
+        None => AgentSpawnMode::Oneshot,
+        Some(Value::String(raw)) => raw.parse::<AgentSpawnMode>().map_err(|_| {
+            ToolError::Failed(format!(
+                "Unknown agent mode '{raw}'; use oneshot, background or teammate"
+            ))
+        })?,
+        Some(_) => return Err(ToolError::Failed("agent mode must be a string".into())),
+    };
     let model = input
         .get("model")
         .and_then(Value::as_str)
@@ -439,6 +493,28 @@ fn task_spec(input: &Value) -> Result<TaskSpec, ToolError> {
         isolation,
         name,
     })
+}
+
+/// The name a worker's row carries: its description, instance name, profile,
+/// or the start of its prompt.
+fn progress_label(spec: &TaskSpec) -> String {
+    let base = spec
+        .description
+        .clone()
+        .filter(|text| !text.trim().is_empty())
+        .or_else(|| spec.name.clone())
+        .unwrap_or_else(|| {
+            let prompt = spec.prompt.lines().next().unwrap_or("").trim();
+            let mut clipped: String = prompt.chars().take(48).collect();
+            if prompt.chars().count() > 48 {
+                clipped.push('…');
+            }
+            clipped
+        });
+    match &spec.agent {
+        Some(profile) if !base.starts_with(profile.as_str()) => format!("{profile}: {base}"),
+        _ => base,
+    }
 }
 
 fn cap_output(mut content: String, cap: usize) -> String {
@@ -487,6 +563,34 @@ pub fn run_tool(
         ));
     }
 
+    if async_count > 0 && !parent.allow_async {
+        return Err(ToolError::Failed(
+            "background and teammate agents need an interactive or RPC session; in --print mode use mode 'oneshot'".into(),
+        ));
+    }
+    if specs
+        .iter()
+        .any(|spec| spec.mode == AgentSpawnMode::Teammate)
+        && !parent.teams_enabled
+    {
+        return Err(ToolError::Failed(
+            "teammate mode is disabled; set DAVINCI_EXPERIMENTAL_AGENT_TEAMS=1 to enable agent teams".into(),
+        ));
+    }
+    if async_count > 0 {
+        if let Some(runtime) = &parent.runtime {
+            runtime.ensure_lead_registered(
+                parent.provider.as_deref().unwrap_or_default(),
+                parent.model_id.as_deref().unwrap_or_default(),
+                &std::env::current_dir().unwrap_or_default(),
+            );
+        }
+    }
+    if async_count > 0 && parent.runtime.is_none() {
+        return Err(ToolError::Failed(
+            "async agents require a session runtime".into(),
+        ));
+    }
     let is_parent_readonly = parent.permission_mode == Some(PermissionMode::ReadOnly);
     for spec in &specs {
         if is_parent_readonly {
@@ -509,10 +613,6 @@ pub fn run_tool(
         }
     }
 
-    let allow_mutation = matches!(
-        parent.permission_mode,
-        Some(PermissionMode::Edits | PermissionMode::Auto | PermissionMode::AlwaysApprove)
-    );
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as i64)
@@ -532,7 +632,8 @@ pub fn run_tool(
                     .and_then(|rt| rt.worktree_manager.clone())
             })
             .unwrap_or_else(|| {
-                let repo_root = std::env::current_dir().unwrap_or_default();
+                let cwd = std::env::current_dir().unwrap_or_default();
+                let repo_root = crate::runtime::worktree::git_toplevel(&cwd).unwrap_or(cwd);
                 let wt_root = std::env::temp_dir().join("davinci").join("worktrees");
                 let mut m = WorktreeManager::new(repo_root, wt_root);
                 if let Some(rt) = &parent.runtime {
@@ -545,19 +646,37 @@ pub fn run_tool(
         None
     };
 
-    let mut rollback =
-        LaunchRollback::new(parent.runtime.as_ref().map(|runtime| &runtime.registry));
+    let mut rollback = LaunchRollback::new(
+        parent.runtime.as_ref().map(|runtime| &runtime.registry),
+        parent.runtime.as_ref().map(|rt| &rt.team),
+    );
     let mut requests: Vec<SubagentRequest> = Vec::with_capacity(specs.len());
     let mut leases: Vec<Option<WorktreeLease>> = Vec::with_capacity(specs.len());
-    for spec in &specs {
+    let total = specs.len();
+    for (position, spec) in specs.iter().enumerate() {
         let child_agent_id = AgentId::new();
-        let child_token = parent.cancellation_token.as_ref().map(|p| p.child_token());
+        // Async workers outlive the lead's turn: their token comes from the
+        // session roster, so Esc on the lead does not kill them, while
+        // agent_stop and session shutdown still do.
+        let child_token = if spec.mode != AgentSpawnMode::Oneshot {
+            parent
+                .runtime
+                .as_ref()
+                .map(|rt| rt.team.admit(child_agent_id))
+        } else {
+            parent.cancellation_token.as_ref().map(|p| p.child_token())
+        };
+        rollback.track_agent(child_agent_id);
         let abort = child_token
             .as_ref()
             .map(|t| t.as_atomic_bool())
             .or_else(|| parent.abort.clone());
         let is_wt = spec.isolation.as_deref() == Some("worktree");
-        let allow_mut = allow_mutation || (is_wt && !is_parent_readonly);
+        // The host runs shared-workspace workers read-only unless a profile
+        // grants more (checked host-side), so only a worktree lease earns
+        // mutating tools here. Offering tools the worker cannot use wastes
+        // schema tokens and produces denials mid-task.
+        let allow_mut = is_wt && !is_parent_readonly;
         let fallback_registry;
         let capability_registry = if let Some(runtime) = &parent.runtime {
             &runtime.capability_registry
@@ -571,6 +690,16 @@ pub fn run_tool(
             allow_mut,
             capability_registry,
         );
+        let mut scoped = scoped;
+        if spec.mode == AgentSpawnMode::Teammate {
+            for tool in TEAMMATE_TOOLS {
+                if parent_tools.iter().any(|known| known == tool)
+                    && !scoped.iter().any(|have| have == tool)
+                {
+                    scoped.push((*tool).to_string());
+                }
+            }
+        }
 
         let mut lease_opt: Option<WorktreeLease> = None;
         if is_wt {
@@ -633,7 +762,6 @@ pub fn run_tool(
             rt.registry.register_agent(record).map_err(|error| {
                 ToolError::Failed(format!("failed to register subagent: {error}"))
             })?;
-            rollback.track_agent(child_agent_id);
             rt.registry
                 .transition(child_agent_id, AgentState::Running)
                 .map_err(|error| ToolError::Failed(format!("failed to start subagent: {error}")))?;
@@ -645,9 +773,23 @@ pub fn run_tool(
             .map(|runtime| runtime.for_worker(child_agent_id, child_token.clone()))
             .transpose()
             .map_err(ToolError::Failed)?;
+        let progress = match (&parent.event_sink, &parent.tool_call_id) {
+            (Some(sink), Some(call)) => Some(crate::subagent_progress::ProgressReporter::new(
+                call.clone(),
+                sink.clone(),
+                child_agent_id.to_string(),
+                progress_label(spec),
+                (position, total),
+                spec.mode.to_string(),
+            )),
+            _ => None,
+        };
         requests.push(SubagentRequest {
+            progress,
+            max_turns: None,
             prompt: spec.prompt.clone(),
             tools: scoped,
+            parent_tools: Some(parent_tools.to_vec()),
             description: spec.description.clone(),
             provider: parent.provider.clone(),
             model_id: parent.model_id.clone(),
@@ -709,6 +851,11 @@ pub fn run_tool(
         vec![None; requests.len()]
     };
 
+    for request in &requests {
+        if let Some(progress) = &request.progress {
+            progress.started();
+        }
+    }
     let any_async = requests.iter().any(|r| r.mode != AgentSpawnMode::Oneshot);
     if any_async {
         let mut launched_ids = Vec::new();
@@ -732,17 +879,33 @@ pub fn run_tool(
                     }
                     let outcome =
                         run_journaled_subagent(&req_clone, &runner_clone, operation.as_ref());
-                    if let Some(rt) = &rt_clone {
-                        let next_state = match &outcome {
-                            Ok(_) => AgentState::Completed,
-                            Err(_) => AgentState::Failed,
-                        };
-                        let _ = rt.registry.transition(cid, next_state);
+                    if let Some(progress) = &req_clone.progress {
+                        progress.finish(outcome.is_ok());
                     }
+                    let mut preserved = None;
                     if let (Some(mgr), Some(lease)) = (wt_mgr_clone, lease_opt) {
-                        if outcome.is_ok() {
+                        let keep = outcome.is_err() || mgr.is_dirty(&lease);
+                        if keep {
+                            preserved = Some(format!(
+                                "worktree kept: {} (branch {})",
+                                lease.path.display(),
+                                lease.branch
+                            ));
+                        } else {
                             let _ = mgr.release_lease(&lease, false);
                         }
+                    }
+                    if let Some(worker) = &req_clone.runtime {
+                        report_async_outcome(
+                            worker,
+                            req_clone.mode,
+                            &outcome,
+                            preserved.as_deref(),
+                        );
+                    }
+                    if let Some(rt) = &rt_clone {
+                        crate::runtime::team::finish_agent(&rt.registry, cid, outcome.is_ok());
+                        rt.team.forget(&cid);
                     }
                 })
                 .map_err(|e| {
@@ -765,6 +928,9 @@ pub fn run_tool(
                 return Err(ToolError::Failed(
                     "background agent thread exited before launch".into(),
                 ));
+            }
+            if let Some(progress) = &req.progress {
+                progress.backgrounded();
             }
             launched_ids.push(cid);
         }
@@ -815,6 +981,9 @@ pub fn run_tool(
         rollback.commit();
         let aid = requests[0].runtime_agent_id.unwrap_or_default();
         let outcome = run_journaled_subagent(&requests[0], runner, child_operations[0].as_ref());
+        if let Some(progress) = &requests[0].progress {
+            progress.finish(outcome.is_ok());
+        }
         if let Some(rt) = &parent.runtime {
             let next = match &outcome {
                 Ok(_) => AgentState::Completed,
@@ -822,18 +991,43 @@ pub fn run_tool(
             };
             let _ = rt.registry.transition(aid, next);
         }
+        let mut worktree_note = None;
         if let (Some(mgr), Some(lease)) = (&wt_manager, &leases[0]) {
-            if outcome.is_ok() {
+            if outcome.is_ok() && !mgr.is_dirty(lease) {
                 let _ = mgr.release_lease(lease, false);
+            } else {
+                worktree_note = Some(serde_json::json!({
+                    "path": lease.path.display().to_string(),
+                    "branch": lease.branch,
+                    "preserved": true,
+                }));
             }
         }
-        let text = outcome.map_err(ToolError::Failed)?;
+        let text = outcome.map_err(|error| {
+            ToolError::Failed(match &worktree_note {
+                Some(note) => format!(
+                    "{error}\nworktree kept: {} (branch {})",
+                    note["path"].as_str().unwrap_or_default(),
+                    note["branch"].as_str().unwrap_or_default()
+                ),
+                None => error,
+            })
+        })?;
+        let mut content = cap_output(text, SUBAGENT_OUTPUT_CAP);
+        if let Some(note) = &worktree_note {
+            content.push_str(&format!(
+                "\n\nWorker changes are in worktree {} on branch {}. Review and merge them; the worktree is kept until then.",
+                note["path"].as_str().unwrap_or_default(),
+                note["branch"].as_str().unwrap_or_default()
+            ));
+        }
         return Ok(ToolResult {
-            content: cap_output(text, SUBAGENT_OUTPUT_CAP),
+            content,
             is_error: false,
             details: Some(serde_json::json!({
                 "agentId": aid.to_string(),
                 "mode": "oneshot",
+                "worktree": worktree_note,
                 "status": "completed"
             })),
         });
@@ -867,6 +1061,11 @@ pub fn run_tool(
         parent_abort.as_deref(),
         |_| {},
     );
+    for (index, request) in requests.iter().enumerate() {
+        if let Some(progress) = &request.progress {
+            progress.finish(matches!(outcomes.get(index), Some(Ok(_))));
+        }
+    }
     if let Some(rt) = &parent.runtime {
         for (index, req) in requests.iter().enumerate() {
             if let Some(aid) = req.runtime_agent_id {
@@ -878,11 +1077,20 @@ pub fn run_tool(
             }
         }
     }
+    let mut notes = vec![None; requests.len()];
     if let Some(mgr) = &wt_manager {
         for (index, lease_opt) in leases.iter().enumerate() {
             if let Some(lease) = lease_opt {
-                if matches!(outcomes.get(index), Some(Ok(_))) {
-                    let _ = mgr.release_lease(lease, false);
+                if matches!(outcomes.get(index), Some(Ok(_))) && !mgr.is_dirty(lease) {
+                    if let Err(error) = mgr.release_lease(lease, false) {
+                        notes[index] = Some(
+                            serde_json::json!({"path": lease.path, "branch": lease.branch, "preserved": true, "cleanup_error": error.to_string()}),
+                        );
+                    }
+                } else {
+                    notes[index] = Some(
+                        serde_json::json!({"path": lease.path, "branch": lease.branch, "preserved": true}),
+                    );
                 }
             }
         }
@@ -895,7 +1103,7 @@ pub fn run_tool(
             .description
             .clone()
             .unwrap_or_else(|| format!("task {}", index + 1));
-        let body = match outcomes.get(index) {
+        let mut body = match outcomes.get(index) {
             Some(Ok(text)) => cap_output(text.clone(), per_task_cap),
             Some(Err(err)) => {
                 failures += 1;
@@ -906,6 +1114,13 @@ pub fn run_tool(
                 "(not run: interrupted)".to_string()
             }
         };
+        if let Some(note) = &notes[index] {
+            body.push_str(&format!(
+                "\n\nworktree kept: {} (branch {}). Review and merge manually.",
+                note["path"].as_str().unwrap_or_default(),
+                note["branch"].as_str().unwrap_or_default()
+            ));
+        }
         sections.push(format!("## {} — {title}\n{body}", index + 1));
     }
     if failures == requests.len() {
@@ -921,8 +1136,45 @@ pub fn run_tool(
         details: Some(serde_json::json!({
             "tasks": requests.len(),
             "failed": failures,
+            "worktrees": notes,
+            "agentIds": requests.iter().filter_map(|r| r.runtime_agent_id).map(|id| id.to_string()).collect::<Vec<_>>(),
         })),
     })
+}
+
+/// The lead hears once how an async worker ended.
+///
+/// A background worker reports its single result. A teammate has already
+/// reported every turn from its loop, so its exit is one `stopped` notice
+/// (the host's exit note, or the error it left on). A teammate that failed
+/// before its loop ran (host construction, a panic) never reported, so its
+/// failure is reported as a failure, not as a departure.
+fn report_async_outcome(
+    worker: &RuntimeHandle,
+    mode: AgentSpawnMode,
+    outcome: &Result<String, String>,
+    worktree_note: Option<&str>,
+) {
+    use crate::runtime::team::{report_status_to_lead, report_to_lead};
+    match mode {
+        AgentSpawnMode::Background | AgentSpawnMode::Oneshot => {
+            report_to_lead(worker, outcome, worktree_note)
+        }
+        AgentSpawnMode::Teammate => {
+            let reported = worker.team.report_count(&worker.agent_id) > 0;
+            match outcome {
+                Err(_) if !reported => report_to_lead(worker, outcome, worktree_note),
+                Ok(note) | Err(note) => {
+                    let body = if note.trim().is_empty() {
+                        "left the team"
+                    } else {
+                        note.as_str()
+                    };
+                    report_status_to_lead(worker, "stopped", body, worktree_note)
+                }
+            }
+        }
+    }
 }
 
 fn run_journaled_subagent(
@@ -930,18 +1182,21 @@ fn run_journaled_subagent(
     runner: &SubagentRunner,
     operation: Option<&AgentOperationHandle>,
 ) -> Result<String, String> {
-    let run = || match runner.run(request) {
-        Ok(content) => ToolResult {
-            content,
-            is_error: false,
-            details: None,
-        },
-        Err(error) => ToolResult {
-            content: error,
-            is_error: true,
-            details: None,
-        },
-    };
+    let run =
+        || match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| runner.run(request)))
+            .unwrap_or_else(|_| Err("subagent runner panicked".into()))
+        {
+            Ok(content) => ToolResult {
+                content,
+                is_error: false,
+                details: None,
+            },
+            Err(error) => ToolResult {
+                content: error,
+                is_error: true,
+                details: None,
+            },
+        };
     let result = if let Some(operation) = operation {
         operation
             .execute(
@@ -1026,6 +1281,8 @@ mod tests {
                 Some(&runner),
                 &SubagentParent {
                     runtime: Some(parent.clone()),
+                    allow_async: true,
+                    teams_enabled: true,
                     ..Default::default()
                 },
             )
@@ -1519,6 +1776,7 @@ mod tests {
 
         let parent = SubagentParent {
             runtime: Some(handle.clone()),
+            allow_async: true,
             agent_id: Some(handle.agent_id),
             ..SubagentParent::default()
         };
@@ -1548,6 +1806,107 @@ mod tests {
         assert!(executed.load(std::sync::atomic::Ordering::SeqCst));
         let record_after = handle.registry.get(&aid).expect("record exists");
         assert_eq!(record_after.state, AgentState::Completed);
+    }
+
+    #[test]
+    fn fan_out_worktree_notes_name_paths_verbatim() {
+        let repo = init_subagent_temp_git_repo();
+        let worktrees = tempfile::tempdir().unwrap();
+        let manager = WorktreeManager::new(repo.path(), worktrees.path());
+        let runner = SubagentRunner::new(|req| {
+            std::fs::write(req.worktree_path.as_ref().unwrap().join("kept.txt"), "x").unwrap();
+            Ok("edited".into())
+        });
+        let result = run_tool(
+            &json!({"tasks": [
+                {"prompt": "a", "isolation": "worktree", "tools": ["write"]},
+                {"prompt": "b", "isolation": "worktree", "tools": ["write"]}
+            ]}),
+            &["write".into()],
+            Some(&runner),
+            &SubagentParent {
+                worktree_manager: Some(manager),
+                permission_mode: Some(PermissionMode::Edits),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let details = result.details.unwrap();
+        for note in details["worktrees"].as_array().unwrap() {
+            let path = note["path"].as_str().unwrap();
+            // A JSON-rendered value would be quoted (and doubled backslashes
+            // on Windows); the reader must see the path it can open.
+            assert!(result
+                .content
+                .contains(&format!("worktree kept: {path} (branch")));
+            assert!(!result.content.contains(&format!("\"{path}")));
+        }
+    }
+
+    #[test]
+    fn workers_report_progress_under_the_parent_call() {
+        use crate::subagent_progress::SubagentProgressState as P;
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let store = seen.clone();
+        let sink = crate::EventSink(Arc::new(move |event: &crate::AgentEvent| {
+            if let crate::AgentEvent::SubagentProgress {
+                tool_call_id,
+                progress,
+            } = event
+            {
+                store
+                    .lock()
+                    .unwrap()
+                    .push((tool_call_id.clone(), progress.index, progress.state));
+            }
+        }));
+        let runner = SubagentRunner::new(|req| {
+            if req.prompt == "b" {
+                Err("down".into())
+            } else {
+                Ok("ok".into())
+            }
+        });
+        let mut parent = parent_with_runtime(PermissionMode::Ask);
+        parent.event_sink = Some(sink);
+        parent.tool_call_id = Some("call-7".into());
+        run_tool(
+            &json!({"tasks": [{"prompt": "a", "description": "first"}, {"prompt": "b"}]}),
+            &["read".into()],
+            Some(&runner),
+            &parent,
+        )
+        .unwrap();
+        let events = seen.lock().unwrap().clone();
+        assert!(events.iter().all(|(call, _, _)| call == "call-7"));
+        assert!(events.contains(&("call-7".into(), 0, P::Running)));
+        assert!(events.contains(&("call-7".into(), 1, P::Running)));
+        assert!(events.contains(&("call-7".into(), 0, P::Done)));
+        assert!(events.contains(&("call-7".into(), 1, P::Failed)));
+
+        seen.lock().unwrap().clear();
+        run_tool(
+            &json!({"prompt": "c", "mode": "background"}),
+            &["read".into()],
+            Some(&runner),
+            &parent,
+        )
+        .unwrap();
+        let start = std::time::Instant::now();
+        while !seen
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|(_, _, state)| *state == P::Done)
+        {
+            assert!(start.elapsed() < std::time::Duration::from_secs(5));
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(seen
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|(_, _, state)| *state == P::Background));
     }
 
     fn init_subagent_temp_git_repo() -> tempfile::TempDir {
@@ -1742,7 +2101,7 @@ mod tests {
         }
 
         {
-            let mut rollback = LaunchRollback::new(Some(&runtime.registry));
+            let mut rollback = LaunchRollback::new(Some(&runtime.registry), Some(&runtime.team));
             rollback.track_agent(started_id);
             rollback.track_lease(started_manager.clone(), started_lease.clone());
             rollback.track_agent(unstarted_id);
@@ -1829,7 +2188,7 @@ mod tests {
         assert_eq!(runtime.unresolved_child_operations().unwrap().len(), 1);
 
         {
-            let mut rollback = LaunchRollback::new(Some(&runtime.registry));
+            let mut rollback = LaunchRollback::new(Some(&runtime.registry), Some(&runtime.team));
             rollback.track_operation(child_id, operation);
         }
 
@@ -1888,6 +2247,43 @@ mod tests {
         assert_eq!(record.worktree, Some(captured.clone()));
         assert_eq!(record.cwd, captured);
         assert_eq!(record.state, AgentState::Completed);
+    }
+
+    #[test]
+    fn oneshot_worktree_changes_are_reported() {
+        let repo = init_subagent_temp_git_repo();
+        let worktrees = tempfile::tempdir().unwrap();
+        let manager = WorktreeManager::new(repo.path(), worktrees.path());
+        let runner = SubagentRunner::new(|req| {
+            std::fs::write(
+                req.worktree_path.as_ref().unwrap().join("change.txt"),
+                "kept",
+            )
+            .unwrap();
+            Ok("edited".into())
+        });
+        let result = run_tool(
+            &json!({"prompt":"edit", "isolation":"worktree", "tools":["write"]}),
+            &["write".into()],
+            Some(&runner),
+            &SubagentParent {
+                worktree_manager: Some(manager),
+                permission_mode: Some(PermissionMode::Edits),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let details = result.details.unwrap();
+        let kept = &details["worktree"];
+        assert_eq!(kept["preserved"], true);
+        let path = kept["path"].as_str().unwrap();
+        let branch = kept["branch"].as_str().unwrap();
+        assert_eq!(
+            std::fs::read_to_string(PathBuf::from(path).join("change.txt")).unwrap(),
+            "kept"
+        );
+        assert!(result.content.contains(path));
+        assert!(result.content.contains(branch));
     }
 
     #[test]
@@ -1983,5 +2379,179 @@ mod tests {
         let wt_path = created_path.lock().unwrap().clone().expect("captured path");
         // Failed worktree must be preserved for inspection
         assert!(wt_path.exists());
+    }
+    fn parent_with_runtime(mode: PermissionMode) -> SubagentParent {
+        let runtime = crate::runtime::RuntimeHandle::new(
+            crate::runtime::RunId::new(),
+            AgentId::new(),
+            crate::runtime::RuntimeBus::new(),
+        );
+        SubagentParent {
+            provider: Some("p".into()),
+            model_id: Some("m".into()),
+            runtime: Some(runtime),
+            permission_mode: Some(mode),
+            allow_async: true,
+            teams_enabled: true,
+            ..SubagentParent::default()
+        }
+    }
+
+    #[test]
+    fn unknown_mode_is_an_error_not_oneshot() {
+        let runner = SubagentRunner::new(|_| Ok("ran".into()));
+        let err = run_tool(
+            &json!({"prompt": "x", "mode": "persistent-ish"}),
+            &["read".into()],
+            Some(&runner),
+            &parent_with_runtime(PermissionMode::Ask),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("Unknown agent mode"));
+    }
+
+    #[test]
+    fn async_modes_are_rejected_when_the_host_cannot_keep_them() {
+        let runner = SubagentRunner::new(|_| Ok("ran".into()));
+        let mut parent = parent_with_runtime(PermissionMode::Ask);
+        parent.allow_async = false;
+        let err = run_tool(
+            &json!({"prompt": "x", "mode": "background"}),
+            &["read".into()],
+            Some(&runner),
+            &parent,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("interactive or RPC"));
+    }
+
+    #[test]
+    fn teammate_requires_the_team_flag() {
+        let runner = SubagentRunner::new(|_| Ok("ran".into()));
+        let mut parent = parent_with_runtime(PermissionMode::Ask);
+        parent.teams_enabled = false;
+        let err = run_tool(
+            &json!({"prompt": "x", "mode": "teammate"}),
+            &["read".into()],
+            Some(&runner),
+            &parent,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("DAVINCI_EXPERIMENTAL_AGENT_TEAMS"));
+    }
+
+    #[test]
+    fn background_result_is_reported_to_the_lead() {
+        let runner = SubagentRunner::new(|_| Ok("background answer".into()));
+        let parent = parent_with_runtime(PermissionMode::Ask);
+        let lead = parent.runtime.clone().unwrap();
+        let result = run_tool(
+            &json!({"prompt": "x", "mode": "background", "name": "bg"}),
+            &["read".into()],
+            Some(&runner),
+            &parent,
+        )
+        .unwrap();
+        assert!(!result.is_error);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while lead.mailbox.pending_count(&lead.agent_id) == 0 {
+            assert!(std::time::Instant::now() < deadline, "no report");
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let reports = lead.take_labeled_messages(10);
+        assert!(reports[0].contains("from=\"bg\""));
+        assert!(reports[0].contains("background answer"));
+    }
+
+    #[test]
+    fn async_workers_survive_the_parent_turn_token() {
+        let (tx, rx) = std::sync::mpsc::channel::<bool>();
+        let runner = SubagentRunner::new(move |req| {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            let _ = tx.send(
+                req.cancellation_token
+                    .as_ref()
+                    .is_some_and(|t| t.is_cancelled()),
+            );
+            Ok("done".into())
+        });
+        let mut parent = parent_with_runtime(PermissionMode::Ask);
+        let turn_token = crate::runtime::CancellationToken::new();
+        parent.cancellation_token = Some(turn_token.clone());
+        run_tool(
+            &json!({"prompt": "x", "mode": "background"}),
+            &["read".into()],
+            Some(&runner),
+            &parent,
+        )
+        .unwrap();
+        turn_token.cancel();
+        assert!(!rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap());
+    }
+
+    #[test]
+    fn shared_workers_do_not_receive_tools_their_mode_denies() {
+        let parent_tools: Vec<String> = ["read", "grep", "write", "edit", "bash"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let (tx, rx) = std::sync::mpsc::channel::<Vec<String>>();
+        let runner = SubagentRunner::new(move |req| {
+            let _ = tx.send(req.tools.clone());
+            Ok("ok".into())
+        });
+        run_tool(
+            &json!({"prompt": "x", "tools": ["read", "write", "bash"]}),
+            &parent_tools,
+            Some(&runner),
+            &parent_with_runtime(PermissionMode::Edits),
+        )
+        .unwrap();
+        assert_eq!(rx.recv().unwrap(), vec!["read".to_string()]);
+    }
+
+    #[test]
+    fn teammates_get_team_tools_even_when_not_requested() {
+        let parent_tools: Vec<String> = [
+            "read",
+            "agent_status",
+            "agent_message",
+            "task_list",
+            "task_get",
+            "task_update",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        let (tx, rx) = std::sync::mpsc::channel::<Vec<String>>();
+        let runner = SubagentRunner::new(move |req| {
+            let _ = tx.send(req.tools.clone());
+            Ok("ok".into())
+        });
+        run_tool(
+            &json!({"prompt": "x", "mode": "teammate", "tools": ["read"]}),
+            &parent_tools,
+            Some(&runner),
+            &parent_with_runtime(PermissionMode::Ask),
+        )
+        .unwrap();
+        let tools = rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
+        for expected in TEAMMATE_TOOLS {
+            assert!(tools.iter().any(|t| t == expected), "missing {expected}");
+        }
+    }
+
+    #[test]
+    fn schema_hides_teammate_when_teams_are_off() {
+        let off = tool_parameters_for(false);
+        assert_eq!(
+            off.pointer("/properties/mode/enum").unwrap(),
+            &json!(["oneshot", "background"])
+        );
+        let on = tool_parameters_for(true);
+        assert_eq!(
+            on.pointer("/properties/mode/enum").unwrap(),
+            &json!(["oneshot", "background", "teammate"])
+        );
     }
 }

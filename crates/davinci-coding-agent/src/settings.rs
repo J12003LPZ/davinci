@@ -335,6 +335,25 @@ pub struct Settings {
     /// session). No TypeScript counterpart.
     #[serde(default, rename = "showToolOutput")]
     pub show_tool_output: Option<bool>,
+    /// Dynamic workflows (`workflow_run`), like Claude Code's `/config`
+    /// "Dynamic workflows" row. `DAVINCI_EXPERIMENTAL_WORKFLOWS` overrides.
+    /// No TypeScript counterpart.
+    #[serde(default, rename = "dynamicWorkflows")]
+    pub dynamic_workflows: Option<bool>,
+    /// Claude Code's `workflowSizeGuideline`: unrestricted | small | medium |
+    /// large. No TypeScript counterpart.
+    #[serde(default, rename = "workflowSizeGuideline")]
+    pub workflow_size_guideline: Option<String>,
+    /// Workflow agents running at once, 1-256 (Claude Code:
+    /// `CLAUDE_CODE_WORKFLOW_MAX_CONCURRENT_AGENTS`).
+    /// `DAVINCI_WORKFLOW_MAX_CONCURRENT_AGENTS` overrides. No TypeScript
+    /// counterpart.
+    #[serde(default, rename = "workflowMaxConcurrentAgents")]
+    pub workflow_max_concurrent_agents: Option<u64>,
+    /// Agent teams (persistent teammates). `DAVINCI_EXPERIMENTAL_AGENT_TEAMS`
+    /// overrides. No TypeScript counterpart.
+    #[serde(default, rename = "agentTeams")]
+    pub agent_teams: Option<bool>,
     /// `web_search` provider keys. No TypeScript counterpart.
     #[serde(default, rename = "webSearch")]
     pub web_search: Option<WebSearchSettings>,
@@ -1656,6 +1675,32 @@ pub fn to_interactive_config(
             Some(levels) if !levels.is_empty() => format!("{} overrides", levels.len()),
             _ => "none".into(),
         },
+        dynamic_workflows: settings.dynamic_workflows.unwrap_or(false),
+        workflow_size: settings
+            .workflow_settings(None)
+            .size_guideline
+            .as_str()
+            .to_string(),
+        workflow_max_concurrent: settings
+            .workflow_settings(None)
+            .max_concurrent_agents
+            .to_string(),
+        agent_teams: settings.agent_teams.unwrap_or(false),
+    }
+}
+
+impl Settings {
+    /// Workflow sizing from these settings; `env_concurrency` is the
+    /// `DAVINCI_WORKFLOW_MAX_CONCURRENT_AGENTS` value, which wins.
+    pub fn workflow_settings(
+        &self,
+        env_concurrency: Option<&str>,
+    ) -> davinci_agent::runtime::WorkflowSettings {
+        davinci_agent::runtime::WorkflowSettings::resolve(
+            self.workflow_size_guideline.as_deref(),
+            self.workflow_max_concurrent_agents,
+            env_concurrency,
+        )
     }
 }
 

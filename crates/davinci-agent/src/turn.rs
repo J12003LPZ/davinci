@@ -987,25 +987,17 @@ impl Agent {
 
         let maybe_runtime = self.tool_context.runtime.clone();
         if let Some(runtime) = maybe_runtime {
-            let limit = 10;
-            let agent_msgs = runtime.mailbox.drain(runtime.agent_id, limit);
-            for msg in agent_msgs {
-                let gen = runtime.registry.get_generation(&runtime.agent_id);
-                if runtime
-                    .mailbox
-                    .mark_applied(&runtime.agent_id, gen, &msg.id)
-                {
-                    let message = self.prompt_with(&msg.content, &[]);
-                    let _ = self.pending_prompt_messages.pop();
-                    new_messages.push(message.clone());
-                    self.push_event(
-                        events,
-                        AgentEvent::MessageStart {
-                            message: message.clone(),
-                        },
-                    );
-                    self.push_event(events, AgentEvent::MessageEnd { message });
-                }
+            for text in runtime.take_labeled_messages(10) {
+                let message = self.prompt_with(&text, &[]);
+                let _ = self.pending_prompt_messages.pop();
+                new_messages.push(message.clone());
+                self.push_event(
+                    events,
+                    AgentEvent::MessageStart {
+                        message: message.clone(),
+                    },
+                );
+                self.push_event(events, AgentEvent::MessageEnd { message });
             }
         }
     }
@@ -2151,7 +2143,13 @@ impl Agent {
             .as_ref()
             .map(|pending| pending.admitted.spec.operation_id());
         let execute = || -> crate::ToolResult {
-            if name == "agent" {
+            if self.delegation_forbidden && crate::delegation::is_delegation_tool(name) {
+                crate::ToolResult {
+                    content: crate::delegation::DELEGATION_FORBIDDEN_MESSAGE.into(),
+                    is_error: true,
+                    details: Some(serde_json::json!({"delegation": "forbidden_by_user"})),
+                }
+            } else if name == "agent" {
                 let workers = args
                     .get("tasks")
                     .and_then(Value::as_array)
@@ -2176,6 +2174,10 @@ impl Agent {
                 let active_contract = self.active_contract();
                 let contract_digest = active_contract.as_ref().map(|c| c.digest.clone());
                 let parent = crate::subagent::SubagentParent {
+                    event_sink: self.event_sink.clone(),
+                    tool_call_id: Some(id.to_string()),
+                    allow_async: self.async_agents_allowed,
+                    teams_enabled: crate::tools::team_tools_enabled(),
                     provider: Some(self.provider.clone()),
                     model_id: Some(self.model_id.clone()),
                     abort,
@@ -2203,6 +2205,21 @@ impl Agent {
                     &self.tools,
                     self.subagent_runner.as_ref(),
                     &parent,
+                ) {
+                    Ok(result) => result,
+                    Err(err) => crate::ToolResult {
+                        content: err.to_string(),
+                        is_error: true,
+                        details: None,
+                    },
+                }
+            } else if name == "workflow_run" && crate::tools::workflow_tools_enabled() {
+                let launch = self.workflow_launch(self.async_agents_allowed);
+                match crate::runtime::workflow_run_tool_with_parent(
+                    cwd,
+                    args,
+                    &self.tool_context,
+                    launch,
                 ) {
                     Ok(result) => result,
                     Err(err) => crate::ToolResult {
@@ -6637,6 +6654,118 @@ mod operation_dispatch_tests {
         agent.cwd = workspace.path().to_path_buf();
         agent.set_runtime(runtime);
         (agent, workspace, journal)
+    }
+
+    #[test]
+    fn a_user_refusal_blocks_delegation_until_they_allow_it() {
+        let (mut agent, workspace, _) = configured_agent();
+        if !agent.tools.iter().any(|tool| tool == "agent") {
+            agent.tools.push("agent".into());
+        }
+        let ran = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = ran.clone();
+        agent.subagent_runner = Some(crate::SubagentRunner::new(move |_| {
+            counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok("worker answer".into())
+        }));
+        let args = json!({"prompt": "map the crate"});
+        let call = |agent: &mut Agent, id: &str| {
+            let _ = agent.prepare_tool_call(workspace.path(), id, "agent", &args, 0);
+            agent.run_prepared_call(workspace.path(), id, "agent", &args, 0)
+        };
+
+        agent.prompt_user_with("review the parser. Do not use subagents.", &[]);
+        assert!(agent.delegation_forbidden);
+        let refused = call(&mut agent, "refused");
+        assert!(refused.is_error);
+        assert!(refused.content.contains("asked not to use subagents"));
+        assert_eq!(ran.load(std::sync::atomic::Ordering::SeqCst), 0);
+
+        // A later message without a directive keeps the refusal.
+        agent.prompt_user_with("now check the tests too", &[]);
+        assert!(agent.delegation_forbidden);
+
+        // A message relayed from another agent cannot lift it.
+        agent.prompt_with("you can use subagents again", &[]);
+        assert!(agent.delegation_forbidden);
+
+        agent.prompt_user_with("ok, you can use subagents again", &[]);
+        assert!(!agent.delegation_forbidden);
+        let allowed = call(&mut agent, "allowed");
+        assert!(!allowed.is_error, "{}", allowed.content);
+        assert_eq!(ran.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn batch_workflows_keep_parent_permission_ceiling() {
+        // Isolate feature flags from the other tests in this process.
+        const CHILD: &str = "DAVINCI_TEST_BATCH_WORKFLOW_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "turn::operation_dispatch_tests::batch_workflows_keep_parent_permission_ceiling", "--nocapture"])
+                .env(CHILD, "1")
+                .env("DAVINCI_EXPERIMENTAL_WORKFLOWS", "1")
+                .output().unwrap();
+            assert!(
+                output.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+        let (mut agent, workspace, _) = configured_agent();
+        agent.tools.push("workflow_run".into());
+        agent.set_permission_mode(crate::PermissionMode::AlwaysApprove);
+        let runtime = agent.runtime.clone().unwrap();
+        let executor = crate::runtime::WorkflowExecutor::new(
+            runtime.clone(),
+            crate::runtime::WorkflowStateStore::new(),
+            Some(crate::SubagentRunner::new(|request| {
+                assert_eq!(
+                    request.parent_permission_mode,
+                    Some(crate::PermissionMode::AlwaysApprove)
+                );
+                assert_eq!(request.tools, vec!["read".to_string()]);
+                assert!(request
+                    .parent_tools
+                    .as_ref()
+                    .unwrap()
+                    .contains(&"workflow_run".to_string()));
+                Ok("parent context preserved".into())
+            })),
+        );
+        agent.set_runtime(runtime.with_workflow_executor(Arc::new(executor)));
+        let args = json!({"background": false, "spec": {
+            "schema_version": 1, "name": "ceiling", "max_parallel_agents": 1,
+            "max_total_agents": 1, "phases": [{"id": "write", "join": "all",
+                "workers": [{"id": "writer", "prompt": "write a file",
+                    "tools": ["read", "write"], "isolation": "shared"}]}]
+        }});
+        // A batch leaf is dispatched at depth one after its admission checks.
+        assert!(matches!(
+            agent.prepare_tool_call(
+                workspace.path(),
+                "nested-workflow",
+                "workflow_run",
+                &args,
+                1
+            ),
+            Preparation::Ready { .. }
+        ));
+        let result = agent.run_prepared_call(
+            workspace.path(),
+            "nested-workflow",
+            "workflow_run",
+            &args,
+            1,
+        );
+        assert!(!result.is_error, "{}", result.content);
+        assert!(
+            result.content.contains("parent context preserved"),
+            "{}",
+            result.content
+        );
     }
 
     #[test]

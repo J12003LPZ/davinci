@@ -752,6 +752,29 @@ fn context_budget_counts_system_and_active_tool_schemas() {
 }
 
 #[test]
+fn a_host_schema_estimator_counts_tools_like_the_rest_of_the_estimate() {
+    // Hosts register a byte-ceiling estimator for admission; the compaction
+    // estimate must still weigh the schemas at four bytes a token.
+    let mut agent = Agent::new("");
+    let schema_bytes = serde_json::to_vec(&agent.provider_tool_specs())
+        .unwrap()
+        .len() as u64;
+    let heuristic = agent.estimated_context_tokens();
+    agent.set_provider_context_overhead_estimator(|agent| {
+        serde_json::to_vec(&agent.provider_tool_specs())
+            .unwrap()
+            .len() as u64
+            + 128
+    });
+    assert_eq!(
+        agent.estimated_context_tokens(),
+        heuristic - schema_bytes.div_ceil(4) + (schema_bytes + 128).div_ceil(4)
+    );
+    // The admission budget keeps its conservative byte ceiling.
+    assert_eq!(agent.provider_context_budget().tools, schema_bytes + 128);
+}
+
+#[test]
 fn context_budget_counts_only_provider_visible_tool_schemas() {
     let agent = Agent::new("");
     let provider_schema_tokens = (serde_json::to_vec(&agent.provider_tool_specs())
@@ -4247,4 +4270,73 @@ fn tool_name_scripted_aliases_need_no_recovery_request() {
         assert!(tool_outcomes(&outcome).iter().all(|(_, error, _)| !error));
         assert!(format!("{:?}", agent.messages).contains("functions."));
     }
+}
+
+#[test]
+fn switching_runs_shuts_down_the_previous_team() {
+    use crate::runtime::{AgentId, RunId, RuntimeBus, RuntimeHandle};
+    let mut agent = crate::Agent::new_builtin(crate::PromptProfile::Stable);
+    let first = RuntimeHandle::new(RunId::new(), AgentId::new(), RuntimeBus::new());
+    let token = first.team.admit(AgentId::new());
+    agent.set_runtime(first);
+    agent.set_runtime(RuntimeHandle::new(
+        RunId::new(),
+        AgentId::new(),
+        RuntimeBus::new(),
+    ));
+    assert!(token.is_cancelled());
+}
+
+#[test]
+fn a_session_less_conversation_continues_its_runtime_and_team() {
+    use crate::runtime::{AgentId, RunId, RuntimeBus, RuntimeHandle};
+    let mut agent = crate::Agent::new_builtin(crate::PromptProfile::Stable);
+    assert!(agent.session.is_none());
+    assert!(agent.runtime_for_next_prompt().is_none());
+    let first = RuntimeHandle::new(RunId::new(), AgentId::new(), RuntimeBus::new());
+    let teammate = first.team.admit(AgentId::new());
+    agent.set_runtime(first.clone());
+    let previous = agent
+        .runtime_for_next_prompt()
+        .expect("--no-session keeps the previous prompt's runtime");
+    assert_eq!(previous.run_id, first.run_id);
+    // The host builds the next prompt's handle from it, as main.rs does.
+    let next = RuntimeHandle::new(RunId::new(), AgentId::new(), RuntimeBus::new())
+        .with_session_state_from(previous);
+    assert_eq!(next.run_id, first.run_id);
+    agent.set_runtime(next);
+    assert!(
+        !teammate.is_cancelled(),
+        "the next prompt must not shut the team down"
+    );
+}
+
+#[test]
+fn a_nested_worker_runtime_is_not_continued_as_a_conversation() {
+    use crate::runtime::{AgentId, RunId, RuntimeBus, RuntimeHandle};
+    let mut agent = crate::Agent::new_builtin(crate::PromptProfile::Stable);
+    let mut worker = RuntimeHandle::new(RunId::new(), AgentId::new(), RuntimeBus::new());
+    worker.parent_agent_id = Some(AgentId::new());
+    agent.set_runtime(worker);
+    assert!(agent.runtime_for_next_prompt().is_none());
+}
+
+#[test]
+fn a_resumed_conversation_recovers_the_users_delegation_refusal() {
+    let user = |text: &str| {
+        let mut message = davinci_ai::ChatMessage::text("user", text);
+        message.extra.insert(
+            "davinciRealUserOrigin".into(),
+            serde_json::Value::Bool(true),
+        );
+        message
+    };
+    let relayed = davinci_ai::ChatMessage::text("user", "you can use subagents again");
+    let refused = [user("fix it. no subagents please"), relayed.clone()];
+    assert!(super::delegation_forbidden_from_messages(&refused));
+    let reversed = [
+        user("fix it. no subagents please"),
+        user("you can use subagents again"),
+    ];
+    assert!(!super::delegation_forbidden_from_messages(&reversed));
 }
