@@ -36,6 +36,8 @@ pub use task_migration::LegacyTaskRecovery;
 pub mod task_store;
 pub mod task_transport;
 pub mod tasks;
+pub mod team;
+pub use team::{format_agent_message, resolve_agent, TeamRoster};
 pub mod tools_agent;
 pub mod tools_task;
 pub mod workflow;
@@ -146,6 +148,7 @@ pub struct RuntimeHandle {
     pub context_broker: ContextBroker,
     pub task_registry: TaskRegistry,
     pub mailbox: AgentMailbox,
+    pub team: TeamRoster,
     pub worktree_manager: Option<WorktreeManager>,
     pub workflow_executor: Option<Arc<WorkflowExecutor>>,
     pub operations: Option<operations::ToolOperationRuntime>,
@@ -171,6 +174,64 @@ impl std::fmt::Debug for RuntimeHandle {
 }
 
 impl RuntimeHandle {
+    /// Drain this agent's mailbox exactly once. Messages from a registered
+    /// agent are wrapped with its name and kind. Messages whose sender is not
+    /// registered are host steering (`AgentMailbox::send_steer` mints a fresh,
+    /// unregistered sender id for user steering), so they are delivered as
+    /// plain text exactly as before this change. Agents cannot forge that
+    /// path: `agent_message` always sends from the caller's registered id.
+    pub fn take_labeled_messages(&self, limit: usize) -> Vec<String> {
+        let mut labeled = Vec::new();
+        for msg in self.mailbox.drain(self.agent_id, limit) {
+            let generation = self.registry.get_generation(&self.agent_id);
+            if !self
+                .mailbox
+                .mark_applied(&self.agent_id, generation, &msg.id)
+            {
+                continue;
+            }
+            match self.registry.get(&msg.from) {
+                Some(sender) => labeled.push(team::format_agent_message(
+                    &msg,
+                    Some((sender.name.as_str(), sender.kind)),
+                )),
+                None => labeled.push(msg.content.clone()),
+            }
+        }
+        labeled
+    }
+
+    /// The lead must be a registered recipient before workers can report
+    /// to it. Idempotent.
+    pub fn ensure_lead_registered(&self, provider: &str, model_id: &str, cwd: &std::path::Path) {
+        if self.registry.get(&self.agent_id).is_some() {
+            return;
+        }
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as i64)
+            .unwrap_or(0);
+        let record = AgentRecord {
+            id: self.agent_id,
+            run_id: self.run_id,
+            parent: None,
+            kind: AgentKind::Main,
+            name: "lead".to_string(),
+            provider: provider.to_string(),
+            model_id: model_id.to_string(),
+            cwd: cwd.to_path_buf(),
+            state: AgentState::Starting,
+            task_id: None,
+            worktree: None,
+            started_ms: now,
+            updated_ms: now,
+            failure_reason: None,
+        };
+        if self.registry.register_agent(record).is_ok() {
+            let _ = self.registry.transition(self.agent_id, AgentState::Running);
+        }
+    }
+
     pub fn new(run_id: RunId, agent_id: AgentId, bus: RuntimeBus) -> Self {
         let registry = RuntimeRegistry::with_bus(bus.clone());
         let task_registry = TaskRegistry::with_bus(bus.clone());
@@ -196,6 +257,7 @@ impl RuntimeHandle {
             context_broker: ContextBroker::new(),
             task_registry,
             mailbox,
+            team: TeamRoster::default(),
             worktree_manager: None,
             workflow_executor: None,
             operations: None,
@@ -278,6 +340,7 @@ impl RuntimeHandle {
         self.bus = previous.bus.clone();
         self.registry = previous.registry.clone();
         self.mailbox = previous.mailbox.clone();
+        self.team = previous.team.clone();
         self.task_registry = previous.task_registry.clone();
         self.operations = previous.operations.clone();
         self.progress_watchdog = previous.progress_watchdog.clone();
@@ -307,6 +370,7 @@ impl RuntimeHandle {
         self.task_registry = worker.task_registry.clone();
         self.operations = worker.operations.clone();
         self.mailbox = worker.mailbox.clone();
+        self.team = worker.team.clone();
         self.progress_watchdog = worker.progress_watchdog.clone();
         self
     }
