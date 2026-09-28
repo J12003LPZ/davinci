@@ -2686,7 +2686,7 @@ Expected: both hashes equal. If the copy fails because a running session holds t
 
 In a scratch git repo, run `DAVINCI_EXPERIMENTAL_AGENT_TEAMS=1 davinci` and ask: "Spawn two teammates named ux and arch to review README.md from their angle, then synthesize." Check: two reports arrive as team updates without typing; `/agents` lists both as Idle; `/agents msg ux summarize in one line` produces a third report; `/agents stop ux` moves it to Completed/Cancelled; Esc during the lead's turn leaves `arch` alive.
 
-- [ ] **Step 5: Rebase, push, PR**
+- [x] **Step 5: Rebase, push, PR**
 
 ```bash
 git fetch origin
@@ -2778,3 +2778,18 @@ hook configuration was changed. No dependencies or version numbers changed.
 
 Restart existing DaVinci sessions to load this executable. Agent teams remain
 opt-in with `DAVINCI_EXPERIMENTAL_AGENT_TEAMS=1`.
+
+### Published delivery
+
+- Pull request: [#66](https://github.com/J12003LPZ/davinci/pull/66).
+- Branch: `fix/agent-orchestration-a-grade`; no merge or main-branch push.
+- Installed `davinci --help` also exited successfully.
+- The push hook hit the same missing WSL Bash error as the commit hook. The
+  push used a command-scoped hook override after the completed local checks.
+  GitHub CLI initially selected a broken local `git.cmd` wrapper; creation
+  succeeded with the installed Git executable first on that process's PATH.
+  No persistent Git, PATH, or hook settings were changed.
+- Completion: **DONE_WITH_CONCERNS**. All implementation and delivery steps
+  are complete. The optional live provider/TUI smoke remains unverified; run
+  the documented manual scenario to close that validation gap. CI was not a
+  delivery gate, per the user's instruction.
