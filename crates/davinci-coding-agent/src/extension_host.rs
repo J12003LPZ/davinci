@@ -596,6 +596,7 @@ impl ExtensionHost {
     /// Index the current session snapshot after a settled turn. Errors are
     /// returned to the caller so the runtime can record diagnostics without
     /// surfacing them as provider/tool failures.
+    #[allow(dead_code)]
     pub fn native_index_messages(
         &self,
         messages: &[crate::native_extensions::MemoryMessage],
