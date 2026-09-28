@@ -5,6 +5,16 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
+/// Wall-clock bound on one snapshot. Unit tests get a generous bound so a
+/// loaded CI runner cannot truncate a tiny workspace and silently drop a
+/// verification the test relies on; budget exhaustion itself is covered by
+/// an explicit `Duration::ZERO` capture.
+const CAPTURE_BUDGET: Duration = if cfg!(test) {
+    Duration::from_secs(10)
+} else {
+    Duration::from_millis(100)
+};
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct FileStamp {
     // A dangling symlink and a present empty target have different identities.
@@ -34,7 +44,7 @@ impl Snapshot {
     }
 
     pub(crate) fn capture_inputs(root: &Path, paths: &[PathBuf]) -> Self {
-        Self::capture_with_limits(root, paths, 16_384, Duration::from_millis(100))
+        Self::capture_with_limits(root, paths, 16_384, CAPTURE_BUDGET)
     }
 
     pub(crate) fn complete(&self) -> bool {
