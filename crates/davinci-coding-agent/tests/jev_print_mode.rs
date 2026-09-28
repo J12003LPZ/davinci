@@ -65,7 +65,7 @@ impl DecisionProvider for FixtureProvider {
                     let probabilities = (0..levels)
                         .map(|level| (level.to_string(), json!(probability)))
                         .collect::<Map<String, Value>>();
-                    let score = (id == "regression_risk").then_some(levels - 1).unwrap_or(0);
+                    let score = if id == "regression_risk" { levels - 1 } else { 0 };
                     json!({
                         "type": "score",
                         "score": score,
