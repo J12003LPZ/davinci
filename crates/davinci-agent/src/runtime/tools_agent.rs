@@ -185,7 +185,7 @@ pub fn agent_stop_tool(input: &Value, context: &ToolContext) -> Result<ToolResul
         .and_then(Value::as_str)
         .ok_or_else(|| ToolError::Failed("Missing required field 'agent_id'".into()))?;
 
-    let aid = super::team::resolve_agent(runtime, aid_str).map_err(ToolError::Failed)?;
+    let aid = super::team::resolve_worker(runtime, aid_str).map_err(ToolError::Failed)?;
 
     let reason = input.get("reason").and_then(Value::as_str);
 
@@ -369,6 +369,20 @@ mod tests {
         )
         .unwrap_err();
         assert!(err.to_string().contains("not found"));
+    }
+
+    #[test]
+    fn agent_stop_refuses_the_lead_and_itself() {
+        let run_id = RunId::new();
+        let lead = AgentId::new();
+        let context = make_test_context(run_id, lead);
+        let rt = context.runtime.as_ref().unwrap();
+        rt.ensure_lead_registered("p", "m", std::path::Path::new("."));
+        for target in ["lead".to_string(), lead.to_string()] {
+            let err = agent_stop_tool(&json!({"agent_id": target}), &context).unwrap_err();
+            assert!(err.to_string().contains("stop itself") || err.to_string().contains("lead"));
+        }
+        assert_eq!(rt.registry.get(&lead).unwrap().state, AgentState::Running);
     }
 
     #[test]

@@ -3634,24 +3634,41 @@ fn worker_host_enforces_profile_tool_and_worktree_permission_ceilings() {
     assert!(!child.tools.contains(&"write".into()));
     assert!(!child.tools.contains(&"agent".into()));
     assert_eq!(child.max_model_turns, Some(60));
-    for mode in [
-        davinci_agent::PermissionMode::ReadOnly,
-        davinci_agent::PermissionMode::Ask,
+    // Plan Mode keeps a worktree worker read-only. Every other parent mode,
+    // including the default Manual mode, edits inside the isolated lease: the
+    // child has no approver, so `Ask` there could only deny every write.
+    for (parent, expected) in [
+        (
+            davinci_agent::PermissionMode::ReadOnly,
+            davinci_agent::PermissionMode::ReadOnly,
+        ),
+        (
+            davinci_agent::PermissionMode::Ask,
+            davinci_agent::PermissionMode::Edits,
+        ),
+        (
+            davinci_agent::PermissionMode::Edits,
+            davinci_agent::PermissionMode::Edits,
+        ),
     ] {
         let req = davinci_agent::SubagentRequest {
             agent: None,
-            parent_permission_mode: Some(mode),
+            parent_permission_mode: Some(parent),
             worktree_path: Some(dir.path().to_path_buf()),
             ..req.clone()
         };
-        let (child, _) = build_worker_agent(
+        let (child, shared_writer) = build_worker_agent(
             &parsed,
             dir.path(),
             &davinci_agent::McpRegistry::default(),
             &req,
         )
         .unwrap();
-        assert_eq!(child.permission_mode(), mode);
+        assert_eq!(child.permission_mode(), expected, "parent {parent:?}");
+        assert!(
+            !shared_writer,
+            "a worktree worker never holds the shared lock"
+        );
     }
 }
 
@@ -3718,4 +3735,45 @@ fn fixture_teammate_reports_wakes_and_times_out_through_host_runner() {
         std::thread::sleep(std::time::Duration::from_millis(5));
     }
     assert!(!runtime.team.is_member(&id));
+}
+
+#[test]
+fn worker_host_feeds_its_own_events_into_the_leads_progress() {
+    let _lock = PROCESS_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let dir = tempfile::tempdir().unwrap();
+    let _config = EnvRestore::set("PI_CODING_AGENT_DIR", dir.path().to_str().unwrap());
+    let parsed = Args {
+        offline: true,
+        no_extensions: true,
+        ..Default::default()
+    };
+    let reporter = davinci_agent::subagent_progress::ProgressReporter::new(
+        "call",
+        davinci_agent::EventSink(std::sync::Arc::new(|_| {})),
+        "a1",
+        "map auth",
+        (0, 1),
+        "oneshot",
+    );
+    let req = davinci_agent::SubagentRequest {
+        tools: vec!["read".into()],
+        progress: Some(reporter.clone()),
+        ..Default::default()
+    };
+    let (child, _) = build_worker_agent(
+        &parsed,
+        dir.path(),
+        &davinci_agent::McpRegistry::default(),
+        &req,
+    )
+    .unwrap();
+    let sink = child.event_sink.expect("the worker reports its progress");
+    (sink.0)(&davinci_agent::AgentEvent::ToolExecutionStart {
+        tool_call_id: "t".into(),
+        tool_name: "grep".into(),
+        args: serde_json::json!({"pattern": "auth"}),
+    });
+    let snapshot = reporter.snapshot();
+    assert_eq!(snapshot.tool_uses, 1);
+    assert_eq!(snapshot.recent, vec!["Search(\"auth\")".to_string()]);
 }

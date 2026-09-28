@@ -3478,3 +3478,251 @@ fn team_wake_text_drains_teammate_reports_into_one_prompt() {
     assert!(text.contains("<agent-message"));
     assert!(team_wake_text(&agent).is_none());
 }
+
+#[test]
+fn delegated_workers_draw_live_under_their_agent_call() {
+    use davinci_agent::subagent_progress::{SubagentProgress, SubagentProgressState};
+    let mut m = model();
+    let mut turn = Turn::default();
+    let args = serde_json::json!({"tasks": [
+        {"prompt": "map auth", "description": "map auth"},
+        {"prompt": "map db", "description": "map db"}
+    ]});
+    apply(
+        &mut m,
+        &mut turn,
+        &AgentEvent::ToolExecutionStart {
+            tool_call_id: "call-1".into(),
+            tool_name: "agent".into(),
+            args: args.clone(),
+        },
+    );
+    let call_row = m
+        .transcript
+        .iter()
+        .position(|entry| matches!(entry, Entry::Tool { .. }))
+        .expect("the agent call row");
+    assert!(matches!(
+        &m.transcript[call_row],
+        Entry::Tool { target, .. } if target == "agent 2 tasks"
+    ));
+    let progress = |index: usize, state, uses, recent: &[&str]| AgentEvent::SubagentProgress {
+        tool_call_id: "call-1".into(),
+        progress: SubagentProgress {
+            agent_id: format!("a{index}"),
+            label: ["map auth", "map db"][index].into(),
+            index,
+            total: 2,
+            mode: "oneshot".into(),
+            state,
+            tool_uses: uses,
+            tokens: 1_500,
+            recent: recent.iter().map(|call| call.to_string()).collect(),
+            elapsed_ms: 3_000,
+        },
+    };
+    apply(
+        &mut m,
+        &mut turn,
+        &progress(0, SubagentProgressState::Running, 1, &["Read(a.rs)"]),
+    );
+    apply(
+        &mut m,
+        &mut turn,
+        &progress(1, SubagentProgressState::Running, 0, &[]),
+    );
+    apply(
+        &mut m,
+        &mut turn,
+        &progress(0, SubagentProgressState::Done, 4, &["Read(b.rs)"]),
+    );
+    let Entry::Subagents(rows) = &m.transcript[call_row + 1] else {
+        panic!("no worker block under the call: {:?}", m.transcript);
+    };
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0].state, SubagentRowState::Done);
+    assert_eq!(rows[0].tool_uses, 4);
+    assert_eq!(rows[1].state, SubagentRowState::Running);
+    assert_eq!(
+        m.transcript
+            .iter()
+            .filter(|entry| matches!(entry, Entry::Subagents(_)))
+            .count(),
+        1,
+        "one block per call"
+    );
+    // The call still ends on its own row, found through the shifted index.
+    apply(
+        &mut m,
+        &mut turn,
+        &AgentEvent::ToolExecutionEnd {
+            tool_call_id: "call-1".into(),
+            tool_name: "agent".into(),
+            result: serde_json::json!("## 1 — map auth\nfound it"),
+            is_error: false,
+            details: None,
+        },
+    );
+    assert!(matches!(
+        &m.transcript[call_row],
+        Entry::Tool {
+            duration: Some(_),
+            ..
+        }
+    ));
+    // A report after the call ended has nowhere to go and changes nothing.
+    let before = m.transcript.len();
+    apply(
+        &mut m,
+        &mut turn,
+        &progress(1, SubagentProgressState::Done, 2, &[]),
+    );
+    assert_eq!(m.transcript.len(), before);
+}
+
+#[test]
+fn agent_calls_are_named_like_claude_code() {
+    assert_eq!(
+        target_of(
+            "agent",
+            &serde_json::json!({"description": "map auth", "prompt": "x"})
+        ),
+        "agent map auth"
+    );
+    assert_eq!(
+        target_of(
+            "agent",
+            &serde_json::json!({"prompt": "x", "description": "scan", "agent": "reviewer", "mode": "background"})
+        ),
+        "agent reviewer · scan · background"
+    );
+    assert_eq!(
+        target_of(
+            "agent",
+            &serde_json::json!({"prompt": "review copy", "mode": "teammate", "name": "ux"})
+        ),
+        "agent teammate ux · review copy"
+    );
+}
+
+#[test]
+fn background_counts_include_live_workers_only() {
+    use davinci_agent::{
+        AgentId, AgentKind, AgentRecord, AgentState, RunId, RuntimeBus, RuntimeHandle,
+    };
+    let mut agent = davinci_agent::Agent::new_builtin(davinci_agent::PromptProfile::Stable);
+    let runtime = RuntimeHandle::new(RunId::new(), AgentId::new(), RuntimeBus::new());
+    let register = |kind, finished: bool| {
+        let id = AgentId::new();
+        runtime
+            .registry
+            .register_agent(AgentRecord {
+                id,
+                run_id: runtime.run_id,
+                parent: Some(runtime.agent_id),
+                kind,
+                name: "w".into(),
+                provider: String::new(),
+                model_id: String::new(),
+                cwd: ".".into(),
+                state: AgentState::Starting,
+                task_id: None,
+                worktree: None,
+                started_ms: 0,
+                updated_ms: 0,
+                failure_reason: None,
+            })
+            .unwrap();
+        runtime
+            .registry
+            .transition(id, AgentState::Running)
+            .unwrap();
+        if finished {
+            runtime
+                .registry
+                .transition(id, AgentState::Completed)
+                .unwrap();
+        }
+    };
+    register(AgentKind::Background, false);
+    register(AgentKind::Teammate, false);
+    register(AgentKind::Background, true);
+    register(AgentKind::Subagent, false);
+    agent.set_runtime(runtime);
+    assert_eq!(background_counts(&agent), (2, 0));
+}
+
+#[test]
+fn the_workflows_view_lists_phases_in_order_with_agents_and_results() {
+    let mut agent = davinci_agent::Agent::new_builtin(davinci_agent::PromptProfile::Stable);
+    let runtime = davinci_agent::RuntimeHandle::new(
+        davinci_agent::RunId::new(),
+        davinci_agent::AgentId::new(),
+        davinci_agent::RuntimeBus::new(),
+    );
+    let executor = std::sync::Arc::new(davinci_agent::WorkflowExecutor::new(
+        runtime.clone(),
+        davinci_agent::WorkflowStateStore::new(),
+        Some(davinci_agent::SubagentRunner::new(|req| {
+            if req.instance_name.as_deref() == Some("flaky") {
+                Err("provider down".into())
+            } else {
+                Ok(format!(
+                    "answer from {}",
+                    req.instance_name.clone().unwrap_or_default()
+                ))
+            }
+        })),
+    ));
+    agent.runtime = Some(runtime.with_workflow_executor(executor.clone()));
+    let spec: davinci_agent::WorkflowSpec = serde_json::from_value(serde_json::json!({
+        "schema_version": 1, "name": "audit", "max_parallel_agents": 2, "max_total_agents": 3,
+        "phases": [
+            {"id": "zeta-first", "join": "all", "workers": [
+                {"id": "reader", "prompt": "read", "tools": ["read"]}]},
+            {"id": "alpha-second", "depends_on": ["zeta-first"], "join": "any", "workers": [
+                {"id": "good", "prompt": "check", "tools": ["read"]},
+                {"id": "flaky", "prompt": "check", "tools": ["read"]}]}
+        ]
+    }))
+    .unwrap();
+    let _ = executor.execute(spec);
+    let rows = workflow_rows(&agent);
+    assert_eq!(rows.len(), 1);
+    let run = &rows[0];
+    assert_eq!(
+        run.phase_rows
+            .iter()
+            .map(|phase| phase.id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["zeta-first", "alpha-second"],
+        "spec order, not map order"
+    );
+    let reader = &run.phase_rows[0].agents[0];
+    assert_eq!(reader.label, "reader");
+    assert_eq!(reader.status, "completed");
+    assert_eq!(reader.detail.as_deref(), Some("answer from reader"));
+    let second = &run.phase_rows[1].agents;
+    assert!(second
+        .iter()
+        .any(|agent| agent.label == "good" && agent.status == "completed"));
+    assert!(
+        !run.elapsed.ends_with("ms"),
+        "human elapsed: {}",
+        run.elapsed
+    );
+
+    let mut m = model();
+    open_workflows_sheet(&agent, &mut m);
+    let sheet = m.workflows.as_mut().unwrap();
+    sheet.drill_in();
+    sheet.move_selection(1);
+    sheet.drill_in();
+    assert_eq!(sheet.phase().unwrap().id, "alpha-second");
+    // Reopening while open keeps the place.
+    open_workflows_sheet(&agent, &mut m);
+    assert_eq!(
+        m.workflows.as_ref().unwrap().level,
+        davinci_tui::davinci::model::WorkflowLevel::Agents
+    );
+}

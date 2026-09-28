@@ -18,8 +18,8 @@ use davinci_tui::davinci::model::{
     GovernorSheet, GovernorStored, GraphRunSheet, GraphTask, Hunk, HunkKind, KeymapGroup,
     McpServerRow, McpSheet, Model, ModelItem, Overlay, PermissionRow, PickerItem, PlanStep,
     ProviderRow, ResumeRow, ReviewFile, ReviewSheet, Screen, SecurityScan, SettingRow, Severity,
-    Step, ThinkingRow, Tone, TreeNode, VectorIndex, WorkflowRow, WorkflowsSheet, Working,
-    WorkshopSheet,
+    Step, SubagentRow, SubagentRowState, ThinkingRow, Tone, TreeNode, VectorIndex, WorkflowRow,
+    WorkflowsSheet, Working, WorkshopSheet,
 };
 use davinci_tui::davinci::theme::State;
 
@@ -335,15 +335,7 @@ pub fn target_of(tool_name: &str, args: &serde_json::Value) -> String {
                 .unwrap_or_default();
             format!("edit {}{cell}", field("path"))
         }
-        "agent" => {
-            let label = args
-                .get("description")
-                .and_then(serde_json::Value::as_str)
-                .filter(|text| !text.is_empty())
-                .map(|text| clip(text, 60))
-                .unwrap_or_else(|| field("prompt"));
-            format!("agent {label}")
-        }
+        "agent" => agent_target(args, &field),
         "mcp_read" => format!("mcp {} {}", field("server"), field("uri")),
         name if name.starts_with("mcp__") => mcp_target(name, args),
         other => {
@@ -354,6 +346,67 @@ pub fn target_of(tool_name: &str, args: &serde_json::Value) -> String {
                 format!("{other} \"{detail}\"")
             }
         }
+    }
+}
+
+/// A worker's progress as the transcript draws it.
+fn subagent_row(progress: &davinci_agent::subagent_progress::SubagentProgress) -> SubagentRow {
+    use davinci_agent::subagent_progress::SubagentProgressState as Progress;
+    SubagentRow {
+        label: progress.label.clone(),
+        state: match progress.state {
+            Progress::Running => SubagentRowState::Running,
+            Progress::Background => SubagentRowState::Background,
+            Progress::Done => SubagentRowState::Done,
+            Progress::Failed => SubagentRowState::Failed,
+        },
+        tool_uses: progress.tool_uses,
+        tokens: progress.tokens,
+        recent: progress.recent.clone(),
+        elapsed_secs: progress.elapsed_ms / 1000,
+    }
+}
+
+/// `Agent(map auth)`, `Agent(reviewer · map auth)`, `Agent(3 tasks)`,
+/// `Agent(map auth · background)`, `Agent(teammate ux · review the copy)`.
+fn agent_target(args: &serde_json::Value, field: &dyn Fn(&str) -> String) -> String {
+    if let Some(tasks) = args
+        .get("tasks")
+        .and_then(serde_json::Value::as_array)
+        .filter(|tasks| !tasks.is_empty())
+    {
+        let background = tasks
+            .iter()
+            .any(|task| task.get("mode").and_then(serde_json::Value::as_str) == Some("background"));
+        return format!(
+            "agent {}{}",
+            plural_of(tasks.len(), "task"),
+            if background { " · background" } else { "" }
+        );
+    }
+    let mut label = args
+        .get("description")
+        .and_then(serde_json::Value::as_str)
+        .filter(|text| !text.is_empty())
+        .map(|text| clip(text, 60))
+        .unwrap_or_else(|| field("prompt"));
+    if let Some(profile) = args
+        .get("agent")
+        .and_then(serde_json::Value::as_str)
+        .filter(|name| !name.is_empty())
+    {
+        label = format!("{profile} · {label}");
+    }
+    match args.get("mode").and_then(serde_json::Value::as_str) {
+        Some("background") => format!("agent {label} · background"),
+        Some("teammate") => {
+            let name = args
+                .get("name")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("");
+            format!("agent teammate {name} · {label}")
+        }
+        _ => format!("agent {label}"),
     }
 }
 
@@ -730,6 +783,38 @@ impl Turn {
             }
         }
         self.finish_step(model);
+    }
+
+    /// A delegated worker moved on: draw it in the block under its `agent`
+    /// call, creating the block the first time. A call that already ended
+    /// (a background worker reporting later) has no open row to draw under.
+    fn subagent_progress(
+        &mut self,
+        model: &mut Model,
+        tool_call_id: &str,
+        progress: &davinci_agent::subagent_progress::SubagentProgress,
+    ) {
+        let Some(index) = self
+            .open
+            .iter()
+            .find(|(id, _, _, _)| id == tool_call_id)
+            .map(|(_, index, _, _)| *index)
+        else {
+            return;
+        };
+        let slot = index + 1;
+        if !matches!(model.transcript.get(slot), Some(Entry::Subagents(_))) {
+            model.transcript.insert(slot, Entry::Subagents(Vec::new()));
+            self.shift(index, 1);
+        }
+        if let Some(Entry::Subagents(rows)) = model.transcript.get_mut(slot) {
+            let total = progress.total.max(progress.index + 1);
+            if rows.len() < total {
+                rows.resize(total, SubagentRow::default());
+            }
+            rows[progress.index] = subagent_row(progress);
+        }
+        model.dirty = true;
     }
 
     /// Keep the recorded indices valid when detail rows are spliced in.
@@ -1144,6 +1229,11 @@ fn thinking_effort(agent: &Agent) -> Option<String> {
 /// Fold one agent event into the transcript.
 fn apply(model: &mut Model, turn: &mut Turn, event: &AgentEvent) {
     match event {
+        AgentEvent::SubagentProgress {
+            tool_call_id,
+            progress,
+        } => turn.subagent_progress(model, tool_call_id, progress),
+
         AgentEvent::ToolExecutionStart {
             tool_call_id,
             tool_name,
@@ -2169,11 +2259,23 @@ pub fn corpus(
         "command",
     ));
     if davinci_agent::tools::workflow_tools_enabled() {
-        items.push(CorpusItem::new(
-            "/workflow",
-            "workflow runs · list | status <id> | cancel <id>",
-            "command",
-        ));
+        for (name, summary) in [
+            (
+                "/workflow",
+                "run a saved workflow or a goal · /workflow <name|goal>",
+            ),
+            ("/workflows", "workflow runs · phases, agents and progress"),
+            (
+                "/workflow-stop",
+                "stop a running workflow · /workflow-stop <id>",
+            ),
+            (
+                "/workflow-resume",
+                "resume a paused workflow · /workflow-resume <id>",
+            ),
+        ] {
+            items.push(CorpusItem::new(name, summary, "command"));
+        }
     }
 
     for tool in &agent.tools {
@@ -4653,6 +4755,12 @@ pub fn run(
             model.dirty = true;
             last_tick = Instant::now();
             poll_jobs(&agent.tool_context.jobs, &mut model);
+            let (agents, workflows) = background_counts(agent);
+            if (agents, workflows) != (model.agents_running, model.workflows_running) {
+                model.agents_running = agents;
+                model.workflows_running = workflows;
+                model.dirty = true;
+            }
         }
         // Lines shared code printed while the screen was ours belong in the
         // transcript, which is the only place a davinci shell can say anything
@@ -4744,6 +4852,14 @@ pub fn run(
             {
                 refresh_graph_sheet(&mut model, &host);
                 model.dirty = true;
+            }
+            // The workflows view is live, like claude code's progress view.
+            if model.screen == Screen::Workflows {
+                let rows = workflow_rows(agent);
+                if let Some(sheet) = model.workflows.as_mut() {
+                    sheet.refresh(rows);
+                    model.dirty = true;
+                }
             }
             if model.screen == Screen::Securitas {
                 let locked = host.lock().unwrap_or_else(|e| e.into_inner());
@@ -8901,6 +9017,7 @@ fn on_choice(shell: &mut Shell<'_>, choice: Choice) -> Next {
         }
         Choice::Permission(index) => apply_permission_row(shell, index),
         Choice::AgentAction { action, index } => apply_agent_action(shell, action, index),
+        Choice::WorkflowAction { action } => apply_workflow_action(shell, action),
         Choice::ContextInspectorAction { action, index } => {
             apply_context_inspector_action(shell, action, index)
         }
@@ -9410,43 +9527,193 @@ fn jobs_command(shell: &mut Shell<'_>, arg: &str) -> Next {
     Next::Go
 }
 
-fn open_workflows_sheet(agent: &Agent, model: &mut Model) {
-    let workflows = if let Some(runtime) = &agent.runtime {
-        if let Some(exec) = &runtime.workflow_executor {
-            let list = exec.list_workflows();
-            list.into_iter()
-                .map(|w| {
-                    let mut phases = Vec::new();
-                    for (p_id, p_st) in &w.phases {
-                        phases.push((p_id.clone(), format!("{:?}", p_st.status).to_lowercase()));
-                    }
-                    WorkflowRow {
-                        id: w.id.to_string(),
-                        name: w.name,
-                        status: format!("{:?}", w.status).to_lowercase(),
-                        phases,
-                        started_ms: w.started_ms,
-                        elapsed: if let Some(fin) = w.finished_ms {
-                            format!("{}ms", fin.saturating_sub(w.started_ms))
-                        } else {
-                            "running".into()
-                        },
-                        error: w.error,
-                    }
-                })
-                .collect()
-        } else {
-            Vec::new()
-        }
+/// `3m 12s`, `41s`.
+fn human_elapsed(ms: i64) -> String {
+    let seconds = (ms.max(0) / 1000) as u64;
+    if seconds >= 60 {
+        format!("{}m {}s", seconds / 60, seconds % 60)
     } else {
-        Vec::new()
-    };
+        format!("{seconds}s")
+    }
+}
 
-    model.workflows = Some(WorkflowsSheet {
-        workflows,
-        selected_index: 0,
-    });
+fn now_epoch_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_millis() as i64)
+        .unwrap_or(0)
+}
+
+/// One workflow agent for the view: its registry state, live activity and
+/// either its result or why it failed.
+fn workflow_agent_row(
+    runtime: &davinci_agent::RuntimeHandle,
+    executor: &davinci_agent::WorkflowExecutor,
+    run: &davinci_agent::runtime::WorkflowExecutionState,
+    phase: &str,
+    agent: &davinci_agent::AgentId,
+) -> davinci_tui::davinci::model::WorkflowAgentRow {
+    use davinci_agent::AgentState;
+    let record = runtime.registry.get(agent);
+    let progress = executor.agent_progress(agent);
+    let status = match record.as_ref().map(|record| record.state) {
+        Some(AgentState::Completed) => "completed",
+        Some(AgentState::Failed) => "failed",
+        Some(AgentState::Cancelled) => "cancelled",
+        Some(_) if progress.is_some() => "running",
+        _ => "pending",
+    };
+    let detail = match status {
+        "failed" | "cancelled" => record
+            .as_ref()
+            .and_then(|record| record.failure_reason.clone()),
+        "completed" => executor
+            .store
+            .list_phase_artifacts(run.id, phase)
+            .into_iter()
+            .find(|artifact| &artifact.worker_id == agent)
+            .map(|artifact| {
+                artifact
+                    .value
+                    .get("output")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_string)
+                    .unwrap_or_else(|| artifact.to_reference_summary().to_string())
+            }),
+        _ => None,
+    };
+    davinci_tui::davinci::model::WorkflowAgentRow {
+        agent_id: agent.to_string(),
+        label: record
+            .as_ref()
+            .map(|record| record.name.clone())
+            .unwrap_or_else(|| agent.to_string()),
+        status: status.into(),
+        tool_uses: progress.as_ref().map_or(0, |p| p.tool_uses),
+        tokens: progress.as_ref().map_or(0, |p| p.tokens),
+        elapsed_secs: progress.as_ref().map_or(0, |p| p.elapsed_ms / 1000),
+        recent: progress.map(|p| p.recent).unwrap_or_default(),
+        detail,
+    }
+}
+
+/// Every run this conversation's executor knows, newest first, with its
+/// phases in spec order and each phase's agents.
+pub(crate) fn workflow_rows(agent: &Agent) -> Vec<WorkflowRow> {
+    let Some(runtime) = agent.runtime.as_ref() else {
+        return Vec::new();
+    };
+    let Some(executor) = runtime.workflow_executor.as_ref() else {
+        return Vec::new();
+    };
+    let now = now_epoch_ms();
+    let mut runs = executor.list_workflows();
+    runs.sort_by_key(|run| std::cmp::Reverse(run.started_ms));
+    runs.into_iter()
+        .map(|run| {
+            let mut order = executor.phase_order(&run.id);
+            for id in run.phases.keys() {
+                if !order.contains(id) {
+                    order.push(id.clone());
+                }
+            }
+            let phase_rows: Vec<davinci_tui::davinci::model::WorkflowPhaseRow> = order
+                .iter()
+                .filter_map(|id| run.phases.get(id).map(|state| (id, state)))
+                .map(
+                    |(id, state)| davinci_tui::davinci::model::WorkflowPhaseRow {
+                        id: id.clone(),
+                        status: format!("{:?}", state.status).to_lowercase(),
+                        agents: state
+                            .worker_agent_ids
+                            .iter()
+                            .map(|agent| workflow_agent_row(runtime, executor, &run, id, agent))
+                            .collect(),
+                    },
+                )
+                .collect();
+            WorkflowRow {
+                id: run.id.to_string(),
+                name: run.name.clone(),
+                status: format!("{:?}", run.status).to_lowercase(),
+                phases: phase_rows
+                    .iter()
+                    .map(|phase| (phase.id.clone(), phase.status.clone()))
+                    .collect(),
+                started_ms: run.started_ms,
+                elapsed: human_elapsed(run.finished_ms.unwrap_or(now) - run.started_ms),
+                error: run.error.clone(),
+                phase_rows,
+            }
+        })
+        .collect()
+}
+
+fn open_workflows_sheet(agent: &Agent, model: &mut Model) {
+    let rows = workflow_rows(agent);
+    match model.workflows.as_mut() {
+        // Reopening keeps the place: same run, phase and agent.
+        Some(sheet) if model.screen == Screen::Workflows => sheet.refresh(rows),
+        _ => {
+            model.workflows = Some(WorkflowsSheet {
+                workflows: rows,
+                ..WorkflowsSheet::default()
+            });
+        }
+    }
     open_sheet(model, Screen::Workflows);
+}
+
+/// `p`, `x` on the workflows view, on its current selection.
+fn apply_workflow_action(shell: &mut Shell<'_>, action: &str) -> Next {
+    let Some(sheet) = shell.model.workflows.as_ref() else {
+        return Next::Go;
+    };
+    let Some(run_id) = sheet
+        .run()
+        .and_then(|run| run.id.parse::<davinci_agent::runtime::WorkflowId>().ok())
+    else {
+        return Next::Go;
+    };
+    let agent_id = sheet
+        .agent()
+        .and_then(|agent| agent.agent_id.parse::<davinci_agent::AgentId>().ok());
+    let Some(executor) = shell
+        .agent
+        .runtime
+        .as_ref()
+        .and_then(|runtime| runtime.workflow_executor.clone())
+    else {
+        shell.note("workflows are not available in this session");
+        return Next::Go;
+    };
+    let outcome = match action {
+        "pause" => match executor.get_state(&run_id).map(|state| state.status) {
+            Some(davinci_agent::runtime::WorkflowStatus::Paused) => {
+                executor.resume(&run_id).map(|_| "resumed".to_string())
+            }
+            _ => executor
+                .pause(&run_id)
+                .map(|_| "paused: no new agents start".to_string()),
+        }
+        .map_err(|error| error.to_string()),
+        "stop_agent" => match agent_id {
+            Some(agent) if executor.cancel_agent(&agent) => Ok("stopping agent".to_string()),
+            Some(_) => Err("that agent is not running".to_string()),
+            None => Err("no agent selected".to_string()),
+        },
+        _ => executor
+            .cancel(&run_id)
+            .map(|_| "workflow stopped".to_string())
+            .map_err(|error| error.to_string()),
+    };
+    open_workflows_sheet(shell.agent, shell.model);
+    if let Some(sheet) = shell.model.workflows.as_mut() {
+        sheet.notice = Some(match outcome {
+            Ok(text) | Err(text) => text,
+        });
+    }
+    Next::Go
 }
 
 fn workflows_command(shell: &mut Shell<'_>, _arg: &str) -> Next {
@@ -9773,10 +10040,87 @@ fn apply_graph_action(shell: &mut Shell<'_>, action: &str, index: usize) -> Next
     Next::Go
 }
 
+/// `/workflow` — bare: the runs view. `list|status <id>|cancel <id>`: text
+/// answers. A saved workflow's name runs it in the background; anything else
+/// is a goal the model turns into a workflow.
 fn workflow_command(shell: &mut Shell<'_>, args: &str) -> Next {
-    let text = workflow_command_text(shell.agent, args);
-    shell.say(&text);
-    Next::Go
+    let args = args.trim();
+    match workflow_route(args) {
+        WorkflowRoute::Sheet => {
+            open_workflows_sheet(shell.agent, shell.model);
+            Next::Go
+        }
+        WorkflowRoute::Text => {
+            let text = workflow_command_text(shell.agent, args);
+            shell.say(&text);
+            Next::Go
+        }
+        WorkflowRoute::Run => run_workflow_command(shell, args),
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum WorkflowRoute {
+    Sheet,
+    Text,
+    Run,
+}
+
+pub(crate) fn workflow_route(args: &str) -> WorkflowRoute {
+    match args.split_whitespace().next() {
+        None => WorkflowRoute::Sheet,
+        Some("list" | "status" | "cancel") => WorkflowRoute::Text,
+        Some(_) => WorkflowRoute::Run,
+    }
+}
+
+fn run_workflow_command(shell: &mut Shell<'_>, goal: &str) -> Next {
+    if !davinci_agent::tools::workflow_tools_enabled() {
+        shell.note("dynamic workflows are off; turn them on in /settings (Dynamic workflows)");
+        return Next::Go;
+    }
+    let trusted = shell
+        .agent
+        .runtime
+        .as_ref()
+        .is_some_and(|runtime| runtime.project_trusted);
+    match davinci_agent::find_saved_workflow(&shell.agent.cwd, goal, trusted) {
+        Ok(spec) => {
+            let executor = shell
+                .agent
+                .runtime
+                .as_ref()
+                .and_then(|runtime| runtime.workflow_executor.clone());
+            let Some(executor) = executor else {
+                shell.note("the workflow runner is not ready yet; send a prompt first");
+                return Next::Go;
+            };
+            let launch = shell.agent.workflow_launch(true);
+            match executor.execute_background_with(spec, launch) {
+                Ok(id) => {
+                    shell.model.running = false;
+                    shell.model.transcript.push(Entry::Gap);
+                    shell.model.transcript.push(Entry::tool(
+                        State::Active,
+                        "opus",
+                        &format!("workflow {goal} · running in background · /workflows ({id})"),
+                        None,
+                    ));
+                }
+                Err(error) => shell.note(&format!("failed to start workflow: {error}")),
+            }
+            Next::Go
+        }
+        Err(error) if error.contains("requires project trust") => {
+            shell.note(&error);
+            Next::Go
+        }
+        Err(_) => submit_prompt(
+            shell,
+            &format!("Create and run a workflow with workflow_run for this goal:\n{goal}"),
+            &[],
+        ),
+    }
 }
 
 fn workflow_stop_command(shell: &mut Shell<'_>, id_str: &str) -> Next {
@@ -10005,6 +10349,38 @@ fn refresh_context(model: &mut Model, agent: &Agent) {
 #[path = "davinci_interactive_tests.rs"]
 mod tests;
 
+/// Background agents, teammates and workflow runs still running, for the
+/// footer (`2 agents · 1 workflow`).
+pub(crate) fn background_counts(agent: &Agent) -> (usize, usize) {
+    let Some(runtime) = agent.tool_context.runtime.as_ref() else {
+        return (0, 0);
+    };
+    let agents = runtime
+        .registry
+        .get_by_run(&runtime.run_id)
+        .into_iter()
+        .filter(|record| {
+            matches!(
+                record.kind,
+                davinci_agent::AgentKind::Background | davinci_agent::AgentKind::Teammate
+            ) && !matches!(
+                record.state,
+                davinci_agent::AgentState::Completed
+                    | davinci_agent::AgentState::Failed
+                    | davinci_agent::AgentState::Cancelled
+            )
+        })
+        .count();
+    let workflows = runtime.workflow_executor.as_ref().map_or(0, |executor| {
+        executor
+            .list_workflows()
+            .iter()
+            .filter(|run| run.status == davinci_agent::runtime::WorkflowStatus::Running)
+            .count()
+    });
+    (agents, workflows)
+}
+
 /// `/agents` with no args: profiles plus the live team. `msg` and `stop`
 /// act on a member by name. Steering retains its plain text, but delegated
 /// turns cannot approve user-only actions on behalf of the lead.
@@ -10044,7 +10420,7 @@ pub(crate) fn team_command_text(agent: &Agent, profiles_text: String, args: &str
             let Some(name) = words.next() else {
                 return "usage: /agents stop <name>".into();
             };
-            match davinci_agent::runtime::resolve_agent(runtime, name) {
+            match davinci_agent::runtime::resolve_worker(runtime, name) {
                 Ok(id) => {
                     let _ = runtime
                         .registry

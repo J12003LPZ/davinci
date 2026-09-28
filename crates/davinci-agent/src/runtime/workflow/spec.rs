@@ -123,4 +123,12 @@ pub struct WorkflowLaunch {
     pub parent_tools: Vec<String>,
     /// Report completion to the lead's mailbox (background runs).
     pub report_to_lead: bool,
+    /// The calling turn's cancellation. A synchronous run stops when the
+    /// turn is interrupted; a background run ignores it and descends from
+    /// the session's team token instead.
+    pub turn_token: Option<crate::runtime::CancellationToken>,
+    /// Session concurrency ceiling (`workflowMaxConcurrentAgents`).
+    pub max_concurrent_agents: Option<usize>,
+    /// Agents a run may schedule before it is flagged as a large workflow.
+    pub large_workflow_threshold: Option<usize>,
 }

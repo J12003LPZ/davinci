@@ -198,6 +198,18 @@ pub fn workflow_run_tool_with_parent(
         ));
     }
 
+    // Advisory, like Claude Code's `Large workflow` warning: it never blocks
+    // or limits the run, it tells the model and the user where to stop it.
+    let scheduled: usize = spec.phases.iter().map(|phase| phase.workers.len()).sum();
+    let threshold = launch
+        .large_workflow_threshold
+        .unwrap_or(super::limits::LARGE_WORKFLOW_AGENTS);
+    let large_warning = (scheduled > threshold).then(|| {
+        format!(
+            "Large workflow: {scheduled} agents scheduled (threshold {threshold}). Stop it with /workflow cancel <id> if it is more than the task needs."
+        )
+    });
+
     let mut saved_path_info = None;
     if let Some(save_name) = save_as {
         let path = save_workflow_to_project(cwd, save_name, &spec, runtime.project_trusted)
@@ -223,7 +235,8 @@ pub fn workflow_run_tool_with_parent(
             "name": spec.name,
             "status": "running",
             "saved_to": saved_path_info,
-            "message": "Workflow started in background. Use workflow_status to inspect progress."
+            "message": "Workflow started in background. Its report arrives as an <agent-message>; use workflow_status to inspect progress.",
+            "warning": large_warning,
         });
 
         Ok(ToolResult {
@@ -261,6 +274,9 @@ pub fn workflow_run_tool_with_parent(
             }
         }
         val["final_outputs"] = serde_json::json!(outputs);
+        if let Some(warning) = &large_warning {
+            val["warning"] = serde_json::json!(warning);
+        }
         if background {
             val["note"] = serde_json::json!(
                 "ran synchronously: background workflows need an interactive or RPC session"
@@ -371,6 +387,33 @@ mod tests {
             ..Default::default()
         };
         (context, dir)
+    }
+
+    #[test]
+    fn a_workflow_over_the_threshold_carries_a_large_warning() {
+        let (context, dir) = setup_context(true);
+        let spec: Value = serde_json::from_str(VALID_3_PHASE_WORKFLOW_JSON).unwrap();
+        let workers: usize = spec["phases"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|phase| phase["workers"].as_array().unwrap().len())
+            .sum();
+        let run = |threshold: usize| {
+            workflow_run_tool_with_parent(
+                dir.path(),
+                &serde_json::json!({"spec": spec, "background": false}),
+                &context,
+                WorkflowLaunch {
+                    large_workflow_threshold: Some(threshold),
+                    ..WorkflowLaunch::default()
+                },
+            )
+            .unwrap()
+            .content
+        };
+        assert!(run(workers - 1).contains("Large workflow"));
+        assert!(!run(workers).contains("Large workflow"));
     }
 
     #[test]

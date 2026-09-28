@@ -824,13 +824,48 @@ pub fn disabled_composer(model: &Model, text: &str) -> Vec<Line<'static>> {
         .lines()
 }
 
-/// `1 job` / `2 jobs` while background commands run; nothing otherwise, so
-/// the bar says it only when there is something to know.
+/// What runs in the background: `1 job · 2 agents · 1 workflow`, like
+/// claude code's `N agents` footer. Nothing when nothing runs, so the bar
+/// says it only when there is something to know.
 fn jobs_note(model: &Model) -> Option<String> {
-    match model.jobs_running {
+    let count = |n: usize, one: &str, many: &str| match n {
         0 => None,
-        1 => Some("1 job".into()),
-        n => Some(format!("{n} jobs")),
+        1 => Some(format!("1 {one}")),
+        n => Some(format!("{n} {many}")),
+    };
+    let parts: Vec<String> = [
+        count(model.jobs_running, "job", "jobs"),
+        count(model.agents_running, "agent", "agents"),
+        count(model.workflows_running, "workflow", "workflows"),
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
+    (!parts.is_empty()).then(|| parts.join(" · "))
+}
+
+#[cfg(test)]
+mod background_note_tests {
+    use super::*;
+    use crate::davinci::theme::{ColorDepth, Theme};
+
+    #[test]
+    fn the_footer_counts_jobs_agents_and_workflows() {
+        let mut model = Model::new(
+            Theme::da_vinci(ColorDepth::TrueColor, false),
+            100,
+            30,
+            false,
+        );
+        assert_eq!(jobs_note(&model), None);
+        model.agents_running = 2;
+        assert_eq!(jobs_note(&model).as_deref(), Some("2 agents"));
+        model.jobs_running = 1;
+        model.workflows_running = 1;
+        assert_eq!(
+            jobs_note(&model).as_deref(),
+            Some("1 job · 2 agents · 1 workflow")
+        );
     }
 }
 
