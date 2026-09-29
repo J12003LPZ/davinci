@@ -9,7 +9,7 @@ use std::io::{BufRead, BufReader, Read};
 use std::time::Duration;
 
 use crate::jsonrpc::{Notification, Request, Response};
-use crate::{Error, Result, Rpc, CALL_TIMEOUT_SECS, PROTOCOL_VERSION};
+use crate::{Error, Result, RpcTransport, CALL_TIMEOUT_SECS, PROTOCOL_VERSION};
 
 /// The `initialize` result names the version both sides will speak; until
 /// then requests carry none.
@@ -238,7 +238,7 @@ impl HttpTransport {
     }
 }
 
-impl Rpc for HttpTransport {
+impl RpcTransport for HttpTransport {
     fn call(&mut self, method: &str, params: Value) -> Result<Value> {
         let id = self.next_id;
         self.next_id += 1;
