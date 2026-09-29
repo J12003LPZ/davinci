@@ -626,6 +626,16 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
+    fn runtime_mount_discovery_never_exposes_the_user_home_root() {
+        let workspace = tempfile::tempdir().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let mut sources = Vec::new();
+        push_runtime_source(&mut sources, home.path(), workspace.path());
+        assert!(sources.is_empty(), "user home root must never become a runtime mount");
+    }
+
+    #[test]
     fn configured_hard_limits_become_required_backend_capabilities() {
         let root = tempfile::tempdir().unwrap();
         let spec = resolve_sandbox_settings(
