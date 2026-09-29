@@ -5171,6 +5171,7 @@ mod sandbox_process_fail_closed_tests {
             id: SandboxId("fail-closed".into()),
             mode: SandboxMode::FullAccess,
             backend: SandboxBackendKind::Host,
+            container: None,
             workspace: root.canonicalize().unwrap().to_string_lossy().into_owned(),
             filesystem: FilesystemPolicy::default(),
             network: NetworkPolicy::Unrestricted,
