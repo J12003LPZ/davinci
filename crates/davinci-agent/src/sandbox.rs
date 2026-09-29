@@ -376,6 +376,12 @@ pub fn attenuate_child_spec(
         }
     }
 
+    if requested.container != parent.container {
+        return Err(SandboxFailure::policy_denied(
+            "child cannot change container runtime or image authority",
+        ));
+    }
+
     let backend = match (parent.backend, requested.backend) {
         (parent, SandboxBackendKind::Auto) => parent,
         (SandboxBackendKind::Auto, child) if child != SandboxBackendKind::Host => child,
