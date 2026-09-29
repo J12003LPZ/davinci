@@ -166,15 +166,25 @@ pub(super) fn run(
         } else {
             "; process cleanup did not finish within deadline"
         };
-        let evidence = config.execution_evidence(
-            process.identity().clone(),
-            exit.as_ref()
-                .map(|exit| exit.launch_state)
-                .unwrap_or(crate::jobs::supervisor::ProcessLaunchState::Unknown),
-            exit.as_ref().and_then(|exit| exit.code),
-            exit.as_ref()
-                .map(|exit| exit.output_complete && !capture.overflow),
-        );
+        let evidence = config
+            .execution_evidence(
+                process.identity().clone(),
+                exit.as_ref()
+                    .map(|exit| exit.launch_state)
+                    .unwrap_or(crate::jobs::supervisor::ProcessLaunchState::Unknown),
+                exit.as_ref().and_then(|exit| exit.code),
+                exit.as_ref()
+                    .map(|exit| exit.output_complete && !capture.overflow),
+            )
+            .with_effective_sandbox(exit.as_ref().and_then(|exit| exit.sandbox.clone()))
+            .unwrap_or_else(|_| {
+                config.execution_evidence(
+                    process.identity().clone(),
+                    crate::jobs::supervisor::ProcessLaunchState::Unknown,
+                    exit.as_ref().and_then(|exit| exit.code),
+                    Some(false),
+                )
+            });
         if let Some(receipt) = &context.command_receipt {
             receipt.process_observed(evidence, started_at_ms, &capture.stdout, &capture.stderr);
         }
@@ -203,12 +213,19 @@ pub(super) fn run(
     };
     let mut captured = capture.lock().unwrap_or_else(|e| e.into_inner());
     let output_complete = exit.output_complete && !captured.overflow;
-    let evidence = config.execution_evidence(
-        exit.identity.clone(),
-        exit.launch_state,
-        exit.code,
-        Some(output_complete),
-    );
+    let evidence = config
+        .execution_evidence(
+            exit.identity.clone(),
+            exit.launch_state,
+            exit.code,
+            Some(output_complete),
+        )
+        .with_effective_sandbox(exit.sandbox.clone())
+        .map_err(|error| {
+            ToolError::Failed(format!(
+                "sandbox execution evidence mismatch: {error}"
+            ))
+        })?;
     if let Some(receipt) = &context.command_receipt {
         receipt.process_observed(evidence, started_at_ms, &captured.stdout, &captured.stderr);
     }
