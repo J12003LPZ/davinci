@@ -1789,8 +1789,8 @@ fn boundary_path_identity(path: &Path) -> PathBuf {
 /// Resolve only an alias of the trusted root, leaving target components intact
 /// for symlink checks and the transaction directory's no-follow traversal.
 pub(crate) fn boundary_relative_path(root: &Path, target: &Path) -> Option<PathBuf> {
-    let lexical_root = strip_verbatim_prefix(root);
-    let target = strip_verbatim_prefix(target);
+    let lexical_root = PathBuf::from(slashes(&strip_verbatim_prefix(root)));
+    let target = PathBuf::from(slashes(&strip_verbatim_prefix(target)));
     if let Ok(relative) = target.strip_prefix(&lexical_root) {
         return Some(relative.to_path_buf());
     }
