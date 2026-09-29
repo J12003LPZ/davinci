@@ -818,6 +818,12 @@ fn build_agent(parsed: &Args, session_dir: &Path, cwd: &Path) -> Result<Agent, S
     // trusted project, a project request that may narrow but never widen it.
     // Do not use the already deep-merged settings for this security boundary.
     let global_sandbox_settings = load_settings(&default_agent_dir());
+    let mut effective_global_sandbox = global_sandbox_settings.sandbox.clone();
+    if let Some(mode) = parsed.execution_sandbox_mode.as_ref() {
+        effective_global_sandbox
+            .get_or_insert_with(Default::default)
+            .mode = Some(mode.clone());
+    }
     let project_trusted_for_sandbox = trust::resolve_project_trusted(
         &default_agent_dir(),
         cwd,
@@ -834,7 +840,7 @@ fn build_agent(parsed: &Args, session_dir: &Path, cwd: &Path) -> Result<Agent, S
     };
     agent.tool_context.sandbox = davinci_coding_agent::sandbox_config::resolve_sandbox_settings(
         cwd,
-        global_sandbox_settings.sandbox.as_ref(),
+        effective_global_sandbox.as_ref(),
         project_sandbox_settings.as_ref(),
         project_trusted_for_sandbox,
     )?;
