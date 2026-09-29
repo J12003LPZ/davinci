@@ -90,10 +90,53 @@ pub struct Args {
     pub permission_mode: Option<PermissionMode>,
     /// `--prompt-profile <stable|preview|legacy-v1>`
     pub prompt_profile: Option<davinci_agent::PromptProfile>,
+    /// `--cd, -C <dir>`: a Davinci addition for Codex `exec` parity. `run`
+    /// applies it through [`take_cd_flag`] before anything reads the working
+    /// directory, so this field is only set when `parse_args` sees the raw flag.
+    pub cd: Option<String>,
+    /// `--output-last-message, -o <file>`: a Davinci addition for Codex `exec`
+    /// parity. Print and json runs write the final reply text there.
+    pub output_last_message: Option<String>,
+    /// `--output-schema <file>`: a Davinci addition for Codex `exec` parity.
+    /// `run` loads the JSON schema the final answer of a print or json run
+    /// must match; this is the path as given.
+    pub output_schema: Option<String>,
+    /// `--approval-policy <abort|deny-continue>`: what print and json runs do
+    /// when a call needs approval nobody can give.
+    pub approval_policy: ApprovalPolicy,
+    /// `--fail-on-denied`: exit 3 when a deny-continue run denied anything.
+    pub fail_on_denied: bool,
+    /// `--add-dir <dir>` (repeatable): extra writable roots beside the
+    /// workspace. A Davinci addition for Codex parity. Each value is
+    /// validated and canonicalized at parse time against the working
+    /// directory, which `--cd` has already applied.
+    pub add_dirs: Vec<std::path::PathBuf>,
     pub messages: Vec<String>,
     pub file_args: Vec<String>,
     pub unknown_flags: BTreeMap<String, FlagValue>,
     pub diagnostics: Vec<Diagnostic>,
+}
+
+/// What a non-interactive run does at a permission `Ask`. No TS counterpart;
+/// `deny-continue` mirrors Codex `exec -a never`, where the refusal goes back
+/// to the model as a tool error and the run carries on.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum ApprovalPolicy {
+    /// Stop at the first `Ask`, report `approval_required` and exit 1.
+    #[default]
+    Abort,
+    /// Deny the call, tell the model why, and keep going.
+    DenyContinue,
+}
+
+impl ApprovalPolicy {
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "abort" => Some(Self::Abort),
+            "deny-continue" => Some(Self::DenyContinue),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -119,6 +162,83 @@ pub fn normalize_session_name(value: &str) -> Option<String> {
     } else {
         Some(name.to_string())
     }
+}
+
+const CD_FLAG: &str = "--cd";
+const OUTPUT_LAST_MESSAGE_FLAG: &str = "--output-last-message";
+const OUTPUT_SCHEMA_FLAG: &str = "--output-schema";
+const ADD_DIR_FLAG: &str = "--add-dir";
+
+/// The long name of the Davinci path flag `arg` spells, in any of its forms:
+/// long, short, or long with `=value`. Neither flag exists in TS pi; both
+/// mirror Codex `exec` (`-C/--cd`, `-o/--output-last-message`).
+fn path_flag_name(arg: &str) -> Option<&'static str> {
+    [(CD_FLAG, "-C"), (OUTPUT_LAST_MESSAGE_FLAG, "-o")]
+        .into_iter()
+        .find(|(long, short)| {
+            arg == *long
+                || arg == *short
+                || arg
+                    .strip_prefix(long)
+                    .is_some_and(|rest| rest.starts_with('='))
+        })
+        .map(|(long, _)| long)
+}
+
+/// The value a path flag carries: the text after `=`, or the next argument
+/// unless that is another option. Returns how many extra arguments it used.
+fn split_path_flag<'a>(arg: &'a str, next: Option<&'a String>) -> (Option<&'a str>, usize) {
+    match arg.split_once('=') {
+        Some((_, value)) => (Some(value), 0),
+        None => match next {
+            Some(value) if !value.starts_with('-') => (Some(value.as_str()), 1),
+            _ => (None, 0),
+        },
+    }
+}
+
+/// A missing or empty value is an error, so `-o -p task` never writes a file
+/// named `-p`. A dash-led path is still reachable as `--cd=-dir`.
+fn path_flag_value(name: &str, value: Option<&str>) -> Result<String, String> {
+    match value {
+        Some(value) if !value.is_empty() => Ok(value.to_string()),
+        _ => Err(format!(
+            "{name} requires {}",
+            if name == CD_FLAG || name == ADD_DIR_FLAG {
+                "a directory"
+            } else {
+                "a file path"
+            }
+        )),
+    }
+}
+
+/// Removes every `--cd` / `-C` before a literal `--` and returns the other
+/// arguments with the last directory named. `run` calls this first, so the
+/// subcommands (`plugin`, `install`, `inspect`) and everything that reads the
+/// working directory see the same arguments and the same cwd. A `-C` that is
+/// really the value of another flag (`--name -C`) is read as `--cd` here.
+pub fn take_cd_flag(raw: Vec<String>) -> Result<(Vec<String>, Option<String>), String> {
+    let mut rest = Vec::with_capacity(raw.len());
+    let mut cd = None;
+    let mut args = raw.into_iter().peekable();
+    while let Some(arg) = args.next() {
+        if arg == "--" {
+            rest.push(arg);
+            rest.extend(args);
+            break;
+        }
+        if path_flag_name(&arg) != Some(CD_FLAG) {
+            rest.push(arg);
+            continue;
+        }
+        let (value, consumed) = split_path_flag(&arg, args.peek());
+        cd = Some(path_flag_value(CD_FLAG, value)?);
+        if consumed == 1 {
+            args.next();
+        }
+    }
+    Ok((rest, cd))
 }
 
 pub fn parse_args(args: &[String]) -> Args {
@@ -364,6 +484,84 @@ pub fn parse_args(args: &[String]) -> Args {
                     }
                 }
             }
+        } else if arg == "--approval-policy" || arg.starts_with("--approval-policy=") {
+            let value = match arg.split_once('=') {
+                Some((_, value)) => Some(value),
+                None => match args.get(i + 1) {
+                    Some(next) if !next.starts_with('-') => {
+                        i += 1;
+                        Some(next.as_str())
+                    }
+                    _ => None,
+                },
+            };
+            match value.and_then(ApprovalPolicy::parse) {
+                Some(policy) => result.approval_policy = policy,
+                None => result.diagnostics.push(Diagnostic {
+                    kind: "error",
+                    message: match value {
+                        Some(value) => format!(
+                            "Invalid approval policy \"{value}\". Valid values: abort, deny-continue"
+                        ),
+                        None => "--approval-policy requires abort or deny-continue".into(),
+                    },
+                }),
+            }
+        } else if arg == "--fail-on-denied" {
+            result.fail_on_denied = true;
+        } else if arg == OUTPUT_SCHEMA_FLAG
+            || arg
+                .strip_prefix(OUTPUT_SCHEMA_FLAG)
+                .is_some_and(|rest| rest.starts_with('='))
+        {
+            // Codex has no short form for this one.
+            let (value, consumed) = split_path_flag(arg, args.get(i + 1));
+            i += consumed;
+            match path_flag_value(OUTPUT_SCHEMA_FLAG, value) {
+                Ok(value) => result.output_schema = Some(value),
+                Err(message) => result.diagnostics.push(Diagnostic {
+                    kind: "error",
+                    message,
+                }),
+            }
+        } else if arg == ADD_DIR_FLAG
+            || arg
+                .strip_prefix(ADD_DIR_FLAG)
+                .is_some_and(|rest| rest.starts_with('='))
+        {
+            // Parsed natively, so an extension flag of the same name never
+            // receives it.
+            let (value, consumed) = split_path_flag(arg, args.get(i + 1));
+            i += consumed;
+            let checked = path_flag_value(ADD_DIR_FLAG, value).and_then(|value| {
+                let cwd =
+                    std::env::current_dir().map_err(|err| format!("{ADD_DIR_FLAG}: {err}"))?;
+                davinci_agent::validate_extra_root(
+                    &value,
+                    &cwd,
+                    davinci_session::home_dir().as_deref(),
+                )
+                .map_err(|reason| format!("{ADD_DIR_FLAG}: {reason}"))
+            });
+            match checked {
+                Ok(root) if !result.add_dirs.contains(&root) => result.add_dirs.push(root),
+                Ok(_) => {}
+                Err(message) => result.diagnostics.push(Diagnostic {
+                    kind: "error",
+                    message,
+                }),
+            }
+        } else if let Some(name) = path_flag_name(arg) {
+            let (value, consumed) = split_path_flag(arg, args.get(i + 1));
+            i += consumed;
+            match path_flag_value(name, value) {
+                Ok(value) if name == CD_FLAG => result.cd = Some(value),
+                Ok(value) => result.output_last_message = Some(value),
+                Err(message) => result.diagnostics.push(Diagnostic {
+                    kind: "error",
+                    message,
+                }),
+            }
         } else if arg == "--approve" || arg == "-a" {
             result.project_trust_override = Some(true);
         } else if arg == "--no-approve" || arg == "-na" {
@@ -502,6 +700,254 @@ mod tests {
             .diagnostics
             .iter()
             .any(|d| d.message.contains("--sandbox requires")));
+    }
+
+    #[test]
+    fn codex_exec_path_flags_parse_long_short_and_equals_forms() {
+        let args =
+            |list: &[&str]| parse_args(&list.iter().map(|s| s.to_string()).collect::<Vec<_>>());
+
+        let long = args(&[
+            "--output-last-message",
+            "out.txt",
+            "--cd",
+            "repo",
+            "-p",
+            "go",
+        ]);
+        assert_eq!(long.output_last_message.as_deref(), Some("out.txt"));
+        assert_eq!(long.cd.as_deref(), Some("repo"));
+        assert_eq!(long.messages, ["go"]);
+        assert!(long.diagnostics.is_empty() && long.unknown_flags.is_empty());
+
+        let short = args(&["-o", "out.txt", "-C", "repo", "go"]);
+        assert_eq!(short.output_last_message.as_deref(), Some("out.txt"));
+        assert_eq!(short.cd.as_deref(), Some("repo"));
+        assert_eq!(short.messages, ["go"]);
+
+        let equals = args(&["--output-last-message=a b.txt", "--cd=-odd"]);
+        assert_eq!(equals.output_last_message.as_deref(), Some("a b.txt"));
+        assert_eq!(equals.cd.as_deref(), Some("-odd"));
+        assert!(equals.unknown_flags.is_empty());
+
+        // After `--` they are message text, like every other flag.
+        let literal = args(&["--", "-o", "-C"]);
+        assert_eq!(literal.output_last_message, None);
+        assert_eq!(literal.messages, ["-o", "-C"]);
+    }
+
+    #[test]
+    fn codex_exec_path_flags_without_a_value_are_errors() {
+        let args =
+            |list: &[&str]| parse_args(&list.iter().map(|s| s.to_string()).collect::<Vec<_>>());
+        let error = |parsed: &Args| {
+            parsed
+                .diagnostics
+                .iter()
+                .find(|d| d.kind == "error")
+                .map(|d| d.message.clone())
+        };
+
+        for missing in [
+            args(&["-o"]),
+            args(&["--output-last-message"]),
+            args(&["--output-last-message="]),
+            args(&["-o", "-p", "task"]),
+        ] {
+            assert_eq!(missing.output_last_message, None);
+            assert_eq!(
+                error(&missing).as_deref(),
+                Some("--output-last-message requires a file path")
+            );
+        }
+        // `-o -p task` must not swallow the print flag or its message.
+        let swallowed = args(&["-o", "-p", "task"]);
+        assert!(swallowed.print);
+        assert_eq!(swallowed.messages, ["task"]);
+
+        for missing in [args(&["-C"]), args(&["--cd"]), args(&["--cd", "--print"])] {
+            assert_eq!(missing.cd, None);
+            assert_eq!(
+                error(&missing).as_deref(),
+                Some("--cd requires a directory")
+            );
+        }
+    }
+
+    #[test]
+    fn take_cd_flag_strips_the_flag_so_subcommands_never_see_it() {
+        let raw = |list: &[&str]| list.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+
+        assert_eq!(
+            take_cd_flag(raw(&["-C", "repo", "plugin", "list"])).unwrap(),
+            (raw(&["plugin", "list"]), Some("repo".to_string()))
+        );
+        assert_eq!(
+            take_cd_flag(raw(&["-p", "--cd=one", "go", "--cd", "two"])).unwrap(),
+            (raw(&["-p", "go"]), Some("two".to_string()))
+        );
+        assert_eq!(
+            take_cd_flag(raw(&["-p", "go", "--", "-C", "x"])).unwrap(),
+            (raw(&["-p", "go", "--", "-C", "x"]), None)
+        );
+        assert_eq!(
+            take_cd_flag(raw(&["-p", "go"])).unwrap(),
+            (raw(&["-p", "go"]), None)
+        );
+        assert_eq!(
+            take_cd_flag(raw(&["-p", "go", "-C"])).unwrap_err(),
+            "--cd requires a directory"
+        );
+        assert_eq!(
+            take_cd_flag(raw(&["--cd="])).unwrap_err(),
+            "--cd requires a directory"
+        );
+    }
+
+    #[test]
+    fn approval_policy_parses_both_values_and_rejects_the_rest() {
+        let args =
+            |list: &[&str]| parse_args(&list.iter().map(|s| s.to_string()).collect::<Vec<_>>());
+        let error = |parsed: &Args| {
+            parsed
+                .diagnostics
+                .iter()
+                .find(|d| d.kind == "error")
+                .map(|d| d.message.clone())
+        };
+
+        let default = args(&["-p", "go"]);
+        assert_eq!(default.approval_policy, ApprovalPolicy::Abort);
+        assert!(!default.fail_on_denied);
+
+        let spaced = args(&[
+            "--approval-policy",
+            "deny-continue",
+            "--fail-on-denied",
+            "go",
+        ]);
+        assert_eq!(spaced.approval_policy, ApprovalPolicy::DenyContinue);
+        assert!(spaced.fail_on_denied);
+        assert_eq!(spaced.messages, ["go"]);
+        assert!(spaced.diagnostics.is_empty() && spaced.unknown_flags.is_empty());
+
+        let equals = args(&["--approval-policy=abort", "go"]);
+        assert_eq!(equals.approval_policy, ApprovalPolicy::Abort);
+        assert_eq!(equals.messages, ["go"]);
+
+        let bad = args(&["--approval-policy", "never", "go"]);
+        assert_eq!(bad.approval_policy, ApprovalPolicy::Abort);
+        assert_eq!(
+            error(&bad).as_deref(),
+            Some("Invalid approval policy \"never\". Valid values: abort, deny-continue")
+        );
+        assert_eq!(bad.messages, ["go"]);
+
+        // A missing value never swallows the next flag.
+        for missing in [
+            args(&["--approval-policy"]),
+            args(&["--approval-policy="]),
+            args(&["--approval-policy", "-p", "go"]),
+        ] {
+            assert!(error(&missing).is_some_and(|message| message.contains("abort")));
+        }
+        let before_print = args(&["--approval-policy", "-p", "go"]);
+        assert!(before_print.print);
+        assert_eq!(before_print.messages, ["go"]);
+    }
+
+    #[test]
+    fn add_dir_repeats_and_validates_each_directory() {
+        let args =
+            |list: &[&str]| parse_args(&list.iter().map(|s| s.to_string()).collect::<Vec<_>>());
+        let temp = tempfile::tempdir().unwrap();
+        let base = davinci_agent::strip_verbatim_prefix(&temp.path().canonicalize().unwrap());
+        let [one, two] = ["one", "two"].map(|name| {
+            let dir = base.join(name);
+            std::fs::create_dir_all(&dir).unwrap();
+            dir
+        });
+        let one_text = one.to_string_lossy().into_owned();
+        let two_text = two.to_string_lossy().into_owned();
+        let parsed = args(&[
+            "--add-dir",
+            &one_text,
+            &format!("--add-dir={two_text}"),
+            "--add-dir",
+            &one_text,
+            "go",
+        ]);
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        assert_eq!(parsed.add_dirs, [one, two]);
+        assert_eq!(parsed.messages, ["go"]);
+        assert!(
+            !parsed.unknown_flags.contains_key("add-dir"),
+            "extension passthrough must not see --add-dir"
+        );
+
+        let missing = base.join("missing").to_string_lossy().into_owned();
+        let parsed = args(&["--add-dir", &missing]);
+        assert!(parsed.add_dirs.is_empty());
+        assert_eq!(parsed.diagnostics.len(), 1);
+        assert_eq!(parsed.diagnostics[0].kind, "error");
+        assert!(
+            parsed.diagnostics[0].message.starts_with("--add-dir: ")
+                && parsed.diagnostics[0].message.contains("does not exist"),
+            "{:?}",
+            parsed.diagnostics
+        );
+
+        for bare in [args(&["--add-dir"]), args(&["--add-dir", "--print"])] {
+            assert_eq!(
+                bare.diagnostics[0].message,
+                "--add-dir requires a directory"
+            );
+        }
+        assert!(args(&["--", "--add-dir", "x"]).add_dirs.is_empty());
+    }
+
+    #[test]
+    fn output_schema_takes_a_path_in_spaced_and_equals_forms() {
+        let args =
+            |list: &[&str]| parse_args(&list.iter().map(|s| s.to_string()).collect::<Vec<_>>());
+
+        let spaced = args(&["--output-schema", "schema.json", "-p", "go"]);
+        assert_eq!(spaced.output_schema.as_deref(), Some("schema.json"));
+        assert_eq!(spaced.messages, ["go"]);
+        assert!(spaced.diagnostics.is_empty() && spaced.unknown_flags.is_empty());
+
+        let equals = args(&["--output-schema=a b.json", "go"]);
+        assert_eq!(equals.output_schema.as_deref(), Some("a b.json"));
+        assert_eq!(equals.messages, ["go"]);
+
+        assert_eq!(args(&["-p", "go"]).output_schema, None);
+        assert_eq!(args(&["--", "--output-schema", "x"]).output_schema, None);
+
+        for missing in [
+            args(&["--output-schema"]),
+            args(&["--output-schema="]),
+            args(&["--output-schema", "-p", "go"]),
+        ] {
+            assert_eq!(missing.output_schema, None);
+            assert!(missing
+                .diagnostics
+                .iter()
+                .any(|d| d.kind == "error" && d.message == "--output-schema requires a file path"));
+        }
+        // A missing value never swallows the print flag or its message.
+        let before_print = args(&["--output-schema", "-p", "go"]);
+        assert!(before_print.print);
+        assert_eq!(before_print.messages, ["go"]);
+    }
+
+    #[test]
+    fn help_lists_the_codex_exec_path_flags() {
+        let help = print_help();
+        assert!(help.contains("--output-schema <file>"));
+        assert!(help.contains("--output-last-message, -o <file>"));
+        assert!(help.contains("--cd, -C <dir>"));
+        assert!(help.contains("--approval-policy <abort|deny-continue>"));
+        assert!(help.contains("--fail-on-denied"));
     }
 
     #[test]

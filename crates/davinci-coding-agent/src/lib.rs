@@ -11,6 +11,7 @@ pub mod interactive_tui;
 pub mod native_extensions;
 pub mod native_tools;
 pub mod optimization;
+pub mod output_schema;
 pub mod package_source;
 pub mod permissions;
 pub mod plugins;

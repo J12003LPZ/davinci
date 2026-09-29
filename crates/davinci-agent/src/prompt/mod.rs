@@ -10,6 +10,7 @@ pub mod core;
 pub mod environment;
 pub mod manifest;
 pub mod model_policy;
+pub mod named_files;
 pub mod provider;
 pub mod runtime_state;
 pub mod session;

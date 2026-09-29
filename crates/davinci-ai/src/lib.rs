@@ -32,6 +32,7 @@ mod catalog;
 mod codex;
 pub mod codex_capabilities;
 pub mod codex_flags;
+mod codex_models;
 pub mod codex_telemetry;
 pub mod codex_transport;
 pub mod codex_usage;
@@ -101,6 +102,11 @@ pub use codex::{
     WEBSOCKET_CONNECTION_LIMIT_REACHED, WEBSOCKET_MESSAGE_TOO_BIG_CLOSE_CODE,
 };
 pub use codex_flags::CodexFeatureFlags;
+pub use codex_models::{
+    codex_cli_cache_path, codex_model_source_paths, codex_models_path, load_codex_models,
+    merge_codex_models, overlay_codex_models, parse_codex_models, refresh_codex_models,
+    CodexModelInfo, CodexModelsFile, CodexModelsRefresh, CODEX_MODELS_REFRESH_INTERVAL_MS,
+};
 pub use deferred::{
     cancel_deferred, fetch_deferred, DeferredFetchOptions, DeferredFetchResult, DeferredHandle,
 };

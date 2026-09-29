@@ -61,6 +61,7 @@ pub fn wire_body_for_next_request(agent: &Agent, model: &davinci_ai::Model) -> V
         &tools,
         &davinci_ai::StreamOptions {
             thinking_level: Some(agent.thinking_level),
+            output_schema: agent.output_schema.clone(),
             ..Default::default()
         },
     )

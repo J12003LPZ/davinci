@@ -317,6 +317,9 @@ pub struct Settings {
     pub openai_verbosity: Option<String>,
     #[serde(default, rename = "autoVerify")]
     pub auto_verify: Option<bool>,
+    /// Attach files the user's request names to the turn (default true).
+    #[serde(default, rename = "namedFileContext")]
+    pub named_file_context: Option<bool>,
     #[serde(default, rename = "serviceTier")]
     pub service_tier: Option<String>,
     #[serde(default, rename = "effortPolicy")]
@@ -475,6 +478,15 @@ pub struct PermissionSettings {
     pub allow: Vec<String>,
     #[serde(default)]
     pub deny: Vec<String>,
+    /// Extra writable roots, like `--add-dir`. Davinci addition. Relative
+    /// paths resolve against the working directory; the project file's list
+    /// counts only when the project is trusted.
+    #[serde(
+        default,
+        rename = "additionalDirectories",
+        skip_serializing_if = "Vec::is_empty"
+    )]
+    pub additional_directories: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -1215,6 +1227,11 @@ impl Settings {
         self.auto_verify.unwrap_or(true) && !matches!(environment, Some("0" | "false" | "off"))
     }
 
+    pub fn named_file_context_enabled(&self, environment: Option<&str>) -> bool {
+        self.named_file_context.unwrap_or(true)
+            && !matches!(environment, Some("0" | "false" | "off"))
+    }
+
     pub fn decision_intelligence_enabled(&self) -> bool {
         self.decision_intelligence
             .as_ref()
@@ -1761,6 +1778,20 @@ mod tests {
         }
         assert!(defaults.auto_verify_enabled(Some("1")));
         assert!(!settings.auto_verify_enabled(Some("1")));
+    }
+
+    #[test]
+    fn named_file_context_setting_parses_and_environment_can_disable_it() {
+        let settings: super::Settings =
+            serde_json::from_str(r#"{"namedFileContext":false}"#).unwrap();
+        assert_eq!(settings.named_file_context, Some(false));
+        assert!(!settings.named_file_context_enabled(None));
+        let defaults = super::Settings::default();
+        assert!(defaults.named_file_context_enabled(None));
+        for value in ["0", "false", "off"] {
+            assert!(!defaults.named_file_context_enabled(Some(value)));
+        }
+        assert!(!settings.named_file_context_enabled(Some("1")));
     }
     use super::*;
 

@@ -252,8 +252,21 @@ class StreamTelemetryTests(unittest.TestCase):
         ]
         result = bench.parse_stream("davinci", "\n".join(map(json.dumps, events)))
         self.assertEqual(result["gate_reminders"], {"verification_required": 1})
+        self.assertEqual(result["gate_reminder_causes"], {"none_recorded": 1})
         self.assertEqual(result["auto_verify_runs"], 1)
         self.assertEqual(result["tool_calls"], 0)
+
+    def test_gate_reminder_causes_are_counted(self):
+        events = [
+            {"type": "message_end", "message": {
+                "davinciCapabilityReminder": "verification_required",
+                "davinciCapabilityReminderReason": "nonliteral_command"}},
+            {"type": "message_end", "message": {
+                "davinciCapabilityReminder": "verification_required",
+                "davinciCapabilityReminderReason": "nonliteral_command"}},
+        ]
+        result = bench.parse_stream("davinci", "\n".join(map(json.dumps, events)))
+        self.assertEqual(result["gate_reminder_causes"], {"nonliteral_command": 2})
 
 
 if __name__ == "__main__":

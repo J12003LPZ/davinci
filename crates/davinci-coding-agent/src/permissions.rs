@@ -45,6 +45,48 @@ impl PermissionSources {
         }
     }
 
+    /// The extra writable roots for this run: `--add-dir` values (already
+    /// validated at parse time) first, then `permissions.additionalDirectories`
+    /// from the user file and, only when the project is trusted, the project
+    /// file. Settings entries are validated like the flag. A bad entry is
+    /// skipped with the returned warning instead of failing startup, so a
+    /// stale path in a settings file cannot lock anyone out.
+    pub fn additional_directories(
+        &self,
+        flags: &[PathBuf],
+        cwd: &Path,
+        home: Option<&Path>,
+    ) -> (Vec<PathBuf>, Vec<String>) {
+        let mut roots: Vec<PathBuf> = Vec::new();
+        let mut warnings = Vec::new();
+        for root in flags {
+            if !roots.contains(root) {
+                roots.push(root.clone());
+            }
+        }
+        let entries = self
+            .user
+            .additional_directories
+            .iter()
+            .map(|raw| ("user", raw))
+            .chain(self.project.iter().flat_map(|project| {
+                project
+                    .additional_directories
+                    .iter()
+                    .map(|raw| ("project", raw))
+            }));
+        for (source, raw) in entries {
+            match davinci_agent::validate_extra_root(raw, cwd, home) {
+                Ok(root) if !roots.contains(&root) => roots.push(root),
+                Ok(_) => {}
+                Err(reason) => warnings.push(format!(
+                    "ignoring {source} permissions.additionalDirectories entry `{raw}`: {reason}"
+                )),
+            }
+        }
+        (roots, warnings)
+    }
+
     /// The mode in force before any flag: the project's word, then the
     /// user's, then `ask`.
     pub fn mode(&self) -> PermissionMode {
@@ -276,7 +318,53 @@ mod tests {
             mode: mode.map(str::to_string),
             allow: allow.iter().map(|s| s.to_string()).collect(),
             deny: deny.iter().map(|s| s.to_string()).collect(),
+            additional_directories: Vec::new(),
         }
+    }
+
+    #[test]
+    fn additional_directories_come_from_flags_user_and_trusted_project_only() {
+        let temp = tempfile::tempdir().unwrap();
+        let base = davinci_agent::strip_verbatim_prefix(&temp.path().canonicalize().unwrap());
+        let project = base.join("app");
+        let [flag, user, shared] = ["flag", "user", "shared"].map(|name| {
+            let dir = base.join(name);
+            std::fs::create_dir_all(&dir).unwrap();
+            dir
+        });
+        std::fs::create_dir_all(project.join(".pi")).unwrap();
+        let agent_dir = user_dir_with(
+            PermissionSettings {
+                additional_directories: vec!["../user".into(), "../missing".into()],
+                ..PermissionSettings::default()
+            },
+            &[],
+        );
+        std::fs::write(
+            project_settings_path(&project),
+            r#"{"permissions": {"additionalDirectories": ["../shared", "../user"]}}"#,
+        )
+        .unwrap();
+
+        let untrusted = PermissionSources::load(agent_dir.path(), &project, Some(false));
+        let (roots, warnings) =
+            untrusted.additional_directories(std::slice::from_ref(&flag), &project, None);
+        assert_eq!(roots, [flag.clone(), user.clone()], "no project entries");
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(warnings[0].contains("`../missing`") && warnings[0].contains("does not exist"));
+
+        let trusted = PermissionSources::load(agent_dir.path(), &project, Some(true));
+        let (roots, _) = trusted.additional_directories(&[flag.clone()], &project, None);
+        assert_eq!(roots, [flag, user, shared], "deduplicated, flags first");
+    }
+
+    #[test]
+    fn additional_directories_setting_round_trips_under_its_camel_case_name() {
+        let parsed: PermissionSettings =
+            serde_json::from_str(r#"{"additionalDirectories": ["../lib"]}"#).unwrap();
+        assert_eq!(parsed.additional_directories, ["../lib"]);
+        let empty = serde_json::to_value(PermissionSettings::default()).unwrap();
+        assert!(empty.get("additionalDirectories").is_none());
     }
 
     #[test]

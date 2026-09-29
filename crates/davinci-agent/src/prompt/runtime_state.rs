@@ -16,6 +16,10 @@ pub struct RuntimePromptState {
     pub visual_verification_relevant: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub environment: Option<crate::prompt::environment::EnvironmentSnapshot>,
+    /// Extra writable roots (`--add-dir`). Empty renders nothing, so the
+    /// default prompt bytes stay the same.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub additional_directories: Vec<String>,
 }
 
 pub fn runtime_state_text(state: &RuntimePromptState) -> String {
@@ -74,6 +78,13 @@ pub fn runtime_state_text(state: &RuntimePromptState) -> String {
         lines.push(environment.render());
     }
 
+    if !state.additional_directories.is_empty() {
+        lines.push(format!(
+            "Additional writable directories (use absolute paths): {}.",
+            state.additional_directories.join(", ")
+        ));
+    }
+
     format!("<runtime_state>\n{}\n</runtime_state>", lines.join("\n"))
 }
 
@@ -101,6 +112,7 @@ mod tests {
             visual_verification_available: false,
             visual_verification_relevant: true,
             environment: None,
+            additional_directories: Vec::new(),
         });
 
         assert!(text.contains("Plan Mode"));
@@ -128,6 +140,7 @@ mod tests {
                 visual_verification_available: true,
                 visual_verification_relevant: true,
                 environment: None,
+                additional_directories: Vec::new(),
             };
             let text1 = runtime_state_text(&state);
             let text2 = runtime_state_text(&state);
@@ -145,6 +158,42 @@ mod tests {
     }
 
     #[test]
+    fn additional_directories_render_only_when_present() {
+        let mut state = RuntimePromptState {
+            permission_mode: PermissionMode::Edits,
+            plan_revision: None,
+            plan_approved: false,
+            active_contract: false,
+            visual_verification_available: false,
+            visual_verification_relevant: false,
+            environment: None,
+            additional_directories: Vec::new(),
+        };
+        let default_text = runtime_state_text(&state);
+        assert!(!default_text.contains("Additional writable"));
+        assert_eq!(
+            serde_json::to_value(&state)
+                .unwrap()
+                .get("additional_directories"),
+            None,
+            "an empty list must not change the serialized state"
+        );
+
+        state.additional_directories = vec!["/work/lib".into(), "/work/docs".into()];
+        let text = runtime_state_text(&state);
+        assert!(text.contains(
+            "Additional writable directories (use absolute paths): /work/lib, /work/docs."
+        ));
+        assert_eq!(
+            text.replace(
+                "\nAdditional writable directories (use absolute paths): /work/lib, /work/docs.",
+                ""
+            ),
+            default_text
+        );
+    }
+
+    #[test]
     fn suffix_stays_within_token_budget() {
         let state = RuntimePromptState {
             permission_mode: PermissionMode::ReadOnly,
@@ -154,6 +203,7 @@ mod tests {
             visual_verification_available: false,
             visual_verification_relevant: true,
             environment: None,
+            additional_directories: Vec::new(),
         };
         let text = runtime_state_text(&state);
         assert!(estimate_tokens_from_str(&text) <= 500);

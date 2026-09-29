@@ -1394,11 +1394,86 @@ fn read_tool_cached(
     })
 }
 
+/// Files a missing-path suggestion scans at most, and how many it names.
+const MISSING_FILE_SCAN_LIMIT: usize = 2_000;
+const MISSING_FILE_SUGGESTIONS: usize = 5;
+
+/// The error for a `read` of a path that does not exist: the path as the
+/// model wrote it plus the closest workspace files, so a wrong guess costs
+/// one call instead of a find/ls detour. The bare OS text ("The system
+/// cannot find the file specified. (os error 2)") named neither. Davinci
+/// divergence from TS read.ts, which surfaces the raw ENOENT.
+fn missing_file_message(cwd: &Path, raw_path: &str, path: &Path) -> String {
+    let wanted = path
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let wanted_lower = wanted.to_lowercase();
+    let wanted_stem = Path::new(&wanted_lower)
+        .file_stem()
+        .map(|stem| stem.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let mut scored: Vec<(u8, String)> = Vec::new();
+    let mut scanned = 0;
+    if !wanted.is_empty() {
+        walk_workspace_files(cwd, MISSING_FILE_SCAN_LIMIT, &mut |file| {
+            scanned += 1;
+            let name = file
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            let lower = name.to_lowercase();
+            let stem = Path::new(&lower)
+                .file_stem()
+                .map(|stem| stem.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            let score = if name == wanted {
+                Some(0)
+            } else if lower == wanted_lower {
+                Some(1)
+            } else if !wanted_stem.is_empty() && stem == wanted_stem {
+                Some(2)
+            } else if wanted_stem.len() >= 3
+                && (lower.contains(&wanted_stem)
+                    || (stem.len() >= 3 && wanted_lower.contains(&stem)))
+            {
+                Some(3)
+            } else {
+                None
+            };
+            if let Some(score) = score {
+                scored.push((score, relativize_find_result_path(file, cwd)));
+            }
+            scanned < MISSING_FILE_SCAN_LIMIT
+        });
+    }
+    scored.sort();
+    scored.dedup();
+    let names: Vec<String> = scored
+        .into_iter()
+        .take(MISSING_FILE_SUGGESTIONS)
+        .map(|(_, name)| name)
+        .collect();
+    if names.is_empty() {
+        format!("File not found: {raw_path}. No similar files in the workspace.")
+    } else {
+        format!(
+            "File not found: {raw_path}. Closest matches: {}",
+            names.join(", ")
+        )
+    }
+}
+
 fn read_tool(cwd: &Path, input: &serde_json::Value) -> Result<ToolResult, ToolError> {
     let raw_path = required_str(input, "path")?;
     let path = resolve(cwd, raw_path)?;
-    let mut prefix_file =
-        fs::File::open(&path).map_err(|err| ToolError::Failed(err.to_string()))?;
+    let mut prefix_file = fs::File::open(&path).map_err(|err| {
+        if err.kind() == std::io::ErrorKind::NotFound {
+            ToolError::Failed(missing_file_message(cwd, raw_path, &path))
+        } else {
+            ToolError::Failed(err.to_string())
+        }
+    })?;
     let mut prefix = [0_u8; 12];
     let prefix_len = prefix_file
         .read(&mut prefix)
@@ -1885,7 +1960,26 @@ fn edit_tool_locked(
     })
 }
 
+/// A `timeout` at or above this many "seconds" that is a whole multiple of
+/// 1000 is read as milliseconds. GPT models trained on Codex's millisecond
+/// shell parameters send `120000` or `10000` here; taken as seconds those
+/// are 33 and 2.8 hours. No foreground command is given 10,000+ seconds on
+/// purpose in whole thousands, while 1000-9999 stays seconds because values
+/// such as 1800 or 3600 are plausible. Davinci divergence from TS bash.ts.
+const MILLISECOND_TIMEOUT_THRESHOLD: f64 = 10_000.0;
+
 fn resolve_bash_timeout_ms(input: &serde_json::Value) -> Result<Option<u64>, ToolError> {
+    // Codex spelling, accepted though not advertised so the schema keeps
+    // TS parity.
+    if let Some(value) = input.get("timeout_ms").filter(|value| !value.is_null()) {
+        let millis = value
+            .as_f64()
+            .filter(|millis| millis.is_finite() && *millis > 0.0)
+            .ok_or_else(|| {
+                ToolError::Failed("Invalid timeout_ms: must be a positive number".into())
+            })?;
+        return resolve_bash_timeout_seconds(millis / 1000.0).map(Some);
+    }
     let Some(value) = input.get("timeout") else {
         return Ok(None);
     };
@@ -1895,6 +1989,41 @@ fn resolve_bash_timeout_ms(input: &serde_json::Value) -> Result<Option<u64>, Too
     let seconds = value.as_f64().ok_or_else(|| {
         ToolError::Failed("Invalid timeout: must be a finite number of seconds".into())
     })?;
+    if seconds >= MILLISECOND_TIMEOUT_THRESHOLD && seconds % 1000.0 == 0.0 {
+        return resolve_bash_timeout_seconds(seconds / 1000.0).map(Some);
+    }
+    resolve_bash_timeout_seconds(seconds).map(Some)
+}
+
+/// The seconds shown in "Command timed out after N seconds". The model's own
+/// `timeout` text is kept when it was read as seconds (TS prints it
+/// verbatim, e.g. `0.2`); a value read as milliseconds, or `timeout_ms`,
+/// is shown as the seconds actually applied.
+fn shell_timeout_label(input: &serde_json::Value, timeout_ms: Option<u64>) -> Option<String> {
+    let timeout_ms = timeout_ms?;
+    if let Some(value) = input
+        .get("timeout")
+        .filter(|_| input.get("timeout_ms").is_none())
+    {
+        if value
+            .as_f64()
+            .is_some_and(|seconds| ((seconds * 1000.0) as u64) == timeout_ms)
+        {
+            return Some(match value {
+                serde_json::Value::Number(number) => number.to_string(),
+                other => other.to_string(),
+            });
+        }
+    }
+    let seconds = timeout_ms as f64 / 1000.0;
+    Some(if seconds.fract() == 0.0 {
+        format!("{}", seconds as u64)
+    } else {
+        format!("{seconds}")
+    })
+}
+
+fn resolve_bash_timeout_seconds(seconds: f64) -> Result<u64, ToolError> {
     if !seconds.is_finite() || seconds <= 0.0 {
         return Err(ToolError::Failed(
             "Invalid timeout: must be a finite number of seconds".into(),
@@ -1908,7 +2037,7 @@ fn resolve_bash_timeout_ms(input: &serde_json::Value) -> Result<Option<u64>, Too
             MAX_TIMEOUT_MS / 1000.0
         )));
     }
-    Ok(Some(timeout_ms as u64))
+    Ok(timeout_ms as u64)
 }
 
 fn wants_background(input: &serde_json::Value) -> bool {
@@ -2075,10 +2204,7 @@ fn shell_tool(
             );
         return Ok(crate::jobs::started_result(id, pid, shown));
     }
-    let timeout_label = input.get("timeout").map(|value| match value {
-        serde_json::Value::Number(number) => number.to_string(),
-        other => other.to_string(),
-    });
+    let timeout_label = shell_timeout_label(input, timeout_ms);
     let (output, pipe_truncated) = if let Some(host) = &context.foreground_supervisor {
         let custom = std::env::var("PI_SHELL")
             .ok()
@@ -2371,7 +2497,7 @@ fn powershell_tool(
 ) -> Result<ToolResult, ToolError> {
     let command = required_str(input, "command")?;
     let timeout_ms = resolve_bash_timeout_ms(input)?;
-    let timeout_label = input.get("timeout").map(ToString::to_string);
+    let timeout_label = shell_timeout_label(input, timeout_ms);
     if let Ok(reply) = std::env::var("PI_POWERSHELL_REPLY") {
         return Ok(ToolResult {
             content: reply,
@@ -2600,10 +2726,43 @@ fn path_is_inside_git_repo(search_path: &Path) -> bool {
     }
 }
 
+/// Directories the fd and rg fast paths skip, matching what the native
+/// fallback's `IgnoreRules` already skips. `--hidden` alone made `.git`
+/// internals the bulk of find and grep output, so results depended on
+/// whether fd/rg were installed. Davinci divergence from TS pi, whose fd
+/// path has the same gap (find.ts) while its fallback excludes `.git`.
+const SEARCH_EXCLUDED_DIRS: &[&str] = &[".git", "node_modules"];
+
+/// True when the caller deliberately aimed at an excluded directory: the
+/// search root lies inside one, or the pattern/glob names one. Those
+/// searches keep today's behaviour.
+fn targets_excluded_dir(pattern: &str, search_path: &Path) -> bool {
+    let names_dir = |text: &str| {
+        text.split(['/', '\\']).any(|part| {
+            // A directory-specific glob is explicit intent; broad `*` and
+            // `**` still retain the default noise exclusions.
+            part.chars().any(|ch| ch.is_alphanumeric() || ch == '.')
+                && SEARCH_EXCLUDED_DIRS
+                    .iter()
+                    .any(|dir| crate::permission::glob_matches(part, dir))
+        })
+    };
+    (!pattern.starts_with('!') && names_dir(pattern))
+        || search_path.components().any(|component| {
+            SEARCH_EXCLUDED_DIRS.contains(&component.as_os_str().to_string_lossy().as_ref())
+        })
+}
+
 fn build_fd_args(pattern: &str, search_path: &Path, limit: usize) -> Vec<String> {
     let mut args = vec!["--glob".into(), "--color=never".into(), "--hidden".into()];
     if !path_is_inside_git_repo(search_path) {
         args.push("--no-require-git".into());
+    }
+    if !targets_excluded_dir(pattern, search_path) {
+        for dir in SEARCH_EXCLUDED_DIRS {
+            args.push("--exclude".into());
+            args.push((*dir).into());
+        }
     }
     args.push("--max-results".into());
     args.push(limit.to_string());
@@ -2645,6 +2804,14 @@ fn build_rg_args(
     if let Some(glob) = glob {
         args.push("--glob".into());
         args.push(glob.to_string());
+    }
+    // After the user's glob: rg lets a later glob override an earlier one,
+    // so a broad `**/*` placed last would bring `.git` back.
+    if !targets_excluded_dir(glob.unwrap_or(""), search_path) {
+        for dir in SEARCH_EXCLUDED_DIRS {
+            args.push("--glob".into());
+            args.push(format!("!{dir}"));
+        }
     }
     args.push("--".into());
     args.push(pattern.to_string());
@@ -2843,6 +3010,46 @@ fn run_rg_streaming(
     Ok(Some((stream.matches, stream.limit_reached)))
 }
 
+/// Render grep matches of one file with `context` lines around each, merging
+/// overlapping or adjacent windows so every line prints once and putting a
+/// `--` line between separate groups, as ripgrep does. `match_lines` are
+/// 1-based and ascending. Returns the lines and whether any line was cut.
+/// Davinci divergence from TS grep.ts, which repeated shared context lines.
+fn render_grep_context(
+    display: &str,
+    file_lines: &[&str],
+    match_lines: &[usize],
+    context: usize,
+) -> (Vec<String>, bool) {
+    let mut out = Vec::new();
+    let mut lines_truncated = false;
+    let mut ranges: Vec<(usize, usize)> = Vec::new();
+    for &line in match_lines {
+        let start = line.saturating_sub(context).max(1);
+        let end = (line + context).min(file_lines.len().max(line));
+        match ranges.last_mut() {
+            Some(last) if start <= last.1 + 1 => last.1 = last.1.max(end),
+            _ => ranges.push((start, end)),
+        }
+    }
+    for (group, (start, end)) in ranges.into_iter().enumerate() {
+        if group > 0 {
+            out.push("--".to_string());
+        }
+        for current in start..=end {
+            let (text, truncated) =
+                truncate_line(file_lines.get(current - 1).copied().unwrap_or(""));
+            lines_truncated |= truncated;
+            if match_lines.binary_search(&current).is_ok() {
+                out.push(format!("{display}:{current}: {text}"));
+            } else {
+                out.push(format!("{display}-{current}- {text}"));
+            }
+        }
+    }
+    (out, lines_truncated)
+}
+
 fn grep_tool(
     cwd: &Path,
     input: &serde_json::Value,
@@ -2898,9 +3105,36 @@ fn grep_tool(
     }
     let mut lines_truncated = false;
     let mut matches = Vec::new();
-    for (file, line_number, line_text) in raw_matches {
-        let display = format_grep_path(&file, &search_path, is_dir);
-        if context == 0 {
+    if context > 0 {
+        // ripgrep reports a file's matches together and in line order, so
+        // each run of equal paths is one file: read it once, merge windows.
+        let mut index = 0;
+        while index < raw_matches.len() {
+            let file = raw_matches[index].0.clone();
+            let mut lines = Vec::new();
+            while index < raw_matches.len() && raw_matches[index].0 == file {
+                lines.push(raw_matches[index].1);
+                index += 1;
+            }
+            lines.sort_unstable();
+            lines.dedup();
+            let display = format_grep_path(&file, &search_path, is_dir);
+            let Ok(body) = fs::read_to_string(&file) else {
+                for line_number in lines {
+                    matches.push(format!("{display}:{line_number}: (unable to read file)"));
+                }
+                continue;
+            };
+            let normalized = body.replace("\r\n", "\n").replace('\r', "\n");
+            let file_lines: Vec<&str> = normalized.split('\n').collect();
+            let (rendered, truncated) = render_grep_context(&display, &file_lines, &lines, context);
+            lines_truncated |= truncated;
+            matches.extend(rendered);
+        }
+    }
+    if context == 0 {
+        for (file, line_number, line_text) in raw_matches {
+            let display = format_grep_path(&file, &search_path, is_dir);
             let text = line_text
                 .as_deref()
                 .unwrap_or("")
@@ -2911,25 +3145,6 @@ fn grep_tool(
             let (text, truncated) = truncate_line(&text);
             lines_truncated |= truncated;
             matches.push(format!("{display}:{line_number}: {text}"));
-            continue;
-        }
-        let Ok(body) = fs::read_to_string(&file) else {
-            matches.push(format!("{display}:{line_number}: (unable to read file)"));
-            continue;
-        };
-        let normalized = body.replace("\r\n", "\n").replace('\r', "\n");
-        let file_lines: Vec<&str> = normalized.split('\n').collect();
-        let start = line_number.saturating_sub(context).max(1);
-        let end = (line_number + context).min(file_lines.len());
-        for current in start..=end {
-            let (text, truncated) =
-                truncate_line(file_lines.get(current - 1).copied().unwrap_or(""));
-            lines_truncated |= truncated;
-            if current == line_number {
-                matches.push(format!("{display}:{current}: {text}"));
-            } else {
-                matches.push(format!("{display}-{current}- {text}"));
-            }
         }
     }
     let mut output_text = matches.join("\n");
@@ -3049,25 +3264,18 @@ fn grep_scan_file(
         return Some((out, lines_truncated));
     }
     let file_lines: Vec<&str> = body.lines().collect();
+    let mut match_lines = Vec::new();
     for (index, line) in file_lines.iter().enumerate() {
-        if out.len() >= remaining {
+        if match_lines.len() >= remaining {
             break;
         }
-        if !matcher.is_match(line) {
-            continue;
-        }
-        let start = index.saturating_sub(context);
-        let end = (index + context + 1).min(file_lines.len());
-        for (current, line) in file_lines.iter().enumerate().take(end).skip(start) {
-            let (text, truncated) = truncate_line(line);
-            lines_truncated |= truncated;
-            if current == index {
-                out.push(format!("{display}:{}: {text}", current + 1));
-            } else {
-                out.push(format!("{display}-{}- {text}", current + 1));
-            }
+        if matcher.is_match(line) {
+            match_lines.push(index + 1);
         }
     }
+    let (rendered, truncated) = render_grep_context(display, &file_lines, &match_lines, context);
+    out.extend(rendered);
+    lines_truncated |= truncated;
     Some((out, lines_truncated))
 }
 
@@ -3407,6 +3615,57 @@ struct IgnoreRules {
 }
 
 impl IgnoreRules {
+    /// Automatic discovery cannot read arbitrary-size ignore files or scan
+    /// arbitrarily many ancestors before its entry budget even starts.
+    fn load_for_discovery(root: &Path) -> Option<Self> {
+        let mut patterns = vec![".git".to_string(), "node_modules".to_string()];
+        let mut remaining = 16 * 1024;
+        let mut current = root;
+        for _ in 0..64 {
+            let path = current.join(".gitignore");
+            match fs::symlink_metadata(&path) {
+                Ok(metadata) => {
+                    if !metadata.is_file() || metadata.len() > remaining as u64 {
+                        return None;
+                    }
+                    let mut body = String::new();
+                    fs::File::open(&path)
+                        .ok()?
+                        .take(remaining as u64 + 1)
+                        .read_to_string(&mut body)
+                        .ok()?;
+                    if body.len() > remaining {
+                        return None;
+                    }
+                    remaining -= body.len();
+                    for line in body.lines().map(str::trim) {
+                        if line.is_empty() || line.starts_with('#') || line.starts_with('!') {
+                            continue;
+                        }
+                        if patterns.len() >= 256 {
+                            return None;
+                        }
+                        patterns.push(line.trim_end_matches('/').to_string());
+                    }
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(_) => return None,
+            }
+            let parent = current.parent();
+            if current.join(".git").exists() || parent.is_none() {
+                let (path_patterns, name_patterns) = patterns
+                    .into_iter()
+                    .partition(|pattern| pattern.contains('/'));
+                return Some(Self {
+                    name_patterns,
+                    path_patterns,
+                });
+            }
+            current = parent?;
+        }
+        None
+    }
+
     fn load(root: &Path) -> Self {
         let mut patterns = vec![".git".into(), "node_modules".into()];
         let mut current = if root.is_file() {
@@ -3513,6 +3772,53 @@ fn walk_files(root: &Path, ignore: &IgnoreRules, visit: &mut dyn FnMut(&Path) ->
         }
         stack.extend(dirs.into_iter().rev());
     }
+}
+
+/// Bounded discovery for automatic context and missing-file suggestions.
+/// Counts every directory entry, including ignored paths and empty directories.
+/// Returns false on truncation or I/O failure: a partial scan proves no uniqueness.
+/// A directory larger than the remaining budget is not partially sorted or visited.
+pub(crate) fn walk_workspace_files(
+    root: &Path,
+    max_entries: usize,
+    visit: &mut dyn FnMut(&Path) -> bool,
+) -> bool {
+    let Some(ignore) = IgnoreRules::load_for_discovery(root) else {
+        return false;
+    };
+    let mut remaining = max_entries;
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let Ok(entries) = fs::read_dir(&dir) else {
+            return false;
+        };
+        let entries: Result<Vec<_>, _> = entries.take(remaining.saturating_add(1)).collect();
+        let Ok(mut entries) = entries else {
+            return false;
+        };
+        if entries.len() > remaining {
+            return false;
+        }
+        remaining -= entries.len();
+        entries.sort_by_key(|entry| entry.file_name());
+        let mut dirs = Vec::new();
+        for entry in entries {
+            let path = entry.path();
+            if ignore.ignored(&path) {
+                continue;
+            }
+            let Ok(kind) = entry.file_type() else {
+                return false;
+            };
+            if kind.is_dir() {
+                dirs.push(path);
+            } else if (kind.is_file() || kind.is_symlink() && path.is_file()) && !visit(&path) {
+                return false;
+            }
+        }
+        stack.extend(dirs.into_iter().rev());
+    }
+    true
 }
 
 fn format_grep_path(file: &Path, search_path: &Path, is_dir: bool) -> String {
@@ -4846,6 +5152,10 @@ mod tests {
                 "--glob",
                 "--color=never",
                 "--hidden",
+                "--exclude",
+                ".git",
+                "--exclude",
+                "node_modules",
                 "--max-results",
                 "25",
                 "--full-path",
@@ -4866,6 +5176,10 @@ mod tests {
                 "--fixed-strings",
                 "--glob",
                 "*.rs",
+                "--glob",
+                "!.git",
+                "--glob",
+                "!node_modules",
                 "--",
                 "Needle",
                 dir.path().to_string_lossy().as_ref(),
@@ -4878,6 +5192,137 @@ mod tests {
         let dir = tempdir().unwrap();
         let args = build_fd_args("*.rs", dir.path(), 10);
         assert!(args.iter().any(|arg| arg == "--no-require-git"));
+    }
+
+    #[test]
+    fn shell_timeout_reads_codex_millisecond_values() {
+        let resolve = |input: serde_json::Value| resolve_bash_timeout_ms(&input).unwrap();
+        assert_eq!(resolve(serde_json::json!({"timeout": 120})), Some(120_000));
+        assert_eq!(
+            resolve(serde_json::json!({"timeout": 3600})),
+            Some(3_600_000)
+        );
+        assert_eq!(resolve(serde_json::json!({"timeout": 1.5})), Some(1_500));
+        // Millisecond-shaped values seen from GPT models in the benchmark.
+        assert_eq!(
+            resolve(serde_json::json!({"timeout": 120000})),
+            Some(120_000)
+        );
+        assert_eq!(resolve(serde_json::json!({"timeout": 10000})), Some(10_000));
+        // Above the threshold but not whole thousands: still seconds.
+        assert_eq!(
+            resolve(serde_json::json!({"timeout": 10001})),
+            Some(10_001_000)
+        );
+        assert_eq!(
+            resolve(serde_json::json!({"timeout_ms": 2500})),
+            Some(2_500)
+        );
+        assert_eq!(resolve(serde_json::json!({})), None);
+        assert!(resolve_bash_timeout_ms(&serde_json::json!({"timeout_ms": -1})).is_err());
+        assert!(resolve_bash_timeout_ms(&serde_json::json!({"timeout": 0})).is_err());
+        let label = |input: serde_json::Value| {
+            shell_timeout_label(&input, resolve_bash_timeout_ms(&input).unwrap())
+        };
+        assert_eq!(
+            label(serde_json::json!({"timeout": 0.2})).as_deref(),
+            Some("0.2")
+        );
+        assert_eq!(
+            label(serde_json::json!({"timeout": 120000})).as_deref(),
+            Some("120")
+        );
+        assert_eq!(
+            label(serde_json::json!({"timeout_ms": 2500})).as_deref(),
+            Some("2.5")
+        );
+        assert_eq!(label(serde_json::json!({})), None);
+    }
+
+    #[test]
+    fn read_of_missing_file_names_closest_matches() {
+        let dir = tempdir().unwrap();
+        fs::create_dir_all(dir.path().join("shop")).unwrap();
+        fs::write(dir.path().join("shop").join("pricing.py"), "x").unwrap();
+        fs::write(dir.path().join("README.md"), "x").unwrap();
+        let err = execute_tool(
+            dir.path(),
+            "read",
+            &serde_json::json!({"path": "pricing.py"}),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("File not found: pricing.py"), "{err}");
+        assert!(err.contains("shop/pricing.py"), "{err}");
+        assert!(!err.contains("os error"), "{err}");
+        let err = execute_tool(dir.path(), "read", &serde_json::json!({"path": "zzz.rs"}))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("No similar files"), "{err}");
+    }
+
+    #[test]
+    fn search_fast_paths_keep_excluded_dirs_when_targeted() {
+        let dir = tempdir().unwrap();
+        let fd = build_fd_args(".git/hooks/*", dir.path(), 10);
+        assert!(!fd.iter().any(|arg| arg == "--exclude"));
+        let rg = build_rg_args("x", &dir.path().join(".git"), None, false, false);
+        assert!(!rg.iter().any(|arg| arg == "!.git"));
+        let rg = build_rg_args("x", dir.path(), Some("node_modules/**"), false, false);
+        assert!(!rg.iter().any(|arg| arg == "!node_modules"));
+        // A broad user glob must not re-include .git: the negation comes last.
+        let rg = build_rg_args("x", dir.path(), Some("**/*"), false, false);
+        let user = rg.iter().position(|arg| arg == "**/*").unwrap();
+        let negated = rg.iter().position(|arg| arg == "!.git").unwrap();
+        assert!(negated > user, "{rg:?}");
+        // A file that merely starts with ".git" is not a request for .git.
+        let fd = build_fd_args(".gitignore", dir.path(), 10);
+        assert!(fd.iter().any(|arg| arg == ".git"));
+    }
+
+    #[test]
+    fn grep_context_merges_overlapping_windows() {
+        let lines: Vec<&str> = (1..=12).map(|_| "x").collect();
+        let (out, truncated) = render_grep_context("f.py", &lines, &[3, 5, 11], 1);
+        assert!(!truncated);
+        assert_eq!(
+            out,
+            vec![
+                "f.py-2- x",
+                "f.py:3: x",
+                "f.py-4- x",
+                "f.py:5: x",
+                "f.py-6- x",
+                "--",
+                "f.py-10- x",
+                "f.py:11: x",
+                "f.py-12- x",
+            ]
+        );
+        // Adjacent windows join without a separator; edges clamp to the file.
+        let (out, _) = render_grep_context("f.py", &lines, &[1, 4], 1);
+        assert_eq!(out.first().unwrap(), "f.py:1: x");
+        assert!(!out.contains(&"--".to_string()));
+        assert_eq!(out.len(), 5);
+    }
+
+    #[test]
+    fn native_grep_prints_each_context_line_once() {
+        let dir = tempdir().unwrap();
+        fs::write(
+            dir.path().join("a.txt"),
+            "one\nneedle\nthree\nneedle\nfive\n",
+        )
+        .unwrap();
+        let out = grep_tool_native(
+            dir.path(),
+            &serde_json::json!({"pattern": "needle", "context": 1}),
+            &ToolContext::default(),
+        )
+        .unwrap()
+        .content;
+        assert_eq!(out.matches("three").count(), 1, "{out}");
+        assert_eq!(out.matches("needle").count(), 2, "{out}");
     }
 
     #[test]
@@ -5127,5 +5572,46 @@ impl User {
             .unwrap_err()
             .to_string()
             .contains("Rename preview is unavailable"));
+    }
+}
+
+#[cfg(test)]
+mod bounded_discovery_regressions {
+    use super::*;
+
+    #[test]
+    fn wildcard_directory_targets_are_not_overridden() {
+        for pattern in [
+            "**/node_modules*/**",
+            "**/.git*/**",
+            "node_module?/pkg/*.js",
+        ] {
+            assert!(targets_excluded_dir(pattern, Path::new(".")), "{pattern}");
+            let args = build_rg_args("needle", Path::new("."), Some(pattern), false, false);
+            assert!(!args
+                .iter()
+                .any(|arg| arg == "!node_modules" || arg == "!.git"));
+        }
+        assert!(!targets_excluded_dir("**/*", Path::new(".")));
+        assert!(!targets_excluded_dir("!**/.git*/**", Path::new(".")));
+        assert!(targets_excluded_dir(
+            &format!(".git{}", "*".repeat(40000)),
+            Path::new(".")
+        ));
+    }
+
+    #[test]
+    fn discovery_counts_empty_directories_and_reports_truncation() {
+        let root = tempfile::tempdir().unwrap();
+        for n in 0..20 {
+            fs::create_dir(root.path().join(format!("dir{n:02}"))).unwrap();
+        }
+        let mut visited = 0;
+        assert!(!walk_workspace_files(root.path(), 3, &mut |_| {
+            visited += 1;
+            true
+        }));
+        assert_eq!(visited, 0);
+        assert!(walk_workspace_files(root.path(), 20, &mut |_| true));
     }
 }

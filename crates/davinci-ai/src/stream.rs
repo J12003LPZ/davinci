@@ -40,6 +40,41 @@ pub struct StreamOptions {
     /// Set from another thread to stop a live stream between frames. The
     /// message then closes with `StopReason::Aborted`.
     pub abort_signal: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    /// `--output-schema`: a JSON schema the final answer must match. OpenAI
+    /// Responses routes send it as `text.format`, chat completions as
+    /// `response_format`; other providers get no wire change and rely on the
+    /// caller's validation.
+    pub output_schema: Option<Value>,
+}
+
+/// The schema name the constrained-output wire formats carry. Codex exec
+/// sends its own; ours only has to be stable and within OpenAI's name rules.
+pub const OUTPUT_SCHEMA_NAME: &str = "davinci_output_schema";
+
+/// Responses `text.format`: merged into an existing `text` object so the
+/// Codex `verbosity` setting survives.
+fn apply_responses_output_schema(body: &mut Value, schema: &Value) {
+    if !body["text"].is_object() {
+        body["text"] = serde_json::json!({});
+    }
+    body["text"]["format"] = serde_json::json!({
+        "type": "json_schema",
+        "name": OUTPUT_SCHEMA_NAME,
+        "strict": true,
+        "schema": schema,
+    });
+}
+
+/// Chat completions `response_format`.
+fn apply_completions_output_schema(body: &mut Value, schema: &Value) {
+    body["response_format"] = serde_json::json!({
+        "type": "json_schema",
+        "json_schema": {
+            "name": OUTPUT_SCHEMA_NAME,
+            "strict": true,
+            "schema": schema,
+        },
+    });
 }
 
 #[allow(unused_imports)]
@@ -1538,6 +1573,9 @@ fn openai_responses_body_with_service_tier(
         body["tool_choice"] = Value::String("auto".into());
         body["parallel_tool_calls"] = Value::Bool(true);
     }
+    if let Some(schema) = options.output_schema.as_ref() {
+        apply_responses_output_schema(&mut body, schema);
+    }
     let session_key = crate::cache::effective_prompt_cache_key(options)
         .filter(|id| !id.is_empty())
         .map(crate::cache::clamp_openai_prompt_cache_key);
@@ -2052,6 +2090,11 @@ fn openai_body(
         );
     }
     apply_openai_thinking(&mut body, model, options);
+    if model.api == "openai-completions" {
+        if let Some(schema) = options.output_schema.as_ref() {
+            apply_completions_output_schema(&mut body, schema);
+        }
+    }
 
     // openai-completions.ts:805-810.
     let retention = crate::cache::cache_retention_from_options(options);
@@ -2724,6 +2767,139 @@ mod tests {
                 };
                 assert_eq!(body.get("service_tier").and_then(Value::as_str), expected);
             }
+        }
+    }
+
+    fn output_schema_fixture() -> Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": {"ok": {"type": "boolean"}},
+            "required": ["ok"],
+            "additionalProperties": false
+        })
+    }
+
+    fn schema_options() -> StreamOptions {
+        StreamOptions {
+            output_schema: Some(output_schema_fixture()),
+            ..StreamOptions::default()
+        }
+    }
+
+    #[test]
+    fn output_schema_becomes_text_format_on_every_responses_route() {
+        let mut model = load_builtin_models()
+            .into_iter()
+            .find(|model| model.api == "openai-codex-responses")
+            .unwrap();
+        let messages = [ChatMessage::text("user", "hi")];
+        for api in [
+            "openai-codex-responses",
+            "openai-responses",
+            "azure-openai-responses",
+        ] {
+            model.api = api.into();
+            let plain = request_body_with(&model, &messages, None, &[], &StreamOptions::default());
+            assert!(plain.pointer("/text/format").is_none(), "{api}: {plain}");
+
+            let body = request_body_with(&model, &messages, None, &[], &schema_options());
+            assert_eq!(
+                body["text"]["format"],
+                serde_json::json!({
+                    "type": "json_schema",
+                    "name": OUTPUT_SCHEMA_NAME,
+                    "strict": true,
+                    "schema": output_schema_fixture(),
+                }),
+                "{api}"
+            );
+            assert!(body.get("response_format").is_none(), "{api}");
+            if api == "openai-codex-responses" {
+                // Merged into the existing object, not replacing it.
+                assert_eq!(body["text"]["verbosity"], plain["text"]["verbosity"]);
+                assert!(body["text"]["verbosity"].is_string());
+            } else {
+                assert!(plain.get("text").is_none(), "{api}: {plain}");
+                assert_eq!(body["text"].as_object().unwrap().len(), 1, "{api}");
+            }
+        }
+    }
+
+    #[test]
+    fn output_schema_survives_into_the_codex_websocket_request() {
+        let model = load_builtin_models()
+            .into_iter()
+            .find(|model| model.api == "openai-codex-responses")
+            .unwrap();
+        let first = request_body_with(
+            &model,
+            &[ChatMessage::text("user", "hi")],
+            None,
+            &[],
+            &schema_options(),
+        );
+        let (full, used) = crate::codex::build_cached_websocket_request_body(&first, None);
+        assert!(!used);
+        assert_eq!(full["text"], first["text"]);
+
+        // A continuation turn sends only the input delta; the format rides along.
+        let second = request_body_with(
+            &model,
+            &[
+                ChatMessage::text("user", "hi"),
+                ChatMessage::text("assistant", "hello"),
+                ChatMessage::text("user", "again"),
+            ],
+            None,
+            &[],
+            &schema_options(),
+        );
+        let continuation = crate::codex::CachedWebSocketContinuation {
+            last_request_body: first.clone(),
+            last_response_id: "resp_1".into(),
+            last_response_items: serde_json::json!([second["input"][1].clone()]),
+        };
+        let (delta, used) =
+            crate::codex::build_cached_websocket_request_body(&second, Some(&continuation));
+        assert!(used, "{delta}");
+        assert_eq!(delta["previous_response_id"], "resp_1");
+        assert_eq!(delta["text"]["format"]["schema"], output_schema_fixture());
+    }
+
+    #[test]
+    fn output_schema_becomes_response_format_on_chat_completions_only() {
+        let models = load_builtin_models();
+        let chat = models
+            .iter()
+            .find(|model| model.api == "openai-completions")
+            .unwrap();
+        let messages = [ChatMessage::text("user", "hi")];
+        let plain = request_body_with(chat, &messages, None, &[], &StreamOptions::default());
+        assert!(plain.get("response_format").is_none());
+        let body = request_body_with(chat, &messages, None, &[], &schema_options());
+        assert_eq!(
+            body["response_format"],
+            serde_json::json!({
+                "type": "json_schema",
+                "json_schema": {
+                    "name": OUTPUT_SCHEMA_NAME,
+                    "strict": true,
+                    "schema": output_schema_fixture(),
+                },
+            })
+        );
+        assert!(body.get("text").is_none());
+
+        // Other providers keep their wire format; the caller validates.
+        for api in [
+            "anthropic-messages",
+            "google-generative-ai",
+            "mistral-conversations",
+        ] {
+            let model = models.iter().find(|model| model.api == api).unwrap();
+            let plain = request_body_with(model, &messages, None, &[], &StreamOptions::default());
+            let body = request_body_with(model, &messages, None, &[], &schema_options());
+            assert_eq!(body, plain, "{api}");
         }
     }
 

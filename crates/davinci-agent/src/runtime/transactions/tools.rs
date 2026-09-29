@@ -11,6 +11,8 @@ type Check = dyn Fn(&Path) -> Result<(), String> + Send + Sync;
 pub struct MutationAuthority {
     source: Arc<Check>,
     git: Option<Arc<Check>>,
+    // Host-selected root for this dispatch, never supplied as model identity.
+    transaction_root: Option<PathBuf>,
 }
 impl std::fmt::Debug for MutationAuthority {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -22,6 +24,7 @@ impl MutationAuthority {
         Self {
             source: Arc::new(check),
             git: None,
+            transaction_root: None,
         }
     }
     pub fn check(&self, path: &Path) -> Result<(), String> {
@@ -41,6 +44,25 @@ impl MutationAuthority {
         let name = name.to_owned();
         let args = args.clone();
         let targets = crate::runtime::contracts::extract_tool_targets(&name, &args);
+        // Single-file tools retain journaling inside the explicitly added root.
+        // Patch tools retain their existing primary-workspace-relative contract.
+        let transaction_root = policy.lock().ok().and_then(|current| {
+            if !matches!(name.as_str(), "write" | "edit" | "notebook_edit") {
+                return None;
+            }
+            let boundary = &current.filesystem_boundary;
+            let selected = targets.first().and_then(|path| {
+                boundary
+                    .extra_root_containing(&cwd.join(path))
+                    .map(Path::to_path_buf)
+            })?;
+            targets
+                .iter()
+                .all(|path| boundary.boundary_root_for(&cwd, &cwd.join(path)) == selected)
+                .then_some(selected)
+        });
+        let dispatch_root = transaction_root.clone().unwrap_or_else(|| cwd.clone());
+        let canonical_dispatch_root = dispatch_root.canonicalize().ok();
         let consumed = std::sync::atomic::AtomicBool::new(false);
         let git_policy = policy.clone();
         let git_root = cwd.clone();
@@ -69,14 +91,19 @@ impl MutationAuthority {
                 if cwd.canonicalize().ok().as_ref() != Some(root) {
                     return false;
                 }
-                let requested = crate::permission::normalize_lexically(
-                    &crate::permission::strip_verbatim_prefix(&cwd),
-                );
-                lexical.strip_prefix(&requested).is_ok_and(|relative| {
-                    crate::permission::normalize_lexically(
-                        &crate::permission::strip_verbatim_prefix(&root.join(relative)),
-                    ) == normalized
-                })
+                if dispatch_root.canonicalize().ok() != canonical_dispatch_root {
+                    return false;
+                }
+                match (
+                    crate::permission::boundary_relative_path(&dispatch_root, &absolute),
+                    crate::permission::boundary_relative_path(&dispatch_root, path),
+                ) {
+                    (Some(requested), Some(actual)) => {
+                        crate::permission::normalize_lexically(&requested)
+                            == crate::permission::normalize_lexically(&actual)
+                    }
+                    _ => false,
+                }
             });
             if !in_call {
                 return Err("transaction target was not authorized by this dispatch".into());
@@ -121,11 +148,12 @@ impl MutationAuthority {
             }
         });
         Self {
-            git: Some(Arc::new(move |_| {
+            transaction_root,
+            git: Some(Arc::new(move |root| {
                 let current = git_policy
                     .lock()
                     .map_err(|_| "permission policy lock poisoned")?;
-                let args = serde_json::json!({"id":"base-observation", "paths":[".git"], "observe_commit":true});
+                let args = serde_json::json!({"id":"base-observation", "paths":[root.join(".git")], "observe_commit":true});
                 match current.decide("transaction-base", "patch_status", &args, &git_root) {
                     crate::PermissionVerdict::Allow => Ok(()),
                     _ => Err("base revision requires current Git metadata read authority".into()),
@@ -156,6 +184,11 @@ impl<'a> ToolTransaction<'a> {
         self.coordinator.clone()
     }
     pub fn new(cwd: &Path, context: &'a ToolContext) -> Result<Self, ToolError> {
+        let cwd = context
+            .mutation_authority
+            .as_ref()
+            .and_then(|authority| authority.transaction_root.as_deref())
+            .unwrap_or(cwd);
         let root = super::files::root(cwd).map_err(ToolError::Failed)?;
         let owner = if let Some(runtime) = &context.runtime {
             TransactionOwner {
@@ -191,9 +224,6 @@ impl<'a> ToolTransaction<'a> {
     }
     pub fn snapshot(&self, path: &Path) -> Result<SourceSnapshot, ToolError> {
         self.authorize(path).map_err(ToolError::Failed)?;
-        let path = crate::permission::strip_verbatim_prefix(path);
-        let root = crate::permission::strip_verbatim_prefix(&self.root);
-        let requested_root = crate::permission::strip_verbatim_prefix(&self.requested_root);
         // Preserve the host's workspace spelling (case on Windows, /var aliases
         // on macOS), without canonicalizing a target and following its symlinks.
         if super::files::root(&self.requested_root).map_err(ToolError::Failed)? != self.root {
@@ -201,10 +231,10 @@ impl<'a> ToolTransaction<'a> {
                 "transaction workspace alias changed".into(),
             ));
         }
-        let relative = path
-            .strip_prefix(&root)
-            .or_else(|_| path.strip_prefix(&requested_root))
-            .map_err(|_| ToolError::Failed("transaction target is outside the workspace".into()))?;
+        let relative =
+            crate::permission::boundary_relative_path(&self.root, path).ok_or_else(|| {
+                ToolError::Failed("transaction target is outside the workspace".into())
+            })?;
         let relative = relative
             .to_str()
             .ok_or_else(|| ToolError::Failed("transaction path is not UTF-8".into()))?;
@@ -497,5 +527,47 @@ mod tests {
             std::os::unix::fs::symlink(real.join("a.txt"), real.join("link.txt")).unwrap();
             assert!(transaction.snapshot(&alias.join("link.txt")).is_err());
         }
+    }
+
+    #[test]
+    fn added_root_alias_retains_dispatch_authority_and_journaling() {
+        let root = tempfile::tempdir().unwrap();
+        let work = root.path().join("work");
+        let extra = root.path().join("SharedWorkspace");
+        std::fs::create_dir(&work).unwrap();
+        std::fs::create_dir(&extra).unwrap();
+        #[cfg(windows)]
+        let alias = root.path().join("sharedworkspace");
+        #[cfg(unix)]
+        let alias = {
+            let alias = root.path().join("alias");
+            std::os::unix::fs::symlink(&extra, &alias).unwrap();
+            alias
+        };
+        let mut policy = PermissionPolicy::new(PermissionMode::Edits);
+        policy.filesystem_boundary.root = Some(work.clone());
+        policy.filesystem_boundary.extra_roots = vec![crate::permission::strip_verbatim_prefix(
+            &extra.canonicalize().unwrap(),
+        )];
+        let args = serde_json::json!({"path":alias.join("new.txt"),"content":"after"});
+        let mut context = ToolContext::default();
+        context.mutation_authority = Some(MutationAuthority::for_dispatch(
+            &work,
+            "write",
+            &args,
+            Arc::new(PermissionState::new(policy)),
+            context.active_contract.clone(),
+            None,
+        ));
+        let result = crate::tools::execute_tool_with(&work, "write", &args, &context).unwrap();
+        assert!(!result.is_error, "{}", result.content);
+        assert_eq!(std::fs::read(extra.join("new.txt")).unwrap(), b"after");
+        assert_eq!(result.details.unwrap()["transaction"]["state"], "applied");
+        assert!(context
+            .mutation_authority
+            .as_ref()
+            .unwrap()
+            .check(&extra.join("other.txt"))
+            .is_err());
     }
 }

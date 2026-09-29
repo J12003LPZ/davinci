@@ -395,6 +395,29 @@ fn unfiltered_suite(words: &[String]) -> bool {
     })
 }
 
+/// Plain-language reason a post-edit command is not credited as a check.
+pub(crate) fn unrecognized_check_reason(assessment: &Assessment) -> &'static str {
+    if assessment.kind == CheckKind::SyntaxOnly {
+        return "a syntax check does not verify behavior";
+    }
+    match assessment.reason {
+        "nonliteral_command" => "shell variables, `$(...)` and other expansions are not inspected",
+        "unsupported_shell" => "PowerShell here-strings and heredocs are not inspected",
+        "masked_status" => "its exit status comes from a later command in a `;`, `|` or `||` chain",
+        "no_applicable_check" => {
+            "it asserts nothing about the changed code; printing a result is not a check"
+        }
+        "unsupported_command" => "running a program directly is not recognized as a check",
+        "unquoted_heredoc" => "only a quoted heredoc such as `<<'PY'` is inspected",
+        "heredoc_marker" | "heredoc_tail" => "the heredoc could not be parsed",
+        "inspection_unavailable" => "the check's source could not be analyzed",
+        "noop_option" => "that option does not run any check",
+        "assertions_disabled" => "PYTHONOPTIMIZE disables assert statements",
+        "cwd" => "its working directory could not be resolved",
+        _ => "the harness could not classify it",
+    }
+}
+
 pub(crate) fn classify_in_workspace(
     tool: &str,
     command: &str,

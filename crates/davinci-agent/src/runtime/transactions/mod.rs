@@ -24,6 +24,7 @@ pub use model::{
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
+pub use store::store_dir as transaction_store_dir;
 use store::Store;
 pub use tools::{coordinator_for_context, MutationAuthority};
 
@@ -240,14 +241,10 @@ impl TransactionCoordinator {
     /// authority: begin_verification rechecks ownership and live read policy.
     pub(crate) fn verification_candidates(&self) -> Result<Vec<String>, String> {
         self.check_root()?;
-        let directory =
-            match super::cache::directory::Directory::open(&self.root.join(STORE_NAME), false) {
-                Ok(directory) => directory,
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
-                Err(error) => return Err(error.to_string()),
-            };
-        let store = Store { directory };
-        let mut names = store.directory.names().map_err(|e| e.to_string())?;
+        let Some(store) = Store::open_existing(&self.root)? else {
+            return Ok(Vec::new());
+        };
+        let mut names = store.record_names().map_err(|e| e.to_string())?;
         names.retain(|name| name.ends_with(".json") && name != "active.json");
         if names.len() > MAX_RECORDS {
             return Err("transaction record capacity exceeded".into());
@@ -783,6 +780,155 @@ fn cancelled(abort: Option<&AtomicBool>) -> Result<(), String> {
         Err("transaction cancelled".into())
     } else {
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod git_store_tests {
+    use super::*;
+
+    fn git(dir: &Path, args: &[&str]) {
+        let status = std::process::Command::new(davinci_sys::process::resolve_program("git"))
+            .args(args)
+            .current_dir(dir)
+            .status()
+            .unwrap();
+        assert!(status.success(), "git {args:?}");
+    }
+
+    fn untracked(dir: &Path) -> String {
+        let output = std::process::Command::new(davinci_sys::process::resolve_program("git"))
+            .args([
+                "status",
+                "--porcelain",
+                "--ignored",
+                "--untracked-files=all",
+            ])
+            .current_dir(dir)
+            .output()
+            .unwrap();
+        String::from_utf8_lossy(&output.stdout).into_owned()
+    }
+
+    fn owner() -> TransactionOwner {
+        TransactionOwner {
+            session_id: Some("git-store".into()),
+            ..TransactionOwner::default()
+        }
+    }
+
+    #[test]
+    fn git_work_tree_keeps_records_out_of_the_working_tree() {
+        // Regression: every edit left `.davinci-transactions/` in the user's
+        // repository (a record, `active.lock` and a `.gitignore`).
+        let repo = tempfile::tempdir().unwrap();
+        git(repo.path(), &["init", "--quiet"]);
+        let root = repo.path().canonicalize().unwrap();
+        let manager = TransactionCoordinator::new(&root, owner()).unwrap();
+        let preview = manager
+            .preview(vec![ProposedChange::write("source.txt", b"after".to_vec())])
+            .unwrap();
+        manager.apply(&preview.id, &|_| Ok(()), None).unwrap();
+
+        assert!(!root.join(STORE_NAME).exists());
+        assert_eq!(untracked(repo.path()), "?? source.txt\n");
+        let store = root.join(".git").join(store::GIT_STORE_NAME);
+        assert_eq!(transaction_store_dir(&root), store);
+        assert!(store.join(format!("{}.json", preview.id)).is_file());
+        // Records stay usable: discovery and rollback still find them.
+        assert_eq!(
+            manager.verification_candidates().unwrap(),
+            [preview.id.clone()]
+        );
+        manager.rollback(&preview.id, &|_| Ok(()), None).unwrap();
+        assert!(!root.join("source.txt").exists());
+        assert!(
+            untracked(repo.path()).is_empty(),
+            "{}",
+            untracked(repo.path())
+        );
+    }
+
+    #[test]
+    fn subdirectory_and_linked_worktree_layouts() {
+        let repo = tempfile::tempdir().unwrap();
+        git(repo.path(), &["init", "--quiet"]);
+        let top = repo.path().canonicalize().unwrap();
+        std::fs::create_dir_all(top.join("pkg/app")).unwrap();
+        let sub = top.join("pkg/app");
+        let sub_store = transaction_store_dir(&sub);
+        assert!(sub_store.starts_with(top.join(".git").join(store::GIT_STORE_NAME)));
+        assert_ne!(sub_store, transaction_store_dir(&top));
+        assert!(sub_store
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .starts_with("sub-"));
+
+        // A linked worktree's `.git` is a file naming its own git dir.
+        let linked = tempfile::tempdir().unwrap();
+        let git_dir = top.join(".git").join("worktrees").join("wt");
+        std::fs::create_dir_all(&git_dir).unwrap();
+        std::fs::write(
+            linked.path().join(".git"),
+            format!("gitdir: {}\n", git_dir.display()),
+        )
+        .unwrap();
+        let linked_root = linked.path().canonicalize().unwrap();
+        assert_eq!(
+            transaction_store_dir(&linked_root),
+            git_dir.canonicalize().unwrap().join(store::GIT_STORE_NAME)
+        );
+    }
+
+    #[test]
+    fn non_git_workspace_and_unfinished_legacy_store_keep_the_in_tree_store() {
+        let plain = tempfile::tempdir().unwrap();
+        let plain_root = plain.path().canonicalize().unwrap();
+        assert_eq!(
+            transaction_store_dir(&plain_root),
+            plain_root.join(STORE_NAME)
+        );
+
+        // An older build crashed mid-transaction in a Git repo: recovery must
+        // keep reading that store until the transaction is resolved.
+        let repo = tempfile::tempdir().unwrap();
+        git(repo.path(), &["init", "--quiet"]);
+        let root = repo.path().canonicalize().unwrap();
+        std::fs::create_dir_all(root.join(STORE_NAME)).unwrap();
+        std::fs::write(
+            root.join(STORE_NAME).join("active.json"),
+            uuid::Uuid::new_v4().to_string(),
+        )
+        .unwrap();
+        assert_eq!(transaction_store_dir(&root), root.join(STORE_NAME));
+    }
+
+    #[test]
+    fn records_from_a_legacy_in_tree_store_remain_readable() {
+        let repo = tempfile::tempdir().unwrap();
+        let root = repo.path().canonicalize().unwrap();
+        // Written before Git existed here, so it used the in-tree store.
+        let owner = owner();
+        let manager = TransactionCoordinator::new(&root, owner.clone()).unwrap();
+        let preview = manager
+            .preview(vec![ProposedChange::write("source.txt", b"after".to_vec())])
+            .unwrap();
+        manager.apply(&preview.id, &|_| Ok(()), None).unwrap();
+        assert!(root
+            .join(STORE_NAME)
+            .join(format!("{}.json", preview.id))
+            .is_file());
+
+        git(repo.path(), &["init", "--quiet"]);
+        assert_eq!(
+            transaction_store_dir(&root),
+            root.join(".git").join(store::GIT_STORE_NAME)
+        );
+        let reader = TransactionCoordinator::new(&root, owner).unwrap();
+        assert_eq!(reader.status(&preview.id).unwrap().id, preview.id);
+        reader.rollback(&preview.id, &|_| Ok(()), None).unwrap();
+        assert!(!root.join("source.txt").exists());
     }
 }
 
