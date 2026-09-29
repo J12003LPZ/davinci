@@ -110,7 +110,17 @@ impl ExecutionReceipt {
             && !self.permission_denied
             && !self.simulated
             && !self.hook_vetoed
+            && self.sandbox_evidence_satisfied()
             && self.assertions_passed()
+    }
+
+    fn sandbox_evidence_satisfied(&self) -> bool {
+        self.process_evidence.as_ref().is_none_or(|process| {
+            process
+                .sandbox
+                .as_ref()
+                .is_none_or(|sandbox| sandbox.effective.is_some())
+        })
     }
 
     fn assertions_passed(&self) -> bool {
