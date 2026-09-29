@@ -34,6 +34,43 @@ pub fn write_raw_stdout_line(text: &str) -> io::Result<()> {
     write_raw_stdout(&format!("{text}\n"))
 }
 
+/// Writes `contents` to `path` through a temporary file in the same directory
+/// and a rename, so a reader never sees a half-written file and a failed write
+/// leaves any previous file intact. `--output-last-message` uses it.
+pub fn write_file_atomically(path: &std::path::Path, contents: &str) -> io::Result<()> {
+    let name = path.file_name().ok_or_else(|| {
+        io::Error::new(
+            ErrorKind::InvalidInput,
+            format!("{} does not name a file", path.display()),
+        )
+    })?;
+    let dir = match path.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent,
+        _ => std::path::Path::new("."),
+    };
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_nanos())
+        .unwrap_or_default();
+    let mut temp_name = std::ffi::OsString::from(".");
+    temp_name.push(name);
+    temp_name.push(format!(".{}.{nanos}.tmp", std::process::id()));
+    let temp = dir.join(temp_name);
+    let written = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&temp)
+        .and_then(|mut file| {
+            file.write_all(contents.as_bytes())?;
+            file.sync_all()
+        })
+        .and_then(|()| std::fs::rename(&temp, path));
+    if written.is_err() {
+        let _ = std::fs::remove_file(&temp);
+    }
+    written
+}
+
 use serde::{Deserialize, Serialize};
 
 #[allow(dead_code)]
@@ -463,6 +500,52 @@ pub fn print_graph_status_plain(status: &StructuredGraphStatus) -> io::Result<()
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn leftover_temp_files(dir: &std::path::Path) -> Vec<String> {
+        std::fs::read_dir(dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|name| name.ends_with(".tmp"))
+            .collect()
+    }
+
+    #[test]
+    fn atomic_write_creates_and_replaces_the_file_without_leftovers() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("last.txt");
+        write_file_atomically(&path, "first reply").unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "first reply");
+        write_file_atomically(&path, "").unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "");
+        write_file_atomically(&path, "héllo\nsecond").unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "héllo\nsecond");
+        assert!(leftover_temp_files(dir.path()).is_empty());
+    }
+
+    #[test]
+    fn atomic_write_failure_reports_the_error_and_keeps_the_old_file() {
+        let dir = tempfile::tempdir().unwrap();
+        // The parent directory does not exist: the temp file cannot be made.
+        let missing = dir.path().join("no-such-dir").join("last.txt");
+        let error = write_file_atomically(&missing, "reply").unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::NotFound);
+        assert!(!missing.exists());
+
+        // The target is a directory: the rename fails after the temp file was
+        // written, the directory survives and the temp file is removed.
+        let occupied = dir.path().join("occupied");
+        std::fs::create_dir(&occupied).unwrap();
+        std::fs::write(occupied.join("keep.txt"), "kept").unwrap();
+        assert!(write_file_atomically(&occupied, "reply").is_err());
+        assert_eq!(
+            std::fs::read_to_string(occupied.join("keep.txt")).unwrap(),
+            "kept"
+        );
+        assert!(leftover_temp_files(dir.path()).is_empty());
+
+        let no_name = write_file_atomically(std::path::Path::new(".."), "reply").unwrap_err();
+        assert_eq!(no_name.kind(), ErrorKind::InvalidInput);
+    }
 
     #[test]
     fn backpressure_detects_enobufs_and_eagain() {

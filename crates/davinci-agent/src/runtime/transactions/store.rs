@@ -2,27 +2,164 @@ use super::{files, model::*};
 use crate::runtime::cache::directory::Directory;
 use crate::runtime::checkpoints::compute_sha256;
 use std::io::{Read, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
+
+fn canonical(root: &Path) -> Result<PathBuf, String> {
+    // Resolve host-selected aliases (notably macOS /var -> /private/var)
+    // before the no-follow component walk. Descendants remain protected
+    // by Directory's handle-bound O_NOFOLLOW traversal.
+    root.canonicalize()
+        .map_err(|e| format!("transaction workspace: {e}"))
+}
+
+/// Directory name for records kept inside a Git directory.
+pub const GIT_STORE_NAME: &str = "davinci-transactions";
+
+/// Where a workspace's transaction records live. `root` must be canonical.
+///
+/// In a Git work tree the records go under the Git directory, like Git's own
+/// rebase and merge state: they never appear in the working tree, stay on the
+/// workspace's filesystem, and are per worktree. A workspace below the top
+/// level gets its own subdirectory. Elsewhere the store stays in
+/// `<root>/.davinci-transactions`. A legacy in-tree store holding an
+/// unfinished transaction stays authoritative so recovery finds it.
+pub fn store_dir(root: &Path) -> PathBuf {
+    let legacy = root.join(STORE_NAME);
+    if legacy.join("active.json").is_file() {
+        return legacy;
+    }
+    git_store_dir(root).unwrap_or(legacy)
+}
+
+fn git_store_dir(root: &Path) -> Option<PathBuf> {
+    for top in root.ancestors() {
+        let dot_git = top.join(".git");
+        let Ok(metadata) = std::fs::symlink_metadata(&dot_git) else {
+            continue;
+        };
+        let git_dir = if metadata.is_dir() {
+            dot_git
+        } else if metadata.is_file() {
+            // Linked worktrees and submodules: `gitdir: <path>`.
+            let text = std::fs::read_to_string(&dot_git).ok()?;
+            let target = text.lines().next()?.strip_prefix("gitdir:")?.trim();
+            if target.is_empty() {
+                return None;
+            }
+            top.join(target)
+        } else {
+            return None;
+        };
+        let git_dir = git_dir.canonicalize().ok()?;
+        let mut dir = git_dir.join(GIT_STORE_NAME);
+        if top != root {
+            let relative = root.strip_prefix(top).ok()?;
+            let key = crate::runtime::checkpoints::compute_sha256(
+                relative.to_string_lossy().replace('\\', "/").as_bytes(),
+            );
+            dir = dir.join(format!("sub-{}", &key[..16]));
+        }
+        return Some(dir);
+    }
+    None
+}
 
 pub(super) struct Store {
     pub directory: Directory,
+    /// A pre-existing in-tree store, read for records written before the
+    /// store moved into the Git directory (rollback of older transactions).
+    legacy: Option<Directory>,
 }
 impl Store {
     pub fn open(root: &Path) -> Result<Self, String> {
-        // Resolve host-selected aliases (notably macOS /var -> /private/var)
-        // before the no-follow component walk. Descendants remain protected
-        // by Directory's handle-bound O_NOFOLLOW traversal.
-        let root = root
-            .canonicalize()
-            .map_err(|e| format!("transaction workspace: {e}"))?;
-        let directory = Directory::open(&root.join(STORE_NAME), true)
-            .map_err(|e| format!("transaction store: {e}"))?;
-        // Recovery records are local state. Exclusive creation preserves any
-        // existing entry, and Directory keeps the store's link protections.
-        if let Ok(mut file) = directory.file(".gitignore", true) {
-            let _ = file.write_all(b"*\n");
+        let root = canonical(root)?;
+        let location = store_dir(&root);
+        let directory = match Directory::open(&location, true) {
+            Ok(directory) => directory,
+            // A Git directory reached through a link, or one we cannot write:
+            // keep the in-tree store rather than failing the edit.
+            Err(_) if location != root.join(STORE_NAME) => {
+                return Self::open_at(&root, root.join(STORE_NAME));
+            }
+            Err(e) => return Err(format!("transaction store: {e}")),
+        };
+        Ok(Self::with_legacy(&root, location, directory))
+    }
+
+    fn open_at(root: &Path, location: PathBuf) -> Result<Self, String> {
+        let directory =
+            Directory::open(&location, true).map_err(|e| format!("transaction store: {e}"))?;
+        Ok(Self::with_legacy(root, location, directory))
+    }
+
+    fn with_legacy(root: &Path, location: PathBuf, directory: Directory) -> Self {
+        let legacy_path = root.join(STORE_NAME);
+        if location == legacy_path {
+            // Recovery records are local state. Exclusive creation preserves any
+            // existing entry, and Directory keeps the store's link protections.
+            if let Ok(mut file) = directory.file(".gitignore", true) {
+                let _ = file.write_all(b"*\n");
+            }
+            return Self {
+                directory,
+                legacy: None,
+            };
         }
-        Ok(Self { directory })
+        let legacy = Directory::open(&legacy_path, false).ok();
+        Self { directory, legacy }
+    }
+
+    /// Open without creating anything; `None` when no store exists yet.
+    pub fn open_existing(root: &Path) -> Result<Option<Self>, String> {
+        let root = canonical(root)?;
+        let location = store_dir(&root);
+        let legacy_path = root.join(STORE_NAME);
+        let directory = match Directory::open(&location, false) {
+            Ok(directory) => Some(directory),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+            Err(_) if location != legacy_path => None,
+            Err(e) => return Err(e.to_string()),
+        };
+        let legacy = if location == legacy_path {
+            None
+        } else {
+            match Directory::open(&legacy_path, false) {
+                Ok(directory) => Some(directory),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+                Err(e) => return Err(e.to_string()),
+            }
+        };
+        Ok(match (directory, legacy) {
+            (Some(directory), legacy) => Some(Self { directory, legacy }),
+            (None, Some(legacy)) => Some(Self {
+                directory: legacy,
+                legacy: None,
+            }),
+            (None, None) => None,
+        })
+    }
+
+    /// Record file names from the store and any legacy in-tree store.
+    pub fn record_names(&self) -> std::io::Result<Vec<String>> {
+        let mut names = self.directory.names()?;
+        if let Some(legacy) = &self.legacy {
+            for name in legacy.names()? {
+                if !names.contains(&name) {
+                    names.push(name);
+                }
+            }
+        }
+        Ok(names)
+    }
+
+    fn record_file(&self, name: &str) -> std::io::Result<std::fs::File> {
+        match self.directory.file(name, false) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => match &self.legacy {
+                Some(legacy) => legacy.file(name, false),
+                None => Err(e),
+            },
+            other => other,
+        }
     }
     pub fn load(
         &self,
@@ -44,8 +181,7 @@ impl Store {
     ) -> Result<Record, String> {
         let id = valid_id(id)?;
         let mut file = self
-            .directory
-            .file(&format!("{id}.json"), false)
+            .record_file(&format!("{id}.json"))
             .map_err(|e| format!("transaction record: {e}"))?;
         let limit = MAX_RECORD_BYTES.min(*remaining);
         if file.metadata().map_err(|e| e.to_string())?.len() > limit {

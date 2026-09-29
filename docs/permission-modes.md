@@ -24,9 +24,49 @@ This is an **approval policy, not an OS sandbox**. Allowed project checks can ex
 
 The policy classifies every patch target separately, including deletion actions; a harmless target cannot conceal a secret or outside-workspace target in a compound display string. Path checks include protected harness settings, Git metadata, common credential paths, Windows aliases and existing symlink ancestors. Deny rules take precedence over grants. Subagent profiles cannot request a mode more permissive than their parent's mode. Existing graph subprocesses explicitly request the former non-interactive behavior using `always-approve`, retaining their separate role-tool and shell-policy guards.
 
+## Additional writable directories
+
+`--add-dir <dir>` (repeatable, also `--add-dir=<dir>`) adds an existing project
+directory beside the primary workspace. Relative values resolve against the
+working directory after `--cd`. `permissions.additionalDirectories` accepts
+an array of the same paths in user settings or trusted project settings.
+CLI entries are validated at startup; invalid CLI entries fail the run.
+Invalid settings entries produce a warning and are ignored. Home directories,
+filesystem roots, and directories containing credential or Davinci state
+locations are rejected.
+
+In Accept Edits and Auto modes, ordinary edits inside an added directory no
+longer require outside-workspace approval. Manual mode still asks for edits,
+Plan Mode still denies mutations, explicit deny rules still win, and sensitive
+files retain their guards. Rule subjects outside the primary workspace remain
+absolute. Reads inside an added directory do not ask in Auto mode. Auto's
+routine read-only shell checks accept a `workdir` or relative path argument
+inside an added directory. An absolute Windows path argument still asks,
+because Auto never approves a shell word containing `:`. The flag is not an
+OS sandbox and does not grant arbitrary shell execution. Protected paths such
+as `.git`, `.env` and credential files inside an added directory keep their
+guards. An allow rule reaches one only when it names that exact file; a glob
+such as `write(/work/lib/**)` does not. Graph workers and isolated worktree workers do not inherit these
+additional roots. Prompt context and `/status` list the active roots.
+
+Containment accepts Windows short and long spellings of the same root. Only
+the root alias is resolved; symlink and junction components beneath it retain
+their boundary checks. Escapes from either the workspace or an added root are
+denied in every mode, even with a blanket grant or a separately added destination.
+
+Single-file `write`, `edit`, and `notebook_edit` operations keep transactional
+snapshots and journaling in the selected added directory. The `apply_patch`
+and explicit `patch_*` tools retain their primary-workspace-relative path
+contract; `--add-dir` does not widen patch syntax to absolute paths or `..`.
+Use the single-file tools for added-directory edits. This is a Davinci
+addition, not TypeScript pi behavior. Offline executable tests cover the CLI,
+permission gate and actual transactional file write together.
+
 ## Approval prompts
 
 In print mode, an action requiring approval stops the turn and exits with status 1. Standard output contains an `approval_required` JSON object with the tool call ID, action name, redacted target, permission mode, and resolved global settings path. With `--mode json`, this object follows the normal JSON event stream. Approve the action in an interactive host or configure a narrow `permissions.allow` rule; explicit denies still win. Print mode never records consent, waits for an approval response, or processes later supplied prompts after this result.
+
+That stop is the default approval policy, `--approval-policy abort`. With `--approval-policy deny-continue` (the Codex `exec -a never` behaviour), print mode does not stop. The call is denied and the model gets a tool error that says the action needs approval and this non-interactive run cannot ask, so it can use a workspace-local alternative or finish without it. Nothing is recorded as consent. When the run ends, text mode prints one summary line of the denied actions on standard error. With `--mode json`, a `{"type":"denied_actions","actions":[...]}` line follows the event stream, with the tool call ID, action, redacted target and permission mode of each denial. The line is only written when something was denied, so a clean run keeps the default stream. The exit code is 0 when the model finishes; add `--fail-on-denied` to exit 3 instead when anything was denied. Retries are bounded: the third denial of the same action (same tool and target) in one run falls back to the abort behaviour, writes `approval_required` and exits 1. Calls refused outright by a deny rule never reach the approval policy and are not listed.
 
 The native permission panel offers only choices allowed by the policy. Arrow keys or numbers focus a choice; plain Enter confirms it. Escape denies the call. Mode shortcuts, paste and arriving voice transcripts cannot change the conversation draft while the panel is open.
 

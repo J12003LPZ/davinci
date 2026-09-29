@@ -104,6 +104,11 @@ pub fn refresh_model_catalogs(
         }
     }
     let _ = save_models_store(agent_dir, &store);
+    let codex_network = allow_network && std::env::var("PI_CATALOG_DRY_RUN").is_err();
+    if let Err(err) = refresh_codex_model_list(agent_dir, codex_network, force) {
+        errors.push(("openai-codex models".to_string(), err));
+    }
+    models = davinci_ai::overlay_codex_models(&models, agent_dir);
     let catalogs = agent_dir.join("models");
     let _ = std::fs::create_dir_all(&catalogs);
     for provider in builtin_provider_ids() {
@@ -150,7 +155,44 @@ fn load_cached_or_builtin(agent_dir: &Path) -> Vec<Model> {
     for entry in store.providers.values() {
         models = merge_models(&models, &entry.models);
     }
-    models
+    davinci_ai::overlay_codex_models(&models, agent_dir)
+}
+
+/// Keep `<agent dir>/codex-models.json` in step with the models Codex offers
+/// this ChatGPT account. A missing login is not an error: there is nothing to
+/// list. The OAuth token is refreshed first, as a Codex request would do.
+fn refresh_codex_model_list(
+    agent_dir: &Path,
+    allow_network: bool,
+    force: bool,
+) -> Result<(), String> {
+    let offline = ["DAVINCI_OFFLINE", "PI_OFFLINE", "PI_DISABLE_NETWORK"]
+        .iter()
+        .any(|name| std::env::var_os(name).is_some());
+    // Tests may use the reply fixture but never read the real login.
+    let allow_network = allow_network && !offline && !cfg!(test);
+    let token = if allow_network {
+        codex_access_token()
+    } else {
+        None
+    };
+    davinci_ai::refresh_codex_models(agent_dir, token.as_deref(), allow_network, force).map(|_| ())
+}
+
+fn codex_access_token() -> Option<String> {
+    const PROVIDER: &str = "openai-codex";
+    let mut storage = davinci_ai::AuthStorage::create().ok()?;
+    let _ = storage.maybe_refresh(PROVIDER, davinci_ai::now_ms(), 60_000, false);
+    let credential = storage.get(PROVIDER)?;
+    if credential.kind != davinci_ai::CredentialKind::Oauth {
+        // An API key is not a ChatGPT login; the models route rejects it.
+        return None;
+    }
+    credential
+        .access
+        .clone()
+        .or_else(|| credential.key.clone())
+        .filter(|token| !token.is_empty())
 }
 
 fn refresh_provider(
@@ -311,6 +353,34 @@ mod tests {
         let failed = refresh_model_catalogs(dir.path(), true, true);
         std::env::remove_var("PI_CATALOG_REFRESH_ERROR");
         assert!(failed.status.contains("openai, anthropic"));
+
+        // Codex models the catalog lacks are discovered and kept on disk.
+        // Kept in this test: the refresh fixtures above are process-wide env.
+        let codex_home = tempdir().unwrap();
+        std::env::set_var("CODEX_HOME", codex_home.path());
+        std::env::set_var(
+            "DAVINCI_CODEX_MODELS_REPLY",
+            r#"{"models": [{"slug": "gpt-6-luna", "display_name": "GPT-6-Luna",
+                "visibility": "list", "context_window": 272000,
+                "supported_reasoning_levels": [{"effort": "low"}, {"effort": "max"}]}]}"#,
+        );
+        std::env::set_var("PI_CATALOG_DRY_RUN", "1");
+        let discovered = refresh_model_catalogs(dir.path(), true, true);
+        std::env::remove_var("DAVINCI_CODEX_MODELS_REPLY");
+        std::env::remove_var("PI_CATALOG_DRY_RUN");
+        assert!(discovered.errors.is_empty(), "{:?}", discovered.errors);
+        let luna = discovered
+            .models
+            .iter()
+            .find(|model| model.provider == "openai-codex" && model.id == "gpt-6-luna")
+            .expect("gpt-6-luna discovered");
+        assert_eq!(luna.name, "GPT-6-Luna");
+        assert!(dir.path().join("codex-models.json").is_file());
+        // A later run with no network still has it, from the saved file.
+        assert!(load_cached_or_builtin(dir.path())
+            .iter()
+            .any(|model| model.provider == "openai-codex" && model.id == "gpt-6-luna"));
+        std::env::remove_var("CODEX_HOME");
         let mut merged = CatalogRefreshResult {
             models: Vec::new(),
             status: refresh_status_ok().into(),

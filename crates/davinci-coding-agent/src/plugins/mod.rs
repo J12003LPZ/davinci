@@ -224,6 +224,15 @@ impl ActivePlugins {
         !self.hooks_for(event).is_empty()
     }
 
+    /// Whether an approved hook for `event` would run for the Claude tool
+    /// name `subject`. The harness asks this before reading a file on the
+    /// model's behalf, since such a hook would never see that read.
+    pub fn has_matching_hook(&self, event: HookEvent, subject: &str) -> bool {
+        self.hooks_for(event)
+            .iter()
+            .any(|(_, hook)| hooks::matcher_accepts(hook.matcher.as_deref(), subject))
+    }
+
     /// Run every matching hook for `event`. Contexts are collected in order;
     /// the first block stops the run.
     pub fn run_event(
@@ -584,11 +593,14 @@ mod tests {
 
         // Unapproved: the hook never runs.
         assert!(!plugins.has_hooks(HookEvent::PreToolUse));
+        assert!(!plugins.has_matching_hook(HookEvent::PreToolUse, "Bash"));
 
         // Approved: it runs; a changed hook file revokes it.
         install_fixture(&agent_dir, &root, true);
         let plugins = active(&agent_dir);
         assert!(plugins.plugins[0].hooks_approved());
+        assert!(plugins.has_matching_hook(HookEvent::PreToolUse, "Bash"));
+        assert!(!plugins.has_matching_hook(HookEvent::PreToolUse, "Read"));
         write(
             &root.join("hooks/hooks.json"),
             r#"{"hooks":{"PreToolUse":[{"matcher":"Bash","hooks":[{"type":"command","command":"exit 0"}]}]}}"#,

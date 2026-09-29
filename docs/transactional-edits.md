@@ -26,9 +26,17 @@ discovery does not permit stale or unauthorized writes.
 
 ## Recovery and verification
 
-Recovery records live in `.davinci-transactions` under the workspace. They contain
-file preimages and must be treated as private repository data, not disposable
-computation cache. Preserve them when recovery fails. Do not edit journal JSON or
+Recovery records live outside the working tree whenever the workspace is inside
+a Git work tree: under the Git directory at `<git-dir>/davinci-transactions/`,
+the way Git keeps its own rebase and merge state. Each linked worktree has its
+own Git directory and so its own records, and a workspace below the repository
+top level gets a `sub-<hash>` subdirectory. Outside Git they stay in
+`.davinci-transactions` under the workspace (with a `*` `.gitignore`). An
+existing in-tree store that holds an unfinished transaction (`active.json`)
+stays in use until that transaction is resolved, and records written there by
+older builds remain readable for status and rollback. `transaction_store_dir`
+names the location for a workspace. The records contain file preimages and must
+be treated as private repository data, not disposable computation cache. Preserve them when recovery fails. Do not edit journal JSON or
 delete it merely to bypass a conflict or capacity error.
 
 An ordinary resumed session may recover its own records when the session and task

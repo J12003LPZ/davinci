@@ -1,5 +1,6 @@
 use davinci_agent::runtime::transactions::{
-    ProposedChange, TransactionCoordinator, TransactionOwner, TransactionState,
+    transaction_store_dir, ProposedChange, TransactionCoordinator, TransactionOwner,
+    TransactionState,
 };
 use std::{fs, path::Path, process::Command};
 
@@ -79,8 +80,14 @@ fn transaction_recovery_is_scoped_to_the_git_worktree_not_common_metadata() {
     second.apply(&linked_preview.id, &|_| Ok(()), None).unwrap();
     // Even an exact copy of a journal with the same owner cannot be adopted by
     // the other worktree merely because both share Git metadata.
-    let record = format!(".davinci-transactions/{}.json", preview.id);
-    fs::copy(main.join(&record), linked.join(&record)).unwrap();
+    // Each worktree keeps records in its own Git directory.
+    let record = format!("{}.json", preview.id);
+    let main_store = transaction_store_dir(&main.canonicalize().unwrap());
+    let linked_store = transaction_store_dir(&linked.canonicalize().unwrap());
+    assert_ne!(main_store, linked_store);
+    assert!(!main.join(".davinci-transactions").exists());
+    assert!(!linked.join(".davinci-transactions").exists());
+    fs::copy(main_store.join(&record), linked_store.join(&record)).unwrap();
     let error = second.rollback(&preview.id, &|_| Ok(()), None).unwrap_err();
     assert!(error.contains("workspace or owner mismatch"), "{error}");
     assert_eq!(fs::read(linked.join("source.txt")).unwrap(), b"linked edit");

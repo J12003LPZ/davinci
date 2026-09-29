@@ -242,8 +242,21 @@ impl<'a> ChangeImpactAnalyzer<'a> {
         if tx_id.contains('/') || tx_id.contains('\\') || tx_id.contains("..") {
             return Err(format!("invalid transaction ID format: {tx_id}"));
         }
-        let store_dir = self.root.join(".davinci-transactions");
-        let record_path = store_dir.join(format!("{tx_id}.json"));
+        // Records live in the Git directory for Git work trees; older ones may
+        // still sit in the in-tree store.
+        let file = format!("{tx_id}.json");
+        let root = self
+            .root
+            .canonicalize()
+            .unwrap_or_else(|_| self.root.to_path_buf());
+        let record_path = [
+            davinci_agent::runtime::transactions::transaction_store_dir(&root),
+            root.join(".davinci-transactions"),
+        ]
+        .into_iter()
+        .map(|dir| dir.join(&file))
+        .find(|path| path.exists())
+        .unwrap_or_else(|| root.join(".davinci-transactions").join(&file));
         if !record_path.exists() {
             warnings.push(format!("Transaction ID {tx_id} record not found on disk"));
             return Ok(());

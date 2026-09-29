@@ -4,6 +4,7 @@
 def activity(events):
     logical, ended, attempts, attempts_ended = set(), set(), set(), set()
     reasons, auto_ids, started_tools, ended_batches = {}, set(), set(), set()
+    causes = {}
     auto_runs = batch_children = top_level = after_reminder = 0
     telemetry_seen = overflow = False
     unknown_outcome = False
@@ -73,6 +74,10 @@ def activity(events):
             reason = message.get("davinciCapabilityReminder")
             if isinstance(reason, str) and reason:
                 reasons[reason] = reasons.get(reason, 0) + 1
+                # Why the last check after the change was not credited.
+                cause = message.get("davinciCapabilityReminderReason")
+                cause = cause if isinstance(cause, str) and cause else "none_recorded"
+                causes[cause] = causes.get(cause, 0) + 1
             if message.get("davinciHarnessVerification") is True:
                 content = message.get("content")
                 for block in content if isinstance(content, list) else []:
@@ -117,6 +122,7 @@ def activity(events):
             and all((purpose, request) in logical for purpose, request, _ in attempts),
         "requests_after_first_reminder": after_reminder if available else None,
         "gate_reminders": reasons,
+        "gate_reminder_causes": causes,
         "auto_verify_runs": auto_runs,
         "tool_calls": top_level,
         "tools": tools,

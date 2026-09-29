@@ -45,6 +45,10 @@ pub struct TurnContextState {
     pub plan_revision: Option<u64>,
     #[serde(default)]
     pub plan_mode: bool,
+    /// `path#tag` keys of the files this message attached
+    /// (`prompt::named_files`); not part of the state hash.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub named_files: Vec<String>,
 }
 
 impl TurnContextState {
@@ -73,6 +77,8 @@ pub struct TurnContextInput<'a> {
     pub runtime_state: &'a str,
     pub plan_mode_appendix: Option<&'a str>,
     pub living_plan: Option<(u64, &'a str)>,
+    /// The rendered `<named_files>` block of this user turn, if any.
+    pub named_files: Option<&'a str>,
     pub memory: Option<&'a str>,
 }
 
@@ -113,6 +119,14 @@ pub fn render_turn_context(
         }
     }
 
+    if let Some(named_files) = input
+        .named_files
+        .map(str::trim)
+        .filter(|block| !block.is_empty())
+    {
+        sections.push(named_files.to_string());
+    }
+
     if let Some(memory) = input
         .memory
         .map(str::trim)
@@ -134,6 +148,7 @@ pub fn render_turn_context(
             state_hash: Some(state_hash),
             plan_revision,
             plan_mode,
+            named_files: Vec::new(),
         },
     ))
 }
@@ -147,6 +162,7 @@ mod tests {
             runtime_state: state,
             plan_mode_appendix: None,
             living_plan: None,
+            named_files: None,
             memory,
         }
     }
@@ -188,6 +204,7 @@ mod tests {
             runtime_state: "Permission mode: Plan Mode (read-only).",
             plan_mode_appendix: Some("PLAN APPENDIX"),
             living_plan: None,
+            named_files: None,
             memory: None,
         };
         let (_, state) = render_turn_context(&TurnContextState::default(), &entering).unwrap();
@@ -198,11 +215,35 @@ mod tests {
     }
 
     #[test]
+    fn named_files_ride_along_without_restating_state() {
+        let (_, state) =
+            render_turn_context(&TurnContextState::default(), &input("same", None)).unwrap();
+        let with_files = TurnContextInput {
+            runtime_state: "same",
+            plan_mode_appendix: None,
+            living_plan: None,
+            named_files: Some(
+                "<named_files untrusted=\"true\">
+x
+</named_files>",
+            ),
+            memory: None,
+        };
+        let (text, next) = render_turn_context(&state, &with_files).unwrap();
+        assert!(text.contains("<named_files untrusted=\"true\">"));
+        assert!(!text.contains("same"));
+        // The block is not state: the next turn does not restate it.
+        assert_eq!(next.state_hash, state.state_hash);
+        assert_eq!(render_turn_context(&next, &input("same", None)), None);
+    }
+
+    #[test]
     fn plan_revision_is_sent_once() {
         let with_plan = TurnContextInput {
             runtime_state: "s",
             plan_mode_appendix: None,
             living_plan: Some((3, "step 1")),
+            named_files: None,
             memory: None,
         };
         let (text, state) = render_turn_context(&TurnContextState::default(), &with_plan).unwrap();

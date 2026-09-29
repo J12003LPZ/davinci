@@ -374,6 +374,8 @@ impl WorktreeLease {
             read_outside_root: read_policy,
             enforce_root_for_mutations: true,
             allow_git_metadata: true,
+            // A lease is isolated: the user's extra roots never follow it.
+            extra_roots: Vec::new(),
         }
     }
 

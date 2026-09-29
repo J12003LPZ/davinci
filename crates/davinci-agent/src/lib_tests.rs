@@ -4340,3 +4340,211 @@ fn a_resumed_conversation_recovers_the_users_delegation_refusal() {
     ];
     assert!(!super::delegation_forbidden_from_messages(&reversed));
 }
+
+fn tool_result_texts(agent: &Agent) -> Vec<String> {
+    agent
+        .messages
+        .iter()
+        .filter(|message| message.role == "toolResult")
+        .map(|message| davinci_ai::content_text(&message.content))
+        .collect()
+}
+
+#[test]
+fn a_print_only_check_is_told_inline_why_it_does_not_count() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut agent = verifying_agent(dir.path());
+    agent.auto_verify = false;
+    agent.prompt("write and check");
+    let mut script = scripted_tool_calls(vec![
+        (
+            "write",
+            serde_json::json!({"path":"changed.py", "content":"def f(x): return x * 2\n"}),
+        ),
+        (
+            shell_tool(),
+            serde_json::json!({"command":"python -c \"from changed import f; print(f(2))\""}),
+        ),
+        (
+            shell_tool(),
+            serde_json::json!({"command":"python -c \"from changed import f; print(f(3))\""}),
+        ),
+    ]);
+    agent.run_loop(|current| script(current)).unwrap();
+    let results = tool_result_texts(&agent);
+    let noted: Vec<&String> = results
+        .iter()
+        .filter(|text| text.contains("[harness: this command does not count as verification"))
+        .collect();
+    assert_eq!(noted.len(), 1, "once per change: {results:?}");
+    assert!(noted[0].contains("changed.py"), "{}", noted[0]);
+    assert!(noted[0].contains("asserts nothing"), "{}", noted[0]);
+    assert!(noted[0].contains("python - <<'PY'"), "{}", noted[0]);
+    // The completion gate stays the backstop and now says why.
+    let reminder = agent
+        .messages
+        .iter()
+        .find(|message| message.extra.contains_key("davinciCapabilityReminder"))
+        .expect("gate still fires");
+    assert_eq!(
+        reminder.extra.get("davinciCapabilityReminderReason"),
+        Some(&serde_json::json!("no_applicable_check"))
+    );
+}
+
+#[test]
+fn an_asserting_check_gets_no_inline_note() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut agent = verifying_agent(dir.path());
+    agent.prompt("write and check");
+    let mut script = scripted_tool_calls(vec![
+        (
+            "write",
+            serde_json::json!({"path":"changed.py", "content":"def f(x): return x * 2\n"}),
+        ),
+        (
+            shell_tool(),
+            serde_json::json!({"command":"python -c \"from changed import f; assert f(2) == 4\""}),
+        ),
+    ]);
+    agent.run_loop(|current| script(current)).unwrap();
+    assert!(tool_result_texts(&agent)
+        .iter()
+        .all(|text| !text.contains("[harness:")));
+    assert!(reminders(&agent).is_empty());
+}
+
+#[test]
+fn a_failing_command_gets_no_inline_note() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut agent = verifying_agent(dir.path());
+    agent.auto_verify = false;
+    agent.prompt("write and check");
+    let mut script = scripted_tool_calls(vec![
+        (
+            "write",
+            serde_json::json!({"path":"changed.py", "content":"def f(x): return x * 2\n"}),
+        ),
+        (
+            shell_tool(),
+            serde_json::json!({"command":"python -c \"import changed; raise SystemExit(3)\""}),
+        ),
+    ]);
+    agent.run_loop(|current| script(current)).unwrap();
+    assert!(tool_result_texts(&agent)
+        .iter()
+        .all(|text| !text.contains("[harness:")));
+}
+
+#[test]
+fn an_inspection_command_does_not_use_up_the_inline_note() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut agent = verifying_agent(dir.path());
+    agent.auto_verify = false;
+    agent.prompt("write and check");
+    let mut script = scripted_tool_calls(vec![
+        (
+            "write",
+            serde_json::json!({"path":"changed.py", "content":"def f(x): return x * 2\n"}),
+        ),
+        (
+            shell_tool(),
+            serde_json::json!({"command":"cat changed.py"}),
+        ),
+        (
+            shell_tool(),
+            serde_json::json!({"command":"python -c \"from changed import f; print(f(2))\""}),
+        ),
+        (
+            shell_tool(),
+            serde_json::json!({"command":"cat changed.py"}),
+        ),
+    ]);
+    agent.run_loop(|current| script(current)).unwrap();
+    let results = tool_result_texts(&agent);
+    let noted: Vec<usize> = results
+        .iter()
+        .enumerate()
+        .filter(|(_, text)| text.contains("[harness: this command does not count"))
+        .map(|(index, _)| index)
+        .collect();
+    // Results: write, cat, python, cat. Only the python check is told.
+    assert_eq!(noted, vec![2], "{results:?}");
+    let reminder = agent
+        .messages
+        .iter()
+        .find(|message| message.extra.contains_key("davinciCapabilityReminder"))
+        .expect("gate still fires");
+    // The trailing `cat` does not overwrite the reason of the real check.
+    assert_eq!(
+        reminder.extra.get("davinciCapabilityReminderReason"),
+        Some(&serde_json::json!("no_applicable_check"))
+    );
+}
+
+#[test]
+fn checker_programs_match_only_as_the_program_word() {
+    use crate::turn::invokes_checker;
+    for command in [
+        "python -c 'print(1)'",
+        "python3.12 -m pytest -q",
+        "cd app && npm test",
+        "PYTHONPATH=. pytest tests/test_a.py",
+        "./venv/bin/python check.py",
+        r"C:\Python312\python.exe check.py",
+        "uv run pytest",
+        "cat a.py | python -",
+        "& python x.py",
+        "go test ./...",
+    ] {
+        assert!(invokes_checker(command), "{command}");
+    }
+    for command in [
+        "cat pricing.py",
+        "git diff pricing.py",
+        "ls node_modules",
+        "rg cargo Cargo.toml",
+        "echo python",
+        "Get-Content app.py",
+    ] {
+        assert!(!invokes_checker(command), "{command}");
+    }
+}
+
+#[test]
+fn gate_reason_distinguishes_failed_and_incomplete_checks() {
+    for (command, expected) in [
+        (
+            "python -c \"from alpha import f; assert f() == 1\"",
+            "coverage_incomplete",
+        ),
+        (
+            "python -c \"from alpha import f; assert f() == 99\"",
+            "check_failed",
+        ),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let mut agent = verifying_agent(dir.path());
+        agent.auto_verify = false;
+        agent.prompt("write and check");
+        let mut script = scripted_tool_calls(vec![
+            (
+                "write",
+                serde_json::json!({"path":"alpha.py","content":"def f(): return 1\n"}),
+            ),
+            (
+                "write",
+                serde_json::json!({"path":"beta.py","content":"def g(): return 2\n"}),
+            ),
+            (shell_tool(), serde_json::json!({"command":command})),
+        ]);
+        agent.run_loop(|current| script(current)).unwrap();
+        assert_eq!(
+            agent
+                .mutation_verification_state()
+                .last_classification_reason
+                .as_deref(),
+            Some(expected)
+        );
+    }
+}

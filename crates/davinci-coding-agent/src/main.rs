@@ -235,7 +235,8 @@ use davinci_tui::{
 };
 
 use args::{
-    format_terminal_title, parse_args, print_help, Args, ListModels, Mode, APP_NAME, VERSION,
+    format_terminal_title, parse_args, print_help, ApprovalPolicy, Args, ListModels, Mode,
+    APP_NAME, VERSION,
 };
 use auth_cmd::{
     is_auth_command_help, parse_auth_command, print_auth_command_help, validate_auth_command_args,
@@ -365,8 +366,37 @@ fn preactivate_execution_boundary(raw: &[String], cwd: &Path) -> Result<(), Stri
     Ok(())
 }
 
+/// `--cd`: become the process working directory before anything reads it.
+/// The path is canonicalized so a relative or symlinked spelling encodes the
+/// same session directory as starting there, and the Windows verbatim prefix
+/// is dropped for the same reason.
+fn apply_cd(dir: &str) -> Result<(), String> {
+    let canonical = std::fs::canonicalize(dir).map_err(|err| match err.kind() {
+        io::ErrorKind::NotFound => format!("--cd: directory does not exist: {dir}"),
+        _ => format!("--cd: cannot use {dir}: {err}"),
+    })?;
+    if !canonical.is_dir() {
+        return Err(format!("--cd: not a directory: {dir}"));
+    }
+    let canonical = davinci_agent::strip_verbatim_prefix(&canonical);
+    std::env::set_current_dir(&canonical)
+        .map_err(|err| format!("--cd: cannot enter {dir}: {err}"))?;
+    // Shells trust an inherited PWD that names their real cwd; keep it true.
+    if std::env::var_os("PWD").is_some() {
+        std::env::set_var("PWD", &canonical);
+    }
+    Ok(())
+}
+
 fn run(raw: Vec<String>) -> Result<i32, String> {
     startup_mark("start");
+    // `-o` resolves against the directory davinci was started in, as in Codex;
+    // everything else behaves as if davinci had been started in the `--cd` dir.
+    let launch_dir = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let (raw, cd) = args::take_cd_flag(raw)?;
+    if let Some(dir) = cd.as_deref() {
+        apply_cd(dir)?;
+    }
     apply_offline_mode(&raw);
     if let Some(result) = davinci_coding_agent::runtime_inspect::try_run(&raw) {
         return result;
@@ -490,6 +520,58 @@ fn run(raw: Vec<String>) -> Result<i32, String> {
         return Ok(0);
     }
 
+    // Fixture: force the interactive path without a TTY so tests can inspect
+    // the rendered chrome (line-session mode).
+    let force_interactive = matches!(
+        std::env::var("PI_FORCE_INTERACTIVE").as_deref(),
+        Ok("1") | Ok("true")
+    );
+    let stdin_tty = io::stdin().is_terminal() || force_interactive;
+    let stdout_tty = io::stdout().is_terminal() || force_interactive;
+    let print_mode = parsed.print || parsed.mode == Some(Mode::Json) || !stdin_tty || !stdout_tty;
+    let last_message_path = match parsed.output_last_message.as_deref() {
+        None => None,
+        Some(_) if parsed.mode == Some(Mode::Rpc) => {
+            eprintln!(
+                "Error: --output-last-message is not supported with --mode rpc; use --print or --mode json"
+            );
+            return Ok(1);
+        }
+        Some(_) if !print_mode => {
+            eprintln!(
+                "Error: --output-last-message needs a non-interactive run; add --print (-p) or --mode json"
+            );
+            return Ok(1);
+        }
+        Some(path) => Some(launch_dir.join(path)),
+    };
+    // Loaded before the agent is built, so a bad schema costs no provider call.
+    // A relative path resolves against the launch directory, like `-o`.
+    let output_schema = match parsed.output_schema.as_deref() {
+        None => None,
+        Some(_) if parsed.mode == Some(Mode::Rpc) => {
+            eprintln!(
+                "Error: --output-schema is not supported with --mode rpc; use --print or --mode json"
+            );
+            return Ok(1);
+        }
+        Some(_) if !print_mode => {
+            eprintln!(
+                "Error: --output-schema needs a non-interactive run; add --print (-p) or --mode json"
+            );
+            return Ok(1);
+        }
+        Some(path) => {
+            match davinci_coding_agent::output_schema::load_schema(&launch_dir.join(path)) {
+                Ok(schema) => Some(schema),
+                Err(message) => {
+                    eprintln!("Error: {message}");
+                    return Ok(1);
+                }
+            }
+        }
+    };
+
     let session_dir = resolved_session_dir(&parsed, &cwd);
     let migrations = migrations::maybe_run_startup_migrations(&cwd);
     let mut agent = match build_agent(&parsed, &session_dir, &cwd) {
@@ -514,17 +596,10 @@ fn run(raw: Vec<String>) -> Result<i32, String> {
         return code;
     }
 
-    // Fixture: force the interactive path without a TTY so tests can inspect
-    // the rendered chrome (line-session mode).
-    let force_interactive = matches!(
-        std::env::var("PI_FORCE_INTERACTIVE").as_deref(),
-        Ok("1") | Ok("true")
-    );
-    let stdin_tty = io::stdin().is_terminal() || force_interactive;
-    let stdout_tty = io::stdout().is_terminal() || force_interactive;
-    if parsed.print || parsed.mode == Some(Mode::Json) || !stdin_tty || !stdout_tty {
+    if print_mode {
         let _ = tools_manager::ensure_managed_tools();
-        let code = run_print(&parsed, &mut agent);
+        agent.output_schema = output_schema;
+        let code = run_print(&parsed, &mut agent, last_message_path.as_deref());
         run_stop_hooks_for(&parsed, &agent.cwd);
         return code;
     }
@@ -571,7 +646,17 @@ fn provider_identity(agent: &Agent) -> Option<String> {
 }
 
 fn synchronize_provider_system_prompt(agent: &mut Agent) {
-    let suffix = provider_identity(agent);
+    let mut suffix = provider_identity(agent);
+    if let Some(schema) = &agent.output_schema {
+        let contract = davinci_coding_agent::output_schema::system_instruction(schema);
+        match &mut suffix {
+            Some(text) => {
+                text.push_str("\n\n");
+                text.push_str(&contract);
+            }
+            None => suffix = Some(contract),
+        }
+    }
     agent.set_provider_system_prompt_suffix(suffix);
 }
 
@@ -818,14 +903,26 @@ fn build_agent(parsed: &Args, session_dir: &Path, cwd: &Path) -> Result<Agent, S
     // is only for embedders. Who answers an ask is the mode's business:
     // davinci, RPC and the legacy chrome each install an approver, and a
     // `--print` run fails closed.
-    agent.permissions = Arc::new(davinci_agent::PermissionState::new(
-        permissions::policy_for(
-            &default_agent_dir(),
+    let permission_sources = permissions::PermissionSources::load(
+        &default_agent_dir(),
+        cwd,
+        parsed.project_trust_override,
+    );
+    let mut policy = permission_sources.policy(parsed.permission_mode);
+    // `--add-dir` and `permissions.additionalDirectories`. A Graph worker is
+    // isolated and never inherits them, even from the user's settings file.
+    if graph_worker.is_none() {
+        let (roots, warnings) = permission_sources.additional_directories(
+            &parsed.add_dirs,
             cwd,
-            parsed.project_trust_override,
-            parsed.permission_mode,
-        ),
-    ));
+            davinci_session::home_dir().as_deref(),
+        );
+        for warning in warnings {
+            eprintln!("Warning: {warning}");
+        }
+        policy.filesystem_boundary.extra_roots = roots;
+    }
+    agent.permissions = Arc::new(davinci_agent::PermissionState::new(policy));
     agent.tool_context.cache = davinci_agent::runtime::cache::CacheRuntime::shared(
         settings.cache.clone().unwrap_or_default(),
         default_agent_dir(),
@@ -1001,6 +1098,8 @@ fn build_agent(parsed: &Args, session_dir: &Path, cwd: &Path) -> Result<Agent, S
     agent.auto_compaction = settings.compaction_enabled();
     agent.auto_verify =
         settings.auto_verify_enabled(std::env::var("DAVINCI_AUTO_VERIFY").ok().as_deref());
+    agent.named_file_context =
+        settings.named_file_context_enabled(std::env::var("DAVINCI_NAMED_FILES").ok().as_deref());
     agent.effort_policy =
         settings.effort_policy(std::env::var("DAVINCI_EFFORT_POLICY").ok().as_deref());
     agent.tool_surface =
@@ -1349,6 +1448,7 @@ fn complete_simple_summarization(
         native_responses_resume: None,
         install_telemetry: Some(load_settings(&default_agent_dir()).install_telemetry_enabled()),
         abort_signal: None,
+        output_schema: None,
     };
     let response = complete_simple(
         &model,
@@ -1634,13 +1734,17 @@ impl ModelRuntimeKey {
             ),
             cwd: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
             env_hash: hasher.finish(),
-            files: vec![
-                stamp(davinci_ai::models_store_path(&agent_dir)),
-                stamp(models_json_path(&agent_dir)),
-                stamp(crate::settings::settings_path(&agent_dir)),
-                stamp(davinci_ai::default_auth_path()),
-                stamp(agent_dir.join("extensions")),
-            ],
+            files: [
+                davinci_ai::models_store_path(&agent_dir),
+                models_json_path(&agent_dir),
+                crate::settings::settings_path(&agent_dir),
+                davinci_ai::default_auth_path(),
+                agent_dir.join("extensions"),
+            ]
+            .into_iter()
+            .chain(davinci_ai::codex_model_source_paths(&agent_dir))
+            .map(stamp)
+            .collect(),
         }
     }
 
@@ -1705,6 +1809,8 @@ fn build_model_runtime(parsed: &Args) -> ModelRuntimeSnapshot {
     for entry in store.providers.values() {
         models = davinci_ai::merge_models(&models, &entry.models);
     }
+    // Codex models discovered live or by Codex CLI; models.json still wins.
+    models = davinci_ai::overlay_codex_models(&models, &agent_dir);
     let config = ModelConfig::load(&models_json_path(&agent_dir));
     let mut composition_errors = std::collections::BTreeMap::new();
     models = match apply_models_config(&models, &config) {
@@ -2489,15 +2595,7 @@ fn complete_prompt_with_host(
             Ok("1") | Ok("true") | Ok("yes")
         );
     let models = available_models(parsed);
-    let model = find_model(&models, &agent.provider, &agent.model_id)
-        .cloned()
-        .or_else(|| {
-            models
-                .iter()
-                .find(|m| m.provider == agent.provider)
-                .cloned()
-        })
-        .or_else(|| models.first().cloned());
+    let model = model_resolver::model_for_request(&models, &agent.provider, &agent.model_id);
     let mut storage = AuthStorage::create().ok();
     if let (Some(storage), Some(key)) = (storage.as_mut(), parsed.api_key.as_deref()) {
         storage.set_runtime_override(&agent.provider, key);
@@ -2604,6 +2702,10 @@ fn complete_prompt_with_host(
             memory,
             run_plugin_prompt_hooks(&plugin_hooks, &plugin_hook_base, &prompt),
         );
+        // Before the commit reads it: files attached for the model would
+        // bypass any hook that can block a `read`.
+        agent.named_file_hooks_active =
+            named_file_hooks_active(agent, parsed, &plugin_hooks, &host);
         match agent.turn_context_placement() {
             davinci_agent::turn_context::TurnContextPlacement::Appended => {
                 agent.commit_turn_context(memory);
@@ -2971,6 +3073,7 @@ fn complete_prompt_with_host(
                                 current.native_responses_resume_record(),
                             install_telemetry: Some(current.install_telemetry),
                             abort_signal: current.abort_signal.clone(),
+                            output_schema: current.output_schema.clone(),
                         },
                         &mut sink,
                     );
@@ -3365,11 +3468,87 @@ fn parse_model_ref(provider: &str, model: Option<&str>) -> (String, String) {
 
 /// Print cannot collect consent. Stop at the first policy-owned challenge and
 /// report it without creating grants or leaving a sticky cancellation signal.
+/// The default `--approval-policy abort`; the fail-closed tests drive it.
+#[cfg(test)]
 fn with_print_approval<T>(
     agent: &mut Agent,
     configuration_path: &Path,
     run: impl FnOnce(&mut Agent) -> T,
 ) -> (T, Option<serde_json::Value>) {
+    with_print_approval_policy(agent, configuration_path, None, run)
+}
+
+/// The third denial of one action ends a deny-continue run the abort way, so
+/// a model that keeps retrying the same refused call cannot spin forever.
+const PRINT_DENIAL_CAP: u32 = 3;
+
+/// What `--approval-policy deny-continue` has refused in this print run. It
+/// outlives each prompt, so the repeat cap and the final report cover the run.
+#[derive(Debug, Default)]
+struct PrintDenials {
+    /// One redacted entry per denial returned to the model.
+    actions: Vec<serde_json::Value>,
+    /// Denials so far per action (tool and subject).
+    repeats: std::collections::HashMap<String, u32>,
+}
+
+impl PrintDenials {
+    /// Records one denial. True when the action reached the cap and the run
+    /// has to stop and report `approval_required` instead.
+    fn record(
+        &mut self,
+        request: &davinci_agent::ToolApprovalRequest,
+        challenge: &davinci_agent::approval::ApprovalChallenge,
+    ) -> bool {
+        let count = self
+            .repeats
+            .entry(format!("{}\u{0}{}", request.tool, request.subject))
+            .or_default();
+        *count += 1;
+        if *count >= PRINT_DENIAL_CAP {
+            return true;
+        }
+        self.actions.push(serde_json::json!({
+            "tool_call_id": challenge.call_id,
+            "action": challenge.action_label,
+            "target": native_extensions::vector_memory::redact_secrets(&challenge.display_target),
+            "permission_mode": challenge.mode,
+        }));
+        false
+    }
+}
+
+/// The one stderr line a text-mode deny-continue run ends with.
+fn denied_actions_summary(actions: &[serde_json::Value]) -> String {
+    let listed: Vec<String> = actions
+        .iter()
+        .map(|action| {
+            let field = |key: &str| action[key].as_str().unwrap_or_default().to_string();
+            format!("{} {}", field("action"), field("target"))
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ")
+        })
+        .collect();
+    format!(
+        "Denied {} action{} needing approval in this non-interactive run: {}",
+        actions.len(),
+        if actions.len() == 1 { "" } else { "s" },
+        listed.join("; ")
+    )
+}
+
+/// `denials` selects `--approval-policy deny-continue`: a challenge is denied
+/// with a headless reason and the turn goes on, until one action is refused
+/// [`PRINT_DENIAL_CAP`] times. Without it the first challenge stops the run.
+fn with_print_approval_policy<T>(
+    agent: &mut Agent,
+    configuration_path: &Path,
+    denials: Option<&Arc<Mutex<PrintDenials>>>,
+    run: impl FnOnce(&mut Agent) -> T,
+) -> (T, Option<serde_json::Value>) {
+    let denials = denials.cloned();
+    let headless = denials.is_some();
     let required = Arc::new(Mutex::new(None));
     let captured = required.clone();
     let path = configuration_path.to_string_lossy().into_owned();
@@ -3377,8 +3556,21 @@ fn with_print_approval<T>(
     let cancelled = abort.clone();
     let previous_abort = agent.abort_signal.replace(abort);
     let previous_approver = agent.approver.take();
+    let previous_headless = std::mem::replace(&mut agent.headless_approval, headless);
     let previous_responder = agent.approval_responder.replace(
-        davinci_agent::approval::ApprovalResponder(Arc::new(move |_, challenge| {
+        davinci_agent::approval::ApprovalResponder(Arc::new(move |request, challenge| {
+            let stop = denials.as_ref().map_or(true, |denials| {
+                denials
+                    .lock()
+                    .unwrap_or_else(|err| err.into_inner())
+                    .record(request, challenge)
+            });
+            if !stop {
+                return davinci_agent::approval::ApprovalReply::from_legacy(
+                    challenge,
+                    davinci_agent::ToolApprovalDecision::Deny,
+                );
+            }
             let mut report = captured.lock().unwrap_or_else(|err| err.into_inner());
             if report.is_none() {
                 *report = Some(serde_json::json!({
@@ -3399,6 +3591,7 @@ fn with_print_approval<T>(
     );
     let result = run(agent);
     agent.approval_responder = previous_responder;
+    agent.headless_approval = previous_headless;
     agent.approver = previous_approver;
     agent.abort_signal = previous_abort;
     let report = required
@@ -3460,7 +3653,39 @@ fn rpc_scope_expansion_result(
     )
 }
 
-fn run_print(parsed: &Args, agent: &mut Agent) -> Result<i32, String> {
+/// Print and json mode. With `--output-last-message` the final reply text is
+/// written after the run however it ended (error, block, early exit), and a
+/// failed write turns a successful exit into 1 without masking a failed run.
+fn run_print(
+    parsed: &Args,
+    agent: &mut Agent,
+    last_message_path: Option<&Path>,
+) -> Result<i32, String> {
+    let mut last_reply = String::new();
+    let result = run_print_turns(parsed, agent, &mut last_reply);
+    let Some(path) = last_message_path else {
+        return result;
+    };
+    match output::write_file_atomically(path, &last_reply) {
+        Ok(()) => result,
+        Err(err) => {
+            eprintln!(
+                "Error: could not write --output-last-message file {}: {err}",
+                path.display()
+            );
+            match result {
+                Ok(0) => Ok(1),
+                other => other,
+            }
+        }
+    }
+}
+
+fn run_print_turns(
+    parsed: &Args,
+    agent: &mut Agent,
+    last_reply: &mut String,
+) -> Result<i32, String> {
     if let Some(code) = immediate_shutdown_if_fixture(parsed) {
         return Ok(code);
     }
@@ -3490,9 +3715,10 @@ fn run_print(parsed: &Args, agent: &mut Agent) -> Result<i32, String> {
         }
         write_prompt_manifest_json_event(agent)?;
     }
-    let mut last_reply = String::new();
     let mut approval_required = None;
     let configuration_path = settings::settings_path(&default_agent_dir());
+    let denials = (parsed.approval_policy == ApprovalPolicy::DenyContinue)
+        .then(|| Arc::new(Mutex::new(PrintDenials::default())));
     let mut all_events = Vec::new();
     if let Some(prompt) = &prepared.text {
         if !prompt.trim().is_empty() || !prepared.images.is_empty() {
@@ -3518,12 +3744,14 @@ fn run_print(parsed: &Args, agent: &mut Agent) -> Result<i32, String> {
                     if json_mode {
                         write_prompt_manifest_json_event(agent)?;
                     }
-                    let ((reply, events), required) =
-                        with_print_approval(agent, &configuration_path, |agent| {
-                            complete_prompt_with_host(parsed, agent, None, json_mode)
-                        });
+                    let ((reply, events), required) = with_print_approval_policy(
+                        agent,
+                        &configuration_path,
+                        denials.as_ref(),
+                        |agent| complete_prompt_with_host(parsed, agent, None, json_mode),
+                    );
                     approval_required = blocking_host_report(agent, &events, required);
-                    last_reply = reply;
+                    *last_reply = reply;
                     all_events.extend(events);
                 }
             }
@@ -3532,7 +3760,7 @@ fn run_print(parsed: &Args, agent: &mut Agent) -> Result<i32, String> {
     for extra in &prepared.remaining_messages {
         if approval_required.is_some()
             || agent.ensure_session_persistence().is_err()
-            || runtime_blocked(&last_reply)
+            || runtime_blocked(last_reply)
         {
             break;
         }
@@ -3558,16 +3786,31 @@ fn run_print(parsed: &Args, agent: &mut Agent) -> Result<i32, String> {
                 if json_mode {
                     write_prompt_manifest_json_event(agent)?;
                 }
-                let ((reply, events), required) =
-                    with_print_approval(agent, &configuration_path, |agent| {
-                        complete_prompt_with_host(parsed, agent, None, json_mode)
-                    });
+                let ((reply, events), required) = with_print_approval_policy(
+                    agent,
+                    &configuration_path,
+                    denials.as_ref(),
+                    |agent| complete_prompt_with_host(parsed, agent, None, json_mode),
+                );
                 approval_required = blocking_host_report(agent, &events, required);
-                last_reply = reply;
+                *last_reply = reply;
                 all_events.extend(events);
             }
         }
     }
+    let schema_check = match agent.output_schema.clone() {
+        Some(schema) if !all_events.is_empty() => enforce_output_schema(
+            &schema,
+            parsed,
+            agent,
+            &configuration_path,
+            denials.as_ref(),
+            last_reply,
+            &mut all_events,
+            &mut approval_required,
+        ),
+        _ => None,
+    };
     // Stdout carries the reply; Context VM notices go to stderr.
     if !json_mode {
         for event in &all_events {
@@ -3584,29 +3827,139 @@ fn run_print(parsed: &Args, agent: &mut Agent) -> Result<i32, String> {
     // A provider failure that the loop gave up on carries no error stop
     // reason of its own: it is the reply text. Report it as the failure it is.
     let (exit_code, error) = match error {
-        None if last_reply.starts_with("Provider error: ") || runtime_blocked(&last_reply) => {
+        None if last_reply.starts_with("Provider error: ") || runtime_blocked(last_reply) => {
             (1, Some(last_reply.clone()))
         }
         other => (exit_code, other),
     };
-    let exit_code = if let Some(required) = approval_required {
-        let encoded = serde_json::to_string(&required).map_err(|err| err.to_string())?;
+    let denied = denials
+        .map(|denials| {
+            std::mem::take(
+                &mut denials
+                    .lock()
+                    .unwrap_or_else(|err| err.into_inner())
+                    .actions,
+            )
+        })
+        .unwrap_or_default();
+    // Written before any approval_required, which stays the final line.
+    if json_mode && !denied.is_empty() {
+        let encoded = serde_json::to_string(&serde_json::json!({
+            "type": "denied_actions",
+            "actions": denied,
+        }))
+        .map_err(|err| err.to_string())?;
         output::write_raw_stdout_line(&encoded).map_err(|err| err.to_string())?;
-        1
-    } else {
-        if !json_mode {
-            if let Some(error) = error {
-                eprintln!("{error}");
-            } else if !last_reply.is_empty() {
-                println!("{last_reply}");
+    }
+    // Also before any approval_required. Only schema runs write it; `checked`
+    // is false when the run failed before there was an answer to check.
+    if json_mode && agent.output_schema.is_some() && !all_events.is_empty() {
+        let encoded = serde_json::to_string(&serde_json::json!({
+            "type": "output_schema",
+            "checked": schema_check.is_some(),
+            "valid": matches!(schema_check, Some(Ok(()))),
+            "repairTurns": agent.stats.output_schema_repair_turns,
+            "errors": match &schema_check {
+                Some(Err(errors)) => errors.clone(),
+                _ => Vec::new(),
+            },
+        }))
+        .map_err(|err| err.to_string())?;
+        output::write_raw_stdout_line(&encoded).map_err(|err| err.to_string())?;
+    }
+    let exit_code =
+        if let (Some(Err(errors)), None, 0) = (&schema_check, &approval_required, exit_code) {
+            eprintln!(
+                "Error: the final reply does not match --output-schema after {} repair turn{}:",
+                agent.stats.output_schema_repair_turns,
+                if agent.stats.output_schema_repair_turns == 1 {
+                    ""
+                } else {
+                    "s"
+                }
+            );
+            for error in errors {
+                eprintln!("- {error}");
             }
-        }
+            1
+        } else if let Some(required) = approval_required {
+            let encoded = serde_json::to_string(&required).map_err(|err| err.to_string())?;
+            output::write_raw_stdout_line(&encoded).map_err(|err| err.to_string())?;
+            1
+        } else {
+            if !json_mode {
+                if let Some(error) = error {
+                    eprintln!("{error}");
+                } else if !last_reply.is_empty() {
+                    println!("{last_reply}");
+                }
+            }
+            exit_code
+        };
+    if !json_mode && !denied.is_empty() {
+        eprintln!("{}", denied_actions_summary(&denied));
+    }
+    let exit_code = if exit_code == 0 && parsed.fail_on_denied && !denied.is_empty() {
+        3
+    } else {
         exit_code
     };
     loaded_extension_host(parsed).emit(ExtensionEvent::SessionShutdown {
         reason: "quit".into(),
     });
     Ok(exit_code)
+}
+
+/// True when a print run ended in a failure of its own (provider error, token
+/// limit, blocked runtime, lost session file), so there is no answer to check.
+fn print_run_failed(events: &[AgentEvent], reply: &str) -> bool {
+    print_text_exit(events).0 != 0
+        || reply.starts_with("Provider error: ")
+        || runtime_blocked(reply)
+}
+
+/// `--output-schema`: checks the final answer and, when it does not match,
+/// runs exactly one repair turn that hands the model the validator's errors.
+/// A matching answer replaces `last_reply` with its bare JSON text (fence
+/// removed), which is what stdout and `-o` then hold. `None` means nothing was
+/// checked because the run failed or stopped for approval first.
+#[allow(clippy::too_many_arguments)]
+fn enforce_output_schema(
+    schema: &serde_json::Value,
+    parsed: &Args,
+    agent: &mut Agent,
+    configuration_path: &Path,
+    denials: Option<&Arc<Mutex<PrintDenials>>>,
+    last_reply: &mut String,
+    all_events: &mut Vec<AgentEvent>,
+    approval_required: &mut Option<serde_json::Value>,
+) -> Option<Result<(), Vec<String>>> {
+    use davinci_coding_agent::output_schema::{check_reply, repair_prompt};
+    if approval_required.is_some() || print_run_failed(all_events, last_reply) {
+        return None;
+    }
+    let errors = match check_reply(schema, last_reply) {
+        Ok(json) => {
+            *last_reply = json;
+            return Some(Ok(()));
+        }
+        Err(errors) => errors,
+    };
+    let json_mode = parsed.mode == Some(Mode::Json);
+    // Validator diagnostics are harness output, not a new user instruction.
+    agent.prompt_with(&repair_prompt(&errors), &[]);
+    agent.stats.output_schema_repair_turns += 1;
+    let ((reply, events), required) =
+        with_print_approval_policy(agent, configuration_path, denials, |agent| {
+            complete_prompt_with_host(parsed, agent, None, json_mode)
+        });
+    *approval_required = blocking_host_report(agent, &events, required);
+    *last_reply = reply;
+    all_events.extend(events);
+    if approval_required.is_some() || print_run_failed(all_events, last_reply) {
+        return None;
+    }
+    Some(check_reply(schema, last_reply).map(|json| *last_reply = json))
 }
 
 fn prompt_manifest_json_event(agent: &Agent) -> Option<serde_json::Value> {
@@ -7504,6 +7857,8 @@ fn sync_agent_from_settings(agent: &mut Agent) {
     agent.auto_compaction = stored.compaction_enabled();
     agent.auto_verify =
         stored.auto_verify_enabled(std::env::var("DAVINCI_AUTO_VERIFY").ok().as_deref());
+    agent.named_file_context =
+        stored.named_file_context_enabled(std::env::var("DAVINCI_NAMED_FILES").ok().as_deref());
     agent.effort_policy =
         stored.effort_policy(std::env::var("DAVINCI_EFFORT_POLICY").ok().as_deref());
     agent.compaction = stored.compaction_settings();
@@ -8005,6 +8360,13 @@ pub fn format_session_cost(parsed: &Args, agent: &Agent) -> String {
     )
 }
 
+/// The `/status` line naming `--add-dir` roots; `None` when there are none,
+/// so default status output is unchanged.
+pub fn additional_directories_status_line(agent: &Agent) -> Option<String> {
+    let roots = agent.additional_directories();
+    (!roots.is_empty()).then(|| format!("additional directories: {}", roots.join(", ")))
+}
+
 pub fn format_session_status(parsed: &Args, agent: &Agent) -> String {
     let mode = agent
         .permissions
@@ -8053,6 +8415,10 @@ pub fn format_session_status(parsed: &Args, agent: &Agent) -> String {
         if let Some(diag) = &agent.prompt_session.transition_diagnostic {
             text.push_str(&format!(" · transition: {diag}"));
         }
+    }
+    if let Some(line) = additional_directories_status_line(agent) {
+        text.push('\n');
+        text.push_str(&line);
     }
     if let Some(vm) = output::ContextVmStatusSummary::for_status(agent) {
         text.push('\n');
@@ -8647,6 +9013,27 @@ fn join_turn_context(first: Option<String>, second: Option<String>) -> Option<St
 
 /// `PreToolUse` plugin hooks. `Some(reason)` blocks the call. An `allow`
 /// decision never bypasses the DaVinci permission gate.
+/// Whether a user hook, an approved plugin `PreToolUse` hook matching `Read`
+/// or a JavaScript extension (whose `tool_call` handler may block) could
+/// intercept a `read`. Named-file context stays off while one could, since
+/// the harness's own reads never pass through those hooks.
+fn named_file_hooks_active(
+    agent: &Agent,
+    parsed: &Args,
+    plugins: &davinci_coding_agent::plugins::ActivePlugins,
+    host: &ExtensionHost,
+) -> bool {
+    use davinci_coding_agent::plugins::hooks::{claude_tool_name, HookEvent};
+    if !host.js.is_empty()
+        || plugins.has_matching_hook(HookEvent::PreToolUse, &claude_tool_name("read"))
+    {
+        return true;
+    }
+    let settings = load_merged_settings(&default_agent_dir(), &agent.cwd);
+    let trusted = is_trusted(&settings, &agent.cwd, parsed.project_trust_override);
+    hooks::load(&default_agent_dir(), &agent.cwd, trusted).intercepts_tool("read")
+}
+
 fn run_plugin_pre_tool(
     plugins: &davinci_coding_agent::plugins::ActivePlugins,
     base: &davinci_coding_agent::plugins::HookInput,

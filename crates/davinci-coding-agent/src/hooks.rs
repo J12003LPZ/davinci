@@ -366,6 +366,19 @@ impl HooksFile {
         Ok(())
     }
 
+    /// Whether a hook here can see, and so block, a call to `tool` before it
+    /// runs: any `preTool` command, or a `preTool` policy rule for that tool
+    /// (a path-scoped rule counts, since a read names a path).
+    pub fn intercepts_tool(&self, tool: &str) -> bool {
+        !self.pre_tool.is_empty()
+            || self.rules.iter().any(|rule| {
+                normalize_event_name(&rule.event) == "beforeTool"
+                    && rule.tool.as_deref().map_or(true, |name| {
+                        name.is_empty() || name.eq_ignore_ascii_case(tool)
+                    })
+            })
+    }
+
     pub fn get_legacy_commands(&self, kind: &str) -> Vec<&Vec<String>> {
         match kind {
             "sessionStart" => self.session_start.iter().collect(),
@@ -798,6 +811,31 @@ mod tests {
     }
     use super::*;
     use std::sync::Mutex;
+
+    #[test]
+    fn intercepts_tool_sees_pre_tool_commands_and_rules() {
+        assert!(!HooksFile::default().intercepts_tool("read"));
+        let commands = HooksFile {
+            pre_tool: vec![vec!["guard".into()]],
+            ..HooksFile::default()
+        };
+        assert!(commands.intercepts_tool("read"));
+        let rule = |event: &str, tool: Option<&str>| HooksFile {
+            rules: vec![HookPolicyRule {
+                event: event.into(),
+                tool: tool.map(str::to_string),
+                path_pattern: Some("secrets/**".into()),
+                action: vec!["deny".into()],
+                timeout_ms: None,
+                on_failure: HookFailurePolicy::Block,
+            }],
+            ..HooksFile::default()
+        };
+        assert!(rule("preTool", Some("read")).intercepts_tool("read"));
+        assert!(rule("beforeTool", None).intercepts_tool("read"));
+        assert!(!rule("preTool", Some("bash")).intercepts_tool("read"));
+        assert!(!rule("postTool", Some("read")).intercepts_tool("read"));
+    }
 
     static ENV_LOCK: Mutex<()> = Mutex::new(());
 

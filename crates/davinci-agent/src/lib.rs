@@ -89,10 +89,10 @@ pub(crate) use permission::read_only_capability_allows;
 pub use permission::{
     check_path_boundary, glob_matches, is_git_metadata_path, is_outside_or_symlink_escape,
     is_sensitive_file_path, is_symlink_escape, project_relative, session_rule_for,
-    strip_verbatim_prefix, subject_of, summary_of, tool_class, FilesystemBoundaryPolicy,
-    PermissionMode, PermissionPolicy, PermissionRule, PermissionVerdict, ReadOutsideRootPolicy,
-    RuleParseError, RuleSpecifier, ToolApprovalDecision, ToolApprovalRequest, ToolApprover,
-    ToolClass,
+    strip_verbatim_prefix, subject_of, summary_of, tool_class, validate_extra_root,
+    FilesystemBoundaryPolicy, PermissionMode, PermissionPolicy, PermissionRule, PermissionVerdict,
+    ReadOutsideRootPolicy, RuleParseError, RuleSpecifier, ToolApprovalDecision,
+    ToolApprovalRequest, ToolApprover, ToolClass,
 };
 pub use prompt::{
     CapabilityGateOutcome, CapabilityRunState, DebuggingState, FrontendDesignState,
@@ -330,6 +330,9 @@ pub struct MutationVerificationState {
     pub unscoped_verification_failure: bool,
     #[serde(default)]
     pub last_classification_reason: Option<String>,
+    /// Generation whose unrecognized check already got an inline note.
+    #[serde(default)]
+    pub inline_note_generation: Option<u64>,
     #[serde(default)]
     pub latest_evidence: Option<VerificationEvidence>,
     #[serde(default)]
@@ -420,6 +423,14 @@ pub struct Agent {
     pub tool_surface: ToolSurface,
     /// Repeat the last verification call after later mutations at completion.
     pub auto_verify: bool,
+    /// Attach the files a user request names to that turn's appended harness
+    /// context (`prompt::named_files`). Settings `namedFileContext`,
+    /// environment `DAVINCI_NAMED_FILES`.
+    pub named_file_context: bool,
+    /// Set by the host when a user hook, approved plugin hook or extension
+    /// could intercept a `read`. The harness then reads nothing on the
+    /// model's behalf, since such a hook would never see that read.
+    pub named_file_hooks_active: bool,
     /// Task 5 environment/guidance experiment; disabled pending promotion.
     pub environment_context: bool,
     pub auto_compaction: bool,
@@ -468,6 +479,13 @@ pub struct Agent {
     pub approver: Option<ToolApprover>,
     /// Typed trusted-host responder; takes precedence over the legacy approver.
     pub approval_responder: Option<approval::ApprovalResponder>,
+    /// The responder is an unattended policy, not a person. A denial it
+    /// returns tells the model the run cannot ask, not that a user declined.
+    pub headless_approval: bool,
+    /// `--output-schema`: the JSON schema a print run's final answer must
+    /// match. The host puts it on every provider request of this agent;
+    /// workers and summaries never carry it.
+    pub output_schema: Option<Value>,
     approval_registry: Arc<approval::ApprovalRegistry>,
     /// Background shell jobs (`jobs.rs`) and the model's todo ledger
     /// (`todo.rs`), shared with the tool thread and the shell.
@@ -602,6 +620,11 @@ impl Agent {
             decision_advice_key: None,
             tool_surface: ToolSurface::default(),
             auto_verify: true,
+            named_file_context: !matches!(
+                std::env::var("DAVINCI_NAMED_FILES").ok().as_deref(),
+                Some("0" | "false" | "off")
+            ),
+            named_file_hooks_active: false,
             environment_context: std::env::var("PI_ENVIRONMENT_CONTEXT").ok().as_deref()
                 == Some("1"),
             auto_compaction: true,
@@ -641,6 +664,8 @@ impl Agent {
             permissions: Arc::new(PermissionState::new(PermissionPolicy::default())),
             approver: None,
             approval_responder: None,
+            headless_approval: false,
+            output_schema: None,
             approval_registry: Arc::new(approval::ApprovalRegistry::default()),
             tool_context: ToolContext::default(),
             summarizer: None,
@@ -974,7 +999,21 @@ impl Agent {
                     .as_deref()
                     .is_some_and(prompt::environment::visual_verification_requested),
             environment: self.runtime_environment.clone(),
+            additional_directories: self.additional_directories(),
         }
+    }
+
+    /// The extra writable roots in force, for the prompt and `/status`.
+    /// Empty for an isolated worker even if a caller set some.
+    pub fn additional_directories(&self) -> Vec<String> {
+        self.permissions
+            .lock()
+            .unwrap_or_else(|err| err.into_inner())
+            .filesystem_boundary
+            .active_extra_roots()
+            .iter()
+            .map(|root| root.display().to_string())
+            .collect()
     }
 
     /// Update host capability availability before the next prompt is prepared.
@@ -1386,15 +1425,21 @@ impl Agent {
         let previous = turn_context::TurnContextState::from_messages(&self.messages);
         let runtime_state = self.turn_state_pending.clone().unwrap_or_default();
         let plan = self.plan_turn_context();
+        let named_files = self.named_files_for_turn();
+        let named_files_text = named_files.as_ref().map(|files| files.render());
         let input = turn_context::TurnContextInput {
             runtime_state: &runtime_state,
             plan_mode_appendix: self.is_plan_mode().then_some(crate::PLAN_MODE_APPENDIX),
             living_plan: plan
                 .as_ref()
                 .map(|(revision, text)| (*revision, text.as_str())),
+            named_files: named_files_text.as_deref(),
             memory: memory.as_deref(),
         };
-        if let Some((text, state)) = turn_context::render_turn_context(&previous, &input) {
+        if let Some((text, mut state)) = turn_context::render_turn_context(&previous, &input) {
+            state.named_files = named_files
+                .map(|files| files.attached_keys())
+                .unwrap_or_default();
             self.record_custom_message(&serde_json::json!({
                 "customType": turn_context::TURN_CONTEXT_CUSTOM_TYPE,
                 "content": text,

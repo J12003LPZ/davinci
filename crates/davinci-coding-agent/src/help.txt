@@ -28,6 +28,22 @@ Options:
   --mode <mode>                  Output mode: text (default), json, or rpc
   --print, -p                    Non-interactive mode: process prompt and exit
                                 Unresolved approval emits approval_required JSON and exits 1
+                                 (see --approval-policy)
+  --approval-policy <abort|deny-continue>
+                                 Print/json mode, when a call needs approval: abort (default) stops
+                                 as above; deny-continue returns the denial to the model and keeps
+                                 going, then reports the denied actions (3 denials of one action abort)
+  --fail-on-denied               With deny-continue: exit 3 instead of 0 if anything was denied
+  --output-last-message, -o <file>
+                                 Print/json mode: also write the final reply text to <file> (atomic;
+                                 written even when the run fails). Davinci addition, Codex exec parity
+  --output-schema <file>         Print/json mode: the final reply must be JSON matching the JSON schema
+                                 in <file>. OpenAI routes also enforce it on the wire. One repair turn
+                                 on a mismatch, then exit 1. Davinci addition, Codex exec parity
+  --cd, -C <dir>                 Run as if started in <dir>: settings, trust, AGENTS.md and
+                                 the session directory all follow it. Davinci addition, Codex exec parity
+  --add-dir <dir>                Add an existing writable project directory (repeatable).
+                                 Explicit denies and worker isolation still apply.
   --continue, -c                 Continue previous session
   --resume, -r                   Select a session to resume
   --session <path|id>            Use specific session file or partial UUID

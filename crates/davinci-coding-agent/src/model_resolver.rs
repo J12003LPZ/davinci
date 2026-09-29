@@ -217,6 +217,31 @@ fn build_fallback_model(
     Some(model)
 }
 
+/// The model record a request for `provider`/`model_id` should use.
+///
+/// An id missing from the catalog (a custom or newly released model the CLI
+/// resolver accepted) keeps its id on a copy of the provider's default
+/// record. It must never turn into a different catalog model: that sent
+/// `gpt-5.3-codex-spark` for a requested `gpt-6-luna`.
+pub fn model_for_request(models: &[Model], provider: &str, model_id: &str) -> Option<Model> {
+    if let Some(model) = models
+        .iter()
+        .find(|model| model.provider == provider && model.id == model_id)
+    {
+        return Some(model.clone());
+    }
+    if !model_id.is_empty() {
+        if let Some(model) = build_fallback_model(provider, model_id, models) {
+            return Some(model);
+        }
+    }
+    models
+        .iter()
+        .find(|model| model.provider == provider)
+        .or_else(|| models.first())
+        .cloned()
+}
+
 pub fn parse_model_pattern(
     pattern: &str,
     available_models: &[Model],
@@ -768,6 +793,31 @@ fn fixture_models() -> Vec<Model> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn request_model_keeps_an_unknown_id_instead_of_swapping_models() {
+        // Regression: `--model gpt-6-luna` on a catalog without it sent the
+        // provider's first record (`gpt-5.3-codex-spark`) to the backend.
+        let models = vec![
+            mock_model("openai-codex", "gpt-5.3-codex-spark", "Spark", true),
+            mock_model("openai-codex", "gpt-6-astra", "GPT-6 Astra", true),
+            mock_model("openai", "gpt-4o", "GPT-4o", false),
+        ];
+        let luna = model_for_request(&models, "openai-codex", "gpt-6-luna").unwrap();
+        assert_eq!(luna.id, "gpt-6-luna");
+        assert_eq!(luna.provider, "openai-codex");
+        // Transport fields come from the provider default, not the first record.
+        assert_eq!(luna.api, models[1].api);
+
+        let exact = model_for_request(&models, "openai-codex", "gpt-6-astra").unwrap();
+        assert_eq!(exact, models[1]);
+        // No id at all still picks a usable model for the provider.
+        let empty = model_for_request(&models, "openai-codex", "").unwrap();
+        assert_eq!(empty.id, "gpt-5.3-codex-spark");
+        // An unknown provider with no records falls back to the first model.
+        let other = model_for_request(&models, "nobody", "x").unwrap();
+        assert_eq!(other.id, "gpt-5.3-codex-spark");
+    }
 
     #[test]
     fn parse_pattern_fuzzy_and_thinking_suffix() {

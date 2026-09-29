@@ -1473,8 +1473,10 @@ mod tests {
     fn write_stdin_delivers_bytes_to_interactive_process() {
         fn spawn_interactive(script: &str) -> Child {
             let mut command = if cfg!(windows) {
-                let mut c = Command::new("powershell");
-                c.args(["-NoProfile", "-NonInteractive", "-Command", script]);
+                // Keep this pipe-delivery fixture independent of PowerShell's
+                // startup time under parallel Windows CI load.
+                let mut c = Command::new("cmd");
+                c.args(["/D", "/V:ON", "/C", script]);
                 c
             } else {
                 let mut c = Command::new("sh");
@@ -1490,7 +1492,7 @@ mod tests {
         }
 
         let script = if cfg!(windows) {
-            "$line = [Console]::In.ReadLine(); Write-Output \"observed: $line\""
+            "set /p line= & echo observed: !line!"
         } else {
             "read line && echo \"observed: $line\""
         };

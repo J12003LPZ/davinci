@@ -834,12 +834,14 @@ mod tests {
     #[test]
     fn descendants_are_cleaned_even_when_server_parent_exited() {
         let transport = fixture("normal");
+        // This deadline includes Node startup and spawning the descendant;
+        // it measures successful cleanup, not request latency under CI load.
         let pid = transport
-            .request("fixture/orphan", json!({}), Duration::from_secs(3))
+            .request("fixture/orphan", json!({}), Duration::from_secs(30))
             .unwrap()
             .as_u64()
             .unwrap();
-        let deadline = Instant::now() + Duration::from_secs(3);
+        let deadline = Instant::now() + Duration::from_secs(30);
         while transport
             .child
             .lock()

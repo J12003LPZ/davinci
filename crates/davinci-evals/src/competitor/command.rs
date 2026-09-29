@@ -457,7 +457,8 @@ mod tests {
         let task = ExternalTask {
             repo_path: repo.path().to_path_buf(),
             request: "do work".into(),
-            timeout: Duration::from_secs(10),
+            // Allow interpreter startup under concurrent Windows CI workloads.
+            timeout: Duration::from_secs(30),
             artifact_dir: repo.path().join("artifacts"),
             environment: BTreeMap::new(),
             ignore_paths: vec!["ignored.txt".into()],

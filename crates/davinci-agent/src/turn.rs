@@ -893,6 +893,19 @@ impl Agent {
             "davinciCapabilityReminder".into(),
             Value::String(reason_code.to_string()),
         );
+        // Attribution for benchmarks: why the last shell call after the
+        // latest change was not credited. Absent when none ran.
+        if reason_code == "verification_required" {
+            if let Some(reason) = self
+                .mutation_verification_state()
+                .last_classification_reason
+            {
+                message.extra.insert(
+                    "davinciCapabilityReminderReason".into(),
+                    Value::String(reason),
+                );
+            }
+        }
         self.messages.push(message.clone());
         self.persist_full_message(&message);
         new_messages.push(message.clone());
@@ -2750,7 +2763,11 @@ impl Agent {
             if crate::tools::is_coordinated_mutation(name) && !pre_hook_error && !result.is_error {
                 self.record_successful_mutation_paths(mutation_paths_from_tool(name, args));
             }
-            self.observe_shell_verification(id, cwd, name, args, &pre_hook_result, &result);
+            if let Some(note) =
+                self.observe_shell_verification(id, cwd, name, args, &pre_hook_result, &result)
+            {
+                append_harness_note(&mut result, &note);
+            }
         }
         let hook_vetoed = !pre_hook_error && result.is_error;
         if !replayed {
@@ -2805,6 +2822,75 @@ impl Agent {
             .insert(id.to_string(), generation);
     }
 
+    /// One line telling the model, in the shell result itself, that a check it
+    /// just ran after an edit cannot count as verification and why. Without
+    /// it the model finds out only when its final answer is refused by the
+    /// completion gate, which costs that answer plus 1-2 more requests
+    /// (t5-csv and t7-cli in the 2026-09-25 head-to-head). At most once per
+    /// mutation generation, and only for a command that succeeded and runs a
+    /// checker program (`invokes_checker`), so `cat app.py` or `git diff`
+    /// never uses up the note before the real check. Davinci-only; the gate
+    /// stays the backstop.
+    fn unrecognized_check_note(
+        &self,
+        generation: u64,
+        command: &str,
+        assessment: &crate::verification::Assessment,
+        state: &crate::MutationVerificationState,
+        failed: bool,
+    ) -> Option<String> {
+        if failed
+            || generation == 0
+            || state.mutation_paths.is_empty()
+            || state.verified_generation == Some(generation)
+        {
+            return None;
+        }
+        if !invokes_checker(command) {
+            return None;
+        }
+        let reason = crate::verification::unrecognized_check_reason(assessment);
+        {
+            let mut current = self
+                .mutation_verification
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            if current.mutation_generation != generation
+                || current.inline_note_generation == Some(generation)
+            {
+                return None;
+            }
+            current.inline_note_generation = Some(generation);
+        }
+        let mut paths: Vec<String> = state
+            .mutation_paths
+            .iter()
+            .take(3)
+            .map(|path| {
+                path.strip_prefix(&self.cwd)
+                    .unwrap_or(path)
+                    .to_string_lossy()
+                    .replace('\\', "/")
+            })
+            .collect();
+        if state.mutation_paths.len() > 3 {
+            paths.push("...".into());
+        }
+        let all_python = state
+            .mutation_paths
+            .iter()
+            .all(|path| path.extension().is_some_and(|ext| ext == "py"));
+        let remedy = if all_python {
+            "To count, run the project's tests, or one bash `python - <<'PY'` heredoc (or `python -c`) with literal words that imports the changed module and asserts the expected results."
+        } else {
+            "To count, run the project's test command, or a check whose exit status fails when the change is wrong."
+        };
+        Some(format!(
+            "[harness: this command does not count as verification of {} ({reason}). {remedy}]",
+            paths.join(", ")
+        ))
+    }
+
     pub(crate) fn observe_shell_verification(
         &self,
         id: &str,
@@ -2813,15 +2899,12 @@ impl Agent {
         args: &Value,
         original: &crate::ToolResult,
         decorated: &crate::ToolResult,
-    ) {
+    ) -> Option<String> {
         let generation = self
             .verification_starts
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .remove(id);
-        let Some(generation) = generation else {
-            return;
-        };
+            .remove(id)?;
         let before = self
             .shell_mutation_snapshots
             .lock()
@@ -2864,21 +2947,23 @@ impl Agent {
             let changed = before.changes(&after);
             if !changed.is_empty() {
                 self.record_successful_mutation_paths(changed);
-                return;
+                return None;
             }
             if !(before.complete() && after.complete()
                 || assessment.full_workspace && before.required_inputs_observed(&after))
             {
                 self.record_unknown_shell_scope();
-                return;
+                return None;
             }
         }
         // Concurrent shell calls can share a starting generation. Always
         // observe their edits first; only their verification credit is stale.
         if generation != state.mutation_generation {
-            return;
+            return None;
         }
-        {
+        // Only a checker run explains a later gate reminder; an inspection
+        // command such as `cat` must not overwrite the reason of the check.
+        if invokes_checker(command) {
             let mut state = self
                 .mutation_verification
                 .lock()
@@ -2891,7 +2976,13 @@ impl Agent {
             assessment.kind,
             crate::verification::CheckKind::Suite | crate::verification::CheckKind::TargetedScript
         ) {
-            return;
+            return self.unrecognized_check_note(
+                generation,
+                command,
+                &assessment,
+                &state,
+                original.is_error,
+            );
         }
         let receipt = self
             .command_receipts
@@ -2953,6 +3044,24 @@ impl Agent {
             self.remember_verification_call(name, args, cwd);
         }
         self.record_verification_assessment(generation, command, &assessment, terminal);
+        if invokes_checker(command) {
+            let mut current = self
+                .mutation_verification
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            if current.mutation_generation == generation {
+                current.last_classification_reason = Some(
+                    match terminal {
+                        None => "no_terminal_evidence",
+                        Some(false) => "check_failed",
+                        Some(true) if current.verified_generation == Some(generation) => "verified",
+                        Some(true) => "coverage_incomplete",
+                    }
+                    .into(),
+                );
+            }
+        }
+        None
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -3355,7 +3464,11 @@ impl Agent {
                             }
                             Ok(crate::approval::GrantScope::Deny | crate::approval::GrantScope::DenyWithInstructions) => {
                                 let guidance = reply.instructions.as_deref().map(crate::approval::instruction_text).unwrap_or_default();
-                                let mut reason = format!("Permission denied: the user declined `{}`.", request.summary);
+                                let mut reason = if self.headless_approval {
+                                    headless_denial_reason(&request.summary)
+                                } else {
+                                    format!("Permission denied: the user declined `{}`.", request.summary)
+                                };
                                 if !guidance.is_empty() {
                                     reason.push(' ');
                                     reason.push_str(&guidance);
@@ -4280,6 +4393,15 @@ impl Agent {
 
 /// A tool's details as an event carries them: the same object without the
 /// image payloads, which belong in the message and not in every sink.
+/// What the model reads when an unattended responder (`Agent::headless_approval`)
+/// refuses a call: nobody declined it, the run simply cannot ask.
+fn headless_denial_reason(summary: &str) -> String {
+    format!(
+        "Permission denied: this action needs approval (`{summary}`) and this non-interactive run cannot ask. \
+         Use a workspace-local alternative or finish without it."
+    )
+}
+
 fn event_details(details: Option<&Value>) -> Option<Value> {
     let Value::Object(map) = details? else {
         return None;
@@ -4995,6 +5117,42 @@ mod tests {
             .contains(&instructions));
         assert!(!dir.path().join("denied.txt").exists());
         assert!(agent.permissions.lock().unwrap().session_allow.is_empty());
+    }
+
+    #[test]
+    fn headless_responder_denial_says_the_run_cannot_ask() {
+        for headless in [false, true] {
+            let dir = tempdir().unwrap();
+            let mut agent = Agent::new("offline headless denial fixture");
+            agent.tools = vec!["write".into()];
+            agent.permissions = Arc::new(crate::PermissionState::new(
+                crate::PermissionPolicy::new(crate::PermissionMode::Ask),
+            ));
+            agent.headless_approval = headless;
+            agent.approval_responder = Some(crate::approval::ApprovalResponder(Arc::new(
+                |_, challenge| {
+                    crate::approval::ApprovalReply::from_legacy(
+                        challenge,
+                        crate::ToolApprovalDecision::Deny,
+                    )
+                },
+            )));
+            let args = json!({"path":"headless.txt", "content":"must not be written"});
+            let Preparation::Immediate(result) =
+                agent.prepare_tool_call(dir.path(), "headless", "write", &args, 0)
+            else {
+                panic!("a denial must not dispatch the executor");
+            };
+            assert!(result.is_error);
+            let text = serde_json::to_string(&result.content).unwrap();
+            assert_eq!(
+                text.contains("this non-interactive run cannot ask"),
+                headless,
+                "{text}"
+            );
+            assert_eq!(text.contains("the user declined"), !headless, "{text}");
+            assert!(!dir.path().join("headless.txt").exists());
+        }
     }
 
     #[test]
@@ -7130,5 +7288,83 @@ mod tool_name_tests {
                 .mutation_generation,
             1
         );
+    }
+}
+
+/// Programs whose run can check a change: test runners, build tools and
+/// interpreters. `python` also covers `python3`, `python3.12` and `py`.
+const CHECKER_PROGRAMS: &[&str] = &[
+    "python", "py", "pytest", "node", "npm", "npx", "pnpm", "yarn", "cargo", "go", "deno", "bun",
+    "uv", "tox", "nox", "make", "jest", "vitest", "mocha", "ruby", "rspec", "rake", "bundle",
+    "dotnet", "mvn", "gradle", "gradlew", "java", "php", "phpunit", "swift", "ctest",
+];
+
+/// Whether some segment of `command` (split on `&&`, `||`, `;`, `|`, `&` and
+/// newlines) starts with a checker program. Only the program word counts,
+/// so file names (`node_modules/`, `cargo.lock`) and substrings (`go` in
+/// `cargo`) never match. Leading `VAR=value` assignments and `env`, `time`,
+/// `sudo` or `uv run` prefixes are skipped; a path or `.exe` suffix on the
+/// program is ignored.
+pub(crate) fn invokes_checker(command: &str) -> bool {
+    let (segments, malformed) = crate::shell_policy::split_shell_segments_with_diagnostic(command);
+    if malformed {
+        return false;
+    }
+    segments.iter().any(|segment| {
+        let mut words = segment.split_whitespace().peekable();
+        while let Some(word) = words.peek() {
+            let skip = word.contains('=') && !word.starts_with('-')
+                || matches!(*word, "env" | "time" | "sudo" | "command" | "exec");
+            if !skip {
+                break;
+            }
+            words.next();
+        }
+        let Some(program) = words.next() else {
+            return false;
+        };
+        let program = program
+            .trim_matches(|ch| matches!(ch, '"' | '\'' | '(' | ')' | '{' | '}'))
+            .rsplit(['/', '\\'])
+            .next()
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        let program = program.strip_suffix(".exe").unwrap_or(&program);
+        if program == "uv" && words.peek().is_some_and(|next| *next == "run") {
+            return true;
+        }
+        CHECKER_PROGRAMS.iter().any(|checker| {
+            program == *checker
+                || *checker == "python"
+                    && program
+                        .strip_prefix("python")
+                        .is_some_and(|rest| rest.chars().all(|ch| ch.is_ascii_digit() || ch == '.'))
+        })
+    })
+}
+
+/// Append a harness line to a tool result the model will read.
+pub(crate) fn append_harness_note(result: &mut crate::ToolResult, note: &str) {
+    if !result.content.is_empty() {
+        result.content.push_str("\n\n");
+    }
+    result.content.push_str(note);
+}
+
+#[cfg(test)]
+mod checker_quote_regressions {
+    #[test]
+    fn quoted_separators_do_not_invoke_a_checker() {
+        for command in [
+            "printf 'status; python -c print(1)'",
+            "echo \"status | cargo test\"",
+            "printf 'status\npytest'",
+            "echo 'unterminated; python test.py",
+        ] {
+            assert!(!super::invokes_checker(command), "{command}");
+        }
+        assert!(super::invokes_checker(
+            "echo 'status; done' && python check.py"
+        ));
     }
 }
