@@ -13,6 +13,8 @@ use crate::permission::ToolClass;
 use crate::runtime::{CapabilitySource, RuntimeCapability, RuntimeCapabilityRegistry};
 use crate::tools::{AgentTool, ToolError, ToolResult};
 
+mod sandboxed;
+
 /// One connected (or failed) MCP server, as `/mcp` lists it.
 #[derive(Debug, Clone)]
 pub struct McpServerRow {
@@ -56,11 +58,31 @@ impl McpRegistry {
     /// Spawn and handshake every enabled server. Failures become an error row;
     /// they do not abort the session.
     pub fn connect(config: &davinci_mcp::ConfigFile, cwd: &Path) -> Self {
+        Self::connect_inner(config, cwd, None)
+    }
+
+    pub fn connect_with_executor(
+        config: &davinci_mcp::ConfigFile,
+        cwd: &Path,
+        host: &crate::jobs::supervisor::SupervisorCommand,
+        sandbox: &davinci_protocol::SandboxSpec,
+    ) -> Self {
+        Self::connect_inner(config, cwd, Some((host, sandbox)))
+    }
+
+    fn connect_inner(
+        config: &davinci_mcp::ConfigFile,
+        cwd: &Path,
+        executor: Option<(
+            &crate::jobs::supervisor::SupervisorCommand,
+            &davinci_protocol::SandboxSpec,
+        )>,
+    ) -> Self {
         let registry = Self::default();
         {
             let mut inner = registry.lock();
             for (name, server) in &config.mcp_servers {
-                inner.connect_one(name, server, cwd);
+                inner.connect_one(name, server, cwd, executor);
             }
         }
         registry
@@ -279,7 +301,16 @@ impl Inner {
         Err(ToolError::Failed(err.to_string()))
     }
 
-    fn connect_one(&mut self, name: &str, server: &davinci_mcp::ServerConfig, cwd: &Path) {
+    fn connect_one(
+        &mut self,
+        name: &str,
+        server: &davinci_mcp::ServerConfig,
+        cwd: &Path,
+        executor: Option<(
+            &crate::jobs::supervisor::SupervisorCommand,
+            &davinci_protocol::SandboxSpec,
+        )>,
+    ) {
         self.trusted_read_only_servers.remove(name);
         let transport_label = if server.url.is_some() {
             "http"
@@ -297,7 +328,7 @@ impl Inner {
             });
             return;
         }
-        if server.disabled {
+        if server.disabled || server.execution == Some(davinci_mcp::McpExecutionPolicy::Disabled) {
             self.rows.push(McpServerRow {
                 name: name.to_string(),
                 transport: transport_label.into(),
@@ -306,6 +337,30 @@ impl Inner {
                 error: None,
                 skipped: Vec::new(),
             });
+            return;
+        }
+        if server.execution == Some(davinci_mcp::McpExecutionPolicy::Sandboxed)
+            && server.command.is_some()
+        {
+            let Some((host, sandbox)) = executor else {
+                self.rows.push(McpServerRow {
+                    name: name.to_string(),
+                    transport: "sandboxed-stdio".into(),
+                    status: "error".into(),
+                    tools: 0,
+                    error: Some(
+                        "sandboxed local MCP requires the executor transport; refusing direct host spawn"
+                            .into(),
+                    ),
+                    skipped: Vec::new(),
+                });
+                return;
+            };
+            let client = sandboxed::SupervisedMcpTransport::spawn(host, server, cwd, sandbox)
+                .and_then(|transport| {
+                    davinci_mcp::Client::connect_transport(name, Box::new(transport))
+                });
+            self.finish_connection(name, server, "sandboxed-stdio", client);
             return;
         }
         let transport = match server.transport() {
@@ -322,7 +377,18 @@ impl Inner {
                 return;
             }
         };
-        match davinci_mcp::Client::connect(name, transport, cwd) {
+        let client = davinci_mcp::Client::connect(name, transport, cwd);
+        self.finish_connection(name, server, transport_label, client);
+    }
+
+    fn finish_connection(
+        &mut self,
+        name: &str,
+        server: &davinci_mcp::ServerConfig,
+        transport_label: &str,
+        client: davinci_mcp::Result<davinci_mcp::Client>,
+    ) {
+        match client {
             Ok(client) => {
                 let tools = client.tools.len();
                 let skipped = client.skipped.clone();
@@ -346,16 +412,14 @@ impl Inner {
                     skipped,
                 });
             }
-            Err(err) => {
-                self.rows.push(McpServerRow {
-                    name: name.to_string(),
-                    transport: transport_label.into(),
-                    status: "error".into(),
-                    tools: 0,
-                    error: Some(err.to_string()),
-                    skipped: Vec::new(),
-                });
-            }
+            Err(err) => self.rows.push(McpServerRow {
+                name: name.to_string(),
+                transport: transport_label.into(),
+                status: "error".into(),
+                tools: 0,
+                error: Some(err.to_string()),
+                skipped: Vec::new(),
+            }),
         }
     }
 
@@ -618,6 +682,24 @@ mod tests {
         let specs = registry.specs();
         assert_eq!(specs.len(), 1);
         assert_eq!(specs[0].parameters, davinci_mcp::default_input_schema());
+    }
+
+    #[test]
+    fn sandboxed_local_mcp_never_falls_back_to_direct_host_stdio() {
+        let config = davinci_mcp::parse_config(
+            r#"{"mcpServers":{"project":{"command":"does-not-run","execution":"sandboxed"}}}"#,
+        )
+        .unwrap();
+        let registry = McpRegistry::connect(&config, Path::new("."));
+        assert!(registry.specs().is_empty());
+        let rows = registry.rows();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].transport, "sandboxed-stdio");
+        assert_eq!(rows[0].status, "error");
+        assert!(rows[0]
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("refusing direct host spawn")));
     }
 
     #[test]

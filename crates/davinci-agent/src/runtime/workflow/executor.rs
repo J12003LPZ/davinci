@@ -735,6 +735,8 @@ impl WorkflowExecutor {
                 runtime_agent_id: Some(aid),
                 runtime: Some(self.runtime.for_worker(aid, Some(child_token))?),
                 parent_permission_mode: launch.parent_permission_mode,
+                foreground_supervisor: launch.foreground_supervisor.clone(),
+                sandbox: launch.sandbox.clone(),
                 worktree_path: lease.as_ref().map(|l| l.path.clone()),
                 contract_digest: None,
                 active_contract: None,

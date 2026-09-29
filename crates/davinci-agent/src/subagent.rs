@@ -247,6 +247,12 @@ pub struct SubagentRequest {
     pub runtime: Option<RuntimeHandle>,
     /// Parent permission mode to enforce permission containment.
     pub parent_permission_mode: Option<PermissionMode>,
+    /// Host-owned process supervisor inherited from the lead. This is never
+    /// accepted from model-authored agent tool JSON.
+    pub foreground_supervisor: Option<crate::jobs::supervisor::SupervisorCommand>,
+    /// Parent sandbox authority. The coding-agent host rebinds it to the
+    /// worker's actual trusted workspace after profile/permission resolution.
+    pub sandbox: Option<davinci_protocol::SandboxSpec>,
     /// Path to isolated worktree if isolation: worktree was requested.
     pub worktree_path: Option<PathBuf>,
     /// Active contract digest propagated to child worker.
@@ -347,6 +353,9 @@ pub struct SubagentParent {
     pub permission_mode: Option<PermissionMode>,
     pub agent_id: Option<AgentId>,
     pub worktree_manager: Option<WorktreeManager>,
+    /// Host-owned process supervisor and sandbox ceiling for delegated work.
+    pub foreground_supervisor: Option<crate::jobs::supervisor::SupervisorCommand>,
+    pub sandbox: Option<davinci_protocol::SandboxSpec>,
     pub contract_digest: Option<String>,
     pub active_contract: Option<crate::runtime::contracts::TaskContract>,
 }
@@ -803,6 +812,8 @@ pub fn run_tool(
             runtime_agent_id: Some(child_agent_id),
             runtime,
             parent_permission_mode: parent.permission_mode,
+            foreground_supervisor: parent.foreground_supervisor.clone(),
+            sandbox: parent.sandbox.clone(),
             worktree_path: wt_path,
             contract_digest: parent.contract_digest.clone(),
             active_contract: parent.active_contract.clone(),

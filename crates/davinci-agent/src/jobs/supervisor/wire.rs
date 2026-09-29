@@ -1,4 +1,5 @@
 use super::{ProcessConfig, ProcessIdentity};
+use davinci_protocol::SandboxReceipt;
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use std::io::{self, Read, Write};
 
@@ -34,6 +35,8 @@ pub(super) enum Event {
     Started {
         identity: ProcessIdentity,
         pid: u32,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        sandbox: Option<SandboxReceipt>,
     },
     Output {
         identity: ProcessIdentity,

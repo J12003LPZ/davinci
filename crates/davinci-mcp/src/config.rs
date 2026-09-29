@@ -1,4 +1,4 @@
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -10,6 +10,15 @@ use crate::{Error, Result, TransportConfig};
 pub struct File {
     #[serde(default)]
     pub mcp_servers: BTreeMap<String, ServerConfig>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum McpExecutionPolicy {
+    Host,
+    Sandboxed,
+    Remote,
+    Disabled,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -26,6 +35,11 @@ pub struct ServerConfig {
     pub headers: BTreeMap<String, String>,
     #[serde(default)]
     pub disabled: bool,
+    /// Where this MCP server is allowed to execute. Local commands default
+    /// to sandboxed; HTTP endpoints default to remote. The coding-agent host
+    /// may explicitly preserve legacy trusted user configuration as host.
+    #[serde(default)]
+    pub execution: Option<McpExecutionPolicy>,
     /// Explicit local attestation that this server's read-only annotations may
     /// authorize tools. Discovery and project trust do not imply this opt-in.
     #[serde(default, rename = "trustReadOnlyHints")]
@@ -33,6 +47,27 @@ pub struct ServerConfig {
 }
 
 impl ServerConfig {
+    pub fn execution_policy(&self) -> Result<McpExecutionPolicy> {
+        if self.disabled || self.execution == Some(McpExecutionPolicy::Disabled) {
+            return Ok(McpExecutionPolicy::Disabled);
+        }
+        match (&self.url, &self.command, self.execution) {
+            (Some(_), _, None | Some(McpExecutionPolicy::Remote)) => Ok(McpExecutionPolicy::Remote),
+            (Some(_), _, Some(_)) => Err(Error::Protocol(
+                "remote MCP server execution must be `remote` or `disabled`".into(),
+            )),
+            (None, Some(_), None | Some(McpExecutionPolicy::Sandboxed)) => {
+                Ok(McpExecutionPolicy::Sandboxed)
+            }
+            (None, Some(_), Some(McpExecutionPolicy::Host)) => Ok(McpExecutionPolicy::Host),
+            (None, Some(_), Some(McpExecutionPolicy::Remote)) => Err(Error::Protocol(
+                "local MCP command cannot use remote execution policy".into(),
+            )),
+            (None, Some(_), Some(McpExecutionPolicy::Disabled)) => Ok(McpExecutionPolicy::Disabled),
+            (None, None, _) => Err(Error::Protocol("server needs `command` or `url`".into())),
+        }
+    }
+
     pub fn transport(&self) -> Result<TransportConfig> {
         let expand = |map: &BTreeMap<String, String>| {
             map.iter()
@@ -64,7 +99,7 @@ impl ServerConfig {
 
 /// `${NAME}` becomes the parent's value of NAME (empty when unset). A bare
 /// `$NAME` is left alone, so values that legitimately contain `$` survive.
-fn expand_env(value: &str, lookup: impl Fn(&str) -> Option<String>) -> String {
+pub fn expand_env(value: &str, lookup: impl Fn(&str) -> Option<String>) -> String {
     let mut out = String::with_capacity(value.len());
     let mut rest = value;
     while let Some(start) = rest.find("${") {
@@ -146,6 +181,47 @@ mod tests {
         let merged = merge(user, project);
         assert!(merged.mcp_servers["a"].command.is_some());
         assert_eq!(merged.mcp_servers["b"].url.as_deref(), Some("https://p"));
+    }
+
+    #[test]
+    fn local_execution_policy_defaults_sandboxed_and_transport_is_explicit() {
+        let file = parse(
+            r#"{"mcpServers":{
+                "local":{"command":"tool"},
+                "host":{"command":"tool","execution":"host"},
+                "remote":{"url":"https://example.com/mcp"},
+                "off":{"command":"tool","execution":"disabled"}
+            }}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            file.mcp_servers["local"].execution_policy().unwrap(),
+            McpExecutionPolicy::Sandboxed
+        );
+        assert_eq!(
+            file.mcp_servers["host"].execution_policy().unwrap(),
+            McpExecutionPolicy::Host
+        );
+        assert_eq!(
+            file.mcp_servers["remote"].execution_policy().unwrap(),
+            McpExecutionPolicy::Remote
+        );
+        assert_eq!(
+            file.mcp_servers["off"].execution_policy().unwrap(),
+            McpExecutionPolicy::Disabled
+        );
+    }
+
+    #[test]
+    fn execution_policy_cannot_mismatch_transport() {
+        let remote_host =
+            parse(r#"{"mcpServers":{"x":{"url":"https://example.com","execution":"host"}}}"#)
+                .unwrap();
+        assert!(remote_host.mcp_servers["x"].execution_policy().is_err());
+
+        let local_remote =
+            parse(r#"{"mcpServers":{"x":{"command":"tool","execution":"remote"}}}"#).unwrap();
+        assert!(local_remote.mcp_servers["x"].execution_policy().is_err());
     }
 
     #[test]

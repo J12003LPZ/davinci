@@ -101,6 +101,9 @@ mod file_processor;
 use davinci_coding_agent::hooks;
 mod image_convert;
 mod js_host;
+// Shared with the lib, not redeclared: the binary's module copies must see the
+// same process-wide execution-boundary flag the lib enables.
+use davinci_coding_agent::{execution_boundary, sandbox_config};
 mod llama;
 mod mcp;
 mod migrations;
@@ -339,6 +342,30 @@ pub(crate) fn startup_mark(stage: &str) {
     }
 }
 
+fn preactivate_execution_boundary(raw: &[String], cwd: &Path) -> Result<(), String> {
+    let mut settings = load_settings(&default_agent_dir()).sandbox;
+    if let Some(index) = raw.iter().position(|value| value == "--execution-sandbox") {
+        let mode = raw
+            .get(index + 1)
+            .ok_or("--execution-sandbox requires a mode")?
+            .clone();
+        settings.get_or_insert_with(Default::default).mode = Some(mode);
+    }
+    let Some(spec) = davinci_coding_agent::sandbox_config::resolve_sandbox_settings(
+        cwd,
+        settings.as_ref(),
+        None,
+        false,
+    )?
+    else {
+        return Ok(());
+    };
+    if spec.mode != davinci_protocol::SandboxMode::FullAccess {
+        davinci_coding_agent::execution_boundary::enable();
+    }
+    Ok(())
+}
+
 /// `--cd`: become the process working directory before anything reads it.
 /// The path is canonicalized so a relative or symlinked spelling encodes the
 /// same session directory as starting there, and the Windows verbatim prefix
@@ -390,6 +417,7 @@ fn run(raw: Vec<String>) -> Result<i32, String> {
         std::env::set_var("PI_DAVINCI", "0");
     }
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    preactivate_execution_boundary(&raw, &cwd)?;
     tools_manager::prepend_tools_bin_to_path();
     if matches!(raw.first().map(String::as_str), Some("plugin" | "plugins")) {
         let agent_dir = default_agent_dir();
@@ -911,6 +939,45 @@ fn build_agent(parsed: &Args, session_dir: &Path, cwd: &Path) -> Result<Agent, S
             .tool_registry
             .retain(|name| !davinci_agent::runtime::transactions::is_tool(name));
     }
+    // Sandbox authority is resolved from the user settings and, only for a
+    // trusted project, a project request that may narrow but never widen it.
+    // Do not use the already deep-merged settings for this security boundary.
+    let global_sandbox_settings = load_settings(&default_agent_dir());
+    let mut effective_global_sandbox = global_sandbox_settings.sandbox.clone();
+    if let Some(mode) = parsed.execution_sandbox_mode.as_ref() {
+        effective_global_sandbox
+            .get_or_insert_with(Default::default)
+            .mode = Some(mode.clone());
+    }
+    let project_trusted_for_sandbox = trust::resolve_project_trusted(
+        &default_agent_dir(),
+        cwd,
+        parsed.project_trust_override,
+        global_sandbox_settings.default_project_trust.as_deref(),
+        &global_sandbox_settings.trusted_projects,
+    );
+    let project_sandbox_settings = if project_trusted_for_sandbox {
+        let [current, legacy] = project_config::candidates(cwd, "settings.json");
+        let path = if current.exists() { current } else { legacy };
+        settings::load_settings_file(&path).sandbox
+    } else {
+        None
+    };
+    agent.tool_context.sandbox = davinci_coding_agent::sandbox_config::resolve_sandbox_settings(
+        cwd,
+        effective_global_sandbox.as_ref(),
+        project_sandbox_settings.as_ref(),
+        project_trusted_for_sandbox,
+    )?;
+    if agent
+        .tool_context
+        .sandbox
+        .as_ref()
+        .is_some_and(|spec| spec.mode != davinci_protocol::SandboxMode::FullAccess)
+    {
+        davinci_coding_agent::execution_boundary::enable();
+    }
+
     agent.tool_context.foreground_supervisor = std::env::current_exe().ok().map(|executable| {
         davinci_agent::jobs::supervisor::SupervisorCommand {
             executable,
@@ -952,10 +1019,22 @@ fn build_agent(parsed: &Args, session_dir: &Path, cwd: &Path) -> Result<Agent, S
     }
     let trusted = is_trusted(&settings, cwd, parsed.project_trust_override);
     if !parsed.no_mcp {
-        agent.attach_mcp(davinci_agent::McpRegistry::connect(
-            &mcp::load(&default_agent_dir(), cwd, trusted),
+        let mcp_config = mcp::load(
+            &default_agent_dir(),
             cwd,
-        ));
+            trusted,
+            agent.tool_context.sandbox.is_some(),
+        );
+        let registry = match (
+            agent.tool_context.foreground_supervisor.as_ref(),
+            agent.tool_context.sandbox.as_ref(),
+        ) {
+            (Some(host), Some(sandbox)) => {
+                davinci_agent::McpRegistry::connect_with_executor(&mcp_config, cwd, host, sandbox)
+            }
+            _ => davinci_agent::McpRegistry::connect(&mcp_config, cwd),
+        };
+        agent.attach_mcp(registry);
     }
     // Overflowing batch output is kept where the model can `read` it
     // back, under the agent dir so a fixture dir keeps tests contained.
@@ -2302,6 +2381,24 @@ fn build_worker_agent(
     child.permissions = Arc::new(davinci_agent::PermissionState::new(policy));
     child.approver = None;
     child.approval_responder = None;
+    child.tool_context.foreground_supervisor = req.foreground_supervisor.clone();
+    child.tool_context.sandbox = req
+        .sandbox
+        .as_ref()
+        .map(|parent| {
+            let worker_id = req
+                .runtime_agent_id
+                .map(|id| id.to_string())
+                .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+            davinci_agent::sandbox::rebind_worker_spec(
+                parent,
+                effective_cwd,
+                davinci_protocol::SandboxId(format!("worker-{worker_id}")),
+                !matches!(child_mode, davinci_agent::PermissionMode::ReadOnly),
+            )
+            .map_err(|error| format!("worker sandbox delegation failed: {error}"))
+        })
+        .transpose()?;
     // `mcp_read` and read-only MCP tools need the parent's connections.
     child.tool_context.mcp = mcp.clone();
     child.abort_signal = req.abort.clone();
@@ -7192,6 +7289,13 @@ fn handle_user_line(
             let text = format_session_cost(parsed, agent);
             session.chrome.transcript.push("cost", &text);
             session.chrome.status = "cost".into();
+            println!("{text}");
+            Ok(true)
+        }
+        SlashAction::ShowSandboxStatus => {
+            let text = sandbox_config::format_sandbox_status(agent.tool_context.sandbox.as_ref());
+            session.chrome.transcript.push("sandbox", &text);
+            session.chrome.status = "sandbox".into();
             println!("{text}");
             Ok(true)
         }

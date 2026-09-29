@@ -33,6 +33,7 @@ pub mod provider_budget;
 mod pruning;
 pub use prepared_context::PreparedContextImage;
 mod queues;
+pub mod sandbox;
 mod scheduler;
 pub mod semantic;
 pub mod shell_policy;
@@ -911,6 +912,8 @@ impl Agent {
             provider: Some(self.provider.clone()),
             model_id: Some(self.model_id.clone()),
             parent_tools: self.tools.clone(),
+            foreground_supervisor: self.tool_context.foreground_supervisor.clone(),
+            sandbox: self.tool_context.sandbox.clone(),
             report_to_lead,
             turn_token: self
                 .runtime

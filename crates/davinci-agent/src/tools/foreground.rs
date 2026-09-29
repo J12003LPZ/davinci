@@ -28,9 +28,12 @@ impl Capture {
     }
 }
 
-/// Foreground shell tools have always inherited the host environment. Preserve
-/// that contract explicitly across the private helper, without exposing values.
-pub(super) fn config(
+/// Builds the trusted process configuration for foreground shell execution.
+///
+/// Sandboxed execution starts from a minimal environment. The legacy unsandboxed
+/// compatibility path keeps its historical environment behavior, but it carries
+/// no sandbox receipt and must never be represented as OS-isolated.
+pub(super) fn process_config(
     cwd: &std::path::Path,
     executable: std::path::PathBuf,
     argv: Vec<String>,
@@ -44,19 +47,48 @@ pub(super) fn config(
         .ok_or_else(|| ToolError::Failed("command executable path is not UTF-8".into()))?;
     let executable = crate::process_manager::resolve_native_executable(executable, &cwd)
         .map_err(ToolError::Failed)?;
-    let environment = std::env::vars_os()
-        .map(|(key, value)| {
-            Ok((
-                key.into_string().map_err(|_| {
-                    ToolError::Failed("command environment name is not UTF-8".into())
-                })?,
-                value.into_string().map_err(|_| {
-                    ToolError::Failed("command environment value is not UTF-8".into())
-                })?,
-            ))
-        })
-        .collect::<Result<_, ToolError>>()?;
-    let config = ProcessConfig::new(executable, argv, cwd, environment);
+
+    let (environment, sandbox) = if let Some(spec) = context.sandbox.as_ref() {
+        let workspace = std::path::Path::new(&spec.workspace);
+        if !cwd.starts_with(workspace) {
+            return Err(ToolError::Failed(
+                "command cwd is outside the active sandbox workspace".into(),
+            ));
+        }
+        let environment = crate::sandbox::sanitize_current_environment(&spec.environment)
+            .map_err(|error| ToolError::Failed(format!("sandbox environment denied: {error}")))?;
+        (environment, Some(spec.clone()))
+    } else {
+        let environment = std::env::vars_os()
+            .map(|(key, value)| {
+                Ok((
+                    key.into_string().map_err(|_| {
+                        ToolError::Failed("command environment name is not UTF-8".into())
+                    })?,
+                    value.into_string().map_err(|_| {
+                        ToolError::Failed("command environment value is not UTF-8".into())
+                    })?,
+                ))
+            })
+            .collect::<Result<_, ToolError>>()?;
+        (environment, None)
+    };
+
+    let mut config = ProcessConfig::new(executable, argv, cwd, environment);
+    if let Some(sandbox) = sandbox {
+        config = config.with_sandbox(sandbox);
+    }
+    Ok(config)
+}
+
+/// Foreground configuration bound to this dispatch's command receipt.
+pub(super) fn config(
+    cwd: &std::path::Path,
+    executable: std::path::PathBuf,
+    argv: Vec<String>,
+    context: &ToolContext,
+) -> Result<ProcessConfig, ToolError> {
+    let config = process_config(cwd, executable, argv, context)?;
     Ok(context
         .command_receipt
         .as_ref()
@@ -145,15 +177,25 @@ pub(super) fn run(
         } else {
             "; process cleanup did not finish within deadline"
         };
-        let evidence = config.execution_evidence(
-            process.identity().clone(),
-            exit.as_ref()
-                .map(|exit| exit.launch_state)
-                .unwrap_or(crate::jobs::supervisor::ProcessLaunchState::Unknown),
-            exit.as_ref().and_then(|exit| exit.code),
-            exit.as_ref()
-                .map(|exit| exit.output_complete && !capture.overflow),
-        );
+        let evidence = config
+            .execution_evidence(
+                process.identity().clone(),
+                exit.as_ref()
+                    .map(|exit| exit.launch_state)
+                    .unwrap_or(crate::jobs::supervisor::ProcessLaunchState::Unknown),
+                exit.as_ref().and_then(|exit| exit.code),
+                exit.as_ref()
+                    .map(|exit| exit.output_complete && !capture.overflow),
+            )
+            .with_effective_sandbox(exit.as_ref().and_then(|exit| exit.sandbox.clone()))
+            .unwrap_or_else(|_| {
+                config.execution_evidence(
+                    process.identity().clone(),
+                    crate::jobs::supervisor::ProcessLaunchState::Unknown,
+                    exit.as_ref().and_then(|exit| exit.code),
+                    Some(false),
+                )
+            });
         if let Some(receipt) = &context.command_receipt {
             receipt.process_observed(evidence, started_at_ms, &capture.stdout, &capture.stderr);
         }
@@ -182,12 +224,17 @@ pub(super) fn run(
     };
     let mut captured = capture.lock().unwrap_or_else(|e| e.into_inner());
     let output_complete = exit.output_complete && !captured.overflow;
-    let evidence = config.execution_evidence(
-        exit.identity.clone(),
-        exit.launch_state,
-        exit.code,
-        Some(output_complete),
-    );
+    let evidence = config
+        .execution_evidence(
+            exit.identity.clone(),
+            exit.launch_state,
+            exit.code,
+            Some(output_complete),
+        )
+        .with_effective_sandbox(exit.sandbox.clone())
+        .map_err(|error| {
+            ToolError::Failed(format!("sandbox execution evidence mismatch: {error}"))
+        })?;
     if let Some(receipt) = &context.command_receipt {
         receipt.process_observed(evidence, started_at_ms, &captured.stdout, &captured.stderr);
     }
@@ -279,6 +326,52 @@ mod tests {
         }
         assert!(child.try_wait().unwrap().is_none());
         std::process::exit(0);
+    }
+
+    #[test]
+    fn sandboxed_foreground_config_does_not_copy_ambient_secrets() {
+        use davinci_protocol::{
+            EnvironmentPolicy, FilesystemPolicy, NetworkPolicy, ProcessPolicy, ResourcePolicy,
+            SandboxBackendKind, SandboxCapabilities, SandboxId, SandboxMode, SandboxSpec,
+        };
+        static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let root = tempfile::tempdir().unwrap();
+        let cwd = root.path().canonicalize().unwrap();
+        let executable = std::env::current_exe().unwrap().canonicalize().unwrap();
+        let previous = std::env::var_os("DAVINCI_FOREGROUND_SECRET_FIXTURE");
+        std::env::set_var("DAVINCI_FOREGROUND_SECRET_FIXTURE", "must-not-leak");
+        let spec = SandboxSpec {
+            id: SandboxId("foreground-env".into()),
+            mode: SandboxMode::FullAccess,
+            backend: SandboxBackendKind::Host,
+            container: None,
+            workspace: cwd.to_string_lossy().into_owned(),
+            filesystem: FilesystemPolicy::default(),
+            network: NetworkPolicy::Unrestricted,
+            environment: EnvironmentPolicy::default(),
+            resources: ResourcePolicy::default(),
+            process: ProcessPolicy::default(),
+            required_capabilities: SandboxCapabilities {
+                environment_isolation: true,
+                process_tree_isolation: true,
+                deterministic_teardown: true,
+                ..Default::default()
+            },
+        };
+        let context = ToolContext {
+            sandbox: Some(spec.clone()),
+            ..Default::default()
+        };
+        let config = config(&cwd, executable, vec![], &context).unwrap();
+        match previous {
+            Some(value) => std::env::set_var("DAVINCI_FOREGROUND_SECRET_FIXTURE", value),
+            None => std::env::remove_var("DAVINCI_FOREGROUND_SECRET_FIXTURE"),
+        }
+        assert_eq!(config.sandbox.as_ref(), Some(&spec));
+        assert!(!config
+            .environment
+            .contains_key("DAVINCI_FOREGROUND_SECRET_FIXTURE"));
     }
 
     #[test]

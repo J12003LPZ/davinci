@@ -3971,6 +3971,97 @@ fn worker_host_enforces_profile_tool_and_worktree_permission_ceilings() {
 }
 
 #[test]
+fn worker_host_rebinds_sandbox_and_supervisor_to_effective_worktree() {
+    let _lock = PROCESS_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let agent_dir = tempfile::tempdir().unwrap();
+    let parent_root = tempfile::tempdir().unwrap();
+    let child_root = tempfile::tempdir().unwrap();
+    let _config = EnvRestore::set("PI_CODING_AGENT_DIR", agent_dir.path().to_str().unwrap());
+    let parent = parent_root.path().canonicalize().unwrap();
+    let child_path = child_root.path().canonicalize().unwrap();
+    let parent_text = parent.to_string_lossy().into_owned();
+    let spec = davinci_protocol::SandboxSpec {
+        id: davinci_protocol::SandboxId("parent-sandbox".into()),
+        mode: davinci_protocol::SandboxMode::WorkspaceWrite,
+        backend: davinci_protocol::SandboxBackendKind::Auto,
+        container: None,
+        workspace: parent_text.clone(),
+        filesystem: davinci_protocol::FilesystemPolicy {
+            mounts: vec![davinci_protocol::MountRule {
+                source: Some(parent_text.clone()),
+                target: parent_text,
+                access: davinci_protocol::MountAccess::ReadWrite,
+            }],
+        },
+        network: davinci_protocol::NetworkPolicy::Denied,
+        environment: davinci_protocol::EnvironmentPolicy::default(),
+        resources: davinci_protocol::ResourcePolicy {
+            max_memory_bytes: Some(1024 * 1024),
+            ..Default::default()
+        },
+        process: davinci_protocol::ProcessPolicy::default(),
+        required_capabilities: davinci_protocol::SandboxCapabilities::default(),
+    };
+    let supervisor = davinci_agent::jobs::supervisor::SupervisorCommand {
+        executable: std::env::current_exe().unwrap(),
+        argv: vec!["--internal-process-supervisor".into()],
+    };
+    let req = davinci_agent::SubagentRequest {
+        tools: vec!["read".into(), "write".into()],
+        parent_tools: Some(vec!["read".into(), "write".into(), "agent".into()]),
+        parent_permission_mode: Some(davinci_agent::PermissionMode::Edits),
+        worktree_path: Some(child_path.clone()),
+        foreground_supervisor: Some(supervisor.clone()),
+        sandbox: Some(spec.clone()),
+        ..Default::default()
+    };
+    let parsed = Args {
+        offline: true,
+        no_extensions: true,
+        project_trust_override: Some(true),
+        ..Default::default()
+    };
+
+    let (worker, shared_writer) = build_worker_agent(
+        &parsed,
+        &parent,
+        &davinci_agent::McpRegistry::default(),
+        &req,
+    )
+    .unwrap();
+
+    assert!(!shared_writer);
+    let worker_spec = worker
+        .tool_context
+        .sandbox
+        .as_ref()
+        .expect("worker keeps a sandbox boundary");
+    assert_ne!(worker_spec.id, spec.id);
+    assert_eq!(worker_spec.workspace, child_path.to_string_lossy());
+    assert_eq!(
+        worker_spec.mode,
+        davinci_protocol::SandboxMode::WorkspaceWrite
+    );
+    assert_eq!(worker_spec.network, davinci_protocol::NetworkPolicy::Denied);
+    assert_eq!(
+        worker_spec.resources.max_memory_bytes,
+        spec.resources.max_memory_bytes
+    );
+    assert!(worker_spec.filesystem.mounts.iter().any(|mount| {
+        mount.source.as_deref() == Some(worker_spec.workspace.as_str())
+            && mount.target == worker_spec.workspace
+            && mount.access == davinci_protocol::MountAccess::ReadWrite
+    }));
+    let inherited = worker
+        .tool_context
+        .foreground_supervisor
+        .as_ref()
+        .expect("worker inherits the trusted executor supervisor");
+    assert_eq!(inherited.executable, supervisor.executable);
+    assert_eq!(inherited.argv, supervisor.argv);
+}
+
+#[test]
 fn fixture_teammate_reports_wakes_and_times_out_through_host_runner() {
     let _lock = PROCESS_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let dir = tempfile::tempdir().unwrap();

@@ -59,7 +59,8 @@ Options:
   --exclude-tools, -xt <tools>   Comma-separated denylist of tool names to disable
   --permission-mode <mode>       manual (default), accept-edits, plan-mode, auto, always-approve
                                  Legacy aliases ask, edits, and read-only are also accepted.
-  --sandbox <preset>             Same flag, Codex names: read-only, workspace-write, full-access (a policy preset, not an OS sandbox)
+  --sandbox <preset>             Historical permission alias: read-only, workspace-write, full-access (not an OS sandbox)
+  --execution-sandbox <mode>      OS execution policy: none, restricted, workspace-write, full-access
   --thinking <level>             Set thinking level: off, minimal, low, medium, high, xhigh, max
   --extension, -e <path>         Load an extension file (can be used multiple times)
   --no-extensions, -ne           Disable JS extension discovery (native intelligence stays enabled)
@@ -159,7 +160,8 @@ Permission Modes (interactive):
   Shift+Tab                       Cycle Manual -> Accept Edits -> Plan Mode -> Auto Mode
                                   -> Always Approve -> Manual (idle composer only)
   Alt+Shift+T                     Cycle thinking level (where supported)
-  /permissions [mode]             Show the mode picker or select a named mode
+  /permissions [mode]             Show the approval-policy picker or select a named mode
+  /sandbox-status                  Show configured execution sandbox policy and evidence semantics
   /plan                           Enter read-only planning
   /plan show | /plan diff          Inspect the current plan or its latest revision
   /plan edit <id> <text>           Edit one decision without replacing the whole plan

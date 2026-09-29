@@ -110,7 +110,17 @@ impl ExecutionReceipt {
             && !self.permission_denied
             && !self.simulated
             && !self.hook_vetoed
+            && self.sandbox_evidence_satisfied()
             && self.assertions_passed()
+    }
+
+    fn sandbox_evidence_satisfied(&self) -> bool {
+        self.process_evidence.as_ref().is_none_or(|process| {
+            process
+                .sandbox
+                .as_ref()
+                .is_none_or(|sandbox| sandbox.effective.is_some())
+        })
     }
 
     fn assertions_passed(&self) -> bool {
@@ -578,5 +588,71 @@ mod tests {
         let sanitized = sanitize_display_output(raw);
         assert!(!sanitized.contains("\x1b"));
         assert!(sanitized.contains("&lt;script&gt;"));
+    }
+
+    #[test]
+    fn requested_sandbox_without_effective_executor_receipt_cannot_pass() {
+        use crate::jobs::supervisor::{
+            ProcessExecutionEvidence, ProcessIdentity, ProcessLaunchState, ProcessSandboxEvidence,
+        };
+        use davinci_protocol::{
+            SandboxBackendKind, SandboxCapabilities, SandboxId, SandboxLifecycle, SandboxMode,
+            SandboxReceipt,
+        };
+
+        let requested = ProcessSandboxEvidence {
+            id: "sbx-verification".into(),
+            spec_digest: "digest".into(),
+            mode: SandboxMode::WorkspaceWrite,
+            requested_backend: SandboxBackendKind::LinuxBubblewrap,
+            effective: None,
+        };
+        let mut receipt = ExecutionReceipt {
+            started: true,
+            exit_code: Some(0),
+            process_evidence: Some(ProcessExecutionEvidence {
+                identity: ProcessIdentity {
+                    operation: None,
+                    lifetime: uuid::Uuid::new_v4(),
+                },
+                launch_state: ProcessLaunchState::Exited,
+                executable: "/bin/true".into(),
+                argv: Vec::new(),
+                cwd: "/workspace".into(),
+                environment_references: Vec::new(),
+                environment_digest: "env".into(),
+                sandbox: Some(requested),
+                exit_code: Some(0),
+                output_complete: Some(true),
+            }),
+            ..Default::default()
+        };
+        assert!(
+            !receipt.is_passed(),
+            "requested sandbox policy alone is not executor evidence"
+        );
+
+        receipt
+            .process_evidence
+            .as_mut()
+            .unwrap()
+            .sandbox
+            .as_mut()
+            .unwrap()
+            .effective = Some(SandboxReceipt {
+            sandbox_id: SandboxId("sbx-verification".into()),
+            spec_digest: "digest".into(),
+            backend: SandboxBackendKind::LinuxBubblewrap,
+            capabilities: SandboxCapabilities {
+                filesystem_isolation: true,
+                network_denied: true,
+                environment_isolation: true,
+                process_tree_isolation: true,
+                deterministic_teardown: true,
+                ..Default::default()
+            },
+            lifecycle: SandboxLifecycle::Running,
+        });
+        assert!(receipt.is_passed());
     }
 }

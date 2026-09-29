@@ -112,6 +112,7 @@ impl BrowserProcess {
         host: &SupervisorCommand,
         config: BrowserProcessConfig<'_>,
     ) -> Result<Self, String> {
+        crate::execution_boundary::require_executor("browser process")?;
         let workspace = config
             .workspace
             .canonicalize()
@@ -218,6 +219,9 @@ impl BrowserProcess {
                         ],
                         cwd: directory.clone(),
                         environment,
+                        sandbox: None,
+                        background: true,
+                        service: true,
                         operation: None,
                     },
                     Arc::new(move |event| {

@@ -93,6 +93,11 @@ impl Supervisor {
                 "process configuration exceeds 64 KiB",
             ));
         }
+        let launch_id = identity.lifetime.simple().to_string();
+        let container_cleanup = config
+            .sandbox
+            .as_ref()
+            .and_then(|spec| crate::sandbox::container_cleanup_plan(spec, Some(&launch_id)));
         let mut command = Command::new(&host.executable);
         command.args(&host.argv).env_clear();
         // The trusted helper needs platform paths, never credentials or loader
@@ -177,7 +182,17 @@ impl Supervisor {
             }
         });
         let monitor_identity = identity.clone();
-        thread::spawn(move || monitor(child, event_rx, control, event, stderr, monitor_identity));
+        thread::spawn(move || {
+            monitor(
+                child,
+                event_rx,
+                control,
+                event,
+                stderr,
+                monitor_identity,
+                container_cleanup,
+            )
+        });
         owner
             .control
             .input
@@ -328,6 +343,59 @@ impl Drop for Supervisor {
     }
 }
 
+fn cleanup_container(plan: &crate::sandbox::ContainerCleanupPlan) -> Result<(), String> {
+    fn run_bounded(
+        executable: &std::path::Path,
+        args: &[&str],
+    ) -> Result<std::process::ExitStatus, String> {
+        let mut command = Command::new(executable);
+        command
+            .args(args)
+            .env_clear()
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            command.creation_flags(0x08000000);
+        }
+        let mut child = command
+            .spawn()
+            .map_err(|error| format!("cleanup command spawn: {error}"))?;
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            match child.try_wait() {
+                Ok(Some(status)) => return Ok(status),
+                Ok(None) if std::time::Instant::now() < deadline => {
+                    thread::sleep(Duration::from_millis(20));
+                }
+                Ok(None) => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err("cleanup command timed out".into());
+                }
+                Err(error) => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err(format!("cleanup command wait: {error}"));
+                }
+            }
+        }
+    }
+
+    let _ = run_bounded(&plan.executable, &["rm", "-f", &plan.name]);
+    let inspect = run_bounded(&plan.executable, &["container", "inspect", &plan.name])?;
+    if inspect.success() {
+        Err(format!(
+            "container {} still exists after teardown",
+            plan.name
+        ))
+    } else {
+        Ok(())
+    }
+}
+
 fn monitor(
     mut child: Child,
     events: mpsc::Receiver<Event>,
@@ -335,19 +403,23 @@ fn monitor(
     callback: Arc<dyn Fn(ProcessEvent) + Send + Sync>,
     stderr_callback: Arc<dyn Fn(Vec<u8>) + Send + Sync>,
     identity: ProcessIdentity,
+    container_cleanup: Option<crate::sandbox::ContainerCleanupPlan>,
 ) {
     let mut code = None;
     let mut exit_reported = false;
     let mut output_complete = false;
     let mut error = None;
     let mut launch_state = ProcessLaunchState::Unknown;
+    let mut sandbox = None;
     while !control.stop.load(Ordering::SeqCst) {
         match events.recv_timeout(POLL) {
             Ok(Event::Started {
                 identity: observed,
                 pid,
+                sandbox: receipt,
             }) if observed == identity => {
                 launch_state = ProcessLaunchState::Started;
+                sandbox = receipt;
                 control.state.lock().unwrap_or_else(|e| e.into_inner()).pid = Some(pid);
                 control.changed.notify_all();
             }
@@ -426,6 +498,26 @@ fn monitor(
     if child.wait().is_err() {
         error = Some("supervisor reap failed".into());
     }
+    if sandbox
+        .as_ref()
+        .is_some_and(|receipt| receipt.backend == davinci_protocol::SandboxBackendKind::Container)
+    {
+        if let Some(plan) = container_cleanup.as_ref() {
+            if let Err(cleanup) = cleanup_container(plan) {
+                error = Some(match error {
+                    Some(existing) => format!("{existing}; container cleanup failed: {cleanup}"),
+                    None => format!("container cleanup failed: {cleanup}"),
+                });
+            }
+        } else {
+            error = Some(match error {
+                Some(existing) => {
+                    format!("{existing}; container cleanup plan unavailable")
+                }
+                None => "container cleanup plan unavailable".into(),
+            });
+        }
+    }
     if !stopped && !exit_reported && error.is_none() {
         error = Some("supervisor exited without command status".into());
     }
@@ -435,6 +527,7 @@ fn monitor(
     let exit = ProcessExit {
         identity,
         launch_state,
+        sandbox,
         code,
         stopped,
         error,

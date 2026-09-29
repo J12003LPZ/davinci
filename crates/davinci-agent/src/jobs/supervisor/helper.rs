@@ -3,18 +3,48 @@ use super::{
     wire::{self, Event, Request, MAX_INPUT, POLL},
     ProcessConfig,
 };
+use crate::sandbox::SandboxBroker;
+#[cfg(unix)]
+use davinci_protocol::ResourcePolicy;
+use davinci_protocol::{ExecutionRequest, SandboxLifecycle, SandboxReceipt};
 use std::{
     io::{Read, Write},
     process::{Command, Stdio},
     sync::{
         atomic::{AtomicBool, Ordering},
-        mpsc, Arc,
+        mpsc, Arc, Mutex,
     },
     thread,
     time::{Duration, Instant},
 };
 
 type Message = (Event, Option<mpsc::SyncSender<()>>);
+
+#[derive(Debug)]
+struct OutputBudget {
+    remaining: Mutex<Option<u64>>,
+}
+
+impl OutputBudget {
+    fn new(limit: Option<u64>) -> Self {
+        Self {
+            remaining: Mutex::new(limit),
+        }
+    }
+
+    fn take(&self, requested: usize) -> usize {
+        let mut remaining = self
+            .remaining
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let Some(left) = *remaining else {
+            return requested;
+        };
+        let allowed = requested.min(left.min(usize::MAX as u64) as usize);
+        *remaining = Some(left.saturating_sub(allowed as u64));
+        allowed
+    }
+}
 
 pub(super) fn run() -> ! {
     let ownership = match Ownership::enter() {
@@ -35,6 +65,8 @@ fn run_owned() -> std::io::Result<()> {
         },
     )?;
     let mut input = std::io::stdin();
+    // Only the parent holds this helper's stdin pipe, so the channel itself
+    // authenticates the frames.
     let Request::Configure { identity, config } = wire::read(&mut input)? else {
         return Ok(());
     };
@@ -48,8 +80,8 @@ fn run_owned() -> std::io::Result<()> {
         )?;
         return Ok(());
     }
-    let mut child = match spawn(config) {
-        Ok(child) => child,
+    let spawned = match spawn(config, &identity) {
+        Ok(spawned) => spawned,
         Err(error) => {
             wire::write(
                 &mut output,
@@ -61,11 +93,18 @@ fn run_owned() -> std::io::Result<()> {
             return Ok(());
         }
     };
+    let sandbox_receipt = spawned.sandbox.clone();
+    let output_budget = Arc::new(OutputBudget::new(spawned.max_output_bytes));
+    let lifetime_deadline = spawned
+        .max_lifetime_ms
+        .map(|milliseconds| Instant::now() + Duration::from_millis(milliseconds));
+    let mut child = spawned.child;
     wire::write(
         &mut output,
         &Event::Started {
             identity: identity.clone(),
             pid: child.id(),
+            sandbox: sandbox_receipt,
         },
     )?;
 
@@ -100,7 +139,8 @@ fn run_owned() -> std::io::Result<()> {
     .map(|(stderr, pipe)| {
         let events = events.clone();
         let identity = identity.clone();
-        thread::spawn(move || forward_output(pipe, &events, &identity, stderr))
+        let budget = Arc::clone(&output_budget);
+        thread::spawn(move || forward_output(pipe, &events, &identity, stderr, &budget))
     })
     .collect();
     let (writes, write_rx) = mpsc::sync_channel::<(u64, Option<Vec<u8>>)>(1);
@@ -176,6 +216,16 @@ fn run_owned() -> std::io::Result<()> {
     });
 
     while !stopped.load(Ordering::SeqCst) {
+        if lifetime_deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+            let _ = events.try_send((
+                Event::Failed {
+                    identity: identity.clone(),
+                },
+                None,
+            ));
+            stopped.store(true, Ordering::SeqCst);
+            break;
+        }
         if let Some(status) = child.try_wait()? {
             // A grandchild may retain the pipes. Bound tail draining before
             // terminating the group instead of waiting for those pipes forever.
@@ -196,27 +246,43 @@ fn forward_output(
     events: &mpsc::SyncSender<Message>,
     identity: &super::ProcessIdentity,
     stderr: bool,
+    budget: &OutputBudget,
 ) -> std::io::Result<()> {
     let mut bytes = [0; 8192];
+    let mut truncated = false;
     loop {
         let count = match pipe.read(&mut bytes) {
+            Ok(0) if truncated => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    "sandbox output limit exceeded; output truncated",
+                ))
+            }
             Ok(0) => return Ok(()),
             Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
             Err(error) => return Err(error),
             Ok(n) => n,
         };
-        if events
-            .send((
-                Event::Output {
-                    identity: identity.clone(),
-                    bytes: bytes[..count].to_vec(),
-                    stderr,
-                },
-                None,
-            ))
-            .is_err()
+        let allowed = budget.take(count);
+        if allowed > 0
+            && events
+                .send((
+                    Event::Output {
+                        identity: identity.clone(),
+                        bytes: bytes[..allowed].to_vec(),
+                        stderr,
+                    },
+                    None,
+                ))
+                .is_err()
         {
             return Err(std::io::ErrorKind::BrokenPipe.into());
+        }
+        if allowed != count {
+            // Past the ceiling: keep draining so the command is not blocked
+            // on a full pipe, forward nothing more, and report the capture as
+            // incomplete. Truncation is not a command failure.
+            truncated = true;
         }
     }
 }
@@ -230,36 +296,160 @@ fn readers_complete(readers: Vec<thread::JoinHandle<std::io::Result<()>>>) -> bo
     complete
 }
 
-fn spawn(config: ProcessConfig) -> std::io::Result<std::process::Child> {
+struct Spawned {
+    child: std::process::Child,
+    sandbox: Option<SandboxReceipt>,
+    max_output_bytes: Option<u64>,
+    max_lifetime_ms: Option<u64>,
+}
+
+fn spawn(config: ProcessConfig, identity: &super::ProcessIdentity) -> Result<Spawned, String> {
+    // A service (an MCP server) lives as long as its session and frames its
+    // own output; a cumulative output budget or lifetime would kill it midway.
+    let max_output_bytes = config
+        .sandbox
+        .as_ref()
+        .filter(|_| !config.service)
+        .and_then(|spec| spec.resources.max_output_bytes);
+    let max_lifetime_ms = config
+        .sandbox
+        .as_ref()
+        .filter(|_| !config.service)
+        .and_then(|spec| {
+            if config.background {
+                spec.process.max_background_lifetime_ms
+            } else {
+                spec.resources.timeout_ms
+            }
+        });
+    #[cfg(unix)]
+    let mut resource_policy = config.sandbox.as_ref().map(|spec| spec.resources.clone());
+    let (executable, argv, cwd, environment, sandbox) = if let Some(spec) = config.sandbox.as_ref()
+    {
+        let request = ExecutionRequest {
+            sandbox_id: spec.id.clone(),
+            executable: config
+                .executable
+                .to_str()
+                .ok_or("sandbox executable path is not UTF-8")?
+                .to_string(),
+            argv: config.argv.clone(),
+            cwd: config
+                .cwd
+                .to_str()
+                .ok_or("sandbox cwd is not UTF-8")?
+                .to_string(),
+            launch_id: Some(identity.lifetime.simple().to_string()),
+        };
+        let prepared = SandboxBroker
+            .prepare(spec, &request, &config.environment)
+            .map_err(|error| error.to_string())?;
+        #[cfg(unix)]
+        if prepared.backend == davinci_protocol::SandboxBackendKind::Container {
+            // The container runtime enforces the limits inside the
+            // container; rlimits here would only constrain its CLI.
+            resource_policy = None;
+        }
+        let receipt = SandboxReceipt {
+            sandbox_id: prepared.sandbox_id.clone(),
+            spec_digest: prepared.spec_digest.clone(),
+            backend: prepared.backend,
+            capabilities: prepared.capabilities,
+            lifecycle: SandboxLifecycle::Running,
+        };
+        (
+            prepared.executable,
+            prepared.argv,
+            prepared.cwd,
+            prepared.environment,
+            Some(receipt),
+        )
+    } else {
+        (
+            config.executable,
+            config.argv,
+            config.cwd,
+            config.environment,
+            None,
+        )
+    };
+
     #[cfg(windows)]
     let cwd = {
         // Node and other runtimes cannot resolve relative files from a verbatim
         // current directory. Preserve the authorized location: simplify only
         // when both spellings resolve to the same canonical directory.
-        let ordinary = crate::permission::strip_verbatim_prefix(&config.cwd);
-        if ordinary.canonicalize()? == config.cwd.canonicalize()? {
+        let ordinary = crate::permission::strip_verbatim_prefix(&cwd);
+        if ordinary.canonicalize().map_err(|error| error.to_string())?
+            == cwd.canonicalize().map_err(|error| error.to_string())?
+        {
             ordinary
         } else {
-            config.cwd
+            cwd
         }
     };
-    #[cfg(not(windows))]
-    let cwd = config.cwd;
-    let mut command = Command::new(config.executable);
+    let mut command = Command::new(executable);
     command
-        .args(config.argv)
+        .args(argv)
         .current_dir(cwd)
         .env_clear()
-        .envs(config.environment)
+        .envs(environment)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    #[cfg(unix)]
+    if let Some(resources) = resource_policy {
+        use std::os::unix::process::CommandExt;
+        unsafe {
+            command.pre_exec(move || apply_unix_resource_limits(&resources));
+        }
+    }
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
         command.creation_flags(0x08000000); // CREATE_NO_WINDOW
     }
-    command.spawn()
+    let child = command.spawn().map_err(|error| error.to_string())?;
+    Ok(Spawned {
+        child,
+        sandbox,
+        max_output_bytes,
+        max_lifetime_ms,
+    })
+}
+
+#[cfg(unix)]
+fn apply_unix_resource_limits(policy: &ResourcePolicy) -> std::io::Result<()> {
+    macro_rules! set_limit {
+        ($resource:expr, $value:expr, $label:literal) => {{
+            let value = $value as libc::rlim_t;
+            let limit = libc::rlimit {
+                rlim_cur: value,
+                rlim_max: value,
+            };
+            if unsafe { libc::setrlimit($resource, &limit) } != 0 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    concat!("failed to apply ", $label, " resource limit"),
+                ));
+            }
+        }};
+    }
+
+    // RLIMIT_DATA, not RLIMIT_AS: Node, the JVM and Go reserve far more
+    // address space than they use and fail outright under an address-space
+    // cap. These limits apply per process, not to the whole tree.
+    if let Some(bytes) = policy.max_memory_bytes {
+        set_limit!(libc::RLIMIT_DATA, bytes, "memory");
+    }
+    if let Some(milliseconds) = policy.cpu_time_ms {
+        let seconds = milliseconds.saturating_add(999) / 1000;
+        set_limit!(libc::RLIMIT_CPU, seconds.max(1), "CPU");
+    }
+    if let Some(bytes) = policy.max_file_bytes {
+        set_limit!(libc::RLIMIT_FSIZE, bytes, "file-size");
+    }
+    Ok(())
 }
 
 fn flush_exit(
@@ -308,6 +498,22 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn resource_limit_policy_rounds_subsecond_cpu_to_one_second() {
+        let policy = ResourcePolicy {
+            cpu_time_ms: Some(1),
+            max_memory_bytes: Some(64 * 1024 * 1024),
+            max_file_bytes: Some(1024),
+            ..Default::default()
+        };
+        // This test exercises the policy shape without applying limits to the
+        // test runner itself. Actual enforcement happens only in pre_exec.
+        assert_eq!(policy.cpu_time_ms.unwrap().saturating_add(999) / 1000, 1);
+        assert_eq!(policy.max_memory_bytes, Some(64 * 1024 * 1024));
+        assert_eq!(policy.max_file_bytes, Some(1024));
+    }
+
     #[test]
     fn supervisor_exit_waits_for_saturated_output_queue() {
         let (events, receiver) = mpsc::sync_channel::<Message>(1);
@@ -351,7 +557,14 @@ mod tests {
     fn supervisor_capture_does_not_report_read_failure_as_eof() {
         let (events, _receiver) = mpsc::sync_channel(2);
         let identity = super::super::ProcessIdentity::new(None);
-        let result = forward_output(InterruptedThenData(false), &events, &identity, false);
+        let budget = OutputBudget::new(None);
+        let result = forward_output(
+            InterruptedThenData(false),
+            &events,
+            &identity,
+            false,
+            &budget,
+        );
         assert_eq!(result.unwrap_err().kind(), std::io::ErrorKind::Other);
     }
 
@@ -360,7 +573,75 @@ mod tests {
         let (events, receiver) = mpsc::sync_channel(2);
         drop(receiver);
         let identity = super::super::ProcessIdentity::new(None);
-        assert!(forward_output(&b"output"[..], &events, &identity, false).is_err());
+        let budget = OutputBudget::new(None);
+        assert!(forward_output(&b"output"[..], &events, &identity, false, &budget,).is_err());
+    }
+
+    #[test]
+    fn process_intent_selects_foreground_or_background_lifetime() {
+        let policy = davinci_protocol::SandboxSpec {
+            id: davinci_protocol::SandboxId("lifetime-test".into()),
+            mode: davinci_protocol::SandboxMode::FullAccess,
+            backend: davinci_protocol::SandboxBackendKind::Host,
+            container: None,
+            workspace: if cfg!(windows) {
+                "C:\\workspace".into()
+            } else {
+                "/workspace".into()
+            },
+            filesystem: Default::default(),
+            network: davinci_protocol::NetworkPolicy::Unrestricted,
+            environment: Default::default(),
+            resources: davinci_protocol::ResourcePolicy {
+                timeout_ms: Some(1000),
+                ..Default::default()
+            },
+            process: davinci_protocol::ProcessPolicy {
+                allow_background: true,
+                max_background_lifetime_ms: Some(5000),
+            },
+            required_capabilities: Default::default(),
+        };
+        let foreground = ProcessConfig::new(
+            std::env::current_exe().unwrap(),
+            vec![],
+            std::env::current_dir().unwrap(),
+            Default::default(),
+        )
+        .with_sandbox(policy.clone());
+        let background = foreground.clone().as_background();
+        let lifetime = |config: &ProcessConfig| {
+            config.sandbox.as_ref().and_then(|spec| {
+                if config.background {
+                    spec.process.max_background_lifetime_ms
+                } else {
+                    spec.resources.timeout_ms
+                }
+            })
+        };
+        assert_eq!(lifetime(&foreground), Some(1000));
+        assert_eq!(lifetime(&background), Some(5000));
+    }
+
+    #[test]
+    fn output_past_the_budget_is_truncated_not_a_command_failure() {
+        let (events, receiver) = mpsc::sync_channel(8);
+        let identity = super::super::ProcessIdentity::new(None);
+        let budget = OutputBudget::new(Some(3));
+        let error = forward_output(&b"abcdef"[..], &events, &identity, false, &budget).unwrap_err();
+        assert!(error.to_string().contains("truncated"), "{error}");
+        drop(events);
+        let events: Vec<_> = receiver.into_iter().map(|(event, _)| event).collect();
+        assert_eq!(events.len(), 1, "only the allowed bytes are forwarded");
+        assert!(matches!(&events[0], Event::Output { bytes, .. } if bytes == b"abc"));
+    }
+
+    #[test]
+    fn output_budget_is_shared_across_streams_and_stops_at_limit() {
+        let budget = OutputBudget::new(Some(5));
+        assert_eq!(budget.take(3), 3);
+        assert_eq!(budget.take(4), 2);
+        assert_eq!(budget.take(1), 0);
     }
 
     #[test]

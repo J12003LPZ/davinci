@@ -98,6 +98,12 @@ impl Transport {
     }
 
     pub fn spawn_with_client(command: &mut Command, client: ClientRequestState) -> Result<Self> {
+        crate::execution_boundary::require_executor("language server").map_err(|_| {
+            IntelligenceError::new(
+                "sandbox_executor_required",
+                "Language-server direct host spawn is disabled while execution sandboxing is active",
+            )
+        })?;
         command
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())

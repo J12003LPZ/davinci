@@ -2,6 +2,13 @@
 //! This is not a tool dispatcher: callers must authorize every operation first.
 //! Model arguments must never construct owners, scopes, or supervisor commands.
 mod restarts;
+
+/// Output and exit wiring for a one-off supervised job (no restarts).
+pub(super) fn job_callback(
+    shared: std::sync::Weak<super::Shared>,
+) -> Arc<dyn Fn(super::supervisor::ProcessEvent) + Send + Sync> {
+    restarts::callback(shared, false)
+}
 use super::{
     supervisor::{ProcessConfig, ProcessEvent, ProcessExit, Supervisor, SupervisorCommand},
     Job, JobBook, JobStatus, OutputBuffer, Shared, LIVE_JOBS,
@@ -363,6 +370,7 @@ impl ManagedOwner {
         restart_check: Option<RestartCheck>,
     ) -> Result<(u32, bool), String> {
         options.validate()?;
+        config.background = true;
         self.ensure_open()?;
         validate()?;
         if abort.load(Ordering::SeqCst) {

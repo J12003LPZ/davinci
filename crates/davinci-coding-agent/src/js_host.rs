@@ -319,6 +319,7 @@ fn extension_timeout_for_op(op: &str) -> Duration {
 
 impl PersistentJsSession {
     fn start(module: &Path) -> Result<Self, String> {
+        crate::execution_boundary::require_executor("JavaScript extension")?;
         #[cfg(test)]
         JS_SESSION_SPAWNS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let node =
@@ -626,6 +627,7 @@ pub fn run_js_extension(
     op: &str,
     payload: &Value,
 ) -> Result<JsExtensionResult, String> {
+    crate::execution_boundary::require_executor("JavaScript extension")?;
     let wait_ui = ui_waiter_installed();
     // The UI-wait channel and the `PI_EXTENSION_UI_REPLY` fixture are wired
     // through spawn-time environment, so those calls keep the one-shot path.
@@ -1037,6 +1039,7 @@ pub fn execute_command_tool(
     cwd: &Path,
     timeout_ms: Option<u64>,
 ) -> Result<String, String> {
+    crate::execution_boundary::require_executor("extension command")?;
     let args_json = serde_json::to_string(args).map_err(|err| err.to_string())?;
     let mut process = if cfg!(windows) {
         let mut process = Command::new(davinci_sys::process::resolve_program("cmd"));

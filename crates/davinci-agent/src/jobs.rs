@@ -384,6 +384,52 @@ pub struct JobSummary {
 /// this list instead of the books.
 static LIVE_JOBS: Mutex<Vec<(u32, std::sync::Weak<Shared>)>> = Mutex::new(Vec::new());
 
+/// A background process started through the trusted supervisor and not yet
+/// registered; dropping it stops the process.
+pub struct SupervisedLaunch {
+    shared: Arc<Shared>,
+    supervisor: Arc<supervisor::Supervisor>,
+}
+
+impl SupervisedLaunch {
+    pub fn spawn(
+        host: &supervisor::SupervisorCommand,
+        config: supervisor::ProcessConfig,
+    ) -> Result<Self, String> {
+        let shared = Arc::new(Shared {
+            status: Mutex::new(JobStatus::Running),
+            output: Mutex::new(OutputBuffer::default()),
+            child: Mutex::new(None),
+            stdin: Mutex::new(None),
+            finished_at: Mutex::new(None),
+            supports_stdin: true,
+            supervisor: Mutex::new(None),
+        });
+        let supervisor = Arc::new(
+            supervisor::Supervisor::spawn(
+                host,
+                config,
+                managed::job_callback(Arc::downgrade(&shared)),
+            )
+            .map_err(|error| error.to_string())?,
+        );
+        *shared
+            .supervisor
+            .lock()
+            .unwrap_or_else(|err| err.into_inner()) = Some(supervisor.clone());
+        Ok(Self { shared, supervisor })
+    }
+
+    pub fn pid(&self) -> u32 {
+        self.supervisor.child_pid()
+    }
+
+    pub fn write_stdin(&self, bytes: &[u8]) -> Result<(), String> {
+        self.supervisor.write(bytes)?;
+        self.supervisor.close_stdin()
+    }
+}
+
 /// Kill every job still running in this process. For exits that skip
 /// destructors (a signal, a hung turn); a normal return drops the books.
 pub fn kill_every_job() {
@@ -577,6 +623,53 @@ impl JobBook {
         });
         // Cancellation may have drained the book between spawn and registration.
         // Registration and the cancellation callback share the caller's book lock.
+        if self
+            .cancellation_owner
+            .as_ref()
+            .and_then(std::sync::Weak::upgrade)
+            .is_some_and(|owner| owner.load(std::sync::atomic::Ordering::SeqCst))
+        {
+            self.kill(id);
+        }
+        id
+    }
+
+    /// Register a background command started through the trusted process
+    /// supervisor (the only way a sandboxed command may run in the
+    /// background). Output, stdin, exit status and `job_kill` go through the
+    /// supervisor, as for managed processes.
+    pub fn register_supervised(
+        &mut self,
+        command: &str,
+        launch: SupervisedLaunch,
+        agent_id: Option<crate::runtime::ids::AgentId>,
+        operation: Option<AgentOperationHandle>,
+    ) -> u32 {
+        self.next_id += 1;
+        let id = self.next_id;
+        let pid = launch.pid();
+        {
+            let mut live = LIVE_JOBS.lock().unwrap_or_else(|err| err.into_inner());
+            live.retain(|(_, weak)| weak.strong_count() > 0);
+            live.push((pid, Arc::downgrade(&launch.shared)));
+        }
+        if davinci_ai::trace::enabled() {
+            davinci_ai::trace::log(&format!("job {id} start pid={pid} supervised {command}"));
+        }
+        self.jobs.push(Job {
+            id,
+            command: command.to_string(),
+            pid,
+            started: Instant::now(),
+            task_id: None,
+            agent_id,
+            generation: None,
+            operation,
+            shared: launch.shared,
+            managed: None,
+            announced: false,
+            seen: false,
+        });
         if self
             .cancellation_owner
             .as_ref()
