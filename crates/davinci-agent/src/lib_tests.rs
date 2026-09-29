@@ -4447,12 +4447,18 @@ fn an_inspection_command_does_not_use_up_the_inline_note() {
             "write",
             serde_json::json!({"path":"changed.py", "content":"def f(x): return x * 2\n"}),
         ),
-        (shell_tool(), serde_json::json!({"command":"cat changed.py"})),
+        (
+            shell_tool(),
+            serde_json::json!({"command":"cat changed.py"}),
+        ),
         (
             shell_tool(),
             serde_json::json!({"command":"python -c \"from changed import f; print(f(2))\""}),
         ),
-        (shell_tool(), serde_json::json!({"command":"cat changed.py"})),
+        (
+            shell_tool(),
+            serde_json::json!({"command":"cat changed.py"}),
+        ),
     ]);
     agent.run_loop(|current| script(current)).unwrap();
     let results = tool_result_texts(&agent);

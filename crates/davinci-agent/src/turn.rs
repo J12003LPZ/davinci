@@ -7275,9 +7275,9 @@ mod tool_name_tests {
 /// Programs whose run can check a change: test runners, build tools and
 /// interpreters. `python` also covers `python3`, `python3.12` and `py`.
 const CHECKER_PROGRAMS: &[&str] = &[
-    "python", "py", "pytest", "node", "npm", "npx", "pnpm", "yarn", "cargo", "go", "deno",
-    "bun", "uv", "tox", "nox", "make", "jest", "vitest", "mocha", "ruby", "rspec", "rake",
-    "bundle", "dotnet", "mvn", "gradle", "gradlew", "java", "php", "phpunit", "swift", "ctest",
+    "python", "py", "pytest", "node", "npm", "npx", "pnpm", "yarn", "cargo", "go", "deno", "bun",
+    "uv", "tox", "nox", "make", "jest", "vitest", "mocha", "ruby", "rspec", "rake", "bundle",
+    "dotnet", "mvn", "gradle", "gradlew", "java", "php", "phpunit", "swift", "ctest",
 ];
 
 /// Whether some segment of `command` (split on `&&`, `||`, `;`, `|`, `&` and
@@ -7287,39 +7287,37 @@ const CHECKER_PROGRAMS: &[&str] = &[
 /// `sudo` or `uv run` prefixes are skipped; a path or `.exe` suffix on the
 /// program is ignored.
 pub(crate) fn invokes_checker(command: &str) -> bool {
-    command
-        .split(['&', '|', ';', '\n'])
-        .any(|segment| {
-            let mut words = segment.split_whitespace().peekable();
-            while let Some(word) = words.peek() {
-                let skip = word.contains('=') && !word.starts_with('-')
-                    || matches!(*word, "env" | "time" | "sudo" | "command" | "exec");
-                if !skip {
-                    break;
-                }
-                words.next();
+    command.split(['&', '|', ';', '\n']).any(|segment| {
+        let mut words = segment.split_whitespace().peekable();
+        while let Some(word) = words.peek() {
+            let skip = word.contains('=') && !word.starts_with('-')
+                || matches!(*word, "env" | "time" | "sudo" | "command" | "exec");
+            if !skip {
+                break;
             }
-            let Some(program) = words.next() else {
-                return false;
-            };
-            let program = program
-                .trim_matches(|ch| matches!(ch, '"' | '\'' | '(' | ')' | '{' | '}'))
-                .rsplit(['/', '\\'])
-                .next()
-                .unwrap_or("")
-                .to_ascii_lowercase();
-            let program = program.strip_suffix(".exe").unwrap_or(&program);
-            if program == "uv" && words.peek().is_some_and(|next| *next == "run") {
-                return true;
-            }
-            CHECKER_PROGRAMS.iter().any(|checker| {
-                program == *checker
-                    || *checker == "python"
-                        && program
-                            .strip_prefix("python")
-                            .is_some_and(|rest| rest.chars().all(|ch| ch.is_ascii_digit() || ch == '.'))
-            })
+            words.next();
+        }
+        let Some(program) = words.next() else {
+            return false;
+        };
+        let program = program
+            .trim_matches(|ch| matches!(ch, '"' | '\'' | '(' | ')' | '{' | '}'))
+            .rsplit(['/', '\\'])
+            .next()
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        let program = program.strip_suffix(".exe").unwrap_or(&program);
+        if program == "uv" && words.peek().is_some_and(|next| *next == "run") {
+            return true;
+        }
+        CHECKER_PROGRAMS.iter().any(|checker| {
+            program == *checker
+                || *checker == "python"
+                    && program
+                        .strip_prefix("python")
+                        .is_some_and(|rest| rest.chars().all(|ch| ch.is_ascii_digit() || ch == '.'))
         })
+    })
 }
 
 /// Append a harness line to a tool result the model will read.
