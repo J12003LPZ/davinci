@@ -297,13 +297,31 @@ impl Inner {
             });
             return;
         }
-        if server.disabled {
+        if server.disabled
+            || server.execution == Some(davinci_mcp::McpExecutionPolicy::Disabled)
+        {
             self.rows.push(McpServerRow {
                 name: name.to_string(),
                 transport: transport_label.into(),
                 status: "disabled".into(),
                 tools: 0,
                 error: None,
+                skipped: Vec::new(),
+            });
+            return;
+        }
+        if server.execution == Some(davinci_mcp::McpExecutionPolicy::Sandboxed)
+            && server.command.is_some()
+        {
+            self.rows.push(McpServerRow {
+                name: name.to_string(),
+                transport: "sandboxed-stdio".into(),
+                status: "error".into(),
+                tools: 0,
+                error: Some(
+                    "sandboxed local MCP requires the executor transport; refusing direct host spawn"
+                        .into(),
+                ),
                 skipped: Vec::new(),
             });
             return;
@@ -618,6 +636,24 @@ mod tests {
         let specs = registry.specs();
         assert_eq!(specs.len(), 1);
         assert_eq!(specs[0].parameters, davinci_mcp::default_input_schema());
+    }
+
+    #[test]
+    fn sandboxed_local_mcp_never_falls_back_to_direct_host_stdio() {
+        let config = davinci_mcp::parse_config(
+            r#"{"mcpServers":{"project":{"command":"does-not-run","execution":"sandboxed"}}}"#,
+        )
+        .unwrap();
+        let registry = McpRegistry::connect(&config, Path::new("."));
+        assert!(registry.specs().is_empty());
+        let rows = registry.rows();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].transport, "sandboxed-stdio");
+        assert_eq!(rows[0].status, "error");
+        assert!(rows[0]
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("refusing direct host spawn")));
     }
 
     #[test]
