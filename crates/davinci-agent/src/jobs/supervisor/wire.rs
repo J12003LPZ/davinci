@@ -1,4 +1,5 @@
 use super::{ProcessConfig, ProcessIdentity};
+use davinci_protocol::SandboxReceipt;
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use std::io::{self, Read, Write};
 
@@ -11,15 +12,18 @@ pub(super) const POLL: std::time::Duration = std::time::Duration::from_millis(20
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub(super) enum Request {
     Configure {
+        token: String,
         identity: ProcessIdentity,
         config: ProcessConfig,
     },
     Write {
+        token: String,
         identity: ProcessIdentity,
         id: u64,
         bytes: Vec<u8>,
     },
     CloseStdin {
+        token: String,
         identity: ProcessIdentity,
         id: u64,
     },
@@ -34,6 +38,8 @@ pub(super) enum Event {
     Started {
         identity: ProcessIdentity,
         pid: u32,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        sandbox: Option<SandboxReceipt>,
     },
     Output {
         identity: ProcessIdentity,
