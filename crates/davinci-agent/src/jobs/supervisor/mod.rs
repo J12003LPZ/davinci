@@ -20,6 +20,10 @@ pub struct ProcessConfig {
     /// Host-resolved sandbox policy. None is the explicit legacy compatibility path.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sandbox: Option<SandboxSpec>,
+    /// Long-lived process: use ProcessPolicy::max_background_lifetime_ms
+    /// instead of the foreground command timeout.
+    #[serde(default)]
+    pub background: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub operation: Option<crate::runtime::operations::ProcessOperationBinding>,
 }
@@ -37,6 +41,7 @@ impl ProcessConfig {
             cwd,
             environment,
             sandbox: None,
+            background: false,
             operation: None,
         }
     }
@@ -56,6 +61,11 @@ impl ProcessConfig {
 
     pub fn with_sandbox(mut self, sandbox: SandboxSpec) -> Self {
         self.sandbox = Some(sandbox);
+        self
+    }
+
+    pub fn as_background(mut self) -> Self {
+        self.background = true;
         self
     }
 
