@@ -506,6 +506,78 @@ fn find_host_executable(name: &str, workspace: &Path) -> Option<PathBuf> {
     None
 }
 
+
+pub fn rebind_worker_spec(
+    parent: &SandboxSpec,
+    child_workspace: &Path,
+    child_id: SandboxId,
+    allow_workspace_write: bool,
+) -> Result<SandboxSpec, SandboxFailure> {
+    parent.validate()?;
+    let child_workspace = child_workspace.canonicalize().map_err(|error| {
+        SandboxFailure::new(
+            SandboxErrorCode::FilesystemDenied,
+            format!("worker workspace is unavailable: {error}"),
+        )
+    })?;
+    let child_workspace = child_workspace
+        .to_str()
+        .ok_or_else(|| SandboxFailure::policy_denied("worker workspace path is not UTF-8"))?
+        .to_string();
+
+    let mode = match parent.mode {
+        SandboxMode::NoExecution => SandboxMode::NoExecution,
+        SandboxMode::Restricted => SandboxMode::Restricted,
+        SandboxMode::WorkspaceWrite if allow_workspace_write => SandboxMode::WorkspaceWrite,
+        SandboxMode::WorkspaceWrite => SandboxMode::Restricted,
+        SandboxMode::FullAccess => SandboxMode::FullAccess,
+    };
+
+    let mut mounts = Vec::with_capacity(parent.filesystem.mounts.len());
+    let mut rebound_workspace = false;
+    for mount in &parent.filesystem.mounts {
+        let is_parent_workspace = mount.source.as_deref() == Some(parent.workspace.as_str())
+            && mount.target == parent.workspace
+            && matches!(mount.access, MountAccess::ReadOnly | MountAccess::ReadWrite);
+        if is_parent_workspace {
+            rebound_workspace = true;
+            mounts.push(davinci_protocol::MountRule {
+                source: Some(child_workspace.clone()),
+                target: child_workspace.clone(),
+                access: if mode == SandboxMode::WorkspaceWrite {
+                    MountAccess::ReadWrite
+                } else {
+                    MountAccess::ReadOnly
+                },
+            });
+            continue;
+        }
+        if mount.access == MountAccess::ReadWrite {
+            return Err(SandboxFailure::policy_denied(
+                "isolated worker cannot inherit an unrelated writable host mount",
+            ));
+        }
+        mounts.push(mount.clone());
+    }
+
+    if matches!(parent.mode, SandboxMode::Restricted | SandboxMode::WorkspaceWrite)
+        && !rebound_workspace
+    {
+        return Err(SandboxFailure::new(
+            SandboxErrorCode::FilesystemDenied,
+            "parent sandbox has no exact workspace mount to delegate",
+        ));
+    }
+
+    let mut child = parent.clone();
+    child.id = child_id;
+    child.mode = mode;
+    child.workspace = child_workspace;
+    child.filesystem.mounts = mounts;
+    child.validate()?;
+    Ok(child)
+}
+
 pub fn sandbox_spec_digest(spec: &SandboxSpec) -> Result<String, SandboxFailure> {
     let mut redacted = spec.clone();
     for value in redacted.environment.inject.values_mut() {
