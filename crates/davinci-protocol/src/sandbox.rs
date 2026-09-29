@@ -36,6 +36,21 @@ pub enum SandboxBackendKind {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+pub enum ContainerRuntime {
+    Auto,
+    Docker,
+    Podman,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ContainerPolicy {
+    pub runtime: ContainerRuntime,
+    pub image: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum SandboxLifecycle {
     Created,
     Ready,
@@ -184,6 +199,8 @@ pub struct SandboxSpec {
     pub id: SandboxId,
     pub mode: SandboxMode,
     pub backend: SandboxBackendKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub container: Option<ContainerPolicy>,
     pub workspace: String,
     #[serde(default)]
     pub filesystem: FilesystemPolicy,
@@ -208,6 +225,18 @@ impl SandboxSpec {
             return Err(SandboxFailure::policy_denied("invalid sandbox id"));
         }
         validate_absolute_path(&self.workspace, "workspace")?;
+        if let Some(container) = &self.container {
+            let image = container.image.trim();
+            if image.is_empty()
+                || image.len() > 512
+                || image.chars().any(char::is_control)
+                || image.chars().any(char::is_whitespace)
+            {
+                return Err(SandboxFailure::policy_denied(
+                    "invalid container image reference",
+                ));
+            }
+        }
         for mount in &self.filesystem.mounts {
             validate_absolute_path(&mount.target, "mount target")?;
             match mount.access {
@@ -490,6 +519,22 @@ mod tests {
     }
 
     #[test]
+    fn container_image_reference_is_bounded_and_token_safe() {
+        let mut spec = fixture_spec();
+        spec.backend = SandboxBackendKind::Container;
+        spec.container = Some(ContainerPolicy {
+            runtime: ContainerRuntime::Docker,
+            image: "example.invalid/davinci-rust:1.83".into(),
+        });
+        assert!(spec.validate().is_ok());
+        spec.container.as_mut().unwrap().image = "bad image".into();
+        assert_eq!(
+            spec.validate().unwrap_err().code,
+            SandboxErrorCode::PolicyDenied
+        );
+    }
+
+    #[test]
     fn environment_names_are_validated() {
         let mut spec = fixture_spec();
         spec.environment.inject = BTreeMap::from([("BAD=NAME".into(), "secret".into())]);
@@ -505,6 +550,7 @@ mod tests {
             "id": "sbx-1",
             "mode": "restricted",
             "backend": "auto",
+            "container": null,
             "workspace": "/workspace",
             "filesystem": {"mounts": []},
             "network": {"mode": "denied"},
@@ -522,6 +568,7 @@ mod tests {
             id: SandboxId("sbx-1".into()),
             mode: SandboxMode::Restricted,
             backend: SandboxBackendKind::Auto,
+            container: None,
             workspace: if cfg!(windows) {
                 "C:\\workspace".into()
             } else {
