@@ -184,7 +184,6 @@ impl SandboxBackend for LinuxBubblewrapBackend {
             "/dev".into(),
             "--tmpfs".into(),
             "/tmp".into(),
-            "--clearenv".into(),
         ];
         if matches!(spec.network, NetworkPolicy::Denied) {
             argv.push("--unshare-net".into());
@@ -212,11 +211,10 @@ impl SandboxBackend for LinuxBubblewrapBackend {
             }
         }
 
-        for (name, value) in environment {
-            argv.push("--setenv".into());
-            argv.push(name.clone());
-            argv.push(value.clone());
-        }
+        // The executor helper already starts this wrapper with env_clear()
+        // and exactly the sanitized environment. Let bubblewrap inherit it;
+        // putting values in --setenv argv would expose them through host
+        // process inspection.
         argv.push("--chdir".into());
         argv.push(request.cwd.clone());
         argv.push("--".into());
@@ -231,9 +229,9 @@ impl SandboxBackend for LinuxBubblewrapBackend {
             executable: self.executable.clone(),
             argv,
             cwd: PathBuf::from("/"),
-            // Child environment is set by bubblewrap arguments. The wrapper
-            // receives no ambient credentials.
-            environment: BTreeMap::new(),
+            // The executor helper clears ambient credentials before launching
+            // bubblewrap. The sandbox inherits only this sanitized map.
+            environment: environment.clone(),
         })
     }
 }
