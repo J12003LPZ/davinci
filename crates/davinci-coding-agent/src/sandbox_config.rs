@@ -629,9 +629,9 @@ mod tests {
     #[cfg(unix)]
     fn runtime_mount_discovery_never_exposes_the_user_home_root() {
         let workspace = tempfile::tempdir().unwrap();
-        let home = tempfile::tempdir().unwrap();
+        let home = std::env::var_os("HOME").map(PathBuf::from).unwrap();
         let mut sources = Vec::new();
-        push_runtime_source(&mut sources, home.path(), workspace.path());
+        push_runtime_source(&mut sources, &home, workspace.path());
         assert!(sources.is_empty(), "user home root must never become a runtime mount");
     }
 
