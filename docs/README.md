@@ -54,7 +54,7 @@ Comprehensive specifications detailing the design contracts and algorithms:
 | [`ecosystem.md`](ecosystem.md) | Closed ecosystem integration architecture connecting Graph, Token Governor, Vector Memory, Learning, and Security. |
 | [`plugins.md`](plugins.md) | Claude Code / Codex compatible plugins: marketplaces, importing existing installs, and hook approval. |
 | [`vector-memory.md`](vector-memory.md) | Vector memory storage, commands, and the `/memory-page` connection report. |
-| [`runtime/named-file-context.md`](runtime/named-file-context.md) | Files a user request names are read at turn start and attached to the runtime state, removing the discovery round trip. |
+| [`runtime/named-file-context.md`](runtime/named-file-context.md) | Files a user request names are read at turn start and appended to the turn context on OpenAI routes, removing the discovery round trip. |
 | [`ecosystem-verification-2026-09-23.md`](ecosystem-verification-2026-09-23.md) | Live end-to-end verification of graph, token governor, vector memory, and language intelligence, with the defects it found. |
 
 ---

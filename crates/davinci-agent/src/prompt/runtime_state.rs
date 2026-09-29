@@ -16,8 +16,6 @@ pub struct RuntimePromptState {
     pub visual_verification_relevant: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub environment: Option<crate::prompt::environment::EnvironmentSnapshot>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub named_files: Option<crate::prompt::named_files::NamedFilesSnapshot>,
 }
 
 pub fn runtime_state_text(state: &RuntimePromptState) -> String {
@@ -76,10 +74,6 @@ pub fn runtime_state_text(state: &RuntimePromptState) -> String {
         lines.push(environment.render());
     }
 
-    if let Some(named_files) = &state.named_files {
-        lines.push(named_files.render());
-    }
-
     format!("<runtime_state>\n{}\n</runtime_state>", lines.join("\n"))
 }
 
@@ -107,7 +101,6 @@ mod tests {
             visual_verification_available: false,
             visual_verification_relevant: true,
             environment: None,
-            named_files: None,
         });
 
         assert!(text.contains("Plan Mode"));
@@ -135,7 +128,6 @@ mod tests {
                 visual_verification_available: true,
                 visual_verification_relevant: true,
                 environment: None,
-                named_files: None,
             };
             let text1 = runtime_state_text(&state);
             let text2 = runtime_state_text(&state);
@@ -162,7 +154,6 @@ mod tests {
             visual_verification_available: false,
             visual_verification_relevant: true,
             environment: None,
-            named_files: None,
         };
         let text = runtime_state_text(&state);
         assert!(estimate_tokens_from_str(&text) <= 500);

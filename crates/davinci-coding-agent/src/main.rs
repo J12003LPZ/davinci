@@ -2583,6 +2583,10 @@ fn complete_prompt_with_host(
             memory,
             run_plugin_prompt_hooks(&plugin_hooks, &plugin_hook_base, &prompt),
         );
+        // Before the commit reads it: files attached for the model would
+        // bypass any hook that can block a `read`.
+        agent.named_file_hooks_active =
+            named_file_hooks_active(agent, parsed, &plugin_hooks, &host);
         match agent.turn_context_placement() {
             davinci_agent::turn_context::TurnContextPlacement::Appended => {
                 agent.commit_turn_context(memory);
@@ -8871,6 +8875,27 @@ fn join_turn_context(first: Option<String>, second: Option<String>) -> Option<St
 
 /// `PreToolUse` plugin hooks. `Some(reason)` blocks the call. An `allow`
 /// decision never bypasses the DaVinci permission gate.
+/// Whether a user hook, an approved plugin `PreToolUse` hook matching `Read`
+/// or a JavaScript extension (whose `tool_call` handler may block) could
+/// intercept a `read`. Named-file context stays off while one could, since
+/// the harness's own reads never pass through those hooks.
+fn named_file_hooks_active(
+    agent: &Agent,
+    parsed: &Args,
+    plugins: &davinci_coding_agent::plugins::ActivePlugins,
+    host: &ExtensionHost,
+) -> bool {
+    use davinci_coding_agent::plugins::hooks::{claude_tool_name, HookEvent};
+    if !host.js.is_empty()
+        || plugins.has_matching_hook(HookEvent::PreToolUse, &claude_tool_name("read"))
+    {
+        return true;
+    }
+    let settings = load_merged_settings(&default_agent_dir(), &agent.cwd);
+    let trusted = is_trusted(&settings, &agent.cwd, parsed.project_trust_override);
+    hooks::load(&default_agent_dir(), &agent.cwd, trusted).intercepts_tool("read")
+}
+
 fn run_plugin_pre_tool(
     plugins: &davinci_coding_agent::plugins::ActivePlugins,
     base: &davinci_coding_agent::plugins::HookInput,

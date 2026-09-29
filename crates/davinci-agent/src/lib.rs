@@ -422,10 +422,14 @@ pub struct Agent {
     pub tool_surface: ToolSurface,
     /// Repeat the last verification call after later mutations at completion.
     pub auto_verify: bool,
-    /// Attach the files a user request names to that turn's runtime state
-    /// (`prompt::named_files`). Settings `namedFileContext`, environment
-    /// `DAVINCI_NAMED_FILES`.
+    /// Attach the files a user request names to that turn's appended harness
+    /// context (`prompt::named_files`). Settings `namedFileContext`,
+    /// environment `DAVINCI_NAMED_FILES`.
     pub named_file_context: bool,
+    /// Set by the host when a user hook, approved plugin hook or extension
+    /// could intercept a `read`. The harness then reads nothing on the
+    /// model's behalf, since such a hook would never see that read.
+    pub named_file_hooks_active: bool,
     /// Task 5 environment/guidance experiment; disabled pending promotion.
     pub environment_context: bool,
     pub auto_compaction: bool,
@@ -531,8 +535,6 @@ pub struct Agent {
     /// Whether the host has registered a backend capable of visual verification.
     visual_verification_available: bool,
     runtime_environment: Option<prompt::environment::EnvironmentSnapshot>,
-    /// Frozen once per real user turn; continuations reuse it.
-    named_files: Option<prompt::named_files::NamedFilesSnapshot>,
     environment_key: Option<prompt::environment::EnvironmentKey>,
     environment_capture: prompt::environment::EnvironmentCapture,
     last_verification_notice: Option<(u64, CompletionEvidence)>,
@@ -621,6 +623,7 @@ impl Agent {
                 std::env::var("DAVINCI_NAMED_FILES").ok().as_deref(),
                 Some("0" | "false" | "off")
             ),
+            named_file_hooks_active: false,
             environment_context: std::env::var("PI_ENVIRONMENT_CONTEXT").ok().as_deref()
                 == Some("1"),
             auto_compaction: true,
@@ -691,7 +694,6 @@ impl Agent {
             previous_plan_revision: None,
             visual_verification_available: false,
             runtime_environment: None,
-            named_files: None,
             environment_key: None,
             environment_capture: prompt::environment::EnvironmentCapture::default(),
             last_verification_notice: None,
@@ -994,7 +996,6 @@ impl Agent {
                     .as_deref()
                     .is_some_and(prompt::environment::visual_verification_requested),
             environment: self.runtime_environment.clone(),
-            named_files: self.named_files.clone(),
         }
     }
 
@@ -1407,15 +1408,21 @@ impl Agent {
         let previous = turn_context::TurnContextState::from_messages(&self.messages);
         let runtime_state = self.turn_state_pending.clone().unwrap_or_default();
         let plan = self.plan_turn_context();
+        let named_files = self.named_files_for_turn();
+        let named_files_text = named_files.as_ref().map(|files| files.render());
         let input = turn_context::TurnContextInput {
             runtime_state: &runtime_state,
             plan_mode_appendix: self.is_plan_mode().then_some(crate::PLAN_MODE_APPENDIX),
             living_plan: plan
                 .as_ref()
                 .map(|(revision, text)| (*revision, text.as_str())),
+            named_files: named_files_text.as_deref(),
             memory: memory.as_deref(),
         };
-        if let Some((text, state)) = turn_context::render_turn_context(&previous, &input) {
+        if let Some((text, mut state)) = turn_context::render_turn_context(&previous, &input) {
+            state.named_files = named_files
+                .map(|files| files.attached_keys())
+                .unwrap_or_default();
             self.record_custom_message(&serde_json::json!({
                 "customType": turn_context::TURN_CONTEXT_CUSTOM_TYPE,
                 "content": text,
@@ -1481,7 +1488,6 @@ impl Agent {
             self.turn_state_pending = None;
             self.runtime_environment = None;
             self.environment_key = None;
-            self.named_files = None;
             let no_capabilities = prompt::CapabilityDecision {
                 capabilities: Vec::new(),
                 reasons: Vec::new(),
@@ -1512,7 +1518,6 @@ impl Agent {
         self.capture_runtime_environment(&davinci_session::utc_date_from_unix_ms(
             davinci_session::now_ms(),
         ));
-        self.capture_named_files(user_text);
         let mut runtime_state = self.runtime_prompt_state();
         runtime_state.visual_verification_relevant = !self.environment_context
             || capabilities
@@ -3617,7 +3622,6 @@ impl Agent {
         if session_changed {
             self.runtime_environment = None;
             self.environment_key = None;
-            self.named_files = None;
             self.last_verification_notice = None;
             self.turn_state_pending = None;
             if let Some(processes) = &self.tool_context.processes {

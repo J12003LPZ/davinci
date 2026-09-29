@@ -156,7 +156,6 @@ mod tests {
             visual_verification_available: false,
             visual_verification_relevant: true,
             environment: None,
-            named_files: None,
         };
 
         let composed = compose_turn_prompt(&session, &ctx, &capabilities, &state).unwrap();
@@ -207,7 +206,6 @@ mod tests {
             visual_verification_available: false,
             visual_verification_relevant: true,
             environment: None,
-            named_files: None,
         };
 
         let result = compose_turn_prompt(&session, &ctx, &capabilities, &state);
@@ -240,7 +238,6 @@ mod tests {
             visual_verification_available: false,
             visual_verification_relevant: true,
             environment: None,
-            named_files: None,
         };
 
         let composed = compose_turn_prompt(&session, &ctx, &capabilities, &state).unwrap();
