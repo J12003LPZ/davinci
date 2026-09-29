@@ -2197,6 +2197,8 @@ impl Agent {
                     permission_mode,
                     agent_id: parent_agent_id,
                     worktree_manager,
+                    foreground_supervisor: self.tool_context.foreground_supervisor.clone(),
+                    sandbox: self.tool_context.sandbox.clone(),
                     contract_digest,
                     active_contract,
                 };
