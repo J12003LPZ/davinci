@@ -350,7 +350,10 @@ fn push_runtime_source(sources: &mut Vec<PathBuf>, path: &Path, workspace: &Path
     let Ok(path) = path.canonicalize() else {
         return;
     };
-    if path.starts_with(workspace) || sources.iter().any(|seen| seen == &path) {
+    if path.starts_with(workspace)
+        || exposes_user_home_root(&path)
+        || sources.iter().any(|seen| seen == &path)
+    {
         return;
     }
     // Avoid redundant nested mounts when an already declared parent covers it.
@@ -359,6 +362,18 @@ fn push_runtime_source(sources: &mut Vec<PathBuf>, path: &Path, workspace: &Path
     }
     sources.retain(|seen| !seen.starts_with(&path));
     sources.push(path);
+}
+
+fn exposes_user_home_root(path: &Path) -> bool {
+    let Some(home) = std::env::var_os("HOME").map(PathBuf::from) else {
+        return false;
+    };
+    let Ok(home) = home.canonicalize() else {
+        return false;
+    };
+    // Mounting HOME itself, or one of its ancestors (for example /home or /),
+    // would make credential descendants such as ~/.ssh and ~/.aws readable.
+    home.starts_with(path)
 }
 
 fn network_is_no_more_permissive(parent: &NetworkPolicy, child: &NetworkPolicy) -> bool {
