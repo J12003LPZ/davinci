@@ -2825,8 +2825,10 @@ impl Agent {
     /// it the model finds out only when its final answer is refused by the
     /// completion gate, which costs that answer plus 1-2 more requests
     /// (t5-csv and t7-cli in the 2026-09-25 head-to-head). At most once per
-    /// mutation generation, and only for a command that succeeded and looks
-    /// like a check of the change. Davinci-only; the gate stays the backstop.
+    /// mutation generation, and only for a command that succeeded and runs a
+    /// checker program (`invokes_checker`), so `cat app.py` or `git diff`
+    /// never uses up the note before the real check. Davinci-only; the gate
+    /// stays the backstop.
     fn unrecognized_check_note(
         &self,
         generation: u64,
@@ -2842,18 +2844,7 @@ impl Agent {
         {
             return None;
         }
-        let lowered = command.to_ascii_lowercase();
-        let names_change = state.mutation_paths.iter().any(|path| {
-            path.file_stem()
-                .and_then(|stem| stem.to_str())
-                .is_some_and(|stem| stem.len() >= 3 && lowered.contains(&stem.to_ascii_lowercase()))
-        });
-        let runs_checker = [
-            "python", "pytest", "node", "npm", "cargo", "go ", "deno", "bun ",
-        ]
-        .iter()
-        .any(|word| lowered.contains(word));
-        if !(names_change || runs_checker) {
+        if !invokes_checker(command) {
             return None;
         }
         let reason = crate::verification::unrecognized_check_reason(assessment);
@@ -2968,7 +2959,9 @@ impl Agent {
         if generation != state.mutation_generation {
             return None;
         }
-        {
+        // Only a checker run explains a later gate reminder; an inspection
+        // command such as `cat` must not overwrite the reason of the check.
+        if invokes_checker(command) {
             let mut state = self
                 .mutation_verification
                 .lock()
@@ -7277,6 +7270,56 @@ mod tool_name_tests {
             1
         );
     }
+}
+
+/// Programs whose run can check a change: test runners, build tools and
+/// interpreters. `python` also covers `python3`, `python3.12` and `py`.
+const CHECKER_PROGRAMS: &[&str] = &[
+    "python", "py", "pytest", "node", "npm", "npx", "pnpm", "yarn", "cargo", "go", "deno",
+    "bun", "uv", "tox", "nox", "make", "jest", "vitest", "mocha", "ruby", "rspec", "rake",
+    "bundle", "dotnet", "mvn", "gradle", "gradlew", "java", "php", "phpunit", "swift", "ctest",
+];
+
+/// Whether some segment of `command` (split on `&&`, `||`, `;`, `|`, `&` and
+/// newlines) starts with a checker program. Only the program word counts,
+/// so file names (`node_modules/`, `cargo.lock`) and substrings (`go` in
+/// `cargo`) never match. Leading `VAR=value` assignments and `env`, `time`,
+/// `sudo` or `uv run` prefixes are skipped; a path or `.exe` suffix on the
+/// program is ignored.
+pub(crate) fn invokes_checker(command: &str) -> bool {
+    command
+        .split(['&', '|', ';', '\n'])
+        .any(|segment| {
+            let mut words = segment.split_whitespace().peekable();
+            while let Some(word) = words.peek() {
+                let skip = word.contains('=') && !word.starts_with('-')
+                    || matches!(*word, "env" | "time" | "sudo" | "command" | "exec");
+                if !skip {
+                    break;
+                }
+                words.next();
+            }
+            let Some(program) = words.next() else {
+                return false;
+            };
+            let program = program
+                .trim_matches(|ch| matches!(ch, '"' | '\'' | '(' | ')' | '{' | '}'))
+                .rsplit(['/', '\\'])
+                .next()
+                .unwrap_or("")
+                .to_ascii_lowercase();
+            let program = program.strip_suffix(".exe").unwrap_or(&program);
+            if program == "uv" && words.peek().is_some_and(|next| *next == "run") {
+                return true;
+            }
+            CHECKER_PROGRAMS.iter().any(|checker| {
+                program == *checker
+                    || *checker == "python"
+                        && program
+                            .strip_prefix("python")
+                            .is_some_and(|rest| rest.chars().all(|ch| ch.is_ascii_digit() || ch == '.'))
+            })
+        })
 }
 
 /// Append a harness line to a tool result the model will read.

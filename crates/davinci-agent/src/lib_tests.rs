@@ -4435,3 +4435,72 @@ fn a_failing_command_gets_no_inline_note() {
         .iter()
         .all(|text| !text.contains("[harness:")));
 }
+
+#[test]
+fn an_inspection_command_does_not_use_up_the_inline_note() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut agent = verifying_agent(dir.path());
+    agent.auto_verify = false;
+    agent.prompt("write and check");
+    let mut script = scripted_tool_calls(vec![
+        (
+            "write",
+            serde_json::json!({"path":"changed.py", "content":"def f(x): return x * 2\n"}),
+        ),
+        (shell_tool(), serde_json::json!({"command":"cat changed.py"})),
+        (
+            shell_tool(),
+            serde_json::json!({"command":"python -c \"from changed import f; print(f(2))\""}),
+        ),
+        (shell_tool(), serde_json::json!({"command":"cat changed.py"})),
+    ]);
+    agent.run_loop(|current| script(current)).unwrap();
+    let results = tool_result_texts(&agent);
+    let noted: Vec<usize> = results
+        .iter()
+        .enumerate()
+        .filter(|(_, text)| text.contains("[harness: this command does not count"))
+        .map(|(index, _)| index)
+        .collect();
+    // Results: write, cat, python, cat. Only the python check is told.
+    assert_eq!(noted, vec![2], "{results:?}");
+    let reminder = agent
+        .messages
+        .iter()
+        .find(|message| message.extra.contains_key("davinciCapabilityReminder"))
+        .expect("gate still fires");
+    // The trailing `cat` does not overwrite the reason of the real check.
+    assert_eq!(
+        reminder.extra.get("davinciCapabilityReminderReason"),
+        Some(&serde_json::json!("no_applicable_check"))
+    );
+}
+
+#[test]
+fn checker_programs_match_only_as_the_program_word() {
+    use crate::turn::invokes_checker;
+    for command in [
+        "python -c 'print(1)'",
+        "python3.12 -m pytest -q",
+        "cd app && npm test",
+        "PYTHONPATH=. pytest tests/test_a.py",
+        "./venv/bin/python check.py",
+        r"C:\Python312\python.exe check.py",
+        "uv run pytest",
+        "cat a.py | python -",
+        "& python x.py",
+        "go test ./...",
+    ] {
+        assert!(invokes_checker(command), "{command}");
+    }
+    for command in [
+        "cat pricing.py",
+        "git diff pricing.py",
+        "ls node_modules",
+        "rg cargo Cargo.toml",
+        "echo python",
+        "Get-Content app.py",
+    ] {
+        assert!(!invokes_checker(command), "{command}");
+    }
+}
