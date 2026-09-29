@@ -86,7 +86,7 @@ impl SandboxBackend for HostBackend {
         require_capabilities(spec, capabilities)?;
         Ok(PreparedExecution {
             sandbox_id: spec.id.clone(),
-            spec_digest: spec_digest(spec)?,
+            spec_digest: sandbox_spec_digest(spec)?,
             backend: self.kind(),
             capabilities,
             executable: PathBuf::from(&request.executable),
@@ -223,7 +223,7 @@ impl SandboxBackend for LinuxBubblewrapBackend {
 
         Ok(PreparedExecution {
             sandbox_id: spec.id.clone(),
-            spec_digest: spec_digest(spec)?,
+            spec_digest: sandbox_spec_digest(spec)?,
             backend: self.kind(),
             capabilities,
             executable: self.executable.clone(),
@@ -506,7 +506,7 @@ fn find_host_executable(name: &str, workspace: &Path) -> Option<PathBuf> {
     None
 }
 
-fn spec_digest(spec: &SandboxSpec) -> Result<String, SandboxFailure> {
+pub fn sandbox_spec_digest(spec: &SandboxSpec) -> Result<String, SandboxFailure> {
     let mut redacted = spec.clone();
     for value in redacted.environment.inject.values_mut() {
         *value = "[injected]".into();
