@@ -289,7 +289,7 @@ fn forward_output(
             ));
             stopped.store(true, Ordering::SeqCst);
             return Err(std::io::Error::new(
-                std::io::ErrorKind::FileTooLarge,
+                std::io::ErrorKind::Other,
                 "sandbox output limit exceeded",
             ));
         }
