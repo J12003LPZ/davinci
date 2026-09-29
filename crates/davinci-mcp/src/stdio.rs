@@ -15,7 +15,7 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 use crate::jsonrpc::{Notification, Request, Response};
-use crate::{Error, Result, Rpc, CALL_TIMEOUT_SECS};
+use crate::{Error, Result, RpcTransport, CALL_TIMEOUT_SECS};
 
 /// How much of the child's stderr is kept for the error row.
 pub const STDERR_TAIL_BYTES: usize = 64 * 1024;
@@ -353,7 +353,7 @@ fn timeout_message(timeout: Duration) -> String {
     format!("mcp call timed out after {}s", timeout.as_secs())
 }
 
-impl Rpc for StdioTransport {
+impl RpcTransport for StdioTransport {
     fn call(&mut self, method: &str, params: Value) -> Result<Value> {
         let id = self.next_id;
         self.next_id += 1;
