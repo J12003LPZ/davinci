@@ -3452,7 +3452,11 @@ impl Agent {
                             }
                             Ok(crate::approval::GrantScope::Deny | crate::approval::GrantScope::DenyWithInstructions) => {
                                 let guidance = reply.instructions.as_deref().map(crate::approval::instruction_text).unwrap_or_default();
-                                let mut reason = format!("Permission denied: the user declined `{}`.", request.summary);
+                                let mut reason = if self.headless_approval {
+                                    headless_denial_reason(&request.summary)
+                                } else {
+                                    format!("Permission denied: the user declined `{}`.", request.summary)
+                                };
                                 if !guidance.is_empty() {
                                     reason.push(' ');
                                     reason.push_str(&guidance);
@@ -4377,6 +4381,15 @@ impl Agent {
 
 /// A tool's details as an event carries them: the same object without the
 /// image payloads, which belong in the message and not in every sink.
+/// What the model reads when an unattended responder (`Agent::headless_approval`)
+/// refuses a call: nobody declined it, the run simply cannot ask.
+fn headless_denial_reason(summary: &str) -> String {
+    format!(
+        "Permission denied: this action needs approval (`{summary}`) and this non-interactive run cannot ask. \
+         Use a workspace-local alternative or finish without it."
+    )
+}
+
 fn event_details(details: Option<&Value>) -> Option<Value> {
     let Value::Object(map) = details? else {
         return None;
@@ -5092,6 +5105,42 @@ mod tests {
             .contains(&instructions));
         assert!(!dir.path().join("denied.txt").exists());
         assert!(agent.permissions.lock().unwrap().session_allow.is_empty());
+    }
+
+    #[test]
+    fn headless_responder_denial_says_the_run_cannot_ask() {
+        for headless in [false, true] {
+            let dir = tempdir().unwrap();
+            let mut agent = Agent::new("offline headless denial fixture");
+            agent.tools = vec!["write".into()];
+            agent.permissions = Arc::new(crate::PermissionState::new(
+                crate::PermissionPolicy::new(crate::PermissionMode::Ask),
+            ));
+            agent.headless_approval = headless;
+            agent.approval_responder = Some(crate::approval::ApprovalResponder(Arc::new(
+                |_, challenge| {
+                    crate::approval::ApprovalReply::from_legacy(
+                        challenge,
+                        crate::ToolApprovalDecision::Deny,
+                    )
+                },
+            )));
+            let args = json!({"path":"headless.txt", "content":"must not be written"});
+            let Preparation::Immediate(result) =
+                agent.prepare_tool_call(dir.path(), "headless", "write", &args, 0)
+            else {
+                panic!("a denial must not dispatch the executor");
+            };
+            assert!(result.is_error);
+            let text = serde_json::to_string(&result.content).unwrap();
+            assert_eq!(
+                text.contains("this non-interactive run cannot ask"),
+                headless,
+                "{text}"
+            );
+            assert_eq!(text.contains("the user declined"), !headless, "{text}");
+            assert!(!dir.path().join("headless.txt").exists());
+        }
     }
 
     #[test]

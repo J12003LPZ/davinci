@@ -232,7 +232,8 @@ use davinci_tui::{
 };
 
 use args::{
-    format_terminal_title, parse_args, print_help, Args, ListModels, Mode, APP_NAME, VERSION,
+    format_terminal_title, parse_args, print_help, ApprovalPolicy, Args, ListModels, Mode,
+    APP_NAME, VERSION,
 };
 use auth_cmd::{
     is_auth_command_help, parse_auth_command, print_auth_command_help, validate_auth_command_args,
@@ -3315,11 +3316,87 @@ fn parse_model_ref(provider: &str, model: Option<&str>) -> (String, String) {
 
 /// Print cannot collect consent. Stop at the first policy-owned challenge and
 /// report it without creating grants or leaving a sticky cancellation signal.
+/// The default `--approval-policy abort`; the fail-closed tests drive it.
+#[cfg(test)]
 fn with_print_approval<T>(
     agent: &mut Agent,
     configuration_path: &Path,
     run: impl FnOnce(&mut Agent) -> T,
 ) -> (T, Option<serde_json::Value>) {
+    with_print_approval_policy(agent, configuration_path, None, run)
+}
+
+/// The third denial of one action ends a deny-continue run the abort way, so
+/// a model that keeps retrying the same refused call cannot spin forever.
+const PRINT_DENIAL_CAP: u32 = 3;
+
+/// What `--approval-policy deny-continue` has refused in this print run. It
+/// outlives each prompt, so the repeat cap and the final report cover the run.
+#[derive(Debug, Default)]
+struct PrintDenials {
+    /// One redacted entry per denial returned to the model.
+    actions: Vec<serde_json::Value>,
+    /// Denials so far per action (tool and subject).
+    repeats: std::collections::HashMap<String, u32>,
+}
+
+impl PrintDenials {
+    /// Records one denial. True when the action reached the cap and the run
+    /// has to stop and report `approval_required` instead.
+    fn record(
+        &mut self,
+        request: &davinci_agent::ToolApprovalRequest,
+        challenge: &davinci_agent::approval::ApprovalChallenge,
+    ) -> bool {
+        let count = self
+            .repeats
+            .entry(format!("{}\u{0}{}", request.tool, request.subject))
+            .or_default();
+        *count += 1;
+        if *count >= PRINT_DENIAL_CAP {
+            return true;
+        }
+        self.actions.push(serde_json::json!({
+            "tool_call_id": challenge.call_id,
+            "action": challenge.action_label,
+            "target": native_extensions::vector_memory::redact_secrets(&challenge.display_target),
+            "permission_mode": challenge.mode,
+        }));
+        false
+    }
+}
+
+/// The one stderr line a text-mode deny-continue run ends with.
+fn denied_actions_summary(actions: &[serde_json::Value]) -> String {
+    let listed: Vec<String> = actions
+        .iter()
+        .map(|action| {
+            let field = |key: &str| action[key].as_str().unwrap_or_default().to_string();
+            format!("{} {}", field("action"), field("target"))
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ")
+        })
+        .collect();
+    format!(
+        "Denied {} action{} needing approval in this non-interactive run: {}",
+        actions.len(),
+        if actions.len() == 1 { "" } else { "s" },
+        listed.join("; ")
+    )
+}
+
+/// `denials` selects `--approval-policy deny-continue`: a challenge is denied
+/// with a headless reason and the turn goes on, until one action is refused
+/// [`PRINT_DENIAL_CAP`] times. Without it the first challenge stops the run.
+fn with_print_approval_policy<T>(
+    agent: &mut Agent,
+    configuration_path: &Path,
+    denials: Option<&Arc<Mutex<PrintDenials>>>,
+    run: impl FnOnce(&mut Agent) -> T,
+) -> (T, Option<serde_json::Value>) {
+    let denials = denials.cloned();
+    let headless = denials.is_some();
     let required = Arc::new(Mutex::new(None));
     let captured = required.clone();
     let path = configuration_path.to_string_lossy().into_owned();
@@ -3327,8 +3404,21 @@ fn with_print_approval<T>(
     let cancelled = abort.clone();
     let previous_abort = agent.abort_signal.replace(abort);
     let previous_approver = agent.approver.take();
+    let previous_headless = std::mem::replace(&mut agent.headless_approval, headless);
     let previous_responder = agent.approval_responder.replace(
-        davinci_agent::approval::ApprovalResponder(Arc::new(move |_, challenge| {
+        davinci_agent::approval::ApprovalResponder(Arc::new(move |request, challenge| {
+            let stop = denials.as_ref().map_or(true, |denials| {
+                denials
+                    .lock()
+                    .unwrap_or_else(|err| err.into_inner())
+                    .record(request, challenge)
+            });
+            if !stop {
+                return davinci_agent::approval::ApprovalReply::from_legacy(
+                    challenge,
+                    davinci_agent::ToolApprovalDecision::Deny,
+                );
+            }
             let mut report = captured.lock().unwrap_or_else(|err| err.into_inner());
             if report.is_none() {
                 *report = Some(serde_json::json!({
@@ -3349,6 +3439,7 @@ fn with_print_approval<T>(
     );
     let result = run(agent);
     agent.approval_responder = previous_responder;
+    agent.headless_approval = previous_headless;
     agent.approver = previous_approver;
     agent.abort_signal = previous_abort;
     let report = required
@@ -3474,6 +3565,8 @@ fn run_print_turns(
     }
     let mut approval_required = None;
     let configuration_path = settings::settings_path(&default_agent_dir());
+    let denials = (parsed.approval_policy == ApprovalPolicy::DenyContinue)
+        .then(|| Arc::new(Mutex::new(PrintDenials::default())));
     let mut all_events = Vec::new();
     if let Some(prompt) = &prepared.text {
         if !prompt.trim().is_empty() || !prepared.images.is_empty() {
@@ -3499,10 +3592,12 @@ fn run_print_turns(
                     if json_mode {
                         write_prompt_manifest_json_event(agent)?;
                     }
-                    let ((reply, events), required) =
-                        with_print_approval(agent, &configuration_path, |agent| {
-                            complete_prompt_with_host(parsed, agent, None, json_mode)
-                        });
+                    let ((reply, events), required) = with_print_approval_policy(
+                        agent,
+                        &configuration_path,
+                        denials.as_ref(),
+                        |agent| complete_prompt_with_host(parsed, agent, None, json_mode),
+                    );
                     approval_required = blocking_host_report(agent, &events, required);
                     *last_reply = reply;
                     all_events.extend(events);
@@ -3539,10 +3634,12 @@ fn run_print_turns(
                 if json_mode {
                     write_prompt_manifest_json_event(agent)?;
                 }
-                let ((reply, events), required) =
-                    with_print_approval(agent, &configuration_path, |agent| {
-                        complete_prompt_with_host(parsed, agent, None, json_mode)
-                    });
+                let ((reply, events), required) = with_print_approval_policy(
+                    agent,
+                    &configuration_path,
+                    denials.as_ref(),
+                    |agent| complete_prompt_with_host(parsed, agent, None, json_mode),
+                );
                 approval_required = blocking_host_report(agent, &events, required);
                 *last_reply = reply;
                 all_events.extend(events);
@@ -3570,6 +3667,25 @@ fn run_print_turns(
         }
         other => (exit_code, other),
     };
+    let denied = denials
+        .map(|denials| {
+            std::mem::take(
+                &mut denials
+                    .lock()
+                    .unwrap_or_else(|err| err.into_inner())
+                    .actions,
+            )
+        })
+        .unwrap_or_default();
+    // Written before any approval_required, which stays the final line.
+    if json_mode && !denied.is_empty() {
+        let encoded = serde_json::to_string(&serde_json::json!({
+            "type": "denied_actions",
+            "actions": denied,
+        }))
+        .map_err(|err| err.to_string())?;
+        output::write_raw_stdout_line(&encoded).map_err(|err| err.to_string())?;
+    }
     let exit_code = if let Some(required) = approval_required {
         let encoded = serde_json::to_string(&required).map_err(|err| err.to_string())?;
         output::write_raw_stdout_line(&encoded).map_err(|err| err.to_string())?;
@@ -3582,6 +3698,14 @@ fn run_print_turns(
                 println!("{last_reply}");
             }
         }
+        exit_code
+    };
+    if !json_mode && !denied.is_empty() {
+        eprintln!("{}", denied_actions_summary(&denied));
+    }
+    let exit_code = if exit_code == 0 && parsed.fail_on_denied && !denied.is_empty() {
+        3
+    } else {
         exit_code
     };
     loaded_extension_host(parsed).emit(ExtensionEvent::SessionShutdown {

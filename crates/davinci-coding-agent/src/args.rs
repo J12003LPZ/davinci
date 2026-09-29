@@ -97,10 +97,37 @@ pub struct Args {
     /// `--output-last-message, -o <file>`: a Davinci addition for Codex `exec`
     /// parity. Print and json runs write the final reply text there.
     pub output_last_message: Option<String>,
+    /// `--approval-policy <abort|deny-continue>`: what print and json runs do
+    /// when a call needs approval nobody can give.
+    pub approval_policy: ApprovalPolicy,
+    /// `--fail-on-denied`: exit 3 when a deny-continue run denied anything.
+    pub fail_on_denied: bool,
     pub messages: Vec<String>,
     pub file_args: Vec<String>,
     pub unknown_flags: BTreeMap<String, FlagValue>,
     pub diagnostics: Vec<Diagnostic>,
+}
+
+/// What a non-interactive run does at a permission `Ask`. No TS counterpart;
+/// `deny-continue` mirrors Codex `exec -a never`, where the refusal goes back
+/// to the model as a tool error and the run carries on.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum ApprovalPolicy {
+    /// Stop at the first `Ask`, report `approval_required` and exit 1.
+    #[default]
+    Abort,
+    /// Deny the call, tell the model why, and keep going.
+    DenyContinue,
+}
+
+impl ApprovalPolicy {
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "abort" => Some(Self::Abort),
+            "deny-continue" => Some(Self::DenyContinue),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -446,6 +473,31 @@ pub fn parse_args(args: &[String]) -> Args {
                     }
                 }
             }
+        } else if arg == "--approval-policy" || arg.starts_with("--approval-policy=") {
+            let value = match arg.split_once('=') {
+                Some((_, value)) => Some(value),
+                None => match args.get(i + 1) {
+                    Some(next) if !next.starts_with('-') => {
+                        i += 1;
+                        Some(next.as_str())
+                    }
+                    _ => None,
+                },
+            };
+            match value.and_then(ApprovalPolicy::parse) {
+                Some(policy) => result.approval_policy = policy,
+                None => result.diagnostics.push(Diagnostic {
+                    kind: "error",
+                    message: match value {
+                        Some(value) => format!(
+                            "Invalid approval policy \"{value}\". Valid values: abort, deny-continue"
+                        ),
+                        None => "--approval-policy requires abort or deny-continue".into(),
+                    },
+                }),
+            }
+        } else if arg == "--fail-on-denied" {
+            result.fail_on_denied = true;
         } else if let Some(name) = path_flag_name(arg) {
             let (value, consumed) = split_path_flag(arg, args.get(i + 1));
             i += consumed;
@@ -700,10 +752,64 @@ mod tests {
     }
 
     #[test]
+    fn approval_policy_parses_both_values_and_rejects_the_rest() {
+        let args =
+            |list: &[&str]| parse_args(&list.iter().map(|s| s.to_string()).collect::<Vec<_>>());
+        let error = |parsed: &Args| {
+            parsed
+                .diagnostics
+                .iter()
+                .find(|d| d.kind == "error")
+                .map(|d| d.message.clone())
+        };
+
+        let default = args(&["-p", "go"]);
+        assert_eq!(default.approval_policy, ApprovalPolicy::Abort);
+        assert!(!default.fail_on_denied);
+
+        let spaced = args(&[
+            "--approval-policy",
+            "deny-continue",
+            "--fail-on-denied",
+            "go",
+        ]);
+        assert_eq!(spaced.approval_policy, ApprovalPolicy::DenyContinue);
+        assert!(spaced.fail_on_denied);
+        assert_eq!(spaced.messages, ["go"]);
+        assert!(spaced.diagnostics.is_empty() && spaced.unknown_flags.is_empty());
+
+        let equals = args(&["--approval-policy=abort", "go"]);
+        assert_eq!(equals.approval_policy, ApprovalPolicy::Abort);
+        assert_eq!(equals.messages, ["go"]);
+
+        let bad = args(&["--approval-policy", "never", "go"]);
+        assert_eq!(bad.approval_policy, ApprovalPolicy::Abort);
+        assert_eq!(
+            error(&bad).as_deref(),
+            Some("Invalid approval policy \"never\". Valid values: abort, deny-continue")
+        );
+        assert_eq!(bad.messages, ["go"]);
+
+        // A missing value never swallows the next flag.
+        for missing in [
+            args(&["--approval-policy"]),
+            args(&["--approval-policy="]),
+            args(&["--approval-policy", "-p", "go"]),
+        ] {
+            assert!(error(&missing).is_some_and(|message| message.contains("abort")));
+        }
+        let before_print = args(&["--approval-policy", "-p", "go"]);
+        assert!(before_print.print);
+        assert_eq!(before_print.messages, ["go"]);
+    }
+
+    #[test]
     fn help_lists_the_codex_exec_path_flags() {
         let help = print_help();
         assert!(help.contains("--output-last-message, -o <file>"));
         assert!(help.contains("--cd, -C <dir>"));
+        assert!(help.contains("--approval-policy <abort|deny-continue>"));
+        assert!(help.contains("--fail-on-denied"));
     }
 
     #[test]

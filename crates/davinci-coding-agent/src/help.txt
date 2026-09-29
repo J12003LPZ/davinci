@@ -28,6 +28,12 @@ Options:
   --mode <mode>                  Output mode: text (default), json, or rpc
   --print, -p                    Non-interactive mode: process prompt and exit
                                 Unresolved approval emits approval_required JSON and exits 1
+                                 (see --approval-policy)
+  --approval-policy <abort|deny-continue>
+                                 Print/json mode, when a call needs approval: abort (default) stops
+                                 as above; deny-continue returns the denial to the model and keeps
+                                 going, then reports the denied actions (3 denials of one action abort)
+  --fail-on-denied               With deny-continue: exit 3 instead of 0 if anything was denied
   --output-last-message, -o <file>
                                  Print/json mode: also write the final reply text to <file> (atomic;
                                  written even when the run fails). Davinci addition, Codex exec parity

@@ -474,6 +474,9 @@ pub struct Agent {
     pub approver: Option<ToolApprover>,
     /// Typed trusted-host responder; takes precedence over the legacy approver.
     pub approval_responder: Option<approval::ApprovalResponder>,
+    /// The responder is an unattended policy, not a person. A denial it
+    /// returns tells the model the run cannot ask, not that a user declined.
+    pub headless_approval: bool,
     approval_registry: Arc<approval::ApprovalRegistry>,
     /// Background shell jobs (`jobs.rs`) and the model's todo ledger
     /// (`todo.rs`), shared with the tool thread and the shell.
@@ -653,6 +656,7 @@ impl Agent {
             permissions: Arc::new(PermissionState::new(PermissionPolicy::default())),
             approver: None,
             approval_responder: None,
+            headless_approval: false,
             approval_registry: Arc::new(approval::ApprovalRegistry::default()),
             tool_context: ToolContext::default(),
             summarizer: None,
