@@ -3,6 +3,7 @@
 mod cbor;
 mod codec;
 mod framing;
+mod sandbox;
 mod schemas;
 
 pub use cbor::{
@@ -18,4 +19,5 @@ pub use framing::{
     assert_complete_frame, encode_frame, FrameDecoder, FrameDecoderOptions, FrameError,
     DEFAULT_MAX_FRAME_LENGTH,
 };
+pub use sandbox::*;
 pub use schemas::*;
