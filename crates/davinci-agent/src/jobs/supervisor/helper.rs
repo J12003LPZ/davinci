@@ -109,6 +109,9 @@ fn run_owned() -> std::io::Result<()> {
     };
     let sandbox_receipt = spawned.sandbox.clone();
     let output_budget = Arc::new(OutputBudget::new(spawned.max_output_bytes));
+    let lifetime_deadline = spawned
+        .max_lifetime_ms
+        .map(|milliseconds| Instant::now() + Duration::from_millis(milliseconds));
     let mut child = spawned.child;
     wire::write(
         &mut output,
@@ -234,6 +237,16 @@ fn run_owned() -> std::io::Result<()> {
     });
 
     while !stopped.load(Ordering::SeqCst) {
+        if lifetime_deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+            let _ = events.try_send((
+                Event::Failed {
+                    identity: identity.clone(),
+                },
+                None,
+            ));
+            stopped.store(true, Ordering::SeqCst);
+            break;
+        }
         if let Some(status) = child.try_wait()? {
             // A grandchild may retain the pipes. Bound tail draining before
             // terminating the group instead of waiting for those pipes forever.
@@ -309,6 +322,7 @@ struct Spawned {
     child: std::process::Child,
     sandbox: Option<SandboxReceipt>,
     max_output_bytes: Option<u64>,
+    max_lifetime_ms: Option<u64>,
 }
 
 fn spawn(config: ProcessConfig) -> Result<Spawned, String> {
@@ -316,6 +330,13 @@ fn spawn(config: ProcessConfig) -> Result<Spawned, String> {
         .sandbox
         .as_ref()
         .and_then(|spec| spec.resources.max_output_bytes);
+    let max_lifetime_ms = config.sandbox.as_ref().and_then(|spec| {
+        if config.background {
+            spec.process.max_background_lifetime_ms
+        } else {
+            spec.resources.timeout_ms
+        }
+    });
     #[cfg(unix)]
     let resource_policy = config.sandbox.as_ref().map(|spec| spec.resources.clone());
     let (executable, argv, cwd, environment, sandbox) =
@@ -403,6 +424,7 @@ fn spawn(config: ProcessConfig) -> Result<Spawned, String> {
         child,
         sandbox,
         max_output_bytes,
+        max_lifetime_ms,
     })
 }
 
@@ -572,6 +594,52 @@ mod tests {
             &stopped,
         )
         .is_err());
+    }
+
+    #[test]
+    fn process_intent_selects_foreground_or_background_lifetime() {
+        let policy = davinci_protocol::SandboxSpec {
+            id: davinci_protocol::SandboxId("lifetime-test".into()),
+            mode: davinci_protocol::SandboxMode::FullAccess,
+            backend: davinci_protocol::SandboxBackendKind::Host,
+            container: None,
+            workspace: if cfg!(windows) {
+                "C:\\workspace".into()
+            } else {
+                "/workspace".into()
+            },
+            filesystem: Default::default(),
+            network: davinci_protocol::NetworkPolicy::Unrestricted,
+            environment: Default::default(),
+            resources: davinci_protocol::ResourcePolicy {
+                timeout_ms: Some(1000),
+                ..Default::default()
+            },
+            process: davinci_protocol::ProcessPolicy {
+                allow_background: true,
+                max_background_lifetime_ms: Some(5000),
+            },
+            required_capabilities: Default::default(),
+        };
+        let foreground = ProcessConfig::new(
+            std::env::current_exe().unwrap(),
+            vec![],
+            std::env::current_dir().unwrap(),
+            Default::default(),
+        )
+        .with_sandbox(policy.clone());
+        let background = foreground.clone().as_background();
+        let lifetime = |config: &ProcessConfig| {
+            config.sandbox.as_ref().and_then(|spec| {
+                if config.background {
+                    spec.process.max_background_lifetime_ms
+                } else {
+                    spec.resources.timeout_ms
+                }
+            })
+        };
+        assert_eq!(lifetime(&foreground), Some(1000));
+        assert_eq!(lifetime(&background), Some(5000));
     }
 
     #[test]
