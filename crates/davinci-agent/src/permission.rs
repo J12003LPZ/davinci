@@ -1840,7 +1840,7 @@ pub fn check_path_boundary(root: &Path, target: &Path) -> (bool, bool) {
                     } else {
                         link
                     };
-                    let clean_resolved = strip_verbatim_prefix(&normalize_lexically(&resolved));
+                    let clean_resolved = boundary_path_identity(&resolved);
                     if !clean_resolved.starts_with(&norm_root) {
                         symlink_escape = true;
                     }
@@ -1878,8 +1878,7 @@ pub fn check_path_boundary(root: &Path, target: &Path) -> (bool, bool) {
                             } else {
                                 link
                             };
-                            let clean_resolved =
-                                strip_verbatim_prefix(&normalize_lexically(&resolved));
+                            let clean_resolved = boundary_path_identity(&resolved);
                             if !clean_resolved.starts_with(&norm_root) {
                                 symlink_escape = true;
                                 break;
