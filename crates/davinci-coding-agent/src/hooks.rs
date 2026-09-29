@@ -613,6 +613,7 @@ pub fn run_supervised_hook(
     if std::env::var("PI_HOOKS_DRY_RUN").is_ok() {
         return Ok(());
     }
+    crate::execution_boundary::require_executor("hook process")?;
 
     let _depth_guard = HookDepthGuard::enter(max_depth)?;
 
