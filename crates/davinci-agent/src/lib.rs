@@ -477,6 +477,10 @@ pub struct Agent {
     /// The responder is an unattended policy, not a person. A denial it
     /// returns tells the model the run cannot ask, not that a user declined.
     pub headless_approval: bool,
+    /// `--output-schema`: the JSON schema a print run's final answer must
+    /// match. The host puts it on every provider request of this agent;
+    /// workers and summaries never carry it.
+    pub output_schema: Option<Value>,
     approval_registry: Arc<approval::ApprovalRegistry>,
     /// Background shell jobs (`jobs.rs`) and the model's todo ledger
     /// (`todo.rs`), shared with the tool thread and the shell.
@@ -657,6 +661,7 @@ impl Agent {
             approver: None,
             approval_responder: None,
             headless_approval: false,
+            output_schema: None,
             approval_registry: Arc::new(approval::ApprovalRegistry::default()),
             tool_context: ToolContext::default(),
             summarizer: None,

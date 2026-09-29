@@ -97,6 +97,10 @@ pub struct Args {
     /// `--output-last-message, -o <file>`: a Davinci addition for Codex `exec`
     /// parity. Print and json runs write the final reply text there.
     pub output_last_message: Option<String>,
+    /// `--output-schema <file>`: a Davinci addition for Codex `exec` parity.
+    /// `run` loads the JSON schema the final answer of a print or json run
+    /// must match; this is the path as given.
+    pub output_schema: Option<String>,
     /// `--approval-policy <abort|deny-continue>`: what print and json runs do
     /// when a call needs approval nobody can give.
     pub approval_policy: ApprovalPolicy,
@@ -157,6 +161,7 @@ pub fn normalize_session_name(value: &str) -> Option<String> {
 
 const CD_FLAG: &str = "--cd";
 const OUTPUT_LAST_MESSAGE_FLAG: &str = "--output-last-message";
+const OUTPUT_SCHEMA_FLAG: &str = "--output-schema";
 
 /// The long name of the Davinci path flag `arg` spells, in any of its forms:
 /// long, short, or long with `=value`. Neither flag exists in TS pi; both
@@ -498,6 +503,21 @@ pub fn parse_args(args: &[String]) -> Args {
             }
         } else if arg == "--fail-on-denied" {
             result.fail_on_denied = true;
+        } else if arg == OUTPUT_SCHEMA_FLAG
+            || arg
+                .strip_prefix(OUTPUT_SCHEMA_FLAG)
+                .is_some_and(|rest| rest.starts_with('='))
+        {
+            // Codex has no short form for this one.
+            let (value, consumed) = split_path_flag(arg, args.get(i + 1));
+            i += consumed;
+            match path_flag_value(OUTPUT_SCHEMA_FLAG, value) {
+                Ok(value) => result.output_schema = Some(value),
+                Err(message) => result.diagnostics.push(Diagnostic {
+                    kind: "error",
+                    message,
+                }),
+            }
         } else if let Some(name) = path_flag_name(arg) {
             let (value, consumed) = split_path_flag(arg, args.get(i + 1));
             i += consumed;
@@ -804,8 +824,43 @@ mod tests {
     }
 
     #[test]
+    fn output_schema_takes_a_path_in_spaced_and_equals_forms() {
+        let args =
+            |list: &[&str]| parse_args(&list.iter().map(|s| s.to_string()).collect::<Vec<_>>());
+
+        let spaced = args(&["--output-schema", "schema.json", "-p", "go"]);
+        assert_eq!(spaced.output_schema.as_deref(), Some("schema.json"));
+        assert_eq!(spaced.messages, ["go"]);
+        assert!(spaced.diagnostics.is_empty() && spaced.unknown_flags.is_empty());
+
+        let equals = args(&["--output-schema=a b.json", "go"]);
+        assert_eq!(equals.output_schema.as_deref(), Some("a b.json"));
+        assert_eq!(equals.messages, ["go"]);
+
+        assert_eq!(args(&["-p", "go"]).output_schema, None);
+        assert_eq!(args(&["--", "--output-schema", "x"]).output_schema, None);
+
+        for missing in [
+            args(&["--output-schema"]),
+            args(&["--output-schema="]),
+            args(&["--output-schema", "-p", "go"]),
+        ] {
+            assert_eq!(missing.output_schema, None);
+            assert!(missing
+                .diagnostics
+                .iter()
+                .any(|d| d.kind == "error" && d.message == "--output-schema requires a file path"));
+        }
+        // A missing value never swallows the print flag or its message.
+        let before_print = args(&["--output-schema", "-p", "go"]);
+        assert!(before_print.print);
+        assert_eq!(before_print.messages, ["go"]);
+    }
+
+    #[test]
     fn help_lists_the_codex_exec_path_flags() {
         let help = print_help();
+        assert!(help.contains("--output-schema <file>"));
         assert!(help.contains("--output-last-message, -o <file>"));
         assert!(help.contains("--cd, -C <dir>"));
         assert!(help.contains("--approval-policy <abort|deny-continue>"));

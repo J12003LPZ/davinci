@@ -238,6 +238,20 @@ These two flags are Davinci additions for Codex `exec` parity. TypeScript pi has
 - `--cd, -C <dir>` runs as if davinci had been started in `<dir>`. It applies before settings, project trust, AGENTS.md discovery and session-directory resolution, so the session is stored under that directory's encoding. Relative `@file` and `--session` paths resolve against it. A missing path or a file is an error.
 - `--output-last-message, -o <file>` writes the final assistant reply text to `<file>` after a `--print` or `--mode json` run. The write is atomic (temporary file, then rename). It happens even when the run fails or is blocked, with an empty file when there is no reply. A relative path resolves against the directory davinci was started in, not the `--cd` directory. If the write fails, davinci prints an error and exits 1, unless the run already failed with its own code. Interactive and `--mode rpc` runs reject the flag.
 
+A final answer that must be JSON of a known shape:
+
+~~~bash
+davinci --output-schema report.schema.json -o report.json -p "Summarize the open issues."
+~~~
+
+`--output-schema <file>` is also a Codex `exec` parity addition. It works with `--print` and `--mode json`.
+
+- The file must hold a JSON object, the JSON schema. A missing file or invalid JSON is an error before any model call. A relative path resolves against the launch directory, like `-o`.
+- OpenAI Responses routes (`openai-responses`, `openai-codex-responses`, `azure-openai-responses`) send the schema as `text.format` with `strict: true`. Chat completions routes send it as `response_format`. The schema is passed through as written, so a provider that rejects it fails the run with its own error. Other providers get no wire change.
+- Every provider's final answer is then checked. The answer may be surrounded by whitespace or be one fenced `json` block. Davinci checks `type`, `properties`, `required`, `additionalProperties`, `items`, `minItems`, `maxItems`, `enum`, `const` and `anyOf`. Other keywords are not checked.
+- A mismatch gets exactly one repair turn: the model is told what failed and asked for only the corrected JSON. If that answer still fails, davinci lists the errors on stderr and exits 1.
+- On success stdout and the `-o` file hold the bare JSON, without a fence. `--mode json` ends with an `output_schema` event (`checked`, `valid`, `repairTurns`, `errors`). The repair turn is also counted as `outputSchemaRepairTurns` in the run stats.
+
 JSON-RPC over stdio:
 
 ~~~bash

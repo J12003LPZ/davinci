@@ -120,6 +120,10 @@ pub struct RunStats {
     /// Mid-run steering inputs injected by the user.
     #[serde(default)]
     pub user_steers: u64,
+    /// Extra turns `--output-schema` spent asking the model to fix a final
+    /// answer that did not match the schema. Also counted in `model_turns`.
+    #[serde(default)]
+    pub output_schema_repair_turns: u64,
     /// Total tokens charged by the root resource ledger across turns.
     #[serde(default)]
     pub budget_tokens_charged: u64,
@@ -201,6 +205,7 @@ mod tests {
         obj.remove("verificationFailures");
         obj.remove("capabilityIncompleteEvidence");
         obj.remove("userSteers");
+        obj.remove("outputSchemaRepairTurns");
         let restored: RunStats = serde_json::from_value(json).unwrap();
         assert_eq!(restored.permission_prompts, 0);
         assert_eq!(restored.permission_denials, 0);
@@ -209,5 +214,6 @@ mod tests {
         assert_eq!(restored.verification_failures, 0);
         assert_eq!(restored.capability_incomplete_evidence, 0);
         assert_eq!(restored.user_steers, 0);
+        assert_eq!(restored.output_schema_repair_turns, 0);
     }
 }

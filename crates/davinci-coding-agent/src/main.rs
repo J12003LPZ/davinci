@@ -517,6 +517,32 @@ fn run(raw: Vec<String>) -> Result<i32, String> {
         }
         Some(path) => Some(launch_dir.join(path)),
     };
+    // Loaded before the agent is built, so a bad schema costs no provider call.
+    // A relative path resolves against the launch directory, like `-o`.
+    let output_schema = match parsed.output_schema.as_deref() {
+        None => None,
+        Some(_) if parsed.mode == Some(Mode::Rpc) => {
+            eprintln!(
+                "Error: --output-schema is not supported with --mode rpc; use --print or --mode json"
+            );
+            return Ok(1);
+        }
+        Some(_) if !print_mode => {
+            eprintln!(
+                "Error: --output-schema needs a non-interactive run; add --print (-p) or --mode json"
+            );
+            return Ok(1);
+        }
+        Some(path) => {
+            match davinci_coding_agent::output_schema::load_schema(&launch_dir.join(path)) {
+                Ok(schema) => Some(schema),
+                Err(message) => {
+                    eprintln!("Error: {message}");
+                    return Ok(1);
+                }
+            }
+        }
+    };
 
     let session_dir = resolved_session_dir(&parsed, &cwd);
     let migrations = migrations::maybe_run_startup_migrations(&cwd);
@@ -544,6 +570,7 @@ fn run(raw: Vec<String>) -> Result<i32, String> {
 
     if print_mode {
         let _ = tools_manager::ensure_managed_tools();
+        agent.output_schema = output_schema;
         let code = run_print(&parsed, &mut agent, last_message_path.as_deref());
         run_stop_hooks_for(&parsed, &agent.cwd);
         return code;
@@ -1320,6 +1347,7 @@ fn complete_simple_summarization(
         native_responses_resume: None,
         install_telemetry: Some(load_settings(&default_agent_dir()).install_telemetry_enabled()),
         abort_signal: None,
+        output_schema: None,
     };
     let response = complete_simple(
         &model,
@@ -2922,6 +2950,7 @@ fn complete_prompt_with_host(
                                 current.native_responses_resume_record(),
                             install_telemetry: Some(current.install_telemetry),
                             abort_signal: current.abort_signal.clone(),
+                            output_schema: current.output_schema.clone(),
                         },
                         &mut sink,
                     );
@@ -3646,6 +3675,19 @@ fn run_print_turns(
             }
         }
     }
+    let schema_check = match agent.output_schema.clone() {
+        Some(schema) if !all_events.is_empty() => enforce_output_schema(
+            &schema,
+            parsed,
+            agent,
+            &configuration_path,
+            denials.as_ref(),
+            last_reply,
+            &mut all_events,
+            &mut approval_required,
+        ),
+        _ => None,
+    };
     // Stdout carries the reply; Context VM notices go to stderr.
     if !json_mode {
         for event in &all_events {
@@ -3686,20 +3728,51 @@ fn run_print_turns(
         .map_err(|err| err.to_string())?;
         output::write_raw_stdout_line(&encoded).map_err(|err| err.to_string())?;
     }
-    let exit_code = if let Some(required) = approval_required {
-        let encoded = serde_json::to_string(&required).map_err(|err| err.to_string())?;
+    // Also before any approval_required. Only schema runs write it; `checked`
+    // is false when the run failed before there was an answer to check.
+    if json_mode && agent.output_schema.is_some() && !all_events.is_empty() {
+        let encoded = serde_json::to_string(&serde_json::json!({
+            "type": "output_schema",
+            "checked": schema_check.is_some(),
+            "valid": matches!(schema_check, Some(Ok(()))),
+            "repairTurns": agent.stats.output_schema_repair_turns,
+            "errors": match &schema_check {
+                Some(Err(errors)) => errors.clone(),
+                _ => Vec::new(),
+            },
+        }))
+        .map_err(|err| err.to_string())?;
         output::write_raw_stdout_line(&encoded).map_err(|err| err.to_string())?;
-        1
-    } else {
-        if !json_mode {
-            if let Some(error) = error {
-                eprintln!("{error}");
-            } else if !last_reply.is_empty() {
-                println!("{last_reply}");
+    }
+    let exit_code =
+        if let (Some(Err(errors)), None, 0) = (&schema_check, &approval_required, exit_code) {
+            eprintln!(
+                "Error: the final reply does not match --output-schema after {} repair turn{}:",
+                agent.stats.output_schema_repair_turns,
+                if agent.stats.output_schema_repair_turns == 1 {
+                    ""
+                } else {
+                    "s"
+                }
+            );
+            for error in errors {
+                eprintln!("- {error}");
             }
-        }
-        exit_code
-    };
+            1
+        } else if let Some(required) = approval_required {
+            let encoded = serde_json::to_string(&required).map_err(|err| err.to_string())?;
+            output::write_raw_stdout_line(&encoded).map_err(|err| err.to_string())?;
+            1
+        } else {
+            if !json_mode {
+                if let Some(error) = error {
+                    eprintln!("{error}");
+                } else if !last_reply.is_empty() {
+                    println!("{last_reply}");
+                }
+            }
+            exit_code
+        };
     if !json_mode && !denied.is_empty() {
         eprintln!("{}", denied_actions_summary(&denied));
     }
@@ -3712,6 +3785,57 @@ fn run_print_turns(
         reason: "quit".into(),
     });
     Ok(exit_code)
+}
+
+/// True when a print run ended in a failure of its own (provider error, token
+/// limit, blocked runtime, lost session file), so there is no answer to check.
+fn print_run_failed(events: &[AgentEvent], reply: &str) -> bool {
+    print_text_exit(events).0 != 0
+        || reply.starts_with("Provider error: ")
+        || runtime_blocked(reply)
+}
+
+/// `--output-schema`: checks the final answer and, when it does not match,
+/// runs exactly one repair turn that hands the model the validator's errors.
+/// A matching answer replaces `last_reply` with its bare JSON text (fence
+/// removed), which is what stdout and `-o` then hold. `None` means nothing was
+/// checked because the run failed or stopped for approval first.
+#[allow(clippy::too_many_arguments)]
+fn enforce_output_schema(
+    schema: &serde_json::Value,
+    parsed: &Args,
+    agent: &mut Agent,
+    configuration_path: &Path,
+    denials: Option<&Arc<Mutex<PrintDenials>>>,
+    last_reply: &mut String,
+    all_events: &mut Vec<AgentEvent>,
+    approval_required: &mut Option<serde_json::Value>,
+) -> Option<Result<(), Vec<String>>> {
+    use davinci_coding_agent::output_schema::{check_reply, repair_prompt};
+    if approval_required.is_some() || print_run_failed(all_events, last_reply) {
+        return None;
+    }
+    let errors = match check_reply(schema, last_reply) {
+        Ok(json) => {
+            *last_reply = json;
+            return Some(Ok(()));
+        }
+        Err(errors) => errors,
+    };
+    let json_mode = parsed.mode == Some(Mode::Json);
+    agent.prompt_user_with(&repair_prompt(&errors), &[]);
+    agent.stats.output_schema_repair_turns += 1;
+    let ((reply, events), required) =
+        with_print_approval_policy(agent, configuration_path, denials, |agent| {
+            complete_prompt_with_host(parsed, agent, None, json_mode)
+        });
+    *approval_required = blocking_host_report(agent, &events, required);
+    *last_reply = reply;
+    all_events.extend(events);
+    if approval_required.is_some() || print_run_failed(all_events, last_reply) {
+        return None;
+    }
+    Some(check_reply(schema, last_reply).map(|json| *last_reply = json))
 }
 
 fn prompt_manifest_json_event(agent: &Agent) -> Option<serde_json::Value> {
