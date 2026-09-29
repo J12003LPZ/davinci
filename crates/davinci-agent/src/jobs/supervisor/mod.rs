@@ -1,5 +1,6 @@
 //! Trusted host process supervision. No model-facing policy or process registry.
 //! The caller supplies an authorized, resolved command and retains the owner.
+use davinci_protocol::{SandboxBackendKind, SandboxMode, SandboxSpec};
 use serde::{Deserialize, Serialize};
 use std::{collections::BTreeMap, path::PathBuf};
 
@@ -16,6 +17,9 @@ pub struct ProcessConfig {
     pub argv: Vec<String>,
     pub cwd: PathBuf,
     pub environment: BTreeMap<String, String>,
+    /// Host-resolved sandbox policy. None is the explicit legacy compatibility path.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sandbox: Option<SandboxSpec>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub operation: Option<crate::runtime::operations::ProcessOperationBinding>,
 }
@@ -32,6 +36,7 @@ impl ProcessConfig {
             argv,
             cwd,
             environment,
+            sandbox: None,
             operation: None,
         }
     }
@@ -49,6 +54,11 @@ impl ProcessConfig {
         self
     }
 
+    pub fn with_sandbox(mut self, sandbox: SandboxSpec) -> Self {
+        self.sandbox = Some(sandbox);
+        self
+    }
+
     pub fn execution_evidence(
         &self,
         identity: ProcessIdentity,
@@ -57,6 +67,13 @@ impl ProcessConfig {
         output_complete: Option<bool>,
     ) -> ProcessExecutionEvidence {
         let environment = environment_evidence(&self.environment);
+        let sandbox = self.sandbox.as_ref().map(|spec| ProcessSandboxEvidence {
+            id: spec.id.0.clone(),
+            spec_digest: crate::sandbox::sandbox_spec_digest(spec)
+                .unwrap_or_else(|_| "invalid-sandbox-spec".into()),
+            mode: spec.mode,
+            requested_backend: spec.backend,
+        });
         ProcessExecutionEvidence {
             identity,
             launch_state,
@@ -65,6 +82,7 @@ impl ProcessConfig {
             cwd: self.cwd.to_string_lossy().into_owned(),
             environment_references: environment.references,
             environment_digest: environment.digest,
+            sandbox,
             exit_code,
             output_complete,
         }
@@ -110,8 +128,19 @@ pub struct ProcessExecutionEvidence {
     /// Environment variable names only; values remain private to the launch pipe.
     pub environment_references: Vec<String>,
     pub environment_digest: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sandbox: Option<ProcessSandboxEvidence>,
     pub exit_code: Option<i32>,
     pub output_complete: Option<bool>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProcessSandboxEvidence {
+    pub id: String,
+    pub spec_digest: String,
+    pub mode: SandboxMode,
+    pub requested_backend: SandboxBackendKind,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
