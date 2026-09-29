@@ -4,7 +4,9 @@ use super::{
     ProcessConfig,
 };
 use crate::sandbox::{SandboxBackend, SandboxBroker};
-use davinci_protocol::{ExecutionRequest, ResourcePolicy, SandboxLifecycle, SandboxReceipt};
+use davinci_protocol::{ExecutionRequest, SandboxLifecycle, SandboxReceipt};
+#[cfg(unix)]
+use davinci_protocol::ResourcePolicy;
 use std::{
     io::{Read, Write},
     process::{Command, Stdio},
@@ -263,6 +265,7 @@ struct Spawned {
 }
 
 fn spawn(config: ProcessConfig) -> Result<Spawned, String> {
+    #[cfg(unix)]
     let resource_policy = config.sandbox.as_ref().map(|spec| spec.resources.clone());
     let (executable, argv, cwd, environment, sandbox) =
         if let Some(spec) = config.sandbox.as_ref() {
