@@ -161,6 +161,9 @@ pub struct ToolContext {
     /// Trusted host entry point for foreground process ownership. Without this,
     /// legacy commands remain available but cannot emit verification receipts.
     pub foreground_supervisor: Option<crate::jobs::supervisor::SupervisorCommand>,
+    /// Host-resolved execution policy for untrusted subprocesses. This is never
+    /// deserialized from model tool arguments.
+    pub sandbox: Option<davinci_protocol::SandboxSpec>,
     /// Per-dispatch host capture; never reconstructed from tool result JSON.
     pub command_receipt: Option<crate::command_receipt::CommandReceiptCapture>,
     /// Trusted host setting; ordinary mutation safety cannot be disabled.
