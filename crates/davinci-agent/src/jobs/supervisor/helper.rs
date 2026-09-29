@@ -20,6 +20,32 @@ use std::{
 
 type Message = (Event, Option<mpsc::SyncSender<()>>);
 
+#[derive(Debug)]
+struct OutputBudget {
+    remaining: Mutex<Option<u64>>,
+}
+
+impl OutputBudget {
+    fn new(limit: Option<u64>) -> Self {
+        Self {
+            remaining: Mutex::new(limit),
+        }
+    }
+
+    fn take(&self, requested: usize) -> usize {
+        let mut remaining = self
+            .remaining
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let Some(left) = *remaining else {
+            return requested;
+        };
+        let allowed = requested.min(left.min(usize::MAX as u64) as usize);
+        *remaining = Some(left.saturating_sub(allowed as u64));
+        allowed
+    }
+}
+
 pub(super) fn run() -> ! {
     let ownership = match Ownership::enter() {
         Ok(value) => value,
@@ -82,6 +108,7 @@ fn run_owned() -> std::io::Result<()> {
         }
     };
     let sandbox_receipt = spawned.sandbox.clone();
+    let output_budget = Arc::new(OutputBudget::new(spawned.max_output_bytes));
     let mut child = spawned.child;
     wire::write(
         &mut output,
@@ -123,7 +150,9 @@ fn run_owned() -> std::io::Result<()> {
     .map(|(stderr, pipe)| {
         let events = events.clone();
         let identity = identity.clone();
-        thread::spawn(move || forward_output(pipe, &events, &identity, stderr))
+        let budget = Arc::clone(&output_budget);
+        let stop = Arc::clone(&stopped);
+        thread::spawn(move || forward_output(pipe, &events, &identity, stderr, &budget, &stop))
     })
     .collect();
     let (writes, write_rx) = mpsc::sync_channel::<(u64, Option<Vec<u8>>)>(1);
@@ -225,6 +254,8 @@ fn forward_output(
     events: &mpsc::SyncSender<Message>,
     identity: &super::ProcessIdentity,
     stderr: bool,
+    budget: &OutputBudget,
+    stopped: &AtomicBool,
 ) -> std::io::Result<()> {
     let mut bytes = [0; 8192];
     loop {
@@ -234,18 +265,33 @@ fn forward_output(
             Err(error) => return Err(error),
             Ok(n) => n,
         };
-        if events
-            .send((
-                Event::Output {
-                    identity: identity.clone(),
-                    bytes: bytes[..count].to_vec(),
-                    stderr,
-                },
-                None,
-            ))
-            .is_err()
+        let allowed = budget.take(count);
+        if allowed > 0
+            && events
+                .send((
+                    Event::Output {
+                        identity: identity.clone(),
+                        bytes: bytes[..allowed].to_vec(),
+                        stderr,
+                    },
+                    None,
+                ))
+                .is_err()
         {
             return Err(std::io::ErrorKind::BrokenPipe.into());
+        }
+        if allowed != count {
+            let _ = events.try_send((
+                Event::Failed {
+                    identity: identity.clone(),
+                },
+                None,
+            ));
+            stopped.store(true, Ordering::SeqCst);
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::FileTooLarge,
+                "sandbox output limit exceeded",
+            ));
         }
     }
 }
@@ -262,9 +308,14 @@ fn readers_complete(readers: Vec<thread::JoinHandle<std::io::Result<()>>>) -> bo
 struct Spawned {
     child: std::process::Child,
     sandbox: Option<SandboxReceipt>,
+    max_output_bytes: Option<u64>,
 }
 
 fn spawn(config: ProcessConfig) -> Result<Spawned, String> {
+    let max_output_bytes = config
+        .sandbox
+        .as_ref()
+        .and_then(|spec| spec.resources.max_output_bytes);
     #[cfg(unix)]
     let resource_policy = config.sandbox.as_ref().map(|spec| spec.resources.clone());
     let (executable, argv, cwd, environment, sandbox) =
@@ -348,7 +399,11 @@ fn spawn(config: ProcessConfig) -> Result<Spawned, String> {
         command.creation_flags(0x08000000); // CREATE_NO_WINDOW
     }
     let child = command.spawn().map_err(|error| error.to_string())?;
-    Ok(Spawned { child, sandbox })
+    Ok(Spawned {
+        child,
+        sandbox,
+        max_output_bytes,
+    })
 }
 
 
@@ -488,7 +543,16 @@ mod tests {
     fn supervisor_capture_does_not_report_read_failure_as_eof() {
         let (events, _receiver) = mpsc::sync_channel(2);
         let identity = super::super::ProcessIdentity::new(None);
-        let result = forward_output(InterruptedThenData(false), &events, &identity, false);
+        let budget = OutputBudget::new(None);
+        let stopped = AtomicBool::new(false);
+        let result = forward_output(
+            InterruptedThenData(false),
+            &events,
+            &identity,
+            false,
+            &budget,
+            &stopped,
+        );
         assert_eq!(result.unwrap_err().kind(), std::io::ErrorKind::Other);
     }
 
@@ -497,7 +561,25 @@ mod tests {
         let (events, receiver) = mpsc::sync_channel(2);
         drop(receiver);
         let identity = super::super::ProcessIdentity::new(None);
-        assert!(forward_output(&b"output"[..], &events, &identity, false).is_err());
+        let budget = OutputBudget::new(None);
+        let stopped = AtomicBool::new(false);
+        assert!(forward_output(
+            &b"output"[..],
+            &events,
+            &identity,
+            false,
+            &budget,
+            &stopped,
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn output_budget_is_shared_across_streams_and_stops_at_limit() {
+        let budget = OutputBudget::new(Some(5));
+        assert_eq!(budget.take(3), 3);
+        assert_eq!(budget.take(4), 2);
+        assert_eq!(budget.take(1), 0);
     }
 
     #[test]
