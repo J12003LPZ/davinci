@@ -838,6 +838,9 @@ fn build_agent(parsed: &Args, session_dir: &Path, cwd: &Path) -> Result<Agent, S
         project_sandbox_settings.as_ref(),
         project_trusted_for_sandbox,
     )?;
+    if agent.tool_context.sandbox.is_some() {
+        davinci_coding_agent::execution_boundary::enable();
+    }
 
     agent.tool_context.foreground_supervisor = std::env::current_exe().ok().map(|executable| {
         davinci_agent::jobs::supervisor::SupervisorCommand {
