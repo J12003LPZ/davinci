@@ -220,6 +220,7 @@ impl BrowserProcess {
                         cwd: directory.clone(),
                         environment,
                         sandbox: None,
+                        background: true,
                         operation: None,
                     },
                     Arc::new(move |event| {
