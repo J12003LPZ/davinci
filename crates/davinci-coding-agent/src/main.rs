@@ -338,6 +338,29 @@ pub(crate) fn startup_mark(stage: &str) {
     }
 }
 
+fn preactivate_execution_boundary(raw: &[String], cwd: &Path) -> Result<(), String> {
+    let mut settings = load_settings(&default_agent_dir()).sandbox;
+    if let Some(index) = raw.iter().position(|value| value == "--execution-sandbox") {
+        let mode = raw
+            .get(index + 1)
+            .ok_or("--execution-sandbox requires a mode")?
+            .clone();
+        settings.get_or_insert_with(Default::default).mode = Some(mode);
+    }
+    let Some(spec) = davinci_coding_agent::sandbox_config::resolve_sandbox_settings(
+        cwd,
+        settings.as_ref(),
+        None,
+        false,
+    )? else {
+        return Ok(());
+    };
+    if spec.mode != davinci_protocol::SandboxMode::FullAccess {
+        davinci_coding_agent::execution_boundary::enable();
+    }
+    Ok(())
+}
+
 fn run(raw: Vec<String>) -> Result<i32, String> {
     startup_mark("start");
     apply_offline_mode(&raw);
@@ -360,6 +383,7 @@ fn run(raw: Vec<String>) -> Result<i32, String> {
         std::env::set_var("PI_DAVINCI", "0");
     }
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    preactivate_execution_boundary(&raw, &cwd)?;
     tools_manager::prepend_tools_bin_to_path();
     if matches!(raw.first().map(String::as_str), Some("plugin" | "plugins")) {
         let agent_dir = default_agent_dir();
@@ -844,7 +868,12 @@ fn build_agent(parsed: &Args, session_dir: &Path, cwd: &Path) -> Result<Agent, S
         project_sandbox_settings.as_ref(),
         project_trusted_for_sandbox,
     )?;
-    if agent.tool_context.sandbox.is_some() {
+    if agent
+        .tool_context
+        .sandbox
+        .as_ref()
+        .is_some_and(|spec| spec.mode != davinci_protocol::SandboxMode::FullAccess)
+    {
         davinci_coding_agent::execution_boundary::enable();
     }
 
