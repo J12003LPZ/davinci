@@ -24,6 +24,10 @@ pub struct ProcessConfig {
     /// instead of the foreground command timeout.
     #[serde(default)]
     pub background: bool,
+    /// Session-long service (an MCP server): exempt from the sandbox output
+    /// budget and lifetime, which bound individual commands.
+    #[serde(default)]
+    pub service: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub operation: Option<crate::runtime::operations::ProcessOperationBinding>,
 }
@@ -42,6 +46,7 @@ impl ProcessConfig {
             environment,
             sandbox: None,
             background: false,
+            service: false,
             operation: None,
         }
     }
@@ -66,6 +71,12 @@ impl ProcessConfig {
 
     pub fn as_background(mut self) -> Self {
         self.background = true;
+        self
+    }
+
+    pub fn as_service(mut self) -> Self {
+        self.background = true;
+        self.service = true;
         self
     }
 

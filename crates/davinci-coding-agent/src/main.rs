@@ -921,7 +921,12 @@ fn build_agent(parsed: &Args, session_dir: &Path, cwd: &Path) -> Result<Agent, S
     }
     let trusted = is_trusted(&settings, cwd, parsed.project_trust_override);
     if !parsed.no_mcp {
-        let mcp_config = mcp::load(&default_agent_dir(), cwd, trusted);
+        let mcp_config = mcp::load(
+            &default_agent_dir(),
+            cwd,
+            trusted,
+            agent.tool_context.sandbox.is_some(),
+        );
         let registry = match (
             agent.tool_context.foreground_supervisor.as_ref(),
             agent.tool_context.sandbox.as_ref(),

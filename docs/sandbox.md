@@ -9,7 +9,7 @@ Agent / Context VM / Memory / Scheduler / Permissions / Task Contracts
                               v
                         Sandbox Broker
                               |
-                   typed authenticated protocol
+              typed protocol over a private pipe
 ==============================|================================
                               v
 UNTRUSTED EXECUTION PLANE
@@ -33,6 +33,9 @@ User settings use the existing JSON settings format:
     "network": {
       "mode": "deny"
     },
+    "environment": {
+      "allow": ["NPM_TOKEN"]
+    },
     "resources": {
       "timeoutSeconds": 300,
       "maxMemoryMb": 4096,
@@ -41,6 +44,8 @@ User settings use the existing JSON settings format:
   }
 }
 ```
+
+`environment.allow` names host variables passed through to sandboxed processes; nothing else from the host environment is inherited. `timeoutSeconds` is optional: without it a command's own tool-call timeout governs, as it does without a sandbox. With it, it is a ceiling for every command.
 
 The command line can override only the execution mode for the run:
 
@@ -72,12 +77,22 @@ No subprocess execution is permitted by the sandbox policy.
 
 ### `workspace_write`
 
-- workspace read/write;
+- workspace read/write, except `.git`, `.davinci` and `.pi`, which stay read-only (see [Workspace control paths](#workspace-control-paths));
 - host filesystem outside explicit mounts unavailable when the selected backend enforces filesystem isolation;
 - network denied by default;
 - sanitized environment;
 - process ownership, timeout and output controls remain enabled;
 - configured hard memory/PID limits are mandatory and fail closed if the backend cannot enforce them.
+
+### Workspace control paths
+
+The host acts on some workspace files outside the sandbox: Davinci runs `git status`, `git ls-files` and `git diff` in the workspace, the user commits from it, and project configuration defines hooks, MCP servers and extensions. If sandboxed code could write `.git/config` (`core.fsmonitor`, filters, hooks) or `.davinci/`, those commands would run on the host. So in `workspace_write`, existing `.git`, `.davinci` and `.pi` entries are bound read-only on top of the writable workspace at every launch. A repository an earlier command created is protected from then on.
+
+Consequences and limits:
+
+- `git commit`, `git add` and other commands that write `.git` fail inside the sandbox; run them from the host.
+- A single command that creates `.git` where none existed can still write its config in that same command, before the next launch protects it.
+- A symlinked `.git` cannot be protected by a bind mount and is left as is.
 
 ### `full_access`
 
@@ -92,7 +107,8 @@ The current native isolated backend is bubblewrap when a trusted host `bwrap` ex
 It prepares:
 
 - a constructed mount namespace;
-- explicit read-only runtime/toolchain mounts;
+- explicit read-only runtime/toolchain mounts. System paths that are symlinks on the host (`/bin`, `/lib`, `/lib64` on usr-merged distributions, a systemd-managed `/etc/resolv.conf`) are also mounted at their own spelling, since every dynamic executable names `/lib64/ld-linux-*.so` as its interpreter. `/etc/alternatives`, name-resolution files and CA stores are included;
+- Rust toolchains: `RUSTUP_HOME` points at the read-only host rustup directory, and `CARGO_HOME` is a writable directory in the ephemeral home with the host's downloaded registry and git checkouts mounted read-only, so offline builds of locked projects work;
 - workspace RO or RW according to mode;
 - private `/tmp`;
 - PID/IPC/UTS/session isolation;
@@ -108,7 +124,7 @@ Used only for explicit `full_access`. It retains DaVinci's supervised process-tr
 
 ### Container backend
 
-The typed backend exists in policy, but a container runtime implementation is not yet complete on this branch. Selecting it returns `SandboxUnavailable` rather than silently falling back.
+Experimental. With `backend: "container"` (or `auto` without bubblewrap) and a user-configured `container.image`, commands run through Docker or Podman with a read-only root, `--network none` for denied networking, and `--memory`/`--pids-limit`/ulimits. Each launch gets its own container name, so concurrent launches under one policy never collide or tear each other down. The same host runtime mounts as bubblewrap are bound into the container, which replaces the image's own `/usr`; treat this backend as unfinished.
 
 ### Windows and macOS
 
@@ -151,12 +167,16 @@ The existing supervisor is the execution-plane seed:
 
 - Unix establishes a fresh session/process group before untrusted child spawn.
 - Windows establishes a kill-on-close Job Object before child spawn.
-- helper stdin is a parent lifeline;
-- cancellation/timeout terminates the owned process lifetime;
-- sandbox policy and a per-helper authentication token cross the private control channel;
-- the requested child never receives that control token.
+- helper stdin is a parent lifeline and the private control channel: only the parent holds it, so the channel itself authenticates the frames;
+- cancellation/timeout terminates the owned process lifetime.
 
-Background lifetimes remain bounded by sandbox/process policy.
+Background commands (`bash`/`powershell` with `background: true`) run through the same supervisor with the sandboxed configuration and are registered as supervised jobs; `job_output`, `job_kill` and stdin work as usual. Their lifetime is bounded to 30 minutes outside `full_access`.
+
+Output beyond the output ceiling (4 MiB) is dropped, not fatal: the command keeps running, and its capture is reported incomplete.
+
+### Resource limits
+
+On Unix, `maxMemoryMb` sets `RLIMIT_DATA` (not `RLIMIT_AS`, under which Node, the JVM and Go fail while reserving address space), and CPU time and file size use `RLIMIT_CPU`/`RLIMIT_FSIZE`. These apply **per process**, not to the process tree. The container backend enforces its limits inside the container instead.
 
 ## Evidence and verification
 
@@ -201,9 +221,12 @@ Writable worktree workers receive a sandbox rebound to their own canonical workt
 
 Local MCP has a sandbox-aware transport. Other persistent/specialized transports remain intentionally fail closed while they are migrated.
 
+Without an execution sandbox (the default), local MCP servers from every source run on the host as before; only a server that explicitly asks for `"execution": "sandboxed"` is refused, never silently run unsandboxed.
+
 When execution sandboxing is active:
 
-- project/plugin local MCP commands marked `sandboxed` run through the authenticated process supervisor and active sandbox backend; their server-level environment is intersected with the trusted sandbox environment policy;
+- project/plugin local MCP commands always run sandboxed, through the process supervisor and the active sandbox backend, as session-long services: the per-command output ceiling and background lifetime do not apply to them (their own 16 MiB line limit does);
+- a sandboxed server's `env` values are passed as written; `${NAME}` references resolve only for host variables in `sandbox.environment.allow`, and a reference to any other variable refuses the server rather than leaking or silently dropping it;
 - explicit trusted-user MCP commands marked `host` remain a separate escape hatch;
 - remote MCP HTTP remains control-plane networking;
 - language-server raw host spawn is refused;
@@ -239,7 +262,7 @@ A non-zero exit from a successfully sandboxed command is an execution result, no
 This branch does not yet satisfy the entire long-term acceptance target:
 
 - container backend execution is not implemented;
-- hard memory/PID/CPU/disk controls are capability-gated but not all available in the native bubblewrap backend;
+- hard memory/PID/CPU/disk controls are capability-gated but not all available in the native bubblewrap backend, and its memory/CPU limits are per-process rlimits;
 - LSP, extension/hook, graph, package-manager and browser specialized transports are fail-closed rather than fully migrated;
 - domain network allowlisting is intentionally unsupported;
 - benchmark numbers are not published until they can be measured on a capable runner.

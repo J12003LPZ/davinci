@@ -221,6 +221,7 @@ impl BrowserProcess {
                         environment,
                         sandbox: None,
                         background: true,
+                        service: true,
                         operation: None,
                     },
                     Arc::new(move |event| {

@@ -87,6 +87,53 @@ impl State {
     }
 }
 
+/// The server's configured `env`. Literal values pass as written; a
+/// `${NAME}` reference resolves only for host variables the sandbox policy
+/// allows, so a project-supplied server cannot pull ambient credentials into
+/// the sandbox. Variables the policy injects (HOME, TMPDIR...) are not
+/// overridable.
+fn server_environment(
+    server: &ServerConfig,
+    sandbox: &SandboxSpec,
+) -> Result<BTreeMap<String, String>> {
+    let mut environment = BTreeMap::new();
+    for (name, template) in &server.env {
+        if sandbox.environment.inject.contains_key(name) {
+            continue;
+        }
+        let valid = !name.is_empty()
+            && !name.as_bytes()[0].is_ascii_digit()
+            && name.bytes().all(|byte| byte.is_ascii_alphanumeric() || byte == b'_');
+        if !valid {
+            return Err(Error::Protocol(format!(
+                "sandboxed MCP env has an invalid variable name: {name}"
+            )));
+        }
+        let denied = std::cell::RefCell::new(None::<String>);
+        let value = davinci_mcp::expand_env(template, |reference| {
+            if sandbox.environment.allow.iter().any(|allowed| allowed == reference) {
+                std::env::var(reference).ok()
+            } else {
+                denied
+                    .borrow_mut()
+                    .get_or_insert_with(|| reference.to_string());
+                None
+            }
+        });
+        if let Some(reference) = denied.into_inner() {
+            return Err(Error::Protocol(format!(
+                "sandboxed MCP env {name} references host variable {reference}, which \
+                 sandbox.environment.allow does not include"
+            )));
+        }
+        if value.contains('\0') {
+            return Err(Error::Protocol(format!("sandboxed MCP env {name} contains NUL")));
+        }
+        environment.insert(name.clone(), value);
+    }
+    Ok(environment)
+}
+
 pub struct SupervisedMcpTransport {
     supervisor: Arc<Supervisor>,
     state: Arc<(Mutex<State>, Condvar)>,
@@ -113,18 +160,13 @@ impl SupervisedMcpTransport {
 
         let mut environment = crate::sandbox::sanitize_current_environment(&sandbox.environment)
             .map_err(|error| Error::Transport(format!("sandboxed MCP environment: {error}")))?;
-        for name in &sandbox.environment.allow {
-            if sandbox.environment.inject.contains_key(name) {
-                continue;
-            }
-            if let Some(value) = server.env.get(name) {
-                environment.insert(name.clone(), value.clone());
-            }
-        }
+        environment.extend(server_environment(server, sandbox)?);
 
+        // A service: the per-command output budget and lifetime would kill a
+        // session-long server midway. Its framing limits above still apply.
         let config = ProcessConfig::new(executable, server.args.clone(), cwd, environment)
             .with_sandbox(sandbox.clone())
-            .as_background();
+            .as_service();
 
         let state = Arc::new((Mutex::new(State::default()), Condvar::new()));
         let stdout_state = Arc::clone(&state);
@@ -370,6 +412,63 @@ fn resolve_program(command: &str, cwd: &Path) -> std::result::Result<PathBuf, St
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn sandbox(allow: &[&str]) -> SandboxSpec {
+        use davinci_protocol::{
+            EnvironmentPolicy, FilesystemPolicy, NetworkPolicy, ProcessPolicy, ResourcePolicy,
+            SandboxBackendKind, SandboxCapabilities, SandboxId, SandboxMode,
+        };
+        SandboxSpec {
+            id: SandboxId("mcp-env".into()),
+            mode: SandboxMode::FullAccess,
+            backend: SandboxBackendKind::Host,
+            container: None,
+            workspace: "/workspace".into(),
+            filesystem: FilesystemPolicy::default(),
+            network: NetworkPolicy::Unrestricted,
+            environment: EnvironmentPolicy {
+                allow: allow.iter().map(|name| name.to_string()).collect(),
+                inject: BTreeMap::from([("HOME".into(), "/tmp/davinci-home".into())]),
+            },
+            resources: ResourcePolicy::default(),
+            process: ProcessPolicy::default(),
+            required_capabilities: SandboxCapabilities::default(),
+        }
+    }
+
+    fn server(env: &[(&str, &str)]) -> ServerConfig {
+        ServerConfig {
+            command: Some("server".into()),
+            env: env
+                .iter()
+                .map(|(name, value)| (name.to_string(), value.to_string()))
+                .collect(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn configured_env_reaches_the_sandboxed_server_and_expands_allowed_references() {
+        let path = std::env::var("PATH").unwrap();
+        let env = server_environment(
+            &server(&[("MODE", "fast"), ("SEARCH", "${PATH}"), ("HOME", "/root")]),
+            &sandbox(&["PATH"]),
+        )
+        .unwrap();
+        assert_eq!(env.get("MODE").map(String::as_str), Some("fast"));
+        assert_eq!(env.get("SEARCH"), Some(&path));
+        assert!(!env.contains_key("HOME"), "injected sandbox variables stay fixed");
+    }
+
+    #[test]
+    fn env_references_to_unallowed_host_variables_are_refused() {
+        let error = server_environment(
+            &server(&[("TOKEN", "${GITHUB_TOKEN}")]),
+            &sandbox(&[]),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("GITHUB_TOKEN"), "{error}");
+    }
 
     #[test]
     fn rpc_response_preserves_result_and_rpc_error_class() {

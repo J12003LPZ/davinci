@@ -33,7 +33,7 @@ impl Capture {
 /// Sandboxed execution starts from a minimal environment. The legacy unsandboxed
 /// compatibility path keeps its historical environment behavior, but it carries
 /// no sandbox receipt and must never be represented as OS-isolated.
-pub(super) fn config(
+pub(super) fn process_config(
     cwd: &std::path::Path,
     executable: std::path::PathBuf,
     argv: Vec<String>,
@@ -78,6 +78,17 @@ pub(super) fn config(
     if let Some(sandbox) = sandbox {
         config = config.with_sandbox(sandbox);
     }
+    Ok(config)
+}
+
+/// Foreground configuration bound to this dispatch's command receipt.
+pub(super) fn config(
+    cwd: &std::path::Path,
+    executable: std::path::PathBuf,
+    argv: Vec<String>,
+    context: &ToolContext,
+) -> Result<ProcessConfig, ToolError> {
+    let config = process_config(cwd, executable, argv, context)?;
     Ok(context
         .command_receipt
         .as_ref()

@@ -12,6 +12,9 @@ pub struct SandboxSettings {
     pub mode: Option<String>,
     pub backend: Option<String>,
     pub container: Option<SandboxContainerSettings>,
+    /// Host variable names passed through to sandboxed processes (and
+    /// available to `${NAME}` references in sandboxed MCP `env`).
+    pub environment: Option<SandboxEnvironmentSettings>,
     pub network: Option<SandboxNetworkSettings>,
     pub resources: Option<SandboxResourceSettings>,
 }
@@ -21,6 +24,12 @@ pub struct SandboxSettings {
 pub struct SandboxContainerSettings {
     pub runtime: Option<String>,
     pub image: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+#[serde(default, rename_all = "camelCase", deny_unknown_fields)]
+pub struct SandboxEnvironmentSettings {
+    pub allow: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
@@ -82,7 +91,12 @@ pub fn resolve_sandbox_settings(
         .to_str()
         .ok_or("sandbox workspace path is not UTF-8")?
         .to_string();
-    let mut mounts = runtime_mounts(&workspace);
+    let runtime = if matches!(mode, SandboxMode::Restricted | SandboxMode::WorkspaceWrite) {
+        runtime_layout(&workspace)
+    } else {
+        RuntimeLayout::default()
+    };
+    let mut mounts = runtime.mounts;
     match mode {
         SandboxMode::Restricted => mounts.push(MountRule {
             source: Some(workspace_text.clone()),
@@ -99,19 +113,24 @@ pub fn resolve_sandbox_settings(
     if !matches!(mode, SandboxMode::NoExecution | SandboxMode::FullAccess) {
         mounts.push(MountRule {
             source: None,
-            target: "/tmp/davinci-home".into(),
+            target: SANDBOX_HOME.into(),
             access: MountAccess::Temporary,
         });
+        // Read-only toolchain caches inside the ephemeral home; they must
+        // follow the tmpfs they are nested in.
+        mounts.extend(runtime.home_mounts);
     }
 
-    let mut environment = EnvironmentPolicy::default();
+    let mut environment = EnvironmentPolicy {
+        allow: parse_environment_allow(effective.environment.as_ref())?,
+        ..Default::default()
+    };
     if !matches!(mode, SandboxMode::NoExecution | SandboxMode::FullAccess) {
-        environment
-            .inject
-            .insert("HOME".into(), "/tmp/davinci-home".into());
+        environment.inject.insert("HOME".into(), SANDBOX_HOME.into());
         environment.inject.insert("TMPDIR".into(), "/tmp".into());
         environment.inject.insert("TMP".into(), "/tmp".into());
         environment.inject.insert("TEMP".into(), "/tmp".into());
+        environment.inject.extend(runtime.environment);
     }
 
     let mut required = SandboxCapabilities {
@@ -195,6 +214,15 @@ fn narrow_settings(
         if project_container != global_container {
             return Err("project sandbox cannot change container runtime or image".into());
         }
+    }
+
+    if let Some(project_environment) = project.environment.as_ref() {
+        let global_allow = parse_environment_allow(global.environment.as_ref())?;
+        let project_allow = parse_environment_allow(Some(project_environment))?;
+        if project_allow.iter().any(|name| !global_allow.contains(name)) {
+            return Err("project sandbox environment cannot widen global authority".into());
+        }
+        global.environment = Some(project_environment.clone());
     }
 
     if let Some(project_network) = project.network.as_ref() {
@@ -321,8 +349,10 @@ fn parse_resources(
     settings: Option<&SandboxResourceSettings>,
 ) -> Result<ResourcePolicy, String> {
     let Some(settings) = settings else {
+        // No sandbox-level deadline unless configured: the tool call's own
+        // timeout governs, as it does without a sandbox.
         return Ok(ResourcePolicy {
-            timeout_ms: Some(300_000),
+            timeout_ms: None,
             max_output_bytes: Some(4 * 1024 * 1024),
             ..Default::default()
         });
@@ -330,8 +360,7 @@ fn parse_resources(
     let timeout_ms = settings
         .timeout_seconds
         .map(|seconds| seconds.checked_mul(1000).ok_or("sandbox timeout overflows"))
-        .transpose()?
-        .or(Some(300_000));
+        .transpose()?;
     let max_memory_bytes = settings
         .max_memory_mb
         .map(|mb| mb.checked_mul(1024 * 1024).ok_or("sandbox memory limit overflows"))
@@ -351,73 +380,211 @@ fn parse_resources(
     })
 }
 
-fn runtime_mounts(workspace: &Path) -> Vec<MountRule> {
-    let mut sources = Vec::<PathBuf>::new();
+const SANDBOX_HOME: &str = "/tmp/davinci-home";
+
+fn parse_environment_allow(
+    settings: Option<&SandboxEnvironmentSettings>,
+) -> Result<Vec<String>, String> {
+    let Some(settings) = settings else {
+        return Ok(Vec::new());
+    };
+    let mut allow = Vec::new();
+    for name in &settings.allow {
+        let valid = !name.is_empty()
+            && name.len() <= 128
+            && !name.as_bytes()[0].is_ascii_digit()
+            && name.bytes().all(|byte| byte.is_ascii_alphanumeric() || byte == b'_');
+        if !valid {
+            return Err(format!("invalid sandbox environment variable name: {name}"));
+        }
+        if !allow.contains(name) {
+            allow.push(name.clone());
+        }
+    }
+    Ok(allow)
+}
+
+/// Host runtime a sandboxed command needs: read-only system and toolchain
+/// mounts plus the environment that points tools at them.
+#[derive(Default)]
+struct RuntimeLayout {
+    mounts: Vec<MountRule>,
+    /// Mounted under the ephemeral `SANDBOX_HOME` tmpfs, so they must follow it.
+    home_mounts: Vec<MountRule>,
+    environment: std::collections::BTreeMap<String, String>,
+}
+
+/// Host paths a sandboxed process needs to execute ordinary tools.
+///
+/// Each path is mounted at its canonical location. A path that is itself a
+/// symlink (`/lib64 -> usr/lib64` on usr-merged distributions, a
+/// `/etc/resolv.conf` managed by systemd) is also mounted at its own
+/// spelling, because nothing else in the sandbox root provides that link:
+/// every dynamic executable names `/lib64/ld-linux-*.so` as its interpreter.
+#[cfg(unix)]
+const RUNTIME_PATHS: &[&str] = &[
+    "/usr",
+    "/bin",
+    "/sbin",
+    "/lib",
+    "/lib32",
+    "/lib64",
+    "/libx32",
+    // Debian/Ubuntu route awk, cc, c++, java and others through here.
+    "/etc/alternatives",
+    "/etc/ssl",
+    "/etc/pki",
+    "/etc/ca-certificates",
+    "/etc/passwd",
+    "/etc/group",
+    "/etc/nsswitch.conf",
+    // Name resolution when the network policy allows egress.
+    "/etc/hosts",
+    "/etc/host.conf",
+    "/etc/resolv.conf",
+    "/etc/localtime",
+    "/etc/ld.so.cache",
+    "/etc/ld.so.conf",
+    "/etc/ld.so.conf.d",
+];
+
+fn runtime_layout(workspace: &Path) -> RuntimeLayout {
+    let mut layout = RuntimeLayout::default();
     #[cfg(unix)]
     {
-        for path in [
-            "/usr",
-            "/bin",
-            "/sbin",
-            "/lib",
-            "/lib64",
-            "/etc/ssl",
-            "/etc/ca-certificates",
-            "/etc/passwd",
-            "/etc/group",
-            "/etc/ld.so.cache",
-            "/etc/ld.so.conf",
-            "/etc/ld.so.conf.d",
-        ] {
-            push_runtime_source(&mut sources, Path::new(path), workspace);
+        let mut mounts = RuntimeMounts::default();
+        for path in RUNTIME_PATHS {
+            mounts.push(Path::new(path), workspace);
         }
         if let Some(path) = std::env::var_os("PATH") {
             for directory in std::env::split_paths(&path) {
-                push_runtime_source(&mut sources, &directory, workspace);
+                mounts.push(&directory, workspace);
             }
         }
-        if let Some(home) = std::env::var_os("RUSTUP_HOME").map(PathBuf::from).or_else(|| {
-            std::env::var_os("HOME").map(PathBuf::from).map(|home| home.join(".rustup"))
-        }) {
-            push_runtime_source(&mut sources, &home, workspace);
-        }
-        if let Some(cargo) = std::env::var_os("CARGO_HOME").map(PathBuf::from).or_else(|| {
-            std::env::var_os("HOME").map(PathBuf::from).map(|home| home.join(".cargo"))
-        }) {
-            for relative in ["bin", "registry", "git"] {
-                push_runtime_source(&mut sources, &cargo.join(relative), workspace);
+        let home = std::env::var_os("HOME").map(PathBuf::from);
+        // rustup proxies in PATH look for toolchains under RUSTUP_HOME, which
+        // defaults to the (replaced) HOME: point them at the mounted copy.
+        if let Some(rustup) = std::env::var_os("RUSTUP_HOME")
+            .map(PathBuf::from)
+            .or_else(|| home.as_ref().map(|home| home.join(".rustup")))
+        {
+            if let Some(path) = mounts.push(&rustup, workspace) {
+                layout.environment.insert("RUSTUP_HOME".into(), path);
             }
         }
+        // Cargo needs a writable CARGO_HOME for its locks, so it lives in the
+        // ephemeral home with the host's downloaded crates mounted read-only.
+        if let Some(cargo) = std::env::var_os("CARGO_HOME")
+            .map(PathBuf::from)
+            .or_else(|| home.as_ref().map(|home| home.join(".cargo")))
+        {
+            mounts.push(&cargo.join("bin"), workspace);
+            let sandbox_cargo = format!("{SANDBOX_HOME}/.cargo");
+            let mut any = false;
+            for relative in ["registry", "git", "config.toml", "config"] {
+                let Ok(source) = cargo.join(relative).canonicalize() else {
+                    continue;
+                };
+                if source.starts_with(workspace) || exposes_user_home_root(&source) {
+                    continue;
+                }
+                let Some(source) = source.to_str() else {
+                    continue;
+                };
+                any = true;
+                layout.home_mounts.push(MountRule {
+                    source: Some(source.to_string()),
+                    target: format!("{sandbox_cargo}/{relative}"),
+                    access: MountAccess::ReadOnly,
+                });
+            }
+            if any {
+                layout.environment.insert("CARGO_HOME".into(), sandbox_cargo);
+            }
+        }
+        layout.mounts = mounts.into_rules();
     }
-    sources
-        .into_iter()
-        .filter_map(|source| {
-            let target = source.to_str()?.to_string();
-            Some(MountRule {
-                source: Some(target.clone()),
-                target,
-                access: MountAccess::ReadOnly,
-            })
-        })
-        .collect()
+    #[cfg(not(unix))]
+    let _ = workspace;
+    layout
 }
 
-fn push_runtime_source(sources: &mut Vec<PathBuf>, path: &Path, workspace: &Path) {
-    let Ok(path) = path.canonicalize() else {
-        return;
-    };
-    if path.starts_with(workspace)
-        || exposes_user_home_root(&path)
-        || sources.iter().any(|seen| seen == &path)
-    {
-        return;
+#[derive(Default)]
+struct RuntimeMounts {
+    /// Canonical host directories and files, mounted at the same path.
+    canonical: Vec<PathBuf>,
+    /// `(spelling, canonical)` for paths that are symlinks on the host.
+    aliases: Vec<(PathBuf, PathBuf)>,
+}
+
+impl RuntimeMounts {
+    /// Records `path`; returns its canonical spelling when it is mounted.
+    fn push(&mut self, path: &Path, workspace: &Path) -> Option<String> {
+        if !path.is_absolute() {
+            return None;
+        }
+        let canonical = path.canonicalize().ok()?;
+        if canonical.starts_with(workspace) || exposes_user_home_root(&canonical) {
+            return None;
+        }
+        // Avoid redundant nested mounts when an already declared parent covers it.
+        if !self.canonical.iter().any(|seen| canonical.starts_with(seen)) {
+            self.canonical.retain(|seen| !seen.starts_with(&canonical));
+            self.canonical.push(canonical.clone());
+        }
+        let spelling = lexical(path)?;
+        if spelling != canonical && !self.aliases.iter().any(|(seen, _)| seen == &spelling) {
+            self.aliases.push((spelling, canonical.clone()));
+        }
+        canonical.to_str().map(str::to_string)
     }
-    // Avoid redundant nested mounts when an already declared parent covers it.
-    if sources.iter().any(|seen| path.starts_with(seen)) {
-        return;
+
+    fn into_rules(self) -> Vec<MountRule> {
+        let mut rules = Vec::new();
+        for path in &self.canonical {
+            if let Some(path) = path.to_str() {
+                rules.push(MountRule {
+                    source: Some(path.to_string()),
+                    target: path.to_string(),
+                    access: MountAccess::ReadOnly,
+                });
+            }
+        }
+        for (spelling, canonical) in &self.aliases {
+            // A link inside an already mounted tree (e.g. /usr/local/bin ->
+            // /opt/...) resolves through that mount; only links whose
+            // spelling nothing else provides need their own mount.
+            if self.canonical.iter().any(|seen| spelling.starts_with(seen))
+                || self
+                    .aliases
+                    .iter()
+                    .any(|(other, _)| other != spelling && spelling.starts_with(other))
+            {
+                continue;
+            }
+            if let (Some(source), Some(target)) = (canonical.to_str(), spelling.to_str()) {
+                rules.push(MountRule {
+                    source: Some(source.to_string()),
+                    target: target.to_string(),
+                    access: MountAccess::ReadOnly,
+                });
+            }
+        }
+        rules
     }
-    sources.retain(|seen| !seen.starts_with(&path));
-    sources.push(path);
+}
+
+/// `path` without `.` components; `None` when it has `..`.
+fn lexical(path: &Path) -> Option<PathBuf> {
+    let mut out = PathBuf::new();
+    for component in path.components() {
+        match component {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => return None,
+            other => out.push(other),
+        }
+    }
+    Some(out)
 }
 
 fn exposes_user_home_root(path: &Path) -> bool {
@@ -620,6 +787,7 @@ mod tests {
             mode: Some("workspace_write".into()),
             backend: Some("auto".into()),
             container: None,
+            environment: None,
             network: Some(SandboxNetworkSettings {
                 mode: Some("deny".into()),
                 ..Default::default()
@@ -634,6 +802,7 @@ mod tests {
             mode: Some("restricted".into()),
             backend: None,
             container: None,
+            environment: None,
             network: Some(SandboxNetworkSettings {
                 mode: Some("deny".into()),
                 ..Default::default()
@@ -731,9 +900,136 @@ mod tests {
     fn runtime_mount_discovery_never_exposes_the_user_home_root() {
         let workspace = tempfile::tempdir().unwrap();
         let home = std::env::var_os("HOME").map(PathBuf::from).unwrap();
-        let mut sources = Vec::new();
-        push_runtime_source(&mut sources, &home, workspace.path());
-        assert!(sources.is_empty(), "user home root must never become a runtime mount");
+        let mut mounts = RuntimeMounts::default();
+        assert!(mounts.push(&home, workspace.path()).is_none());
+        assert!(
+            mounts.into_rules().is_empty(),
+            "user home root must never become a runtime mount"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn symlinked_runtime_paths_are_also_mounted_at_their_own_spelling() {
+        // Usr-merged hosts: /lib64 -> usr/lib64 holds the ELF interpreter of
+        // every dynamic executable, and nothing else creates that link.
+        let workspace = tempfile::tempdir().unwrap();
+        let host = tempfile::tempdir().unwrap();
+        let host = host.path().canonicalize().unwrap();
+        std::fs::create_dir_all(host.join("usr/lib64")).unwrap();
+        std::os::unix::fs::symlink("usr/lib64", host.join("lib64")).unwrap();
+        let mut mounts = RuntimeMounts::default();
+        mounts.push(&host.join("usr"), workspace.path());
+        mounts.push(&host.join("lib64"), workspace.path());
+        let rules = mounts.into_rules();
+        let text = |path: PathBuf| path.to_string_lossy().into_owned();
+        assert!(rules.iter().any(|rule| {
+            rule.source.as_deref() == Some(text(host.join("usr/lib64")).as_str())
+                && rule.target == text(host.join("lib64"))
+                && rule.access == MountAccess::ReadOnly
+        }));
+        // The canonical target is already covered by the /usr mount.
+        assert_eq!(rules.len(), 2, "{rules:?}");
+    }
+
+    /// Runs the real launch plan under bubblewrap when this host can.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn bubblewrap_workspace_write_runs_host_tools_and_keeps_git_read_only() {
+        use davinci_agent::sandbox::SandboxBroker;
+        let usable = std::process::Command::new("bwrap")
+            .args(["--ro-bind", "/", "/", "--unshare-pid", "--", "true"])
+            .output()
+            .is_ok_and(|output| output.status.success());
+        if !usable {
+            eprintln!("skipping: bubblewrap is unavailable or cannot create namespaces here");
+            return;
+        }
+        let root = tempfile::tempdir().unwrap();
+        let workspace = root.path().canonicalize().unwrap();
+        let git = std::process::Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(&workspace)
+            .status();
+        if !git.is_ok_and(|status| status.success()) {
+            eprintln!("skipping: git is unavailable");
+            return;
+        }
+        let settings = SandboxSettings {
+            mode: Some("workspace_write".into()),
+            backend: Some("bwrap".into()),
+            ..Default::default()
+        };
+        let spec = resolve_sandbox_settings(&workspace, Some(&settings), None, false)
+            .unwrap()
+            .unwrap();
+        let environment =
+            davinci_agent::sandbox::sanitize_current_environment(&spec.environment).unwrap();
+        let shell = ["/usr/bin/bash", "/bin/bash", "/usr/bin/sh", "/bin/sh"]
+            .into_iter()
+            .find(|path| Path::new(path).exists())
+            .unwrap();
+        let run = |script: &str| {
+            let request = davinci_protocol::ExecutionRequest {
+                sandbox_id: spec.id.clone(),
+                executable: shell.into(),
+                argv: vec!["-c".into(), script.into()],
+                cwd: spec.workspace.clone(),
+                launch_id: None,
+            };
+            let prepared = SandboxBroker.prepare(&spec, &request, &environment).unwrap();
+            std::process::Command::new(&prepared.executable)
+                .args(&prepared.argv)
+                .current_dir(&prepared.cwd)
+                .env_clear()
+                .envs(&prepared.environment)
+                .output()
+                .unwrap()
+        };
+        // The dynamic loader resolves: ordinary executables start.
+        let output = run("echo started && echo data > file && cat file");
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(String::from_utf8_lossy(&output.stdout), "started\ndata\n");
+        // .git is not writable from inside, so its config cannot gain
+        // commands the host later runs.
+        let output = run("git config core.fsmonitor 'touch escaped'");
+        assert!(!output.status.success());
+        let config = std::fs::read_to_string(workspace.join(".git/config")).unwrap();
+        assert!(!config.contains("fsmonitor"), "{config}");
+    }
+
+    #[test]
+    fn project_environment_allowlist_can_only_narrow() {
+        let root = tempfile::tempdir().unwrap();
+        let global = SandboxSettings {
+            environment: Some(SandboxEnvironmentSettings {
+                allow: vec!["GITHUB_TOKEN".into(), "NPM_TOKEN".into()],
+            }),
+            ..Default::default()
+        };
+        let widen = SandboxSettings {
+            environment: Some(SandboxEnvironmentSettings {
+                allow: vec!["AWS_SECRET_ACCESS_KEY".into()],
+            }),
+            ..Default::default()
+        };
+        assert!(resolve_sandbox_settings(root.path(), Some(&global), Some(&widen), true)
+            .unwrap_err()
+            .contains("environment"));
+        let narrow = SandboxSettings {
+            environment: Some(SandboxEnvironmentSettings {
+                allow: vec!["NPM_TOKEN".into()],
+            }),
+            ..Default::default()
+        };
+        let spec = resolve_sandbox_settings(root.path(), Some(&global), Some(&narrow), true)
+            .unwrap()
+            .unwrap();
+        assert_eq!(spec.environment.allow, vec!["NPM_TOKEN".to_string()]);
     }
 
     #[test]

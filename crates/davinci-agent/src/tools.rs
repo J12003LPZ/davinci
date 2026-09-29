@@ -2034,6 +2034,93 @@ fn spawn_shell(
     Ok(child)
 }
 
+/// Resolves the shell for a sandboxed background command; see
+/// [`sandboxed_background`].
+fn sandboxed_background_shell(
+    cwd: &Path,
+    input: &serde_json::Value,
+    command: &str,
+    context: &ToolContext,
+) -> Result<ToolResult, ToolError> {
+    let custom = std::env::var("PI_SHELL")
+        .ok()
+        .filter(|value| !value.is_empty());
+    let shell = davinci_ai::resolve_shell_config(custom.as_deref()).map_err(ToolError::Failed)?;
+    let mut argv = shell.args;
+    let stdin = match shell.command_transport {
+        davinci_ai::CommandTransport::Argv => {
+            argv.push(command.to_string());
+            None
+        }
+        davinci_ai::CommandTransport::Stdin => Some(command.as_bytes()),
+    };
+    sandboxed_background(
+        cwd,
+        input,
+        ("shell", command),
+        (shell.shell.into(), argv, stdin),
+        context,
+    )
+}
+
+/// A background command under a sandbox policy: launched through the trusted
+/// supervisor with the sandboxed configuration, never as a direct host child,
+/// and registered as a supervised job.
+fn sandboxed_background(
+    cwd: &Path,
+    input: &serde_json::Value,
+    (tool, command): (&str, &str),
+    (executable, argv, stdin): (std::path::PathBuf, Vec<String>, Option<&[u8]>),
+    context: &ToolContext,
+) -> Result<ToolResult, ToolError> {
+    let sandbox = context.sandbox.as_ref().expect("caller checked the sandbox");
+    let Some(host) = &context.foreground_supervisor else {
+        return Err(ToolError::Failed(
+            "sandbox policy requires the trusted process supervisor; direct host background spawn denied"
+                .into(),
+        ));
+    };
+    if !sandbox.process.allow_background {
+        return Err(ToolError::Failed(
+            "sandbox policy does not permit background processes".into(),
+        ));
+    }
+    let config = foreground::process_config(cwd, executable, argv, context)?.as_background();
+    let operation = admit_background_operation(context, tool, command)?;
+    if let Some(operation) = operation.as_ref() {
+        if let Some(result) = reject_existing_background_operation(operation)? {
+            return Ok(result);
+        }
+    }
+    let launch = || -> Result<crate::jobs::SupervisedLaunch, ToolError> {
+        let launch = crate::jobs::SupervisedLaunch::spawn(host, config.clone())
+            .map_err(ToolError::Failed)?;
+        if let Some(bytes) = stdin {
+            launch.write_stdin(bytes).map_err(ToolError::Failed)?;
+        }
+        Ok(launch)
+    };
+    let launch = match operation.as_ref() {
+        Some(operation) => operation
+            .begin(false, || Ok(()), launch)
+            .map_err(|error| ToolError::Failed(format!("background job dispatch failed: {error}")))??,
+        None => launch()?,
+    };
+    let shown = required_str(input, "command")?;
+    let pid = launch.pid();
+    let id = context
+        .jobs
+        .lock()
+        .unwrap_or_else(|err| err.into_inner())
+        .register_supervised(
+            shown,
+            launch,
+            context.runtime.as_ref().map(|runtime| runtime.agent_id),
+            operation,
+        );
+    Ok(crate::jobs::started_result(id, pid, shown))
+}
+
 fn shell_tool(
     cwd: &Path,
     input: &serde_json::Value,
@@ -2048,10 +2135,7 @@ fn shell_tool(
     let background = wants_background(input);
     let started_at_ms = crate::command_receipt::now();
     if background && context.sandbox.is_some() {
-        return Err(ToolError::Failed(
-            "sandbox policy requires supervised background execution; direct host background spawn denied"
-                .into(),
-        ));
+        return sandboxed_background_shell(cwd, input, &command, context);
     }
     if background {
         let operation = admit_background_operation(context, "shell", &command)?;
@@ -2397,10 +2481,22 @@ fn powershell_tool(
     let wrapped = format!("{POWERSHELL_UTF8_PREFIX}{command}");
     let background = wants_background(input);
     if background && context.sandbox.is_some() {
-        return Err(ToolError::Failed(
-            "sandbox policy requires supervised background execution; direct host background spawn denied"
-                .into(),
-        ));
+        return sandboxed_background(
+            cwd,
+            input,
+            ("powershell", command),
+            (
+                resolve_powershell_executable(cwd)?,
+                vec![
+                    "-NoProfile".into(),
+                    "-NonInteractive".into(),
+                    "-Command".into(),
+                    wrapped,
+                ],
+                None,
+            ),
+            context,
+        );
     }
     if !background && context.sandbox.is_some() && context.foreground_supervisor.is_none() {
         return Err(ToolError::Failed(
@@ -5202,6 +5298,52 @@ mod sandbox_process_fail_closed_tests {
                 && error.to_string().contains("supervisor"),
             "{error}"
         );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn sandboxed_background_command_runs_as_a_supervised_job() {
+        let root = tempfile::tempdir().unwrap();
+        let mut spec = sandbox(root.path());
+        spec.process.allow_background = true;
+        let context = ToolContext {
+            sandbox: Some(spec),
+            foreground_supervisor: Some(crate::jobs::supervisor::SupervisorCommand {
+                executable: std::env::current_exe().unwrap(),
+                argv: vec![
+                    "--exact".into(),
+                    "tools::foreground::tests::foreground_supervisor_fixture".into(),
+                    "--nocapture".into(),
+                ],
+            }),
+            ..Default::default()
+        };
+        let started = execute_tool_with(
+            root.path(),
+            "exec_command",
+            &serde_json::json!({
+                "command": "printf supervised-background; exit 3",
+                "background": true
+            }),
+            &context,
+        )
+        .unwrap();
+        let id = started.details.as_ref().unwrap()["jobId"].as_u64().unwrap();
+        let output = execute_tool_with(
+            root.path(),
+            "job_output",
+            &serde_json::json!({"jobId": id, "wait": 10}),
+            &context,
+        )
+        .unwrap();
+        assert!(
+            output.content.contains("supervised-background"),
+            "{}",
+            output.content
+        );
+        let job_book = context.jobs.lock().unwrap();
+        let job = job_book.get(id as u32).unwrap();
+        assert_eq!(job.status(), crate::jobs::JobStatus::Exited(3));
     }
 
     #[test]

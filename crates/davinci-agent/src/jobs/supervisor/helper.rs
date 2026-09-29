@@ -56,8 +56,6 @@ pub(super) fn run() -> ! {
 }
 
 fn run_owned() -> std::io::Result<()> {
-    let expected_token = std::env::var("DAVINCI_INTERNAL_SANDBOX_TOKEN")
-        .map_err(|_| std::io::Error::new(std::io::ErrorKind::PermissionDenied, "missing supervisor token"))?;
     let mut output = std::io::stdout();
     output.write_all(wire::MAGIC)?;
     wire::write(
@@ -67,23 +65,11 @@ fn run_owned() -> std::io::Result<()> {
         },
     )?;
     let mut input = std::io::stdin();
-    let Request::Configure {
-        token,
-        identity,
-        config,
-    } = wire::read(&mut input)? else {
+    // Only the parent holds this helper's stdin pipe, so the channel itself
+    // authenticates the frames.
+    let Request::Configure { identity, config } = wire::read(&mut input)? else {
         return Ok(());
     };
-    if token != expected_token {
-        wire::write(
-            &mut output,
-            &Event::LaunchFailed {
-                identity,
-                message: "supervisor authentication failed".into(),
-            },
-        )?;
-        return Ok(());
-    }
     if identity.operation != config.operation {
         wire::write(
             &mut output,
@@ -94,7 +80,7 @@ fn run_owned() -> std::io::Result<()> {
         )?;
         return Ok(());
     }
-    let spawned = match spawn(config) {
+    let spawned = match spawn(config, &identity) {
         Ok(spawned) => spawned,
         Err(error) => {
             wire::write(
@@ -154,8 +140,7 @@ fn run_owned() -> std::io::Result<()> {
         let events = events.clone();
         let identity = identity.clone();
         let budget = Arc::clone(&output_budget);
-        let stop = Arc::clone(&stopped);
-        thread::spawn(move || forward_output(pipe, &events, &identity, stderr, &budget, &stop))
+        thread::spawn(move || forward_output(pipe, &events, &identity, stderr, &budget))
     })
     .collect();
     let (writes, write_rx) = mpsc::sync_channel::<(u64, Option<Vec<u8>>)>(1);
@@ -196,21 +181,15 @@ fn run_owned() -> std::io::Result<()> {
     let input_stop = stopped.clone();
     let input_events = events.clone();
     let input_identity = identity.clone();
-    let input_token = expected_token.clone();
     thread::spawn(move || {
         while let Ok(request) = wire::read(&mut input) {
             let (request_identity, id, bytes) = match request {
                 Request::Write {
-                    token,
                     identity,
                     id,
                     bytes,
-                } if token == input_token && bytes.len() <= MAX_INPUT => (identity, id, Some(bytes)),
-                Request::CloseStdin {
-                    token,
-                    identity,
-                    id,
-                } if token == input_token => (identity, id, None),
+                } if bytes.len() <= MAX_INPUT => (identity, id, Some(bytes)),
+                Request::CloseStdin { identity, id } => (identity, id, None),
                 _ => break,
             };
             if request_identity != input_identity {
@@ -268,11 +247,17 @@ fn forward_output(
     identity: &super::ProcessIdentity,
     stderr: bool,
     budget: &OutputBudget,
-    stopped: &AtomicBool,
 ) -> std::io::Result<()> {
     let mut bytes = [0; 8192];
+    let mut truncated = false;
     loop {
         let count = match pipe.read(&mut bytes) {
+            Ok(0) if truncated => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    "sandbox output limit exceeded; output truncated",
+                ))
+            }
             Ok(0) => return Ok(()),
             Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
             Err(error) => return Err(error),
@@ -294,17 +279,10 @@ fn forward_output(
             return Err(std::io::ErrorKind::BrokenPipe.into());
         }
         if allowed != count {
-            let _ = events.try_send((
-                Event::Failed {
-                    identity: identity.clone(),
-                },
-                None,
-            ));
-            stopped.store(true, Ordering::SeqCst);
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                "sandbox output limit exceeded",
-            ));
+            // Past the ceiling: keep draining so the command is not blocked
+            // on a full pipe, forward nothing more, and report the capture as
+            // incomplete. Truncation is not a command failure.
+            truncated = true;
         }
     }
 }
@@ -325,12 +303,15 @@ struct Spawned {
     max_lifetime_ms: Option<u64>,
 }
 
-fn spawn(config: ProcessConfig) -> Result<Spawned, String> {
+fn spawn(config: ProcessConfig, identity: &super::ProcessIdentity) -> Result<Spawned, String> {
+    // A service (an MCP server) lives as long as its session and frames its
+    // own output; a cumulative output budget or lifetime would kill it midway.
     let max_output_bytes = config
         .sandbox
         .as_ref()
+        .filter(|_| !config.service)
         .and_then(|spec| spec.resources.max_output_bytes);
-    let max_lifetime_ms = config.sandbox.as_ref().and_then(|spec| {
+    let max_lifetime_ms = config.sandbox.as_ref().filter(|_| !config.service).and_then(|spec| {
         if config.background {
             spec.process.max_background_lifetime_ms
         } else {
@@ -338,7 +319,7 @@ fn spawn(config: ProcessConfig) -> Result<Spawned, String> {
         }
     });
     #[cfg(unix)]
-    let resource_policy = config.sandbox.as_ref().map(|spec| spec.resources.clone());
+    let mut resource_policy = config.sandbox.as_ref().map(|spec| spec.resources.clone());
     let (executable, argv, cwd, environment, sandbox) =
         if let Some(spec) = config.sandbox.as_ref() {
             let request = ExecutionRequest {
@@ -354,10 +335,17 @@ fn spawn(config: ProcessConfig) -> Result<Spawned, String> {
                     .to_str()
                     .ok_or("sandbox cwd is not UTF-8")?
                     .to_string(),
+                launch_id: Some(identity.lifetime.simple().to_string()),
             };
             let prepared = SandboxBroker
                 .prepare(spec, &request, &config.environment)
                 .map_err(|error| error.to_string())?;
+            #[cfg(unix)]
+            if prepared.backend == davinci_protocol::SandboxBackendKind::Container {
+                // The container runtime enforces the limits inside the
+                // container; rlimits here would only constrain its CLI.
+                resource_policy = None;
+            }
             let receipt = SandboxReceipt {
                 sandbox_id: prepared.sandbox_id.clone(),
                 spec_digest: prepared.spec_digest.clone(),
@@ -447,8 +435,11 @@ fn apply_unix_resource_limits(policy: &ResourcePolicy) -> std::io::Result<()> {
         }};
     }
 
+    // RLIMIT_DATA, not RLIMIT_AS: Node, the JVM and Go reserve far more
+    // address space than they use and fail outright under an address-space
+    // cap. These limits apply per process, not to the whole tree.
     if let Some(bytes) = policy.max_memory_bytes {
-        set_limit!(libc::RLIMIT_AS, bytes, "memory");
+        set_limit!(libc::RLIMIT_DATA, bytes, "memory");
     }
     if let Some(milliseconds) = policy.cpu_time_ms {
         let seconds = milliseconds.saturating_add(999) / 1000;
@@ -566,14 +557,12 @@ mod tests {
         let (events, _receiver) = mpsc::sync_channel(2);
         let identity = super::super::ProcessIdentity::new(None);
         let budget = OutputBudget::new(None);
-        let stopped = AtomicBool::new(false);
         let result = forward_output(
             InterruptedThenData(false),
             &events,
             &identity,
             false,
             &budget,
-            &stopped,
         );
         assert_eq!(result.unwrap_err().kind(), std::io::ErrorKind::Other);
     }
@@ -584,14 +573,12 @@ mod tests {
         drop(receiver);
         let identity = super::super::ProcessIdentity::new(None);
         let budget = OutputBudget::new(None);
-        let stopped = AtomicBool::new(false);
         assert!(forward_output(
             &b"output"[..],
             &events,
             &identity,
             false,
             &budget,
-            &stopped,
         )
         .is_err());
     }
@@ -640,6 +627,20 @@ mod tests {
         };
         assert_eq!(lifetime(&foreground), Some(1000));
         assert_eq!(lifetime(&background), Some(5000));
+    }
+
+    #[test]
+    fn output_past_the_budget_is_truncated_not_a_command_failure() {
+        let (events, receiver) = mpsc::sync_channel(8);
+        let identity = super::super::ProcessIdentity::new(None);
+        let budget = OutputBudget::new(Some(3));
+        let error = forward_output(&b"abcdef"[..], &events, &identity, false, &budget)
+            .unwrap_err();
+        assert!(error.to_string().contains("truncated"), "{error}");
+        drop(events);
+        let events: Vec<_> = receiver.into_iter().map(|(event, _)| event).collect();
+        assert_eq!(events.len(), 1, "only the allowed bytes are forwarded");
+        assert!(matches!(&events[0], Event::Output { bytes, .. } if bytes == b"abc"));
     }
 
     #[test]

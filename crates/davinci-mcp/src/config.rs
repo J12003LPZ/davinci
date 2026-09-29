@@ -105,7 +105,7 @@ impl ServerConfig {
 
 /// `${NAME}` becomes the parent's value of NAME (empty when unset). A bare
 /// `$NAME` is left alone, so values that legitimately contain `$` survive.
-fn expand_env(value: &str, lookup: impl Fn(&str) -> Option<String>) -> String {
+pub fn expand_env(value: &str, lookup: impl Fn(&str) -> Option<String>) -> String {
     let mut out = String::with_capacity(value.len());
     let mut rest = value;
     while let Some(start) = rest.find("${") {

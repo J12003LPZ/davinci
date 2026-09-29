@@ -211,6 +211,12 @@ impl SandboxBackend for LinuxBubblewrapBackend {
                 MountAccess::Hidden => {}
             }
         }
+        // After the writable workspace bind, so these read-only binds sit on top.
+        for path in protected_workspace_paths(spec) {
+            argv.push("--ro-bind".into());
+            argv.push(path.clone());
+            argv.push(path);
+        }
 
         // The executor helper already starts this wrapper with env_clear()
         // and exactly the sanitized environment. Let bubblewrap inherit it;
@@ -253,10 +259,12 @@ impl ContainerBackend {
         Self { executable }
     }
 
-    fn container_name(spec: &SandboxSpec) -> String {
-        let suffix = spec
-            .id
-            .0
+    fn container_name(spec: &SandboxSpec, launch_id: Option<&str>) -> String {
+        let raw = match launch_id {
+            Some(launch) => format!("{}-{launch}", spec.id.0),
+            None => spec.id.0.clone(),
+        };
+        let suffix = raw
             .chars()
             .map(|ch| {
                 if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.') {
@@ -322,7 +330,7 @@ impl SandboxBackend for ContainerBackend {
         let mut argv = vec![
             "run".into(),
             "--name".into(),
-            Self::container_name(spec),
+            Self::container_name(spec, request.launch_id.as_deref()),
             "--rm".into(),
             "--init".into(),
             "--read-only".into(),
@@ -358,6 +366,18 @@ impl SandboxBackend for ContainerBackend {
                 }
                 MountAccess::Hidden => {}
             }
+        }
+        for path in protected_workspace_paths(spec) {
+            if path.contains(',') {
+                return Err(SandboxFailure::new(
+                    SandboxErrorCode::FilesystemDenied,
+                    "container mount paths containing commas are unsupported",
+                ));
+            }
+            argv.extend([
+                "--mount".into(),
+                format!("type=bind,src={path},dst={path},readonly"),
+            ]);
         }
 
         for name in environment.keys() {
@@ -402,7 +422,10 @@ impl SandboxBackend for ContainerBackend {
     }
 }
 
-pub fn container_cleanup_plan(spec: &SandboxSpec) -> Option<ContainerCleanupPlan> {
+pub fn container_cleanup_plan(
+    spec: &SandboxSpec,
+    launch_id: Option<&str>,
+) -> Option<ContainerCleanupPlan> {
     if spec.backend != SandboxBackendKind::Container
         && !(spec.backend == SandboxBackendKind::Auto && spec.container.is_some())
     {
@@ -412,7 +435,7 @@ pub fn container_cleanup_plan(spec: &SandboxSpec) -> Option<ContainerCleanupPlan
     let runtime = resolve_container_runtime(container.runtime, Path::new(&spec.workspace))?;
     Some(ContainerCleanupPlan {
         executable: runtime,
-        name: ContainerBackend::container_name(spec),
+        name: ContainerBackend::container_name(spec, launch_id),
     })
 }
 
@@ -789,10 +812,52 @@ pub fn rebind_worker_spec(
     let mut child = parent.clone();
     child.id = child_id;
     child.mode = mode;
-    child.workspace = child_workspace;
+    child.workspace = child_workspace.clone();
     child.filesystem.mounts = mounts;
     child.validate()?;
-    Ok(child)
+
+    // Defense in depth: the delegated spec must be no wider than the parent
+    // with its workspace moved to the worker's, on every dimension.
+    let mut ceiling = parent.clone();
+    ceiling.id = child.id.clone();
+    ceiling.workspace = child_workspace.clone();
+    for mount in &mut ceiling.filesystem.mounts {
+        if mount.source.as_deref() == Some(parent.workspace.as_str())
+            && mount.target == parent.workspace
+        {
+            mount.source = Some(child_workspace.clone());
+            mount.target = child_workspace.clone();
+        }
+    }
+    attenuate_child_spec(&ceiling, &child)
+}
+
+/// Workspace paths a sandboxed process must not modify even when the
+/// workspace itself is writable, because the host later acts on them outside
+/// the sandbox: `.git` (config such as `core.fsmonitor`, hooks and filters run
+/// when Davinci or the user runs `git`) and project configuration (`.davinci`,
+/// `.pi`: hooks, MCP servers, extensions, settings). Evaluated per launch, so
+/// a repository created by an earlier command is protected from then on.
+pub fn protected_workspace_paths(spec: &SandboxSpec) -> Vec<String> {
+    if spec.mode != SandboxMode::WorkspaceWrite {
+        return Vec::new();
+    }
+    let workspace = Path::new(&spec.workspace);
+    [".git", ".davinci", ".pi"]
+        .into_iter()
+        .filter_map(|name| {
+            let path = workspace.join(name);
+            // A symlink would bind its target, not the link; the link itself
+            // stays replaceable, so refuse to guess and protect only real
+            // entries (a symlinked `.git` pointing outside the workspace is
+            // not mounted at all).
+            let metadata = std::fs::symlink_metadata(&path).ok()?;
+            if metadata.file_type().is_symlink() {
+                return None;
+            }
+            path.to_str().map(str::to_string)
+        })
+        .collect()
 }
 
 pub fn sandbox_spec_digest(spec: &SandboxSpec) -> Result<String, SandboxFailure> {
@@ -1007,6 +1072,54 @@ mod tests {
     }
 
     #[test]
+    fn workspace_write_keeps_git_and_project_config_read_only() {
+        let root = tempfile::tempdir().unwrap();
+        let workspace = root.path().canonicalize().unwrap();
+        std::fs::create_dir(workspace.join(".git")).unwrap();
+        std::fs::create_dir(workspace.join(".davinci")).unwrap();
+        let mut spec = spec(SandboxMode::WorkspaceWrite, NetworkPolicy::Denied);
+        spec.workspace = workspace.to_string_lossy().into_owned();
+        spec.filesystem.mounts[0].source = Some(spec.workspace.clone());
+        spec.filesystem.mounts[0].target = spec.workspace.clone();
+        let argv = LinuxBubblewrapBackend::new(PathBuf::from("/usr/bin/bwrap"))
+            .prepare(&spec, &request(&spec), &BTreeMap::new())
+            .unwrap()
+            .argv;
+        let position = |args: [String; 3]| argv.windows(3).position(|window| window == args);
+        let git = workspace.join(".git").to_string_lossy().into_owned();
+        let config = workspace.join(".davinci").to_string_lossy().into_owned();
+        let bind = position(["--bind".into(), spec.workspace.clone(), spec.workspace.clone()])
+            .expect("workspace bind");
+        let git_bind = position(["--ro-bind".into(), git.clone(), git]).expect("read-only .git");
+        assert!(git_bind > bind, "the read-only bind must sit on top of the workspace");
+        assert!(position(["--ro-bind".into(), config.clone(), config]).is_some());
+
+        // Read-only mode has nothing writable to protect.
+        spec.mode = SandboxMode::Restricted;
+        assert!(protected_workspace_paths(&spec).is_empty());
+    }
+
+    #[test]
+    fn container_names_are_unique_per_launch() {
+        let mut spec = spec(SandboxMode::WorkspaceWrite, NetworkPolicy::Denied);
+        spec.backend = SandboxBackendKind::Container;
+        spec.container = Some(davinci_protocol::ContainerPolicy {
+            runtime: ContainerRuntime::Docker,
+            image: "example/image".into(),
+        });
+        let backend = ContainerBackend::new(PathBuf::from("/usr/bin/docker"));
+        let name = |launch: &str| {
+            let mut request = request(&spec);
+            request.launch_id = Some(launch.into());
+            let argv = backend.prepare(&spec, &request, &BTreeMap::new()).unwrap().argv;
+            let at = argv.iter().position(|arg| arg == "--name").unwrap();
+            argv[at + 1].clone()
+        };
+        assert_ne!(name("a"), name("b"));
+        assert_eq!(name("a"), ContainerBackend::container_name(&spec, Some("a")));
+    }
+
+    #[test]
     fn bubblewrap_does_not_claim_domain_allowlisting() {
         let backend = LinuxBubblewrapBackend::new(PathBuf::from("/usr/bin/bwrap"));
         let mut spec = spec(
@@ -1043,6 +1156,7 @@ mod tests {
             },
             argv: vec!["-c".into(), "true".into()],
             cwd: spec.workspace.clone(),
+            launch_id: None,
         }
     }
 

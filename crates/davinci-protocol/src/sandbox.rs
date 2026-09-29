@@ -374,6 +374,11 @@ pub struct ExecutionRequest {
     #[serde(default)]
     pub argv: Vec<String>,
     pub cwd: String,
+    /// Unique per launch. Backends that name host-visible resources (a
+    /// container) derive the name from it so concurrent launches under one
+    /// sandbox policy never collide or tear each other down.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub launch_id: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

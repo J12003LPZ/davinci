@@ -23,7 +23,6 @@ struct State {
 }
 
 struct Control {
-    token: String,
     stop: AtomicBool,
     state: Mutex<State>,
     changed: Condvar,
@@ -94,11 +93,11 @@ impl Supervisor {
                 "process configuration exceeds 64 KiB",
             ));
         }
+        let launch_id = identity.lifetime.simple().to_string();
         let container_cleanup = config
             .sandbox
             .as_ref()
-            .and_then(crate::sandbox::container_cleanup_plan);
-        let token = uuid::Uuid::new_v4().to_string();
+            .and_then(|spec| crate::sandbox::container_cleanup_plan(spec, Some(&launch_id)));
         let mut command = Command::new(&host.executable);
         command.args(&host.argv).env_clear();
         // The trusted helper needs platform paths, never credentials or loader
@@ -110,7 +109,6 @@ impl Supervisor {
         }
         command
             .env("DAVINCI_INTERNAL_PROCESS_SUPERVISOR", "1")
-            .env("DAVINCI_INTERNAL_SANDBOX_TOKEN", &token)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null());
@@ -155,7 +153,6 @@ impl Supervisor {
         }
         let (input, input_rx) = mpsc::sync_channel(2);
         let control = Arc::new(Control {
-            token: token.clone(),
             stop: AtomicBool::new(false),
             state: Mutex::new(State::default()),
             changed: Condvar::new(),
@@ -200,7 +197,6 @@ impl Supervisor {
             .control
             .input
             .try_send(Request::Configure {
-                token,
                 identity: identity.clone(),
                 config: config.clone(),
             })
@@ -283,13 +279,11 @@ impl Supervisor {
             .input
             .try_send(match bytes {
                 Some(bytes) => Request::Write {
-                    token: self.control.token.clone(),
                     identity: self.identity.clone(),
                     id,
                     bytes: bytes.to_vec(),
                 },
                 None => Request::CloseStdin {
-                    token: self.control.token.clone(),
                     identity: self.identity.clone(),
                     id,
                 },

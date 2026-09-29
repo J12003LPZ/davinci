@@ -12,18 +12,15 @@ pub(super) const POLL: std::time::Duration = std::time::Duration::from_millis(20
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub(super) enum Request {
     Configure {
-        token: String,
         identity: ProcessIdentity,
         config: ProcessConfig,
     },
     Write {
-        token: String,
         identity: ProcessIdentity,
         id: u64,
         bytes: Vec<u8>,
     },
     CloseStdin {
-        token: String,
         identity: ProcessIdentity,
         id: u64,
     },
