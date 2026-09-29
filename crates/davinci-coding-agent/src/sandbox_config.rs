@@ -139,8 +139,15 @@ pub fn resolve_sandbox_settings(
         environment,
         resources,
         process: ProcessPolicy {
-            allow_background: mode == SandboxMode::FullAccess,
-            max_background_lifetime_ms: None,
+            // Managed processes remain available, but ownership and teardown
+            // stay with the existing session supervisor. The manager can apply
+            // the lifetime bound independently of foreground command timeout.
+            allow_background: mode != SandboxMode::NoExecution,
+            max_background_lifetime_ms: if mode == SandboxMode::FullAccess {
+                None
+            } else {
+                Some(30 * 60 * 1000)
+            },
         },
         required_capabilities: required,
     }))
