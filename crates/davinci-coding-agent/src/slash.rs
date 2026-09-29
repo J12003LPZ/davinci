@@ -82,6 +82,7 @@ pub fn builtin_slash_commands() -> Vec<SlashCommand> {
         ("mcp", "Connected MCP servers, tools and errors", None),
         ("cost", "Tokens and USD spent this session", None),
         ("status", "Model, permission, jobs, MCP, tokens", None),
+        ("sandbox-status", "Execution sandbox policy and enforcement status", None),
         (
             "permissions",
             "Choose Manual, Accept Edits, Plan Mode, Auto Mode, or Always Approve",
@@ -165,6 +166,7 @@ pub enum SlashAction {
     Mcp,
     ShowCost,
     ShowStatus,
+    ShowSandboxStatus,
     /// `/context`: the window by category; `/context inspect` opens the
     /// prepared-manifest inspector.
     Context(String),
@@ -252,6 +254,7 @@ pub fn parse_line(line: &str) -> SlashAction {
         "mcp" => SlashAction::Mcp,
         "cost" => SlashAction::ShowCost,
         "status" => SlashAction::ShowStatus,
+        "sandbox-status" => SlashAction::ShowSandboxStatus,
         "context" => SlashAction::Context(args.to_string()),
         "workflow" | "workflows" => SlashAction::Workflow(args.to_string()),
         "agents" => SlashAction::Agents(args.to_string()),
@@ -406,6 +409,19 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn sandbox_status_is_separate_from_permission_status() {
+        assert!(builtin_slash_commands()
+            .iter()
+            .any(|command| command.name == "sandbox-status"));
+        assert_eq!(parse_line("/sandbox-status"), SlashAction::ShowSandboxStatus);
+        assert_eq!(
+            parse_line("/sandbox"),
+            SlashAction::Prompt("/sandbox".into()),
+            "the historical permission CLI alias must not become a slash-level OS sandbox claim"
+        );
     }
 
     #[test]
