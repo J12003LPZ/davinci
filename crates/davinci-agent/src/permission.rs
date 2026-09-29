@@ -832,25 +832,27 @@ impl FilesystemBoundaryPolicy {
         }
     }
 
-    /// The active extra root that lexically contains the absolute `target`.
+    /// The active extra root that contains the absolute `target`. Compare
+    /// filesystem identities rather than raw spellings so Windows short-path
+    /// aliases and case differences cannot turn an allowed root into an
+    /// apparent outside path.
     pub fn extra_root_containing(&self, target: &Path) -> Option<&Path> {
-        let target = strip_verbatim_prefix(&normalize_lexically(target));
+        let target = boundary_path_identity(target);
         self.active_extra_roots()
             .iter()
             .map(PathBuf::as_path)
-            .find(|root| target.starts_with(strip_verbatim_prefix(&normalize_lexically(root))))
+            .find(|root| target.starts_with(boundary_path_identity(root)))
     }
 
     /// The root whose symlink checks apply to the absolute `target`: the
-    /// primary root, unless the path is lexically outside it and inside an
-    /// extra root.
+    /// primary root, unless the path is outside it and inside an extra root.
     pub fn boundary_root_for<'a>(&'a self, cwd: &'a Path, target: &Path) -> &'a Path {
         let root = self.root.as_deref().unwrap_or(cwd);
-        let normalized = strip_verbatim_prefix(&normalize_lexically(target));
-        if normalized.starts_with(strip_verbatim_prefix(&normalize_lexically(root))) {
+        let target = boundary_path_identity(target);
+        if target.starts_with(boundary_path_identity(root)) {
             return root;
         }
-        self.extra_root_containing(target).unwrap_or(root)
+        self.extra_root_containing(target.as_path()).unwrap_or(root)
     }
 }
 
@@ -1759,11 +1761,38 @@ pub fn is_git_metadata_path(path: &Path, repo_root: Option<&Path>, root: Option<
         && normalized.components().any(|c| c.as_os_str() == ".git")
 }
 
+/// Resolve a path to the identity of its nearest existing ancestor, then
+/// reattach any non-existent suffix. This preserves checks for new files while
+/// normalizing symlinked parents and Windows short/case aliases. Normalize only
+/// after resolving the existing prefix so parent traversals cannot hide a
+/// symlink escape.
+fn boundary_path_identity(path: &Path) -> PathBuf {
+    let mut ancestor = path;
+    let mut suffix = Vec::new();
+    loop {
+        if let Ok(mut identity) = std::fs::canonicalize(ancestor) {
+            for name in suffix.into_iter().rev() {
+                identity.push(name);
+            }
+            return strip_verbatim_prefix(&normalize_lexically(&identity));
+        }
+        let Some(name) = ancestor.file_name() else {
+            break;
+        };
+        suffix.push(name.to_os_string());
+        let Some(parent) = ancestor.parent() else {
+            break;
+        };
+        ancestor = parent;
+    }
+    strip_verbatim_prefix(&normalize_lexically(path))
+}
+
 /// Check whether `target` escapes `root` either lexically or via symlinks.
 /// Returns `(outside_lexical, symlink_escape)`.
 pub fn check_path_boundary(root: &Path, target: &Path) -> (bool, bool) {
-    let norm_root = strip_verbatim_prefix(&normalize_lexically(root));
-    let norm_target = strip_verbatim_prefix(&normalize_lexically(target));
+    let norm_root = boundary_path_identity(root);
+    let norm_target = boundary_path_identity(target);
 
     // 1. Lexical check
     let outside_lexical = !norm_target.starts_with(&norm_root);
