@@ -358,3 +358,66 @@ fn sandbox_policy_is_bound_into_process_evidence_without_secret_values() {
     assert!(serialized.contains("host"));
     assert!(!serialized.contains("receipt-must-not-contain-this"));
 }
+
+
+#[test]
+fn effective_sandbox_receipt_is_bound_to_process_evidence() {
+    use davinci_protocol::{
+        EnvironmentPolicy, FilesystemPolicy, NetworkPolicy, ProcessPolicy, ResourcePolicy,
+        SandboxBackendKind, SandboxCapabilities, SandboxId, SandboxMode, SandboxSpec,
+    };
+
+    let fixture = Fixture::new();
+    let spec = SandboxSpec {
+        id: SandboxId("sandbox-effective".into()),
+        mode: SandboxMode::FullAccess,
+        backend: SandboxBackendKind::Host,
+        workspace: fixture.workspace.to_string_lossy().into_owned(),
+        filesystem: FilesystemPolicy::default(),
+        network: NetworkPolicy::Unrestricted,
+        environment: EnvironmentPolicy::default(),
+        resources: ResourcePolicy::default(),
+        process: ProcessPolicy::default(),
+        required_capabilities: SandboxCapabilities {
+            environment_isolation: true,
+            process_tree_isolation: true,
+            deterministic_teardown: true,
+            ..Default::default()
+        },
+    };
+    let config = config(
+        std::env::current_exe().unwrap(),
+        vec![
+            "--exact".into(),
+            "operation_process_child_fixture".into(),
+            "--nocapture".into(),
+        ],
+        &fixture.workspace,
+    )
+    .with_sandbox(spec);
+    let evidence_config = config.clone();
+    let process = Supervisor::spawn(
+        &supervisor_host("operation_process_supervisor_fixture"),
+        config,
+        Arc::new(|_| {}),
+    )
+    .unwrap();
+    let exit = process.wait(std::time::Duration::from_secs(5)).unwrap();
+    let effective = exit
+        .sandbox
+        .clone()
+        .expect("sandboxed launch must report effective executor receipt");
+    assert_eq!(effective.backend, SandboxBackendKind::Host);
+
+    let evidence = evidence_config
+        .execution_evidence(
+            exit.identity,
+            exit.launch_state,
+            exit.code,
+            Some(exit.output_complete),
+        )
+        .with_effective_sandbox(exit.sandbox)
+        .expect("effective receipt must match the requested sandbox identity");
+    let sandbox = evidence.sandbox.expect("requested sandbox evidence");
+    assert_eq!(sandbox.effective, Some(effective));
+}
