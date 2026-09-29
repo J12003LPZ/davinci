@@ -3,6 +3,8 @@ use super::{
     wire::{self, Event, Request, MAX_INPUT, POLL},
     ProcessConfig,
 };
+use crate::sandbox::{SandboxBackend, SandboxBroker};
+use davinci_protocol::{ExecutionRequest, SandboxLifecycle, SandboxReceipt};
 use std::{
     io::{Read, Write},
     process::{Command, Stdio},
@@ -26,6 +28,8 @@ pub(super) fn run() -> ! {
 }
 
 fn run_owned() -> std::io::Result<()> {
+    let expected_token = std::env::var("DAVINCI_INTERNAL_SANDBOX_TOKEN")
+        .map_err(|_| std::io::Error::new(std::io::ErrorKind::PermissionDenied, "missing supervisor token"))?;
     let mut output = std::io::stdout();
     output.write_all(wire::MAGIC)?;
     wire::write(
@@ -35,9 +39,23 @@ fn run_owned() -> std::io::Result<()> {
         },
     )?;
     let mut input = std::io::stdin();
-    let Request::Configure { identity, config } = wire::read(&mut input)? else {
+    let Request::Configure {
+        token,
+        identity,
+        config,
+    } = wire::read(&mut input)? else {
         return Ok(());
     };
+    if token != expected_token {
+        wire::write(
+            &mut output,
+            &Event::LaunchFailed {
+                identity,
+                message: "supervisor authentication failed".into(),
+            },
+        )?;
+        return Ok(());
+    }
     if identity.operation != config.operation {
         wire::write(
             &mut output,
@@ -48,8 +66,8 @@ fn run_owned() -> std::io::Result<()> {
         )?;
         return Ok(());
     }
-    let mut child = match spawn(config) {
-        Ok(child) => child,
+    let mut spawned = match spawn(config) {
+        Ok(spawned) => spawned,
         Err(error) => {
             wire::write(
                 &mut output,
@@ -61,11 +79,14 @@ fn run_owned() -> std::io::Result<()> {
             return Ok(());
         }
     };
+    let sandbox_receipt = spawned.sandbox.clone();
+    let mut child = spawned.child;
     wire::write(
         &mut output,
         &Event::Started {
             identity: identity.clone(),
             pid: child.id(),
+            sandbox: sandbox_receipt,
         },
     )?;
 
@@ -141,15 +162,21 @@ fn run_owned() -> std::io::Result<()> {
     let input_stop = stopped.clone();
     let input_events = events.clone();
     let input_identity = identity.clone();
+    let input_token = expected_token.clone();
     thread::spawn(move || {
         while let Ok(request) = wire::read(&mut input) {
             let (request_identity, id, bytes) = match request {
                 Request::Write {
+                    token,
                     identity,
                     id,
                     bytes,
-                } if bytes.len() <= MAX_INPUT => (identity, id, Some(bytes)),
-                Request::CloseStdin { identity, id } => (identity, id, None),
+                } if token == input_token && bytes.len() <= MAX_INPUT => (identity, id, Some(bytes)),
+                Request::CloseStdin {
+                    token,
+                    identity,
+                    id,
+                } if token == input_token => (identity, id, None),
                 _ => break,
             };
             if request_identity != input_identity {
@@ -230,27 +257,77 @@ fn readers_complete(readers: Vec<thread::JoinHandle<std::io::Result<()>>>) -> bo
     complete
 }
 
-fn spawn(config: ProcessConfig) -> std::io::Result<std::process::Child> {
+struct Spawned {
+    child: std::process::Child,
+    sandbox: Option<SandboxReceipt>,
+}
+
+fn spawn(config: ProcessConfig) -> Result<Spawned, String> {
+    let (executable, argv, cwd, environment, sandbox) =
+        if let Some(spec) = config.sandbox.as_ref() {
+            let request = ExecutionRequest {
+                sandbox_id: spec.id.clone(),
+                executable: config
+                    .executable
+                    .to_str()
+                    .ok_or("sandbox executable path is not UTF-8")?
+                    .to_string(),
+                argv: config.argv.clone(),
+                cwd: config
+                    .cwd
+                    .to_str()
+                    .ok_or("sandbox cwd is not UTF-8")?
+                    .to_string(),
+            };
+            let prepared = SandboxBroker
+                .prepare(spec, &request, &config.environment)
+                .map_err(|error| error.to_string())?;
+            let receipt = SandboxReceipt {
+                sandbox_id: prepared.sandbox_id.clone(),
+                spec_digest: prepared.spec_digest.clone(),
+                backend: prepared.backend,
+                capabilities: prepared.capabilities,
+                lifecycle: SandboxLifecycle::Running,
+            };
+            (
+                prepared.executable,
+                prepared.argv,
+                prepared.cwd,
+                prepared.environment,
+                Some(receipt),
+            )
+        } else {
+            (
+                config.executable,
+                config.argv,
+                config.cwd,
+                config.environment,
+                None,
+            )
+        };
+
     #[cfg(windows)]
     let cwd = {
         // Node and other runtimes cannot resolve relative files from a verbatim
         // current directory. Preserve the authorized location: simplify only
         // when both spellings resolve to the same canonical directory.
-        let ordinary = crate::permission::strip_verbatim_prefix(&config.cwd);
-        if ordinary.canonicalize()? == config.cwd.canonicalize()? {
+        let ordinary = crate::permission::strip_verbatim_prefix(&cwd);
+        if ordinary
+            .canonicalize()
+            .map_err(|error| error.to_string())?
+            == cwd.canonicalize().map_err(|error| error.to_string())?
+        {
             ordinary
         } else {
-            config.cwd
+            cwd
         }
     };
-    #[cfg(not(windows))]
-    let cwd = config.cwd;
-    let mut command = Command::new(config.executable);
+    let mut command = Command::new(executable);
     command
-        .args(config.argv)
+        .args(argv)
         .current_dir(cwd)
         .env_clear()
-        .envs(config.environment)
+        .envs(environment)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
@@ -259,7 +336,8 @@ fn spawn(config: ProcessConfig) -> std::io::Result<std::process::Child> {
         use std::os::windows::process::CommandExt;
         command.creation_flags(0x08000000); // CREATE_NO_WINDOW
     }
-    command.spawn()
+    let child = command.spawn().map_err(|error| error.to_string())?;
+    Ok(Spawned { child, sandbox })
 }
 
 fn flush_exit(
