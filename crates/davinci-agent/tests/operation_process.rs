@@ -306,3 +306,55 @@ fn launch_failure_and_missing_ack_have_distinct_certainty() {
         "the child ran before the acknowledgement was lost"
     );
 }
+
+
+#[test]
+fn sandbox_policy_is_bound_into_process_evidence_without_secret_values() {
+    use davinci_protocol::{
+        EnvironmentPolicy, FilesystemPolicy, NetworkPolicy, ProcessPolicy, ResourcePolicy,
+        SandboxBackendKind, SandboxCapabilities, SandboxId, SandboxMode, SandboxSpec,
+    };
+
+    let fixture = Fixture::new();
+    let mut injected = BTreeMap::new();
+    injected.insert("SHORT_LIVED_TOKEN".into(), "receipt-must-not-contain-this".into());
+    let spec = SandboxSpec {
+        id: SandboxId("sandbox-evidence".into()),
+        mode: SandboxMode::FullAccess,
+        backend: SandboxBackendKind::Host,
+        workspace: fixture.workspace.to_string_lossy().into_owned(),
+        filesystem: FilesystemPolicy::default(),
+        network: NetworkPolicy::Unrestricted,
+        environment: EnvironmentPolicy {
+            allow: vec![],
+            inject: injected,
+        },
+        resources: ResourcePolicy::default(),
+        process: ProcessPolicy::default(),
+        required_capabilities: SandboxCapabilities {
+            environment_isolation: true,
+            process_tree_isolation: true,
+            deterministic_teardown: true,
+            ..Default::default()
+        },
+    };
+    let config = config(
+        std::env::current_exe().unwrap(),
+        vec![],
+        &fixture.workspace,
+    )
+    .with_sandbox(spec);
+    let evidence = config.execution_evidence(
+        davinci_agent::jobs::supervisor::ProcessIdentity {
+            operation: None,
+            lifetime: uuid::Uuid::new_v4(),
+        },
+        ProcessLaunchState::FailedBeforeChild,
+        None,
+        Some(false),
+    );
+    let serialized = serde_json::to_string(&evidence).unwrap();
+    assert!(serialized.contains("sandbox-evidence"));
+    assert!(serialized.contains("host"));
+    assert!(!serialized.contains("receipt-must-not-contain-this"));
+}
