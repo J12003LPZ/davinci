@@ -307,7 +307,6 @@ fn launch_failure_and_missing_ack_have_distinct_certainty() {
     );
 }
 
-
 #[test]
 fn sandbox_policy_is_bound_into_process_evidence_without_secret_values() {
     use davinci_protocol::{
@@ -317,7 +316,10 @@ fn sandbox_policy_is_bound_into_process_evidence_without_secret_values() {
 
     let fixture = Fixture::new();
     let mut injected = BTreeMap::new();
-    injected.insert("SHORT_LIVED_TOKEN".into(), "receipt-must-not-contain-this".into());
+    injected.insert(
+        "SHORT_LIVED_TOKEN".into(),
+        "receipt-must-not-contain-this".into(),
+    );
     let spec = SandboxSpec {
         id: SandboxId("sandbox-evidence".into()),
         mode: SandboxMode::FullAccess,
@@ -339,12 +341,8 @@ fn sandbox_policy_is_bound_into_process_evidence_without_secret_values() {
             ..Default::default()
         },
     };
-    let config = config(
-        std::env::current_exe().unwrap(),
-        vec![],
-        &fixture.workspace,
-    )
-    .with_sandbox(spec);
+    let config =
+        config(std::env::current_exe().unwrap(), vec![], &fixture.workspace).with_sandbox(spec);
     let evidence = config.execution_evidence(
         davinci_agent::jobs::supervisor::ProcessIdentity {
             operation: None,
@@ -359,7 +357,6 @@ fn sandbox_policy_is_bound_into_process_evidence_without_secret_values() {
     assert!(serialized.contains("host"));
     assert!(!serialized.contains("receipt-must-not-contain-this"));
 }
-
 
 #[test]
 fn effective_sandbox_receipt_is_bound_to_process_evidence() {

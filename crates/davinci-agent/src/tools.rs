@@ -2073,7 +2073,10 @@ fn sandboxed_background(
     (executable, argv, stdin): (std::path::PathBuf, Vec<String>, Option<&[u8]>),
     context: &ToolContext,
 ) -> Result<ToolResult, ToolError> {
-    let sandbox = context.sandbox.as_ref().expect("caller checked the sandbox");
+    let sandbox = context
+        .sandbox
+        .as_ref()
+        .expect("caller checked the sandbox");
     let Some(host) = &context.foreground_supervisor else {
         return Err(ToolError::Failed(
             "sandbox policy requires the trusted process supervisor; direct host background spawn denied"
@@ -2103,7 +2106,9 @@ fn sandboxed_background(
     let launch = match operation.as_ref() {
         Some(operation) => operation
             .begin(false, || Ok(()), launch)
-            .map_err(|error| ToolError::Failed(format!("background job dispatch failed: {error}")))??,
+            .map_err(|error| {
+                ToolError::Failed(format!("background job dispatch failed: {error}"))
+            })??,
         None => launch()?,
     };
     let shown = required_str(input, "command")?;
@@ -5253,7 +5258,6 @@ impl User {
     }
 }
 
-
 #[cfg(test)]
 mod sandbox_process_fail_closed_tests {
     use super::*;
@@ -5294,8 +5298,7 @@ mod sandbox_process_fail_closed_tests {
         )
         .unwrap_err();
         assert!(
-            error.to_string().contains("sandbox")
-                && error.to_string().contains("supervisor"),
+            error.to_string().contains("sandbox") && error.to_string().contains("supervisor"),
             "{error}"
         );
     }
@@ -5365,8 +5368,7 @@ mod sandbox_process_fail_closed_tests {
         )
         .unwrap_err();
         assert!(
-            error.to_string().contains("sandbox")
-                && error.to_string().contains("background"),
+            error.to_string().contains("sandbox") && error.to_string().contains("background"),
             "{error}"
         );
     }

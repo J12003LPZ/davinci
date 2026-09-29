@@ -233,9 +233,7 @@ pub(super) fn run(
         )
         .with_effective_sandbox(exit.sandbox.clone())
         .map_err(|error| {
-            ToolError::Failed(format!(
-                "sandbox execution evidence mismatch: {error}"
-            ))
+            ToolError::Failed(format!("sandbox execution evidence mismatch: {error}"))
         })?;
     if let Some(receipt) = &context.command_receipt {
         receipt.process_observed(evidence, started_at_ms, &captured.stdout, &captured.stderr);
@@ -329,7 +327,6 @@ mod tests {
         assert!(child.try_wait().unwrap().is_none());
         std::process::exit(0);
     }
-
 
     #[test]
     fn sandboxed_foreground_config_does_not_copy_ambient_secrets() {

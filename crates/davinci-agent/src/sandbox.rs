@@ -308,7 +308,10 @@ impl SandboxBackend for ContainerBackend {
         environment: &BTreeMap<String, String>,
     ) -> Result<PreparedExecution, SandboxFailure> {
         validate_request(spec, request)?;
-        if !matches!(spec.mode, SandboxMode::Restricted | SandboxMode::WorkspaceWrite) {
+        if !matches!(
+            spec.mode,
+            SandboxMode::Restricted | SandboxMode::WorkspaceWrite
+        ) {
             return Err(SandboxFailure::capability_unavailable(
                 "container backend is for restricted/workspace_write execution",
             ));
@@ -350,8 +353,7 @@ impl SandboxBackend for ContainerBackend {
                             "container mount paths containing commas are unsupported",
                         ));
                     }
-                    let mut value =
-                        format!("type=bind,src={source},dst={}", mount.target);
+                    let mut value = format!("type=bind,src={source},dst={}", mount.target);
                     if mount.access == MountAccess::ReadOnly {
                         value.push_str(",readonly");
                     }
@@ -393,16 +395,10 @@ impl SandboxBackend for ContainerBackend {
         }
         if let Some(milliseconds) = spec.resources.cpu_time_ms {
             let seconds = milliseconds.saturating_add(999) / 1000;
-            argv.extend([
-                "--ulimit".into(),
-                format!("cpu={0}:{0}", seconds.max(1)),
-            ]);
+            argv.extend(["--ulimit".into(), format!("cpu={0}:{0}", seconds.max(1))]);
         }
         if let Some(bytes) = spec.resources.max_file_bytes {
-            argv.extend([
-                "--ulimit".into(),
-                format!("fsize={bytes}:{bytes}"),
-            ]);
+            argv.extend(["--ulimit".into(), format!("fsize={bytes}:{bytes}")]);
         }
 
         argv.push(container.image.clone());
@@ -467,14 +463,13 @@ impl SandboxBroker {
         match spec.backend {
             SandboxBackendKind::Host => HostBackend.prepare(spec, request, environment),
             SandboxBackendKind::LinuxBubblewrap => {
-                let path = find_host_executable("bwrap", Path::new(&spec.workspace)).ok_or_else(
-                    || {
+                let path =
+                    find_host_executable("bwrap", Path::new(&spec.workspace)).ok_or_else(|| {
                         SandboxFailure::new(
                             SandboxErrorCode::SandboxUnavailable,
                             "bubblewrap executable is unavailable outside the workspace",
                         )
-                    },
-                )?;
+                    })?;
                 LinuxBubblewrapBackend::new(path).prepare(spec, request, environment)
             }
             SandboxBackendKind::Container => {
@@ -484,25 +479,24 @@ impl SandboxBroker {
                         "container backend requires trusted runtime/image configuration",
                     )
                 })?;
-                let runtime = resolve_container_runtime(
-                    container.runtime,
-                    Path::new(&spec.workspace),
-                )
-                .ok_or_else(|| {
-                    SandboxFailure::new(
+                let runtime =
+                    resolve_container_runtime(container.runtime, Path::new(&spec.workspace))
+                        .ok_or_else(|| {
+                            SandboxFailure::new(
                         SandboxErrorCode::SandboxUnavailable,
                         "configured Docker/Podman runtime is unavailable outside the workspace",
                     )
-                })?;
+                        })?;
                 ContainerBackend::new(runtime).prepare(spec, request, environment)
-            },
+            }
             SandboxBackendKind::Auto => {
                 if cfg!(target_os = "linux") {
-                    if let Some(path) =
-                        find_host_executable("bwrap", Path::new(&spec.workspace))
-                    {
-                        return LinuxBubblewrapBackend::new(path)
-                            .prepare(spec, request, environment);
+                    if let Some(path) = find_host_executable("bwrap", Path::new(&spec.workspace)) {
+                        return LinuxBubblewrapBackend::new(path).prepare(
+                            spec,
+                            request,
+                            environment,
+                        );
                     }
                 }
                 if let Some(container) = spec.container.as_ref() {
@@ -530,7 +524,11 @@ pub fn sanitize_environment_from(
     parent: &BTreeMap<String, String>,
 ) -> Result<BTreeMap<String, String>, SandboxFailure> {
     let mut child = BTreeMap::new();
-    for name in BASELINE_ENVIRONMENT.iter().copied().chain(policy.allow.iter().map(String::as_str)) {
+    for name in BASELINE_ENVIRONMENT
+        .iter()
+        .copied()
+        .chain(policy.allow.iter().map(String::as_str))
+    {
         if let Some(value) = parent.get(name) {
             child.insert(name.to_string(), value.clone());
         }
@@ -635,8 +633,11 @@ pub fn attenuate_child_spec(
 
     let mut effective = requested.clone();
     effective.backend = backend;
-    effective.resources.timeout_ms =
-        bounded_u64(parent.resources.timeout_ms, requested.resources.timeout_ms, "timeout")?;
+    effective.resources.timeout_ms = bounded_u64(
+        parent.resources.timeout_ms,
+        requested.resources.timeout_ms,
+        "timeout",
+    )?;
     effective.resources.cpu_time_ms = bounded_u64(
         parent.resources.cpu_time_ms,
         requested.resources.cpu_time_ms,
@@ -674,8 +675,10 @@ pub fn attenuate_child_spec(
         requested.process.max_background_lifetime_ms,
         "background lifetime",
     )?;
-    effective.required_capabilities =
-        capability_union(parent.required_capabilities, requested.required_capabilities);
+    effective.required_capabilities = capability_union(
+        parent.required_capabilities,
+        requested.required_capabilities,
+    );
     Ok(effective)
 }
 
@@ -692,10 +695,7 @@ fn require_capabilities(
     }
 }
 
-fn validate_request(
-    spec: &SandboxSpec,
-    request: &ExecutionRequest,
-) -> Result<(), SandboxFailure> {
+fn validate_request(spec: &SandboxSpec, request: &ExecutionRequest) -> Result<(), SandboxFailure> {
     spec.validate()?;
     if request.sandbox_id != spec.id {
         return Err(SandboxFailure::new(
@@ -719,12 +719,7 @@ fn validate_request(
     }
     if request.argv.len() > 256
         || request.argv.iter().any(|arg| arg.contains('\0'))
-        || request
-            .argv
-            .iter()
-            .map(String::len)
-            .sum::<usize>()
-            > 64 * 1024
+        || request.argv.iter().map(String::len).sum::<usize>() > 64 * 1024
     {
         return Err(SandboxFailure::policy_denied(
             "invalid or oversized executor argv",
@@ -745,7 +740,6 @@ fn find_host_executable(name: &str, workspace: &Path) -> Option<PathBuf> {
     }
     None
 }
-
 
 pub fn rebind_worker_spec(
     parent: &SandboxSpec,
@@ -800,8 +794,10 @@ pub fn rebind_worker_spec(
         mounts.push(mount.clone());
     }
 
-    if matches!(parent.mode, SandboxMode::Restricted | SandboxMode::WorkspaceWrite)
-        && !rebound_workspace
+    if matches!(
+        parent.mode,
+        SandboxMode::Restricted | SandboxMode::WorkspaceWrite
+    ) && !rebound_workspace
     {
         return Err(SandboxFailure::new(
             SandboxErrorCode::FilesystemDenied,
@@ -915,7 +911,9 @@ fn network_is_no_more_permissive(parent: &NetworkPolicy, child: &NetworkPolicy) 
                 ports: child_ports,
             },
         ) => {
-            child_domains.iter().all(|value| parent_domains.contains(value))
+            child_domains
+                .iter()
+                .all(|value| parent_domains.contains(value))
                 && child_ports.iter().all(|value| parent_ports.contains(value))
         }
         (NetworkPolicy::Unrestricted, _) => true,
@@ -926,8 +924,10 @@ fn network_is_no_more_permissive(parent: &NetworkPolicy, child: &NetworkPolicy) 
 fn mount_access_is_no_more_permissive(child: MountAccess, parent: MountAccess) -> bool {
     matches!(
         (child, parent),
-        (MountAccess::ReadOnly, MountAccess::ReadOnly | MountAccess::ReadWrite)
-            | (MountAccess::ReadWrite, MountAccess::ReadWrite)
+        (
+            MountAccess::ReadOnly,
+            MountAccess::ReadOnly | MountAccess::ReadWrite
+        ) | (MountAccess::ReadWrite, MountAccess::ReadWrite)
             | (MountAccess::Temporary, MountAccess::Temporary)
             | (MountAccess::Hidden, _)
     )
@@ -961,10 +961,7 @@ fn bounded_u32(
     }
 }
 
-fn capability_union(
-    left: SandboxCapabilities,
-    right: SandboxCapabilities,
-) -> SandboxCapabilities {
+fn capability_union(left: SandboxCapabilities, right: SandboxCapabilities) -> SandboxCapabilities {
     SandboxCapabilities {
         filesystem_isolation: left.filesystem_isolation || right.filesystem_isolation,
         network_denied: left.network_denied || right.network_denied,
@@ -986,9 +983,9 @@ fn capability_union(
 mod tests {
     use super::*;
     use davinci_protocol::{
-        EnvironmentPolicy, FilesystemPolicy, MountAccess, MountRule, NetworkPolicy,
-        ProcessPolicy, ResourcePolicy, SandboxBackendKind, SandboxCapabilities, SandboxId,
-        SandboxMode, SandboxSpec,
+        EnvironmentPolicy, FilesystemPolicy, MountAccess, MountRule, NetworkPolicy, ProcessPolicy,
+        ResourcePolicy, SandboxBackendKind, SandboxCapabilities, SandboxId, SandboxMode,
+        SandboxSpec,
     };
     use std::collections::BTreeMap;
     use std::path::PathBuf;
@@ -1067,7 +1064,11 @@ mod tests {
         assert_eq!(prepared.executable, PathBuf::from("/usr/bin/bwrap"));
         assert!(prepared.argv.iter().any(|arg| arg == "--unshare-net"));
         assert!(prepared.argv.windows(3).any(|args| {
-            args == [String::from("--bind"), spec.workspace.clone(), spec.workspace.clone()]
+            args == [
+                String::from("--bind"),
+                spec.workspace.clone(),
+                spec.workspace.clone(),
+            ]
         }));
     }
 
@@ -1088,10 +1089,17 @@ mod tests {
         let position = |args: [String; 3]| argv.windows(3).position(|window| window == args);
         let git = workspace.join(".git").to_string_lossy().into_owned();
         let config = workspace.join(".davinci").to_string_lossy().into_owned();
-        let bind = position(["--bind".into(), spec.workspace.clone(), spec.workspace.clone()])
-            .expect("workspace bind");
+        let bind = position([
+            "--bind".into(),
+            spec.workspace.clone(),
+            spec.workspace.clone(),
+        ])
+        .expect("workspace bind");
         let git_bind = position(["--ro-bind".into(), git.clone(), git]).expect("read-only .git");
-        assert!(git_bind > bind, "the read-only bind must sit on top of the workspace");
+        assert!(
+            git_bind > bind,
+            "the read-only bind must sit on top of the workspace"
+        );
         assert!(position(["--ro-bind".into(), config.clone(), config]).is_some());
 
         // Read-only mode has nothing writable to protect.
@@ -1111,12 +1119,18 @@ mod tests {
         let name = |launch: &str| {
             let mut request = request(&spec);
             request.launch_id = Some(launch.into());
-            let argv = backend.prepare(&spec, &request, &BTreeMap::new()).unwrap().argv;
+            let argv = backend
+                .prepare(&spec, &request, &BTreeMap::new())
+                .unwrap()
+                .argv;
             let at = argv.iter().position(|arg| arg == "--name").unwrap();
             argv[at + 1].clone()
         };
         assert_ne!(name("a"), name("b"));
-        assert_eq!(name("a"), ContainerBackend::container_name(&spec, Some("a")));
+        assert_eq!(
+            name("a"),
+            ContainerBackend::container_name(&spec, Some("a"))
+        );
     }
 
     #[test]
@@ -1218,19 +1232,18 @@ mod tests {
         parent.resources.max_memory_bytes = Some(1024);
         parent.process.allow_background = true;
 
-        let child = rebind_worker_spec(
-            &parent,
-            &child_path,
-            SandboxId("worker-child".into()),
-            true,
-        )
-        .unwrap();
+        let child =
+            rebind_worker_spec(&parent, &child_path, SandboxId("worker-child".into()), true)
+                .unwrap();
 
         assert_eq!(child.id.0, "worker-child");
         assert_eq!(child.mode, SandboxMode::WorkspaceWrite);
         assert_eq!(child.network, NetworkPolicy::Denied);
         assert_eq!(child.resources.max_memory_bytes, Some(1024));
-        assert_eq!(child.process.allow_background, parent.process.allow_background);
+        assert_eq!(
+            child.process.allow_background,
+            parent.process.allow_background
+        );
         assert_eq!(child.workspace, child_path.to_string_lossy());
         assert!(child.filesystem.mounts.iter().any(|mount| {
             mount.source.as_deref() == Some(child.workspace.as_str())
@@ -1258,13 +1271,8 @@ mod tests {
             access: MountAccess::ReadOnly,
         }];
 
-        let child = rebind_worker_spec(
-            &parent,
-            &child_path,
-            SandboxId("worker-ro".into()),
-            true,
-        )
-        .unwrap();
+        let child =
+            rebind_worker_spec(&parent, &child_path, SandboxId("worker-ro".into()), true).unwrap();
         assert_eq!(child.mode, SandboxMode::Restricted);
         assert!(child.filesystem.mounts.iter().any(|mount| {
             mount.source.as_deref() == Some(child.workspace.as_str())
@@ -1308,5 +1316,4 @@ mod tests {
             SandboxErrorCode::PolicyDenied
         );
     }
-
 }

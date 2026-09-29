@@ -3763,7 +3763,10 @@ fn worker_host_rebinds_sandbox_and_supervisor_to_effective_worktree() {
         .expect("worker keeps a sandbox boundary");
     assert_ne!(worker_spec.id, spec.id);
     assert_eq!(worker_spec.workspace, child_path.to_string_lossy());
-    assert_eq!(worker_spec.mode, davinci_protocol::SandboxMode::WorkspaceWrite);
+    assert_eq!(
+        worker_spec.mode,
+        davinci_protocol::SandboxMode::WorkspaceWrite
+    );
     assert_eq!(worker_spec.network, davinci_protocol::NetworkPolicy::Denied);
     assert_eq!(
         worker_spec.resources.max_memory_bytes,

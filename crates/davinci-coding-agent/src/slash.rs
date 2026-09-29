@@ -82,7 +82,11 @@ pub fn builtin_slash_commands() -> Vec<SlashCommand> {
         ("mcp", "Connected MCP servers, tools and errors", None),
         ("cost", "Tokens and USD spent this session", None),
         ("status", "Model, permission, jobs, MCP, tokens", None),
-        ("sandbox-status", "Execution sandbox policy and enforcement status", None),
+        (
+            "sandbox-status",
+            "Execution sandbox policy and enforcement status",
+            None,
+        ),
         (
             "permissions",
             "Choose Manual, Accept Edits, Plan Mode, Auto Mode, or Always Approve",
@@ -416,7 +420,10 @@ mod tests {
         assert!(builtin_slash_commands()
             .iter()
             .any(|command| command.name == "sandbox-status"));
-        assert_eq!(parse_line("/sandbox-status"), SlashAction::ShowSandboxStatus);
+        assert_eq!(
+            parse_line("/sandbox-status"),
+            SlashAction::ShowSandboxStatus
+        );
         assert_eq!(
             parse_line("/sandbox"),
             SlashAction::Prompt("/sandbox".into()),

@@ -174,9 +174,9 @@ impl ProcessExecutionEvidence {
     ) -> Result<Self, String> {
         match (self.sandbox.as_mut(), effective) {
             (None, None) => Ok(self),
-            (None, Some(_)) => Err(
-                "executor reported sandbox evidence for an unsandboxed process".into(),
-            ),
+            (None, Some(_)) => {
+                Err("executor reported sandbox evidence for an unsandboxed process".into())
+            }
             (Some(_), None) => Ok(self),
             (Some(requested), Some(effective)) => {
                 if requested.id != effective.sandbox_id.0

@@ -328,9 +328,7 @@ impl Inner {
             });
             return;
         }
-        if server.disabled
-            || server.execution == Some(davinci_mcp::McpExecutionPolicy::Disabled)
-        {
+        if server.disabled || server.execution == Some(davinci_mcp::McpExecutionPolicy::Disabled) {
             self.rows.push(McpServerRow {
                 name: name.to_string(),
                 transport: transport_label.into(),

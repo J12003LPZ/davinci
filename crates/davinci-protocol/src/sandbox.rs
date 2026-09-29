@@ -218,9 +218,7 @@ pub struct SandboxSpec {
 
 impl SandboxSpec {
     pub fn validate(&self) -> Result<(), SandboxFailure> {
-        if self.id.0.is_empty()
-            || self.id.0.len() > 128
-            || self.id.0.chars().any(char::is_control)
+        if self.id.0.is_empty() || self.id.0.len() > 128 || self.id.0.chars().any(char::is_control)
         {
             return Err(SandboxFailure::policy_denied("invalid sandbox id"));
         }
@@ -288,9 +286,7 @@ impl SandboxSpec {
                 })
                 || ports.iter().any(|port| *port == 0)
             {
-                return Err(SandboxFailure::policy_denied(
-                    "invalid network allowlist",
-                ));
+                return Err(SandboxFailure::policy_denied("invalid network allowlist"));
             }
         }
         for (value, name) in [
@@ -346,9 +342,7 @@ fn is_absolute_portable(value: &str) -> bool {
 }
 
 fn has_parent_component(value: &str) -> bool {
-    value
-        .split(['/', '\\'])
-        .any(|component| component == "..")
+    value.split(['/', '\\']).any(|component| component == "..")
 }
 
 fn validate_environment_name(name: &str) -> Result<(), SandboxFailure> {

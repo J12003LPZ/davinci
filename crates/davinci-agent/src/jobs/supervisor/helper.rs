@@ -4,9 +4,9 @@ use super::{
     ProcessConfig,
 };
 use crate::sandbox::SandboxBroker;
-use davinci_protocol::{ExecutionRequest, SandboxLifecycle, SandboxReceipt};
 #[cfg(unix)]
 use davinci_protocol::ResourcePolicy;
+use davinci_protocol::{ExecutionRequest, SandboxLifecycle, SandboxReceipt};
 use std::{
     io::{Read, Write},
     process::{Command, Stdio},
@@ -311,64 +311,68 @@ fn spawn(config: ProcessConfig, identity: &super::ProcessIdentity) -> Result<Spa
         .as_ref()
         .filter(|_| !config.service)
         .and_then(|spec| spec.resources.max_output_bytes);
-    let max_lifetime_ms = config.sandbox.as_ref().filter(|_| !config.service).and_then(|spec| {
-        if config.background {
-            spec.process.max_background_lifetime_ms
-        } else {
-            spec.resources.timeout_ms
-        }
-    });
+    let max_lifetime_ms = config
+        .sandbox
+        .as_ref()
+        .filter(|_| !config.service)
+        .and_then(|spec| {
+            if config.background {
+                spec.process.max_background_lifetime_ms
+            } else {
+                spec.resources.timeout_ms
+            }
+        });
     #[cfg(unix)]
     let mut resource_policy = config.sandbox.as_ref().map(|spec| spec.resources.clone());
-    let (executable, argv, cwd, environment, sandbox) =
-        if let Some(spec) = config.sandbox.as_ref() {
-            let request = ExecutionRequest {
-                sandbox_id: spec.id.clone(),
-                executable: config
-                    .executable
-                    .to_str()
-                    .ok_or("sandbox executable path is not UTF-8")?
-                    .to_string(),
-                argv: config.argv.clone(),
-                cwd: config
-                    .cwd
-                    .to_str()
-                    .ok_or("sandbox cwd is not UTF-8")?
-                    .to_string(),
-                launch_id: Some(identity.lifetime.simple().to_string()),
-            };
-            let prepared = SandboxBroker
-                .prepare(spec, &request, &config.environment)
-                .map_err(|error| error.to_string())?;
-            #[cfg(unix)]
-            if prepared.backend == davinci_protocol::SandboxBackendKind::Container {
-                // The container runtime enforces the limits inside the
-                // container; rlimits here would only constrain its CLI.
-                resource_policy = None;
-            }
-            let receipt = SandboxReceipt {
-                sandbox_id: prepared.sandbox_id.clone(),
-                spec_digest: prepared.spec_digest.clone(),
-                backend: prepared.backend,
-                capabilities: prepared.capabilities,
-                lifecycle: SandboxLifecycle::Running,
-            };
-            (
-                prepared.executable,
-                prepared.argv,
-                prepared.cwd,
-                prepared.environment,
-                Some(receipt),
-            )
-        } else {
-            (
-                config.executable,
-                config.argv,
-                config.cwd,
-                config.environment,
-                None,
-            )
+    let (executable, argv, cwd, environment, sandbox) = if let Some(spec) = config.sandbox.as_ref()
+    {
+        let request = ExecutionRequest {
+            sandbox_id: spec.id.clone(),
+            executable: config
+                .executable
+                .to_str()
+                .ok_or("sandbox executable path is not UTF-8")?
+                .to_string(),
+            argv: config.argv.clone(),
+            cwd: config
+                .cwd
+                .to_str()
+                .ok_or("sandbox cwd is not UTF-8")?
+                .to_string(),
+            launch_id: Some(identity.lifetime.simple().to_string()),
         };
+        let prepared = SandboxBroker
+            .prepare(spec, &request, &config.environment)
+            .map_err(|error| error.to_string())?;
+        #[cfg(unix)]
+        if prepared.backend == davinci_protocol::SandboxBackendKind::Container {
+            // The container runtime enforces the limits inside the
+            // container; rlimits here would only constrain its CLI.
+            resource_policy = None;
+        }
+        let receipt = SandboxReceipt {
+            sandbox_id: prepared.sandbox_id.clone(),
+            spec_digest: prepared.spec_digest.clone(),
+            backend: prepared.backend,
+            capabilities: prepared.capabilities,
+            lifecycle: SandboxLifecycle::Running,
+        };
+        (
+            prepared.executable,
+            prepared.argv,
+            prepared.cwd,
+            prepared.environment,
+            Some(receipt),
+        )
+    } else {
+        (
+            config.executable,
+            config.argv,
+            config.cwd,
+            config.environment,
+            None,
+        )
+    };
 
     #[cfg(windows)]
     let cwd = {
@@ -376,9 +380,7 @@ fn spawn(config: ProcessConfig, identity: &super::ProcessIdentity) -> Result<Spa
         // current directory. Preserve the authorized location: simplify only
         // when both spellings resolve to the same canonical directory.
         let ordinary = crate::permission::strip_verbatim_prefix(&cwd);
-        if ordinary
-            .canonicalize()
-            .map_err(|error| error.to_string())?
+        if ordinary.canonicalize().map_err(|error| error.to_string())?
             == cwd.canonicalize().map_err(|error| error.to_string())?
         {
             ordinary
@@ -415,7 +417,6 @@ fn spawn(config: ProcessConfig, identity: &super::ProcessIdentity) -> Result<Spa
         max_lifetime_ms,
     })
 }
-
 
 #[cfg(unix)]
 fn apply_unix_resource_limits(policy: &ResourcePolicy) -> std::io::Result<()> {
@@ -573,14 +574,7 @@ mod tests {
         drop(receiver);
         let identity = super::super::ProcessIdentity::new(None);
         let budget = OutputBudget::new(None);
-        assert!(forward_output(
-            &b"output"[..],
-            &events,
-            &identity,
-            false,
-            &budget,
-        )
-        .is_err());
+        assert!(forward_output(&b"output"[..], &events, &identity, false, &budget,).is_err());
     }
 
     #[test]
@@ -634,8 +628,7 @@ mod tests {
         let (events, receiver) = mpsc::sync_channel(8);
         let identity = super::super::ProcessIdentity::new(None);
         let budget = OutputBudget::new(Some(3));
-        let error = forward_output(&b"abcdef"[..], &events, &identity, false, &budget)
-            .unwrap_err();
+        let error = forward_output(&b"abcdef"[..], &events, &identity, false, &budget).unwrap_err();
         assert!(error.to_string().contains("truncated"), "{error}");
         drop(events);
         let events: Vec<_> = receiver.into_iter().map(|(event, _)| event).collect();

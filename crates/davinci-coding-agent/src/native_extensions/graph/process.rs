@@ -112,9 +112,8 @@ pub fn run_child_with_deadline(
     mut on_stdout: impl FnMut(&str),
     mut on_stderr: impl FnMut(&str),
 ) -> std::io::Result<ChildOutcome> {
-    crate::execution_boundary::require_executor("graph worker process").map_err(|error| {
-        std::io::Error::new(std::io::ErrorKind::PermissionDenied, error)
-    })?;
+    crate::execution_boundary::require_executor("graph worker process")
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::PermissionDenied, error))?;
     let mut child = command
         .stdin(Stdio::null())
         .stdout(Stdio::piped())

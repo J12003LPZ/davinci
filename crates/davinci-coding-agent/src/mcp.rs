@@ -48,8 +48,7 @@ pub fn load(agent_dir: &Path, cwd: &Path, trusted: bool, sandbox_active: bool) -
         mcp_servers: davinci_coding_agent::plugins::active(agent_dir).mcp_servers(),
     };
     resolve_origin(&mut plugins, true, sandbox_active);
-    let mut user_file =
-        davinci_mcp::load_path(&agent_dir.join("mcp.json")).unwrap_or_default();
+    let mut user_file = davinci_mcp::load_path(&agent_dir.join("mcp.json")).unwrap_or_default();
     resolve_origin(&mut user_file, false, sandbox_active);
     let user = davinci_mcp::merge(plugins, user_file);
     if !trusted {

@@ -655,5 +655,4 @@ mod tests {
         });
         assert!(receipt.is_passed());
     }
-
 }

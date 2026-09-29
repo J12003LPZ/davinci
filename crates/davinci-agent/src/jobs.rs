@@ -413,8 +413,10 @@ impl SupervisedLaunch {
             )
             .map_err(|error| error.to_string())?,
         );
-        *shared.supervisor.lock().unwrap_or_else(|err| err.into_inner()) =
-            Some(supervisor.clone());
+        *shared
+            .supervisor
+            .lock()
+            .unwrap_or_else(|err| err.into_inner()) = Some(supervisor.clone());
         Ok(Self { shared, supervisor })
     }
 

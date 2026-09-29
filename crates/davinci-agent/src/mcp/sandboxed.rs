@@ -1,6 +1,4 @@
-use crate::jobs::supervisor::{
-    ProcessConfig, ProcessEvent, Supervisor, SupervisorCommand,
-};
+use crate::jobs::supervisor::{ProcessConfig, ProcessEvent, Supervisor, SupervisorCommand};
 use davinci_mcp::{Error, Result, RpcTransport, ServerConfig};
 use davinci_protocol::SandboxSpec;
 use serde_json::{json, Value};
@@ -103,7 +101,9 @@ fn server_environment(
         }
         let valid = !name.is_empty()
             && !name.as_bytes()[0].is_ascii_digit()
-            && name.bytes().all(|byte| byte.is_ascii_alphanumeric() || byte == b'_');
+            && name
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_');
         if !valid {
             return Err(Error::Protocol(format!(
                 "sandboxed MCP env has an invalid variable name: {name}"
@@ -111,7 +111,12 @@ fn server_environment(
         }
         let denied = std::cell::RefCell::new(None::<String>);
         let value = davinci_mcp::expand_env(template, |reference| {
-            if sandbox.environment.allow.iter().any(|allowed| allowed == reference) {
+            if sandbox
+                .environment
+                .allow
+                .iter()
+                .any(|allowed| allowed == reference)
+            {
                 std::env::var(reference).ok()
             } else {
                 denied
@@ -127,7 +132,9 @@ fn server_environment(
             )));
         }
         if value.contains('\0') {
-            return Err(Error::Protocol(format!("sandboxed MCP env {name} contains NUL")));
+            return Err(Error::Protocol(format!(
+                "sandboxed MCP env {name} contains NUL"
+            )));
         }
         environment.insert(name.clone(), value);
     }
@@ -210,8 +217,8 @@ impl SupervisedMcpTransport {
     }
 
     fn write_value(&self, value: &Value) -> Result<()> {
-        let mut bytes =
-            serde_json::to_vec(value).map_err(|error| Error::Protocol(format!("encode: {error}")))?;
+        let mut bytes = serde_json::to_vec(value)
+            .map_err(|error| Error::Protocol(format!("encode: {error}")))?;
         bytes.push(b'\n');
         for chunk in bytes.chunks(WRITE_CHUNK) {
             self.supervisor
@@ -457,16 +464,16 @@ mod tests {
         .unwrap();
         assert_eq!(env.get("MODE").map(String::as_str), Some("fast"));
         assert_eq!(env.get("SEARCH"), Some(&path));
-        assert!(!env.contains_key("HOME"), "injected sandbox variables stay fixed");
+        assert!(
+            !env.contains_key("HOME"),
+            "injected sandbox variables stay fixed"
+        );
     }
 
     #[test]
     fn env_references_to_unallowed_host_variables_are_refused() {
-        let error = server_environment(
-            &server(&[("TOKEN", "${GITHUB_TOKEN}")]),
-            &sandbox(&[]),
-        )
-        .unwrap_err();
+        let error = server_environment(&server(&[("TOKEN", "${GITHUB_TOKEN}")]), &sandbox(&[]))
+            .unwrap_err();
         assert!(error.to_string().contains("GITHUB_TOKEN"), "{error}");
     }
 
@@ -492,7 +499,10 @@ mod tests {
         );
         assert_eq!(state.server_requests.len(), 1);
         assert_eq!(
-            state.responses.get(&9).and_then(|value| value.get("result")),
+            state
+                .responses
+                .get(&9)
+                .and_then(|value| value.get("result")),
             Some(&json!({"ok":true}))
         );
         assert!(state.failure.is_none());

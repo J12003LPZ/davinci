@@ -52,9 +52,7 @@ impl ServerConfig {
             return Ok(McpExecutionPolicy::Disabled);
         }
         match (&self.url, &self.command, self.execution) {
-            (Some(_), _, None | Some(McpExecutionPolicy::Remote)) => {
-                Ok(McpExecutionPolicy::Remote)
-            }
+            (Some(_), _, None | Some(McpExecutionPolicy::Remote)) => Ok(McpExecutionPolicy::Remote),
             (Some(_), _, Some(_)) => Err(Error::Protocol(
                 "remote MCP server execution must be `remote` or `disabled`".into(),
             )),
@@ -65,12 +63,8 @@ impl ServerConfig {
             (None, Some(_), Some(McpExecutionPolicy::Remote)) => Err(Error::Protocol(
                 "local MCP command cannot use remote execution policy".into(),
             )),
-            (None, Some(_), Some(McpExecutionPolicy::Disabled)) => {
-                Ok(McpExecutionPolicy::Disabled)
-            }
-            (None, None, _) => Err(Error::Protocol(
-                "server needs `command` or `url`".into(),
-            )),
+            (None, Some(_), Some(McpExecutionPolicy::Disabled)) => Ok(McpExecutionPolicy::Disabled),
+            (None, None, _) => Err(Error::Protocol("server needs `command` or `url`".into())),
         }
     }
 
@@ -220,10 +214,9 @@ mod tests {
 
     #[test]
     fn execution_policy_cannot_mismatch_transport() {
-        let remote_host = parse(
-            r#"{"mcpServers":{"x":{"url":"https://example.com","execution":"host"}}}"#,
-        )
-        .unwrap();
+        let remote_host =
+            parse(r#"{"mcpServers":{"x":{"url":"https://example.com","execution":"host"}}}"#)
+                .unwrap();
         assert!(remote_host.mcp_servers["x"].execution_policy().is_err());
 
         let local_remote =

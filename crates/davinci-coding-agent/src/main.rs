@@ -355,7 +355,8 @@ fn preactivate_execution_boundary(raw: &[String], cwd: &Path) -> Result<(), Stri
         settings.as_ref(),
         None,
         false,
-    )? else {
+    )?
+    else {
         return Ok(());
     };
     if spec.mode != davinci_protocol::SandboxMode::FullAccess {
@@ -931,12 +932,9 @@ fn build_agent(parsed: &Args, session_dir: &Path, cwd: &Path) -> Result<Agent, S
             agent.tool_context.foreground_supervisor.as_ref(),
             agent.tool_context.sandbox.as_ref(),
         ) {
-            (Some(host), Some(sandbox)) => davinci_agent::McpRegistry::connect_with_executor(
-                &mcp_config,
-                cwd,
-                host,
-                sandbox,
-            ),
+            (Some(host), Some(sandbox)) => {
+                davinci_agent::McpRegistry::connect_with_executor(&mcp_config, cwd, host, sandbox)
+            }
             _ => davinci_agent::McpRegistry::connect(&mcp_config, cwd),
         };
         agent.attach_mcp(registry);

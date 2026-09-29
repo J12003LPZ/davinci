@@ -344,7 +344,10 @@ impl Drop for Supervisor {
 }
 
 fn cleanup_container(plan: &crate::sandbox::ContainerCleanupPlan) -> Result<(), String> {
-    fn run_bounded(executable: &std::path::Path, args: &[&str]) -> Result<std::process::ExitStatus, String> {
+    fn run_bounded(
+        executable: &std::path::Path,
+        args: &[&str],
+    ) -> Result<std::process::ExitStatus, String> {
         let mut command = Command::new(executable);
         command
             .args(args)
@@ -384,7 +387,10 @@ fn cleanup_container(plan: &crate::sandbox::ContainerCleanupPlan) -> Result<(), 
     let _ = run_bounded(&plan.executable, &["rm", "-f", &plan.name]);
     let inspect = run_bounded(&plan.executable, &["container", "inspect", &plan.name])?;
     if inspect.success() {
-        Err(format!("container {} still exists after teardown", plan.name))
+        Err(format!(
+            "container {} still exists after teardown",
+            plan.name
+        ))
     } else {
         Ok(())
     }

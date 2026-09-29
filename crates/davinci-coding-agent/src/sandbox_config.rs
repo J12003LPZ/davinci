@@ -1,7 +1,7 @@
 use davinci_protocol::{
     ContainerPolicy, ContainerRuntime, EnvironmentPolicy, FilesystemPolicy, MountAccess, MountRule,
-    NetworkPolicy, ProcessPolicy, ResourcePolicy, SandboxBackendKind, SandboxCapabilities, SandboxId,
-    SandboxMode, SandboxSpec,
+    NetworkPolicy, ProcessPolicy, ResourcePolicy, SandboxBackendKind, SandboxCapabilities,
+    SandboxId, SandboxMode, SandboxSpec,
 };
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
@@ -76,7 +76,10 @@ pub fn resolve_sandbox_settings(
     if mode != SandboxMode::FullAccess && backend == SandboxBackendKind::Host {
         return Err("host sandbox backend requires explicit full_access mode".into());
     }
-    if mode == SandboxMode::FullAccess && backend != SandboxBackendKind::Host && backend != SandboxBackendKind::Auto {
+    if mode == SandboxMode::FullAccess
+        && backend != SandboxBackendKind::Host
+        && backend != SandboxBackendKind::Auto
+    {
         return Err("full_access may use only host or auto backend".into());
     }
     let container = parse_container(effective.container.as_ref(), backend)?;
@@ -126,7 +129,9 @@ pub fn resolve_sandbox_settings(
         ..Default::default()
     };
     if !matches!(mode, SandboxMode::NoExecution | SandboxMode::FullAccess) {
-        environment.inject.insert("HOME".into(), SANDBOX_HOME.into());
+        environment
+            .inject
+            .insert("HOME".into(), SANDBOX_HOME.into());
         environment.inject.insert("TMPDIR".into(), "/tmp".into());
         environment.inject.insert("TMP".into(), "/tmp".into());
         environment.inject.insert("TEMP".into(), "/tmp".into());
@@ -183,10 +188,7 @@ pub fn resolve_sandbox_settings(
     }))
 }
 
-fn narrow_settings(
-    global: &mut SandboxSettings,
-    project: &SandboxSettings,
-) -> Result<(), String> {
+fn narrow_settings(global: &mut SandboxSettings, project: &SandboxSettings) -> Result<(), String> {
     let global_mode = parse_mode(global.mode.as_deref().unwrap_or("workspace_write"))?;
     if let Some(value) = project.mode.as_deref() {
         let project_mode = parse_mode(value)?;
@@ -209,7 +211,9 @@ fn narrow_settings(
 
     if let Some(project_container) = project.container.as_ref() {
         let Some(global_container) = global.container.as_ref() else {
-            return Err("project sandbox cannot introduce container runtime/image authority".into());
+            return Err(
+                "project sandbox cannot introduce container runtime/image authority".into(),
+            );
         };
         if project_container != global_container {
             return Err("project sandbox cannot change container runtime or image".into());
@@ -219,7 +223,10 @@ fn narrow_settings(
     if let Some(project_environment) = project.environment.as_ref() {
         let global_allow = parse_environment_allow(global.environment.as_ref())?;
         let project_allow = parse_environment_allow(Some(project_environment))?;
-        if project_allow.iter().any(|name| !global_allow.contains(name)) {
+        if project_allow
+            .iter()
+            .any(|name| !global_allow.contains(name))
+        {
             return Err("project sandbox environment cannot widen global authority".into());
         }
         global.environment = Some(project_environment.clone());
@@ -312,7 +319,6 @@ fn parse_container(
     }))
 }
 
-
 fn parse_network(
     settings: Option<&SandboxNetworkSettings>,
     mode: SandboxMode,
@@ -345,9 +351,7 @@ fn parse_network(
     }
 }
 
-fn parse_resources(
-    settings: Option<&SandboxResourceSettings>,
-) -> Result<ResourcePolicy, String> {
+fn parse_resources(settings: Option<&SandboxResourceSettings>) -> Result<ResourcePolicy, String> {
     let Some(settings) = settings else {
         // No sandbox-level deadline unless configured: the tool call's own
         // timeout governs, as it does without a sandbox.
@@ -363,12 +367,12 @@ fn parse_resources(
         .transpose()?;
     let max_memory_bytes = settings
         .max_memory_mb
-        .map(|mb| mb.checked_mul(1024 * 1024).ok_or("sandbox memory limit overflows"))
+        .map(|mb| {
+            mb.checked_mul(1024 * 1024)
+                .ok_or("sandbox memory limit overflows")
+        })
         .transpose()?;
-    if timeout_ms == Some(0)
-        || max_memory_bytes == Some(0)
-        || settings.max_processes == Some(0)
-    {
+    if timeout_ms == Some(0) || max_memory_bytes == Some(0) || settings.max_processes == Some(0) {
         return Err("sandbox resource limits must be greater than zero".into());
     }
     Ok(ResourcePolicy {
@@ -393,7 +397,9 @@ fn parse_environment_allow(
         let valid = !name.is_empty()
             && name.len() <= 128
             && !name.as_bytes()[0].is_ascii_digit()
-            && name.bytes().all(|byte| byte.is_ascii_alphanumeric() || byte == b'_');
+            && name
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_');
         if !valid {
             return Err(format!("invalid sandbox environment variable name: {name}"));
         }
@@ -499,7 +505,9 @@ fn runtime_layout(workspace: &Path) -> RuntimeLayout {
                 });
             }
             if any {
-                layout.environment.insert("CARGO_HOME".into(), sandbox_cargo);
+                layout
+                    .environment
+                    .insert("CARGO_HOME".into(), sandbox_cargo);
             }
         }
         layout.mounts = mounts.into_rules();
@@ -528,7 +536,11 @@ impl RuntimeMounts {
             return None;
         }
         // Avoid redundant nested mounts when an already declared parent covers it.
-        if !self.canonical.iter().any(|seen| canonical.starts_with(seen)) {
+        if !self
+            .canonical
+            .iter()
+            .any(|seen| canonical.starts_with(seen))
+        {
             self.canonical.retain(|seen| !seen.starts_with(&canonical));
             self.canonical.push(canonical.clone());
         }
@@ -613,7 +625,9 @@ fn network_is_no_more_permissive(parent: &NetworkPolicy, child: &NetworkPolicy) 
                 ports: child_ports,
             },
         ) => {
-            child_domains.iter().all(|domain| parent_domains.contains(domain))
+            child_domains
+                .iter()
+                .all(|domain| parent_domains.contains(domain))
                 && child_ports.iter().all(|port| parent_ports.contains(port))
         }
         (NetworkPolicy::Unrestricted, _) => true,
@@ -628,7 +642,9 @@ fn ensure_limit_not_weaker(
 ) -> Result<(), String> {
     if let Some(parent) = parent {
         if child.is_none_or(|child| child > parent) {
-            return Err(format!("project sandbox {name} limit cannot widen global authority"));
+            return Err(format!(
+                "project sandbox {name} limit cannot widen global authority"
+            ));
         }
     }
     Ok(())
@@ -641,12 +657,13 @@ fn ensure_limit_not_weaker_u32(
 ) -> Result<(), String> {
     if let Some(parent) = parent {
         if child.is_none_or(|child| child > parent) {
-            return Err(format!("project sandbox {name} limit cannot widen global authority"));
+            return Err(format!(
+                "project sandbox {name} limit cannot widen global authority"
+            ));
         }
     }
     Ok(())
 }
-
 
 pub fn format_sandbox_status(spec: Option<&SandboxSpec>) -> String {
     let Some(spec) = spec else {
@@ -767,9 +784,11 @@ mod tests {
         let mut project = global.clone();
         project.container.as_mut().unwrap().image = Some("malicious/repo-image:latest".into());
         let root = tempfile::tempdir().unwrap();
-        assert!(resolve_sandbox_settings(root.path(), Some(&global), Some(&project), true)
-            .unwrap_err()
-            .contains("cannot change container runtime or image"));
+        assert!(
+            resolve_sandbox_settings(root.path(), Some(&global), Some(&project), true)
+                .unwrap_err()
+                .contains("cannot change container runtime or image")
+        );
 
         let spec = resolve_sandbox_settings(root.path(), Some(&global), None, false)
             .unwrap()
@@ -841,8 +860,8 @@ mod tests {
             ..Default::default()
         };
         let root = tempfile::tempdir().unwrap();
-        let error = resolve_sandbox_settings(root.path(), Some(&global), Some(&project), true)
-            .unwrap_err();
+        let error =
+            resolve_sandbox_settings(root.path(), Some(&global), Some(&project), true).unwrap_err();
         assert!(error.contains("cannot widen"), "{error}");
     }
 
@@ -977,7 +996,9 @@ mod tests {
                 cwd: spec.workspace.clone(),
                 launch_id: None,
             };
-            let prepared = SandboxBroker.prepare(&spec, &request, &environment).unwrap();
+            let prepared = SandboxBroker
+                .prepare(&spec, &request, &environment)
+                .unwrap();
             std::process::Command::new(&prepared.executable)
                 .args(&prepared.argv)
                 .current_dir(&prepared.cwd)
@@ -1017,9 +1038,11 @@ mod tests {
             }),
             ..Default::default()
         };
-        assert!(resolve_sandbox_settings(root.path(), Some(&global), Some(&widen), true)
-            .unwrap_err()
-            .contains("environment"));
+        assert!(
+            resolve_sandbox_settings(root.path(), Some(&global), Some(&widen), true)
+                .unwrap_err()
+                .contains("environment")
+        );
         let narrow = SandboxSettings {
             environment: Some(SandboxEnvironmentSettings {
                 allow: vec!["NPM_TOKEN".into()],
