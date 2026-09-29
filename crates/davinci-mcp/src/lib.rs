@@ -10,7 +10,7 @@ mod jsonrpc;
 mod stdio;
 mod types;
 
-pub use config::{load_path, merge, parse as parse_config, File as ConfigFile, ServerConfig};
+pub use config::{load_path, merge, parse as parse_config, File as ConfigFile, McpExecutionPolicy, ServerConfig};
 pub use http::parse_http_body;
 pub use jsonrpc::{RpcError, RpcId};
 pub use stdio::{resolve_command_in, StdioTransport, STDERR_TAIL_BYTES};
