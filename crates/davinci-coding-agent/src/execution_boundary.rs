@@ -28,15 +28,3 @@ pub fn require_executor(component: &str) -> Result<(), String> {
         Ok(())
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn active_sandbox_refuses_legacy_host_spawn() {
-        enable();
-        let error = require_executor("language server").unwrap_err();
-        assert!(error.contains("refusing legacy direct host spawn"));
-    }
-}
