@@ -281,6 +281,52 @@ mod tests {
         std::process::exit(0);
     }
 
+
+    #[test]
+    fn sandboxed_foreground_config_does_not_copy_ambient_secrets() {
+        use davinci_protocol::{
+            EnvironmentPolicy, FilesystemPolicy, NetworkPolicy, ProcessPolicy, ResourcePolicy,
+            SandboxBackendKind, SandboxCapabilities, SandboxId, SandboxMode, SandboxSpec,
+        };
+        static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let root = tempfile::tempdir().unwrap();
+        let cwd = root.path().canonicalize().unwrap();
+        let executable = std::env::current_exe().unwrap().canonicalize().unwrap();
+        let previous = std::env::var_os("DAVINCI_FOREGROUND_SECRET_FIXTURE");
+        std::env::set_var("DAVINCI_FOREGROUND_SECRET_FIXTURE", "must-not-leak");
+        let spec = SandboxSpec {
+            id: SandboxId("foreground-env".into()),
+            mode: SandboxMode::FullAccess,
+            backend: SandboxBackendKind::Host,
+            workspace: cwd.to_string_lossy().into_owned(),
+            filesystem: FilesystemPolicy::default(),
+            network: NetworkPolicy::Unrestricted,
+            environment: EnvironmentPolicy::default(),
+            resources: ResourcePolicy::default(),
+            process: ProcessPolicy::default(),
+            required_capabilities: SandboxCapabilities {
+                environment_isolation: true,
+                process_tree_isolation: true,
+                deterministic_teardown: true,
+                ..Default::default()
+            },
+        };
+        let context = ToolContext {
+            sandbox: Some(spec.clone()),
+            ..Default::default()
+        };
+        let config = config(&cwd, executable, vec![], &context).unwrap();
+        match previous {
+            Some(value) => std::env::set_var("DAVINCI_FOREGROUND_SECRET_FIXTURE", value),
+            None => std::env::remove_var("DAVINCI_FOREGROUND_SECRET_FIXTURE"),
+        }
+        assert_eq!(config.sandbox.as_ref(), Some(&spec));
+        assert!(!config
+            .environment
+            .contains_key("DAVINCI_FOREGROUND_SECRET_FIXTURE"));
+    }
+
     #[test]
     fn foreground_supervisor_capture_and_cancellation() {
         let root = tempfile::tempdir().unwrap();
