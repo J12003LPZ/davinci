@@ -317,6 +317,10 @@ impl RuntimeSubscriber for RuntimeLogSubscriber {
         }
         RuntimeDecision::Continue
     }
+
+    fn read_transparent(&self) -> bool {
+        true
+    }
 }
 
 #[cfg(test)]

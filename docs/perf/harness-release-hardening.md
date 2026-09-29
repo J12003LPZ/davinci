@@ -32,9 +32,10 @@ allowed; the fixed path retains the transaction coordinator and journal.
   declines installed pre-tool hooks, runtime-bound turns, active Context VM,
   workers, missing read tools, and active contracts. Ordinary gated reads
   remain available in those configurations.
-- Discovery counts at most 2,000 directory entries and requires a complete
-  scan before declaring a basename unique. Ignore loading has separate byte,
-  rule-count and ancestor limits. See [named-file context](../runtime/named-file-context.md).
+- Discovery uses the Git index in Git work trees (capped at 200,000 files and
+  2 seconds) and otherwise counts at most 10,000 directory entries; it
+  requires a complete listing before declaring a basename unique. Ignore
+  loading for the walk has separate byte, rule-count and ancestor limits. See [named-file context](../runtime/named-file-context.md).
 - Structured output supports a documented JSON Schema subset. Unsupported
   assertions fail before a provider request; schema/reply size, nesting,
   validation work, and diagnostics are bounded. Precision-losing numeric

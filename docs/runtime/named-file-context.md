@@ -47,10 +47,15 @@ The harness reads nothing on the model's behalf when any of these holds:
   extension is loaded (its `tool_call` handler may block). Those hooks would
   never see the harness's own read, so the feature stays off rather than
   bypass them.
-- A library `pre_tool` hook or a runtime handle is installed. Runtime decision
-  subscribers cannot be assumed read-transparent. The normal gated `read`
-  tool remains available instead. This deliberately limits automatic capture
-  to initial host turns and unbound library turns.
+- A library `pre_tool` hook is installed, or the bound runtime has a
+  subscriber that does not declare itself read-transparent
+  (`RuntimeSubscriber::read_transparent`, default false, aggregated by
+  `RuntimeBus::read_transparent`). The host's own subscribers declare it: the
+  compaction observer and the runtime log never deny, and the user-hook bridge
+  does only while no `preTool` command or rule covers `read` and its hook file
+  passes trust and integrity checks. Hosts bind a runtime on every prompt, so
+  capture keeps working after the first turn; an embedder's unknown decision
+  hook still turns it off. The normal gated `read` tool remains available.
 - Context VM is active. Its provider image may omit older authoritative
   messages, so history alone cannot prove a previous attachment is visible.
 - The `read` tool is not active (for example `--no-tools`).
@@ -73,13 +78,19 @@ When several genuine user messages are queued into one turn, all contribute.
 Harness notices and background-job output are not treated as user requests.
 
 Each candidate resolves against the working directory. A bare name such as
-`pricing.py` that is not at the root is looked up among at most 2,000
+`pricing.py` that is not at the root is looked up in the Git index when the
+working directory is in a Git work tree: `git ls-files -z --cached --others
+--exclude-standard` (tracked files plus untracked files `.gitignore` does not
+exclude), capped at 200,000 files, 32 MiB of output and 2 seconds, with no
+index lock taken. That covers large repositories. Outside Git, or when the
+listing fails or hits a cap, a bounded walk looks among at most 10,000
 directory entries, including ignored entries and empty directories (same
-ignore rules as native `find`). Only a complete scan can establish uniqueness;
-truncation or an I/O error disables basename attachment for that turn.
-Ignore-file loading is also bounded: 16 KiB total, 256 patterns including
-built-in exclusions, and at most 64 ancestor directories. Exceeding any
-limit leaves discovery to an explicit tool call.
+ignore rules as native `find`). Only a complete listing can establish
+uniqueness; truncation or an I/O error disables basename attachment for that
+turn. The walk's ignore-file loading is also bounded: 64 KiB total, 2,048
+patterns including built-in exclusions, and at most 64 ancestor directories.
+Exceeding any limit leaves discovery to an explicit tool call. A `read` of a
+missing path suggests close matches from the same sources.
 
 A file is listed only if all of these hold:
 

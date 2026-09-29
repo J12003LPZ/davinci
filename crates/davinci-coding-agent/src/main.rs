@@ -3369,8 +3369,6 @@ fn parse_model_ref(provider: &str, model: Option<&str>) -> (String, String) {
     }
 }
 
-/// Print cannot collect consent. Stop at the first policy-owned challenge and
-/// report it without creating grants or leaving a sticky cancellation signal.
 /// The default `--approval-policy abort`; the fail-closed tests drive it.
 #[cfg(test)]
 fn with_print_approval<T>(
@@ -3384,6 +3382,9 @@ fn with_print_approval<T>(
 /// The third denial of one action ends a deny-continue run the abort way, so
 /// a model that keeps retrying the same refused call cannot spin forever.
 const PRINT_DENIAL_CAP: u32 = 3;
+/// Denials of all actions together that end a deny-continue run the same way,
+/// so a model that varies the target on every retry cannot spin either.
+const PRINT_DENIAL_TOTAL_CAP: usize = 12;
 
 /// What `--approval-policy deny-continue` has refused in this print run. It
 /// outlives each prompt, so the repeat cap and the final report cover the run.
@@ -3396,8 +3397,9 @@ struct PrintDenials {
 }
 
 impl PrintDenials {
-    /// Records one denial. True when the action reached the cap and the run
-    /// has to stop and report `approval_required` instead.
+    /// Records one denial. True when the action reached the repeat cap, or
+    /// the run reached the total cap, and the run has to stop and report
+    /// `approval_required` instead.
     fn record(
         &mut self,
         request: &davinci_agent::ToolApprovalRequest,
@@ -3408,7 +3410,7 @@ impl PrintDenials {
             .entry(format!("{}\u{0}{}", request.tool, request.subject))
             .or_default();
         *count += 1;
-        if *count >= PRINT_DENIAL_CAP {
+        if *count >= PRINT_DENIAL_CAP || self.actions.len() + 1 >= PRINT_DENIAL_TOTAL_CAP {
             return true;
         }
         self.actions.push(serde_json::json!({
@@ -3441,9 +3443,12 @@ fn denied_actions_summary(actions: &[serde_json::Value]) -> String {
     )
 }
 
+/// Print cannot collect consent. Stop at the first policy-owned challenge and
+/// report it without creating grants or leaving a sticky cancellation signal.
 /// `denials` selects `--approval-policy deny-continue`: a challenge is denied
 /// with a headless reason and the turn goes on, until one action is refused
-/// [`PRINT_DENIAL_CAP`] times. Without it the first challenge stops the run.
+/// [`PRINT_DENIAL_CAP`] times or the run reaches [`PRINT_DENIAL_TOTAL_CAP`]
+/// denials. Without it the first challenge stops the run.
 fn with_print_approval_policy<T>(
     agent: &mut Agent,
     configuration_path: &Path,

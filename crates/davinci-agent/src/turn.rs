@@ -4389,8 +4389,6 @@ impl Agent {
     }
 }
 
-/// A tool's details as an event carries them: the same object without the
-/// image payloads, which belong in the message and not in every sink.
 /// What the model reads when an unattended responder (`Agent::headless_approval`)
 /// refuses a call: nobody declined it, the run simply cannot ask.
 fn headless_denial_reason(summary: &str) -> String {
@@ -4400,6 +4398,8 @@ fn headless_denial_reason(summary: &str) -> String {
     )
 }
 
+/// A tool's details as an event carries them: the same object without the
+/// image payloads, which belong in the message and not in every sink.
 fn event_details(details: Option<&Value>) -> Option<Value> {
     let Value::Object(map) = details? else {
         return None;
@@ -7289,55 +7289,138 @@ mod tool_name_tests {
     }
 }
 
-/// Programs whose run can check a change: test runners, build tools and
-/// interpreters. `python` also covers `python3`, `python3.12` and `py`.
+/// Programs whose run can check a change: test runners, build tools, type
+/// checkers, linters and interpreters. `python` also covers `python3`,
+/// `python3.12` and `py`.
 const CHECKER_PROGRAMS: &[&str] = &[
     "python", "py", "pytest", "node", "npm", "npx", "pnpm", "yarn", "cargo", "go", "deno", "bun",
     "uv", "tox", "nox", "make", "jest", "vitest", "mocha", "ruby", "rspec", "rake", "bundle",
-    "dotnet", "mvn", "gradle", "gradlew", "java", "php", "phpunit", "swift", "ctest",
+    "dotnet", "mvn", "gradle", "gradlew", "java", "php", "phpunit", "swift", "ctest", "tsc",
+    "ruff", "mypy", "pyright", "eslint", "flake8", "pylint", "just", "bazel", "rustc", "gcc",
+    "g++", "clang", "clang++", "javac", "mix", "elixir", "dart", "flutter", "zig", "perl", "prove",
 ];
+
+/// Environment runners whose `run` subcommand runs a project command
+/// (`uv run pytest`, `poetry run pytest`).
+const RUN_WRAPPERS: &[&str] = &["uv", "poetry", "pipenv", "pdm", "hatch", "rye"];
+
+/// Shells whose `-c` string or script argument is the actual command.
+const SHELLS: &[&str] = &["bash", "sh", "zsh", "dash"];
 
 /// Whether some segment of `command` (split on `&&`, `||`, `;`, `|`, `&` and
 /// newlines) starts with a checker program. Only the program word counts,
 /// so file names (`node_modules/`, `cargo.lock`) and substrings (`go` in
-/// `cargo`) never match. Leading `VAR=value` assignments and `env`, `time`,
-/// `sudo` or `uv run` prefixes are skipped; a path or `.exe` suffix on the
-/// program is ignored.
+/// `cargo`) never match. Leading `VAR=value` assignments and the prefixes
+/// `env`, `time`, `sudo`, `command`, `exec`, `nohup`, `nice`, `stdbuf`,
+/// `xvfb-run` and `timeout` (with their options and duration) are skipped;
+/// `<runner> run` (`uv`, `poetry`, `pipenv`, `pdm`, `hatch`, `rye`), a shell
+/// script (`bash run_tests.sh`, `./test.sh`) and a shell's `-c` string that
+/// itself runs a checker all count. A path or `.exe` suffix on the program is
+/// ignored.
 pub(crate) fn invokes_checker(command: &str) -> bool {
+    invokes_checker_at(command, 0)
+}
+
+fn invokes_checker_at(command: &str, depth: usize) -> bool {
+    if depth > 2 {
+        return false;
+    }
     let (segments, malformed) = crate::shell_policy::split_shell_segments_with_diagnostic(command);
     if malformed {
         return false;
     }
-    segments.iter().any(|segment| {
-        let mut words = segment.split_whitespace().peekable();
-        while let Some(word) = words.peek() {
-            let skip = word.contains('=') && !word.starts_with('-')
-                || matches!(*word, "env" | "time" | "sudo" | "command" | "exec");
-            if !skip {
-                break;
+    segments
+        .iter()
+        .any(|segment| segment_invokes_checker(segment, depth))
+}
+
+fn program_name(word: &str) -> String {
+    let program = word
+        .trim_matches(|ch| matches!(ch, '"' | '\'' | '(' | ')' | '{' | '}'))
+        .rsplit(['/', '\\'])
+        .next()
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    program
+        .strip_suffix(".exe")
+        .map(str::to_string)
+        .unwrap_or(program)
+}
+
+fn segment_invokes_checker(segment: &str, depth: usize) -> bool {
+    let words: Vec<&str> = segment.split_whitespace().collect();
+    let mut index = 0;
+    // Skip assignments and wrappers that only change how the command runs.
+    while let Some(word) = words.get(index) {
+        let name = program_name(word);
+        if word.contains('=') && !word.starts_with('-')
+            || matches!(
+                name.as_str(),
+                "env" | "time" | "sudo" | "command" | "exec" | "nohup"
+            )
+        {
+            index += 1;
+        } else if matches!(name.as_str(), "nice" | "stdbuf" | "xvfb-run") {
+            index += 1;
+            while let Some(option) = words.get(index).filter(|word| word.starts_with('-')) {
+                // `nice -n 10`, `xvfb-run -s "args"`.
+                let takes_value = matches!(*option, "-n" | "-s" | "--server-args");
+                index += if takes_value { 2 } else { 1 };
             }
-            words.next();
+        } else if matches!(name.as_str(), "timeout" | "gtimeout") {
+            index += 1;
+            while let Some(option) = words.get(index).filter(|word| word.starts_with('-')) {
+                // `timeout -s KILL -k 5 60 pytest`, `--signal=KILL`.
+                let takes_value = matches!(*option, "-s" | "-k" | "--signal" | "--kill-after");
+                index += if takes_value { 2 } else { 1 };
+            }
+            // The duration.
+            index += 1;
+        } else {
+            break;
         }
-        let Some(program) = words.next() else {
-            return false;
-        };
-        let program = program
-            .trim_matches(|ch| matches!(ch, '"' | '\'' | '(' | ')' | '{' | '}'))
-            .rsplit(['/', '\\'])
-            .next()
-            .unwrap_or("")
-            .to_ascii_lowercase();
-        let program = program.strip_suffix(".exe").unwrap_or(&program);
-        if program == "uv" && words.peek().is_some_and(|next| *next == "run") {
-            return true;
+    }
+    let Some(word) = words.get(index) else {
+        return false;
+    };
+    let program = program_name(word);
+    let next = words.get(index + 1).copied();
+    if RUN_WRAPPERS.contains(&program.as_str()) && next == Some("run") {
+        return true;
+    }
+    // `./test.sh`, `scripts/check.sh`.
+    if program.ends_with(".sh") {
+        return true;
+    }
+    if SHELLS.contains(&program.as_str()) {
+        let mut rest = index + 1;
+        while let Some(option) = words.get(rest).filter(|word| word.starts_with('-')) {
+            // `bash -c "..."`, `bash -lc '...'`, `sh -ec ...`.
+            if option.len() > 1 && !option.starts_with("--") && option.contains('c') {
+                let inner = words[rest + 1..].join(" ");
+                let inner = inner.trim();
+                let unquoted = inner
+                    .strip_prefix('"')
+                    .and_then(|text| text.strip_suffix('"'))
+                    .or_else(|| {
+                        inner
+                            .strip_prefix('\'')
+                            .and_then(|text| text.strip_suffix('\''))
+                    })
+                    .unwrap_or(inner);
+                return invokes_checker_at(unquoted, depth + 1);
+            }
+            rest += 1;
         }
-        CHECKER_PROGRAMS.iter().any(|checker| {
-            program == *checker
-                || *checker == "python"
-                    && program
-                        .strip_prefix("python")
-                        .is_some_and(|rest| rest.chars().all(|ch| ch.is_ascii_digit() || ch == '.'))
-        })
+        // `bash run_tests.sh`: a script is run.
+        return words.get(rest).is_some();
+    }
+    CHECKER_PROGRAMS.iter().any(|checker| {
+        program == *checker
+            || *checker == "python"
+                && program
+                    .strip_prefix("python")
+                    .is_some_and(|rest| rest.chars().all(|ch| ch.is_ascii_digit() || ch == '.'))
     })
 }
 
@@ -7364,5 +7447,39 @@ mod checker_quote_regressions {
         assert!(super::invokes_checker(
             "echo 'status; done' && python check.py"
         ));
+    }
+
+    #[test]
+    fn wrapped_and_scripted_checks_count_as_checker_runs() {
+        for command in [
+            "timeout 60 pytest -q",
+            "timeout -s KILL -k 5 120s python -m pytest",
+            "timeout --preserve-status 30 cargo test",
+            "nice -n 10 npm test",
+            "xvfb-run -a npx playwright test",
+            "poetry run pytest",
+            "pipenv run python -m unittest",
+            "hatch run test",
+            "bash run_tests.sh",
+            "sh -c 'pytest -q'",
+            "bash -lc \"cd app && go test ./...\"",
+            "./scripts/test.sh",
+            "tsc --noEmit",
+            "ruff check .",
+            "mypy src",
+        ] {
+            assert!(super::invokes_checker(command), "{command}");
+        }
+        for command in [
+            "cat app.py",
+            "git diff",
+            "timeout 5 cat log.txt",
+            "bash -c 'cat app.py'",
+            "sh",
+            "poetry show",
+            "echo 'timeout 60 pytest'",
+        ] {
+            assert!(!super::invokes_checker(command), "{command}");
+        }
     }
 }

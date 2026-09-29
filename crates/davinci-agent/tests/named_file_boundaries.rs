@@ -31,16 +31,55 @@ fn installed_read_hook_is_not_bypassed() {
     assert!(!attach(&mut agent, "Fix calc.py").contains("PRIVATE_FILE_BODY"));
 }
 
+/// A decision hook that does not declare itself read-transparent.
+struct OpaqueDecisionHook;
+
+impl davinci_agent::RuntimeSubscriber for OpaqueDecisionHook {
+    fn on_event(&self, _: &davinci_agent::RuntimeEventEnvelope) -> davinci_agent::RuntimeDecision {
+        davinci_agent::RuntimeDecision::Continue
+    }
+}
+
+fn bound_runtime(bus: davinci_agent::RuntimeBus) -> davinci_agent::RuntimeHandle {
+    davinci_agent::RuntimeHandle::new(
+        davinci_agent::RunId::new(),
+        davinci_agent::AgentId::new(),
+        bus,
+    )
+}
+
 #[test]
 fn runtime_bound_agents_do_not_bypass_decision_subscribers() {
     let dir = tempfile::tempdir().unwrap();
     fs::write(dir.path().join("calc.py"), "PRIVATE_FILE_BODY").unwrap();
     let mut agent = agent(dir.path());
-    agent.set_runtime(davinci_agent::RuntimeHandle::new(
-        davinci_agent::RunId::new(),
-        davinci_agent::AgentId::new(),
-        davinci_agent::RuntimeBus::new(),
-    ));
+    let bus = davinci_agent::RuntimeBus::new();
+    bus.subscribe(Arc::new(OpaqueDecisionHook));
+    agent.set_runtime(bound_runtime(bus));
+    assert!(!attach(&mut agent, "Fix calc.py").contains("PRIVATE_FILE_BODY"));
+}
+
+#[test]
+fn a_read_transparent_runtime_keeps_capture_on_later_turns() {
+    // Hosts bind a fresh runtime on every prompt; that alone must not turn
+    // the feature off after the first turn.
+    let dir = tempfile::tempdir().unwrap();
+    fs::write(dir.path().join("calc.py"), "FIRST_FILE_BODY").unwrap();
+    fs::write(dir.path().join("other.py"), "SECOND_FILE_BODY").unwrap();
+    let mut agent = agent(dir.path());
+    assert!(attach(&mut agent, "Fix calc.py").contains("FIRST_FILE_BODY"));
+    agent.set_runtime(bound_runtime(davinci_agent::RuntimeBus::new()));
+    assert!(attach(&mut agent, "Now fix other.py").contains("SECOND_FILE_BODY"));
+}
+
+#[test]
+fn workers_never_capture_even_with_a_transparent_runtime() {
+    let dir = tempfile::tempdir().unwrap();
+    fs::write(dir.path().join("calc.py"), "PRIVATE_FILE_BODY").unwrap();
+    let mut agent = agent(dir.path());
+    let mut runtime = bound_runtime(davinci_agent::RuntimeBus::new());
+    runtime.parent_agent_id = Some(davinci_agent::AgentId::new());
+    agent.set_runtime(runtime);
     assert!(!attach(&mut agent, "Fix calc.py").contains("PRIVATE_FILE_BODY"));
 }
 
@@ -70,8 +109,9 @@ fn incomplete_basename_scan_cannot_claim_uniqueness() {
     fs::create_dir(dir.path().join("a")).unwrap();
     fs::create_dir(dir.path().join("z")).unwrap();
     fs::write(dir.path().join("a/pricing.py"), "WRONG_COPY").unwrap();
-    for i in 0..2001 {
-        fs::write(dir.path().join(format!("a/z{i:04}.txt")), "").unwrap();
+    // One more than the fallback walk's 10,000-entry budget (not a Git tree).
+    for i in 0..10_001 {
+        fs::write(dir.path().join(format!("a/z{i:05}.txt")), "").unwrap();
     }
     fs::write(dir.path().join("z/pricing.py"), "OTHER_COPY").unwrap();
     assert!(capture_named_files(dir.path(), "pricing.py", &|_| true, &HashSet::new()).is_none());
@@ -151,8 +191,62 @@ fn huge_ignore_files_do_not_defeat_the_discovery_budget() {
     let dir = tempfile::tempdir().unwrap();
     fs::create_dir(dir.path().join("src")).unwrap();
     fs::write(dir.path().join("src/calc.py"), "FILE_BODY").unwrap();
-    fs::write(dir.path().join(".gitignore"), "a".repeat(20000)).unwrap();
+    // Over the walk's 64 KiB ignore-file budget.
+    fs::write(dir.path().join(".gitignore"), "a".repeat(70_000)).unwrap();
     assert!(capture_named_files(dir.path(), "calc.py", &|_| true, &HashSet::new()).is_none());
     // A direct path does not require discovery or ignore-file parsing.
     assert!(capture_named_files(dir.path(), "src/calc.py", &|_| true, &HashSet::new()).is_some());
+}
+
+fn git(dir: &std::path::Path, args: &[&str]) {
+    let status = std::process::Command::new("git")
+        .args(args)
+        .current_dir(dir)
+        .env(
+            "GIT_CONFIG_GLOBAL",
+            if cfg!(windows) { "NUL" } else { "/dev/null" },
+        )
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .status()
+        .unwrap();
+    assert!(status.success(), "git {args:?}");
+}
+
+#[test]
+fn git_index_resolves_a_bare_name_in_a_repository_past_the_walk_budget() {
+    // Regression: the bounded walk gave up after 2,000 entries, so a bare
+    // name never resolved in a real repository.
+    let dir = tempfile::tempdir().unwrap();
+    git(dir.path(), &["init", "--quiet"]);
+    fs::create_dir_all(dir.path().join("vendor")).unwrap();
+    for i in 0..10_050 {
+        fs::write(dir.path().join(format!("vendor/f{i:05}.txt")), "").unwrap();
+    }
+    fs::create_dir_all(dir.path().join("zz/shop")).unwrap();
+    fs::write(dir.path().join("zz/shop/pricing.py"), "PRICING_BODY").unwrap();
+    // An ignored duplicate is not a file the user can mean.
+    fs::create_dir_all(dir.path().join("build")).unwrap();
+    fs::write(dir.path().join("build/pricing.py"), "BUILD_COPY").unwrap();
+    fs::write(dir.path().join(".gitignore"), "build/\n").unwrap();
+    let snapshot = capture_named_files(dir.path(), "fix pricing.py", &|_| true, &HashSet::new())
+        .expect("unique through the Git index");
+    assert_eq!(snapshot.files[0].path, "zz/shop/pricing.py");
+    assert!(snapshot.render().contains("PRICING_BODY"));
+}
+
+#[test]
+fn git_index_keeps_ambiguity_and_skips_deleted_tracked_files() {
+    let dir = tempfile::tempdir().unwrap();
+    git(dir.path(), &["init", "--quiet"]);
+    fs::create_dir_all(dir.path().join("a")).unwrap();
+    fs::create_dir_all(dir.path().join("b")).unwrap();
+    fs::write(dir.path().join("a/calc.py"), "A_BODY").unwrap();
+    fs::write(dir.path().join("b/calc.py"), "B_BODY").unwrap();
+    git(dir.path(), &["add", "."]);
+    assert!(capture_named_files(dir.path(), "calc.py", &|_| true, &HashSet::new()).is_none());
+    // Deleted from disk but still in the index: only `a/calc.py` remains.
+    fs::remove_file(dir.path().join("b/calc.py")).unwrap();
+    let snapshot = capture_named_files(dir.path(), "calc.py", &|_| true, &HashSet::new())
+        .expect("the deleted twin no longer makes it ambiguous");
+    assert_eq!(snapshot.files[0].path, "a/calc.py");
 }

@@ -301,6 +301,16 @@ impl HooksRuntimeSubscriber {
 }
 
 impl RuntimeSubscriber for HooksRuntimeSubscriber {
+    /// A `read` reaches these hooks only through a `preTool` command or rule
+    /// for it, and an invalid hook file denies every decision event.
+    fn read_transparent(&self) -> bool {
+        !self.hooks.intercepts_tool("read")
+            && self
+                .hooks
+                .validate_trust_and_integrity(&self.cwd, &self.agent_dir)
+                .is_ok()
+    }
+
     fn on_event(&self, event: &RuntimeEventEnvelope) -> RuntimeDecision {
         use std::sync::atomic::Ordering;
 
@@ -535,6 +545,11 @@ impl RuntimeSubscriber for CompactionRuntimeSubscriber {
             }
         }
         RuntimeDecision::Continue
+    }
+
+    /// Observes compaction only; never denies.
+    fn read_transparent(&self) -> bool {
+        true
     }
 }
 

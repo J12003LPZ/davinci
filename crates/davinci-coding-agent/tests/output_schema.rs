@@ -124,6 +124,9 @@ fn davinci_options(root: &Path, base_url: &str, api: &str, read_tool: bool) -> C
             "baseUrl": base_url,
             "api": api,
             "apiKey": "sk-test",
+            // Opt the loopback chat-completions server into `response_format`,
+            // which Davinci otherwise sends only to api.openai.com.
+            "compat": {"supportsStrictMode": true},
             "models": [{"id": "demo", "name": "Demo"}]
         }}})
         .to_string(),
@@ -218,7 +221,8 @@ fn one_repair_turn_fixes_a_nonconforming_answer() {
     let schema: Value = serde_json::from_str(SCHEMA).unwrap();
     for body in seen.iter() {
         assert_eq!(body["response_format"]["type"], "json_schema");
-        assert_eq!(body["response_format"]["json_schema"]["strict"], true);
+        // SCHEMA leaves `items` optional, outside OpenAI's strict subset.
+        assert_eq!(body["response_format"]["json_schema"]["strict"], false);
         assert_eq!(body["response_format"]["json_schema"]["schema"], schema);
     }
     let repair = last_user_text(&seen[1]);
@@ -455,6 +459,27 @@ fn named_file_bytes_reach_the_first_cli_provider_request() {
         "{}",
         seen[0]
     );
+}
+
+#[test]
+fn named_file_bytes_reach_later_prompts_after_the_host_binds_a_runtime() {
+    // Regression: the host binds a runtime on every prompt and the capture
+    // declined any bound runtime, so only the first prompt got its files.
+    let root = tempfile::tempdir().unwrap();
+    fs::write(root.path().join("calc.py"), "FIRST_FILE_BODY = 1\n").unwrap();
+    fs::write(root.path().join("other.py"), "SECOND_FILE_BODY = 2\n").unwrap();
+    let (base, seen) = provider(&["Reviewed.", "Reviewed again."]);
+    let output = davinci_options(root.path(), &base, "openai-completions", true)
+        .env("DAVINCI_TURN_CONTEXT", "appended")
+        .env("DAVINCI_NAMED_FILES", "1")
+        .args(["-p", "Review calc.py", "Now review other.py"])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(0), "{}", describe(&output));
+    let seen = seen.lock().unwrap();
+    assert_eq!(seen.len(), 2);
+    let second = seen[1]["messages"].to_string();
+    assert!(second.contains("SECOND_FILE_BODY"), "{}", seen[1]);
 }
 
 #[test]

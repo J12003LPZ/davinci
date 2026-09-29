@@ -237,6 +237,44 @@ pub fn thinking_level_map(levels: &[CodexReasoningLevel]) -> BTreeMap<String, Op
     map
 }
 
+/// The upstream compatibility identity sent when nothing better is known. The
+/// Davinci product version is never a provider wire identity (it changes with
+/// every release and is not a Codex version).
+pub const CODEX_MODELS_CLIENT_VERSION: &str = "0.84.4";
+
+fn plausible_version(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 32
+        && value.starts_with(|ch: char| ch.is_ascii_digit())
+        && value
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '.' | '-' | '+'))
+}
+
+/// The `client_version` the models route receives. The backend filters its
+/// list by client version, so the version Codex CLI itself last sent (kept in
+/// its `models_cache.json`) yields the list Codex shows. Otherwise
+/// `DAVINCI_CODEX_CLIENT_VERSION`, then [`CODEX_MODELS_CLIENT_VERSION`].
+pub fn codex_client_version() -> String {
+    if let Some(version) = std::env::var("DAVINCI_CODEX_CLIENT_VERSION")
+        .ok()
+        .filter(|version| plausible_version(version))
+    {
+        return version;
+    }
+    codex_cli_cache_path()
+        .and_then(|path| fs::read_to_string(path).ok())
+        .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
+        .and_then(|cache| {
+            cache
+                .get("client_version")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        })
+        .filter(|version| plausible_version(version))
+        .unwrap_or_else(|| CODEX_MODELS_CLIENT_VERSION.to_string())
+}
+
 /// Result of [`refresh_codex_models`].
 #[derive(Debug, Clone, PartialEq)]
 pub enum CodexModelsRefresh {
@@ -295,11 +333,7 @@ pub fn refresh_codex_models(
         return Ok(CodexModelsRefresh::Skipped);
     }
     let separator = if base.contains('?') { '&' } else { '?' };
-    // The backend requires a client version; Davinci's own passes its checks.
-    let url = format!(
-        "{base}{separator}client_version={}",
-        env!("CARGO_PKG_VERSION")
-    );
+    let url = format!("{base}{separator}client_version={}", codex_client_version());
     let mut request = crate::http::agent(crate::http::CONTROL_IDLE_TIMEOUT)
         .get(&url)
         .timeout(std::time::Duration::from_secs(10))
@@ -603,19 +637,41 @@ mod tests {
             requests
         });
         let dir = tempfile::tempdir().unwrap();
+        let codex_home = tempfile::tempdir().unwrap();
         let _env = env_lock();
         std::env::remove_var("DAVINCI_CODEX_MODELS_REPLY");
+        std::env::remove_var("DAVINCI_CODEX_CLIENT_VERSION");
+        std::env::set_var("CODEX_HOME", codex_home.path());
         std::env::set_var(
             "DAVINCI_CODEX_MODELS_URL",
             format!("http://{addr}/codex/models"),
         );
         let first = refresh_codex_models(dir.path(), Some("tok-1"), true, true);
+        // Codex CLI's own cache names the version Codex sends; reuse it.
+        let mut cache = live_reply();
+        cache["client_version"] = json!("0.157.1");
+        fs::write(
+            codex_home.path().join("models_cache.json"),
+            cache.to_string(),
+        )
+        .unwrap();
         let second = refresh_codex_models(dir.path(), Some("tok-1"), true, true);
         std::env::remove_var("DAVINCI_CODEX_MODELS_URL");
+        std::env::remove_var("CODEX_HOME");
         assert_eq!(first, Ok(CodexModelsRefresh::Updated(4)));
         assert_eq!(second, Ok(CodexModelsRefresh::Unchanged));
         let requests = server.join().unwrap();
-        assert!(requests[0].starts_with("get /codex/models?client_version="));
+        // Never the Davinci product version.
+        assert!(
+            requests[0].starts_with("get /codex/models?client_version=0.84.4 "),
+            "{}",
+            requests[0]
+        );
+        assert!(
+            requests[1].starts_with("get /codex/models?client_version=0.157.1 "),
+            "{}",
+            requests[1]
+        );
         assert!(requests[0].contains("authorization: bearer tok-1"));
         assert!(requests[0].contains("originator: "));
         assert!(!requests[0].contains("if-none-match"));

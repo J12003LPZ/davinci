@@ -1395,8 +1395,80 @@ fn read_tool_cached(
 }
 
 /// Files a missing-path suggestion scans at most, and how many it names.
-const MISSING_FILE_SCAN_LIMIT: usize = 2_000;
+const MISSING_FILE_SCAN_LIMIT: usize = 10_000;
 const MISSING_FILE_SUGGESTIONS: usize = 5;
+
+/// Most files the Git index listing may name before it counts as truncated.
+const GIT_INDEX_MAX_FILES: usize = 200_000;
+/// Bytes of `git ls-files -z` output read at most.
+const GIT_INDEX_MAX_BYTES: usize = 32 * 1024 * 1024;
+/// A slower listing is abandoned; the bounded walk is the fallback.
+const GIT_INDEX_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Every file of the Git work tree at or below `root`, as absolute paths:
+/// tracked files plus untracked ones `.gitignore` does not exclude, which is
+/// what a user can name. Unlike the bounded walk this scales to large
+/// repositories, so a bare file name can be proven unique there. `None`
+/// outside a Git work tree, when Git is missing, fails, is slow, lists
+/// nothing, or the listing would be truncated: callers then fall back to
+/// [`walk_workspace_files`]. A tracked file deleted from disk may appear;
+/// callers check the path before using it.
+pub(crate) fn git_workspace_files(root: &Path) -> Option<Vec<PathBuf>> {
+    if !path_is_inside_git_repo(root) {
+        return None;
+    }
+    let mut command = Command::new(davinci_sys::process::resolve_program("git"));
+    command
+        .current_dir(root)
+        // Never take the index lock or rewrite the index for a listing.
+        .env("GIT_OPTIONAL_LOCKS", "0")
+        .args([
+            "-c",
+            "core.quotepath=off",
+            "ls-files",
+            "-z",
+            "--cached",
+            "--others",
+            "--exclude-standard",
+            "--",
+            ".",
+        ]);
+    let output = davinci_sys::process::run_bounded(
+        command,
+        None,
+        davinci_sys::process::RunLimits {
+            timeout: GIT_INDEX_TIMEOUT,
+            output_cap: GIT_INDEX_MAX_BYTES,
+        },
+        &|| false,
+    )
+    .ok()?;
+    if !output.status.is_some_and(|status| status.success()) || output.stdout_truncated {
+        return None;
+    }
+    let mut seen = std::collections::HashSet::new();
+    let mut files = Vec::new();
+    for entry in output.stdout.split(|byte| *byte == 0) {
+        if entry.is_empty() {
+            continue;
+        }
+        // Git prints paths relative to `root`; skip names that are not UTF-8.
+        let Ok(relative) = std::str::from_utf8(entry) else {
+            continue;
+        };
+        // An unmerged path is listed once per conflict stage.
+        if !seen.insert(relative) {
+            continue;
+        }
+        if files.len() >= GIT_INDEX_MAX_FILES {
+            return None;
+        }
+        files.push(root.join(relative));
+    }
+    // An enclosing repository that ignores this directory (a dotfiles repo in
+    // the home directory, say) lists nothing: the walk knows better.
+    (!files.is_empty()).then_some(files)
+}
 
 /// The error for a `read` of a path that does not exist: the path as the
 /// model wrote it plus the closest workspace files, so a wrong guess costs
@@ -1416,7 +1488,8 @@ fn missing_file_message(cwd: &Path, raw_path: &str, path: &Path) -> String {
     let mut scored: Vec<(u8, String)> = Vec::new();
     let mut scanned = 0;
     if !wanted.is_empty() {
-        walk_workspace_files(cwd, MISSING_FILE_SCAN_LIMIT, &mut |file| {
+        let git_files = git_workspace_files(cwd);
+        let mut score_file = |file: &Path| {
             scanned += 1;
             let name = file
                 .file_name()
@@ -1445,7 +1518,20 @@ fn missing_file_message(cwd: &Path, raw_path: &str, path: &Path) -> String {
                 scored.push((score, relativize_find_result_path(file, cwd)));
             }
             scanned < MISSING_FILE_SCAN_LIMIT
-        });
+        };
+        match git_files {
+            // The Git index covers the whole tree however large it is. Only
+            // the matches are checked on disk, not every listed file.
+            Some(files) => {
+                for file in &files {
+                    score_file(file);
+                }
+                scored.retain(|(_, name)| cwd.join(name).is_file());
+            }
+            None => {
+                walk_workspace_files(cwd, MISSING_FILE_SCAN_LIMIT, &mut score_file);
+            }
+        }
     }
     scored.sort();
     scored.dedup();
@@ -3619,7 +3705,9 @@ impl IgnoreRules {
     /// arbitrarily many ancestors before its entry budget even starts.
     fn load_for_discovery(root: &Path) -> Option<Self> {
         let mut patterns = vec![".git".to_string(), "node_modules".to_string()];
-        let mut remaining = 16 * 1024;
+        // Large enough for common templates (Visual Studio's alone is ~400
+        // rules); still bounded before the entry budget starts.
+        let mut remaining = 64 * 1024;
         let mut current = root;
         for _ in 0..64 {
             let path = current.join(".gitignore");
@@ -3642,7 +3730,7 @@ impl IgnoreRules {
                         if line.is_empty() || line.starts_with('#') || line.starts_with('!') {
                             continue;
                         }
-                        if patterns.len() >= 256 {
+                        if patterns.len() >= 2_048 {
                             return None;
                         }
                         patterns.push(line.trim_end_matches('/').to_string());

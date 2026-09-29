@@ -30,8 +30,9 @@ pub const NAMED_FILES_MAX: usize = 3;
 pub const NAMED_FILE_MAX_BYTES: usize = 8 * 1024;
 /// All attached contents together stay under this many bytes.
 pub const NAMED_FILES_TOTAL_BYTES: usize = 12 * 1024;
-/// Files a bare name (no directory) is looked up among, at most.
-const BASENAME_SCAN_LIMIT: usize = 2_000;
+/// Directory entries the fallback walk visits, at most, outside a Git work
+/// tree (Git work trees use the Git index, which has no such limit).
+const BASENAME_SCAN_LIMIT: usize = 10_000;
 /// Candidate tokens considered from one message, at most.
 const TOKEN_LIMIT: usize = 64;
 /// Markup a file must not contain to be embedded: the tags of the harness
@@ -261,9 +262,10 @@ fn resolve_named_paths(root: &Path, text: &str, allowed: &dyn Fn(&Path) -> bool)
             if !*complete {
                 continue;
             }
-            let mut matches = index
-                .iter()
-                .filter(|path| path.file_name().is_some_and(|name| name == token.as_str()));
+            // The Git index can list a tracked file deleted from disk.
+            let mut matches = index.iter().filter(|path| {
+                path.file_name().is_some_and(|name| name == token.as_str()) && path.is_file()
+            });
             match (matches.next(), matches.next()) {
                 (Some(only), None) => Some(only.clone()),
                 _ => None,
@@ -396,9 +398,15 @@ impl crate::Agent {
         if !self.named_file_context
             || self.named_file_hooks_active
             || self.pre_tool.is_some()
-            // Runtime decision subscribers cannot be proven read-transparent.
-            // Leave these reads on the normal gated tool path instead.
-            || self.runtime.is_some()
+            // A runtime decision subscriber that could deny a `read` would
+            // never see the harness's own read. Hosts bind a runtime on every
+            // prompt, so a bound runtime alone must not end the feature after
+            // the first turn: only subscribers that declare themselves
+            // read-transparent (`RuntimeSubscriber::read_transparent`) pass.
+            || self
+                .runtime
+                .as_ref()
+                .is_some_and(|runtime| !runtime.bus.read_transparent())
             || self.context_vm_mode() == crate::runtime::ContextVmMode::Active
             || !self.tools.iter().any(|tool| tool == "read")
             || self.active_contract().is_some()
@@ -470,7 +478,14 @@ impl crate::Agent {
     }
 }
 
+/// The files a bare name is looked up among, and whether the list is
+/// complete. A Git work tree uses the Git index, which covers large
+/// repositories; elsewhere a bounded walk runs and a truncated walk proves no
+/// uniqueness.
 fn workspace_files(root: &Path) -> (Vec<PathBuf>, bool) {
+    if let Some(files) = crate::tools::git_workspace_files(root) {
+        return (files, true);
+    }
     let mut files = Vec::new();
     let complete = crate::tools::walk_workspace_files(root, BASENAME_SCAN_LIMIT, &mut |path| {
         files.push(path.to_path_buf());

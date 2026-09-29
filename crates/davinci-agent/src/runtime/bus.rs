@@ -15,6 +15,14 @@ pub enum RuntimeDecision {
 
 pub trait RuntimeSubscriber: Send + Sync {
     fn on_event(&self, event: &RuntimeEventEnvelope) -> RuntimeDecision;
+
+    /// True when this subscriber can never deny, or never needs to see, a
+    /// `read` tool call. The harness then may read a file the user named on
+    /// the model's behalf (`prompt::named_files`) without bypassing it.
+    /// Defaults to false so an unknown decision hook fails closed.
+    fn read_transparent(&self) -> bool {
+        false
+    }
 }
 
 #[derive(Default)]
@@ -49,6 +57,10 @@ impl RuntimeSubscriber for QueuedObserver {
         }
         RuntimeDecision::Continue
     }
+
+    fn read_transparent(&self) -> bool {
+        true
+    }
 }
 
 #[derive(Clone, Default)]
@@ -72,6 +84,17 @@ impl RuntimeBus {
                 session: false,
             });
         }
+    }
+
+    /// Whether every subscriber declares itself read-transparent
+    /// (`RuntimeSubscriber::read_transparent`). An empty bus is.
+    pub fn read_transparent(&self) -> bool {
+        self.inner
+            .subscribers
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .all(|entry| entry.observer.read_transparent())
     }
 
     /// Install a session-owned observer once, retaining it across prompt turns.

@@ -51,6 +51,91 @@ pub struct StreamOptions {
 /// sends its own; ours only has to be stable and within OpenAI's name rules.
 pub const OUTPUT_SCHEMA_NAME: &str = "davinci_output_schema";
 
+/// Whether `schema` fits OpenAI's strict structured-output subset: an object
+/// root, every object closed (`additionalProperties: false`) with every
+/// property listed in `required`, and only keywords strict mode is known to
+/// accept. OpenAI answers any other schema sent with `strict: true` with HTTP
+/// 400 on the first request, so such a schema is sent with `strict: false`
+/// (best-effort guidance) and the caller's validation stays the proof.
+/// Deliberately conservative: an unlisted keyword means not strict.
+pub fn openai_strict_compatible(schema: &Value) -> bool {
+    const STRICT_KEYWORDS: &[&str] = &[
+        "type",
+        "properties",
+        "required",
+        "additionalProperties",
+        "items",
+        "anyOf",
+        "enum",
+        "const",
+        "description",
+        "title",
+    ];
+    fn node(schema: &Value, depth: usize) -> bool {
+        let Some(object) = schema.as_object() else {
+            // Boolean schemas are not part of the strict subset.
+            return false;
+        };
+        if depth > 64
+            || object
+                .keys()
+                .any(|key| !STRICT_KEYWORDS.contains(&key.as_str()))
+        {
+            return false;
+        }
+        let is_object = match object.get("type") {
+            Some(Value::String(name)) => name == "object",
+            Some(Value::Array(names)) => names.iter().any(|name| name == "object"),
+            _ => object.contains_key("properties"),
+        };
+        if let Some(extra) = object.get("additionalProperties") {
+            if extra != &Value::Bool(false) {
+                return false;
+            }
+        }
+        if is_object {
+            if object.get("additionalProperties") != Some(&Value::Bool(false)) {
+                return false;
+            }
+            let properties = match object.get("properties") {
+                Some(Value::Object(properties)) => properties,
+                None => return false,
+                Some(_) => return false,
+            };
+            let Some(Value::Array(required)) = object.get("required") else {
+                return false;
+            };
+            if required.len() != properties.len()
+                || !properties
+                    .keys()
+                    .all(|key| required.iter().any(|name| name == key))
+            {
+                return false;
+            }
+            if !properties.values().all(|child| node(child, depth + 1)) {
+                return false;
+            }
+        }
+        if let Some(items) = object.get("items") {
+            if !node(items, depth + 1) {
+                return false;
+            }
+        }
+        if let Some(branches) = object.get("anyOf") {
+            let Some(branches) = branches.as_array() else {
+                return false;
+            };
+            if !branches.iter().all(|branch| node(branch, depth + 1)) {
+                return false;
+            }
+        }
+        true
+    }
+    schema.get("type").and_then(Value::as_str) == Some("object")
+        && schema.get("anyOf").is_none()
+        && node(schema, 0)
+}
+
 /// Responses `text.format`: merged into an existing `text` object so the
 /// Codex `verbosity` setting survives.
 fn apply_responses_output_schema(body: &mut Value, schema: &Value) {
@@ -60,9 +145,28 @@ fn apply_responses_output_schema(body: &mut Value, schema: &Value) {
     body["text"]["format"] = serde_json::json!({
         "type": "json_schema",
         "name": OUTPUT_SCHEMA_NAME,
-        "strict": true,
+        "strict": openai_strict_compatible(schema),
         "schema": schema,
     });
+}
+
+/// Whether a chat-completions provider takes OpenAI's `response_format`
+/// `json_schema`: api.openai.com, or a provider whose `compat` declares
+/// `supportsStrictMode`. Other OpenAI-compatible servers (Ollama, DeepSeek,
+/// llama.cpp and similar) reject the field or constrain every turn to JSON,
+/// which blocks tool calls. They get the schema through the final-answer
+/// instructions and the caller's validation only.
+fn completions_accepts_response_format(model: &Model) -> bool {
+    model
+        .base_url
+        .as_deref()
+        .unwrap_or("https://api.openai.com/v1")
+        .contains("api.openai.com")
+        || model
+            .compat
+            .get("supportsStrictMode")
+            .and_then(Value::as_bool)
+            == Some(true)
 }
 
 /// Chat completions `response_format`.
@@ -71,7 +175,7 @@ fn apply_completions_output_schema(body: &mut Value, schema: &Value) {
         "type": "json_schema",
         "json_schema": {
             "name": OUTPUT_SCHEMA_NAME,
-            "strict": true,
+            "strict": openai_strict_compatible(schema),
             "schema": schema,
         },
     });
@@ -2090,7 +2194,7 @@ fn openai_body(
         );
     }
     apply_openai_thinking(&mut body, model, options);
-    if model.api == "openai-completions" {
+    if model.api == "openai-completions" && completions_accepts_response_format(model) {
         if let Some(schema) = options.output_schema.as_ref() {
             apply_completions_output_schema(&mut body, schema);
         }
@@ -2869,10 +2973,13 @@ mod tests {
     #[test]
     fn output_schema_becomes_response_format_on_chat_completions_only() {
         let models = load_builtin_models();
-        let chat = models
+        let mut chat = models
             .iter()
             .find(|model| model.api == "openai-completions")
-            .unwrap();
+            .unwrap()
+            .clone();
+        chat.base_url = Some("https://api.openai.com/v1".into());
+        let chat = &chat;
         let messages = [ChatMessage::text("user", "hi")];
         let plain = request_body_with(chat, &messages, None, &[], &StreamOptions::default());
         assert!(plain.get("response_format").is_none());
@@ -2901,6 +3008,85 @@ mod tests {
             let body = request_body_with(model, &messages, None, &[], &schema_options());
             assert_eq!(body, plain, "{api}");
         }
+    }
+
+    #[test]
+    fn response_format_goes_only_to_openai_or_opted_in_completions_hosts() {
+        let mut chat = load_builtin_models()
+            .into_iter()
+            .find(|model| model.api == "openai-completions")
+            .unwrap();
+        let messages = [ChatMessage::text("user", "hi")];
+        // An OpenAI-compatible server (Ollama, DeepSeek, llama.cpp ...) may
+        // reject the field or force JSON on tool turns: instructions only.
+        chat.base_url = Some("http://127.0.0.1:11434/v1".into());
+        chat.compat = serde_json::json!({});
+        let body = request_body_with(&chat, &messages, None, &[], &schema_options());
+        assert!(body.get("response_format").is_none(), "{body}");
+        // A provider that declares strict-mode support opts in.
+        chat.compat = serde_json::json!({"supportsStrictMode": true});
+        let body = request_body_with(&chat, &messages, None, &[], &schema_options());
+        assert_eq!(body["response_format"]["type"], "json_schema");
+    }
+
+    #[test]
+    fn strict_is_sent_only_for_schemas_in_openais_strict_subset() {
+        assert!(openai_strict_compatible(&output_schema_fixture()));
+        let nested = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "items": {"type": "array", "items": {
+                    "type": "object",
+                    "properties": {"name": {"type": ["string", "null"]}},
+                    "required": ["name"],
+                    "additionalProperties": false
+                }},
+                "kind": {"anyOf": [{"type": "string", "enum": ["a", "b"]}, {"type": "null"}]}
+            },
+            "required": ["items", "kind"],
+            "additionalProperties": false
+        });
+        assert!(openai_strict_compatible(&nested));
+        for rejected in [
+            // An optional property.
+            serde_json::json!({"type": "object", "properties": {"a": {"type": "string"}},
+                "required": [], "additionalProperties": false}),
+            // An open object.
+            serde_json::json!({"type": "object", "properties": {"a": {"type": "string"}},
+                "required": ["a"]}),
+            // A nested open object.
+            serde_json::json!({"type": "object", "properties": {"a": {"type": "object",
+                "properties": {}, "required": []}}, "required": ["a"],
+                "additionalProperties": false}),
+            // A keyword outside the known strict subset.
+            serde_json::json!({"type": "object", "properties": {"a": {"type": "array",
+                "items": {"type": "string"}, "minItems": 1}}, "required": ["a"],
+                "additionalProperties": false}),
+            // A non-object root.
+            serde_json::json!({"type": "array", "items": {"type": "string"}}),
+            serde_json::json!({"anyOf": [{"type": "object"}]}),
+        ] {
+            assert!(!openai_strict_compatible(&rejected), "{rejected}");
+        }
+
+        let mut model = load_builtin_models()
+            .into_iter()
+            .find(|model| model.api == "openai-responses")
+            .unwrap();
+        model.base_url = Some("https://api.openai.com/v1".into());
+        let loose = StreamOptions {
+            output_schema: Some(serde_json::json!({"type": "object",
+                "properties": {"a": {"type": "string"}}})),
+            ..StreamOptions::default()
+        };
+        let body = request_body_with(
+            &model,
+            &[ChatMessage::text("user", "hi")],
+            None,
+            &[],
+            &loose,
+        );
+        assert_eq!(body["text"]["format"]["strict"], false, "{body}");
     }
 
     #[test]

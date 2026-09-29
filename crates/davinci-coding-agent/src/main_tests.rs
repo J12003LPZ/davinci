@@ -1829,6 +1829,17 @@ fn deny_continue_counts_each_action_separately() {
         )
     );
     assert!(denied_actions_summary(&denials.actions).starts_with("Denied 4 actions "));
+
+    // A model that changes the target on every retry never repeats an
+    // action, so the total cap has to stop it.
+    let mut varied = PrintDenials::default();
+    let stopped_at = (0..PRINT_DENIAL_TOTAL_CAP * 2).find(|n| {
+        let mut request = a.clone();
+        request.subject = format!("file{n}.txt");
+        varied.record(&request, a_challenge)
+    });
+    assert_eq!(stopped_at, Some(PRINT_DENIAL_TOTAL_CAP - 1));
+    assert_eq!(varied.actions.len(), PRINT_DENIAL_TOTAL_CAP - 1);
 }
 
 #[test]
