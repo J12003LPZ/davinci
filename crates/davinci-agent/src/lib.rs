@@ -887,6 +887,8 @@ impl Agent {
             provider: Some(self.provider.clone()),
             model_id: Some(self.model_id.clone()),
             parent_tools: self.tools.clone(),
+            foreground_supervisor: self.tool_context.foreground_supervisor.clone(),
+            sandbox: self.tool_context.sandbox.clone(),
             report_to_lead,
             turn_token: self
                 .runtime
