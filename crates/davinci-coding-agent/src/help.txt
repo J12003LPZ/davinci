@@ -28,6 +28,11 @@ Options:
   --mode <mode>                  Output mode: text (default), json, or rpc
   --print, -p                    Non-interactive mode: process prompt and exit
                                 Unresolved approval emits approval_required JSON and exits 1
+  --output-last-message, -o <file>
+                                 Print/json mode: also write the final reply text to <file> (atomic;
+                                 written even when the run fails). Davinci addition, Codex exec parity
+  --cd, -C <dir>                 Run as if started in <dir>: settings, trust, AGENTS.md and
+                                 the session directory all follow it. Davinci addition, Codex exec parity
   --continue, -c                 Continue previous session
   --resume, -r                   Select a session to resume
   --session <path|id>            Use specific session file or partial UUID

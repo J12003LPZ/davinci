@@ -90,6 +90,13 @@ pub struct Args {
     pub permission_mode: Option<PermissionMode>,
     /// `--prompt-profile <stable|preview|legacy-v1>`
     pub prompt_profile: Option<davinci_agent::PromptProfile>,
+    /// `--cd, -C <dir>`: a Davinci addition for Codex `exec` parity. `run`
+    /// applies it through [`take_cd_flag`] before anything reads the working
+    /// directory, so this field is only set when `parse_args` sees the raw flag.
+    pub cd: Option<String>,
+    /// `--output-last-message, -o <file>`: a Davinci addition for Codex `exec`
+    /// parity. Print and json runs write the final reply text there.
+    pub output_last_message: Option<String>,
     pub messages: Vec<String>,
     pub file_args: Vec<String>,
     pub unknown_flags: BTreeMap<String, FlagValue>,
@@ -119,6 +126,81 @@ pub fn normalize_session_name(value: &str) -> Option<String> {
     } else {
         Some(name.to_string())
     }
+}
+
+const CD_FLAG: &str = "--cd";
+const OUTPUT_LAST_MESSAGE_FLAG: &str = "--output-last-message";
+
+/// The long name of the Davinci path flag `arg` spells, in any of its forms:
+/// long, short, or long with `=value`. Neither flag exists in TS pi; both
+/// mirror Codex `exec` (`-C/--cd`, `-o/--output-last-message`).
+fn path_flag_name(arg: &str) -> Option<&'static str> {
+    [(CD_FLAG, "-C"), (OUTPUT_LAST_MESSAGE_FLAG, "-o")]
+        .into_iter()
+        .find(|(long, short)| {
+            arg == *long
+                || arg == *short
+                || arg
+                    .strip_prefix(long)
+                    .is_some_and(|rest| rest.starts_with('='))
+        })
+        .map(|(long, _)| long)
+}
+
+/// The value a path flag carries: the text after `=`, or the next argument
+/// unless that is another option. Returns how many extra arguments it used.
+fn split_path_flag<'a>(arg: &'a str, next: Option<&'a String>) -> (Option<&'a str>, usize) {
+    match arg.split_once('=') {
+        Some((_, value)) => (Some(value), 0),
+        None => match next {
+            Some(value) if !value.starts_with('-') => (Some(value.as_str()), 1),
+            _ => (None, 0),
+        },
+    }
+}
+
+/// A missing or empty value is an error, so `-o -p task` never writes a file
+/// named `-p`. A dash-led path is still reachable as `--cd=-dir`.
+fn path_flag_value(name: &str, value: Option<&str>) -> Result<String, String> {
+    match value {
+        Some(value) if !value.is_empty() => Ok(value.to_string()),
+        _ => Err(format!(
+            "{name} requires {}",
+            if name == CD_FLAG {
+                "a directory"
+            } else {
+                "a file path"
+            }
+        )),
+    }
+}
+
+/// Removes every `--cd` / `-C` before a literal `--` and returns the other
+/// arguments with the last directory named. `run` calls this first, so the
+/// subcommands (`plugin`, `install`, `inspect`) and everything that reads the
+/// working directory see the same arguments and the same cwd. A `-C` that is
+/// really the value of another flag (`--name -C`) is read as `--cd` here.
+pub fn take_cd_flag(raw: Vec<String>) -> Result<(Vec<String>, Option<String>), String> {
+    let mut rest = Vec::with_capacity(raw.len());
+    let mut cd = None;
+    let mut args = raw.into_iter().peekable();
+    while let Some(arg) = args.next() {
+        if arg == "--" {
+            rest.push(arg);
+            rest.extend(args);
+            break;
+        }
+        if path_flag_name(&arg) != Some(CD_FLAG) {
+            rest.push(arg);
+            continue;
+        }
+        let (value, consumed) = split_path_flag(&arg, args.peek());
+        cd = Some(path_flag_value(CD_FLAG, value)?);
+        if consumed == 1 {
+            args.next();
+        }
+    }
+    Ok((rest, cd))
 }
 
 pub fn parse_args(args: &[String]) -> Args {
@@ -364,6 +446,17 @@ pub fn parse_args(args: &[String]) -> Args {
                     }
                 }
             }
+        } else if let Some(name) = path_flag_name(arg) {
+            let (value, consumed) = split_path_flag(arg, args.get(i + 1));
+            i += consumed;
+            match path_flag_value(name, value) {
+                Ok(value) if name == CD_FLAG => result.cd = Some(value),
+                Ok(value) => result.output_last_message = Some(value),
+                Err(message) => result.diagnostics.push(Diagnostic {
+                    kind: "error",
+                    message,
+                }),
+            }
         } else if arg == "--approve" || arg == "-a" {
             result.project_trust_override = Some(true);
         } else if arg == "--no-approve" || arg == "-na" {
@@ -502,6 +595,115 @@ mod tests {
             .diagnostics
             .iter()
             .any(|d| d.message.contains("--sandbox requires")));
+    }
+
+    #[test]
+    fn codex_exec_path_flags_parse_long_short_and_equals_forms() {
+        let args =
+            |list: &[&str]| parse_args(&list.iter().map(|s| s.to_string()).collect::<Vec<_>>());
+
+        let long = args(&[
+            "--output-last-message",
+            "out.txt",
+            "--cd",
+            "repo",
+            "-p",
+            "go",
+        ]);
+        assert_eq!(long.output_last_message.as_deref(), Some("out.txt"));
+        assert_eq!(long.cd.as_deref(), Some("repo"));
+        assert_eq!(long.messages, ["go"]);
+        assert!(long.diagnostics.is_empty() && long.unknown_flags.is_empty());
+
+        let short = args(&["-o", "out.txt", "-C", "repo", "go"]);
+        assert_eq!(short.output_last_message.as_deref(), Some("out.txt"));
+        assert_eq!(short.cd.as_deref(), Some("repo"));
+        assert_eq!(short.messages, ["go"]);
+
+        let equals = args(&["--output-last-message=a b.txt", "--cd=-odd"]);
+        assert_eq!(equals.output_last_message.as_deref(), Some("a b.txt"));
+        assert_eq!(equals.cd.as_deref(), Some("-odd"));
+        assert!(equals.unknown_flags.is_empty());
+
+        // After `--` they are message text, like every other flag.
+        let literal = args(&["--", "-o", "-C"]);
+        assert_eq!(literal.output_last_message, None);
+        assert_eq!(literal.messages, ["-o", "-C"]);
+    }
+
+    #[test]
+    fn codex_exec_path_flags_without_a_value_are_errors() {
+        let args =
+            |list: &[&str]| parse_args(&list.iter().map(|s| s.to_string()).collect::<Vec<_>>());
+        let error = |parsed: &Args| {
+            parsed
+                .diagnostics
+                .iter()
+                .find(|d| d.kind == "error")
+                .map(|d| d.message.clone())
+        };
+
+        for missing in [
+            args(&["-o"]),
+            args(&["--output-last-message"]),
+            args(&["--output-last-message="]),
+            args(&["-o", "-p", "task"]),
+        ] {
+            assert_eq!(missing.output_last_message, None);
+            assert_eq!(
+                error(&missing).as_deref(),
+                Some("--output-last-message requires a file path")
+            );
+        }
+        // `-o -p task` must not swallow the print flag or its message.
+        let swallowed = args(&["-o", "-p", "task"]);
+        assert!(swallowed.print);
+        assert_eq!(swallowed.messages, ["task"]);
+
+        for missing in [args(&["-C"]), args(&["--cd"]), args(&["--cd", "--print"])] {
+            assert_eq!(missing.cd, None);
+            assert_eq!(
+                error(&missing).as_deref(),
+                Some("--cd requires a directory")
+            );
+        }
+    }
+
+    #[test]
+    fn take_cd_flag_strips_the_flag_so_subcommands_never_see_it() {
+        let raw = |list: &[&str]| list.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+
+        assert_eq!(
+            take_cd_flag(raw(&["-C", "repo", "plugin", "list"])).unwrap(),
+            (raw(&["plugin", "list"]), Some("repo".to_string()))
+        );
+        assert_eq!(
+            take_cd_flag(raw(&["-p", "--cd=one", "go", "--cd", "two"])).unwrap(),
+            (raw(&["-p", "go"]), Some("two".to_string()))
+        );
+        assert_eq!(
+            take_cd_flag(raw(&["-p", "go", "--", "-C", "x"])).unwrap(),
+            (raw(&["-p", "go", "--", "-C", "x"]), None)
+        );
+        assert_eq!(
+            take_cd_flag(raw(&["-p", "go"])).unwrap(),
+            (raw(&["-p", "go"]), None)
+        );
+        assert_eq!(
+            take_cd_flag(raw(&["-p", "go", "-C"])).unwrap_err(),
+            "--cd requires a directory"
+        );
+        assert_eq!(
+            take_cd_flag(raw(&["--cd="])).unwrap_err(),
+            "--cd requires a directory"
+        );
+    }
+
+    #[test]
+    fn help_lists_the_codex_exec_path_flags() {
+        let help = print_help();
+        assert!(help.contains("--output-last-message, -o <file>"));
+        assert!(help.contains("--cd, -C <dir>"));
     }
 
     #[test]

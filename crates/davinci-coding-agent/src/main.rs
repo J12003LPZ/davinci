@@ -338,8 +338,37 @@ pub(crate) fn startup_mark(stage: &str) {
     }
 }
 
+/// `--cd`: become the process working directory before anything reads it.
+/// The path is canonicalized so a relative or symlinked spelling encodes the
+/// same session directory as starting there, and the Windows verbatim prefix
+/// is dropped for the same reason.
+fn apply_cd(dir: &str) -> Result<(), String> {
+    let canonical = std::fs::canonicalize(dir).map_err(|err| match err.kind() {
+        io::ErrorKind::NotFound => format!("--cd: directory does not exist: {dir}"),
+        _ => format!("--cd: cannot use {dir}: {err}"),
+    })?;
+    if !canonical.is_dir() {
+        return Err(format!("--cd: not a directory: {dir}"));
+    }
+    let canonical = davinci_agent::strip_verbatim_prefix(&canonical);
+    std::env::set_current_dir(&canonical)
+        .map_err(|err| format!("--cd: cannot enter {dir}: {err}"))?;
+    // Shells trust an inherited PWD that names their real cwd; keep it true.
+    if std::env::var_os("PWD").is_some() {
+        std::env::set_var("PWD", &canonical);
+    }
+    Ok(())
+}
+
 fn run(raw: Vec<String>) -> Result<i32, String> {
     startup_mark("start");
+    // `-o` resolves against the directory davinci was started in, as in Codex;
+    // everything else behaves as if davinci had been started in the `--cd` dir.
+    let launch_dir = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let (raw, cd) = args::take_cd_flag(raw)?;
+    if let Some(dir) = cd.as_deref() {
+        apply_cd(dir)?;
+    }
     apply_offline_mode(&raw);
     if let Some(result) = davinci_coding_agent::runtime_inspect::try_run(&raw) {
         return result;
@@ -462,6 +491,32 @@ fn run(raw: Vec<String>) -> Result<i32, String> {
         return Ok(0);
     }
 
+    // Fixture: force the interactive path without a TTY so tests can inspect
+    // the rendered chrome (line-session mode).
+    let force_interactive = matches!(
+        std::env::var("PI_FORCE_INTERACTIVE").as_deref(),
+        Ok("1") | Ok("true")
+    );
+    let stdin_tty = io::stdin().is_terminal() || force_interactive;
+    let stdout_tty = io::stdout().is_terminal() || force_interactive;
+    let print_mode = parsed.print || parsed.mode == Some(Mode::Json) || !stdin_tty || !stdout_tty;
+    let last_message_path = match parsed.output_last_message.as_deref() {
+        None => None,
+        Some(_) if parsed.mode == Some(Mode::Rpc) => {
+            eprintln!(
+                "Error: --output-last-message is not supported with --mode rpc; use --print or --mode json"
+            );
+            return Ok(1);
+        }
+        Some(_) if !print_mode => {
+            eprintln!(
+                "Error: --output-last-message needs a non-interactive run; add --print (-p) or --mode json"
+            );
+            return Ok(1);
+        }
+        Some(path) => Some(launch_dir.join(path)),
+    };
+
     let session_dir = resolved_session_dir(&parsed, &cwd);
     let migrations = migrations::maybe_run_startup_migrations(&cwd);
     let mut agent = match build_agent(&parsed, &session_dir, &cwd) {
@@ -486,17 +541,9 @@ fn run(raw: Vec<String>) -> Result<i32, String> {
         return code;
     }
 
-    // Fixture: force the interactive path without a TTY so tests can inspect
-    // the rendered chrome (line-session mode).
-    let force_interactive = matches!(
-        std::env::var("PI_FORCE_INTERACTIVE").as_deref(),
-        Ok("1") | Ok("true")
-    );
-    let stdin_tty = io::stdin().is_terminal() || force_interactive;
-    let stdout_tty = io::stdout().is_terminal() || force_interactive;
-    if parsed.print || parsed.mode == Some(Mode::Json) || !stdin_tty || !stdout_tty {
+    if print_mode {
         let _ = tools_manager::ensure_managed_tools();
-        let code = run_print(&parsed, &mut agent);
+        let code = run_print(&parsed, &mut agent, last_message_path.as_deref());
         run_stop_hooks_for(&parsed, &agent.cwd);
         return code;
     }
@@ -3363,7 +3410,39 @@ fn rpc_scope_expansion_result(
     )
 }
 
-fn run_print(parsed: &Args, agent: &mut Agent) -> Result<i32, String> {
+/// Print and json mode. With `--output-last-message` the final reply text is
+/// written after the run however it ended (error, block, early exit), and a
+/// failed write turns a successful exit into 1 without masking a failed run.
+fn run_print(
+    parsed: &Args,
+    agent: &mut Agent,
+    last_message_path: Option<&Path>,
+) -> Result<i32, String> {
+    let mut last_reply = String::new();
+    let result = run_print_turns(parsed, agent, &mut last_reply);
+    let Some(path) = last_message_path else {
+        return result;
+    };
+    match output::write_file_atomically(path, &last_reply) {
+        Ok(()) => result,
+        Err(err) => {
+            eprintln!(
+                "Error: could not write --output-last-message file {}: {err}",
+                path.display()
+            );
+            match result {
+                Ok(0) => Ok(1),
+                other => other,
+            }
+        }
+    }
+}
+
+fn run_print_turns(
+    parsed: &Args,
+    agent: &mut Agent,
+    last_reply: &mut String,
+) -> Result<i32, String> {
     if let Some(code) = immediate_shutdown_if_fixture(parsed) {
         return Ok(code);
     }
@@ -3393,7 +3472,6 @@ fn run_print(parsed: &Args, agent: &mut Agent) -> Result<i32, String> {
         }
         write_prompt_manifest_json_event(agent)?;
     }
-    let mut last_reply = String::new();
     let mut approval_required = None;
     let configuration_path = settings::settings_path(&default_agent_dir());
     let mut all_events = Vec::new();
@@ -3426,7 +3504,7 @@ fn run_print(parsed: &Args, agent: &mut Agent) -> Result<i32, String> {
                             complete_prompt_with_host(parsed, agent, None, json_mode)
                         });
                     approval_required = blocking_host_report(agent, &events, required);
-                    last_reply = reply;
+                    *last_reply = reply;
                     all_events.extend(events);
                 }
             }
@@ -3435,7 +3513,7 @@ fn run_print(parsed: &Args, agent: &mut Agent) -> Result<i32, String> {
     for extra in &prepared.remaining_messages {
         if approval_required.is_some()
             || agent.ensure_session_persistence().is_err()
-            || runtime_blocked(&last_reply)
+            || runtime_blocked(last_reply)
         {
             break;
         }
@@ -3466,7 +3544,7 @@ fn run_print(parsed: &Args, agent: &mut Agent) -> Result<i32, String> {
                         complete_prompt_with_host(parsed, agent, None, json_mode)
                     });
                 approval_required = blocking_host_report(agent, &events, required);
-                last_reply = reply;
+                *last_reply = reply;
                 all_events.extend(events);
             }
         }
@@ -3487,7 +3565,7 @@ fn run_print(parsed: &Args, agent: &mut Agent) -> Result<i32, String> {
     // A provider failure that the loop gave up on carries no error stop
     // reason of its own: it is the reply text. Report it as the failure it is.
     let (exit_code, error) = match error {
-        None if last_reply.starts_with("Provider error: ") || runtime_blocked(&last_reply) => {
+        None if last_reply.starts_with("Provider error: ") || runtime_blocked(last_reply) => {
             (1, Some(last_reply.clone()))
         }
         other => (exit_code, other),

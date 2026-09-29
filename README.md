@@ -227,6 +227,17 @@ Machine-readable output:
 davinci --mode json -p "Run the relevant tests and summarize the result."
 ~~~
 
+Scripted runs in another directory, keeping the final reply in a file:
+
+~~~bash
+davinci -C ../service -o last-reply.txt -p "Fix the failing test."
+~~~
+
+These two flags are Davinci additions for Codex `exec` parity. TypeScript pi has neither.
+
+- `--cd, -C <dir>` runs as if davinci had been started in `<dir>`. It applies before settings, project trust, AGENTS.md discovery and session-directory resolution, so the session is stored under that directory's encoding. Relative `@file` and `--session` paths resolve against it. A missing path or a file is an error.
+- `--output-last-message, -o <file>` writes the final assistant reply text to `<file>` after a `--print` or `--mode json` run. The write is atomic (temporary file, then rename). It happens even when the run fails or is blocked, with an empty file when there is no reply. A relative path resolves against the directory davinci was started in, not the `--cd` directory. If the write fails, davinci prints an error and exits 1, unless the run already failed with its own code. Interactive and `--mode rpc` runs reject the flag.
+
 JSON-RPC over stdio:
 
 ~~~bash
