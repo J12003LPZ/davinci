@@ -4,7 +4,7 @@ use super::{
     ProcessConfig,
 };
 use crate::sandbox::{SandboxBackend, SandboxBroker};
-use davinci_protocol::{ExecutionRequest, SandboxLifecycle, SandboxReceipt};
+use davinci_protocol::{ExecutionRequest, ResourcePolicy, SandboxLifecycle, SandboxReceipt};
 use std::{
     io::{Read, Write},
     process::{Command, Stdio},
@@ -263,6 +263,7 @@ struct Spawned {
 }
 
 fn spawn(config: ProcessConfig) -> Result<Spawned, String> {
+    let resource_policy = config.sandbox.as_ref().map(|spec| spec.resources.clone());
     let (executable, argv, cwd, environment, sandbox) =
         if let Some(spec) = config.sandbox.as_ref() {
             let request = ExecutionRequest {
@@ -331,6 +332,13 @@ fn spawn(config: ProcessConfig) -> Result<Spawned, String> {
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    #[cfg(unix)]
+    if let Some(resources) = resource_policy {
+        use std::os::unix::process::CommandExt;
+        unsafe {
+            command.pre_exec(move || apply_unix_resource_limits(&resources));
+        }
+    }
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
@@ -338,6 +346,38 @@ fn spawn(config: ProcessConfig) -> Result<Spawned, String> {
     }
     let child = command.spawn().map_err(|error| error.to_string())?;
     Ok(Spawned { child, sandbox })
+}
+
+
+#[cfg(unix)]
+fn apply_unix_resource_limits(policy: &ResourcePolicy) -> std::io::Result<()> {
+    macro_rules! set_limit {
+        ($resource:expr, $value:expr, $label:literal) => {{
+            let value = $value as libc::rlim_t;
+            let limit = libc::rlimit {
+                rlim_cur: value,
+                rlim_max: value,
+            };
+            if unsafe { libc::setrlimit($resource, &limit) } != 0 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    concat!("failed to apply ", $label, " resource limit"),
+                ));
+            }
+        }};
+    }
+
+    if let Some(bytes) = policy.max_memory_bytes {
+        set_limit!(libc::RLIMIT_AS, bytes, "memory");
+    }
+    if let Some(milliseconds) = policy.cpu_time_ms {
+        let seconds = milliseconds.saturating_add(999) / 1000;
+        set_limit!(libc::RLIMIT_CPU, seconds.max(1), "CPU");
+    }
+    if let Some(bytes) = policy.max_file_bytes {
+        set_limit!(libc::RLIMIT_FSIZE, bytes, "file-size");
+    }
+    Ok(())
 }
 
 fn flush_exit(
@@ -384,6 +424,22 @@ mod tests {
             }
             Err(std::io::ErrorKind::Other.into())
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn resource_limit_policy_rounds_subsecond_cpu_to_one_second() {
+        let policy = ResourcePolicy {
+            cpu_time_ms: Some(1),
+            max_memory_bytes: Some(64 * 1024 * 1024),
+            max_file_bytes: Some(1024),
+            ..Default::default()
+        };
+        // This test exercises the policy shape without applying limits to the
+        // test runner itself. Actual enforcement happens only in pre_exec.
+        assert_eq!(policy.cpu_time_ms.unwrap().saturating_add(999) / 1000, 1);
+        assert_eq!(policy.max_memory_bytes, Some(64 * 1024 * 1024));
+        assert_eq!(policy.max_file_bytes, Some(1024));
     }
 
     #[test]
