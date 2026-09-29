@@ -73,6 +73,7 @@ impl ProcessConfig {
                 .unwrap_or_else(|_| "invalid-sandbox-spec".into()),
             mode: spec.mode,
             requested_backend: spec.backend,
+            effective: None,
         });
         ProcessExecutionEvidence {
             identity,
@@ -141,6 +142,40 @@ pub struct ProcessSandboxEvidence {
     pub spec_digest: String,
     pub mode: SandboxMode,
     pub requested_backend: SandboxBackendKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effective: Option<SandboxReceipt>,
+}
+
+impl ProcessExecutionEvidence {
+    pub fn with_effective_sandbox(
+        mut self,
+        effective: Option<SandboxReceipt>,
+    ) -> Result<Self, String> {
+        match (self.sandbox.as_mut(), effective) {
+            (None, None) => Ok(self),
+            (None, Some(_)) => Err(
+                "executor reported sandbox evidence for an unsandboxed process".into(),
+            ),
+            (Some(_), None) => Ok(self),
+            (Some(requested), Some(effective)) => {
+                if requested.id != effective.sandbox_id.0
+                    || requested.spec_digest != effective.spec_digest
+                {
+                    return Err(
+                        "executor sandbox receipt does not match requested sandbox policy".into(),
+                    );
+                }
+                requested.effective = Some(effective);
+                Ok(self)
+            }
+        }
+    }
+
+    pub fn sandbox_enforcement_verified(&self) -> bool {
+        self.sandbox
+            .as_ref()
+            .is_some_and(|sandbox| sandbox.effective.is_some())
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
