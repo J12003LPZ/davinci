@@ -922,6 +922,8 @@ fn build_agent(parsed: &Args, session_dir: &Path, cwd: &Path) -> Result<Agent, S
     agent.auto_compaction = settings.compaction_enabled();
     agent.auto_verify =
         settings.auto_verify_enabled(std::env::var("DAVINCI_AUTO_VERIFY").ok().as_deref());
+    agent.named_file_context =
+        settings.named_file_context_enabled(std::env::var("DAVINCI_NAMED_FILES").ok().as_deref());
     agent.effort_policy =
         settings.effort_policy(std::env::var("DAVINCI_EFFORT_POLICY").ok().as_deref());
     agent.tool_surface =
@@ -7398,6 +7400,8 @@ fn sync_agent_from_settings(agent: &mut Agent) {
     agent.auto_compaction = stored.compaction_enabled();
     agent.auto_verify =
         stored.auto_verify_enabled(std::env::var("DAVINCI_AUTO_VERIFY").ok().as_deref());
+    agent.named_file_context =
+        stored.named_file_context_enabled(std::env::var("DAVINCI_NAMED_FILES").ok().as_deref());
     agent.effort_policy =
         stored.effort_policy(std::env::var("DAVINCI_EFFORT_POLICY").ok().as_deref());
     agent.compaction = stored.compaction_settings();

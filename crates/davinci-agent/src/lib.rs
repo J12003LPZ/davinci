@@ -419,6 +419,10 @@ pub struct Agent {
     pub tool_surface: ToolSurface,
     /// Repeat the last verification call after later mutations at completion.
     pub auto_verify: bool,
+    /// Attach the files a user request names to that turn's runtime state
+    /// (`prompt::named_files`). Settings `namedFileContext`, environment
+    /// `DAVINCI_NAMED_FILES`.
+    pub named_file_context: bool,
     /// Task 5 environment/guidance experiment; disabled pending promotion.
     pub environment_context: bool,
     pub auto_compaction: bool,
@@ -517,6 +521,8 @@ pub struct Agent {
     /// Whether the host has registered a backend capable of visual verification.
     visual_verification_available: bool,
     runtime_environment: Option<prompt::environment::EnvironmentSnapshot>,
+    /// Frozen once per real user turn; continuations reuse it.
+    named_files: Option<prompt::named_files::NamedFilesSnapshot>,
     environment_key: Option<prompt::environment::EnvironmentKey>,
     environment_capture: prompt::environment::EnvironmentCapture,
     last_verification_notice: Option<(u64, CompletionEvidence)>,
@@ -601,6 +607,10 @@ impl Agent {
             decision_advice_key: None,
             tool_surface: ToolSurface::default(),
             auto_verify: true,
+            named_file_context: !matches!(
+                std::env::var("DAVINCI_NAMED_FILES").ok().as_deref(),
+                Some("0" | "false" | "off")
+            ),
             environment_context: std::env::var("PI_ENVIRONMENT_CONTEXT").ok().as_deref()
                 == Some("1"),
             auto_compaction: true,
@@ -669,6 +679,7 @@ impl Agent {
             previous_plan_revision: None,
             visual_verification_available: false,
             runtime_environment: None,
+            named_files: None,
             environment_key: None,
             environment_capture: prompt::environment::EnvironmentCapture::default(),
             last_verification_notice: None,
@@ -971,6 +982,7 @@ impl Agent {
                     .as_deref()
                     .is_some_and(prompt::environment::visual_verification_requested),
             environment: self.runtime_environment.clone(),
+            named_files: self.named_files.clone(),
         }
     }
 
@@ -1457,6 +1469,7 @@ impl Agent {
             self.turn_state_pending = None;
             self.runtime_environment = None;
             self.environment_key = None;
+            self.named_files = None;
             let no_capabilities = prompt::CapabilityDecision {
                 capabilities: Vec::new(),
                 reasons: Vec::new(),
@@ -1487,6 +1500,7 @@ impl Agent {
         self.capture_runtime_environment(&davinci_session::utc_date_from_unix_ms(
             davinci_session::now_ms(),
         ));
+        self.capture_named_files(user_text);
         let mut runtime_state = self.runtime_prompt_state();
         runtime_state.visual_verification_relevant = !self.environment_context
             || capabilities
@@ -3591,6 +3605,7 @@ impl Agent {
         if session_changed {
             self.runtime_environment = None;
             self.environment_key = None;
+            self.named_files = None;
             self.last_verification_notice = None;
             self.turn_state_pending = None;
             if let Some(processes) = &self.tool_context.processes {

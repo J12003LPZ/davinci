@@ -161,6 +161,7 @@ pub fn compose_with_mutations(
             visual_verification_available: false,
             visual_verification_relevant: true,
             environment: None,
+            named_files: None,
         },
     ));
 

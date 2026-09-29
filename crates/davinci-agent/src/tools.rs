@@ -3718,6 +3718,14 @@ fn walk_files(root: &Path, ignore: &IgnoreRules, visit: &mut dyn FnMut(&Path) ->
     }
 }
 
+/// Walk the files under `root` with the same ignore rules as the native
+/// find/grep (`.gitignore`, `.git`, `node_modules`), in a stable order, until
+/// `visit` returns false.
+pub(crate) fn walk_workspace_files(root: &Path, visit: &mut dyn FnMut(&Path) -> bool) {
+    let ignore = IgnoreRules::load(root);
+    walk_files(root, &ignore, visit);
+}
+
 fn format_grep_path(file: &Path, search_path: &Path, is_dir: bool) -> String {
     if is_dir {
         let relative = file

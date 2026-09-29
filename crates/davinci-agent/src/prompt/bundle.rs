@@ -56,6 +56,7 @@ impl PromptBundle {
                 visual_verification_available: false,
                 visual_verification_relevant: true,
                 environment: None,
+                named_files: None,
             },
         ));
         let mut composed = compose_modules(&modules);
