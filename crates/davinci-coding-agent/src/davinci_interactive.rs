@@ -4263,6 +4263,9 @@ pub fn perform(
         SlashAction::ShowStatus => Ok(Done::Said(status_as_list(&crate::format_session_status(
             parsed, agent,
         )))),
+        SlashAction::ShowSandboxStatus => Ok(Done::Said(
+            crate::sandbox_config::format_sandbox_status(agent.tool_context.sandbox.as_ref()),
+        )),
         SlashAction::Workflow(args) => Ok(Done::Said(workflow_command_text(agent, &args))),
         SlashAction::Agents(args) => {
             let settings =
