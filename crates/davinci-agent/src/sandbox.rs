@@ -845,6 +845,7 @@ mod tests {
             } else {
                 SandboxBackendKind::LinuxBubblewrap
             },
+            container: None,
             workspace: workspace.clone(),
             filesystem: FilesystemPolicy {
                 mounts: vec![MountRule {
