@@ -1,4 +1,4 @@
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -10,6 +10,15 @@ use crate::{Error, Result, TransportConfig};
 pub struct File {
     #[serde(default)]
     pub mcp_servers: BTreeMap<String, ServerConfig>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum McpExecutionPolicy {
+    Host,
+    Sandboxed,
+    Remote,
+    Disabled,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -26,6 +35,11 @@ pub struct ServerConfig {
     pub headers: BTreeMap<String, String>,
     #[serde(default)]
     pub disabled: bool,
+    /// Where this MCP server is allowed to execute. Local commands default
+    /// to sandboxed; HTTP endpoints default to remote. The coding-agent host
+    /// may explicitly preserve legacy trusted user configuration as host.
+    #[serde(default)]
+    pub execution: Option<McpExecutionPolicy>,
     /// Explicit local attestation that this server's read-only annotations may
     /// authorize tools. Discovery and project trust do not imply this opt-in.
     #[serde(default, rename = "trustReadOnlyHints")]
@@ -33,6 +47,30 @@ pub struct ServerConfig {
 }
 
 impl ServerConfig {
+    pub fn execution_policy(&self) -> Result<McpExecutionPolicy> {
+        if self.disabled || self.execution == Some(McpExecutionPolicy::Disabled) {
+            return Ok(McpExecutionPolicy::Disabled);
+        }
+        match (&self.url, &self.command, self.execution) {
+            (Some(_), _, None | Some(McpExecutionPolicy::Remote)) => {
+                Ok(McpExecutionPolicy::Remote)
+            }
+            (Some(_), _, Some(_)) => Err(Error::Protocol(
+                "remote MCP server execution must be `remote` or `disabled`".into(),
+            )),
+            (None, Some(_), None | Some(McpExecutionPolicy::Sandboxed)) => {
+                Ok(McpExecutionPolicy::Sandboxed)
+            }
+            (None, Some(_), Some(McpExecutionPolicy::Host)) => Ok(McpExecutionPolicy::Host),
+            (None, Some(_), Some(McpExecutionPolicy::Remote)) => Err(Error::Protocol(
+                "local MCP command cannot use remote execution policy".into(),
+            )),
+            (None, None, _) => Err(Error::Protocol(
+                "server needs `command` or `url`".into(),
+            )),
+        }
+    }
+
     pub fn transport(&self) -> Result<TransportConfig> {
         let expand = |map: &BTreeMap<String, String>| {
             map.iter()
