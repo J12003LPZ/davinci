@@ -35,6 +35,7 @@ pub use prepared_context::PreparedContextImage;
 mod queues;
 mod scheduler;
 pub mod semantic;
+pub mod sandbox;
 pub mod shell_policy;
 mod skills;
 mod stats;
