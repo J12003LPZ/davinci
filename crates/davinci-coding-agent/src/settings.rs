@@ -196,6 +196,10 @@ pub struct Settings {
         deserialize_with = "parse_process_manager"
     )]
     pub process_manager: Option<ProcessManagerSettings>,
+    /// OS execution sandbox. This is resolved separately from permission
+    /// approval so application consent cannot be confused with confinement.
+    #[serde(default)]
+    pub sandbox: Option<crate::sandbox_config::SandboxSettings>,
     #[serde(
         default,
         rename = "decisionIntelligence",
