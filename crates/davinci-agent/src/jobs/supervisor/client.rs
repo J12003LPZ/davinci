@@ -388,7 +388,7 @@ fn cleanup_container(plan: &crate::sandbox::ContainerCleanupPlan) -> Result<(), 
     }
 
     let _ = run_bounded(&plan.executable, &["rm", "-f", &plan.name]);
-    let inspect = run_bounded(&plan.executable, &["inspect", &plan.name])?;
+    let inspect = run_bounded(&plan.executable, &["container", "inspect", &plan.name])?;
     if inspect.success() {
         Err(format!("container {} still exists after teardown", plan.name))
     } else {
