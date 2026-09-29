@@ -7,8 +7,9 @@
 //! before untrusted code can run.
 
 use davinci_protocol::{
-    EnvironmentPolicy, ExecutionRequest, MountAccess, NetworkPolicy, SandboxBackendKind,
-    SandboxCapabilities, SandboxErrorCode, SandboxFailure, SandboxId, SandboxMode, SandboxSpec,
+    ContainerRuntime, EnvironmentPolicy, ExecutionRequest, MountAccess, NetworkPolicy,
+    SandboxBackendKind, SandboxCapabilities, SandboxErrorCode, SandboxFailure, SandboxId,
+    SandboxMode, SandboxSpec,
 };
 use sha2::{Digest, Sha256};
 use std::{
@@ -236,6 +237,194 @@ impl SandboxBackend for LinuxBubblewrapBackend {
     }
 }
 
+#[derive(Debug, Clone)]
+pub struct ContainerBackend {
+    executable: PathBuf,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ContainerCleanupPlan {
+    pub executable: PathBuf,
+    pub name: String,
+}
+
+impl ContainerBackend {
+    pub fn new(executable: PathBuf) -> Self {
+        Self { executable }
+    }
+
+    fn container_name(spec: &SandboxSpec) -> String {
+        let suffix = spec
+            .id
+            .0
+            .chars()
+            .map(|ch| {
+                if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.') {
+                    ch
+                } else {
+                    '-'
+                }
+            })
+            .collect::<String>();
+        format!("davinci-{}", suffix)
+    }
+}
+
+impl SandboxBackend for ContainerBackend {
+    fn kind(&self) -> SandboxBackendKind {
+        SandboxBackendKind::Container
+    }
+
+    fn capabilities(&self) -> SandboxCapabilities {
+        SandboxCapabilities {
+            filesystem_isolation: true,
+            network_denied: true,
+            environment_isolation: true,
+            process_tree_isolation: true,
+            pid_limit: true,
+            memory_limit: true,
+            cpu_limit: true,
+            ephemeral_root: true,
+            ephemeral_temp: true,
+            output_limit: true,
+            timeout: true,
+            deterministic_teardown: true,
+            ..Default::default()
+        }
+    }
+
+    fn prepare(
+        &self,
+        spec: &SandboxSpec,
+        request: &ExecutionRequest,
+        environment: &BTreeMap<String, String>,
+    ) -> Result<PreparedExecution, SandboxFailure> {
+        validate_request(spec, request)?;
+        if !matches!(spec.mode, SandboxMode::Restricted | SandboxMode::WorkspaceWrite) {
+            return Err(SandboxFailure::capability_unavailable(
+                "container backend is for restricted/workspace_write execution",
+            ));
+        }
+        let container = spec.container.as_ref().ok_or_else(|| {
+            SandboxFailure::new(
+                SandboxErrorCode::SandboxUnavailable,
+                "container backend requires trusted runtime/image configuration",
+            )
+        })?;
+        if matches!(spec.network, NetworkPolicy::AllowList { .. }) {
+            return Err(SandboxFailure::capability_unavailable(
+                "container backend does not implement DNS-safe domain allowlisting",
+            ));
+        }
+        let capabilities = self.capabilities();
+        require_capabilities(spec, capabilities)?;
+
+        let mut argv = vec![
+            "run".into(),
+            "--name".into(),
+            Self::container_name(spec),
+            "--rm".into(),
+            "--init".into(),
+            "--read-only".into(),
+        ];
+        if matches!(spec.network, NetworkPolicy::Denied) {
+            argv.extend(["--network".into(), "none".into()]);
+        }
+        argv.extend(["--workdir".into(), request.cwd.clone()]);
+
+        for mount in &spec.filesystem.mounts {
+            match mount.access {
+                MountAccess::ReadOnly | MountAccess::ReadWrite => {
+                    let source = mount.source.as_ref().expect("validated mount source");
+                    if source.contains(',') || mount.target.contains(',') {
+                        return Err(SandboxFailure::new(
+                            SandboxErrorCode::FilesystemDenied,
+                            "container mount paths containing commas are unsupported",
+                        ));
+                    }
+                    let mut value =
+                        format!("type=bind,src={source},dst={}", mount.target);
+                    if mount.access == MountAccess::ReadOnly {
+                        value.push_str(",readonly");
+                    }
+                    argv.extend(["--mount".into(), value]);
+                }
+                MountAccess::Temporary => {
+                    let mut value = format!("{}:rw,nosuid,nodev", mount.target);
+                    if let Some(bytes) = spec.resources.max_temp_bytes {
+                        value.push_str(&format!(",size={bytes}"));
+                    }
+                    argv.extend(["--tmpfs".into(), value]);
+                }
+                MountAccess::Hidden => {}
+            }
+        }
+
+        for name in environment.keys() {
+            // Docker/Podman copy the value from their own sanitized environment.
+            // Values never appear in argv/process listings.
+            argv.extend(["--env".into(), name.clone()]);
+        }
+        if let Some(bytes) = spec.resources.max_memory_bytes {
+            argv.extend(["--memory".into(), bytes.to_string()]);
+        }
+        if let Some(processes) = spec.resources.max_processes {
+            argv.extend(["--pids-limit".into(), processes.to_string()]);
+        }
+        if let Some(milliseconds) = spec.resources.cpu_time_ms {
+            let seconds = milliseconds.saturating_add(999) / 1000;
+            argv.extend([
+                "--ulimit".into(),
+                format!("cpu={0}:{0}", seconds.max(1)),
+            ]);
+        }
+        if let Some(bytes) = spec.resources.max_file_bytes {
+            argv.extend([
+                "--ulimit".into(),
+                format!("fsize={bytes}:{bytes}"),
+            ]);
+        }
+
+        argv.push(container.image.clone());
+        argv.push(request.executable.clone());
+        argv.extend(request.argv.clone());
+
+        Ok(PreparedExecution {
+            sandbox_id: spec.id.clone(),
+            spec_digest: sandbox_spec_digest(spec)?,
+            backend: self.kind(),
+            capabilities,
+            executable: self.executable.clone(),
+            argv,
+            cwd: PathBuf::from(&spec.workspace),
+            environment: environment.clone(),
+        })
+    }
+}
+
+pub fn container_cleanup_plan(spec: &SandboxSpec) -> Option<ContainerCleanupPlan> {
+    if spec.backend != SandboxBackendKind::Container
+        && !(spec.backend == SandboxBackendKind::Auto && spec.container.is_some())
+    {
+        return None;
+    }
+    let container = spec.container.as_ref()?;
+    let runtime = resolve_container_runtime(container.runtime, Path::new(&spec.workspace))?;
+    Some(ContainerCleanupPlan {
+        executable: runtime,
+        name: ContainerBackend::container_name(spec),
+    })
+}
+
+fn resolve_container_runtime(runtime: ContainerRuntime, workspace: &Path) -> Option<PathBuf> {
+    match runtime {
+        ContainerRuntime::Docker => find_host_executable("docker", workspace),
+        ContainerRuntime::Podman => find_host_executable("podman", workspace),
+        ContainerRuntime::Auto => find_host_executable("podman", workspace)
+            .or_else(|| find_host_executable("docker", workspace)),
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct SandboxBroker;
 
@@ -265,10 +454,25 @@ impl SandboxBroker {
                 )?;
                 LinuxBubblewrapBackend::new(path).prepare(spec, request, environment)
             }
-            SandboxBackendKind::Container => Err(SandboxFailure::new(
-                SandboxErrorCode::SandboxUnavailable,
-                "container backend requires explicit runtime/image wiring",
-            )),
+            SandboxBackendKind::Container => {
+                let container = spec.container.as_ref().ok_or_else(|| {
+                    SandboxFailure::new(
+                        SandboxErrorCode::SandboxUnavailable,
+                        "container backend requires trusted runtime/image configuration",
+                    )
+                })?;
+                let runtime = resolve_container_runtime(
+                    container.runtime,
+                    Path::new(&spec.workspace),
+                )
+                .ok_or_else(|| {
+                    SandboxFailure::new(
+                        SandboxErrorCode::SandboxUnavailable,
+                        "configured Docker/Podman runtime is unavailable outside the workspace",
+                    )
+                })?;
+                ContainerBackend::new(runtime).prepare(spec, request, environment)
+            },
             SandboxBackendKind::Auto => {
                 if cfg!(target_os = "linux") {
                     if let Some(path) =
@@ -276,6 +480,13 @@ impl SandboxBroker {
                     {
                         return LinuxBubblewrapBackend::new(path)
                             .prepare(spec, request, environment);
+                    }
+                }
+                if let Some(container) = spec.container.as_ref() {
+                    if let Some(runtime) =
+                        resolve_container_runtime(container.runtime, Path::new(&spec.workspace))
+                    {
+                        return ContainerBackend::new(runtime).prepare(spec, request, environment);
                     }
                 }
                 if spec.mode == SandboxMode::FullAccess {
