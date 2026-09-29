@@ -121,6 +121,10 @@ pub struct WorkflowLaunch {
     pub provider: Option<String>,
     pub model_id: Option<String>,
     pub parent_tools: Vec<String>,
+    /// Host-owned execution authority inherited from the launching agent.
+    /// Workflow JSON never deserializes these fields.
+    pub foreground_supervisor: Option<crate::jobs::supervisor::SupervisorCommand>,
+    pub sandbox: Option<davinci_protocol::SandboxSpec>,
     /// Report completion to the lead's mailbox (background runs).
     pub report_to_lead: bool,
     /// The calling turn's cancellation. A synchronous run stops when the
