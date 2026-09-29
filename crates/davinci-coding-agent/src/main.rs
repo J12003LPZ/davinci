@@ -101,6 +101,9 @@ mod file_processor;
 use davinci_coding_agent::hooks;
 mod image_convert;
 mod js_host;
+// Shared with the lib, not redeclared: the binary's module copies must see the
+// same process-wide execution-boundary flag the lib enables.
+use davinci_coding_agent::{execution_boundary, sandbox_config};
 mod llama;
 mod mcp;
 mod migrations;
@@ -6930,6 +6933,13 @@ fn handle_user_line(
             let text = format_session_cost(parsed, agent);
             session.chrome.transcript.push("cost", &text);
             session.chrome.status = "cost".into();
+            println!("{text}");
+            Ok(true)
+        }
+        SlashAction::ShowSandboxStatus => {
+            let text = sandbox_config::format_sandbox_status(agent.tool_context.sandbox.as_ref());
+            session.chrome.transcript.push("sandbox", &text);
+            session.chrome.status = "sandbox".into();
             println!("{text}");
             Ok(true)
         }

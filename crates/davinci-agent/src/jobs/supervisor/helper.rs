@@ -3,7 +3,7 @@ use super::{
     wire::{self, Event, Request, MAX_INPUT, POLL},
     ProcessConfig,
 };
-use crate::sandbox::{SandboxBackend, SandboxBroker};
+use crate::sandbox::SandboxBroker;
 use davinci_protocol::{ExecutionRequest, SandboxLifecycle, SandboxReceipt};
 #[cfg(unix)]
 use davinci_protocol::ResourcePolicy;
@@ -12,7 +12,7 @@ use std::{
     process::{Command, Stdio},
     sync::{
         atomic::{AtomicBool, Ordering},
-        mpsc, Arc,
+        mpsc, Arc, Mutex,
     },
     thread,
     time::{Duration, Instant},
@@ -94,7 +94,7 @@ fn run_owned() -> std::io::Result<()> {
         )?;
         return Ok(());
     }
-    let mut spawned = match spawn(config) {
+    let spawned = match spawn(config) {
         Ok(spawned) => spawned,
         Err(error) => {
             wire::write(

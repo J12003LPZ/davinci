@@ -65,6 +65,9 @@ impl ServerConfig {
             (None, Some(_), Some(McpExecutionPolicy::Remote)) => Err(Error::Protocol(
                 "local MCP command cannot use remote execution policy".into(),
             )),
+            (None, Some(_), Some(McpExecutionPolicy::Disabled)) => {
+                Ok(McpExecutionPolicy::Disabled)
+            }
             (None, None, _) => Err(Error::Protocol(
                 "server needs `command` or `url`".into(),
             )),

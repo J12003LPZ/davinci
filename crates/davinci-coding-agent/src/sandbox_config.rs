@@ -619,6 +619,7 @@ mod tests {
         let global = SandboxSettings {
             mode: Some("workspace_write".into()),
             backend: Some("auto".into()),
+            container: None,
             network: Some(SandboxNetworkSettings {
                 mode: Some("deny".into()),
                 ..Default::default()
@@ -632,6 +633,7 @@ mod tests {
         let project = SandboxSettings {
             mode: Some("restricted".into()),
             backend: None,
+            container: None,
             network: Some(SandboxNetworkSettings {
                 mode: Some("deny".into()),
                 ..Default::default()

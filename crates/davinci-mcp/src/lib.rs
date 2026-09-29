@@ -228,7 +228,7 @@ impl Client {
 }
 
 impl Transport {
-    fn rpc(&mut self) -> &mut dyn Rpc {
+    fn rpc(&mut self) -> &mut Rpc {
         match self {
             Transport::Stdio(t) => t,
             Transport::Http(t) => t,
