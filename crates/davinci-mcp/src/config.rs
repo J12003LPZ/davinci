@@ -149,6 +149,48 @@ mod tests {
     }
 
     #[test]
+    fn local_execution_policy_defaults_sandboxed_and_transport_is_explicit() {
+        let file = parse(
+            r#"{"mcpServers":{
+                "local":{"command":"tool"},
+                "host":{"command":"tool","execution":"host"},
+                "remote":{"url":"https://example.com/mcp"},
+                "off":{"command":"tool","execution":"disabled"}
+            }}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            file.mcp_servers["local"].execution_policy().unwrap(),
+            McpExecutionPolicy::Sandboxed
+        );
+        assert_eq!(
+            file.mcp_servers["host"].execution_policy().unwrap(),
+            McpExecutionPolicy::Host
+        );
+        assert_eq!(
+            file.mcp_servers["remote"].execution_policy().unwrap(),
+            McpExecutionPolicy::Remote
+        );
+        assert_eq!(
+            file.mcp_servers["off"].execution_policy().unwrap(),
+            McpExecutionPolicy::Disabled
+        );
+    }
+
+    #[test]
+    fn execution_policy_cannot_mismatch_transport() {
+        let remote_host = parse(
+            r#"{"mcpServers":{"x":{"url":"https://example.com","execution":"host"}}}"#,
+        )
+        .unwrap();
+        assert!(remote_host.mcp_servers["x"].execution_policy().is_err());
+
+        let local_remote =
+            parse(r#"{"mcpServers":{"x":{"command":"tool","execution":"remote"}}}"#).unwrap();
+        assert!(local_remote.mcp_servers["x"].execution_policy().is_err());
+    }
+
+    #[test]
     fn env_values_expand_parent_variables() {
         let lookup = |name: &str| (name == "GITHUB_TOKEN").then(|| "ghp_x".to_string());
         assert_eq!(expand_env("${GITHUB_TOKEN}", lookup), "ghp_x");
