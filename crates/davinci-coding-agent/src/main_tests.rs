@@ -3709,6 +3709,7 @@ fn worker_host_rebinds_sandbox_and_supervisor_to_effective_worktree() {
         id: davinci_protocol::SandboxId("parent-sandbox".into()),
         mode: davinci_protocol::SandboxMode::WorkspaceWrite,
         backend: davinci_protocol::SandboxBackendKind::Auto,
+        container: None,
         workspace: parent_text.clone(),
         filesystem: davinci_protocol::FilesystemPolicy {
             mounts: vec![davinci_protocol::MountRule {
