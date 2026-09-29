@@ -7,28 +7,48 @@
 
 use std::path::Path;
 
-use davinci_mcp::ConfigFile;
+use davinci_mcp::{ConfigFile, McpExecutionPolicy};
+
+fn resolve_origin(config: &mut ConfigFile, project_or_plugin: bool) {
+    for server in config.mcp_servers.values_mut() {
+        if server.disabled || server.execution == Some(McpExecutionPolicy::Disabled) {
+            server.execution = Some(McpExecutionPolicy::Disabled);
+        } else if server.url.is_some() {
+            server.execution = Some(McpExecutionPolicy::Remote);
+        } else if server.command.is_some() {
+            if project_or_plugin {
+                server.execution = Some(McpExecutionPolicy::Sandboxed);
+            } else if server.execution.is_none() {
+                server.execution = Some(McpExecutionPolicy::Host);
+            }
+        }
+    }
+}
 
 pub fn load(agent_dir: &Path, cwd: &Path, trusted: bool) -> ConfigFile {
     if let Ok(path) =
         std::env::var("DAVINCI_MCP_CONFIG").or_else(|_| std::env::var("PI_MCP_CONFIG"))
     {
-        return davinci_mcp::load_path(Path::new(&path)).unwrap_or_default();
+        let mut config = davinci_mcp::load_path(Path::new(&path)).unwrap_or_default();
+        resolve_origin(&mut config, false);
+        return config;
     }
-    let plugins = ConfigFile {
+    let mut plugins = ConfigFile {
         mcp_servers: davinci_coding_agent::plugins::active(agent_dir).mcp_servers(),
     };
-    let user = davinci_mcp::merge(
-        plugins,
-        davinci_mcp::load_path(&agent_dir.join("mcp.json")).unwrap_or_default(),
-    );
+    resolve_origin(&mut plugins, true);
+    let mut user_file =
+        davinci_mcp::load_path(&agent_dir.join("mcp.json")).unwrap_or_default();
+    resolve_origin(&mut user_file, false);
+    let user = davinci_mcp::merge(plugins, user_file);
     if !trusted {
         return user;
     }
     let Some(path) = crate::project_config::resolve(cwd, "mcp.json") else {
         return user;
     };
-    let project = davinci_mcp::load_path(&path).unwrap_or_default();
+    let mut project = davinci_mcp::load_path(&path).unwrap_or_default();
+    resolve_origin(&mut project, true);
     davinci_mcp::merge(user, project)
 }
 
