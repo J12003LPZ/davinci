@@ -1,6 +1,7 @@
 use davinci_protocol::{
-    EnvironmentPolicy, FilesystemPolicy, MountAccess, MountRule, NetworkPolicy, ProcessPolicy,
-    ResourcePolicy, SandboxBackendKind, SandboxCapabilities, SandboxId, SandboxMode, SandboxSpec,
+    ContainerPolicy, ContainerRuntime, EnvironmentPolicy, FilesystemPolicy, MountAccess, MountRule,
+    NetworkPolicy, ProcessPolicy, ResourcePolicy, SandboxBackendKind, SandboxCapabilities, SandboxId,
+    SandboxMode, SandboxSpec,
 };
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
@@ -10,8 +11,16 @@ use std::path::{Path, PathBuf};
 pub struct SandboxSettings {
     pub mode: Option<String>,
     pub backend: Option<String>,
+    pub container: Option<SandboxContainerSettings>,
     pub network: Option<SandboxNetworkSettings>,
     pub resources: Option<SandboxResourceSettings>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+#[serde(default, rename_all = "camelCase", deny_unknown_fields)]
+pub struct SandboxContainerSettings {
+    pub runtime: Option<String>,
+    pub image: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
@@ -61,6 +70,7 @@ pub fn resolve_sandbox_settings(
     if mode == SandboxMode::FullAccess && backend != SandboxBackendKind::Host && backend != SandboxBackendKind::Auto {
         return Err("full_access may use only host or auto backend".into());
     }
+    let container = parse_container(effective.container.as_ref(), backend)?;
 
     let network = parse_network(effective.network.as_ref(), mode)?;
     if mode == SandboxMode::FullAccess && !matches!(network, NetworkPolicy::Unrestricted) {
@@ -133,6 +143,7 @@ pub fn resolve_sandbox_settings(
         id: SandboxId(format!("session-{}", uuid::Uuid::new_v4())),
         mode,
         backend,
+        container,
         workspace: workspace_text,
         filesystem: FilesystemPolicy { mounts },
         network,
@@ -175,6 +186,15 @@ fn narrow_settings(
             return Err("project sandbox backend cannot weaken global isolation".into());
         }
         global.backend = Some(value.to_string());
+    }
+
+    if let Some(project_container) = project.container.as_ref() {
+        let Some(global_container) = global.container.as_ref() else {
+            return Err("project sandbox cannot introduce container runtime/image authority".into());
+        };
+        if project_container != global_container {
+            return Err("project sandbox cannot change container runtime or image".into());
+        }
     }
 
     if let Some(project_network) = project.network.as_ref() {
@@ -228,6 +248,42 @@ fn parse_backend(value: &str) -> Result<SandboxBackendKind, String> {
         other => Err(format!("unknown sandbox backend: {other}")),
     }
 }
+
+fn parse_container(
+    settings: Option<&SandboxContainerSettings>,
+    backend: SandboxBackendKind,
+) -> Result<Option<ContainerPolicy>, String> {
+    let Some(settings) = settings else {
+        if backend == SandboxBackendKind::Container {
+            return Err("container sandbox backend requires sandbox.container.image".into());
+        }
+        return Ok(None);
+    };
+    let image = settings
+        .image
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or("sandbox.container.image is required when container settings are present")?;
+    let runtime = match settings
+        .runtime
+        .as_deref()
+        .unwrap_or("auto")
+        .trim()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "auto" => ContainerRuntime::Auto,
+        "docker" => ContainerRuntime::Docker,
+        "podman" => ContainerRuntime::Podman,
+        other => return Err(format!("unknown container runtime: {other}")),
+    };
+    Ok(Some(ContainerPolicy {
+        runtime,
+        image: image.to_string(),
+    }))
+}
+
 
 fn parse_network(
     settings: Option<&SandboxNetworkSettings>,
@@ -528,6 +584,34 @@ mod tests {
         let disabled = format_sandbox_status(None);
         assert!(disabled.contains("disabled (compatibility mode)"));
         assert!(disabled.contains("none claimed"));
+    }
+
+    #[test]
+    fn container_runtime_and_image_are_user_authority_not_project_authority() {
+        let global = SandboxSettings {
+            mode: Some("workspace_write".into()),
+            backend: Some("container".into()),
+            container: Some(SandboxContainerSettings {
+                runtime: Some("podman".into()),
+                image: Some("example.invalid/davinci:rust-1.83".into()),
+            }),
+            ..Default::default()
+        };
+        let mut project = global.clone();
+        project.container.as_mut().unwrap().image = Some("malicious/repo-image:latest".into());
+        let root = tempfile::tempdir().unwrap();
+        assert!(resolve_sandbox_settings(root.path(), Some(&global), Some(&project), true)
+            .unwrap_err()
+            .contains("cannot change container runtime or image"));
+
+        let spec = resolve_sandbox_settings(root.path(), Some(&global), None, false)
+            .unwrap()
+            .unwrap();
+        assert_eq!(spec.backend, SandboxBackendKind::Container);
+        assert_eq!(
+            spec.container.as_ref().map(|value| value.runtime),
+            Some(ContainerRuntime::Podman)
+        );
     }
 
     #[test]
