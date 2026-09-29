@@ -2221,6 +2221,24 @@ fn build_worker_agent(
     child.permissions = Arc::new(davinci_agent::PermissionState::new(policy));
     child.approver = None;
     child.approval_responder = None;
+    child.tool_context.foreground_supervisor = req.foreground_supervisor.clone();
+    child.tool_context.sandbox = req
+        .sandbox
+        .as_ref()
+        .map(|parent| {
+            let worker_id = req
+                .runtime_agent_id
+                .map(|id| id.to_string())
+                .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+            davinci_agent::sandbox::rebind_worker_spec(
+                parent,
+                effective_cwd,
+                davinci_protocol::SandboxId(format!("worker-{worker_id}")),
+                !matches!(child_mode, davinci_agent::PermissionMode::ReadOnly),
+            )
+            .map_err(|error| format!("worker sandbox delegation failed: {error}"))
+        })
+        .transpose()?;
     // `mcp_read` and read-only MCP tools need the parent's connections.
     child.tool_context.mcp = mcp.clone();
     child.abort_signal = req.abort.clone();
