@@ -123,7 +123,8 @@ impl SupervisedMcpTransport {
         }
 
         let config = ProcessConfig::new(executable, server.args.clone(), cwd, environment)
-            .with_sandbox(sandbox.clone());
+            .with_sandbox(sandbox.clone())
+            .as_background();
 
         let state = Arc::new((Mutex::new(State::default()), Condvar::new()));
         let stdout_state = Arc::clone(&state);
