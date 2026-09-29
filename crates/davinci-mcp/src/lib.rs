@@ -491,6 +491,44 @@ mod tests {
         .expect("fixture")
     }
 
+    struct FixtureRpc {
+        calls: Vec<String>,
+    }
+
+    impl RpcTransport for FixtureRpc {
+        fn call(&mut self, method: &str, _params: Value) -> Result<Value> {
+            self.calls.push(method.into());
+            match method {
+                "initialize" => Ok(json!({
+                    "protocolVersion": PROTOCOL_VERSION,
+                    "capabilities": {"tools": {}},
+                    "serverInfo": {"name":"fixture","version":"1"}
+                })),
+                "tools/list" => Ok(json!({
+                    "tools":[{"name":"echo","inputSchema":{"type":"object"}}]
+                })),
+                "tools/call" => Ok(json!({
+                    "content":[{"type":"text","text":"ok"}]
+                })),
+                other => Err(Error::Protocol(format!("unexpected fixture call {other}"))),
+            }
+        }
+
+        fn notify(&mut self, method: &str, _params: Value) -> Result<()> {
+            self.calls.push(method.into());
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn custom_transport_uses_the_same_mcp_handshake_and_client_contract() {
+        let transport = FixtureRpc { calls: Vec::new() };
+        let mut client = Client::connect_transport("fixture", Box::new(transport)).unwrap();
+        assert_eq!(client.tools.len(), 1);
+        assert_eq!(client.tools[0].name, "echo");
+        assert_eq!(client.call_tool("echo", json!({})).unwrap().text(), "ok");
+    }
+
     #[test]
     fn server_names_are_unambiguous_and_long_tools_are_bounded() {
         assert!(validate_server_name("server-memory").is_ok());
