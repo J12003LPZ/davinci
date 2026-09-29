@@ -1,6 +1,6 @@
 //! Trusted host process supervision. No model-facing policy or process registry.
 //! The caller supplies an authorized, resolved command and retains the owner.
-use davinci_protocol::{SandboxBackendKind, SandboxMode, SandboxSpec};
+use davinci_protocol::{SandboxBackendKind, SandboxMode, SandboxReceipt, SandboxSpec};
 use serde::{Deserialize, Serialize};
 use std::{collections::BTreeMap, path::PathBuf};
 
@@ -228,6 +228,8 @@ pub struct SupervisorCommand {
 pub struct ProcessExit {
     pub identity: ProcessIdentity,
     pub launch_state: ProcessLaunchState,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sandbox: Option<SandboxReceipt>,
     pub code: Option<i32>,
     pub stopped: bool,
     pub error: Option<String>,
