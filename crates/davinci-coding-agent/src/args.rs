@@ -86,8 +86,10 @@ pub struct Args {
     /// `--legacy-tui`: open the previous chrome instead of the davinci shell.
     pub legacy_tui: bool,
     pub project_trust_override: Option<bool>,
-    /// `--permission-mode <mode>` or its `--sandbox <preset>` alias.
+    /// `--permission-mode <mode>` or its historical `--sandbox <preset>` alias.
     pub permission_mode: Option<PermissionMode>,
+    /// Separate OS execution policy override. This never changes approval mode.
+    pub execution_sandbox_mode: Option<String>,
     /// `--prompt-profile <stable|preview|legacy-v1>`
     pub prompt_profile: Option<davinci_agent::PromptProfile>,
     pub messages: Vec<String>,
@@ -335,6 +337,28 @@ pub fn parse_args(args: &[String]) -> Args {
             // `--davinci --screen <id>`; `--legacy-tui` asks for the old
             // chrome. Both are read from the raw argv in `main`.
             result.legacy_tui = arg == "--legacy-tui";
+        } else if arg == "--execution-sandbox" {
+            match args.get(i + 1) {
+                None => result.diagnostics.push(Diagnostic {
+                    kind: "error",
+                    message: "--execution-sandbox requires one of: none, restricted, workspace-write, full-access".into(),
+                }),
+                Some(value) => {
+                    i += 1;
+                    match value.trim().to_ascii_lowercase().replace('_', "-").as_str() {
+                        "none" | "no-execution" | "restricted" | "read-only"
+                        | "workspace-write" | "workspace" | "full-access" | "full" => {
+                            result.execution_sandbox_mode = Some(value.clone());
+                        }
+                        _ => result.diagnostics.push(Diagnostic {
+                            kind: "error",
+                            message: format!(
+                                "Invalid execution sandbox mode \"{value}\". Valid values: none, restricted, workspace-write, full-access"
+                            ),
+                        }),
+                    }
+                }
+            }
         } else if arg == "--permission-mode" || arg == "--sandbox" {
             // Two spellings of one flag: ours, and the Codex CLI's sandbox
             // presets (`read-only`, `workspace-write`, `full-access`), which
@@ -467,6 +491,30 @@ mod tests {
         assert_eq!(davinci.messages, vec!["explain the runtime".to_string()]);
 
         assert!(!args(&["explain the runtime"]).legacy_tui);
+    }
+
+    #[test]
+    fn execution_sandbox_flag_is_separate_from_permission_mode() {
+        let args =
+            |list: &[&str]| parse_args(&list.iter().map(|s| s.to_string()).collect::<Vec<_>>());
+        let parsed = args(&[
+            "--permission-mode",
+            "manual",
+            "--execution-sandbox",
+            "workspace-write",
+        ]);
+        assert_eq!(parsed.permission_mode, Some(PermissionMode::Ask));
+        assert_eq!(
+            parsed.execution_sandbox_mode.as_deref(),
+            Some("workspace-write")
+        );
+
+        let invalid = args(&["--execution-sandbox", "magic"]);
+        assert!(invalid.execution_sandbox_mode.is_none());
+        assert!(invalid
+            .diagnostics
+            .iter()
+            .any(|item| item.message.contains("Invalid execution sandbox mode")));
     }
 
     #[test]
