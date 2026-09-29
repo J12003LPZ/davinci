@@ -49,6 +49,11 @@ guards. An allow rule reaches one only when it names that exact file; a glob
 such as `write(/work/lib/**)` does not. Graph workers and isolated worktree workers do not inherit these
 additional roots. Prompt context and `/status` list the active roots.
 
+Containment accepts Windows short and long spellings of the same root. Only
+the root alias is resolved; symlink and junction components beneath it retain
+their boundary checks. Escapes from either the workspace or an added root are
+denied in every mode, even with a blanket grant or a separately added destination.
+
 Single-file `write`, `edit`, and `notebook_edit` operations keep transactional
 snapshots and journaling in the selected added directory. The `apply_patch`
 and explicit `patch_*` tools retain their primary-workspace-relative path

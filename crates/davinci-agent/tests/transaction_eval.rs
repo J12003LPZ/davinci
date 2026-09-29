@@ -7,6 +7,57 @@ use serde_json::json;
 use std::{fs, time::Instant};
 
 #[test]
+fn root_alias_boundary_security_matrix() {
+    use davinci_agent::{
+        FilesystemBoundaryPolicy, PermissionMode, PermissionPolicy, PermissionRule,
+        PermissionVerdict,
+    };
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("Workspace");
+    let extra = temp.path().join("Shared");
+    fs::create_dir(&root).unwrap();
+    fs::create_dir(&extra).unwrap();
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(&extra, root.join("link")).unwrap();
+    #[cfg(windows)]
+    assert!(std::process::Command::new("cmd")
+        .args(["/C", "mklink", "/J"])
+        .arg(root.join("link"))
+        .arg(&extra)
+        .output()
+        .unwrap()
+        .status
+        .success());
+    fs::write(extra.join("existing.rs"), "fixture").unwrap();
+    let mut cases = 0;
+    for mode in PermissionMode::ALL {
+        let mut policy = PermissionPolicy::new(mode);
+        policy.filesystem_boundary = FilesystemBoundaryPolicy {
+            root: Some(root.clone()),
+            extra_roots: vec![extra.clone()],
+            ..Default::default()
+        };
+        policy.allow.push(PermissionRule::bare("*"));
+        for suffix in ["existing.rs", "new.rs", "missing/deep/new.rs"] {
+            let args = json!({"path":root.join("link").join(suffix), "content":"bad"});
+            assert!(
+                matches!(
+                    policy.decide("eval", "write", &args, &root),
+                    PermissionVerdict::Deny { .. }
+                ),
+                "{mode:?} {suffix}"
+            );
+            cases += 1;
+        }
+    }
+    assert_eq!(fs::read(extra.join("existing.rs")).unwrap(), b"fixture");
+    println!(
+        "{}",
+        json!({"evaluation":"root-alias-boundary", "escape_cases_denied":cases, "destination_bytes_preserved":true})
+    );
+}
+
+#[test]
 fn transaction_after_measurement() {
     let root = tempfile::tempdir().unwrap();
     fs::write(root.path().join("a.txt"), "before\n").unwrap();

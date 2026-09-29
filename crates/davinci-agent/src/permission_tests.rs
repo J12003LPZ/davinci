@@ -504,6 +504,93 @@ fn relative_targets_are_resolved_from_execution_cwd_not_policy_root() {
 }
 
 #[test]
+fn boundary_alias_resolution_preserves_target_symlinks() {
+    let dirs = ExtraRoots::new();
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(&dirs.extra, dirs.workspace.join("link")).unwrap();
+    #[cfg(windows)]
+    {
+        let output = std::process::Command::new("cmd")
+            .args(["/C", "mklink", "/J"])
+            .arg(dirs.workspace.join("link"))
+            .arg(&dirs.extra)
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+    }
+    let target = dirs.workspace.join("link/new/deep/file.rs");
+    assert_eq!(
+        boundary_relative_path(&dirs.workspace, &target),
+        Some(PathBuf::from("link/new/deep/file.rs"))
+    );
+    assert_eq!(check_path_boundary(&dirs.workspace, &target), (false, true));
+    for mode in PermissionMode::ALL {
+        let mut p = dirs.policy(mode);
+        p.allow.push(PermissionRule::bare("*"));
+        assert!(is_deny(&dirs.write(&p, &target)), "{mode:?}");
+        assert_eq!(
+            p.filesystem_boundary
+                .boundary_root_for(&dirs.workspace, &target),
+            dirs.workspace
+        );
+    }
+}
+
+#[cfg(windows)]
+#[test]
+fn boundary_identity_strips_verbatim_prefix_before_parent_traversal() {
+    let root = PathBuf::from(r"\\?\C:\work\proj");
+    let target = root.join(r"nested\..\new\file.rs");
+    assert_eq!(
+        boundary_path_identity(&target),
+        PathBuf::from("C:/work/proj/new/file.rs")
+    );
+    assert_eq!(check_path_boundary(&root, &target), (false, false));
+    assert_eq!(
+        project_relative(&root, "C:/work/proj/new/file.rs"),
+        ("new/file.rs".into(), false)
+    );
+}
+
+#[cfg(windows)]
+#[test]
+fn windows_short_root_alias_keeps_relative_rules_and_extra_grants() {
+    use std::os::windows::ffi::{OsStrExt, OsStringExt};
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn GetShortPathNameW(long: *const u16, short: *mut u16, size: u32) -> u32;
+    }
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("LongWorkspaceDirectory");
+    std::fs::create_dir(&root).unwrap();
+    let long: Vec<u16> = root.as_os_str().encode_wide().chain(Some(0)).collect();
+    let mut short = vec![0u16; 32768];
+    // SAFETY: the input is terminated and both buffers live for the call.
+    let len = unsafe { GetShortPathNameW(long.as_ptr(), short.as_mut_ptr(), short.len() as u32) };
+    assert!(len > 0 && (len as usize) < short.len());
+    let alias = PathBuf::from(std::ffi::OsString::from_wide(&short[..len as usize]));
+    let target = alias.join("new.rs");
+    assert_eq!(check_path_boundary(&root, &target), (false, false));
+    let mut p = policy(PermissionMode::Edits);
+    p.filesystem_boundary.root = Some(root.clone());
+    p.deny.push(PermissionRule::parse("write(new.rs)").unwrap());
+    assert!(is_deny(&p.decide(
+        "test",
+        "write",
+        &json!({"path":target}),
+        &root
+    )));
+    let boundary = FilesystemBoundaryPolicy {
+        extra_roots: vec![root.clone()],
+        ..Default::default()
+    };
+    assert_eq!(
+        boundary.extra_root_containing(&target),
+        Some(root.as_path())
+    );
+}
+
+#[test]
 fn shell_workdir_changes_cannot_hide_an_outside_operand() {
     let root = cwd();
     let execution_cwd = root.join("nested");
