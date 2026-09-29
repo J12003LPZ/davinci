@@ -249,14 +249,16 @@ impl Agent {
                                 crate::turn::mutation_paths_from_tool(&tool, &args),
                             );
                         }
-                        agent.observe_shell_verification(
+                        if let Some(note) = agent.observe_shell_verification(
                             &op_id,
                             cwd,
                             &tool,
                             &args,
                             &pre_hook_result,
                             &result,
-                        );
+                        ) {
+                            crate::turn::append_harness_note(&mut result, &note);
+                        }
                     }
                     let hook_vetoed = !pre_hook_error && result.is_error;
                     agent.record_receipt(

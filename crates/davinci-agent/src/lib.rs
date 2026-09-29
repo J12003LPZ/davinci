@@ -329,6 +329,9 @@ pub struct MutationVerificationState {
     pub unscoped_verification_failure: bool,
     #[serde(default)]
     pub last_classification_reason: Option<String>,
+    /// Generation whose unrecognized check already got an inline note.
+    #[serde(default)]
+    pub inline_note_generation: Option<u64>,
     #[serde(default)]
     pub latest_evidence: Option<VerificationEvidence>,
     #[serde(default)]

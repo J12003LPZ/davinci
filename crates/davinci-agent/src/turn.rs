@@ -893,6 +893,19 @@ impl Agent {
             "davinciCapabilityReminder".into(),
             Value::String(reason_code.to_string()),
         );
+        // Attribution for benchmarks: why the last shell call after the
+        // latest change was not credited. Absent when none ran.
+        if reason_code == "verification_required" {
+            if let Some(reason) = self
+                .mutation_verification_state()
+                .last_classification_reason
+            {
+                message.extra.insert(
+                    "davinciCapabilityReminderReason".into(),
+                    Value::String(reason),
+                );
+            }
+        }
         self.messages.push(message.clone());
         self.persist_full_message(&message);
         new_messages.push(message.clone());
@@ -2748,7 +2761,11 @@ impl Agent {
             if crate::tools::is_coordinated_mutation(name) && !pre_hook_error && !result.is_error {
                 self.record_successful_mutation_paths(mutation_paths_from_tool(name, args));
             }
-            self.observe_shell_verification(id, cwd, name, args, &pre_hook_result, &result);
+            if let Some(note) =
+                self.observe_shell_verification(id, cwd, name, args, &pre_hook_result, &result)
+            {
+                append_harness_note(&mut result, &note);
+            }
         }
         let hook_vetoed = !pre_hook_error && result.is_error;
         if !replayed {
@@ -2803,6 +2820,84 @@ impl Agent {
             .insert(id.to_string(), generation);
     }
 
+    /// One line telling the model, in the shell result itself, that a check it
+    /// just ran after an edit cannot count as verification and why. Without
+    /// it the model finds out only when its final answer is refused by the
+    /// completion gate, which costs that answer plus 1-2 more requests
+    /// (t5-csv and t7-cli in the 2026-09-25 head-to-head). At most once per
+    /// mutation generation, and only for a command that succeeded and looks
+    /// like a check of the change. Davinci-only; the gate stays the backstop.
+    fn unrecognized_check_note(
+        &self,
+        generation: u64,
+        command: &str,
+        assessment: &crate::verification::Assessment,
+        state: &crate::MutationVerificationState,
+        failed: bool,
+    ) -> Option<String> {
+        if failed
+            || generation == 0
+            || state.mutation_paths.is_empty()
+            || state.verified_generation == Some(generation)
+        {
+            return None;
+        }
+        let lowered = command.to_ascii_lowercase();
+        let names_change = state.mutation_paths.iter().any(|path| {
+            path.file_stem()
+                .and_then(|stem| stem.to_str())
+                .is_some_and(|stem| stem.len() >= 3 && lowered.contains(&stem.to_ascii_lowercase()))
+        });
+        let runs_checker = [
+            "python", "pytest", "node", "npm", "cargo", "go ", "deno", "bun ",
+        ]
+        .iter()
+        .any(|word| lowered.contains(word));
+        if !(names_change || runs_checker) {
+            return None;
+        }
+        let reason = crate::verification::unrecognized_check_reason(assessment);
+        {
+            let mut current = self
+                .mutation_verification
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            if current.mutation_generation != generation
+                || current.inline_note_generation == Some(generation)
+            {
+                return None;
+            }
+            current.inline_note_generation = Some(generation);
+        }
+        let mut paths: Vec<String> = state
+            .mutation_paths
+            .iter()
+            .take(3)
+            .map(|path| {
+                path.strip_prefix(&self.cwd)
+                    .unwrap_or(path)
+                    .to_string_lossy()
+                    .replace('\\', "/")
+            })
+            .collect();
+        if state.mutation_paths.len() > 3 {
+            paths.push("...".into());
+        }
+        let all_python = state
+            .mutation_paths
+            .iter()
+            .all(|path| path.extension().is_some_and(|ext| ext == "py"));
+        let remedy = if all_python {
+            "To count, run the project's tests, or one bash `python - <<'PY'` heredoc (or `python -c`) with literal words that imports the changed module and asserts the expected results."
+        } else {
+            "To count, run the project's test command, or a check whose exit status fails when the change is wrong."
+        };
+        Some(format!(
+            "[harness: this command does not count as verification of {} ({reason}). {remedy}]",
+            paths.join(", ")
+        ))
+    }
+
     pub(crate) fn observe_shell_verification(
         &self,
         id: &str,
@@ -2811,15 +2906,12 @@ impl Agent {
         args: &Value,
         original: &crate::ToolResult,
         decorated: &crate::ToolResult,
-    ) {
+    ) -> Option<String> {
         let generation = self
             .verification_starts
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .remove(id);
-        let Some(generation) = generation else {
-            return;
-        };
+            .remove(id)?;
         let before = self
             .shell_mutation_snapshots
             .lock()
@@ -2862,19 +2954,19 @@ impl Agent {
             let changed = before.changes(&after);
             if !changed.is_empty() {
                 self.record_successful_mutation_paths(changed);
-                return;
+                return None;
             }
             if !(before.complete() && after.complete()
                 || assessment.full_workspace && before.required_inputs_observed(&after))
             {
                 self.record_unknown_shell_scope();
-                return;
+                return None;
             }
         }
         // Concurrent shell calls can share a starting generation. Always
         // observe their edits first; only their verification credit is stale.
         if generation != state.mutation_generation {
-            return;
+            return None;
         }
         {
             let mut state = self
@@ -2889,7 +2981,13 @@ impl Agent {
             assessment.kind,
             crate::verification::CheckKind::Suite | crate::verification::CheckKind::TargetedScript
         ) {
-            return;
+            return self.unrecognized_check_note(
+                generation,
+                command,
+                &assessment,
+                &state,
+                original.is_error,
+            );
         }
         let receipt = self
             .command_receipts
@@ -2951,6 +3049,7 @@ impl Agent {
             self.remember_verification_call(name, args, cwd);
         }
         self.record_verification_assessment(generation, command, &assessment, terminal);
+        None
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -7129,4 +7228,12 @@ mod tool_name_tests {
             1
         );
     }
+}
+
+/// Append a harness line to a tool result the model will read.
+pub(crate) fn append_harness_note(result: &mut crate::ToolResult, note: &str) {
+    if !result.content.is_empty() {
+        result.content.push_str("\n\n");
+    }
+    result.content.push_str(note);
 }
