@@ -2047,6 +2047,12 @@ fn shell_tool(
     };
     let background = wants_background(input);
     let started_at_ms = crate::command_receipt::now();
+    if background && context.sandbox.is_some() {
+        return Err(ToolError::Failed(
+            "sandbox policy requires supervised background execution; direct host background spawn denied"
+                .into(),
+        ));
+    }
     if background {
         let operation = admit_background_operation(context, "shell", &command)?;
         if let Some(operation) = operation.as_ref() {
@@ -2082,6 +2088,12 @@ fn shell_tool(
         serde_json::Value::Number(number) => number.to_string(),
         other => other.to_string(),
     });
+    if context.sandbox.is_some() && context.foreground_supervisor.is_none() {
+        return Err(ToolError::Failed(
+            "sandbox policy requires the trusted process supervisor; direct host fallback denied"
+                .into(),
+        ));
+    }
     let (output, pipe_truncated) = if let Some(host) = &context.foreground_supervisor {
         let custom = std::env::var("PI_SHELL")
             .ok()
@@ -2384,6 +2396,18 @@ fn powershell_tool(
     }
     let wrapped = format!("{POWERSHELL_UTF8_PREFIX}{command}");
     let background = wants_background(input);
+    if background && context.sandbox.is_some() {
+        return Err(ToolError::Failed(
+            "sandbox policy requires supervised background execution; direct host background spawn denied"
+                .into(),
+        ));
+    }
+    if !background && context.sandbox.is_some() && context.foreground_supervisor.is_none() {
+        return Err(ToolError::Failed(
+            "sandbox policy requires the trusted process supervisor; direct host fallback denied"
+                .into(),
+        ));
+    }
     if !background {
         if let Some(host) = &context.foreground_supervisor {
             let executable = resolve_powershell_executable(cwd)?;
