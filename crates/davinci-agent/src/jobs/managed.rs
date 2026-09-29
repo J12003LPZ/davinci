@@ -363,6 +363,7 @@ impl ManagedOwner {
         restart_check: Option<RestartCheck>,
     ) -> Result<(u32, bool), String> {
         options.validate()?;
+        config.background = true;
         self.ensure_open()?;
         validate()?;
         if abort.load(Ordering::SeqCst) {
