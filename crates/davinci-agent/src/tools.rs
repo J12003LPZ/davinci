@@ -5132,3 +5132,75 @@ impl User {
             .contains("Rename preview is unavailable"));
     }
 }
+
+
+#[cfg(test)]
+mod sandbox_process_fail_closed_tests {
+    use super::*;
+    use davinci_protocol::{
+        EnvironmentPolicy, FilesystemPolicy, NetworkPolicy, ProcessPolicy, ResourcePolicy,
+        SandboxBackendKind, SandboxCapabilities, SandboxId, SandboxMode, SandboxSpec,
+    };
+
+    fn sandbox(root: &std::path::Path) -> SandboxSpec {
+        SandboxSpec {
+            id: SandboxId("fail-closed".into()),
+            mode: SandboxMode::FullAccess,
+            backend: SandboxBackendKind::Host,
+            workspace: root.canonicalize().unwrap().to_string_lossy().into_owned(),
+            filesystem: FilesystemPolicy::default(),
+            network: NetworkPolicy::Unrestricted,
+            environment: EnvironmentPolicy::default(),
+            resources: ResourcePolicy::default(),
+            process: ProcessPolicy::default(),
+            required_capabilities: SandboxCapabilities::default(),
+        }
+    }
+
+    #[test]
+    fn configured_sandbox_never_falls_back_to_direct_foreground_spawn() {
+        let root = tempfile::tempdir().unwrap();
+        let context = ToolContext {
+            sandbox: Some(sandbox(root.path())),
+            foreground_supervisor: None,
+            ..Default::default()
+        };
+        let error = execute_tool_with(
+            root.path(),
+            "exec_command",
+            &serde_json::json!({"command":"echo sandbox-bypass"}),
+            &context,
+        )
+        .unwrap_err();
+        assert!(
+            error.to_string().contains("sandbox")
+                && error.to_string().contains("supervisor"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn configured_sandbox_never_falls_back_to_direct_background_spawn() {
+        let root = tempfile::tempdir().unwrap();
+        let context = ToolContext {
+            sandbox: Some(sandbox(root.path())),
+            foreground_supervisor: None,
+            ..Default::default()
+        };
+        let error = execute_tool_with(
+            root.path(),
+            "exec_command",
+            &serde_json::json!({
+                "command":"echo sandbox-background-bypass",
+                "background":true
+            }),
+            &context,
+        )
+        .unwrap_err();
+        assert!(
+            error.to_string().contains("sandbox")
+                && error.to_string().contains("background"),
+            "{error}"
+        );
+    }
+}
