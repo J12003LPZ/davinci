@@ -832,22 +832,22 @@ impl FilesystemBoundaryPolicy {
         }
     }
 
-    /// The active extra root that lexically contains the absolute `target`.
+    /// The active extra root that contains the absolute `target`. Compare
+    /// filesystem identities rather than raw spellings so Windows short-path
+    /// aliases and case differences cannot turn an allowed root into an
+    /// apparent outside path.
     pub fn extra_root_containing(&self, target: &Path) -> Option<&Path> {
-        let target = strip_verbatim_prefix(&normalize_lexically(target));
         self.active_extra_roots()
             .iter()
             .map(PathBuf::as_path)
-            .find(|root| target.starts_with(strip_verbatim_prefix(&normalize_lexically(root))))
+            .find(|root| !check_path_boundary(root, target).0)
     }
 
     /// The root whose symlink checks apply to the absolute `target`: the
-    /// primary root, unless the path is lexically outside it and inside an
-    /// extra root.
+    /// primary root, unless the path is outside it and inside an extra root.
     pub fn boundary_root_for<'a>(&'a self, cwd: &'a Path, target: &Path) -> &'a Path {
         let root = self.root.as_deref().unwrap_or(cwd);
-        let normalized = strip_verbatim_prefix(&normalize_lexically(target));
-        if normalized.starts_with(strip_verbatim_prefix(&normalize_lexically(root))) {
+        if !check_path_boundary(root, target).0 {
             return root;
         }
         self.extra_root_containing(target).unwrap_or(root)
@@ -1759,11 +1759,58 @@ pub fn is_git_metadata_path(path: &Path, repo_root: Option<&Path>, root: Option<
         && normalized.components().any(|c| c.as_os_str() == ".git")
 }
 
+/// Resolve a path to the identity of its nearest existing ancestor, then
+/// reattach any non-existent suffix. This preserves checks for new files while
+/// normalizing symlinked parents and Windows short/case aliases. Normalize only
+/// after resolving the existing prefix so parent traversals cannot hide a
+/// symlink escape.
+fn boundary_path_identity(path: &Path) -> PathBuf {
+    let mut ancestor = path;
+    let mut suffix = Vec::new();
+    loop {
+        if let Ok(mut identity) = std::fs::canonicalize(ancestor) {
+            for name in suffix.into_iter().rev() {
+                identity.push(name);
+            }
+            return normalize_lexically(&strip_verbatim_prefix(&identity));
+        }
+        let Some(name) = ancestor.file_name() else {
+            break;
+        };
+        suffix.push(name.to_os_string());
+        let Some(parent) = ancestor.parent() else {
+            break;
+        };
+        ancestor = parent;
+    }
+    normalize_lexically(&strip_verbatim_prefix(path))
+}
+
+/// Resolve only an alias of the trusted root, leaving target components intact
+/// for symlink checks and the transaction directory's no-follow traversal.
+pub(crate) fn boundary_relative_path(root: &Path, target: &Path) -> Option<PathBuf> {
+    let lexical_root = PathBuf::from(slashes(&strip_verbatim_prefix(root)));
+    let target = PathBuf::from(slashes(&strip_verbatim_prefix(target)));
+    if let Ok(relative) = target.strip_prefix(&lexical_root) {
+        return Some(relative.to_path_buf());
+    }
+    let root_identity = boundary_path_identity(root);
+    // Prefer the outermost root alias: an inner link back to the root must
+    // remain in the suffix rather than becoming a new trusted prefix.
+    let ancestor = target
+        .ancestors()
+        .filter(|ancestor| boundary_path_identity(ancestor) == root_identity)
+        .last()?;
+    target.strip_prefix(ancestor).ok().map(Path::to_path_buf)
+}
+
 /// Check whether `target` escapes `root` either lexically or via symlinks.
 /// Returns `(outside_lexical, symlink_escape)`.
 pub fn check_path_boundary(root: &Path, target: &Path) -> (bool, bool) {
-    let norm_root = strip_verbatim_prefix(&normalize_lexically(root));
-    let norm_target = strip_verbatim_prefix(&normalize_lexically(target));
+    let norm_root = boundary_path_identity(root);
+    let norm_target = boundary_relative_path(root, target)
+        .map(|relative| normalize_lexically(&norm_root.join(relative)))
+        .unwrap_or_else(|| normalize_lexically(&strip_verbatim_prefix(target)));
 
     // 1. Lexical check
     let outside_lexical = !norm_target.starts_with(&norm_root);
@@ -1793,7 +1840,7 @@ pub fn check_path_boundary(root: &Path, target: &Path) -> (bool, bool) {
                     } else {
                         link
                     };
-                    let clean_resolved = strip_verbatim_prefix(&normalize_lexically(&resolved));
+                    let clean_resolved = boundary_path_identity(&resolved);
                     if !clean_resolved.starts_with(&norm_root) {
                         symlink_escape = true;
                     }
@@ -1831,8 +1878,7 @@ pub fn check_path_boundary(root: &Path, target: &Path) -> (bool, bool) {
                             } else {
                                 link
                             };
-                            let clean_resolved =
-                                strip_verbatim_prefix(&normalize_lexically(&resolved));
+                            let clean_resolved = boundary_path_identity(&resolved);
                             if !clean_resolved.starts_with(&norm_root) {
                                 symlink_escape = true;
                                 break;
@@ -1887,10 +1933,9 @@ pub fn project_relative_with_boundary(
     let outside = is_diff_drive || outside_lexical || symlink_escape;
 
     let full = normalize_lexically(&joined);
-    let root = normalize_lexically(effective_root);
-    match full.strip_prefix(&root) {
-        Ok(rest) if !outside => {
-            let text = slashes(rest);
+    match boundary_relative_path(effective_root, &joined) {
+        Some(rest) if !outside => {
+            let text = slashes(&normalize_lexically(&rest));
             (if text.is_empty() { ".".into() } else { text }, false)
         }
         _ => {
@@ -1917,7 +1962,7 @@ fn drive_differs(raw: &str, root: &Path) -> bool {
         return false;
     }
     let drive = raw.chars().next().map(|c| c.to_ascii_uppercase());
-    let root_drive = root
+    let root_drive = strip_verbatim_prefix(root)
         .to_string_lossy()
         .chars()
         .next()

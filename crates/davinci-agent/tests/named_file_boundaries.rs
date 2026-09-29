@@ -144,6 +144,8 @@ fn junction_alias_deny_is_not_lost_during_canonicalization() {
         "{}",
         String::from_utf8_lossy(&result.stderr)
     );
+    let mut unrestricted = agent(dir.path());
+    assert!(attach(&mut unrestricted, "Fix alias/pricing.py").contains("PRIVATE_FILE_BODY"));
     let mut agent = agent(dir.path());
     agent
         .permissions
@@ -152,6 +154,38 @@ fn junction_alias_deny_is_not_lost_during_canonicalization() {
         .deny
         .push(davinci_agent::PermissionRule::parse("read(alias/pricing.py)").unwrap());
     assert!(!attach(&mut agent, "Fix alias/pricing.py").contains("PRIVATE_FILE_BODY"));
+
+    // Runner temp directories may use a root spelling different from its
+    // canonical path (for example RUNNER~1 instead of runneradmin).
+    let alias_parent = tempfile::tempdir().unwrap();
+    let junction_root = alias_parent.path().join("workspace");
+    let result = std::process::Command::new("cmd")
+        .args(["/C", "mklink", "/J"])
+        .arg(&junction_root)
+        .arg(dir.path())
+        .output()
+        .unwrap();
+    assert!(result.status.success());
+    fs::remove_dir(&alias).unwrap();
+    let result = std::process::Command::new("cmd")
+        .args(["/C", "mklink", "/J"])
+        .arg(&alias)
+        .arg(junction_root.join("source"))
+        .output()
+        .unwrap();
+    assert!(result.status.success());
+    for root_alias in [dir.path(), junction_root.as_path()] {
+        let mut unrestricted = self::agent(root_alias);
+        assert!(attach(&mut unrestricted, "Fix alias/pricing.py").contains("PRIVATE_FILE_BODY"));
+        let mut agent = self::agent(root_alias);
+        agent
+            .permissions
+            .lock()
+            .unwrap()
+            .deny
+            .push(davinci_agent::PermissionRule::parse("read(alias/pricing.py)").unwrap());
+        assert!(!attach(&mut agent, "Fix alias/pricing.py").contains("PRIVATE_FILE_BODY"));
+    }
 }
 
 #[cfg(unix)]

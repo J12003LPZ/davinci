@@ -1688,6 +1688,9 @@ mod tests {
     use tempfile::tempdir;
     use types::{ArtifactKind, Phase, TaskStatus};
 
+    // Durable state writes can take seconds under parallel Windows CI load.
+    const CONTROLLER_TEST_WAIT: Duration = Duration::from_secs(30);
+
     #[test]
     fn displayed_run_has_no_baseline_contents() {
         let secret: Vec<u8> = b"OPENAI_API_KEY=sk-secret".to_vec();
@@ -1858,7 +1861,7 @@ mod tests {
             run_graph(options, deps)
         });
         assert_eq!(
-            receive.recv_timeout(Duration::from_secs(5)).unwrap(),
+            receive.recv_timeout(CONTROLLER_TEST_WAIT).unwrap(),
             if verification {
                 "verify-first"
             } else {
@@ -1876,7 +1879,7 @@ mod tests {
         };
         let pause = controller.command("graph-control", &serde_json::to_string(&request).unwrap());
         release.store(true, Ordering::SeqCst);
-        let deadline = Instant::now() + Duration::from_secs(5);
+        let deadline = Instant::now() + CONTROLLER_TEST_WAIT;
         while !active.is_finished()
             && Instant::now() < deadline
             && active.snapshot().unwrap().current_lifecycle() != types::GraphLifecycle::Paused
@@ -1892,7 +1895,7 @@ mod tests {
             ..request
         };
         let resumed = controller.command("graph-control", &serde_json::to_string(&resume).unwrap());
-        let deadline = Instant::now() + Duration::from_secs(5);
+        let deadline = Instant::now() + CONTROLLER_TEST_WAIT;
         while !active.is_finished() && Instant::now() < deadline {
             thread::sleep(Duration::from_millis(10));
         }
@@ -2048,12 +2051,14 @@ mod tests {
     }
 
     fn drain_active(cwd: &Path) {
-        // A dry run finishes in milliseconds; wait for it so the next test in
-        // the same directory is not refused as "already active".
-        for _ in 0..200 {
-            if !is_running(cwd) {
-                break;
-            }
+        // Wait for durable completion before removing the registry entry.
+        // Removing a still-running controller races the next state assertion.
+        let deadline = Instant::now() + CONTROLLER_TEST_WAIT;
+        while is_running(cwd) {
+            assert!(
+                Instant::now() < deadline,
+                "fixture controller did not finish"
+            );
             thread::sleep(Duration::from_millis(10));
         }
         active_runs()
