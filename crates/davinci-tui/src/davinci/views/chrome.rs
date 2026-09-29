@@ -605,7 +605,29 @@ pub fn composer(model: &Model, lines: Option<&[String]>, hint: Hint) -> Vec<Line
         let (shown, column) = composer_view(&entry, column, model.width.saturating_sub(6));
         let split = column.and_then(|col| split_at_caret(&shown, col));
         let caret_here = split.is_some();
-        let body = if entry.is_empty() {
+        // The caret of an empty composer sits on the placeholder's first
+        // character, so the hint reads as ghost text after the cursor rather
+        // than as typed input the cursor has moved past.
+        let caret_on_hint = entry.is_empty()
+            && index == caret_row
+            && !overlaid
+            && placeholder.as_deref().is_some_and(|hint| !hint.is_empty());
+        let body = if caret_on_hint {
+            let hint = placeholder.clone().unwrap_or_default();
+            let mut chars = hint.chars();
+            let first: String = chars.next().map(String::from).unwrap_or_default();
+            let mut under = if lit {
+                Span::styled(first, caret_style)
+            } else {
+                span(first, th.text)
+            };
+            if !lit {
+                under.style = under.style.add_modifier(Modifier::DIM);
+            }
+            let mut rest = span(chars.as_str().to_string(), th.text);
+            rest.style = rest.style.add_modifier(Modifier::DIM);
+            vec![under, rest]
+        } else if entry.is_empty() {
             let mut hint_span = span(placeholder.clone().unwrap_or_default(), th.text);
             hint_span.style = hint_span.style.add_modifier(Modifier::DIM);
             vec![hint_span]
@@ -639,7 +661,7 @@ pub fn composer(model: &Model, lines: Option<&[String]>, hint: Hint) -> Vec<Line
         };
         let mut run = vec![span(prompt, prompt_color)];
         run.extend(body);
-        if index == caret_row && !overlaid && !caret_here {
+        if index == caret_row && !overlaid && !caret_here && !caret_on_hint {
             if lit {
                 run.push(Span::styled(" ", caret_style));
             } else {
@@ -1591,6 +1613,21 @@ mod tests {
             column += UnicodeWidthStr::width(span.content.as_ref());
         }
         caret.map(|at| at.saturating_sub(2))
+    }
+
+    #[test]
+    fn the_caret_of_an_empty_composer_sits_before_the_placeholder_not_after_it() {
+        let m = model(100);
+        let line = composer(&m, None, Hint::Default).remove(2);
+        let drawn = text(&line);
+        assert!(drawn.contains("Try \""), "placeholder is shown: {drawn}");
+        assert_eq!(
+            caret_column(&m, 1),
+            Some(0),
+            "the caret is the first cell after the prompt: {drawn}"
+        );
+        // Nothing is drawn after the hint: no caret cell trailing it.
+        assert!(drawn.trim_end().ends_with('"'), "{drawn:?}");
     }
 
     #[test]
