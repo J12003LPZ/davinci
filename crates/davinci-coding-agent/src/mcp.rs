@@ -37,6 +37,50 @@ mod tests {
     use super::*;
 
     #[test]
+    fn mcp_execution_provenance_never_lets_project_or_plugin_local_commands_run_on_host() {
+        let dir = tempfile::tempdir().unwrap();
+        let agent_dir = dir.path().join("agent");
+        let project = dir.path().join("project");
+        std::fs::create_dir_all(&agent_dir).unwrap();
+        std::fs::create_dir_all(project.join(".davinci")).unwrap();
+        std::fs::write(
+            agent_dir.join("mcp.json"),
+            r#"{"mcpServers":{
+                "legacy-user":{"command":"user-tool"},
+                "explicit-user-sandbox":{"command":"user-safe","execution":"sandboxed"}
+            }}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            project.join(".davinci/mcp.json"),
+            r#"{"mcpServers":{
+                "project":{"command":"project-tool","execution":"host"},
+                "remote":{"url":"https://example.com/mcp","execution":"remote"}
+            }}"#,
+        )
+        .unwrap();
+
+        let loaded = load(&agent_dir, &project, true);
+        assert_eq!(
+            loaded.mcp_servers["legacy-user"].execution,
+            Some(davinci_mcp::McpExecutionPolicy::Host)
+        );
+        assert_eq!(
+            loaded.mcp_servers["explicit-user-sandbox"].execution,
+            Some(davinci_mcp::McpExecutionPolicy::Sandboxed)
+        );
+        assert_eq!(
+            loaded.mcp_servers["project"].execution,
+            Some(davinci_mcp::McpExecutionPolicy::Sandboxed),
+            "a project must not promote its local MCP command to host execution"
+        );
+        assert_eq!(
+            loaded.mcp_servers["remote"].execution,
+            Some(davinci_mcp::McpExecutionPolicy::Remote)
+        );
+    }
+
+    #[test]
     fn pi_mcp_config_wins_and_an_untrusted_project_file_is_ignored() {
         let dir = tempfile::tempdir().unwrap();
         let fixture = dir.path().join("fixture.json");
