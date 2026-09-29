@@ -409,9 +409,111 @@ fn ensure_limit_not_weaker_u32(
     Ok(())
 }
 
+
+pub fn format_sandbox_status(spec: Option<&SandboxSpec>) -> String {
+    let Some(spec) = spec else {
+        return [
+            "Sandbox: disabled (compatibility mode)",
+            "Enforcement: none claimed",
+            "Permission policy remains separate from OS isolation",
+        ]
+        .join("\n");
+    };
+
+    let mode = match spec.mode {
+        SandboxMode::NoExecution => "no_execution",
+        SandboxMode::Restricted => "restricted",
+        SandboxMode::WorkspaceWrite => "workspace_write",
+        SandboxMode::FullAccess => "full_access",
+    };
+    let backend = match spec.backend {
+        SandboxBackendKind::Auto => "auto",
+        SandboxBackendKind::LinuxBubblewrap => "linux_bubblewrap",
+        SandboxBackendKind::Container => "container",
+        SandboxBackendKind::Host => "host",
+    };
+    let network = match &spec.network {
+        NetworkPolicy::Denied => "denied".to_string(),
+        NetworkPolicy::Unrestricted => "unrestricted".to_string(),
+        NetworkPolicy::AllowList { domains, ports } => format!(
+            "allowlist ({} domains, {} ports; requires a backend that enforces DNS + egress)",
+            domains.len(),
+            ports.len()
+        ),
+    };
+    let workspace_access = spec
+        .filesystem
+        .mounts
+        .iter()
+        .find(|mount| {
+            mount.source.as_deref() == Some(spec.workspace.as_str())
+                && mount.target == spec.workspace
+        })
+        .map(|mount| match mount.access {
+            MountAccess::ReadOnly => "read-only",
+            MountAccess::ReadWrite => "read-write",
+            MountAccess::Temporary => "temporary",
+            MountAccess::Hidden => "hidden",
+        })
+        .unwrap_or("not mounted");
+    let memory = spec
+        .resources
+        .max_memory_bytes
+        .map(|bytes| format!("{} MiB", bytes / (1024 * 1024)))
+        .unwrap_or_else(|| "not required".into());
+    let processes = spec
+        .resources
+        .max_processes
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| "not required".into());
+    let timeout = spec
+        .resources
+        .timeout_ms
+        .map(|value| format!("{:.1}s", value as f64 / 1000.0))
+        .unwrap_or_else(|| "not configured".into());
+
+    [
+        format!("Sandbox: {mode}"),
+        format!("Backend: {backend}"),
+        format!("Network: {network}"),
+        format!("Filesystem: workspace {workspace_access} + explicit runtime mounts + temp"),
+        format!("Memory: {memory}"),
+        format!("Processes: {processes}"),
+        format!("Timeout: {timeout}"),
+        "Enforcement: verified per execution receipt; required unsupported capabilities fail closed"
+            .into(),
+    ]
+    .join("\n")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sandbox_status_does_not_claim_enforcement_from_configuration_alone() {
+        let root = tempfile::tempdir().unwrap();
+        let spec = resolve_sandbox_settings(
+            root.path(),
+            Some(&SandboxSettings {
+                mode: Some("workspace_write".into()),
+                ..Default::default()
+            }),
+            None,
+            false,
+        )
+        .unwrap()
+        .unwrap();
+        let status = format_sandbox_status(Some(&spec));
+        assert!(status.contains("Sandbox: workspace_write"));
+        assert!(status.contains("Network: denied"));
+        assert!(status.contains("verified per execution receipt"));
+        assert!(!status.contains("State: active"));
+
+        let disabled = format_sandbox_status(None);
+        assert!(disabled.contains("disabled (compatibility mode)"));
+        assert!(disabled.contains("none claimed"));
+    }
 
     #[test]
     fn project_policy_can_only_narrow_global_authority() {
