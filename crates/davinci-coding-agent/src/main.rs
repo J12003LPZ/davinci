@@ -814,6 +814,31 @@ fn build_agent(parsed: &Args, session_dir: &Path, cwd: &Path) -> Result<Agent, S
             .tool_registry
             .retain(|name| !davinci_agent::runtime::transactions::is_tool(name));
     }
+    // Sandbox authority is resolved from the user settings and, only for a
+    // trusted project, a project request that may narrow but never widen it.
+    // Do not use the already deep-merged settings for this security boundary.
+    let global_sandbox_settings = load_settings(&default_agent_dir());
+    let project_trusted_for_sandbox = trust::resolve_project_trusted(
+        &default_agent_dir(),
+        cwd,
+        parsed.project_trust_override,
+        global_sandbox_settings.default_project_trust.as_deref(),
+        &global_sandbox_settings.trusted_projects,
+    );
+    let project_sandbox_settings = if project_trusted_for_sandbox {
+        let [current, legacy] = project_config::candidates(cwd, "settings.json");
+        let path = if current.exists() { current } else { legacy };
+        settings::load_settings_file(&path).sandbox
+    } else {
+        None
+    };
+    agent.tool_context.sandbox = davinci_coding_agent::sandbox_config::resolve_sandbox_settings(
+        cwd,
+        global_sandbox_settings.sandbox.as_ref(),
+        project_sandbox_settings.as_ref(),
+        project_trusted_for_sandbox,
+    )?;
+
     agent.tool_context.foreground_supervisor = std::env::current_exe().ok().map(|executable| {
         davinci_agent::jobs::supervisor::SupervisorCommand {
             executable,
