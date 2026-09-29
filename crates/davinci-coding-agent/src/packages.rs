@@ -496,6 +496,7 @@ fn ensure_npm_project(root: &Path) -> Result<(), String> {
 }
 
 fn run_install_command(program: &str, args: &[String], cwd: Option<&Path>) -> Result<(), String> {
+    crate::execution_boundary::require_executor("package manager")?;
     let mut command = std::process::Command::new(davinci_sys::process::resolve_program(program));
     command.args(args);
     if let Some(cwd) = cwd {
