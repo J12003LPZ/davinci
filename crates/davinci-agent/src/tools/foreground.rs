@@ -337,6 +337,7 @@ mod tests {
             id: SandboxId("foreground-env".into()),
             mode: SandboxMode::FullAccess,
             backend: SandboxBackendKind::Host,
+            container: None,
             workspace: cwd.to_string_lossy().into_owned(),
             filesystem: FilesystemPolicy::default(),
             network: NetworkPolicy::Unrestricted,
