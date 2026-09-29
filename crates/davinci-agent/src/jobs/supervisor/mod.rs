@@ -228,7 +228,6 @@ pub struct SupervisorCommand {
 pub struct ProcessExit {
     pub identity: ProcessIdentity,
     pub launch_state: ProcessLaunchState,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sandbox: Option<SandboxReceipt>,
     pub code: Option<i32>,
     pub stopped: bool,
