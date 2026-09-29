@@ -22,6 +22,10 @@ const SCHEMA: &str = r#"{
 /// Answers each POST with the next scripted reply (the last one repeats) and
 /// keeps the request bodies it saw.
 fn provider(replies: &[&str]) -> (String, Arc<Mutex<Vec<Value>>>) {
+    provider_with_api(replies, false)
+}
+
+fn provider_with_api(replies: &[&str], anthropic: bool) -> (String, Arc<Mutex<Vec<Value>>>) {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let base = format!("http://{}", listener.local_addr().unwrap());
     let replies: Vec<String> = replies.iter().map(|reply| reply.to_string()).collect();
@@ -58,6 +62,26 @@ fn provider(replies: &[&str]) -> (String, Arc<Mutex<Vec<Value>>>) {
                     "HTTP/1.1 400 Bad Request\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{error}",
                     error.len()
                 )
+            } else if anthropic {
+                let events = [
+                    json!({"type":"message_start","message":{"id":"fixture","type":"message","role":"assistant","model":"demo","content":[],"usage":{"input_tokens":1,"output_tokens":0}}}),
+                    json!({"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}),
+                    json!({"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":text}}),
+                    json!({"type":"content_block_stop","index":0}),
+                    json!({"type":"message_delta","delta":{"stop_reason":"end_turn","stop_sequence":null},"usage":{"output_tokens":1}}),
+                    json!({"type":"message_stop"}),
+                ];
+                let body = events
+                    .iter()
+                    .map(|event| {
+                        format!(
+                            "event: {}\ndata: {event}\n\n",
+                            event["type"].as_str().unwrap()
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join("");
+                format!("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n{body}")
             } else if streaming {
                 let frame = json!({"choices": [{"index": 0, "delta": {"content": text}, "finish_reason": "stop"}]});
                 format!(
@@ -79,6 +103,14 @@ fn provider(replies: &[&str]) -> (String, Arc<Mutex<Vec<Value>>>) {
 }
 
 fn davinci(root: &Path, base_url: &str) -> Command {
+    davinci_with_api(root, base_url, "openai-completions")
+}
+
+fn davinci_with_api(root: &Path, base_url: &str, api: &str) -> Command {
+    davinci_options(root, base_url, api, false)
+}
+
+fn davinci_options(root: &Path, base_url: &str, api: &str, read_tool: bool) -> Command {
     let config = root.join("config");
     fs::create_dir_all(&config).unwrap();
     fs::write(
@@ -90,7 +122,7 @@ fn davinci(root: &Path, base_url: &str) -> Command {
         config.join("models.json"),
         json!({"providers": {"local": {
             "baseUrl": base_url,
-            "api": "openai-completions",
+            "api": api,
             "apiKey": "sk-test",
             "models": [{"id": "demo", "name": "Demo"}]
         }}})
@@ -112,7 +144,6 @@ fn davinci(root: &Path, base_url: &str) -> Command {
             "--no-skills",
             "--no-prompt-templates",
             "--no-mcp",
-            "--no-tools",
             "--no-session",
             "--provider",
             "local",
@@ -129,6 +160,11 @@ fn davinci(root: &Path, base_url: &str) -> Command {
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    if read_tool {
+        command.args(["--tools", "read"]);
+    } else {
+        command.arg("--no-tools");
+    }
     command
 }
 
@@ -355,4 +391,115 @@ fn without_the_flag_nothing_changes_on_the_wire_or_in_the_output() {
     let seen = seen.lock().unwrap();
     assert_eq!(seen.len(), 1);
     assert!(seen[0].get("response_format").is_none());
+}
+
+#[test]
+fn anthropic_receives_schema_before_first_answer_and_repair() {
+    let root = tempfile::tempdir().unwrap();
+    let (base, seen) = provider_with_api(&["not json", r#"{"ok":true}"#], true);
+    let output = davinci_with_api(root.path(), &base, "anthropic-messages")
+        .args(["--output-schema", "schema.json", "-p", "report"])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(0), "{}", describe(&output));
+    let seen = seen.lock().unwrap();
+    assert_eq!(seen.len(), 2, "{seen:#?}");
+    for request in seen.iter() {
+        let system = request["system"].to_string();
+        assert!(system.contains("Final answer contract"), "{request}");
+        assert!(
+            system.contains("required") && system.contains("additionalProperties"),
+            "{system}"
+        );
+        assert!(request.get("response_format").is_none());
+    }
+}
+
+#[test]
+fn unsupported_nested_assertion_fails_before_any_provider_request() {
+    let root = tempfile::tempdir().unwrap();
+    let (base, seen) = provider(&[r#"{"ok":true}"#]);
+    let mut command = davinci(root.path(), &base);
+    fs::write(
+        root.path().join("schema.json"),
+        r#"{"properties":{"ok":{"pattern":"x"}}}"#,
+    )
+    .unwrap();
+    let output = command
+        .args(["--output-schema", "schema.json", "-p", "report"])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(1), "{}", describe(&output));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("unsupported schema keyword"));
+    assert!(seen.lock().unwrap().is_empty());
+}
+
+#[test]
+fn named_file_bytes_reach_the_first_cli_provider_request() {
+    let root = tempfile::tempdir().unwrap();
+    fs::write(root.path().join("calc.py"), "CAPTURED_FILE_BODY = 7\n").unwrap();
+    let (base, seen) = provider(&["Reviewed."]);
+    let output = davinci_options(root.path(), &base, "openai-completions", true)
+        .env("DAVINCI_TURN_CONTEXT", "appended")
+        .env("DAVINCI_NAMED_FILES", "1")
+        .args(["-p", "Review calc.py"])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(0), "{}", describe(&output));
+    let seen = seen.lock().unwrap();
+    assert_eq!(seen.len(), 1);
+    assert!(
+        seen[0]["messages"]
+            .to_string()
+            .contains("CAPTURED_FILE_BODY"),
+        "{}",
+        seen[0]
+    );
+}
+
+#[test]
+fn repair_diagnostics_are_not_genuine_user_file_requests() {
+    let root = tempfile::tempdir().unwrap();
+    fs::write(root.path().join("invoice.py"), "PRIVATE_INVOICE_BODY").unwrap();
+    let (base, seen) = provider(&["{}", r#"{"invoice.py":true}"#]);
+    let mut command = davinci_options(root.path(), &base, "openai-completions", true);
+    fs::write(
+        root.path().join("schema.json"),
+        r#"{"type":"object","required":["invoice.py"]}"#,
+    )
+    .unwrap();
+    let output = command
+        .env("DAVINCI_TURN_CONTEXT", "appended")
+        .env("DAVINCI_NAMED_FILES", "1")
+        .args([
+            "--output-schema",
+            "schema.json",
+            "--mode",
+            "json",
+            "-p",
+            "Generate JSON",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(0), "{}", describe(&output));
+    let requests = seen.lock().unwrap();
+    assert_eq!(requests.len(), 2);
+    assert!(!requests
+        .iter()
+        .any(|request| request.to_string().contains("PRIVATE_INVOICE_BODY")));
+    let messages: Vec<Value> = String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .filter(|event| event["type"] == "message_start" && event["message"]["role"] == "user")
+        .map(|event| event["message"].clone())
+        .collect();
+    let repair = messages
+        .iter()
+        .find(|message| {
+            message["content"]
+                .to_string()
+                .contains("does not match the required JSON schema")
+        })
+        .expect("repair appears as a harness message");
+    assert_ne!(repair["davinciRealUserOrigin"], json!(true));
 }

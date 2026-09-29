@@ -478,6 +478,15 @@ pub struct PermissionSettings {
     pub allow: Vec<String>,
     #[serde(default)]
     pub deny: Vec<String>,
+    /// Extra writable roots, like `--add-dir`. Davinci addition. Relative
+    /// paths resolve against the working directory; the project file's list
+    /// counts only when the project is trusted.
+    #[serde(
+        default,
+        rename = "additionalDirectories",
+        skip_serializing_if = "Vec::is_empty"
+    )]
+    pub additional_directories: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]

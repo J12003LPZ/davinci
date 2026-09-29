@@ -957,6 +957,18 @@ fn codex_fixture_login_persists_exact_provider_without_aliasing() {
         .available
         .iter()
         .any(|model| model.provider == "openai-codex"));
+    // Other provider credentials may exist in the test process. Request the
+    // provider this test exercises instead of assuming it is the only one.
+    let model = snapshot
+        .available
+        .iter()
+        .find(|model| model.provider == "openai-codex")
+        .unwrap();
+    let parsed = Args {
+        provider: Some("openai-codex".into()),
+        model: Some(model.id.clone()),
+        ..parsed
+    };
     let mut agent = Agent::new("fixture");
     apply_resolved_models(&parsed, &mut agent).unwrap();
     assert_eq!(agent.provider, "openai-codex");
@@ -2464,6 +2476,45 @@ fn status_text_not_automatically_appended_to_model_context() {
         initial_len,
         "status output must not append to agent messages"
     );
+}
+
+#[test]
+fn additional_directories_reach_status_and_runtime_state_only_when_set() {
+    let agent = Agent::new("sys");
+    let parsed = Args::default();
+    let baseline = agent.runtime_prompt_state();
+    assert!(baseline.additional_directories.is_empty());
+    assert!(!davinci_agent::runtime_state_text(&baseline).contains("Additional writable"));
+    assert!(!format_session_status(&parsed, &agent).contains("additional directories"));
+
+    let (workspace, lib) = if cfg!(windows) {
+        ("C:\\work\\app", "C:\\work\\lib")
+    } else {
+        ("/work/app", "/work/lib")
+    };
+    agent
+        .permissions
+        .lock()
+        .unwrap()
+        .filesystem_boundary
+        .extra_roots = vec![std::path::PathBuf::from(lib)];
+    let state = agent.runtime_prompt_state();
+    assert_eq!(state.additional_directories, [lib]);
+    assert!(davinci_agent::runtime_state_text(&state).contains(&format!(
+        "Additional writable directories (use absolute paths): {lib}."
+    )));
+    assert!(format_session_status(&parsed, &agent)
+        .lines()
+        .any(|line| line == format!("additional directories: {lib}")));
+
+    // An isolated boundary drops them from both surfaces.
+    agent
+        .permissions
+        .lock()
+        .unwrap()
+        .set_worktree_boundary(std::path::Path::new(workspace), None);
+    assert_eq!(agent.runtime_prompt_state(), baseline);
+    assert!(!format_session_status(&parsed, &agent).contains("additional directories"));
 }
 
 #[test]

@@ -11,6 +11,8 @@ type Check = dyn Fn(&Path) -> Result<(), String> + Send + Sync;
 pub struct MutationAuthority {
     source: Arc<Check>,
     git: Option<Arc<Check>>,
+    // Host-selected root for this dispatch, never supplied as model identity.
+    transaction_root: Option<PathBuf>,
 }
 impl std::fmt::Debug for MutationAuthority {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -22,6 +24,7 @@ impl MutationAuthority {
         Self {
             source: Arc::new(check),
             git: None,
+            transaction_root: None,
         }
     }
     pub fn check(&self, path: &Path) -> Result<(), String> {
@@ -41,6 +44,23 @@ impl MutationAuthority {
         let name = name.to_owned();
         let args = args.clone();
         let targets = crate::runtime::contracts::extract_tool_targets(&name, &args);
+        // Single-file tools retain journaling inside the explicitly added root.
+        // Patch tools retain their existing primary-workspace-relative contract.
+        let transaction_root = policy.lock().ok().and_then(|current| {
+            if !matches!(name.as_str(), "write" | "edit" | "notebook_edit") {
+                return None;
+            }
+            let boundary = &current.filesystem_boundary;
+            let selected = targets.first().and_then(|path| {
+                boundary
+                    .extra_root_containing(&cwd.join(path))
+                    .map(Path::to_path_buf)
+            })?;
+            targets
+                .iter()
+                .all(|path| boundary.boundary_root_for(&cwd, &cwd.join(path)) == selected)
+                .then_some(selected)
+        });
         let consumed = std::sync::atomic::AtomicBool::new(false);
         let git_policy = policy.clone();
         let git_root = cwd.clone();
@@ -121,11 +141,12 @@ impl MutationAuthority {
             }
         });
         Self {
-            git: Some(Arc::new(move |_| {
+            transaction_root,
+            git: Some(Arc::new(move |root| {
                 let current = git_policy
                     .lock()
                     .map_err(|_| "permission policy lock poisoned")?;
-                let args = serde_json::json!({"id":"base-observation", "paths":[".git"], "observe_commit":true});
+                let args = serde_json::json!({"id":"base-observation", "paths":[root.join(".git")], "observe_commit":true});
                 match current.decide("transaction-base", "patch_status", &args, &git_root) {
                     crate::PermissionVerdict::Allow => Ok(()),
                     _ => Err("base revision requires current Git metadata read authority".into()),
@@ -156,6 +177,11 @@ impl<'a> ToolTransaction<'a> {
         self.coordinator.clone()
     }
     pub fn new(cwd: &Path, context: &'a ToolContext) -> Result<Self, ToolError> {
+        let cwd = context
+            .mutation_authority
+            .as_ref()
+            .and_then(|authority| authority.transaction_root.as_deref())
+            .unwrap_or(cwd);
         let root = super::files::root(cwd).map_err(ToolError::Failed)?;
         let owner = if let Some(runtime) = &context.runtime {
             TransactionOwner {
@@ -191,7 +217,8 @@ impl<'a> ToolTransaction<'a> {
     }
     pub fn snapshot(&self, path: &Path) -> Result<SourceSnapshot, ToolError> {
         self.authorize(path).map_err(ToolError::Failed)?;
-        let path = crate::permission::strip_verbatim_prefix(path);
+        let path =
+            crate::permission::normalize_lexically(&crate::permission::strip_verbatim_prefix(path));
         let root = crate::permission::strip_verbatim_prefix(&self.root);
         let requested_root = crate::permission::strip_verbatim_prefix(&self.requested_root);
         // Preserve the host's workspace spelling (case on Windows, /var aliases

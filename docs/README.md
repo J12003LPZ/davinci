@@ -15,6 +15,7 @@ Agent orchestration: [subagents, agent teams and workflows](agent-teams.md) and 
 Context and routing: [Context VM](context-vm.md), [Jev](decision-intelligence.md),
 and [hardening measurements](context-vm-jev-measurements.md).
 OpenAI provider operations: [cache and Responses efficiency](openai-efficiency.md).
+CLI and request safety: [harness hardening and offline evidence](perf/harness-release-hardening.md).
 Program closeout: [engineering program verification](engineering-program-verification.md).
 
 ---

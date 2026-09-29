@@ -1416,8 +1416,7 @@ fn missing_file_message(cwd: &Path, raw_path: &str, path: &Path) -> String {
     let mut scored: Vec<(u8, String)> = Vec::new();
     let mut scanned = 0;
     if !wanted.is_empty() {
-        let ignore = IgnoreRules::load(cwd);
-        walk_files(cwd, &ignore, &mut |file| {
+        walk_workspace_files(cwd, MISSING_FILE_SCAN_LIMIT, &mut |file| {
             scanned += 1;
             let name = file
                 .file_name()
@@ -2739,10 +2738,16 @@ const SEARCH_EXCLUDED_DIRS: &[&str] = &[".git", "node_modules"];
 /// searches keep today's behaviour.
 fn targets_excluded_dir(pattern: &str, search_path: &Path) -> bool {
     let names_dir = |text: &str| {
-        text.split(['/', '\\'])
-            .any(|part| SEARCH_EXCLUDED_DIRS.contains(&part))
+        text.split(['/', '\\']).any(|part| {
+            // A directory-specific glob is explicit intent; broad `*` and
+            // `**` still retain the default noise exclusions.
+            part.chars().any(|ch| ch.is_alphanumeric() || ch == '.')
+                && SEARCH_EXCLUDED_DIRS
+                    .iter()
+                    .any(|dir| crate::permission::glob_matches(part, dir))
+        })
     };
-    names_dir(pattern)
+    (!pattern.starts_with('!') && names_dir(pattern))
         || search_path.components().any(|component| {
             SEARCH_EXCLUDED_DIRS.contains(&component.as_os_str().to_string_lossy().as_ref())
         })
@@ -3610,6 +3615,57 @@ struct IgnoreRules {
 }
 
 impl IgnoreRules {
+    /// Automatic discovery cannot read arbitrary-size ignore files or scan
+    /// arbitrarily many ancestors before its entry budget even starts.
+    fn load_for_discovery(root: &Path) -> Option<Self> {
+        let mut patterns = vec![".git".to_string(), "node_modules".to_string()];
+        let mut remaining = 16 * 1024;
+        let mut current = root;
+        for _ in 0..64 {
+            let path = current.join(".gitignore");
+            match fs::symlink_metadata(&path) {
+                Ok(metadata) => {
+                    if !metadata.is_file() || metadata.len() > remaining as u64 {
+                        return None;
+                    }
+                    let mut body = String::new();
+                    fs::File::open(&path)
+                        .ok()?
+                        .take(remaining as u64 + 1)
+                        .read_to_string(&mut body)
+                        .ok()?;
+                    if body.len() > remaining {
+                        return None;
+                    }
+                    remaining -= body.len();
+                    for line in body.lines().map(str::trim) {
+                        if line.is_empty() || line.starts_with('#') || line.starts_with('!') {
+                            continue;
+                        }
+                        if patterns.len() >= 256 {
+                            return None;
+                        }
+                        patterns.push(line.trim_end_matches('/').to_string());
+                    }
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(_) => return None,
+            }
+            let parent = current.parent();
+            if current.join(".git").exists() || parent.is_none() {
+                let (path_patterns, name_patterns) = patterns
+                    .into_iter()
+                    .partition(|pattern| pattern.contains('/'));
+                return Some(Self {
+                    name_patterns,
+                    path_patterns,
+                });
+            }
+            current = parent?;
+        }
+        None
+    }
+
     fn load(root: &Path) -> Self {
         let mut patterns = vec![".git".into(), "node_modules".into()];
         let mut current = if root.is_file() {
@@ -3718,12 +3774,51 @@ fn walk_files(root: &Path, ignore: &IgnoreRules, visit: &mut dyn FnMut(&Path) ->
     }
 }
 
-/// Walk the files under `root` with the same ignore rules as the native
-/// find/grep (`.gitignore`, `.git`, `node_modules`), in a stable order, until
-/// `visit` returns false.
-pub(crate) fn walk_workspace_files(root: &Path, visit: &mut dyn FnMut(&Path) -> bool) {
-    let ignore = IgnoreRules::load(root);
-    walk_files(root, &ignore, visit);
+/// Bounded discovery for automatic context and missing-file suggestions.
+/// Counts every directory entry, including ignored paths and empty directories.
+/// Returns false on truncation or I/O failure: a partial scan proves no uniqueness.
+/// A directory larger than the remaining budget is not partially sorted or visited.
+pub(crate) fn walk_workspace_files(
+    root: &Path,
+    max_entries: usize,
+    visit: &mut dyn FnMut(&Path) -> bool,
+) -> bool {
+    let Some(ignore) = IgnoreRules::load_for_discovery(root) else {
+        return false;
+    };
+    let mut remaining = max_entries;
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let Ok(entries) = fs::read_dir(&dir) else {
+            return false;
+        };
+        let entries: Result<Vec<_>, _> = entries.take(remaining.saturating_add(1)).collect();
+        let Ok(mut entries) = entries else {
+            return false;
+        };
+        if entries.len() > remaining {
+            return false;
+        }
+        remaining -= entries.len();
+        entries.sort_by_key(|entry| entry.file_name());
+        let mut dirs = Vec::new();
+        for entry in entries {
+            let path = entry.path();
+            if ignore.ignored(&path) {
+                continue;
+            }
+            let Ok(kind) = entry.file_type() else {
+                return false;
+            };
+            if kind.is_dir() {
+                dirs.push(path);
+            } else if (kind.is_file() || kind.is_symlink() && path.is_file()) && !visit(&path) {
+                return false;
+            }
+        }
+        stack.extend(dirs.into_iter().rev());
+    }
+    true
 }
 
 fn format_grep_path(file: &Path, search_path: &Path, is_dir: bool) -> String {
@@ -5477,5 +5572,46 @@ impl User {
             .unwrap_err()
             .to_string()
             .contains("Rename preview is unavailable"));
+    }
+}
+
+#[cfg(test)]
+mod bounded_discovery_regressions {
+    use super::*;
+
+    #[test]
+    fn wildcard_directory_targets_are_not_overridden() {
+        for pattern in [
+            "**/node_modules*/**",
+            "**/.git*/**",
+            "node_module?/pkg/*.js",
+        ] {
+            assert!(targets_excluded_dir(pattern, Path::new(".")), "{pattern}");
+            let args = build_rg_args("needle", Path::new("."), Some(pattern), false, false);
+            assert!(!args
+                .iter()
+                .any(|arg| arg == "!node_modules" || arg == "!.git"));
+        }
+        assert!(!targets_excluded_dir("**/*", Path::new(".")));
+        assert!(!targets_excluded_dir("!**/.git*/**", Path::new(".")));
+        assert!(targets_excluded_dir(
+            &format!(".git{}", "*".repeat(40000)),
+            Path::new(".")
+        ));
+    }
+
+    #[test]
+    fn discovery_counts_empty_directories_and_reports_truncation() {
+        let root = tempfile::tempdir().unwrap();
+        for n in 0..20 {
+            fs::create_dir(root.path().join(format!("dir{n:02}"))).unwrap();
+        }
+        let mut visited = 0;
+        assert!(!walk_workspace_files(root.path(), 3, &mut |_| {
+            visited += 1;
+            true
+        }));
+        assert_eq!(visited, 0);
+        assert!(walk_workspace_files(root.path(), 20, &mut |_| true));
     }
 }

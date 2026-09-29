@@ -302,3 +302,135 @@ fn cd_rejects_missing_and_non_directory_targets() {
     assert_eq!(output.status.code(), Some(1), "{}", describe(&output));
     assert!(String::from_utf8_lossy(&output.stderr).contains("--cd requires a directory"));
 }
+
+#[test]
+fn add_dir_grants_only_the_requested_sibling_and_respects_denies() {
+    let root = tempfile::tempdir().unwrap();
+    let work = root.path().join("work");
+    let shared = root.path().join("shared");
+    let other = root.path().join("other");
+    let config = root.path().join("config");
+    for dir in [&work, &shared, &other] {
+        fs::create_dir(dir).unwrap();
+    }
+    let target = shared.join("marker.txt");
+    let call = |path: &Path| {
+        json!({"name":"write", "arguments":{"path":path, "content":"marker"}}).to_string()
+    };
+    let mut plain = davinci(&work, &config);
+    let output = run(plain
+        .args([
+            "--no-session",
+            "--permission-mode",
+            "accept-edits",
+            "--tools",
+            "write",
+            "--mode",
+            "json",
+            "-p",
+            "write marker",
+        ])
+        .env("PI_OFFLINE_TOOL_CALL", call(&target)));
+    assert_eq!(output.status.code(), Some(1), "{}", describe(&output));
+    assert!(!target.exists());
+
+    let mut added = davinci(root.path(), &config);
+    let output = run(added
+        .args([
+            "--no-session",
+            "--permission-mode",
+            "accept-edits",
+            "--tools",
+            "write",
+            "--mode",
+            "json",
+            "-C",
+            "work",
+            "--add-dir",
+            "../shared",
+            "-p",
+            "write marker",
+        ])
+        .env("PI_OFFLINE_TOOL_CALL", call(&target)));
+    assert!(output.status.success(), "{}", describe(&output));
+    assert!(target.exists(), "{}", describe(&output));
+    assert_eq!(fs::read_to_string(&target).unwrap(), "marker");
+    let relative = shared.join("relative.txt");
+    let output = run(davinci(&work, &config)
+        .args(["--no-session", "--permission-mode", "accept-edits", "--tools", "write,edit", "--mode", "json", "--add-dir", "../shared", "-p", "write and edit"])
+        .env("PI_OFFLINE_TOOL_CALL", json!([
+            {"name":"write","arguments":{"path":"../shared/relative.txt","content":"marker"}},
+            {"name":"edit","arguments":{"path":"../shared/relative.txt","oldText":"marker","newText":"edited"}}
+        ]).to_string()));
+    assert!(output.status.success(), "{}", describe(&output));
+    assert_eq!(
+        fs::read_to_string(relative).unwrap(),
+        "edited",
+        "{}",
+        describe(&output)
+    );
+
+    let outside = other.join("marker.txt");
+    let mut unlisted = davinci(&work, &config);
+    let output = run(unlisted
+        .args([
+            "--no-session",
+            "--permission-mode",
+            "accept-edits",
+            "--tools",
+            "write",
+            "--mode",
+            "json",
+            "--add-dir",
+            "../shared",
+            "-p",
+            "write marker",
+        ])
+        .env("PI_OFFLINE_TOOL_CALL", call(&outside)));
+    assert_eq!(output.status.code(), Some(1), "{}", describe(&output));
+    assert!(!outside.exists());
+
+    let denied = shared.join("denied.txt");
+    let mut explicit = davinci(&work, &config);
+    let subject = davinci_agent::strip_verbatim_prefix(&denied)
+        .to_string_lossy()
+        .replace('\\', "/");
+    fs::write(config.join("settings.json"), json!({"processManager":{"enabled":false},"permissions":{"deny":[format!("write({subject})")]}}).to_string()).unwrap();
+    let output = run(explicit
+        .args([
+            "--no-session",
+            "--permission-mode",
+            "accept-edits",
+            "--tools",
+            "write",
+            "--mode",
+            "json",
+            "--add-dir",
+            "../shared",
+            "-p",
+            "write marker",
+        ])
+        .env("PI_OFFLINE_TOOL_CALL", call(&denied)));
+    assert!(!denied.exists(), "{}", describe(&output));
+    assert!(
+        String::from_utf8_lossy(&output.stdout).contains("deny rule"),
+        "{}",
+        describe(&output)
+    );
+}
+
+#[test]
+fn invalid_add_dir_fails_before_any_offline_tool_runs() {
+    let root = tempfile::tempdir().unwrap();
+    let config = root.path().join("config");
+    let marker = root.path().join("should-not-exist.txt");
+    let output = run(davinci(root.path(), &config)
+        .args(["--no-session", "--add-dir", "absent", "-p", "write"])
+        .env(
+            "PI_OFFLINE_TOOL_CALL",
+            json!({"name":"write","arguments":{"path":marker,"content":"bad"}}).to_string(),
+        ));
+    assert_eq!(output.status.code(), Some(1), "{}", describe(&output));
+    assert!(!marker.exists());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("--add-dir"));
+}

@@ -18,6 +18,8 @@ pub(super) struct FileTarget {
     pub protected: bool,
     pub secret: bool,
     pub destructive: bool,
+    /// Inside an additional writable directory rather than the primary root.
+    pub extra_root: bool,
 }
 
 fn normalized_parts(path: &str) -> Vec<String> {
@@ -120,7 +122,9 @@ fn target(
 ) -> FileTarget {
     let (subject, outside) = project_relative_with_boundary(cwd, raw, Some(boundary));
     let joined = resolved_path(cwd, raw);
-    let root = boundary.root.as_deref().unwrap_or(cwd);
+    // An additional directory runs its own symlink check, like the root.
+    let root = boundary.boundary_root_for(cwd, &joined);
+    let extra_root = root != boundary.root.as_deref().unwrap_or(cwd);
     let mut protected = is_protected_path(&subject);
     let mut secret = is_secret_path(&subject);
     // A harmless-looking symlink into an in-root credential/config directory
@@ -145,6 +149,7 @@ fn target(
         protected,
         secret,
         destructive,
+        extra_root,
     }
 }
 

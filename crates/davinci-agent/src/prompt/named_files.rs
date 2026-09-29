@@ -79,7 +79,7 @@ pub struct NamedFile {
     /// Present only when `status` is `Attached`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub content: Option<String>,
-    /// Short content hash; None when the file was not read.
+    /// Full SHA-256 of the source text; None when the file was not read.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tag: Option<String>,
 }
@@ -150,10 +150,7 @@ is newer than this copy."
 
 fn content_tag(content: &str) -> String {
     let digest = Sha256::digest(content.as_bytes());
-    format!(
-        "{:02x}{:02x}{:02x}{:02x}",
-        digest[0], digest[1], digest[2], digest[3]
-    )
+    format!("{digest:x}")
 }
 
 /// Path-like tokens of `text`, in order and without duplicates: a relative
@@ -248,7 +245,7 @@ pub fn capture_named_files(
 
 fn resolve_named_paths(root: &Path, text: &str, allowed: &dyn Fn(&Path) -> bool) -> Vec<PathBuf> {
     let mut resolved: Vec<PathBuf> = Vec::new();
-    let mut basenames: Option<Vec<PathBuf>> = None;
+    let mut basenames: Option<(Vec<PathBuf>, bool)> = None;
     for token in candidate_paths(text) {
         if resolved.len() >= NAMED_FILES_MAX {
             break;
@@ -259,7 +256,11 @@ fn resolve_named_paths(root: &Path, text: &str, allowed: &dyn Fn(&Path) -> bool)
         } else if !token.contains('/') && !token.contains('\\') {
             // A bare name such as `pricing.py` for `shop/pricing.py`: attach
             // only an unambiguous match.
-            let index = basenames.get_or_insert_with(|| workspace_files(root));
+            let (index, complete) = basenames.get_or_insert_with(|| workspace_files(root));
+            // A truncated index cannot prove that a basename is unique.
+            if !*complete {
+                continue;
+            }
             let mut matches = index
                 .iter()
                 .filter(|path| path.file_name().is_some_and(|name| name == token.as_str()));
@@ -271,6 +272,15 @@ fn resolve_named_paths(root: &Path, text: &str, allowed: &dyn Fn(&Path) -> bool)
             None
         };
         let Some(path) = path else { continue };
+        // Apply both the spelling the user named and the resolved spelling.
+        // Canonicalization must not erase a deny on a symlink alias.
+        let lexical = relative_posix(&path, root);
+        if !safe_display_path(&lexical)
+            || crate::permission::is_sensitive_file_path(&lexical)
+            || !allowed(&path)
+        {
+            continue;
+        }
         let Ok(canonical) = path.canonicalize() else {
             continue;
         };
@@ -278,7 +288,10 @@ fn resolve_named_paths(root: &Path, text: &str, allowed: &dyn Fn(&Path) -> bool)
             continue;
         }
         let relative = relative_posix(&canonical, root);
-        if crate::permission::is_sensitive_file_path(&relative) || !allowed(&canonical) {
+        if !safe_display_path(&relative)
+            || crate::permission::is_sensitive_file_path(&relative)
+            || !allowed(&canonical)
+        {
             continue;
         }
         resolved.push(canonical);
@@ -318,7 +331,9 @@ fn read_named_file(
         return Some(too_large(raw.len() as u64));
     }
     let bytes = raw.len() as u64;
-    let content = String::from_utf8_lossy(&raw).replace("\r\n", "\n");
+    // Invalid UTF-8 is not editable text. Replacement characters can also
+    // triple the encoded size and invalidate the attachment budget.
+    let content = String::from_utf8(raw).ok()?.replace("\r\n", "\n");
     let tag = content_tag(&content);
     let mut named = NamedFile {
         path: relative,
@@ -342,11 +357,11 @@ fn read_named_file(
         named.status = NamedFileStatus::Markup;
         return Some(named);
     }
-    if raw.len() > *budget {
+    if content.len() > *budget {
         named.status = NamedFileStatus::TooLarge;
         return Some(named);
     }
-    *budget = budget.saturating_sub(raw.len());
+    *budget -= content.len();
     named.content = Some(content);
     Some(named)
 }
@@ -378,11 +393,13 @@ impl crate::Agent {
     /// by the current permission policy: a path that would ask or is denied
     /// is left for the model to request through the gate.
     pub(crate) fn named_files_for_turn(&self) -> Option<NamedFilesSnapshot> {
-        let pressure = self.context_window > 0
-            && self.estimated_context_tokens().saturating_mul(2) > self.context_window;
         if !self.named_file_context
             || self.named_file_hooks_active
-            || pressure
+            || self.pre_tool.is_some()
+            // Runtime decision subscribers cannot be proven read-transparent.
+            // Leave these reads on the normal gated tool path instead.
+            || self.runtime.is_some()
+            || self.context_vm_mode() == crate::runtime::ContextVmMode::Active
             || !self.tools.iter().any(|tool| tool == "read")
             || self.active_contract().is_some()
             || self
@@ -393,12 +410,19 @@ impl crate::Agent {
         {
             return None;
         }
-        // Every queued user message of this turn, so a batch keeps them all.
+        // Only genuine user requests count, not job notices or gate reminders.
+        // Cheap disable checks above precede the context estimate.
+        if self.context_window > 0
+            && self.estimated_context_tokens().saturating_mul(2) > self.context_window
+        {
+            return None;
+        }
         let text = self
             .messages
             .iter()
             .rev()
             .take_while(|message| message.role == "user")
+            .filter(|message| message.extra_bool(crate::REAL_USER_ORIGIN_FIELD))
             .map(|message| {
                 message
                     .content
@@ -446,13 +470,21 @@ impl crate::Agent {
     }
 }
 
-fn workspace_files(root: &Path) -> Vec<PathBuf> {
+fn workspace_files(root: &Path) -> (Vec<PathBuf>, bool) {
     let mut files = Vec::new();
-    crate::tools::walk_workspace_files(root, &mut |path| {
+    let complete = crate::tools::walk_workspace_files(root, BASENAME_SCAN_LIMIT, &mut |path| {
         files.push(path.to_path_buf());
-        files.len() < BASENAME_SCAN_LIMIT
+        true
     });
-    files
+    (files, complete)
+}
+
+fn safe_display_path(path: &str) -> bool {
+    !path.is_empty()
+        && path.len() <= 512
+        && path
+            .chars()
+            .all(|ch| ch.is_alphanumeric() || matches!(ch, '_' | '-' | '.' | '/' | ' '))
 }
 
 fn relative_posix(path: &Path, root: &Path) -> String {

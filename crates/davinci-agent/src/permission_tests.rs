@@ -1760,3 +1760,276 @@ fn git_metadata_access_preserved() {
         PermissionVerdict::Deny { .. }
     ));
 }
+
+/// Canonical `workspace`, `extra` and `other` directories beside each other,
+/// with a policy rooted at the workspace and `extra` as an additional root.
+struct ExtraRoots {
+    _temp: tempfile::TempDir,
+    workspace: PathBuf,
+    extra: PathBuf,
+    other: PathBuf,
+}
+
+impl ExtraRoots {
+    fn new() -> Self {
+        let temp = tempfile::tempdir().unwrap();
+        let base = strip_verbatim_prefix(&temp.path().canonicalize().unwrap());
+        let [workspace, extra, other] = ["workspace", "extra", "other"].map(|name| {
+            let dir = base.join(name);
+            std::fs::create_dir_all(dir.join("src")).unwrap();
+            dir
+        });
+        Self {
+            _temp: temp,
+            workspace,
+            extra,
+            other,
+        }
+    }
+
+    fn policy(&self, mode: PermissionMode) -> PermissionPolicy {
+        let mut policy = PermissionPolicy::new(mode);
+        policy.filesystem_boundary.root = Some(self.workspace.clone());
+        policy.filesystem_boundary.extra_roots = vec![self.extra.clone()];
+        policy
+    }
+
+    fn write(&self, policy: &PermissionPolicy, path: &Path) -> PermissionVerdict {
+        policy.decide(
+            "extra",
+            "write",
+            &json!({"path": path.to_string_lossy(), "content": "x"}),
+            &self.workspace,
+        )
+    }
+}
+
+#[test]
+fn extra_root_edits_are_inside_and_other_directories_still_ask() {
+    let dirs = ExtraRoots::new();
+    for mode in [PermissionMode::Edits, PermissionMode::Auto] {
+        let policy = dirs.policy(mode);
+        assert_eq!(
+            dirs.write(&policy, &dirs.extra.join("x.rs")),
+            PermissionVerdict::Allow,
+            "{mode:?}"
+        );
+        assert!(
+            is_ask(&dirs.write(&policy, &dirs.other.join("x.rs"))),
+            "{mode:?}"
+        );
+    }
+    // The same policy without the extra root treats it as outside.
+    let mut plain = dirs.policy(PermissionMode::Edits);
+    plain.filesystem_boundary.extra_roots.clear();
+    assert!(is_ask(&dirs.write(&plain, &dirs.extra.join("x.rs"))));
+}
+
+#[test]
+fn extra_root_reads_do_not_ask_in_auto() {
+    let dirs = ExtraRoots::new();
+    let policy = dirs.policy(PermissionMode::Auto);
+    let read = |path: &Path| {
+        policy.decide(
+            "read",
+            "read",
+            &json!({"path": path.to_string_lossy()}),
+            &dirs.workspace,
+        )
+    };
+    assert_eq!(
+        read(&dirs.extra.join("src/lib.rs")),
+        PermissionVerdict::Allow
+    );
+    assert!(is_ask(&read(&dirs.other.join("src/lib.rs"))));
+}
+
+#[test]
+fn extra_root_subjects_stay_absolute_so_relative_rules_do_not_match() {
+    let dirs = ExtraRoots::new();
+    let mut policy = dirs.policy(PermissionMode::Ask);
+    policy
+        .allow
+        .push(PermissionRule::parse("write(src/*)").unwrap());
+    assert_eq!(
+        dirs.write(&policy, &dirs.workspace.join("src/x.rs")),
+        PermissionVerdict::Allow
+    );
+    let target = dirs.extra.join("src").join("x.rs");
+    match dirs.write(&policy, &target) {
+        PermissionVerdict::Ask(request) => {
+            assert_eq!(request.subject, slashes(&target));
+            assert!(!request.outside_project);
+        }
+        other => panic!("expected an ask, got {other:?}"),
+    }
+    let (subject, outside) = project_relative_with_boundary(
+        &dirs.workspace,
+        &target.to_string_lossy(),
+        Some(&policy.filesystem_boundary),
+    );
+    assert_eq!((subject, outside), (slashes(&target), false));
+}
+
+#[test]
+fn protected_paths_in_extra_roots_need_an_exact_grant() {
+    let dirs = ExtraRoots::new();
+    std::fs::create_dir_all(dirs.extra.join(".git")).unwrap();
+    let config = dirs.extra.join(".git").join("config");
+    let mut policy = dirs.policy(PermissionMode::Edits);
+    assert!(is_ask(&dirs.write(&policy, &config)));
+
+    // The absolute-glob workaround and a relative rule both fall short.
+    policy.allow.push(PermissionRule::subject(
+        "write",
+        format!("{}/**", slashes(&dirs.extra)),
+    ));
+    policy
+        .allow
+        .push(PermissionRule::parse("write(.git/*)").unwrap());
+    policy.allow.push(PermissionRule::bare("write"));
+    assert!(is_ask(&dirs.write(&policy, &config)));
+    assert!(is_ask(&dirs.write(&policy, &dirs.extra.join(".env"))));
+    // The glob still covers ordinary files in that root.
+    assert_eq!(
+        dirs.write(&policy, &dirs.extra.join("src/y.rs")),
+        PermissionVerdict::Allow
+    );
+
+    // Naming the exact file is the user's explicit choice.
+    policy
+        .allow
+        .push(PermissionRule::subject("write", slashes(&config)));
+    assert_eq!(dirs.write(&policy, &config), PermissionVerdict::Allow);
+}
+
+#[test]
+fn symlinks_escaping_the_workspace_or_an_extra_root_are_denied() {
+    let dirs = ExtraRoots::new();
+    #[cfg(unix)]
+    let link = |from: &Path, to: &Path| std::os::unix::fs::symlink(to, from).is_ok();
+    // Without the symlink privilege, a junction resolves the same way.
+    #[cfg(windows)]
+    let link = |from: &Path, to: &Path| {
+        std::os::windows::fs::symlink_dir(to, from).is_ok()
+            || std::process::Command::new("cmd")
+                .arg("/C")
+                .arg("mklink")
+                .arg("/J")
+                .arg(from)
+                .arg(to)
+                .output()
+                .is_ok_and(|out| out.status.success())
+    };
+    if !link(&dirs.workspace.join("link"), &dirs.other) {
+        return; // No way to link on this host.
+    }
+    assert!(link(&dirs.extra.join("link"), &dirs.other));
+    for mode in PermissionMode::ALL {
+        let mut policy = dirs.policy(mode);
+        policy.allow.push(PermissionRule::bare("*"));
+        for target in [
+            dirs.workspace.join("link").join("x.rs"),
+            dirs.extra.join("link").join("x.rs"),
+        ] {
+            assert!(
+                is_deny(&dirs.write(&policy, &target)),
+                "{mode:?} {}",
+                target.display()
+            );
+        }
+    }
+}
+
+#[test]
+fn isolated_worktree_boundaries_ignore_extra_roots() {
+    let dirs = ExtraRoots::new();
+    // Set before isolating: cleared.
+    let mut before = dirs.policy(PermissionMode::AlwaysApprove);
+    before.set_worktree_boundary(&dirs.workspace, None);
+    assert!(before.filesystem_boundary.extra_roots.is_empty());
+    assert!(is_deny(&dirs.write(&before, &dirs.extra.join("x.rs"))));
+    // Set after isolating: ignored.
+    let mut after = PermissionPolicy::new(PermissionMode::AlwaysApprove);
+    after.set_worktree_boundary(&dirs.workspace, None);
+    after.filesystem_boundary.extra_roots = vec![dirs.extra.clone()];
+    assert!(after.filesystem_boundary.active_extra_roots().is_empty());
+    assert!(is_deny(&dirs.write(&after, &dirs.extra.join("x.rs"))));
+}
+
+#[test]
+fn auto_shell_workdir_inside_an_extra_root_is_routine() {
+    let dirs = ExtraRoots::new();
+    let policy = dirs.policy(PermissionMode::Auto);
+    let shell = |workdir: &Path| {
+        policy.decide(
+            "shell",
+            "bash",
+            &json!({"command": "cat src/lib.rs", "workdir": workdir.to_string_lossy()}),
+            &dirs.workspace,
+        )
+    };
+    assert_eq!(shell(&dirs.extra), PermissionVerdict::Allow);
+    assert!(is_ask(&shell(&dirs.other)));
+    assert!(is_ask(&shell(&dirs.extra.join(".git"))));
+
+    // Path arguments from the workspace follow the same boundary.
+    let command = |command: &str| {
+        policy.decide(
+            "shell",
+            "bash",
+            &json!({ "command": command }),
+            &dirs.workspace,
+        )
+    };
+    assert_eq!(command("cat ../extra/src/lib.rs"), PermissionVerdict::Allow);
+    assert!(is_ask(&command("cat ../other/src/lib.rs")));
+    assert!(is_ask(&command("cat ../extra/.git/config")));
+    let mut plain = dirs.policy(PermissionMode::Auto);
+    plain.filesystem_boundary.extra_roots.clear();
+    assert!(is_ask(&plain.decide(
+        "shell",
+        "bash",
+        &json!({"command": "cat ../extra/src/lib.rs"}),
+        &dirs.workspace,
+    )));
+}
+
+#[test]
+fn validate_extra_root_accepts_project_directories_and_rejects_the_rest() {
+    let temp = tempfile::tempdir().unwrap();
+    let base = strip_verbatim_prefix(&temp.path().canonicalize().unwrap());
+    let home = base.join("home");
+    let cwd = home.join("work").join("app");
+    let lib = home.join("work").join("lib");
+    for dir in [&cwd, &lib, &home.join(".ssh").join("keys")] {
+        std::fs::create_dir_all(dir).unwrap();
+    }
+    std::fs::write(home.join("work").join("file.txt"), "x").unwrap();
+    let check = |raw: &str| validate_extra_root(raw, &cwd, Some(&home));
+
+    assert_eq!(check("../lib").unwrap(), lib);
+    assert_eq!(check(&lib.to_string_lossy()).unwrap(), lib);
+    assert_eq!(check("~/work/lib").unwrap(), lib);
+
+    let error = |raw: &str| check(raw).unwrap_err();
+    assert!(
+        error("../missing").contains("does not exist"),
+        "{}",
+        error("../missing")
+    );
+    assert!(error("../file.txt").contains("is not a directory"));
+    assert!(error(".").contains("already the workspace"));
+    assert!(error(&cwd.to_string_lossy()).contains("already the workspace"));
+    assert!(error("~").contains("home directory"));
+    assert!(error(&base.to_string_lossy()).contains("contains"));
+    assert!(error("~/.ssh").contains("contains"));
+    assert!(error("~/.ssh/keys").contains("is inside"));
+    assert!(error("  ").contains("empty"));
+    let filesystem_root = base.ancestors().last().unwrap().to_path_buf();
+    assert!(
+        validate_extra_root(&filesystem_root.to_string_lossy(), &cwd, None)
+            .unwrap_err()
+            .contains("filesystem root")
+    );
+}

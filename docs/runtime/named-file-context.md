@@ -47,6 +47,12 @@ The harness reads nothing on the model's behalf when any of these holds:
   extension is loaded (its `tool_call` handler may block). Those hooks would
   never see the harness's own read, so the feature stays off rather than
   bypass them.
+- A library `pre_tool` hook or a runtime handle is installed. Runtime decision
+  subscribers cannot be assumed read-transparent. The normal gated `read`
+  tool remains available instead. This deliberately limits automatic capture
+  to initial host turns and unbound library turns.
+- Context VM is active. Its provider image may omit older authoritative
+  messages, so history alone cannot prove a previous attachment is visible.
 - The `read` tool is not active (for example `--no-tools`).
 - The agent is a worker (its runtime has a parent) or a graph worker
   (`PI_GRAPH_ROLE`).
@@ -61,15 +67,19 @@ quotes, backticks, brackets, trailing punctuation, a leading `./` or `@`, and
 a `:line` or `:line:column` suffix. It skips URLs, flags, `~` paths, words
 containing `..`, and absolute or UNC paths (a leading `/` or `\`; a drive
 letter's `:` is not a path character here), so no such path is ever probed on
-disk. It considers at most 64 words.
+disk. It accepts at most 64 distinct path-like candidates.
 
-When several user messages are queued into one turn, the words of all of them
-are used.
+When several genuine user messages are queued into one turn, all contribute.
+Harness notices and background-job output are not treated as user requests.
 
 Each candidate resolves against the working directory. A bare name such as
 `pricing.py` that is not at the root is looked up among at most 2,000
-workspace files (same ignore rules as the native `find`), and it is attached
-only when exactly one file has that name.
+directory entries, including ignored entries and empty directories (same
+ignore rules as native `find`). Only a complete scan can establish uniqueness;
+truncation or an I/O error disables basename attachment for that turn.
+Ignore-file loading is also bounded: 16 KiB total, 256 patterns including
+built-in exclusions, and at most 64 ancestor directories. Exceeding any
+limit leaves discovery to an explicit tool call.
 
 A file is listed only if all of these hold:
 
@@ -77,14 +87,15 @@ A file is listed only if all of these hold:
 - It is not a protected or credential path (`permission::is_sensitive_file_path`,
   which covers `.env*`, `.ssh`, `auth.json`, `.git` internals and similar).
 - A `read` of it is allowed outright by the current permission policy, for
-  both its workspace-relative and absolute spelling. A path that would ask,
+  both its original and resolved path, each in relative and absolute spelling.
+  Resolved names must also be safe single-line path text. A path that would ask,
   or that a deny rule, Plan Mode boundary or filesystem boundary refuses, is
   left out. The model can still request it through the normal gate.
-- It is text (no NUL byte). Binary files are left out.
+- It is valid UTF-8 with no NUL byte. Invalid text is omitted, not repaired with replacement characters.
 
 At most 3 files are listed. For each listed file:
 
-- Over 8 KB on disk: listed with its byte count and never opened for reading,
+- Over 8 KiB on disk: listed with its byte count; file contents are not read,
   however large it is.
 - Otherwise at most 8 KB + 1 byte is read, so a file that grows between the
   size check and the read still costs a bounded read.
@@ -112,7 +123,7 @@ big.py (40000 bytes): too large to attach, read the parts you need
 ```
 
 Contents are verbatim so an `edit` can quote them exactly. The bracketed tag
-is the first 4 bytes of the SHA-256 of the contents. The turn-context
+is the full SHA-256 of the contents (abbreviated in the illustrative format above). The turn-context
 message's `details.namedFiles` records `path#tag` for every attached file;
 that is how a later mention finds the earlier copy.
 

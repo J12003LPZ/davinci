@@ -374,6 +374,13 @@ impl PermissionRule {
         self.matches_call(tool, &Value::Null, subject)
     }
 
+    /// A rule naming one tool and one literal subject, with no glob.
+    pub fn is_exact(&self) -> bool {
+        !self.tool.contains(['*', '?'])
+            && matches!(&self.specifier, Some(RuleSpecifier::Subject(pattern))
+                if !pattern.contains(['*', '?']))
+    }
+
     pub fn matches_call(&self, tool: &str, args: &Value, subject: &str) -> bool {
         if !self.tool_matches(tool) {
             return false;
@@ -806,6 +813,119 @@ pub struct FilesystemBoundaryPolicy {
     pub enforce_root_for_mutations: bool,
     /// If true, git metadata operations (such as under `repo_root/.git`) are permitted.
     pub allow_git_metadata: bool,
+    /// Canonical directories the user made writable beside `root`
+    /// (`--add-dir`, `permissions.additionalDirectories`). A path inside one
+    /// is not outside the project, but its rule subject stays absolute.
+    /// Ignored while `enforce_root_for_mutations` holds: an isolated worker
+    /// owns exactly one root.
+    pub extra_roots: Vec<PathBuf>,
+}
+
+impl FilesystemBoundaryPolicy {
+    /// The extra roots in force. An isolated boundary has none, even when a
+    /// caller set some before or after isolating it.
+    pub fn active_extra_roots(&self) -> &[PathBuf] {
+        if self.enforce_root_for_mutations {
+            &[]
+        } else {
+            &self.extra_roots
+        }
+    }
+
+    /// The active extra root that lexically contains the absolute `target`.
+    pub fn extra_root_containing(&self, target: &Path) -> Option<&Path> {
+        let target = strip_verbatim_prefix(&normalize_lexically(target));
+        self.active_extra_roots()
+            .iter()
+            .map(PathBuf::as_path)
+            .find(|root| target.starts_with(strip_verbatim_prefix(&normalize_lexically(root))))
+    }
+
+    /// The root whose symlink checks apply to the absolute `target`: the
+    /// primary root, unless the path is lexically outside it and inside an
+    /// extra root.
+    pub fn boundary_root_for<'a>(&'a self, cwd: &'a Path, target: &Path) -> &'a Path {
+        let root = self.root.as_deref().unwrap_or(cwd);
+        let normalized = strip_verbatim_prefix(&normalize_lexically(target));
+        if normalized.starts_with(strip_verbatim_prefix(&normalize_lexically(root))) {
+            return root;
+        }
+        self.extra_root_containing(target).unwrap_or(root)
+    }
+}
+
+/// Credential and Davinci state directories under the home directory. An
+/// additional writable directory may not be, contain, or sit inside one.
+const PROTECTED_HOME_DIRS: [&str; 5] = [".davinci", ".pi", ".ssh", ".aws", ".gnupg"];
+
+/// Validate one `--add-dir` or `permissions.additionalDirectories` entry and
+/// return its canonical path. `~` expands to `home` and a relative path
+/// resolves against `cwd`. The error names the problem without a prefix, so
+/// the caller can say which flag or setting carried the value.
+pub fn validate_extra_root(raw: &str, cwd: &Path, home: Option<&Path>) -> Result<PathBuf, String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Err("an empty path is not a directory".into());
+    }
+    let expanded = match (trimmed.strip_prefix('~'), home) {
+        (Some(rest), Some(home)) if rest.is_empty() || rest.starts_with(['/', '\\']) => {
+            home.join(rest.trim_start_matches(['/', '\\']))
+        }
+        _ => PathBuf::from(trimmed),
+    };
+    let joined = if expanded.is_absolute() {
+        expanded
+    } else {
+        cwd.join(expanded)
+    };
+    let canonical = match joined.canonicalize() {
+        Ok(path) => strip_verbatim_prefix(&path),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            return Err(format!("{trimmed} does not exist"))
+        }
+        Err(err) => return Err(format!("cannot use {trimmed}: {err}")),
+    };
+    if !canonical.is_dir() {
+        return Err(format!("{trimmed} is not a directory"));
+    }
+    if canonical.parent().is_none() {
+        return Err(format!(
+            "{trimmed} is a filesystem root; name a project directory instead"
+        ));
+    }
+    let settled = |path: &Path| {
+        path.canonicalize()
+            .map(|path| strip_verbatim_prefix(&path))
+            .unwrap_or_else(|_| strip_verbatim_prefix(&normalize_lexically(path)))
+    };
+    if let Some(home) = home {
+        let home = settled(home);
+        if canonical == home {
+            return Err(format!(
+                "{trimmed} is your home directory; name a project directory instead"
+            ));
+        }
+        for name in PROTECTED_HOME_DIRS {
+            let lexical = home.join(name);
+            let protected = settled(&lexical);
+            if protected.starts_with(&canonical) || lexical.starts_with(&canonical) {
+                return Err(format!(
+                    "{trimmed} contains {}, which holds credentials or Davinci state",
+                    lexical.display()
+                ));
+            }
+            if canonical.starts_with(&protected) || canonical.starts_with(&lexical) {
+                return Err(format!(
+                    "{trimmed} is inside {}, which holds credentials or Davinci state",
+                    lexical.display()
+                ));
+            }
+        }
+    }
+    if canonical == settled(cwd) {
+        return Err(format!("{trimmed} is already the workspace"));
+    }
+    Ok(canonical)
 }
 
 /// The mode plus every rule in force. `allow` and `deny` come from settings;
@@ -866,6 +986,8 @@ impl PermissionPolicy {
         self.filesystem_boundary.repo_root = repo_root.map(|p| p.to_path_buf());
         self.filesystem_boundary.enforce_root_for_mutations = true;
         self.filesystem_boundary.allow_git_metadata = true;
+        // An isolated worker owns one root; the user's extra roots stay home.
+        self.filesystem_boundary.extra_roots.clear();
         // The structural boundary is distinct from explicit deny rules.
         // Injecting broad parent denies then exempting metadata would allow
         // unrelated user deny rules to be bypassed.
@@ -1185,12 +1307,19 @@ impl PermissionPolicy {
 
         // Every patch target and every shell segment needs its own grant.
         // A subject pattern cannot authorize hidden command substitutions.
-        if subjects.iter().all(|part| {
+        // A protected file inside an additional directory needs an exact
+        // grant: a glob written for convenience must not reach another
+        // checkout's `.git` or credentials.
+        if subjects.iter().enumerate().all(|(index, part)| {
+            let exact_only = targets
+                .get(index)
+                .is_some_and(|target| target.extra_root && (target.protected || target.secret));
             self.allow
                 .iter()
                 .chain(self.session_allow.iter())
                 .any(|rule| {
                     rule.matches_call(tool, args, part)
+                        && (!exact_only || rule.is_exact())
                         && (class != ToolClass::Shell
                             || (rule.specifier.is_none() && rule.pattern.is_none())
                             || !has_command_substitution(part))
@@ -1741,18 +1870,7 @@ pub fn project_relative_with_boundary(
 ) -> (String, bool) {
     let effective_root = boundary.and_then(|b| b.root.as_deref()).unwrap_or(cwd);
     let raw_trimmed = raw.trim();
-
-    let is_diff_drive = if has_windows_drive_prefix(raw_trimmed) {
-        let drive_char = raw_trimmed.chars().next().map(|c| c.to_ascii_uppercase());
-        let root_drive_char = effective_root
-            .to_string_lossy()
-            .chars()
-            .next()
-            .map(|c| c.to_ascii_uppercase());
-        drive_char != root_drive_char
-    } else {
-        false
-    };
+    let is_diff_drive = drive_differs(raw_trimmed, effective_root);
 
     let given = Path::new(raw_trimmed);
     let joined = if given.is_absolute()
@@ -1775,8 +1893,36 @@ pub fn project_relative_with_boundary(
             let text = slashes(rest);
             (if text.is_empty() { ".".into() } else { text }, false)
         }
-        _ => (slashes(&full), outside),
+        _ => {
+            // Inside an additional directory the subject stays absolute, so
+            // a project-relative rule cannot match it, and that root's own
+            // drive and symlink checks decide whether the path is inside.
+            // A symlink escape from the primary root is never rescued.
+            if outside_lexical {
+                if let Some(extra) = boundary.and_then(|b| b.extra_root_containing(&joined)) {
+                    let (extra_outside, extra_escape) = check_path_boundary(extra, &joined);
+                    let outside =
+                        drive_differs(raw_trimmed, extra) || extra_outside || extra_escape;
+                    return (slashes(&full), outside);
+                }
+            }
+            (slashes(&full), outside)
+        }
     }
+}
+
+/// True when `raw` names a Windows drive other than the one `root` is on.
+fn drive_differs(raw: &str, root: &Path) -> bool {
+    if !has_windows_drive_prefix(raw) {
+        return false;
+    }
+    let drive = raw.chars().next().map(|c| c.to_ascii_uppercase());
+    let root_drive = root
+        .to_string_lossy()
+        .chars()
+        .next()
+        .map(|c| c.to_ascii_uppercase());
+    drive != root_drive
 }
 
 /// Resolve `.` and `..` without touching the file system: the target may

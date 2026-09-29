@@ -3042,6 +3042,23 @@ impl Agent {
             self.remember_verification_call(name, args, cwd);
         }
         self.record_verification_assessment(generation, command, &assessment, terminal);
+        if invokes_checker(command) {
+            let mut current = self
+                .mutation_verification
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            if current.mutation_generation == generation {
+                current.last_classification_reason = Some(
+                    match terminal {
+                        None => "no_terminal_evidence",
+                        Some(false) => "check_failed",
+                        Some(true) if current.verified_generation == Some(generation) => "verified",
+                        Some(true) => "coverage_incomplete",
+                    }
+                    .into(),
+                );
+            }
+        }
         None
     }
 
@@ -7287,7 +7304,11 @@ const CHECKER_PROGRAMS: &[&str] = &[
 /// `sudo` or `uv run` prefixes are skipped; a path or `.exe` suffix on the
 /// program is ignored.
 pub(crate) fn invokes_checker(command: &str) -> bool {
-    command.split(['&', '|', ';', '\n']).any(|segment| {
+    let (segments, malformed) = crate::shell_policy::split_shell_segments_with_diagnostic(command);
+    if malformed {
+        return false;
+    }
+    segments.iter().any(|segment| {
         let mut words = segment.split_whitespace().peekable();
         while let Some(word) = words.peek() {
             let skip = word.contains('=') && !word.starts_with('-')
@@ -7326,4 +7347,22 @@ pub(crate) fn append_harness_note(result: &mut crate::ToolResult, note: &str) {
         result.content.push_str("\n\n");
     }
     result.content.push_str(note);
+}
+
+#[cfg(test)]
+mod checker_quote_regressions {
+    #[test]
+    fn quoted_separators_do_not_invoke_a_checker() {
+        for command in [
+            "printf 'status; python -c print(1)'",
+            "echo \"status | cargo test\"",
+            "printf 'status\npytest'",
+            "echo 'unterminated; python test.py",
+        ] {
+            assert!(!super::invokes_checker(command), "{command}");
+        }
+        assert!(super::invokes_checker(
+            "echo 'status; done' && python check.py"
+        ));
+    }
 }

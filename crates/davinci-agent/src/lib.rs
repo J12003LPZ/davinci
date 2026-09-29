@@ -88,10 +88,10 @@ pub(crate) use permission::read_only_capability_allows;
 pub use permission::{
     check_path_boundary, glob_matches, is_git_metadata_path, is_outside_or_symlink_escape,
     is_sensitive_file_path, is_symlink_escape, project_relative, session_rule_for,
-    strip_verbatim_prefix, subject_of, summary_of, tool_class, FilesystemBoundaryPolicy,
-    PermissionMode, PermissionPolicy, PermissionRule, PermissionVerdict, ReadOutsideRootPolicy,
-    RuleParseError, RuleSpecifier, ToolApprovalDecision, ToolApprovalRequest, ToolApprover,
-    ToolClass,
+    strip_verbatim_prefix, subject_of, summary_of, tool_class, validate_extra_root,
+    FilesystemBoundaryPolicy, PermissionMode, PermissionPolicy, PermissionRule, PermissionVerdict,
+    ReadOutsideRootPolicy, RuleParseError, RuleSpecifier, ToolApprovalDecision,
+    ToolApprovalRequest, ToolApprover, ToolClass,
 };
 pub use prompt::{
     CapabilityGateOutcome, CapabilityRunState, DebuggingState, FrontendDesignState,
@@ -996,7 +996,21 @@ impl Agent {
                     .as_deref()
                     .is_some_and(prompt::environment::visual_verification_requested),
             environment: self.runtime_environment.clone(),
+            additional_directories: self.additional_directories(),
         }
+    }
+
+    /// The extra writable roots in force, for the prompt and `/status`.
+    /// Empty for an isolated worker even if a caller set some.
+    pub fn additional_directories(&self) -> Vec<String> {
+        self.permissions
+            .lock()
+            .unwrap_or_else(|err| err.into_inner())
+            .filesystem_boundary
+            .active_extra_roots()
+            .iter()
+            .map(|root| root.display().to_string())
+            .collect()
     }
 
     /// Update host capability availability before the next prompt is prepared.

@@ -4510,3 +4510,41 @@ fn checker_programs_match_only_as_the_program_word() {
         assert!(!invokes_checker(command), "{command}");
     }
 }
+
+#[test]
+fn gate_reason_distinguishes_failed_and_incomplete_checks() {
+    for (command, expected) in [
+        (
+            "python -c \"from alpha import f; assert f() == 1\"",
+            "coverage_incomplete",
+        ),
+        (
+            "python -c \"from alpha import f; assert f() == 99\"",
+            "check_failed",
+        ),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let mut agent = verifying_agent(dir.path());
+        agent.auto_verify = false;
+        agent.prompt("write and check");
+        let mut script = scripted_tool_calls(vec![
+            (
+                "write",
+                serde_json::json!({"path":"alpha.py","content":"def f(): return 1\n"}),
+            ),
+            (
+                "write",
+                serde_json::json!({"path":"beta.py","content":"def g(): return 2\n"}),
+            ),
+            (shell_tool(), serde_json::json!({"command":command})),
+        ]);
+        agent.run_loop(|current| script(current)).unwrap();
+        assert_eq!(
+            agent
+                .mutation_verification_state()
+                .last_classification_reason
+                .as_deref(),
+            Some(expected)
+        );
+    }
+}

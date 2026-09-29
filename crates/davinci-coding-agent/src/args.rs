@@ -106,6 +106,11 @@ pub struct Args {
     pub approval_policy: ApprovalPolicy,
     /// `--fail-on-denied`: exit 3 when a deny-continue run denied anything.
     pub fail_on_denied: bool,
+    /// `--add-dir <dir>` (repeatable): extra writable roots beside the
+    /// workspace. A Davinci addition for Codex parity. Each value is
+    /// validated and canonicalized at parse time against the working
+    /// directory, which `--cd` has already applied.
+    pub add_dirs: Vec<std::path::PathBuf>,
     pub messages: Vec<String>,
     pub file_args: Vec<String>,
     pub unknown_flags: BTreeMap<String, FlagValue>,
@@ -162,6 +167,7 @@ pub fn normalize_session_name(value: &str) -> Option<String> {
 const CD_FLAG: &str = "--cd";
 const OUTPUT_LAST_MESSAGE_FLAG: &str = "--output-last-message";
 const OUTPUT_SCHEMA_FLAG: &str = "--output-schema";
+const ADD_DIR_FLAG: &str = "--add-dir";
 
 /// The long name of the Davinci path flag `arg` spells, in any of its forms:
 /// long, short, or long with `=value`. Neither flag exists in TS pi; both
@@ -198,7 +204,7 @@ fn path_flag_value(name: &str, value: Option<&str>) -> Result<String, String> {
         Some(value) if !value.is_empty() => Ok(value.to_string()),
         _ => Err(format!(
             "{name} requires {}",
-            if name == CD_FLAG {
+            if name == CD_FLAG || name == ADD_DIR_FLAG {
                 "a directory"
             } else {
                 "a file path"
@@ -518,6 +524,33 @@ pub fn parse_args(args: &[String]) -> Args {
                     message,
                 }),
             }
+        } else if arg == ADD_DIR_FLAG
+            || arg
+                .strip_prefix(ADD_DIR_FLAG)
+                .is_some_and(|rest| rest.starts_with('='))
+        {
+            // Parsed natively, so an extension flag of the same name never
+            // receives it.
+            let (value, consumed) = split_path_flag(arg, args.get(i + 1));
+            i += consumed;
+            let checked = path_flag_value(ADD_DIR_FLAG, value).and_then(|value| {
+                let cwd =
+                    std::env::current_dir().map_err(|err| format!("{ADD_DIR_FLAG}: {err}"))?;
+                davinci_agent::validate_extra_root(
+                    &value,
+                    &cwd,
+                    davinci_session::home_dir().as_deref(),
+                )
+                .map_err(|reason| format!("{ADD_DIR_FLAG}: {reason}"))
+            });
+            match checked {
+                Ok(root) if !result.add_dirs.contains(&root) => result.add_dirs.push(root),
+                Ok(_) => {}
+                Err(message) => result.diagnostics.push(Diagnostic {
+                    kind: "error",
+                    message,
+                }),
+            }
         } else if let Some(name) = path_flag_name(arg) {
             let (value, consumed) = split_path_flag(arg, args.get(i + 1));
             i += consumed;
@@ -821,6 +854,56 @@ mod tests {
         let before_print = args(&["--approval-policy", "-p", "go"]);
         assert!(before_print.print);
         assert_eq!(before_print.messages, ["go"]);
+    }
+
+    #[test]
+    fn add_dir_repeats_and_validates_each_directory() {
+        let args =
+            |list: &[&str]| parse_args(&list.iter().map(|s| s.to_string()).collect::<Vec<_>>());
+        let temp = tempfile::tempdir().unwrap();
+        let base = davinci_agent::strip_verbatim_prefix(&temp.path().canonicalize().unwrap());
+        let [one, two] = ["one", "two"].map(|name| {
+            let dir = base.join(name);
+            std::fs::create_dir_all(&dir).unwrap();
+            dir
+        });
+        let one_text = one.to_string_lossy().into_owned();
+        let two_text = two.to_string_lossy().into_owned();
+        let parsed = args(&[
+            "--add-dir",
+            &one_text,
+            &format!("--add-dir={two_text}"),
+            "--add-dir",
+            &one_text,
+            "go",
+        ]);
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        assert_eq!(parsed.add_dirs, [one, two]);
+        assert_eq!(parsed.messages, ["go"]);
+        assert!(
+            !parsed.unknown_flags.contains_key("add-dir"),
+            "extension passthrough must not see --add-dir"
+        );
+
+        let missing = base.join("missing").to_string_lossy().into_owned();
+        let parsed = args(&["--add-dir", &missing]);
+        assert!(parsed.add_dirs.is_empty());
+        assert_eq!(parsed.diagnostics.len(), 1);
+        assert_eq!(parsed.diagnostics[0].kind, "error");
+        assert!(
+            parsed.diagnostics[0].message.starts_with("--add-dir: ")
+                && parsed.diagnostics[0].message.contains("does not exist"),
+            "{:?}",
+            parsed.diagnostics
+        );
+
+        for bare in [args(&["--add-dir"]), args(&["--add-dir", "--print"])] {
+            assert_eq!(
+                bare.diagnostics[0].message,
+                "--add-dir requires a directory"
+            );
+        }
+        assert!(args(&["--", "--add-dir", "x"]).add_dirs.is_empty());
     }
 
     #[test]

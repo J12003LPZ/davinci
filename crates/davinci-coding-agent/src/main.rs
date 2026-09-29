@@ -618,7 +618,17 @@ fn provider_identity(agent: &Agent) -> Option<String> {
 }
 
 fn synchronize_provider_system_prompt(agent: &mut Agent) {
-    let suffix = provider_identity(agent);
+    let mut suffix = provider_identity(agent);
+    if let Some(schema) = &agent.output_schema {
+        let contract = davinci_coding_agent::output_schema::system_instruction(schema);
+        match &mut suffix {
+            Some(text) => {
+                text.push_str("\n\n");
+                text.push_str(&contract);
+            }
+            None => suffix = Some(contract),
+        }
+    }
     agent.set_provider_system_prompt_suffix(suffix);
 }
 
@@ -865,14 +875,26 @@ fn build_agent(parsed: &Args, session_dir: &Path, cwd: &Path) -> Result<Agent, S
     // is only for embedders. Who answers an ask is the mode's business:
     // davinci, RPC and the legacy chrome each install an approver, and a
     // `--print` run fails closed.
-    agent.permissions = Arc::new(davinci_agent::PermissionState::new(
-        permissions::policy_for(
-            &default_agent_dir(),
+    let permission_sources = permissions::PermissionSources::load(
+        &default_agent_dir(),
+        cwd,
+        parsed.project_trust_override,
+    );
+    let mut policy = permission_sources.policy(parsed.permission_mode);
+    // `--add-dir` and `permissions.additionalDirectories`. A Graph worker is
+    // isolated and never inherits them, even from the user's settings file.
+    if graph_worker.is_none() {
+        let (roots, warnings) = permission_sources.additional_directories(
+            &parsed.add_dirs,
             cwd,
-            parsed.project_trust_override,
-            parsed.permission_mode,
-        ),
-    ));
+            davinci_session::home_dir().as_deref(),
+        );
+        for warning in warnings {
+            eprintln!("Warning: {warning}");
+        }
+        policy.filesystem_boundary.extra_roots = roots;
+    }
+    agent.permissions = Arc::new(davinci_agent::PermissionState::new(policy));
     agent.tool_context.cache = davinci_agent::runtime::cache::CacheRuntime::shared(
         settings.cache.clone().unwrap_or_default(),
         default_agent_dir(),
@@ -3827,7 +3849,8 @@ fn enforce_output_schema(
         Err(errors) => errors,
     };
     let json_mode = parsed.mode == Some(Mode::Json);
-    agent.prompt_user_with(&repair_prompt(&errors), &[]);
+    // Validator diagnostics are harness output, not a new user instruction.
+    agent.prompt_with(&repair_prompt(&errors), &[]);
     agent.stats.output_schema_repair_turns += 1;
     let ((reply, events), required) =
         with_print_approval_policy(agent, configuration_path, denials, |agent| {
@@ -8233,6 +8256,13 @@ pub fn format_session_cost(parsed: &Args, agent: &Agent) -> String {
     )
 }
 
+/// The `/status` line naming `--add-dir` roots; `None` when there are none,
+/// so default status output is unchanged.
+pub fn additional_directories_status_line(agent: &Agent) -> Option<String> {
+    let roots = agent.additional_directories();
+    (!roots.is_empty()).then(|| format!("additional directories: {}", roots.join(", ")))
+}
+
 pub fn format_session_status(parsed: &Args, agent: &Agent) -> String {
     let mode = agent
         .permissions
@@ -8281,6 +8311,10 @@ pub fn format_session_status(parsed: &Args, agent: &Agent) -> String {
         if let Some(diag) = &agent.prompt_session.transition_diagnostic {
             text.push_str(&format!(" · transition: {diag}"));
         }
+    }
+    if let Some(line) = additional_directories_status_line(agent) {
+        text.push('\n');
+        text.push_str(&line);
     }
     if let Some(vm) = output::ContextVmStatusSummary::for_status(agent) {
         text.push('\n');
