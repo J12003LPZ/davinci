@@ -797,4 +797,112 @@ mod tests {
             },
         }
     }
+    #[test]
+    fn worker_workspace_rebind_preserves_parent_authority() {
+        let parent_root = tempfile::tempdir().unwrap();
+        let child_root = tempfile::tempdir().unwrap();
+        let parent_path = parent_root.path().canonicalize().unwrap();
+        let child_path = child_root.path().canonicalize().unwrap();
+
+        let mut parent = spec(SandboxMode::WorkspaceWrite, NetworkPolicy::Denied);
+        parent.workspace = parent_path.to_string_lossy().into_owned();
+        parent.filesystem.mounts = vec![MountRule {
+            source: Some(parent.workspace.clone()),
+            target: parent.workspace.clone(),
+            access: MountAccess::ReadWrite,
+        }];
+        parent.resources.max_memory_bytes = Some(1024);
+        parent.process.allow_background = true;
+
+        let child = rebind_worker_spec(
+            &parent,
+            &child_path,
+            SandboxId("worker-child".into()),
+            true,
+        )
+        .unwrap();
+
+        assert_eq!(child.id.0, "worker-child");
+        assert_eq!(child.mode, SandboxMode::WorkspaceWrite);
+        assert_eq!(child.network, NetworkPolicy::Denied);
+        assert_eq!(child.resources.max_memory_bytes, Some(1024));
+        assert_eq!(child.process.allow_background, parent.process.allow_background);
+        assert_eq!(child.workspace, child_path.to_string_lossy());
+        assert!(child.filesystem.mounts.iter().any(|mount| {
+            mount.source.as_deref() == Some(child.workspace.as_str())
+                && mount.target == child.workspace
+                && mount.access == MountAccess::ReadWrite
+        }));
+        assert!(!child.filesystem.mounts.iter().any(|mount| {
+            mount.source.as_deref() == Some(parent.workspace.as_str())
+                && mount.access == MountAccess::ReadWrite
+        }));
+    }
+
+    #[test]
+    fn read_only_worker_cannot_gain_workspace_write() {
+        let parent_root = tempfile::tempdir().unwrap();
+        let child_root = tempfile::tempdir().unwrap();
+        let parent_path = parent_root.path().canonicalize().unwrap();
+        let child_path = child_root.path().canonicalize().unwrap();
+
+        let mut parent = spec(SandboxMode::Restricted, NetworkPolicy::Denied);
+        parent.workspace = parent_path.to_string_lossy().into_owned();
+        parent.filesystem.mounts = vec![MountRule {
+            source: Some(parent.workspace.clone()),
+            target: parent.workspace.clone(),
+            access: MountAccess::ReadOnly,
+        }];
+
+        let child = rebind_worker_spec(
+            &parent,
+            &child_path,
+            SandboxId("worker-ro".into()),
+            true,
+        )
+        .unwrap();
+        assert_eq!(child.mode, SandboxMode::Restricted);
+        assert!(child.filesystem.mounts.iter().any(|mount| {
+            mount.source.as_deref() == Some(child.workspace.as_str())
+                && mount.access == MountAccess::ReadOnly
+        }));
+    }
+
+    #[test]
+    fn isolated_worker_rejects_unrelated_parent_write_mounts() {
+        let parent_root = tempfile::tempdir().unwrap();
+        let child_root = tempfile::tempdir().unwrap();
+        let shared_root = tempfile::tempdir().unwrap();
+        let parent_path = parent_root.path().canonicalize().unwrap();
+        let child_path = child_root.path().canonicalize().unwrap();
+        let shared_path = shared_root.path().canonicalize().unwrap();
+
+        let mut parent = spec(SandboxMode::WorkspaceWrite, NetworkPolicy::Denied);
+        parent.workspace = parent_path.to_string_lossy().into_owned();
+        parent.filesystem.mounts = vec![
+            MountRule {
+                source: Some(parent.workspace.clone()),
+                target: parent.workspace.clone(),
+                access: MountAccess::ReadWrite,
+            },
+            MountRule {
+                source: Some(shared_path.to_string_lossy().into_owned()),
+                target: shared_path.to_string_lossy().into_owned(),
+                access: MountAccess::ReadWrite,
+            },
+        ];
+
+        assert_eq!(
+            rebind_worker_spec(
+                &parent,
+                &child_path,
+                SandboxId("worker-denied".into()),
+                true,
+            )
+            .unwrap_err()
+            .code,
+            SandboxErrorCode::PolicyDenied
+        );
+    }
+
 }
