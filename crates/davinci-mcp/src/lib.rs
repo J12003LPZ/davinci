@@ -80,6 +80,7 @@ pub enum TransportConfig {
 enum Transport {
     Stdio(StdioTransport),
     Http(http::HttpTransport),
+    External(Box<dyn RpcTransport>),
 }
 
 /// Every stdio child still alive, so a `process::exit` path can reap them
@@ -175,10 +176,24 @@ impl Client {
         })
     }
 
+    pub fn connect_transport(name: &str, mut transport: Box<dyn RpcTransport>) -> Result<Self> {
+        let handshake = handshake(transport.as_mut())?;
+        Ok(Self {
+            name: name.to_string(),
+            transport: Transport::External(transport),
+            initialize: handshake.initialize,
+            tools: handshake.tools,
+            skipped: handshake.skipped,
+            resources: handshake.resources,
+            child: None,
+        })
+    }
+
     pub fn set_call_timeout(&mut self, timeout: Duration) {
         match &mut self.transport {
             Transport::Stdio(t) => t.set_call_timeout(timeout),
             Transport::Http(t) => t.set_call_timeout(timeout),
+            Transport::External(t) => t.set_call_timeout(timeout),
         }
     }
 
@@ -187,6 +202,7 @@ impl Client {
         match &self.transport {
             Transport::Stdio(t) => Some(t.stderr_tail()),
             Transport::Http(_) => None,
+            Transport::External(t) => t.stderr_tail(),
         }
     }
 
@@ -216,6 +232,7 @@ impl Transport {
         match self {
             Transport::Stdio(t) => t,
             Transport::Http(t) => t,
+            Transport::External(t) => t.as_mut(),
         }
     }
 }
@@ -228,10 +245,16 @@ impl Drop for Client {
     }
 }
 
-trait Rpc {
+pub trait RpcTransport: Send {
     fn call(&mut self, method: &str, params: Value) -> Result<Value>;
     fn notify(&mut self, method: &str, params: Value) -> Result<()>;
+    fn set_call_timeout(&mut self, _timeout: Duration) {}
+    fn stderr_tail(&self) -> Option<String> {
+        None
+    }
 }
+
+type Rpc = dyn RpcTransport;
 
 struct Handshake {
     initialize: InitializeResult,
@@ -240,7 +263,7 @@ struct Handshake {
     resources: Vec<Resource>,
 }
 
-fn handshake(rpc: &mut dyn Rpc) -> Result<Handshake> {
+fn handshake(rpc: &mut Rpc) -> Result<Handshake> {
     let init = rpc.call(
         "initialize",
         json!({
@@ -300,7 +323,7 @@ fn named(method: &str, err: Error) -> Error {
 
 /// Every item of a paginated list, following `nextCursor` until the server
 /// stops sending one.
-fn list_pages(rpc: &mut dyn Rpc, method: &str, key: &str) -> Result<Vec<Value>> {
+fn list_pages(rpc: &mut Rpc, method: &str, key: &str) -> Result<Vec<Value>> {
     let mut items = Vec::new();
     let mut cursor: Option<String> = None;
     for _ in 0..MAX_LIST_PAGES {
