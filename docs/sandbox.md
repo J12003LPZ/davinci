@@ -199,11 +199,13 @@ Writable worktree workers receive a sandbox rebound to their own canonical workt
 
 ## Local MCP, LSP, extensions, hooks, packages, graph workers and browser processes
 
-This branch is intentionally fail closed while these persistent/specialized transports are migrated.
+Local MCP has a sandbox-aware transport. Other persistent/specialized transports remain intentionally fail closed while they are migrated.
 
 When execution sandboxing is active:
 
-- project/plugin local MCP commands marked `sandboxed` do not fall back to direct host stdio;
+- project/plugin local MCP commands marked `sandboxed` run through the authenticated process supervisor and active sandbox backend; their server-level environment is intersected with the trusted sandbox environment policy;
+- explicit trusted-user MCP commands marked `host` remain a separate escape hatch;
+- remote MCP HTTP remains control-plane networking;
 - language-server raw host spawn is refused;
 - JavaScript extension raw host spawn is refused;
 - executable hooks are refused;
@@ -238,7 +240,7 @@ This branch does not yet satisfy the entire long-term acceptance target:
 
 - container backend execution is not implemented;
 - hard memory/PID/CPU/disk controls are capability-gated but not all available in the native bubblewrap backend;
-- specialized long-lived transports listed above are fail-closed rather than fully migrated;
+- LSP, extension/hook, graph, package-manager and browser specialized transports are fail-closed rather than fully migrated;
 - domain network allowlisting is intentionally unsupported;
 - benchmark numbers are not published until they can be measured on a capable runner.
 
