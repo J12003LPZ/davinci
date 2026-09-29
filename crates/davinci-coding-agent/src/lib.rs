@@ -18,6 +18,7 @@ pub mod project_config;
 pub mod prompt_host;
 pub mod runtime_host;
 pub mod runtime_inspect;
+pub mod execution_boundary;
 pub mod sandbox_config;
 pub mod sdk;
 pub mod self_update;
