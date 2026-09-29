@@ -28,8 +28,11 @@ impl Capture {
     }
 }
 
-/// Foreground shell tools have always inherited the host environment. Preserve
-/// that contract explicitly across the private helper, without exposing values.
+/// Builds the trusted process configuration for foreground shell execution.
+///
+/// Sandboxed execution starts from a minimal environment. The legacy unsandboxed
+/// compatibility path keeps its historical environment behavior, but it carries
+/// no sandbox receipt and must never be represented as OS-isolated.
 pub(super) fn config(
     cwd: &std::path::Path,
     executable: std::path::PathBuf,
@@ -44,19 +47,37 @@ pub(super) fn config(
         .ok_or_else(|| ToolError::Failed("command executable path is not UTF-8".into()))?;
     let executable = crate::process_manager::resolve_native_executable(executable, &cwd)
         .map_err(ToolError::Failed)?;
-    let environment = std::env::vars_os()
-        .map(|(key, value)| {
-            Ok((
-                key.into_string().map_err(|_| {
-                    ToolError::Failed("command environment name is not UTF-8".into())
-                })?,
-                value.into_string().map_err(|_| {
-                    ToolError::Failed("command environment value is not UTF-8".into())
-                })?,
-            ))
-        })
-        .collect::<Result<_, ToolError>>()?;
-    let config = ProcessConfig::new(executable, argv, cwd, environment);
+
+    let (environment, sandbox) = if let Some(spec) = context.sandbox.as_ref() {
+        let workspace = std::path::Path::new(&spec.workspace);
+        if !cwd.starts_with(workspace) {
+            return Err(ToolError::Failed(
+                "command cwd is outside the active sandbox workspace".into(),
+            ));
+        }
+        let environment = crate::sandbox::sanitize_current_environment(&spec.environment)
+            .map_err(|error| ToolError::Failed(format!("sandbox environment denied: {error}")))?;
+        (environment, Some(spec.clone()))
+    } else {
+        let environment = std::env::vars_os()
+            .map(|(key, value)| {
+                Ok((
+                    key.into_string().map_err(|_| {
+                        ToolError::Failed("command environment name is not UTF-8".into())
+                    })?,
+                    value.into_string().map_err(|_| {
+                        ToolError::Failed("command environment value is not UTF-8".into())
+                    })?,
+                ))
+            })
+            .collect::<Result<_, ToolError>>()?;
+        (environment, None)
+    };
+
+    let mut config = ProcessConfig::new(executable, argv, cwd, environment);
+    if let Some(sandbox) = sandbox {
+        config = config.with_sandbox(sandbox);
+    }
     Ok(context
         .command_receipt
         .as_ref()
