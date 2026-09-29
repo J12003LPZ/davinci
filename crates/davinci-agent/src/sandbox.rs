@@ -131,6 +131,8 @@ impl SandboxBackend for LinuxBubblewrapBackend {
             network_denied: true,
             environment_isolation: true,
             process_tree_isolation: true,
+            memory_limit: true,
+            cpu_limit: true,
             ephemeral_root: true,
             ephemeral_temp: true,
             output_limit: true,
