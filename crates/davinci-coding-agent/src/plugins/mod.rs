@@ -208,7 +208,11 @@ impl ActivePlugins {
         }
         self.plugins
             .iter()
-            .filter(|active| active.hooks_approved())
+            .filter(|active| {
+                active.hooks_approved()
+                    && hooks::digest(&active.plugin.root, &active.plugin.hooks)
+                        == active.plugin.hooks_digest
+            })
             .flat_map(|active| {
                 active
                     .plugin
@@ -290,6 +294,7 @@ pub struct HookInput {
     pub tool_response: Option<Value>,
     pub prompt: Option<String>,
     pub source: Option<String>,
+    pub stop_hook_active: bool,
 }
 
 impl HookInput {
@@ -300,6 +305,9 @@ impl HookInput {
             "cwd": self.cwd,
             "hook_event_name": event.as_str(),
         });
+        if event == HookEvent::Stop {
+            value["stop_hook_active"] = json!(self.stop_hook_active);
+        }
         let object = value.as_object_mut().expect("object literal");
         if let Some(tool) = &self.tool_name {
             object.insert("tool_name".into(), json!(tool));
@@ -528,6 +536,66 @@ fn expand_strings(value: &Value, vars: &[(&str, String)]) -> Value {
 mod tests {
     use super::*;
     use crate::plugins::external::tests::{write, FakeHomes};
+
+    #[test]
+    fn stop_payload_reports_continuation_only_for_stop() {
+        for active in [false, true] {
+            let input = HookInput {
+                stop_hook_active: active,
+                ..Default::default()
+            };
+            assert_eq!(input.payload(HookEvent::Stop)["stop_hook_active"], active);
+            assert!(input
+                .payload(HookEvent::PostToolUse)
+                .get("stop_hook_active")
+                .is_none());
+        }
+    }
+
+    #[test]
+    fn stop_hooks_require_current_approval_digest_and_never_run_in_workers() {
+        let dir = tempfile::tempdir().unwrap();
+        let _homes = FakeHomes::new(dir.path());
+        let agent_dir = dir.path().join("agent");
+        let root = dir.path().join("stop-demo");
+        write(
+            &root.join(".claude-plugin/plugin.json"),
+            r#"{"name":"stop-demo"}"#,
+        );
+        write(
+            &root.join("hooks/hooks.json"),
+            r#"{"hooks":{"Stop":[{"hooks":[{"command":"echo completion denied >&2; exit 2"}]}]}}"#,
+        );
+        install_fixture(&agent_dir, &root, false);
+        let unapproved = active(&agent_dir);
+        assert!(!unapproved.has_hooks(HookEvent::Stop));
+        assert_eq!(
+            unapproved
+                .run_event(HookEvent::Stop, None, &HookInput::default())
+                .block,
+            None
+        );
+        install_fixture(&agent_dir, &root, true);
+        let approved = active(&agent_dir);
+        assert!(approved.has_hooks(HookEvent::Stop));
+        std::env::set_var("PI_GRAPH_ROLE", "writer");
+        let worker_has_hooks = approved.has_hooks(HookEvent::Stop);
+        let worker_result = approved.run_event(HookEvent::Stop, None, &HookInput::default());
+        std::env::remove_var("PI_GRAPH_ROLE");
+        assert!(!worker_has_hooks);
+        assert_eq!(worker_result.block, None);
+        write(&root.join("new-script.sh"), "changed during this prompt");
+        assert!(
+            !approved.has_hooks(HookEvent::Stop),
+            "already loaded plugins must recheck their digest"
+        );
+        assert_eq!(
+            approved
+                .run_event(HookEvent::Stop, None, &HookInput::default())
+                .block,
+            None
+        );
+    }
 
     fn install_fixture(agent_dir: &Path, root: &Path, approve: bool) {
         let plugin = manifest::load_plugin(root).unwrap();

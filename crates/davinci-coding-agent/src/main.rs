@@ -2730,16 +2730,19 @@ fn complete_prompt_with_host(
     let settings = load_merged_settings(&default_agent_dir(), &agent.cwd);
     let trusted = is_trusted(&settings, &agent.cwd, parsed.project_trust_override);
     let user_hooks = hooks::load(&default_agent_dir(), &agent.cwd, trusted);
+    agent.requirement_review_enabled = settings
+        .requirement_review_enabled(std::env::var("DAVINCI_REQUIREMENT_REVIEW").ok().as_deref());
 
     let hook_policy = settings.hook_policy.clone().unwrap_or_default();
     let runtime_bus = davinci_agent::RuntimeBus::new();
     runtime_bus.subscribe(Arc::new(
         runtime_host::HooksRuntimeSubscriber::new_with_config(
             user_hooks.clone(),
-            hook_policy,
+            hook_policy.clone(),
             agent.cwd.clone(),
             default_agent_dir(),
-        ),
+        )
+        .with_post_tool_feedback(),
     ));
     runtime_bus.subscribe(Arc::new(runtime_host::CompactionRuntimeSubscriber::new(
         hook_host
@@ -2834,6 +2837,7 @@ fn complete_prompt_with_host(
     host.lock()
         .unwrap_or_else(|error| error.into_inner())
         .register_with(&runtime_handle.capability_registry);
+    let post_hook_runtime = runtime_handle.clone();
     agent.set_runtime(runtime_handle);
     // After the runtime registry exists, so its tools are part of the frozen
     // prefix. A no-op outside cache-sensitive (appended) routes.
@@ -2849,6 +2853,23 @@ fn complete_prompt_with_host(
         agent,
         &host.lock().unwrap_or_else(|error| error.into_inner()),
     );
+
+    let completion_hooks = user_hooks.clone();
+    let completion_plugins = plugin_hooks.clone();
+    let completion_base = plugin_hook_base.clone();
+    let completion_cwd = agent.cwd.clone();
+    let completion_agent_dir = default_agent_dir();
+    let completion_policy = hook_policy.clone();
+    agent.completion_hook = Some(davinci_agent::CompletionHook(Arc::new(move |active| {
+        hooks::run_completion(
+            &completion_hooks,
+            &completion_policy,
+            &completion_cwd,
+            &completion_agent_dir,
+            active,
+        )
+        .or_else(|| run_plugin_completion_hooks(&completion_plugins, &completion_base, active))
+    })));
 
     let pre_hooks = user_hooks.clone();
     let pre_plugin_hooks = plugin_hooks.clone();
@@ -2892,11 +2913,12 @@ fn complete_prompt_with_host(
     })));
     let post_host = host.clone();
     let post_hooks = user_hooks;
+    let post_agent_dir = default_agent_dir();
     let post_plugin_hooks = plugin_hooks.clone();
     let post_plugin_base = plugin_hook_base.clone();
     let session_path = agent.session.as_ref().map(|session| session.path.clone());
     agent.post_tool = Some(davinci_agent::PostToolHook(Arc::new(
-        move |tool_call_id, _cwd, name, args, result| {
+        move |tool_call_id, cwd, name, args, result| {
             // A call the gate refused never ran: no post hook, and the row
             // says `denied` so the ledger does not count it as a tool run.
             let denied = result
@@ -2905,9 +2927,6 @@ fn complete_prompt_with_host(
                 .and_then(|details| details.get("denied"))
                 .and_then(serde_json::Value::as_bool)
                 .unwrap_or(false);
-            if !denied && std::env::var("DAVINCI_RUNTIME_HOOKS_V2").as_deref() == Ok("0") {
-                hooks::run_post_tool(&post_hooks, name, args, &result.content);
-            }
             hooks::append_event(
                 session_path.as_ref(),
                 if denied { "denied" } else { "tool" },
@@ -2925,6 +2944,31 @@ fn complete_prompt_with_host(
             let result = if denied || pre_blocked {
                 result
             } else {
+                // Reuse the runtime identity for the hook stdin contract;
+                // the actual PostToolUse observation is still emitted once
+                // by the agent after result decoration.
+                let envelope = davinci_agent::RuntimeEventEnvelope::new(
+                    0,
+                    post_hook_runtime.run_id,
+                    post_hook_runtime.session_id.clone(),
+                    Some(post_hook_runtime.agent_id),
+                    post_hook_runtime.parent_agent_id,
+                    davinci_agent::RuntimeEvent::PostToolUse {
+                        call_id: tool_call_id.into(),
+                        tool: name.into(),
+                        is_error: result.is_error,
+                    },
+                );
+                let result = hooks::run_post_tool_feedback(
+                    &post_hooks,
+                    &hook_policy,
+                    cwd,
+                    &post_agent_dir,
+                    name,
+                    args,
+                    Some(&envelope),
+                    result,
+                );
                 run_plugin_post_tool(&post_plugin_hooks, &post_plugin_base, name, args, result)
             };
             match post_host.lock() {
@@ -3167,11 +3211,7 @@ fn complete_prompt_with_host(
         .unwrap_or_default();
     agent.pre_tool = None;
     agent.post_tool = None;
-    run_plugin_observer_hooks(
-        &plugin_hooks,
-        &plugin_hook_base,
-        davinci_coding_agent::plugins::hooks::HookEvent::Stop,
-    );
+    agent.completion_hook = None;
     let mut session_failure = None;
     {
         let mut host = host.lock().unwrap_or_else(|err| err.into_inner());
@@ -3814,7 +3854,9 @@ fn run_print_turns(
     // Stdout carries the reply; Context VM notices go to stderr.
     if !json_mode {
         for event in &all_events {
-            if let AgentEvent::VerificationNotice { text, .. } = event {
+            if let AgentEvent::VerificationNotice { text, .. }
+            | AgentEvent::CompletionNotice { text, .. } = event
+            {
                 eprintln!("{text}");
             }
         }
@@ -5379,7 +5421,7 @@ fn apply_stream_event(
     pushed_assistant: &mut bool,
 ) {
     match event {
-        AgentEvent::VerificationNotice { text, .. } => {
+        AgentEvent::VerificationNotice { text, .. } | AgentEvent::CompletionNotice { text, .. } => {
             session.chrome.transcript.push("system", text.clone());
         }
         AgentEvent::ToolExecutionStart {
@@ -7007,7 +7049,9 @@ fn submit_user_message(
             session.chrome.editor.handle_input("");
             println!("{reply}");
             for event in &events {
-                if let AgentEvent::VerificationNotice { text, .. } = event {
+                if let AgentEvent::VerificationNotice { text, .. }
+                | AgentEvent::CompletionNotice { text, .. } = event
+                {
                     session.chrome.transcript.push("system", text.clone());
                     eprintln!("{text}");
                 }
@@ -9088,15 +9132,21 @@ fn run_plugin_post_tool(
     result
 }
 
-/// `Stop` and `SessionEnd` plugin hooks run for their effect only.
-fn run_plugin_observer_hooks(
+/// A plugin Stop decision is feedback for the in-loop completion gate.
+fn run_plugin_completion_hooks(
     plugins: &davinci_coding_agent::plugins::ActivePlugins,
     base: &davinci_coding_agent::plugins::HookInput,
-    event: davinci_coding_agent::plugins::hooks::HookEvent,
-) {
-    if plugins.has_hooks(event) {
-        report_plugin_warnings(&plugins.run_event(event, None, base));
+    stop_hook_active: bool,
+) -> Option<String> {
+    use davinci_coding_agent::plugins::hooks::HookEvent;
+    if !plugins.has_hooks(HookEvent::Stop) {
+        return None;
     }
+    let mut input = base.clone();
+    input.stop_hook_active = stop_hook_active;
+    let result = plugins.run_event(HookEvent::Stop, None, &input);
+    report_plugin_warnings(&result);
+    result.block
 }
 
 fn apply_discovered_resources(parsed: &Args, agent: &mut Agent) {

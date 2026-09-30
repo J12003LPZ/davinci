@@ -250,6 +250,8 @@ pub struct Settings {
         Option<crate::native_extensions::workspace_snapshot::WorkspaceSnapshotConfig>,
     #[serde(default, rename = "hookPolicy", deserialize_with = "parse_hook_policy")]
     pub hook_policy: Option<crate::hooks::HookPolicyConfig>,
+    #[serde(default, rename = "requirementReview")]
+    pub requirement_review: Option<bool>,
     #[serde(default, rename = "repoIntelligence")]
     pub repo_intelligence:
         Option<crate::native_extensions::repo_intelligence::RepoIntelligenceConfig>,
@@ -1213,6 +1215,18 @@ pub fn apply_http_proxy_settings(http_proxy: Option<&str>) {
 }
 
 impl Settings {
+    pub fn requirement_review_enabled(&self, environment: Option<&str>) -> bool {
+        match environment
+            .map(str::trim)
+            .map(str::to_ascii_lowercase)
+            .as_deref()
+        {
+            Some("1" | "true" | "on" | "yes") => true,
+            Some("0" | "false" | "off" | "no") => false,
+            _ => self.requirement_review.unwrap_or(true),
+        }
+    }
+
     pub fn tool_surface(&self, environment: Option<&str>) -> davinci_agent::ToolSurface {
         environment
             .or(self.tool_surface.as_deref())
@@ -1737,6 +1751,22 @@ pub fn is_trusted(settings: &Settings, cwd: &Path, override_trust: Option<bool>)
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn requirement_review_defaults_on_and_environment_selects_evaluation_arm() {
+        let default = super::Settings::default();
+        assert!(default.requirement_review_enabled(None));
+        let disabled: super::Settings =
+            serde_json::from_str(r#"{"requirementReview":false}"#).unwrap();
+        assert!(!disabled.requirement_review_enabled(None));
+        assert!(!disabled.requirement_review_enabled(Some("invalid")));
+        for value in ["1", "true", " ON ", "yes"] {
+            assert!(disabled.requirement_review_enabled(Some(value)));
+        }
+        for value in ["0", "false", " OFF ", "no"] {
+            assert!(!default.requirement_review_enabled(Some(value)));
+        }
+    }
+
     #[test]
     fn service_tier_setting_parses() {
         let settings: super::Settings = serde_json::from_str(r#"{"serviceTier":"fast"}"#).unwrap();

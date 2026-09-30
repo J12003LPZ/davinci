@@ -90,6 +90,17 @@ Supported events: `SessionStart`, `UserPromptSubmit`, `PreToolUse`,
 but can never approve one: DaVinci's permission mode still decides. Hooks do
 not run in graph workers.
 
+`Stop` runs inside the completion loop for each prompt. Exit 2 sends stderr
+back to the model; exit 0 with `decision: "block"` and a `reason` on stdout
+also asks the model to continue. Stdin's `stop_hook_active` is true after a
+previous hook block. Three blocks per prompt produce a visible limit notice.
+`PostToolUse` exit 2 appends stderr to the tool result as feedback; other
+failures are non-blocking warnings. The hook approval digest is checked again
+before dispatch, so files changed during a prompt require new approval.
+See [the completion hook recipe](completion-hooks.md) to make repository
+checks the finish line. User `completion` hooks are distinct from legacy
+run-end `stop` hooks.
+
 Hook commands run in Git Bash on Windows (set `DAVINCI_HOOK_BASH` to choose a
 bash; without one, hooks do not run) and receive Claude Code's stdin JSON and
 `CLAUDE_PLUGIN_ROOT`. Environment variables that look like credentials

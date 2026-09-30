@@ -259,6 +259,7 @@ pub struct HooksRuntimeSubscriber {
     cwd: std::path::PathBuf,
     agent_dir: std::path::PathBuf,
     unmet_requirements: Mutex<Vec<String>>,
+    post_tool_feedback: bool,
 }
 
 /// Install an observation-only host projection without giving it a path to
@@ -296,7 +297,15 @@ impl HooksRuntimeSubscriber {
             cwd,
             agent_dir,
             unmet_requirements: Mutex::new(Vec::new()),
+            post_tool_feedback: false,
         }
+    }
+
+    /// The product host runs post-tool hooks through its result decorator.
+    /// Keep other embedders' observation-only subscriber behavior unchanged.
+    pub fn with_post_tool_feedback(mut self) -> Self {
+        self.post_tool_feedback = true;
+        self
     }
 }
 
@@ -305,6 +314,9 @@ impl RuntimeSubscriber for HooksRuntimeSubscriber {
         use std::sync::atomic::Ordering;
 
         if std::env::var("DAVINCI_RUNTIME_HOOKS_V2").as_deref() == Ok("0") {
+            return RuntimeDecision::Continue;
+        }
+        if self.post_tool_feedback && matches!(event.payload, RuntimeEvent::PostToolUse { .. }) {
             return RuntimeDecision::Continue;
         }
 

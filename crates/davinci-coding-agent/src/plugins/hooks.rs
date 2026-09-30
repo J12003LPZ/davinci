@@ -556,6 +556,32 @@ mod tests {
     use super::*;
 
     #[test]
+    fn stop_and_post_tool_block_feedback_uses_stderr_and_warns_on_exit_one() {
+        for event in [HookEvent::Stop, HookEvent::PostToolUse] {
+            assert_eq!(
+                interpret(event, Some(2), "wrong stream", "run boundary tests\n")
+                    .block
+                    .as_deref(),
+                Some("run boundary tests")
+            );
+            assert_eq!(
+                interpret(
+                    event,
+                    Some(0),
+                    r#"{"decision":"block","reason":"lint failed"}"#,
+                    ""
+                )
+                .block
+                .as_deref(),
+                Some("lint failed")
+            );
+            let warning = interpret(event, Some(1), "", "ordinary failure");
+            assert_eq!(warning.block, None);
+            assert!(warning.warning.unwrap().contains("ordinary failure"));
+        }
+    }
+
+    #[test]
     fn parses_events_matchers_and_unsupported_entries() {
         let doc = json!({"hooks": {
             "PreToolUse": [{"matcher": "Edit|Write", "hooks": [
