@@ -30,6 +30,39 @@ jobs:
         run: node --test crates/davinci-coding-agent/export-html/template.test.cjs
       - name: Use repository-pinned Rust
         run: rustup show
+      - name: Native Seatbelt enforcement and honest capability boundaries
+        id: seatbelt
+        if: runner.os == 'macOS'
+        run: cargo test -p davinci-agent --locked --test sandbox_seatbelt
+      - name: Bounded native sandbox failure diagnostics
+        if: failure() && runner.os == 'macOS' && steps.seatbelt.outcome == 'failure'
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import pathlib, subprocess, time
+          limit = 128 * 1024
+          predicate = 'process != "log" AND (eventMessage CONTAINS[c] "sandbox_seatbe" OR eventMessage CONTAINS[c] "sandbox-exec")'
+          try:
+              result = subprocess.run(["sudo", "-n", "/usr/bin/log", "show", "--last", "2m", "--style", "compact", "--info", "--debug", "--predicate", predicate], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=15)
+              print("Native sandbox system log:", result.returncode)
+              print(result.stdout[:limit].decode("utf-8", errors="replace"))
+          except (OSError, subprocess.TimeoutExpired) as error:
+              print("Native sandbox system log unavailable:", error)
+          reports = []
+          for directory in [pathlib.Path.home() / "Library/Logs/DiagnosticReports", pathlib.Path("/Library/Logs/DiagnosticReports")]:
+              for pattern in ["sandbox_seatbe*.ips", "sandbox-exec*.ips"]:
+                  try:
+                      reports.extend(path for path in directory.glob(pattern) if path.is_file() and time.time() - path.stat().st_mtime < 600)
+                  except OSError as error:
+                      print("Crash report directory unavailable:", error)
+          for path in sorted(reports, key=lambda path: path.stat().st_mtime, reverse=True)[:3]:
+              try:
+                  with path.open("rb") as report:
+                      print("Native sandbox crash report:", path.name)
+                      print(report.read(limit).decode("utf-8", errors="replace"))
+              except OSError as error:
+                  print("Crash report unavailable:", error)
+          PY
       - name: Native listener ownership proof
         run: |
           cargo test -p davinci-agent --locked --lib process_manager::socket_owner
@@ -44,9 +77,6 @@ jobs:
         run: cargo test -p davinci-agent --locked --lib process_manager::tests
       - name: Native supervisor ownership and public process contracts
         run: cargo test -p davinci-agent --locked --test process_supervisor --test process_manager
-      - name: Native Seatbelt enforcement and honest capability boundaries
-        if: runner.os == 'macOS'
-        run: cargo test -p davinci-agent --locked --test sandbox_seatbelt
       - name: Evidence artifact retrieval boundaries
         run: cargo test -p davinci-agent --locked --lib runtime::evidence_store
       - name: Graph process leases
