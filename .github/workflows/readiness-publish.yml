@@ -1,0 +1,63 @@
+name: Readiness tree staging
+
+on:
+  push:
+    branches: [codex/2026-09-30-production-harness-readiness]
+    paths: [.readiness.patch.b64]
+
+permissions:
+  contents: write
+
+jobs:
+  tree:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Apply reviewed patch as data and stage tree
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import base64, gzip, hashlib, json, os, pathlib, subprocess, urllib.request
+          def git(*args):
+              return subprocess.check_output(['git', *args])
+          root = pathlib.Path.cwd()
+          patch = gzip.decompress(base64.b64decode((root / '.readiness.patch.b64').read_text(), validate=False))
+          if len(patch) > 10 * 1024 * 1024:
+              raise SystemExit('patch exceeds bound')
+          patch_path = pathlib.Path(os.environ['RUNNER_TEMP']) / 'readiness.patch'
+          patch_path.write_bytes(patch)
+          subprocess.run(['git', 'apply', '--check', '--index', str(patch_path)], check=True)
+          subprocess.run(['git', 'apply', '--index', str(patch_path)], check=True)
+          subprocess.run(['git', 'rm', '--ignore-unmatch', '.readiness.patch.b64', '.github/workflows/readiness-publish.yml', '.github/workflows/readiness-investigation.yml'], check=True)
+          paths = git('diff', '--cached', '--name-only', '-z').decode().split('\0')
+          entries = []
+          for path in filter(None, paths):
+              staged = git('ls-files', '--stage', '-z', '--', path)
+              if not staged:
+                  entries.append({'path': path, 'mode': '100644', 'type': 'blob', 'sha': None})
+                  continue
+              mode = staged.decode().split()[0]
+              if mode not in ('100644', '100755'):
+                  raise SystemExit('unexpected non-regular patch entry: ' + path)
+              entries.append({'path': path, 'mode': mode, 'type': 'blob', 'content': git('show', ':' + path).decode('utf-8')})
+          body = json.dumps({'base_tree': git('rev-parse', 'HEAD^{tree}').decode().strip(), 'tree': entries}).encode()
+          url = 'https://api.github.com/repos/' + os.environ['GITHUB_REPOSITORY'] + '/git/trees'
+          request = urllib.request.Request(url, body, headers={'Authorization': 'Bearer ' + os.environ['GH_TOKEN'], 'Accept': 'application/vnd.github+json', 'Content-Type': 'application/json'}, method='POST')
+          with urllib.request.urlopen(request, timeout=60) as response:
+              tree = json.load(response)
+          result = {'parent': git('rev-parse', 'HEAD').decode().strip(), 'tree': tree['sha'], 'patch_sha256': hashlib.sha256(patch).hexdigest(), 'paths': paths}
+          pathlib.Path(os.environ['RUNNER_TEMP'], 'readiness-tree.json').write_text(json.dumps(result, indent=2))
+          print(json.dumps(result, indent=2))
+          PY
+      - uses: actions/upload-artifact@v4
+        with:
+          name: readiness-reviewed-tree
+          path: ${{ runner.temp }}/readiness-tree.json
+          retention-days: 3
+          if-no-files-found: error
