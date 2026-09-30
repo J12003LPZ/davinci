@@ -95,9 +95,11 @@ An idle interactive lead with an empty composer starts a turn 750 ms after repor
 
 Agent messages carry information, never user authorization: they cannot approve plans, permissions or destructive actions. Workers never exceed the lead's permission ceiling.
 
-- A worker in the shared workspace gets read-only tools unless its profile grants more. One session-wide lock lets only one shared-workspace writer run at a time.
+- Every worker reads and edits files. A worker that names no tools gets `read`, `grep`, `find`, `ls`, `web_fetch`, `web_search`, `mcp_read`, `write` and `edit` (those the lead has). Workers are read-only only when the lead is in Plan Mode.
+- A worker in the shared workspace runs in Accept Edits mode with file tools (`write`, `edit`, `notebook_edit`, `apply_patch`) but no shell. A session-wide lease lets only one shared-workspace writer edit at a time: a worker takes it at its first mutating call and releases it when its turn ends, so read-only work still runs in parallel.
+- A profile without `permission_mode` (or with `permission_mode: inherit`) follows the same rule. A profile that sets `read-only` or its own `tools` list keeps that restriction.
 - A worker with `isolation: "worktree"` edits inside its own lease. It is read-only only when the lead is in Plan Mode. In the default Manual mode it may edit, because nothing reaches your tree until you merge its branch.
-- Background writers need `isolation: "worktree"`.
+- Background workers in the shared workspace edit through the same lease; use `isolation: "worktree"` to keep their changes off your tree until you merge them.
 - Clean leases are released. Dirty or failed leases are kept, and their path and branch are reported. Review and merge them yourself. Leases are rooted at the repository top even when Davinci starts in a subdirectory.
 
 Teammates get `agent_status`, `agent_message`, `task_list`, `task_get` and `task_update` when the lead has them. The lead creates work with `task_create`; teammates claim ready tasks with their agent ID and complete them with `task_update`. `/tasks` shows the board. Workers cannot start nested teams.

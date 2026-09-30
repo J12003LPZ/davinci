@@ -36,6 +36,13 @@ pub const DEFAULT_SUBAGENT_TOOLS: &[&str] = &[
     "mcp_read",
 ];
 
+/// Added to a worker's default tools whenever it may edit files.
+pub const DEFAULT_SUBAGENT_EDIT_TOOLS: &[&str] = &["write", "edit"];
+
+/// File-editing tools a shared-workspace worker may use. Shell tools are not
+/// among them: a shell reaches past the workspace and the file transactions.
+pub const FILE_EDIT_TOOLS: &[&str] = &["write", "edit", "notebook_edit", "apply_patch"];
+
 const MUTATION_TOOLS: &[&str] = &[
     "bash",
     "powershell",
@@ -287,6 +294,32 @@ impl SubagentRunner {
     }
 }
 
+/// What a worker may do to files, decided by the host from the parent's
+/// permission mode and the worker's isolation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WorkerAccess {
+    /// Read and search only (the lead is in Plan Mode).
+    ReadOnly,
+    /// Read, search and edit files in the shared workspace; no shell.
+    FileEdits,
+    /// Everything the parent has except `agent` (a worktree lease).
+    Full,
+}
+
+impl WorkerAccess {
+    /// Every worker reads and edits files unless the lead is in Plan Mode (or
+    /// the host did not say, which is treated the same). A worktree lease is
+    /// its own checkout, so it also gets the parent's shell tools.
+    pub fn for_worker(parent_mode: Option<PermissionMode>, worktree: bool) -> Self {
+        match parent_mode {
+            Some(PermissionMode::ReadOnly) => Self::ReadOnly,
+            _ if worktree => Self::Full,
+            Some(_) => Self::FileEdits,
+            None => Self::ReadOnly,
+        }
+    }
+}
+
 pub fn scoped_tools_with_policy(
     requested: Option<&[String]>,
     parent: &[String],
@@ -307,23 +340,46 @@ pub fn scoped_tools_with_registry(
     allow_mutation: bool,
     registry: &RuntimeCapabilityRegistry,
 ) -> Vec<String> {
+    let access = if allow_mutation {
+        WorkerAccess::Full
+    } else {
+        WorkerAccess::ReadOnly
+    };
+    scoped_tools_for_access(requested, parent, access, registry)
+}
+
+/// Scope child tools for `access`. A worker that names no tools gets the
+/// default read set plus `write` and `edit` whenever it may edit files.
+pub fn scoped_tools_for_access(
+    requested: Option<&[String]>,
+    parent: &[String],
+    access: WorkerAccess,
+    registry: &RuntimeCapabilityRegistry,
+) -> Vec<String> {
     let wanted: Vec<String> = match requested {
         Some(list) if !list.is_empty() => list.to_vec(),
-        _ => DEFAULT_SUBAGENT_TOOLS
-            .iter()
-            .map(|name| (*name).to_string())
-            .collect(),
+        _ => {
+            let edits: &[&str] = if access == WorkerAccess::ReadOnly {
+                &[]
+            } else {
+                DEFAULT_SUBAGENT_EDIT_TOOLS
+            };
+            DEFAULT_SUBAGENT_TOOLS
+                .iter()
+                .chain(edits)
+                .map(|name| (*name).to_string())
+                .collect()
+        }
     };
+    let read_only = |name: &str| !MUTATION_TOOLS.contains(&name) && registry.is_read_only(name);
     wanted
         .into_iter()
         .filter(|name| parent.iter().any(|known| known == name))
-        .filter(|name| {
-            if allow_mutation {
-                // Do not allow nested agent to prevent infinite fork recursion
-                name != "agent"
-            } else {
-                !MUTATION_TOOLS.contains(&name.as_str()) && registry.is_read_only(name)
-            }
+        .filter(|name| match access {
+            // Do not allow nested agent to prevent infinite fork recursion
+            WorkerAccess::Full => name != "agent",
+            WorkerAccess::FileEdits => FILE_EDIT_TOOLS.contains(&name.as_str()) || read_only(name),
+            WorkerAccess::ReadOnly => read_only(name),
         })
         .collect()
 }
@@ -735,11 +791,11 @@ pub fn run_tool(
             .map(|t| t.as_atomic_bool())
             .or_else(|| parent.abort.clone());
         let is_wt = spec.isolation.as_deref() == Some("worktree");
-        // The host runs shared-workspace workers read-only unless a profile
-        // grants more (checked host-side), so only a worktree lease earns
-        // mutating tools here. Offering tools the worker cannot use wastes
-        // schema tokens and produces denials mid-task.
-        let allow_mut = is_wt && !is_parent_readonly;
+        // Every worker reads and edits files unless the lead is in Plan
+        // Mode; only a worktree lease also earns shell tools. The host runs
+        // the worker in the matching permission mode, so nothing offered
+        // here is denied mid-task.
+        let access = WorkerAccess::for_worker(parent.permission_mode, is_wt);
         let fallback_registry;
         let capability_registry = if let Some(runtime) = &parent.runtime {
             &runtime.capability_registry
@@ -747,10 +803,10 @@ pub fn run_tool(
             fallback_registry = RuntimeCapabilityRegistry::with_builtins();
             &fallback_registry
         };
-        let scoped = scoped_tools_with_registry(
+        let scoped = scoped_tools_for_access(
             spec.tools.as_deref(),
             parent_tools,
-            allow_mut,
+            access,
             capability_registry,
         );
         let mut scoped = scoped;
@@ -2585,19 +2641,57 @@ mod tests {
             .iter()
             .map(|s| s.to_string())
             .collect();
-        let (tx, rx) = std::sync::mpsc::channel::<Vec<String>>();
-        let runner = SubagentRunner::new(move |req| {
-            let _ = tx.send(req.tools.clone());
-            Ok("ok".into())
-        });
-        run_tool(
-            &json!({"prompt": "x", "tools": ["read", "write", "bash"]}),
+        let scoped_for = |call: Value, mode: PermissionMode| {
+            let (tx, rx) = std::sync::mpsc::channel::<Vec<String>>();
+            let runner = SubagentRunner::new(move |req| {
+                let _ = tx.send(req.tools.clone());
+                Ok("ok".into())
+            });
+            run_tool(
+                &call,
+                &parent_tools,
+                Some(&runner),
+                &parent_with_runtime(mode),
+            )
+            .unwrap();
+            rx.recv().unwrap()
+        };
+        let asked = json!({"prompt": "x", "tools": ["read", "write", "bash"]});
+        // Shared workers edit files but never get a shell.
+        for mode in [
+            PermissionMode::Ask,
+            PermissionMode::Edits,
+            PermissionMode::Auto,
+        ] {
+            assert_eq!(scoped_for(asked.clone(), mode), vec!["read", "write"]);
+        }
+    }
+
+    #[test]
+    fn workers_read_and_edit_files_by_default() {
+        let parent_tools: Vec<String> = ["read", "grep", "find", "ls", "write", "edit", "bash"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let registry = RuntimeCapabilityRegistry::with_builtins();
+        let shared = scoped_tools_for_access(
+            None,
             &parent_tools,
-            Some(&runner),
-            &parent_with_runtime(PermissionMode::Edits),
-        )
-        .unwrap();
-        assert_eq!(rx.recv().unwrap(), vec!["read".to_string()]);
+            WorkerAccess::for_worker(Some(PermissionMode::Ask), false),
+            &registry,
+        );
+        assert_eq!(shared, vec!["read", "grep", "find", "ls", "write", "edit"]);
+        let plan = scoped_tools_for_access(
+            None,
+            &parent_tools,
+            WorkerAccess::for_worker(Some(PermissionMode::ReadOnly), false),
+            &registry,
+        );
+        assert_eq!(plan, vec!["read", "grep", "find", "ls"]);
+        assert_eq!(
+            WorkerAccess::for_worker(Some(PermissionMode::Ask), true),
+            WorkerAccess::Full
+        );
     }
 
     #[test]

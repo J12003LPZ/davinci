@@ -8,7 +8,7 @@
 
 use std::collections::HashMap;
 use std::str::FromStr;
-use std::sync::{Arc, Mutex, MutexGuard, RwLock};
+use std::sync::{Arc, Condvar, Mutex, RwLock};
 
 use super::cancellation::CancellationToken;
 use super::events::{AgentKind, AgentRecord, AgentState};
@@ -29,7 +29,8 @@ pub struct TeamRoster {
 struct RosterInner {
     root: Mutex<Option<CancellationToken>>,
     members: RwLock<HashMap<AgentId, CancellationToken>>,
-    shared_write: Mutex<()>,
+    shared_write: Mutex<bool>,
+    shared_write_released: Condvar,
     /// Reports each worker has delivered to the lead.
     reports: Mutex<HashMap<AgentId, u64>>,
 }
@@ -126,31 +127,53 @@ impl TeamRoster {
             .clear();
     }
 
-    /// Held for the whole turn of any worker that may write the shared
-    /// workspace, so at most one such writer runs at a time.
-    pub fn shared_write_guard(&self) -> MutexGuard<'_, ()> {
-        self.inner
+    /// Exclusive ownership of the shared workspace for writing, so at most
+    /// one shared-workspace worker writes at a time. A worker takes it at its
+    /// first mutating tool call and keeps it until its turn ends; read-only
+    /// work never waits for it. Returns `None` once `token` is cancelled.
+    pub fn acquire_shared_write(
+        &self,
+        token: Option<&CancellationToken>,
+    ) -> Option<SharedWriteLease> {
+        let mut held = self
+            .inner
             .shared_write
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-    }
-
-    pub fn shared_write_guard_until_cancelled(
-        &self,
-        token: &CancellationToken,
-    ) -> Option<MutexGuard<'_, ()>> {
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         loop {
-            if token.is_cancelled() {
+            if token.is_some_and(CancellationToken::is_cancelled) {
                 return None;
             }
-            match self.inner.shared_write.try_lock() {
-                Ok(guard) => return Some(guard),
-                Err(std::sync::TryLockError::Poisoned(error)) => return Some(error.into_inner()),
-                Err(std::sync::TryLockError::WouldBlock) => {
-                    std::thread::sleep(Duration::from_millis(10))
-                }
+            if !*held {
+                *held = true;
+                return Some(SharedWriteLease {
+                    roster: self.clone(),
+                });
             }
+            held = self
+                .inner
+                .shared_write_released
+                .wait_timeout(held, Duration::from_millis(10))
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .0;
         }
+    }
+}
+
+/// Held shared-workspace write ownership; released on drop.
+pub struct SharedWriteLease {
+    roster: TeamRoster,
+}
+
+impl Drop for SharedWriteLease {
+    fn drop(&mut self) {
+        *self
+            .roster
+            .inner
+            .shared_write
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = false;
+        self.roster.inner.shared_write_released.notify_all();
     }
 }
 
@@ -458,10 +481,24 @@ mod tests {
     #[test]
     fn cancelled_writer_does_not_wait_for_the_shared_workspace() {
         let roster = TeamRoster::default();
-        let _guard = roster.shared_write_guard();
+        let _lease = roster.acquire_shared_write(None).unwrap();
         let token = CancellationToken::new();
         token.cancel();
-        assert!(roster.shared_write_guard_until_cancelled(&token).is_none());
+        assert!(roster.acquire_shared_write(Some(&token)).is_none());
+    }
+
+    #[test]
+    fn shared_write_lease_is_exclusive_until_dropped() {
+        let roster = TeamRoster::default();
+        let lease = roster.acquire_shared_write(None).unwrap();
+        let waiter = {
+            let roster = roster.clone();
+            std::thread::spawn(move || roster.acquire_shared_write(None).is_some())
+        };
+        std::thread::sleep(Duration::from_millis(50));
+        assert!(!waiter.is_finished(), "a second writer waits");
+        drop(lease);
+        assert!(waiter.join().unwrap());
     }
 
     #[test]
