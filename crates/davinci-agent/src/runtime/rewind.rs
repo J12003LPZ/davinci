@@ -383,7 +383,37 @@ pub fn validate_rewind_path(
     base_dir: &Path,
     relative_path: &str,
 ) -> Result<std::path::PathBuf, String> {
-    crate::apply_patch::sanitize_relative_path(base_dir, relative_path)
+    let resolved = crate::apply_patch::sanitize_relative_path(base_dir, relative_path)?;
+    let relative = resolved
+        .strip_prefix(base_dir)
+        .map_err(|error| error.to_string())?;
+    let mut component_path = base_dir.to_path_buf();
+    // A replacement link can stay inside the workspace while redirecting an
+    // owned pathname to an unrelated file whose bytes happen to match. Rewind
+    // therefore refuses every symlink below the workspace, including parents.
+    for component in relative.components() {
+        component_path.push(component);
+        match std::fs::symlink_metadata(&component_path) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                return Err(format!("Symlink path rejected by rewind: {relative_path}"));
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(format!("Inspect rewind path {relative_path}: {error}")),
+        }
+    }
+    Ok(resolved)
+}
+
+fn read_current_rewind_content(path: &Path) -> Result<Option<Vec<u8>>, String> {
+    match std::fs::read(path) {
+        Ok(bytes) => Ok(Some(bytes)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(format!(
+            "Cannot read current rewind file {}: {error}",
+            path.display()
+        )),
+    }
 }
 
 pub fn build_rewind_preview(
@@ -466,7 +496,20 @@ pub fn build_rewind_preview(
         }
 
         let current_path = base_dir.join(&path);
-        let current_bytes = std::fs::read(&current_path).ok();
+        let current_bytes = match read_current_rewind_content(&current_path) {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                conflict_count += 1;
+                files.push(FileRewindPlan::new(
+                    path,
+                    "conflict",
+                    None,
+                    true,
+                    Some(error),
+                ));
+                continue;
+            }
+        };
         let pre_rewind_hash = current_bytes
             .as_ref()
             .map(|b| format!("{:x}", Sha256::digest(b)));
@@ -575,23 +618,6 @@ pub fn apply_rewind_transaction(
     for f in &preview.files {
         let target = validate_rewind_path(workspace_root, &f.path)?;
 
-        if let Ok(meta) = target.symlink_metadata() {
-            if meta.file_type().is_symlink() {
-                let canon = target.canonicalize().map_err(|e| {
-                    format!("Symlink traversal validation failed for {}: {e}", f.path)
-                })?;
-                let root_canon = workspace_root
-                    .canonicalize()
-                    .map_err(|e| format!("Workspace root canonicalize failed: {e}"))?;
-                if !canon.starts_with(&root_canon) {
-                    return Err(format!(
-                        "Symlink traversal outside workspace root rejected: {}",
-                        f.path
-                    ));
-                }
-            }
-        }
-
         if f.is_conflict {
             return Err(format!(
                 "Unresolved conflict in {}: {}",
@@ -600,7 +626,7 @@ pub fn apply_rewind_transaction(
             ));
         }
 
-        let current_bytes = std::fs::read(&target).ok();
+        let current_bytes = read_current_rewind_content(&target)?;
         let current_hash = current_bytes
             .as_ref()
             .map(|b| format!("{:x}", Sha256::digest(b)));
@@ -620,7 +646,7 @@ pub fn apply_rewind_transaction(
             expected_pre_rewind_content: current_bytes,
             target_restored_content: f.resolved_content.clone(),
         });
-        planned_mutations.push((target, f.resolved_content.clone()));
+        planned_mutations.push((target, f.clone()));
     }
 
     let journal = RewindJournal {
@@ -650,54 +676,73 @@ pub fn apply_rewind_transaction(
     drop(journal_file);
 
     let mut applied_so_far: Vec<RewindJournalEntry> = Vec::new();
-    for (target, target_content) in planned_mutations {
+    for (target, plan) in planned_mutations {
         let entry = journal
             .entries
             .iter()
-            .find(|e| {
-                validate_rewind_path(workspace_root, &e.relative_path)
-                    .map(|p| p == target)
-                    .unwrap_or(false)
-            })
+            .find(|e| e.relative_path == plan.path)
             .cloned();
 
-        let mutation_result = match &target_content {
-            Some(content) => {
-                if let Some(parent) = target.parent() {
-                    let _ = std::fs::create_dir_all(parent);
-                }
-                std::fs::write(&target, content)
+        // Revalidate after the journal flush as well as during preflight. A
+        // link or content replacement while preparing the transaction must
+        // enter rollback instead of redirecting a write to another file.
+        let validation = validate_rewind_path(workspace_root, &plan.path).and_then(|_| {
+            let current_hash = read_current_rewind_content(&target)?
+                .map(|bytes| format!("{:x}", Sha256::digest(bytes)));
+            if current_hash != plan.pre_rewind_hash {
+                return Err(format!(
+                    "Stale preview: {} changed before mutation",
+                    plan.path
+                ));
             }
-            None => match std::fs::remove_file(&target) {
-                Ok(_) => Ok(()),
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-                Err(e) => Err(e),
+            Ok(())
+        });
+        let mutation_started = validation.is_ok();
+        let mutation_result = match validation {
+            Err(error) => Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, error)),
+            Ok(()) => match &plan.resolved_content {
+                Some(content) => {
+                    if let Some(parent) = target.parent() {
+                        let _ = std::fs::create_dir_all(parent);
+                    }
+                    std::fs::write(&target, content)
+                }
+                None => match std::fs::remove_file(&target) {
+                    Ok(_) => Ok(()),
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                    Err(e) => Err(e),
+                },
             },
         };
 
         if let Err(err) = mutation_result {
-            if let Some(e) = entry {
-                applied_so_far.push(e);
+            if mutation_started {
+                if let Some(e) = entry {
+                    applied_so_far.push(e);
+                }
             }
             let mut rollback_errors = Vec::new();
             for e in applied_so_far.into_iter().rev() {
-                if let Ok(t) = validate_rewind_path(workspace_root, &e.relative_path) {
-                    let res = match &e.expected_pre_rewind_content {
-                        Some(orig) => {
-                            if let Some(parent) = t.parent() {
-                                let _ = std::fs::create_dir_all(parent);
+                match validate_rewind_path(workspace_root, &e.relative_path) {
+                    Ok(t) => {
+                        let res = match &e.expected_pre_rewind_content {
+                            Some(orig) => {
+                                if let Some(parent) = t.parent() {
+                                    let _ = std::fs::create_dir_all(parent);
+                                }
+                                std::fs::write(&t, orig)
                             }
-                            std::fs::write(&t, orig)
+                            None => match std::fs::remove_file(&t) {
+                                Ok(_) => Ok(()),
+                                Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                                Err(err) => Err(err),
+                            },
+                        };
+                        if let Err(r_err) = res {
+                            rollback_errors.push(format!("{}: {r_err}", e.relative_path));
                         }
-                        None => match std::fs::remove_file(&t) {
-                            Ok(_) => Ok(()),
-                            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
-                            Err(err) => Err(err),
-                        },
-                    };
-                    if let Err(r_err) = res {
-                        rollback_errors.push(format!("{}: {r_err}", e.relative_path));
                     }
+                    Err(error) => rollback_errors.push(format!("{}: {error}", e.relative_path)),
                 }
             }
 
@@ -748,7 +793,7 @@ pub fn recover_incomplete_rewind_journal(workspace_root: &Path) -> Result<String
     // Pre-flight check: validate each entry and detect manual conflicts
     for entry in &journal.entries {
         let target = validate_rewind_path(workspace_root, &entry.relative_path)?;
-        let current_bytes = std::fs::read(&target).ok();
+        let current_bytes = read_current_rewind_content(&target)?;
         let matches_pre = current_bytes == entry.expected_pre_rewind_content;
         let matches_target = current_bytes == entry.target_restored_content;
         if !matches_pre && !matches_target {
@@ -2657,6 +2702,143 @@ mod rewind_persistence_tests {
 
 #[cfg(test)]
 mod rewind_workspace_tests {
+    #[cfg(unix)]
+    #[test]
+    fn prompt_rewind_unreadable_recreated_file_is_not_absent() {
+        use std::os::unix::fs::PermissionsExt;
+        for stale_apply in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("a.txt");
+            std::fs::write(&path, "original deleted content").unwrap();
+            let mut agent = super::prompt_rewind_tests::agent_at(dir.path());
+            agent.prompt("delete owned file");
+            super::prompt_rewind_tests::tool_turn(
+                &mut agent,
+                "apply_patch",
+                serde_json::json!({"input":"*** Begin Patch\n*** Delete File: a.txt\n*** End Patch"}),
+            );
+            let id = agent.prompt_checkpoints()[0].id.clone();
+            let clean = agent.preview_prompt_rewind(&id).unwrap();
+            assert_eq!(clean.conflict_count, 0);
+            std::fs::write(&path, "user recreated content").unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o200)).unwrap();
+            assert_eq!(
+                std::fs::read(&path).unwrap_err().kind(),
+                std::io::ErrorKind::PermissionDenied
+            );
+            if stale_apply {
+                let result = super::apply_rewind_transaction(dir.path(), &clean, true);
+                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+                assert!(result.is_err(), "unreadable recreation must refuse apply");
+            } else {
+                let conflicted = agent.preview_prompt_rewind(&id).unwrap();
+                let result = agent.apply_prompt_rewind(
+                    &id,
+                    &conflicted.preview_digest,
+                    &super::RewindSelection {
+                        code: true,
+                        task_state: false,
+                        transcript: false,
+                    },
+                );
+                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+                assert_eq!(conflicted.conflict_count, 1, "{conflicted:?}");
+                assert!(result.is_err());
+            }
+            assert_eq!(
+                std::fs::read_to_string(path).unwrap(),
+                "user recreated content"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn prompt_rewind_user_symlink_alias_is_a_conflict_and_never_changes_its_target() {
+        for parent_alias in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let owned = if parent_alias {
+                "nested/a.txt"
+            } else {
+                "a.txt"
+            };
+            std::fs::create_dir_all(dir.path().join("nested")).unwrap();
+            std::fs::create_dir_all(dir.path().join("unrelated")).unwrap();
+            std::fs::write(dir.path().join(owned), "before").unwrap();
+            let unrelated = dir.path().join("unrelated/a.txt");
+            std::fs::write(&unrelated, "after").unwrap();
+            let mut agent = super::prompt_rewind_tests::agent_at(dir.path());
+            agent.prompt("change owned file");
+            super::prompt_rewind_tests::tool_turn(
+                &mut agent,
+                "write",
+                serde_json::json!({"path":owned,"content":"after"}),
+            );
+            let id = agent.prompt_checkpoints()[0].id.clone();
+            if parent_alias {
+                std::fs::rename(
+                    dir.path().join("nested"),
+                    dir.path().join("original-nested"),
+                )
+                .unwrap();
+                std::os::unix::fs::symlink("unrelated", dir.path().join("nested")).unwrap();
+            } else {
+                std::fs::remove_file(dir.path().join(owned)).unwrap();
+                std::os::unix::fs::symlink("unrelated/a.txt", dir.path().join(owned)).unwrap();
+            }
+            let preview = agent.preview_prompt_rewind(&id).unwrap();
+            assert_eq!(preview.conflict_count, 1, "{preview:?}");
+            assert!(agent
+                .apply_prompt_rewind(
+                    &id,
+                    &preview.preview_digest,
+                    &super::RewindSelection {
+                        code: true,
+                        task_state: false,
+                        transcript: false,
+                    },
+                )
+                .is_err());
+            assert_eq!(std::fs::read_to_string(unrelated).unwrap(), "after");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn prompt_rewind_same_bytes_symlink_replacement_invalidates_preview_and_engine_apply() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.txt"), "before").unwrap();
+        std::fs::write(dir.path().join("b.txt"), "after").unwrap();
+        let mut agent = super::prompt_rewind_tests::agent_at(dir.path());
+        agent.prompt("change owned file");
+        super::prompt_rewind_tests::tool_turn(
+            &mut agent,
+            "write",
+            serde_json::json!({"path":"a.txt","content":"after"}),
+        );
+        let id = agent.prompt_checkpoints()[0].id.clone();
+        let preview = agent.preview_prompt_rewind(&id).unwrap();
+        assert_eq!(preview.conflict_count, 0);
+        std::fs::remove_file(dir.path().join("a.txt")).unwrap();
+        std::os::unix::fs::symlink("b.txt", dir.path().join("a.txt")).unwrap();
+        assert!(agent
+            .apply_prompt_rewind(
+                &id,
+                &preview.preview_digest,
+                &super::RewindSelection {
+                    code: true,
+                    task_state: false,
+                    transcript: false,
+                },
+            )
+            .is_err());
+        assert!(super::apply_rewind_transaction(dir.path(), &preview, true).is_err());
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("b.txt")).unwrap(),
+            "after"
+        );
+    }
+
     #[test]
     fn prompt_rewind_refuses_to_restore_a_same_named_file_in_a_different_workspace() {
         let first = tempfile::tempdir().unwrap();

@@ -17,6 +17,9 @@ A new file is removed when its contents still match the recorded version; a
 deleted file is recreated from its preimage. Empty directories created for new
 files can remain after their files are removed. Existing path, symlink and
 unfinished-transaction protections still apply.
+Rewind refuses symlinks in a recorded pathname or its parent directories,
+including links whose targets remain inside the workspace.
+An unreadable current file is a conflict; only a missing file counts as absent.
 
 **Changes made through shell commands are not tracked and cannot be restored by
 rewind.** This includes `bash`, `powershell`, `exec_command`, shell mode (`!`), and
