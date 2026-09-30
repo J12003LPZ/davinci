@@ -2,11 +2,7 @@ name: Workflow lint
 
 on:
   pull_request:
-    paths:
-      - '.github/workflows/**'
   push:
-    paths:
-      - '.github/workflows/**'
 
 jobs:
   actionlint:
