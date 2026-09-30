@@ -107,6 +107,10 @@ impl MacosSeatbeltBackend {
             }
         }
         let mut profile = String::from("(version 1)\n(deny default)\n(allow process-fork)\n(allow sysctl-read)\n(allow file-read-metadata)\n");
+        // macOS 26 dyld's CacheFinder opens the root directory before main.
+        // Native failure evidence reports file-read-data / and an ignition
+        // abort. Match only that directory, never files beneath the root.
+        profile.push_str("(allow file-read-data (literal \"/\"))\n");
         // POSIX tools need these specific devices, never the entire /dev tree.
         profile.push_str("(allow file-read* file-write* (literal \"/dev/null\") (literal \"/dev/zero\"))\n(allow file-read* (literal \"/dev/random\") (literal \"/dev/urandom\"))\n");
         grant(
@@ -341,6 +345,9 @@ mod tests {
         }
         assert!(!profile.contains("(allow network"));
         assert!(!profile.contains("(subpath \"/\")"));
+        assert!(profile.contains("(allow file-read-data (literal \"/\"))"));
+        assert!(!profile.contains("(allow file-read* (literal \"/\"))"));
+        assert!(!profile.contains("(allow file-write* (literal \"/\"))"));
         assert!(!profile.contains("(subpath \"/tmp\")"));
         assert_eq!(prepared.argv.last().unwrap(), "literal;arg");
         assert_eq!(
