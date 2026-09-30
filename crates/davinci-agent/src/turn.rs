@@ -852,6 +852,10 @@ impl Agent {
                 runtime.emit_turn_end(!self.abort_requested());
             }
 
+            // Inputs can arrive while the provider or a completion hook runs.
+            // Drain at the finish boundary as well as at the next request.
+            self.drain_remote_queues();
+
             if had_tools && !self.abort_requested() {
                 self.push_event(&mut events, AgentEvent::TurnStart);
                 if let Some(runtime) = &self.runtime {
@@ -970,12 +974,7 @@ impl Agent {
         new_messages: &mut Vec<ChatMessage>,
         steer: bool,
     ) {
-        for (kind, message) in self.remote.drain() {
-            match kind {
-                crate::QueueKind::Steer => self.queues.steer.push(message),
-                crate::QueueKind::FollowUp => self.queues.follow_up.push(message),
-            }
-        }
+        self.drain_remote_queues();
 
         let drained = if steer {
             let mode = self.queues.steer_mode;
@@ -1024,6 +1023,15 @@ impl Agent {
                     },
                 );
                 self.push_event(events, AgentEvent::MessageEnd { message });
+            }
+        }
+    }
+
+    fn drain_remote_queues(&mut self) {
+        for (kind, message) in self.remote.drain() {
+            match kind {
+                crate::QueueKind::Steer => self.queues.steer.push(message),
+                crate::QueueKind::FollowUp => self.queues.follow_up.push(message),
             }
         }
     }
@@ -4332,7 +4340,11 @@ impl Agent {
                 custom_type: None,
                 extra: serde_json::Map::new(),
             });
-            if let Some(record) = native_responses_resume {
+            // Native tapes include exact request inputs. An ephemeral overlay
+            // must not enter saved session history through this second route.
+            if let Some(record) =
+                native_responses_resume.filter(|_| self.completion_context.is_empty())
+            {
                 if let Ok(data) = serde_json::to_value(record) {
                     let mut extra = serde_json::Map::new();
                     extra.insert("data".into(), data);

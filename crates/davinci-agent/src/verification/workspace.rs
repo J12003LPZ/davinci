@@ -133,6 +133,7 @@ impl Snapshot {
                                 entry.file_name().to_str(),
                                 Some(
                                     ".git"
+                                        | ".davinci-transactions"
                                         | ".davinci"
                                         | ".pi"
                                         | "node_modules"

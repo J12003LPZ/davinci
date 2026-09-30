@@ -157,3 +157,21 @@ fn completion_keeps_stable_prompt_and_frozen_tool_schema() {
             |message: &ChatMessage| !davinci_ai::content_text(&message.content).contains(REMINDER)
         ));
 }
+
+#[test]
+fn disabled_requirement_review_is_a_baseline_arm_without_prompt_changes() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut agent = agent(
+        dir.path(),
+        "Handle normal input, reject invalid input; preserve the format.",
+    );
+    let system = agent.system_prompt.clone();
+    let schema = agent.provider_tool_schema_identity();
+    agent.requirement_review_enabled = false;
+    for path in ["app.py", "test_app.py"] {
+        std::fs::write(dir.path().join(path), "after").unwrap();
+    }
+    assert_eq!(reminders(&agent.run_loop(reply).unwrap()), 0);
+    assert_eq!(agent.provider_tool_schema_identity(), schema);
+    assert_eq!(agent.system_prompt, system);
+}

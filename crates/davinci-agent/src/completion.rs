@@ -28,6 +28,14 @@ pub(crate) struct CompletionState {
     requirement_sent: bool,
     hook_blocks: u32,
     hook_limit_noticed: bool,
+    initial_mutation_generation: u64,
+    initial_tool_calls: u64,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub(crate) struct CompletionContextMessage {
+    pub(crate) after_message: usize,
+    pub(crate) message: ChatMessage,
 }
 
 impl Agent {
@@ -42,6 +50,8 @@ impl Agent {
             request: text.into(),
             before,
             git_before,
+            initial_mutation_generation: self.mutation_verification_state().mutation_generation,
+            initial_tool_calls: self.stats.tool_calls,
             ..CompletionState::default()
         };
         self.invalidate_context_image();
@@ -56,6 +66,13 @@ impl Agent {
         let Ok(relative) = absolute.strip_prefix(&self.cwd) else {
             return false;
         };
+        if relative
+            .components()
+            .next()
+            .is_some_and(|part| part.as_os_str() == ".davinci-transactions")
+        {
+            return false;
+        }
         let (outside, escape) = crate::is_outside_or_symlink_escape(&self.cwd, &absolute);
         if relative
             .components()
@@ -159,7 +176,7 @@ impl Agent {
     }
 
     pub(crate) fn queue_requirement_completion(&mut self, events: &mut Vec<AgentEvent>) -> bool {
-        if self.is_plan_mode() || self.abort_requested() {
+        if !self.requirement_review_enabled || self.is_plan_mode() || self.abort_requested() {
             return false;
         }
         let state = self
@@ -168,6 +185,15 @@ impl Agent {
             .unwrap_or_else(|error| error.into_inner())
             .clone();
         if state.requirement_sent || state.request.is_empty() {
+            return false;
+        }
+        // Read-only tools cannot attribute outside edits to this run. Besides
+        // avoiding false reviews, this keeps their finish path free of hashing.
+        if state.mutations.is_empty()
+            && self.stats.tool_calls > state.initial_tool_calls
+            && self.mutation_verification_state().mutation_generation
+                == state.initial_mutation_generation
+        {
             return false;
         }
         let inputs: Vec<_> = state.mutations.iter().cloned().collect();
@@ -301,8 +327,15 @@ impl Agent {
         reason: &str,
         events: &mut Vec<AgentEvent>,
     ) {
-        self.completion_context
-            .push(ChatMessage::text("user", text));
+        let mut message = ChatMessage::text("user", text);
+        message.extra.insert(
+            "davinciCompletionOverlay".into(),
+            serde_json::Value::Bool(true),
+        );
+        self.completion_context.push(CompletionContextMessage {
+            after_message: self.messages.len(),
+            message,
+        });
         self.invalidate_context_image();
         self.push_event(
             events,
@@ -310,6 +343,23 @@ impl Agent {
                 reason_code: reason.into(),
             },
         );
+    }
+
+    pub(crate) fn completion_provider_history(&self, history: &[ChatMessage]) -> Vec<ChatMessage> {
+        let mut messages = Vec::with_capacity(history.len() + self.completion_context.len());
+        let mut overlays = self.completion_context.iter().peekable();
+        for index in 0..=history.len() {
+            while overlays
+                .peek()
+                .is_some_and(|overlay| overlay.after_message.min(history.len()) <= index)
+            {
+                messages.push(overlays.next().unwrap().message.clone());
+            }
+            if let Some(message) = history.get(index) {
+                messages.push(message.clone());
+            }
+        }
+        messages
     }
 }
 
@@ -342,4 +392,349 @@ fn parse_git_status(bytes: &[u8]) -> Option<BTreeMap<PathBuf, [u8; 2]>> {
         }
     }
     Some(paths)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use davinci_ai::AssistantMessage;
+
+    fn reply(_: &Agent) -> Result<AssistantMessage, String> {
+        serde_json::from_value(serde_json::json!({"id":"answer", "role":"assistant",
+            "model":"fixture", "content":[{"type":"text", "text":"Done"}], "stopReason":"stop"}))
+        .map_err(|error| error.to_string())
+    }
+
+    fn fixture(root: &Path) -> Agent {
+        let mut agent = Agent::new("fixture");
+        agent.cwd = root.into();
+        agent.auto_compaction = false;
+        agent.auto_verify = false;
+        agent
+    }
+
+    fn git(root: &Path, args: &[&str]) {
+        let output = std::process::Command::new("git")
+            .current_dir(root)
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env(
+                "GIT_CONFIG_GLOBAL",
+                if cfg!(windows) { "NUL" } else { "/dev/null" },
+            )
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[test]
+    fn change_set_detects_dirty_to_dirty_edits_and_marks_only_new_files() {
+        let root = tempfile::tempdir().unwrap();
+        for path in ["app.py", "user.py"] {
+            std::fs::write(root.path().join(path), "clean").unwrap();
+        }
+        git(root.path(), &["init", "-q"]);
+        git(root.path(), &["add", "."]);
+        git(
+            root.path(),
+            &[
+                "-c",
+                "user.name=Fixture",
+                "-c",
+                "user.email=fixture@example.invalid",
+                "commit",
+                "-qm",
+                "initial",
+            ],
+        );
+        for path in ["app.py", "user.py", "preexisting.py"] {
+            std::fs::write(root.path().join(path), "dirty before").unwrap();
+        }
+        let mut agent = fixture(root.path());
+        agent.prompt("Handle normal input, reject invalid input; preserve the format.");
+        std::fs::write(root.path().join("app.py"), "dirty after").unwrap();
+        std::fs::write(root.path().join("preexisting.py"), "dirty after").unwrap();
+        std::fs::write(root.path().join("fresh.py"), "new").unwrap();
+        let mut reminder = None;
+        agent
+            .run_loop(|agent| {
+                if let Some(last) = agent.completion_context.last() {
+                    reminder = Some(davinci_ai::content_text(&last.message.content));
+                }
+                reply(agent)
+            })
+            .unwrap();
+        let reminder = reminder.unwrap();
+        assert!(reminder.contains("- \"app.py\"\n"));
+        assert!(reminder.contains("- \"preexisting.py\"\n"));
+        assert!(reminder.contains("- \"fresh.py\" (new file)"));
+        assert!(!reminder.contains("user.py"));
+        assert_eq!(agent.stats.completion_requirement_reminders, 1);
+    }
+
+    #[test]
+    fn reverted_successful_mutations_are_omitted_from_change_set() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("app.py"), "original").unwrap();
+        let mut agent = fixture(root.path());
+        agent.prompt("Handle normal input, reject invalid input; preserve the format.");
+        std::fs::write(root.path().join("app.py"), "edited").unwrap();
+        agent.record_successful_mutation_paths(vec!["app.py".into()]);
+        std::fs::write(root.path().join("app.py"), "original").unwrap();
+        agent.record_successful_mutation_paths(vec!["app.py".into()]);
+        let events = agent.run_loop(reply).unwrap();
+        assert!(!events
+            .iter()
+            .any(|event| matches!(event, AgentEvent::CompletionReminder { .. })));
+    }
+
+    #[test]
+    fn denied_reads_do_not_enter_requirement_change_list() {
+        let root = tempfile::tempdir().unwrap();
+        let mut agent = fixture(root.path());
+        agent
+            .permissions
+            .lock()
+            .unwrap()
+            .deny
+            .push(crate::PermissionRule::parse("read(private.py)").unwrap());
+        agent.prompt("Handle normal input, reject invalid input; preserve the format.");
+        for path in ["private.py", "public.py"] {
+            std::fs::write(root.path().join(path), "changed").unwrap();
+        }
+        agent.record_successful_mutation_paths(vec!["private.py".into(), "public.py".into()]);
+        let mut text = String::new();
+        agent
+            .run_loop(|agent| {
+                if let Some(message) = agent.completion_context.last() {
+                    text = davinci_ai::content_text(&message.message.content);
+                }
+                reply(agent)
+            })
+            .unwrap();
+        assert!(text.contains("public.py"));
+        assert!(!text.contains("private.py"));
+        assert!(text.contains("incomplete"));
+    }
+
+    #[test]
+    fn steering_starts_a_fresh_requirement_budget_and_snapshot() {
+        let root = tempfile::tempdir().unwrap();
+        let mut agent = fixture(root.path());
+        agent.prompt("Handle normal input, reject invalid input; preserve the format.");
+        std::fs::write(root.path().join("app.py"), "initial").unwrap();
+        let remote = agent.remote_queue();
+        let mut injected = false;
+        agent
+            .run_loop(|agent| {
+                if !injected && !agent.completion_context.is_empty() {
+                    remote.push_steer(
+                        "Handle normal input, reject invalid input; also preserve encoding.".into(),
+                        vec![],
+                    );
+                    injected = true;
+                } else if injected && agent.completion_context.is_empty() {
+                    std::fs::write(root.path().join("app.py"), "steered").unwrap();
+                    agent.record_successful_mutation_paths(vec!["app.py".into()]);
+                }
+                reply(agent)
+            })
+            .unwrap();
+        assert_eq!(agent.stats.completion_requirement_reminders, 2);
+        assert_eq!(agent.stats.user_steers, 1);
+    }
+
+    #[test]
+    fn active_context_vm_includes_ephemeral_completion_suffix_and_accounts_for_it() {
+        let root = tempfile::tempdir().unwrap();
+        let mut agent = fixture(root.path());
+        agent.set_runtime(crate::RuntimeHandle::new(
+            crate::RunId::new(),
+            crate::AgentId::new(),
+            crate::RuntimeBus::new(),
+        ));
+        agent.set_context_vm_mode(crate::ContextVmMode::Active);
+        agent.prompt("Handle normal input, reject invalid input; preserve the format.");
+        std::fs::write(root.path().join("app.py"), "after").unwrap();
+        agent.record_successful_mutation_paths(vec!["app.py".into()]);
+        let mut saw = false;
+        agent
+            .run_loop(|agent| {
+                let image = agent.prepared_context_image().unwrap();
+                if !agent.completion_context.is_empty() {
+                    saw = true;
+                    assert!(
+                        davinci_ai::content_text(&image.messages.last().unwrap().content)
+                            .contains("List each explicit requirement")
+                    );
+                    assert!(image.entries.last().unwrap().mandatory);
+                    assert!(
+                        image.estimated_tokens
+                            >= crate::provider_budget::message_token_ceiling(
+                                &agent.completion_context.last().unwrap().message
+                            )
+                    );
+                    assert!(agent
+                        .context_vm_events_for_runtime()
+                        .iter()
+                        .all(|event| !event
+                            .visible_text
+                            .contains("List each explicit requirement")));
+                }
+                reply(agent)
+            })
+            .unwrap();
+        assert!(saw);
+        assert!(
+            !serde_json::to_string(&agent.prepared_context_image().unwrap().messages)
+                .unwrap()
+                .contains("List each explicit requirement")
+        );
+    }
+
+    #[test]
+    fn git_porcelain_tracks_both_rename_paths_and_literal_newlines() {
+        let parsed =
+            parse_git_status(b"R  new.py\0old.py\0?? odd\nname.py\0 M dirty.py\0").unwrap();
+        assert_eq!(parsed.len(), 4);
+        assert_eq!(parsed[Path::new("new.py")], *b"R ");
+        assert_eq!(parsed[Path::new("old.py")], *b"R ");
+        assert_eq!(parsed[Path::new("odd\nname.py")], *b"??");
+        assert!(parse_git_status(b"R  new.py\0").is_none());
+    }
+
+    #[test]
+    fn requirement_rule_counts_separate_clauses_without_inferring_requirements() {
+        assert_eq!(requirement_clause_count("Fix a typo."), 1);
+        assert_eq!(
+            requirement_clause_count("Normal input, invalid input; old format."),
+            3
+        );
+        assert_eq!(requirement_clause_count("One. Two. Three."), 3);
+    }
+
+    #[test]
+    fn runtime_bookkeeping_does_not_turn_a_trivial_edit_into_multiple_changed_files() {
+        let root = tempfile::tempdir().unwrap();
+        let mut agent = fixture(root.path());
+        agent.prompt("Fix the typo");
+        std::fs::write(root.path().join("app.py"), "after").unwrap();
+        std::fs::create_dir(root.path().join(".davinci-transactions")).unwrap();
+        std::fs::write(root.path().join(".davinci-transactions/journal.json"), "{}").unwrap();
+        assert!(!agent
+            .run_loop(reply)
+            .unwrap()
+            .iter()
+            .any(|event| matches!(event, AgentEvent::CompletionReminder { .. })));
+    }
+
+    #[test]
+    fn requirement_then_verification_feedback_preserves_the_previous_provider_prefix() {
+        let root = tempfile::tempdir().unwrap();
+        let mut agent = fixture(root.path());
+        agent.prompt("Handle normal input, reject invalid input; preserve the format.");
+        std::fs::write(root.path().join("app.py"), "after").unwrap();
+        agent.record_successful_mutation_paths(vec!["app.py".into()]);
+        let mut previous = Vec::new();
+        agent
+            .run_loop(|agent| {
+                let messages = agent.messages_for_provider();
+                assert!(
+                    messages.starts_with(&previous),
+                    "completion feedback reordered existing provider input"
+                );
+                previous = messages;
+                reply(agent)
+            })
+            .unwrap();
+        assert_eq!(agent.stats.model_turns, 3);
+    }
+
+    #[test]
+    fn native_responses_resume_records_cannot_save_transient_completion_input() {
+        let root = tempfile::tempdir().unwrap();
+        let sessions = tempfile::tempdir().unwrap();
+        let mut agent = fixture(root.path());
+        agent.session =
+            Some(crate::JsonlSession::create(sessions.path(), "native-completion", None).unwrap());
+        agent.prompt("Handle normal input, reject invalid input; preserve the format.");
+        std::fs::write(root.path().join("app.py"), "after").unwrap();
+        agent.record_successful_mutation_paths(vec!["app.py".into()]);
+        let model = crate::cache_stability::codex_test_model();
+        agent
+            .run_loop(|agent| {
+                let prepared = davinci_ai::PreparedProviderRequest::new(
+                    crate::cache_stability::wire_body_for_next_request(agent, &model),
+                );
+                let turn = davinci_ai::NativeResponsesTurn::from_prepared(
+                    &prepared,
+                    davinci_ai::NativeResponsesOutput {
+                        response_id: Some("fixture".into()),
+                        output_items: vec![],
+                        final_response: None,
+                        terminal_event_type: "response.completed".into(),
+                    },
+                )
+                .unwrap();
+                Ok::<_, String>(crate::CompleteOutput {
+                    message: reply(agent)?,
+                    stream_events: None,
+                    streamed_live: false,
+                    native_responses_resume: Some(davinci_ai::NativeResponsesResumeRecord {
+                        turn,
+                        resume_provider_message_count: 0,
+                        resume_provider_messages_fingerprint: String::new(),
+                    }),
+                })
+            })
+            .unwrap();
+        let saved = std::fs::read_to_string(&agent.session.as_ref().unwrap().path).unwrap();
+        assert!(!saved.contains("List each explicit requirement"));
+        assert_eq!(
+            agent
+                .session
+                .as_ref()
+                .unwrap()
+                .entries
+                .iter()
+                .filter(|entry| entry.custom_type.as_deref()
+                    == Some(davinci_ai::NATIVE_RESPONSES_TURN_ENTRY_TYPE))
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn read_only_tools_do_not_attribute_external_workspace_edits_to_the_run() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("app.py"), "before").unwrap();
+        let mut agent = fixture(root.path());
+        agent.prompt("Inspect the source");
+        let mut step = 0;
+        let events = agent
+            .run_loop(|agent| {
+                step += 1;
+                let mut message = reply(agent)?;
+                if step == 1 {
+                    message.content = vec![davinci_ai::ContentBlock::ToolCall {
+                        id: "read".into(),
+                        name: "read".into(),
+                        arguments: serde_json::json!({"path":"app.py"}),
+                    }];
+                } else {
+                    for path in ["external.py", "other.py"] {
+                        std::fs::write(root.path().join(path), "external change").unwrap();
+                    }
+                }
+                Ok::<_, String>(message)
+            })
+            .unwrap();
+        assert!(!events
+            .iter()
+            .any(|event| matches!(event, AgentEvent::CompletionReminder { .. })));
+    }
 }

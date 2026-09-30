@@ -213,6 +213,9 @@ mod tests {
         obj.remove("verificationCommandsRun");
         obj.remove("verificationFailures");
         obj.remove("capabilityIncompleteEvidence");
+        obj.remove("completionRequirementReminders");
+        obj.remove("completionHookBlocks");
+        obj.remove("completionHookLimitHits");
         obj.remove("userSteers");
         obj.remove("outputSchemaRepairTurns");
         let restored: RunStats = serde_json::from_value(json).unwrap();
@@ -222,6 +225,9 @@ mod tests {
         assert_eq!(restored.verification_commands_run, 0);
         assert_eq!(restored.verification_failures, 0);
         assert_eq!(restored.capability_incomplete_evidence, 0);
+        assert_eq!(restored.completion_requirement_reminders, 0);
+        assert_eq!(restored.completion_hook_blocks, 0);
+        assert_eq!(restored.completion_hook_limit_hits, 0);
         assert_eq!(restored.user_steers, 0);
         assert_eq!(restored.output_schema_repair_turns, 0);
     }

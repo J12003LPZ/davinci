@@ -425,6 +425,8 @@ pub struct Agent {
     pub tool_surface: ToolSurface,
     /// Repeat the last verification call after later mutations at completion.
     pub auto_verify: bool,
+    /// Host A/B control; leaves Stable instructions and the tool schema frozen.
+    pub requirement_review_enabled: bool,
     /// Attach the files a user request names to that turn's appended harness
     /// context (`prompt::named_files`). Settings `namedFileContext`,
     /// environment `DAVINCI_NAMED_FILES`.
@@ -549,7 +551,7 @@ pub struct Agent {
     mutation_verification: Arc<Mutex<MutationVerificationState>>,
     completion_state: Arc<Mutex<completion::CompletionState>>,
     /// Bounded request suffix; never session/WAL history or compaction input.
-    completion_context: Vec<ChatMessage>,
+    completion_context: Vec<completion::CompletionContextMessage>,
     pending_transaction_verification:
         Arc<Mutex<std::collections::BTreeMap<String, Vec<transaction_verification::Pending>>>>,
     /// Bounded actual command evidence, populated only by built-in execution.
@@ -627,6 +629,7 @@ impl Agent {
             decision_advice_key: None,
             tool_surface: ToolSurface::default(),
             auto_verify: true,
+            requirement_review_enabled: true,
             named_file_context: !matches!(
                 std::env::var("DAVINCI_NAMED_FILES").ok().as_deref(),
                 Some("0" | "false" | "off")
@@ -1830,27 +1833,26 @@ impl Agent {
             && self.pruned_tool_results.is_empty()
             && plan_context.is_none()
         {
-            let mut messages = convert_to_llm_for_provider(&self.messages, self.block_images);
-            messages.extend(self.completion_context.iter().cloned());
-            return messages;
+            return convert_to_llm_for_provider(
+                &self.completion_provider_history(&self.messages),
+                self.block_images,
+            );
         }
-        let mut messages = self.project_with_evidence();
+        let mut messages = self.completion_provider_history(&self.project_with_evidence());
         if ephemeral_context.is_empty() && plan_context.is_none() {
-            let mut messages = convert_to_llm_for_provider(&messages, self.block_images);
-            messages.extend(self.completion_context.iter().cloned());
-            return messages;
+            return convert_to_llm_for_provider(&messages, self.block_images);
         }
         let insertion = messages
             .iter()
-            .rposition(|message| message.role == "user")
+            .rposition(|message| {
+                message.role == "user" && !message.extra_bool("davinciCompletionOverlay")
+            })
             .unwrap_or(messages.len());
         messages.splice(
             insertion..insertion,
             plan_context.into_iter().chain(ephemeral_context),
         );
-        let mut messages = convert_to_llm_for_provider(&messages, self.block_images);
-        messages.extend(self.completion_context.iter().cloned());
-        messages
+        convert_to_llm_for_provider(&messages, self.block_images)
     }
 
     #[doc(hidden)]
@@ -1898,7 +1900,11 @@ impl Agent {
         }
         let budget = self.provider_context_budget();
         let mut live = self.live_tool_exchange();
-        live.extend(self.completion_context.iter().cloned());
+        live.extend(
+            self.completion_context
+                .iter()
+                .map(|overlay| overlay.message.clone()),
+        );
         let live_tokens = live
             .iter()
             .map(provider_budget::message_token_ceiling)
@@ -2171,7 +2177,11 @@ impl Agent {
                 .unwrap_or(0)
             + (self.provider_system_prompt().len() as u64).div_ceil(4)
             + self.estimated_tool_schema_tokens()
-            + estimate_context_tokens(&self.completion_context)
+            + self
+                .completion_context
+                .iter()
+                .map(|overlay| compaction::estimate_tokens(&overlay.message))
+                .sum::<u64>()
     }
 
     /// Tool schemas on the same four-bytes-a-token scale as the rest of
@@ -3562,6 +3572,9 @@ impl Agent {
         }
         if result.compacted {
             self.messages = result.messages.clone();
+            for overlay in &mut self.completion_context {
+                overlay.after_message = self.messages.len();
+            }
         }
         let estimated_after = self.estimated_context_tokens();
         if let Some(runtime) = &self.runtime {

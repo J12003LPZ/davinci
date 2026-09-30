@@ -24,7 +24,9 @@ contribute; the reminder states that its list may be incomplete. Up to 64 paths
 are shown. Paths are quoted file data. The harness never deletes files.
 
 Requirement reminders and blocking completion-hook feedback are transient
-provider suffixes. They are excluded from saved sessions, compaction input and
+provider overlays. Each stays at the position where it was appended during the
+prompt so later requests preserve the existing provider prefix. They are
+excluded from saved sessions, native replay records, compaction input and
 the final answer. The Stable prompt hash and provider tool schema are unchanged.
 Reason-only `completion_reminder` events identify `completion.requirements` and
 `completion.hook_block`; `RunStats` exposes `completionRequirementReminders`,
@@ -40,3 +42,8 @@ uncached token growth against an agreed ceiling. No accuracy or cost improvement
 is claimed from fixture results. The source rows behind the readiness plan's
 22/36 benchmark are not present in this checkout; its four unrelated-edit causes
 cannot be established here.
+
+The host can disable requirement review for a baseline arm with
+`requirementReview: false` (or `DAVINCI_REQUIREMENT_REVIEW=0`). This control does
+not disable existing verification or completion hooks and does not modify the
+Stable prompt or tool schema.
