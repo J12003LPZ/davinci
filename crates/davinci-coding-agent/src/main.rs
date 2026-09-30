@@ -363,13 +363,18 @@ fn preactivate_execution_boundary(raw: &[String], cwd: &Path) -> Result<(), Stri
     {
         return Ok(());
     }
+    // Only an Auto default without explicit settings uses the probed backend;
+    // other launches must not pay for the probe before the first frame.
+    let detected = (settings.is_none() && mode == davinci_agent::PermissionMode::Auto)
+        .then(|| davinci_agent::sandbox::detected_native_backend(cwd))
+        .flatten();
     let Some(spec) = sandbox_config::resolve_auto_sandbox_settings(
         cwd,
         settings.as_ref(),
         None,
         false,
         mode,
-        davinci_agent::sandbox::detected_native_backend(cwd),
+        detected,
     )?
     else {
         return Ok(());
@@ -689,8 +694,14 @@ fn offline_stub_message(current: &Agent, last_user: usize) -> AssistantMessage {
         .ok()
         .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok())
         .and_then(|fixture| {
+            let harness_reminder = |message: &davinci_ai::ChatMessage| {
+                message.extra.contains_key("davinciCapabilityReminder")
+                    || message
+                        .extra
+                        .contains_key(davinci_agent::COMPLETION_REMINDER_FIELD)
+            };
             let is_prompt = |message: &davinci_ai::ChatMessage| {
-                message.role == "user" && !message.extra.contains_key("davinciCapabilityReminder")
+                message.role == "user" && !harness_reminder(message)
             };
             let Some(calls) = fixture.as_array() else {
                 return current
@@ -707,7 +718,7 @@ fn offline_stub_message(current: &Agent, last_user: usize) -> AssistantMessage {
             let last = turn
                 .iter()
                 .rev()
-                .find(|message| !message.extra.contains_key("davinciCapabilityReminder"))?;
+                .find(|message| !harness_reminder(message))?;
             if !is_prompt(last) && last.role != "toolResult" {
                 return None;
             }
@@ -981,7 +992,6 @@ fn build_agent(parsed: &Args, session_dir: &Path, cwd: &Path) -> Result<Agent, S
     } else {
         None
     };
-    let detected = davinci_agent::sandbox::detected_native_backend(cwd);
     agent.tool_context.sandbox = sandbox_config::resolve_sandbox_settings(
         cwd,
         effective_global_sandbox.as_ref(),
@@ -989,34 +999,39 @@ fn build_agent(parsed: &Args, session_dir: &Path, cwd: &Path) -> Result<Agent, S
         project_trusted_for_sandbox,
     )?;
     if effective_global_sandbox.is_none() {
-        let (candidate, candidate_error) = match sandbox_config::resolve_auto_sandbox_settings(
-            cwd,
-            None,
-            project_sandbox_settings.as_ref(),
-            project_trusted_for_sandbox,
-            davinci_agent::PermissionMode::Auto,
-            detected,
-        ) {
-            Ok(candidate) => (candidate, None),
-            Err(error) if agent.permission_mode() == davinci_agent::PermissionMode::Auto => {
-                return Err(error)
+        let resolve_auto = {
+            let cwd = cwd.to_path_buf();
+            let project = project_sandbox_settings.clone();
+            move || {
+                sandbox_config::resolve_auto_sandbox_settings(
+                    &cwd,
+                    None,
+                    project.as_ref(),
+                    project_trusted_for_sandbox,
+                    davinci_agent::PermissionMode::Auto,
+                    davinci_agent::sandbox::detected_native_backend(&cwd),
+                )
             }
-            // Ask/Edits sessions retain their existing behavior. An invalid
-            // narrowing request cannot make a future Auto policy available.
-            Err(error) => (None, Some(format!("Auto policy unavailable: {error}"))),
         };
-        let fenced = candidate.is_some();
         agent.set_auto_sandbox_activation_guard(Arc::new(
             execution_boundary::activate_auto_boundary,
         ));
+        // No explicit sandbox exists here, so an active one after a switch to
+        // Auto is the probed default.
         agent.set_permission_mode_change_hook(Arc::new(move |mode, context| {
-            if fenced && mode == davinci_agent::PermissionMode::Auto && context.sandbox.is_some() {
+            if mode == davinci_agent::PermissionMode::Auto && context.sandbox.is_some() {
                 execution_boundary::enable();
             }
         }));
-        agent.configure_auto_sandbox(candidate);
-        if let Some(error) = candidate_error {
-            agent.disable_auto_sandbox(error);
+        if agent.permission_mode() == davinci_agent::PermissionMode::Auto {
+            agent.configure_auto_sandbox(resolve_auto()?);
+        } else {
+            // Ask/Edits sessions probe the native backend (bubblewrap can take
+            // seconds) only if the user actually switches to Auto. An invalid
+            // narrowing request then cannot make an Auto policy available.
+            agent.configure_auto_sandbox_lazy(Arc::new(move || {
+                resolve_auto().map_err(|error| format!("Auto policy unavailable: {error}"))
+            }));
         }
     }
     if agent
@@ -1079,9 +1094,7 @@ fn build_agent(parsed: &Args, session_dir: &Path, cwd: &Path) -> Result<Agent, S
             let confined_config = mcp::load(&default_agent_dir(), cwd, trusted, true);
             if mcp::auto_requires_restart(&mcp_config, &confined_config) {
                 execution_boundary::record_legacy_execution("local project/plugin MCP")?;
-                if detected.is_some() {
-                    agent.disable_auto_sandbox("local project/plugin MCP may have unowned host descendants; restart directly in Auto to activate confinement");
-                }
+                agent.withdraw_auto_sandbox("local project/plugin MCP may have unowned host descendants; restart directly in Auto to activate confinement");
             }
         }
         let registry = match (
@@ -2919,16 +2932,26 @@ fn complete_prompt_with_host(
     let completion_cwd = agent.cwd.clone();
     let completion_agent_dir = default_agent_dir();
     let completion_policy = hook_policy.clone();
-    agent.completion_hook = Some(davinci_agent::CompletionHook(Arc::new(move |active| {
-        hooks::run_completion(
-            &completion_hooks,
-            &completion_policy,
-            &completion_cwd,
-            &completion_agent_dir,
-            active,
-        )
-        .or_else(|| run_plugin_completion_hooks(&completion_plugins, &completion_base, active))
-    })));
+    agent.completion_hook = Some(davinci_agent::CompletionHook(Arc::new(
+        move |active, cancelled| {
+            hooks::run_completion(
+                &completion_hooks,
+                &completion_policy,
+                &completion_cwd,
+                &completion_agent_dir,
+                active,
+                cancelled,
+            )
+            .or_else(|| {
+                run_plugin_completion_hooks(
+                    &completion_plugins,
+                    &completion_base,
+                    active,
+                    cancelled,
+                )
+            })
+        },
+    )));
 
     let pre_hooks = user_hooks.clone();
     let pre_plugin_hooks = plugin_hooks.clone();
@@ -8515,12 +8538,13 @@ pub fn format_session_status(parsed: &Args, agent: &Agent) -> String {
         .unwrap_or_else(|err| err.into_inner())
         .running();
     let mcp = agent.tool_context.mcp.rows().len();
+    // The first cost line belongs on the ` · ` header; background accounting
+    // follows on lines of its own.
+    let cost = format_session_cost(parsed, agent);
+    let (cost_line, cost_details) = cost.split_once('\n').unwrap_or((cost.as_str(), ""));
     let mut text = format!(
-        "{}/{} · {mode} · {plan} · {} jobs · {mcp} mcp · {}",
-        agent.provider,
-        agent.model_id,
-        jobs,
-        format_session_cost(parsed, agent),
+        "{}/{} · {mode} · {plan} · {} jobs · {mcp} mcp · {cost_line}",
+        agent.provider, agent.model_id, jobs,
     );
     if let Some(manifest) = &agent.prompt_manifest {
         let hash_prefix = if manifest.stable_sha256.len() >= 8 {
@@ -8549,6 +8573,10 @@ pub fn format_session_status(parsed: &Args, agent: &Agent) -> String {
             text.push_str(&format!(" · transition: {diag}"));
         }
     }
+    if !cost_details.is_empty() {
+        text.push('\n');
+        text.push_str(cost_details);
+    }
     text.push('\n');
     text.push_str(&sandbox_config::format_sandbox_status(
         agent.tool_context.sandbox.as_ref(),
@@ -8572,10 +8600,6 @@ pub fn format_session_status(parsed: &Args, agent: &Agent) -> String {
             text.push_str(&compact.join("\n"));
         }
     }
-    text.push_str(&format!(
-        "\n{}",
-        sandbox_config::format_sandbox_status(agent.tool_context.sandbox.as_ref())
-    ));
     if let Some(sections) = native_extensions::background_usage::native_status(agent) {
         for (name, section) in sections.as_object().into_iter().flatten() {
             text.push_str(&format!(
@@ -9255,14 +9279,15 @@ fn run_plugin_completion_hooks(
     plugins: &davinci_coding_agent::plugins::ActivePlugins,
     base: &davinci_coding_agent::plugins::HookInput,
     stop_hook_active: bool,
+    cancelled: &dyn Fn() -> bool,
 ) -> Option<String> {
     use davinci_coding_agent::plugins::hooks::HookEvent;
-    if !plugins.has_hooks(HookEvent::Stop) {
+    if cancelled() || !plugins.has_hooks(HookEvent::Stop) {
         return None;
     }
     let mut input = base.clone();
     input.stop_hook_active = stop_hook_active;
-    let result = plugins.run_event(HookEvent::Stop, None, &input);
+    let result = plugins.run_event_cancellable(HookEvent::Stop, None, &input, cancelled);
     report_plugin_warnings(&result);
     result.block
 }

@@ -2692,6 +2692,17 @@ fn status_text_not_automatically_appended_to_model_context() {
 }
 
 #[test]
+fn status_header_is_one_line_and_sandbox_is_reported_once() {
+    let agent = Agent::new("sys");
+    let status = format_session_status(&Args::default(), &agent);
+    let header = status.lines().next().unwrap();
+    assert!(header.contains(" · input "), "{status}");
+    assert!(!header.contains("Background accounting"), "{status}");
+    assert!(status.contains("Background accounting"), "{status}");
+    assert_eq!(status.matches("Enforcement:").count(), 1, "{status}");
+}
+
+#[test]
 fn additional_directories_reach_status_and_runtime_state_only_when_set() {
     let agent = Agent::new("sys");
     let parsed = Args::default();

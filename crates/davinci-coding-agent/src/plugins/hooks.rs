@@ -168,6 +168,74 @@ pub fn digest_cached(root: &Path, hooks: &[PluginHook]) -> Option<String> {
     value
 }
 
+/// [`digest`] for execution-time approval checks, which run on every tool
+/// call. The tree's metadata (paths, sizes, modification times and, on Unix,
+/// change times and inodes, which a file's owner cannot set back) is compared
+/// first; file contents are hashed again only when that metadata changed.
+pub fn digest_unless_unchanged(root: &Path, hooks: &[PluginHook]) -> Option<String> {
+    type Cache = Mutex<BTreeMap<(PathBuf, String), (String, Option<String>)>>;
+    static CACHE: OnceLock<Cache> = OnceLock::new();
+    if hooks.is_empty() {
+        return None;
+    }
+    let key = (root.to_path_buf(), definitions_json(hooks));
+    let fingerprint = tree_fingerprint(root);
+    let cache = CACHE.get_or_init(|| Mutex::new(BTreeMap::new()));
+    if let Some((seen, value)) = cache.lock().unwrap_or_else(|e| e.into_inner()).get(&key) {
+        if *seen == fingerprint {
+            return value.clone();
+        }
+    }
+    let value = digest(root, hooks);
+    cache
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(key, (fingerprint, value.clone()));
+    value
+}
+
+fn tree_fingerprint(root: &Path) -> String {
+    let mut hasher = Sha256::new();
+    let walker = walkdir::WalkDir::new(root)
+        .follow_links(false)
+        .sort_by_file_name()
+        .into_iter()
+        .filter_entry(|entry| entry.file_name() != ".git");
+    for entry in walker {
+        let Ok(entry) = entry else {
+            hasher.update(b"<unreadable>");
+            continue;
+        };
+        hasher.update(entry.path().to_string_lossy().as_bytes());
+        hasher.update([0]);
+        match std::fs::symlink_metadata(entry.path()) {
+            Ok(meta) => {
+                let modified = meta
+                    .modified()
+                    .ok()
+                    .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                    .map(|d| d.as_nanos())
+                    .unwrap_or(0);
+                hasher.update(format!("{:?}:{}:{modified}", meta.file_type(), meta.len()));
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::MetadataExt;
+                    hasher.update(format!(
+                        ":{}.{}:{}:{}",
+                        meta.ctime(),
+                        meta.ctime_nsec(),
+                        meta.ino(),
+                        meta.dev()
+                    ));
+                }
+            }
+            Err(_) => hasher.update(b"<unreadable>"),
+        }
+        hasher.update([0]);
+    }
+    hex(&hasher.finalize())
+}
+
 fn definitions_json(hooks: &[PluginHook]) -> String {
     Value::Array(
         hooks
@@ -378,6 +446,17 @@ pub fn interpret(
 /// Run one hook and interpret its result. `async` hooks are started on a
 /// background thread and report nothing.
 pub fn run(hook: &PluginHook, ctx: &HookContext, payload: &Value) -> HookOutcome {
+    run_cancellable(hook, ctx, payload, &|| false)
+}
+
+/// [`run`] that stops a synchronous hook's process tree once `cancelled`
+/// reports true; a cancelled hook neither blocks nor adds context.
+pub fn run_cancellable(
+    hook: &PluginHook,
+    ctx: &HookContext,
+    payload: &Value,
+    cancelled: &dyn Fn() -> bool,
+) -> HookOutcome {
     if std::env::var_os("PI_HOOKS_DRY_RUN").is_some() {
         return HookOutcome::default();
     }
@@ -411,11 +490,12 @@ pub fn run(hook: &PluginHook, ctx: &HookContext, payload: &Value) -> HookOutcome
         });
         return HookOutcome::default();
     }
-    match davinci_sys::process::run_bounded(command, Some(input), limits, &|| false) {
+    match davinci_sys::process::run_bounded(command, Some(input), limits, cancelled) {
         Err(err) => HookOutcome {
             warning: Some(format!("could not start: {err}")),
             ..HookOutcome::default()
         },
+        Ok(output) if output.cancelled => HookOutcome::default(),
         Ok(output) if output.timed_out => HookOutcome {
             warning: Some(format!("timed out after {}s", hook.timeout_secs)),
             ..HookOutcome::default()
@@ -564,6 +644,47 @@ pub(crate) fn find_bash() -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn execution_digest_is_reused_only_while_the_tree_is_unchanged() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::write(root.join("run.sh"), "echo safe").unwrap();
+        let hooks = vec![PluginHook {
+            event: HookEvent::PreToolUse,
+            matcher: None,
+            command: "bash \"$CLAUDE_PLUGIN_ROOT/run.sh\"".into(),
+            timeout_secs: 60,
+            shell: None,
+            is_async: false,
+        }];
+        let first = digest_unless_unchanged(root, &hooks).unwrap();
+        assert_eq!(first, digest(root, &hooks).unwrap());
+        assert_eq!(digest_unless_unchanged(root, &hooks).unwrap(), first);
+
+        std::fs::write(root.join("run.sh"), "echo evil, longer").unwrap();
+        let changed = digest_unless_unchanged(root, &hooks).unwrap();
+        assert_ne!(changed, first);
+        assert_eq!(changed, digest(root, &hooks).unwrap());
+
+        // Same size with the old modification time put back: on Unix the
+        // change time cannot be put back, so the edit is still seen.
+        #[cfg(unix)]
+        {
+            let path = root.join("run.sh");
+            let modified = std::fs::metadata(&path).unwrap().modified().unwrap();
+            std::fs::write(&path, "echo worse, longer").unwrap();
+            std::fs::File::options()
+                .write(true)
+                .open(&path)
+                .unwrap()
+                .set_modified(modified)
+                .unwrap();
+            let edited = digest_unless_unchanged(root, &hooks).unwrap();
+            assert_ne!(edited, changed);
+            assert_eq!(edited, digest(root, &hooks).unwrap());
+        }
+    }
 
     #[test]
     fn stop_and_post_tool_block_feedback_uses_stderr_and_warns_on_exit_one() {

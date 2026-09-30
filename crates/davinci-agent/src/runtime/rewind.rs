@@ -474,7 +474,45 @@ pub fn build_rewind_preview(
     base_dir: &Path,
     irreversible: Vec<ExternalEffectReceipt>,
 ) -> RewindPreview {
-    let checkpoint_id = checkpoint_id.into();
+    build_rewind_preview_with(
+        checkpoint_id.into(),
+        effects,
+        blob_store,
+        base_dir,
+        irreversible,
+        false,
+    )
+}
+
+/// Like [`build_rewind_preview`], but a file whose recorded edits do not chain
+/// (something changed it between two of them) is a conflict. Normal-conversation
+/// rewind spans prompts during which the user may edit files; a graph task's
+/// own worker changes between its recorded edits are part of that task.
+pub fn build_contiguous_rewind_preview(
+    checkpoint_id: impl Into<String>,
+    effects: &[OwnedFileEffect],
+    blob_store: &BlobStore,
+    base_dir: &Path,
+    irreversible: Vec<ExternalEffectReceipt>,
+) -> RewindPreview {
+    build_rewind_preview_with(
+        checkpoint_id.into(),
+        effects,
+        blob_store,
+        base_dir,
+        irreversible,
+        true,
+    )
+}
+
+fn build_rewind_preview_with(
+    checkpoint_id: String,
+    effects: &[OwnedFileEffect],
+    blob_store: &BlobStore,
+    base_dir: &Path,
+    irreversible: Vec<ExternalEffectReceipt>,
+    require_contiguous: bool,
+) -> RewindPreview {
     let mut files = Vec::new();
     let mut conflict_count = 0;
 
@@ -505,9 +543,10 @@ pub fn build_rewind_preview(
 
         // A user (or an untracked shell command) may edit between prompt
         // effects. Collapsing across that gap would silently erase their edit.
-        if file_effects
-            .windows(2)
-            .any(|pair| pair[0].after_blob != pair[1].before_blob)
+        if require_contiguous
+            && file_effects
+                .windows(2)
+                .any(|pair| pair[0].after_blob != pair[1].before_blob)
         {
             conflict_count += 1;
             files.push(FileRewindPlan::new(
@@ -1141,6 +1180,49 @@ mod tests {
     }
 
     #[test]
+    fn graph_rewind_spans_unrecorded_worker_changes_but_prompt_rewind_does_not() {
+        let dir = tempfile::tempdir().unwrap();
+        let file_path = dir.path().join("lib.rs");
+        let blob_store = BlobStore::new();
+        let task_id = crate::runtime::ids::TaskId::new();
+        let store = |bytes: &[u8]| blob_store.store_blob_for_task(task_id, bytes).unwrap();
+        let edit = |before: &str, after: &str| {
+            let mut effect = OwnedFileEffect::new(
+                "op",
+                crate::runtime::ids::AgentId::new(),
+                1,
+                "lib.rs",
+                crate::runtime::effects::FileEffectKind::Modified,
+                task_id,
+            );
+            effect.before_blob = Some(store(before.as_bytes()));
+            effect.after_blob = Some(store(after.as_bytes()));
+            effect
+        };
+        // Edit, then `cargo fmt` through the shell (unrecorded), then edit again.
+        let effects = [
+            edit("original\n", "edited\n"),
+            edit("formatted\n", "final\n"),
+        ];
+        std::fs::write(&file_path, "final\n").unwrap();
+
+        let graph = build_rewind_preview("task", &effects, &blob_store, dir.path(), Vec::new());
+        assert_eq!(graph.conflict_count, 0, "{graph:?}");
+        apply_rewind_transaction(dir.path(), &graph, true).unwrap();
+        assert_eq!(std::fs::read_to_string(&file_path).unwrap(), "original\n");
+
+        std::fs::write(&file_path, "final\n").unwrap();
+        let prompt = build_contiguous_rewind_preview(
+            "prompt",
+            &effects,
+            &blob_store,
+            dir.path(),
+            Vec::new(),
+        );
+        assert_eq!(prompt.conflict_count, 1);
+    }
+
+    #[test]
     fn test_apply_rewind_transaction_success() {
         let dir = tempfile::tempdir().unwrap();
         let file_path = dir.path().join("code.rs");
@@ -1540,7 +1622,14 @@ mod tests {
 /// cannot be restored by normal-conversation rewind.
 pub const SHELL_REWIND_LIMITATION: &str =
     "Changes made through shell commands are not tracked and cannot be restored by rewind.";
+/// Full-state snapshot written by earlier builds; still read as a base.
 const PROMPT_REWIND_ENTRY: &str = "davinci.prompt_rewind.v1";
+/// One change per entry, folded along the session path on load, so each prompt
+/// appends a bounded amount no matter how long the conversation is.
+const PROMPT_REWIND_DELTA_ENTRY: &str = "davinci.prompt_rewind.v2";
+/// Without a saved session a transcript snapshot is the only way back, so only
+/// the most recent prompts keep one.
+pub const MAX_UNSAVED_TRANSCRIPT_SNAPSHOTS: usize = 10;
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub(crate) struct PromptRewindState {
@@ -1556,6 +1645,119 @@ pub(crate) struct PromptRewindState {
     authority: Option<RewindPreview>,
     #[serde(skip)]
     persistence_error: Option<String>,
+    /// Why earlier checkpoints were not loaded; recording continues.
+    #[serde(skip)]
+    notice: Option<String>,
+    /// Why recording cannot continue; seeds the runtime's rewind fault.
+    #[serde(skip)]
+    fault: Option<String>,
+    /// Earlier entries were unusable: the next record starts a new base.
+    #[serde(skip)]
+    pending_reset: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+enum PromptRewindChange {
+    /// Entries before this one are ignored; the report restarted empty.
+    Reset {
+        report_source: Option<std::path::PathBuf>,
+    },
+    Record {
+        checkpoint: PromptCheckpoint,
+        report_source: Option<std::path::PathBuf>,
+    },
+    Settle {
+        checkpoint_id: String,
+        effect_end: usize,
+        report_source: Option<std::path::PathBuf>,
+    },
+    Apply {
+        restored_effects: Vec<usize>,
+        truncate_checkpoints: Option<usize>,
+        report_source: Option<std::path::PathBuf>,
+    },
+}
+
+impl PromptRewindState {
+    fn apply_change(&mut self, change: PromptRewindChange) {
+        match change {
+            PromptRewindChange::Reset { report_source } => {
+                *self = PromptRewindState {
+                    report_source,
+                    ..Default::default()
+                };
+            }
+            PromptRewindChange::Record {
+                checkpoint,
+                report_source,
+            } => {
+                self.active_checkpoint = Some(checkpoint.id.clone());
+                self.checkpoints.push(checkpoint);
+                self.report_source = report_source;
+            }
+            PromptRewindChange::Settle {
+                checkpoint_id,
+                effect_end,
+                report_source,
+            } => {
+                if let Some(checkpoint) = self
+                    .checkpoints
+                    .iter_mut()
+                    .find(|checkpoint| checkpoint.id == checkpoint_id)
+                {
+                    checkpoint.effect_end = Some(effect_end);
+                }
+                self.report_source = report_source;
+            }
+            PromptRewindChange::Apply {
+                restored_effects,
+                truncate_checkpoints,
+                report_source,
+            } => {
+                self.restored_effects.extend(restored_effects);
+                if let Some(len) = truncate_checkpoints {
+                    self.checkpoints.truncate(len);
+                }
+                self.active_checkpoint = None;
+                self.report_source = report_source;
+            }
+        }
+    }
+}
+
+/// Fold the rewind entries on the current branch, starting at the latest full
+/// snapshot or reset marker.
+fn prompt_rewind_state_from_path(
+    session: &davinci_session::JsonlSession,
+) -> Result<PromptRewindState, String> {
+    let path = davinci_session::build_session_path(&session.entries, session.leaf_id.as_deref());
+    let mut state = PromptRewindState::default();
+    let mut changes = Vec::new();
+    for entry in path.iter().rev() {
+        let data = || entry.extra.get("data").cloned().unwrap_or_default();
+        match entry.custom_type.as_deref() {
+            Some(PROMPT_REWIND_ENTRY) => {
+                state = serde_json::from_value::<PromptRewindState>(data())
+                    .map_err(|error| format!("Invalid prompt rewind checkpoint: {error}"))?;
+                break;
+            }
+            Some(PROMPT_REWIND_DELTA_ENTRY) => {
+                let change = serde_json::from_value::<PromptRewindChange>(data())
+                    .map_err(|error| format!("Invalid prompt rewind checkpoint: {error}"))?;
+                if matches!(change, PromptRewindChange::Reset { .. }) {
+                    state.apply_change(change);
+                    break;
+                }
+                changes.push(change);
+            }
+            _ => {}
+        }
+    }
+    for change in changes.into_iter().rev() {
+        state.apply_change(change);
+    }
+    Ok(state)
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1569,7 +1771,7 @@ pub struct PromptCheckpoint {
     pub effect_start: usize,
     pub effect_end: Option<usize>,
     #[serde(skip)]
-    messages_before: Vec<davinci_ai::ChatMessage>,
+    messages_before: Option<Vec<davinci_ai::ChatMessage>>,
 }
 
 pub(crate) type PreparedPromptRewind = (PromptRewindState, BlobStore, Vec<OwnedFileEffect>);
@@ -1578,19 +1780,7 @@ pub(crate) type PreparedPromptRewind = (PromptRewindState, BlobStore, Vec<OwnedF
 pub(crate) fn prepare_prompt_rewind(
     session: &davinci_session::JsonlSession,
 ) -> Result<PreparedPromptRewind, String> {
-    let mut state =
-        davinci_session::build_session_path(&session.entries, session.leaf_id.as_deref())
-            .into_iter()
-            .rev()
-            .find(|entry| entry.custom_type.as_deref() == Some(PROMPT_REWIND_ENTRY))
-            .map(|entry| {
-                serde_json::from_value::<PromptRewindState>(
-                    entry.extra.get("data").cloned().unwrap_or_default(),
-                )
-            })
-            .transpose()
-            .map_err(|error| format!("Invalid prompt rewind checkpoint: {error}"))?
-            .unwrap_or_default();
+    let mut state = prompt_rewind_state_from_path(session)?;
     let report_path = session.path.with_extension("rewind-effects.jsonl");
     let inherited = state
         .report_source
@@ -1688,7 +1878,79 @@ pub(crate) fn prepare_prompt_rewind(
     ))
 }
 
+/// Like [`prepare_prompt_rewind`], but unusable rewind data never keeps the
+/// conversation from opening: earlier checkpoints are dropped with a notice,
+/// an unreadable effect report is set aside, and recording starts again.
+pub(crate) fn prepare_prompt_rewind_or_reset(
+    session: &davinci_session::JsonlSession,
+) -> PreparedPromptRewind {
+    match prepare_prompt_rewind(session) {
+        Ok(prepared) => prepared,
+        Err(reason) => reset_prompt_rewind(session, &reason),
+    }
+}
+
+fn reset_prompt_rewind(
+    session: &davinci_session::JsonlSession,
+    reason: &str,
+) -> PreparedPromptRewind {
+    let report_path = session.path.with_extension("rewind-effects.jsonl");
+    let mut state = PromptRewindState {
+        binding: Some(format!("{}:{}", session.header.id, session.path.display())),
+        report_source: Some(report_path.clone()),
+        pending_reset: true,
+        ..Default::default()
+    };
+    let earlier = format!("Earlier rewind checkpoints could not be loaded: {reason}");
+    match std::fs::symlink_metadata(&report_path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            state.notice = Some(format!("{earlier}. Rewind records prompts from here."));
+        }
+        _ => {
+            let mut name = report_path
+                .file_name()
+                .map(|name| name.to_os_string())
+                .unwrap_or_default();
+            name.push(format!(
+                ".invalid-{}",
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|duration| duration.as_millis())
+                    .unwrap_or(0)
+            ));
+            let aside = report_path.with_file_name(name);
+            match std::fs::rename(&report_path, &aside) {
+                Ok(()) => {
+                    state.notice = Some(format!(
+                        "{earlier}. The old effect report was kept at {}. Rewind records prompts from here.",
+                        aside.display()
+                    ));
+                }
+                Err(error) => {
+                    // New effects must never be appended after unusable lines.
+                    state.fault = Some(format!(
+                        "{earlier}; its effect report could not be set aside: {error}"
+                    ));
+                }
+            }
+        }
+    }
+    (state, BlobStore::new(), Vec::new())
+}
+
 impl crate::Agent {
+    /// Why normal-conversation rewind is unavailable or lost earlier prompts.
+    pub fn prompt_rewind_notice(&self) -> Option<String> {
+        self.prompt_rewind_fault()
+            .or_else(|| self.prompt_rewind.notice.clone())
+    }
+
+    fn prompt_rewind_fault(&self) -> Option<String> {
+        self.runtime
+            .as_ref()
+            .and_then(|runtime| runtime.prompt_rewind_fault())
+    }
+
     pub(crate) fn prompt_rewind_binding(&self) -> Option<String> {
         self.session
             .as_ref()
@@ -1714,13 +1976,17 @@ impl crate::Agent {
             self.set_runtime(runtime);
             self.prompt_checkpoint_bus = Some((identity, bus));
         }
-        if let Some(path) = self
-            .runtime
-            .as_ref()
-            .and_then(|runtime| runtime.prompt_effect_report_path.as_ref())
-        {
-            if let Err(error) = super::effects::ensure_effect_report(path) {
-                self.prompt_rewind.persistence_error = Some(error);
+        if let Some(runtime) = self.runtime.as_ref() {
+            if let (Some(path), None) = (
+                runtime.prompt_effect_report_path.as_ref(),
+                runtime.prompt_rewind_fault(),
+            ) {
+                // Rewind is best effort; its report failing must not stop the prompt.
+                if let Err(error) = super::effects::ensure_effect_report(path) {
+                    runtime.fail_prompt_rewind(format!(
+                        "Rewind is unavailable because its effect report could not be created: {error}"
+                    ));
+                }
             }
         }
         if let Err(error) = self.settle_prompt_checkpoint() {
@@ -1754,32 +2020,57 @@ impl crate::Agent {
             user_entry_id: None,
             effect_start,
             effect_end: None,
-            messages_before: if self.session.is_none() {
-                self.messages.clone()
-            } else {
-                Vec::new()
-            },
+            messages_before: self.session.is_none().then(|| self.messages.clone()),
         }
     }
 
     pub(crate) fn record_prompt_checkpoint(&mut self, mut checkpoint: PromptCheckpoint) {
+        if self.prompt_rewind_fault().is_some() {
+            return;
+        }
         checkpoint.user_entry_id = self
             .session
             .as_ref()
             .and_then(|session| session.leaf_id.clone());
         self.prompt_rewind.active_checkpoint = Some(checkpoint.id.clone());
-        self.prompt_rewind.checkpoints.push(checkpoint);
-        if let Err(error) = self.persist_prompt_checkpoints() {
+        self.prompt_rewind.checkpoints.push(checkpoint.clone());
+        let unsaved = self.prompt_rewind.checkpoints.len();
+        for older in self
+            .prompt_rewind
+            .checkpoints
+            .iter_mut()
+            .take(unsaved.saturating_sub(MAX_UNSAVED_TRANSCRIPT_SNAPSHOTS))
+        {
+            older.messages_before = None;
+        }
+        if std::mem::take(&mut self.prompt_rewind.pending_reset) {
+            let report_source = self.prompt_rewind_report_path();
+            if let Err(error) =
+                self.persist_prompt_rewind_change(PromptRewindChange::Reset { report_source })
+            {
+                self.prompt_rewind.persistence_error = Some(error);
+                return;
+            }
+        }
+        let report_source = self.prompt_rewind_report_path();
+        if let Err(error) = self.persist_prompt_rewind_change(PromptRewindChange::Record {
+            checkpoint,
+            report_source,
+        }) {
             self.prompt_rewind.persistence_error = Some(error);
         }
     }
 
-    fn persist_prompt_checkpoints(&mut self) -> Result<(), String> {
-        self.prompt_rewind.report_source = self
-            .session
+    fn prompt_rewind_report_path(&self) -> Option<std::path::PathBuf> {
+        self.session
             .as_ref()
-            .map(|session| session.path.with_extension("rewind-effects.jsonl"));
-        let data = serde_json::to_value(&self.prompt_rewind).map_err(|error| error.to_string())?;
+            .map(|session| session.path.with_extension("rewind-effects.jsonl"))
+    }
+
+    /// Append one bounded change; the in-memory state is already updated.
+    fn persist_prompt_rewind_change(&mut self, change: PromptRewindChange) -> Result<(), String> {
+        self.prompt_rewind.report_source = self.prompt_rewind_report_path();
+        let data = serde_json::to_value(&change).map_err(|error| error.to_string())?;
         if let Some(session) = &mut self.session {
             session
                 .append_entry(davinci_session::SessionEntry {
@@ -1789,7 +2080,7 @@ impl crate::Agent {
                     seq: 0,
                     timestamp: 0,
                     message: None,
-                    custom_type: Some(PROMPT_REWIND_ENTRY.into()),
+                    custom_type: Some(PROMPT_REWIND_DELTA_ENTRY.into()),
                     extra: serde_json::Map::from_iter([("data".into(), data)]),
                 })
                 .map_err(|error| format!("Prompt rewind persistence failed: {error}"))?;
@@ -1800,6 +2091,11 @@ impl crate::Agent {
     pub(crate) fn settle_prompt_checkpoint(&mut self) -> Result<(), String> {
         if let Some(error) = &self.prompt_rewind.persistence_error {
             return Err(error.clone());
+        }
+        // Once recording stopped, the ledger may hold effects the report does
+        // not; persisted ranges must keep pointing at reported lines only.
+        if self.prompt_rewind_fault().is_some() {
+            return Ok(());
         }
         let end = self
             .runtime
@@ -1818,8 +2114,14 @@ impl crate::Agent {
                 && checkpoint.effect_end != Some(end)
             {
                 checkpoint.effect_end = Some(end);
+                let checkpoint_id = checkpoint.id.clone();
                 self.prompt_rewind.authority = None;
-                self.persist_prompt_checkpoints()?;
+                let report_source = self.prompt_rewind_report_path();
+                self.persist_prompt_rewind_change(PromptRewindChange::Settle {
+                    checkpoint_id,
+                    effect_end: end,
+                    report_source,
+                })?;
             }
         }
         Ok(())
@@ -1837,22 +2139,27 @@ impl crate::Agent {
             self.prompt_rewind = PromptRewindState::default();
             return Ok(());
         };
-        let prepared = prepare_prompt_rewind(session)?;
+        let prepared = prepare_prompt_rewind_or_reset(session);
         self.install_prompt_checkpoints(prepared);
         Ok(())
     }
 
     pub(crate) fn install_prompt_checkpoints(&mut self, prepared: PreparedPromptRewind) {
-        let (state, blobs, effects) = prepared;
+        let (mut state, blobs, effects) = prepared;
         if let Some(runtime) = &mut self.runtime {
             runtime.blob_store = blobs;
             runtime.effect_ledger = std::sync::Arc::new(std::sync::RwLock::new(effects));
+            runtime.prompt_rewind_fault =
+                std::sync::Arc::new(std::sync::Mutex::new(state.fault.take()));
         }
         self.tool_context.runtime = self.runtime.clone();
         self.prompt_rewind = state;
     }
 
     pub fn prompt_checkpoints(&self) -> Vec<PromptCheckpoint> {
+        if self.prompt_rewind_fault().is_some() {
+            return Vec::new();
+        }
         self.prompt_rewind
             .checkpoints
             .iter()
@@ -1939,7 +2246,7 @@ impl crate::Agent {
                     .map(|(_, effect)| effect.clone()),
             );
         }
-        let mut preview = build_rewind_preview(
+        let mut preview = build_contiguous_rewind_preview(
             checkpoint_id,
             &effects,
             &runtime.blob_store,
@@ -2022,11 +2329,17 @@ impl crate::Agent {
             .position(|checkpoint| checkpoint.id == checkpoint_id)
             .ok_or("Prompt checkpoint not found")?;
         let checkpoint = self.prompt_rewind.checkpoints[position].clone();
+        if selection.transcript && self.session.is_none() && checkpoint.messages_before.is_none() {
+            return Err(format!(
+                "Without a saved session only the last {MAX_UNSAVED_TRANSCRIPT_SNAPSHOTS} prompts keep a conversation snapshot; rewind code only for this prompt"
+            ));
+        }
         let old_state = self.prompt_rewind.clone();
         let old_leaf = self
             .session
             .as_ref()
             .and_then(|session| session.leaf_id.clone());
+        let mut restored = Vec::new();
         if selection.code {
             apply_rewind_transaction(&self.cwd, &current, true)?;
             if !current.files.is_empty() {
@@ -2053,20 +2366,26 @@ impl crate::Agent {
                 })
                 .unwrap_or(0);
             for checkpoint in &self.prompt_rewind.checkpoints[position..] {
-                self.prompt_rewind
-                    .restored_effects
-                    .extend(checkpoint.effect_start..checkpoint.effect_end.unwrap_or(end));
+                restored.extend(checkpoint.effect_start..checkpoint.effect_end.unwrap_or(end));
             }
+            self.prompt_rewind
+                .restored_effects
+                .extend(restored.iter().copied());
         }
         if selection.transcript {
             self.prompt_rewind.checkpoints.truncate(position);
             if let Some(session) = &mut self.session {
-                session.set_leaf(checkpoint.conversation_parent);
+                session.set_leaf(checkpoint.conversation_parent.clone());
             }
         }
         self.prompt_rewind.authority = None;
         self.prompt_rewind.active_checkpoint = None;
-        if let Err(error) = self.persist_prompt_checkpoints() {
+        let report_source = self.prompt_rewind_report_path();
+        if let Err(error) = self.persist_prompt_rewind_change(PromptRewindChange::Apply {
+            restored_effects: restored,
+            truncate_checkpoints: selection.transcript.then_some(position),
+            report_source,
+        }) {
             self.prompt_rewind = old_state;
             self.prompt_rewind.authority = None;
             self.prompt_rewind.persistence_error = Some(error.clone());
@@ -2082,7 +2401,8 @@ impl crate::Agent {
                 .session
                 .as_ref()
                 .map(crate::messages_from_session)
-                .unwrap_or(checkpoint.messages_before);
+                .or(checkpoint.messages_before)
+                .unwrap_or_default();
             self.pending_prompt_messages.clear();
             self.last_real_user_request =
                 crate::last_real_user_request_from_messages(&self.messages);
@@ -2614,8 +2934,19 @@ mod rewind_branch_tests {
 
 #[cfg(test)]
 mod rewind_persistence_tests {
+    use super::prompt_rewind_tests::{agent_at, tool_turn};
     use super::*;
+    use crate::Agent;
     use serde_json::json;
+    use tempfile::tempdir;
+
+    fn select(code: bool, transcript: bool) -> RewindSelection {
+        RewindSelection {
+            code,
+            task_state: false,
+            transcript,
+        }
+    }
 
     #[test]
     fn prompt_rewind_fork_keeps_settled_checkpoint_bytes_and_has_independent_report() {
@@ -2678,12 +3009,11 @@ mod rewind_persistence_tests {
     }
 
     #[test]
-    fn prompt_rewind_missing_report_fails_before_session_switch_and_persistence_failure_prevents_model_call(
+    fn prompt_rewind_missing_report_opens_session_without_old_checkpoints_and_persistence_failure_prevents_model_call(
     ) {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().join("sessions");
         let first = davinci_session::JsonlSession::create(&root, "/fixture", None).unwrap();
-        let first_path = first.path.clone();
         let mut current = crate::Agent::new("fixture");
         current.load_from_session(first).unwrap();
         current.prompt("first");
@@ -2696,20 +3026,264 @@ mod rewind_persistence_tests {
         other.settle_prompt_checkpoint().unwrap();
         drop(other);
         std::fs::remove_file(second_path.with_extension("rewind-effects.jsonl")).unwrap();
-        let error = current
+        // The conversation opens; only its earlier checkpoints are lost.
+        current
             .load_from_session(davinci_session::JsonlSession::open(&second_path).unwrap())
-            .unwrap_err();
-        assert!(error.contains("report is missing"));
-        assert_eq!(current.session.as_ref().unwrap().path, first_path);
-        assert_eq!(current.prompt_checkpoints()[0].prompt, "first");
+            .unwrap();
+        assert_eq!(current.session.as_ref().unwrap().path, second_path);
+        assert!(current.prompt_checkpoints().is_empty());
+        assert!(current
+            .prompt_rewind_notice()
+            .is_some_and(|notice| notice.contains("report is missing")));
+        // Recording starts again, and the reset keeps later loads clean.
+        current.prompt("third");
+        current.settle_prompt_checkpoint().unwrap();
+        drop(current);
+        let mut reopened = crate::Agent::new("fixture");
+        reopened
+            .load_from_session(davinci_session::JsonlSession::open(&second_path).unwrap())
+            .unwrap();
+        assert_eq!(reopened.prompt_checkpoints().len(), 1);
+        assert_eq!(reopened.prompt_checkpoints()[0].prompt, "third");
+        assert!(reopened.prompt_rewind_notice().is_none());
 
-        current.prompt_rewind.persistence_error = Some("fixture durable storage failed".into());
-        let result = current.run_loop::<_, davinci_ai::AssistantMessage>(|_| {
+        reopened.prompt_rewind.persistence_error = Some("fixture durable storage failed".into());
+        let result = reopened.run_loop::<_, davinci_ai::AssistantMessage>(|_| {
             panic!("storage failure must prevent model dispatch")
         });
         assert!(result
             .unwrap_err()
             .contains("fixture durable storage failed"));
+    }
+
+    #[test]
+    fn prompt_rewind_corrupt_report_is_set_aside_and_session_still_opens() {
+        let dir = tempdir().unwrap();
+        let workspace = dir.path().join("workspace");
+        std::fs::create_dir(&workspace).unwrap();
+        std::fs::write(workspace.join("a.txt"), "before\n").unwrap();
+        let session = davinci_session::JsonlSession::create(
+            &dir.path().join("sessions"),
+            &workspace.to_string_lossy(),
+            None,
+        )
+        .unwrap();
+        let path = session.path.clone();
+        let report = path.with_extension("rewind-effects.jsonl");
+        let mut agent = agent_at(&workspace);
+        agent.load_from_session(session).unwrap();
+        agent.prompt("first");
+        tool_turn(
+            &mut agent,
+            "write",
+            json!({"path":"a.txt","content":"one\n"}),
+        );
+        drop(agent);
+        // A partially written last line.
+        let mut bytes = std::fs::read(&report).unwrap();
+        bytes.truncate(bytes.len() / 2);
+        std::fs::write(&report, bytes).unwrap();
+
+        let mut resumed = agent_at(&workspace);
+        resumed
+            .load_from_session(davinci_session::JsonlSession::open(&path).unwrap())
+            .unwrap();
+        assert!(resumed.prompt_checkpoints().is_empty());
+        assert!(resumed
+            .prompt_rewind_notice()
+            .is_some_and(|notice| notice.contains("kept at")));
+        assert!(!report.exists(), "the unreadable report is set aside");
+        assert!(std::fs::read_dir(report.parent().unwrap())
+            .unwrap()
+            .flatten()
+            .any(|entry| entry.file_name().to_string_lossy().contains(".invalid-")));
+
+        resumed.prompt("second");
+        tool_turn(
+            &mut resumed,
+            "write",
+            json!({"path":"a.txt","content":"two\n"}),
+        );
+        let second = resumed.prompt_checkpoints()[0].id.clone();
+        drop(resumed);
+        let mut reopened = agent_at(&workspace);
+        reopened
+            .load_from_session(davinci_session::JsonlSession::open(&path).unwrap())
+            .unwrap();
+        let preview = reopened.preview_prompt_rewind(&second).unwrap();
+        reopened
+            .apply_prompt_rewind(&second, &preview.preview_digest, &select(true, false))
+            .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(workspace.join("a.txt")).unwrap(),
+            "one\n"
+        );
+    }
+
+    #[test]
+    fn prompt_rewind_report_failure_keeps_the_edit_and_stops_recording() {
+        let dir = tempdir().unwrap();
+        let workspace = dir.path().join("workspace");
+        std::fs::create_dir(&workspace).unwrap();
+        std::fs::write(workspace.join("a.txt"), "before\n").unwrap();
+        let session = davinci_session::JsonlSession::create(
+            &dir.path().join("sessions"),
+            &workspace.to_string_lossy(),
+            None,
+        )
+        .unwrap();
+        let path = session.path.clone();
+        let report = path.with_extension("rewind-effects.jsonl");
+        let mut agent = agent_at(&workspace);
+        agent.load_from_session(session).unwrap();
+        agent.prompt("first");
+        tool_turn(
+            &mut agent,
+            "write",
+            json!({"path":"a.txt","content":"one\n"}),
+        );
+        let first = agent.prompt_checkpoints()[0].id.clone();
+        // The report can no longer be written (a directory takes its place).
+        let saved = dir.path().join("saved-report.jsonl");
+        std::fs::rename(&report, &saved).unwrap();
+        std::fs::create_dir(&report).unwrap();
+        agent.prompt("second");
+        // tool_turn asserts that the write itself is not reported as failed.
+        tool_turn(
+            &mut agent,
+            "write",
+            json!({"path":"a.txt","content":"two\n"}),
+        );
+        assert_eq!(
+            std::fs::read_to_string(workspace.join("a.txt")).unwrap(),
+            "two\n"
+        );
+        assert!(agent.prompt_checkpoints().is_empty());
+        assert!(agent.prompt_rewind_notice().is_some());
+        assert!(agent.require_prompt_checkpoint_persistence().is_ok());
+        drop(agent);
+
+        // The settled first prompt still loads against the lines that reached
+        // disk, and the unrecorded second edit shows up as a conflict.
+        std::fs::remove_dir(&report).unwrap();
+        std::fs::rename(&saved, &report).unwrap();
+        let mut reopened = agent_at(&workspace);
+        reopened
+            .load_from_session(davinci_session::JsonlSession::open(&path).unwrap())
+            .unwrap();
+        let checkpoints = reopened.prompt_checkpoints();
+        assert_eq!(checkpoints.len(), 1);
+        assert_eq!(checkpoints[0].id, first);
+        let preview = reopened.preview_prompt_rewind(&first).unwrap();
+        assert_eq!(preview.conflict_count, 1);
+    }
+
+    #[test]
+    fn prompt_rewind_storage_limit_keeps_editing() {
+        let dir = tempdir().unwrap();
+        std::fs::write(dir.path().join("a.txt"), "before\n").unwrap();
+        let mut agent = agent_at(dir.path());
+        agent.prompt("first");
+        // The session's checkpoint budget (256 MiB in production) is used up.
+        agent
+            .runtime
+            .as_ref()
+            .unwrap()
+            .blob_store
+            .set_task_capacity(1);
+        // tool_turn asserts that the edit is not refused.
+        tool_turn(
+            &mut agent,
+            "write",
+            json!({"path":"a.txt","content":"middle\n"}),
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("a.txt")).unwrap(),
+            "middle\n"
+        );
+        assert!(agent.prompt_checkpoints().is_empty());
+        assert!(agent
+            .prompt_rewind_notice()
+            .is_some_and(|notice| notice.contains("storage is full")));
+        agent.prompt("second");
+        tool_turn(
+            &mut agent,
+            "write",
+            json!({"path":"a.txt","content":"after\n"}),
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("a.txt")).unwrap(),
+            "after\n"
+        );
+    }
+
+    #[test]
+    fn prompt_rewind_session_entries_stay_bounded_per_prompt() {
+        let dir = tempdir().unwrap();
+        let session = davinci_session::JsonlSession::create(
+            &dir.path().join("sessions"),
+            &dir.path().to_string_lossy(),
+            None,
+        )
+        .unwrap();
+        let mut agent = agent_at(dir.path());
+        agent.load_from_session(session).unwrap();
+        let rewind_bytes = |agent: &Agent| -> Vec<usize> {
+            agent
+                .session
+                .as_ref()
+                .unwrap()
+                .entries
+                .iter()
+                .filter(|entry| entry.custom_type.as_deref() == Some(PROMPT_REWIND_DELTA_ENTRY))
+                .map(|entry| serde_json::to_vec(&entry.extra).unwrap().len())
+                .collect()
+        };
+        for index in 0..40 {
+            agent.prompt(&format!("prompt {index}"));
+            agent.settle_prompt_checkpoint().unwrap();
+            agent
+                .prompt_rewind
+                .checkpoints
+                .last_mut()
+                .unwrap()
+                .effect_end = None;
+            agent.settle_prompt_checkpoint().unwrap();
+        }
+        let sizes = rewind_bytes(&agent);
+        let largest = sizes.iter().copied().max().unwrap();
+        assert!(
+            largest < 2_048,
+            "entry size must not grow with history: {largest}"
+        );
+        assert_eq!(agent.prompt_checkpoints().len(), 40);
+    }
+
+    #[test]
+    fn prompt_rewind_without_session_keeps_bounded_transcript_snapshots() {
+        let dir = tempdir().unwrap();
+        let mut agent = agent_at(dir.path());
+        for index in 0..(MAX_UNSAVED_TRANSCRIPT_SNAPSHOTS + 5) {
+            agent.prompt(&format!("prompt {index}"));
+        }
+        let kept = agent
+            .prompt_rewind
+            .checkpoints
+            .iter()
+            .filter(|checkpoint| checkpoint.messages_before.is_some())
+            .count();
+        assert_eq!(kept, MAX_UNSAVED_TRANSCRIPT_SNAPSHOTS);
+        let oldest = agent.prompt_rewind.checkpoints[0].id.clone();
+        let preview = agent.preview_prompt_rewind(&oldest).unwrap();
+        let error = agent
+            .apply_prompt_rewind(&oldest, &preview.preview_digest, &select(false, true))
+            .unwrap_err();
+        assert!(error.contains("rewind code only"));
+        let newest = agent.prompt_checkpoints()[0].id.clone();
+        let preview = agent.preview_prompt_rewind(&newest).unwrap();
+        agent
+            .apply_prompt_rewind(&newest, &preview.preview_digest, &select(false, true))
+            .unwrap();
     }
 }
 

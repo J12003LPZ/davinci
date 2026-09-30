@@ -9,9 +9,16 @@ use std::sync::Arc;
 const MAX_HOOK_BLOCKS: u32 = 3;
 const MAX_CHANGED_PATHS: usize = 64;
 const MAX_HOOK_REASON_BYTES: usize = 8 * 1024;
+/// Marks the saved stand-in for an ephemeral completion reminder.
+pub const COMPLETION_REMINDER_FIELD: &str = "davinciCompletionReminder";
+const COMPLETION_REMINDER_MARKER: &str = "[DaVinci asked for a completion check before finishing.]";
 
+/// Runs the host's completion hooks. The first argument is `stop_hook_active`
+/// (a previous hook already blocked this prompt); the second reports whether
+/// the user aborted, so a long-running hook can be stopped.
 #[derive(Clone)]
-pub struct CompletionHook(pub Arc<dyn Fn(bool) -> Option<String> + Send + Sync>);
+#[allow(clippy::type_complexity)]
+pub struct CompletionHook(pub Arc<dyn Fn(bool, &dyn Fn() -> bool) -> Option<String> + Send + Sync>);
 
 impl std::fmt::Debug for CompletionHook {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -29,20 +36,30 @@ pub(crate) struct CompletionState {
     hook_blocks: u32,
     hook_limit_noticed: bool,
     initial_mutation_generation: u64,
-    initial_tool_calls: u64,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
 pub(crate) struct CompletionContextMessage {
     pub(crate) after_message: usize,
     pub(crate) message: ChatMessage,
+    /// The saved marker at `after_message` stands in for this reminder; the
+    /// provider sees the reminder in its place while the run is active.
+    pub(crate) replaces_marker: bool,
 }
 
 impl Agent {
     pub(crate) fn begin_completion_prompt(&mut self, text: &str) {
         self.completion_context.clear();
-        let before = self.completion_file_snapshot(&[]);
-        let git_before = self.completion_git_status();
+        // The baseline only serves the requirement review; skip the hashing and
+        // Git observation when that review cannot run for this prompt.
+        let (before, git_before) = if self.requirement_review_enabled && !self.is_plan_mode() {
+            (
+                self.completion_file_snapshot(&[]),
+                self.completion_git_status(),
+            )
+        } else {
+            (None, None)
+        };
         *self
             .completion_state
             .lock()
@@ -51,13 +68,17 @@ impl Agent {
             before,
             git_before,
             initial_mutation_generation: self.mutation_verification_state().mutation_generation,
-            initial_tool_calls: self.stats.tool_calls,
             ..CompletionState::default()
         };
         self.invalidate_context_image();
     }
 
-    fn completion_observation_allowed(&self, path: &Path) -> bool {
+    /// `canonical_root` is resolved once per observation pass, not per file.
+    fn completion_observation_allowed_in(
+        &self,
+        path: &Path,
+        canonical_root: Option<&Path>,
+    ) -> bool {
         let absolute = if path.is_absolute() {
             path.to_path_buf()
         } else {
@@ -88,7 +109,7 @@ impl Agent {
             absolute.to_string_lossy().into_owned(),
         ];
         if let Ok(canonical) = absolute.canonicalize() {
-            let root = self.cwd.canonicalize().unwrap_or_else(|_| self.cwd.clone());
+            let root = canonical_root.unwrap_or(&self.cwd);
             let Ok(canonical_relative) = canonical.strip_prefix(root) else {
                 return false;
             };
@@ -138,10 +159,11 @@ impl Agent {
         {
             return None;
         }
+        let root = self.cwd.canonicalize().ok();
         Some(crate::verification::workspace::Snapshot::capture_guarded(
             &self.cwd,
             inputs,
-            &|path| self.completion_observation_allowed(path),
+            &|path| self.completion_observation_allowed_in(path, root.as_deref()),
         ))
     }
 
@@ -186,7 +208,8 @@ impl Agent {
         )
         .ok()?;
         let mut status = parse_git_status(&bytes)?;
-        status.retain(|path, _| self.completion_observation_allowed(path));
+        let root = self.cwd.canonicalize().ok();
+        status.retain(|path, _| self.completion_observation_allowed_in(path, root.as_deref()));
         Some(status)
     }
 
@@ -202,10 +225,12 @@ impl Agent {
         if state.requirement_sent || state.request.is_empty() {
             return false;
         }
-        // Read-only tools cannot attribute outside edits to this run. Besides
-        // avoiding false reviews, this keeps their finish path free of hashing.
+        // Only this run's own changes justify a review. A text-only answer or
+        // read-only tools cannot attribute outside edits (an editor save, a
+        // watcher) to the run; shell writes advance the mutation generation.
+        // Besides avoiding false reviews, this keeps their finish path free of
+        // hashing.
         if state.mutations.is_empty()
-            && self.stats.tool_calls > state.initial_tool_calls
             && self.mutation_verification_state().mutation_generation
                 == state.initial_mutation_generation
         {
@@ -235,8 +260,9 @@ impl Agent {
             };
             Some(relative)
         }));
+        let root = self.cwd.canonicalize().ok();
         paths.retain(|path| {
-            self.completion_observation_allowed(path)
+            self.completion_observation_allowed_in(path, root.as_deref())
                 && !matches!((&state.before, &after), (Some(before), Some(after)) if before.path_changed(after, path) == Some(false))
         });
         if paths.is_empty() || (paths.len() < 2 && requirement_clause_count(&state.request) < 3) {
@@ -308,7 +334,7 @@ impl Agent {
             }
             return false;
         }
-        let reason = (hook.0)(blocks > 0);
+        let reason = (hook.0)(blocks > 0, &|| self.abort_requested());
         if self.abort_requested() {
             return false;
         }
@@ -342,14 +368,27 @@ impl Agent {
         reason: &str,
         events: &mut Vec<AgentEvent>,
     ) {
+        // The reminder text stays out of the saved transcript, but the reply
+        // to it is saved. A short marker keeps user/assistant turns
+        // alternating once the overlay is gone (strict chat templates reject
+        // two assistant messages in a row) and keeps the next prompt's prefix.
+        let mut marker = ChatMessage::text("user", COMPLETION_REMINDER_MARKER);
+        marker.extra.insert(
+            COMPLETION_REMINDER_FIELD.into(),
+            serde_json::Value::String(reason.into()),
+        );
+        let marker_index = self.messages.len();
+        self.messages.push(marker.clone());
+        self.persist_full_message(&marker);
         let mut message = ChatMessage::text("user", text);
         message.extra.insert(
             "davinciCompletionOverlay".into(),
             serde_json::Value::Bool(true),
         );
         self.completion_context.push(CompletionContextMessage {
-            after_message: self.messages.len(),
+            after_message: marker_index,
             message,
+            replaces_marker: true,
         });
         self.invalidate_context_image();
         self.push_event(
@@ -364,23 +403,43 @@ impl Agent {
         let mut messages = Vec::with_capacity(history.len() + self.completion_context.len());
         let mut overlays = self.completion_context.iter().peekable();
         for index in 0..=history.len() {
+            let mut replaced = false;
             while overlays
                 .peek()
                 .is_some_and(|overlay| overlay.after_message.min(history.len()) <= index)
             {
-                messages.push(overlays.next().unwrap().message.clone());
+                let overlay = overlays.next().unwrap();
+                replaced |= overlay.replaces_marker && overlay.after_message == index;
+                messages.push(overlay.message.clone());
             }
             if let Some(message) = history.get(index) {
-                messages.push(message.clone());
+                if !(replaced && message.extra.contains_key(COMPLETION_REMINDER_FIELD)) {
+                    messages.push(message.clone());
+                }
             }
         }
         messages
     }
 }
 
+/// Clauses end at a line break or at punctuation followed by whitespace or the
+/// end, so file names, versions and URLs (`foo.py`, `1.2.3`) stay one clause.
 fn requirement_clause_count(request: &str) -> usize {
-    request
-        .split([',', ';', '.', '!', '?', '\n'])
+    let mut clauses = Vec::new();
+    let mut start = 0;
+    let mut chars = request.char_indices().peekable();
+    while let Some((index, character)) = chars.next() {
+        let boundary = character == '\n'
+            || (matches!(character, ',' | ';' | '.' | '!' | '?')
+                && chars.peek().is_none_or(|(_, next)| next.is_whitespace()));
+        if boundary {
+            clauses.push(&request[start..index]);
+            start = index + character.len_utf8();
+        }
+    }
+    clauses.push(&request[start..]);
+    clauses
+        .into_iter()
         .filter(|clause| clause.chars().any(char::is_alphanumeric))
         .count()
 }
@@ -503,6 +562,8 @@ mod tests {
         std::fs::write(root.path().join("app.py"), "dirty after").unwrap();
         std::fs::write(root.path().join("preexisting.py"), "dirty after").unwrap();
         std::fs::write(root.path().join("fresh.py"), "new").unwrap();
+        // The run's own edit; the other two arrive as unrecorded shell changes.
+        agent.record_successful_mutation_paths(vec!["app.py".into()]);
         let mut reminder = None;
         agent
             .run_loop(|agent| {
@@ -571,6 +632,7 @@ mod tests {
         let mut agent = fixture(root.path());
         agent.prompt("Handle normal input, reject invalid input; preserve the format.");
         std::fs::write(root.path().join("app.py"), "initial").unwrap();
+        agent.record_successful_mutation_paths(vec!["app.py".into()]);
         let remote = agent.remote_queue();
         let mut injected = false;
         agent
@@ -659,6 +721,109 @@ mod tests {
             3
         );
         assert_eq!(requirement_clause_count("One. Two. Three."), 3);
+        assert_eq!(requirement_clause_count("Rename foo.py to bar.py"), 1);
+        assert_eq!(requirement_clause_count("Bump version to 1.2.3"), 1);
+        assert_eq!(
+            requirement_clause_count("Read https://example.com/a.b?c=1,2 first"),
+            1
+        );
+        assert_eq!(
+            requirement_clause_count("Keep 1,000 rows, drop the rest."),
+            2
+        );
+    }
+
+    #[test]
+    fn text_only_answer_does_not_attribute_external_edits_to_the_run() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("app.py"), "before").unwrap();
+        let mut agent = fixture(root.path());
+        agent.prompt("Explain normal input, invalid input; and the old format.");
+        // An editor save and a watcher write while the model answers in text.
+        std::fs::write(root.path().join("app.py"), "saved in the editor").unwrap();
+        std::fs::write(root.path().join("watcher.log"), "written").unwrap();
+        let events = agent.run_loop(reply).unwrap();
+        assert!(!events
+            .iter()
+            .any(|event| matches!(event, AgentEvent::CompletionReminder { .. })));
+        assert_eq!(agent.stats.completion_requirement_reminders, 0);
+        assert_eq!(agent.stats.model_turns, 1);
+    }
+
+    #[test]
+    fn completion_reminder_keeps_saved_turns_alternating() {
+        let root = tempfile::tempdir().unwrap();
+        let sessions = tempfile::tempdir().unwrap();
+        let mut agent = fixture(root.path());
+        agent.session =
+            Some(crate::JsonlSession::create(sessions.path(), "alternation", None).unwrap());
+        let request = "Handle normal input, reject invalid input; preserve the format.";
+        agent.prompt(request);
+        std::fs::write(root.path().join("app.py"), "after").unwrap();
+        agent.record_successful_mutation_paths(vec!["app.py".into()]);
+        let mut saw_reminder_in_place = false;
+        agent
+            .run_loop(|agent| {
+                let messages = agent.messages_for_provider();
+                if !agent.completion_context.is_empty() {
+                    // The full reminder replaces its marker; users never repeat.
+                    saw_reminder_in_place = messages
+                        .windows(2)
+                        .all(|pair| !(pair[0].role == "user" && pair[1].role == "user"))
+                        && messages
+                            .iter()
+                            .all(|message| !message.extra.contains_key(COMPLETION_REMINDER_FIELD));
+                }
+                reply(agent)
+            })
+            .unwrap();
+        assert!(saw_reminder_in_place);
+        assert_eq!(agent.stats.completion_requirement_reminders, 1);
+        let alternating = |messages: &[ChatMessage]| {
+            messages
+                .windows(2)
+                .all(|pair| !(pair[0].role == "assistant" && pair[1].role == "assistant"))
+        };
+        assert!(alternating(&agent.messages));
+        assert!(alternating(&agent.messages_for_provider()));
+        let path = agent.session.as_ref().unwrap().path.clone();
+        let saved = std::fs::read_to_string(&path).unwrap();
+        assert!(!saved.contains("List each explicit requirement"));
+        assert!(saved.contains(COMPLETION_REMINDER_FIELD));
+        let reloaded = crate::messages_from_session(&crate::JsonlSession::open(&path).unwrap());
+        assert!(alternating(&reloaded));
+        assert_eq!(
+            crate::last_real_user_request_from_messages(&reloaded).as_deref(),
+            Some(request)
+        );
+    }
+
+    #[test]
+    fn interrupted_final_answer_still_ends_its_turn() {
+        let root = tempfile::tempdir().unwrap();
+        let mut agent = fixture(root.path());
+        agent.prompt("Handle normal input, reject invalid input; preserve the format.");
+        std::fs::write(root.path().join("app.py"), "after").unwrap();
+        agent.record_successful_mutation_paths(vec!["app.py".into()]);
+        let signal = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        agent.abort_signal = Some(signal.clone());
+        let events = agent
+            .run_loop(|agent| {
+                // Esc arrives as the final answer finishes streaming.
+                signal.store(true, std::sync::atomic::Ordering::SeqCst);
+                reply(agent)
+            })
+            .unwrap();
+        assert!(events
+            .iter()
+            .any(|event| matches!(event, AgentEvent::TurnEnd { .. })));
+        assert!(events
+            .iter()
+            .any(|event| matches!(event, AgentEvent::VerificationNotice { .. })));
+        assert!(!events
+            .iter()
+            .any(|event| matches!(event, AgentEvent::CompletionReminder { .. })));
+        assert_eq!(agent.stats.model_turns, 1);
     }
 
     #[test]

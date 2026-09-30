@@ -73,7 +73,7 @@ pub use compaction::{
     SUMMARIZATION_PROMPT, SUMMARIZATION_SYSTEM_PROMPT, TURN_PREFIX_SUMMARIZATION_PROMPT,
     UPDATE_SUMMARIZATION_PROMPT,
 };
-pub use completion::CompletionHook;
+pub use completion::{CompletionHook, COMPLETION_REMINDER_FIELD};
 pub use context::{
     load_context_files, load_context_files_for_targets, ContextBudgetReport, ContextContribution,
     ContextFile, ContextPriority, RootContextAccount, SelectedRootContext,
@@ -432,6 +432,18 @@ impl std::fmt::Debug for AutoSandboxGuard {
     }
 }
 
+/// Resolve the host's Auto sandbox default when it is first needed.
+pub type AutoSandboxResolver =
+    dyn Fn() -> Result<Option<davinci_protocol::SandboxSpec>, String> + Send + Sync;
+
+#[derive(Clone)]
+struct AutoSandboxResolverHandle(Arc<AutoSandboxResolver>);
+impl std::fmt::Debug for AutoSandboxResolverHandle {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("AutoSandboxResolver")
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Agent {
     pub system_prompt: String,
@@ -561,6 +573,7 @@ pub struct Agent {
     /// Return target for /act, not another active mode.
     previous_execution_mode: Option<PermissionMode>,
     auto_sandbox: Option<davinci_protocol::SandboxSpec>,
+    auto_sandbox_resolver: Option<AutoSandboxResolverHandle>,
     auto_sandbox_unavailable_reason: Option<String>,
     auto_sandbox_guard: Option<AutoSandboxGuard>,
     /// Host fence updates happen while idle, before the next approval.
@@ -736,6 +749,7 @@ impl Agent {
             base_system_prompt: system_prompt,
             previous_execution_mode: None,
             auto_sandbox: None,
+            auto_sandbox_resolver: None,
             auto_sandbox_unavailable_reason: None,
             auto_sandbox_guard: None,
             permission_mode_change_hook: None,
@@ -822,6 +836,7 @@ impl Agent {
             if let Some(previous) = &self.runtime {
                 runtime.blob_store = previous.blob_store.clone();
                 runtime.effect_ledger = previous.effect_ledger.clone();
+                runtime.prompt_rewind_fault = previous.prompt_rewind_fault.clone();
             }
         }
         runtime.prompt_effect_report_path = self
@@ -1438,6 +1453,15 @@ impl Agent {
         self.activate_auto_sandbox(self.permission_mode());
     }
 
+    /// Like [`Self::configure_auto_sandbox`], but the candidate (which may
+    /// probe a native backend) is resolved on the first switch to Auto.
+    pub fn configure_auto_sandbox_lazy(&mut self, resolve: Arc<AutoSandboxResolver>) {
+        self.auto_sandbox = None;
+        self.auto_sandbox_unavailable_reason = None;
+        self.auto_sandbox_resolver = Some(AutoSandboxResolverHandle(resolve));
+        self.activate_auto_sandbox(self.permission_mode());
+    }
+
     pub fn set_auto_sandbox_activation_guard(&mut self, guard: Arc<AutoSandboxGuardCallback>) {
         self.auto_sandbox_guard = Some(AutoSandboxGuard(guard));
     }
@@ -1446,8 +1470,27 @@ impl Agent {
     /// its handles. Retain approval behavior and explain the missing boundary.
     pub fn disable_auto_sandbox(&mut self, reason: impl Into<String>) {
         self.auto_sandbox = None;
+        self.auto_sandbox_resolver = None;
         if self.tool_context.sandbox.is_none() {
             self.auto_sandbox_unavailable_reason = Some(reason.into());
+        }
+    }
+
+    /// Withdraw the Auto default, if the host has one, for `reason`. A lazily
+    /// resolved default is withdrawn only if resolving would produce one, so
+    /// hosts without a capable backend keep their existing status.
+    pub fn withdraw_auto_sandbox(&mut self, reason: impl Into<String>) {
+        let reason = reason.into();
+        if let Some(resolver) = self.auto_sandbox_resolver.take() {
+            self.auto_sandbox_resolver =
+                Some(AutoSandboxResolverHandle(Arc::new(
+                    move || match (resolver.0)()? {
+                        Some(_) => Err(reason.clone()),
+                        None => Ok(None),
+                    },
+                )));
+        } else if self.auto_sandbox.is_some() {
+            self.disable_auto_sandbox(reason);
         }
     }
 
@@ -1456,6 +1499,14 @@ impl Agent {
     }
 
     fn activate_auto_sandbox(&mut self, mode: PermissionMode) {
+        if mode == PermissionMode::Auto && self.tool_context.sandbox.is_none() {
+            if let Some(resolver) = self.auto_sandbox_resolver.take() {
+                match (resolver.0)() {
+                    Ok(candidate) => self.auto_sandbox = candidate,
+                    Err(reason) => self.auto_sandbox_unavailable_reason = Some(reason),
+                }
+            }
+        }
         if mode == PermissionMode::Auto
             && self.tool_context.sandbox.is_none()
             && self.auto_sandbox.is_some()
@@ -1964,7 +2015,11 @@ impl Agent {
         let insertion = messages
             .iter()
             .rposition(|message| {
-                message.role == "user" && !message.extra_bool("davinciCompletionOverlay")
+                message.role == "user"
+                    && !message.extra_bool("davinciCompletionOverlay")
+                    && !message
+                        .extra
+                        .contains_key(completion::COMPLETION_REMINDER_FIELD)
             })
             .unwrap_or(messages.len());
         messages.splice(
@@ -3693,6 +3748,8 @@ impl Agent {
             self.messages = result.messages.clone();
             for overlay in &mut self.completion_context {
                 overlay.after_message = self.messages.len();
+                // Its marker was folded into the summary.
+                overlay.replaces_marker = false;
             }
         }
         let estimated_after = self.estimated_context_tokens();
@@ -3791,7 +3848,9 @@ impl Agent {
                     )
                 })?;
         }
-        let rewind = runtime::rewind::prepare_prompt_rewind(&session)?;
+        // Unusable rewind data drops earlier checkpoints with a notice; it
+        // never keeps the conversation itself from opening.
+        let rewind = runtime::rewind::prepare_prompt_rewind_or_reset(&session);
         let messages = messages_from_session(&session);
         if session_changed {
             self.runtime_environment = None;
