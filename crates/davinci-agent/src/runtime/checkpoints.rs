@@ -55,6 +55,17 @@ pub struct FileCapture {
     pub size: u64,
 }
 
+impl CheckpointError {
+    /// A size or capacity limit of the in-memory store, as opposed to failing
+    /// to read or store the bytes at all.
+    pub fn is_storage_limit(&self) -> bool {
+        matches!(
+            self,
+            Self::BlobTooLarge { .. } | Self::TaskCapacityExceeded { .. }
+        )
+    }
+}
+
 pub fn may_mutate_with_checkpoint(
     authorized: bool,
     durable_checkpoint: bool,
@@ -72,6 +83,8 @@ pub struct BlobStore {
     blobs: Arc<RwLock<HashMap<String, Vec<u8>>>>,
     task_usage: Arc<RwLock<HashMap<TaskId, u64>>>,
     disk_full_injection: Arc<RwLock<bool>>,
+    /// Lower per-task capacity for tests; zero means [`MAX_TASK_BLOBS_BYTES`].
+    task_capacity_override: Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl BlobStore {
@@ -83,6 +96,12 @@ impl BlobStore {
         if let Ok(mut df) = self.disk_full_injection.write() {
             *df = disk_full;
         }
+    }
+
+    #[doc(hidden)]
+    pub fn set_task_capacity(&self, bytes: u64) {
+        self.task_capacity_override
+            .store(bytes, std::sync::atomic::Ordering::Relaxed);
     }
 
     pub fn store_blob_for_task(
@@ -115,7 +134,14 @@ impl BlobStore {
             })?;
             let current = usage.entry(task_id).or_insert(0);
             let next = *current + bytes.len() as u64;
-            if next > MAX_TASK_BLOBS_BYTES {
+            let capacity = match self
+                .task_capacity_override
+                .load(std::sync::atomic::Ordering::Relaxed)
+            {
+                0 => MAX_TASK_BLOBS_BYTES,
+                capacity => capacity,
+            };
+            if next > capacity {
                 return Err(CheckpointError::TaskCapacityExceeded { current: *current });
             }
             *current = next;

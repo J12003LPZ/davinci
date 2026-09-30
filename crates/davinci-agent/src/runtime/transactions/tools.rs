@@ -351,7 +351,18 @@ impl<'a> ToolTransaction<'a> {
                 .coordinator
                 .effect_reports(id)
                 .map_err(ToolError::Failed)?;
-            for report in &reports {
+            // Without a task contract the checkpoint only serves prompt rewind,
+            // which stops recording rather than refusing the patch.
+            let prompt_rewind_only = self
+                .context
+                .active_contract
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .is_none();
+            'reserve: for report in &reports {
+                if prompt_rewind_only && runtime.prompt_rewind_fault().is_some() {
+                    break;
+                }
                 for bytes in [
                     report.before_bytes.as_deref(),
                     report.after_bytes.as_deref(),
@@ -359,14 +370,23 @@ impl<'a> ToolTransaction<'a> {
                 .into_iter()
                 .flatten()
                 {
-                    runtime
+                    match runtime
                         .blob_store
                         .store_blob_for_task(report.effect.task_id, bytes)
-                        .map_err(|e| {
-                            ToolError::Failed(format!(
+                    {
+                        Ok(_) => {}
+                        Err(e) if prompt_rewind_only && e.is_storage_limit() => {
+                            runtime.fail_prompt_rewind(format!(
+                                "Rewind stopped recording because checkpoint storage is full: {e}"
+                            ));
+                            break 'reserve;
+                        }
+                        Err(e) => {
+                            return Err(ToolError::Failed(format!(
                                 "checkpoint unavailable before mutation: {e}"
-                            ))
-                        })?;
+                            )))
+                        }
+                    }
                 }
             }
             Some(reports)
@@ -400,16 +420,13 @@ impl<'a> ToolTransaction<'a> {
                 Ok(mut ledger) => {
                     for mut report in reports {
                         report.effect.owner_generation = applied.sequence;
-                        if let Some(path) = &runtime.prompt_effect_report_path {
-                            if let Err(error) = super::super::effects::append_effect_report(
-                                path,
-                                &report.effect,
-                                report.before_bytes.as_deref(),
-                                report.after_bytes.as_deref(),
-                            ) {
-                                handoff_error.get_or_insert(error);
-                            }
-                        }
+                        // Prompt rewind is best effort: a report failure stops
+                        // its recording but is not a handoff failure.
+                        runtime.report_prompt_effect(
+                            &report.effect,
+                            report.before_bytes.as_deref(),
+                            report.after_bytes.as_deref(),
+                        );
                         if let Some(path) = std::env::var_os("PI_GRAPH_EFFECT_REPORT") {
                             if let Err(error) = super::super::effects::append_effect_report(
                                 Path::new(&path),

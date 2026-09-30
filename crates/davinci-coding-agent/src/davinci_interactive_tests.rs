@@ -3793,3 +3793,47 @@ fn prompt_rewind_command_opens_recent_prompt_picker_with_shell_limitation() {
     assert_eq!(checkpoints[0].1, "second prompt");
     assert_eq!(checkpoints[1].1, "first prompt");
 }
+
+#[test]
+fn prompt_rewind_notices_reach_native_transcript_and_picker() {
+    let dir = tempfile::tempdir().unwrap();
+    let store =
+        davinci_session::JsonlSession::create(dir.path(), &dir.path().to_string_lossy(), None)
+            .unwrap();
+    std::fs::write(store.path.with_extension("rewind-effects.jsonl"), "{broken").unwrap();
+    let mut agent = Agent::new("rewind notice fixture");
+    agent.cwd = dir.path().into();
+    agent.load_from_session(store).unwrap();
+    let notice = agent.prompt_rewind_notice().unwrap();
+    let mut m = model();
+    push_context_vm_notices(&agent, &mut m);
+    assert!(m.transcript.iter().any(|entry|
+        matches!(entry, Entry::Tool { state: State::Attention, target, .. } if target == &notice)));
+    let count = m.transcript.len();
+    push_context_vm_notices(&agent, &mut m);
+    assert_eq!(m.transcript.len(), count);
+    assert!(
+        matches!(perform(&crate::Args::default(), &mut agent, &mut m, crate::slash::SlashAction::Rewind).unwrap(),
+        Done::Note(text) if text == notice)
+    );
+    agent.prompt("new prompt");
+    let Done::Ask(question) = perform(
+        &crate::Args::default(),
+        &mut agent,
+        &mut m,
+        crate::slash::SlashAction::Rewind,
+    )
+    .unwrap() else {
+        panic!("recording resumed, so the picker should open");
+    };
+    assert!(question.ask(&agent).note.contains(&notice));
+    let failure = "Rewind stopped recording because checkpoint storage is full";
+    agent.runtime.as_ref().unwrap().fail_prompt_rewind(failure);
+    push_context_vm_notices(&agent, &mut m);
+    assert!(m.transcript.iter().any(|entry|
+        matches!(entry, Entry::Tool { state: State::Attention, target, .. } if target == failure)));
+    assert!(
+        matches!(perform(&crate::Args::default(), &mut agent, &mut m, crate::slash::SlashAction::Rewind).unwrap(),
+        Done::Note(text) if text == failure)
+    );
+}

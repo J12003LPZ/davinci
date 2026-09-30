@@ -155,3 +155,68 @@ fn containment_does_not_loosen_network_or_outside_command_approval() {
         assert!(!matches!(after, davinci_agent::PermissionVerdict::Allow));
     }
 }
+
+#[test]
+fn lazy_default_is_resolved_only_on_the_first_switch_to_auto() {
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    };
+    let root = tempfile::tempdir().unwrap();
+    let workspace = root.path().to_path_buf();
+    let mut agent = Agent::new("fixture");
+    agent.set_permission_mode(PermissionMode::Ask);
+    let probes = Arc::new(AtomicUsize::new(0));
+    let counted = probes.clone();
+    agent.configure_auto_sandbox_lazy(Arc::new(move || {
+        counted.fetch_add(1, Ordering::SeqCst);
+        Ok(Some(policy(&workspace)))
+    }));
+    agent.set_permission_mode(PermissionMode::Edits);
+    assert_eq!(probes.load(Ordering::SeqCst), 0, "no probe outside Auto");
+    agent.set_permission_mode(PermissionMode::Auto);
+    assert_eq!(probes.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        agent.tool_context.sandbox.as_ref().unwrap().id.0,
+        "probed-default"
+    );
+    agent.set_permission_mode(PermissionMode::Ask);
+    agent.set_permission_mode(PermissionMode::Auto);
+    assert_eq!(probes.load(Ordering::SeqCst), 1, "resolved once");
+}
+
+#[test]
+fn lazy_default_errors_and_withdrawal_become_the_unavailable_reason() {
+    use std::sync::Arc;
+    let root = tempfile::tempdir().unwrap();
+    let workspace = root.path().to_path_buf();
+
+    let mut invalid = Agent::new("fixture");
+    invalid.set_permission_mode(PermissionMode::Ask);
+    invalid.configure_auto_sandbox_lazy(Arc::new(|| Err("Auto policy unavailable: bad".into())));
+    invalid.set_permission_mode(PermissionMode::Auto);
+    assert!(invalid.tool_context.sandbox.is_none());
+    assert_eq!(
+        invalid.auto_sandbox_unavailable_reason(),
+        Some("Auto policy unavailable: bad")
+    );
+
+    let mut withdrawn = Agent::new("fixture");
+    withdrawn.set_permission_mode(PermissionMode::Ask);
+    withdrawn.configure_auto_sandbox_lazy(Arc::new(move || Ok(Some(policy(&workspace)))));
+    withdrawn.withdraw_auto_sandbox("unowned MCP descendants");
+    withdrawn.set_permission_mode(PermissionMode::Auto);
+    assert!(withdrawn.tool_context.sandbox.is_none());
+    assert_eq!(
+        withdrawn.auto_sandbox_unavailable_reason(),
+        Some("unowned MCP descendants")
+    );
+
+    // Without a capable backend there is nothing to withdraw.
+    let mut none = Agent::new("fixture");
+    none.set_permission_mode(PermissionMode::Ask);
+    none.configure_auto_sandbox_lazy(Arc::new(|| Ok(None)));
+    none.withdraw_auto_sandbox("unowned MCP descendants");
+    none.set_permission_mode(PermissionMode::Auto);
+    assert_eq!(none.auto_sandbox_unavailable_reason(), None);
+}

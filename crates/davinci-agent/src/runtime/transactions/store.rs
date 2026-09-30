@@ -452,12 +452,12 @@ fn validate(record: &Record, root: &Path) -> Result<(), String> {
     let mut paths = std::collections::BTreeSet::new();
     let mut bytes = 0usize;
     for change in &record.changes {
-        if (change.alias_pending && change.proposed.windows_short_name.is_empty())
+        if (change.alias_pending && change.proposed.hash.is_none())
             || (change.restore_alias_pending
                 && change
                     .restored
                     .as_ref()
-                    .is_none_or(|image| image.windows_short_name.is_empty()))
+                    .is_none_or(|image| image.hash.is_none()))
             || ((change.alias_pending || change.restore_alias_pending)
                 && !matches!(
                     record.summary.state,

@@ -55,7 +55,8 @@ impl ActivePlugin {
                 .and_then(|path| manifest::canonical(&path).ok())
                 .as_ref()
                 == Some(&self.plugin.root)
-            && hooks::digest(&self.plugin.root, &self.plugin.hooks).as_ref() == Some(digest)
+            && hooks::digest_unless_unchanged(&self.plugin.root, &self.plugin.hooks).as_ref()
+                == Some(digest)
     }
 
     fn hook_context(&self, cwd: &Path) -> HookContext {
@@ -264,11 +265,29 @@ impl ActivePlugins {
         subject: Option<&str>,
         input: &HookInput,
     ) -> EventResult {
+        self.run_event_cancellable(event, subject, input, &|| false)
+    }
+
+    /// [`Self::run_event`] that stops at the first hook once `cancelled`
+    /// reports true, including one that is already running.
+    pub fn run_event_cancellable(
+        &self,
+        event: HookEvent,
+        subject: Option<&str>,
+        input: &HookInput,
+        cancelled: &dyn Fn() -> bool,
+    ) -> EventResult {
         if !input.session_id.is_empty() {
             *last_session_id().lock().unwrap_or_else(|e| e.into_inner()) = input.session_id.clone();
         }
         let mut result = EventResult::default();
+        // `hooks_for` has just verified approval; re-check only once a hook
+        // has run, since it may have changed files or revoked approval.
+        let mut hook_ran = false;
         for (active, hook) in self.hooks_for(event) {
+            if cancelled() {
+                break;
+            }
             let matched = match event {
                 HookEvent::PreToolUse | HookEvent::PostToolUse | HookEvent::SessionStart => {
                     hooks::matcher_accepts(hook.matcher.as_deref(), subject.unwrap_or(""))
@@ -280,13 +299,15 @@ impl ActivePlugins {
             }
             // An earlier hook may revoke approval or change files. Loaded
             // references are discovery data, never continuing execution consent.
-            if !hooks_allowed_here() || !active.hooks_approved() {
+            if hook_ran && (!hooks_allowed_here() || !active.hooks_approved()) {
                 continue;
             }
-            let outcome: HookOutcome = hooks::run(
+            hook_ran = true;
+            let outcome: HookOutcome = hooks::run_cancellable(
                 hook,
                 &active.hook_context(&input.cwd),
                 &input.payload(event),
+                cancelled,
             );
             if let Some(context) = outcome.context {
                 result.contexts.push((active.plugin.name.clone(), context));

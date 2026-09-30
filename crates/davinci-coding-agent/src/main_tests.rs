@@ -38,6 +38,41 @@ fn contextual_dispatch_attachments_require_context_and_live_cancellation() {
 }
 use super::*;
 
+#[test]
+fn prompt_rewind_notices_reach_host_warnings_and_legacy_picker() {
+    let dir = tempfile::tempdir().unwrap();
+    let store =
+        davinci_session::JsonlSession::create(dir.path(), &dir.path().to_string_lossy(), None)
+            .unwrap();
+    std::fs::write(store.path.with_extension("rewind-effects.jsonl"), "{broken").unwrap();
+    let mut agent = Agent::new("rewind notice fixture");
+    agent.cwd = dir.path().into();
+    agent.load_from_session(store).unwrap();
+    let notice = agent.prompt_rewind_notice().unwrap();
+    assert!(notice.contains("kept at"));
+    let calls = context_vm_notify_calls(&agent);
+    assert!(calls
+        .iter()
+        .any(|call| call["message"] == notice && call["type"] == "warning"));
+    assert!(!context_vm_notify_calls(&agent)
+        .iter()
+        .any(|call| call["message"] == notice));
+    let mut ui = InteractiveSession::new(builtin_themes()[0].clone(), "fixture", vec![]);
+    open_prompt_rewind(&agent, &mut ui).unwrap();
+    assert_eq!(ui.chrome.status, notice);
+
+    // The load notice remains useful after recording begins again.
+    agent.prompt("new prompt");
+    open_prompt_rewind(&agent, &mut ui).unwrap();
+    assert_eq!(ui.chrome.status, notice);
+    let failure = "Rewind stopped recording because its effect report could not be written";
+    agent.runtime.as_ref().unwrap().fail_prompt_rewind(failure);
+    let calls = context_vm_notify_calls(&agent);
+    assert!(calls.iter().any(|call| call["message"] == failure));
+    open_prompt_rewind(&agent, &mut ui).unwrap();
+    assert_eq!(ui.chrome.status, failure);
+}
+
 #[cfg(unix)]
 #[test]
 fn completion_hooks_share_print_rpc_and_interactive_host_path() {
@@ -173,7 +208,7 @@ fn plugin_completion_dispatch_and_post_tool_feedback_reach_host() {
     };
     for active in [false, true] {
         assert_eq!(
-            run_plugin_completion_hooks(&plugins, &input, active).as_deref(),
+            run_plugin_completion_hooks(&plugins, &input, active, &|| false).as_deref(),
             Some("plugin finish-line: lint failed")
         );
         let payload: serde_json::Value =
@@ -2689,6 +2724,17 @@ fn status_text_not_automatically_appended_to_model_context() {
         initial_len,
         "status output must not append to agent messages"
     );
+}
+
+#[test]
+fn status_header_is_one_line_and_sandbox_is_reported_once() {
+    let agent = Agent::new("sys");
+    let status = format_session_status(&Args::default(), &agent);
+    let header = status.lines().next().unwrap();
+    assert!(header.contains(" · input "), "{status}");
+    assert!(!header.contains("Background accounting"), "{status}");
+    assert!(status.contains("Background accounting"), "{status}");
+    assert_eq!(status.matches("Enforcement:").count(), 1, "{status}");
 }
 
 #[test]

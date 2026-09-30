@@ -557,12 +557,16 @@ pub fn append_event(
 
 /// Per-prompt completion gate. Project trust/integrity and the graph-worker
 /// fence apply before executing any command. Legacy `stop` is separate.
+///
+/// These hooks run on the agent loop at the moment the model tries to finish,
+/// so `cancelled` (the user's Esc/Ctrl+C) stops a running hook immediately.
 pub fn run_completion(
     hooks: &HooksFile,
     config: &HookPolicyConfig,
     cwd: &Path,
     agent_dir: &Path,
     stop_hook_active: bool,
+    cancelled: &dyn Fn() -> bool,
 ) -> Option<String> {
     if std::env::var_os("PI_GRAPH_ROLE").is_some() {
         return None;
@@ -573,7 +577,10 @@ pub fn run_completion(
     }
     let args = serde_json::json!({"stop_hook_active": stop_hook_active});
     for argv in &hooks.completion {
-        if let Err(reason) = run_supervised_hook(
+        if cancelled() {
+            return None;
+        }
+        if let Err(reason) = run_supervised_hook_cancellable(
             argv,
             "completion",
             "",
@@ -584,15 +591,19 @@ pub fn run_completion(
             None,
             Some(cwd),
             3,
+            cancelled,
         ) {
             return Some(reason);
         }
     }
     if config.enabled {
         for rule in &hooks.rules {
+            if cancelled() {
+                return None;
+            }
             if rule.matches("completion", "", None) {
-                if let Err(reason) = run_rule(
-                    rule,
+                if let Err(reason) = run_supervised_hook_cancellable(
+                    &rule.action,
                     "completion",
                     "",
                     None,
@@ -602,6 +613,7 @@ pub fn run_completion(
                     rule.timeout_ms.or(Some(config.default_timeout_ms)),
                     Some(cwd),
                     config.max_depth,
+                    cancelled,
                 ) {
                     match rule.on_failure {
                         HookFailurePolicy::Block => return Some(reason),
@@ -793,6 +805,38 @@ pub fn run_supervised_hook(
     cwd: Option<&Path>,
     max_depth: usize,
 ) -> Result<(), String> {
+    run_supervised_hook_cancellable(
+        argv,
+        kind,
+        tool,
+        path,
+        args,
+        result,
+        envelope,
+        timeout_ms,
+        cwd,
+        max_depth,
+        &|| false,
+    )
+}
+
+/// [`run_supervised_hook`] that stops the hook's process tree as soon as
+/// `cancelled` reports true. A cancelled hook neither blocks nor passes; the
+/// caller sees the abort itself.
+#[allow(clippy::too_many_arguments)]
+pub fn run_supervised_hook_cancellable(
+    argv: &[String],
+    kind: &str,
+    tool: &str,
+    path: Option<&Path>,
+    args: &Value,
+    result: Option<&str>,
+    envelope: Option<&davinci_agent::RuntimeEventEnvelope>,
+    timeout_ms: Option<u64>,
+    cwd: Option<&Path>,
+    max_depth: usize,
+    cancelled: &dyn Fn() -> bool,
+) -> Result<(), String> {
     let Some(program) = argv.first() else {
         return hook_failure(kind, "empty hook command".to_string());
     };
@@ -888,11 +932,14 @@ pub fn run_supervised_hook(
             timeout,
             output_cap: MAX_HOOK_STREAM_BYTES,
         },
-        &|| false,
+        cancelled,
     ) {
         Ok(output) => output,
         Err(err) => return hook_failure(kind, format!("hook `{program}` failed: {err}")),
     };
+    if output.cancelled {
+        return Ok(());
+    }
 
     if output.timed_out {
         GLOBAL_HOOK_TELEMETRY
@@ -1066,17 +1113,17 @@ mod tests {
 
     fn output_hook(code: i32, stdout: &str, stderr: &str) -> Vec<String> {
         if cfg!(windows) {
-            // cmd's /C grammar does not use the CRT quote/backslash rules
-            // applied to argv by Command. Emit the fixture's exact JSON bytes.
-            vec![
-                "powershell".into(),
-                "-NoProfile".into(),
-                "-Command".into(),
-                format!(
-                    "[Console]::In.ReadToEnd() | Out-Null; [Console]::Out.Write('{}'); [Console]::Error.Write('{}'); exit {code}",
-                    stdout.replace('\'', "''"), stderr.replace('\'', "''")
-                ),
-            ]
+            // Avoid PowerShell in Windows hook fixtures: on windows-latest
+            // cold PowerShell startup can exceed the short hook deadlines this
+            // module is testing. Python is already available on the CI image
+            // and receives argv without cmd.exe quoting rules, so it can emit
+            // exact JSON fixture bytes while still draining stdin.
+            let script = format!(
+                "import sys; sys.stdin.read(); sys.stdout.write({}); sys.stderr.write({}); sys.exit({code})",
+                serde_json::to_string(stdout).unwrap(),
+                serde_json::to_string(stderr).unwrap(),
+            );
+            vec!["python".into(), "-c".into(), script]
         } else {
             vec![
                 "sh".into(),
@@ -1117,9 +1164,36 @@ mod tests {
                 completion: vec![argv],
                 ..Default::default()
             };
-            let result = run_completion(&hooks, &config, dir.path(), dir.path(), false);
+            let result = run_completion(&hooks, &config, dir.path(), dir.path(), false, &|| false);
             assert_eq!(result.as_deref(), expected);
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn completion_hook_stops_when_the_user_aborts() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        let hooks = HooksFile {
+            completion: vec![vec!["sh".into(), "-c".into(), "sleep 30; exit 2".into()]],
+            ..Default::default()
+        };
+        let started = std::time::Instant::now();
+        let aborted = || started.elapsed() > Duration::from_millis(200);
+        let result = run_completion(
+            &hooks,
+            &HookPolicyConfig::default(),
+            dir.path(),
+            dir.path(),
+            false,
+            &aborted,
+        );
+        assert_eq!(result, None, "a cancelled hook neither blocks nor passes");
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "the hook kept running after abort: {:?}",
+            started.elapsed()
+        );
     }
 
     #[test]
@@ -1140,7 +1214,8 @@ mod tests {
                     &HookPolicyConfig::default(),
                     dir.path(),
                     dir.path(),
-                    active
+                    active,
+                    &|| false
                 ),
                 None
             );
@@ -1166,31 +1241,31 @@ mod tests {
                 tool: None,
                 path_pattern: None,
                 action: output_hook(2, "", "rule feedback"),
-                timeout_ms: Some(500),
+                timeout_ms: Some(5_000),
                 on_failure: HookFailurePolicy::Block,
             }],
             ..Default::default()
         };
         let mut config = HookPolicyConfig::default();
         assert_eq!(
-            run_completion(&hooks, &config, dir.path(), dir.path(), false).as_deref(),
+            run_completion(&hooks, &config, dir.path(), dir.path(), false, &|| false).as_deref(),
             Some("rule feedback")
         );
         config.enabled = false;
         assert_eq!(
-            run_completion(&hooks, &config, dir.path(), dir.path(), false),
+            run_completion(&hooks, &config, dir.path(), dir.path(), false, &|| false),
             None
         );
         config.enabled = true;
         hooks.rules[0].on_failure = HookFailurePolicy::Warn;
         assert_eq!(
-            run_completion(&hooks, &config, dir.path(), dir.path(), false),
+            run_completion(&hooks, &config, dir.path(), dir.path(), false, &|| false),
             None
         );
         hooks.rules[0].on_failure = HookFailurePolicy::Block;
         hooks.rules[0].tool = Some("read".into());
         assert_eq!(
-            run_completion(&hooks, &config, dir.path(), dir.path(), false),
+            run_completion(&hooks, &config, dir.path(), dir.path(), false, &|| false),
             None
         );
         hooks.rules[0].tool = None;
@@ -1202,7 +1277,7 @@ mod tests {
         hooks.rules[0].timeout_ms = Some(100);
         let started = std::time::Instant::now();
         assert_eq!(
-            run_completion(&hooks, &config, dir.path(), dir.path(), false),
+            run_completion(&hooks, &config, dir.path(), dir.path(), false, &|| false),
             None
         );
         assert!(started.elapsed() < Duration::from_secs(5));
@@ -1231,20 +1306,21 @@ mod tests {
                 &config,
                 &project,
                 &agent,
-                false
+                false,
+                &|| false
             ),
             None
         );
         assert!(!capture.exists());
         let trusted = load(&agent, &project, true);
         std::env::set_var("PI_GRAPH_ROLE", "writer");
-        let blocked_worker = run_completion(&trusted, &config, &project, &agent, false);
+        let blocked_worker = run_completion(&trusted, &config, &project, &agent, false, &|| false);
         std::env::remove_var("PI_GRAPH_ROLE");
         assert_eq!(blocked_worker, None);
         assert!(!capture.exists());
         std::fs::write(&path, "{}").unwrap();
         assert_eq!(
-            run_completion(&trusted, &config, &project, &agent, false),
+            run_completion(&trusted, &config, &project, &agent, false, &|| false),
             None
         );
         assert!(!capture.exists(), "changed project hooks never execute");
@@ -1258,7 +1334,7 @@ mod tests {
             .set(&project, Some(false))
             .unwrap();
         assert_eq!(
-            run_completion(&trusted, &config, &project, &agent, false),
+            run_completion(&trusted, &config, &project, &agent, false, &|| false),
             None
         );
         assert!(!capture.exists(), "revoked trust never executes");
@@ -1514,6 +1590,7 @@ mod tests {
 
     #[test]
     fn a_hook_that_ignores_large_stdin_still_times_out() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         // Windows: `ping` runs about 30 s and never reads stdin, like
         // `sleep 30`; PowerShell is avoided in these tests (see `shell_hook`).
         let command = if cfg!(windows) {
@@ -1541,7 +1618,9 @@ mod tests {
             3,
         );
         assert!(result.unwrap_err().contains("timed out"));
-        assert!(started.elapsed() < Duration::from_secs(5));
+        // Include runner contention and process-tree cleanup, while staying
+        // well below the fixture's 30-second natural exit.
+        assert!(started.elapsed() < Duration::from_secs(10));
     }
 
     #[test]

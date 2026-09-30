@@ -601,6 +601,7 @@ pub fn handle_rpc(runtime: &mut RpcRuntime, command: RpcCommand) -> RpcResponse 
             &kind,
             Some(serde_json::json!({
                 "checkpoints": runtime.agent.prompt_checkpoints(),
+                "notice": runtime.agent.prompt_rewind_notice(),
                 "limitation": davinci_agent::runtime::rewind::SHELL_REWIND_LIMITATION,
             })),
         ),
@@ -614,6 +615,7 @@ pub fn handle_rpc(runtime: &mut RpcRuntime, command: RpcCommand) -> RpcResponse 
                     &kind,
                     Some(serde_json::json!({
                         "preview": preview,
+                        "notice": runtime.agent.prompt_rewind_notice(),
                         "limitation": davinci_agent::runtime::rewind::SHELL_REWIND_LIMITATION,
                     })),
                 ),
@@ -2587,6 +2589,73 @@ mod tests {
 #[cfg(test)]
 mod rewind_rpc_tests {
     use super::*;
+
+    #[test]
+    fn rpc_rewind_notices_explain_corrupt_load_and_recording_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let store =
+            davinci_session::JsonlSession::create(dir.path(), &dir.path().to_string_lossy(), None)
+                .unwrap();
+        std::fs::write(store.path.with_extension("rewind-effects.jsonl"), "{broken").unwrap();
+        let mut agent = Agent::new("rewind notice fixture");
+        agent.cwd = dir.path().into();
+        agent.load_from_session(store).unwrap();
+        let notice = agent.prompt_rewind_notice().unwrap();
+        let mut runtime = RpcRuntime::new(agent, dir.path().into(), dir.path().into());
+        let list = handle_rpc(
+            &mut runtime,
+            RpcCommand {
+                kind: "get_rewind_checkpoints".into(),
+                ..Default::default()
+            },
+        );
+        assert_eq!(list.data.unwrap()["notice"], notice);
+        runtime.agent.prompt("new prompt");
+        let id = runtime.agent.prompt_checkpoints()[0].id.clone();
+        let preview = handle_rpc(
+            &mut runtime,
+            RpcCommand {
+                kind: "rewind_preview".into(),
+                checkpoint_id: Some(id.clone()),
+                ..Default::default()
+            },
+        );
+        let data = preview.data.unwrap();
+        assert_eq!(data["notice"], notice);
+        let digest = data["preview"]["preview_digest"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let failure = "Rewind stopped recording because its effect report could not be written";
+        runtime
+            .agent
+            .runtime
+            .as_ref()
+            .unwrap()
+            .fail_prompt_rewind(failure);
+        let list = handle_rpc(
+            &mut runtime,
+            RpcCommand {
+                kind: "get_rewind_checkpoints".into(),
+                ..Default::default()
+            },
+        );
+        assert_eq!(list.data.unwrap()["notice"], failure);
+        for kind in ["rewind_preview", "rewind_apply"] {
+            let response = handle_rpc(
+                &mut runtime,
+                RpcCommand {
+                    kind: kind.into(),
+                    checkpoint_id: Some(id.clone()),
+                    preview_digest: Some(digest.clone()),
+                    mode: Some("conversation".into()),
+                    ..Default::default()
+                },
+            );
+            assert!(!response.success);
+            assert_eq!(response.error.as_deref(), Some(failure));
+        }
+    }
 
     #[test]
     fn rpc_rewind_lists_previews_and_requires_current_host_authority() {
