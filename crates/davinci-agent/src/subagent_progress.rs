@@ -9,7 +9,7 @@
 //! anything about the worker.
 
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -18,6 +18,9 @@ use crate::events::AgentEvent;
 
 /// How many recent tool calls a snapshot keeps.
 pub const RECENT_CALLS: usize = 8;
+
+/// How often a streaming reply re-estimates its tokens for the live count.
+const STREAM_ESTIMATE_INTERVAL: Duration = Duration::from_millis(250);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -52,6 +55,12 @@ pub struct SubagentProgress {
 struct Inner {
     progress: SubagentProgress,
     started: Instant,
+    /// Tokens of finished replies, as the provider reported them.
+    settled: u64,
+    /// Estimate for the reply still streaming; replaced by its reported
+    /// usage when it ends.
+    streaming: u64,
+    last_estimate: Option<Instant>,
 }
 
 /// Collects one worker's activity and forwards it to the lead.
@@ -92,6 +101,9 @@ impl ProgressReporter {
                     ..SubagentProgress::default()
                 },
                 started: Instant::now(),
+                settled: 0,
+                streaming: 0,
+                last_estimate: None,
             })),
         }
     }
@@ -128,9 +140,58 @@ impl ProgressReporter {
     }
 
     pub fn add_tokens(&self, tokens: u64) {
-        if tokens > 0 {
-            self.update(|progress| progress.tokens += tokens);
-        }
+        self.update_tokens(|inner| {
+            inner.settled += tokens;
+            inner.streaming = 0;
+            inner.last_estimate = None;
+            true
+        });
+    }
+
+    /// A reply is streaming: count its estimated tokens now, so the lead sees
+    /// the worker's usage climb while it works, not only after each reply.
+    /// Re-estimated at most every [`STREAM_ESTIMATE_INTERVAL`].
+    pub fn streaming(&self, message: &davinci_ai::ChatMessage) {
+        self.update_tokens(|inner| {
+            if inner
+                .last_estimate
+                .is_some_and(|at| at.elapsed() < STREAM_ESTIMATE_INTERVAL)
+            {
+                return false;
+            }
+            inner.last_estimate = Some(Instant::now());
+            let estimate = crate::compaction::estimate_tokens(message);
+            if estimate <= inner.streaming {
+                return false;
+            }
+            inner.streaming = estimate;
+            true
+        });
+    }
+
+    /// Apply `change` to the token counters and emit a snapshot only when it
+    /// says the visible count moved.
+    fn update_tokens(&self, change: impl FnOnce(&mut Inner) -> bool) {
+        let snapshot = {
+            let mut inner = self
+                .inner
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let before = inner.progress.tokens;
+            if !change(&mut inner) {
+                return;
+            }
+            inner.progress.tokens = inner.settled + inner.streaming;
+            if inner.progress.tokens == before {
+                return;
+            }
+            inner.progress.elapsed_ms = inner.started.elapsed().as_millis() as u64;
+            inner.progress.clone()
+        };
+        (self.sink.0)(&AgentEvent::SubagentProgress {
+            tool_call_id: self.tool_call_id.clone(),
+            progress: snapshot,
+        });
     }
 
     pub fn backgrounded(&self) {
@@ -153,8 +214,18 @@ impl ProgressReporter {
             AgentEvent::ToolExecutionStart {
                 tool_name, args, ..
             } => self.tool_started(tool_name, args),
+            AgentEvent::MessageUpdate { message, .. } if message.role == "assistant" => {
+                self.streaming(message)
+            }
             AgentEvent::MessageEnd { message } if message.role == "assistant" => {
-                self.add_tokens(message_tokens(message))
+                // A reply without reported usage keeps its streamed estimate.
+                let reported = message_tokens(message);
+                let tokens = if reported > 0 {
+                    reported
+                } else {
+                    crate::compaction::estimate_tokens(message)
+                };
+                self.add_tokens(tokens)
             }
             _ => {}
         }
@@ -269,6 +340,27 @@ mod tests {
         assert_eq!(last.tokens, 1250);
         assert_eq!(last.recent, vec!["Read(src/auth.rs)".to_string()]);
         assert_eq!(last.label, "map auth");
+    }
+
+    #[test]
+    fn streaming_replies_count_live_then_settle_to_reported_usage() {
+        let (sink, seen) = collecting();
+        let reporter = ProgressReporter::new("call-1", sink, "a1", "map auth", (0, 1), "oneshot");
+        let partial = davinci_ai::ChatMessage::text("assistant", "word ".repeat(400));
+        reporter.streaming(&partial);
+        let live = seen.lock().unwrap().last().unwrap().tokens;
+        assert!(live > 0, "a streaming reply counts before it ends");
+        // Throttled: an immediate second delta does not re-emit.
+        let emitted = seen.lock().unwrap().len();
+        reporter.streaming(&partial);
+        assert_eq!(seen.lock().unwrap().len(), emitted);
+        let mut answer = davinci_ai::ChatMessage::text("assistant", "done");
+        answer.extra.insert(
+            "usage".into(),
+            serde_json::json!({"input": 3000, "output": 500}),
+        );
+        reporter.observe(&AgentEvent::MessageEnd { message: answer });
+        assert_eq!(seen.lock().unwrap().last().unwrap().tokens, 3500);
     }
 
     #[test]

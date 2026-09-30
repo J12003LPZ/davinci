@@ -374,6 +374,11 @@ jobs:
         run: |
           set -euo pipefail
           umask 077
+          # Process-heavy Windows suites otherwise compete for child startup
+          # and can exhaust fixture deadlines on hosted runners.
+          if [[ "$RUNNER_OS" == "Windows" ]]; then
+            export RUST_TEST_THREADS=4
+          fi
           if [[ "${{ matrix.package }}" == "davinci-coding-agent" ]]; then
             cargo build -p davinci-coding-agent --bin davinci --locked
           fi

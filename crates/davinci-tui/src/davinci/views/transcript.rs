@@ -433,7 +433,18 @@ fn subagent_lines(model: &Model, rows: &[SubagentRow], width: u16) -> Vec<Line<'
     };
     if let [row] = rows {
         let failed = row.state == SubagentRowState::Failed;
-        if row.state != SubagentRowState::Running || row.recent.is_empty() {
+        let running = row.state == SubagentRowState::Running;
+        if running && row.recent.is_empty() {
+            // Thinking before its first tool call still spends tokens.
+            let tokens = subagent_stats(row, false);
+            let text = if tokens.is_empty() {
+                "Initializing…".to_string()
+            } else {
+                format!("Initializing… · {tokens}")
+            };
+            return vec![line(format!("{ELBOW}{text}"), false)];
+        }
+        if !running {
             return vec![line(format!("{ELBOW}{}", subagent_outcome(row)), failed)];
         }
         let cap = if model.show_tool_output {
@@ -450,19 +461,29 @@ fn subagent_lines(model: &Model, rows: &[SubagentRow], width: u16) -> Vec<Line<'
                 line(format!("{lead}{call}"), false)
             })
             .collect();
+        // The live tally under the calls: `+3 more tool uses · 12.4k tokens`.
         let hidden = row.tool_uses.saturating_sub(shown.len() as u64);
+        let mut tally = Vec::new();
         if hidden > 0 {
-            let more = if hidden == 1 {
+            tally.push(if hidden == 1 {
                 "+1 more tool use".to_string()
             } else {
                 format!("+{hidden} more tool uses")
-            };
-            let hint = if model.show_tool_output {
+            });
+        }
+        if row.tokens > 0 {
+            tally.push(format!("{} tokens", compact_tokens(row.tokens)));
+        }
+        if !tally.is_empty() {
+            let hint = if hidden == 0 || model.show_tool_output {
                 ""
             } else {
                 " (ctrl+t to expand)"
             };
-            out.push(line(format!("{ELBOW_GAP}{more}{hint}"), false));
+            out.push(line(
+                format!("{ELBOW_GAP}{}{hint}", tally.join(" · ")),
+                false,
+            ));
         }
         return out;
     }
@@ -930,7 +951,35 @@ mod tests {
         assert_eq!(rows.len(), 4, "{rows:?}");
         assert!(rows[0].contains("⎿") && rows[0].ends_with("Search(\"auth\")"));
         assert!(rows[2].ends_with("Read(c.rs)"));
-        assert!(rows[3].contains("+4 more tool uses (ctrl+t to expand)"));
+        assert!(
+            rows[3].contains("+4 more tool uses · 23.4k tokens (ctrl+t to expand)"),
+            "{rows:?}"
+        );
+    }
+
+    #[test]
+    fn a_running_worker_shows_its_live_token_count() {
+        let m = model(100);
+        let rows = drawn(
+            &m,
+            vec![worker(
+                "map auth",
+                SubagentRowState::Running,
+                1,
+                &["Read(a.rs)"],
+            )],
+        );
+        assert_eq!(rows.len(), 2, "{rows:?}");
+        assert!(rows[1].trim_end().ends_with("23.4k tokens"), "{rows:?}");
+        assert!(!rows[1].contains("ctrl+t"), "nothing hidden to expand");
+        let thinking = drawn(
+            &m,
+            vec![worker("map auth", SubagentRowState::Running, 0, &[])],
+        );
+        assert!(
+            thinking[0].ends_with("Initializing… · 23.4k tokens"),
+            "{thinking:?}"
+        );
     }
 
     #[test]

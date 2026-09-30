@@ -694,8 +694,14 @@ fn seatbelt_parent_loss_fixture() {
         String::from_utf8_lossy(&output.lock().unwrap()).contains("SEATBELT_RESULT")
     });
     fs::write(
-        root.join("owned-temp.json"),
+        root.join("owned-temp.json.pending"),
         serde_json::to_vec(&result(&output)).unwrap(),
+    )
+    .unwrap();
+    // Existence is the reader's readiness signal: publish only complete JSON.
+    fs::rename(
+        root.join("owned-temp.json.pending"),
+        root.join("owned-temp.json"),
     )
     .unwrap();
     // The test's owner is deliberately killed without destructors. Retain the
