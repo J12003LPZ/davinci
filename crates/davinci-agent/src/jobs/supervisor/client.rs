@@ -204,7 +204,10 @@ impl Supervisor {
             }
             match input_rx.recv_timeout(POLL) {
                 Ok(request) if wire::write(&mut stdin, &request).is_err() => {
-                    control.stop.store(true, Ordering::SeqCst);
+                    // A helper can exit before a late stdin request arrives.
+                    // Transport closure is not caller cancellation: dropping
+                    // this writer closes the lifeline, while the monitor drains
+                    // buffered output and the authoritative terminal receipt.
                     break;
                 }
                 Ok(_) | Err(mpsc::RecvTimeoutError::Timeout) => {}

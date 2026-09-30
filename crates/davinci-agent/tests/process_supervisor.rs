@@ -643,3 +643,77 @@ fn stopping_one_owned_lifetime_preserves_an_unrelated_process_tree() {
         "second tree cleanup",
     );
 }
+
+#[test]
+fn supervisor_late_stdin_close_preserves_authoritative_exit() {
+    for pause_output in [false, true] {
+        let directory = tempfile::tempdir().unwrap();
+        let output = Arc::new(Mutex::new(Vec::new()));
+        let captured = output.clone();
+        let (reached, reached_rx) = std::sync::mpsc::sync_channel(1);
+        let (resume, resume_rx) = std::sync::mpsc::sync_channel(1);
+        let resume_rx = Mutex::new(resume_rx);
+        let process = Supervisor::spawn(
+            &host(),
+            config(
+                directory.path(),
+                vec![
+                    "-e".into(),
+                    "process.stdout.write('out');process.stderr.write('err');process.exitCode=7"
+                        .into(),
+                ],
+            ),
+            Arc::new(move |event| {
+                if let ProcessEvent::Output(bytes) = event {
+                    let mut output = captured.lock().unwrap();
+                    output.extend(bytes);
+                    let all_output_received = output.len() == 6;
+                    drop(output);
+                    if pause_output && all_output_received {
+                        reached.send(()).unwrap();
+                        resume_rx
+                            .lock()
+                            .unwrap()
+                            .recv_timeout(Duration::from_secs(5))
+                            .expect("release the paused output consumer");
+                    }
+                }
+            }),
+        )
+        .unwrap();
+        if pause_output {
+            reached_rx
+                .recv_timeout(Duration::from_secs(5))
+                .expect("both output streams must reach the consumer");
+            // The wire reader keeps receiving the helper's terminal receipt
+            // while the monitor is paused. Drive the stdin writer to closure
+            // rather than guessing when the helper has exited with a sleep.
+            let deadline = Instant::now() + Duration::from_secs(5);
+            loop {
+                match process.close_stdin() {
+                    Err(error)
+                        if error == "process is stopped"
+                            || error == "stdin queue is unavailable" =>
+                    {
+                        break;
+                    }
+                    _ => assert!(Instant::now() < deadline, "stdin writer did not close"),
+                }
+            }
+            assert!(process.wait(Duration::ZERO).is_none());
+            resume.send(()).unwrap();
+        }
+        let exit = process
+            .wait(Duration::from_secs(5))
+            .expect("the terminal receipt must survive stdin closure");
+        assert_eq!(exit.code, Some(7), "{exit:?}");
+        assert!(
+            !exit.stopped,
+            "transport closure is not caller cancellation"
+        );
+        assert!(exit.output_complete, "{exit:?}");
+        assert!(exit.error.is_none(), "{exit:?}");
+        let output = output.lock().unwrap();
+        assert!(output.as_slice() == b"outerr" || output.as_slice() == b"errout");
+    }
+}
