@@ -630,21 +630,43 @@ mod tests {
         let (lead, worker) = team_pair();
         let mate = worker.agent_id;
         let lead_for_thread = lead.clone();
+        let (turn_started_tx, turn_started_rx) = std::sync::mpsc::channel();
+        let (retry_queued_tx, retry_queued_rx) = std::sync::mpsc::channel();
         let nudger = std::thread::spawn(move || {
-            for _ in 0..2 {
-                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-                while lead_for_thread.registry.get(&mate).unwrap().state != AgentState::Idle {
-                    assert!(std::time::Instant::now() < deadline);
-                    std::thread::sleep(std::time::Duration::from_millis(10));
-                }
-                lead_for_thread.send_message(mate, "retry").unwrap();
+            for turn in 1..=2 {
+                turn_started_rx
+                    .recv_timeout(std::time::Duration::from_secs(5))
+                    .expect("turn did not start");
+                lead_for_thread
+                    .send_message(mate, format!("retry {turn}"))
+                    .unwrap();
+                retry_queued_tx.send(()).unwrap();
             }
         });
-        let exit = run_teammate_loop(&worker, "task", std::time::Duration::from_secs(30), |_| {
-            Err("provider down".into())
-        });
+        let mut prompts = Vec::new();
+        let exit = run_teammate_loop(
+            &worker,
+            "task",
+            std::time::Duration::from_secs(30),
+            |prompt| {
+                prompts.push(prompt.to_string());
+                if prompts.len() < 3 {
+                    // Queue one retry while this turn is still running. The
+                    // handshake prevents batching retries or racing idle wakes.
+                    turn_started_tx.send(()).unwrap();
+                    retry_queued_rx
+                        .recv_timeout(std::time::Duration::from_secs(5))
+                        .expect("retry was not queued");
+                }
+                Err("provider down".into())
+            },
+        );
         nudger.join().unwrap();
         assert!(matches!(exit, TeammateExit::Failed(ref e) if e.contains("provider down")));
+        assert_eq!(prompts.len(), 3);
+        assert_eq!(prompts[0], "task");
+        assert!(prompts[1].contains("retry 1"));
+        assert!(prompts[2].contains("retry 2"));
         assert_eq!(lead.take_labeled_messages(10).len(), 3);
     }
 
