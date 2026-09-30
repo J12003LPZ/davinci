@@ -242,6 +242,8 @@ impl Agent {
         self.ensure_session_persistence()?;
         self.recover_pending_operation_publications()?;
         let result = self.run_loop_body(emit_prompt_messages, complete);
+        self.completion_context.clear();
+        self.invalidate_context_image();
         let persistence = self.ensure_session_persistence();
         match (&result, persistence) {
             (_, Err(error)) => {
@@ -696,6 +698,13 @@ impl Agent {
                 .collect::<Vec<_>>();
 
             if tool_calls.is_empty() {
+                if self.abort_requested() {
+                    self.finish_run(&mut events, new_messages);
+                    return Ok(events);
+                }
+                if self.queue_requirement_completion(&mut events) {
+                    continue;
+                }
                 let capability_state = self.capability_run_state();
                 match crate::prompt::evaluate_completion(
                     &capability_state,
@@ -798,6 +807,10 @@ impl Agent {
                             continue;
                         }
                     }
+                }
+
+                if self.queue_completion_hook(&mut events) {
+                    continue;
                 }
             }
 

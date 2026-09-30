@@ -14,6 +14,7 @@ mod batch;
 mod branch;
 pub mod command_receipt;
 mod compaction;
+mod completion;
 mod context;
 pub mod context_usage;
 mod edit_diff;
@@ -72,6 +73,7 @@ pub use compaction::{
     SUMMARIZATION_PROMPT, SUMMARIZATION_SYSTEM_PROMPT, TURN_PREFIX_SUMMARIZATION_PROMPT,
     UPDATE_SUMMARIZATION_PROMPT,
 };
+pub use completion::CompletionHook;
 pub use context::{
     load_context_files, load_context_files_for_targets, ContextBudgetReport, ContextContribution,
     ContextFile, ContextPriority, RootContextAccount, SelectedRootContext,
@@ -468,6 +470,8 @@ pub struct Agent {
     pub custom_tool_executor: Option<CustomToolExecutor>,
     pub pre_tool: Option<PreToolHook>,
     pub post_tool: Option<PostToolHook>,
+    /// Trusted host callback at attempted completion; bool is stop_hook_active.
+    pub completion_hook: Option<CompletionHook>,
     /// Which tools may run without asking (`permission.rs`). Shared, because
     /// the gate reads it from `&self` on the tool thread while the host reads
     /// the mode for its chrome, and a granted rule is written back mid-turn.
@@ -543,6 +547,9 @@ pub struct Agent {
     capability_run_state: Arc<Mutex<prompt::CapabilityRunState>>,
     /// Mutation generations and verification evidence for the current run.
     mutation_verification: Arc<Mutex<MutationVerificationState>>,
+    completion_state: Arc<Mutex<completion::CompletionState>>,
+    /// Bounded request suffix; never session/WAL history or compaction input.
+    completion_context: Vec<ChatMessage>,
     pending_transaction_verification:
         Arc<Mutex<std::collections::BTreeMap<String, Vec<transaction_verification::Pending>>>>,
     /// Bounded actual command evidence, populated only by built-in execution.
@@ -661,6 +668,7 @@ impl Agent {
             custom_tool_executor: None,
             pre_tool: None,
             post_tool: None,
+            completion_hook: None,
             permissions: Arc::new(PermissionState::new(PermissionPolicy::default())),
             approver: None,
             approval_responder: None,
@@ -700,6 +708,8 @@ impl Agent {
             last_verification_notice: None,
             capability_run_state: Arc::new(Mutex::new(prompt::CapabilityRunState::default())),
             mutation_verification: Arc::new(Mutex::new(MutationVerificationState::default())),
+            completion_state: Arc::new(Mutex::new(completion::CompletionState::default())),
+            completion_context: Vec::new(),
             pending_transaction_verification: Arc::new(Mutex::new(
                 std::collections::BTreeMap::new(),
             )),
@@ -1127,6 +1137,11 @@ impl Agent {
     }
 
     pub(crate) fn record_successful_mutation_paths(&self, paths: Vec<PathBuf>) {
+        self.completion_state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .mutations
+            .extend(paths.iter().cloned());
         let mut state = self
             .mutation_verification
             .lock()
@@ -1725,6 +1740,7 @@ impl Agent {
         text: &str,
         images: &[davinci_ai::MessageContent],
     ) -> ChatMessage {
+        self.begin_completion_prompt(text);
         self.clear_turn_decision();
         let message = self.prompt_with_origin(text, images, true);
         self.delegation_forbidden =
@@ -1814,11 +1830,15 @@ impl Agent {
             && self.pruned_tool_results.is_empty()
             && plan_context.is_none()
         {
-            return convert_to_llm_for_provider(&self.messages, self.block_images);
+            let mut messages = convert_to_llm_for_provider(&self.messages, self.block_images);
+            messages.extend(self.completion_context.iter().cloned());
+            return messages;
         }
         let mut messages = self.project_with_evidence();
         if ephemeral_context.is_empty() && plan_context.is_none() {
-            return convert_to_llm_for_provider(&messages, self.block_images);
+            let mut messages = convert_to_llm_for_provider(&messages, self.block_images);
+            messages.extend(self.completion_context.iter().cloned());
+            return messages;
         }
         let insertion = messages
             .iter()
@@ -1828,7 +1848,9 @@ impl Agent {
             insertion..insertion,
             plan_context.into_iter().chain(ephemeral_context),
         );
-        convert_to_llm_for_provider(&messages, self.block_images)
+        let mut messages = convert_to_llm_for_provider(&messages, self.block_images);
+        messages.extend(self.completion_context.iter().cloned());
+        messages
     }
 
     #[doc(hidden)]
@@ -1875,7 +1897,8 @@ impl Agent {
             });
         }
         let budget = self.provider_context_budget();
-        let live = self.live_tool_exchange();
+        let mut live = self.live_tool_exchange();
+        live.extend(self.completion_context.iter().cloned());
         let live_tokens = live
             .iter()
             .map(provider_budget::message_token_ceiling)
@@ -2148,6 +2171,7 @@ impl Agent {
                 .unwrap_or(0)
             + (self.provider_system_prompt().len() as u64).div_ceil(4)
             + self.estimated_tool_schema_tokens()
+            + estimate_context_tokens(&self.completion_context)
     }
 
     /// Tool schemas on the same four-bytes-a-token scale as the rest of

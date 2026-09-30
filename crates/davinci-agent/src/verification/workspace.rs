@@ -24,7 +24,7 @@ struct FileStamp {
     link: Option<PathBuf>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub(crate) struct Snapshot {
     files: BTreeMap<PathBuf, Option<FileStamp>>,
     complete: bool,
@@ -47,6 +47,14 @@ impl Snapshot {
         Self::capture_with_limits(root, paths, 16_384, CAPTURE_BUDGET)
     }
 
+    pub(crate) fn capture_guarded(
+        root: &Path,
+        paths: &[PathBuf],
+        allowed: &dyn Fn(&Path) -> bool,
+    ) -> Self {
+        Self::capture_with_guard(root, paths, 16_384, Duration::from_millis(100), allowed)
+    }
+
     pub(crate) fn complete(&self) -> bool {
         self.complete
     }
@@ -64,6 +72,16 @@ impl Snapshot {
         paths: &[PathBuf],
         max_entries: usize,
         budget: Duration,
+    ) -> Self {
+        Self::capture_with_guard(root, paths, max_entries, budget, &|_| true)
+    }
+
+    fn capture_with_guard(
+        root: &Path,
+        paths: &[PathBuf],
+        max_entries: usize,
+        budget: Duration,
+        allowed: &dyn Fn(&Path) -> bool,
     ) -> Self {
         let start = Instant::now();
         let mut snapshot = Self {
@@ -85,6 +103,11 @@ impl Snapshot {
                 .strip_prefix(root)
                 .unwrap_or(&absolute)
                 .to_path_buf();
+            if !allowed(&absolute) {
+                snapshot.complete = false;
+                snapshot.required_complete = false;
+                continue;
+            }
             match stamp(&absolute, start, budget, &mut remaining_bytes) {
                 Ok(stamp) => {
                     snapshot.files.insert(relative, stamp);
@@ -141,6 +164,10 @@ impl Snapshot {
             if snapshot.files.contains_key(relative) {
                 continue;
             }
+            if !allowed(entry.path()) {
+                snapshot.complete = false;
+                continue;
+            }
             match stamp(entry.path(), start, budget, &mut remaining_bytes) {
                 Ok(stamp) => {
                     snapshot.files.insert(relative.to_path_buf(), stamp);
@@ -152,6 +179,18 @@ impl Snapshot {
             }
         }
         snapshot
+    }
+
+    pub(crate) fn path_changed(&self, after: &Self, path: &Path) -> Option<bool> {
+        let before = self.files.get(path);
+        let next = after.files.get(path);
+        ((self.complete || before.is_some()) && (after.complete || next.is_some()))
+            .then(|| before.and_then(Option::as_ref) != next.and_then(Option::as_ref))
+    }
+
+    pub(crate) fn path_is_new(&self, path: &Path) -> bool {
+        (self.complete || self.files.contains_key(path))
+            && self.files.get(path).and_then(Option::as_ref).is_none()
     }
 
     pub(crate) fn changes(&self, after: &Self) -> Vec<PathBuf> {

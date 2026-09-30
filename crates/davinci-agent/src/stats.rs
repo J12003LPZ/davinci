@@ -117,6 +117,15 @@ pub struct RunStats {
     /// evidence still incomplete.
     #[serde(default)]
     pub capability_incomplete_evidence: u64,
+    /// `completion.requirements` continuations, at most one per real prompt.
+    #[serde(default)]
+    pub completion_requirement_reminders: u64,
+    /// `completion.hook_block` continuations.
+    #[serde(default)]
+    pub completion_hook_blocks: u64,
+    /// `completion.hook_limit` notices after three consecutive blocks.
+    #[serde(default)]
+    pub completion_hook_limit_hits: u64,
     /// Mid-run steering inputs injected by the user.
     #[serde(default)]
     pub user_steers: u64,

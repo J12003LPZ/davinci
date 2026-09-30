@@ -26,7 +26,12 @@ impl Agent {
         let mut out = Fingerprint(Sha256::new());
         // Public mutable fields remain compatible: stream their fingerprint
         // without allocating/cloning the transcript or traversing its branch.
-        out.feed(&(&self.messages, &self.ephemeral_context, &self.context_files));
+        out.feed(&(
+            &self.messages,
+            &self.ephemeral_context,
+            &self.context_files,
+            &self.completion_context,
+        ));
         if let Some(session) = &self.session {
             out.feed(&(
                 &session.path,

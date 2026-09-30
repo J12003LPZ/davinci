@@ -1287,7 +1287,7 @@ fn apply(model: &mut Model, turn: &mut Turn, event: &AgentEvent) {
             }
         }
 
-        AgentEvent::VerificationNotice { text, .. } => {
+        AgentEvent::VerificationNotice { text, .. } | AgentEvent::CompletionNotice { text, .. } => {
             model.transcript.push(Entry::notice(State::Attention, text));
         }
 

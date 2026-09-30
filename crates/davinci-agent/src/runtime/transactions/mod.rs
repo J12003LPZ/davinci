@@ -2,6 +2,7 @@
 //! Authorization is supplied by the current host; records never grant authority.
 mod api;
 mod commit;
+pub(crate) use commit::git as observe_git;
 mod files;
 mod macos_acl;
 mod model;
