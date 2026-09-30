@@ -34,12 +34,28 @@ pub struct ActivePlugin {
     pub record: InstalledPlugin,
     pub plugin: Plugin,
     pub data_dir: PathBuf,
+    /// User store that authorized this loaded plugin, bound independently of cwd.
+    pub agent_dir: PathBuf,
 }
 
 impl ActivePlugin {
     /// Hooks run only when the approved digest matches the hooks on disk.
     pub fn hooks_approved(&self) -> bool {
-        self.plugin.hooks_digest.is_some() && self.record.hooks_approved == self.plugin.hooks_digest
+        let Some(digest) = &self.plugin.hooks_digest else {
+            return false;
+        };
+        let installed = store::load(&self.agent_dir);
+        let Some(record) = installed.plugins.get(&self.key) else {
+            return false;
+        };
+        record.enabled
+            && record.hooks_approved.as_ref() == Some(digest)
+            && locate(&self.key, record)
+                .ok()
+                .and_then(|path| manifest::canonical(&path).ok())
+                .as_ref()
+                == Some(&self.plugin.root)
+            && hooks::digest(&self.plugin.root, &self.plugin.hooks).as_ref() == Some(digest)
     }
 
     fn hook_context(&self, cwd: &Path) -> HookContext {
@@ -71,7 +87,7 @@ pub fn disabled_by_env() -> bool {
 }
 
 fn hooks_allowed_here() -> bool {
-    std::env::var_os("PI_GRAPH_ROLE").is_none()
+    !disabled_by_env() && std::env::var_os("PI_GRAPH_ROLE").is_none()
 }
 
 /// Where an installed plugin lives right now.
@@ -97,9 +113,15 @@ pub fn active(agent_dir: &Path) -> ActivePlugins {
         if !record.enabled {
             continue;
         }
-        let loaded = locate(&key, &record).and_then(|path| manifest::load_plugin(&path));
+        let loaded = manifest::canonical(agent_dir)
+            .map_err(|error| format!("plugin store unavailable: {error}"))
+            .and_then(|bound_dir| {
+                locate(&key, &record)
+                    .and_then(|path| manifest::load_plugin(&path))
+                    .map(|plugin| (bound_dir, plugin))
+            });
         match loaded {
-            Ok(plugin) => {
+            Ok((bound_dir, plugin)) => {
                 let data_dir = store::plugins_dir(agent_dir)
                     .join("data")
                     .join(store::split_key(&key).0);
@@ -108,6 +130,7 @@ pub fn active(agent_dir: &Path) -> ActivePlugins {
                     record,
                     plugin,
                     data_dir,
+                    agent_dir: bound_dir,
                 });
             }
             Err(err) => out.errors.push((key, err)),
@@ -208,11 +231,7 @@ impl ActivePlugins {
         }
         self.plugins
             .iter()
-            .filter(|active| {
-                active.hooks_approved()
-                    && hooks::digest(&active.plugin.root, &active.plugin.hooks)
-                        == active.plugin.hooks_digest
-            })
+            .filter(|active| active.hooks_approved())
             .flat_map(|active| {
                 active
                     .plugin
@@ -257,6 +276,11 @@ impl ActivePlugins {
                 _ => true,
             };
             if !matched {
+                continue;
+            }
+            // An earlier hook may revoke approval or change files. Loaded
+            // references are discovery data, never continuing execution consent.
+            if !hooks_allowed_here() || !active.hooks_approved() {
                 continue;
             }
             let outcome: HookOutcome = hooks::run(
@@ -618,6 +642,175 @@ mod tests {
             Ok(())
         })
         .unwrap();
+    }
+
+    fn loaded_hook_revocation(change: &str) {
+        let dir = tempfile::tempdir().unwrap();
+        let _homes = FakeHomes::new(dir.path());
+        let agent_dir = dir.path().join("agent");
+        let root = dir.path().join("revocation-demo");
+        let marker = dir.path().join("hook-marker");
+        write(&root.join("plugin.json"), r#"{"name":"revocation-demo"}"#);
+        #[cfg(windows)]
+        let command = format!(
+            "$null = [Console]::In.ReadToEnd(); [IO.File]::AppendAllText('{}', 'ran')",
+            marker.display()
+        );
+        #[cfg(not(windows))]
+        let command = format!("cat >/dev/null; echo ran >> '{}'", marker.display());
+        let hook =
+            json!({"command": command, "shell": if cfg!(windows) { "powershell" } else { "bash" }});
+        write(
+            &root.join("hooks/hooks.json"),
+            &json!({"hooks": {
+                "Stop": [{"hooks": [hook.clone()]}],
+                "PostToolUse": [{"hooks": [hook]}]
+            }})
+            .to_string(),
+        );
+        install_fixture(&agent_dir, &root, true);
+        let loaded = active(&agent_dir);
+        let input = HookInput {
+            cwd: dir.path().to_path_buf(),
+            ..Default::default()
+        };
+        loaded.run_event(HookEvent::Stop, None, &input);
+        assert!(marker.exists(), "approved fixture must actually execute");
+        std::fs::remove_file(&marker).unwrap();
+        if change == "env-off" {
+            std::env::set_var("DAVINCI_PLUGINS", "off");
+        } else {
+            store::update(&agent_dir, |file| {
+                if change == "remove" {
+                    file.plugins.remove("revocation-demo@local");
+                } else {
+                    let record = file.plugins.get_mut("revocation-demo@local").unwrap();
+                    match change {
+                        "revoke" => record.hooks_approved = None,
+                        "disable" => record.enabled = false,
+                        _ => panic!("unknown fixture change"),
+                    }
+                }
+                Ok(())
+            })
+            .unwrap();
+        }
+        let stop_present = loaded.has_hooks(HookEvent::Stop);
+        let post_present = loaded.has_matching_hook(HookEvent::PostToolUse, "Write");
+        loaded.run_event(HookEvent::Stop, None, &input);
+        loaded.run_event(HookEvent::PostToolUse, Some("Write"), &input);
+        if change == "env-off" {
+            std::env::remove_var("DAVINCI_PLUGINS");
+        }
+        assert!(
+            !marker.exists(),
+            "{change}: loaded hooks executed after revocation"
+        );
+        assert!(!stop_present, "{change}: loaded Stop remained approved");
+        assert!(
+            !post_present,
+            "{change}: loaded PostToolUse remained approved"
+        );
+    }
+
+    #[test]
+    fn loaded_hooks_recheck_revoked_approval() {
+        loaded_hook_revocation("revoke");
+    }
+
+    #[test]
+    fn loaded_hooks_recheck_disabled_plugin() {
+        loaded_hook_revocation("disable");
+    }
+
+    #[test]
+    fn loaded_hooks_recheck_removed_plugin() {
+        loaded_hook_revocation("remove");
+    }
+
+    #[test]
+    fn loaded_hooks_recheck_environment_off() {
+        loaded_hook_revocation("env-off");
+    }
+
+    #[test]
+    fn loaded_hooks_refuse_direct_spawn_when_sandbox_boundary_is_enabled() {
+        const CHILD_FLAG: &str = "DAVINCI_TEST_PLUGIN_SANDBOX_BOUNDARY";
+        if std::env::var_os(CHILD_FLAG).is_none() {
+            // The boundary is monotonic, so enable it only in an isolated test process.
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "plugins::tests::loaded_hooks_refuse_direct_spawn_when_sandbox_boundary_is_enabled",
+                    "--nocapture",
+                ])
+                .env(CHILD_FLAG, "1")
+                .env_remove("PI_HOOKS_DRY_RUN")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "isolated fixture failed:\n{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let _homes = FakeHomes::new(dir.path());
+        let agent_dir = dir.path().join("agent");
+        let root = dir.path().join("boundary-demo");
+        let marker = dir.path().join("hook-marker");
+        write(&root.join("plugin.json"), r#"{"name":"boundary-demo"}"#);
+        #[cfg(windows)]
+        let command = format!(
+            "$null = [Console]::In.ReadToEnd(); [IO.File]::AppendAllText('{}', 'ran')",
+            marker.display()
+        );
+        #[cfg(not(windows))]
+        let command = format!("cat >/dev/null; echo ran >> '{}'", marker.display());
+        let hook =
+            json!({"command": command, "shell": if cfg!(windows) { "powershell" } else { "bash" }});
+        let hook_path = root.join("hooks/hooks.json");
+        write(
+            &hook_path,
+            &json!({"hooks": {"Stop": [{"hooks": [hook.clone()]}]}}).to_string(),
+        );
+        install_fixture(&agent_dir, &root, true);
+        let input = HookInput {
+            cwd: dir.path().to_path_buf(),
+            ..Default::default()
+        };
+        active(&agent_dir).run_event(HookEvent::Stop, None, &input);
+        assert!(marker.exists(), "approved fixture must actually execute");
+        std::fs::remove_file(&marker).unwrap();
+
+        let mut async_hook = hook.clone();
+        async_hook["async"] = json!(true);
+        write(
+            &hook_path,
+            &json!({"hooks": {
+                "Stop": [{"hooks": [hook.clone(), async_hook.clone()]}],
+                "PostToolUse": [{"hooks": [hook, async_hook]}]
+            }})
+            .to_string(),
+        );
+        install_fixture(&agent_dir, &root, true);
+        let loaded = active(&agent_dir);
+        crate::execution_boundary::enable();
+        for (event, subject) in [
+            (HookEvent::Stop, None),
+            (HookEvent::PostToolUse, Some("Write")),
+        ] {
+            let outcome = loaded.run_event(event, subject, &input);
+            assert!(!marker.exists(), "{event:?} bypassed the sandbox boundary");
+            assert_eq!(outcome.block, None);
+            assert_eq!(outcome.warnings.len(), 2, "{event:?}: {outcome:?}");
+            assert!(outcome.warnings.iter().all(|warning| {
+                warning.contains("plugin hook process requires the sandbox executor transport")
+            }));
+        }
     }
 
     #[test]

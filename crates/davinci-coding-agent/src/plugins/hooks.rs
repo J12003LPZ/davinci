@@ -381,6 +381,12 @@ pub fn run(hook: &PluginHook, ctx: &HookContext, payload: &Value) -> HookOutcome
     if std::env::var_os("PI_HOOKS_DRY_RUN").is_some() {
         return HookOutcome::default();
     }
+    if let Err(warning) = crate::execution_boundary::require_executor("plugin hook process") {
+        return HookOutcome {
+            warning: Some(warning),
+            ..HookOutcome::default()
+        };
+    }
     let command = match build_command(hook, ctx) {
         Ok(command) => command,
         Err(warning) => {
@@ -397,6 +403,10 @@ pub fn run(hook: &PluginHook, ctx: &HookContext, payload: &Value) -> HookOutcome
     };
     if hook.is_async {
         std::thread::spawn(move || {
+            // Sandboxing may be enabled after this hook was scheduled.
+            if crate::execution_boundary::require_executor("plugin hook process").is_err() {
+                return;
+            }
             let _ = davinci_sys::process::run_bounded(command, Some(input), limits, &|| false);
         });
         return HookOutcome::default();

@@ -142,19 +142,28 @@ fn plugin_completion_dispatch_and_post_tool_feedback_reach_host() {
         "PostToolUse":[{"hooks":[{"command":"cat >/dev/null; printf 'test feedback' >&2; exit 2"}]}]
     }}).to_string()).unwrap();
     let plugin = davinci_coding_agent::plugins::manifest::load_plugin(&root).unwrap();
+    let agent_dir = dir.path().join("agent");
+    let record = InstalledPlugin {
+        origin: Origin::Davinci,
+        install_path: Some(root),
+        version: None,
+        enabled: true,
+        hooks_approved: plugin.hooks_digest.clone(),
+        installed_at: 0,
+    };
+    davinci_coding_agent::plugins::store::update(&agent_dir, |file| {
+        file.plugins
+            .insert("finish-line@fixture".into(), record.clone());
+        Ok(())
+    })
+    .unwrap();
     let plugins = ActivePlugins {
         plugins: vec![ActivePlugin {
             key: "finish-line@fixture".into(),
-            record: InstalledPlugin {
-                origin: Origin::Davinci,
-                install_path: Some(root),
-                version: None,
-                enabled: true,
-                hooks_approved: plugin.hooks_digest.clone(),
-                installed_at: 0,
-            },
+            record,
             plugin,
             data_dir: dir.path().join("data"),
+            agent_dir,
         }],
         errors: Vec::new(),
     };

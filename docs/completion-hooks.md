@@ -75,8 +75,12 @@ do not run these hooks.
 
 All completion and post-tool hooks stay off in graph workers. Project trust
 and integrity checks still apply, and plugin hooks require the current
-`hooksApproved` digest, including files changed during the prompt. Hooks never
-approve a tool call or bypass its permission gate.
+`hooksApproved` digest, including files changed during the prompt. Each dispatch
+also rereads the user installation record; revoking approval, disabling or
+removing the plugin, or setting `DAVINCI_PLUGINS=off` stops already loaded hooks.
+When execution sandboxing is enabled, plugin hooks refuse direct host execution
+with a warning until their runner uses the sandbox executor transport. Hooks
+never approve a tool call or bypass its permission gate.
 
 The host fixtures cover allow/block/warning outputs, timeouts, continuation
 flags, legacy stop separation, trust and digest changes, result feedback, and
