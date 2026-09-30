@@ -410,6 +410,28 @@ impl ToolSurface {
     }
 }
 
+/// Trusted host callback applied while idle before a permission mode changes.
+pub type PermissionModeChangeCallback = dyn Fn(PermissionMode, &mut ToolContext) + Send + Sync;
+
+#[derive(Clone)]
+struct PermissionModeChangeHook(Arc<PermissionModeChangeCallback>);
+impl std::fmt::Debug for PermissionModeChangeHook {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("PermissionModeChangeHook")
+    }
+}
+
+/// Return the reason a host cannot safely establish its future Auto boundary.
+pub type AutoSandboxGuardCallback = dyn Fn() -> Option<String> + Send + Sync;
+
+#[derive(Clone)]
+struct AutoSandboxGuard(Arc<AutoSandboxGuardCallback>);
+impl std::fmt::Debug for AutoSandboxGuard {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("AutoSandboxGuard")
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Agent {
     pub system_prompt: String,
@@ -538,6 +560,11 @@ pub struct Agent {
     base_system_prompt: String,
     /// Return target for /act, not another active mode.
     previous_execution_mode: Option<PermissionMode>,
+    auto_sandbox: Option<davinci_protocol::SandboxSpec>,
+    auto_sandbox_unavailable_reason: Option<String>,
+    auto_sandbox_guard: Option<AutoSandboxGuard>,
+    /// Host fence updates happen while idle, before the next approval.
+    permission_mode_change_hook: Option<PermissionModeChangeHook>,
     /// Historical snapshot for a bounded revision diff, never an active plan.
     previous_plan_revision: Option<LivingPlan>,
     /// Whether the host has registered a backend capable of visual verification.
@@ -705,6 +732,10 @@ impl Agent {
             pruned_evidence: std::collections::HashMap::new(),
             base_system_prompt: system_prompt,
             previous_execution_mode: None,
+            auto_sandbox: None,
+            auto_sandbox_unavailable_reason: None,
+            auto_sandbox_guard: None,
+            permission_mode_change_hook: None,
             previous_plan_revision: None,
             visual_verification_available: false,
             runtime_environment: None,
@@ -1375,9 +1406,62 @@ impl Agent {
         self.is_plan_mode()
     }
 
+    /// Update trusted host process boundaries while idle, before approval.
+    pub fn set_permission_mode_change_hook(&mut self, hook: Arc<PermissionModeChangeCallback>) {
+        self.permission_mode_change_hook = Some(PermissionModeChangeHook(hook));
+    }
+
+    /// Install a probed host default, preserving every explicit sandbox policy.
+    /// Entry through /permissions, mode cycling, RPC, or plan exit shares this
+    /// activation point. Once activated, it persists for the session.
+    pub fn configure_auto_sandbox(&mut self, candidate: Option<davinci_protocol::SandboxSpec>) {
+        self.auto_sandbox = candidate;
+        self.auto_sandbox_unavailable_reason = None;
+        self.activate_auto_sandbox(self.permission_mode());
+    }
+
+    pub fn set_auto_sandbox_activation_guard(&mut self, guard: Arc<AutoSandboxGuardCallback>) {
+        self.auto_sandbox_guard = Some(AutoSandboxGuard(guard));
+    }
+
+    /// A host cannot reconcile already-running unowned execution by replacing
+    /// its handles. Retain approval behavior and explain the missing boundary.
+    pub fn disable_auto_sandbox(&mut self, reason: impl Into<String>) {
+        self.auto_sandbox = None;
+        if self.tool_context.sandbox.is_none() {
+            self.auto_sandbox_unavailable_reason = Some(reason.into());
+        }
+    }
+
+    pub fn auto_sandbox_unavailable_reason(&self) -> Option<&str> {
+        self.auto_sandbox_unavailable_reason.as_deref()
+    }
+
+    fn activate_auto_sandbox(&mut self, mode: PermissionMode) {
+        if mode == PermissionMode::Auto
+            && self.tool_context.sandbox.is_none()
+            && self.auto_sandbox.is_some()
+        {
+            let blocker = self
+                .auto_sandbox_guard
+                .as_ref()
+                .and_then(|guard| (guard.0)());
+            if let Some(reason) = blocker {
+                self.auto_sandbox_unavailable_reason = Some(reason);
+            } else {
+                self.tool_context.sandbox = self.auto_sandbox.clone();
+                self.auto_sandbox_unavailable_reason = None;
+            }
+        }
+        if let Some(hook) = &self.permission_mode_change_hook {
+            (hook.0)(mode, &mut self.tool_context);
+        }
+    }
+
     /// Hosts call this while idle, before another tool can be approved.
     pub fn set_permission_mode(&mut self, mode: PermissionMode) {
         let previous = self.permission_mode();
+        self.activate_auto_sandbox(mode);
         if previous != mode {
             if mode == PermissionMode::ReadOnly {
                 self.previous_execution_mode = Some(previous);

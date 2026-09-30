@@ -62,9 +62,44 @@ pub fn load(agent_dir: &Path, cwd: &Path, trusted: bool, sandbox_active: bool) -
     davinci_mcp::merge(user, project)
 }
 
+/// Raw stdio owns only its direct child. Reconnecting cannot prove that its
+/// grandchildren stopped, including after a failed handshake. Decide before
+/// launching any raw server; starting directly in Auto uses the executor.
+pub fn auto_requires_restart(current: &ConfigFile, confined: &ConfigFile) -> bool {
+    current.mcp_servers.iter().any(|(name, server)| {
+        !server.disabled
+            && server.command.is_some()
+            && server.execution == Some(McpExecutionPolicy::Host)
+            && confined
+                .mcp_servers
+                .get(name)
+                .is_some_and(|confined| confined.execution == Some(McpExecutionPolicy::Sandboxed))
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn legacy_project_stdio_prevents_in_place_auto_transition() {
+        let mut current: ConfigFile = serde_json::from_value(serde_json::json!({
+            "mcpServers": {"project": {"command":"fixture", "execution":"host"}}
+        }))
+        .unwrap();
+        let confined: ConfigFile = serde_json::from_value(serde_json::json!({
+            "mcpServers": {"project": {"command":"fixture", "execution":"sandboxed"}}
+        }))
+        .unwrap();
+        assert!(auto_requires_restart(&current, &confined));
+        current.mcp_servers.get_mut("project").unwrap().disabled = true;
+        assert!(!auto_requires_restart(&current, &confined));
+        let user: ConfigFile = serde_json::from_value(serde_json::json!({
+            "mcpServers": {"project": {"command":"fixture", "execution":"host"}}
+        }))
+        .unwrap();
+        assert!(!auto_requires_restart(&user, &user));
+    }
 
     #[test]
     fn mcp_execution_provenance_never_lets_project_or_plugin_local_commands_run_on_host() {

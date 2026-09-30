@@ -343,25 +343,43 @@ pub(crate) fn startup_mark(stage: &str) {
 }
 
 fn preactivate_execution_boundary(raw: &[String], cwd: &Path) -> Result<(), String> {
+    // Use the CLI parser's last-value-wins and project trust semantics before
+    // loading extensions, including --help's extension flag discovery.
+    let parsed = parse_args(raw);
     let mut settings = load_settings(&default_agent_dir()).sandbox;
-    if let Some(index) = raw.iter().position(|value| value == "--execution-sandbox") {
-        let mode = raw
-            .get(index + 1)
-            .ok_or("--execution-sandbox requires a mode")?
-            .clone();
-        settings.get_or_insert_with(Default::default).mode = Some(mode);
+    if let Some(mode) = &parsed.execution_sandbox_mode {
+        settings.get_or_insert_with(Default::default).mode = Some(mode.clone());
     }
-    let Some(spec) = davinci_coding_agent::sandbox_config::resolve_sandbox_settings(
+    let mode = permissions::PermissionSources::load(
+        &default_agent_dir(),
+        cwd,
+        parsed.project_trust_override,
+    )
+    .policy(parsed.permission_mode)
+    .mode;
+    if settings.is_none()
+        && mode == davinci_agent::PermissionMode::Auto
+        && execution_boundary::auto_activation_blocker().is_some()
+    {
+        return Ok(());
+    }
+    let Some(spec) = sandbox_config::resolve_auto_sandbox_settings(
         cwd,
         settings.as_ref(),
         None,
         false,
+        mode,
+        davinci_agent::sandbox::detected_native_backend(cwd),
     )?
     else {
         return Ok(());
     };
     if spec.mode != davinci_protocol::SandboxMode::FullAccess {
-        davinci_coding_agent::execution_boundary::enable();
+        if settings.is_none() {
+            let _ = execution_boundary::activate_auto_boundary();
+        } else {
+            execution_boundary::enable();
+        }
     }
     Ok(())
 }
@@ -963,12 +981,44 @@ fn build_agent(parsed: &Args, session_dir: &Path, cwd: &Path) -> Result<Agent, S
     } else {
         None
     };
-    agent.tool_context.sandbox = davinci_coding_agent::sandbox_config::resolve_sandbox_settings(
+    let detected = davinci_agent::sandbox::detected_native_backend(cwd);
+    agent.tool_context.sandbox = sandbox_config::resolve_sandbox_settings(
         cwd,
         effective_global_sandbox.as_ref(),
         project_sandbox_settings.as_ref(),
         project_trusted_for_sandbox,
     )?;
+    if effective_global_sandbox.is_none() {
+        let (candidate, candidate_error) = match sandbox_config::resolve_auto_sandbox_settings(
+            cwd,
+            None,
+            project_sandbox_settings.as_ref(),
+            project_trusted_for_sandbox,
+            davinci_agent::PermissionMode::Auto,
+            detected,
+        ) {
+            Ok(candidate) => (candidate, None),
+            Err(error) if agent.permission_mode() == davinci_agent::PermissionMode::Auto => {
+                return Err(error)
+            }
+            // Ask/Edits sessions retain their existing behavior. An invalid
+            // narrowing request cannot make a future Auto policy available.
+            Err(error) => (None, Some(format!("Auto policy unavailable: {error}"))),
+        };
+        let fenced = candidate.is_some();
+        agent.set_auto_sandbox_activation_guard(Arc::new(
+            execution_boundary::activate_auto_boundary,
+        ));
+        agent.set_permission_mode_change_hook(Arc::new(move |mode, context| {
+            if fenced && mode == davinci_agent::PermissionMode::Auto && context.sandbox.is_some() {
+                execution_boundary::enable();
+            }
+        }));
+        agent.configure_auto_sandbox(candidate);
+        if let Some(error) = candidate_error {
+            agent.disable_auto_sandbox(error);
+        }
+    }
     if agent
         .tool_context
         .sandbox
@@ -1025,6 +1075,15 @@ fn build_agent(parsed: &Args, session_dir: &Path, cwd: &Path) -> Result<Agent, S
             trusted,
             agent.tool_context.sandbox.is_some(),
         );
+        if agent.tool_context.sandbox.is_none() {
+            let confined_config = mcp::load(&default_agent_dir(), cwd, trusted, true);
+            if mcp::auto_requires_restart(&mcp_config, &confined_config) {
+                execution_boundary::record_legacy_execution("local project/plugin MCP")?;
+                if detected.is_some() {
+                    agent.disable_auto_sandbox("local project/plugin MCP may have unowned host descendants; restart directly in Auto to activate confinement");
+                }
+            }
+        }
         let registry = match (
             agent.tool_context.foreground_supervisor.as_ref(),
             agent.tool_context.sandbox.as_ref(),
@@ -7347,6 +7406,10 @@ fn handle_user_line(
         }
         SlashAction::ShowSandboxStatus => {
             let text = sandbox_config::format_sandbox_status(agent.tool_context.sandbox.as_ref());
+            let text = match agent.auto_sandbox_unavailable_reason() {
+                Some(reason) => format!("{text}\nAuto unavailable: {reason}"),
+                None => text,
+            };
             session.chrome.transcript.push("sandbox", &text);
             session.chrome.status = "sandbox".into();
             println!("{text}");
@@ -8485,6 +8548,13 @@ pub fn format_session_status(parsed: &Args, agent: &Agent) -> String {
         if let Some(diag) = &agent.prompt_session.transition_diagnostic {
             text.push_str(&format!(" · transition: {diag}"));
         }
+    }
+    text.push('\n');
+    text.push_str(&sandbox_config::format_sandbox_status(
+        agent.tool_context.sandbox.as_ref(),
+    ));
+    if let Some(reason) = agent.auto_sandbox_unavailable_reason() {
+        text.push_str(&format!("\nAuto unavailable: {reason}"));
     }
     if let Some(line) = additional_directories_status_line(agent) {
         text.push('\n');

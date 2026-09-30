@@ -325,6 +325,7 @@ impl PersistentJsSession {
         let node =
             find_node().ok_or_else(|| "Node.js is not available for JS extensions".to_string())?;
         let runner = runner_path()?;
+        crate::execution_boundary::record_legacy_execution("JavaScript extension")?;
         let mut child = Command::new(node)
             .arg(&runner)
             .arg(module)
@@ -565,6 +566,8 @@ fn run_in_js_pool(
     op: &str,
     payload: &Value,
 ) -> Result<JsExtensionResult, String> {
+    // Existing sessions cannot bypass a boundary enabled after their load.
+    crate::execution_boundary::require_executor("JavaScript extension")?;
     if !pool.sessions.contains_key(module) {
         pool.ensure_capacity();
         pool.sessions
@@ -674,6 +677,7 @@ pub fn run_js_extension(
         command.env("PI_EXTENSION_UI_CHANNEL", dir);
         command.env_remove("PI_EXTENSION_UI_REPLY");
     }
+    crate::execution_boundary::record_legacy_execution("JavaScript extension")?;
     let mut child = command.spawn().map_err(|err| err.to_string())?;
     if let Some(mut stdin) = child.stdin.take() {
         stdin
@@ -1053,6 +1057,7 @@ pub fn execute_command_tool(
     process
         .current_dir(cwd)
         .env("DAVINCI_TOOL_ARGS", &args_json);
+    crate::execution_boundary::record_legacy_execution("extension command")?;
     let output = davinci_sys::process::run_bounded(
         process,
         Some(args_json.into_bytes()),
@@ -1079,6 +1084,123 @@ pub fn execute_command_tool(
 mod tests {
     use super::*;
     use tempfile::tempdir;
+
+    #[test]
+    fn sandbox_persistent_js_transition_fixture() {
+        let action = std::env::var("DAVINCI_SANDBOX_JS_TRANSITION_FIXTURE");
+        if action.as_deref() == Ok("race") {
+            let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+            let start = barrier.clone();
+            let legacy = std::thread::spawn(move || {
+                start.wait();
+                crate::execution_boundary::record_legacy_execution("JavaScript extension").is_ok()
+            });
+            let activation = std::thread::spawn(move || {
+                barrier.wait();
+                crate::execution_boundary::activate_auto_boundary().is_none()
+            });
+            assert_ne!(
+                legacy.join().unwrap(),
+                activation.join().unwrap(),
+                "a legacy spawn and Auto reservation must not both succeed"
+            );
+            return;
+        }
+        if action.as_deref() == Ok("reserve") {
+            assert!(crate::execution_boundary::activate_auto_boundary().is_none());
+            assert!(
+                crate::execution_boundary::record_legacy_execution("JavaScript extension").is_err()
+            );
+            assert!(crate::execution_boundary::auto_activation_blocker().is_none());
+            return;
+        }
+        if action.as_deref() != Ok("1") {
+            return;
+        }
+        assert!(
+            find_node().is_some(),
+            "Node is required for the existing JS transport fixture"
+        );
+        let root = tempdir().unwrap();
+        let module = root.path().join("index.js");
+        std::fs::write(
+            &module,
+            r#"
+const fs = require('node:fs');
+module.exports = (pi) => {
+  pi.on('agent_start', (event) => { fs.writeFileSync(event.marker, 'ran'); });
+};
+"#,
+        )
+        .unwrap();
+        assert!(
+            run_persistent_js_extension(&module, "load", &serde_json::json!({}))
+                .unwrap()
+                .ok
+        );
+        let mut agent = davinci_agent::Agent::new("fixture");
+        agent.set_permission_mode(davinci_agent::PermissionMode::Ask);
+        agent.set_auto_sandbox_activation_guard(std::sync::Arc::new(
+            crate::execution_boundary::activate_auto_boundary,
+        ));
+        let policy = serde_json::from_value(serde_json::json!({
+            "id":"fixture-auto", "mode":"workspace_write", "backend":"auto",
+            "workspace":root.path().canonicalize().unwrap().to_string_lossy()
+        }))
+        .unwrap();
+        agent.configure_auto_sandbox(Some(policy));
+        agent.set_permission_mode(davinci_agent::PermissionMode::Auto);
+        assert!(agent.tool_context.sandbox.is_none());
+        assert!(agent
+            .auto_sandbox_unavailable_reason()
+            .unwrap()
+            .contains("legacy host execution"));
+        let marker = root.path().join("marker");
+        let payload = serde_json::json!({"type":"agent_start","marker":marker});
+        assert!(
+            run_persistent_js_extension(&module, "emit", &payload)
+                .unwrap()
+                .ok
+        );
+        assert!(marker.exists());
+        std::fs::remove_file(&marker).unwrap();
+        crate::execution_boundary::enable();
+        assert!(run_persistent_js_extension(&module, "emit", &payload)
+            .unwrap_err()
+            .contains("requires the sandbox executor"));
+        assert!(
+            !marker.exists(),
+            "existing pool bypassed the active boundary"
+        );
+        shutdown_js_pool();
+        assert!(
+            crate::execution_boundary::auto_activation_blocker().is_some(),
+            "dropping direct handles cannot erase execution history"
+        );
+    }
+
+    #[test]
+    fn sandbox_persistent_js_transition_blocks_existing_pool() {
+        // Isolate the intentionally monotonic process boundary from other JS
+        // tests, and exercise the real Node runner and a warmed session.
+        for action in ["1", "reserve", "race"] {
+            let output = Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "js_host::tests::sandbox_persistent_js_transition_fixture",
+                    "--nocapture",
+                ])
+                .env("DAVINCI_SANDBOX_JS_TRANSITION_FIXTURE", action)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+    }
 
     /// Persistent JS sessions are process-wide. Tests that inspect spawn counts
     /// or clear the shared pool serialize through this lock.

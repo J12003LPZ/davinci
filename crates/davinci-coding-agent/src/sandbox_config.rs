@@ -48,6 +48,41 @@ pub struct SandboxResourceSettings {
     pub max_processes: Option<u32>,
 }
 
+/// User authority is explicit when configured. Otherwise Auto receives a
+/// native default only after the host has successfully probed confinement.
+pub fn resolve_auto_sandbox_settings(
+    workspace: &Path,
+    global: Option<&SandboxSettings>,
+    project: Option<&SandboxSettings>,
+    project_trusted: bool,
+    mode: davinci_agent::PermissionMode,
+    detected: Option<SandboxBackendKind>,
+) -> Result<Option<SandboxSpec>, String> {
+    let defaults;
+    let global = if global.is_none() && mode == davinci_agent::PermissionMode::Auto {
+        let Some(backend) =
+            detected.filter(|backend| davinci_agent::sandbox::supports_auto_sandbox(*backend))
+        else {
+            return Ok(None);
+        };
+        defaults = SandboxSettings {
+            mode: Some("workspace_write".into()),
+            backend: Some(
+                match backend {
+                    SandboxBackendKind::MacosSeatbelt => "macos_seatbelt",
+                    _ => "linux_bubblewrap",
+                }
+                .into(),
+            ),
+            ..Default::default()
+        };
+        Some(&defaults)
+    } else {
+        global
+    };
+    resolve_sandbox_settings(workspace, global, project, project_trusted)
+}
+
 pub fn resolve_sandbox_settings(
     workspace: &Path,
     global: Option<&SandboxSettings>,
@@ -278,6 +313,7 @@ fn parse_backend(value: &str) -> Result<SandboxBackendKind, String> {
     match value.trim().to_ascii_lowercase().replace('-', "_").as_str() {
         "auto" => Ok(SandboxBackendKind::Auto),
         "linux_bubblewrap" | "bubblewrap" | "bwrap" => Ok(SandboxBackendKind::LinuxBubblewrap),
+        "macos_seatbelt" | "seatbelt" => Ok(SandboxBackendKind::MacosSeatbelt),
         "container" | "docker" | "podman" => Ok(SandboxBackendKind::Container),
         "host" => Ok(SandboxBackendKind::Host),
         other => Err(format!("unknown sandbox backend: {other}")),
@@ -427,7 +463,7 @@ struct RuntimeLayout {
 /// `/etc/resolv.conf` managed by systemd) is also mounted at its own
 /// spelling, because nothing else in the sandbox root provides that link:
 /// every dynamic executable names `/lib64/ld-linux-*.so` as its interpreter.
-#[cfg(unix)]
+#[cfg(all(unix, not(target_os = "macos")))]
 const RUNTIME_PATHS: &[&str] = &[
     "/usr",
     "/bin",
@@ -452,6 +488,22 @@ const RUNTIME_PATHS: &[&str] = &[
     "/etc/ld.so.cache",
     "/etc/ld.so.conf",
     "/etc/ld.so.conf.d",
+];
+
+#[cfg(target_os = "macos")]
+const RUNTIME_PATHS: &[&str] = &[
+    "/System",
+    "/System/Volumes/Preboot/Cryptexes/OS/System",
+    "/usr",
+    "/bin",
+    "/sbin",
+    "/Library/Developer",
+    "/private/etc/passwd",
+    "/private/etc/group",
+    "/private/etc/hosts",
+    "/private/etc/resolv.conf",
+    "/private/etc/localtime",
+    "/private/etc/ssl",
 ];
 
 fn runtime_layout(workspace: &Path) -> RuntimeLayout {
@@ -485,7 +537,9 @@ fn runtime_layout(workspace: &Path) -> RuntimeLayout {
             .or_else(|| home.as_ref().map(|home| home.join(".cargo")))
         {
             mounts.push(&cargo.join("bin"), workspace);
+            #[cfg(not(target_os = "macos"))]
             let sandbox_cargo = format!("{SANDBOX_HOME}/.cargo");
+            #[cfg(not(target_os = "macos"))]
             let mut any = false;
             for relative in ["registry", "git", "config.toml", "config"] {
                 let Ok(source) = cargo.join(relative).canonicalize() else {
@@ -497,19 +551,36 @@ fn runtime_layout(workspace: &Path) -> RuntimeLayout {
                 let Some(source) = source.to_str() else {
                     continue;
                 };
-                any = true;
-                layout.home_mounts.push(MountRule {
-                    source: Some(source.to_string()),
-                    target: format!("{sandbox_cargo}/{relative}"),
-                    access: MountAccess::ReadOnly,
-                });
+                // Seatbelt cannot mount cache directories at a synthetic
+                // home. Keep selected cache content read-only in place.
+                #[cfg(target_os = "macos")]
+                {
+                    if relative == "registry" || relative == "git" {
+                        mounts.push(Path::new(source), workspace);
+                    }
+                    continue;
+                }
+                #[cfg(not(target_os = "macos"))]
+                {
+                    any = true;
+                    layout.home_mounts.push(MountRule {
+                        source: Some(source.to_string()),
+                        target: format!("{sandbox_cargo}/{relative}"),
+                        access: MountAccess::ReadOnly,
+                    });
+                }
             }
+            #[cfg(not(target_os = "macos"))]
             if any {
                 layout
                     .environment
                     .insert("CARGO_HOME".into(), sandbox_cargo);
             }
         }
+        #[cfg(target_os = "macos")]
+        layout
+            .environment
+            .insert("CARGO_HOME".into(), format!("{SANDBOX_HOME}/.cargo"));
         layout.mounts = mounts.into_rules();
     }
     #[cfg(not(unix))]
@@ -532,6 +603,16 @@ impl RuntimeMounts {
             return None;
         }
         let canonical = path.canonicalize().ok()?;
+        #[cfg(target_os = "macos")]
+        if canonical == Path::new("/private")
+            || canonical == Path::new("/private/var")
+            || canonical.starts_with("/private/tmp")
+            || canonical.starts_with("/private/var/folders")
+        {
+            // Inherited PATH must not turn a shared temp/OS cache parent into
+            // a runtime grant and expose other launches' temporary data.
+            return None;
+        }
         if canonical.starts_with(workspace) || exposes_user_home_root(&canonical) {
             return None;
         }
@@ -539,7 +620,7 @@ impl RuntimeMounts {
         if !self
             .canonical
             .iter()
-            .any(|seen| canonical.starts_with(seen))
+            .any(|seen| runtime_covers(seen, &canonical))
         {
             self.canonical.retain(|seen| !seen.starts_with(&canonical));
             self.canonical.push(canonical.clone());
@@ -566,7 +647,10 @@ impl RuntimeMounts {
             // A link inside an already mounted tree (e.g. /usr/local/bin ->
             // /opt/...) resolves through that mount; only links whose
             // spelling nothing else provides need their own mount.
-            if self.canonical.iter().any(|seen| spelling.starts_with(seen))
+            if self
+                .canonical
+                .iter()
+                .any(|seen| runtime_covers(seen, spelling))
                 || self
                     .aliases
                     .iter()
@@ -584,6 +668,18 @@ impl RuntimeMounts {
         }
         rules
     }
+}
+
+fn runtime_covers(parent: &Path, child: &Path) -> bool {
+    // The Seatbelt /System rule deliberately excludes mounted host volumes.
+    // Preserve an explicit, narrower OS-runtime grant on the Preboot volume.
+    if cfg!(target_os = "macos")
+        && parent == Path::new("/System")
+        && child.starts_with("/System/Volumes")
+    {
+        return false;
+    }
+    child.starts_with(parent)
 }
 
 /// `path` without `.` components; `None` when it has `..`.
@@ -667,12 +763,15 @@ fn ensure_limit_not_weaker_u32(
 
 pub fn format_sandbox_status(spec: Option<&SandboxSpec>) -> String {
     let Some(spec) = spec else {
-        return [
-            "Sandbox: disabled (compatibility mode)",
+        let mut lines = vec![
+            "Sandbox: inactive (no capable native backend or Auto default not selected)",
             "Enforcement: none claimed",
-            "Permission policy remains separate from OS isolation",
-        ]
-        .join("\n");
+            "Permission policy remains separate from OS isolation; Windows: use WSL2 for confinement",
+        ];
+        if cfg!(target_os = "macos") {
+            lines.push("Seatbelt unavailable: detached descendant ownership is not enforced");
+        }
+        return lines.join("\n");
     };
 
     let mode = match spec.mode {
@@ -684,6 +783,7 @@ pub fn format_sandbox_status(spec: Option<&SandboxSpec>) -> String {
     let backend = match spec.backend {
         SandboxBackendKind::Auto => "auto",
         SandboxBackendKind::LinuxBubblewrap => "linux_bubblewrap",
+        SandboxBackendKind::MacosSeatbelt => "macos_seatbelt",
         SandboxBackendKind::Container => "container",
         SandboxBackendKind::Host => "host",
     };
@@ -766,7 +866,7 @@ mod tests {
         assert!(!status.contains("State: active"));
 
         let disabled = format_sandbox_status(None);
-        assert!(disabled.contains("disabled (compatibility mode)"));
+        assert!(disabled.contains("inactive"));
         assert!(disabled.contains("none claimed"));
     }
 
@@ -1076,5 +1176,138 @@ mod tests {
         .unwrap();
         assert!(spec.required_capabilities.memory_limit);
         assert!(spec.required_capabilities.pid_limit);
+    }
+}
+
+#[cfg(test)]
+mod auto_defaults_tests {
+    use super::*;
+    use davinci_agent::PermissionMode;
+
+    #[test]
+    fn auto_defaults_require_a_probed_native_backend() {
+        let root = tempfile::tempdir().unwrap();
+        for backend in [
+            None,
+            Some(SandboxBackendKind::Host),
+            Some(SandboxBackendKind::Container),
+            Some(SandboxBackendKind::MacosSeatbelt),
+        ] {
+            assert!(resolve_auto_sandbox_settings(
+                root.path(),
+                None,
+                None,
+                false,
+                PermissionMode::Auto,
+                backend
+            )
+            .unwrap()
+            .is_none());
+        }
+        {
+            let backend = SandboxBackendKind::LinuxBubblewrap;
+            let spec = resolve_auto_sandbox_settings(
+                root.path(),
+                None,
+                None,
+                false,
+                PermissionMode::Auto,
+                Some(backend),
+            )
+            .unwrap()
+            .unwrap();
+            assert_eq!(spec.mode, SandboxMode::WorkspaceWrite);
+            assert_eq!(spec.backend, backend);
+            assert_eq!(spec.network, NetworkPolicy::Denied);
+            assert!(spec.environment.allow.is_empty());
+            assert!(spec.required_capabilities.ephemeral_temp);
+        }
+    }
+
+    #[test]
+    fn only_auto_implicitly_selects_sandbox_and_explicit_authority_wins() {
+        let root = tempfile::tempdir().unwrap();
+        for mode in [
+            PermissionMode::Ask,
+            PermissionMode::Edits,
+            PermissionMode::ReadOnly,
+            PermissionMode::AlwaysApprove,
+        ] {
+            assert!(resolve_auto_sandbox_settings(
+                root.path(),
+                None,
+                None,
+                false,
+                mode,
+                Some(SandboxBackendKind::LinuxBubblewrap)
+            )
+            .unwrap()
+            .is_none());
+        }
+        let explicit = SandboxSettings {
+            mode: Some("no_execution".into()),
+            ..Default::default()
+        };
+        let spec = resolve_auto_sandbox_settings(
+            root.path(),
+            Some(&explicit),
+            None,
+            false,
+            PermissionMode::Auto,
+            Some(SandboxBackendKind::LinuxBubblewrap),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(spec.mode, SandboxMode::NoExecution);
+    }
+
+    #[test]
+    fn trusted_project_can_narrow_default_but_cannot_widen_it() {
+        let root = tempfile::tempdir().unwrap();
+        let narrow = SandboxSettings {
+            mode: Some("restricted".into()),
+            ..Default::default()
+        };
+        let spec = resolve_auto_sandbox_settings(
+            root.path(),
+            None,
+            Some(&narrow),
+            true,
+            PermissionMode::Auto,
+            Some(SandboxBackendKind::LinuxBubblewrap),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(spec.mode, SandboxMode::Restricted);
+        let widen = SandboxSettings {
+            network: Some(SandboxNetworkSettings {
+                mode: Some("unrestricted".into()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert!(resolve_auto_sandbox_settings(
+            root.path(),
+            None,
+            Some(&widen),
+            true,
+            PermissionMode::Auto,
+            Some(SandboxBackendKind::LinuxBubblewrap)
+        )
+        .is_err());
+        assert_eq!(
+            resolve_auto_sandbox_settings(
+                root.path(),
+                None,
+                Some(&widen),
+                false,
+                PermissionMode::Auto,
+                Some(SandboxBackendKind::LinuxBubblewrap)
+            )
+            .unwrap()
+            .unwrap()
+            .network,
+            NetworkPolicy::Denied
+        );
     }
 }
