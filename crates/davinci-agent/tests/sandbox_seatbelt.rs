@@ -11,7 +11,10 @@ use std::{
     fs,
     io::{Read, Seek},
     net::{TcpListener, TcpStream, UdpSocket},
-    os::unix::net::{UnixListener, UnixStream},
+    os::unix::{
+        net::{UnixListener, UnixStream},
+        process::ExitStatusExt,
+    },
     path::{Path, PathBuf},
     process::{Command, Stdio},
     sync::{Arc, Mutex},
@@ -42,6 +45,12 @@ fn seatbelt_command_fixture() {
         return;
     };
     let workspace = std::env::current_dir().unwrap();
+    if action == "stdio" {
+        println!("RUST_STDOUT");
+        eprintln!("RUST_STDERR");
+        fs::write(workspace.join("rust-runtime-control"), "RUST_FILE").unwrap();
+        return;
+    }
     if action == "heartbeat" || action == "detached-heartbeat" {
         let detached = action == "detached-heartbeat";
         if detached {
@@ -339,6 +348,153 @@ fn wait_for_process(
         );
         std::thread::sleep(Duration::from_millis(10));
     }
+}
+
+#[test]
+fn native_runtime_stdio_and_libtest_controls() {
+    use davinci_agent::sandbox::{MacosSeatbeltBackend, SandboxBackend};
+    let root = tempfile::tempdir().unwrap();
+    let policy = spec(root.path());
+    let temp = tempfile::tempdir().unwrap();
+    fs::create_dir(temp.path().join("home")).unwrap();
+    let backend = MacosSeatbeltBackend::new(Some(temp.path()));
+    let executable = std::env::current_exe().unwrap();
+    let cases = [
+        ("true", PathBuf::from("/usr/bin/true"), vec![], ""),
+        (
+            "shell",
+            PathBuf::from("/bin/sh"),
+            vec![
+                "-c".to_owned(),
+                "printf SHELL_STDOUT; printf SHELL_STDERR >&2; printf SHELL_FILE > shell-runtime-control".to_owned(),
+            ],
+            "SHELL_STDOUT",
+        ),
+        (
+            "rust-list",
+            executable.clone(),
+            vec!["--list".to_owned()],
+            "seatbelt_command_fixture",
+        ),
+        (
+            "rust-single-thread",
+            executable,
+            vec![
+                "--exact".to_owned(),
+                "seatbelt_command_fixture".to_owned(),
+                "--nocapture".to_owned(),
+                "--test-threads=1".to_owned(),
+            ],
+            "RUST_STDOUT",
+        ),
+    ];
+    let mut observations = Vec::new();
+    for (name, executable, argv, expected_output) in cases {
+        for pipes in [true, false] {
+            let request = davinci_protocol::ExecutionRequest {
+                sandbox_id: policy.id.clone(),
+                executable: executable.to_string_lossy().into_owned(),
+                argv: argv.clone(),
+                cwd: policy.workspace.clone(),
+                launch_id: None,
+            };
+            let prepared = backend
+                .prepare(
+                    &policy,
+                    &request,
+                    &BTreeMap::from([("SEATBELT_ACTION".into(), "stdio".into())]),
+                )
+                .unwrap();
+            let stdout_path = root.path().join(format!("{name}.stdout"));
+            let stderr_path = root.path().join(format!("{name}.stderr"));
+            let mut command = Command::new(prepared.executable);
+            command
+                .args(prepared.argv)
+                .current_dir(prepared.cwd)
+                .env_clear()
+                .envs(prepared.environment)
+                .stdin(Stdio::null())
+                .stdout(if pipes {
+                    Stdio::piped()
+                } else {
+                    fs::File::create(&stdout_path).unwrap().into()
+                })
+                .stderr(if pipes {
+                    Stdio::piped()
+                } else {
+                    fs::File::create(&stderr_path).unwrap().into()
+                });
+            let mut owner = FixtureOwner(command.spawn().unwrap());
+            let deadline = Instant::now() + Duration::from_secs(3);
+            let status = loop {
+                if let Some(status) = owner.0.try_wait().unwrap() {
+                    break Some(status);
+                }
+                if Instant::now() >= deadline {
+                    owner.0.kill().unwrap();
+                    owner.0.wait().unwrap();
+                    break None;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            };
+            let read = |mut input: Box<dyn Read>| {
+                let mut bytes = Vec::new();
+                input.by_ref().take(4096).read_to_end(&mut bytes).unwrap();
+                String::from_utf8_lossy(&bytes).into_owned()
+            };
+            let (stdout, stderr) = if pipes {
+                (
+                    read(Box::new(owner.0.stdout.take().unwrap())),
+                    read(Box::new(owner.0.stderr.take().unwrap())),
+                )
+            } else {
+                (
+                    read(Box::new(fs::File::open(stdout_path).unwrap())),
+                    read(Box::new(fs::File::open(stderr_path).unwrap())),
+                )
+            };
+            observations.push(serde_json::json!({
+                "case":name, "pipes":pipes, "pid":owner.0.id(),
+                "code":status.and_then(|status| status.code()),
+                "signal":status.and_then(|status| status.signal()),
+                "stdout":stdout, "stderr":stderr,
+                "expected_output":expected_output,
+            }));
+        }
+    }
+    println!(
+        "SEATBELT_RUNTIME_CONTROLS {}",
+        serde_json::Value::from(observations.clone())
+    );
+    for observation in observations {
+        assert_eq!(observation["code"], 0, "{observation}");
+        assert!(
+            observation["stdout"]
+                .as_str()
+                .unwrap()
+                .contains(observation["expected_output"].as_str().unwrap()),
+            "{observation}"
+        );
+        if observation["case"] == "shell" {
+            assert!(observation["stderr"]
+                .as_str()
+                .unwrap()
+                .contains("SHELL_STDERR"));
+        } else if observation["case"] == "rust-single-thread" {
+            assert!(observation["stderr"]
+                .as_str()
+                .unwrap()
+                .contains("RUST_STDERR"));
+        }
+    }
+    assert_eq!(
+        fs::read(root.path().join("shell-runtime-control")).unwrap(),
+        b"SHELL_FILE"
+    );
+    assert_eq!(
+        fs::read(root.path().join("rust-runtime-control")).unwrap(),
+        b"RUST_FILE"
+    );
 }
 
 #[test]
