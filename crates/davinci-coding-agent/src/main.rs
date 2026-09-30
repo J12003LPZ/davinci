@@ -3946,6 +3946,9 @@ fn run_print_turns(
     for notice in agent.take_context_vm_notices() {
         eprintln!("{notice}");
     }
+    if let Some(notice) = agent.take_prompt_rewind_notice() {
+        eprintln!("{notice}");
+    }
     print_plugin_notices();
     let (exit_code, error) = print_text_exit(&all_events);
     // A provider failure that the loop gave up on carries no error stop
@@ -4422,6 +4425,11 @@ fn run_rpc_with_host(
             }));
     }
     loop {
+        if let Some(message) = runtime.agent.take_prompt_rewind_notice() {
+            emit_extension_ui_requests(&[
+                serde_json::json!({"op":"notify","message":message,"type":"warning"}),
+            ])?;
+        }
         let Some(line) = rpc_next_line(&leftover, &rx) else {
             break;
         };
@@ -4919,6 +4927,7 @@ fn context_vm_notify_calls(agent: &Agent) -> Vec<serde_json::Value> {
     agent
         .take_context_vm_notices()
         .into_iter()
+        .chain(agent.take_prompt_rewind_notice())
         // Plugin warnings (failed SessionStart hooks) ride the same drain.
         .chain(davinci_coding_agent::plugins::take_notices())
         .map(|message| serde_json::json!({"op": "notify", "message": message, "type": "warning"}))
@@ -10299,6 +10308,9 @@ fn apply_changelog_overlay(
 }
 
 fn refresh_chrome_footer(session: &mut InteractiveSession, agent: &Agent) {
+    if let Some(notice) = agent.take_prompt_rewind_notice() {
+        session.chrome.transcript.push("warning", &notice);
+    }
     session.chrome.footer_cwd = Some(agent.cwd.to_string_lossy().into_owned());
     session.chrome.footer_home = davinci_session::home_dir().map(|home| home.display().to_string());
     session.chrome.footer_branch = resolve_git_branch(&agent.cwd);
@@ -12438,9 +12450,11 @@ fn teammate_idle_timeout() -> std::time::Duration {
 }
 
 fn open_prompt_rewind(agent: &Agent, session: &mut InteractiveSession) -> Result<bool, String> {
+    let notice = agent.prompt_rewind_notice();
     let checkpoints = agent.prompt_checkpoints();
     if checkpoints.is_empty() {
-        session.chrome.status = "No prompt checkpoints in this conversation".into();
+        session.chrome.status =
+            notice.unwrap_or_else(|| "No prompt checkpoints in this conversation".into());
         return Ok(true);
     }
     session.extension_dialog_context = Some("rewind-checkpoint".into());
@@ -12461,6 +12475,9 @@ fn open_prompt_rewind(agent: &Agent, session: &mut InteractiveSession) -> Result
             })
             .collect(),
     );
+    if let Some(notice) = notice {
+        session.chrome.status = notice;
+    }
     Ok(true)
 }
 

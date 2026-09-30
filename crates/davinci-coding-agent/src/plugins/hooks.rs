@@ -169,10 +169,23 @@ pub fn digest_cached(root: &Path, hooks: &[PluginHook]) -> Option<String> {
 }
 
 /// [`digest`] for execution-time approval checks, which run on every tool
-/// call. The tree's metadata (paths, sizes, modification times and, on Unix,
-/// change times and inodes, which a file's owner cannot set back) is compared
-/// first; file contents are hashed again only when that metadata changed.
+/// call. On Unix the tree's metadata includes change times and inodes, so
+/// restoring a file's size and modification time still invalidates the cache.
+/// Other platforms hash afresh because size and modification time alone cannot
+/// establish that the approved contents are unchanged.
 pub fn digest_unless_unchanged(root: &Path, hooks: &[PluginHook]) -> Option<String> {
+    #[cfg(not(unix))]
+    {
+        digest(root, hooks)
+    }
+    #[cfg(unix)]
+    {
+        digest_with_metadata_cache(root, hooks)
+    }
+}
+
+#[cfg(unix)]
+fn digest_with_metadata_cache(root: &Path, hooks: &[PluginHook]) -> Option<String> {
     type Cache = Mutex<BTreeMap<(PathBuf, String), (String, Option<String>)>>;
     static CACHE: OnceLock<Cache> = OnceLock::new();
     if hooks.is_empty() {
@@ -194,6 +207,7 @@ pub fn digest_unless_unchanged(root: &Path, hooks: &[PluginHook]) -> Option<Stri
     value
 }
 
+#[cfg(unix)]
 fn tree_fingerprint(root: &Path) -> String {
     let mut hasher = Sha256::new();
     let walker = walkdir::WalkDir::new(root)
@@ -673,7 +687,9 @@ mod tests {
         {
             let path = root.join("run.sh");
             let modified = std::fs::metadata(&path).unwrap().modified().unwrap();
-            std::fs::write(&path, "echo worse, longer").unwrap();
+            let old_len = std::fs::metadata(&path).unwrap().len();
+            std::fs::write(&path, "echo harm, longer").unwrap();
+            assert_eq!(std::fs::metadata(&path).unwrap().len(), old_len);
             std::fs::File::options()
                 .write(true)
                 .open(&path)
@@ -684,6 +700,40 @@ mod tests {
             assert_ne!(edited, changed);
             assert_eq!(edited, digest(root, &hooks).unwrap());
         }
+    }
+
+    #[cfg(not(unix))]
+    #[test]
+    fn execution_digest_rehashes_when_change_time_is_unavailable() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("run.sh");
+        std::fs::write(&path, "echo safe").unwrap();
+        let hooks = vec![PluginHook {
+            event: HookEvent::PreToolUse,
+            matcher: None,
+            command: "bash \"$CLAUDE_PLUGIN_ROOT/run.sh\"".into(),
+            timeout_secs: 60,
+            shell: None,
+            is_async: false,
+        }];
+        let approved = digest_unless_unchanged(dir.path(), &hooks).unwrap();
+        let metadata = std::fs::metadata(&path).unwrap();
+        std::fs::write(&path, "echo evil").unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_modified(metadata.modified().unwrap())
+            .unwrap();
+        let changed_metadata = std::fs::metadata(&path).unwrap();
+        assert_eq!(changed_metadata.len(), metadata.len());
+        assert_eq!(
+            changed_metadata.modified().unwrap(),
+            metadata.modified().unwrap()
+        );
+        let changed = digest_unless_unchanged(dir.path(), &hooks).unwrap();
+        assert_ne!(changed, approved);
+        assert_eq!(changed, digest(dir.path(), &hooks).unwrap());
     }
 
     #[test]

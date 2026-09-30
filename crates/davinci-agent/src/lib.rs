@@ -2003,14 +2003,17 @@ impl Agent {
             && self.pruned_tool_results.is_empty()
             && plan_context.is_none()
         {
-            return convert_to_llm_for_provider(
+            return completion::coalesce_completion_user_messages(convert_to_llm_for_provider(
                 &self.completion_provider_history(&self.messages),
                 self.block_images,
-            );
+            ));
         }
         let mut messages = self.completion_provider_history(&self.project_with_evidence());
         if ephemeral_context.is_empty() && plan_context.is_none() {
-            return convert_to_llm_for_provider(&messages, self.block_images);
+            return completion::coalesce_completion_user_messages(convert_to_llm_for_provider(
+                &messages,
+                self.block_images,
+            ));
         }
         let insertion = messages
             .iter()
@@ -2026,7 +2029,10 @@ impl Agent {
             insertion..insertion,
             plan_context.into_iter().chain(ephemeral_context),
         );
-        convert_to_llm_for_provider(&messages, self.block_images)
+        completion::coalesce_completion_user_messages(convert_to_llm_for_provider(
+            &messages,
+            self.block_images,
+        ))
     }
 
     #[doc(hidden)]
@@ -2073,20 +2079,21 @@ impl Agent {
             });
         }
         let budget = self.provider_context_budget();
-        let mut live = self.live_tool_exchange();
-        live.extend(
-            self.completion_context
-                .iter()
-                .map(|overlay| overlay.message.clone()),
-        );
+        let live = self.live_tool_exchange();
         let live_tokens = live
             .iter()
             .map(provider_budget::message_token_ceiling)
             .fold(0u64, u64::saturating_add);
-        if budget.reserved().saturating_add(live_tokens) >= budget.window {
+        let completion_tokens = self
+            .completion_context
+            .iter()
+            .map(|overlay| provider_budget::message_token_ceiling(&overlay.message))
+            .fold(0u64, u64::saturating_add);
+        let transient_tokens = live_tokens.saturating_add(completion_tokens);
+        if budget.reserved().saturating_add(transient_tokens) >= budget.window {
             return Err(runtime::context_vm::CONTEXT_BUDGET_EXCEEDED.into());
         }
-        let max_tokens = budget.working_set_budget().saturating_sub(live_tokens);
+        let max_tokens = budget.working_set_budget().saturating_sub(transient_tokens);
         let direct_tokens = items.iter().map(|item| item.estimated_tokens).sum::<u64>();
         let goal = self
             .last_real_user_request
@@ -2145,6 +2152,7 @@ impl Agent {
         }
         image.messages.extend(live);
         image.estimated_tokens = image.estimated_tokens.saturating_add(live_tokens);
+        self.apply_completion_context_to_image(&mut image)?;
         Ok(image)
     }
 
@@ -3745,12 +3753,9 @@ impl Agent {
             }
         }
         if result.compacted {
+            let previous_len = self.messages.len();
             self.messages = result.messages.clone();
-            for overlay in &mut self.completion_context {
-                overlay.after_message = self.messages.len();
-                // Its marker was folded into the summary.
-                overlay.replaces_marker = false;
-            }
+            self.reindex_completion_context_after_compaction(previous_len);
         }
         let estimated_after = self.estimated_context_tokens();
         if let Some(runtime) = &self.runtime {

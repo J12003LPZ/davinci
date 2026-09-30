@@ -40,11 +40,25 @@ restore is available even when code has conflicts.
 Conversation restore moves to a durable branch before the selected prompt. The
 abandoned messages remain in the session tree. Code-only restore keeps the
 conversation, and restored effects are marked so another rewind does not replay
-them. Checkpoint metadata and bounded effect reports survive reopening the
-session. Reports contain exact file bytes and are created with user-only access
+them, including after a later conversation restore branches away from that
+code restore. Checkpoint metadata uses incremental v2 entries; earlier v1
+snapshots remain readable. Both metadata and bounded effect reports survive
+reopening the session. Without a saved session, only the last 10 prompts retain
+conversation snapshots; older prompts still support code-only restore.
+Reports contain exact file bytes and are created with user-only access
 on Unix, beside the session as `<session>.rewind-effects.jsonl`; keep them with the
 session. Existing 16 MiB per-blob, 256 MiB task-storage and 128 MiB effect-report
-limits apply. A missing or invalid report fails closed.
+limits apply. Missing or invalid rewind data does not prevent the conversation
+from opening. Earlier checkpoints are dropped with a visible notice, an unusable
+report is preserved as `<session>.rewind-effects.jsonl.invalid-<timestamp>`, and
+recording starts again. If the report cannot be set aside, rewind stays disabled
+for that conversation and the notice explains why.
+
+Reaching the checkpoint storage budget or failing to write the effect report
+disables rewind with a warning while file edits continue. This does not relax
+file-tool safety checks: an unreadable source file or a full physical disk still
+refuses the edit. New rewind previews and applies are refused once recording is
+disabled, including requests using an earlier checkpoint ID.
 Checkpoints are bound to the original workspace, so changing directories cannot
 restore similarly named files in another project. Forks inherit completed
 checkpoints and copy their validated reports into the fork's own report.
@@ -56,10 +70,10 @@ unavailable. Graceful aborts settle their checkpoint before returning.
 
 All commands use the existing JSONL RPC transport. No model call is needed.
 
-1. `{"type":"get_rewind_checkpoints"}` returns `checkpoints` (newest first) and
-   the shell-change limitation.
-2. `{"type":"rewind_preview","checkpointId":"<id>"}` returns `preview` and
-   the limitation. Read `preview.preview_digest`, files and conflicts.
+1. `{"type":"get_rewind_checkpoints"}` returns `checkpoints` (newest first),
+   the shell-change limitation, and `notice` (a warning string or `null`).
+2. `{"type":"rewind_preview","checkpointId":"<id>"}` returns `preview`,
+   the limitation, and `notice`. Read `preview.preview_digest`, files and conflicts.
 3. `{"type":"rewind_apply","checkpointId":"<id>","previewDigest":"<digest>","mode":"both"}`
    restores the chosen domains. `mode` is `code`, `conversation`, or `both`.
 

@@ -1648,6 +1648,9 @@ pub(crate) struct PromptRewindState {
     /// Why earlier checkpoints were not loaded; recording continues.
     #[serde(skip)]
     notice: Option<String>,
+    /// Hosts display each changed notice once while rewind responses keep it.
+    #[serde(skip)]
+    reported_notice: std::sync::Arc<std::sync::Mutex<Option<String>>>,
     /// Why recording cannot continue; seeds the runtime's rewind fault.
     #[serde(skip)]
     fault: Option<String>,
@@ -1945,6 +1948,21 @@ impl crate::Agent {
             .or_else(|| self.prompt_rewind.notice.clone())
     }
 
+    /// Drain a new rewind warning for the host's user-facing notice channel.
+    pub fn take_prompt_rewind_notice(&self) -> Option<String> {
+        let notice = self.prompt_rewind_notice()?;
+        let mut reported = self
+            .prompt_rewind
+            .reported_notice
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if reported.as_ref() == Some(&notice) {
+            return None;
+        }
+        *reported = Some(notice.clone());
+        Some(notice)
+    }
+
     fn prompt_rewind_fault(&self) -> Option<String> {
         self.runtime
             .as_ref()
@@ -1991,6 +2009,18 @@ impl crate::Agent {
         }
         if let Err(error) = self.settle_prompt_checkpoint() {
             self.prompt_rewind.persistence_error = Some(error);
+        }
+        // The reset must precede conversation_parent: rewinding the first
+        // recovered prompt must not put invalid metadata back on the branch.
+        if self.prompt_rewind_fault().is_none()
+            && std::mem::take(&mut self.prompt_rewind.pending_reset)
+        {
+            let report_source = self.prompt_rewind_report_path();
+            if let Err(error) =
+                self.persist_prompt_rewind_change(PromptRewindChange::Reset { report_source })
+            {
+                self.prompt_rewind.persistence_error = Some(error);
+            }
         }
         self.prompt_rewind.authority = None;
         let effect_start = self
@@ -2042,15 +2072,6 @@ impl crate::Agent {
             .take(unsaved.saturating_sub(MAX_UNSAVED_TRANSCRIPT_SNAPSHOTS))
         {
             older.messages_before = None;
-        }
-        if std::mem::take(&mut self.prompt_rewind.pending_reset) {
-            let report_source = self.prompt_rewind_report_path();
-            if let Err(error) =
-                self.persist_prompt_rewind_change(PromptRewindChange::Reset { report_source })
-            {
-                self.prompt_rewind.persistence_error = Some(error);
-                return;
-            }
         }
         let report_source = self.prompt_rewind_report_path();
         if let Err(error) = self.persist_prompt_rewind_change(PromptRewindChange::Record {
@@ -2169,6 +2190,9 @@ impl crate::Agent {
     }
 
     fn require_rewind_idle(&self) -> Result<(), String> {
+        if let Some(error) = self.prompt_rewind_fault() {
+            return Err(error);
+        }
         if self.prompt_rewind.binding != self.prompt_rewind_binding() {
             return Err("Rewind checkpoints belong to a different session".into());
         }
@@ -2376,6 +2400,14 @@ impl crate::Agent {
             self.prompt_rewind.checkpoints.truncate(position);
             if let Some(session) = &mut self.session {
                 session.set_leaf(checkpoint.conversation_parent.clone());
+                // Earlier Apply entries can fall off the new ancestry. Carry
+                // their restored indexes forward without snapshotting history.
+                restored = self
+                    .prompt_rewind
+                    .restored_effects
+                    .iter()
+                    .copied()
+                    .collect();
             }
         }
         self.prompt_rewind.authority = None;
@@ -2946,6 +2978,121 @@ mod rewind_persistence_tests {
             task_state: false,
             transcript,
         }
+    }
+
+    #[test]
+    fn prompt_rewind_restored_effects_survive_transcript_branch_and_reopen() {
+        // Exercise both v2-only histories and v2 changes after a legacy v1 base.
+        for legacy_base in [false, true] {
+            let dir = tempdir().unwrap();
+            let session = davinci_session::JsonlSession::create(
+                &dir.path().join("sessions"),
+                &dir.path().to_string_lossy(),
+                None,
+            )
+            .unwrap();
+            let path = session.path.clone();
+            let mut agent = agent_at(dir.path());
+            agent.load_from_session(session).unwrap();
+            agent.prompt("first");
+            tool_turn(&mut agent, "write", json!({"path":"a.txt","content":"one"}));
+            let first = agent.prompt_checkpoints()[0].id.clone();
+            if legacy_base {
+                let data = serde_json::to_value(&agent.prompt_rewind).unwrap();
+                agent
+                    .session
+                    .as_mut()
+                    .unwrap()
+                    .append_entry(davinci_session::custom_entry(
+                        "legacy-base",
+                        PROMPT_REWIND_ENTRY,
+                        data,
+                    ))
+                    .unwrap();
+            }
+            agent.prompt("second");
+            tool_turn(&mut agent, "write", json!({"path":"b.txt","content":"two"}));
+            let second = agent.prompt_checkpoints()[0].id.clone();
+            let preview = agent.preview_prompt_rewind(&first).unwrap();
+            agent
+                .apply_prompt_rewind(&first, &preview.preview_digest, &select(true, false))
+                .unwrap();
+            let preview = agent.preview_prompt_rewind(&second).unwrap();
+            agent
+                .apply_prompt_rewind(&second, &preview.preview_digest, &select(false, true))
+                .unwrap();
+            assert!(agent
+                .preview_prompt_rewind(&first)
+                .unwrap()
+                .files
+                .is_empty());
+            drop(agent);
+
+            let mut reopened = agent_at(dir.path());
+            reopened
+                .load_from_session(davinci_session::JsonlSession::open(&path).unwrap())
+                .unwrap();
+            assert!(reopened.preview_prompt_rewind(&first).unwrap().files.is_empty(),
+                "a transcript branch must retain restorations recorded on the old branch (legacy={legacy_base})");
+            reopened.prompt("third");
+            tool_turn(
+                &mut reopened,
+                "write",
+                json!({"path":"a.txt","content":"three"}),
+            );
+            let preview = reopened.preview_prompt_rewind(&first).unwrap();
+            assert_eq!(preview.conflict_count, 0);
+            assert_eq!(preview.files.len(), 1);
+            reopened
+                .apply_prompt_rewind(&first, &preview.preview_digest, &select(true, false))
+                .unwrap();
+            assert!(!dir.path().join("a.txt").exists());
+            assert!(!dir.path().join("b.txt").exists());
+        }
+    }
+
+    #[test]
+    fn prompt_rewind_reset_survives_rewinding_first_prompt_and_reopen() {
+        let dir = tempdir().unwrap();
+        let mut session = davinci_session::JsonlSession::create(
+            &dir.path().join("sessions"),
+            &dir.path().to_string_lossy(),
+            None,
+        )
+        .unwrap();
+        session
+            .append_entry(davinci_session::custom_entry(
+                "invalid-rewind",
+                PROMPT_REWIND_DELTA_ENTRY,
+                json!({"kind":"invalid"}),
+            ))
+            .unwrap();
+        let path = session.path.clone();
+        let mut agent = agent_at(dir.path());
+        agent.load_from_session(session).unwrap();
+        assert!(agent.prompt_rewind_notice().is_some());
+        agent.prompt("first after reset");
+        let first = agent.prompt_checkpoints()[0].id.clone();
+        let preview = agent.preview_prompt_rewind(&first).unwrap();
+        agent
+            .apply_prompt_rewind(&first, &preview.preview_digest, &select(false, true))
+            .unwrap();
+        agent.prompt("new branch after reset");
+        agent.settle_prompt_checkpoint().unwrap();
+        drop(agent);
+        let mut reopened = agent_at(dir.path());
+        reopened
+            .load_from_session(davinci_session::JsonlSession::open(&path).unwrap())
+            .unwrap();
+        assert!(
+            reopened.prompt_rewind_notice().is_none(),
+            "the reset must remain on the new branch"
+        );
+        assert_eq!(reopened.prompt_checkpoints().len(), 1);
+        assert_eq!(
+            reopened.prompt_checkpoints()[0].prompt,
+            "new branch after reset"
+        );
     }
 
     #[test]

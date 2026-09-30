@@ -2832,7 +2832,12 @@ impl Question {
                 title: "Rewind".into(),
                 name: "REWIND".into(),
                 key: "/rewind".into(),
-                note: davinci_agent::runtime::rewind::SHELL_REWIND_LIMITATION.into(),
+                note: std::iter::once(
+                    davinci_agent::runtime::rewind::SHELL_REWIND_LIMITATION.to_owned(),
+                )
+                .chain(_agent.prompt_rewind_notice())
+                .collect::<Vec<_>>()
+                .join("\n"),
                 items: checkpoints
                     .iter()
                     .map(|(_, prompt)| PickerItem::new(prompt, "restore from before this prompt"))
@@ -3910,9 +3915,9 @@ pub fn perform(
                 .map(|checkpoint| (checkpoint.id, checkpoint.prompt))
                 .collect::<Vec<_>>();
             if checkpoints.is_empty() {
-                Ok(Done::Note(
-                    "No prompt checkpoints in this conversation".into(),
-                ))
+                Ok(Done::Note(agent.prompt_rewind_notice().unwrap_or_else(
+                    || "No prompt checkpoints in this conversation".into(),
+                )))
             } else {
                 Ok(Done::Ask(Question::Rewind { checkpoints }))
             }
@@ -4347,6 +4352,7 @@ fn push_context_vm_notices(agent: &Agent, model: &mut Model) {
     for notice in agent
         .take_context_vm_notices()
         .into_iter()
+        .chain(agent.take_prompt_rewind_notice())
         .chain(plugin_warnings)
     {
         model.transcript.push(Entry::Gap);
@@ -10449,6 +10455,11 @@ fn detached_login_message(provider: &str, oauth_pending: bool) -> Result<String,
 }
 
 fn refresh_context(model: &mut Model, agent: &Agent) {
+    if let Some(notice) = agent.take_prompt_rewind_notice() {
+        model
+            .transcript
+            .push(Entry::notice(State::Attention, &notice));
+    }
     // Session restoration and fail-closed tool failures can change the mode
     // without a composer event; always redraw from the authoritative policy.
     sync_permission_state(agent, model);

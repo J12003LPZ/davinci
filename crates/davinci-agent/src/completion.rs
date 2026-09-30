@@ -45,6 +45,9 @@ pub(crate) struct CompletionContextMessage {
     /// The saved marker at `after_message` stands in for this reminder; the
     /// provider sees the reminder in its place while the run is active.
     pub(crate) replaces_marker: bool,
+    /// Identifies the saved marker in a compiled Context VM image without
+    /// adding the full reminder to the VM's durable event stream.
+    marker_source_ref: Option<String>,
 }
 
 impl Agent {
@@ -380,6 +383,10 @@ impl Agent {
         let marker_index = self.messages.len();
         self.messages.push(marker.clone());
         self.persist_full_message(&marker);
+        let marker_source_ref = self
+            .context_vm_events_for_runtime()
+            .last()
+            .map(|event| event.source_ref.clone());
         let mut message = ChatMessage::text("user", text);
         message.extra.insert(
             "davinciCompletionOverlay".into(),
@@ -389,6 +396,7 @@ impl Agent {
             after_message: marker_index,
             message,
             replaces_marker: true,
+            marker_source_ref,
         });
         self.invalidate_context_image();
         self.push_event(
@@ -420,6 +428,111 @@ impl Agent {
         }
         messages
     }
+
+    pub(crate) fn reindex_completion_context_after_compaction(&mut self, previous_len: usize) {
+        // Legacy compaction replaces a prefix with one summary and retains
+        // the remaining messages verbatim, including pending reminder markers.
+        let first_kept = previous_len.saturating_sub(self.messages.len().saturating_sub(1));
+        let events = self
+            .session
+            .is_none()
+            .then(|| self.context_vm_events_for_runtime());
+        for overlay in &mut self.completion_context {
+            if overlay.replaces_marker && overlay.after_message >= first_kept {
+                overlay.after_message = overlay.after_message - first_kept + 1;
+            } else {
+                overlay.after_message = self.messages.len();
+                overlay.replaces_marker = false;
+            }
+            if let Some(events) = &events {
+                overlay.marker_source_ref = overlay
+                    .replaces_marker
+                    .then(|| {
+                        events
+                            .iter()
+                            .find(|event| event.seq == overlay.after_message as u64 + 1)
+                            .map(|event| event.source_ref.clone())
+                    })
+                    .flatten();
+            }
+        }
+        self.completion_context
+            .sort_by_key(|overlay| overlay.after_message);
+    }
+
+    pub(crate) fn apply_completion_context_to_image(
+        &self,
+        image: &mut crate::runtime::ContextImage,
+    ) -> Result<(), String> {
+        for (index, overlay) in self.completion_context.iter().enumerate() {
+            let content = serde_json::to_string(&overlay.message).map_err(|e| e.to_string())?;
+            let entry = crate::runtime::ContextImageEntry {
+                id: format!("completion-reminder:{index}"),
+                source_ref: overlay
+                    .marker_source_ref
+                    .clone()
+                    .unwrap_or_else(|| format!("completion-reminder:{index}")),
+                category: "completion_reminder".into(),
+                provenance_kind: crate::runtime::context_manifest::ProvenanceKind::ToolEvidence,
+                content_hash: crate::runtime::cache::digest(content.as_bytes()),
+                estimated_tokens: crate::provider_budget::message_token_ceiling(&overlay.message),
+                content,
+                mandatory: true,
+                stable_for_cache: false,
+            };
+            image.estimated_tokens = image
+                .estimated_tokens
+                .saturating_add(entry.estimated_tokens);
+            let marker_index = overlay.marker_source_ref.as_ref().and_then(|source| {
+                image
+                    .entries
+                    .iter()
+                    .position(|entry| &entry.source_ref == source && entry.category == "hot_user")
+            });
+            if let Some(marker_index) = marker_index {
+                image.estimated_tokens = image
+                    .estimated_tokens
+                    .saturating_sub(image.entries[marker_index].estimated_tokens);
+                image.entries[marker_index] = entry;
+                image.messages[marker_index] = overlay.message.clone();
+            } else {
+                // A folded or paged-out marker has no hot message to replace.
+                // Keep its reminder available as an ephemeral suffix.
+                image.entries.push(entry);
+                image.messages.push(overlay.message.clone());
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Compaction or ephemeral context can leave a reminder next to another user
+/// message. Keep both payloads in one provider turn, including once only the
+/// saved marker remains. Ordinary conversation turns keep their boundaries.
+pub(crate) fn coalesce_completion_user_messages(messages: Vec<ChatMessage>) -> Vec<ChatMessage> {
+    let is_completion = |message: &ChatMessage| {
+        message.extra_bool("davinciCompletionOverlay")
+            || message.extra.contains_key(COMPLETION_REMINDER_FIELD)
+    };
+    let mut turns: Vec<ChatMessage> = Vec::with_capacity(messages.len());
+    for mut message in messages {
+        if turns.last().is_some_and(|previous| {
+            previous.role == "user"
+                && message.role == "user"
+                && (is_completion(previous) || is_completion(&message))
+        }) {
+            // An inserted context block may precede the summary, so consume
+            // the entire adjacent user group once it includes a reminder.
+            while turns.last().is_some_and(|previous| previous.role == "user") {
+                let mut previous = turns.pop().unwrap();
+                previous.content.extend(message.content);
+                previous.extra.extend(message.extra);
+                message = previous;
+            }
+        }
+        turns.push(message);
+    }
+    turns
 }
 
 /// Clauses end at a line break or at punctuation followed by whitespace or the
@@ -673,11 +786,27 @@ mod tests {
                 let image = agent.prepared_context_image().unwrap();
                 if !agent.completion_context.is_empty() {
                     saw = true;
-                    assert!(
-                        davinci_ai::content_text(&image.messages.last().unwrap().content)
-                            .contains("List each explicit requirement")
-                    );
-                    assert!(image.entries.last().unwrap().mandatory);
+                    assert!(image.messages.iter().all(|message| {
+                        message.role != "user"
+                            || davinci_ai::content_text(&message.content)
+                                != COMPLETION_REMINDER_MARKER
+                    }));
+                    assert!(image
+                        .messages
+                        .windows(2)
+                        .all(|pair| { !(pair[0].role == "user" && pair[1].role == "user") }));
+                    let reminders = image
+                        .messages
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, message)| {
+                            davinci_ai::content_text(&message.content)
+                                .contains("List each explicit requirement")
+                        })
+                        .collect::<Vec<_>>();
+                    assert_eq!(reminders.len(), 1);
+                    assert!(image.entries[reminders[0].0].mandatory);
+                    assert!(reminders[0].1.extra_bool("davinciCompletionOverlay"));
                     assert!(
                         image.estimated_tokens
                             >= crate::provider_budget::message_token_ceiling(
@@ -700,6 +829,151 @@ mod tests {
                 .unwrap()
                 .contains("List each explicit requirement")
         );
+        assert!(agent.messages.iter().any(|message| {
+            davinci_ai::content_text(&message.content) == COMPLETION_REMINDER_MARKER
+        }));
+    }
+
+    #[test]
+    fn completion_reminder_replaces_its_retained_marker_after_compaction() {
+        let root = tempfile::tempdir().unwrap();
+        let sessions = tempfile::tempdir().unwrap();
+        let mut agent = fixture(root.path());
+        agent.session = Some(
+            crate::JsonlSession::create(sessions.path(), "compacted-completion", None).unwrap(),
+        );
+        agent.prompt("Finish the task");
+        let answer = ChatMessage::text("assistant", "Ready to finish");
+        agent.messages.push(answer.clone());
+        agent.persist_full_message(&answer);
+        agent.queue_completion_reminder(
+            "Check the final result before finishing".into(),
+            "completion.hook_block",
+            &mut Vec::new(),
+        );
+        agent.compaction.keep_recent_tokens = 1;
+        agent.summarizer = Some(crate::Summarizer::new(|_| {
+            Ok(crate::SummarizeResponse {
+                text: "The task is ready for a final check.".into(),
+                usage: Default::default(),
+                stop_reason: Some(davinci_ai::StopReason::Stop),
+                error_message: None,
+                has_tool_call: false,
+            })
+        }));
+        assert!(agent.compact(None).compacted);
+        assert!(agent.compact(None).compacted);
+        agent.ephemeral_context.push(ChatMessage::text(
+            "custom",
+            "Preserve the final-check evidence.",
+        ));
+        agent
+            .run_loop(|agent| {
+                let users = agent
+                    .messages_for_provider()
+                    .into_iter()
+                    .filter(|message| message.role == "user")
+                    .map(|message| davinci_ai::content_text(&message.content))
+                    .collect::<Vec<_>>();
+                assert_eq!(users.len(), 1);
+                assert!(users[0].contains("The task is ready for a final check."));
+                assert!(users[0].contains("Preserve the final-check evidence."));
+                assert_eq!(
+                    users[0]
+                        .matches("Check the final result before finishing")
+                        .count(),
+                    1
+                );
+                assert!(!users[0].contains(COMPLETION_REMINDER_MARKER));
+                reply(agent)
+            })
+            .unwrap();
+        let saved = std::fs::read_to_string(&agent.session.as_ref().unwrap().path).unwrap();
+        assert!(saved.contains(COMPLETION_REMINDER_MARKER));
+        assert!(!saved.contains("Check the final result before finishing"));
+        assert!(agent
+            .messages_for_provider()
+            .iter()
+            .any(|message| { message.extra.contains_key(COMPLETION_REMINDER_FIELD) }));
+    }
+
+    #[test]
+    fn active_context_vm_replaces_multiple_markers_in_their_original_turns() {
+        for persisted in [false, true] {
+            let root = tempfile::tempdir().unwrap();
+            let sessions = tempfile::tempdir().unwrap();
+            let mut agent = fixture(root.path());
+            if persisted {
+                agent.session = Some(
+                    crate::JsonlSession::create(sessions.path(), "vm-completion", None).unwrap(),
+                );
+            }
+            agent.set_runtime(crate::RuntimeHandle::new(
+                crate::RunId::new(),
+                crate::AgentId::new(),
+                crate::RuntimeBus::new(),
+            ));
+            agent.set_context_vm_mode(crate::ContextVmMode::Active);
+            let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let hook_calls = calls.clone();
+            agent.completion_hook = Some(CompletionHook(Arc::new(move |_, _| {
+                let call = hook_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                (call < 2).then(|| format!("Review step {call}"))
+            })));
+            agent.prompt("Finish the task");
+            agent
+                .run_loop(|agent| {
+                    let image = agent.prepared_context_image().unwrap();
+                    let turns = image
+                        .messages
+                        .iter()
+                        .filter(|message| matches!(message.role.as_str(), "user" | "assistant"))
+                        .collect::<Vec<_>>();
+                    assert!(turns.windows(2).all(|pair| pair[0].role != pair[1].role));
+                    assert_eq!(
+                        turns
+                            .iter()
+                            .filter(|message| message.extra_bool("davinciCompletionOverlay"))
+                            .count(),
+                        agent.completion_context.len()
+                    );
+                    assert_eq!(
+                        image.estimated_tokens,
+                        image
+                            .entries
+                            .iter()
+                            .map(|entry| entry.estimated_tokens)
+                            .sum::<u64>()
+                    );
+                    assert!(agent
+                        .runtime
+                        .as_ref()
+                        .unwrap()
+                        .context_vm
+                        .source_contents
+                        .read()
+                        .unwrap()
+                        .values()
+                        .all(|text| !text.contains("A completion hook blocked this attempt")));
+                    reply(agent)
+                })
+                .unwrap();
+            assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 3);
+            let image = agent.prepared_context_image().unwrap();
+            assert_eq!(
+                image
+                    .messages
+                    .iter()
+                    .filter(|message| {
+                        davinci_ai::content_text(&message.content) == COMPLETION_REMINDER_MARKER
+                    })
+                    .count(),
+                2
+            );
+            assert!(!serde_json::to_string(&image.messages)
+                .unwrap()
+                .contains("Review step"));
+        }
     }
 
     #[test]
