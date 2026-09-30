@@ -117,10 +117,10 @@ impl Agent {
 
     fn completion_auxiliary_observation_allowed(&self) -> bool {
         self.active_contract().is_none()
-            && !self
+            && self
                 .runtime
                 .as_ref()
-                .is_some_and(|runtime| runtime.parent_agent_id.is_some())
+                .is_none_or(|runtime| runtime.parent_agent_id.is_none())
             && std::env::var_os("PI_GRAPH_ROLE").is_none()
     }
 
