@@ -147,10 +147,10 @@ def make_identity(binary, source, ci, tag, version="1.0.71", require_tag=True):
             "binary_sha256": file_hash(binary), "built_at": datetime.now(timezone.utc).isoformat()}
 
 
-def record_identity(proof, binary, output):
+def record_identity(proof, binary, output, require_tag=True):
     proof = json.loads(Path(proof).read_text(encoding="utf-8"))
     require_same_source(proof["repo"], proof["source"])
-    identity = make_identity(binary, proof["source"], proof["ci"], proof["release_tag"], proof["version"])
+    identity = make_identity(binary, proof["source"], proof["ci"], proof["release_tag"], proof["version"], require_tag=require_tag)
     Path(output).write_text(json.dumps(identity, indent=2) + "\n", encoding="utf-8")
     return identity
 
@@ -166,6 +166,7 @@ def main():
     after.add_argument("--proof", required=True)
     after.add_argument("--binary", required=True)
     after.add_argument("--output", required=True)
+    after.add_argument("--benchmark", action="store_true", help="green committed benchmark, not a tagged installation")
     args = parser.parse_args()
     try:
         if args.command == "preflight":
@@ -173,7 +174,7 @@ def main():
             Path(args.output).write_text(json.dumps(proof, indent=2) + "\n", encoding="utf-8")
             print(f"Green CI: {proof['ci']['ci_url']}; source: {proof['source']['source_sha']}")
         else:
-            record_identity(args.proof, args.binary, args.output)
+            record_identity(args.proof, args.binary, args.output, require_tag=not args.benchmark)
             print(f"Recorded installation identity: {args.output}")
     except (ValueError, OSError, subprocess.SubprocessError, KeyError) as error:
         parser.exit(1, f"davinci release gate: {error}\n")
