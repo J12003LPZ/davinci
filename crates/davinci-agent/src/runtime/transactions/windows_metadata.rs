@@ -574,6 +574,63 @@ mod tests {
     }
 
     #[test]
+    fn transaction_metadata_publication_denied_before_source_replacement() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("a.txt");
+        std::fs::write(&path, b"before").unwrap();
+        let file = std::fs::OpenOptions::new()
+            .access_mode(0xe0000)
+            .open(&path)
+            .unwrap();
+        let access = super::super::windows_acl::read(&file).unwrap();
+        let dacl = access.find("D:").unwrap();
+        // Deny WRITE_ATTRIBUTES to everyone, retaining all other file rights.
+        let denied = format!("{}D:P(D;;0x100;;;WD)(A;;FA;;;WD)", &access[..dacl]);
+        super::super::windows_acl::apply(&file, &denied).unwrap();
+        drop(file);
+        let manager =
+            TransactionCoordinator::new(root.path(), TransactionOwner::default()).unwrap();
+        let preview = manager
+            .preview(vec![ProposedChange::write("a.txt", b"after".to_vec())])
+            .unwrap();
+        let result = manager.apply(&preview.id, &|_| Ok(()), None);
+        assert!(result
+            .unwrap_err()
+            .contains("cannot publish transaction metadata"));
+        assert_eq!(std::fs::read(&path).unwrap(), b"before");
+        assert_eq!(
+            manager.status(&preview.id).unwrap().state,
+            super::super::TransactionState::RolledBack
+        );
+        let file = std::fs::OpenOptions::new()
+            .access_mode(0xe0000)
+            .open(&path)
+            .unwrap();
+        super::super::windows_acl::apply(&file, &access).unwrap();
+    }
+
+    #[test]
+    fn transaction_pending_publication_tolerates_only_creation_time() {
+        use super::super::files;
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("a.txt"), b"before").unwrap();
+        let expected = files::capture(root.path(), "a.txt").unwrap().0;
+        let mut tunneled = expected.clone();
+        tunneled.windows_metadata.as_mut().unwrap().created -= 10_000;
+        assert!(files::publication_matches(&tunneled, &expected));
+        let mut changed = tunneled.clone();
+        changed.hash = Some("foreign content".into());
+        assert!(!files::publication_matches(&changed, &expected));
+        let mut changed = tunneled.clone();
+        changed.identity = Some("foreign file".into());
+        assert!(!files::publication_matches(&changed, &expected));
+        let mut changed = tunneled;
+        changed.windows_metadata.as_mut().unwrap().attributes ^= 0x2;
+        assert!(!files::publication_matches(&changed, &expected));
+    }
+
+    #[test]
     fn transaction_encrypted_attributes_cannot_enter_plaintext_journal() {
         for attributes in [0x4000, 0x4020, 0x6002, u32::MAX] {
             let error = ensure_snapshot_attributes(attributes).unwrap_err();

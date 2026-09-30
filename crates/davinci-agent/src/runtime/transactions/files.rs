@@ -239,6 +239,14 @@ pub(super) fn replace(
             ));
         }
         check_alias_available(&dir, &name, proposed, expected)?;
+        // The staged file already has the destination ACL. Prove publication
+        // rights before replacing source bytes, rather than discovering a denied
+        // attribute write only after the irreversible rename.
+        #[cfg(windows)]
+        drop(
+            dir.source_alias_file(staged)
+                .map_err(|e| format!("cannot publish transaction metadata for {path}: {e}"))?,
+        );
         dir.replace_source(staged, &name, expected.hash.is_some(), true)
             .map_err(|e| format!("replace {path}: {e}"))?;
         publish_alias(&dir, &name, proposed)
