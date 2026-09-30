@@ -58,7 +58,7 @@ do not inspect holdout transcripts to redesign a failed candidate.
 
 ## Freeze campaigns before tuning
 
-Use the existing `bench.py run`, `--variant`, `--reps 0 1 2`, `--seed`,
+Use the existing `bench.py run`, `--variant`, `--reps 3`, `--order-seed`,
 `--private-suite`, `--split`, `--price-table` and checkpoint build path. A checkpoint
 must have schema-3 provenance for clean committed source, its exact binary hash
 and a completed green full CI run. A campaign pins executable hashes, fixture

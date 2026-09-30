@@ -31,7 +31,7 @@ jobs:
         run: |
           rustup show
           node --version
-          cargo build -p davinci-coding-agent --bin davinci --locked
+          cargo build -p davinci-coding-agent --bin davinci --features test-fixtures --locked
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           cargo test -p davinci-coding-agent --lib --locked --no-run
           exit $LASTEXITCODE
