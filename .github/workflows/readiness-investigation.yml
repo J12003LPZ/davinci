@@ -9,71 +9,75 @@ permissions:
   contents: read
 
 jobs:
-  windows-spawn:
+  windows-parallel:
     runs-on: windows-latest
-    timeout-minutes: 10
+    timeout-minutes: 35
+    env:
+      PI_OFFLINE: '1'
+      DAVINCI_OFFLINE: '1'
+      CARGO_INCREMENTAL: '0'
     steps:
       - uses: actions/checkout@v4
-      - name: Resolve pinned tools
+      - name: Build with repository-pinned Rust
         shell: pwsh
         run: |
           rustup show
           node --version
-          Get-Command node | Format-List Source,Version
-      - name: Compare Windows launch spellings and stdin
+          cargo build -p davinci-coding-agent --bin davinci --locked
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo test -p davinci-coding-agent --lib --locked --no-run
+          exit $LASTEXITCODE
+      - name: Sample two full parallel library runs
         shell: pwsh
         run: |
-          @'
-          use std::{env, fs, path::{Path, PathBuf}, process::{Command, Stdio}, thread, time::{Duration, Instant}};
-          use std::os::windows::process::CommandExt;
-          fn ordinary(p: &Path) -> PathBuf {
-              let s = p.to_string_lossy();
-              if let Some(rest) = s.strip_prefix(r"\\?\UNC\") { return PathBuf::from(format!(r"\\{}", rest)); }
-              PathBuf::from(s.strip_prefix(r"\\?\").unwrap_or(&s))
-          }
-          fn main() {
-              let root = env::temp_dir().join(format!("davinci-spawn-diagnostic-{}", std::process::id()));
-              fs::create_dir_all(&root).unwrap();
-              fs::write(root.join("relative.cjs"), "console.error('SCRIPT_ENTERED');require('fs').writeFileSync('relative-script.ok','OK');console.log(process.cwd())").unwrap();
-              let node = PathBuf::from(env::args_os().nth(1).unwrap()).canonicalize().unwrap();
-              let cwd = root.canonicalize().unwrap();
-              for (name, exe, dir, piped) in [
-                  ("canonical-exe/ordinary-cwd/piped", node.clone(), ordinary(&cwd), true),
-                  ("ordinary-exe/ordinary-cwd/piped", ordinary(&node), ordinary(&cwd), true),
-                  ("canonical-exe/canonical-cwd/piped", node.clone(), cwd.clone(), true),
-                  ("canonical-exe/ordinary-cwd/null", node.clone(), ordinary(&cwd), false),
-              ] {
-                  let _ = fs::remove_file(root.join("relative-script.ok"));
-                  let mut cmd = Command::new(&exe);
-                  cmd.arg("relative.cjs").current_dir(&dir).env_clear().creation_flags(0x08000000)
-                     .stdout(Stdio::inherit()).stderr(Stdio::inherit());
-                  for key in ["PATH", "SystemRoot", "TEMP", "TMP", "WINDIR"] {
-                      if let Some(value) = env::var_os(key) { cmd.env(key, value); }
-                  }
-                  cmd.stdin(if piped { Stdio::piped() } else { Stdio::null() });
-                  println!("CASE={name} exe={exe:?} cwd={dir:?}");
-                  let start = Instant::now();
-                  let mut child = cmd.spawn().unwrap();
-                  println!("PID={}", child.id());
-                  loop {
-                      if let Some(status) = child.try_wait().unwrap() {
-                          println!("EXIT={status} elapsed={:?} marker={}", start.elapsed(), root.join("relative-script.ok").is_file());
-                          break;
-                      }
-                      if start.elapsed() > Duration::from_secs(15) {
-                          println!("TIMEOUT marker={}", root.join("relative-script.ok").is_file());
-                          child.kill().unwrap(); child.wait().unwrap(); break;
-                      }
-                      thread::sleep(Duration::from_millis(25));
-                  }
+          $samples = Join-Path $env:RUNNER_TEMP 'windows-process-samples.jsonl'
+          $monitor = Start-Job -ArgumentList $samples -ScriptBlock {
+            param($path)
+            while ($true) {
+              $nodes = @(Get-CimInstance Win32_Process -Filter "Name='node.exe'" -ErrorAction SilentlyContinue)
+              $cpu = Get-CimInstance Win32_PerfFormattedData_PerfOS_Processor -Filter "Name='_Total'" -ErrorAction SilentlyContinue
+              foreach ($node in $nodes) {
+                if ($node.CommandLine -notmatch 'relative.cjs') { continue }
+                $process = Get-Process -Id $node.ProcessId -ErrorAction SilentlyContinue
+                $row = [ordered]@{
+                  at = [DateTime]::UtcNow.ToString('o')
+                  pid = $node.ProcessId
+                  parent = $node.ParentProcessId
+                  command = $node.CommandLine
+                  user_time = $node.UserModeTime
+                  kernel_time = $node.KernelModeTime
+                  node_count = $nodes.Count
+                  total_cpu = $cpu.PercentProcessorTime
+                  threads = @($process.Threads | Select-Object Id,ThreadState,WaitReason)
+                }
+                $row | ConvertTo-Json -Depth 5 -Compress | Add-Content -Path $path
               }
-              fs::remove_dir_all(root).unwrap();
+              Start-Sleep -Seconds 1
+            }
           }
-          '@ | Set-Content -Encoding utf8 "$env:RUNNER_TEMP\spawn.rs"
-          rustc --edition 2021 "$env:RUNNER_TEMP\spawn.rs" -o "$env:RUNNER_TEMP\spawn.exe"
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          & "$env:RUNNER_TEMP\spawn.exe" (Get-Command node).Source
-          exit $LASTEXITCODE
+          $failed = $false
+          try {
+            foreach ($attempt in 1,2) {
+              cargo test -p davinci-coding-agent --lib --locked 2>&1 | Tee-Object -FilePath (Join-Path $env:RUNNER_TEMP "windows-library-$attempt.log")
+              if ($LASTEXITCODE -ne 0) { $failed = $true }
+            }
+          } finally {
+            Stop-Job $monitor
+            Receive-Job $monitor
+            Remove-Job $monitor
+            if (Test-Path $samples) { Get-Content $samples }
+          }
+          if ($failed) { exit 1 }
+      - name: Preserve investigation evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: readiness-windows-parallel
+          path: |
+            ${{ runner.temp }}/windows-library-*.log
+            ${{ runner.temp }}/windows-process-samples.jsonl
+          retention-days: 3
+          if-no-files-found: warn
 
   offline-build-inputs:
     runs-on: ubuntu-latest
@@ -85,10 +89,12 @@ jobs:
         run: |
           set -euo pipefail
           rustup show
-          cargo fetch --locked
+          # Download only; compilation remains on the repository's Rust 1.83.
+          # Inactive optional dependencies may use newer manifest syntax.
+          cargo +stable fetch --locked --target x86_64-unknown-linux-gnu
           git archive --format=tar HEAD | gzip > "$RUNNER_TEMP/davinci-source.tar.gz"
           toolchain="$(dirname "$(dirname "$(rustup which rustc)")")"
-          tar -czf "$RUNNER_TEMP/davinci-rust-1.83.tar.gz" --exclude=share/doc -C "$toolchain" bin lib libexec etc share
+          tar -czf "$RUNNER_TEMP/davinci-rust-1.83.tar.gz" --exclude='./share/doc' -C "$toolchain" .
           tar -czf "$RUNNER_TEMP/davinci-cargo-cache.tar.gz" -C "$HOME/.cargo" registry
       - uses: actions/upload-artifact@v4
         with:
