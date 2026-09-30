@@ -10,6 +10,10 @@ if ! command -v cargo >/dev/null 2>&1; then
 	exit 1
 fi
 
+proof="$(mktemp)"
+trap 'rm -f "$proof"' EXIT
+python3 "$root/scripts/release_identity.py" preflight --repo "$root" --require-tag --output "$proof"
+
 cargo build --release -p davinci-coding-agent --locked
 cargo build --release -p davinci-voice --features native --bin davinci-voice-worker --locked
 # Build both before replacing either executable; both come from this checkout.
@@ -21,5 +25,6 @@ cp "$root/crates/davinci-voice/THIRD_PARTY_NOTICES.md" "$notice_dir/"
 cp -R "$root/crates/davinci-voice/licenses" "$notice_dir/"
 install -m 755 "$root/target/release/davinci-voice-worker" "$bin_dir/davinci-voice-worker"
 install -m 755 "$root/target/release/davinci" "$bin_dir/davinci"
+python3 "$root/scripts/release_identity.py" record --proof "$proof" --binary "$bin_dir/davinci" --output "$bin_dir/davinci.identity.json"
 echo "Installed davinci $(davinci --version) to $(command -v davinci)"
 echo "TypeScript sources remain in vendor/davinci as the behavioral reference (legacy-pi)."

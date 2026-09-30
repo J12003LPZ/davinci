@@ -12,9 +12,12 @@ $ErrorActionPreference = 'Stop'
 $repo = Split-Path -Parent $PSScriptRoot
 $binDir = Join-Path $HOME '.cargo\bin'
 $target = Join-Path $binDir 'davinci.exe'
+$proof = [System.IO.Path]::GetTempFileName()
 
 Push-Location $repo
 try {
+    python (Join-Path $repo 'scripts\release_identity.py') preflight --repo $repo --require-tag --output $proof
+    if ($LASTEXITCODE -ne 0) { throw "installation requires an exact product version tag and green full CI" }
     cargo build --release -p davinci-coding-agent --locked
     if ($LASTEXITCODE -ne 0) { throw "build failed" }
     cargo build --release -p davinci-voice --features native --bin davinci-voice-worker --locked
@@ -32,8 +35,11 @@ try {
     # overwrite: the delete succeeds once the old process has exited.
     if (Test-Path $target) { Remove-Item $target -Force }
     Copy-Item $built $target
+    python (Join-Path $repo 'scripts\release_identity.py') record --proof $proof --binary $target --output "$target.identity.json"
+    if ($LASTEXITCODE -ne 0) { throw "could not record verified installation identity" }
 
     & $target --version
 } finally {
     Pop-Location
+    Remove-Item -LiteralPath $proof -ErrorAction SilentlyContinue
 }

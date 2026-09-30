@@ -17,8 +17,7 @@ clippy:
 	cargo clippy --workspace --all-targets -- -D warnings
 
 install:
-	cargo install --path crates/davinci-coding-agent --force
+	bash scripts/install.sh
 
 install-davinci: install
 	davinci --version
-

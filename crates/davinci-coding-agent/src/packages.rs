@@ -5,7 +5,7 @@ use crate::self_update::{current_install_method, InstallMethod};
 use crate::settings::{load_settings, save_settings, update_settings, PackageSource, Settings};
 use davinci_tui::{Component, ConfigResource, ConfigResourceKind, ConfigScope, ConfigSelector};
 
-const CANNOT_SELF_UPDATE: &str = "Davinci cannot self-update this installation automatically. Update it manually by building the release binary and replacing the installed executable (for this repository: cargo build --release -p davinci-coding-agent, then copy target/release/davinci or davinci.exe).";
+const CANNOT_SELF_UPDATE: &str = "DaVinci updates manually by reinstalling from a green tagged source checkout. Run scripts/install.sh on Linux/macOS or pwsh scripts/install-davinci.ps1 on Windows. The install scripts verify CI and record the installed binary identity.";
 const ALL_CONFLICT: &str =
     "--all cannot be combined with --self, --extensions, --models, or --extension";
 const MODELS_CONFLICT: &str =
@@ -1180,6 +1180,9 @@ mod tests {
         std::env::remove_var("PI_PACKAGE_DIR");
         std::env::remove_var("PI_EXEC_PATH");
         assert!(error.contains("manually"), "{error}");
+        assert!(error.contains("scripts/install.sh"), "{error}");
+        assert!(error.contains("scripts/install-davinci.ps1"), "{error}");
+        assert!(!error.contains("pi-mono"), "{error}");
         assert!(!error.contains("Updated davinci from"));
     }
 
