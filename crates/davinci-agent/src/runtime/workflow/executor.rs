@@ -712,14 +712,17 @@ impl WorkflowExecutor {
                     },
                 ),
                 prompt: effective_prompt,
-                tools: crate::subagent::scoped_tools_with_registry(
+                tools: crate::subagent::scoped_tools_for_access(
                     Some(&worker.tools),
                     if launch.parent_tools.is_empty() && launch.parent_permission_mode.is_none() {
                         &worker.tools
                     } else {
                         &launch.parent_tools
                     },
-                    lease.is_some(),
+                    crate::subagent::WorkerAccess::for_worker(
+                        launch.parent_permission_mode,
+                        lease.is_some(),
+                    ),
                     &self.runtime.capability_registry,
                 ),
                 description: Some(worker.id.clone()),

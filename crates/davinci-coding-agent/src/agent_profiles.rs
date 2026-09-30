@@ -60,6 +60,10 @@ impl std::fmt::Display for MemoryScope {
     }
 }
 
+/// A profile without `permission_mode` follows the lead: it reads and edits
+/// files, and is read-only while the lead is in Plan Mode.
+pub const INHERIT_PERMISSION_MODE: &str = "inherit";
+
 /// A parsed custom agent profile.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct AgentProfile {
@@ -69,7 +73,9 @@ pub struct AgentProfile {
     pub description: String,
     /// Model to use ("inherit" or specific provider/model).
     pub model: String,
-    /// Permission mode ("read-only", "ask", "edits", "auto").
+    /// Permission mode ("inherit", "read-only", "ask", "edits", "auto").
+    /// "inherit" (the default) reads and edits files like any worker, and is
+    /// read-only when the lead is in Plan Mode.
     pub permission_mode: String,
     /// Allowed tools for this agent.
     pub tools: Vec<String>,
@@ -115,7 +121,7 @@ impl AgentProfile {
             .or_else(|| frontmatter.get("permissions"))
             .cloned()
             .filter(|p| !p.trim().is_empty())
-            .unwrap_or_else(|| "read-only".to_string());
+            .unwrap_or_else(|| INHERIT_PERMISSION_MODE.to_string());
 
         let tools = frontmatter
             .get("tools")
@@ -159,7 +165,7 @@ impl AgentProfile {
         }
 
         // Validate permission mode
-        let valid_modes = ["read-only", "ask", "edits", "auto"];
+        let valid_modes = [INHERIT_PERMISSION_MODE, "read-only", "ask", "edits", "auto"];
         if !valid_modes.contains(&self.permission_mode.as_str()) {
             return Err(format!(
                 "Profile '{}' has invalid permission mode '{}'. Valid modes: {:?}",

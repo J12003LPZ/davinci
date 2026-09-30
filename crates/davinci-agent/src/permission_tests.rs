@@ -1269,10 +1269,38 @@ fn agent_allow_rule_must_match_every_task() {
 }
 
 #[test]
-fn agent_top_level_fields_beside_tasks_are_refused() {
+fn agent_top_level_fields_beside_tasks_are_task_defaults() {
+    let mut policy = PermissionPolicy::new(PermissionMode::Ask);
+    policy.allow = vec![PermissionRule::parse("agent(isolation:worktree)").unwrap()];
+    // A task's own field wins over the top-level default.
+    let own_wins = json!({"isolation":"shared","tasks":[{"prompt":"a","isolation":"worktree"}]});
+    assert!(matches!(
+        verdict(&policy, "agent", own_wins),
+        PermissionVerdict::Allow
+    ));
+    // The top-level default reaches tasks that do not set the field.
+    let inherited = json!({"isolation":"shared","tasks":[{"prompt":"a"}]});
+    assert!(is_ask(&verdict(&policy, "agent", inherited)));
+}
+
+#[test]
+fn agent_empty_tasks_beside_a_prompt_is_a_single_worker() {
     let policy = PermissionPolicy::new(PermissionMode::AlwaysApprove);
-    let ambiguous = json!({"isolation":"shared","tasks":[{"prompt":"a","isolation":"worktree"}]});
-    assert!(is_deny(&verdict(&policy, "agent", ambiguous)));
+    for tasks in [json!([]), serde_json::Value::Null] {
+        let call =
+            json!({"agent":"scout","description":"orient","prompt":"map the repo","tasks":tasks});
+        assert!(matches!(
+            verdict(&policy, "agent", call),
+            PermissionVerdict::Allow
+        ));
+    }
+}
+
+#[test]
+fn agent_tasks_that_are_not_an_array_are_refused() {
+    let policy = PermissionPolicy::new(PermissionMode::AlwaysApprove);
+    let call = json!({"prompt":"a","tasks":"b"});
+    assert!(is_deny(&verdict(&policy, "agent", call)));
 }
 
 #[test]

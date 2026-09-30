@@ -4230,6 +4230,67 @@ fn worker_host_enforces_profile_tool_and_worktree_permission_ceilings() {
 }
 
 #[test]
+fn shared_workers_and_inheriting_profiles_edit_files_outside_plan_mode() {
+    let _lock = PROCESS_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let dir = tempfile::tempdir().unwrap();
+    let _config = EnvRestore::set("PI_CODING_AGENT_DIR", dir.path().to_str().unwrap());
+    let profiles = dir.path().join(".davinci/agents");
+    std::fs::create_dir_all(&profiles).unwrap();
+    std::fs::write(
+        profiles.join("scout.md"),
+        "---\nname: scout\n---\nScout fixture",
+    )
+    .unwrap();
+    let parsed = Args {
+        offline: true,
+        no_extensions: true,
+        project_trust_override: Some(true),
+        ..Default::default()
+    };
+    for agent in [None, Some("scout".to_string())] {
+        for (parent, expected, writer) in [
+            (
+                davinci_agent::PermissionMode::ReadOnly,
+                davinci_agent::PermissionMode::ReadOnly,
+                false,
+            ),
+            (
+                davinci_agent::PermissionMode::Ask,
+                davinci_agent::PermissionMode::Edits,
+                true,
+            ),
+            (
+                davinci_agent::PermissionMode::Auto,
+                davinci_agent::PermissionMode::Edits,
+                true,
+            ),
+        ] {
+            let req = davinci_agent::SubagentRequest {
+                agent: agent.clone(),
+                tools: vec!["read".into(), "write".into(), "edit".into()],
+                parent_tools: Some(vec!["read".into(), "write".into(), "edit".into()]),
+                parent_permission_mode: Some(parent),
+                ..Default::default()
+            };
+            let (child, shared_writer) = build_worker_agent(
+                &parsed,
+                dir.path(),
+                &davinci_agent::McpRegistry::default(),
+                &req,
+            )
+            .unwrap();
+            assert_eq!(
+                child.permission_mode(),
+                expected,
+                "{agent:?} under {parent:?}"
+            );
+            assert_eq!(shared_writer, writer, "{agent:?} under {parent:?}");
+            assert!(child.tools.contains(&"edit".into()));
+        }
+    }
+}
+
+#[test]
 fn worker_host_rebinds_sandbox_and_supervisor_to_effective_worktree() {
     let _lock = PROCESS_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let agent_dir = tempfile::tempdir().unwrap();

@@ -2434,17 +2434,17 @@ fn build_worker_agent(
     // A worker's output is bounded by the parent; its own overflow has
     // nowhere useful to go.
     child.evidence = None;
-    let child_mode = if let Some(profile) = &profile {
-        davinci_agent::PermissionMode::parse(&profile.permission_mode)
-            .unwrap_or(davinci_agent::PermissionMode::ReadOnly)
-    } else if req.worktree_path.is_some() {
-        // A worktree lease is its own checkout: nothing reaches the user's
-        // tree until they merge the branch, and a child has no approver, so
-        // `Ask` could only deny. Plan Mode (or an unknown parent) stays
-        // read-only; every other parent mode edits inside the lease.
-        worktree_child_mode(req.parent_permission_mode)
-    } else {
-        davinci_agent::PermissionMode::ReadOnly
+    let child_mode = match &profile {
+        Some(profile) if profile.permission_mode != agent_profiles::INHERIT_PERMISSION_MODE => {
+            davinci_agent::PermissionMode::parse(&profile.permission_mode)
+                .unwrap_or(davinci_agent::PermissionMode::ReadOnly)
+        }
+        // Every worker reads and edits files. A child has no approver, so
+        // `Ask` could only deny: Plan Mode (or an unknown parent) stays
+        // read-only and every other parent mode accepts edits. A worktree
+        // lease is its own checkout; in the shared workspace, writers take
+        // turns through the team's shared-write lease.
+        _ => worker_child_mode(req.parent_permission_mode),
     };
     let mut policy = davinci_agent::PermissionPolicy::new(child_mode);
     if let Some(wt) = &req.worktree_path {
@@ -2526,8 +2526,8 @@ fn build_worker_agent(
     Ok((child, shared_writer))
 }
 
-/// Permission mode for a worker that runs in its own worktree lease.
-fn worktree_child_mode(
+/// Permission mode for a worker without an explicit profile mode.
+fn worker_child_mode(
     parent: Option<davinci_agent::PermissionMode>,
 ) -> davinci_agent::PermissionMode {
     match parent {
@@ -2560,22 +2560,41 @@ fn run_nested_subagent(
     req: &davinci_agent::SubagentRequest,
 ) -> Result<String, String> {
     let (mut child, shared_writer) = build_worker_agent(parsed, cwd, mcp, req)?;
-    if req.mode == davinci_agent::AgentSpawnMode::Background && shared_writer {
-        return Err("a background worker that writes needs isolation: \"worktree\"".into());
-    }
     let team = req.runtime.as_ref().map(|runtime| runtime.team.clone());
+    // One shared-workspace writer at a time across the whole session. A
+    // worker takes the lease at its first mutating call and keeps it until
+    // its turn ends, so read-only work still runs in parallel.
+    let write_lease: Arc<Mutex<Option<davinci_agent::runtime::team::SharedWriteLease>>> =
+        Arc::default();
+    if let (Some(team), true) = (&team, shared_writer) {
+        let team = team.clone();
+        let lease = write_lease.clone();
+        let token = req.cancellation_token.clone();
+        child.pre_tool = Some(davinci_agent::PreToolHook(Arc::new(move |name, _| {
+            if matches!(
+                davinci_agent::tool_class(name),
+                davinci_agent::ToolClass::Read | davinci_agent::ToolClass::Network
+            ) {
+                return None;
+            }
+            let mut held = lease.lock().unwrap_or_else(|e| e.into_inner());
+            if held.is_none() {
+                match team.acquire_shared_write(token.as_ref()) {
+                    Some(acquired) => *held = Some(acquired),
+                    None => {
+                        return Some(
+                            "worker cancelled while waiting for the shared workspace".into(),
+                        )
+                    }
+                }
+            }
+            None
+        })));
+    }
     let mut turn = |prompt: &str| {
-        // One shared-workspace writer at a time across the whole session.
-        let _write = match (&team, shared_writer) {
-            (Some(team), true) => Some(match req.cancellation_token.as_ref() {
-                Some(token) => team
-                    .shared_write_guard_until_cancelled(token)
-                    .ok_or("worker cancelled while waiting for the shared workspace")?,
-                None => team.shared_write_guard(),
-            }),
-            _ => None,
-        };
-        run_worker_turn(parsed, &mut child, prompt)
+        let result = run_worker_turn(parsed, &mut child, prompt);
+        write_lease.lock().unwrap_or_else(|e| e.into_inner()).take();
+        result
     };
     if req.mode == davinci_agent::AgentSpawnMode::Teammate {
         let runtime = req

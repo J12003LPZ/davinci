@@ -68,6 +68,7 @@ fn agent_call_may_write_shared(args: &Value, mode: crate::PermissionMode) -> boo
 
     let task_may_write_shared =
         |task: &Value| task.get("isolation").and_then(Value::as_str) != Some("worktree");
+    let args = &crate::subagent::normalize_agent_args(args);
     match args.get("tasks").and_then(Value::as_array) {
         Some(tasks) if !tasks.is_empty() => tasks.iter().any(task_may_write_shared),
         _ => task_may_write_shared(args),
