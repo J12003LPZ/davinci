@@ -574,7 +574,7 @@ mod tests {
     }
 
     #[test]
-    fn transaction_metadata_publication_denied_before_source_replacement() {
+    fn transaction_metadata_publication_respects_effective_permissions() {
         use std::os::windows::fs::OpenOptionsExt;
         let root = tempfile::tempdir().unwrap();
         let path = root.path().join("a.txt");
@@ -589,15 +589,26 @@ mod tests {
         let denied = format!("{}D:P(D;;0x100;;;WD)(A;;FA;;;WD)", &access[..dacl]);
         super::super::windows_acl::apply(&file, &denied).unwrap();
         drop(file);
+        // Elevated backup-capable tokens may still receive the requested rights.
+        // Exercise the actual access decision instead of assuming a token type.
+        let directory =
+            crate::runtime::cache::directory::Directory::open(root.path(), false).unwrap();
+        let can_publish = directory.source_alias_file("a.txt").is_ok();
         let manager =
             TransactionCoordinator::new(root.path(), TransactionOwner::default()).unwrap();
         let preview = manager
             .preview(vec![ProposedChange::write("a.txt", b"after".to_vec())])
             .unwrap();
         let result = manager.apply(&preview.id, &|_| Ok(()), None);
-        assert!(result
-            .unwrap_err()
-            .contains("cannot publish transaction metadata"));
+        if can_publish {
+            result.unwrap();
+            assert_eq!(std::fs::read(&path).unwrap(), b"after");
+            manager.rollback(&preview.id, &|_| Ok(()), None).unwrap();
+        } else {
+            assert!(result
+                .unwrap_err()
+                .contains("cannot publish transaction metadata"));
+        }
         assert_eq!(std::fs::read(&path).unwrap(), b"before");
         assert_eq!(
             manager.status(&preview.id).unwrap().state,
