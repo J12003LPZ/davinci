@@ -154,3 +154,37 @@ fn nothing_is_read_when_off_hooked_or_without_the_read_tool() {
         assert!(!text.contains("CALC_BODY"), "{label}");
     }
 }
+
+#[test]
+fn a_runtime_read_gate_prevents_attachment_after_rewind_bootstrap() {
+    struct DenyReads;
+    impl davinci_agent::RuntimeSubscriber for DenyReads {
+        fn on_event(
+            &self,
+            event: &davinci_agent::RuntimeEventEnvelope,
+        ) -> davinci_agent::RuntimeDecision {
+            if matches!(&event.payload, davinci_agent::RuntimeEvent::PreToolUse { tool, .. } if tool == "read")
+            {
+                davinci_agent::RuntimeDecision::Deny {
+                    reason: "fixture read gate".into(),
+                }
+            } else {
+                davinci_agent::RuntimeDecision::Continue
+            }
+        }
+    }
+    let dir = tempfile::tempdir().unwrap();
+    fs::write(dir.path().join("calc.py"), "RUNTIME_GATED_BODY = 1\n").unwrap();
+    let mut current = agent(dir.path(), TurnContextPlacement::Appended);
+    current.prompt_user_with("Fix calc.py", &[]);
+    current
+        .runtime
+        .as_ref()
+        .unwrap()
+        .bus
+        .subscribe(std::sync::Arc::new(DenyReads));
+    current.commit_turn_context(None);
+    let text = rendered(&current);
+    assert!(!text.contains("<named_files"), "{text}");
+    assert!(!text.contains("RUNTIME_GATED_BODY"), "{text}");
+}
