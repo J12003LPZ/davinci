@@ -55,6 +55,10 @@ including hidden test deletions. Allowed paths are precisely reference-touched
 paths. Frozen bytes, executable modes, labels and provenance are rechecked before
 each run. Explicit split selection is mandatory. Holdout is never a tuning set;
 do not inspect holdout transcripts to redesign a failed candidate.
+Prepared private baselines keep every exported committed file tracked, including
+inputs that match repository or global ignore rules. Changes to tracked files
+remain visible even in cache-named directories; generated untracked caches can
+still be filtered from unrelated-edit reporting.
 
 ## Freeze campaigns before tuning
 

@@ -105,7 +105,11 @@ def prepare(tid, dest):
     checked_git(dest, "config", "user.name", "bench")
     checked_git(dest, "config", "core.autocrlf", "false")
     checked_git(dest, "config", "commit.gpgsign", "false")
-    checked_git(dest, "add", "-A")
+    # A private export contains only original committed files, including files
+    # force-added against repository/global ignores. Preserve that membership.
+    spec_path = os.path.join(TASKS, tid, "task.json")
+    private = os.path.isfile(spec_path) and "private_provenance" in load(tid)
+    checked_git(dest, "add", "-A", *(["-f"] if private else []))
     checked_git(dest, "commit", "-q", "--no-verify", "-m", "fixture")
 
 
@@ -154,7 +158,8 @@ def changed_files(workdir, ignore=True):
                 raise RuntimeError("incomplete git rename record")
             members.append(source)
         for path in members:
-            if not ignore or not any(part in ignored for part in path.split("/")[:-1]):
+            # Ignore generated untracked caches, never committed fixture inputs.
+            if record[:2] != "??" or not ignore or not any(part in ignored for part in path.split("/")[:-1]):
                 paths.add(path)
     return sorted(paths)
 

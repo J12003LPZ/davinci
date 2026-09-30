@@ -291,6 +291,15 @@ class StreamTelemetryTests(unittest.TestCase):
             self.assertEqual(bench.changed_files("fixture"), [
                 "allowed.py", "odd -> name.py", "unrelated.py", "x__pycache__/source.py"])
 
+    def test_tracked_cache_named_changes_and_renames_are_never_filtered(self):
+        status = (" M fixtures/__pycache__/snapshot.json\0 D .pytest_cache/committed.json\0"
+                  "R  fixtures/__pycache__/new.json\0fixtures/__pycache__/old.json\0"
+                  "?? fixtures/__pycache__/generated.pyc\0")
+        with patch.object(bench, "git", return_value=SimpleNamespace(stdout=status, returncode=0)):
+            self.assertEqual(bench.changed_files("fixture"), [
+                ".pytest_cache/committed.json", "fixtures/__pycache__/new.json",
+                "fixtures/__pycache__/old.json", "fixtures/__pycache__/snapshot.json"])
+
     def test_failed_git_status_cannot_establish_no_unrelated_changes(self):
         with patch.object(bench, "git", return_value=SimpleNamespace(stdout="", returncode=1)):
             with self.assertRaises(RuntimeError):

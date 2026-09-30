@@ -13,6 +13,31 @@ import private_suite
 
 
 class PrivateSuiteTests(unittest.TestCase):
+    def test_private_committed_cache_changes_are_unrelated_even_when_gitignored(self):
+        for ignored_cache in (False, True):
+            with self.subTest(ignored_cache=ignored_cache), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                manifest, task = self.fixture(root, starter_cache=True, ignored_cache=ignored_cache)
+                private_suite.import_suite(manifest, root / "frozen")
+                runs = root / "runs"
+                runs.mkdir()
+                relative = "fixtures/__pycache__/snapshot.json"
+                measured = {"exit": 0, "stdout": "", "stderr": "", "wall_s": 1,
+                            "cleanup_complete": True, "started_at": "2026-09-30T00:00:00Z", "finished_at": "2026-09-30T00:00:01Z"}
+                def execute(command, workdir, env, timeout):
+                    (Path(workdir) / relative).write_text('{"user_input":"changed"}')
+                    return measured
+                with patch.object(bench, "TASKS", str(root / "frozen")), patch.object(bench, "RUNS", str(runs)), \
+                        patch.object(bench, "execute", side_effect=execute), \
+                        patch.object(bench, "run_check", return_value={"pass": True, "exit": 0, "cleanup_complete": True}), \
+                        patch.object(bench, "grade", return_value=(True, 1, 0, "fixture")):
+                    row = bench.run_one("davinci", task["id"], 0)
+                candidate = runs / "davinci" / (task["id"] + "-r0")
+                self.assertIn(relative, self.git(candidate, "ls-files").splitlines(), "original committed input must remain tracked")
+                self.assertEqual(row["changed"], [relative])
+                self.assertEqual(row["unrelated"], [relative])
+                self.assertFalse(row["pass"], "unrelated committed-input edits must prevent composite success")
+
     def test_regression_cleanup_uncertainty_stops_before_grading_and_records_failure(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -57,7 +82,7 @@ class PrivateSuiteTests(unittest.TestCase):
     def git(self, root, *args):
         return subprocess.run(["git", *args], cwd=root, capture_output=True, text=True, check=True).stdout.strip()
 
-    def fixture(self, root, committed_cache=False):
+    def fixture(self, root, committed_cache=False, starter_cache=False, ignored_cache=False):
         repo = root / "source"
         repo.mkdir()
         self.git(repo, "init", "-q")
@@ -65,7 +90,15 @@ class PrivateSuiteTests(unittest.TestCase):
         self.git(repo, "config", "user.email", "fixture@example.invalid")
         (repo / "calc.py").write_text("def add(a, b): return 0\n")
         (repo / "test_calc.py").write_text("import unittest\nfrom calc import add\nclass Calc(unittest.TestCase):\n def test_sum(self): self.assertEqual(add(2, 3), 0)\n")
+        if starter_cache:
+            cached = repo / "fixtures" / "__pycache__" / "snapshot.json"
+            cached.parent.mkdir(parents=True)
+            cached.write_text('{"user_input":"original"}')
+        if ignored_cache:
+            (repo / ".gitignore").write_text("fixtures/__pycache__/\n")
         self.git(repo, "add", ".")
+        if starter_cache:
+            self.git(repo, "add", "-f", "fixtures/__pycache__/snapshot.json")
         self.git(repo, "commit", "-qm", "starter")
         starter = self.git(repo, "rev-parse", "HEAD")
         (repo / "calc.py").write_text("def add(a, b): return a + b\n")
