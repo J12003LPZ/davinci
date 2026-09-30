@@ -1066,20 +1066,16 @@ mod tests {
 
     fn output_hook(code: i32, stdout: &str, stderr: &str) -> Vec<String> {
         if cfg!(windows) {
-            let out = if stdout.is_empty() {
-                String::new()
-            } else {
-                format!("echo {stdout} & ")
-            };
-            let err = if stderr.is_empty() {
-                String::new()
-            } else {
-                format!("echo {stderr} 1>&2 & ")
-            };
+            // cmd's /C grammar does not use the CRT quote/backslash rules
+            // applied to argv by Command. Emit the fixture's exact JSON bytes.
             vec![
-                "cmd".into(),
-                "/C".into(),
-                format!("more >NUL & {out}{err}exit /b {code}"),
+                "powershell".into(),
+                "-NoProfile".into(),
+                "-Command".into(),
+                format!(
+                    "[Console]::In.ReadToEnd() | Out-Null; [Console]::Out.Write('{}'); [Console]::Error.Write('{}'); exit {code}",
+                    stdout.replace('\'', "''"), stderr.replace('\'', "''")
+                ),
             ]
         } else {
             vec![

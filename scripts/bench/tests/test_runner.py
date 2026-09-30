@@ -105,7 +105,7 @@ class RunnerTests(unittest.TestCase):
     def green_identity(self, binary, source):
         ci = {"repository": "fixture/repo", "source_sha": source["source_sha"], "ci_run": 12,
               "ci_url": "https://github.com/fixture/repo/actions/runs/12", "status": "completed", "conclusion": "success",
-              "workflow_path": ".github/workflows/ci.yml", "jobs": [{"name": name, "status": "completed", "conclusion": "success"}
+              "event": "push", "workflow_path": ".github/workflows/ci.yml", "jobs": [{"name": name, "status": "completed", "conclusion": "success"}
               for name in sorted(runner.release_identity.EXPECTED_CI_JOBS)],
               "workflow_lint": {"status": "completed", "conclusion": "success", "run_id": 13}}
         return runner.release_identity.make_identity(binary, source, ci, None, require_tag=False)

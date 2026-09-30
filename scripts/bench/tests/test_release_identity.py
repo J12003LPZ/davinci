@@ -16,7 +16,7 @@ class ReleaseIdentityTests(unittest.TestCase):
         sha = "a" * 40
         return sha, {"repository": "fixture/repo", "source_sha": sha, "ci_run": 12,
                      "ci_url": "https://github.com/fixture/repo/actions/runs/12",
-                     "status": "completed", "conclusion": "success",
+                     "status": "completed", "conclusion": "success", "event": "push",
                      "workflow_path": ".github/workflows/ci.yml",
                      "jobs": [{"name": name, "status": "completed", "conclusion": "success"}
                               for name in sorted(release_identity.EXPECTED_CI_JOBS)],
@@ -28,7 +28,7 @@ class ReleaseIdentityTests(unittest.TestCase):
         for patch in ({"source_sha": "b" * 40}, {"status": "in_progress"},
                       {"conclusion": "failure"}, {"jobs": record["jobs"][:-1]},
                       {"jobs": [dict(job, conclusion="skipped") for job in record["jobs"]]},
-                      {"workflow_lint": None}, {"repository": "other/repo"}):
+                      {"workflow_lint": None}, {"repository": "other/repo"}, {"event": "pull_request"}):
             with self.subTest(patch=patch), self.assertRaises(ValueError):
                 release_identity.validate_ci(dict(record, **patch), "fixture/repo", sha)
 

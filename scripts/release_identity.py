@@ -71,6 +71,7 @@ def latest_run(runs, sha):
 def validate_ci(record, repository, sha):
     if (not isinstance(record, dict) or record.get("repository") != repository
             or record.get("source_sha") != sha or not re.fullmatch(r"[0-9a-f]{40}", sha)
+            or record.get("event") != "push"
             or record.get("workflow_path") != ".github/workflows/ci.yml"
             or type(record.get("ci_run")) is not int or record["ci_run"] <= 0
             or record.get("ci_url") != f"https://github.com/{repository}/actions/runs/{record['ci_run']}"):
@@ -104,16 +105,19 @@ def fetch_ci(repository, sha):
     if not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", repository):
         raise ValueError("invalid repository name")
     prefix = f"repos/{repository}/actions"
-    runs = [run for page in api_pages(f"{prefix}/workflows/ci.yml/runs?head_sha={sha}&per_page=100")
+    # PR workflows check out a synthetic merge by default; head_sha alone
+    # cannot prove these exact source bytes were tested. Require push CI.
+    runs = [run for page in api_pages(f"{prefix}/workflows/ci.yml/runs?head_sha={sha}&event=push&per_page=100")
             for run in page.get("workflow_runs", [])]
     run = latest_run(runs, sha)
     jobs = [job for page in api_pages(f"{prefix}/runs/{run['id']}/jobs?filter=latest&per_page=100")
             for job in page.get("jobs", [])]
-    lint = latest_run([item for page in api_pages(f"{prefix}/workflows/workflow-lint.yml/runs?head_sha={sha}&per_page=100")
+    lint = latest_run([item for page in api_pages(f"{prefix}/workflows/workflow-lint.yml/runs?head_sha={sha}&event=push&per_page=100")
                        for item in page.get("workflow_runs", [])], sha)
     record = {"repository": repository, "source_sha": sha, "ci_run": run["id"],
               "ci_url": run["html_url"], "workflow_path": run.get("path"),
               "status": run["status"], "conclusion": run["conclusion"],
+              "event": run["event"],
               "jobs": [{key: job[key] for key in ("name", "status", "conclusion")} for job in jobs],
               "workflow_lint": {"run_id": lint["id"], "status": lint["status"], "conclusion": lint["conclusion"]}}
     validate_ci(record, repository, sha)

@@ -4,6 +4,9 @@ Production installation uses `scripts/install.sh` or
 `pwsh scripts/install-davinci.ps1`. Both require a clean checkout at the exact
 `v<workspace version>` tag and a completed successful full CI run for that
 commit, including every workspace shard, quality checks and workflow lint.
+Evidence must come from push CI: GitHub's default PR checkout tests a synthetic
+merge, so its `head_sha` alone does not identify the tested source tree
+([GitHub event semantics](https://docs.github.com/en/actions/reference/workflows-and-actions/events-that-trigger-workflows#pull_request)).
 The product version starts at 1.0.71. No release tag is created by this PR.
 
 The manually invoked **Tag green release** workflow verifies CI before creating
