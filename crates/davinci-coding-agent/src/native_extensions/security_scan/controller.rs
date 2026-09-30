@@ -170,6 +170,27 @@ impl RunHandle {
         Ok(())
     }
     pub fn record_usage(&self, usage: super::usage::RequestUsage) -> u64 {
+        self.record_usage_with_receipts(usage.clone(), std::slice::from_ref(&usage))
+    }
+
+    pub fn record_usage_with_observations(
+        &self,
+        usage: super::usage::RequestUsage,
+        observations: &[davinci_ai::provider_observation::ProviderAttemptObservation],
+    ) -> u64 {
+        let mut provider = crate::native_extensions::background_usage::ProviderReceipts::default();
+        for observation in observations {
+            provider.observe(&serde_json::json!(observation));
+        }
+        let receipts = provider.take(Some(&usage));
+        self.record_usage_with_receipts(usage, &receipts)
+    }
+
+    fn record_usage_with_receipts(
+        &self,
+        usage: super::usage::RequestUsage,
+        receipts: &[super::usage::RequestUsage],
+    ) -> u64 {
         let accounted = usage.accounted_tokens;
         if let Some(counter) = self
             .background_usage
@@ -177,12 +198,18 @@ impl RunHandle {
             .unwrap_or_else(|e| e.into_inner())
             .as_ref()
         {
-            counter.record(&usage);
-            let _ = self.background_pending.fetch_update(
-                Ordering::AcqRel,
-                Ordering::Acquire,
-                |pending| pending.checked_sub(1),
-            );
+            for (index, receipt) in receipts.iter().enumerate() {
+                if index > 0 {
+                    counter.start();
+                    self.background_pending.fetch_add(1, Ordering::Relaxed);
+                }
+                counter.record(receipt);
+                let _ = self.background_pending.fetch_update(
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                    |pending| pending.checked_sub(1),
+                );
+            }
         }
         self.state
             .0

@@ -415,18 +415,46 @@ pub fn reviewer_args(prompt_file: &std::path::Path, model: Option<&str>) -> Vec<
     args
 }
 
-/// Consume only terminal assistant events. `agent_end` repeats messages and
-/// must never double-count usage. The latest assistant text is the review.
+/// Prefer actual send receipts, with terminal assistant usage as a fallback.
+/// `agent_end` repeats messages. The latest assistant text is the review.
 fn read_reviewer_events(
     reader: impl std::io::BufRead,
     counter: &crate::native_extensions::background_usage::Counter,
 ) -> (String, bool) {
     let mut pending = true; // The spawned child owns its first request.
     let mut text = String::new();
+    let mut receipts = crate::native_extensions::background_usage::ProviderReceipts::default();
+    let record =
+        |pending: &mut bool,
+         usage: &crate::native_extensions::security_scan::usage::RequestUsage| {
+            if !*pending {
+                counter.start();
+            }
+            counter.record(usage);
+            *pending = false;
+        };
     for line in reader.lines().map_while(Result::ok) {
         let Ok(event) = serde_json::from_str::<serde_json::Value>(&line) else {
             continue;
         };
+        if event["type"] == "auto_retry_start" {
+            // Actual receipts arrive after the harness retry loop finishes.
+            // Keep the fallback count until those receipts can be reconciled.
+            receipts.retry();
+            if !pending {
+                counter.start();
+                pending = true;
+            }
+            continue;
+        }
+        if event["type"] == "provider_observation" {
+            receipts.observe(&event["observation"]);
+            if receipts.has_activity() && !pending {
+                counter.start();
+                pending = true;
+            }
+            continue;
+        }
         let message = &event["message"];
         if message["role"] != "assistant" {
             continue;
@@ -437,9 +465,6 @@ fn read_reviewer_events(
                 pending = true;
             }
             Some("message_end") => {
-                if !pending {
-                    counter.start();
-                }
                 let usage =
                     serde_json::from_value::<davinci_protocol::Usage>(message["usage"].clone())
                         .ok();
@@ -447,15 +472,15 @@ fn read_reviewer_events(
                     message["stopReason"].as_str(),
                     Some("error" | "aborted" | "length")
                 );
-                counter.record(
-                    &crate::native_extensions::security_scan::usage::RequestUsage::new(
-                        usage.as_ref(),
-                        0,
-                        0,
-                        failed,
-                    ),
+                let terminal = crate::native_extensions::security_scan::usage::RequestUsage::new(
+                    usage.as_ref(),
+                    0,
+                    0,
+                    failed,
                 );
-                pending = false;
+                for receipt in receipts.take(Some(&terminal)) {
+                    record(&mut pending, &receipt);
+                }
                 text = message["content"]
                     .as_array()
                     .into_iter()
@@ -466,6 +491,11 @@ fn read_reviewer_events(
                     .join("\n");
             }
             _ => {}
+        }
+    }
+    if receipts.has_activity() {
+        for receipt in receipts.take(None) {
+            record(&mut pending, &receipt);
         }
     }
     (text, pending)
@@ -620,8 +650,10 @@ mod tests {
             "role":"assistant","content":[{"type":"text","text":"{\"candidates\":[]}"}],
             "usage":davinci_protocol::Usage {input:10,output:5,total_tokens:15,..Default::default()}
         }});
+        let retry = json!({"type":"auto_retry_start","attempt":1,"maxAttempts":3,"delayMs":0,"errorMessage":"retry fixture"});
+        let retry_end = json!({"type":"auto_retry_end","attempt":1,"success":true});
         std::fs::write(&executable, format!(
-            "#!/bin/sh\n[ \"$DAVINCI_SECURITY_WATCH\" = 0 ] || exit 17\n[ \"$PI_LEARNING_DISABLE_BACKGROUND\" = 1 ] || exit 18\ncat <<'DAVINCI_RECEIPT'\n{event}\nDAVINCI_RECEIPT\n"
+            "#!/bin/sh\n[ \"$DAVINCI_SECURITY_WATCH\" = 0 ] || exit 17\n[ \"$PI_LEARNING_DISABLE_BACKGROUND\" = 1 ] || exit 18\ncat <<'DAVINCI_RECEIPT'\n{retry}\n{retry_end}\n{event}\nDAVINCI_RECEIPT\n"
         )).unwrap();
         std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
         let prior = std::env::var_os("PI_LEARNING_REVIEWER_EXECUTABLE");
@@ -644,8 +676,11 @@ mod tests {
         }
         assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
         let totals = run.usage.snapshot();
-        assert_eq!(totals["tokens"]["total"], 15);
-        assert_eq!(totals["requests"], 1);
+        assert!(totals["tokens"].is_null());
+        assert_eq!(totals["measuredTokens"]["total"], 15);
+        assert_eq!(totals["requests"], 2);
+        assert_eq!(totals["failedRequests"], 1);
+        assert_eq!(totals["unknownTokenRequests"], 1);
         assert_eq!(totals["pendingRequests"], 0);
         assert!(totals["estimatedCostUsd"].is_null());
     }
@@ -688,6 +723,141 @@ mod tests {
         assert!(reviewer_args(std::path::Path::new("r.md"), None)
             .windows(2)
             .any(|args| args == ["--mode", "json"]));
+    }
+
+    #[test]
+    fn reviewer_retries_preserve_unknown_failed_attempts_and_final_receipt() {
+        let counter = crate::native_extensions::background_usage::Counter::default();
+        counter.start();
+        let stream = [
+            json!({"type":"auto_retry_start","attempt":1}),
+            json!({"type":"auto_retry_start","attempt":2}),
+            json!({"type":"auto_retry_end","attempt":2,"success":true}),
+            json!({"type":"message_end","message":{
+                "role":"assistant","content":[],"usage":davinci_protocol::Usage {input:20,output:5,total_tokens:25,..Default::default()}
+            }}),
+        ].into_iter().map(|event| event.to_string()).collect::<Vec<_>>().join("\n");
+        let (_, pending) = read_reviewer_events(stream.as_bytes(), &counter);
+        assert!(!pending);
+        let totals = counter.snapshot();
+        assert_eq!(totals["requests"], 3);
+        assert_eq!(totals["failedRequests"], 2);
+        assert_eq!(totals["unknownTokenRequests"], 2);
+        assert!(totals["tokens"].is_null());
+        assert_eq!(totals["measuredTokens"]["total"], 25);
+        assert_eq!(totals["pendingRequests"], 0);
+        assert!(totals["estimatedCostUsd"].is_null());
+    }
+
+    #[test]
+    fn reviewer_provider_receipts_cover_transport_and_harness_retries_without_duplicates() {
+        for harness_retry in [false, true] {
+            for failed_measured in [false, true] {
+                let counter = crate::native_extensions::background_usage::Counter::default();
+                counter.start();
+                let final_usage = davinci_protocol::Usage {
+                    input: 10,
+                    output: 5,
+                    total_tokens: 15,
+                    cost: davinci_protocol::UsageCost {
+                        total: 0.002,
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                };
+                let failed_usage = failed_measured.then_some(davinci_protocol::Usage {
+                    input: 7,
+                    total_tokens: 7,
+                    cost: davinci_protocol::UsageCost {
+                        total: 0.001,
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                });
+                let observed = |id, kind, status, usage| {
+                    json!({"type":"provider_observation","observation":{
+                        "logical_request_id":"fixture","attempt_id":id,"kind":kind,"status":status,"usage":usage
+                    }})
+                };
+                let terminal = json!({"type":"message_end","message":{
+                    "role":"assistant","content":[],"usage":final_usage
+                }});
+                let final_receipt = observed(2, "attempt_end", "completed", json!(final_usage));
+                let mut events = Vec::new();
+                if harness_retry {
+                    events.push(json!({"type":"auto_retry_start","attempt":1}));
+                }
+                events.extend([
+                    observed(1, "attempt_start", "started", json!(null)),
+                    observed(1, "attempt_end", "failed", json!(failed_usage)),
+                    observed(2, "attempt_start", "started", json!(null)),
+                    final_receipt.clone(),
+                    final_receipt,
+                    terminal,
+                ]);
+                let stream = events
+                    .into_iter()
+                    .map(|event| event.to_string())
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                let (_, pending) = read_reviewer_events(stream.as_bytes(), &counter);
+                assert!(!pending);
+                let totals = counter.snapshot();
+                assert_eq!(totals["requests"], 2);
+                assert_eq!(totals["failedRequests"], 1);
+                if failed_measured {
+                    assert_eq!(totals["tokens"]["total"], 22);
+                    assert_eq!(totals["estimatedCostUsd"], 0.003);
+                } else {
+                    assert!(totals["tokens"].is_null());
+                    assert!(totals["estimatedCostUsd"].is_null());
+                    assert_eq!(totals["measuredTokens"]["total"], 15);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn interrupted_provider_attempt_keeps_earlier_receipts() {
+        let counter = crate::native_extensions::background_usage::Counter::default();
+        counter.start();
+        let stream = [
+            json!({"type":"provider_observation","observation":{
+                "logical_request_id":"fixture","attempt_id":1,"kind":"attempt_end","status":"completed",
+                "usage":davinci_protocol::Usage {input:10,output:5,total_tokens:15,..Default::default()}
+            }}),
+            json!({"type":"provider_observation","observation":{
+                "logical_request_id":"fixture","attempt_id":2,"kind":"attempt_start","status":"started"
+            }}),
+        ].into_iter().map(|event| event.to_string()).collect::<Vec<_>>().join("\n");
+        let (_, pending) = read_reviewer_events(stream.as_bytes(), &counter);
+        assert!(!pending);
+        let totals = counter.snapshot();
+        assert_eq!(totals["requests"], 2);
+        assert_eq!(totals["failedRequests"], 1);
+        assert_eq!(totals["pendingRequests"], 0);
+        assert_eq!(totals["measuredTokens"]["total"], 15);
+        assert!(totals["tokens"].is_null());
+    }
+
+    #[test]
+    fn cancelled_scheduled_retry_is_not_an_additional_observed_send() {
+        let counter = crate::native_extensions::background_usage::Counter::default();
+        counter.start();
+        let stream = [
+            json!({"type":"auto_retry_start","attempt":1}),
+            json!({"type":"provider_observation","observation":{
+                "logical_request_id":"fixture","attempt_id":1,"kind":"attempt_end","status":"failed",
+                "usage":davinci_protocol::Usage {input:7,total_tokens:7,..Default::default()}
+            }}),
+            json!({"type":"message_end","message":{"role":"assistant","content":[],"stopReason":"aborted"}}),
+        ].into_iter().map(|event| event.to_string()).collect::<Vec<_>>().join("\n");
+        let (_, pending) = read_reviewer_events(stream.as_bytes(), &counter);
+        assert!(!pending);
+        let totals = counter.snapshot();
+        assert_eq!(totals["requests"], 1);
+        assert_eq!(totals["failedRequests"], 1);
+        assert_eq!(totals["tokens"]["total"], 7);
     }
 
     #[test]

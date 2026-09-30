@@ -219,6 +219,7 @@ impl SecurityWorkerRunner {
                 .ok_or("security review cancelled")?;
             let ticket = run.reserve_request(reservation)?;
             let started = std::time::Instant::now();
+            let observations = davinci_ai::provider_observation::ObservationScope::capture();
             let result = (self.complete)(CompletionRequest {
                 system: &system,
                 messages: &messages,
@@ -232,15 +233,19 @@ impl SecurityWorkerRunner {
                     Some(StopReason::Error | StopReason::Aborted | StopReason::Length)
                 )
             });
-            let accounted = run.record_usage(super::usage::RequestUsage::new(
-                result
-                    .as_ref()
-                    .ok()
-                    .and_then(|response| response.usage.as_ref()),
-                reservation,
-                started.elapsed().as_millis().min(u64::MAX as u128) as u64,
-                failed,
-            ));
+            let observations = observations.finish(if failed { "failed" } else { "completed" });
+            let accounted = run.record_usage_with_observations(
+                super::usage::RequestUsage::new(
+                    result
+                        .as_ref()
+                        .ok()
+                        .and_then(|response| response.usage.as_ref()),
+                    reservation,
+                    started.elapsed().as_millis().min(u64::MAX as u128) as u64,
+                    failed,
+                ),
+                &observations,
+            );
             spent = spent.saturating_add(accounted);
             run.settle_request(ticket, accounted)?;
             drop(slot);
@@ -617,6 +622,60 @@ mod tests {
         assert!(records[0].failed);
         assert!(records[0].measured.is_none());
         assert!(records[0].accounted_tokens > 0);
+    }
+
+    #[test]
+    fn security_watch_usage_counts_transport_attempts_without_duplicating_terminal_usage() {
+        let counter = crate::native_extensions::background_usage::Counter::default();
+        let worker_counter = counter.clone();
+        let runner = SecurityWorkerRunner::new(|_| {
+            use davinci_ai::provider_observation::{begin_request, Attempt};
+            let usage = davinci_protocol::Usage {
+                input: 10,
+                output: 5,
+                total_tokens: 15,
+                cost: davinci_protocol::UsageCost {
+                    total: 0.002,
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
+            begin_request("security-watch", "fixture", None, "fixture");
+            Attempt::start("websocket").finish("failed", None, None);
+            Attempt::start("http").finish("completed", Some(200), Some(usage.clone()));
+            Ok(AssistantMessage {
+                extra: Default::default(),
+                id: "fixture".into(),
+                role: "assistant".into(),
+                model: "fixture".into(),
+                content: vec![ContentBlock::Text {
+                    text: "invalid review fixture".into(),
+                }],
+                usage: Some(usage),
+                stop_reason: Some(StopReason::Stop),
+                error_message: None,
+            })
+        });
+        let run = ScanCoordinator::default()
+            .start(move |run| {
+                run.bind_background_usage(worker_counter);
+                assert!(runner
+                    .run(&audit_objective(), &Snapshot::default(), &run, 1, 96_000)
+                    .is_err());
+                run.finish(Ok(false));
+            })
+            .unwrap();
+        run.wait();
+        let totals = counter.snapshot();
+        assert_eq!(totals["requests"], 2);
+        assert_eq!(totals["failedRequests"], 1);
+        assert_eq!(totals["unknownTokenRequests"], 1);
+        assert_eq!(totals["pendingRequests"], 0);
+        assert_eq!(totals["measuredTokens"]["total"], 15);
+        assert!(totals["tokens"].is_null());
+        assert!(totals["estimatedCostUsd"].is_null());
+        assert_eq!(run.status().usage.len(), 1);
+        assert_eq!(run.status().usage[0].accounted_tokens, 15);
     }
 
     #[test]

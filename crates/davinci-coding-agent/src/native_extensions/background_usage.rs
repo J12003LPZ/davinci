@@ -22,6 +22,91 @@ struct Totals {
 #[derive(Debug, Clone, Default)]
 pub struct Counter(Arc<Mutex<Totals>>);
 
+/// Existing provider telemetry identifies actual sends across retries and
+/// transport fallback. A terminal assistant repeats the last attempt's usage.
+#[derive(Default)]
+pub(crate) struct ProviderReceipts {
+    attempts: Vec<Option<RequestUsage>>,
+    indices: HashMap<(String, u64), usize>,
+    retries: usize,
+    overflow: bool,
+}
+
+impl ProviderReceipts {
+    pub(crate) fn retry(&mut self) {
+        self.retries = self.retries.saturating_add(1);
+    }
+
+    pub(crate) fn observe(&mut self, observation: &Value) {
+        let kind = observation["kind"].as_str();
+        if kind == Some("telemetry_overflow") {
+            self.overflow = true;
+            return;
+        }
+        if !matches!(kind, Some("attempt_start" | "attempt_end")) {
+            return;
+        }
+        let Some((logical, attempt)) = observation["logical_request_id"]
+            .as_str()
+            .filter(|logical| !logical.is_empty())
+            .zip(observation["attempt_id"].as_u64())
+        else {
+            return;
+        };
+        let key = (logical.to_string(), attempt);
+        let index = if let Some(index) = self.indices.get(&key) {
+            *index
+        } else {
+            let index = self.attempts.len();
+            self.indices.insert(key, index);
+            self.attempts.push(None);
+            index
+        };
+        if kind == Some("attempt_end") && self.attempts[index].is_none() {
+            let usage =
+                serde_json::from_value::<davinci_protocol::Usage>(observation["usage"].clone())
+                    .ok();
+            self.attempts[index] = Some(RequestUsage::new(
+                usage.as_ref(),
+                0,
+                0,
+                observation["status"] != "completed",
+            ));
+        }
+    }
+
+    pub(crate) fn has_activity(&self) -> bool {
+        !self.attempts.is_empty() || self.retries > 0 || self.overflow
+    }
+
+    pub(crate) fn take(&mut self, terminal: Option<&RequestUsage>) -> Vec<RequestUsage> {
+        let terminal_failed = terminal.is_some_and(|usage| usage.failed);
+        let unknown = RequestUsage::new(None, 0, 0, true);
+        let terminal = terminal.unwrap_or(&unknown);
+        let mut receipts = Vec::new();
+        if self.attempts.is_empty() {
+            receipts.extend((0..self.retries).map(|_| RequestUsage::new(None, 0, 0, true)));
+            receipts.push(terminal.clone());
+        } else {
+            // Retry markers schedule work; a cancellation may prevent its
+            // dispatch. Actual send observations determine the request count.
+            receipts.extend(
+                self.attempts
+                    .drain(..)
+                    .map(|usage| usage.unwrap_or_else(|| RequestUsage::new(None, 0, 0, true))),
+            );
+            if let Some(last) = receipts.last_mut() {
+                last.failed |= terminal_failed;
+            }
+        }
+        if self.overflow {
+            receipts.push(RequestUsage::new(None, 0, 0, true));
+        }
+        *self = Self::default();
+        receipts
+    }
+}
+
 impl Counter {
     pub fn start(&self) {
         let mut totals = self.0.lock().unwrap_or_else(|e| e.into_inner());

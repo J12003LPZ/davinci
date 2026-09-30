@@ -196,4 +196,11 @@ The fixture explicitly enables background review and project auto-apply:
 
 Counters belong to the session that dispatched the call, including calls still running during a session switch. They cover only the current process and are not restored from session history. Reloading the host within that process preserves existing receipts. No-request totals are zero for a bound host; an unbound host reports unknown. Failed and interrupted requests remain visible.
 
+Existing provider attempt telemetry includes actual sends across harness
+retries, provider retries, and transport fallback. Its receipts take precedence
+over the duplicated terminal assistant usage. Attempts without a receipt remain
+unknown, even when a later attempt succeeds; known measurements remain available
+as a partial total. Legacy retry events without attempt telemetry likewise keep
+discarded failed attempts unknown.
+
 To enable learning review while keeping approval, set `learning.backgroundReview` to `true` in the owner's agent-directory settings. `/learning-approve` and `/learning-reject` control activation. This change does not establish measured quality improvements; live private dev/holdout evaluations remain pending.
