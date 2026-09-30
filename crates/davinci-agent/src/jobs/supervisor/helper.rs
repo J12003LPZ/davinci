@@ -241,7 +241,20 @@ fn run_owned() -> std::io::Result<()> {
             while readers.iter().any(|reader| !reader.is_finished()) && Instant::now() < deadline {
                 thread::sleep(POLL);
             }
-            flush_exit(&events, &identity, status.code(), readers_complete(readers));
+            #[cfg(unix)]
+            let signal = {
+                use std::os::unix::process::ExitStatusExt;
+                status.signal()
+            };
+            #[cfg(not(unix))]
+            let signal = None;
+            flush_exit(
+                &events,
+                &identity,
+                status.code(),
+                signal,
+                readers_complete(readers),
+            );
             return Ok(());
         }
         thread::sleep(POLL);
@@ -468,6 +481,7 @@ fn flush_exit(
     events: &mpsc::SyncSender<Message>,
     identity: &super::ProcessIdentity,
     code: Option<i32>,
+    signal: Option<i32>,
     output_complete: bool,
 ) {
     let (ack, ack_rx) = mpsc::sync_channel(1);
@@ -475,6 +489,7 @@ fn flush_exit(
         Event::Exit {
             identity: identity.clone(),
             code,
+            signal,
             output_complete,
         },
         Some(ack),
@@ -570,7 +585,7 @@ mod tests {
                 .send(())
                 .unwrap();
         });
-        flush_exit(&events, &identity, Some(0), true);
+        flush_exit(&events, &identity, Some(0), None, true);
         drained.join().unwrap();
     }
 

@@ -9,6 +9,7 @@ use davinci_protocol::{MountAccess, MountRule, NetworkPolicy, SandboxBackendKind
 use std::{
     collections::BTreeMap,
     fs,
+    io::{Read, Seek},
     net::{TcpListener, TcpStream, UdpSocket},
     os::unix::net::{UnixListener, UnixStream},
     path::{Path, PathBuf},
@@ -251,6 +252,95 @@ fn wait_for(mut ready: impl FnMut() -> bool) {
     }
 }
 
+fn process_diagnostics(process: &Supervisor, output: &Arc<Mutex<Vec<u8>>>) -> String {
+    let output = {
+        let bytes = output.lock().unwrap();
+        String::from_utf8_lossy(&bytes[..bytes.len().min(16 * 1024)]).into_owned()
+    };
+    format!(
+        "pid={}, exit={:?}, captured output (first 16 KiB): {}\n{}",
+        process.child_pid(),
+        process.wait(Duration::ZERO),
+        output,
+        sandbox_denials(process.child_pid())
+    )
+}
+
+fn sandbox_denials(pid: u32) -> String {
+    fn query(pid: u32) -> std::io::Result<String> {
+        let mut capture = tempfile::tempfile()?;
+        let predicate =
+            format!("eventMessage CONTAINS 'Sandbox:' AND eventMessage CONTAINS '({pid})'");
+        // A trusted host diagnostic, never a rule in the command's policy.
+        // Limit the time range, exact child PID, execution time and report size.
+        let mut child = Command::new("/usr/bin/log")
+            .args([
+                "show",
+                "--last",
+                "1m",
+                "--style",
+                "compact",
+                "--info",
+                "--predicate",
+                &predicate,
+            ])
+            .stdin(Stdio::null())
+            .stdout(capture.try_clone()?)
+            .stderr(capture.try_clone()?)
+            .spawn()?;
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let status = loop {
+            match child.try_wait() {
+                Ok(Some(status)) => break status.to_string(),
+                Ok(None) if Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                result => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    break format!("query stopped: {result:?}");
+                }
+            }
+        };
+        capture.rewind()?;
+        let mut bytes = Vec::new();
+        capture.take(16 * 1024).read_to_end(&mut bytes)?;
+        Ok(format!(
+            "Sandbox denial log ({status}, first 16 KiB): {}",
+            String::from_utf8_lossy(&bytes)
+        ))
+    }
+    query(pid).unwrap_or_else(|error| format!("Sandbox denial log unavailable: {error}"))
+}
+
+fn wait_for_process(
+    process: &Supervisor,
+    output: &Arc<Mutex<Vec<u8>>>,
+    mut ready: impl FnMut() -> bool,
+) {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        if ready() {
+            return;
+        }
+        if process.wait(Duration::ZERO).is_some() {
+            // Output can arrive between the readiness check and the exit.
+            assert!(
+                ready(),
+                "fixture exited before readiness: {}",
+                process_diagnostics(process, output)
+            );
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "fixture timed out: {}",
+            process_diagnostics(process, output)
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
 #[test]
 fn native_workspace_secrets_control_paths_symlinks_temp_and_restricted_mode() {
     assert_eq!(
@@ -301,7 +391,7 @@ fn native_workspace_secrets_control_paths_symlinks_temp_and_restricted_mode() {
             exit.code,
             Some(0),
             "{exit:?}: {}",
-            String::from_utf8_lossy(&output.lock().unwrap())
+            process_diagnostics(&process, &output)
         );
         assert!(exit.error.is_none(), "{exit:?}");
         assert_eq!(
@@ -373,7 +463,12 @@ fn native_network_denies_ipv4_ipv6_dns_datagrams_and_unix_sockets() {
         }
         let (process, output) = spawn(spec, "network", addresses.clone());
         let exit = process.wait(Duration::from_secs(10)).unwrap();
-        assert_eq!(exit.code, Some(0), "{exit:?}");
+        assert_eq!(
+            exit.code,
+            Some(0),
+            "{exit:?}: {}",
+            process_diagnostics(&process, &output)
+        );
         let value = result(&output);
         for key in ["ipv4", "ipv6", "dns_udp", "unix"] {
             assert_eq!(value[key], allowed, "{key}: {value}");
@@ -392,7 +487,9 @@ fn native_group_members_are_cleaned_and_parallel_temp_is_separate() {
             if cancel { "wait" } else { "descendants" },
             BTreeMap::new(),
         );
-        wait_for(|| String::from_utf8_lossy(&output.lock().unwrap()).contains("SEATBELT_RESULT"));
+        wait_for_process(&process, &output, || {
+            String::from_utf8_lossy(&output.lock().unwrap()).contains("SEATBELT_RESULT")
+        });
         if cancel {
             process.stop();
         }
@@ -412,9 +509,11 @@ fn native_group_members_are_cleaned_and_parallel_temp_is_separate() {
     let second_root = tempfile::tempdir().unwrap();
     let (first, first_output) = spawn(spec(first_root.path()), "wait", BTreeMap::new());
     let (second, second_output) = spawn(spec(second_root.path()), "wait", BTreeMap::new());
-    wait_for(|| {
+    wait_for_process(&first, &first_output, || {
         String::from_utf8_lossy(&first_output.lock().unwrap()).contains("SEATBELT_RESULT")
-            && String::from_utf8_lossy(&second_output.lock().unwrap()).contains("SEATBELT_RESULT")
+    });
+    wait_for_process(&second, &second_output, || {
+        String::from_utf8_lossy(&second_output.lock().unwrap()).contains("SEATBELT_RESULT")
     });
     let first_temp = result(&first_output)["temp"].as_str().unwrap().to_string();
     let second_temp = result(&second_output)["temp"].as_str().unwrap().to_string();
@@ -435,7 +534,9 @@ fn seatbelt_parent_loss_fixture() {
     };
     let root = Path::new(&root);
     let (process, output) = spawn(spec(root), "wait", BTreeMap::new());
-    wait_for(|| String::from_utf8_lossy(&output.lock().unwrap()).contains("SEATBELT_RESULT"));
+    wait_for_process(&process, &output, || {
+        String::from_utf8_lossy(&output.lock().unwrap()).contains("SEATBELT_RESULT")
+    });
     fs::write(
         root.join("owned-temp.json"),
         serde_json::to_vec(&result(&output)).unwrap(),
@@ -465,8 +566,8 @@ fn native_parent_loss_cleans_temp_and_group_members() {
             .args(["--exact", "seatbelt_parent_loss_fixture", "--nocapture"])
             .env("SEATBELT_PARENT_ROOT", root.path())
             .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
+            .stdout(Stdio::inherit())
+            .stderr(Stdio::inherit())
             .spawn()
             .unwrap(),
     );
@@ -524,14 +625,21 @@ impl Drop for DetachedFixturePid {
 fn native_detached_descendant_survives_group_teardown_so_auto_is_unavailable() {
     let root = tempfile::tempdir().unwrap();
     let (process, output) = spawn(spec(root.path()), "detached-descendants", BTreeMap::new());
-    wait_for(|| root.path().join("descendant.pid").exists());
+    wait_for_process(&process, &output, || {
+        root.path().join("descendant.pid").exists()
+    });
     let pid = fs::read_to_string(root.path().join("descendant.pid"))
         .unwrap()
         .parse()
         .unwrap();
     let _fixture = DetachedFixturePid(pid);
     let exit = process.wait(Duration::from_secs(10)).unwrap();
-    assert_eq!(exit.code, Some(0), "{exit:?}");
+    assert_eq!(
+        exit.code,
+        Some(0),
+        "{exit:?}: {}",
+        process_diagnostics(&process, &output)
+    );
     let receipt = exit.sandbox.unwrap();
     assert_eq!(receipt.backend, SandboxBackendKind::MacosSeatbelt);
     let capabilities = receipt.capabilities;

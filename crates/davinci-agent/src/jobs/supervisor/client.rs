@@ -506,10 +506,14 @@ fn monitor(
             Ok(Event::Exit {
                 identity: observed,
                 code: value,
+                signal,
                 output_complete: complete,
             }) if observed == identity => {
                 launch_state = ProcessLaunchState::Exited;
                 code = value;
+                if let Some(signal) = signal {
+                    error = Some(format!("supervised command terminated by signal {signal}"));
+                }
                 exit_reported = true;
                 output_complete = complete;
             }

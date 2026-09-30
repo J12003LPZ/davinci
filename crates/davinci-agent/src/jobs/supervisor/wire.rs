@@ -55,6 +55,8 @@ pub(super) enum Event {
     Exit {
         identity: ProcessIdentity,
         code: Option<i32>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        signal: Option<i32>,
         output_complete: bool,
     },
     LaunchFailed {

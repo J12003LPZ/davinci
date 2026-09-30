@@ -201,6 +201,27 @@ fn supervisor_nonzero_exit_and_inherited_pipes_do_not_hang() {
     wait_for(|| !listening(&record), "held-pipe descendant is stopped");
 }
 
+#[cfg(unix)]
+#[test]
+fn supervisor_reports_command_termination_signal() {
+    let directory = tempfile::tempdir().unwrap();
+    let command = ProcessConfig::new(
+        "/bin/sh".into(),
+        vec!["-c".into(), "kill -TERM $$".into()],
+        directory.path().into(),
+        BTreeMap::new(),
+    );
+    let process = Supervisor::spawn(&host(), command, Arc::new(|_| {})).unwrap();
+    let exit = process.wait(Duration::from_secs(5)).unwrap();
+    assert_eq!(exit.code, None);
+    assert!(!exit.stopped);
+    assert!(exit.output_complete, "{exit:?}");
+    assert_eq!(
+        exit.error.as_deref(),
+        Some("supervised command terminated by signal 15")
+    );
+}
+
 #[test]
 fn supervisor_pipe_holder_fixture() {
     let Some(directory) = std::env::var_os("DAVINCI_PIPE_HOLDER_FIXTURE") else {
