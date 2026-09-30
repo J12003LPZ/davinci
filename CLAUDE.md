@@ -202,7 +202,7 @@ The historical HTML mockups and Elixir reference under `docs/ui/` document earli
 
 | Crate | Rust lines |
 | --- | ---: |
-| `davinci-agent` | 142,851 |
+| `davinci-agent` | 143,377 |
 | `davinci-ai` | 27,718 |
 | `davinci-client` | 2,741 |
 | `davinci-coding-agent` | 201,353 |
@@ -216,4 +216,4 @@ The historical HTML mockups and Elixir reference under `docs/ui/` document earli
 | `davinci-telemetry` | 555 |
 | `davinci-tui` | 69,444 |
 | `davinci-voice` | 1,450 |
-| **Total** | **484,484** |
+| **Total** | **485,010** |

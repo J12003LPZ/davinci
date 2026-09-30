@@ -55,7 +55,7 @@
       "task": "0.1",
       "plan_line": 88,
       "requirement": "Rerun the Windows shard until it is green on the fix commit.",
-      "status": "external-evidence-pending",
+      "status": "implemented-verified",
       "implementation": [
         ".github/workflows/readiness-windows.yml",
         "docs/readiness/release-discipline.md"
@@ -63,14 +63,14 @@
       "evidence": [
         "windows"
       ],
-      "remaining": "Full Windows parallel attempts passed, but original failure did not reproduce; its cause is unproven. Final full CI pending; main unchanged because merge is not authorized."
+      "remaining": "Recorded engineering checks verified; exact-source CI46229662 passed all41jobs. Final docs/parser commit CI tracked separately. Live acceptance is covered by the separate pending requirements; no product superiority claim."
     },
     {
       "id": "0.2.1",
       "task": "0.2",
       "plan_line": 94,
       "requirement": "Rule: the installed or benchmarked binary must come from a commit whose full CI (all shards, clippy, fmt) is green.",
-      "status": "implemented-pending-integrated-validation",
+      "status": "implemented-verified",
       "implementation": [
         "scripts/release_identity.py",
         "scripts/install.sh",
@@ -82,7 +82,7 @@
       "evidence": [
         "release"
       ],
-      "remaining": "Final combined-tree and native checks pending; focused fixtures are recorded separately."
+      "remaining": "Recorded engineering checks verified; exact-source CI46229662 passed all41jobs. Final docs/parser commit CI tracked separately. Live acceptance is covered by the separate pending requirements; no product superiority claim."
     },
     {
       "id": "0.2.2",
@@ -108,7 +108,7 @@
       "task": "0.2",
       "plan_line": 96,
       "requirement": "Record the tag, commit, CI run and binary hash in the installation identity file that the install script already writes.",
-      "status": "implemented-pending-integrated-validation",
+      "status": "implemented-verified",
       "implementation": [
         "scripts/release_identity.py",
         "scripts/install.sh",
@@ -120,14 +120,14 @@
       "evidence": [
         "release"
       ],
-      "remaining": "Final combined-tree and native checks pending; focused fixtures are recorded separately."
+      "remaining": "Recorded engineering checks verified; exact-source CI46229662 passed all41jobs. Final docs/parser commit CI tracked separately. Live acceptance is covered by the separate pending requirements; no product superiority claim."
     },
     {
       "id": "0.3.1",
       "task": "0.3",
       "plan_line": 102,
       "requirement": "Either point `davinci update` for the CLI itself at DaVinci's own release source, or make it state plainly that DaVinci updates by reinstall from source and name the install script.",
-      "status": "implemented-pending-integrated-validation",
+      "status": "implemented-verified",
       "implementation": [
         "crates/davinci-coding-agent/src/packages.rs"
       ],
@@ -135,14 +135,14 @@
         "release",
         "integrated"
       ],
-      "remaining": "Final combined-tree and native checks pending; focused fixtures are recorded separately."
+      "remaining": "Recorded engineering checks verified; exact-source CI46229662 passed all41jobs. Final docs/parser commit CI tracked separately. Live acceptance is covered by the separate pending requirements; no product superiority claim."
     },
     {
       "id": "0.3.2",
       "task": "0.3",
       "plan_line": 103,
       "requirement": "Remove the upstream pi package name and pi-mono release link from user-facing output.",
-      "status": "implemented-pending-integrated-validation",
+      "status": "implemented-verified",
       "implementation": [
         "crates/davinci-coding-agent/src/packages.rs"
       ],
@@ -150,14 +150,14 @@
         "release",
         "integrated"
       ],
-      "remaining": "Final combined-tree and native checks pending; focused fixtures are recorded separately."
+      "remaining": "Recorded engineering checks verified; exact-source CI46229662 passed all41jobs. Final docs/parser commit CI tracked separately. Live acceptance is covered by the separate pending requirements; no product superiority claim."
     },
     {
       "id": "0.3.3",
       "task": "0.3",
       "plan_line": 104,
       "requirement": "Keep the TS-parity paths that handle pi packages (not the CLI itself) unchanged.",
-      "status": "implemented-pending-integrated-validation",
+      "status": "implemented-verified",
       "implementation": [
         "crates/davinci-coding-agent/src/packages.rs"
       ],
@@ -165,14 +165,14 @@
         "release",
         "integrated"
       ],
-      "remaining": "Final combined-tree and native checks pending; focused fixtures are recorded separately."
+      "remaining": "Recorded engineering checks verified; exact-source CI46229662 passed all41jobs. Final docs/parser commit CI tracked separately. Live acceptance is covered by the separate pending requirements; no product superiority claim."
     },
     {
       "id": "0.4.1",
       "task": "0.4",
       "plan_line": 108,
       "requirement": "No new subsystems, tools, or slash commands until Phase 1 evaluation exists and Phase 2 is measured. Bug fixes and wiring of existing parts are allowed.",
-      "status": "implemented-pending-integrated-validation",
+      "status": "implemented-verified",
       "implementation": [
         "Cargo.toml",
         "docs/readiness/evaluation.md"
@@ -180,7 +180,7 @@
       "evidence": [
         "documents"
       ],
-      "remaining": "Final combined-tree and native checks pending; focused fixtures are recorded separately."
+      "remaining": "Recorded engineering checks verified; exact-source CI46229662 passed all41jobs. Final docs/parser commit CI tracked separately. Live acceptance is covered by the separate pending requirements; no product superiority claim."
     },
     {
       "id": "1.1.1",
@@ -247,7 +247,7 @@
       "task": "1.1",
       "plan_line": 126,
       "requirement": "Keep the existing 12 public tasks as a smoke set, not the decision set.",
-      "status": "implemented-pending-integrated-validation",
+      "status": "implemented-verified",
       "implementation": [
         "scripts/bench/private_suite.py",
         "scripts/bench/tests/test_private_suite.py"
@@ -255,7 +255,7 @@
       "evidence": [
         "evaluation"
       ],
-      "remaining": "Final combined-tree and native checks pending; focused fixtures are recorded separately."
+      "remaining": "Recorded engineering checks verified; exact-source CI46229662 passed all41jobs. Final docs/parser commit CI tracked separately. Live acceptance is covered by the separate pending requirements; no product superiority claim."
     },
     {
       "id": "1.1.6",
@@ -277,7 +277,7 @@
       "task": "1.1",
       "plan_line": 130,
       "requirement": "Label each task by size class (small/large), by whether it has visible tests, and by whether it requires changing existing tests.",
-      "status": "implemented-pending-integrated-validation",
+      "status": "implemented-verified",
       "implementation": [
         "scripts/bench/private_suite.py",
         "scripts/bench/tests/test_private_suite.py"
@@ -285,14 +285,14 @@
       "evidence": [
         "evaluation"
       ],
-      "remaining": "Final combined-tree and native checks pending; focused fixtures are recorded separately."
+      "remaining": "Recorded engineering checks verified; exact-source CI46229662 passed all41jobs. Final docs/parser commit CI tracked separately. Live acceptance is covered by the separate pending requirements; no product superiority claim."
     },
     {
       "id": "1.2.1",
       "task": "1.2",
       "plan_line": 136,
       "requirement": "Composite success (existing `task_success`: exit 0, grader pass, no unrelated edits, cleanup complete, no transaction/artifact leaks).",
-      "status": "implemented-pending-integrated-validation",
+      "status": "implemented-verified",
       "implementation": [
         "scripts/bench/readiness_metrics.py",
         "scripts/bench/tests/test_readiness_metrics.py"
@@ -300,14 +300,14 @@
       "evidence": [
         "evaluation"
       ],
-      "remaining": "Final combined-tree and native checks pending; focused fixtures are recorded separately."
+      "remaining": "Recorded engineering checks verified; exact-source CI46229662 passed all41jobs. Final docs/parser commit CI tracked separately. Live acceptance is covered by the separate pending requirements; no product superiority claim."
     },
     {
       "id": "1.2.2",
       "task": "1.2",
       "plan_line": 137,
       "requirement": "Regression-free success, where the repository's pre-existing tests still pass.",
-      "status": "implemented-pending-integrated-validation",
+      "status": "implemented-verified",
       "implementation": [
         "scripts/bench/readiness_metrics.py",
         "scripts/bench/tests/test_readiness_metrics.py"
@@ -315,14 +315,14 @@
       "evidence": [
         "evaluation"
       ],
-      "remaining": "Final combined-tree and native checks pending; focused fixtures are recorded separately."
+      "remaining": "Recorded engineering checks verified; exact-source CI46229662 passed all41jobs. Final docs/parser commit CI tracked separately. Live acceptance is covered by the separate pending requirements; no product superiority claim."
     },
     {
       "id": "1.2.3",
       "task": "1.2",
       "plan_line": 138,
       "requirement": "Unrelated-edit rate.",
-      "status": "implemented-pending-integrated-validation",
+      "status": "implemented-verified",
       "implementation": [
         "scripts/bench/readiness_metrics.py",
         "scripts/bench/tests/test_readiness_metrics.py"
@@ -330,14 +330,14 @@
       "evidence": [
         "evaluation"
       ],
-      "remaining": "Final combined-tree and native checks pending; focused fixtures are recorded separately."
+      "remaining": "Recorded engineering checks verified; exact-source CI46229662 passed all41jobs. Final docs/parser commit CI tracked separately. Live acceptance is covered by the separate pending requirements; no product superiority claim."
     },
     {
       "id": "1.2.4",
       "task": "1.2",
       "plan_line": 139,
       "requirement": "Uncached input, cached input and output tokens per verified success, reported separately.",
-      "status": "implemented-pending-integrated-validation",
+      "status": "implemented-verified",
       "implementation": [
         "scripts/bench/readiness_metrics.py",
         "scripts/bench/tests/test_readiness_metrics.py"
@@ -345,14 +345,14 @@
       "evidence": [
         "evaluation"
       ],
-      "remaining": "Final combined-tree and native checks pending; focused fixtures are recorded separately."
+      "remaining": "Recorded engineering checks verified; exact-source CI46229662 passed all41jobs. Final docs/parser commit CI tracked separately. Live acceptance is covered by the separate pending requirements; no product superiority claim."
     },
     {
       "id": "1.2.5",
       "task": "1.2",
       "plan_line": 140,
       "requirement": "Estimated cost per verified success from a pinned price table, labeled as an estimate.",
-      "status": "implemented-pending-integrated-validation",
+      "status": "implemented-verified",
       "implementation": [
         "scripts/bench/readiness_metrics.py",
         "scripts/bench/tests/test_readiness_metrics.py"
@@ -360,14 +360,14 @@
       "evidence": [
         "evaluation"
       ],
-      "remaining": "Final combined-tree and native checks pending; focused fixtures are recorded separately."
+      "remaining": "Recorded engineering checks verified; exact-source CI46229662 passed all41jobs. Final docs/parser commit CI tracked separately. Live acceptance is covered by the separate pending requirements; no product superiority claim."
     },
     {
       "id": "1.2.6",
       "task": "1.2",
       "plan_line": 141,
       "requirement": "Median and P90 wall time.",
-      "status": "implemented-pending-integrated-validation",
+      "status": "implemented-verified",
       "implementation": [
         "scripts/bench/readiness_metrics.py",
         "scripts/bench/tests/test_readiness_metrics.py"
@@ -375,14 +375,14 @@
       "evidence": [
         "evaluation"
       ],
-      "remaining": "Final combined-tree and native checks pending; focused fixtures are recorded separately."
+      "remaining": "Recorded engineering checks verified; exact-source CI46229662 passed all41jobs. Final docs/parser commit CI tracked separately. Live acceptance is covered by the separate pending requirements; no product superiority claim."
     },
     {
       "id": "1.2.7",
       "task": "1.2",
       "plan_line": 142,
       "requirement": "Model requests and tool calls per task.",
-      "status": "implemented-pending-integrated-validation",
+      "status": "implemented-verified",
       "implementation": [
         "scripts/bench/readiness_metrics.py",
         "scripts/bench/tests/test_readiness_metrics.py"
@@ -390,14 +390,14 @@
       "evidence": [
         "evaluation"
       ],
-      "remaining": "Final combined-tree and native checks pending; focused fixtures are recorded separately."
+      "remaining": "Recorded engineering checks verified; exact-source CI46229662 passed all41jobs. Final docs/parser commit CI tracked separately. Live acceptance is covered by the separate pending requirements; no product superiority claim."
     },
     {
       "id": "1.2.8",
       "task": "1.2",
       "plan_line": 143,
       "requirement": "For interactive/RPC measurements only: background model tokens (learning reviewer, security watch), reported separately.",
-      "status": "implemented-pending-integrated-validation",
+      "status": "implemented-verified",
       "implementation": [
         "scripts/bench/readiness_metrics.py",
         "scripts/bench/tests/test_readiness_metrics.py"
@@ -405,7 +405,7 @@
       "evidence": [
         "evaluation"
       ],
-      "remaining": "Final combined-tree and native checks pending; focused fixtures are recorded separately."
+      "remaining": "Recorded engineering checks verified; exact-source CI46229662 passed all41jobs. Final docs/parser commit CI tracked separately. Live acceptance is covered by the separate pending requirements; no product superiority claim."
     },
     {
       "id": "1.3.1",
@@ -490,7 +490,7 @@
       "task": "1.4",
       "plan_line": 158,
       "requirement": "Report the bootstrap intervals the bench already computes. With small samples, say \"no measurable difference\" rather than claiming a win.",
-      "status": "implemented-pending-integrated-validation",
+      "status": "implemented-verified",
       "implementation": [
         "scripts/bench/readiness_protocol.py",
         "scripts/bench/tests/test_readiness_protocol.py"
@@ -498,14 +498,14 @@
       "evidence": [
         "evaluation"
       ],
-      "remaining": "Final combined-tree and native checks pending; focused fixtures are recorded separately."
+      "remaining": "Recorded engineering checks verified; exact-source CI46229662 passed all41jobs. Final docs/parser commit CI tracked separately. Live acceptance is covered by the separate pending requirements; no product superiority claim."
     },
     {
       "id": "2.1.1",
       "task": "2.1",
       "plan_line": 172,
       "requirement": "Trigger it the first time the model tries to finish (an assistant message with no tool calls) when all of these hold:",
-      "status": "implemented-pending-integrated-validation",
+      "status": "implemented-verified",
       "implementation": [
         "crates/davinci-agent/src/completion.rs",
         "crates/davinci-agent/tests/completion_requirements.rs",
@@ -514,14 +514,14 @@
       "evidence": [
         "completion"
       ],
-      "remaining": "Final combined-tree and native checks pending; focused fixtures are recorded separately."
+      "remaining": "Recorded engineering checks verified; exact-source CI46229662 passed all41jobs. Final docs/parser commit CI tracked separately. Live acceptance is covered by the separate pending requirements; no product superiority claim."
     },
     {
       "id": "2.1.2",
       "task": "2.1",
       "plan_line": 176,
       "requirement": "Send one harness reminder asking the model to:",
-      "status": "implemented-pending-integrated-validation",
+      "status": "implemented-verified",
       "implementation": [
         "crates/davinci-agent/src/completion.rs",
         "crates/davinci-agent/tests/completion_requirements.rs",
@@ -530,14 +530,14 @@
       "evidence": [
         "completion"
       ],
-      "remaining": "Final combined-tree and native checks pending; focused fixtures are recorded separately."
+      "remaining": "Recorded engineering checks verified; exact-source CI46229662 passed all41jobs. Final docs/parser commit CI tracked separately. Live acceptance is covered by the separate pending requirements; no product superiority claim."
     },
     {
       "id": "2.1.3",
       "task": "2.1",
       "plan_line": 182,
       "requirement": "Attach the harness-computed change set to the reminder: files changed since the run started, with new files marked (see Task 2.2).",
-      "status": "implemented-pending-integrated-validation",
+      "status": "implemented-verified",
       "implementation": [
         "crates/davinci-agent/src/completion.rs",
         "crates/davinci-agent/tests/completion_requirements.rs",
@@ -546,14 +546,14 @@
       "evidence": [
         "completion"
       ],
-      "remaining": "Final combined-tree and native checks pending; focused fixtures are recorded separately."
+      "remaining": "Recorded engineering checks verified; exact-source CI46229662 passed all41jobs. Final docs/parser commit CI tracked separately. Live acceptance is covered by the separate pending requirements; no product superiority claim."
     },
     {
       "id": "2.1.4",
       "task": "2.1",
       "plan_line": 183,
       "requirement": "Limit it to once per user prompt. The existing verification gate still runs afterwards, because new tests change the mutation generation.",
-      "status": "implemented-pending-integrated-validation",
+      "status": "implemented-verified",
       "implementation": [
         "crates/davinci-agent/src/completion.rs",
         "crates/davinci-agent/tests/completion_requirements.rs",
@@ -562,14 +562,14 @@
       "evidence": [
         "completion"
       ],
-      "remaining": "Final combined-tree and native checks pending; focused fixtures are recorded separately."
+      "remaining": "Recorded engineering checks verified; exact-source CI46229662 passed all41jobs. Final docs/parser commit CI tracked separately. Live acceptance is covered by the separate pending requirements; no product superiority claim."
     },
     {
       "id": "2.1.5",
       "task": "2.1",
       "plan_line": 184,
       "requirement": "Respect abort, steering and follow-up queues exactly as the existing reminders do.",
-      "status": "implemented-pending-integrated-validation",
+      "status": "implemented-verified",
       "implementation": [
         "crates/davinci-agent/src/completion.rs",
         "crates/davinci-agent/tests/completion_requirements.rs",
@@ -578,14 +578,14 @@
       "evidence": [
         "completion"
       ],
-      "remaining": "Final combined-tree and native checks pending; focused fixtures are recorded separately."
+      "remaining": "Recorded engineering checks verified; exact-source CI46229662 passed all41jobs. Final docs/parser commit CI tracked separately. Live acceptance is covered by the separate pending requirements; no product superiority claim."
     },
     {
       "id": "2.1.6",
       "task": "2.1",
       "plan_line": 185,
       "requirement": "Record a reason code (for example `completion.requirements`) in `RunStats` and the event stream so `/status`, `get_session_stats` and the bench can count triggers.",
-      "status": "implemented-pending-integrated-validation",
+      "status": "implemented-verified",
       "implementation": [
         "crates/davinci-agent/src/completion.rs",
         "crates/davinci-agent/tests/completion_requirements.rs",
@@ -594,14 +594,14 @@
       "evidence": [
         "completion"
       ],
-      "remaining": "Final combined-tree and native checks pending; focused fixtures are recorded separately."
+      "remaining": "Recorded engineering checks verified; exact-source CI46229662 passed all41jobs. Final docs/parser commit CI tracked separately. Live acceptance is covered by the separate pending requirements; no product superiority claim."
     },
     {
       "id": "2.1.7",
       "task": "2.1",
       "plan_line": 189,
       "requirement": "triggers once for a multi-file mutation run and never twice in one prompt;",
-      "status": "implemented-pending-integrated-validation",
+      "status": "implemented-verified",
       "implementation": [
         "crates/davinci-agent/src/completion.rs",
         "crates/davinci-agent/tests/completion_requirements.rs",
@@ -610,14 +610,14 @@
       "evidence": [
         "completion"
       ],
-      "remaining": "Final combined-tree and native checks pending; focused fixtures are recorded separately."
+      "remaining": "Recorded engineering checks verified; exact-source CI46229662 passed all41jobs. Final docs/parser commit CI tracked separately. Live acceptance is covered by the separate pending requirements; no product superiority claim."
     },
     {
       "id": "2.1.8",
       "task": "2.1",
       "plan_line": 190,
       "requirement": "does not trigger for read-only runs, Plan Mode, or single-file trivial edits below the threshold;",
-      "status": "implemented-pending-integrated-validation",
+      "status": "implemented-verified",
       "implementation": [
         "crates/davinci-agent/src/completion.rs",
         "crates/davinci-agent/tests/completion_requirements.rs",
@@ -626,14 +626,14 @@
       "evidence": [
         "completion"
       ],
-      "remaining": "Final combined-tree and native checks pending; focused fixtures are recorded separately."
+      "remaining": "Recorded engineering checks verified; exact-source CI46229662 passed all41jobs. Final docs/parser commit CI tracked separately. Live acceptance is covered by the separate pending requirements; no product superiority claim."
     },
     {
       "id": "2.1.9",
       "task": "2.1",
       "plan_line": 191,
       "requirement": "does not change the Stable prompt hash or the provider tool schema;",
-      "status": "implemented-pending-integrated-validation",
+      "status": "implemented-verified",
       "implementation": [
         "crates/davinci-agent/src/completion.rs",
         "crates/davinci-agent/tests/completion_requirements.rs",
@@ -642,14 +642,14 @@
       "evidence": [
         "completion"
       ],
-      "remaining": "Final combined-tree and native checks pending; focused fixtures are recorded separately."
+      "remaining": "Recorded engineering checks verified; exact-source CI46229662 passed all41jobs. Final docs/parser commit CI tracked separately. Live acceptance is covered by the separate pending requirements; no product superiority claim."
     },
     {
       "id": "2.1.10",
       "task": "2.1",
       "plan_line": 192,
       "requirement": "the final saved answer and session file do not contain the reminder text (mirror the existing `verification_notice.rs` test);",
-      "status": "implemented-pending-integrated-validation",
+      "status": "implemented-verified",
       "implementation": [
         "crates/davinci-agent/src/completion.rs",
         "crates/davinci-agent/tests/completion_requirements.rs",
@@ -658,14 +658,14 @@
       "evidence": [
         "completion"
       ],
-      "remaining": "Final combined-tree and native checks pending; focused fixtures are recorded separately."
+      "remaining": "Recorded engineering checks verified; exact-source CI46229662 passed all41jobs. Final docs/parser commit CI tracked separately. Live acceptance is covered by the separate pending requirements; no product superiority claim."
     },
     {
       "id": "2.1.11",
       "task": "2.1",
       "plan_line": 193,
       "requirement": "works identically in print, RPC and interactive modes.",
-      "status": "implemented-pending-integrated-validation",
+      "status": "implemented-verified",
       "implementation": [
         "crates/davinci-agent/src/completion.rs",
         "crates/davinci-agent/tests/completion_requirements.rs",
@@ -674,7 +674,7 @@
       "evidence": [
         "completion"
       ],
-      "remaining": "Final combined-tree and native checks pending; focused fixtures are recorded separately."
+      "remaining": "Recorded engineering checks verified; exact-source CI46229662 passed all41jobs. Final docs/parser commit CI tracked separately. Live acceptance is covered by the separate pending requirements; no product superiority claim."
     },
     {
       "id": "2.1.12",
@@ -728,7 +728,7 @@
       "task": "2.2",
       "plan_line": 205,
       "requirement": "Include the change-set list, with new untracked files flagged, in the Task 2.1 reminder so the model removes temporary files it created.",
-      "status": "implemented-pending-integrated-validation",
+      "status": "implemented-verified",
       "implementation": [
         "crates/davinci-agent/src/completion.rs",
         "crates/davinci-agent/src/verification/workspace.rs"
@@ -736,14 +736,14 @@
       "evidence": [
         "completion"
       ],
-      "remaining": "Final combined-tree and native checks pending; focused fixtures are recorded separately."
+      "remaining": "Recorded engineering checks verified; exact-source CI46229662 passed all41jobs. Final docs/parser commit CI tracked separately. Live acceptance is covered by the separate pending requirements; no product superiority claim."
     },
     {
       "id": "2.2.3",
       "task": "2.2",
       "plan_line": 206,
       "requirement": "Do not delete anything automatically. The model decides; the harness only shows the facts.",
-      "status": "implemented-pending-integrated-validation",
+      "status": "implemented-verified",
       "implementation": [
         "crates/davinci-agent/src/completion.rs",
         "crates/davinci-agent/src/verification/workspace.rs"
@@ -751,7 +751,7 @@
       "evidence": [
         "completion"
       ],
-      "remaining": "Final combined-tree and native checks pending; focused fixtures are recorded separately."
+      "remaining": "Recorded engineering checks verified; exact-source CI46229662 passed all41jobs. Final docs/parser commit CI tracked separately. Live acceptance is covered by the separate pending requirements; no product superiority claim."
     },
     {
       "id": "2.3.1",
@@ -860,7 +860,7 @@
       "task": "3.1",
       "plan_line": 233,
       "requirement": "Add a per-prompt completion hook point inside the agent loop, at the moment the model tries to finish and before the loop ends. Today's user `stop` hooks keep their run-end meaning for compatibility. The new point gets a distinct, documented event name for user hooks.",
-      "status": "implemented-pending-integrated-validation",
+      "status": "implemented-verified",
       "implementation": [
         "crates/davinci-coding-agent/src/hooks.rs",
         "crates/davinci-coding-agent/src/plugins/mod.rs",
@@ -873,14 +873,14 @@
         "hooks",
         "completion"
       ],
-      "remaining": "Final combined-tree and native checks pending; focused fixtures are recorded separately."
+      "remaining": "Recorded engineering checks verified; exact-source CI46229662 passed all41jobs. Final docs/parser commit CI tracked separately. Live acceptance is covered by the separate pending requirements; no product superiority claim."
     },
     {
       "id": "3.1.2",
       "task": "3.1",
       "plan_line": 234,
       "requirement": "Run plugin `Stop` hooks at this new in-loop point instead of after the loop, so a Claude Code plugin's block actually takes effect.",
-      "status": "implemented-pending-integrated-validation",
+      "status": "implemented-verified",
       "implementation": [
         "crates/davinci-coding-agent/src/hooks.rs",
         "crates/davinci-coding-agent/src/plugins/mod.rs",
@@ -893,14 +893,14 @@
         "hooks",
         "completion"
       ],
-      "remaining": "Final combined-tree and native checks pending; focused fixtures are recorded separately."
+      "remaining": "Recorded engineering checks verified; exact-source CI46229662 passed all41jobs. Final docs/parser commit CI tracked separately. Live acceptance is covered by the separate pending requirements; no product superiority claim."
     },
     {
       "id": "3.1.3",
       "task": "3.1",
       "plan_line": 235,
       "requirement": "Block semantics match Claude Code: exit 2 (stderr is the reason) or exit 0 with `decision: block` and a `reason`. The reason is delivered to the model through the reminder channel, and the loop continues.",
-      "status": "implemented-pending-integrated-validation",
+      "status": "implemented-verified",
       "implementation": [
         "crates/davinci-coding-agent/src/hooks.rs",
         "crates/davinci-coding-agent/src/plugins/mod.rs",
@@ -913,14 +913,14 @@
         "hooks",
         "completion"
       ],
-      "remaining": "Final combined-tree and native checks pending; focused fixtures are recorded separately."
+      "remaining": "Recorded engineering checks verified; exact-source CI46229662 passed all41jobs. Final docs/parser commit CI tracked separately. Live acceptance is covered by the separate pending requirements; no product superiority claim."
     },
     {
       "id": "3.1.4",
       "task": "3.1",
       "plan_line": 236,
       "requirement": "Loop guard:",
-      "status": "implemented-pending-integrated-validation",
+      "status": "implemented-verified",
       "implementation": [
         "crates/davinci-coding-agent/src/hooks.rs",
         "crates/davinci-coding-agent/src/plugins/mod.rs",
@@ -933,14 +933,14 @@
         "hooks",
         "completion"
       ],
-      "remaining": "Final combined-tree and native checks pending; focused fixtures are recorded separately."
+      "remaining": "Recorded engineering checks verified; exact-source CI46229662 passed all41jobs. Final docs/parser commit CI tracked separately. Live acceptance is covered by the separate pending requirements; no product superiority claim."
     },
     {
       "id": "3.1.5",
       "task": "3.1",
       "plan_line": 240,
       "requirement": "PostToolUse feedback: exit 2 appends the hook's stderr to that tool result as feedback. Other failures remain non-blocking warnings, as they are today.",
-      "status": "implemented-pending-integrated-validation",
+      "status": "implemented-verified",
       "implementation": [
         "crates/davinci-coding-agent/src/hooks.rs",
         "crates/davinci-coding-agent/src/plugins/mod.rs",
@@ -953,14 +953,14 @@
         "hooks",
         "completion"
       ],
-      "remaining": "Final combined-tree and native checks pending; focused fixtures are recorded separately."
+      "remaining": "Recorded engineering checks verified; exact-source CI46229662 passed all41jobs. Final docs/parser commit CI tracked separately. Live acceptance is covered by the separate pending requirements; no product superiority claim."
     },
     {
       "id": "3.1.6",
       "task": "3.1",
       "plan_line": 241,
       "requirement": "Trust rules stay unchanged: project hooks only in trusted projects, plugin hooks only while `hooksApproved` matches, and never in graph workers.",
-      "status": "implemented-pending-integrated-validation",
+      "status": "implemented-verified",
       "implementation": [
         "crates/davinci-coding-agent/src/hooks.rs",
         "crates/davinci-coding-agent/src/plugins/mod.rs",
@@ -973,14 +973,14 @@
         "hooks",
         "completion"
       ],
-      "remaining": "Final combined-tree and native checks pending; focused fixtures are recorded separately."
+      "remaining": "Recorded engineering checks verified; exact-source CI46229662 passed all41jobs. Final docs/parser commit CI tracked separately. Live acceptance is covered by the separate pending requirements; no product superiority claim."
     },
     {
       "id": "3.1.7",
       "task": "3.1",
       "plan_line": 242,
       "requirement": "Tests: block then continue, the block cap, the `stop_hook_active` flag, untrusted project ignored, plugin hook digest unapproved ignored, print/RPC/interactive parity.",
-      "status": "implemented-pending-integrated-validation",
+      "status": "implemented-verified",
       "implementation": [
         "crates/davinci-coding-agent/src/hooks.rs",
         "crates/davinci-coding-agent/src/plugins/mod.rs",
@@ -993,14 +993,14 @@
         "hooks",
         "completion"
       ],
-      "remaining": "Final combined-tree and native checks pending; focused fixtures are recorded separately."
+      "remaining": "Recorded engineering checks verified; exact-source CI46229662 passed all41jobs. Final docs/parser commit CI tracked separately. Live acceptance is covered by the separate pending requirements; no product superiority claim."
     },
     {
       "id": "3.1.8",
       "task": "3.1",
       "plan_line": 243,
       "requirement": "Document one recipe in `docs/`: \"make the repo's test/lint command the finish line\".",
-      "status": "implemented-pending-integrated-validation",
+      "status": "implemented-verified",
       "implementation": [
         "crates/davinci-coding-agent/src/hooks.rs",
         "crates/davinci-coding-agent/src/plugins/mod.rs",
@@ -1013,14 +1013,14 @@
         "hooks",
         "completion"
       ],
-      "remaining": "Final combined-tree and native checks pending; focused fixtures are recorded separately."
+      "remaining": "Recorded engineering checks verified; exact-source CI46229662 passed all41jobs. Final docs/parser commit CI tracked separately. Live acceptance is covered by the separate pending requirements; no product superiority claim."
     },
     {
       "id": "3.2.1",
       "task": "3.2",
       "plan_line": 251,
       "requirement": "Group captured preimages by user prompt, so each prompt is one checkpoint.",
-      "status": "implemented-pending-integrated-validation",
+      "status": "implemented-verified",
       "implementation": [
         "crates/davinci-agent/src/runtime/rewind.rs",
         "crates/davinci-coding-agent/src/rpc.rs",
@@ -1029,14 +1029,14 @@
       "evidence": [
         "rewind"
       ],
-      "remaining": "Final combined-tree and native checks pending; focused fixtures are recorded separately."
+      "remaining": "Recorded engineering checks verified; exact-source CI46229662 passed all41jobs. Final docs/parser commit CI tracked separately. Live acceptance is covered by the separate pending requirements; no product superiority claim."
     },
     {
       "id": "3.2.2",
       "task": "3.2",
       "plan_line": 252,
       "requirement": "Add `/rewind` to `builtin_slash_commands()`. It lists recent prompts and offers to restore code, conversation, or both.",
-      "status": "implemented-pending-integrated-validation",
+      "status": "implemented-verified",
       "implementation": [
         "crates/davinci-agent/src/runtime/rewind.rs",
         "crates/davinci-coding-agent/src/rpc.rs",
@@ -1045,14 +1045,14 @@
       "evidence": [
         "rewind"
       ],
-      "remaining": "Final combined-tree and native checks pending; focused fixtures are recorded separately."
+      "remaining": "Recorded engineering checks verified; exact-source CI46229662 passed all41jobs. Final docs/parser commit CI tracked separately. Live acceptance is covered by the separate pending requirements; no product superiority claim."
     },
     {
       "id": "3.2.3",
       "task": "3.2",
       "plan_line": 253,
       "requirement": "Offer rewind from double-Escape. Today `double_escape_action` defaults to `tree`; keep `tree` as a configurable option.",
-      "status": "implemented-pending-integrated-validation",
+      "status": "implemented-verified",
       "implementation": [
         "crates/davinci-agent/src/runtime/rewind.rs",
         "crates/davinci-coding-agent/src/rpc.rs",
@@ -1061,14 +1061,14 @@
       "evidence": [
         "rewind"
       ],
-      "remaining": "Final combined-tree and native checks pending; focused fixtures are recorded separately."
+      "remaining": "Recorded engineering checks verified; exact-source CI46229662 passed all41jobs. Final docs/parser commit CI tracked separately. Live acceptance is covered by the separate pending requirements; no product superiority claim."
     },
     {
       "id": "3.2.4",
       "task": "3.2",
       "plan_line": 254,
       "requirement": "Use the existing conflict rules: files edited by the user since the checkpoint show as conflicts and are never silently overwritten.",
-      "status": "implemented-pending-integrated-validation",
+      "status": "implemented-verified",
       "implementation": [
         "crates/davinci-agent/src/runtime/rewind.rs",
         "crates/davinci-coding-agent/src/rpc.rs",
@@ -1077,14 +1077,14 @@
       "evidence": [
         "rewind"
       ],
-      "remaining": "Final combined-tree and native checks pending; focused fixtures are recorded separately."
+      "remaining": "Recorded engineering checks verified; exact-source CI46229662 passed all41jobs. Final docs/parser commit CI tracked separately. Live acceptance is covered by the separate pending requirements; no product superiority claim."
     },
     {
       "id": "3.2.5",
       "task": "3.2",
       "plan_line": 255,
       "requirement": "State the limit plainly in the UI and docs, as Claude Code does: changes made through shell commands are not tracked.",
-      "status": "implemented-pending-integrated-validation",
+      "status": "implemented-verified",
       "implementation": [
         "crates/davinci-agent/src/runtime/rewind.rs",
         "crates/davinci-coding-agent/src/rpc.rs",
@@ -1093,14 +1093,14 @@
       "evidence": [
         "rewind"
       ],
-      "remaining": "Final combined-tree and native checks pending; focused fixtures are recorded separately."
+      "remaining": "Recorded engineering checks verified; exact-source CI46229662 passed all41jobs. Final docs/parser commit CI tracked separately. Live acceptance is covered by the separate pending requirements; no product superiority claim."
     },
     {
       "id": "3.2.6",
       "task": "3.2",
       "plan_line": 256,
       "requirement": "RPC: expose rewind preview and apply.",
-      "status": "implemented-pending-integrated-validation",
+      "status": "implemented-verified",
       "implementation": [
         "crates/davinci-agent/src/runtime/rewind.rs",
         "crates/davinci-coding-agent/src/rpc.rs",
@@ -1109,14 +1109,14 @@
       "evidence": [
         "rewind"
       ],
-      "remaining": "Final combined-tree and native checks pending; focused fixtures are recorded separately."
+      "remaining": "Recorded engineering checks verified; exact-source CI46229662 passed all41jobs. Final docs/parser commit CI tracked separately. Live acceptance is covered by the separate pending requirements; no product superiority claim."
     },
     {
       "id": "3.2.7",
       "task": "3.2",
       "plan_line": 257,
       "requirement": "Tests: restore after write/edit/apply_patch, conflict on user edit, conversation-only restore, code-only restore, and the shell-change limitation message.",
-      "status": "implemented-pending-integrated-validation",
+      "status": "implemented-verified",
       "implementation": [
         "crates/davinci-agent/src/runtime/rewind.rs",
         "crates/davinci-coding-agent/src/rpc.rs",
@@ -1125,14 +1125,14 @@
       "evidence": [
         "rewind"
       ],
-      "remaining": "Final combined-tree and native checks pending; focused fixtures are recorded separately."
+      "remaining": "Recorded engineering checks verified; exact-source CI46229662 passed all41jobs. Final docs/parser commit CI tracked separately. Live acceptance is covered by the separate pending requirements; no product superiority claim."
     },
     {
       "id": "4.1.1",
       "task": "4.1",
       "plan_line": 271,
       "requirement": "Add a backend that generates a Seatbelt profile from the existing sandbox spec: workspace read or read/write, read-only runtime mounts, `.git`/`.davinci`/`.pi` read-only, private temp, network denied unless allowed.",
-      "status": "implemented-pending-integrated-validation",
+      "status": "implemented-verified",
       "implementation": [
         "crates/davinci-agent/src/sandbox/seatbelt.rs",
         "crates/davinci-agent/tests/sandbox_seatbelt.rs",
@@ -1142,14 +1142,14 @@
       "evidence": [
         "sandbox"
       ],
-      "remaining": "Final combined-tree and native checks pending; focused fixtures are recorded separately."
+      "remaining": "Recorded engineering checks verified; exact-source CI46229662 passed all41jobs. Final docs/parser commit CI tracked separately. Live acceptance is covered by the separate pending requirements; no product superiority claim."
     },
     {
       "id": "4.1.2",
       "task": "4.1",
       "plan_line": 272,
       "requirement": "It advertises only the capabilities it actually enforces. Memory/PID limits remain capability-gated.",
-      "status": "implemented-pending-integrated-validation",
+      "status": "implemented-verified",
       "implementation": [
         "crates/davinci-agent/src/sandbox/seatbelt.rs",
         "crates/davinci-agent/tests/sandbox_seatbelt.rs",
@@ -1159,7 +1159,7 @@
       "evidence": [
         "sandbox"
       ],
-      "remaining": "Final combined-tree and native checks pending; focused fixtures are recorded separately."
+      "remaining": "Recorded engineering checks verified; exact-source CI46229662 passed all41jobs. Final docs/parser commit CI tracked separately. Live acceptance is covered by the separate pending requirements; no product superiority claim."
     },
     {
       "id": "4.1.3",
@@ -1176,14 +1176,14 @@
       "evidence": [
         "sandbox"
       ],
-      "remaining": "Seatbelt cannot enforce escaped-descendant ownership, deterministic teardown, tree timeout or lifetime-private temp. Capabilities and native Auto are withheld; native restrictions still require CI."
+      "remaining": "Seatbelt cannot enforce detached-descendant ownership, deterministic whole-tree teardown, tree timeout or lifetime-private temp. Those capabilities and native Auto are withheld. Native filesystem/environment/network tests passed10/10 at46229662."
     },
     {
       "id": "4.1.4",
       "task": "4.1",
       "plan_line": 274,
       "requirement": "Run these on a macOS CI runner.",
-      "status": "external-evidence-pending",
+      "status": "implemented-verified",
       "implementation": [
         "crates/davinci-agent/src/sandbox/seatbelt.rs",
         "crates/davinci-agent/tests/sandbox_seatbelt.rs",
@@ -1193,7 +1193,7 @@
       "evidence": [
         "sandbox"
       ],
-      "remaining": "Required macOS CI execution pending; deterministic escaped-descendant teardown unsupported."
+      "remaining": "Recorded engineering checks verified; exact-source CI46229662 passed all41jobs. Final docs/parser commit CI tracked separately. Live acceptance is covered by the separate pending requirements; no product superiority claim."
     },
     {
       "id": "4.2.1",
@@ -1212,14 +1212,14 @@
       "evidence": [
         "sandbox"
       ],
-      "remaining": "Seatbelt cannot enforce escaped-descendant ownership, deterministic teardown, tree timeout or lifetime-private temp. Capabilities and native Auto are withheld; native restrictions still require CI."
+      "remaining": "Seatbelt cannot enforce detached-descendant ownership, deterministic whole-tree teardown, tree timeout or lifetime-private temp. Those capabilities and native Auto are withheld. Native filesystem/environment/network tests passed10/10 at46229662."
     },
     {
       "id": "4.2.2",
       "task": "4.2",
       "plan_line": 279,
       "requirement": "Commands that need network or paths outside the workspace go through the existing approval path.",
-      "status": "implemented-pending-integrated-validation",
+      "status": "implemented-verified",
       "implementation": [
         "crates/davinci-coding-agent/src/sandbox_config.rs",
         "crates/davinci-agent/tests/sandbox_auto.rs",
@@ -1231,14 +1231,14 @@
       "evidence": [
         "sandbox"
       ],
-      "remaining": "Final combined-tree and native checks pending; focused fixtures are recorded separately."
+      "remaining": "Recorded engineering checks verified; exact-source CI46229662 passed all41jobs. Final docs/parser commit CI tracked separately. Live acceptance is covered by the separate pending requirements; no product superiority claim."
     },
     {
       "id": "4.2.3",
       "task": "4.2",
       "plan_line": 280,
       "requirement": "Where no backend exists, behavior is unchanged and `/status` says so.",
-      "status": "implemented-pending-integrated-validation",
+      "status": "implemented-verified",
       "implementation": [
         "crates/davinci-coding-agent/src/sandbox_config.rs",
         "crates/davinci-agent/tests/sandbox_auto.rs",
@@ -1250,7 +1250,7 @@
       "evidence": [
         "sandbox"
       ],
-      "remaining": "Final combined-tree and native checks pending; focused fixtures are recorded separately."
+      "remaining": "Recorded engineering checks verified; exact-source CI46229662 passed all41jobs. Final docs/parser commit CI tracked separately. Live acceptance is covered by the separate pending requirements; no product superiority claim."
     },
     {
       "id": "4.2.4",
@@ -1276,7 +1276,7 @@
       "task": "5.1",
       "plan_line": 296,
       "requirement": "Make learning background review and the security watch visible in `/cost`, `/status` and `get_session_stats` as separate token lines.",
-      "status": "implemented-pending-integrated-validation",
+      "status": "implemented-verified",
       "implementation": [
         "crates/davinci-coding-agent/src/native_extensions/background_usage.rs",
         "docs/session-diagnostics.md"
@@ -1284,14 +1284,14 @@
       "evidence": [
         "cost-status"
       ],
-      "remaining": "Final combined-tree and native checks pending; focused fixtures are recorded separately."
+      "remaining": "Recorded engineering checks verified; exact-source CI46229662 passed all41jobs. Final docs/parser commit CI tracked separately. Live acceptance is covered by the separate pending requirements; no product superiority claim."
     },
     {
       "id": "5.1.2",
       "task": "5.1",
       "plan_line": 297,
       "requirement": "Choose a default and record the choice here:",
-      "status": "implemented-pending-integrated-validation",
+      "status": "implemented-verified",
       "implementation": [
         "crates/davinci-coding-agent/src/native_extensions/background_usage.rs",
         "docs/session-diagnostics.md"
@@ -1299,7 +1299,7 @@
       "evidence": [
         "cost-status"
       ],
-      "remaining": "Final combined-tree and native checks pending; focused fixtures are recorded separately."
+      "remaining": "Recorded engineering checks verified; exact-source CI46229662 passed all41jobs. Final docs/parser commit CI tracked separately. Live acceptance is covered by the separate pending requirements; no product superiority claim."
     },
     {
       "id": "5.1.3",
@@ -1321,7 +1321,7 @@
       "task": "5.2",
       "plan_line": 304,
       "requirement": "Stop auto-applying learned skills globally without approval (`auto_apply_global`). Default global promotion to require approval; keep project-scoped auto-apply only if the evaluation supports it.",
-      "status": "implemented-pending-integrated-validation",
+      "status": "implemented-verified",
       "implementation": [
         "crates/davinci-coding-agent/src/native_extensions/learning/config.rs",
         "crates/davinci-coding-agent/src/settings.rs"
@@ -1329,14 +1329,14 @@
       "evidence": [
         "cost-status"
       ],
-      "remaining": "Final combined-tree and native checks pending; focused fixtures are recorded separately."
+      "remaining": "Recorded engineering checks verified; exact-source CI46229662 passed all41jobs. Final docs/parser commit CI tracked separately. Live acceptance is covered by the separate pending requirements; no product superiority claim."
     },
     {
       "id": "5.2.2",
       "task": "5.2",
       "plan_line": 305,
       "requirement": "Reason: a wrong lesson learned in one repository should not silently change behavior in every other one.",
-      "status": "implemented-pending-integrated-validation",
+      "status": "implemented-verified",
       "implementation": [
         "crates/davinci-coding-agent/src/native_extensions/learning/config.rs",
         "crates/davinci-coding-agent/src/settings.rs"
@@ -1344,7 +1344,7 @@
       "evidence": [
         "cost-status"
       ],
-      "remaining": "Final combined-tree and native checks pending; focused fixtures are recorded separately."
+      "remaining": "Recorded engineering checks verified; exact-source CI46229662 passed all41jobs. Final docs/parser commit CI tracked separately. Live acceptance is covered by the separate pending requirements; no product superiority claim."
     },
     {
       "id": "5.3.1",
@@ -1432,7 +1432,7 @@
       "task": "5.4",
       "plan_line": 319,
       "requirement": "Context VM and JEV stay off. Evaluate Context VM only on a dedicated long-session set (sessions long enough to compact at least twice) against current compaction; change the default only on a measured win.",
-      "status": "implemented-pending-integrated-validation",
+      "status": "implemented-verified",
       "implementation": [
         "docs/readiness/evaluation.md",
         "docs/readiness/production-harness-readiness-plan.md",
@@ -1442,14 +1442,14 @@
         "documents",
         "evaluation"
       ],
-      "remaining": "Final combined-tree and native checks pending; focused fixtures are recorded separately."
+      "remaining": "Recorded engineering checks verified; exact-source CI46229662 passed all41jobs. Final docs/parser commit CI tracked separately. Live acceptance is covered by the separate pending requirements; no product superiority claim."
     },
     {
       "id": "5.5.1",
       "task": "5.5",
       "plan_line": 323,
       "requirement": "Fold the 14 native `*-status` commands into sections of `/status`, plus a `/doctor` command that checks configuration, credentials, sandbox backend, MCP/LSP health and install identity.",
-      "status": "implemented-pending-integrated-validation",
+      "status": "implemented-verified",
       "implementation": [
         "crates/davinci-coding-agent/src/native_extensions/mod.rs",
         "crates/davinci-coding-agent/src/session_diagnostics.rs",
@@ -1458,14 +1458,14 @@
       "evidence": [
         "cost-status"
       ],
-      "remaining": "Final combined-tree and native checks pending; focused fixtures are recorded separately."
+      "remaining": "Recorded engineering checks verified; exact-source CI46229662 passed all41jobs. Final docs/parser commit CI tracked separately. Live acceptance is covered by the separate pending requirements; no product superiority claim."
     },
     {
       "id": "5.5.2",
       "task": "5.5",
       "plan_line": 324,
       "requirement": "Keep the internal views for RPC and sheets. Remove them from public slash discovery, following the `/security-scan` precedent in CLAUDE.md.",
-      "status": "implemented-pending-integrated-validation",
+      "status": "implemented-verified",
       "implementation": [
         "crates/davinci-coding-agent/src/native_extensions/mod.rs",
         "crates/davinci-coding-agent/src/session_diagnostics.rs",
@@ -1474,21 +1474,21 @@
       "evidence": [
         "cost-status"
       ],
-      "remaining": "Final combined-tree and native checks pending; focused fixtures are recorded separately."
+      "remaining": "Recorded engineering checks verified; exact-source CI46229662 passed all41jobs. Final docs/parser commit CI tracked separately. Live acceptance is covered by the separate pending requirements; no product superiority claim."
     },
     {
       "id": "5.6.1",
       "task": "5.6",
       "plan_line": 328,
       "requirement": "Correct the crate line counts and add the new behaviors (completion step, blocking hooks, `/rewind`, sandbox defaults) once they land.",
-      "status": "implemented-pending-integrated-validation",
+      "status": "implemented-verified",
       "implementation": [
         "CLAUDE.md"
       ],
       "evidence": [
         "documents"
       ],
-      "remaining": "Final combined-tree and native checks pending; focused fixtures are recorded separately."
+      "remaining": "Recorded engineering checks verified; exact-source CI46229662 passed all41jobs. Final docs/parser commit CI tracked separately. Live acceptance is covered by the separate pending requirements; no product superiority claim."
     },
     {
       "id": "6.1",
@@ -1609,10 +1609,10 @@
   "acceptance_complete": false,
   "paid_provider_calls_performed": 0,
   "status_semantics": {
-    "implemented-pending-integrated-validation": "Source and focused offline fixtures exist; final combined tree has not been certified.",
     "external-evidence-pending": "Actual owner data, model campaign, native CI, main integration or release evidence is absent. Plumbing or synthetic fixtures do not meet acceptance.",
     "capability-limited": "The implementation explicitly refuses to advertise or activate an unproved capability.",
-    "conditional-not-triggered": "The specification requires observed traces before this work begins; no qualifying evidence exists."
+    "conditional-not-triggered": "The specification requires observed traces before this work begins; no qualifying evidence exists.",
+    "implemented-verified": "Source implementation and its recorded fixture/native checks verified. Exact source CI46229662 green; final docs/parser commit CI is separately tracked. This status does not imply live acceptance or completed production readiness."
   },
   "owner_decisions": {
     "background": "Off by default, opt-in",
@@ -1626,20 +1626,20 @@
     "release": {
       "kind": "offline-fixtures-and-code-review",
       "tests": "python3 -m unittest discover -s scripts/bench/tests",
-      "log": "/workspace/readiness-evidence/integrated-python.log",
-      "result": "132 total, 125 passed, 7 existing platform skips before final accounting review fixes",
+      "log": "/workspace/readiness-evidence/integrated-final-python-149.log",
+      "result": "Final Python suite149total:142passed7existingplatformskips(2.365s); prior19independent accounting/gate/private-inventory closurecases and4syntheticinstaller scenarios passed. Final parser closure independently passed5focusedtests+5additionalprobes.",
       "review": "/workspace/readiness-evidence/cost-root-cold-review.md",
       "guide": "docs/readiness/release-discipline.md",
-      "remaining": "Final Python fixtures and full push CI; no installed/tagged release"
+      "remaining": "No release tag or installation performed; manual release requires its exact final source commit green."
     },
     "evaluation": {
       "kind": "offline-fixtures-and-code-review",
       "tests": "python3 -m unittest discover -s scripts/bench/tests",
-      "log": "/workspace/readiness-evidence/integrated-python.log",
-      "result": "132 total, 125 passed, 7 existing platform skips before final accounting review fixes",
-      "review": "/workspace/readiness-evidence/evaluation-cold-review.md",
+      "log": "/workspace/readiness-evidence/integrated-final-python-149.log",
+      "result": "Final Python suite149total:142passed7existingplatformskips(2.365s); prior19independent accounting/gate/private-inventory closurecases and4syntheticinstaller scenarios passed. Final parser closure independently passed5focusedtests+5additionalprobes.",
+      "review": "/workspace/readiness-evidence/cost-root-cold-review.md",
       "guide": "docs/readiness/evaluation.md",
-      "remaining": "Review findings on attempt usage and dev metrics/identity gates being fixed; no real private campaign"
+      "remaining": "Actual private dev/holdout and same-model campaigns,independently isolated grading and owner budget pending."
     },
     "completion": {
       "kind": "offline-regression",
@@ -1649,7 +1649,15 @@
       "log": "/workspace/readiness-evidence/integrated-completion-green.log",
       "review": "/workspace/readiness-evidence/completion-runtime-fix-cold-review.md",
       "guide": "docs/completion.md",
-      "remaining": "Final combined tree and native Windows rerun"
+      "remaining": "Recorded fixtures and Ubuntu/Windows agent source shards passed; private efficacy campaigns pending.",
+      "named_files_fix_commit": "7c4091cfbb8bf458787b53e8396f2f458148d9b0",
+      "named_files_result": "Eight attachment integration tests and all ten CLI output-schema fixtures passed after restoring attachment handling for an unsubscribed rewind runtime; subscribed read denial remains enforced.",
+      "runtime_provenance_fix_commit": "c9e167a508dd8ecfbe1825d8045479cbaf0af8bb",
+      "runtime_provenance_result": "18 named-file/boundary fixtures and all 1314 agent library tests passed; shared-bus/original-ID host rebinding and completion snapshot guard regressions verified. Independent cold review closed.",
+      "runtime_provenance_review": "/workspace/readiness-evidence/runtime-provenance-cold-review.md",
+      "benchmark_observation_fix_commit": "d0d88dd23db2a6f3d73873773acbccc1b1d9234c",
+      "benchmark_observation_result": "Two fixtures RED0/2 -> fullPythonGREEN142passed7skipped; independent parser closure5focusedtests+5probes. Reason-only completion.requirements and hook-block events count without retaining remindertext; legacycauses preserved; follow-up requests/mutations computed.",
+      "benchmark_observation_review": "/workspace/readiness-evidence/completion-observations-cold-review.md"
     },
     "hooks": {
       "kind": "offline-fixtures-and-independent-review",
@@ -1658,7 +1666,7 @@
       "log": "/workspace/readiness-evidence/hook-host-results.md",
       "review": "/workspace/readiness-evidence/hooks-independent-review.md",
       "guide": "docs/completion-hooks.md",
-      "remaining": "Final integrated/native checks"
+      "remaining": "Recorded fixtures and Ubuntu/Windows source shards passed; no competitor behavior efficacy claim."
     },
     "rewind": {
       "kind": "offline-fixtures-and-independent-review",
@@ -1668,7 +1676,7 @@
       "log": "/workspace/readiness-evidence/rewind-hard-link-checks.json",
       "review": "/workspace/readiness-evidence/rewind-cold-review.md",
       "guide": "docs/rewind.md",
-      "remaining": "Final hard-link critic closure and integrated/native checks"
+      "remaining": "Recorded fixtures and native source checks passed; shell mutations remain explicitly untracked."
     },
     "sandbox": {
       "kind": "offline-fixtures-and-independent-review",
@@ -1677,7 +1685,17 @@
       "log": "docs/sandbox-verification-2026-09-30.md",
       "review": "/workspace/readiness-evidence/sandbox-cold-review.md",
       "tests": "cargo test -p davinci-agent --locked --test sandbox_seatbelt (required macOS CI only)",
-      "remaining": "Native CI pending; macOS whole-tree teardown and Auto unsupported"
+      "remaining": "Native macOS checks passed. macOS detached descendants,whole-tree teardown and nativeAuto remain unsupported.",
+      "native_diagnostic_commit": "b01e21ab9da04c50d22924095d318ca823225ebd",
+      "native_diagnostic_url": "https://github.com/J12003LPZ/davinci/actions/runs/36699692289/job/109835969775",
+      "native_diagnostic_result": "4 passed / 6 failed, including startup controls. Kernel denied file-read-data /; crash stacks abort in dyld CacheFinder before main. Literal-root-directory read candidate independently reviewed; no descendant/write/network grant added.",
+      "native_fix_commit": "34a2ff65",
+      "native_verification_source": "4622966215f62b7bd1f8072863dce1030f0c2826",
+      "native_verification_url": "https://github.com/J12003LPZ/davinci/actions/runs/36701485168/job/109841707224",
+      "native_verification_result": "Completed macOS job success:10passed0failed0ignored(0.97s), including eight startup controls, unchanged positive/negative filesystem/environment/network assertions, detached descendant gap and mandatory ownership refusal. macOS26.6.2/25G83 arm64 runner; no other macOS version/architecture claim.",
+      "native_local_result": "Root profile fixtures8/8; strict Agent library lint passed44.66s; full-tree format/diff checks passed.",
+      "native_verification_log_sha256": "9efac372d397a329cc37fc38e672d966bff30ac42ab25e02898dd0e88d4844f8",
+      "native_fix_review": "/workspace/readiness-evidence/sandbox-dyld-cold-review.md"
     },
     "cost-status": {
       "kind": "offline-fixtures-and-independent-review",
@@ -1686,7 +1704,7 @@
       "log": "/workspace/readiness-evidence/cost-scoped-results.json",
       "review": "/workspace/readiness-evidence/cost-cold-review.md",
       "guide": "docs/session-diagnostics.md",
-      "remaining": "Final integrated/native checks and interactive/RPC dev campaigns"
+      "remaining": "Recorded fixtures and sourceCI passed; interactive/RPC dev campaigns pending."
     },
     "windows": {
       "kind": "native-ci",
@@ -1695,22 +1713,50 @@
       "url": "https://github.com/J12003LPZ/davinci/actions/runs/36687936657",
       "result": "Two full parallel coding library runs: each 1385 passed, 0 failed, 17 existing ignored; graph relative script passed. Overall CI at that head failed completion and CLI graph ownership tests.",
       "log": "/workspace/readiness-evidence/windows-diagnostic-d6c2ab6c.txt",
-      "remaining": "Original graph failure cause unproven; final full native CI pending"
+      "remaining": "Original graph failure cause unproven. Windows source package shard at46229662 passed; main is unchanged because merge is not authorized."
     },
     "documents": {
       "kind": "source-and-coverage-validation",
       "guide": "docs/readiness/README.md",
       "result": "99 original checkboxes retained; audit table records not-run arms, not estimates; original bytes and source lines retained",
-      "remaining": "Final schema/reference/prefix check and crate-size snapshot validation"
+      "remaining": "Independent final audit and exact-head CI records are linked from the final PR; all99 source-line requirements and8constraints mechanically verified."
     },
     "integrated": {
       "kind": "combined-tree-checks",
-      "result": "Prior d6c workspace check passed in 1m59s; pre-sandbox workspace all-target clippy passed in 2m35s. These do not certify later source.",
+      "result": "Full local workspace run d3ac5e68 completed exit101:134targets5218passed6failed40ignored. Six preserved environment failures:unchanged evaluator bare-python lookup fixtures(5),existing LSP zombie descendant fixture(1). All task regressions passed. Full workspace/all-target lint passed3m10s;fixtureCLIbuild1m05s;rebuiltCLIoutputschema10/0. Exact-source pushCI46229662 completed success all41jobs;requirednativeMacSeatbelt10/0/0,Windowsinstallerparse,UbuntuWindowsAgent/coding/evalsandproductionreleasefixtureguardpassed. Final parserfixd0d88dd2 Python149total142passed7skipped with independent closure; final docs/parser commit CI is recorded separately in PR/Actions.",
       "logs": [
-        "/workspace/readiness-evidence/integrated-check.log",
-        "/workspace/readiness-evidence/integrated-clippy-pre-sandbox.log"
+        "/workspace/readiness-evidence/integrated-final-clippy.log",
+        "/workspace/readiness-evidence/integrated-final-cli-build-after-named.log",
+        "/workspace/readiness-evidence/integrated-named-files-green.log",
+        "/workspace/readiness-evidence/integrated-output-schema-green.log",
+        "/workspace/readiness-evidence/integrated-final-python-147.log",
+        "/workspace/readiness-evidence/integrated-rust-tests.log",
+        "/workspace/readiness-evidence/integrated-rust-tests-7c409.log",
+        "/workspace/readiness-evidence/integrated-d3ac-clippy.log",
+        "/workspace/readiness-evidence/integrated-d3ac-cli-build.log",
+        "/workspace/readiness-evidence/integrated-d3ac-output-schema.log",
+        "/workspace/readiness-evidence/integrated-rust-tests-d3ac.log",
+        "/workspace/readiness-evidence/integrated-dyld-root-tests.log",
+        "/workspace/readiness-evidence/integrated-dyld-root-clippy.log",
+        "/workspace/readiness-evidence/mac-seatbelt-b01-startup.log",
+        "/workspace/readiness-evidence/integrated-final-python-149.log"
       ],
-      "remaining": "Final full combined Rust test/build/clippy, Python/Node and exact-commit CI"
+      "remaining": "Consult final PR/Actions for exact final-head sourceCI. Local environment failures remain preserved.",
+      "source_commit": "d3ac5e68e2125f3db2c2fd0824bb24b50e13926d",
+      "source_ci": {
+        "source_sha": "4622966215f62b7bd1f8072863dce1030f0c2826",
+        "event": "push",
+        "url": "https://github.com/J12003LPZ/davinci/actions/runs/36701485168",
+        "result": "completed success;41/41jobsincluding27workspacepackageshards,quality,contracts,Python,browser,voice,nativeandaggregate;pushworkflowlint36701485101passed"
+      }
+    },
+    "supervisor-race": {
+      "kind": "regression-and-independent-review",
+      "unit_commit": "9466baa52d234eef72fcb26ad2aec71ff3eb4969",
+      "result": "Deterministic late-close regression failed before fix;18supervisor fixtures plus existing foreground test passed afterward. No timeout raised; owned stop/host-loss cleanup and missing-terminal-error contracts preserved.",
+      "log": "/workspace/readiness-evidence/foreground-race-review.md",
+      "review": "/workspace/readiness-evidence/foreground-race-cold-review.md",
+      "remaining": "Native supervisor and Ubuntu/Windows Agent source checks passed; final exact-head CI is recorded separately in PR/Actions."
     }
   },
   "global_constraints": [
@@ -1787,5 +1833,11 @@
     "cost-cold-review.md",
     "evaluation-cold-review.md",
     "cost-root-cold-review.md"
-  ]
+  ],
+  "status_counts": {
+    "external-evidence-pending": 33,
+    "implemented-verified": 59,
+    "conditional-not-triggered": 5,
+    "capability-limited": 2
+  }
 }
