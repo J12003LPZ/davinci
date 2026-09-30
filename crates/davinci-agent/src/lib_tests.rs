@@ -3859,9 +3859,10 @@ fn harness_reruns_the_last_verification_after_a_later_edit() {
         })
         .unwrap();
 
+    assert_eq!(agent.run_stats().completion_requirement_reminders, 1);
     assert_eq!(
-        model_calls, 4,
-        "write, verify, write, done: no reminder round trip"
+        model_calls, 5,
+        "write, verify, write, done, requirement review"
     );
     assert_eq!(harness_runs(&agent), 1);
     assert!(reminders(&agent).is_empty(), "{:?}", reminders(&agent));
@@ -3990,7 +3991,7 @@ fn batch_check_observes_generation_after_earlier_batch_mutation() {
 }
 
 #[test]
-fn partial_check_discloses_unchecked_paths_without_another_model_turn() {
+fn partial_check_discloses_unchecked_paths_after_requirement_review() {
     let dir = tempfile::tempdir().unwrap();
     let mut agent = verifying_agent(dir.path());
     agent.prompt("edit two modules and check one");
@@ -4015,7 +4016,8 @@ fn partial_check_discloses_unchecked_paths_without_another_model_turn() {
             script(current)
         })
         .unwrap();
-    assert_eq!(calls, 4);
+    assert_eq!(agent.run_stats().completion_requirement_reminders, 1);
+    assert_eq!(calls, 5);
     assert_eq!(agent.completion_evidence(), CompletionEvidence::Partial);
     assert_eq!(harness_runs(&agent), 0);
     assert!(reminders(&agent).is_empty());
@@ -4056,6 +4058,7 @@ fn a_passing_rerun_that_misses_the_change_is_not_reported_as_failed() {
         })
         .unwrap();
 
+    assert_eq!(agent.run_stats().completion_requirement_reminders, 1);
     assert_eq!(harness_runs(&agent), 1);
     let reminders = reminders(&agent);
     assert_eq!(reminders.len(), 1, "{reminders:?}");
@@ -4065,7 +4068,7 @@ fn a_passing_rerun_that_misses_the_change_is_not_reported_as_failed() {
         reminders[0]
     );
     assert!(!reminders[0].contains("failed"), "{}", reminders[0]);
-    assert_eq!(model_calls, 5);
+    assert_eq!(model_calls, 6);
 }
 
 #[test]
@@ -4129,6 +4132,7 @@ fn a_failing_harness_rerun_is_reported_to_the_model() {
         })
         .unwrap();
 
+    assert_eq!(agent.run_stats().completion_requirement_reminders, 1);
     assert_eq!(harness_runs(&agent), 1);
     let reminders = reminders(&agent);
     assert_eq!(reminders.len(), 1, "{reminders:?}");
@@ -4137,7 +4141,10 @@ fn a_failing_harness_rerun_is_reported_to_the_model() {
         "{}",
         reminders[0]
     );
-    assert_eq!(model_calls, 5, "the model answers the reminder once");
+    assert_eq!(
+        model_calls, 6,
+        "one requirement review and one verification-failure reminder"
+    );
 }
 
 #[test]

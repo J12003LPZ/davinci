@@ -175,3 +175,23 @@ fn disabled_requirement_review_is_a_baseline_arm_without_prompt_changes() {
     assert_eq!(agent.provider_tool_schema_identity(), schema);
     assert_eq!(agent.system_prompt, system);
 }
+
+#[cfg(unix)]
+#[test]
+fn a_symlink_alias_cannot_bypass_a_denied_completion_read() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("private.py"), "before").unwrap();
+    std::os::unix::fs::symlink("private.py", dir.path().join("alias.py")).unwrap();
+    let mut agent = Agent::new("fixture");
+    agent.cwd = dir.path().into();
+    agent.auto_compaction = false;
+    agent
+        .permissions
+        .lock()
+        .unwrap()
+        .deny
+        .push(davinci_agent::PermissionRule::parse("read(private.py)").unwrap());
+    agent.prompt("Handle normal input, reject invalid input; preserve the format.");
+    std::fs::write(dir.path().join("private.py"), "after").unwrap();
+    assert_eq!(reminders(&agent.run_loop(reply).unwrap()), 0);
+}

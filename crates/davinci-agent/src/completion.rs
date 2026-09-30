@@ -83,20 +83,35 @@ impl Agent {
         {
             return false;
         }
+        let mut spellings = vec![
+            relative.to_string_lossy().into_owned(),
+            absolute.to_string_lossy().into_owned(),
+        ];
+        if let Ok(canonical) = absolute.canonicalize() {
+            let root = self.cwd.canonicalize().unwrap_or_else(|_| self.cwd.clone());
+            let Ok(canonical_relative) = canonical.strip_prefix(root) else {
+                return false;
+            };
+            if crate::is_sensitive_file_path(&canonical_relative.to_string_lossy()) {
+                return false;
+            }
+            spellings.extend([
+                canonical_relative.to_string_lossy().into_owned(),
+                canonical.to_string_lossy().into_owned(),
+            ]);
+        }
         self.permissions.lock().is_ok_and(|policy| {
-            [relative.to_string_lossy(), absolute.to_string_lossy()]
-                .iter()
-                .all(|spelling| {
-                    matches!(
-                        policy.decide(
-                            "completion-observation",
-                            "read",
-                            &serde_json::json!({"path":spelling}),
-                            &self.cwd
-                        ),
-                        PermissionVerdict::Allow
-                    )
-                })
+            spellings.iter().all(|spelling| {
+                matches!(
+                    policy.decide(
+                        "completion-observation",
+                        "read",
+                        &serde_json::json!({"path":spelling}),
+                        &self.cwd
+                    ),
+                    PermissionVerdict::Allow
+                )
+            })
         })
     }
 
