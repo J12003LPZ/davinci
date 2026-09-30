@@ -37,7 +37,8 @@ def activity(events):
                 mutation_generation = max(generation, mutation_generation)
         elif kind == "provider_observation":
             observation = event.get("observation")
-            if not isinstance(observation, dict) or observation.get("schema_version") != 1:
+            if (not isinstance(observation, dict) or type(observation.get("schema_version")) is not int
+                    or observation.get("schema_version") != 1):
                 overflow = True
                 continue
             request = observation.get("logical_request_id")
@@ -48,7 +49,8 @@ def activity(events):
             telemetry_seen = True
             key = (purpose, request)
             phase = observation.get("kind")
-            if phase in ("attempt_end", "logical_end") and observation.get("status") == "unknown":
+            if (phase in ("attempt_end", "logical_end")
+                    and observation.get("status") not in ("completed", "failed", "cancelled")):
                 unknown_outcome = True
             if phase == "logical_start":
                 if key not in logical and reasons and purpose == "coding":

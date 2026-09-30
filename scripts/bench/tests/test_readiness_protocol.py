@@ -25,6 +25,7 @@ class ReadinessProtocolTests(unittest.TestCase):
                               "grading_assurance": "independent", "source_sha": "b" * 40, "source_clean": True,
                               "private_suite_digest": "c" * 64, "split": split, "repository_id": f"repo-{task % 3}",
                               "reference_commit": hashlib.sha256(name.encode()).hexdigest()[:40],
+                              "visible_tests": True, "requires_existing_test_changes": False,
                               "service_tier": "default", "price_table_hash": digest(prices)}
                     baseline.append(fixture(task % 3 != 0, **dict(common, variant="baseline", binary_sha256="a" * 64,
                                                                  effective_settings={"requirementReview": False})))
@@ -45,6 +46,63 @@ class ReadinessProtocolTests(unittest.TestCase):
             groups[3] = [dict(row, **patch) for row in groups[3]]
             result = readiness_protocol.promotion(*groups, target="composite_success_rate", prices=prices)
             self.assertFalse(result["accepted"])
+
+    def test_dev_unknown_metrics_cannot_promote_an_apparent_success_win(self):
+        for missing in ({"regression_pass": None}, {"logical_requests": None},
+                        {"request_metrics_complete": False}, {"tool_calls": None}):
+            with self.subTest(missing=missing):
+                groups, prices = self.complete()
+                groups[1] = [dict(row, **missing) for row in groups[1]]
+                result = readiness_protocol.promotion(*groups, target="composite_success_rate", prices=prices)
+                self.assertFalse(result["accepted"])
+                self.assertEqual(result["rules"]["dev_metrics_available"]["status"], "fail")
+
+    def test_source_labels_must_be_typed_and_complete(self):
+        for patch in ({"repository_id": None}, {"repository_id": 1}, {"repository_id": "  "},
+                      {"reference_commit": None}, {"reference_commit": "abbreviated"},
+                      {"visible_tests": None}, {"visible_tests": 1},
+                      {"requires_existing_test_changes": None}):
+            with self.subTest(patch=patch):
+                groups, _ = self.complete()
+                for group in groups[:2]:
+                    for row in group:
+                        row.update(patch)
+                with self.assertRaises(ValueError):
+                    readiness_protocol.validate_pairs(*groups[:2])
+
+    def test_task_labels_cannot_drift_between_repetitions(self):
+        for field, value in (("repository_id", "different-repo"), ("reference_commit", "e" * 40),
+                             ("size_class", "small"), ("visible_tests", False),
+                             ("requires_existing_test_changes", True)):
+            with self.subTest(field=field):
+                groups, _ = self.complete()
+                for group in groups[:2]:
+                    group[1][field] = value
+                with self.assertRaises(ValueError):
+                    readiness_protocol.validate_pairs(*groups[:2])
+
+    def test_source_revision_cannot_be_relabelled_as_another_task(self):
+        groups, prices = self.complete()
+        for group in groups[:2]:
+            for row in group[3:6]:
+                row.update(repository_id=group[0]["repository_id"], reference_commit=group[0]["reference_commit"])
+        with self.assertRaises(ValueError):
+            readiness_protocol.validate_pairs(*groups[:2])
+        groups, prices = self.complete()
+        for group in groups[2:]:
+            for row in group[:3]:
+                row.update(repository_id=groups[0][0]["repository_id"], reference_commit=groups[0][0]["reference_commit"])
+        with self.assertRaises(ValueError):
+            readiness_protocol.promotion(*groups, target="composite_success_rate", prices=prices)
+
+    def test_holdout_repository_inventory_cannot_exceed_the_frozen_suite_scope(self):
+        groups, prices = self.complete()
+        for group in groups[2:]:
+            for row in group:
+                row["repository_id"] = "new-holdout-repository-" + row["task"]
+        result = readiness_protocol.promotion(*groups, target="composite_success_rate", prices=prices)
+        self.assertFalse(result["accepted"])
+        self.assertEqual(result["rules"]["private_repository_inventory"]["status"], "fail")
 
     def test_frozen_configuration_and_prices_cannot_drift(self):
         groups, prices = self.complete()
@@ -68,6 +126,8 @@ class ReadinessProtocolTests(unittest.TestCase):
                           "grading_assurance": "diagnostic-only", "binary_sha256": "a" * 64,
                           "source_sha": "b" * 40, "source_clean": True, "private_suite_digest": "c" * 64,
                           "split": "dev", "variant": "baseline"}
+                common.update(repository_id=f"repo-{task % 3}", reference_commit=hashlib.sha256(str(task).encode()).hexdigest()[:40],
+                              visible_tests=True, requires_existing_test_changes=False)
                 baseline.append(fixture(not winner, **common))
                 candidate.append(fixture(True, **dict(common, variant="candidate", binary_sha256="d" * 64)))
         return baseline, candidate

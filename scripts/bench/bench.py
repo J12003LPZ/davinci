@@ -232,6 +232,7 @@ def parse_stream(harness, stdout):
     completed_usage = {}
     request_usage = []
     usage_conflict = False
+    malformed_stream = False
     reasoning_values = []
 
     def add_usage(values):
@@ -246,6 +247,14 @@ def parse_stream(harness, stdout):
                 stats[key] = None
             elif key not in missing:
                 stats[key] = (stats[key] or 0) + value
+
+    def davinci_usage(usage):
+        usage = usage if isinstance(usage, dict) else {}
+        uncached, cached, written = usage.get("input"), usage.get("cacheRead"), usage.get("cacheWrite")
+        valid = all(type(value) is int and value >= 0 for value in (uncached, cached, written))
+        return {"input": uncached + cached + written if valid else None,
+                "cached": cached, "output": usage.get("output"), "cache_write": written}
+
     for line in stdout.splitlines():
         line = line.strip()
         if not line.startswith("{"):
@@ -253,10 +262,13 @@ def parse_stream(harness, stdout):
         try:
             event = json.loads(line)
         except ValueError:
+            malformed_stream = True
             continue
         if not isinstance(event, dict):
             continue
         events.append(event)
+    observed = harness == "davinci" and any(event.get("type") == "provider_observation" for event in events)
+    for event in events:
         if harness == "codex":
             if event.get("type") == "turn.completed":
                 stats["user_turns"] += 1
@@ -283,30 +295,85 @@ def parse_stream(harness, stdout):
                 identity = message.get("id") if isinstance(message, dict) else None
                 if isinstance(identity, str) and identity:
                     if identity in completed_usage:
-                        if completed_usage[identity] != u:
+                        if not observed and completed_usage[identity] != u:
                             add_usage({"input": None, "cached": None, "output": None, "cache_write": None})
                             usage_conflict = True
                         continue
                     completed_usage[identity] = u
-                uncached, cached, written = u.get("input"), u.get("cacheRead"), u.get("cacheWrite")
-                valid = all(isinstance(v, int) and not isinstance(v, bool) and v >= 0
-                            for v in (uncached, cached, written))
-                total = uncached + cached + written if valid else None
-                request_usage.append({"input_tokens": total, "cached_tokens": cached if valid else None})
-                reasoning_values.append(u.get("reasoning"))
-                add_usage({"input": total,
-                           "cached": cached, "output": u.get("output"), "cache_write": written})
-                # Completed messages are not authoritative dispatch telemetry.
+                # Message usage is only a legacy fallback. A final response
+                # cannot account for earlier failed or unfinished transports.
                 stats["completed_assistant_messages"] = (
                     stats.get("completed_assistant_messages", 0) + 1)
+                if observed:
+                    continue
+                values = davinci_usage(u)
+                request_usage.append({"input_tokens": values["input"],
+                                      "cached_tokens": values["cached"] if values["input"] is not None else None})
+                reasoning_values.append(u.get("reasoning"))
+                add_usage(values)
             if event.get("type") == "tool_execution_start":
                 name = event.get("toolName") or "?"
                 name = name if isinstance(name, str) else "?"
                 stats["tool_calls"] += 1
                 stats["tools"][name] = stats["tools"].get(name, 0) + 1
-    stats["usage_available"] = usage_seen and not missing
     if harness == "davinci":
         stats.update(activity(events))
+    if observed:
+        receipts, coding_groups = {}, {}
+        for event in events:
+            observation = event.get("observation") if event.get("type") == "provider_observation" else None
+            if not isinstance(observation, dict):
+                continue
+            purpose, request = observation.get("purpose"), observation.get("logical_request_id")
+            if purpose not in ("coding", "prewarm", "jev") or not isinstance(request, str) or not request:
+                continue
+            key = (purpose, request)
+            if observation.get("kind") == "logical_start" and purpose == "coding":
+                coding_groups.setdefault(key, [])
+            if observation.get("kind") == "attempt_end":
+                attempt = observation.get("attempt_id")
+                if type(attempt) is not int or attempt < 1:
+                    continue
+                identity = (*key, attempt)
+                receipt = observation.get("status"), observation.get("usage")
+                # Validate every receipt before replay comparison: Python
+                # considers True == 1 and 1.0 == 1, but token types are exact.
+                if any(type(value) is not int or value < 0 for value in davinci_usage(receipt[1]).values()):
+                    usage_conflict = True
+                if identity in receipts and receipts[identity] != receipt:
+                    usage_conflict = True
+                receipts[identity] = receipt
+        if not stats["request_metrics_complete"] or not receipts or usage_conflict:
+            add_usage({"input": None, "cached": None, "output": None, "cache_write": None})
+            usage_conflict = True
+        else:
+            # Every purpose contributes spend; first/later request groups refer
+            # only to coding logical requests and include all their retries.
+            for (purpose, request, _), (_, usage) in receipts.items():
+                values = davinci_usage(usage)
+                add_usage(values)
+                usage = usage if isinstance(usage, dict) else {}
+                reasoning_values.append(usage.get("reasoning"))
+                if (purpose, request) in coding_groups:
+                    coding_groups[purpose, request].append({"input_tokens": values["input"],
+                                                           "cached_tokens": values["cached"]})
+            request_usage = [{field: aggregate_available(values, field)
+                              for field in ("input_tokens", "cached_tokens")}
+                             for values in coding_groups.values()]
+    elif harness == "davinci" and any(event.get("type") in ("auto_retry_start", "auto_retry_end") for event in events):
+        # Old streams expose retries without per-attempt usage receipts.
+        add_usage({"input": None, "cached": None, "output": None, "cache_write": None})
+        usage_conflict = True
+    if malformed_stream:
+        # A truncated JSON record may have omitted an entire paid attempt.
+        add_usage({"input": None, "cached": None, "output": None, "cache_write": None})
+        usage_conflict = True
+        if harness == "davinci":
+            stats["request_metrics_available"] = stats["request_metrics_complete"] = False
+            for field in ("logical_requests", "requests", "provider_attempts", "coding_provider_attempts",
+                          "prewarm_attempts", "jev_attempts", "requests_after_first_reminder"):
+                stats[field] = None
+    stats["usage_available"] = usage_seen and not missing
     stats["reasoning_tokens"] = (sum(reasoning_values) if reasoning_values and not usage_conflict
         and all(type(v) is int and v >= 0 for v in reasoning_values) else None)
     # Both benchmark routes use Responses output totals, which include reasoning.

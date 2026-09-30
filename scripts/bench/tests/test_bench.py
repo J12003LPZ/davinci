@@ -22,6 +22,130 @@ SPEC.loader.exec_module(bench)
 
 
 class StreamTelemetryTests(unittest.TestCase):
+    def observed_stream(self, attempts, terminal_usage=None):
+        def observation(kind, attempt=None, status="completed", usage=None):
+            return {"type": "provider_observation", "observation": {
+                "schema_version": 1, "logical_request_id": "r1", "purpose": "coding",
+                "kind": kind, "attempt_id": attempt, "status": status, "usage": usage}}
+        events = [observation("logical_start", status="started")]
+        for attempt, status, usage in attempts:
+            events.append(observation("attempt_start", attempt, "started"))
+            if status is not None:
+                events.append(observation("attempt_end", attempt, status, usage))
+        events.append(observation("logical_end"))
+        events.append({"type": "message_update", "assistantMessageEvent": {
+            "type": "done", "message": {"id": "final"}}, "usage": terminal_usage or {
+                "input": 10, "output": 5, "cacheRead": 0, "cacheWrite": 0}})
+        return events
+
+    def test_observed_failed_retry_missing_usage_cannot_be_an_exact_total(self):
+        usage = {"input": 10, "output": 5, "cacheRead": 0, "cacheWrite": 0}
+        events = self.observed_stream([(1, "failed", None), (2, "completed", usage)])
+        result = bench.parse_stream("davinci", "\n".join(map(json.dumps, events)))
+        self.assertEqual(result["provider_attempts"], 2)
+        self.assertFalse(result["usage_available"])
+        for field in ("input", "cached", "cache_write", "output", "first_request_input_tokens"):
+            self.assertIsNone(result[field], field)
+
+    def test_observed_attempt_receipts_include_failed_usage_and_ignore_terminal_done(self):
+        failed = {"input": 20, "output": 2, "cacheRead": 5, "cacheWrite": 3}
+        success = {"input": 10, "output": 5, "cacheRead": 0, "cacheWrite": 0}
+        events = self.observed_stream([(1, "failed", failed), (2, "completed", success)],
+                                      {"input": 999, "output": 999, "cacheRead": 0, "cacheWrite": 0})
+        events += events[:6]  # replayed receipts have the same attempt identity
+        result = bench.parse_stream("davinci", "\n".join(map(json.dumps, events)))
+        self.assertTrue(result["usage_available"])
+        self.assertEqual((result["input"], result["cached"], result["cache_write"], result["output"]),
+                         (38, 5, 3, 7))
+        self.assertEqual(result["first_request_input_tokens"], 38)
+        self.assertEqual(result["first_request_cached_tokens"], 5)
+        self.assertIsNone(result["reasoning_tokens"])
+
+    def test_observed_unknown_pending_and_malformed_receipts_stay_unavailable(self):
+        usage = {"input": 10, "output": 5, "cacheRead": 0, "cacheWrite": 0}
+        for status in ("unknown", "pending", None):
+            with self.subTest(status=status):
+                events = self.observed_stream([(1, status, usage)])
+                result = bench.parse_stream("davinci", "\n".join(map(json.dumps, events)))
+                self.assertFalse(result["usage_available"])
+                self.assertFalse(result["request_metrics_complete"])
+                self.assertIsNone(result["input"])
+        events = self.observed_stream([(1, "completed", usage)])
+        events.append({"type": "provider_observation", "observation": ["invalid"]})
+        result = bench.parse_stream("davinci", "\n".join(map(json.dumps, events)))
+        self.assertFalse(result["usage_available"])
+        self.assertIsNone(result["input"])
+
+    def test_malformed_or_overflow_provider_streams_never_fall_back_to_done(self):
+        usage = {"input": 10, "output": 5, "cacheRead": 0, "cacheWrite": 0}
+        for marker in ({"schema_version": True, "kind": "attempt_end", "attempt_id": 1,
+                        "purpose": "coding", "logical_request_id": "r1", "status": "completed", "usage": usage},
+                       {"schema_version": 1, "kind": "telemetry_overflow", "purpose": "coding",
+                        "logical_request_id": "r1", "status": "unknown"}):
+            with self.subTest(marker=marker):
+                events = self.observed_stream([(1, "completed", usage)])
+                events.append({"type": "provider_observation", "observation": marker})
+                result = bench.parse_stream("davinci", "\n".join(map(json.dumps, events)))
+                self.assertFalse(result["usage_available"])
+                self.assertIsNone(result["input"])
+        stream = '{"type":"provider_observation","observation":' + '\n' + json.dumps(self.observed_stream([])[-1])
+        result = bench.parse_stream("davinci", stream)
+        self.assertFalse(result["usage_available"])
+        self.assertIsNone(result["input"])
+
+    def test_conflicting_attempt_receipts_and_missing_cache_write_stay_unknown(self):
+        usage = {"input": 10, "output": 5, "cacheRead": 0, "cacheWrite": 0}
+        events = self.observed_stream([(1, "completed", usage)])
+        conflict = json.loads(json.dumps(events[2]))
+        conflict["observation"]["usage"]["input"] = 30
+        result = bench.parse_stream("davinci", "\n".join(map(json.dumps, events + [conflict])))
+        self.assertFalse(result["usage_available"])
+        self.assertIsNone(result["input"])
+        usage.pop("cacheWrite")
+        result = bench.parse_stream("davinci", "\n".join(map(json.dumps,
+                                  self.observed_stream([(1, "completed", usage)]))))
+        self.assertFalse(result["usage_available"])
+        self.assertIsNone(result["cache_write"])
+
+    def test_invalid_numeric_receipts_cannot_be_overwritten_by_equal_valid_duplicates(self):
+        for field, invalid, valid in (("input", True, 1), ("output", 1.0, 1),
+                                      ("cacheRead", False, 0), ("cacheWrite", 0.0, 0)):
+            with self.subTest(field=field):
+                usage = {"input": 1, "output": 1, "cacheRead": 0, "cacheWrite": 0}
+                events = self.observed_stream([(1, "completed", dict(usage, **{field: invalid}))])
+                valid_receipt = json.loads(json.dumps(events[2]))
+                valid_receipt["observation"]["usage"][field] = valid
+                result = bench.parse_stream("davinci", "\n".join(map(json.dumps, events + [valid_receipt])))
+                self.assertFalse(result["usage_available"])
+                self.assertIsNone(result["input"])
+
+    def test_legacy_retry_markers_do_not_manufacture_total_usage(self):
+        for kind in ("auto_retry_start", "auto_retry_end"):
+            with self.subTest(kind=kind):
+                done = self.observed_stream([])[-1]
+                events = [{"type": kind}, done]
+                result = bench.parse_stream("davinci", "\n".join(map(json.dumps, events)))
+                self.assertFalse(result["usage_available"])
+                for field in ("input", "cached", "output", "cache_write", "first_request_input_tokens"):
+                    self.assertIsNone(result[field], field)
+
+    def test_observed_usage_groups_logical_retries_and_includes_other_purpose_spend(self):
+        usage = {"input": 10, "output": 5, "cacheRead": 0, "cacheWrite": 0}
+        first = self.observed_stream([(1, "completed", usage), (2, "completed", usage)])[:-1]
+        later = json.loads(json.dumps(self.observed_stream([(1, "completed", usage)])[:-1]))
+        prewarm = json.loads(json.dumps(later))
+        for event in later:
+            event["observation"]["logical_request_id"] = "r2"
+        for event in prewarm:
+            event["observation"]["purpose"] = "prewarm"
+        done = self.observed_stream([])[-1]
+        result = bench.parse_stream("davinci", "\n".join(map(json.dumps, first + later + prewarm + [done])))
+        self.assertEqual(result["input"], 40)
+        self.assertEqual(result["output"], 20)
+        self.assertEqual(result["provider_attempts"], 4)
+        self.assertEqual(result["first_request_input_tokens"], 20)
+        self.assertEqual(result["later_request_input_tokens"], 10)
+
     def test_missing_cache_write_tokens_stay_unknown(self):
         event = {"type": "message_update", "assistantMessageEvent": {"type": "done"},
                  "usage": {"input": 100, "cacheRead": 40, "output": 10}}

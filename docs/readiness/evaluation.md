@@ -110,6 +110,12 @@ tool calls. Failed-attempt spend remains in each numerator. Missing usage,
 regressions, prices or background receipts are unavailable, never zero. Cache
 write tokens need a separate provider price when nonzero. Print background cost
 is explicitly unmeasured; interactive/RPC background counters stay separate.
+When provider observations exist, token totals come from unique transport-attempt
+receipts, including failed attempts and prewarm/JEV calls. Replayed receipts are
+counted once; conflicting, missing, malformed or unfinished receipts keep usage
+and estimated cost unavailable. Final-message usage is a fallback only for
+legacy streams without provider observations or retry markers. First/later cache
+groups follow coding logical requests and include every retry in each group.
 
 ```sh
 python3 scripts/bench/readiness_protocol.py \
@@ -121,13 +127,19 @@ python3 scripts/bench/readiness_protocol.py \
 
 The offline gate rejects mismatched identities/model/effort/labels/repetitions,
 duplicate or absent pairs, dev/holdout overlap, size-class regressions, missing
-holdout or independent-grading evidence, token ceiling violations, unrelated-edit
+required metrics in either dev or holdout, missing independent-grading evidence,
+token ceiling violations, unrelated-edit
 increases and wall-time growth above 15%. It reports paired task-cluster bootstrap
 success intervals; repetitions are not independent tasks. An interval containing
 zero is reported as **no measurable difference**. Existing `bench.py compare`
 continues to enforce its additional provenance and latency gates; readiness
 results do not override them. This JSON gate is a diagnostic decision artifact,
 not verification of a operator-supplied independent-grading attestation.
+Each task needs a nonblank repository ID, full reference SHA and boolean test
+labels, held constant across repetitions and arms. Source revisions cannot be
+relabelled as another task or reused across splits. The combined dev/holdout
+inventory must stay within the suite's 3–5 repositories; labels alone do not
+authenticate repository ownership or an attestation.
 
 A production superiority claim additionally needs a green released tag, at least
 150 private holdout tasks, three repetitions, the exact same model and effort,

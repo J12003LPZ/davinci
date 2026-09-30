@@ -10,6 +10,13 @@ from campaign import digest, metric, percentile, schedule, task_success
 from readiness_metrics import number, report, summarize
 
 
+TASK_LABELS = ("split", "size_class", "repository_id", "reference_commit", "visible_tests",
+               "requires_existing_test_changes")
+REQUIRED_METRICS = ("uncached_input_per_verified_success", "cached_input_per_verified_success",
+                    "output_per_verified_success", "estimated_usd_per_verified_success",
+                    "regression_free_successes", "model_requests_per_task", "tool_calls_per_task")
+
+
 def prepare(tasks, arms, seed=0):
     if not tasks or any(not isinstance(value, str) or not value for value in tasks + arms):
         raise ValueError("nonempty task and arm names required")
@@ -26,6 +33,7 @@ def validate_pairs(baseline, candidate):
     for rows in (baseline, candidate):
         index = {}
         identities = set()
+        task_labels, source_tasks = {}, {}
         for row in rows:
             key = row.get("task"), row.get("rep")
             if (not isinstance(key[0], str) or not key[0] or type(key[1]) is not int
@@ -36,6 +44,20 @@ def validate_pairs(baseline, candidate):
                     raise ValueError("missing frozen " + field)
             if row.get("source_clean") is not True or row.get("size_class") not in ("small", "large"):
                 raise ValueError("clean source and private size labels required")
+            if not isinstance(row.get("repository_id"), str) or not row["repository_id"].strip():
+                raise ValueError("nonblank repository identity required")
+            if not isinstance(row.get("reference_commit"), str) or not re.fullmatch("[0-9a-f]{40}", row["reference_commit"]):
+                raise ValueError("full immutable reference commit required")
+            if any(type(row.get(field)) is not bool for field in ("visible_tests", "requires_existing_test_changes")):
+                raise ValueError("boolean private task labels required")
+            labels = tuple(row.get(field) for field in TASK_LABELS)
+            if key[0] in task_labels and task_labels[key[0]] != labels:
+                raise ValueError("task labels differ between repetitions")
+            task_labels[key[0]] = labels
+            revision = row["repository_id"], row["reference_commit"]
+            if revision in source_tasks and source_tasks[revision] != key[0]:
+                raise ValueError("a source revision cannot appear in multiple tasks")
+            source_tasks[revision] = key[0]
             if not row.get("model") or not row.get("effort_policy") or row.get("split") not in ("dev", "holdout"):
                 raise ValueError("model, effort and split required")
             identities.add(tuple(row.get(field) for field in
@@ -89,6 +111,8 @@ def promotion(baseline, candidate, holdout_baseline, holdout_candidate, *, targe
     rule("independent_grading", all(row.get("grading_assurance") == "independent" for row in baseline + candidate),
          "native lifecycle/container visibility alone cannot certify independent grading")
     before, after = summarize(baseline, prices), summarize(candidate, prices)
+    rule("dev_metrics_available", all(summary[field] is not None for summary in (before, after) for field in REQUIRED_METRICS),
+         "report dev usage, estimated cost, regressions, requests and tools")
     rule("frozen_configuration", all(isinstance(row.get("effective_settings"), dict) and isinstance(row.get("variant"), str)
                                      and isinstance(row.get("service_tier"), str) for row in baseline + candidate),
          "freeze effective settings, arm variant and provider service tier")
@@ -116,12 +140,15 @@ def promotion(baseline, candidate, holdout_baseline, holdout_candidate, *, targe
     hold_before_report = hold_after_report = None
     if holdout_baseline is not None and holdout_candidate is not None:
         validate_pairs(holdout_baseline, holdout_candidate)
+        combined_repos = repos | {row["repository_id"] for row in holdout_baseline}
+        rule("private_repository_inventory", 3 <= len(combined_repos) <= 5,
+             {"repositories": sorted(combined_repos), "count": len(combined_repos)})
         holdout_tasks = {row["task"] for row in holdout_baseline}
         if tasks & holdout_tasks:
             raise ValueError("dev and holdout task identities overlap")
         dev_revisions = {(row.get("repository_id"), row.get("reference_commit")) for row in baseline}
         holdout_revisions = {(row.get("repository_id"), row.get("reference_commit")) for row in holdout_baseline}
-        if (dev_revisions & holdout_revisions) - {(None, None)}:
+        if dev_revisions & holdout_revisions:
             raise ValueError("dev and holdout source revisions overlap")
         for dev, held in ((baseline, holdout_baseline), (candidate, holdout_candidate)):
             for field in ("source_sha", "binary_sha256", "model", "effort_policy", "private_suite_digest",
@@ -140,9 +167,7 @@ def promotion(baseline, candidate, holdout_baseline, holdout_candidate, *, targe
         hold_wall = (hold_before["median_wall_s"], hold_after["median_wall_s"])
         token_values = [[metric(row, "uncached_input_tokens") for row in rows] for rows in (holdout_baseline, holdout_candidate)]
         token_medians = [statistics.median(values) if all(number(value) for value in values) else None for values in token_values]
-        complete_metrics = all(summary[field] is not None for summary in (hold_before, hold_after) for field in
-                               ("uncached_input_per_verified_success", "cached_input_per_verified_success", "output_per_verified_success",
-                                "estimated_usd_per_verified_success", "regression_free_successes", "model_requests_per_task", "tool_calls_per_task"))
+        complete_metrics = all(summary[field] is not None for summary in (hold_before, hold_after) for field in REQUIRED_METRICS)
         rule("holdout_metrics_available", complete_metrics, "report holdout usage, estimated cost, regressions, requests and tools")
         rule("holdout_uncached_token_ceiling", None if None in token_medians else token_medians[1] <= token_medians[0] * (1 + token_ceiling),
              {"baseline_median": token_medians[0], "candidate_median": token_medians[1], "ceiling_fraction": token_ceiling})
