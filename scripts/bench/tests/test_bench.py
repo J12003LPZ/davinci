@@ -22,6 +22,13 @@ SPEC.loader.exec_module(bench)
 
 
 class StreamTelemetryTests(unittest.TestCase):
+    def test_missing_cache_write_tokens_stay_unknown(self):
+        event = {"type": "message_update", "assistantMessageEvent": {"type": "done"},
+                 "usage": {"input": 100, "cacheRead": 40, "output": 10}}
+        result = bench.parse_stream("davinci", json.dumps(event))
+        self.assertIsNone(result["cache_write"])
+        self.assertFalse(result["usage_available"])
+
     def test_uninstrumented_jev_is_unavailable_when_coding_telemetry_exists(self):
         event = {"type": "provider_observation", "observation": {
             "schema_version": 1, "logical_request_id": "coding", "purpose": "coding",
@@ -137,11 +144,11 @@ class StreamTelemetryTests(unittest.TestCase):
     def test_duplicate_usage_is_counted_once_and_conflicts_are_unavailable(self):
         event = {"type": "message_update", "assistantMessageEvent": {
             "type": "done", "message": {"id": "response1"}},
-            "usage": {"input": 20, "cacheRead": 80, "output": 5}}
+            "usage": {"input": 20, "cacheRead": 80, "cacheWrite": 0, "output": 5}}
         result = bench.parse_stream("davinci", "\n".join(map(json.dumps, [event, event])))
         self.assertEqual(result["input"], 100)
         self.assertEqual(result["completed_assistant_messages"], 1)
-        conflicting = dict(event, usage={"input": 50, "cacheRead": 50, "output": 5})
+        conflicting = dict(event, usage={"input": 50, "cacheRead": 50, "cacheWrite": 0, "output": 5})
         result = bench.parse_stream("davinci", "\n".join(map(json.dumps, [event, conflicting])))
         self.assertFalse(result["usage_available"])
         self.assertIsNone(result["input"])

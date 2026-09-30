@@ -6,7 +6,7 @@ import random
 import re
 import statistics
 
-from campaign import metric, percentile, schedule, task_success
+from campaign import digest, metric, percentile, schedule, task_success
 from readiness_metrics import number, report, summarize
 
 
@@ -39,7 +39,8 @@ def validate_pairs(baseline, candidate):
             if not row.get("model") or not row.get("effort_policy") or row.get("split") not in ("dev", "holdout"):
                 raise ValueError("model, effort and split required")
             identities.add(tuple(row.get(field) for field in
-                                 ("source_sha", "binary_sha256", "model", "effort_policy", "private_suite_digest", "split")))
+                                 ("source_sha", "binary_sha256", "model", "effort_policy", "private_suite_digest", "split",
+                                  "service_tier", "variant", "price_table_hash")) + (digest(row.get("effective_settings")),))
             index[key] = row
         if len(identities) != 1 or any({rep for task_id, rep in index if task_id == task} != {0, 1, 2}
                                        for task in {key[0] for key in index}):
@@ -88,6 +89,11 @@ def promotion(baseline, candidate, holdout_baseline, holdout_candidate, *, targe
     rule("independent_grading", all(row.get("grading_assurance") == "independent" for row in baseline + candidate),
          "native lifecycle/container visibility alone cannot certify independent grading")
     before, after = summarize(baseline, prices), summarize(candidate, prices)
+    rule("frozen_configuration", all(isinstance(row.get("effective_settings"), dict) and isinstance(row.get("variant"), str)
+                                     and isinstance(row.get("service_tier"), str) for row in baseline + candidate),
+         "freeze effective settings, arm variant and provider service tier")
+    rule("pinned_prices", prices is not None and all(row.get("price_table_hash") == digest(prices) for row in baseline + candidate),
+         "prices must match the frozen campaign digest")
     classes = {}
     for size in ("small", "large"):
         a, b = ([row for row in rows if row["size_class"] == size] for rows in (baseline, candidate))
@@ -107,6 +113,7 @@ def promotion(baseline, candidate, holdout_baseline, holdout_candidate, *, targe
     a, b = before["median_wall_s"], after["median_wall_s"]
     rule("wall_time_ceiling", None if a is None or b is None else b <= a * 1.15, {"baseline": a, "candidate": b, "ceiling_fraction": .15})
     confirmation = None
+    hold_before_report = hold_after_report = None
     if holdout_baseline is not None and holdout_candidate is not None:
         validate_pairs(holdout_baseline, holdout_candidate)
         holdout_tasks = {row["task"] for row in holdout_baseline}
@@ -117,10 +124,12 @@ def promotion(baseline, candidate, holdout_baseline, holdout_candidate, *, targe
         if (dev_revisions & holdout_revisions) - {(None, None)}:
             raise ValueError("dev and holdout source revisions overlap")
         for dev, held in ((baseline, holdout_baseline), (candidate, holdout_candidate)):
-            for field in ("source_sha", "binary_sha256", "model", "effort_policy", "private_suite_digest"):
+            for field in ("source_sha", "binary_sha256", "model", "effort_policy", "private_suite_digest",
+                          "effective_settings", "variant", "service_tier", "price_table_hash"):
                 if dev[0][field] != held[0][field]:
                     raise ValueError("holdout differs from frozen dev arm: " + field)
         hold_before, hold_after = summarize(holdout_baseline, prices), summarize(holdout_candidate, prices)
+        hold_before_report, hold_after_report = report(holdout_baseline, prices), report(holdout_candidate, prices)
         confirmation = success_interval(holdout_baseline, holdout_candidate)
         a, b = hold_before[target], hold_after[target]
         agrees = a is not None and b is not None and (b > a if target == "composite_success_rate" else b < a)
@@ -129,6 +138,14 @@ def promotion(baseline, candidate, holdout_baseline, holdout_candidate, *, targe
                          >= sum(task_success(row) for row in holdout_baseline if row["size_class"] == size) for size in ("small", "large"))
         hold_unrelated = (hold_before["unrelated_edit_rate"], hold_after["unrelated_edit_rate"])
         hold_wall = (hold_before["median_wall_s"], hold_after["median_wall_s"])
+        token_values = [[metric(row, "uncached_input_tokens") for row in rows] for rows in (holdout_baseline, holdout_candidate)]
+        token_medians = [statistics.median(values) if all(number(value) for value in values) else None for values in token_values]
+        complete_metrics = all(summary[field] is not None for summary in (hold_before, hold_after) for field in
+                               ("uncached_input_per_verified_success", "cached_input_per_verified_success", "output_per_verified_success",
+                                "estimated_usd_per_verified_success", "regression_free_successes", "model_requests_per_task", "tool_calls_per_task"))
+        rule("holdout_metrics_available", complete_metrics, "report holdout usage, estimated cost, regressions, requests and tools")
+        rule("holdout_uncached_token_ceiling", None if None in token_medians else token_medians[1] <= token_medians[0] * (1 + token_ceiling),
+             {"baseline_median": token_medians[0], "candidate_median": token_medians[1], "ceiling_fraction": token_ceiling})
         valid = (len(holdout_tasks) >= 150 and all(row["split"] == "holdout" for row in holdout_baseline)
                  and all(row.get("grading_assurance") == "independent" for row in holdout_baseline + holdout_candidate)
                  and agrees and classes_ok and None not in hold_unrelated and hold_unrelated[1] <= hold_unrelated[0]
@@ -141,7 +158,8 @@ def promotion(baseline, candidate, holdout_baseline, holdout_candidate, *, targe
          "pin a dated USD price table; estimates are not measured charges")
     return {"accepted": all(value["status"] == "pass" for value in rules.values()), "rules": rules,
             "baseline": report(baseline, prices), "candidate": report(candidate, prices),
-            "holdout_interval": confirmation, "model_calls_performed": False}
+            "holdout_interval": confirmation, "holdout_baseline": hold_before_report, "holdout_candidate": hold_after_report,
+            "model_calls_performed": False}
 
 
 def main():

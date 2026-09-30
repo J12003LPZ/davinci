@@ -14,7 +14,7 @@ def fixture(success=True, **changes):
            "size_class": "large", "execution_mode": "print", "exit": 0 if success else 1,
            "grader_pass": success, "unrelated": [], "cleanup_complete": True,
            "transaction_leak": False, "artifact_leak": False, "regression_pass": True,
-           "input_tokens": 100, "cached_tokens": 40, "output_tokens": 10, "wall_s": 2,
+           "input_tokens": 100, "cached_tokens": 40, "cache_write_tokens": 0, "output_tokens": 10, "wall_s": 2,
            "logical_requests": 2, "request_metrics_complete": True, "tool_calls": 3}
     return dict(row, **changes)
 
@@ -60,6 +60,9 @@ class ReadinessMetricsTests(unittest.TestCase):
         self.assertEqual(report["price_label"], "estimate from pinned price table")
 
     def test_prices_are_pinned_and_invalid_rates_fail(self):
+        for change in ({"as_of": ""}, {"as_of": "2026-02-30"}, {"source": " "}):
+            with self.subTest(change=change), self.assertRaises(ValueError):
+                readiness_metrics.validate_prices(dict(self.prices(), **change))
         with tempfile.TemporaryDirectory() as temporary:
             path = Path(temporary) / "prices.json"
             path.write_text(json.dumps(self.prices()))
@@ -74,6 +77,16 @@ class ReadinessMetricsTests(unittest.TestCase):
     def test_stale_declared_pass_does_not_replace_composite_evidence(self):
         summary = readiness_metrics.summarize([fixture(False, **{"pass": True})], self.prices())
         self.assertEqual(summary["composite_successes"], 0)
+
+    def test_absent_cache_write_measurement_is_not_a_zero_charge(self):
+        row = fixture()
+        del row["cache_write_tokens"]
+        self.assertIsNone(readiness_metrics.estimate(row, self.prices()))
+        row = fixture(cache_write_tokens=10)
+        self.assertIsNone(readiness_metrics.estimate(row, self.prices()))
+        prices = self.prices()
+        prices["models"]["fixture-model"]["cache_write_per_million"] = 3
+        self.assertAlmostEqual(readiness_metrics.estimate(row, prices), .00021)
 
 
 if __name__ == "__main__":

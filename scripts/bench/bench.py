@@ -38,7 +38,7 @@ from runner import (create_campaign, isolate_settings, controlled_environment, s
                     pin_model_store, model_stop_reason, validate_large_manifest, container_command,
                     campaign_lock, parent_identity, source_identity)
 from codex_otel import Collector, request_metrics
-from private_suite import apply_hidden, import_suite, load_frozen, run_check
+from private_suite import apply_hidden, import_suite, load_frozen, run_check, GradingLifecycleError
 from readiness_metrics import report as readiness_report, load_prices
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -115,20 +115,24 @@ def grade(tid, workdir):
     if "private_provenance" in spec:
         apply_hidden(spec, hidden, workdir)
         checked = run_check(spec["grader_command"], workdir)
+        if checked["cleanup_complete"] is not True:
+            raise GradingLifecycleError("private grader cleanup incomplete")
         detail = (checked["stdout"] or checked["stderr"]).strip().splitlines()
         return checked["pass"], int(checked["pass"]), int(not checked["pass"]), detail[-1] if detail else str(checked["exit"])
     copy_tree(hidden, workdir)
     files = []
     for base, _, names in os.walk(hidden):
         files += [os.path.relpath(os.path.join(base, n), hidden) for n in names]
-    proc = subprocess.run(
+    checked = run_check(
         [sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider", *files],
-        cwd=workdir, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=120,
+        workdir,
     )
-    tail = proc.stdout.strip().splitlines()[-1] if proc.stdout.strip() else ""
+    if checked["cleanup_complete"] is not True:
+        raise GradingLifecycleError("public grader cleanup incomplete")
+    tail = checked["stdout"].strip().splitlines()[-1] if checked["stdout"].strip() else ""
     passed = int(m.group(1)) if (m := re.search(r"(\d+) passed", tail)) else 0
     failed = sum(int(x) for x in re.findall(r"(\d+) (?:failed|error)", tail))
-    return proc.returncode == 0, passed, failed, tail
+    return checked["pass"], passed, failed, tail
 
 
 def changed_files(workdir, ignore=True):
@@ -284,7 +288,7 @@ def parse_stream(harness, stdout):
                             usage_conflict = True
                         continue
                     completed_usage[identity] = u
-                uncached, cached, written = u.get("input"), u.get("cacheRead"), u.get("cacheWrite", 0)
+                uncached, cached, written = u.get("input"), u.get("cacheRead"), u.get("cacheWrite")
                 valid = all(isinstance(v, int) and not isinstance(v, bool) and v >= 0
                             for v in (uncached, cached, written))
                 total = uncached + cached + written if valid else None
@@ -351,6 +355,7 @@ def run_one(harness, tid, rep, campaign=None):
         f.write(stderr)
     artifacts = {"artifact_leak": None, "transaction_leak": None,
                  "artifact_paths": None, "transaction_paths": None, "artifact_scan_scope": None}
+    cleanup_complete = measured.get("cleanup_complete")
     try:
         if measured.get("cleanup_complete") is not True:
             raise RuntimeError("cannot inspect a workspace while execution may still be active")
@@ -366,11 +371,25 @@ def run_one(harness, tid, rep, campaign=None):
         ok, passed, failed, tail = False, 0, 0, "not run: " + stopped
         regression = None
     else:
-        regression = run_check(spec["regression_command"], workdir) if "private_provenance" in spec else None
+        regression = None
         try:
+            regression = run_check(spec["regression_command"], workdir) if "private_provenance" in spec else None
+            if regression is not None and regression["cleanup_complete"] is not True:
+                stopped = "regression_cleanup_failed"
+                raise GradingLifecycleError("regression cleanup incomplete")
             ok, passed, failed, tail = grade(tid, workdir)
+        except GradingLifecycleError as error:
+            cleanup_complete = False
+            stopped = stopped or "grader_cleanup_failed"
+            ok, passed, failed, tail = False, 0, 0, str(error)
         except (subprocess.TimeoutExpired, OSError) as error:
+            stopped = "grading_failed"
+            cleanup_complete = False
             ok, passed, failed, tail = False, 0, 0, type(error).__name__
+        except (RuntimeError, ValueError) as error:
+            stopped = "grading_failed"
+            cleanup_complete = False
+            ok, passed, failed, tail = False, 0, 0, str(error)
     s = parse_stream(harness, stdout)
     if collector:
         s.update(request_metrics(collector.records, collector.spans, collector.errors))
@@ -383,7 +402,7 @@ def run_one(harness, tid, rep, campaign=None):
         "wall_s": wall, "input_tokens": s["input"], "cached_tokens": s["cached"],
         "output_tokens": s["output"], "cache_write_tokens": s["cache_write"], "tool_calls": s["tool_calls"], "requests": s["requests"],
         "tools": s["tools"], "changed": changed, "unrelated": unrelated,
-        **artifacts, "cleanup_complete": measured.get("cleanup_complete"),
+        **artifacts, "cleanup_complete": cleanup_complete,
         "started_at": measured["started_at"], "finished_at": measured["finished_at"],
         "grading_isolation": (campaign.get("grading_isolation", {}).get(harness, "diagnostic-only")
                                if campaign else "diagnostic-only"),
@@ -485,6 +504,8 @@ def validate(task_set="legacy", large_manifest=None, private_tasks=None):
             copy_tree(os.path.join(TASKS, tid, "solution"), d)
         after = grade(tid, d)
         reference_regression = run_check(load(tid)["regression_command"], d) if "private_provenance" in load(tid) else None
+        if reference_regression is not None and reference_regression["cleanup_complete"] is not True:
+            raise GradingLifecycleError("reference regression cleanup incomplete")
         good = (not before[0]) and after[0] and (reference_regression is None or reference_regression["pass"])
         bad += not good
         print(f"{tid:14} start={'PASS' if before[0] else 'fail'} "

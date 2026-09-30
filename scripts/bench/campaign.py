@@ -27,7 +27,7 @@ def file_hash(path):
         return hashlib.file_digest(source, "sha256").hexdigest()
 
 
-def fixture_manifest(root, tasks):
+def fixture_manifest(root, tasks, *, exclude_generated=True):
     """Hash frozen bytes without loading private fixture contents into reports."""
     root = Path(root).resolve()
     members = {}
@@ -45,7 +45,7 @@ def fixture_manifest(root, tasks):
                 raise ValueError("linked fixture path")
             if path.is_file():
                 # Generated interpreter/cache files are never fixture inputs.
-                if any(part in ("__pycache__", ".pytest_cache", ".git")
+                if exclude_generated and any(part in ("__pycache__", ".pytest_cache", ".git")
                        for part in path.relative_to(directory).parts):
                     continue
                 files[path.relative_to(directory).as_posix()] = file_hash(path)

@@ -13,6 +13,38 @@ import private_suite
 
 
 class PrivateSuiteTests(unittest.TestCase):
+    def test_regression_cleanup_uncertainty_stops_before_grading_and_records_failure(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            manifest, task = self.fixture(root)
+            private_suite.import_suite(manifest, root / "frozen")
+            runs = root / "runs"
+            runs.mkdir()
+            measured = {"exit": 0, "stdout": "", "stderr": "", "wall_s": 1,
+                        "cleanup_complete": True, "started_at": "2026-09-30T00:00:00Z", "finished_at": "2026-09-30T00:00:01Z"}
+            with patch.object(bench, "TASKS", str(root / "frozen")), patch.object(bench, "RUNS", str(runs)), \
+                    patch.object(bench, "execute", return_value=measured), \
+                    patch.object(bench, "run_check", return_value={"pass": False, "exit": "supervisor_failed", "cleanup_complete": False}), \
+                    patch.object(bench, "grade", return_value=(True, 1, 0, "fixture")) as grader:
+                with self.assertRaises(RuntimeError):
+                    bench.run_one("davinci", task["id"], 0)
+                self.assertFalse(grader.called)
+            row = json.loads((runs / "results.jsonl").read_text())
+            self.assertFalse(row["pass"])
+            self.assertFalse(row["cleanup_complete"])
+            self.assertEqual(row["stop_reason"], "regression_cleanup_failed")
+
+    def test_private_grader_cleanup_uncertainty_is_not_an_ordinary_test_failure(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            manifest, task = self.fixture(root)
+            private_suite.import_suite(manifest, root / "frozen")
+            with patch.object(bench, "TASKS", str(root / "frozen")), \
+                    patch.object(bench, "run_check", return_value={"pass": False, "exit": "supervisor_failed", "cleanup_complete": False}):
+                bench.prepare(task["id"], root / "candidate")
+                with self.assertRaises(RuntimeError):
+                    bench.grade(task["id"], root / "candidate")
+
     def fixture_execute(self, command, workdir, env, timeout):
         # The fixtures are known one-shot unittest processes. Exercise their
         # actual exit/output on hosts where native process-tree ownership is
@@ -25,7 +57,7 @@ class PrivateSuiteTests(unittest.TestCase):
     def git(self, root, *args):
         return subprocess.run(["git", *args], cwd=root, capture_output=True, text=True, check=True).stdout.strip()
 
-    def fixture(self, root):
+    def fixture(self, root, committed_cache=False):
         repo = root / "source"
         repo.mkdir()
         self.git(repo, "init", "-q")
@@ -38,6 +70,10 @@ class PrivateSuiteTests(unittest.TestCase):
         starter = self.git(repo, "rev-parse", "HEAD")
         (repo / "calc.py").write_text("def add(a, b): return a + b\n")
         (repo / "test_calc.py").write_text("import unittest\nfrom calc import add\nclass Calc(unittest.TestCase):\n def test_sum(self): self.assertEqual(add(2, 3), 5)\n def test_negative(self): self.assertEqual(add(-2, 3), 1)\n")
+        if committed_cache:
+            cached = repo / "fixtures" / "__pycache__" / "snapshot.json"
+            cached.parent.mkdir(parents=True)
+            cached.write_text('{"committed":true}')
         self.git(repo, "add", ".")
         self.git(repo, "commit", "-qm", "source and tests")
         task = {"id": "private-sum", "repository": "source", "repository_id": "fixture/repo", "language": "python",
@@ -63,6 +99,18 @@ class PrivateSuiteTests(unittest.TestCase):
             self.assertEqual(loaded["labels"][task["id"]]["size_class"], "large")
             self.assertTrue(pinned)
             (root / "frozen" / task["id"] / "repo" / "calc.py").write_text("changed")
+            with self.assertRaises(ValueError):
+                private_suite.load_frozen(root / "frozen", "dev")
+
+    def test_committed_cache_named_inputs_are_hashed_as_fixture_bytes(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            manifest, task = self.fixture(root, committed_cache=True)
+            frozen = private_suite.import_suite(manifest, root / "frozen")
+            relative = "solution/fixtures/__pycache__/snapshot.json"
+            self.assertIn(relative, frozen["files"][task["id"]])
+            target = root / "frozen" / task["id"] / relative
+            target.write_text('{"committed":"changed"}')
             with self.assertRaises(ValueError):
                 private_suite.load_frozen(root / "frozen", "dev")
 

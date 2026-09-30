@@ -1,14 +1,65 @@
 """Offline paired promotion guardrails over synthetic campaign records."""
 import sys
+import hashlib
 from pathlib import Path
 import unittest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import readiness_protocol
+from campaign import digest
 from test_readiness_metrics import fixture
 
 
 class ReadinessProtocolTests(unittest.TestCase):
+    def complete(self):
+        prices = {"schema_version": 1, "currency": "USD", "as_of": "2026-09-30",
+                  "source": "synthetic fixture", "models": {"fixture-model": {
+                  "input_per_million": 2, "cached_input_per_million": 1, "output_per_million": 4}}}
+        groups = []
+        for split, count in (("dev", 40), ("holdout", 150)):
+            baseline, candidate = [], []
+            for task in range(count):
+                for rep in range(3):
+                    name = f"{split}-{task}"
+                    common = {"task": name, "rep": rep, "size_class": "small" if task % 2 else "large",
+                              "grading_assurance": "independent", "source_sha": "b" * 40, "source_clean": True,
+                              "private_suite_digest": "c" * 64, "split": split, "repository_id": f"repo-{task % 3}",
+                              "reference_commit": hashlib.sha256(name.encode()).hexdigest()[:40],
+                              "service_tier": "default", "price_table_hash": digest(prices)}
+                    baseline.append(fixture(task % 3 != 0, **dict(common, variant="baseline", binary_sha256="a" * 64,
+                                                                 effective_settings={"requirementReview": False})))
+                    candidate.append(fixture(True, **dict(common, variant="candidate", binary_sha256="d" * 64,
+                                                          effective_settings={"requirementReview": True})))
+            groups.extend((baseline, candidate))
+        return groups, prices
+
+    def test_complete_synthetic_evidence_is_only_a_fixture(self):
+        groups, prices = self.complete()
+        result = readiness_protocol.promotion(*groups, target="composite_success_rate", prices=prices)
+        self.assertTrue(result["accepted"], result["rules"])
+        self.assertEqual(result["holdout_candidate"]["arms"]["davinci"]["large"]["runs"], 225)
+
+    def test_holdout_unknown_usage_and_excessive_tokens_cannot_confirm(self):
+        for patch in ({"input_tokens": None, "cached_tokens": None, "output_tokens": None}, {"input_tokens": 10000}):
+            groups, prices = self.complete()
+            groups[3] = [dict(row, **patch) for row in groups[3]]
+            result = readiness_protocol.promotion(*groups, target="composite_success_rate", prices=prices)
+            self.assertFalse(result["accepted"])
+
+    def test_frozen_configuration_and_prices_cannot_drift(self):
+        groups, prices = self.complete()
+        groups[1][2]["effective_settings"] = {"requirementReview": False}
+        with self.assertRaises(ValueError):
+            readiness_protocol.validate_pairs(*groups[:2])
+        groups, prices = self.complete()
+        groups[3] = [dict(row, effective_settings={"requirementReview": False}) for row in groups[3]]
+        with self.assertRaises(ValueError):
+            readiness_protocol.promotion(*groups, target="composite_success_rate", prices=prices)
+        groups, prices = self.complete()
+        groups[3] = [dict(row, price_table_hash="f" * 64) for row in groups[3]]
+        with self.assertRaises(ValueError):
+            readiness_protocol.promotion(*groups, target="composite_success_rate", prices=prices)
+
     def rows(self, tasks=4, winner=False):
         baseline, candidate = [], []
         for task in range(tasks):

@@ -1,5 +1,6 @@
 """Comparable readiness metrics with unavailable values kept explicit."""
 import json
+from datetime import date
 import math
 from pathlib import Path
 import statistics
@@ -19,9 +20,14 @@ def load_prices(path):
 
 def validate_prices(table):
     if (not isinstance(table, dict) or table.get("schema_version") != 1 or table.get("currency") != "USD"
-            or not isinstance(table.get("as_of"), str) or not isinstance(table.get("source"), str)
+            or not isinstance(table.get("as_of"), str) or not isinstance(table.get("source"), str) or not table["source"].strip()
             or not isinstance(table.get("models"), dict)):
         raise ValueError("price table needs schema, currency, date, source and model rates")
+    try:
+        if date.fromisoformat(table["as_of"]).isoformat() != table["as_of"]:
+            raise ValueError("noncanonical date")
+    except ValueError as error:
+        raise ValueError("price table as_of must be an ISO calendar date") from error
     for model, rates in table["models"].items():
         if not isinstance(model, str) or not isinstance(rates, dict):
             raise ValueError("invalid model price entry")
@@ -45,7 +51,7 @@ def estimate(row, prices):
         return None
     # Responses has no separate cache-write charge. Other providers must supply
     # cache-write tokens and a pinned rate rather than price them as plain input.
-    written = row.get("cache_write_tokens", 0)
+    written = row.get("cache_write_tokens")
     if not number(written) or written > uncached:
         return None
     write_rate = rates.get("cache_write_per_million")

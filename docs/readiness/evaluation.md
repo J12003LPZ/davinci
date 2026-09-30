@@ -113,9 +113,9 @@ is explicitly unmeasured; interactive/RPC background counters stay separate.
 
 ```sh
 python3 scripts/bench/readiness_protocol.py \
-  --baseline /campaign/baseline/rows.jsonl --candidate /campaign/candidate/rows.jsonl \
-  --holdout-baseline /campaign/holdout-baseline/rows.jsonl \
-  --holdout-candidate /campaign/holdout-candidate/rows.jsonl \
+  --baseline /campaign/baseline/results.jsonl --candidate /campaign/candidate/results.jsonl \
+  --holdout-baseline /campaign/holdout-baseline/results.jsonl \
+  --holdout-candidate /campaign/holdout-candidate/results.jsonl \
   --price-table /campaign/prices.json --target composite_success_rate --token-ceiling 0.25
 ```
 

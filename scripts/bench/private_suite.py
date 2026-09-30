@@ -15,6 +15,10 @@ from campaign import digest, fixture_manifest
 from runner import execute
 
 
+class GradingLifecycleError(RuntimeError):
+    """The grader may still be running; no further workspace mutation is safe."""
+
+
 def relative_path(value):
     if (not isinstance(value, str) or not value or "\\" in value
             or ":" in value or any(ord(ch) < 32 for ch in value)
@@ -161,7 +165,7 @@ def import_suite(manifest, destination):
                     "private_provenance": provenance, "hidden_deleted_paths": deleted,
                     "grader_command": task["grader_command"], "regression_command": task["regression_command"]}
             (target / "task.json").write_text(json.dumps(spec, indent=2), encoding="utf-8")
-        frozen = fixture_manifest(root, [task["id"] for task in suite["tasks"]])
+        frozen = fixture_manifest(root, [task["id"] for task in suite["tasks"]], exclude_generated=False)
         frozen.update(kind="private-repository-suite", inventory=suite_inventory(suite),
                       labels={task["id"]: {key: task[key] for key in
                               ("repository_id", "reference_commit", "split", "size_class", "visible_tests",
@@ -180,7 +184,7 @@ def load_frozen(root, split):
     frozen = json.loads((root / "suite.json").read_text(encoding="utf-8"))
     if frozen.get("kind") != "private-repository-suite" or split not in ("dev", "holdout"):
         raise ValueError("private tasks require an explicit dev or holdout split")
-    current = fixture_manifest(root, frozen["tasks"])
+    current = fixture_manifest(root, frozen["tasks"], exclude_generated=False)
     if current != {key: frozen[key] for key in current}:
         raise ValueError("private fixture bytes changed after freezing")
     if fixture_modes(root, frozen["tasks"]) != frozen.get("file_modes"):
