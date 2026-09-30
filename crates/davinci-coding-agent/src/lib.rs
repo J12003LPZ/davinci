@@ -24,6 +24,7 @@ pub mod sandbox_config;
 pub mod sdk;
 pub mod self_update;
 pub mod semantic;
+pub mod session_diagnostics;
 pub mod settings;
 pub mod trust;
 pub mod turn_decision;

@@ -40,9 +40,24 @@ pub struct WatchConfig {
 impl Default for WatchConfig {
     fn default() -> Self {
         Self {
-            enabled: true,
+            enabled: false,
             min_interval_ms: 600_000,
         }
+    }
+}
+
+#[cfg(test)]
+mod watch_defaults_tests {
+    use super::*;
+
+    #[test]
+    fn omitted_security_watch_is_off_but_explicit_opt_in_remains() {
+        for raw in ["{}", "{\"watch\":{}}"] {
+            let config: ScanConfig = serde_json::from_str(raw).unwrap();
+            assert!(!config.watch.enabled);
+        }
+        let config: ScanConfig = serde_json::from_str("{\"watch\":{\"enabled\":true}}").unwrap();
+        assert!(config.watch.enabled);
     }
 }
 

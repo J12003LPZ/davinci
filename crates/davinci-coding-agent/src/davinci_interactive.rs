@@ -4288,6 +4288,7 @@ pub fn perform(
                 Ok(Done::Opened)
             }
         }
+        SlashAction::ShowDoctor => Ok(Done::Said(crate::format_session_doctor(parsed, agent))),
         SlashAction::ShowCost => Ok(Done::Said(crate::format_session_cost(parsed, agent))),
         SlashAction::ShowStatus => Ok(Done::Said(status_as_list(&crate::format_session_status(
             parsed, agent,
@@ -4601,7 +4602,7 @@ pub fn run(
     {
         let mut host = host.lock().map_err(|err| err.to_string())?;
         host.runtime_flag_values = crate::flag_values_json(parsed);
-        host.bind_native_session(agent.session.as_ref().map(|store| store.header.id.as_str()));
+        crate::bind_native_session(agent, &host);
         host.emit(crate::extension_host::ExtensionEvent::ResourcesDiscover {
             cwd: cwd.display().to_string(),
             reason: "startup".into(),

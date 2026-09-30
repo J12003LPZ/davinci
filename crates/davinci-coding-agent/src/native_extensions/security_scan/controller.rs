@@ -1,7 +1,7 @@
 //! Native-only session-owned lifecycle. Work must execute outside host locks.
 
 use super::types::{RunProgress, RunStatus};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 
 #[derive(Debug, Clone, Default)]
@@ -18,6 +18,8 @@ pub struct RunHandle {
     budget: Arc<Mutex<Option<super::budget::RequestBudget>>>,
     partial_report: Arc<Mutex<Option<serde_json::Value>>>,
     worker_exited: Arc<(Mutex<bool>, Condvar)>,
+    background_usage: Arc<Mutex<Option<crate::native_extensions::background_usage::Counter>>>,
+    background_pending: Arc<AtomicU64>,
 }
 
 struct WorkerExitGuard(RunHandle);
@@ -30,6 +32,16 @@ impl Drop for WorkerExitGuard {
 
 impl RunHandle {
     fn mark_worker_exited(&self) {
+        if let Some(counter) = self
+            .background_usage
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+        {
+            for _ in 0..self.background_pending.swap(0, Ordering::AcqRel) {
+                counter.record(&super::usage::RequestUsage::new(None, 0, 0, true));
+            }
+        }
         let mut exited = self
             .worker_exited
             .0
@@ -103,6 +115,27 @@ impl RunHandle {
         Ok(())
     }
 
+    pub fn bind_background_usage(
+        &self,
+        counter: crate::native_extensions::background_usage::Counter,
+    ) {
+        *self
+            .background_usage
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = Some(counter);
+    }
+    fn start_background_request(&self) {
+        if let Some(counter) = self
+            .background_usage
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+        {
+            counter.start();
+            self.background_pending.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
     pub fn reserve_request(&self, tokens: u64) -> Result<Option<usize>, String> {
         if self.cancelled() {
             return Err("security review cancelled".into());
@@ -117,8 +150,11 @@ impl RunHandle {
                 self.status().status,
                 RunStatus::Mapping | RunStatus::Investigating
             );
-            return budget.reserve_scoped(tokens, discovery).map(Some);
+            let ticket = budget.reserve_scoped(tokens, discovery)?;
+            self.start_background_request();
+            return Ok(Some(ticket));
         }
+        self.start_background_request();
         Ok(None)
     }
 
@@ -135,6 +171,19 @@ impl RunHandle {
     }
     pub fn record_usage(&self, usage: super::usage::RequestUsage) -> u64 {
         let accounted = usage.accounted_tokens;
+        if let Some(counter) = self
+            .background_usage
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+        {
+            counter.record(&usage);
+            let _ = self.background_pending.fetch_update(
+                Ordering::AcqRel,
+                Ordering::Acquire,
+                |pending| pending.checked_sub(1),
+            );
+        }
         self.state
             .0
             .lock()
@@ -351,6 +400,8 @@ impl ScanCoordinator {
             publishing: Arc::new(AtomicBool::new(false)),
             budget: Default::default(),
             partial_report: Default::default(),
+            background_usage: Default::default(),
+            background_pending: Default::default(),
             worker_exited: Arc::new((Mutex::new(false), Condvar::new())),
         };
         let worker = run.clone();
@@ -453,9 +504,24 @@ mod tests {
     #[test]
     fn security_scan_worker_panic_is_not_success() {
         let controller = ScanCoordinator::default();
-        let run = controller.start(|_| panic!("fixture crash")).unwrap();
+        let counter = crate::native_extensions::background_usage::Counter::default();
+        let worker_counter = counter.clone();
+        let run = controller
+            .start(move |run| {
+                run.bind_background_usage(worker_counter);
+                run.reserve_request(1000).unwrap();
+                panic!("fixture crash");
+            })
+            .unwrap();
         run.wait();
+        let mut exited = run.worker_exited.0.lock().unwrap();
+        while !*exited {
+            exited = run.worker_exited.1.wait(exited).unwrap();
+        }
         assert_eq!(run.status().status, RunStatus::Failed);
+        assert_eq!(counter.snapshot()["unknownTokenRequests"], 1);
+        assert_eq!(counter.snapshot()["pendingRequests"], 0);
+        assert_eq!(counter.snapshot()["failedRequests"], 1);
     }
 
     #[test]

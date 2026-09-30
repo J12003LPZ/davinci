@@ -968,12 +968,20 @@ pub fn load_security_scan_config(
     cwd: &Path,
     trusted: bool,
 ) -> Result<crate::native_extensions::ScanConfig, String> {
-    fn read(path: &Path) -> Result<crate::native_extensions::ScanConfig, String> {
+    fn read(
+        path: &Path,
+        inherited_watch: Option<&crate::native_extensions::security_scan::config::WatchConfig>,
+    ) -> Result<crate::native_extensions::ScanConfig, String> {
+        let defaults = || {
+            let mut config = crate::native_extensions::ScanConfig::default();
+            if let Some(watch) = inherited_watch {
+                config.watch = watch.clone();
+            }
+            config
+        };
         let raw = match fs::read_to_string(path) {
             Ok(raw) => raw,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                return Ok(Default::default())
-            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(defaults()),
             Err(_) => return Err("cannot read security scan settings".into()),
         };
         let value = parse_settings_value(&raw)
@@ -982,19 +990,34 @@ pub fn load_security_scan_config(
             return Err("settings must be an object".into());
         }
         match value.get("securityScan") {
-            None => Ok(Default::default()),
-            Some(value) => serde_json::from_value(value.clone())
-                .map_err(|_| "invalid securityScan settings".into()),
+            None => Ok(defaults()),
+            Some(value) => {
+                let mut value = value.clone();
+                if let (Some(inherited), Some(config)) = (inherited_watch, value.as_object_mut()) {
+                    let watch = config
+                        .entry("watch")
+                        .or_insert_with(|| serde_json::json!({}));
+                    if let Some(watch) = watch.as_object_mut() {
+                        watch
+                            .entry("enabled")
+                            .or_insert(serde_json::json!(inherited.enabled));
+                        watch
+                            .entry("minIntervalMs")
+                            .or_insert(serde_json::json!(inherited.min_interval_ms));
+                    }
+                }
+                serde_json::from_value(value).map_err(|_| "invalid securityScan settings".into())
+            }
         }
     }
-    let global = read(&settings_path(agent_dir))?;
+    let global = read(&settings_path(agent_dir), None)?;
     global.validate()?;
     if !trusted {
         return Ok(global);
     }
     let [current, legacy] = crate::project_config::candidates(cwd, "settings.json");
     let project = if current.exists() { current } else { legacy };
-    global.narrow_with(&read(&project)?)
+    global.narrow_with(&read(&project, Some(&global.watch))?)
 }
 
 pub fn load_settings_file(path: &Path) -> Settings {
@@ -1048,11 +1071,67 @@ pub fn load_merged_settings_with_override(
     let [current, legacy] = crate::project_config::candidates(cwd, "settings.json");
     let project_path = if current.exists() { current } else { legacy };
     let project = load_settings_value(&project_path);
-    let merged = enforce_decision_intelligence_user_boundary(
-        &global_value,
-        deep_merge_json(global_value.clone(), project),
+    let merged = enforce_learning_user_boundary(
+        &global,
+        enforce_decision_intelligence_user_boundary(
+            &global_value,
+            deep_merge_json(global_value.clone(), project),
+        ),
     );
     serde_json::from_value(migrate_settings(merged)).unwrap_or_default()
+}
+
+fn enforce_learning_user_boundary(
+    global: &Settings,
+    mut merged: serde_json::Value,
+) -> serde_json::Value {
+    // Trust permits reading project configuration; it does not consent to
+    // background spend or writes into the owner's project/global skill stores.
+    let owner = global.learning.clone().unwrap_or_default();
+    if let Some(learning) = merged
+        .get_mut("learning")
+        .and_then(serde_json::Value::as_object_mut)
+    {
+        for (flag, permitted) in [
+            ("enabled", owner.enabled),
+            ("backgroundReview", owner.background_review),
+            ("autoApplyProject", owner.auto_apply_project),
+            ("autoApplyGlobal", owner.auto_apply_global),
+        ] {
+            if !permitted {
+                learning.insert(flag.into(), serde_json::Value::Bool(false));
+            }
+        }
+        if let Ok(mut effective) = serde_json::from_value::<
+            crate::native_extensions::learning::LearningConfig,
+        >(serde_json::Value::Object(learning.clone()))
+        {
+            effective.shadow_mode |= owner.shadow_mode;
+            effective.max_review_input_tokens = effective
+                .max_review_input_tokens
+                .min(owner.max_review_input_tokens);
+            effective.max_review_iterations = effective
+                .max_review_iterations
+                .min(owner.max_review_iterations);
+            effective.max_candidates_per_review = effective
+                .max_candidates_per_review
+                .min(owner.max_candidates_per_review);
+            effective.review_timeout_ms = effective.review_timeout_ms.min(owner.review_timeout_ms);
+            effective.min_review_interval_ms = effective
+                .min_review_interval_ms
+                .max(owner.min_review_interval_ms);
+            effective.auto_promote_verified_uses = effective
+                .auto_promote_verified_uses
+                .max(owner.auto_promote_verified_uses);
+            if let Some(limits) = serde_json::to_value(effective)
+                .ok()
+                .and_then(|value| value.as_object().cloned())
+            {
+                learning.extend(limits);
+            }
+        }
+    }
+    merged
 }
 
 fn enforce_decision_intelligence_user_boundary(
@@ -1115,6 +1194,11 @@ fn warn_removed_sqlite_backend(path: &Path, value: &serde_json::Value) {
         "pi: the SQLite session backend was removed; sessions are stored as JSONL ({}).",
         path.display()
     );
+}
+
+/// Validate with the runtime's migrations without echoing configuration values.
+pub fn valid_settings_json(raw: &str) -> bool {
+    parse_settings_json(raw).is_some()
 }
 
 fn parse_settings_json(raw: &str) -> Option<Settings> {
@@ -1767,6 +1851,160 @@ mod tests {
         }
     }
 
+    #[test]
+    fn trusted_project_learning_can_narrow_but_cannot_grant_owner_permissions() {
+        let dir = tempfile::tempdir().unwrap();
+        let agent_dir = dir.path().join("agent");
+        let cwd = dir.path().join("project");
+        std::fs::create_dir_all(&agent_dir).unwrap();
+        std::fs::create_dir_all(cwd.join(".davinci")).unwrap();
+        let flags = ["backgroundReview", "autoApplyProject", "autoApplyGlobal"];
+        for owner_enabled in [false, true] {
+            for project_enabled in [false, true] {
+                let mut owner = serde_json::json!({"enabled":true});
+                let mut project = serde_json::json!({"maxReviewInputTokens":4000});
+                for flag in flags {
+                    owner[flag] = serde_json::json!(owner_enabled);
+                    project[flag] = serde_json::json!(project_enabled);
+                }
+                std::fs::write(
+                    agent_dir.join("settings.json"),
+                    serde_json::json!({"learning":owner}).to_string(),
+                )
+                .unwrap();
+                std::fs::write(
+                    cwd.join(".davinci/settings.json"),
+                    serde_json::json!({"learning":project}).to_string(),
+                )
+                .unwrap();
+                let merged =
+                    super::load_merged_settings_with_override(&agent_dir, &cwd, Some(true));
+                let learning = merged.learning.unwrap();
+                assert_eq!(learning.background_review, owner_enabled && project_enabled);
+                assert_eq!(
+                    learning.auto_apply_project,
+                    owner_enabled && project_enabled
+                );
+                assert_eq!(learning.auto_apply_global, owner_enabled && project_enabled);
+                assert_eq!(learning.max_review_input_tokens, 4000);
+            }
+        }
+        std::fs::write(agent_dir.join("settings.json"), "{}").unwrap();
+        std::fs::write(cwd.join(".davinci/settings.json"), r#"{"learning":{"backgroundReview":true,"autoApplyProject":true,"autoApplyGlobal":true}}"#).unwrap();
+        let learning = super::load_merged_settings_with_override(&agent_dir, &cwd, Some(true))
+            .learning
+            .unwrap();
+        assert!(
+            !learning.background_review
+                && !learning.auto_apply_project
+                && !learning.auto_apply_global
+        );
+        std::fs::write(
+            agent_dir.join("settings.json"),
+            r#"{"learning":{"enabled":false}}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            cwd.join(".davinci/settings.json"),
+            r#"{"learning":{"enabled":true}}"#,
+        )
+        .unwrap();
+        assert!(
+            !super::load_merged_settings_with_override(&agent_dir, &cwd, Some(true))
+                .learning
+                .unwrap()
+                .enabled
+        );
+        let owner = crate::native_extensions::learning::LearningConfig {
+            background_review: true,
+            auto_apply_project: true,
+            auto_apply_global: true,
+            shadow_mode: true,
+            ..Default::default()
+        };
+        std::fs::write(
+            agent_dir.join("settings.json"),
+            serde_json::json!({"learning":owner}).to_string(),
+        )
+        .unwrap();
+        std::fs::write(cwd.join(".davinci/settings.json"), serde_json::json!({"learning":{
+            "shadowMode":false,"maxReviewInputTokens":50000,"maxReviewIterations":20,"maxCandidatesPerReview":10,
+            "reviewTimeoutMs":900000,"minReviewIntervalMs":0,"autoPromoteVerifiedUses":1
+        }}).to_string()).unwrap();
+        let learning = super::load_merged_settings_with_override(&agent_dir, &cwd, Some(true))
+            .learning
+            .unwrap();
+        assert!(learning.shadow_mode);
+        assert_eq!(
+            learning.max_review_input_tokens,
+            owner.max_review_input_tokens
+        );
+        assert_eq!(learning.max_review_iterations, owner.max_review_iterations);
+        assert_eq!(
+            learning.max_candidates_per_review,
+            owner.max_candidates_per_review
+        );
+        assert_eq!(learning.review_timeout_ms, owner.review_timeout_ms);
+        assert_eq!(
+            learning.min_review_interval_ms,
+            owner.min_review_interval_ms
+        );
+        assert_eq!(
+            learning.auto_promote_verified_uses,
+            owner.auto_promote_verified_uses
+        );
+    }
+
+    #[test]
+    fn global_watch_opt_in_survives_omitted_project_values_and_honors_explicit_disable() {
+        let dir = tempfile::tempdir().unwrap();
+        let agent_dir = dir.path().join("agent");
+        let cwd = dir.path().join("project");
+        std::fs::create_dir_all(&agent_dir).unwrap();
+        std::fs::create_dir_all(cwd.join(".davinci")).unwrap();
+        std::fs::write(
+            agent_dir.join("settings.json"),
+            r#"{"securityScan":{"watch":{"enabled":true}}}"#,
+        )
+        .unwrap();
+        assert!(
+            super::load_security_scan_config(&agent_dir, &cwd, true)
+                .unwrap()
+                .watch
+                .enabled
+        );
+        for raw in [
+            "{}",
+            "{\"securityScan\":{}}",
+            "{\"securityScan\":{\"watch\":{\"minIntervalMs\":700000}}}",
+        ] {
+            std::fs::write(cwd.join(".davinci/settings.json"), raw).unwrap();
+            assert!(
+                super::load_security_scan_config(&agent_dir, &cwd, true)
+                    .unwrap()
+                    .watch
+                    .enabled
+            );
+        }
+        std::fs::write(
+            cwd.join(".davinci/settings.json"),
+            r#"{"securityScan":{"watch":{"enabled":false}}}"#,
+        )
+        .unwrap();
+        assert!(
+            !super::load_security_scan_config(&agent_dir, &cwd, true)
+                .unwrap()
+                .watch
+                .enabled
+        );
+        std::fs::write(agent_dir.join("settings.json"), "{}").unwrap();
+        std::fs::write(cwd.join(".davinci/settings.json"), r#"{"securityScan":{"watch":{"enabled":true,"minIntervalMs":0},"maxFileBytes":8388608}}"#).unwrap();
+        let config = super::load_security_scan_config(&agent_dir, &cwd, true).unwrap();
+        let defaults = crate::native_extensions::ScanConfig::default();
+        assert!(!config.watch.enabled);
+        assert_eq!(config.watch.min_interval_ms, defaults.watch.min_interval_ms);
+        assert_eq!(config.max_file_bytes, defaults.max_file_bytes);
+    }
     #[test]
     fn service_tier_setting_parses() {
         let settings: super::Settings = serde_json::from_str(r#"{"serviceTier":"fast"}"#).unwrap();

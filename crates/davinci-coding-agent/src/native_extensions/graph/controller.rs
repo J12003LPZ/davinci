@@ -5467,8 +5467,16 @@ mod tests {
             ..Default::default()
         };
 
-        let mut learning =
-            crate::native_extensions::LearningController::new(&cwd, Some(&agent_dir), None);
+        let learning_config = crate::native_extensions::LearningConfig {
+            background_review: true,
+            auto_apply_project: true,
+            ..Default::default()
+        };
+        let mut learning = crate::native_extensions::LearningController::new(
+            &cwd,
+            Some(&agent_dir),
+            Some(learning_config),
+        );
         learning.set_project_trusted(true);
         let learning = Arc::new(Mutex::new(learning));
 

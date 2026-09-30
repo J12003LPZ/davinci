@@ -44,6 +44,7 @@ struct State {
     last_outcome: Option<Value>,
     notices: Vec<String>,
     injection: Option<String>,
+    usage: crate::native_extensions::background_usage::Counter,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -324,7 +325,14 @@ impl SecurityWatch {
         let runner = runner.clone();
         let config = config.clone();
         let root: PathBuf = root.clone();
+        let usage = self
+            .state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .usage
+            .clone();
         let handle = self.coordinator.start(move |run| {
+            run.bind_background_usage(usage);
             // No store: a watch review leaves no checkpoint to resume.
             let outcome = super::review::execute(
                 &root, &request, &config, &runner, &run, None, None,
@@ -438,6 +446,10 @@ impl SecurityWatch {
         let _ = self.coordinator.abort(None);
     }
 
+    pub fn set_usage(&self, counter: crate::native_extensions::background_usage::Counter) {
+        self.state.lock().unwrap_or_else(|e| e.into_inner()).usage = counter;
+    }
+
     pub fn status(&self) -> Value {
         let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         json!({
@@ -532,6 +544,8 @@ mod tests {
         let config = watch_config();
         let watch = SecurityWatch::default();
         watch.configure_with(&config.watch, None);
+        let usage = crate::native_extensions::background_usage::Counter::default();
+        watch.set_usage(usage.clone());
         let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let runner = finding_runner(calls.clone());
 
@@ -557,6 +571,22 @@ mod tests {
             .dispatch(repo.path(), &runner, &config, false)
             .unwrap());
         assert_eq!(watch.status()["last"]["status"], "findings");
+        let receipts = usage.snapshot();
+        assert_eq!(
+            receipts["requests"],
+            calls.load(std::sync::atomic::Ordering::SeqCst)
+        );
+        assert_eq!(
+            receipts["tokens"]["total"],
+            calls.load(std::sync::atomic::Ordering::SeqCst)
+        );
+        assert!(receipts["estimatedCostUsd"].is_null());
+        watch.poll(&config);
+        assert_eq!(
+            usage.snapshot(),
+            receipts,
+            "polling never counts receipts twice"
+        );
     }
 
     #[test]
@@ -575,6 +605,8 @@ mod tests {
         config.watch.min_interval_ms = 60_000;
         let watch = SecurityWatch::default();
         watch.configure_with(&config.watch, None);
+        let usage = crate::native_extensions::background_usage::Counter::default();
+        watch.set_usage(usage.clone());
         // An explicit scan occupies the only review slot.
         let single = ScanConfig {
             max_concurrency: 1,
@@ -596,6 +628,9 @@ mod tests {
         assert!(watch.take_notices().is_empty());
         assert!(watch.take_injection().is_none());
         assert_eq!(watch.status()["last"]["status"], "failed");
+        assert_eq!(usage.snapshot()["unknownTokenRequests"], 1);
+        assert_eq!(usage.snapshot()["failedRequests"], 1);
+        assert!(usage.snapshot()["tokens"].is_null());
         // The interval holds even though the tree changed.
         assert!(!watch.due(now_ms()));
     }
@@ -610,7 +645,10 @@ mod tests {
         assert!(!watch.due(now_ms()));
         assert_eq!(watch.status()["enabled"], false);
         assert!(status_line().is_some());
-        watch.configure(&WatchConfig::default());
+        watch.configure(&WatchConfig {
+            enabled: true,
+            ..Default::default()
+        });
         assert_eq!(
             watch.status()["enabled"],
             environment_block().is_none(),

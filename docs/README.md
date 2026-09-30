@@ -16,6 +16,7 @@ Context and routing: [Context VM](context-vm.md), [Jev](decision-intelligence.md
 and [hardening measurements](context-vm-jev-measurements.md).
 OpenAI provider operations: [cache and Responses efficiency](openai-efficiency.md).
 CLI and request safety: [harness hardening and offline evidence](perf/harness-release-hardening.md).
+Session visibility: [status, doctor, and background cost accounting](session-diagnostics.md).
 Program closeout: [engineering program verification](engineering-program-verification.md).
 
 ---

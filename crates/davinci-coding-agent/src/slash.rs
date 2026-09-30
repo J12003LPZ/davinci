@@ -88,8 +88,8 @@ pub fn builtin_slash_commands() -> Vec<SlashCommand> {
         ("cost", "Tokens and USD spent this session", None),
         ("status", "Model, permission, jobs, MCP, tokens", None),
         (
-            "sandbox-status",
-            "Execution sandbox policy and enforcement status",
+            "doctor",
+            "Check configuration, credential presence, sandbox, MCP/LSP and install identity",
             None,
         ),
         (
@@ -176,6 +176,7 @@ pub enum SlashAction {
     Mcp,
     ShowCost,
     ShowStatus,
+    ShowDoctor,
     ShowSandboxStatus,
     /// `/context`: the window by category; `/context inspect` opens the
     /// prepared-manifest inspector.
@@ -265,6 +266,7 @@ pub fn parse_line(line: &str) -> SlashAction {
         "mcp" => SlashAction::Mcp,
         "cost" => SlashAction::ShowCost,
         "status" => SlashAction::ShowStatus,
+        "doctor" => SlashAction::ShowDoctor,
         "sandbox-status" => SlashAction::ShowSandboxStatus,
         "context" => SlashAction::Context(args.to_string()),
         "workflow" | "workflows" => SlashAction::Workflow(args.to_string()),
@@ -431,10 +433,14 @@ mod tests {
     }
 
     #[test]
-    fn sandbox_status_is_separate_from_permission_status() {
-        assert!(builtin_slash_commands()
+    fn sandbox_status_is_internal_and_doctor_is_public() {
+        assert!(!builtin_slash_commands()
             .iter()
             .any(|command| command.name == "sandbox-status"));
+        assert!(builtin_slash_commands()
+            .iter()
+            .any(|command| command.name == "doctor"));
+        assert_eq!(parse_line("/doctor"), SlashAction::ShowDoctor);
         assert_eq!(
             parse_line("/sandbox-status"),
             SlashAction::ShowSandboxStatus

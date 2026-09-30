@@ -1134,6 +1134,7 @@ pub fn session_stats_for_agent(agent: &Agent, model: Option<&Model>) -> Value {
         "cost": stats.cost,
         "contextUsage": context_usage,
         "runtime": agent.run_stats(),
+        "background": crate::native_extensions::background_usage::for_agent(agent),
         "openaiCache": openai_cache_status(agent, &stats),
     });
     // Present only while the Context VM is not `off`.

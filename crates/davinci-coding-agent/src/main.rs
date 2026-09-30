@@ -7338,6 +7338,13 @@ fn handle_user_line(
             println!("{text}");
             Ok(true)
         }
+        SlashAction::ShowDoctor => {
+            let text = format_session_doctor(parsed, agent);
+            session.chrome.transcript.push("doctor", &text);
+            session.chrome.status = "doctor".into();
+            println!("{text}");
+            Ok(true)
+        }
         SlashAction::ShowSandboxStatus => {
             let text = sandbox_config::format_sandbox_status(agent.tool_context.sandbox.as_ref());
             session.chrome.transcript.push("sandbox", &text);
@@ -8392,7 +8399,7 @@ pub fn format_session_cost(parsed: &Args, agent: &Agent) -> String {
         .iter()
         .find(|item| item.provider == agent.provider && item.id == agent.model_id);
     let stats = rpc::session_stats_for_agent(agent, found);
-    format!(
+    let foreground = format!(
         "input {} · output {} · cache read {} · cache write {} · total {} · ${:.4}",
         stats["tokens"]["input"].as_u64().unwrap_or(0),
         stats["tokens"]["output"].as_u64().unwrap_or(0),
@@ -8403,6 +8410,11 @@ pub fn format_session_cost(parsed: &Args, agent: &Agent) -> String {
             .get("cost")
             .and_then(|value| value.as_f64())
             .unwrap_or(0.0),
+    );
+    format!(
+        "{foreground}\n{}\nBackground accounting: {}",
+        native_extensions::background_usage::render(&stats["background"]),
+        stats["background"]["scope"].as_str().unwrap_or("unknown")
     )
 }
 
@@ -8411,6 +8423,18 @@ pub fn format_session_cost(parsed: &Args, agent: &Agent) -> String {
 pub fn additional_directories_status_line(agent: &Agent) -> Option<String> {
     let roots = agent.additional_directories();
     (!roots.is_empty()).then(|| format!("additional directories: {}", roots.join(", ")))
+}
+
+pub fn format_session_doctor(parsed: &Args, agent: &Agent) -> String {
+    let report = davinci_coding_agent::session_diagnostics::doctor(
+        agent,
+        &default_agent_dir(),
+        parsed
+            .api_key
+            .as_ref()
+            .is_some_and(|key| !key.trim().is_empty()),
+    );
+    serde_json::to_string_pretty(&report).unwrap_or_else(|_| "doctor: unavailable".into())
 }
 
 pub fn format_session_status(parsed: &Args, agent: &Agent) -> String {
@@ -8478,10 +8502,23 @@ pub fn format_session_status(parsed: &Args, agent: &Agent) -> String {
             text.push_str(&compact.join("\n"));
         }
     }
-    if let Some(line) = native_extensions::security_scan::watch_status_line() {
-        text.push('\n');
-        text.push_str(&line);
+    text.push_str(&format!(
+        "\n{}",
+        sandbox_config::format_sandbox_status(agent.tool_context.sandbox.as_ref())
+    ));
+    if let Some(sections) = native_extensions::background_usage::native_status(agent) {
+        for (name, section) in sections.as_object().into_iter().flatten() {
+            text.push_str(&format!(
+                "\n\n{name}:\n{}",
+                serde_json::to_string_pretty(section).unwrap_or_else(|_| "unavailable".into())
+            ));
+        }
+    } else {
+        text.push_str("\nNative status: unavailable (host not bound)");
     }
+    text.push_str(&format_runtime_stats(
+        serde_json::to_value(agent.run_stats()).ok().as_ref(),
+    ));
     let behavior_runs = davinci_telemetry::get_behavior_telemetry();
     if !behavior_runs.is_empty() {
         let profile_filter = agent
@@ -8559,7 +8596,7 @@ fn format_runtime_stats(runtime: Option<&serde_json::Value>) -> String {
     } else {
         get("toolCalls") as f64 / batches as f64
     };
-    format!(
+    let mut text = format!(
         "\n\nRuntime (this run)\nModel turns: {}\nTool calls: {} in {} batches (mean width {:.1}, max {}, {} parallel groups)\nBatch operations: {}\nWorkers: {}\nTime: model {:.1}s, tools {:.1}s\nPeak context: {} tokens\nPruned: {} results, {} chars\nCompactions: {}\nEvidence files: {}",
         get("modelTurns"),
         get("toolCalls"),
@@ -8576,7 +8613,16 @@ fn format_runtime_stats(runtime: Option<&serde_json::Value>) -> String {
         get("prunedChars"),
         get("compactions"),
         get("evidenceFiles"),
-    )
+    );
+    if runtime.get("completionRequirementReminders").is_some() {
+        text.push_str(&format!(
+            "\nCompletion: {} requirement reminders, {} hook blocks, {} hook limit hits",
+            get("completionRequirementReminders"),
+            get("completionHookBlocks"),
+            get("completionHookLimitHits")
+        ));
+    }
+    text
 }
 
 fn apply_extension_shortcuts(
@@ -9578,6 +9624,7 @@ fn execute_agent_language_tool(
 /// executor attach paths run before every turn, so a session switch rebinds.
 fn bind_native_session(agent: &Agent, host: &ExtensionHost) {
     host.bind_native_session(agent.session.as_ref().map(|store| store.header.id.as_str()));
+    native_extensions::background_usage::bind(agent, &host.native);
 }
 
 fn attach_tool_executor(agent: &mut Agent, host: &ExtensionHost) {

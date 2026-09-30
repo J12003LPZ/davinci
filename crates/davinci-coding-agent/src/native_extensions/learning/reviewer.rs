@@ -14,6 +14,7 @@ pub struct ReviewRun {
     pub id: String,
     pub cancelled: Arc<AtomicBool>,
     pub finished: Arc<AtomicBool>,
+    pub usage: crate::native_extensions::background_usage::Counter,
 }
 
 impl ReviewRun {
@@ -22,6 +23,7 @@ impl ReviewRun {
             id: id.into(),
             cancelled: Arc::new(AtomicBool::new(false)),
             finished: Arc::new(AtomicBool::new(false)),
+            usage: Default::default(),
         }
     }
 
@@ -396,6 +398,8 @@ fn reviewer_executable() -> std::io::Result<std::path::PathBuf> {
 pub fn reviewer_args(prompt_file: &std::path::Path, model: Option<&str>) -> Vec<String> {
     let mut args = vec![
         "-p".to_string(),
+        "--mode".to_string(),
+        "json".to_string(),
         "--no-session".to_string(),
         "--no-extensions".to_string(),
         "--no-skills".to_string(),
@@ -409,6 +413,62 @@ pub fn reviewer_args(prompt_file: &std::path::Path, model: Option<&str>) -> Vec<
     }
     args.push(format!("@{}", prompt_file.display()));
     args
+}
+
+/// Consume only terminal assistant events. `agent_end` repeats messages and
+/// must never double-count usage. The latest assistant text is the review.
+fn read_reviewer_events(
+    reader: impl std::io::BufRead,
+    counter: &crate::native_extensions::background_usage::Counter,
+) -> (String, bool) {
+    let mut pending = true; // The spawned child owns its first request.
+    let mut text = String::new();
+    for line in reader.lines().map_while(Result::ok) {
+        let Ok(event) = serde_json::from_str::<serde_json::Value>(&line) else {
+            continue;
+        };
+        let message = &event["message"];
+        if message["role"] != "assistant" {
+            continue;
+        }
+        match event["type"].as_str() {
+            Some("message_start") if !pending => {
+                counter.start();
+                pending = true;
+            }
+            Some("message_end") => {
+                if !pending {
+                    counter.start();
+                }
+                let usage =
+                    serde_json::from_value::<davinci_protocol::Usage>(message["usage"].clone())
+                        .ok();
+                let failed = matches!(
+                    message["stopReason"].as_str(),
+                    Some("error" | "aborted" | "length")
+                );
+                counter.record(
+                    &crate::native_extensions::security_scan::usage::RequestUsage::new(
+                        usage.as_ref(),
+                        0,
+                        0,
+                        failed,
+                    ),
+                );
+                pending = false;
+                text = message["content"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter(|block| block["type"] == "text")
+                    .filter_map(|block| block["text"].as_str())
+                    .collect::<Vec<_>>()
+                    .join("\n");
+            }
+            _ => {}
+        }
+    }
+    (text, pending)
 }
 
 /// Ask a model to review the turn by running this `pi` as a print-mode child.
@@ -454,6 +514,7 @@ pub fn execute_live_review(
         // The child is a normal print turn: it would review itself and index
         // the review into vector memory without these.
         .env("PI_LEARNING_DISABLE_BACKGROUND", "1")
+        .env("DAVINCI_SECURITY_WATCH", "0")
         .env("PI_MEMORY_ENABLED", "0")
         .env("PI_GRAPH_SUPPRESS_MEMORY_INJECT", "1")
         .stdin(std::process::Stdio::null())
@@ -483,7 +544,13 @@ pub fn execute_live_review(
             text
         })
     };
-    let stdout = read_all(stdout.map(|p| Box::new(p) as Box<dyn std::io::Read + Send>));
+    run.usage.start();
+    let counter = run.usage.clone();
+    let stdout = std::thread::spawn(move || {
+        stdout
+            .map(|pipe| read_reviewer_events(std::io::BufReader::new(pipe), &counter))
+            .unwrap_or_else(|| (String::new(), true))
+    });
     let stderr = read_all(stderr.map(|p| Box::new(p) as Box<dyn std::io::Read + Send>));
     let deadline =
         std::time::Instant::now() + std::time::Duration::from_millis(config.review_timeout_ms);
@@ -499,9 +566,19 @@ pub fn execute_live_review(
             Err(_) => break None,
         }
     };
-    let stdout = stdout.join().unwrap_or_default();
+    let (stdout, pending) = stdout.join().unwrap_or_else(|_| (String::new(), true));
     let stderr = stderr.join().unwrap_or_default();
     let _ = std::fs::remove_dir_all(&prompt_dir);
+    if pending {
+        run.usage.record(
+            &crate::native_extensions::security_scan::usage::RequestUsage::new(
+                None,
+                0,
+                0,
+                status.as_ref().is_none_or(|status| !status.success()),
+            ),
+        );
+    }
     let Some(status) = status else {
         return fail(if run.is_cancelled() {
             "review cancelled".into()
@@ -531,6 +608,112 @@ mod tests {
     use std::sync::Mutex;
 
     static FIXTURE_ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    #[cfg(unix)]
+    #[test]
+    fn live_reviewer_child_records_receipts_and_disables_recursive_watch() {
+        use std::os::unix::fs::PermissionsExt;
+        let _lock = FIXTURE_ENV_LOCK.lock().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let executable = dir.path().join("reviewer-fixture");
+        let event = json!({"type":"message_end","message":{
+            "role":"assistant","content":[{"type":"text","text":"{\"candidates\":[]}"}],
+            "usage":davinci_protocol::Usage {input:10,output:5,total_tokens:15,..Default::default()}
+        }});
+        std::fs::write(&executable, format!(
+            "#!/bin/sh\n[ \"$DAVINCI_SECURITY_WATCH\" = 0 ] || exit 17\n[ \"$PI_LEARNING_DISABLE_BACKGROUND\" = 1 ] || exit 18\ncat <<'DAVINCI_RECEIPT'\n{event}\nDAVINCI_RECEIPT\n"
+        )).unwrap();
+        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let prior = std::env::var_os("PI_LEARNING_REVIEWER_EXECUTABLE");
+        std::env::set_var("PI_LEARNING_REVIEWER_EXECUTABLE", &executable);
+        let run = ReviewRun::new("child-receipts");
+        let result = execute_live_review(
+            &fixture_evidence(),
+            &LearningConfig::default(),
+            &run,
+            &LiveReviewSpec {
+                cwd: dir.path().to_path_buf(),
+                model: None,
+                existing_skills: Vec::new(),
+            },
+        );
+        if let Some(prior) = prior {
+            std::env::set_var("PI_LEARNING_REVIEWER_EXECUTABLE", prior);
+        } else {
+            std::env::remove_var("PI_LEARNING_REVIEWER_EXECUTABLE");
+        }
+        assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
+        let totals = run.usage.snapshot();
+        assert_eq!(totals["tokens"]["total"], 15);
+        assert_eq!(totals["requests"], 1);
+        assert_eq!(totals["pendingRequests"], 0);
+        assert!(totals["estimatedCostUsd"].is_null());
+    }
+
+    #[test]
+    fn reviewer_events_preserve_actual_usage_without_agent_end_duplication() {
+        let counter = crate::native_extensions::background_usage::Counter::default();
+        counter.start();
+        let usage = davinci_protocol::Usage {
+            input: 100,
+            output: 40,
+            cache_read: 20,
+            cache_write: 5,
+            total_tokens: 165,
+            reasoning: Some(30),
+            cost: davinci_protocol::UsageCost {
+                total: 0.02,
+                ..Default::default()
+            },
+        };
+        let message = json!({"role":"assistant","content":[{"type":"text","text":"{\"candidates\":[]}"}],"usage":usage});
+        let stream = [
+            json!({"type":"message_start","message":{"role":"user"}}),
+            json!({"type":"message_start","message":{"role":"assistant"}}),
+            json!({"type":"message_end","message":message}),
+            json!({"type":"agent_end","messages":[message]}),
+        ]
+        .into_iter()
+        .map(|event| event.to_string())
+        .collect::<Vec<_>>()
+        .join("\n");
+        let (text, pending) = read_reviewer_events(stream.as_bytes(), &counter);
+        assert_eq!(text, "{\"candidates\":[]}");
+        assert!(!pending);
+        let totals = counter.snapshot();
+        assert_eq!(totals["requests"], 1);
+        assert_eq!(totals["tokens"]["total"], 165);
+        assert_eq!(totals["tokens"]["cacheRead"], 20);
+        assert_eq!(totals["estimatedCostUsd"], 0.02);
+        assert!(reviewer_args(std::path::Path::new("r.md"), None)
+            .windows(2)
+            .any(|args| args == ["--mode", "json"]));
+    }
+
+    #[test]
+    fn interrupted_reviewer_keeps_prior_receipts_and_marks_unmeasured_attempt() {
+        let counter = crate::native_extensions::background_usage::Counter::default();
+        counter.start();
+        let stream = format!(
+            "{}\n{}\n{}",
+            json!({"type":"message_end","message":{
+                "role":"assistant","content":[],"usage":davinci_protocol::Usage { input:20,output:5,total_tokens:25,..Default::default() }
+            }}),
+            json!({"type":"message_start","message":{"role":"assistant"}}),
+            "{partial"
+        );
+        let (_, pending) = read_reviewer_events(stream.as_bytes(), &counter);
+        assert!(pending);
+        counter.record(
+            &crate::native_extensions::security_scan::usage::RequestUsage::new(None, 0, 0, true),
+        );
+        let totals = counter.snapshot();
+        assert_eq!(totals["requests"], 2);
+        assert_eq!(totals["measuredTokens"]["total"], 25);
+        assert!(totals["tokens"].is_null());
+        assert_eq!(totals["failedRequests"], 1);
+        assert_eq!(totals["pendingRequests"], 0);
+    }
 
     fn fixture_evidence() -> LearningEvidence {
         LearningEvidence {

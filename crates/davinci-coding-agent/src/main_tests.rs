@@ -4370,3 +4370,78 @@ fn worker_host_feeds_its_own_events_into_the_leads_progress() {
     assert_eq!(snapshot.tool_uses, 1);
     assert_eq!(snapshot.recent, vec!["Search(\"auth\")".to_string()]);
 }
+
+#[test]
+fn cost_status_and_rpc_expose_background_receipts_without_foreground_pollution() {
+    let dir = tempfile::tempdir().unwrap();
+    let agent = Agent::new_builtin(davinci_agent::PromptProfile::Stable);
+    let host = ExtensionHost::default();
+    bind_native_session(&agent, &host);
+    let usage = davinci_protocol::Usage {
+        input: 20,
+        output: 5,
+        cache_read: 10,
+        total_tokens: 35,
+        ..Default::default()
+    };
+    {
+        let native = host.native.lock().unwrap();
+        native.background.learning.record(
+            &native_extensions::security_scan::usage::RequestUsage::new(
+                Some(&usage),
+                1000,
+                1,
+                false,
+            ),
+        );
+        native.background.security_watch.record(
+            &native_extensions::security_scan::usage::RequestUsage::new(None, 9000, 1, true),
+        );
+    }
+    let parsed = Args::default();
+    let cost = format_session_cost(&parsed, &agent);
+    assert!(cost.starts_with("input 0 · output 0"), "{cost}");
+    assert!(
+        cost.contains("background learning review: input 20 · output 5 · cache read 10"),
+        "{cost}"
+    );
+    assert!(
+        cost.contains("background security watch: tokens unknown"),
+        "{cost}"
+    );
+    let status = format_session_status(&parsed, &agent);
+    for section in [
+        "repo-index:",
+        "lsp:",
+        "hook:",
+        "learning:",
+        "securityWatch:",
+    ] {
+        assert!(status.contains(section), "{section}: {status}");
+    }
+    assert!(status.contains("Sandbox:"));
+    assert!(status.contains("Enforcement:"));
+    let mut runtime =
+        rpc::RpcRuntime::new(agent, dir.path().join("sessions"), dir.path().to_path_buf());
+    let response = rpc::handle_rpc(
+        &mut runtime,
+        rpc::RpcCommand {
+            kind: "get_session_stats".into(),
+            ..Default::default()
+        },
+    );
+    assert!(response.success);
+    let stats = response.data.unwrap();
+    assert_eq!(stats["tokens"]["total"], 0);
+    assert_eq!(stats["background"]["learning"]["tokens"]["total"], 35);
+    assert!(stats["background"]["securityWatch"]["tokens"].is_null());
+    assert_eq!(stats["background"]["securityWatch"]["failedRequests"], 1);
+}
+
+#[test]
+fn runtime_status_renders_completion_counters_when_present() {
+    let runtime = serde_json::json!({"modelTurns":1, "completionRequirementReminders":2,
+        "completionHookBlocks":3,"completionHookLimitHits":1});
+    assert!(format_runtime_stats(Some(&runtime))
+        .contains("Completion: 2 requirement reminders, 3 hook blocks, 1 hook limit hits"));
+}

@@ -1327,6 +1327,10 @@ impl SecurityScanController {
         self.watch.due(now_ms())
     }
 
+    pub fn set_watch_usage(&self, counter: crate::native_extensions::background_usage::Counter) {
+        self.watch.set_usage(counter);
+    }
+
     pub fn watch_status(&self) -> Value {
         self.watch.status()
     }
