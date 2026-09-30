@@ -31,6 +31,16 @@ pub use tools::{coordinator_for_context, MutationAuthority};
 
 type Authority<'a> = &'a dyn Fn(&Path) -> Result<(), String>;
 
+/// Reuse the transaction platform identity guard for other file restorations.
+/// A link count that cannot be established is never mutation authority.
+pub(crate) fn require_unaliased_file(file: &std::fs::File) -> Result<(), String> {
+    let metadata = file.metadata().map_err(|error| error.to_string())?;
+    if !metadata.is_file() {
+        return Err("non-regular restoration source denied".into());
+    }
+    files::identity(file, &metadata).map(|_| ())
+}
+
 #[derive(Debug, Clone)]
 pub struct TransactionCoordinator {
     root: PathBuf,

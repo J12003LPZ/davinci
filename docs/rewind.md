@@ -19,6 +19,11 @@ files can remain after their files are removed. Existing path, symlink and
 unfinished-transaction protections still apply.
 Rewind refuses symlinks in a recorded pathname or its parent directories,
 including links whose targets remain inside the workspace.
+Current files must also have exactly one hard link. Rewind checks link identity
+with the existing transaction metadata guard on Unix and Windows; an unreadable
+or unavailable identity fails closed. Apply, rollback and recovery use the same
+guard immediately before restoring file bytes, so matching content cannot grant
+authority to overwrite an unrelated file through a shared inode.
 An unreadable current file is a conflict; only a missing file counts as absent.
 
 **Changes made through shell commands are not tracked and cannot be restored by
