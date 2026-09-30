@@ -19,7 +19,7 @@ make build          # cargo build -p davinci-coding-agent   (produces the `davin
 make test           # cargo test --workspace
 make fmt            # cargo fmt --check
 make clippy         # cargo clippy --workspace --all-targets -- -D warnings
-make install        # cargo install --path crates/davinci-coding-agent --force
+make install        # tagged clean source, green push CI, staged source install
 ```
 
 Single crate / single test:
@@ -129,7 +129,7 @@ davinci-coding-agent (bin `davinci`) — CLI, TUI wiring, extensions, slash comm
 
 **Ecosystem integration plan**: The roadmap coordinates four bounded workstreams: graph execution hardening, runtime integration with the token governor and vector memory, learning/security feedback, and proof plus CI hygiene. Treat the design document as the contract and the A–D plans as the execution order. Preserve worker isolation, deterministic/offline verification, explicit provenance, bounded context and resource budgets, and fail-closed security approval as cross-cutting acceptance criteria.
 
-**Entrypoint dispatch** (`crates/davinci-coding-agent/src/main.rs`, ~7k lines): `run()` picks a mode — `run_rpc` (`--mode rpc`), `run_print` (`--print` / `--mode json` / non-TTY stdin or stdout), otherwise `run_interactive`, which opens the davinci shell (`davinci_interactive::run`) unless `--legacy-tui` or `PI_DAVINCI=0` asks for the old chrome. Unix-only `experimental` subcommands (`server`, `client`) are stubbed out on Windows by an inline `mod experimental` in `main.rs`.
+**Entrypoint dispatch** (`crates/davinci-coding-agent/src/main.rs`, ~12k lines): `run()` picks a mode — `run_rpc` (`--mode rpc`), `run_print` (`--print` / `--mode json` / non-TTY stdin or stdout), otherwise `run_interactive`, which opens the davinci shell (`davinci_interactive::run`) unless `--legacy-tui` or `PI_DAVINCI=0` asks for the old chrome. Unix-only `experimental` subcommands (`server`, `client`) are stubbed out on Windows by an inline `mod experimental` in `main.rs`.
 
 **Provider streaming** (`davinci-ai`): every request goes through `live_complete_streaming_with_sink` (`stream.rs`), which reads the SSE body on a reader thread and hands each decoded event to a sink as it arrives; `StreamOptions::abort_signal` is polled between frames. Wire formats are decoded by `stream_decoder.rs` (Responses/Codex), `stream_decoder_completions.rs` and `stream_decoder_anthropic.rs`; APIs without a decoder are requested without `stream: true` and their events synthesised. Responses tool-call ids are stored as `call_id|item_id` and only the `call_id` half is replayed. `PI_AI_TRACE=1` (or a file path) logs every request, frame and failure — reach for it before reading code when a turn misbehaves.
 
@@ -192,6 +192,28 @@ The historical HTML mockups and Elixir reference under `docs/ui/` document earli
 
 - **`home_dir()` mirrors Node `os.homedir()`** (`davinci-session/src/discovery.rs`): `USERPROFILE` first on Windows, `HOME` otherwise. Session dirs use the TS `--…--` cwd encoding (every `/`, `\`, `:` becomes `-`); the older Rust `--a--b` encoding is still scanned read-only for pre-existing stores. Tests that create sessions should still set `PI_CODING_AGENT_DIR` or `PI_CODING_AGENT_SESSION_DIR` so they never touch the real `~/.pi`; if `--Users--…/` directories ever reappear in the repo, they are test/session strays — delete, never commit.
 - **Git pre-commit hook on Windows**: Environments where `core.hooksPath` points to Unix shell scripts (e.g. `~/.codex/git-hooks`) may fail on Windows with `execvpe(/bin/bash) failed: No such file or directory`. Use `git commit --no-verify` to bypass this hook when committing on Windows.
-- `davinci-coding-agent` (~47k lines) and `davinci-tui` (~39k lines) are large; prefer targeted `grep` over reading whole files.
+- `davinci-coding-agent` and `davinci-tui` are large; prefer targeted `rg` over reading whole files. Rust line counts (tracked `.rs` files, including tests) are recorded below.
 
 **Session diagnostics and background spend**: `/status` contains the 14 native status sections and sandbox enforcement; native `*-status` handlers remain internal for RPC and sheets and are omitted from slash discovery. `/doctor` checks config validity, credential presence (no helper execution or credential values), observed MCP/LSP health, sandbox status and the running executable's schema-3 sibling identity/hash. `/cost`, `/status` and RPC `get_session_stats.background` keep learning and security-watch provider receipts separate from foreground totals. Unknown usage/pricing is null/unknown, reservations never become measurements, and counters cover the current process per originating session rather than historical persisted totals.
+
+**Production harness controls**: A mutated multi-part prompt gets one ephemeral requirement-to-evidence reminder at attempted completion, after the cached prefix; the Stable prompt and provider schema remain unchanged. `requirementReview` / `DAVINCI_REQUIREMENT_REVIEW` selects the A/B arm. User `completion` and plugin `Stop` hooks may block inside the loop up to three times, with `stop_hook_active` and a visible cap notice; legacy user `stop` stays run-end. Plugin approval/digest and worker/trust fences are rechecked at dispatch. `/rewind` restores owned write/edit/apply_patch effects by prompt, conversation, or both, with conflicts refusing overwrite; shell changes are untracked. Double-Escape selects rewind by default and `tree` remains configurable. Auto uses workspace-write/network-denied only when the available backend meets required capabilities; Seatbelt cannot establish escaped-descendant ownership, so macOS Auto remains unavailable. WSL2 is the Windows isolation route. Already-started raw MCP/JS services prevent unsafe in-place Auto activation. No measured promotion or superiority claim is justified until private dev/holdout evidence exists. See `docs/readiness/README.md`.
+
+**Rust size snapshot**: tracked `.rs` files under `crates/`, including tests, counted with Python `len(Path(file).read_bytes().splitlines())` over `git ls-files crates` after readiness source integration. Generated build output and vendored TypeScript are excluded. Counts change with source edits; this is a source snapshot, not a runtime metric.
+
+| Crate | Rust lines |
+| --- | ---: |
+| `davinci-agent` | 142,851 |
+| `davinci-ai` | 27,718 |
+| `davinci-client` | 2,741 |
+| `davinci-coding-agent` | 201,353 |
+| `davinci-evals` | 21,223 |
+| `davinci-mcp` | 2,829 |
+| `davinci-protocol` | 2,361 |
+| `davinci-server` | 2,085 |
+| `davinci-session` | 6,865 |
+| `davinci-session-sqlite` | 2,023 |
+| `davinci-sys` | 986 |
+| `davinci-telemetry` | 555 |
+| `davinci-tui` | 69,444 |
+| `davinci-voice` | 1,450 |
+| **Total** | **484,484** |

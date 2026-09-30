@@ -17,6 +17,8 @@ and [hardening measurements](context-vm-jev-measurements.md).
 OpenAI provider operations: [cache and Responses efficiency](openai-efficiency.md).
 CLI and request safety: [harness hardening and offline evidence](perf/harness-release-hardening.md).
 Session visibility: [status, doctor, and background cost accounting](session-diagnostics.md).
+Production readiness: [requirements, evidence and remaining acceptance gaps](readiness/README.md),
+[completion review](completion.md), [blocking hooks](completion-hooks.md), and [conversation rewind](rewind.md).
 Program closeout: [engineering program verification](engineering-program-verification.md).
 
 ---

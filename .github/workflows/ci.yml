@@ -44,6 +44,9 @@ jobs:
         run: cargo test -p davinci-agent --locked --lib process_manager::tests
       - name: Native supervisor ownership and public process contracts
         run: cargo test -p davinci-agent --locked --test process_supervisor --test process_manager
+      - name: Native Seatbelt enforcement and honest capability boundaries
+        if: runner.os == 'macOS'
+        run: cargo test -p davinci-agent --locked --test sandbox_seatbelt
       - name: Evidence artifact retrieval boundaries
         run: cargo test -p davinci-agent --locked --lib runtime::evidence_store
       - name: Graph process leases
