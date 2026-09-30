@@ -241,8 +241,16 @@ impl Agent {
     {
         self.ensure_session_persistence()?;
         self.recover_pending_operation_publications()?;
+        self.require_prompt_checkpoint_persistence()?;
         let result = self.run_loop_body(emit_prompt_messages, complete);
+        self.completion_context.clear();
+        self.invalidate_context_image();
+        let rewind_persistence = self.settle_prompt_checkpoint();
         let persistence = self.ensure_session_persistence();
+        if let Err(error) = rewind_persistence {
+            self.fail_turn(&error);
+            return Err(error);
+        }
         match (&result, persistence) {
             (_, Err(error)) => {
                 self.fail_turn(&error);
@@ -695,7 +703,12 @@ impl Agent {
                 })
                 .collect::<Vec<_>>();
 
-            if tool_calls.is_empty() {
+            // An interrupted answer skips the completion gates but still ends
+            // its turn normally (TurnEnd, verification notice).
+            if tool_calls.is_empty() && !self.abort_requested() {
+                if self.queue_requirement_completion(&mut events) {
+                    continue;
+                }
                 let capability_state = self.capability_run_state();
                 match crate::prompt::evaluate_completion(
                     &capability_state,
@@ -799,6 +812,10 @@ impl Agent {
                         }
                     }
                 }
+
+                if self.queue_completion_hook(&mut events) {
+                    continue;
+                }
             }
 
             let had_tools = !tool_calls.is_empty();
@@ -838,6 +855,10 @@ impl Agent {
             if let Some(runtime) = &self.runtime {
                 runtime.emit_turn_end(!self.abort_requested());
             }
+
+            // Inputs can arrive while the provider or a completion hook runs.
+            // Drain at the finish boundary as well as at the next request.
+            self.drain_remote_queues();
 
             if had_tools && !self.abort_requested() {
                 self.push_event(&mut events, AgentEvent::TurnStart);
@@ -957,12 +978,7 @@ impl Agent {
         new_messages: &mut Vec<ChatMessage>,
         steer: bool,
     ) {
-        for (kind, message) in self.remote.drain() {
-            match kind {
-                crate::QueueKind::Steer => self.queues.steer.push(message),
-                crate::QueueKind::FollowUp => self.queues.follow_up.push(message),
-            }
-        }
+        self.drain_remote_queues();
 
         let drained = if steer {
             let mode = self.queues.steer_mode;
@@ -1011,6 +1027,15 @@ impl Agent {
                     },
                 );
                 self.push_event(events, AgentEvent::MessageEnd { message });
+            }
+        }
+    }
+
+    fn drain_remote_queues(&mut self) {
+        for (kind, message) in self.remote.drain() {
+            match kind {
+                crate::QueueKind::Steer => self.queues.steer.push(message),
+                crate::QueueKind::FollowUp => self.queues.follow_up.push(message),
             }
         }
     }
@@ -2258,27 +2283,41 @@ impl Agent {
                     .unwrap_or_default();
 
                 let coordinated = crate::tools::is_coordinated_mutation(name);
-                let preimages: Vec<crate::runtime::checkpoints::FileCapture> =
-                    if mutating && !coordinated {
-                        if let Some(runtime) = &self.runtime {
-                            match targets
-                                .iter()
-                                .map(|target| runtime.blob_store.capture_file(task_id, cwd, target))
-                                .collect::<Result<Vec<_>, _>>()
-                            {
-                                Ok(captures) => captures,
-                                Err(error) => {
-                                    return self.tool_durability_failure(format!(
-                                        "File checkpoint failed before dispatch: {error}"
-                                    ))
-                                }
-                            }
-                        } else {
+                // Without a task contract the captures only serve prompt
+                // rewind, which degrades instead of refusing the edit.
+                let prompt_rewind_only = self.active_contract().is_none();
+                let preimages: Vec<crate::runtime::checkpoints::FileCapture> = if mutating
+                    && !coordinated
+                {
+                    match &self.runtime {
+                        Some(runtime)
+                            if prompt_rewind_only && runtime.prompt_rewind_fault().is_some() =>
+                        {
                             Vec::new()
                         }
-                    } else {
-                        Vec::new()
-                    };
+                        Some(runtime) => match targets
+                            .iter()
+                            .map(|target| runtime.blob_store.capture_file(task_id, cwd, target))
+                            .collect::<Result<Vec<_>, _>>()
+                        {
+                            Ok(captures) => captures,
+                            Err(error) if prompt_rewind_only && checkpoint_storage_full(&error) => {
+                                runtime.fail_prompt_rewind(format!(
+                                        "Rewind stopped recording because checkpoint storage is full: {error}"
+                                    ));
+                                Vec::new()
+                            }
+                            Err(error) => {
+                                return self.tool_durability_failure(format!(
+                                    "File checkpoint failed before dispatch: {error}"
+                                ))
+                            }
+                        },
+                        None => Vec::new(),
+                    }
+                } else {
+                    Vec::new()
+                };
 
                 // The tool sees the turn's abort flag so a long shell command
                 // or a `job_output` wait ends when the user interrupts.
@@ -2481,6 +2520,25 @@ impl Agent {
                                         }
                                     }
                                     if let Ok(mut effects) = runtime.effect_ledger.write() {
+                                        if runtime.prompt_effect_report_path.is_some()
+                                            && runtime.prompt_rewind_fault().is_none()
+                                        {
+                                            let before_bytes = effect
+                                                .before_blob
+                                                .as_deref()
+                                                .and_then(|hash| runtime.blob_store.get_blob(hash));
+                                            let after_bytes = effect
+                                                .after_blob
+                                                .as_deref()
+                                                .and_then(|hash| runtime.blob_store.get_blob(hash));
+                                            // A report failure stops rewind
+                                            // recording; the edit itself stands.
+                                            runtime.report_prompt_effect(
+                                                &effect,
+                                                before_bytes.as_deref(),
+                                                after_bytes.as_deref(),
+                                            );
+                                        }
                                         effects.push(effect);
                                     } else {
                                         executed = self.tool_durability_failure(
@@ -2488,6 +2546,13 @@ impl Agent {
                                                 .into(),
                                         );
                                     }
+                                }
+                                Err(error)
+                                    if prompt_rewind_only && checkpoint_storage_full(&error) =>
+                                {
+                                    runtime.fail_prompt_rewind(format!(
+                                        "Rewind stopped recording because checkpoint storage is full: {error}"
+                                    ));
                                 }
                                 Err(error) => {
                                     executed = self.tool_durability_failure(format!(
@@ -4319,7 +4384,11 @@ impl Agent {
                 custom_type: None,
                 extra: serde_json::Map::new(),
             });
-            if let Some(record) = native_responses_resume {
+            // Native tapes include exact request inputs. An ephemeral overlay
+            // must not enter saved session history through this second route.
+            if let Some(record) =
+                native_responses_resume.filter(|_| self.completion_context.is_empty())
+            {
                 if let Ok(data) = serde_json::to_value(record) {
                     let mut extra = serde_json::Map::new();
                     extra.insert("data".into(), data);
@@ -4521,6 +4590,12 @@ pub(crate) fn mutation_paths_from_tool(name: &str, args: &Value) -> Vec<PathBuf>
         }
     }
     paths
+}
+
+/// Checkpoint storage limits (per-blob size, per-task capacity) as opposed to
+/// failures reading or storing the target itself.
+fn checkpoint_storage_full(error: &crate::runtime::checkpoints::CheckpointError) -> bool {
+    error.is_storage_limit()
 }
 
 #[cfg(test)]

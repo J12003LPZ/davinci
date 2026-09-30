@@ -56,6 +56,12 @@ pub struct RuntimeBus {
     inner: Arc<RuntimeBusInner>,
 }
 
+impl std::fmt::Debug for RuntimeBus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RuntimeBus").finish_non_exhaustive()
+    }
+}
+
 impl RuntimeBus {
     pub fn new() -> Self {
         Self {
@@ -63,6 +69,19 @@ impl RuntimeBus {
                 subscribers: Mutex::new(Vec::new()),
             }),
         }
+    }
+
+    /// Auxiliary reads cannot bypass an installed runtime hook. An empty
+    /// internal bus carries rewind receipts but has no read-decision policy.
+    pub(crate) fn has_subscribers(&self) -> bool {
+        self.inner
+            .subscribers
+            .lock()
+            .map_or(true, |subscribers| !subscribers.is_empty())
+    }
+
+    pub(crate) fn shares_state_with(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.inner, &other.inner)
     }
 
     pub fn subscribe(&self, subscriber: Arc<dyn RuntimeSubscriber>) {

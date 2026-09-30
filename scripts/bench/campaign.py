@@ -27,7 +27,7 @@ def file_hash(path):
         return hashlib.file_digest(source, "sha256").hexdigest()
 
 
-def fixture_manifest(root, tasks):
+def fixture_manifest(root, tasks, *, exclude_generated=True):
     """Hash frozen bytes without loading private fixture contents into reports."""
     root = Path(root).resolve()
     members = {}
@@ -45,7 +45,7 @@ def fixture_manifest(root, tasks):
                 raise ValueError("linked fixture path")
             if path.is_file():
                 # Generated interpreter/cache files are never fixture inputs.
-                if any(part in ("__pycache__", ".pytest_cache", ".git")
+                if exclude_generated and any(part in ("__pycache__", ".pytest_cache", ".git")
                        for part in path.relative_to(directory).parts):
                     continue
                 files[path.relative_to(directory).as_posix()] = file_hash(path)
@@ -172,6 +172,14 @@ def manifest_errors(manifest, rows):
         for field, value in identity.items():
             if field not in row or row[field] != value:
                 errors.append("row differs from manifest identity: " + field)
+        for field in ("private_suite_digest", "price_table_hash"):
+            if field in manifest and row.get(field) != manifest[field]:
+                errors.append("row differs from manifest: " + field)
+        if "private_labels" in manifest:
+            labels = manifest["private_labels"].get(row.get("task"), {})
+            for field in ("size_class", "split", "language", "repository_id", "reference_commit", "visible_tests", "requires_existing_test_changes"):
+                if field not in labels or row.get(field) != labels[field]:
+                    errors.append("row differs from frozen private labels: " + field)
     return errors
 
 

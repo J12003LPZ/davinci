@@ -14,6 +14,9 @@ pub(super) enum Request {
     Configure {
         identity: ProcessIdentity,
         config: ProcessConfig,
+        /// Host-owned resource, never part of the public command config.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        private_temp: Option<std::path::PathBuf>,
     },
     Write {
         identity: ProcessIdentity,
@@ -52,6 +55,8 @@ pub(super) enum Event {
     Exit {
         identity: ProcessIdentity,
         code: Option<i32>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        signal: Option<i32>,
         output_complete: bool,
     },
     LaunchFailed {

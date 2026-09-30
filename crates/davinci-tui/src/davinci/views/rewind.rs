@@ -85,6 +85,7 @@ pub enum RewindModalOutcome {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RewindModalState {
+    pub conversation_checkpoint: bool,
     pub checkpoint_id: String,
     pub checkpoint_name: String,
     pub checkpoint_time: String,
@@ -107,6 +108,7 @@ impl RewindModalState {
         irreversible_effects: Vec<RewindIrreversibleSummary>,
     ) -> Self {
         Self {
+            conversation_checkpoint: false,
             checkpoint_id: checkpoint_id.into(),
             checkpoint_name: checkpoint_name.into(),
             checkpoint_time: checkpoint_time.into(),
@@ -120,7 +122,7 @@ impl RewindModalState {
     }
 
     pub fn can_confirm(&self) -> bool {
-        self.conflict_count == 0 && !self.is_selection_empty()
+        (!self.selection.code || self.conflict_count == 0) && !self.is_selection_empty()
     }
 
     pub fn is_selection_empty(&self) -> bool {
@@ -150,7 +152,11 @@ impl RewindModalState {
                 "toggle"
             }
             "toggle_tasks" => {
-                self.selection.task_state = !self.selection.task_state;
+                if self.conversation_checkpoint {
+                    self.selection.transcript = !self.selection.transcript;
+                } else {
+                    self.selection.task_state = !self.selection.task_state;
+                }
                 "toggle"
             }
             "toggle_transcript" => {
@@ -176,12 +182,26 @@ pub fn lines(state: &RewindModalState, width: u16, th: &Theme) -> Vec<Line<'stat
     body.extend(section_detail(inner, th, &checkpoint_header));
 
     body.extend(section_detail(inner, th, "--- Restore Domains ---"));
+    if state.conversation_checkpoint {
+        body.extend(section_detail(
+            inner,
+            th,
+            "Changes made through shell commands are not tracked and cannot be restored by rewind.",
+        ));
+    }
     let code_check = if state.selection.code { "[x]" } else { "[ ]" };
     body.push(section_row(
         inner,
         th,
         false,
-        &format!("{code_check} 1. Task-owned code changes"),
+        &format!(
+            "{code_check} 1. {} code changes",
+            if state.conversation_checkpoint {
+                "Prompt-owned"
+            } else {
+                "Task-owned"
+            }
+        ),
         "",
     ));
 
@@ -190,13 +210,15 @@ pub fn lines(state: &RewindModalState, width: u16, th: &Theme) -> Vec<Line<'stat
     } else {
         "[ ]"
     };
-    body.push(section_row(
-        inner,
-        th,
-        false,
-        &format!("{task_check} 2. Task execution state"),
-        "",
-    ));
+    if !state.conversation_checkpoint {
+        body.push(section_row(
+            inner,
+            th,
+            false,
+            &format!("{task_check} 2. Task execution state"),
+            "",
+        ));
+    }
 
     let transcript_check = if state.selection.transcript {
         "[x]"
@@ -207,7 +229,10 @@ pub fn lines(state: &RewindModalState, width: u16, th: &Theme) -> Vec<Line<'stat
         inner,
         th,
         false,
-        &format!("{transcript_check} 3. Conversation transcript"),
+        &format!(
+            "{transcript_check} {}. Conversation transcript",
+            if state.conversation_checkpoint { 2 } else { 3 }
+        ),
         "",
     ));
 
@@ -268,14 +293,28 @@ pub fn lines(state: &RewindModalState, width: u16, th: &Theme) -> Vec<Line<'stat
         &[
             confirm_hint,
             super::sheet::hint(th, "1/c code"),
-            super::sheet::hint(th, "2/t tasks"),
+            super::sheet::hint(
+                th,
+                if state.conversation_checkpoint {
+                    "2/t conversation"
+                } else {
+                    "2/t tasks"
+                },
+            ),
             super::sheet::hint(th, "3/s transcript"),
         ],
         Some("esc cancel"),
         th,
     ));
 
-    let title_span = span("Rewind Task", th.primary);
+    let title_span = span(
+        if state.conversation_checkpoint {
+            "Rewind Prompt"
+        } else {
+            "Rewind Task"
+        },
+        th.primary,
+    );
     Surface::section(width, th)
         .inset(inset)
         .title(vec![title_span])
@@ -404,5 +443,67 @@ mod tests {
         assert!(!state.selection.task_state);
 
         assert_eq!(composer_buffer, "my unfinished prompt in composer");
+    }
+}
+
+#[cfg(test)]
+mod prompt_tests {
+    use super::*;
+
+    #[test]
+    fn prompt_rewind_conflict_blocks_code_but_allows_conversation_and_discloses_shell_limit() {
+        let mut state = RewindModalState::new(
+            "prompt",
+            "recent user prompt",
+            "before prompt",
+            "digest",
+            vec![],
+            1,
+            vec![],
+        );
+        state.conversation_checkpoint = true;
+        state.selection = RewindDomainSelection {
+            code: true,
+            task_state: false,
+            transcript: true,
+        };
+        assert!(!state.can_confirm());
+        assert_eq!(state.handle_key("enter"), "blocked");
+        state.handle_key("1");
+        assert!(state.can_confirm());
+        let th = Theme::da_vinci(crate::davinci::theme::ColorDepth::TrueColor, false);
+        let text = lines(&state, 140, &th)
+            .iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(text.contains("shell commands are not tracked"), "{text}");
+        assert!(!text.contains("Task execution state"));
+        assert!(text.contains("2. Conversation transcript"));
+        assert_eq!(state.handle_key("enter"), "confirm");
+        let Some(RewindModalOutcome::Confirmed { selection, .. }) = state.outcome else {
+            panic!("expected confirmation");
+        };
+        assert!(!selection.code);
+        assert!(selection.transcript);
+        assert!(!selection.task_state);
+    }
+
+    #[test]
+    fn prompt_rewind_conversation_toggle_never_enables_task_state() {
+        let mut state =
+            RewindModalState::new("prompt", "prompt", "now", "digest", vec![], 0, vec![]);
+        state.conversation_checkpoint = true;
+        state.selection = RewindDomainSelection {
+            code: false,
+            task_state: false,
+            transcript: true,
+        };
+        state.handle_key("2");
+        assert!(!state.selection.transcript);
+        assert!(!state.selection.task_state);
+        assert!(!state.can_confirm());
+        state.handle_key("2");
+        assert!(state.can_confirm());
     }
 }

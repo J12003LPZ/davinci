@@ -118,7 +118,7 @@ The helper must never ask the LLM whether a syscall/path/host is allowed. It onl
 Types live in `davinci-protocol` so control-plane and execution-plane code share one representation without ad-hoc JSON:
 
 - `SandboxMode::{NoExecution, Restricted, WorkspaceWrite, FullAccess}`
-- `SandboxBackendKind::{Auto, LinuxBubblewrap, Container, Host}`
+- `SandboxBackendKind::{Auto, LinuxBubblewrap, MacosSeatbelt, Container, Host}`
 - `SandboxLifecycle::{Created, Ready, Running, Stopping, Stopped, Failed}`
 - `SandboxId` / `SandboxReceipt`
 - `SandboxSpec`
@@ -320,7 +320,7 @@ Existing Job Object behavior remains useful for process-tree ownership. It is no
 
 ### macOS
 
-Do not silently map application filtering to an OS sandbox. Until a tested backend provides required filesystem/network controls, restricted/workspace-write fail closed or use the optional container backend. Host full access remains explicit.
+The partial Seatbelt backend converts typed policy into a deny-default kernel profile through `/usr/bin/sandbox-exec`. Host paths remain at their canonical locations: relocated mounts and unsupported capabilities fail closed. Seatbelt cannot mediate `setsid`/`setpgid`; the current Unix supervisor cannot own detached descendants. Process-tree isolation, deterministic teardown, tree timeouts, and lifetime-private temp are not advertised. Session policies require these properties and cannot launch through Seatbelt; native Auto remains disabled. Required macOS CI fixtures test reduced-capability filesystem/network/environment policies and this ownership gap. Memory/PID/CPU/temp-size budgets, network allowlists and ephemeral roots remain unsupported. See `docs/sandbox.md` for the limits and unfinished Phase 4 acceptance requirements.
 
 ## Capability negotiation
 

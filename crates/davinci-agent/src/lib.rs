@@ -14,6 +14,7 @@ mod batch;
 mod branch;
 pub mod command_receipt;
 mod compaction;
+mod completion;
 mod context;
 pub mod context_usage;
 mod edit_diff;
@@ -72,6 +73,7 @@ pub use compaction::{
     SUMMARIZATION_PROMPT, SUMMARIZATION_SYSTEM_PROMPT, TURN_PREFIX_SUMMARIZATION_PROMPT,
     UPDATE_SUMMARIZATION_PROMPT,
 };
+pub use completion::{CompletionHook, COMPLETION_REMINDER_FIELD};
 pub use context::{
     load_context_files, load_context_files_for_targets, ContextBudgetReport, ContextContribution,
     ContextFile, ContextPriority, RootContextAccount, SelectedRootContext,
@@ -408,6 +410,40 @@ impl ToolSurface {
     }
 }
 
+/// Trusted host callback applied while idle before a permission mode changes.
+pub type PermissionModeChangeCallback = dyn Fn(PermissionMode, &mut ToolContext) + Send + Sync;
+
+#[derive(Clone)]
+struct PermissionModeChangeHook(Arc<PermissionModeChangeCallback>);
+impl std::fmt::Debug for PermissionModeChangeHook {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("PermissionModeChangeHook")
+    }
+}
+
+/// Return the reason a host cannot safely establish its future Auto boundary.
+pub type AutoSandboxGuardCallback = dyn Fn() -> Option<String> + Send + Sync;
+
+#[derive(Clone)]
+struct AutoSandboxGuard(Arc<AutoSandboxGuardCallback>);
+impl std::fmt::Debug for AutoSandboxGuard {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("AutoSandboxGuard")
+    }
+}
+
+/// Resolve the host's Auto sandbox default when it is first needed.
+pub type AutoSandboxResolver =
+    dyn Fn() -> Result<Option<davinci_protocol::SandboxSpec>, String> + Send + Sync;
+
+#[derive(Clone)]
+struct AutoSandboxResolverHandle(Arc<AutoSandboxResolver>);
+impl std::fmt::Debug for AutoSandboxResolverHandle {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("AutoSandboxResolver")
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Agent {
     pub system_prompt: String,
@@ -423,6 +459,8 @@ pub struct Agent {
     pub tool_surface: ToolSurface,
     /// Repeat the last verification call after later mutations at completion.
     pub auto_verify: bool,
+    /// Host A/B control; leaves Stable instructions and the tool schema frozen.
+    pub requirement_review_enabled: bool,
     /// Attach the files a user request names to that turn's appended harness
     /// context (`prompt::named_files`). Settings `namedFileContext`,
     /// environment `DAVINCI_NAMED_FILES`.
@@ -458,6 +496,7 @@ pub struct Agent {
     pub templates: Vec<PromptTemplate>,
     pub context_files: Vec<ContextFile>,
     pub session: Option<JsonlSession>,
+    pub(crate) prompt_rewind: runtime::rewind::PromptRewindState,
     pub cwd: PathBuf,
     pub aborted: bool,
     pub is_streaming: bool,
@@ -468,6 +507,8 @@ pub struct Agent {
     pub custom_tool_executor: Option<CustomToolExecutor>,
     pub pre_tool: Option<PreToolHook>,
     pub post_tool: Option<PostToolHook>,
+    /// Trusted host callback at attempted completion; bool is stop_hook_active.
+    pub completion_hook: Option<CompletionHook>,
     /// Which tools may run without asking (`permission.rs`). Shared, because
     /// the gate reads it from `&self` on the tool thread while the host reads
     /// the mode for its chrome, and a granted rule is written back mid-turn.
@@ -531,6 +572,12 @@ pub struct Agent {
     base_system_prompt: String,
     /// Return target for /act, not another active mode.
     previous_execution_mode: Option<PermissionMode>,
+    auto_sandbox: Option<davinci_protocol::SandboxSpec>,
+    auto_sandbox_resolver: Option<AutoSandboxResolverHandle>,
+    auto_sandbox_unavailable_reason: Option<String>,
+    auto_sandbox_guard: Option<AutoSandboxGuard>,
+    /// Host fence updates happen while idle, before the next approval.
+    permission_mode_change_hook: Option<PermissionModeChangeHook>,
     /// Historical snapshot for a bounded revision diff, never an active plan.
     previous_plan_revision: Option<LivingPlan>,
     /// Whether the host has registered a backend capable of visual verification.
@@ -543,6 +590,9 @@ pub struct Agent {
     capability_run_state: Arc<Mutex<prompt::CapabilityRunState>>,
     /// Mutation generations and verification evidence for the current run.
     mutation_verification: Arc<Mutex<MutationVerificationState>>,
+    completion_state: Arc<Mutex<completion::CompletionState>>,
+    /// Bounded request suffix; never session/WAL history or compaction input.
+    completion_context: Vec<completion::CompletionContextMessage>,
     pending_transaction_verification:
         Arc<Mutex<std::collections::BTreeMap<String, Vec<transaction_verification::Pending>>>>,
     /// Bounded actual command evidence, populated only by built-in execution.
@@ -576,6 +626,9 @@ pub struct Agent {
     pub last_prepared_manifest: Option<runtime::context_manifest::PreparedContextManifest>,
     /// Optional shared runtime handle for versioned lifecycle events and coordination.
     pub runtime: Option<RuntimeHandle>,
+    /// The bus created solely for prompt checkpoints. Host-bound runtimes
+    /// retain the conservative automatic-read fence, even before subscription.
+    pub(crate) prompt_checkpoint_bus: Option<(Arc<()>, RuntimeBus)>,
     /// Optional additive decision-intelligence runtime. It is deliberately
     /// separate from deterministic routing and remains disabled by default.
     pub decision_runtime: Option<Arc<decision::DecisionRuntime>>,
@@ -620,6 +673,7 @@ impl Agent {
             decision_advice_key: None,
             tool_surface: ToolSurface::default(),
             auto_verify: true,
+            requirement_review_enabled: true,
             named_file_context: !matches!(
                 std::env::var("DAVINCI_NAMED_FILES").ok().as_deref(),
                 Some("0" | "false" | "off")
@@ -650,6 +704,7 @@ impl Agent {
             templates: Vec::new(),
             context_files: Vec::new(),
             session: None,
+            prompt_rewind: runtime::rewind::PromptRewindState::default(),
             cwd: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
             aborted: false,
             is_streaming: false,
@@ -661,6 +716,7 @@ impl Agent {
             custom_tool_executor: None,
             pre_tool: None,
             post_tool: None,
+            completion_hook: None,
             permissions: Arc::new(PermissionState::new(PermissionPolicy::default())),
             approver: None,
             approval_responder: None,
@@ -692,6 +748,11 @@ impl Agent {
             pruned_evidence: std::collections::HashMap::new(),
             base_system_prompt: system_prompt,
             previous_execution_mode: None,
+            auto_sandbox: None,
+            auto_sandbox_resolver: None,
+            auto_sandbox_unavailable_reason: None,
+            auto_sandbox_guard: None,
+            permission_mode_change_hook: None,
             previous_plan_revision: None,
             visual_verification_available: false,
             runtime_environment: None,
@@ -700,6 +761,8 @@ impl Agent {
             last_verification_notice: None,
             capability_run_state: Arc::new(Mutex::new(prompt::CapabilityRunState::default())),
             mutation_verification: Arc::new(Mutex::new(MutationVerificationState::default())),
+            completion_state: Arc::new(Mutex::new(completion::CompletionState::default())),
+            completion_context: Vec::new(),
             pending_transaction_verification: Arc::new(Mutex::new(
                 std::collections::BTreeMap::new(),
             )),
@@ -722,6 +785,7 @@ impl Agent {
             provider_system_prompt_suffix: None,
             last_prepared_manifest: None,
             runtime: None,
+            prompt_checkpoint_bus: None,
             decision_runtime: None,
             runtime_session: None,
         };
@@ -765,7 +829,20 @@ impl Agent {
     }
 
     pub fn set_runtime(&mut self, mut runtime: RuntimeHandle) {
+        self.prompt_checkpoint_bus = None;
         runtime.ensure_conversation_identity_current();
+        let rewind_binding = self.prompt_rewind_binding();
+        if self.prompt_rewind.binding == rewind_binding {
+            if let Some(previous) = &self.runtime {
+                runtime.blob_store = previous.blob_store.clone();
+                runtime.effect_ledger = previous.effect_ledger.clone();
+                runtime.prompt_rewind_fault = previous.prompt_rewind_fault.clone();
+            }
+        }
+        runtime.prompt_effect_report_path = self
+            .session
+            .as_ref()
+            .map(|session| session.path.with_extension("rewind-effects.jsonl"));
         // One Context VM per conversation. Hosts build a fresh handle for each
         // prompt; the derived state, metrics and diagnostics of the handle it
         // replaces carry over while the bound session is unchanged.
@@ -817,6 +894,19 @@ impl Agent {
             }
         }
         self.runtime = Some(runtime);
+    }
+
+    pub(crate) fn runtime_requires_file_capture_guard(&self) -> bool {
+        self.runtime.as_ref().is_some_and(|runtime| {
+            !self
+                .prompt_checkpoint_bus
+                .as_ref()
+                .is_some_and(|(identity, bus)| {
+                    Arc::ptr_eq(identity, &runtime.file_capture_identity())
+                        && bus.shares_state_with(&runtime.bus)
+                })
+                || runtime.bus.has_subscribers()
+        })
     }
 
     pub fn with_runtime(mut self, runtime: RuntimeHandle) -> Self {
@@ -1127,6 +1217,11 @@ impl Agent {
     }
 
     pub(crate) fn record_successful_mutation_paths(&self, paths: Vec<PathBuf>) {
+        self.completion_state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .mutations
+            .extend(paths.iter().cloned());
         let mut state = self
             .mutation_verification
             .lock()
@@ -1344,9 +1439,98 @@ impl Agent {
         self.is_plan_mode()
     }
 
+    /// Update trusted host process boundaries while idle, before approval.
+    pub fn set_permission_mode_change_hook(&mut self, hook: Arc<PermissionModeChangeCallback>) {
+        self.permission_mode_change_hook = Some(PermissionModeChangeHook(hook));
+    }
+
+    /// Install a probed host default, preserving every explicit sandbox policy.
+    /// Entry through /permissions, mode cycling, RPC, or plan exit shares this
+    /// activation point. Once activated, it persists for the session.
+    pub fn configure_auto_sandbox(&mut self, candidate: Option<davinci_protocol::SandboxSpec>) {
+        self.auto_sandbox = candidate;
+        self.auto_sandbox_unavailable_reason = None;
+        self.activate_auto_sandbox(self.permission_mode());
+    }
+
+    /// Like [`Self::configure_auto_sandbox`], but the candidate (which may
+    /// probe a native backend) is resolved on the first switch to Auto.
+    pub fn configure_auto_sandbox_lazy(&mut self, resolve: Arc<AutoSandboxResolver>) {
+        self.auto_sandbox = None;
+        self.auto_sandbox_unavailable_reason = None;
+        self.auto_sandbox_resolver = Some(AutoSandboxResolverHandle(resolve));
+        self.activate_auto_sandbox(self.permission_mode());
+    }
+
+    pub fn set_auto_sandbox_activation_guard(&mut self, guard: Arc<AutoSandboxGuardCallback>) {
+        self.auto_sandbox_guard = Some(AutoSandboxGuard(guard));
+    }
+
+    /// A host cannot reconcile already-running unowned execution by replacing
+    /// its handles. Retain approval behavior and explain the missing boundary.
+    pub fn disable_auto_sandbox(&mut self, reason: impl Into<String>) {
+        self.auto_sandbox = None;
+        self.auto_sandbox_resolver = None;
+        if self.tool_context.sandbox.is_none() {
+            self.auto_sandbox_unavailable_reason = Some(reason.into());
+        }
+    }
+
+    /// Withdraw the Auto default, if the host has one, for `reason`. A lazily
+    /// resolved default is withdrawn only if resolving would produce one, so
+    /// hosts without a capable backend keep their existing status.
+    pub fn withdraw_auto_sandbox(&mut self, reason: impl Into<String>) {
+        let reason = reason.into();
+        if let Some(resolver) = self.auto_sandbox_resolver.take() {
+            self.auto_sandbox_resolver =
+                Some(AutoSandboxResolverHandle(Arc::new(
+                    move || match (resolver.0)()? {
+                        Some(_) => Err(reason.clone()),
+                        None => Ok(None),
+                    },
+                )));
+        } else if self.auto_sandbox.is_some() {
+            self.disable_auto_sandbox(reason);
+        }
+    }
+
+    pub fn auto_sandbox_unavailable_reason(&self) -> Option<&str> {
+        self.auto_sandbox_unavailable_reason.as_deref()
+    }
+
+    fn activate_auto_sandbox(&mut self, mode: PermissionMode) {
+        if mode == PermissionMode::Auto && self.tool_context.sandbox.is_none() {
+            if let Some(resolver) = self.auto_sandbox_resolver.take() {
+                match (resolver.0)() {
+                    Ok(candidate) => self.auto_sandbox = candidate,
+                    Err(reason) => self.auto_sandbox_unavailable_reason = Some(reason),
+                }
+            }
+        }
+        if mode == PermissionMode::Auto
+            && self.tool_context.sandbox.is_none()
+            && self.auto_sandbox.is_some()
+        {
+            let blocker = self
+                .auto_sandbox_guard
+                .as_ref()
+                .and_then(|guard| (guard.0)());
+            if let Some(reason) = blocker {
+                self.auto_sandbox_unavailable_reason = Some(reason);
+            } else {
+                self.tool_context.sandbox = self.auto_sandbox.clone();
+                self.auto_sandbox_unavailable_reason = None;
+            }
+        }
+        if let Some(hook) = &self.permission_mode_change_hook {
+            (hook.0)(mode, &mut self.tool_context);
+        }
+    }
+
     /// Hosts call this while idle, before another tool can be approved.
     pub fn set_permission_mode(&mut self, mode: PermissionMode) {
         let previous = self.permission_mode();
+        self.activate_auto_sandbox(mode);
         if previous != mode {
             if mode == PermissionMode::ReadOnly {
                 self.previous_execution_mode = Some(previous);
@@ -1725,6 +1909,7 @@ impl Agent {
         text: &str,
         images: &[davinci_ai::MessageContent],
     ) -> ChatMessage {
+        self.begin_completion_prompt(text);
         self.clear_turn_decision();
         let message = self.prompt_with_origin(text, images, true);
         self.delegation_forbidden =
@@ -1769,6 +1954,7 @@ impl Agent {
         if self.auto_resize_images {
             content = crate::normalize_tool_result_images(&content, true);
         }
+        let rewind_start = real_user_origin.then(|| self.begin_prompt_checkpoint(text));
         let mut message = ChatMessage {
             role: "user".into(),
             content,
@@ -1786,6 +1972,9 @@ impl Agent {
                 serde_json::to_value(&message.content).unwrap_or(Value::Null),
                 &message.extra,
             ));
+        }
+        if let Some(checkpoint) = rewind_start {
+            self.record_prompt_checkpoint(checkpoint);
         }
         self.pending_prompt_messages.push(message.clone());
         message
@@ -1814,21 +2003,36 @@ impl Agent {
             && self.pruned_tool_results.is_empty()
             && plan_context.is_none()
         {
-            return convert_to_llm_for_provider(&self.messages, self.block_images);
+            return completion::coalesce_completion_user_messages(convert_to_llm_for_provider(
+                &self.completion_provider_history(&self.messages),
+                self.block_images,
+            ));
         }
-        let mut messages = self.project_with_evidence();
+        let mut messages = self.completion_provider_history(&self.project_with_evidence());
         if ephemeral_context.is_empty() && plan_context.is_none() {
-            return convert_to_llm_for_provider(&messages, self.block_images);
+            return completion::coalesce_completion_user_messages(convert_to_llm_for_provider(
+                &messages,
+                self.block_images,
+            ));
         }
         let insertion = messages
             .iter()
-            .rposition(|message| message.role == "user")
+            .rposition(|message| {
+                message.role == "user"
+                    && !message.extra_bool("davinciCompletionOverlay")
+                    && !message
+                        .extra
+                        .contains_key(completion::COMPLETION_REMINDER_FIELD)
+            })
             .unwrap_or(messages.len());
         messages.splice(
             insertion..insertion,
             plan_context.into_iter().chain(ephemeral_context),
         );
-        convert_to_llm_for_provider(&messages, self.block_images)
+        completion::coalesce_completion_user_messages(convert_to_llm_for_provider(
+            &messages,
+            self.block_images,
+        ))
     }
 
     #[doc(hidden)]
@@ -1880,10 +2084,16 @@ impl Agent {
             .iter()
             .map(provider_budget::message_token_ceiling)
             .fold(0u64, u64::saturating_add);
-        if budget.reserved().saturating_add(live_tokens) >= budget.window {
+        let completion_tokens = self
+            .completion_context
+            .iter()
+            .map(|overlay| provider_budget::message_token_ceiling(&overlay.message))
+            .fold(0u64, u64::saturating_add);
+        let transient_tokens = live_tokens.saturating_add(completion_tokens);
+        if budget.reserved().saturating_add(transient_tokens) >= budget.window {
             return Err(runtime::context_vm::CONTEXT_BUDGET_EXCEEDED.into());
         }
-        let max_tokens = budget.working_set_budget().saturating_sub(live_tokens);
+        let max_tokens = budget.working_set_budget().saturating_sub(transient_tokens);
         let direct_tokens = items.iter().map(|item| item.estimated_tokens).sum::<u64>();
         let goal = self
             .last_real_user_request
@@ -1942,6 +2152,7 @@ impl Agent {
         }
         image.messages.extend(live);
         image.estimated_tokens = image.estimated_tokens.saturating_add(live_tokens);
+        self.apply_completion_context_to_image(&mut image)?;
         Ok(image)
     }
 
@@ -2148,6 +2359,11 @@ impl Agent {
                 .unwrap_or(0)
             + (self.provider_system_prompt().len() as u64).div_ceil(4)
             + self.estimated_tool_schema_tokens()
+            + self
+                .completion_context
+                .iter()
+                .map(|overlay| compaction::estimate_tokens(&overlay.message))
+                .sum::<u64>()
     }
 
     /// Tool schemas on the same four-bytes-a-token scale as the rest of
@@ -3537,7 +3753,9 @@ impl Agent {
             }
         }
         if result.compacted {
+            let previous_len = self.messages.len();
             self.messages = result.messages.clone();
+            self.reindex_completion_context_after_compaction(previous_len);
         }
         let estimated_after = self.estimated_context_tokens();
         if let Some(runtime) = &self.runtime {
@@ -3635,6 +3853,9 @@ impl Agent {
                     )
                 })?;
         }
+        // Unusable rewind data drops earlier checkpoints with a notice; it
+        // never keeps the conversation itself from opening.
+        let rewind = runtime::rewind::prepare_prompt_rewind_or_reset(&session);
         let messages = messages_from_session(&session);
         if session_changed {
             self.runtime_environment = None;
@@ -3653,6 +3874,7 @@ impl Agent {
         self.session = Some(session);
         self.tool_ledger = Arc::new(std::sync::Mutex::new(candidate_ledger));
         self.set_runtime(candidate);
+        self.install_prompt_checkpoints(rewind);
         self.restore_living_plan();
         let _ = self.restore_prompt_session();
         Ok(())
@@ -3822,6 +4044,7 @@ impl Agent {
         if let Some(session) = &self.session {
             self.messages = messages_from_session(session);
         }
+        self.restore_prompt_checkpoints()?;
         self.restore_plan()?;
         Ok(TreeNavigateResult {
             cancelled: false,

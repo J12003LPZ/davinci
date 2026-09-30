@@ -39,6 +39,7 @@ const MAX_DIAGNOSTICS: usize = 50;
 #[derive(Debug, Clone)]
 pub struct LearningController {
     pub config: LearningConfig,
+    pub background_usage: super::background_usage::Counter,
     pub project_store: LearningStore,
     pub global_store: LearningStore,
     pub stats: LearningStats,
@@ -208,6 +209,7 @@ impl LearningController {
             completed_reviews: Arc::new(Mutex::new(Vec::new())),
             last_live_review_ms: 0,
             review_runner: None,
+            background_usage: Default::default(),
         }
     }
 
@@ -391,7 +393,8 @@ impl LearningController {
             return None;
         }
         spec.existing_skills = self.learned_skill_summaries();
-        let run = ReviewRun::new(format!("rev-{}-{}", evidence.turn, now));
+        let mut run = ReviewRun::new(format!("rev-{}-{}", evidence.turn, now));
+        run.usage = self.background_usage.clone();
         let run_id = run.id.clone();
         self.live_review = Some(run.clone());
         self.last_live_review_ms = now;
@@ -916,13 +919,17 @@ impl LearningController {
     }
 
     fn auto_promote_version_if_threshold_met(&mut self, skill: &SkillVersionRef) -> bool {
+        if !self.config.enabled || self.config.shadow_mode {
+            return false;
+        }
         let mut promoted = false;
         if let Some(mut record) = self
             .project_store
             .skill_version(&skill.name, skill.version)
             .cloned()
         {
-            if record.content_hash == skill.content_hash
+            if self.config.auto_apply_project
+                && record.content_hash == skill.content_hash
                 && record.status != ArtifactStatus::Active
                 && verified_use_threshold_met(&record, &self.config)
             {
@@ -936,7 +943,8 @@ impl LearningController {
             .skill_version(&skill.name, skill.version)
             .cloned()
         {
-            if record.content_hash == skill.content_hash
+            if self.config.auto_apply_global
+                && record.content_hash == skill.content_hash
                 && record.status != ArtifactStatus::Active
                 && verified_use_threshold_met(&record, &self.config)
             {
@@ -972,6 +980,9 @@ impl LearningController {
             .count();
         json!({
             "enabled": self.config.enabled,
+            "backgroundReview": self.config.background_review,
+            "autoApplyProject": self.config.auto_apply_project,
+            "autoApplyGlobal": self.config.auto_apply_global,
             "shadowMode": self.config.shadow_mode,
             "activeReview": self.active_review.as_ref().map(|r| !r.is_finished()).unwrap_or(false)
                 || self.live_review_running(),
@@ -1542,6 +1553,7 @@ mod tests {
         let _lock = E2E_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let dir = tempdir().unwrap();
         let config = LearningConfig {
+            background_review: true,
             shadow_mode: true,
             auto_apply_project: false,
             ..Default::default()
@@ -1606,8 +1618,8 @@ mod tests {
         let _lock = E2E_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let dir = tempdir().unwrap();
         let config = LearningConfig {
-            enabled: true,
             background_review: true,
+            enabled: true,
             shadow_mode: false,
             auto_apply_project: true,
             auto_apply_global: false,
@@ -1670,8 +1682,8 @@ mod tests {
         let _lock = E2E_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let dir = tempdir().unwrap();
         let config = LearningConfig {
-            enabled: true,
             background_review: true,
+            enabled: true,
             shadow_mode: false,
             auto_apply_project: true,
             auto_apply_global: false,
@@ -1857,6 +1869,7 @@ mod tests {
 
         let dir = tempdir().unwrap();
         let config = LearningConfig {
+            background_review: true,
             shadow_mode: false,
             auto_apply_project: true,
             ..Default::default()
@@ -1919,6 +1932,7 @@ mod tests {
 
         let dir = tempdir().unwrap();
         let config = LearningConfig {
+            background_review: true,
             shadow_mode: false,
             auto_apply_project: true,
             ..Default::default()
@@ -2038,7 +2052,11 @@ mod tests {
     #[test]
     fn test_auto_promote_skill_on_verified_use() {
         let dir = tempdir().unwrap();
-        let mut controller = LearningController::new(dir.path(), None, None);
+        let config = LearningConfig {
+            auto_apply_project: true,
+            ..Default::default()
+        };
+        let mut controller = LearningController::new(dir.path(), None, Some(config));
         let skill_record = SkillLedgerRecord {
             skill_id: "candidate-skill".into(),
             name: "auto-test".into(),
@@ -2077,6 +2095,69 @@ mod tests {
         assert!(notifs
             .iter()
             .any(|n| n.contains("auto-promoted after verified uses")));
+    }
+
+    #[test]
+    fn verified_use_threshold_cannot_bypass_default_project_or_global_approval() {
+        let dir = tempdir().unwrap();
+        let mut controller = LearningController::new(dir.path(), Some(dir.path()), None);
+        let record = SkillLedgerRecord {
+            skill_id: "needs-approval".into(),
+            name: "needs-approval".into(),
+            scope: LearningScope::Project,
+            origin: SkillOrigin::LearnedReview,
+            status: ArtifactStatus::Candidate,
+            path: dir.path().join("SKILL.md"),
+            content_hash: "hash".into(),
+            version: 1,
+            success_count: 2,
+            failure_count: 0,
+            neutral_count: 0,
+            last_used_at_ms: None,
+            created_at_ms: 1,
+            updated_at_ms: 1,
+            applicability: Default::default(),
+            pinned: false,
+        };
+        controller
+            .project_store
+            .upsert_skill(record.clone())
+            .unwrap();
+        let mut global = record;
+        global.scope = LearningScope::Global;
+        controller.global_store.upsert_skill(global).unwrap();
+        let version = SkillVersionRef {
+            name: "needs-approval".into(),
+            version: 1,
+            content_hash: "hash".into(),
+        };
+        assert!(!controller.auto_promote_version_if_threshold_met(&version));
+        assert_eq!(
+            controller
+                .project_store
+                .skill("needs-approval")
+                .unwrap()
+                .status,
+            ArtifactStatus::Candidate
+        );
+        assert_eq!(
+            controller
+                .global_store
+                .skill("needs-approval")
+                .unwrap()
+                .status,
+            ArtifactStatus::Candidate
+        );
+        controller.config.auto_apply_project = true;
+        assert!(controller.auto_promote_version_if_threshold_met(&version));
+        assert_eq!(
+            controller
+                .global_store
+                .skill("needs-approval")
+                .unwrap()
+                .status,
+            ArtifactStatus::Candidate
+        );
     }
 
     #[test]
@@ -2197,8 +2278,8 @@ mod tests {
         let _guard = TEST_LOCK.lock().unwrap();
         let dir = tempdir().unwrap();
         let config = LearningConfig {
-            enabled: true,
             background_review: true,
+            enabled: true,
             shadow_mode: false,
             auto_apply_project: true,
             ..Default::default()
@@ -2317,7 +2398,13 @@ mod tests {
         std::env::remove_var("PI_LEARNING_REVIEW_FIXTURE");
         let project = tempdir().unwrap();
         let agent = tempdir().unwrap();
-        let mut controller = LearningController::new(project.path(), Some(agent.path()), None);
+        let config = LearningConfig {
+            background_review: true,
+            auto_apply_project: true,
+            ..Default::default()
+        };
+        let mut controller =
+            LearningController::new(project.path(), Some(agent.path()), Some(config));
         // An untrusted project: learned skills still apply, because they live
         // in the agent directory, not in the repository.
         controller.set_project_trusted(false);
@@ -2376,6 +2463,21 @@ mod tests {
         controller.review_settled_turn(verified_evidence(2));
         assert!(!controller.live_review_running());
         assert!(controller.project_store.candidates().is_empty());
+    }
+
+    #[test]
+    fn default_learning_never_dispatches_a_configured_live_reviewer() {
+        let dir = tempdir().unwrap();
+        let mut controller = LearningController::new(dir.path(), Some(dir.path()), None);
+        controller.set_live_reviewer(dir.path(), Some("fixture/no-paid-call".into()));
+        controller.review_runner = Some(ReviewRunner(Arc::new(|_, _, _, _| {
+            panic!("default must not dispatch")
+        })));
+        assert!(controller
+            .review_settled_turn(verified_evidence(2))
+            .is_none());
+        assert_eq!(controller.stats.reviews_started, 0);
+        assert!(!controller.live_review_running());
     }
 
     #[test]

@@ -6,6 +6,12 @@ use serde_json::Value;
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub enum AgentEvent {
+    /// Reason-only telemetry for an ephemeral completion continuation.
+    #[serde(rename = "completion_reminder")]
+    CompletionReminder { reason_code: String },
+    /// Host display metadata; never a model answer or saved chat message.
+    #[serde(rename = "completion_notice")]
+    CompletionNotice { reason_code: String, text: String },
     /// Harness display metadata; never an assistant message or provider input.
     #[serde(rename = "verification_notice")]
     VerificationNotice {
@@ -117,6 +123,8 @@ pub enum AgentEvent {
 impl AgentEvent {
     pub fn kind(&self) -> &'static str {
         match self {
+            Self::CompletionReminder { .. } => "completion_reminder",
+            Self::CompletionNotice { .. } => "completion_notice",
             Self::VerificationNotice { .. } => "verification_notice",
             Self::MutationObservation { .. } => "mutation_observation",
             Self::ProviderObservation { .. } => "provider_observation",

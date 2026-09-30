@@ -45,6 +45,10 @@ pub struct RpcCommand {
     pub session_path: Option<String>,
     #[serde(rename = "entryId", default)]
     pub entry_id: Option<String>,
+    #[serde(rename = "checkpointId", default)]
+    pub checkpoint_id: Option<String>,
+    #[serde(rename = "previewDigest", default)]
+    pub preview_digest: Option<String>,
     #[serde(rename = "outputPath", default)]
     pub output_path: Option<String>,
     #[serde(default)]
@@ -592,6 +596,74 @@ pub fn handle_rpc(runtime: &mut RpcRuntime, command: RpcCommand) -> RpcResponse 
             ),
             Err(err) => fail(id, &kind, err),
         },
+        "get_rewind_checkpoints" => ok(
+            id,
+            &kind,
+            Some(serde_json::json!({
+                "checkpoints": runtime.agent.prompt_checkpoints(),
+                "notice": runtime.agent.prompt_rewind_notice(),
+                "limitation": davinci_agent::runtime::rewind::SHELL_REWIND_LIMITATION,
+            })),
+        ),
+        "rewind_preview" => {
+            let Some(checkpoint) = command.checkpoint_id.as_deref() else {
+                return fail(id, &kind, "checkpointId is required".into());
+            };
+            match runtime.agent.preview_prompt_rewind(checkpoint) {
+                Ok(preview) => ok(
+                    id,
+                    &kind,
+                    Some(serde_json::json!({
+                        "preview": preview,
+                        "notice": runtime.agent.prompt_rewind_notice(),
+                        "limitation": davinci_agent::runtime::rewind::SHELL_REWIND_LIMITATION,
+                    })),
+                ),
+                Err(error) => fail(id, &kind, error),
+            }
+        }
+        "rewind_apply" => {
+            let (Some(checkpoint), Some(digest)) = (
+                command.checkpoint_id.as_deref(),
+                command.preview_digest.as_deref(),
+            ) else {
+                return fail(
+                    id,
+                    &kind,
+                    "checkpointId and previewDigest are required".into(),
+                );
+            };
+            let selection = match command.mode.as_deref() {
+                Some("code") => davinci_agent::runtime::rewind::RewindSelection {
+                    code: true,
+                    task_state: false,
+                    transcript: false,
+                },
+                Some("conversation") => davinci_agent::runtime::rewind::RewindSelection {
+                    code: false,
+                    task_state: false,
+                    transcript: true,
+                },
+                Some("both") => davinci_agent::runtime::rewind::RewindSelection {
+                    code: true,
+                    task_state: false,
+                    transcript: true,
+                },
+                _ => return fail(id, &kind, "mode must be code, conversation, or both".into()),
+            };
+            match runtime
+                .agent
+                .apply_prompt_rewind(checkpoint, digest, &selection)
+            {
+                Ok(outcome) => {
+                    if selection.transcript {
+                        runtime.prompt_needs_turn = false;
+                    }
+                    ok(id, &kind, Some(serde_json::json!(outcome)))
+                }
+                Err(error) => fail(id, &kind, error),
+            }
+        }
         "fork" => match fork_session(runtime, command.entry_id.as_deref()) {
             Ok(data) => ok(id, &kind, Some(data)),
             Err(err) => fail(id, &kind, err),
@@ -1064,6 +1136,7 @@ pub fn session_stats_for_agent(agent: &Agent, model: Option<&Model>) -> Value {
         "cost": stats.cost,
         "contextUsage": context_usage,
         "runtime": agent.run_stats(),
+        "background": crate::native_extensions::background_usage::for_agent(agent),
         "openaiCache": openai_cache_status(agent, &stats),
     });
     // Present only while the Context VM is not `off`.
@@ -2510,5 +2583,195 @@ mod tests {
             .modules
             .iter()
             .any(|m| m.id == "capability.frontend-design"));
+    }
+}
+
+#[cfg(test)]
+mod rewind_rpc_tests {
+    use super::*;
+
+    #[test]
+    fn rpc_rewind_notices_explain_corrupt_load_and_recording_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let store =
+            davinci_session::JsonlSession::create(dir.path(), &dir.path().to_string_lossy(), None)
+                .unwrap();
+        std::fs::write(store.path.with_extension("rewind-effects.jsonl"), "{broken").unwrap();
+        let mut agent = Agent::new("rewind notice fixture");
+        agent.cwd = dir.path().into();
+        agent.load_from_session(store).unwrap();
+        let notice = agent.prompt_rewind_notice().unwrap();
+        let mut runtime = RpcRuntime::new(agent, dir.path().into(), dir.path().into());
+        let list = handle_rpc(
+            &mut runtime,
+            RpcCommand {
+                kind: "get_rewind_checkpoints".into(),
+                ..Default::default()
+            },
+        );
+        assert_eq!(list.data.unwrap()["notice"], notice);
+        runtime.agent.prompt("new prompt");
+        let id = runtime.agent.prompt_checkpoints()[0].id.clone();
+        let preview = handle_rpc(
+            &mut runtime,
+            RpcCommand {
+                kind: "rewind_preview".into(),
+                checkpoint_id: Some(id.clone()),
+                ..Default::default()
+            },
+        );
+        let data = preview.data.unwrap();
+        assert_eq!(data["notice"], notice);
+        let digest = data["preview"]["preview_digest"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let failure = "Rewind stopped recording because its effect report could not be written";
+        runtime
+            .agent
+            .runtime
+            .as_ref()
+            .unwrap()
+            .fail_prompt_rewind(failure);
+        let list = handle_rpc(
+            &mut runtime,
+            RpcCommand {
+                kind: "get_rewind_checkpoints".into(),
+                ..Default::default()
+            },
+        );
+        assert_eq!(list.data.unwrap()["notice"], failure);
+        for kind in ["rewind_preview", "rewind_apply"] {
+            let response = handle_rpc(
+                &mut runtime,
+                RpcCommand {
+                    kind: kind.into(),
+                    checkpoint_id: Some(id.clone()),
+                    preview_digest: Some(digest.clone()),
+                    mode: Some("conversation".into()),
+                    ..Default::default()
+                },
+            );
+            assert!(!response.success);
+            assert_eq!(response.error.as_deref(), Some(failure));
+        }
+    }
+
+    #[test]
+    fn rpc_rewind_lists_previews_and_requires_current_host_authority() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut agent = Agent::new("offline rewind RPC fixture");
+        agent.cwd = dir.path().into();
+        agent.prompt("first prompt");
+        let id = agent.prompt_checkpoints()[0].id.clone();
+        let mut runtime = RpcRuntime::new(agent, dir.path().into(), dir.path().into());
+        runtime.prompt_needs_turn = true;
+        let list = handle_rpc(
+            &mut runtime,
+            RpcCommand {
+                kind: "get_rewind_checkpoints".into(),
+                ..Default::default()
+            },
+        );
+        assert!(list.success);
+        let data = list.data.unwrap();
+        assert_eq!(data["checkpoints"][0]["id"], id);
+        assert!(data["limitation"]
+            .as_str()
+            .unwrap()
+            .contains("shell commands are not tracked"));
+        let forged = handle_rpc(
+            &mut runtime,
+            RpcCommand {
+                kind: "rewind_apply".into(),
+                checkpoint_id: Some(id.clone()),
+                preview_digest: Some("forged".into()),
+                mode: Some("conversation".into()),
+                ..Default::default()
+            },
+        );
+        assert!(!forged.success);
+        let preview = handle_rpc(
+            &mut runtime,
+            RpcCommand {
+                kind: "rewind_preview".into(),
+                checkpoint_id: Some(id.clone()),
+                ..Default::default()
+            },
+        );
+        assert!(preview.success);
+        let digest = preview.data.unwrap()["preview"]["preview_digest"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let invalid_mode = handle_rpc(
+            &mut runtime,
+            RpcCommand {
+                kind: "rewind_apply".into(),
+                checkpoint_id: Some(id.clone()),
+                preview_digest: Some(digest.clone()),
+                mode: Some("tasks".into()),
+                ..Default::default()
+            },
+        );
+        assert!(!invalid_mode.success);
+        let applied = handle_rpc(
+            &mut runtime,
+            RpcCommand {
+                kind: "rewind_apply".into(),
+                checkpoint_id: Some(id.clone()),
+                preview_digest: Some(digest.clone()),
+                mode: Some("conversation".into()),
+                ..Default::default()
+            },
+        );
+        assert!(applied.success, "{:?}", applied.error);
+        assert!(runtime.agent.messages.is_empty());
+        assert!(!runtime.prompt_needs_turn);
+        let replay = handle_rpc(
+            &mut runtime,
+            RpcCommand {
+                kind: "rewind_apply".into(),
+                checkpoint_id: Some(id),
+                preview_digest: Some(digest),
+                mode: Some("conversation".into()),
+                ..Default::default()
+            },
+        );
+        assert!(!replay.success);
+    }
+
+    #[test]
+    fn rpc_rewind_rejects_processing_and_stale_conversation() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut agent = Agent::new("offline rewind stale RPC fixture");
+        agent.prompt("first");
+        let id = agent.prompt_checkpoints()[0].id.clone();
+        let mut runtime = RpcRuntime::new(agent, dir.path().into(), dir.path().into());
+        runtime.agent.is_streaming = true;
+        let response = handle_rpc(
+            &mut runtime,
+            RpcCommand {
+                kind: "rewind_preview".into(),
+                checkpoint_id: Some(id.clone()),
+                ..Default::default()
+            },
+        );
+        assert!(!response.success);
+        runtime.agent.is_streaming = false;
+        let preview = runtime.agent.preview_prompt_rewind(&id).unwrap();
+        runtime.agent.prompt_with("synthetic continuation", &[]);
+        let response = handle_rpc(
+            &mut runtime,
+            RpcCommand {
+                kind: "rewind_apply".into(),
+                checkpoint_id: Some(id),
+                preview_digest: Some(preview.preview_digest),
+                mode: Some("both".into()),
+                ..Default::default()
+            },
+        );
+        assert!(!response.success);
+        assert!(response.error.unwrap().contains("stale"));
     }
 }

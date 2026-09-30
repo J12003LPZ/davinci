@@ -398,7 +398,7 @@ impl crate::Agent {
             || self.pre_tool.is_some()
             // Runtime decision subscribers cannot be proven read-transparent.
             // Leave these reads on the normal gated tool path instead.
-            || self.runtime.is_some()
+            || self.runtime_requires_file_capture_guard()
             || self.context_vm_mode() == crate::runtime::ContextVmMode::Active
             || !self.tools.iter().any(|tool| tool == "read")
             || self.active_contract().is_some()

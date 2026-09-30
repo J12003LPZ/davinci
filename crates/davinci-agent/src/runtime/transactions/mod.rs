@@ -2,6 +2,7 @@
 //! Authorization is supplied by the current host; records never grant authority.
 mod api;
 mod commit;
+pub(crate) use commit::git as observe_git;
 mod files;
 mod macos_acl;
 mod model;
@@ -29,6 +30,16 @@ use store::Store;
 pub use tools::{coordinator_for_context, MutationAuthority};
 
 type Authority<'a> = &'a dyn Fn(&Path) -> Result<(), String>;
+
+/// Reuse the transaction platform identity guard for other file restorations.
+/// A link count that cannot be established is never mutation authority.
+pub(crate) fn require_unaliased_file(file: &std::fs::File) -> Result<(), String> {
+    let metadata = file.metadata().map_err(|error| error.to_string())?;
+    if !metadata.is_file() {
+        return Err("non-regular restoration source denied".into());
+    }
+    files::identity(file, &metadata).map(|_| ())
+}
 
 #[derive(Debug, Clone)]
 pub struct TransactionCoordinator {
@@ -403,7 +414,7 @@ impl TransactionCoordinator {
             for index in 0..record.changes.len() {
                 let change = &mut record.changes[index];
                 match files::stage(&self.root,&change.path,change.proposed_bytes.as_deref(),&change.before) {
-                    Ok((image,name)) => { change.alias_pending = !image.windows_short_name.is_empty(); change.proposed=image; change.staged_name=name; }
+                    Ok((image,name)) => { change.alias_pending = cfg!(windows) && image.hash.is_some() || !image.windows_short_name.is_empty(); change.proposed=image; change.staged_name=name; }
                     Err(error) => { self.cleanup(&record); return Err(error); }
                 }
             }
@@ -529,12 +540,12 @@ impl TransactionCoordinator {
                 continue;
             }
             let interrupted_apply =
-                change.alias_pending && current == files::unpublished(&change.proposed);
+                change.alias_pending && files::publication_matches(&current, &change.proposed);
             let interrupted_restore = change.restore_alias_pending
                 && change
                     .restored
                     .as_ref()
-                    .is_some_and(|image| current == files::unpublished(image));
+                    .is_some_and(|image| files::publication_matches(&current, image));
             if interrupted_restore {
                 // Retain the durable restored identity. Restaging here would lose
                 // ownership of the current image if recovery itself were interrupted.
@@ -570,10 +581,9 @@ impl TransactionCoordinator {
             };
             change.restored = Some(image);
             change.restore_name = name;
-            change.restore_alias_pending = change
-                .restored
-                .as_ref()
-                .is_some_and(|image| !image.windows_short_name.is_empty());
+            change.restore_alias_pending = change.restored.as_ref().is_some_and(|image| {
+                cfg!(windows) && image.hash.is_some() || !image.windows_short_name.is_empty()
+            });
         }
         let prepare = store.active().and_then(|active| {
             if active.is_none() {

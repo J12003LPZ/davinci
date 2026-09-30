@@ -30,6 +30,7 @@ impl SandboxMode {
 pub enum SandboxBackendKind {
     Auto,
     LinuxBubblewrap,
+    MacosSeatbelt,
     Container,
     Host,
 }

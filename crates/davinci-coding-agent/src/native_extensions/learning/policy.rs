@@ -328,7 +328,10 @@ mod tests {
 
     #[test]
     fn a_correction_is_learned_as_a_lesson_without_approval() {
-        let config = LearningConfig::default();
+        let config = LearningConfig {
+            auto_apply_project: true,
+            ..Default::default()
+        };
         let candidate = fixture_candidate(
             LearningScope::Project,
             LearningArtifact::FailureLesson {
@@ -410,9 +413,9 @@ mod tests {
     }
 
     #[test]
-    fn global_auto_write_applies_by_default() {
+    fn global_auto_write_requires_approval_by_default() {
         let config = LearningConfig::default();
-        assert!(config.auto_apply_global);
+        assert!(!config.auto_apply_global);
 
         let candidate = fixture_candidate(
             LearningScope::Global,
@@ -433,12 +436,15 @@ mod tests {
         );
 
         let decision = evaluate_candidate(&candidate, &config, true, None);
-        assert_eq!(decision, CandidateDecision::AutoApply);
+        assert_eq!(decision, CandidateDecision::StageForApproval);
     }
 
     #[test]
     fn memory_fact_auto_applies_without_command_execution() {
-        let config = LearningConfig::default();
+        let config = LearningConfig {
+            auto_apply_project: true,
+            ..Default::default()
+        };
         let candidate = fixture_candidate(
             LearningScope::Project,
             LearningArtifact::Memory {

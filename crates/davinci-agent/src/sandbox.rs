@@ -3,8 +3,8 @@
 //! This module does not treat permission/approval as confinement. It converts a
 //! host-resolved `SandboxSpec` into a backend launch plan and fails closed when
 //! a requested property is unavailable. The actual child is still spawned by
-//! the supervised executor helper so process-tree ownership is established
-//! before untrusted code can run.
+//! the supervised executor helper. Capability negotiation must establish
+//! process-tree ownership before a policy requiring it can run.
 
 use davinci_protocol::{
     ContainerRuntime, EnvironmentPolicy, ExecutionRequest, MountAccess, NetworkPolicy,
@@ -16,6 +16,9 @@ use std::{
     collections::BTreeMap,
     path::{Path, PathBuf},
 };
+
+mod seatbelt;
+pub use seatbelt::MacosSeatbeltBackend;
 
 const BASELINE_ENVIRONMENT: &[&str] = &[
     "PATH",
@@ -454,6 +457,16 @@ impl SandboxBroker {
         request: &ExecutionRequest,
         environment: &BTreeMap<String, String>,
     ) -> Result<PreparedExecution, SandboxFailure> {
+        self.prepare_with_private_temp(spec, request, environment, None)
+    }
+
+    pub(crate) fn prepare_with_private_temp(
+        &self,
+        spec: &SandboxSpec,
+        request: &ExecutionRequest,
+        environment: &BTreeMap<String, String>,
+        private_temp: Option<&Path>,
+    ) -> Result<PreparedExecution, SandboxFailure> {
         spec.validate()?;
         if spec.mode == SandboxMode::NoExecution {
             return Err(SandboxFailure::policy_denied(
@@ -471,6 +484,15 @@ impl SandboxBroker {
                         )
                     })?;
                 LinuxBubblewrapBackend::new(path).prepare(spec, request, environment)
+            }
+            SandboxBackendKind::MacosSeatbelt => {
+                if !cfg!(target_os = "macos") {
+                    return Err(SandboxFailure::new(
+                        SandboxErrorCode::SandboxUnavailable,
+                        "Seatbelt requires native macOS",
+                    ));
+                }
+                MacosSeatbeltBackend::new(private_temp).prepare(spec, request, environment)
             }
             SandboxBackendKind::Container => {
                 let container = spec.container.as_ref().ok_or_else(|| {
@@ -490,6 +512,20 @@ impl SandboxBroker {
                 ContainerBackend::new(runtime).prepare(spec, request, environment)
             }
             SandboxBackendKind::Auto => {
+                if spec.mode == SandboxMode::FullAccess {
+                    return HostBackend.prepare(spec, request, environment);
+                }
+                if cfg!(target_os = "macos")
+                    && MacosSeatbeltBackend::new(private_temp)
+                        .capabilities()
+                        .satisfies(&spec.required_capabilities)
+                {
+                    return MacosSeatbeltBackend::new(private_temp).prepare(
+                        spec,
+                        request,
+                        environment,
+                    );
+                }
                 if cfg!(target_os = "linux") {
                     if let Some(path) = find_host_executable("bwrap", Path::new(&spec.workspace)) {
                         return LinuxBubblewrapBackend::new(path).prepare(
@@ -1050,6 +1086,17 @@ mod tests {
     }
 
     #[test]
+    fn auto_full_access_uses_explicit_host_even_with_native_backend_installed() {
+        let mut spec = spec(SandboxMode::FullAccess, NetworkPolicy::Unrestricted);
+        spec.required_capabilities = lifecycle_capabilities();
+        let prepared = SandboxBroker
+            .prepare(&spec, &request(&spec), &BTreeMap::new())
+            .unwrap();
+        assert_eq!(prepared.backend, SandboxBackendKind::Host);
+        assert!(!prepared.capabilities.filesystem_isolation);
+    }
+
+    #[test]
     fn bubblewrap_denied_network_uses_network_namespace() {
         let backend = LinuxBubblewrapBackend::new(PathBuf::from("/usr/bin/bwrap"));
         let spec = spec(SandboxMode::WorkspaceWrite, NetworkPolicy::Denied);
@@ -1315,5 +1362,260 @@ mod tests {
             .code,
             SandboxErrorCode::PolicyDenied
         );
+    }
+}
+
+/// Availability is an execution result, not a PATH lookup. Cache the bounded
+/// probe for this host process; explicit policies still fail closed at launch.
+pub fn detected_native_backend(workspace: &Path) -> Option<SandboxBackendKind> {
+    static AVAILABLE: std::sync::OnceLock<Option<SandboxBackendKind>> = std::sync::OnceLock::new();
+    *AVAILABLE.get_or_init(|| probe_native_backend(workspace))
+}
+
+/// Auto requires both confinement and ownership. A path-policy backend alone
+/// must not enable autonomy while descendants can escape the supervisor.
+pub fn supports_auto_sandbox(backend: SandboxBackendKind) -> bool {
+    let required = SandboxCapabilities {
+        filesystem_isolation: true,
+        network_denied: true,
+        ephemeral_temp: true,
+        ..lifecycle_capabilities()
+    };
+    let capabilities = match backend {
+        SandboxBackendKind::LinuxBubblewrap => {
+            LinuxBubblewrapBackend::new(PathBuf::from("bwrap")).capabilities()
+        }
+        SandboxBackendKind::MacosSeatbelt => MacosSeatbeltBackend::new(None).capabilities(),
+        _ => return false,
+    };
+    capabilities.satisfies(&required)
+}
+
+fn probe_native_backend(workspace: &Path) -> Option<SandboxBackendKind> {
+    if cfg!(target_os = "linux") {
+        let executable = find_host_executable("bwrap", workspace)?;
+        let mut command = std::process::Command::new(executable);
+        command.args([
+            "--die-with-parent",
+            "--new-session",
+            "--unshare-user-try",
+            "--unshare-pid",
+            "--unshare-ipc",
+            "--unshare-uts",
+            "--unshare-net",
+            "--ro-bind",
+            "/",
+            "/",
+            "--",
+            "/bin/true",
+        ]);
+        return bounded_probe(command, std::time::Duration::from_secs(2))
+            .then_some(SandboxBackendKind::LinuxBubblewrap);
+    }
+    if cfg!(target_os = "macos") {
+        // XNU allows setsid/setpgid without Seatbelt mediation. Until the
+        // execution plane owns detached descendants, native Auto is disabled.
+        if !supports_auto_sandbox(SandboxBackendKind::MacosSeatbelt) {
+            return None;
+        }
+        // The profile parser, runtime paths, and deny-default execution must
+        // all work; sandbox-exec merely existing is not sufficient.
+        let directory = PrivateTemp::new(Path::new("/private/tmp")).ok()?;
+        let workspace = directory.path().join("workspace");
+        std::fs::create_dir(&workspace).ok()?;
+        let workspace = workspace.canonicalize().ok()?;
+        let temp = directory.path().join("temp");
+        std::fs::create_dir(&temp).ok()?;
+        std::fs::create_dir(temp.join("home")).ok()?;
+        let text = workspace.to_str()?.to_string();
+        let mut spec = SandboxSpec {
+            id: SandboxId("native-probe".into()),
+            mode: SandboxMode::WorkspaceWrite,
+            backend: SandboxBackendKind::MacosSeatbelt,
+            container: None,
+            workspace: text.clone(),
+            filesystem: Default::default(),
+            network: NetworkPolicy::Denied,
+            environment: Default::default(),
+            resources: Default::default(),
+            process: Default::default(),
+            required_capabilities: Default::default(),
+        };
+        for path in [
+            "/System",
+            "/System/Volumes/Preboot/Cryptexes/OS/System",
+            "/usr",
+            "/bin",
+            "/sbin",
+        ] {
+            if let Ok(source) = Path::new(path).canonicalize() {
+                let source = source.to_str()?.to_string();
+                spec.filesystem.mounts.push(davinci_protocol::MountRule {
+                    source: Some(source.clone()),
+                    target: source,
+                    access: MountAccess::ReadOnly,
+                });
+            }
+        }
+        spec.filesystem.mounts.push(davinci_protocol::MountRule {
+            source: Some(text.clone()),
+            target: text.clone(),
+            access: MountAccess::ReadWrite,
+        });
+        let request = ExecutionRequest {
+            sandbox_id: spec.id.clone(),
+            executable: "/bin/sh".into(),
+            argv: vec![
+                "-c".into(),
+                "printf usable > probe && /bin/cat probe >/dev/null".into(),
+            ],
+            cwd: text,
+            launch_id: None,
+        };
+        let prepared = MacosSeatbeltBackend::new(Some(&temp))
+            .prepare(&spec, &request, &BTreeMap::new())
+            .ok()?;
+        let mut command = std::process::Command::new(prepared.executable);
+        command
+            .args(prepared.argv)
+            .current_dir(prepared.cwd)
+            .envs(prepared.environment);
+        return bounded_probe(command, std::time::Duration::from_secs(2))
+            .then_some(SandboxBackendKind::MacosSeatbelt);
+    }
+    None
+}
+
+fn bounded_probe(mut command: std::process::Command, timeout: std::time::Duration) -> bool {
+    use std::{process::Stdio, time::Instant};
+    command
+        .env_clear()
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        unsafe {
+            command.pre_exec(|| {
+                if libc::setsid() < 0 {
+                    Err(std::io::Error::last_os_error())
+                } else {
+                    Ok(())
+                }
+            });
+        }
+    }
+    let Ok(mut child) = command.spawn() else {
+        return false;
+    };
+    let deadline = Instant::now() + timeout;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return status.success(),
+            Ok(None) if Instant::now() < deadline => {
+                std::thread::sleep(std::time::Duration::from_millis(10))
+            }
+            _ => {
+                #[cfg(unix)]
+                unsafe {
+                    libc::kill(-(child.id() as i32), libc::SIGKILL);
+                }
+                let _ = child.kill();
+                let _ = child.wait();
+                return false;
+            }
+        }
+    }
+}
+
+/// Launch-owned native temp. UUID naming + exclusive mkdir + mode 0700 keep
+/// the directory private without adding a production dependency.
+pub(crate) struct PrivateTemp {
+    path: PathBuf,
+}
+impl PrivateTemp {
+    pub(crate) fn new(parent: &Path) -> std::io::Result<Self> {
+        let path = parent.join(format!(
+            "davinci-seatbelt-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        let builder = std::fs::DirBuilder::new();
+        #[cfg(unix)]
+        let builder = {
+            use std::os::unix::fs::DirBuilderExt;
+            let mut builder = builder;
+            builder.mode(0o700);
+            builder
+        };
+        builder.create(&path)?;
+        let mut directory = Self { path };
+        directory.path = directory.path.canonicalize()?;
+        builder.create(directory.path.join("home"))?;
+        Ok(directory)
+    }
+    pub(crate) fn path(&self) -> &Path {
+        &self.path
+    }
+    pub(crate) fn close(self) -> std::io::Result<()> {
+        std::fs::remove_dir_all(&self.path).or_else(|error| {
+            if error.kind() == std::io::ErrorKind::NotFound {
+                Ok(())
+            } else {
+                Err(error)
+            }
+        })
+    }
+}
+impl Drop for PrivateTemp {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.path);
+    }
+}
+
+#[cfg(test)]
+mod native_probe_tests {
+    use super::*;
+
+    #[test]
+    #[cfg(unix)]
+    fn probe_checks_exit_success_and_is_bounded() {
+        let mut failure = std::process::Command::new("/bin/sh");
+        failure.args(["-c", "exit 1"]);
+        assert!(!bounded_probe(failure, std::time::Duration::from_secs(1)));
+        let mut slow = std::process::Command::new("/bin/sh");
+        slow.args(["-c", "exec /bin/sleep 10"]);
+        let start = std::time::Instant::now();
+        assert!(!bounded_probe(slow, std::time::Duration::from_millis(100)));
+        assert!(start.elapsed() < std::time::Duration::from_secs(2));
+        assert!(bounded_probe(
+            std::process::Command::new("/usr/bin/true"),
+            std::time::Duration::from_secs(1)
+        ));
+    }
+
+    #[test]
+    fn private_temp_is_distinct_exclusive_and_cleaned() {
+        let parent = tempfile::tempdir().unwrap();
+        let first = PrivateTemp::new(parent.path()).unwrap();
+        let second = PrivateTemp::new(parent.path()).unwrap();
+        assert_ne!(first.path(), second.path());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(first.path())
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o700
+            );
+        }
+        let path = first.path().to_path_buf();
+        std::fs::write(path.join("home/state"), "data").unwrap();
+        first.close().unwrap();
+        assert!(!path.exists());
+        assert!(second.path().exists());
     }
 }

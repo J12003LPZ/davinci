@@ -117,6 +117,15 @@ pub struct RunStats {
     /// evidence still incomplete.
     #[serde(default)]
     pub capability_incomplete_evidence: u64,
+    /// `completion.requirements` continuations, at most one per real prompt.
+    #[serde(default)]
+    pub completion_requirement_reminders: u64,
+    /// `completion.hook_block` continuations.
+    #[serde(default)]
+    pub completion_hook_blocks: u64,
+    /// `completion.hook_limit` notices after three consecutive blocks.
+    #[serde(default)]
+    pub completion_hook_limit_hits: u64,
     /// Mid-run steering inputs injected by the user.
     #[serde(default)]
     pub user_steers: u64,
@@ -204,6 +213,9 @@ mod tests {
         obj.remove("verificationCommandsRun");
         obj.remove("verificationFailures");
         obj.remove("capabilityIncompleteEvidence");
+        obj.remove("completionRequirementReminders");
+        obj.remove("completionHookBlocks");
+        obj.remove("completionHookLimitHits");
         obj.remove("userSteers");
         obj.remove("outputSchemaRepairTurns");
         let restored: RunStats = serde_json::from_value(json).unwrap();
@@ -213,6 +225,9 @@ mod tests {
         assert_eq!(restored.verification_commands_run, 0);
         assert_eq!(restored.verification_failures, 0);
         assert_eq!(restored.capability_incomplete_evidence, 0);
+        assert_eq!(restored.completion_requirement_reminders, 0);
+        assert_eq!(restored.completion_hook_blocks, 0);
+        assert_eq!(restored.completion_hook_limit_hits, 0);
         assert_eq!(restored.user_steers, 0);
         assert_eq!(restored.output_schema_repair_turns, 0);
     }

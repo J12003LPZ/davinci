@@ -39,6 +39,254 @@ fn contextual_dispatch_attachments_require_context_and_live_cancellation() {
 use super::*;
 
 #[test]
+fn prompt_rewind_notices_reach_host_warnings_and_legacy_picker() {
+    let dir = tempfile::tempdir().unwrap();
+    let store =
+        davinci_session::JsonlSession::create(dir.path(), &dir.path().to_string_lossy(), None)
+            .unwrap();
+    std::fs::write(store.path.with_extension("rewind-effects.jsonl"), "{broken").unwrap();
+    let mut agent = Agent::new("rewind notice fixture");
+    agent.cwd = dir.path().into();
+    agent.load_from_session(store).unwrap();
+    let notice = agent.prompt_rewind_notice().unwrap();
+    assert!(notice.contains("kept at"));
+    let calls = context_vm_notify_calls(&agent);
+    assert!(calls
+        .iter()
+        .any(|call| call["message"] == notice && call["type"] == "warning"));
+    assert!(!context_vm_notify_calls(&agent)
+        .iter()
+        .any(|call| call["message"] == notice));
+    let mut ui = InteractiveSession::new(builtin_themes()[0].clone(), "fixture", vec![]);
+    open_prompt_rewind(&agent, &mut ui).unwrap();
+    assert_eq!(ui.chrome.status, notice);
+
+    // The load notice remains useful after recording begins again.
+    agent.prompt("new prompt");
+    open_prompt_rewind(&agent, &mut ui).unwrap();
+    assert_eq!(ui.chrome.status, notice);
+    let failure = "Rewind stopped recording because its effect report could not be written";
+    agent.runtime.as_ref().unwrap().fail_prompt_rewind(failure);
+    let calls = context_vm_notify_calls(&agent);
+    assert!(calls.iter().any(|call| call["message"] == failure));
+    open_prompt_rewind(&agent, &mut ui).unwrap();
+    assert_eq!(ui.chrome.status, failure);
+}
+
+#[cfg(unix)]
+#[test]
+fn completion_hooks_share_print_rpc_and_interactive_host_path() {
+    let _env_lock = PROCESS_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let _learning = EnvRestore::set("PI_LEARNING_DISABLE_BACKGROUND", "1");
+    let _security = EnvRestore::set("DAVINCI_SECURITY_WATCH", "0");
+    for (source, mode) in [
+        ("user", "print"),
+        ("user", "rpc"),
+        ("user", "interactive"),
+        ("plugin", "print"),
+        ("plugin", "rpc"),
+        ("plugin", "interactive"),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let requirement_review = mode != "print";
+        let _review_arm = EnvRestore::set(
+            "DAVINCI_REQUIREMENT_REVIEW",
+            if requirement_review { "1" } else { "0" },
+        );
+        let _agent_dir = EnvRestore::set("DAVINCI_CODING_AGENT_DIR", &dir.path().to_string_lossy());
+        let _legacy_agent_dir =
+            EnvRestore::set("PI_CODING_AGENT_DIR", &dir.path().to_string_lossy());
+        let input = dir.path().join("completion-input.jsonl");
+        let command = format!(
+            "cat >> '{}'; printf '\\n' >> '{}'; if [ ! -f '{}' ]; then touch '{}'; printf 'run tests before finishing' >&2; exit 2; fi",
+            input.display(), input.display(), dir.path().join("blocked-once").display(), dir.path().join("blocked-once").display()
+        );
+        if source == "user" {
+            std::fs::write(
+                dir.path().join("hooks.json"),
+                serde_json::json!({"completion":[["sh","-c",command]]}).to_string(),
+            )
+            .unwrap();
+        } else {
+            let root = dir.path().join("fixture-plugin");
+            std::fs::create_dir_all(root.join("hooks")).unwrap();
+            std::fs::write(root.join("plugin.json"), r#"{"name":"finish-line"}"#).unwrap();
+            std::fs::write(
+                root.join("hooks/hooks.json"),
+                serde_json::json!({"hooks":{"Stop":[{"hooks":[{"command":command}]}]}}).to_string(),
+            )
+            .unwrap();
+            let plugin = davinci_coding_agent::plugins::manifest::load_plugin(&root).unwrap();
+            std::fs::create_dir_all(dir.path().join("plugins")).unwrap();
+            std::fs::write(dir.path().join("plugins/installed.json"), serde_json::json!({"version":1,"plugins":{"finish-line@fixture":{
+                "origin":"davinci", "installPath":root, "enabled":true, "hooksApproved":plugin.hooks_digest
+            }}}).to_string()).unwrap();
+        }
+        let mut agent = Agent::new("completion fixture");
+        agent.cwd = dir.path().to_path_buf();
+        agent.prompt("hello");
+        let parsed = Args {
+            offline: true,
+            print: mode == "print",
+            no_extensions: true,
+            no_skills: true,
+            mode: if mode == "rpc" {
+                Some(davinci_coding_agent::args::Mode::Rpc)
+            } else {
+                None
+            },
+            ..Default::default()
+        };
+        let existing = if mode == "interactive" {
+            Some(Arc::new(Mutex::new(ExtensionHost::default())))
+        } else {
+            None
+        };
+        let (reply, events) =
+            complete_prompt_with_host(&parsed, &mut agent, existing, mode == "print");
+        assert!(reply.starts_with("(offline)"), "{source}/{mode}: {reply}");
+        assert_eq!(events.iter().filter(|event| matches!(event, AgentEvent::CompletionReminder { reason_code } if reason_code == "completion.hook_block")).count(), 1, "{source}/{mode}");
+        let input = std::fs::read_to_string(input).unwrap();
+        let payloads: Vec<serde_json::Value> = input
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(payloads.len(), 2, "{mode}: {input}");
+        assert_eq!(payloads[0]["stop_hook_active"], false);
+        assert_eq!(payloads[1]["stop_hook_active"], true);
+        assert!(agent.completion_hook.is_none());
+        assert_eq!(agent.requirement_review_enabled, requirement_review);
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn plugin_completion_dispatch_and_post_tool_feedback_reach_host() {
+    use davinci_coding_agent::plugins::{
+        store::{InstalledPlugin, Origin},
+        ActivePlugin, ActivePlugins, HookInput,
+    };
+    let _env_lock = PROCESS_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("plugin");
+    std::fs::create_dir_all(root.join("hooks")).unwrap();
+    std::fs::write(root.join("plugin.json"), r#"{"name":"finish-line"}"#).unwrap();
+    let capture = dir.path().join("stop.json");
+    std::fs::write(root.join("hooks/hooks.json"), serde_json::json!({"hooks": {
+        "Stop":[{"hooks":[{"command":format!("cat > '{}'; printf 'lint failed' >&2; exit 2", capture.display())}]}],
+        "PostToolUse":[{"hooks":[{"command":"cat >/dev/null; printf 'test feedback' >&2; exit 2"}]}]
+    }}).to_string()).unwrap();
+    let plugin = davinci_coding_agent::plugins::manifest::load_plugin(&root).unwrap();
+    let agent_dir = dir.path().join("agent");
+    let record = InstalledPlugin {
+        origin: Origin::Davinci,
+        install_path: Some(root),
+        version: None,
+        enabled: true,
+        hooks_approved: plugin.hooks_digest.clone(),
+        installed_at: 0,
+    };
+    davinci_coding_agent::plugins::store::update(&agent_dir, |file| {
+        file.plugins
+            .insert("finish-line@fixture".into(), record.clone());
+        Ok(())
+    })
+    .unwrap();
+    let plugins = ActivePlugins {
+        plugins: vec![ActivePlugin {
+            key: "finish-line@fixture".into(),
+            record,
+            plugin,
+            data_dir: dir.path().join("data"),
+            agent_dir,
+        }],
+        errors: Vec::new(),
+    };
+    let input = HookInput {
+        cwd: dir.path().to_path_buf(),
+        ..Default::default()
+    };
+    for active in [false, true] {
+        assert_eq!(
+            run_plugin_completion_hooks(&plugins, &input, active, &|| false).as_deref(),
+            Some("plugin finish-line: lint failed")
+        );
+        let payload: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&capture).unwrap()).unwrap();
+        assert_eq!(payload["stop_hook_active"], active);
+    }
+    let result = run_plugin_post_tool(
+        &plugins,
+        &input,
+        "read",
+        &serde_json::json!({"path":"a.rs"}),
+        davinci_agent::ToolResult {
+            content: "file bytes".into(),
+            is_error: false,
+            details: None,
+        },
+    );
+    assert!(!result.is_error);
+    assert_eq!(result.content, "file bytes\n\n<plugin-hook-feedback>plugin finish-line: test feedback</plugin-hook-feedback>");
+}
+
+#[cfg(unix)]
+#[test]
+fn user_post_tool_feedback_runs_once_and_reaches_provider_result() {
+    let _env_lock = PROCESS_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let _learning = EnvRestore::set("PI_LEARNING_DISABLE_BACKGROUND", "1");
+    let _security = EnvRestore::set("DAVINCI_SECURITY_WATCH", "0");
+    for hooks_v2 in ["1", "0"] {
+        let dir = tempfile::tempdir().unwrap();
+        let _agent_dir = EnvRestore::set("DAVINCI_CODING_AGENT_DIR", &dir.path().to_string_lossy());
+        let _legacy_agent_dir =
+            EnvRestore::set("PI_CODING_AGENT_DIR", &dir.path().to_string_lossy());
+        let _hook_mode = EnvRestore::set("DAVINCI_RUNTIME_HOOKS_V2", hooks_v2);
+        let _fixture = EnvRestore::set(
+            "PI_OFFLINE_TOOL_CALL",
+            r#"{"name":"read","arguments":{"path":"a.rs"}}"#,
+        );
+        std::fs::write(dir.path().join("a.rs"), "fixture bytes").unwrap();
+        let capture = dir.path().join("post.jsonl");
+        std::fs::write(dir.path().join("hooks.json"), serde_json::json!({"postTool":[["sh","-c",format!(
+            "cat >> '{}'; printf '\\n' >> '{}'; printf 'add edge test' >&2; exit 2", capture.display(), capture.display()
+        )]]}).to_string()).unwrap();
+        let mut agent = Agent::new_builtin(davinci_agent::PromptProfile::Stable);
+        agent.cwd = dir.path().to_path_buf();
+        agent.prompt("read a.rs");
+        let (_, events) = complete_prompt_with_host(
+            &Args {
+                offline: true,
+                no_extensions: true,
+                no_skills: true,
+                ..Default::default()
+            },
+            &mut agent,
+            None,
+            false,
+        );
+        assert!(events.iter().any(|event| matches!(event, AgentEvent::ToolExecutionEnd { result, is_error:false, .. }
+            if result.as_str().is_some_and(|text| text.contains("<user-hook-feedback>add edge test</user-hook-feedback>")))), "{events:?}");
+        let capture = std::fs::read_to_string(capture).unwrap();
+        assert_eq!(
+            capture.lines().count(),
+            1,
+            "post hook must not run again in the subscriber"
+        );
+        let payload: serde_json::Value = serde_json::from_str(capture.trim()).unwrap();
+        assert_eq!(payload["args"]["path"], "a.rs");
+        assert!(payload["result"]
+            .as_str()
+            .unwrap()
+            .contains("fixture bytes"));
+        assert!(agent.messages.iter().any(|message| {
+            message.role == "toolResult" && message.content.iter().any(|block|
+            matches!(block, davinci_ai::MessageContent::Text { text } if text.contains("user-hook-feedback")))
+        }));
+    }
+}
+
+#[test]
 fn attached_agents_keep_independent_language_intelligence_permissions() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path().canonicalize().unwrap();
@@ -2479,6 +2727,17 @@ fn status_text_not_automatically_appended_to_model_context() {
 }
 
 #[test]
+fn status_header_is_one_line_and_sandbox_is_reported_once() {
+    let agent = Agent::new("sys");
+    let status = format_session_status(&Args::default(), &agent);
+    let header = status.lines().next().unwrap();
+    assert!(header.contains(" · input "), "{status}");
+    assert!(!header.contains("Background accounting"), "{status}");
+    assert!(status.contains("Background accounting"), "{status}");
+    assert_eq!(status.matches("Enforcement:").count(), 1, "{status}");
+}
+
+#[test]
 fn additional_directories_reach_status_and_runtime_state_only_when_set() {
     let agent = Agent::new("sys");
     let parsed = Args::default();
@@ -4165,4 +4424,79 @@ fn worker_host_feeds_its_own_events_into_the_leads_progress() {
     let snapshot = reporter.snapshot();
     assert_eq!(snapshot.tool_uses, 1);
     assert_eq!(snapshot.recent, vec!["Search(\"auth\")".to_string()]);
+}
+
+#[test]
+fn cost_status_and_rpc_expose_background_receipts_without_foreground_pollution() {
+    let dir = tempfile::tempdir().unwrap();
+    let agent = Agent::new_builtin(davinci_agent::PromptProfile::Stable);
+    let host = ExtensionHost::default();
+    bind_native_session(&agent, &host);
+    let usage = davinci_protocol::Usage {
+        input: 20,
+        output: 5,
+        cache_read: 10,
+        total_tokens: 35,
+        ..Default::default()
+    };
+    {
+        let native = host.native.lock().unwrap();
+        native.background.learning.record(
+            &native_extensions::security_scan::usage::RequestUsage::new(
+                Some(&usage),
+                1000,
+                1,
+                false,
+            ),
+        );
+        native.background.security_watch.record(
+            &native_extensions::security_scan::usage::RequestUsage::new(None, 9000, 1, true),
+        );
+    }
+    let parsed = Args::default();
+    let cost = format_session_cost(&parsed, &agent);
+    assert!(cost.starts_with("input 0 · output 0"), "{cost}");
+    assert!(
+        cost.contains("background learning review: input 20 · output 5 · cache read 10"),
+        "{cost}"
+    );
+    assert!(
+        cost.contains("background security watch: tokens unknown"),
+        "{cost}"
+    );
+    let status = format_session_status(&parsed, &agent);
+    for section in [
+        "repo-index:",
+        "lsp:",
+        "hook:",
+        "learning:",
+        "securityWatch:",
+    ] {
+        assert!(status.contains(section), "{section}: {status}");
+    }
+    assert!(status.contains("Sandbox:"));
+    assert!(status.contains("Enforcement:"));
+    let mut runtime =
+        rpc::RpcRuntime::new(agent, dir.path().join("sessions"), dir.path().to_path_buf());
+    let response = rpc::handle_rpc(
+        &mut runtime,
+        rpc::RpcCommand {
+            kind: "get_session_stats".into(),
+            ..Default::default()
+        },
+    );
+    assert!(response.success);
+    let stats = response.data.unwrap();
+    assert_eq!(stats["tokens"]["total"], 0);
+    assert_eq!(stats["background"]["learning"]["tokens"]["total"], 35);
+    assert!(stats["background"]["securityWatch"]["tokens"].is_null());
+    assert_eq!(stats["background"]["securityWatch"]["failedRequests"], 1);
+}
+
+#[test]
+fn runtime_status_renders_completion_counters_when_present() {
+    let runtime = serde_json::json!({"modelTurns":1, "completionRequirementReminders":2,
+        "completionHookBlocks":3,"completionHookLimitHits":1});
+    assert!(format_runtime_stats(Some(&runtime))
+        .contains("Completion: 2 requirement reminders, 3 hook blocks, 1 hook limit hits"));
 }

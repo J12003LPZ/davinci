@@ -114,7 +114,7 @@ fn valid_revision(value: &str) -> bool {
     matches!(value.len(), 40 | 64) && value.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
-fn git(root: &Path, args: &[&str], limit: usize) -> Result<Vec<u8>, String> {
+pub(crate) fn git(root: &Path, args: &[&str], limit: usize) -> Result<Vec<u8>, String> {
     let mut command = Command::new("git");
     command.current_dir(root).env_clear();
     for name in ["PATH", "SystemRoot", "WINDIR", "TEMP", "TMP"] {

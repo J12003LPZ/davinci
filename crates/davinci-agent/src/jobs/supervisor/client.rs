@@ -75,6 +75,36 @@ impl Supervisor {
         stderr: Arc<dyn Fn(Vec<u8>) + Send + Sync>,
     ) -> Result<Self, ProcessLaunchError> {
         let identity = ProcessIdentity::new(config.operation.clone());
+        let private_temp = if cfg!(target_os = "macos")
+            && config.sandbox.as_ref().is_some_and(|spec| {
+                matches!(
+                    spec.backend,
+                    davinci_protocol::SandboxBackendKind::Auto
+                        | davinci_protocol::SandboxBackendKind::MacosSeatbelt
+                ) && matches!(
+                    spec.mode,
+                    davinci_protocol::SandboxMode::Restricted
+                        | davinci_protocol::SandboxMode::WorkspaceWrite
+                )
+            }) {
+            // Exclusive mkdir uses an unpredictable name and mode 0700. A fixed host
+            // parent avoids granting access to the inherited TMPDIR tree.
+            let directory = crate::sandbox::PrivateTemp::new(std::path::Path::new("/private/tmp"))
+                .map_err(|error| {
+                    ProcessLaunchError::new(
+                        ProcessLaunchState::FailedBeforeChild,
+                        identity.clone(),
+                        &config,
+                        format!("private temp allocation failed: {error}"),
+                    )
+                })?;
+            Some(directory)
+        } else {
+            None
+        };
+        let private_temp_path = private_temp
+            .as_ref()
+            .map(|directory| directory.path().to_path_buf());
         let config_size = serde_json::to_vec(&config)
             .map_err(|_| {
                 ProcessLaunchError::new(
@@ -174,7 +204,10 @@ impl Supervisor {
             }
             match input_rx.recv_timeout(POLL) {
                 Ok(request) if wire::write(&mut stdin, &request).is_err() => {
-                    control.stop.store(true, Ordering::SeqCst);
+                    // A helper can exit before a late stdin request arrives.
+                    // Transport closure is not caller cancellation: dropping
+                    // this writer closes the lifeline, while the monitor drains
+                    // buffered output and the authoritative terminal receipt.
                     break;
                 }
                 Ok(_) | Err(mpsc::RecvTimeoutError::Timeout) => {}
@@ -190,7 +223,10 @@ impl Supervisor {
                 event,
                 stderr,
                 monitor_identity,
-                container_cleanup,
+                LaunchCleanup {
+                    container_cleanup,
+                    private_temp,
+                },
             )
         });
         owner
@@ -199,6 +235,7 @@ impl Supervisor {
             .try_send(Request::Configure {
                 identity: identity.clone(),
                 config: config.clone(),
+                private_temp: private_temp_path,
             })
             .map_err(|_| {
                 ProcessLaunchError::new(
@@ -396,6 +433,11 @@ fn cleanup_container(plan: &crate::sandbox::ContainerCleanupPlan) -> Result<(), 
     }
 }
 
+struct LaunchCleanup {
+    container_cleanup: Option<crate::sandbox::ContainerCleanupPlan>,
+    private_temp: Option<crate::sandbox::PrivateTemp>,
+}
+
 fn monitor(
     mut child: Child,
     events: mpsc::Receiver<Event>,
@@ -403,8 +445,12 @@ fn monitor(
     callback: Arc<dyn Fn(ProcessEvent) + Send + Sync>,
     stderr_callback: Arc<dyn Fn(Vec<u8>) + Send + Sync>,
     identity: ProcessIdentity,
-    container_cleanup: Option<crate::sandbox::ContainerCleanupPlan>,
+    cleanup: LaunchCleanup,
 ) {
+    let LaunchCleanup {
+        container_cleanup,
+        private_temp,
+    } = cleanup;
     let mut code = None;
     let mut exit_reported = false;
     let mut output_complete = false;
@@ -463,10 +509,14 @@ fn monitor(
             Ok(Event::Exit {
                 identity: observed,
                 code: value,
+                signal,
                 output_complete: complete,
             }) if observed == identity => {
                 launch_state = ProcessLaunchState::Exited;
                 code = value;
+                if let Some(signal) = signal {
+                    error = Some(format!("supervised command terminated by signal {signal}"));
+                }
                 exit_reported = true;
                 output_complete = complete;
             }
@@ -516,6 +566,16 @@ fn monitor(
                 }
                 None => "container cleanup plan unavailable".into(),
             });
+        }
+    }
+    // Cleanup happens after terminating/reaping the owned group, before any
+    // Finished event or wait result. Cleanup errors are observable failures.
+    if let Some(directory) = private_temp {
+        if let Err(cleanup) = directory.close() {
+            error = Some(format!(
+                "{}private temp cleanup failed: {cleanup}",
+                error.map(|value| format!("{value}; ")).unwrap_or_default()
+            ));
         }
     }
     if !stopped && !exit_reported && error.is_none() {

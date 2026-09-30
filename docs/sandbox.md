@@ -21,6 +21,18 @@ shell / builds / tests / package code / local executable services
 
 The model is not a security boundary. Approving a command does not grant it access to host credentials or paths that the execution sandbox does not expose.
 
+## Auto defaults
+
+With no explicit user sandbox setting, entering **Auto** activates `workspace_write` with network denied when capability negotiation and a bounded native execution probe succeed. Currently this is bubblewrap on Linux. Seatbelt is not eligible because detached macOS descendants are not owned by the execution plane. Activation applies at CLI startup and when entering Auto through the interactive/RPC permission API. Once activated, the boundary persists for that session, including later permission-mode changes. An explicit user execution policy takes precedence. Trusted project settings can narrow the default; they cannot grant network, environment, host, or filesystem authority.
+
+An installed binary alone is insufficient: the probe must successfully execute under the native policy within two seconds. Where no capable native backend is usable, the prior approval behavior continues. `/status` and `/sandbox-status` report that isolation is inactive. Native Windows should use **WSL2 with a usable bubblewrap installation** for this path; Job Objects alone provide process ownership without filesystem/network isolation.
+
+If local project/plugin MCP servers started through legacy host stdio, entering Auto cannot activate the default in that session. That transport owns only each direct server child; reconnecting cannot prove its grandchildren stopped. Status reports the reason. Restart directly in Auto so those servers start through the confined executor. Explicit trusted user host MCP servers retain their configured authority.
+
+Earlier JavaScript extension or extension-command execution also prevents later Auto activation. The host records unowned spawn attempts, including one-shot loads, persistent sessions, failed startup and later reloads. A live activation guard checks that history before assigning the default; dropping handles cannot establish descendant cleanup. Persistent JavaScript dispatch also checks the active boundary on every call. Start directly in Auto to establish confinement; unmigrated JavaScript execution then refuses to run.
+
+The existing approval policy still asks for commands requiring network or outside-workspace authority. Approval does not widen the execution sandbox. Such a command remains denied until the user explicitly changes their trusted execution policy; project settings and model tool arguments cannot grant that change. No approval rule was loosened by this default.
+
 ## Configuration
 
 User settings use the existing JSON settings format:
@@ -91,8 +103,8 @@ The host acts on some workspace files outside the sandbox: Davinci runs `git sta
 Consequences and limits:
 
 - `git commit`, `git add` and other commands that write `.git` fail inside the sandbox; run them from the host.
-- A single command that creates `.git` where none existed can still write its config in that same command, before the next launch protects it.
-- A symlinked `.git` cannot be protected by a bind mount and is left as is.
+- On Linux, a single command that creates `.git` where none existed can still write its config in that same command, before the next launch protects it. Seatbelt protects these roots even when absent.
+- On Linux, a symlinked `.git` cannot be protected by a bind mount and is left as is. Seatbelt denies writes at both the protected name and its existing canonical target, including a target inside the writable workspace.
 
 ### `full_access`
 
@@ -126,14 +138,25 @@ Used only for explicit `full_access`. It retains DaVinci's supervised process-tr
 
 Experimental. With `backend: "container"` (or `auto` without bubblewrap) and a user-configured `container.image`, commands run through Docker or Podman with a read-only root, `--network none` for denied networking, and `--memory`/`--pids-limit`/ulimits. Each launch gets its own container name, so concurrent launches under one policy never collide or tear each other down. The same host runtime mounts as bubblewrap are bound into the container, which replaces the image's own `/usr`; treat this backend as unfinished.
 
-### Windows and macOS
+### macOS Seatbelt
 
-DaVinci does not equate process ownership with filesystem/network isolation.
+**Partial backend, unavailable for session confinement.** Seatbelt does not mediate `setsid`/`setpgid`; a descendant can leave the Unix supervisor's process group and survive teardown. This backend therefore does not advertise process-tree isolation, deterministic teardown, tree timeouts, or lifetime-private temp. Session policies require those capabilities and fail closed before launch. Auto does not select Seatbelt. Completing macOS autonomy requires an execution-plane ownership mechanism for detached descendants, with native enforcement evidence.
 
-- Windows retains Job Object process-tree ownership, but restricted/workspace-write must use a backend that can truthfully provide the required filesystem/network capabilities.
-- macOS similarly fails closed for required properties that no selected backend can enforce.
+The partial implementation for `backend: "macos_seatbelt"` (alias `"seatbelt"`) uses the fixed trusted `/usr/bin/sandbox-exec` executable with a generated deny-default profile. It grants workspace read or read/write, explicit runtime/toolchain paths read-only, and a private launch directory for `HOME`, `TMPDIR`, `TMP`, and `TEMP`. It excludes hidden paths and read-only overlays from parent write grants and protects `.git`, `.davinci`, and `.pi` even when absent. Network rules are denied by default; unrestricted networking requires explicit trusted user policy. Profiles do not allow wildcard Mach service lookup. Native fixtures deliberately omit the unavailable ownership requirements to test these partial properties; product settings do not.
 
-No platform silently reports an isolation capability that its backend does not advertise.
+Seatbelt filters the existing host filesystem; it does not create a mount namespace or synthetic root. Source and target must resolve to the same host path. Unsupported relocated/temporary mounts fail closed. Global file metadata lookup is permitted for runtime traversal, while file contents outside granted paths remain denied. macOS runtime grants include `/System`, `/usr`, `/bin`, `/sbin`, `/Library/Developer`, and selected `/private/etc` files; the `/System` grant excludes `/System/Volumes` (which contains the writable host Data volume). A narrow OS runtime grant on Preboot is separate; the host home and broad `/private` tree are never granted.
+
+For reduced-capability test launches, the supervisor exclusively creates each unpredictable temp directory with mode `0700`, keeps separate directories for parallel launches, and removes the directory after group termination/reaping, before reporting completion. The helper also attempts cleanup when its parent lifeline closes. This is best-effort disk cleanup: detached descendants can survive, and abrupt host/helper death or cleanup failure can leave temp behind. No lifetime isolation, volatile temp filesystem, or crash-proof erasure is claimed. Cleanup errors during monitored execution are reported as failures.
+
+Memory, PID, CPU-time and temp-size budgets, domain allowlisting, and an ephemeral root are also not advertised. Requests for these unsupported limits fail closed even when the caller omitted the corresponding required capability bit. Environment and output handling use the existing supervisor; file-size limits use the existing per-process Unix limit. Required ownership capabilities are never dropped to make a session policy launch.
+
+Rustup toolchains and selected Cargo registry/git directories can be read-only runtime paths. `CARGO_HOME` itself is private and writable; host Cargo configuration/credential files are not copied. Seatbelt cannot remount those caches into a synthetic home, so automatic reuse of a host Cargo cache is not promised on macOS.
+
+The required macOS job in `.github/workflows/ci.yml` runs native filesystem escapes, protected control paths, environment isolation, IPv4/IPv6/UDP/Unix socket controls, group-member cleanup, and the detached-descendant capability gap. Linux profile-generation tests alone do not establish native macOS enforcement. Phase 4.1's complete teardown requirement and Phase 4.2's macOS Auto default remain unfulfilled.
+
+### Native Windows
+
+Use WSL2 for native execution confinement now. Native Windows retains Job Object ownership and the existing approval policy without filesystem/network isolation claims. Explicit restricted/workspace-write requests still fail closed unless a selected capable backend can enforce them. No native restricted-token/ACL backend is claimed.
 
 ## Environment and secrets
 
@@ -147,7 +170,7 @@ Execution evidence stores environment variable names and a digest, not raw value
 
 ## Filesystem
 
-Filesystem policy is mount-based for isolated backends, not a string-prefix-only check.
+Filesystem policy uses mount namespaces on Linux and kernel Seatbelt path filters on macOS. Application-level string checks alone are not confinement.
 
 DaVinci also retains its existing application-level canonicalization, symlink/reparse checks and task-contract path policy above the sandbox.
 
@@ -176,7 +199,7 @@ Output beyond the output ceiling (4 MiB) is dropped, not fatal: the command keep
 
 ### Resource limits
 
-On Unix, `maxMemoryMb` sets `RLIMIT_DATA` (not `RLIMIT_AS`, under which Node, the JVM and Go fail while reserving address space), and CPU time and file size use `RLIMIT_CPU`/`RLIMIT_FSIZE`. These apply **per process**, not to the process tree. The container backend enforces its limits inside the container instead.
+On Linux, `maxMemoryMb` sets `RLIMIT_DATA` (not `RLIMIT_AS`, under which Node, the JVM and Go fail while reserving address space), and CPU time and file size use `RLIMIT_CPU`/`RLIMIT_FSIZE`. These apply **per process**, not to the process tree. The container backend enforces its limits inside the container instead.
 
 ## Evidence and verification
 

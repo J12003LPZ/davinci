@@ -280,7 +280,8 @@ impl Directory {
         use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
         valid_source_name(name)?;
         let file = OpenOptions::new()
-            .access_mode(0x80010000) // GENERIC_READ | DELETE for SetFileShortNameW.
+            // GENERIC_READ | DELETE (alias) | FILE_WRITE_ATTRIBUTES (creation time).
+            .access_mode(0x80010100)
             .share_mode(1) // Pin against external writes, renames and alias changes.
             .custom_flags(0x02200000)
             .open(self.path.join(name))?;

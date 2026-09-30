@@ -93,20 +93,41 @@ class RunnerTests(unittest.TestCase):
             repo = self.repository(Path(temporary))
             with self.assertRaises(ValueError):
                 runner.checkpoint_identity(binary, repo)
+
             source = runner.source_identity(repo)
-            identity = {"schema_version": 2, "binary_sha256": runner.file_hash(binary), **source}
+            identity = self.green_identity(binary, source)
             binary.with_suffix(".exe.identity.json").write_text(json.dumps(identity))
             self.assertEqual(runner.checkpoint_identity(binary, repo), source)
             binary.write_bytes(b"changed")
             with self.assertRaises(ValueError):
                 runner.checkpoint_identity(binary, repo)
 
+    def green_identity(self, binary, source):
+        ci = {"repository": "fixture/repo", "source_sha": source["source_sha"], "ci_run": 12,
+              "ci_url": "https://github.com/fixture/repo/actions/runs/12", "status": "completed", "conclusion": "success",
+              "event": "push", "workflow_path": ".github/workflows/ci.yml", "jobs": [{"name": name, "status": "completed", "conclusion": "success"}
+              for name in sorted(runner.release_identity.EXPECTED_CI_JOBS)],
+              "workflow_lint": {"status": "completed", "conclusion": "success", "run_id": 13}}
+        return runner.release_identity.make_identity(binary, source, ci, None, require_tag=False)
+
+    def test_checkpoint_refuses_provenance_without_green_ci(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            binary = Path(temporary) / "unverified.exe"
+            binary.write_bytes(b"public fixture binary")
+            repo = self.repository(Path(temporary))
+            source = runner.source_identity(repo)
+            for schema in (2, 3):
+                binary.with_suffix(".exe.identity.json").write_text(json.dumps({
+                    "schema_version": schema, "binary_sha256": runner.file_hash(binary), **source}))
+                with self.subTest(schema=schema), self.assertRaises(ValueError):
+                    runner.checkpoint_identity(binary, repo)
+
     def test_checkpoint_identity_rejects_old_dirty_or_unavailable_source(self):
         with tempfile.TemporaryDirectory() as temporary:
             binary = Path(temporary) / "parent.exe"
             binary.write_bytes(b"public parent executable")
             repo = self.repository(Path(temporary))
-            identity = {"schema_version": 2, "binary_sha256": runner.file_hash(binary), **runner.source_identity(repo)}
+            identity = self.green_identity(binary, runner.source_identity(repo))
             for changes in ({"schema_version": 1}, {"dirty_diff_hash": None},
                             {"dirty_diff_hash": "b" * 64}, {"source_clean": False},
                             {"source_sha": "c" * 40}, {"source_tree": "d" * 40}):

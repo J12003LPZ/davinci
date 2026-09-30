@@ -1,5 +1,6 @@
 """Campaign setup, process-lifetime ownership, and measurement boundaries."""
 import json
+import importlib.util
 from pathlib import Path
 import shutil
 import os
@@ -16,6 +17,11 @@ from contextlib import contextmanager
 from datetime import datetime, timezone
 
 from campaign import LEGACY_TASKS, digest, file_hash
+
+_release_spec = importlib.util.spec_from_file_location(
+    "davinci_release_identity", Path(__file__).resolve().parents[1] / "release_identity.py")
+release_identity = importlib.util.module_from_spec(_release_spec)
+_release_spec.loader.exec_module(release_identity)
 
 CLEAN_DIFF_HASH = hashlib.sha256(b"").hexdigest()
 _campaign_owner = None
@@ -237,8 +243,14 @@ def checkpoint_identity(executable, repo):
         identity = json.loads(sidecar.read_text(encoding="utf-8"))
     except (OSError, ValueError) as error:
         raise ValueError("missing or invalid checkpoint identity sidecar") from error
-    if not isinstance(identity, dict) or identity.get("schema_version") != 2:
-        raise ValueError("checkpoint requires schema 2 clean committed build provenance")
+    if not isinstance(identity, dict) or identity.get("schema_version") != 3:
+        raise ValueError("checkpoint requires schema 3 clean committed green-CI build provenance")
+    if identity.get("ci_verified") is not True:
+        raise ValueError("checkpoint has no green CI proof")
+    ci = identity.get("ci")
+    release_identity.validate_ci(ci, identity.get("repository"), identity.get("source_sha", ""))
+    if identity.get("ci_evidence_sha256") != hashlib.sha256(json.dumps(ci, sort_keys=True).encode()).hexdigest():
+        raise ValueError("checkpoint CI proof changed after recording")
     for field, length in (("binary_sha256", 64), ("source_sha", 40), ("source_tree", 40), ("dirty_diff_hash", 64)):
         value = identity.get(field)
         if not isinstance(value, str) or re.fullmatch("[0-9a-f]{" + str(length) + "}", value) is None:
@@ -277,7 +289,8 @@ def build_checkpoint(repo, destination):
     repo, destination = Path(repo).resolve(), Path(destination).resolve()
     if destination.is_relative_to(repo) or destination.exists():
         raise ValueError("checkpoint destination must be new and outside the repository")
-    before = source_identity(repo)
+    proof = release_identity.preflight(repo)
+    before = proof["source"]
     with tempfile.TemporaryDirectory(prefix="davinci-bench-build-") as target:
         build = ["cargo", "build", "--locked", "--release", "-p", "davinci-coding-agent", "--bin", "davinci",
                  "--target-dir", target]
@@ -288,9 +301,9 @@ def build_checkpoint(repo, destination):
         destination.mkdir(parents=True, exist_ok=False)
         binary = destination / built.name
         shutil.copy2(built, binary)
-        identity = {"schema_version": 2, **before, "binary_sha256": file_hash(binary),
-                    "build_command": build[:-1] + ["<temporary-target>"],
-                    "built_at": datetime.now(timezone.utc).isoformat()}
+        identity = release_identity.make_identity(binary, before, proof["ci"], None,
+                                                 proof["version"], require_tag=False)
+        identity["build_command"] = build[:-1] + ["<temporary-target>"]
         binary.with_suffix(binary.suffix + ".identity.json").write_text(
             json.dumps(identity, indent=2) + "\n", encoding="utf-8")
     return binary

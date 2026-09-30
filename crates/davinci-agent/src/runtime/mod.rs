@@ -143,6 +143,7 @@ pub struct RuntimeHandle {
     pub parent_agent_id: Option<AgentId>,
     pub session_id: Option<String>,
     sequence: Arc<AtomicU64>,
+    file_capture_identity: Arc<()>,
     pub bus: RuntimeBus,
     pub cancellation_token: CancellationToken,
     pub registry: RuntimeRegistry,
@@ -158,6 +159,11 @@ pub struct RuntimeHandle {
     pub progress_watchdog: Arc<Mutex<ProgressWatchdog>>,
     pub blob_store: BlobStore,
     pub effect_ledger: Arc<std::sync::RwLock<Vec<OwnedFileEffect>>>,
+    /// Existing bounded effect-report format, bound by the host to this session.
+    pub prompt_effect_report_path: Option<std::path::PathBuf>,
+    /// Why normal-conversation rewind stopped recording, if it did. Shared
+    /// across the per-prompt handles of one conversation like the ledger.
+    pub prompt_rewind_fault: Arc<Mutex<Option<String>>>,
     pub conversation: Arc<Mutex<ConversationRuntime>>,
 }
 
@@ -252,6 +258,7 @@ impl RuntimeHandle {
             parent_agent_id: None,
             session_id: None,
             sequence: Arc::new(AtomicU64::new(0)),
+            file_capture_identity: Arc::new(()),
             bus,
             cancellation_token: CancellationToken::new(),
             registry,
@@ -267,7 +274,51 @@ impl RuntimeHandle {
             progress_watchdog: Arc::new(Mutex::new(ProgressWatchdog::new())),
             blob_store: BlobStore::new(),
             effect_ledger: Arc::new(std::sync::RwLock::new(Vec::new())),
+            prompt_effect_report_path: None,
+            prompt_rewind_fault: Arc::new(Mutex::new(None)),
             conversation: Arc::new(Mutex::new(ConversationRuntime::new(run_id, agent_id, None))),
+        }
+    }
+
+    /// The reason normal-conversation rewind stopped recording, if any.
+    pub fn prompt_rewind_fault(&self) -> Option<String> {
+        self.prompt_rewind_fault
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+
+    /// Stop recording normal-conversation rewind for this conversation. Rewind
+    /// is a convenience: its storage failing must not fail the edit itself.
+    pub fn fail_prompt_rewind(&self, reason: impl Into<String>) {
+        let mut fault = self
+            .prompt_rewind_fault
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if fault.is_none() {
+            *fault = Some(reason.into());
+        }
+    }
+
+    /// Append one effect to this conversation's rewind report. After the first
+    /// failure nothing more is appended, so settled checkpoint ranges never
+    /// point past the lines that actually reached disk.
+    pub fn report_prompt_effect(
+        &self,
+        effect: &OwnedFileEffect,
+        before_bytes: Option<&[u8]>,
+        after_bytes: Option<&[u8]>,
+    ) {
+        let Some(path) = &self.prompt_effect_report_path else {
+            return;
+        };
+        if self.prompt_rewind_fault().is_some() {
+            return;
+        }
+        if let Err(error) = effects::append_effect_report(path, effect, before_bytes, after_bytes) {
+            self.fail_prompt_rewind(format!(
+                "Rewind stopped recording because its effect report could not be written: {error}"
+            ));
         }
     }
 
@@ -276,6 +327,10 @@ impl RuntimeHandle {
         self.cache = cache.clone();
         self.context_vm = context_vm::ContextVmRuntime::new(config, cache);
         self
+    }
+
+    pub(crate) fn file_capture_identity(&self) -> Arc<()> {
+        self.file_capture_identity.clone()
     }
 
     pub fn with_capability_registry(mut self, registry: RuntimeCapabilityRegistry) -> Self {

@@ -67,7 +67,12 @@ fn run_owned() -> std::io::Result<()> {
     let mut input = std::io::stdin();
     // Only the parent holds this helper's stdin pipe, so the channel itself
     // authenticates the frames.
-    let Request::Configure { identity, config } = wire::read(&mut input)? else {
+    let Request::Configure {
+        identity,
+        config,
+        private_temp,
+    } = wire::read(&mut input)?
+    else {
         return Ok(());
     };
     if identity.operation != config.operation {
@@ -80,7 +85,10 @@ fn run_owned() -> std::io::Result<()> {
         )?;
         return Ok(());
     }
-    let spawned = match spawn(config, &identity) {
+    // On parent-lifeline EOF the helper also attempts cleanup. The parent's
+    // monitor owns the authoritative cleanup after group termination.
+    let _private_temp_cleanup = PrivateTempCleanup(private_temp.clone());
+    let spawned = match spawn(config, &identity, private_temp.as_deref()) {
         Ok(spawned) => spawned,
         Err(error) => {
             wire::write(
@@ -233,7 +241,20 @@ fn run_owned() -> std::io::Result<()> {
             while readers.iter().any(|reader| !reader.is_finished()) && Instant::now() < deadline {
                 thread::sleep(POLL);
             }
-            flush_exit(&events, &identity, status.code(), readers_complete(readers));
+            #[cfg(unix)]
+            let signal = {
+                use std::os::unix::process::ExitStatusExt;
+                status.signal()
+            };
+            #[cfg(not(unix))]
+            let signal = None;
+            flush_exit(
+                &events,
+                &identity,
+                status.code(),
+                signal,
+                readers_complete(readers),
+            );
             return Ok(());
         }
         thread::sleep(POLL);
@@ -303,7 +324,11 @@ struct Spawned {
     max_lifetime_ms: Option<u64>,
 }
 
-fn spawn(config: ProcessConfig, identity: &super::ProcessIdentity) -> Result<Spawned, String> {
+fn spawn(
+    config: ProcessConfig,
+    identity: &super::ProcessIdentity,
+    private_temp: Option<&std::path::Path>,
+) -> Result<Spawned, String> {
     // A service (an MCP server) lives as long as its session and frames its
     // own output; a cumulative output budget or lifetime would kill it midway.
     let max_output_bytes = config
@@ -342,7 +367,7 @@ fn spawn(config: ProcessConfig, identity: &super::ProcessIdentity) -> Result<Spa
             launch_id: Some(identity.lifetime.simple().to_string()),
         };
         let prepared = SandboxBroker
-            .prepare(spec, &request, &config.environment)
+            .prepare_with_private_temp(spec, &request, &config.environment, private_temp)
             .map_err(|error| error.to_string())?;
         #[cfg(unix)]
         if prepared.backend == davinci_protocol::SandboxBackendKind::Container {
@@ -456,6 +481,7 @@ fn flush_exit(
     events: &mpsc::SyncSender<Message>,
     identity: &super::ProcessIdentity,
     code: Option<i32>,
+    signal: Option<i32>,
     output_complete: bool,
 ) {
     let (ack, ack_rx) = mpsc::sync_channel(1);
@@ -463,6 +489,7 @@ fn flush_exit(
         Event::Exit {
             identity: identity.clone(),
             code,
+            signal,
             output_complete,
         },
         Some(ack),
@@ -479,6 +506,15 @@ fn flush_exit(
                 thread::sleep(POLL);
             }
             Err(_) => break,
+        }
+    }
+}
+
+struct PrivateTempCleanup(Option<std::path::PathBuf>);
+impl Drop for PrivateTempCleanup {
+    fn drop(&mut self) {
+        if let Some(path) = &self.0 {
+            let _ = std::fs::remove_dir_all(path);
         }
     }
 }
@@ -549,7 +585,7 @@ mod tests {
                 .send(())
                 .unwrap();
         });
-        flush_exit(&events, &identity, Some(0), true);
+        flush_exit(&events, &identity, Some(0), None, true);
         drained.join().unwrap();
     }
 

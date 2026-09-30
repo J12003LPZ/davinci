@@ -2319,7 +2319,7 @@ pub struct Model {
     /// Whether the stored `show_terminal_progress` asked for OSC 9;4
     /// progress reports while a turn runs.
     pub terminal_progress: bool,
-    /// The stored double-escape action — `tree`, `fork` or `none` — kept on
+    /// The stored double-escape action — `rewind`, `tree`, `fork` or `none` — kept on
     /// the model so a settings change takes effect at once.
     pub double_escape_action: String,
     /// Turns typed while one was already running, waiting their place. They
@@ -2533,7 +2533,7 @@ impl Model {
             terminal_input_registered: false,
             suggestion_rows: SUGGESTION_ROWS,
             terminal_progress: false,
-            double_escape_action: "tree".into(),
+            double_escape_action: "rewind".into(),
             queued: Vec::new(),
             extensions: Extensions::default(),
             query: String::new(),

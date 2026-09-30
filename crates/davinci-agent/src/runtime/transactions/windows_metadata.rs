@@ -395,6 +395,29 @@ mod tests {
     use std::os::windows::io::AsRawHandle;
 
     #[test]
+    fn transaction_recreation_does_not_inherit_deleted_creation_time() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("a.txt");
+        std::fs::write(&path, b"deleted").unwrap();
+        let old = capture(&std::fs::metadata(&path).unwrap()).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        std::fs::remove_file(&path).unwrap();
+        let manager =
+            TransactionCoordinator::new(root.path(), TransactionOwner::default()).unwrap();
+        let preview = manager
+            .preview(vec![ProposedChange::write("a.txt", b"new".to_vec())])
+            .unwrap();
+        manager.apply(&preview.id, &|_| Ok(()), None).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"new");
+        assert_ne!(
+            capture(&std::fs::metadata(&path).unwrap()).unwrap().created,
+            old.created
+        );
+        manager.rollback(&preview.id, &|_| Ok(()), None).unwrap();
+        assert!(!path.exists());
+    }
+
+    #[test]
     fn transaction_stage_does_not_publish_temporary_short_name() {
         use crate::runtime::cache::directory::Directory;
         use std::io::Write;
@@ -488,6 +511,134 @@ mod tests {
                 b"before"
             );
         }
+    }
+
+    #[test]
+    fn transaction_interrupted_creation_time_publication_recovers() {
+        use super::super::{files, model::TransactionState, store::Store};
+        for restoring in [false, true] {
+            let root = tempfile::tempdir().unwrap();
+            let path = "a.txt";
+            std::fs::write(root.path().join(path), b"before").unwrap();
+            let owner = TransactionOwner::default();
+            let manager = TransactionCoordinator::new(root.path(), owner.clone()).unwrap();
+            let preview = manager
+                .preview(vec![ProposedChange::write(path, b"after".to_vec())])
+                .unwrap();
+            if restoring {
+                manager.apply(&preview.id, &|_| Ok(()), None).unwrap();
+            }
+            let root_path = root.path().canonicalize().unwrap();
+            let store = Store::open(&root_path).unwrap();
+            let mut record = store.load(&preview.id, &root_path, &owner, false).unwrap();
+            let change = &mut record.changes[0];
+            let content = if restoring {
+                change.before_bytes.as_deref()
+            } else {
+                change.proposed_bytes.as_deref()
+            };
+            let (image, stage) = files::stage(&root_path, path, content, &change.before).unwrap();
+            let mut tunneled = image.windows_metadata.clone().unwrap();
+            tunneled.created -= 10_000;
+            if restoring {
+                change.restored = Some(image);
+                change.restore_name = stage.clone();
+                change.restore_alias_pending = true;
+                record.summary.state = TransactionState::RollingBack;
+            } else {
+                change.proposed = image;
+                change.staged_name = stage.clone();
+                change.alias_pending = true;
+                record.summary.state = TransactionState::Applying;
+            }
+            store.begin(&preview.id).unwrap();
+            store.save(&record).unwrap();
+            let (dir, name) = files::directory(&root_path, path, false).unwrap();
+            dir.replace_source(stage.as_deref().unwrap(), &name, true, true)
+                .unwrap();
+            restore(&dir.source_alias_file(&name).unwrap(), Some(&tunneled)).unwrap();
+            let recovered = TransactionCoordinator::new(&root_path, owner).unwrap();
+            assert_eq!(
+                recovered
+                    .rollback(&preview.id, &|_| Ok(()), None)
+                    .unwrap()
+                    .state,
+                TransactionState::RolledBack
+            );
+            assert_eq!(std::fs::read(root.path().join(path)).unwrap(), b"before");
+            assert_eq!(
+                files::capture(&root_path, path).unwrap().0.windows_metadata,
+                record.changes[0].before.windows_metadata
+            );
+        }
+    }
+
+    #[test]
+    fn transaction_metadata_publication_respects_effective_permissions() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("a.txt");
+        std::fs::write(&path, b"before").unwrap();
+        let file = std::fs::OpenOptions::new()
+            .access_mode(0xe0000)
+            .open(&path)
+            .unwrap();
+        let access = super::super::windows_acl::read(&file).unwrap();
+        let dacl = access.find("D:").unwrap();
+        // Deny WRITE_ATTRIBUTES to everyone, retaining all other file rights.
+        let denied = format!("{}D:P(D;;0x100;;;WD)(A;;FA;;;WD)", &access[..dacl]);
+        super::super::windows_acl::apply(&file, &denied).unwrap();
+        drop(file);
+        // Elevated backup-capable tokens may still receive the requested rights.
+        // Exercise the actual access decision instead of assuming a token type.
+        let directory =
+            crate::runtime::cache::directory::Directory::open(root.path(), false).unwrap();
+        let can_publish = directory.source_alias_file("a.txt").is_ok();
+        let manager =
+            TransactionCoordinator::new(root.path(), TransactionOwner::default()).unwrap();
+        let preview = manager
+            .preview(vec![ProposedChange::write("a.txt", b"after".to_vec())])
+            .unwrap();
+        let result = manager.apply(&preview.id, &|_| Ok(()), None);
+        if can_publish {
+            result.unwrap();
+            assert_eq!(std::fs::read(&path).unwrap(), b"after");
+            manager.rollback(&preview.id, &|_| Ok(()), None).unwrap();
+        } else {
+            assert!(result
+                .unwrap_err()
+                .contains("cannot publish transaction metadata"));
+        }
+        assert_eq!(std::fs::read(&path).unwrap(), b"before");
+        assert_eq!(
+            manager.status(&preview.id).unwrap().state,
+            super::super::TransactionState::RolledBack
+        );
+        let file = std::fs::OpenOptions::new()
+            .access_mode(0xe0000)
+            .open(&path)
+            .unwrap();
+        super::super::windows_acl::apply(&file, &access).unwrap();
+    }
+
+    #[test]
+    fn transaction_pending_publication_tolerates_only_creation_time() {
+        use super::super::files;
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("a.txt"), b"before").unwrap();
+        let expected = files::capture(root.path(), "a.txt").unwrap().0;
+        let mut tunneled = expected.clone();
+        tunneled.windows_metadata.as_mut().unwrap().created -= 10_000;
+        assert!(files::publication_matches(&tunneled, &expected));
+        let mut changed = tunneled.clone();
+        changed.hash = Some("foreign content".into());
+        assert!(!files::publication_matches(&changed, &expected));
+        let mut changed = tunneled.clone();
+        changed.identity = Some("foreign file".into());
+        assert!(!files::publication_matches(&changed, &expected));
+        let mut changed = tunneled;
+        changed.windows_metadata.as_mut().unwrap().attributes ^= 0x2;
+        assert!(!files::publication_matches(&changed, &expected));
     }
 
     #[test]

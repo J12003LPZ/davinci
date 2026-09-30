@@ -21,10 +21,10 @@ impl Default for LearningConfig {
     fn default() -> Self {
         Self {
             enabled: true,
-            background_review: true,
+            background_review: false,
             shadow_mode: false,
-            auto_apply_project: true,
-            auto_apply_global: true,
+            auto_apply_project: false,
+            auto_apply_global: false,
             max_candidates_per_review: 3,
             max_review_input_tokens: 12_000,
             max_review_iterations: 6,
@@ -43,15 +43,30 @@ mod tests {
     fn learning_defaults_are_safe() {
         let config = LearningConfig::default();
         assert!(config.enabled);
-        assert!(config.background_review);
+        assert!(!config.background_review);
         assert!(!config.shadow_mode);
-        assert!(config.auto_apply_project);
-        assert!(config.auto_apply_global);
+        assert!(!config.auto_apply_project);
+        assert!(!config.auto_apply_global);
         assert_eq!(config.max_candidates_per_review, 3);
         assert_eq!(config.max_review_input_tokens, 12_000);
         assert_eq!(config.max_review_iterations, 6);
         assert_eq!(config.auto_promote_verified_uses, 2);
         assert_eq!(config.review_timeout_ms, 120_000);
         assert_eq!(config.min_review_interval_ms, 180_000);
+    }
+
+    #[test]
+    fn omitted_settings_require_background_opt_in_and_scope_approval() {
+        for raw in ["{}", "{\"enabled\":true}"] {
+            let config: LearningConfig = serde_json::from_str(raw).unwrap();
+            assert!(!config.background_review);
+            assert!(!config.auto_apply_project);
+            assert!(!config.auto_apply_global);
+        }
+        let config: LearningConfig = serde_json::from_str(
+            "{\"backgroundReview\":true,\"autoApplyProject\":true,\"autoApplyGlobal\":true}",
+        )
+        .unwrap();
+        assert!(config.background_review && config.auto_apply_project && config.auto_apply_global);
     }
 }

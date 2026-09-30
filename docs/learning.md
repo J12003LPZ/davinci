@@ -18,32 +18,20 @@ Davinci maintains a strict distinction between declarative facts and procedural 
 ## 2. Core Principles & Safety Model
 
 ### Fail-Open Asynchronous Loop
-- After a turn that passes `should_review_evidence`, the interactive shell and RPC sessions start a model review on a background thread. The review runs this `davinci` as a print-mode child (`-p --no-session --no-extensions --no-skills --no-mcp --no-tools`) on the session's model, with `REVIEWER_SYSTEM_PROMPT` and the turn evidence (`reviewer.rs::execute_live_review`).
+- Background review is off by default (`learning.backgroundReview: false`). When explicitly enabled, after a turn that passes `should_review_evidence`, the interactive shell and RPC sessions start a model review on a background thread. The review runs this `davinci` as a print-mode child (`-p --mode json --no-session --no-extensions --no-skills --no-mcp --no-tools`) on the session's model, with `REVIEWER_SYSTEM_PROMPT` and the turn evidence (`reviewer.rs::execute_live_review`).
 - One review runs at a time, and reviews start at least `minReviewIntervalMs` apart (default 3 minutes). The evidence covers the last ten messages, so a turn skipped for spacing is mostly seen by the next review. A new turn does not cancel a running review.
-- The child runs with `PI_LEARNING_DISABLE_BACKGROUND=1` and `PI_MEMORY_ENABLED=0`, so it neither reviews itself nor indexes the review into vector memory.
+- The child runs with `PI_LEARNING_DISABLE_BACKGROUND=1`, `DAVINCI_SECURITY_WATCH=0`, and `PI_MEMORY_ENABLED=0`, so it neither dispatches further background reviews nor indexes the review into vector memory.
 - Finished reviews are applied at the start of the next turn and by any `/learning-*` or `/skill-*` command. A review still running when the process exits is lost.
-- Print mode (`davinci -p`, graph workers) does not start model reviews. `PI_LEARNING_REVIEW_FIXTURE` still answers synchronously in every mode for tests.
-- Any background failure, parse error, or timeout (`reviewTimeoutMs`, default 2 minutes) is swallowed and recorded in diagnostics; `/learning-status` shows the last one. Foreground turns are never blocked or failed by learning.
+- Print mode (`davinci -p`, graph workers) does not start model reviews. When review is opted in, `PI_LEARNING_REVIEW_FIXTURE` answers synchronously in every mode for tests.
+- Any background failure, parse error, or timeout (`reviewTimeoutMs`, default 2 minutes) is swallowed and recorded in diagnostics; the learning section of `/status` shows the last one. Foreground turns are never blocked or failed by learning.
 - Review can be completely disabled by setting `PI_LEARNING_DISABLE_BACKGROUND=1`.
 
-### Automatic Learning by Default (Zero User Interaction Required)
-- **Automatic Application Enabled**: The system operates with `shadowMode = false`, `autoApplyProject = true`, and `autoApplyGlobal = true` by default. Proven procedural workflows and declarative facts are automatically persisted and activated without requiring manual `/learning-approve` commands or user prompts.
-- **Autonomous Auto-Promotion**:
-  - `auto_apply_project`: Enabled by default (`true`). When project tasks are verified, learned procedural workflows are automatically committed to the project's Davinci-owned skill directory (see Storage Layout).
-  - `auto_apply_global`: Enabled by default (`true`). Global skills and facts are automatically maintained without user intervention.
-  - `auto_promote_verified_uses`: Skills that start as candidates are automatically promoted to `active` once verified in 2 independent successful executions without failures.
-- **Declarative vs. Procedural Verification**:
-  - Declarative memory facts (architecture decisions, conventions, constraints) auto-apply directly to vector memory upon high confidence (≥ 0.80) without requiring command execution.
-  - Procedural workflows require command verification (e.g. tests or build verification commands that exited with code 0) before autonomous activation.
-- **Read-Before-Write Hash Verification & Path Traversal Prevention**:
-  - Patching existing skills checks that the current file content matches the expected hash before applying changes.
-  - Rejects attempts to escape skill directories or overwrite user-authored / imported skills.
-- **Nothing waits for approval**: with the defaults, no candidate is staged for `/learning-approve`. What cannot be applied safely is kept as a `Candidate` (never used) or rejected:
-  - a procedure proposed in a turn the user corrected is kept; a memory or failure lesson from that turn is applied, because recording the correction is the point;
-  - a patch or support file for a user-authored or imported skill, or any `scripts/` file, is kept;
-  - a patch or support file for a skill that does not exist is rejected;
-  - a second `skill_create` for an active skill is kept (the reviewer is shown existing learned skills and asked to patch instead).
-  Staging for approval only happens when you opt into it with `shadowMode: true` or `autoApplyProject`/`autoApplyGlobal: false`.
+### Approval by default
+- `autoApplyProject` and `autoApplyGlobal` default to `false`. Valid candidates are staged for `/learning-approve <id|all>` before activation. Project auto-apply remains opt-in until private evaluation shows a benefit; global promotion always requires approval unless the owner explicitly changes that setting.
+- Enabling background review does not enable automatic promotion. Opt-in belongs in the owner's agent-directory settings: trusted project settings can narrow `enabled`, `backgroundReview`, `autoApplyProject`, and `autoApplyGlobal`, but cannot grant permission that the owner did not enable. Existing owner opt-ins retain the verification, ownership, hash, and path checks.
+- Project configuration cannot disable owner shadow mode, increase review input, iteration, candidate, or timeout limits, shorten the review interval, or lower the verified-use promotion threshold. Smaller review budgets and longer intervals remain available per project.
+- Declarative memory facts and failure lessons need confidence of at least 0.80; procedural workflows also need successful command verification. Both obey the scope's approval setting.
+- User-authored and imported skills remain protected. Executable `scripts/` support files are never written unattended, missing patch targets are rejected, and duplicate active skills are kept as candidates.
 - **Use in later turns**: before each turn, learned skills (ledger status `active`, origin learned) that match the prompt are injected beside precision-gated vector memory, up to 2 skills and 1,200 tokens (`LearningController::learned_skill_block`). Vector memory no longer persists raw settled-turn chat: learning promotes compact typed claims, pinned constraints are bounded, ordinary automatic recall requires a shared code anchor, a clear lead over the runner-up and an unchanged source file, and broader recall remains available through `memory_search` (details in `docs/vector-memory.md`).
   - Maintains versioned history backups (up to 5 versions) under `<store>/history/<skill>/<version>.md`.
 
@@ -110,8 +98,8 @@ Active procedural skills are persisted as standard skill directories containing 
 | Command | Description |
 | :--- | :--- |
 | `/learn [--global] <instruction>` | Distills a reusable procedure into a project or global skill in the foreground. Searches existing skills first to prefer patching over duplicates. |
-| `/learning-status` | Displays current learning configuration, shadow mode status, project trust, candidate stats, and active skills count. |
-| `/learning-pending` | Lists candidates staged for approval. Empty with the default configuration. |
+| `/status` (learning section; `learning-status` remains an internal view) | Displays current learning configuration, shadow mode status, project trust, candidate stats, and active skills count. |
+| `/learning-pending` | Lists candidates staged for approval after an opted-in review. |
 | `/learning-approve <id\|all>` | Approves a staged candidate, activating the skill/memory and updating the ledger. |
 | `/learning-reject <id\|all>` | Rejects a staged candidate, marking it as dismissed. |
 | `/skill-list [query]` | Lists compact descriptors of known skills across project and global scopes with versions and usage counts. |
@@ -131,10 +119,10 @@ Learning configuration is specified under the `"learning"` key in settings:
 {
   "learning": {
     "enabled": true,
-    "backgroundReview": true,
+    "backgroundReview": false,
     "shadowMode": false,
-    "autoApplyProject": true,
-    "autoApplyGlobal": true,
+    "autoApplyProject": false,
+    "autoApplyGlobal": false,
     "maxCandidatesPerReview": 3,
     "maxReviewInputTokens": 12000,
     "maxReviewIterations": 6,
@@ -150,8 +138,8 @@ Learning configuration is specified under the `"learning"` key in settings:
 - **Review disablement**: Setting `PI_LEARNING_DISABLE_BACKGROUND=1` immediately short-circuits background review execution.
 - **Fallback to lexical**: If Ollama or Qdrant are unavailable, skill retrieval cleanly falls back to lexical matching.
 - **Untrusted projects**: Learned project skills live in the Davinci-owned store, so trust does not gate them. A legacy in-repository store in an untrusted project receives no autonomous project writes.
-- **Cost**: each review is one extra model call on the session's model, bounded by `maxReviewInputTokens`, only for turns that pass review gating and the interval.
-- **Self-improving autonomy**: Without user interaction, high-confidence memories and verified skills are automatically promoted and activated.
+- **Cost**: an opted-in review adds provider requests on the session's model, with input bounded by `maxReviewInputTokens`, only for turns that pass review gating and the interval.
+- **Activation**: high-confidence memories and verified skills require approval by default. Autonomous activation additionally requires an explicit scope auto-apply setting.
 
 ---
 
@@ -167,7 +155,8 @@ To eliminate wasteful background reviewer model calls on low-signal turns, `shou
 4. **Deterministic Commands Ran**: Verification commands executed (`commands_ran > 0`).
 5. **Skill Verification Outcome**: An injected skill received verified outcome or user acceptance.
 
-*Efficiency & Quality Impact*: Benchmarking demonstrates a **>= 40% median reviewer input token reduction** while achieving **0% loss (100% preservation)** of accepted high-confidence learning artifacts.
+This deterministic gate limits review eligibility. Its effect on task success,
+tokens, and learning quality still needs live evaluation.
 
 ### Exact Skill Version Provenance & Attribution
 Skills injected into graph worker context carry immutable version references:
@@ -194,7 +183,24 @@ Graph configurations support configurable security verification modes (`off | ri
 When security verification fails, review approval is blocked (`bundle.approval_eligible == false`), security diagnostics are injected into revision notes, and additional revision cycles are required.
 
 ### Closed-Loop Learning Proof
+The fixture explicitly enables background review and project auto-apply:
+
 1. **Run #1**: Performs verified workflow with no prior learned skills; verification bundle triggers settled turn review, persisting a high-confidence memory and a new versioned skill (`SKILL.md` + ledger record).
 2. **Run #2**: A related goal is launched; `build_context_packet` retrieves the persisted memory and exact skill version into worker context.
 3. **Feedback Proof**: Run #2 completes with verified success; graph outcome attribution increments the exact skill version's success counter (`success_count: 1`) in the durable ledger with zero extra coordinator model calls.
 
+
+## Background cost visibility
+
+`/cost`, `/status`, and RPC `get_session_stats.background` report learning review and security watch separately from foreground session tokens. Input, output, cache read, and cache write are provider measurements; reasoning tokens are an output subset and are not added twice. Costs are estimates from provider catalog pricing. Missing usage and zero/unknown prices appear as `null` / `unknown`, with partial measured totals retained. Budget reservations are never presented as measured tokens.
+
+Counters belong to the session that dispatched the call, including calls still running during a session switch. They cover only the current process and are not restored from session history. Reloading the host within that process preserves existing receipts. No-request totals are zero for a bound host; an unbound host reports unknown. Failed and interrupted requests remain visible.
+
+Existing provider attempt telemetry includes actual sends across harness
+retries, provider retries, and transport fallback. Its receipts take precedence
+over the duplicated terminal assistant usage. Attempts without a receipt remain
+unknown, even when a later attempt succeeds; known measurements remain available
+as a partial total. Legacy retry events without attempt telemetry likewise keep
+discarded failed attempts unknown.
+
+To enable learning review while keeping approval, set `learning.backgroundReview` to `true` in the owner's agent-directory settings. `/learning-approve` and `/learning-reject` control activation. This change does not establish measured quality improvements; live private dev/holdout evaluations remain pending.

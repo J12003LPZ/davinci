@@ -9,7 +9,10 @@
 //! (32 KB on Windows) and a hook's input should not be readable by every
 //! process inspector for as long as the hook runs. A `preTool` hook that
 //! exits non-zero blocks the call with its stderr (or stdout) as the reason;
-//! `postTool` and `stop` hooks are run for their effect only.
+//! `postTool` exit 2 adds feedback to the tool result; `stop` remains a
+//! run-end observer. `completion`
+//! runs before a prompt finishes; exit 2 or JSON `decision: block` continues
+//! the prompt with feedback. Its stdin includes `stop_hook_active`.
 
 use std::fs::OpenOptions;
 use std::io::Write;
@@ -232,6 +235,7 @@ pub fn normalize_event_name(raw: &str) -> &'static str {
         "sessionstart" => "sessionStart",
         "sessionend" => "sessionEnd",
         "stop" => "stop",
+        "completion" => "completion",
         "userpromptsubmit" => "userPromptSubmit",
         "permissionrequest" => "permissionRequest",
         "subagentstart" => "subagentStart",
@@ -313,6 +317,8 @@ pub struct HooksFile {
     pub session_end: Vec<Vec<String>>,
     #[serde(default)]
     pub stop: Vec<Vec<String>>,
+    #[serde(default)]
+    pub completion: Vec<Vec<String>>,
 
     #[serde(default, alias = "policies")]
     pub rules: Vec<HookPolicyRule>,
@@ -401,6 +407,7 @@ impl HooksFile {
             "preModelSwitch" => self.pre_model_switch.iter().collect(),
             "postModelSwitch" => self.post_model_switch.iter().collect(),
             "sessionEnd" => self.session_end.iter().chain(self.stop.iter()).collect(),
+            "completion" => self.completion.iter().collect(),
             _ => Vec::new(),
         }
     }
@@ -438,6 +445,7 @@ pub fn load(agent_dir: &Path, cwd: &Path, trusted: bool) -> HooksFile {
                 file.post_model_switch.extend(project.post_model_switch);
                 file.session_end.extend(project.session_end);
                 file.stop.extend(project.stop);
+                file.completion.extend(project.completion);
                 file.rules.extend(project.rules);
             }
         }
@@ -547,6 +555,184 @@ pub fn append_event(
     }
 }
 
+/// Per-prompt completion gate. Project trust/integrity and the graph-worker
+/// fence apply before executing any command. Legacy `stop` is separate.
+///
+/// These hooks run on the agent loop at the moment the model tries to finish,
+/// so `cancelled` (the user's Esc/Ctrl+C) stops a running hook immediately.
+pub fn run_completion(
+    hooks: &HooksFile,
+    config: &HookPolicyConfig,
+    cwd: &Path,
+    agent_dir: &Path,
+    stop_hook_active: bool,
+    cancelled: &dyn Fn() -> bool,
+) -> Option<String> {
+    if std::env::var_os("PI_GRAPH_ROLE").is_some() {
+        return None;
+    }
+    if let Err(error) = hooks.validate_trust_and_integrity(cwd, agent_dir) {
+        eprintln!("[davinci-hooks] completion: {error}");
+        return None;
+    }
+    let args = serde_json::json!({"stop_hook_active": stop_hook_active});
+    for argv in &hooks.completion {
+        if cancelled() {
+            return None;
+        }
+        if let Err(reason) = run_supervised_hook_cancellable(
+            argv,
+            "completion",
+            "",
+            None,
+            &args,
+            None,
+            None,
+            None,
+            Some(cwd),
+            3,
+            cancelled,
+        ) {
+            return Some(reason);
+        }
+    }
+    if config.enabled {
+        for rule in &hooks.rules {
+            if cancelled() {
+                return None;
+            }
+            if rule.matches("completion", "", None) {
+                if let Err(reason) = run_supervised_hook_cancellable(
+                    &rule.action,
+                    "completion",
+                    "",
+                    None,
+                    &args,
+                    None,
+                    None,
+                    rule.timeout_ms.or(Some(config.default_timeout_ms)),
+                    Some(cwd),
+                    config.max_depth,
+                    cancelled,
+                ) {
+                    match rule.on_failure {
+                        HookFailurePolicy::Block => return Some(reason),
+                        HookFailurePolicy::Warn => warn_hook("completion", &reason),
+                        HookFailurePolicy::Ignore => {
+                            GLOBAL_HOOK_TELEMETRY
+                                .ignored
+                                .fetch_add(1, Ordering::Relaxed);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Run post-tool hooks once where the host can decorate the actual result.
+/// Exit 2 is feedback, never a change to the tool's success or permission.
+#[allow(clippy::too_many_arguments)]
+pub fn run_post_tool_feedback(
+    hooks: &HooksFile,
+    config: &HookPolicyConfig,
+    cwd: &Path,
+    agent_dir: &Path,
+    tool: &str,
+    args: &Value,
+    envelope: Option<&davinci_agent::RuntimeEventEnvelope>,
+    mut result: davinci_agent::ToolResult,
+) -> davinci_agent::ToolResult {
+    if std::env::var_os("PI_GRAPH_ROLE").is_some() {
+        return result;
+    }
+    if let Err(error) = hooks.validate_trust_and_integrity(cwd, agent_dir) {
+        warn_hook("postTool", &error);
+        return result;
+    }
+    let kind = if result.is_error {
+        "postToolFailure"
+    } else {
+        "postTool"
+    };
+    let content = result.content.clone();
+    let mut feedback = Vec::new();
+    for argv in hooks.get_legacy_commands(kind) {
+        if let Err(reason) = run_supervised_hook(
+            argv,
+            kind,
+            tool,
+            None,
+            args,
+            Some(&content),
+            envelope,
+            None,
+            Some(cwd),
+            3,
+        ) {
+            feedback.push(reason);
+        }
+    }
+    if config.enabled && std::env::var("DAVINCI_RUNTIME_HOOKS_V2").as_deref() != Ok("0") {
+        let event = if result.is_error {
+            "postToolFailure"
+        } else {
+            "afterTool"
+        };
+        let path = args.get("path").and_then(Value::as_str).map(Path::new);
+        for rule in &hooks.rules {
+            if rule.matches(event, tool, path) {
+                if let Err(reason) = run_rule(
+                    rule,
+                    kind,
+                    tool,
+                    path,
+                    args,
+                    Some(&content),
+                    envelope,
+                    rule.timeout_ms.or(Some(config.default_timeout_ms)),
+                    Some(cwd),
+                    config.max_depth,
+                ) {
+                    match rule.on_failure {
+                        HookFailurePolicy::Block => feedback.push(reason),
+                        HookFailurePolicy::Warn => warn_hook(kind, &reason),
+                        HookFailurePolicy::Ignore => {
+                            GLOBAL_HOOK_TELEMETRY
+                                .ignored
+                                .fetch_add(1, Ordering::Relaxed);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    for reason in feedback {
+        result.content.push_str(&format!(
+            "\n\n<user-hook-feedback>{reason}</user-hook-feedback>"
+        ));
+    }
+    result
+}
+
+fn warn_hook(kind: &str, reason: &str) {
+    GLOBAL_HOOK_TELEMETRY.warned.fetch_add(1, Ordering::Relaxed);
+    eprintln!("[davinci-hooks] {kind}: {reason}");
+}
+
+fn hook_failure(kind: &str, reason: String) -> Result<(), String> {
+    if matches!(kind, "completion" | "postTool" | "postToolFailure") {
+        warn_hook(kind, &reason);
+        Ok(())
+    } else {
+        GLOBAL_HOOK_TELEMETRY
+            .blocked
+            .fetch_add(1, Ordering::Relaxed);
+        Err(reason)
+    }
+}
+
 pub fn run_stop(hooks: &HooksFile) {
     for argv in &hooks.stop {
         let _ = run_one(argv, "stop", "", &Value::Null, None);
@@ -619,16 +805,53 @@ pub fn run_supervised_hook(
     cwd: Option<&Path>,
     max_depth: usize,
 ) -> Result<(), String> {
-    let program = argv
-        .first()
-        .ok_or_else(|| "empty hook command".to_string())?;
+    run_supervised_hook_cancellable(
+        argv,
+        kind,
+        tool,
+        path,
+        args,
+        result,
+        envelope,
+        timeout_ms,
+        cwd,
+        max_depth,
+        &|| false,
+    )
+}
+
+/// [`run_supervised_hook`] that stops the hook's process tree as soon as
+/// `cancelled` reports true. A cancelled hook neither blocks nor passes; the
+/// caller sees the abort itself.
+#[allow(clippy::too_many_arguments)]
+pub fn run_supervised_hook_cancellable(
+    argv: &[String],
+    kind: &str,
+    tool: &str,
+    path: Option<&Path>,
+    args: &Value,
+    result: Option<&str>,
+    envelope: Option<&davinci_agent::RuntimeEventEnvelope>,
+    timeout_ms: Option<u64>,
+    cwd: Option<&Path>,
+    max_depth: usize,
+    cancelled: &dyn Fn() -> bool,
+) -> Result<(), String> {
+    let Some(program) = argv.first() else {
+        return hook_failure(kind, "empty hook command".to_string());
+    };
 
     if std::env::var("PI_HOOKS_DRY_RUN").is_ok() {
         return Ok(());
     }
-    crate::execution_boundary::require_executor("hook process")?;
+    if let Err(reason) = crate::execution_boundary::require_executor("hook process") {
+        return hook_failure(kind, reason);
+    }
 
-    let _depth_guard = HookDepthGuard::enter(max_depth)?;
+    let _depth_guard = match HookDepthGuard::enter(max_depth) {
+        Ok(guard) => guard,
+        Err(reason) => return hook_failure(kind, reason),
+    };
 
     GLOBAL_HOOK_TELEMETRY
         .executed
@@ -641,6 +864,9 @@ pub fn run_supervised_hook(
         "args": args,
         "result": result,
     });
+    if kind == "completion" {
+        payload["stop_hook_active"] = args["stop_hook_active"].clone();
+    }
     if let Some(env) = envelope {
         payload["schemaVersion"] = serde_json::json!(env.schema_version);
         payload["runId"] = serde_json::json!(env.run_id.to_string());
@@ -699,33 +925,55 @@ pub fn run_supervised_hook(
     let timeout = timeout_ms
         .map(Duration::from_millis)
         .unwrap_or(HOOK_TIMEOUT);
-    let output = davinci_sys::process::run_bounded(
+    let output = match davinci_sys::process::run_bounded(
         cmd,
         Some(payload_str.into_bytes()),
         davinci_sys::process::RunLimits {
             timeout,
             output_cap: MAX_HOOK_STREAM_BYTES,
         },
-        &|| false,
-    )
-    .map_err(|err| {
-        GLOBAL_HOOK_TELEMETRY
-            .blocked
-            .fetch_add(1, Ordering::Relaxed);
-        format!("hook `{program}` failed: {err}")
-    })?;
+        cancelled,
+    ) {
+        Ok(output) => output,
+        Err(err) => return hook_failure(kind, format!("hook `{program}` failed: {err}")),
+    };
+    if output.cancelled {
+        return Ok(());
+    }
 
     if output.timed_out {
         GLOBAL_HOOK_TELEMETRY
             .timed_out
             .fetch_add(1, Ordering::Relaxed);
-        GLOBAL_HOOK_TELEMETRY
-            .blocked
-            .fetch_add(1, Ordering::Relaxed);
-        return Err(format!(
-            "hook `{program}` timed out after {}s",
-            timeout.as_secs()
-        ));
+        return hook_failure(
+            kind,
+            format!("hook `{program}` timed out after {}s", timeout.as_secs()),
+        );
+    }
+
+    if matches!(kind, "completion" | "postTool" | "postToolFailure") {
+        let outcome = crate::plugins::hooks::interpret(
+            if kind == "completion" {
+                crate::plugins::hooks::HookEvent::Stop
+            } else {
+                crate::plugins::hooks::HookEvent::PostToolUse
+            },
+            output.status.and_then(|status| status.code()),
+            &String::from_utf8_lossy(&output.stdout),
+            &String::from_utf8_lossy(&output.stderr),
+        );
+        if let Some(warning) = outcome.warning {
+            warn_hook(kind, &format!("`{program}`: {warning}"));
+        }
+        return match outcome.block {
+            Some(reason) => {
+                GLOBAL_HOOK_TELEMETRY
+                    .blocked
+                    .fetch_add(1, Ordering::Relaxed);
+                Err(reason)
+            }
+            None => Ok(()),
+        };
     }
 
     if output.status.is_some_and(|status| status.success()) {
@@ -768,6 +1016,7 @@ pub(crate) fn status_report_with_agent_dir(agent_dir: &Path, cwd: &Path) -> Valu
             "sessionStart": hooks.session_start.len(),
             "sessionEnd": hooks.session_end.len(),
             "stop": hooks.stop.len(),
+            "completion": hooks.completion.len(),
         },
         "telemetry": {
             "executed": GLOBAL_HOOK_TELEMETRY.executed.load(Ordering::Relaxed),
@@ -782,6 +1031,411 @@ pub(crate) fn status_report_with_agent_dir(agent_dir: &Path, cwd: &Path) -> Valu
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
+    #[test]
+    fn completion_docs_recipe_allows_success_and_reports_fmt_or_test_failure() {
+        use std::os::unix::fs::PermissionsExt;
+        let doc = include_str!("../../../docs/completion-hooks.md");
+        let script = doc
+            .split("```sh\n")
+            .nth(1)
+            .unwrap()
+            .split("```")
+            .next()
+            .unwrap();
+        let config = doc
+            .split("```json\n")
+            .nth(1)
+            .unwrap()
+            .split("```")
+            .next()
+            .unwrap();
+        let hooks: HooksFile = serde_json::from_str(config).unwrap();
+        assert_eq!(hooks.rules[0].event, "completion");
+        assert_eq!(hooks.rules[0].action, ["sh", ".davinci/finish-line.sh"]);
+        assert_eq!(hooks.rules[0].timeout_ms, Some(600_000));
+        for (fmt_exit, test_exit, expected_calls) in [(0, 0, 2), (1, 0, 1), (0, 1, 2)] {
+            let dir = tempfile::tempdir().unwrap();
+            std::fs::create_dir_all(dir.path().join(".davinci")).unwrap();
+            std::fs::create_dir_all(dir.path().join("bin")).unwrap();
+            std::fs::write(dir.path().join(".davinci/finish-line.sh"), script).unwrap();
+            let cargo = dir.path().join("bin/cargo");
+            std::fs::write(&cargo, "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$CARGO_CAPTURE\"\nif [ \"$1\" = fmt ]; then echo fixture-format-result; exit \"$FMT_EXIT\"; fi\necho fixture-test-result; exit \"$TEST_EXIT\"\n").unwrap();
+            std::fs::set_permissions(cargo, std::fs::Permissions::from_mode(0o755)).unwrap();
+            let capture = dir.path().join("calls");
+            let mut command = Command::new("sh");
+            command
+                .arg(".davinci/finish-line.sh")
+                .current_dir(dir.path())
+                .env(
+                    "PATH",
+                    format!(
+                        "{}:{}",
+                        dir.path().join("bin").display(),
+                        std::env::var("PATH").unwrap_or_default()
+                    ),
+                )
+                .env("CARGO_CAPTURE", &capture)
+                .env("FMT_EXIT", fmt_exit.to_string())
+                .env("TEST_EXIT", test_exit.to_string());
+            let output = davinci_sys::process::run_bounded(
+                command,
+                None,
+                davinci_sys::process::RunLimits {
+                    timeout: Duration::from_secs(5),
+                    output_cap: MAX_HOOK_STREAM_BYTES,
+                },
+                &|| false,
+            )
+            .unwrap();
+            assert!(!output.timed_out);
+            assert_eq!(
+                output.status.unwrap().code(),
+                Some(if fmt_exit == 0 && test_exit == 0 {
+                    0
+                } else {
+                    2
+                })
+            );
+            let calls = std::fs::read_to_string(capture).unwrap();
+            assert_eq!(calls.lines().count(), expected_calls);
+            assert!(calls.starts_with("fmt --all -- --check\n"));
+            if expected_calls == 2 {
+                assert!(calls.contains("test -p davinci-agent --offline --locked"));
+            }
+            let reason = String::from_utf8_lossy(&output.stderr);
+            assert_eq!(
+                reason.contains("Repository checks failed"),
+                fmt_exit != 0 || test_exit != 0
+            );
+        }
+    }
+
+    fn output_hook(code: i32, stdout: &str, stderr: &str) -> Vec<String> {
+        if cfg!(windows) {
+            // Avoid PowerShell in Windows hook fixtures: on windows-latest
+            // cold PowerShell startup can exceed the short hook deadlines this
+            // module is testing. Python is already available on the CI image
+            // and receives argv without cmd.exe quoting rules, so it can emit
+            // exact JSON fixture bytes while still draining stdin.
+            let script = format!(
+                "import sys; sys.stdin.read(); sys.stdout.write({}); sys.stderr.write({}); sys.exit({code})",
+                serde_json::to_string(stdout).unwrap(),
+                serde_json::to_string(stderr).unwrap(),
+            );
+            vec!["python".into(), "-c".into(), script]
+        } else {
+            vec![
+                "sh".into(),
+                "-c".into(),
+                format!(
+                "cat >/dev/null; printf '%s' '{stdout}'; printf '%s' '{stderr}' >&2; exit {code}"
+            ),
+            ]
+        }
+    }
+
+    #[test]
+    fn completion_exit_two_and_json_block_but_other_failures_warn() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        let config = HookPolicyConfig::default();
+        for (argv, expected) in [
+            (
+                output_hook(2, "wrong stream", "rerun lint"),
+                Some("rerun lint"),
+            ),
+            (
+                output_hook(
+                    0,
+                    r#"{"decision":"block","reason":"missing boundary test"}"#,
+                    "",
+                ),
+                Some("missing boundary test"),
+            ),
+            (output_hook(1, "", "ordinary failure"), None),
+            (output_hook(0, "not json", ""), None),
+            (
+                vec![dir.path().join("missing-executable").display().to_string()],
+                None,
+            ),
+        ] {
+            let hooks = HooksFile {
+                completion: vec![argv],
+                ..Default::default()
+            };
+            let result = run_completion(&hooks, &config, dir.path(), dir.path(), false, &|| false);
+            assert_eq!(result.as_deref(), expected);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn completion_hook_stops_when_the_user_aborts() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        let hooks = HooksFile {
+            completion: vec![vec!["sh".into(), "-c".into(), "sleep 30; exit 2".into()]],
+            ..Default::default()
+        };
+        let started = std::time::Instant::now();
+        let aborted = || started.elapsed() > Duration::from_millis(200);
+        let result = run_completion(
+            &hooks,
+            &HookPolicyConfig::default(),
+            dir.path(),
+            dir.path(),
+            false,
+            &aborted,
+        );
+        assert_eq!(result, None, "a cancelled hook neither blocks nor passes");
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "the hook kept running after abort: {:?}",
+            started.elapsed()
+        );
+    }
+
+    #[test]
+    fn completion_flag_and_legacy_stop_are_separate() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        let completion = dir.path().join("completion.json");
+        let stop = dir.path().join("stop.json");
+        let hooks = HooksFile {
+            completion: vec![shell_hook(0, &completion)],
+            stop: vec![shell_hook(0, &stop)],
+            ..Default::default()
+        };
+        for active in [false, true] {
+            assert_eq!(
+                run_completion(
+                    &hooks,
+                    &HookPolicyConfig::default(),
+                    dir.path(),
+                    dir.path(),
+                    active,
+                    &|| false
+                ),
+                None
+            );
+            let payload: Value =
+                serde_json::from_slice(&std::fs::read(&completion).unwrap()).unwrap();
+            assert_eq!(payload["kind"], "completion");
+            assert_eq!(payload["stop_hook_active"], active);
+            assert!(!stop.exists());
+        }
+        run_stop(&hooks);
+        let payload: Value = serde_json::from_slice(&std::fs::read(stop).unwrap()).unwrap();
+        assert_eq!(payload["kind"], "stop");
+        assert!(payload.get("stop_hook_active").is_none());
+    }
+
+    #[test]
+    fn completion_rules_honor_filters_policy_and_timeout() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        let mut hooks = HooksFile {
+            rules: vec![HookPolicyRule {
+                event: "completion".into(),
+                tool: None,
+                path_pattern: None,
+                action: output_hook(2, "", "rule feedback"),
+                timeout_ms: Some(5_000),
+                on_failure: HookFailurePolicy::Block,
+            }],
+            ..Default::default()
+        };
+        let mut config = HookPolicyConfig::default();
+        assert_eq!(
+            run_completion(&hooks, &config, dir.path(), dir.path(), false, &|| false).as_deref(),
+            Some("rule feedback")
+        );
+        config.enabled = false;
+        assert_eq!(
+            run_completion(&hooks, &config, dir.path(), dir.path(), false, &|| false),
+            None
+        );
+        config.enabled = true;
+        hooks.rules[0].on_failure = HookFailurePolicy::Warn;
+        assert_eq!(
+            run_completion(&hooks, &config, dir.path(), dir.path(), false, &|| false),
+            None
+        );
+        hooks.rules[0].on_failure = HookFailurePolicy::Block;
+        hooks.rules[0].tool = Some("read".into());
+        assert_eq!(
+            run_completion(&hooks, &config, dir.path(), dir.path(), false, &|| false),
+            None
+        );
+        hooks.rules[0].tool = None;
+        hooks.rules[0].action = if cfg!(windows) {
+            vec!["ping".into(), "-n".into(), "31".into(), "127.0.0.1".into()]
+        } else {
+            vec!["sh".into(), "-c".into(), "sleep 30".into()]
+        };
+        hooks.rules[0].timeout_ms = Some(100);
+        let started = std::time::Instant::now();
+        assert_eq!(
+            run_completion(&hooks, &config, dir.path(), dir.path(), false, &|| false),
+            None
+        );
+        assert!(started.elapsed() < Duration::from_secs(5));
+    }
+
+    #[test]
+    fn completion_project_trust_integrity_and_worker_fences() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::remove_var("PI_HOOKS_CONFIG");
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path().join("project");
+        let agent = dir.path().join("agent");
+        std::fs::create_dir_all(project.join(".davinci")).unwrap();
+        std::fs::create_dir_all(&agent).unwrap();
+        let capture = dir.path().join("seen.json");
+        let path = project.join(".davinci/hooks.json");
+        std::fs::write(
+            &path,
+            serde_json::json!({"completion":[shell_hook(2, &capture)]}).to_string(),
+        )
+        .unwrap();
+        let config = HookPolicyConfig::default();
+        assert_eq!(
+            run_completion(
+                &load(&agent, &project, false),
+                &config,
+                &project,
+                &agent,
+                false,
+                &|| false
+            ),
+            None
+        );
+        assert!(!capture.exists());
+        let trusted = load(&agent, &project, true);
+        std::env::set_var("PI_GRAPH_ROLE", "writer");
+        let blocked_worker = run_completion(&trusted, &config, &project, &agent, false, &|| false);
+        std::env::remove_var("PI_GRAPH_ROLE");
+        assert_eq!(blocked_worker, None);
+        assert!(!capture.exists());
+        std::fs::write(&path, "{}").unwrap();
+        assert_eq!(
+            run_completion(&trusted, &config, &project, &agent, false, &|| false),
+            None
+        );
+        assert!(!capture.exists(), "changed project hooks never execute");
+        std::fs::write(
+            &path,
+            serde_json::json!({"completion":[shell_hook(2, &capture)]}).to_string(),
+        )
+        .unwrap();
+        let trusted = load(&agent, &project, true);
+        crate::trust::ProjectTrustStore::open(&agent)
+            .set(&project, Some(false))
+            .unwrap();
+        assert_eq!(
+            run_completion(&trusted, &config, &project, &agent, false, &|| false),
+            None
+        );
+        assert!(!capture.exists(), "revoked trust never executes");
+    }
+
+    #[test]
+    fn post_tool_exit_two_feedback_preserves_result_and_other_failures_warn() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        for is_error in [false, true] {
+            for (code, feedback) in [(2, true), (1, false), (0, false)] {
+                let hooks = HooksFile {
+                    post_tool: vec![output_hook(code, "", "fix this test")],
+                    ..Default::default()
+                };
+                let result = davinci_agent::ToolResult {
+                    content: "original output".into(),
+                    is_error,
+                    details: Some(serde_json::json!({"receipt":"kept"})),
+                };
+                let result = run_post_tool_feedback(
+                    &hooks,
+                    &HookPolicyConfig::default(),
+                    dir.path(),
+                    dir.path(),
+                    "read",
+                    &Value::Null,
+                    None,
+                    result,
+                );
+                assert_eq!(result.is_error, is_error);
+                assert_eq!(result.details.unwrap()["receipt"], "kept");
+                assert!(result.content.starts_with("original output"));
+                assert_eq!(
+                    result
+                        .content
+                        .contains("<user-hook-feedback>fix this test</user-hook-feedback>"),
+                    feedback
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn post_tool_rule_receives_actual_input_and_subscriber_does_not_duplicate_it() {
+        use davinci_agent::{
+            RuntimeDecision, RuntimeEvent, RuntimeEventEnvelope, RuntimeSubscriber,
+        };
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        let capture = dir.path().join("post.json");
+        let hooks = HooksFile {
+            rules: vec![HookPolicyRule {
+                event: "afterTool".into(),
+                tool: Some("read".into()),
+                path_pattern: Some("*.rs".into()),
+                action: shell_hook(2, &capture),
+                timeout_ms: None,
+                on_failure: HookFailurePolicy::Block,
+            }],
+            ..Default::default()
+        };
+        let subscriber = crate::runtime_host::HooksRuntimeSubscriber::new(hooks.clone())
+            .with_post_tool_feedback();
+        let event = RuntimeEventEnvelope::new(
+            1,
+            davinci_agent::RunId::new(),
+            None,
+            None,
+            None,
+            RuntimeEvent::PostToolUse {
+                call_id: "one".into(),
+                tool: "read".into(),
+                is_error: false,
+            },
+        );
+        assert_eq!(subscriber.on_event(&event), RuntimeDecision::Continue);
+        assert!(!capture.exists());
+        let args = serde_json::json!({"path":"file.rs"});
+        let result = run_post_tool_feedback(
+            &hooks,
+            &HookPolicyConfig::default(),
+            dir.path(),
+            dir.path(),
+            "read",
+            &args,
+            Some(&event),
+            davinci_agent::ToolResult {
+                content: "actual result".into(),
+                is_error: false,
+                details: None,
+            },
+        );
+        assert!(result.content.contains("user-hook-feedback"));
+        let payload: Value = serde_json::from_slice(&std::fs::read(capture).unwrap()).unwrap();
+        assert_eq!(payload["args"], args);
+        assert_eq!(payload["result"], "actual result");
+        assert_eq!(payload["runId"], event.run_id.to_string());
+        assert_eq!(payload["event"]["call_id"], "one");
+    }
+
     #[test]
     fn f03_completion_hook_runs_for_proposal_not_success_observation() {
         use davinci_agent::{RuntimeEvent, TaskId};
@@ -936,6 +1590,7 @@ mod tests {
 
     #[test]
     fn a_hook_that_ignores_large_stdin_still_times_out() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         // Windows: `ping` runs about 30 s and never reads stdin, like
         // `sleep 30`; PowerShell is avoided in these tests (see `shell_hook`).
         let command = if cfg!(windows) {
@@ -963,7 +1618,9 @@ mod tests {
             3,
         );
         assert!(result.unwrap_err().contains("timed out"));
-        assert!(started.elapsed() < Duration::from_secs(5));
+        // Include runner contention and process-tree cleanup, while staying
+        // well below the fixture's 30-second natural exit.
+        assert!(started.elapsed() < Duration::from_secs(10));
     }
 
     #[test]

@@ -1,5 +1,6 @@
 //! Native Rust ports of the bundled pi extensions.
 
+pub mod background_usage;
 pub mod browser;
 pub mod build_intelligence;
 pub mod change_impact;
@@ -310,6 +311,7 @@ pub fn command_specs() -> Vec<(&'static str, &'static str, Option<&'static str>)
             Some("[check|trust]"),
         ),
     ]
+    .into_iter().filter(|(name, _, _)| !name.ends_with("-status")).collect()
 }
 
 pub fn native_invocable_commands() -> Vec<Value> {
@@ -344,6 +346,8 @@ pub type SharedLearning = Arc<Mutex<LearningController>>;
 
 #[derive(Debug, Clone, Default)]
 pub struct NativeExtensionHost {
+    pub background: background_usage::BackgroundUsage,
+    pub(crate) accounting_key: Option<String>,
     pub browser: browser::BrowserController,
     pub test_impact: test_impact::TestImpact,
     pub engineering: engineering_snapshot::EngineeringSnapshots,
@@ -526,6 +530,8 @@ impl NativeExtensionHost {
             .unwrap_or_default();
 
         Self {
+            background: Default::default(),
+            accounting_key: None,
             browser: browser::BrowserController::new(cwd, browser_config),
             test_impact,
             engineering,
@@ -908,6 +914,21 @@ impl NativeExtensionHost {
         }
     }
 
+    /// Existing internal views folded into one public status surface.
+    pub fn status_sections(&mut self) -> Value {
+        let mut sections = serde_json::Map::new();
+        for name in NATIVE_COMMANDS.iter().filter(|name| {
+            name.ends_with("-status") && !matches!(**name, "graph-status" | "sec-status")
+        }) {
+            sections.insert(
+                name.trim_end_matches("-status").into(),
+                self.command(name, "").ok().flatten().unwrap_or(Value::Null),
+            );
+        }
+        sections.insert("securityWatch".into(), self.security.watch_status());
+        Value::Object(sections)
+    }
+
     pub fn command(&mut self, name: &str, args: &str) -> Result<Option<Value>, String> {
         if name.starts_with("learning") || name.starts_with("skill") {
             self.poll_learning();
@@ -1189,10 +1210,33 @@ mod tests {
             "sec-report",
         ];
         for name in NATIVE_COMMANDS {
-            if internal_graph.contains(name) {
+            if internal_graph.contains(name) || name.ends_with("-status") {
                 continue;
             }
             assert!(listed.contains(name), "{name} is dispatched but not listed");
+        }
+    }
+
+    #[test]
+    fn fourteen_native_status_views_are_internal_and_folded_into_status() {
+        let names = NATIVE_COMMANDS
+            .iter()
+            .filter(|name| {
+                name.ends_with("-status") && !matches!(**name, "graph-status" | "sec-status")
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(names.len(), 14);
+        assert!(!command_specs()
+            .iter()
+            .any(|(name, _, _)| name.ends_with("-status")));
+        let mut host = NativeExtensionHost::default();
+        let status = host.status_sections();
+        for name in names {
+            assert!(
+                status.get(name.trim_end_matches("-status")).is_some(),
+                "{name}"
+            );
+            assert!(host.command(name, "").unwrap().is_some());
         }
     }
     use std::sync::Arc;
@@ -1233,7 +1277,7 @@ mod tests {
         }
         for command in ["repo-index-status", "cache-status", "lsp-status"] {
             assert!(NATIVE_COMMANDS.contains(&command));
-            assert!(command_specs().iter().any(|(name, _, _)| *name == command));
+            assert!(!command_specs().iter().any(|(name, _, _)| *name == command));
             assert!(host.command(command, "").unwrap().is_some());
         }
         assert_eq!(

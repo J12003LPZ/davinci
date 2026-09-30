@@ -48,7 +48,10 @@ The TUI sheet and RPC polling still read two internal views, `sec-status` and
 
 ## Session security watch
 
-The session also watches its own work. After a settled interactive or RPC turn
+The session security watch is off by default and opt-in through the owner's
+agent-directory settings. Project settings can disable or slow the watch, but
+cannot enable it without owner permission. When enabled, the session watches its
+own work. After a settled interactive or RPC turn
 whose uncommitted working-tree state differs from the last watched state, a
 background Quick review of the changes (`--changed`) runs on the session's model
 and provider authorization, with the same restricted snapshot tools. One watch
@@ -297,7 +300,7 @@ by trusted project settings. Enabled provider wire tracing also prevents admissi
 | `failOn` | confirmed, `high` | Blocking classifications and minimum severity. |
 | `maxConcurrency` | 2 | Security reviews running at once in a session (explicit scan plus watch), 1-4. |
 | `retentionDays` | 30 | Scan directories older than this are swept when `/security-scan` runs (1-3650). |
-| `watch.enabled`, `watch.minIntervalMs` | `true`, 600000 | The session security watch. |
+| `watch.enabled`, `watch.minIntervalMs` | `false`, 600000 | Opt-in session security watch. |
 | `analyzers` | `[]` | Only `cargo-audit` is accepted. |
 
 A project can only narrow: limits and retention take the minimum, reads, hidden
@@ -333,3 +336,5 @@ Measured precision/recall, a held-out model evaluation, cross-platform release
 acceptance, and the optional offline analyzer adapter remain outstanding. See the
 [implementation checkpoint](superpowers/plans/2026-09-06-native-security-scan-execution.md)
 for the validation performed and remaining plan work.
+
+Watch request receipts appear separately in `/cost`, `/status`, and RPC `get_session_stats.background.securityWatch`. Missing provider usage and unknown pricing remain unknown; reservation budgets are not measurements. Accounting is per session within the current process, including failures and calls still running during a session switch. See [learning cost visibility](learning.md#background-cost-visibility).

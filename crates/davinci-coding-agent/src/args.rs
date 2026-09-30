@@ -716,6 +716,29 @@ mod tests {
     }
 
     #[test]
+    fn early_sandbox_activation_uses_the_same_last_flags_and_trust_override() {
+        let parsed = parse_args(&[
+            "--permission-mode".into(),
+            "ask".into(),
+            "--sandbox".into(),
+            "auto".into(),
+            "--execution-sandbox".into(),
+            "restricted".into(),
+            "--execution-sandbox".into(),
+            "workspace-write".into(),
+            "--no-approve".into(),
+            "--approve".into(),
+            "--help".into(),
+        ]);
+        assert_eq!(parsed.permission_mode, Some(PermissionMode::Auto));
+        assert_eq!(
+            parsed.execution_sandbox_mode.as_deref(),
+            Some("workspace-write")
+        );
+        assert_eq!(parsed.project_trust_override, Some(true));
+    }
+
+    #[test]
     fn permission_mode_and_its_sandbox_alias_parse_the_same_modes() {
         let args =
             |list: &[&str]| parse_args(&list.iter().map(|s| s.to_string()).collect::<Vec<_>>());

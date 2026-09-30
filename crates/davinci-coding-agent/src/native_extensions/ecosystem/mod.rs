@@ -636,8 +636,16 @@ mod tests {
 
         // The reviewer answers from a canned fixture on the background thread
         // the live session uses; nothing is seeded into the stores.
-        let mut learning =
-            crate::native_extensions::LearningController::new(&cwd, Some(&agent_dir), None);
+        let learning_config = crate::native_extensions::LearningConfig {
+            background_review: true,
+            auto_apply_project: true,
+            ..Default::default()
+        };
+        let mut learning = crate::native_extensions::LearningController::new(
+            &cwd,
+            Some(&agent_dir),
+            Some(learning_config),
+        );
         learning.set_live_reviewer(&cwd, None);
         let reviewed_run = Arc::new(Mutex::new(None::<String>));
         let seen = Arc::clone(&reviewed_run);

@@ -343,25 +343,48 @@ pub(crate) fn startup_mark(stage: &str) {
 }
 
 fn preactivate_execution_boundary(raw: &[String], cwd: &Path) -> Result<(), String> {
+    // Use the CLI parser's last-value-wins and project trust semantics before
+    // loading extensions, including --help's extension flag discovery.
+    let parsed = parse_args(raw);
     let mut settings = load_settings(&default_agent_dir()).sandbox;
-    if let Some(index) = raw.iter().position(|value| value == "--execution-sandbox") {
-        let mode = raw
-            .get(index + 1)
-            .ok_or("--execution-sandbox requires a mode")?
-            .clone();
-        settings.get_or_insert_with(Default::default).mode = Some(mode);
+    if let Some(mode) = &parsed.execution_sandbox_mode {
+        settings.get_or_insert_with(Default::default).mode = Some(mode.clone());
     }
-    let Some(spec) = davinci_coding_agent::sandbox_config::resolve_sandbox_settings(
+    let mode = permissions::PermissionSources::load(
+        &default_agent_dir(),
+        cwd,
+        parsed.project_trust_override,
+    )
+    .policy(parsed.permission_mode)
+    .mode;
+    if settings.is_none()
+        && mode == davinci_agent::PermissionMode::Auto
+        && execution_boundary::auto_activation_blocker().is_some()
+    {
+        return Ok(());
+    }
+    // Only an Auto default without explicit settings uses the probed backend;
+    // other launches must not pay for the probe before the first frame.
+    let detected = (settings.is_none() && mode == davinci_agent::PermissionMode::Auto)
+        .then(|| davinci_agent::sandbox::detected_native_backend(cwd))
+        .flatten();
+    let Some(spec) = sandbox_config::resolve_auto_sandbox_settings(
         cwd,
         settings.as_ref(),
         None,
         false,
+        mode,
+        detected,
     )?
     else {
         return Ok(());
     };
     if spec.mode != davinci_protocol::SandboxMode::FullAccess {
-        davinci_coding_agent::execution_boundary::enable();
+        if settings.is_none() {
+            let _ = execution_boundary::activate_auto_boundary();
+        } else {
+            execution_boundary::enable();
+        }
     }
     Ok(())
 }
@@ -671,8 +694,14 @@ fn offline_stub_message(current: &Agent, last_user: usize) -> AssistantMessage {
         .ok()
         .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok())
         .and_then(|fixture| {
+            let harness_reminder = |message: &davinci_ai::ChatMessage| {
+                message.extra.contains_key("davinciCapabilityReminder")
+                    || message
+                        .extra
+                        .contains_key(davinci_agent::COMPLETION_REMINDER_FIELD)
+            };
             let is_prompt = |message: &davinci_ai::ChatMessage| {
-                message.role == "user" && !message.extra.contains_key("davinciCapabilityReminder")
+                message.role == "user" && !harness_reminder(message)
             };
             let Some(calls) = fixture.as_array() else {
                 return current
@@ -689,7 +718,7 @@ fn offline_stub_message(current: &Agent, last_user: usize) -> AssistantMessage {
             let last = turn
                 .iter()
                 .rev()
-                .find(|message| !message.extra.contains_key("davinciCapabilityReminder"))?;
+                .find(|message| !harness_reminder(message))?;
             if !is_prompt(last) && last.role != "toolResult" {
                 return None;
             }
@@ -963,12 +992,48 @@ fn build_agent(parsed: &Args, session_dir: &Path, cwd: &Path) -> Result<Agent, S
     } else {
         None
     };
-    agent.tool_context.sandbox = davinci_coding_agent::sandbox_config::resolve_sandbox_settings(
+    agent.tool_context.sandbox = sandbox_config::resolve_sandbox_settings(
         cwd,
         effective_global_sandbox.as_ref(),
         project_sandbox_settings.as_ref(),
         project_trusted_for_sandbox,
     )?;
+    if effective_global_sandbox.is_none() {
+        let resolve_auto = {
+            let cwd = cwd.to_path_buf();
+            let project = project_sandbox_settings.clone();
+            move || {
+                sandbox_config::resolve_auto_sandbox_settings(
+                    &cwd,
+                    None,
+                    project.as_ref(),
+                    project_trusted_for_sandbox,
+                    davinci_agent::PermissionMode::Auto,
+                    davinci_agent::sandbox::detected_native_backend(&cwd),
+                )
+            }
+        };
+        agent.set_auto_sandbox_activation_guard(Arc::new(
+            execution_boundary::activate_auto_boundary,
+        ));
+        // No explicit sandbox exists here, so an active one after a switch to
+        // Auto is the probed default.
+        agent.set_permission_mode_change_hook(Arc::new(move |mode, context| {
+            if mode == davinci_agent::PermissionMode::Auto && context.sandbox.is_some() {
+                execution_boundary::enable();
+            }
+        }));
+        if agent.permission_mode() == davinci_agent::PermissionMode::Auto {
+            agent.configure_auto_sandbox(resolve_auto()?);
+        } else {
+            // Ask/Edits sessions probe the native backend (bubblewrap can take
+            // seconds) only if the user actually switches to Auto. An invalid
+            // narrowing request then cannot make an Auto policy available.
+            agent.configure_auto_sandbox_lazy(Arc::new(move || {
+                resolve_auto().map_err(|error| format!("Auto policy unavailable: {error}"))
+            }));
+        }
+    }
     if agent
         .tool_context
         .sandbox
@@ -1025,6 +1090,13 @@ fn build_agent(parsed: &Args, session_dir: &Path, cwd: &Path) -> Result<Agent, S
             trusted,
             agent.tool_context.sandbox.is_some(),
         );
+        if agent.tool_context.sandbox.is_none() {
+            let confined_config = mcp::load(&default_agent_dir(), cwd, trusted, true);
+            if mcp::auto_requires_restart(&mcp_config, &confined_config) {
+                execution_boundary::record_legacy_execution("local project/plugin MCP")?;
+                agent.withdraw_auto_sandbox("local project/plugin MCP may have unowned host descendants; restart directly in Auto to activate confinement");
+            }
+        }
         let registry = match (
             agent.tool_context.foreground_supervisor.as_ref(),
             agent.tool_context.sandbox.as_ref(),
@@ -2730,16 +2802,19 @@ fn complete_prompt_with_host(
     let settings = load_merged_settings(&default_agent_dir(), &agent.cwd);
     let trusted = is_trusted(&settings, &agent.cwd, parsed.project_trust_override);
     let user_hooks = hooks::load(&default_agent_dir(), &agent.cwd, trusted);
+    agent.requirement_review_enabled = settings
+        .requirement_review_enabled(std::env::var("DAVINCI_REQUIREMENT_REVIEW").ok().as_deref());
 
     let hook_policy = settings.hook_policy.clone().unwrap_or_default();
     let runtime_bus = davinci_agent::RuntimeBus::new();
     runtime_bus.subscribe(Arc::new(
         runtime_host::HooksRuntimeSubscriber::new_with_config(
             user_hooks.clone(),
-            hook_policy,
+            hook_policy.clone(),
             agent.cwd.clone(),
             default_agent_dir(),
-        ),
+        )
+        .with_post_tool_feedback(),
     ));
     runtime_bus.subscribe(Arc::new(runtime_host::CompactionRuntimeSubscriber::new(
         hook_host
@@ -2834,6 +2909,7 @@ fn complete_prompt_with_host(
     host.lock()
         .unwrap_or_else(|error| error.into_inner())
         .register_with(&runtime_handle.capability_registry);
+    let post_hook_runtime = runtime_handle.clone();
     agent.set_runtime(runtime_handle);
     // After the runtime registry exists, so its tools are part of the frozen
     // prefix. A no-op outside cache-sensitive (appended) routes.
@@ -2849,6 +2925,33 @@ fn complete_prompt_with_host(
         agent,
         &host.lock().unwrap_or_else(|error| error.into_inner()),
     );
+
+    let completion_hooks = user_hooks.clone();
+    let completion_plugins = plugin_hooks.clone();
+    let completion_base = plugin_hook_base.clone();
+    let completion_cwd = agent.cwd.clone();
+    let completion_agent_dir = default_agent_dir();
+    let completion_policy = hook_policy.clone();
+    agent.completion_hook = Some(davinci_agent::CompletionHook(Arc::new(
+        move |active, cancelled| {
+            hooks::run_completion(
+                &completion_hooks,
+                &completion_policy,
+                &completion_cwd,
+                &completion_agent_dir,
+                active,
+                cancelled,
+            )
+            .or_else(|| {
+                run_plugin_completion_hooks(
+                    &completion_plugins,
+                    &completion_base,
+                    active,
+                    cancelled,
+                )
+            })
+        },
+    )));
 
     let pre_hooks = user_hooks.clone();
     let pre_plugin_hooks = plugin_hooks.clone();
@@ -2892,11 +2995,12 @@ fn complete_prompt_with_host(
     })));
     let post_host = host.clone();
     let post_hooks = user_hooks;
+    let post_agent_dir = default_agent_dir();
     let post_plugin_hooks = plugin_hooks.clone();
     let post_plugin_base = plugin_hook_base.clone();
     let session_path = agent.session.as_ref().map(|session| session.path.clone());
     agent.post_tool = Some(davinci_agent::PostToolHook(Arc::new(
-        move |tool_call_id, _cwd, name, args, result| {
+        move |tool_call_id, cwd, name, args, result| {
             // A call the gate refused never ran: no post hook, and the row
             // says `denied` so the ledger does not count it as a tool run.
             let denied = result
@@ -2905,9 +3009,6 @@ fn complete_prompt_with_host(
                 .and_then(|details| details.get("denied"))
                 .and_then(serde_json::Value::as_bool)
                 .unwrap_or(false);
-            if !denied && std::env::var("DAVINCI_RUNTIME_HOOKS_V2").as_deref() == Ok("0") {
-                hooks::run_post_tool(&post_hooks, name, args, &result.content);
-            }
             hooks::append_event(
                 session_path.as_ref(),
                 if denied { "denied" } else { "tool" },
@@ -2925,6 +3026,31 @@ fn complete_prompt_with_host(
             let result = if denied || pre_blocked {
                 result
             } else {
+                // Reuse the runtime identity for the hook stdin contract;
+                // the actual PostToolUse observation is still emitted once
+                // by the agent after result decoration.
+                let envelope = davinci_agent::RuntimeEventEnvelope::new(
+                    0,
+                    post_hook_runtime.run_id,
+                    post_hook_runtime.session_id.clone(),
+                    Some(post_hook_runtime.agent_id),
+                    post_hook_runtime.parent_agent_id,
+                    davinci_agent::RuntimeEvent::PostToolUse {
+                        call_id: tool_call_id.into(),
+                        tool: name.into(),
+                        is_error: result.is_error,
+                    },
+                );
+                let result = hooks::run_post_tool_feedback(
+                    &post_hooks,
+                    &hook_policy,
+                    cwd,
+                    &post_agent_dir,
+                    name,
+                    args,
+                    Some(&envelope),
+                    result,
+                );
                 run_plugin_post_tool(&post_plugin_hooks, &post_plugin_base, name, args, result)
             };
             match post_host.lock() {
@@ -3167,11 +3293,7 @@ fn complete_prompt_with_host(
         .unwrap_or_default();
     agent.pre_tool = None;
     agent.post_tool = None;
-    run_plugin_observer_hooks(
-        &plugin_hooks,
-        &plugin_hook_base,
-        davinci_coding_agent::plugins::hooks::HookEvent::Stop,
-    );
+    agent.completion_hook = None;
     let mut session_failure = None;
     {
         let mut host = host.lock().unwrap_or_else(|err| err.into_inner());
@@ -3814,12 +3936,17 @@ fn run_print_turns(
     // Stdout carries the reply; Context VM notices go to stderr.
     if !json_mode {
         for event in &all_events {
-            if let AgentEvent::VerificationNotice { text, .. } = event {
+            if let AgentEvent::VerificationNotice { text, .. }
+            | AgentEvent::CompletionNotice { text, .. } = event
+            {
                 eprintln!("{text}");
             }
         }
     }
     for notice in agent.take_context_vm_notices() {
+        eprintln!("{notice}");
+    }
+    if let Some(notice) = agent.take_prompt_rewind_notice() {
         eprintln!("{notice}");
     }
     print_plugin_notices();
@@ -4298,6 +4425,11 @@ fn run_rpc_with_host(
             }));
     }
     loop {
+        if let Some(message) = runtime.agent.take_prompt_rewind_notice() {
+            emit_extension_ui_requests(&[
+                serde_json::json!({"op":"notify","message":message,"type":"warning"}),
+            ])?;
+        }
         let Some(line) = rpc_next_line(&leftover, &rx) else {
             break;
         };
@@ -4795,6 +4927,7 @@ fn context_vm_notify_calls(agent: &Agent) -> Vec<serde_json::Value> {
     agent
         .take_context_vm_notices()
         .into_iter()
+        .chain(agent.take_prompt_rewind_notice())
         // Plugin warnings (failed SessionStart hooks) ride the same drain.
         .chain(davinci_coding_agent::plugins::take_notices())
         .map(|message| serde_json::json!({"op": "notify", "message": message, "type": "warning"}))
@@ -5379,7 +5512,7 @@ fn apply_stream_event(
     pushed_assistant: &mut bool,
 ) {
     match event {
-        AgentEvent::VerificationNotice { text, .. } => {
+        AgentEvent::VerificationNotice { text, .. } | AgentEvent::CompletionNotice { text, .. } => {
             session.chrome.transcript.push("system", text.clone());
         }
         AgentEvent::ToolExecutionStart {
@@ -5862,7 +5995,7 @@ fn run_interactive(
     session.login_providers = interactive_login_providers(parsed);
     let stored = load_merged_settings(&default_agent_dir(), &agent.cwd);
     session.double_escape_action =
-        DoubleEscapeAction::parse(stored.double_escape_action.as_deref().unwrap_or("tree"));
+        DoubleEscapeAction::parse(stored.double_escape_action.as_deref().unwrap_or("rewind"));
     session.autocomplete_max_visible =
         stored.autocomplete_max_visible.unwrap_or(5).clamp(3, 20) as usize;
     session
@@ -6439,6 +6572,7 @@ fn apply_session_action(
             }
             Ok(true)
         }
+        SessionAction::OpenRewind => open_prompt_rewind(agent, session),
         SessionAction::OpenTree => {
             open_session_tree(agent, session);
             Ok(true)
@@ -7007,7 +7141,9 @@ fn submit_user_message(
             session.chrome.editor.handle_input("");
             println!("{reply}");
             for event in &events {
-                if let AgentEvent::VerificationNotice { text, .. } = event {
+                if let AgentEvent::VerificationNotice { text, .. }
+                | AgentEvent::CompletionNotice { text, .. } = event
+                {
                     session.chrome.transcript.push("system", text.clone());
                     eprintln!("{text}");
                 }
@@ -7211,6 +7347,7 @@ fn handle_user_line(
             }
             Ok(true)
         }
+        SlashAction::Rewind => open_prompt_rewind(agent, session),
         SlashAction::Tree => {
             let mut host = loaded_extension_host(parsed);
             host.runtime_flag_values = flag_values_json(parsed);
@@ -7292,8 +7429,19 @@ fn handle_user_line(
             println!("{text}");
             Ok(true)
         }
+        SlashAction::ShowDoctor => {
+            let text = format_session_doctor(parsed, agent);
+            session.chrome.transcript.push("doctor", &text);
+            session.chrome.status = "doctor".into();
+            println!("{text}");
+            Ok(true)
+        }
         SlashAction::ShowSandboxStatus => {
             let text = sandbox_config::format_sandbox_status(agent.tool_context.sandbox.as_ref());
+            let text = match agent.auto_sandbox_unavailable_reason() {
+                Some(reason) => format!("{text}\nAuto unavailable: {reason}"),
+                None => text,
+            };
             session.chrome.transcript.push("sandbox", &text);
             session.chrome.status = "sandbox".into();
             println!("{text}");
@@ -8346,7 +8494,7 @@ pub fn format_session_cost(parsed: &Args, agent: &Agent) -> String {
         .iter()
         .find(|item| item.provider == agent.provider && item.id == agent.model_id);
     let stats = rpc::session_stats_for_agent(agent, found);
-    format!(
+    let foreground = format!(
         "input {} · output {} · cache read {} · cache write {} · total {} · ${:.4}",
         stats["tokens"]["input"].as_u64().unwrap_or(0),
         stats["tokens"]["output"].as_u64().unwrap_or(0),
@@ -8357,6 +8505,11 @@ pub fn format_session_cost(parsed: &Args, agent: &Agent) -> String {
             .get("cost")
             .and_then(|value| value.as_f64())
             .unwrap_or(0.0),
+    );
+    format!(
+        "{foreground}\n{}\nBackground accounting: {}",
+        native_extensions::background_usage::render(&stats["background"]),
+        stats["background"]["scope"].as_str().unwrap_or("unknown")
     )
 }
 
@@ -8365,6 +8518,18 @@ pub fn format_session_cost(parsed: &Args, agent: &Agent) -> String {
 pub fn additional_directories_status_line(agent: &Agent) -> Option<String> {
     let roots = agent.additional_directories();
     (!roots.is_empty()).then(|| format!("additional directories: {}", roots.join(", ")))
+}
+
+pub fn format_session_doctor(parsed: &Args, agent: &Agent) -> String {
+    let report = davinci_coding_agent::session_diagnostics::doctor(
+        agent,
+        &default_agent_dir(),
+        parsed
+            .api_key
+            .as_ref()
+            .is_some_and(|key| !key.trim().is_empty()),
+    );
+    serde_json::to_string_pretty(&report).unwrap_or_else(|_| "doctor: unavailable".into())
 }
 
 pub fn format_session_status(parsed: &Args, agent: &Agent) -> String {
@@ -8382,12 +8547,13 @@ pub fn format_session_status(parsed: &Args, agent: &Agent) -> String {
         .unwrap_or_else(|err| err.into_inner())
         .running();
     let mcp = agent.tool_context.mcp.rows().len();
+    // The first cost line belongs on the ` · ` header; background accounting
+    // follows on lines of its own.
+    let cost = format_session_cost(parsed, agent);
+    let (cost_line, cost_details) = cost.split_once('\n').unwrap_or((cost.as_str(), ""));
     let mut text = format!(
-        "{}/{} · {mode} · {plan} · {} jobs · {mcp} mcp · {}",
-        agent.provider,
-        agent.model_id,
-        jobs,
-        format_session_cost(parsed, agent),
+        "{}/{} · {mode} · {plan} · {} jobs · {mcp} mcp · {cost_line}",
+        agent.provider, agent.model_id, jobs,
     );
     if let Some(manifest) = &agent.prompt_manifest {
         let hash_prefix = if manifest.stable_sha256.len() >= 8 {
@@ -8416,6 +8582,17 @@ pub fn format_session_status(parsed: &Args, agent: &Agent) -> String {
             text.push_str(&format!(" · transition: {diag}"));
         }
     }
+    if !cost_details.is_empty() {
+        text.push('\n');
+        text.push_str(cost_details);
+    }
+    text.push('\n');
+    text.push_str(&sandbox_config::format_sandbox_status(
+        agent.tool_context.sandbox.as_ref(),
+    ));
+    if let Some(reason) = agent.auto_sandbox_unavailable_reason() {
+        text.push_str(&format!("\nAuto unavailable: {reason}"));
+    }
     if let Some(line) = additional_directories_status_line(agent) {
         text.push('\n');
         text.push_str(&line);
@@ -8432,10 +8609,19 @@ pub fn format_session_status(parsed: &Args, agent: &Agent) -> String {
             text.push_str(&compact.join("\n"));
         }
     }
-    if let Some(line) = native_extensions::security_scan::watch_status_line() {
-        text.push('\n');
-        text.push_str(&line);
+    if let Some(sections) = native_extensions::background_usage::native_status(agent) {
+        for (name, section) in sections.as_object().into_iter().flatten() {
+            text.push_str(&format!(
+                "\n\n{name}:\n{}",
+                serde_json::to_string_pretty(section).unwrap_or_else(|_| "unavailable".into())
+            ));
+        }
+    } else {
+        text.push_str("\nNative status: unavailable (host not bound)");
     }
+    text.push_str(&format_runtime_stats(
+        serde_json::to_value(agent.run_stats()).ok().as_ref(),
+    ));
     let behavior_runs = davinci_telemetry::get_behavior_telemetry();
     if !behavior_runs.is_empty() {
         let profile_filter = agent
@@ -8513,7 +8699,7 @@ fn format_runtime_stats(runtime: Option<&serde_json::Value>) -> String {
     } else {
         get("toolCalls") as f64 / batches as f64
     };
-    format!(
+    let mut text = format!(
         "\n\nRuntime (this run)\nModel turns: {}\nTool calls: {} in {} batches (mean width {:.1}, max {}, {} parallel groups)\nBatch operations: {}\nWorkers: {}\nTime: model {:.1}s, tools {:.1}s\nPeak context: {} tokens\nPruned: {} results, {} chars\nCompactions: {}\nEvidence files: {}",
         get("modelTurns"),
         get("toolCalls"),
@@ -8530,7 +8716,16 @@ fn format_runtime_stats(runtime: Option<&serde_json::Value>) -> String {
         get("prunedChars"),
         get("compactions"),
         get("evidenceFiles"),
-    )
+    );
+    if runtime.get("completionRequirementReminders").is_some() {
+        text.push_str(&format!(
+            "\nCompletion: {} requirement reminders, {} hook blocks, {} hook limit hits",
+            get("completionRequirementReminders"),
+            get("completionHookBlocks"),
+            get("completionHookLimitHits")
+        ));
+    }
+    text
 }
 
 fn apply_extension_shortcuts(
@@ -9088,15 +9283,22 @@ fn run_plugin_post_tool(
     result
 }
 
-/// `Stop` and `SessionEnd` plugin hooks run for their effect only.
-fn run_plugin_observer_hooks(
+/// A plugin Stop decision is feedback for the in-loop completion gate.
+fn run_plugin_completion_hooks(
     plugins: &davinci_coding_agent::plugins::ActivePlugins,
     base: &davinci_coding_agent::plugins::HookInput,
-    event: davinci_coding_agent::plugins::hooks::HookEvent,
-) {
-    if plugins.has_hooks(event) {
-        report_plugin_warnings(&plugins.run_event(event, None, base));
+    stop_hook_active: bool,
+    cancelled: &dyn Fn() -> bool,
+) -> Option<String> {
+    use davinci_coding_agent::plugins::hooks::HookEvent;
+    if cancelled() || !plugins.has_hooks(HookEvent::Stop) {
+        return None;
     }
+    let mut input = base.clone();
+    input.stop_hook_active = stop_hook_active;
+    let result = plugins.run_event_cancellable(HookEvent::Stop, None, &input, cancelled);
+    report_plugin_warnings(&result);
+    result.block
 }
 
 fn apply_discovered_resources(parsed: &Args, agent: &mut Agent) {
@@ -9526,6 +9728,7 @@ fn execute_agent_language_tool(
 /// executor attach paths run before every turn, so a session switch rebinds.
 fn bind_native_session(agent: &Agent, host: &ExtensionHost) {
     host.bind_native_session(agent.session.as_ref().map(|store| store.header.id.as_str()));
+    native_extensions::background_usage::bind(agent, &host.native);
 }
 
 fn attach_tool_executor(agent: &mut Agent, host: &ExtensionHost) {
@@ -10105,6 +10308,9 @@ fn apply_changelog_overlay(
 }
 
 fn refresh_chrome_footer(session: &mut InteractiveSession, agent: &Agent) {
+    if let Some(notice) = agent.take_prompt_rewind_notice() {
+        session.chrome.transcript.push("warning", &notice);
+    }
     session.chrome.footer_cwd = Some(agent.cwd.to_string_lossy().into_owned());
     session.chrome.footer_home = davinci_session::home_dir().map(|home| home.display().to_string());
     session.chrome.footer_branch = resolve_git_branch(&agent.cwd);
@@ -10903,6 +11109,12 @@ fn handle_extension_select(
     choice: Option<String>,
 ) -> Result<bool, String> {
     let context = session.extension_dialog_context.take();
+    if let Some(context) = context
+        .as_deref()
+        .filter(|context| context.starts_with("rewind-"))
+    {
+        return handle_prompt_rewind_choice(agent, session, context, choice.as_deref());
+    }
     if let Some(id) = context
         .as_deref()
         .and_then(|value| value.strip_prefix("branch-summary:"))
@@ -12235,4 +12447,87 @@ fn teammate_idle_timeout() -> std::time::Duration {
         .and_then(|ms| ms.parse().ok())
         .map(std::time::Duration::from_millis)
         .unwrap_or(davinci_agent::runtime::team::TEAMMATE_IDLE_TIMEOUT)
+}
+
+fn open_prompt_rewind(agent: &Agent, session: &mut InteractiveSession) -> Result<bool, String> {
+    let notice = agent.prompt_rewind_notice();
+    let checkpoints = agent.prompt_checkpoints();
+    if checkpoints.is_empty() {
+        session.chrome.status =
+            notice.unwrap_or_else(|| "No prompt checkpoints in this conversation".into());
+        return Ok(true);
+    }
+    session.extension_dialog_context = Some("rewind-checkpoint".into());
+    session.open_extension_selector(
+        format!(
+            "Rewind\n{}",
+            davinci_agent::runtime::rewind::SHELL_REWIND_LIMITATION
+        ),
+        checkpoints
+            .into_iter()
+            .take(30)
+            .map(|checkpoint| {
+                format!(
+                    "{} · {}",
+                    checkpoint.id,
+                    checkpoint.prompt.replace('\n', " ")
+                )
+            })
+            .collect(),
+    );
+    if let Some(notice) = notice {
+        session.chrome.status = notice;
+    }
+    Ok(true)
+}
+
+fn handle_prompt_rewind_choice(
+    agent: &mut Agent,
+    session: &mut InteractiveSession,
+    context: &str,
+    choice: Option<&str>,
+) -> Result<bool, String> {
+    let Some(choice) = choice else {
+        session.chrome.status = "Rewind cancelled".into();
+        return Ok(true);
+    };
+    if context == "rewind-checkpoint" {
+        let id = choice
+            .split_once(" · ")
+            .map(|(id, _)| id)
+            .ok_or("Invalid rewind checkpoint")?;
+        let preview = agent.preview_prompt_rewind(id)?;
+        session.extension_dialog_context =
+            Some(format!("rewind-mode:{id}:{}", preview.preview_digest));
+        let mut modes = vec!["conversation".into()];
+        if preview.conflict_count == 0 {
+            modes.insert(0, "both".into());
+            modes.push("code".into());
+        }
+        session.open_extension_selector(format!("Restore code, conversation, or both?\n{} files; {} conflicts. Shell changes are not tracked.", preview.files.len(), preview.conflict_count), modes);
+    } else if let Some(rest) = context.strip_prefix("rewind-mode:") {
+        if !matches!(choice, "code" | "conversation" | "both") {
+            return Err("Invalid rewind mode".into());
+        }
+        session.extension_dialog_context = Some(format!("rewind-confirm:{rest}:{choice}"));
+        session.open_extension_selector(format!("Restore {choice}?\nAbandoned conversation remains in the session tree. Shell changes are not tracked."), vec!["Confirm rewind".into(), "Cancel".into()]);
+    } else if let Some(rest) = context.strip_prefix("rewind-confirm:") {
+        if choice == "Confirm rewind" {
+            let fields: Vec<_> = rest.split(':').collect();
+            if fields.len() != 3 {
+                return Err("Invalid rewind confirmation".into());
+            }
+            let selection = davinci_agent::runtime::rewind::RewindSelection {
+                code: matches!(fields[2], "code" | "both"),
+                task_state: false,
+                transcript: matches!(fields[2], "conversation" | "both"),
+            };
+            agent.apply_prompt_rewind(fields[0], fields[1], &selection)?;
+            session.chrome.status =
+                format!("Restored {}. Shell changes are not tracked.", fields[2]);
+        } else {
+            session.chrome.status = "Rewind cancelled".into();
+        }
+    }
+    Ok(true)
 }
