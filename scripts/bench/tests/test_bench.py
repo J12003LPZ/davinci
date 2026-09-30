@@ -396,6 +396,40 @@ class StreamTelemetryTests(unittest.TestCase):
         self.assertEqual(result["auto_verify_runs"], 1)
         self.assertEqual(result["tool_calls"], 0)
 
+    def test_completion_reason_events_count_followup_requests_and_mutations(self):
+        first = self.observed_stream([(1, "completed", None)])
+        second = json.loads(json.dumps(first).replace('"r1"', '"r2"'))
+        mutation = lambda generation: {"type": "mutation_observation", "schema_version": 1,
+                                       "generation": generation, "executed_leaf_operations": generation}
+        events = [mutation(0), *first, mutation(1),
+                  {"type": "completion_reminder", "reason_code": "completion.requirements"},
+                  *second, mutation(2), mutation(2)]
+        result = bench.parse_stream("davinci", "\n".join(map(json.dumps, events)))
+        self.assertEqual(result["gate_reminders"], {"completion.requirements": 1})
+        self.assertEqual(result["gate_reminder_causes"], {"completion.requirements": 1})
+        self.assertEqual(result["requests_after_first_reminder"], 1)
+        self.assertEqual(result["mutations_after_reminder"], 1)
+        self.assertTrue(result["request_metrics_complete"])
+        self.assertEqual(result["auto_verify_runs"], 0)
+
+    def test_completion_reminders_preserve_legacy_reasons_and_reject_malformed_events(self):
+        events = [
+            {"type": "message_end", "message": {
+                "davinciCapabilityReminder": "verification_required",
+                "davinciCapabilityReminderReason": "nonliteral_command"}},
+            {"type": "completion_reminder", "reason_code": "completion.requirements"},
+            {"type": "completion_reminder", "reason_code": "completion.requirements"},
+            {"type": "completion_reminder", "reason_code": "completion.hook_block"},
+            {"type": "completion_notice", "reason_code": "completion.hook_cap"},
+            *({"type": "completion_reminder", "reason_code": reason}
+              for reason in (None, "", 1, {}, [])),
+        ]
+        result = bench.parse_stream("davinci", "\n".join(map(json.dumps, events)))
+        self.assertEqual(result["gate_reminders"], {
+            "verification_required": 1, "completion.requirements": 2, "completion.hook_block": 1})
+        self.assertEqual(result["gate_reminder_causes"], {
+            "nonliteral_command": 1, "completion.requirements": 2, "completion.hook_block": 1})
+
     def test_gate_reminder_causes_are_counted(self):
         events = [
             {"type": "message_end", "message": {
