@@ -1052,16 +1052,21 @@ impl PermissionPolicy {
         args: &Value,
         cwd: &Path,
     ) -> PermissionVerdict {
-        if tool == "agent" {
-            if let Some(tasks) = split_agent_tasks(args) {
+        let normalized_agent;
+        let args = if tool == "agent" {
+            normalized_agent = crate::subagent::normalize_agent_args(args);
+            if let Some(tasks) = split_agent_tasks(&normalized_agent) {
                 return self.decide_agent_batch(tool_call_id, &tasks, cwd);
             }
-            if args.get("tasks").is_some() {
+            if normalized_agent.get("tasks").is_some() {
                 return PermissionVerdict::Deny {
-                    reason: "agent: pass per-task fields inside `tasks`, not beside it".into(),
+                    reason: "agent: `tasks` must be an array of task objects".into(),
                 };
             }
-        }
+            &normalized_agent
+        } else {
+            args
+        };
         // Capturing evidence is a compound read. It must obey the same rules
         // as the read tool, including named denies, even when propose_plan is
         // generally permitted or Always Approve is selected.

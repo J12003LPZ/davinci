@@ -447,6 +447,54 @@ impl Drop for LaunchRollback<'_> {
     }
 }
 
+/// Fold the loose shapes models send for `agent` into one canonical call.
+///
+/// An empty or null `tasks` is dropped, so `{"prompt": …, "tasks": []}` is a
+/// single worker. Beside a non-empty `tasks`, every other top-level field is a
+/// default copied into each task that does not set it itself (a task's own
+/// value wins), and the result carries only `tasks`. The permission gate, the
+/// scheduler lane and the tool all read this form, so what is approved is
+/// exactly what runs.
+pub fn normalize_agent_args(args: &Value) -> Value {
+    let Some(object) = args.as_object() else {
+        return args.clone();
+    };
+    match object.get("tasks") {
+        None => args.clone(),
+        Some(Value::Null) => {
+            let mut single = object.clone();
+            single.remove("tasks");
+            Value::Object(single)
+        }
+        Some(Value::Array(tasks)) if tasks.is_empty() => {
+            let mut single = object.clone();
+            single.remove("tasks");
+            Value::Object(single)
+        }
+        Some(Value::Array(tasks)) => {
+            let shared: Vec<(&String, &Value)> =
+                object.iter().filter(|(key, _)| *key != "tasks").collect();
+            let tasks = tasks
+                .iter()
+                .map(|task| match task {
+                    Value::Object(fields) => {
+                        let mut fields = fields.clone();
+                        for (key, value) in &shared {
+                            fields
+                                .entry((*key).clone())
+                                .or_insert_with(|| (*value).clone());
+                        }
+                        Value::Object(fields)
+                    }
+                    other => other.clone(),
+                })
+                .collect();
+            serde_json::json!({ "tasks": Value::Array(tasks) })
+        }
+        Some(_) => args.clone(),
+    }
+}
+
 fn task_spec(input: &Value) -> Result<TaskSpec, ToolError> {
     let prompt = input
         .get("prompt")
@@ -549,6 +597,12 @@ pub fn run_tool(
     let Some(runner) = runner else {
         return Err(ToolError::Failed("agent tool is not configured".into()));
     };
+    let input = &normalize_agent_args(input);
+    if input.get("tasks").is_some_and(|tasks| !tasks.is_array()) {
+        return Err(ToolError::Failed(
+            "agent: `tasks` must be an array of task objects".into(),
+        ));
+    }
     let specs: Vec<TaskSpec> = match input.get("tasks").and_then(Value::as_array) {
         Some(tasks) if !tasks.is_empty() => {
             if tasks.len() > MAX_PARALLEL_TASKS {
@@ -1233,6 +1287,31 @@ fn run_journaled_subagent(
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn normalize_agent_args_folds_loose_shapes() {
+        assert_eq!(
+            normalize_agent_args(&json!({"prompt": "p", "agent": "scout", "tasks": []})),
+            json!({"prompt": "p", "agent": "scout"})
+        );
+        assert_eq!(
+            normalize_agent_args(&json!({"prompt": "p", "tasks": null})),
+            json!({"prompt": "p"})
+        );
+        assert_eq!(
+            normalize_agent_args(&json!({
+                "agent": "scout",
+                "isolation": "shared",
+                "tasks": [{"prompt": "a"}, {"prompt": "b", "isolation": "worktree"}]
+            })),
+            json!({"tasks": [
+                {"prompt": "a", "agent": "scout", "isolation": "shared"},
+                {"prompt": "b", "agent": "scout", "isolation": "worktree"}
+            ]})
+        );
+        let plain = json!({"tasks": [{"prompt": "a"}]});
+        assert_eq!(normalize_agent_args(&plain), plain);
+    }
 
     #[test]
     fn agent_profiles_are_listed_in_the_agent_tool_schema() {
