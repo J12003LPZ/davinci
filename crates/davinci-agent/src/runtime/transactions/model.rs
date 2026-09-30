@@ -206,6 +206,8 @@ pub(super) struct Change {
     pub staged_name: Option<String>,
     pub restored: Option<Image>,
     pub restore_name: Option<String>,
+    // Schema-v3 names retained: Windows publication completes creation time
+    // as well as the optional short alias after the staged file is renamed.
     #[serde(default)]
     pub alias_pending: bool,
     #[serde(default)]

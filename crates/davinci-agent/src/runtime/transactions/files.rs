@@ -183,16 +183,7 @@ pub(super) fn stage(
         #[cfg(windows)]
         {
             super::windows_streams::restore(&dir, &name, &file, &original.streams)?;
-            // Explicitly set creation metadata even for a new source. Otherwise
-            // NTFS tunneling may replace the stage's creation time on rename
-            // with that of a recently deleted destination.
-            let metadata = match &original.windows_metadata {
-                Some(metadata) => Some(metadata.clone()),
-                None => super::windows_metadata::capture(
-                    &file.metadata().map_err(|error| error.to_string())?,
-                ),
-            };
-            super::windows_metadata::restore(&file, metadata.as_ref())?;
+            super::windows_metadata::restore(&file, original.windows_metadata.as_ref())?;
             if let Some(access) = &original.access {
                 super::windows_acl::apply(&file, access)?;
             }
@@ -266,6 +257,22 @@ pub(super) fn unpublished(image: &Image) -> Image {
     }
 }
 
+/// A rename can tunnel the deleted destination's creation time on NTFS.
+/// Only pending publication may accept this difference; ownership, contents,
+/// permissions, attributes, streams and every other field must still match.
+pub(super) fn publication_matches(current: &Image, proposed: &Image) -> bool {
+    let expected = unpublished(proposed);
+    #[cfg(windows)]
+    let mut expected = expected;
+    #[cfg(windows)]
+    if let (Some(expected), Some(current)) =
+        (&mut expected.windows_metadata, &current.windows_metadata)
+    {
+        expected.created = current.created;
+    }
+    current == &expected
+}
+
 fn check_alias_available(
     dir: &Directory,
     name: &str,
@@ -291,24 +298,29 @@ fn check_alias_available(
 }
 
 fn publish_alias(dir: &Directory, name: &str, proposed: &Image) -> Result<(), String> {
-    if proposed.windows_short_name.is_empty() {
-        return Ok(());
-    }
     #[cfg(windows)]
     {
         let file = dir.source_alias_file(name).map_err(|e| e.to_string())?;
         let pin = file.try_clone().map_err(|e| e.to_string())?;
-        if capture_file(dir, name, file, true)?.0 != unpublished(proposed) {
-            return Err("conflict: source changed before alias publication".into());
+        if !publication_matches(&capture_file(dir, name, file, true)?.0, proposed) {
+            return Err("conflict: source changed before metadata publication".into());
         }
-        super::windows_metadata::set_short_name(&pin, &proposed.windows_short_name)?;
+        // Restore after rename: NTFS tunneling ignores metadata set on the stage.
+        super::windows_metadata::restore(&pin, proposed.windows_metadata.as_ref())?;
+        if !proposed.windows_short_name.is_empty() {
+            super::windows_metadata::set_short_name(&pin, &proposed.windows_short_name)?;
+        }
         dir.check_current().map_err(|e| e.to_string())?;
         Ok(())
     }
     #[cfg(not(windows))]
     {
         let _ = (dir, name);
-        Err("Windows short name on unsupported platform".into())
+        if proposed.windows_short_name.is_empty() {
+            Ok(())
+        } else {
+            Err("Windows short name on unsupported platform".into())
+        }
     }
 }
 

@@ -514,6 +514,66 @@ mod tests {
     }
 
     #[test]
+    fn transaction_interrupted_creation_time_publication_recovers() {
+        use super::super::{files, model::TransactionState, store::Store};
+        for restoring in [false, true] {
+            let root = tempfile::tempdir().unwrap();
+            let path = "a.txt";
+            std::fs::write(root.path().join(path), b"before").unwrap();
+            let owner = TransactionOwner::default();
+            let manager = TransactionCoordinator::new(root.path(), owner.clone()).unwrap();
+            let preview = manager
+                .preview(vec![ProposedChange::write(path, b"after".to_vec())])
+                .unwrap();
+            if restoring {
+                manager.apply(&preview.id, &|_| Ok(()), None).unwrap();
+            }
+            let root_path = root.path().canonicalize().unwrap();
+            let store = Store::open(&root_path).unwrap();
+            let mut record = store.load(&preview.id, &root_path, &owner, false).unwrap();
+            let change = &mut record.changes[0];
+            let content = if restoring {
+                change.before_bytes.as_deref()
+            } else {
+                change.proposed_bytes.as_deref()
+            };
+            let (image, stage) = files::stage(&root_path, path, content, &change.before).unwrap();
+            let mut tunneled = image.windows_metadata.clone().unwrap();
+            tunneled.created -= 10_000;
+            if restoring {
+                change.restored = Some(image);
+                change.restore_name = stage.clone();
+                change.restore_alias_pending = true;
+                record.summary.state = TransactionState::RollingBack;
+            } else {
+                change.proposed = image;
+                change.staged_name = stage.clone();
+                change.alias_pending = true;
+                record.summary.state = TransactionState::Applying;
+            }
+            store.begin(&preview.id).unwrap();
+            store.save(&record).unwrap();
+            let (dir, name) = files::directory(&root_path, path, false).unwrap();
+            dir.replace_source(stage.as_deref().unwrap(), &name, true, true)
+                .unwrap();
+            restore(&dir.source_alias_file(&name).unwrap(), Some(&tunneled)).unwrap();
+            let recovered = TransactionCoordinator::new(&root_path, owner).unwrap();
+            assert_eq!(
+                recovered
+                    .rollback(&preview.id, &|_| Ok(()), None)
+                    .unwrap()
+                    .state,
+                TransactionState::RolledBack
+            );
+            assert_eq!(std::fs::read(root.path().join(path)).unwrap(), b"before");
+            assert_eq!(
+                files::capture(&root_path, path).unwrap().0.windows_metadata,
+                record.changes[0].before.windows_metadata
+            );
+        }
+    }
+
+    #[test]
     fn transaction_encrypted_attributes_cannot_enter_plaintext_journal() {
         for attributes in [0x4000, 0x4020, 0x6002, u32::MAX] {
             let error = ensure_snapshot_attributes(attributes).unwrap_err();

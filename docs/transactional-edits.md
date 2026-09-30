@@ -75,9 +75,12 @@ full audit SACL and process-trust/capability label preservation is not establish
 
 Encrypted files and files with object IDs are rejected before source content is
 journaled. Private staging aliases are cleared before content is written. Source
-aliases are captured and restored after publication, with durable intent allowing
+aliases and creation time are restored after publication, with durable intent allowing
 recovery if the process exits between those steps. Recovery refuses an alias
-claimed by another file. Use the primary filename when requesting an edit;
+claimed by another file. NTFS can tunnel a deleted destination's creation time
+during rename; pending publication tolerates only that timestamp difference while
+requiring the staged file's identity, content and remaining metadata to match.
+Use the primary filename when requesting an edit;
 addressing the file through its short alias is rejected to preserve the primary
 directory entry.
 

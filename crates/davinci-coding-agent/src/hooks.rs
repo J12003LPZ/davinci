@@ -1113,17 +1113,17 @@ mod tests {
 
     fn output_hook(code: i32, stdout: &str, stderr: &str) -> Vec<String> {
         if cfg!(windows) {
-            // cmd's /C grammar does not use the CRT quote/backslash rules
-            // applied to argv by Command. Emit the fixture's exact JSON bytes.
-            vec![
-                "powershell".into(),
-                "-NoProfile".into(),
-                "-Command".into(),
-                format!(
-                    "[Console]::In.ReadToEnd() | Out-Null; [Console]::Out.Write('{}'); [Console]::Error.Write('{}'); exit {code}",
-                    stdout.replace('\'', "''"), stderr.replace('\'', "''")
-                ),
-            ]
+            // Avoid PowerShell in Windows hook fixtures: on windows-latest
+            // cold PowerShell startup can exceed the short hook deadlines this
+            // module is testing. Python is already available on the CI image
+            // and receives argv without cmd.exe quoting rules, so it can emit
+            // exact JSON fixture bytes while still draining stdin.
+            let script = format!(
+                "import sys; sys.stdin.read(); sys.stdout.write({}); sys.stderr.write({}); sys.exit({code})",
+                serde_json::to_string(stdout).unwrap(),
+                serde_json::to_string(stderr).unwrap(),
+            );
+            vec!["python".into(), "-c".into(), script]
         } else {
             vec![
                 "sh".into(),
@@ -1241,7 +1241,7 @@ mod tests {
                 tool: None,
                 path_pattern: None,
                 action: output_hook(2, "", "rule feedback"),
-                timeout_ms: Some(500),
+                timeout_ms: Some(5_000),
                 on_failure: HookFailurePolicy::Block,
             }],
             ..Default::default()
@@ -1590,6 +1590,7 @@ mod tests {
 
     #[test]
     fn a_hook_that_ignores_large_stdin_still_times_out() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         // Windows: `ping` runs about 30 s and never reads stdin, like
         // `sleep 30`; PowerShell is avoided in these tests (see `shell_hook`).
         let command = if cfg!(windows) {
@@ -1617,7 +1618,9 @@ mod tests {
             3,
         );
         assert!(result.unwrap_err().contains("timed out"));
-        assert!(started.elapsed() < Duration::from_secs(5));
+        // Include runner contention and process-tree cleanup, while staying
+        // well below the fixture's 30-second natural exit.
+        assert!(started.elapsed() < Duration::from_secs(10));
     }
 
     #[test]

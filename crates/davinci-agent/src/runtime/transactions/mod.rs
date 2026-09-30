@@ -414,7 +414,7 @@ impl TransactionCoordinator {
             for index in 0..record.changes.len() {
                 let change = &mut record.changes[index];
                 match files::stage(&self.root,&change.path,change.proposed_bytes.as_deref(),&change.before) {
-                    Ok((image,name)) => { change.alias_pending = !image.windows_short_name.is_empty(); change.proposed=image; change.staged_name=name; }
+                    Ok((image,name)) => { change.alias_pending = cfg!(windows) && image.hash.is_some() || !image.windows_short_name.is_empty(); change.proposed=image; change.staged_name=name; }
                     Err(error) => { self.cleanup(&record); return Err(error); }
                 }
             }
@@ -480,9 +480,8 @@ impl TransactionCoordinator {
                 }
             }
             for change in &record.changes {
-                let current = files::capture(&self.root,&change.path)?.0;
-                if current != change.proposed {
-                    let reason = format!("conflict: {} changed during application; journal retained; expected {:?}, observed {:?}",change.path,change.proposed,current);
+                if files::capture(&self.root,&change.path)?.0 != change.proposed {
+                    let reason = format!("conflict: {} changed during application; journal retained",change.path);
                     return self.conflict(store,&mut record,reason);
                 }
             }
@@ -541,12 +540,12 @@ impl TransactionCoordinator {
                 continue;
             }
             let interrupted_apply =
-                change.alias_pending && current == files::unpublished(&change.proposed);
+                change.alias_pending && files::publication_matches(&current, &change.proposed);
             let interrupted_restore = change.restore_alias_pending
                 && change
                     .restored
                     .as_ref()
-                    .is_some_and(|image| current == files::unpublished(image));
+                    .is_some_and(|image| files::publication_matches(&current, image));
             if interrupted_restore {
                 // Retain the durable restored identity. Restaging here would lose
                 // ownership of the current image if recovery itself were interrupted.
@@ -582,10 +581,9 @@ impl TransactionCoordinator {
             };
             change.restored = Some(image);
             change.restore_name = name;
-            change.restore_alias_pending = change
-                .restored
-                .as_ref()
-                .is_some_and(|image| !image.windows_short_name.is_empty());
+            change.restore_alias_pending = change.restored.as_ref().is_some_and(|image| {
+                cfg!(windows) && image.hash.is_some() || !image.windows_short_name.is_empty()
+            });
         }
         let prepare = store.active().and_then(|active| {
             if active.is_none() {
