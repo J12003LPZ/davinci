@@ -65,6 +65,15 @@ impl RuntimeBus {
         }
     }
 
+    /// Auxiliary reads cannot bypass an installed runtime hook. An empty
+    /// internal bus carries rewind receipts but has no read-decision policy.
+    pub(crate) fn has_subscribers(&self) -> bool {
+        self.inner
+            .subscribers
+            .lock()
+            .map_or(true, |subscribers| !subscribers.is_empty())
+    }
+
     pub fn subscribe(&self, subscriber: Arc<dyn RuntimeSubscriber>) {
         if let Ok(mut subs) = self.inner.subscribers.lock() {
             subs.push(Subscription {

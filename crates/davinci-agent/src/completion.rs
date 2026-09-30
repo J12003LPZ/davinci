@@ -133,7 +133,10 @@ impl Agent {
         if !self.completion_auxiliary_observation_allowed()
             || self.pre_tool.is_some()
             || self.named_file_hooks_active
-            || self.runtime.is_some()
+            || self
+                .runtime
+                .as_ref()
+                .is_some_and(|runtime| runtime.bus.has_subscribers())
             || !self.tools.iter().any(|tool| tool == "read")
         {
             return None;
