@@ -158,6 +158,8 @@ pub struct RuntimeHandle {
     pub progress_watchdog: Arc<Mutex<ProgressWatchdog>>,
     pub blob_store: BlobStore,
     pub effect_ledger: Arc<std::sync::RwLock<Vec<OwnedFileEffect>>>,
+    /// Existing bounded effect-report format, bound by the host to this session.
+    pub prompt_effect_report_path: Option<std::path::PathBuf>,
     pub conversation: Arc<Mutex<ConversationRuntime>>,
 }
 
@@ -267,6 +269,7 @@ impl RuntimeHandle {
             progress_watchdog: Arc::new(Mutex::new(ProgressWatchdog::new())),
             blob_store: BlobStore::new(),
             effect_ledger: Arc::new(std::sync::RwLock::new(Vec::new())),
+            prompt_effect_report_path: None,
             conversation: Arc::new(Mutex::new(ConversationRuntime::new(run_id, agent_id, None))),
         }
     }

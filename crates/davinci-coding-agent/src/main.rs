@@ -5904,7 +5904,7 @@ fn run_interactive(
     session.login_providers = interactive_login_providers(parsed);
     let stored = load_merged_settings(&default_agent_dir(), &agent.cwd);
     session.double_escape_action =
-        DoubleEscapeAction::parse(stored.double_escape_action.as_deref().unwrap_or("tree"));
+        DoubleEscapeAction::parse(stored.double_escape_action.as_deref().unwrap_or("rewind"));
     session.autocomplete_max_visible =
         stored.autocomplete_max_visible.unwrap_or(5).clamp(3, 20) as usize;
     session
@@ -6481,6 +6481,7 @@ fn apply_session_action(
             }
             Ok(true)
         }
+        SessionAction::OpenRewind => open_prompt_rewind(agent, session),
         SessionAction::OpenTree => {
             open_session_tree(agent, session);
             Ok(true)
@@ -7255,6 +7256,7 @@ fn handle_user_line(
             }
             Ok(true)
         }
+        SlashAction::Rewind => open_prompt_rewind(agent, session),
         SlashAction::Tree => {
             let mut host = loaded_extension_host(parsed);
             host.runtime_flag_values = flag_values_json(parsed);
@@ -10953,6 +10955,12 @@ fn handle_extension_select(
     choice: Option<String>,
 ) -> Result<bool, String> {
     let context = session.extension_dialog_context.take();
+    if let Some(context) = context
+        .as_deref()
+        .filter(|context| context.starts_with("rewind-"))
+    {
+        return handle_prompt_rewind_choice(agent, session, context, choice.as_deref());
+    }
     if let Some(id) = context
         .as_deref()
         .and_then(|value| value.strip_prefix("branch-summary:"))
@@ -12285,4 +12293,82 @@ fn teammate_idle_timeout() -> std::time::Duration {
         .and_then(|ms| ms.parse().ok())
         .map(std::time::Duration::from_millis)
         .unwrap_or(davinci_agent::runtime::team::TEAMMATE_IDLE_TIMEOUT)
+}
+
+fn open_prompt_rewind(agent: &Agent, session: &mut InteractiveSession) -> Result<bool, String> {
+    let checkpoints = agent.prompt_checkpoints();
+    if checkpoints.is_empty() {
+        session.chrome.status = "No prompt checkpoints in this conversation".into();
+        return Ok(true);
+    }
+    session.extension_dialog_context = Some("rewind-checkpoint".into());
+    session.open_extension_selector(
+        format!(
+            "Rewind\n{}",
+            davinci_agent::runtime::rewind::SHELL_REWIND_LIMITATION
+        ),
+        checkpoints
+            .into_iter()
+            .take(30)
+            .map(|checkpoint| {
+                format!(
+                    "{} · {}",
+                    checkpoint.id,
+                    checkpoint.prompt.replace('\n', " ")
+                )
+            })
+            .collect(),
+    );
+    Ok(true)
+}
+
+fn handle_prompt_rewind_choice(
+    agent: &mut Agent,
+    session: &mut InteractiveSession,
+    context: &str,
+    choice: Option<&str>,
+) -> Result<bool, String> {
+    let Some(choice) = choice else {
+        session.chrome.status = "Rewind cancelled".into();
+        return Ok(true);
+    };
+    if context == "rewind-checkpoint" {
+        let id = choice
+            .split_once(" · ")
+            .map(|(id, _)| id)
+            .ok_or("Invalid rewind checkpoint")?;
+        let preview = agent.preview_prompt_rewind(id)?;
+        session.extension_dialog_context =
+            Some(format!("rewind-mode:{id}:{}", preview.preview_digest));
+        let mut modes = vec!["conversation".into()];
+        if preview.conflict_count == 0 {
+            modes.insert(0, "both".into());
+            modes.push("code".into());
+        }
+        session.open_extension_selector(format!("Restore code, conversation, or both?\n{} files; {} conflicts. Shell changes are not tracked.", preview.files.len(), preview.conflict_count), modes);
+    } else if let Some(rest) = context.strip_prefix("rewind-mode:") {
+        if !matches!(choice, "code" | "conversation" | "both") {
+            return Err("Invalid rewind mode".into());
+        }
+        session.extension_dialog_context = Some(format!("rewind-confirm:{rest}:{choice}"));
+        session.open_extension_selector(format!("Restore {choice}?\nAbandoned conversation remains in the session tree. Shell changes are not tracked."), vec!["Confirm rewind".into(), "Cancel".into()]);
+    } else if let Some(rest) = context.strip_prefix("rewind-confirm:") {
+        if choice == "Confirm rewind" {
+            let fields: Vec<_> = rest.split(':').collect();
+            if fields.len() != 3 {
+                return Err("Invalid rewind confirmation".into());
+            }
+            let selection = davinci_agent::runtime::rewind::RewindSelection {
+                code: matches!(fields[2], "code" | "both"),
+                task_state: false,
+                transcript: matches!(fields[2], "conversation" | "both"),
+            };
+            agent.apply_prompt_rewind(fields[0], fields[1], &selection)?;
+            session.chrome.status =
+                format!("Restored {}. Shell changes are not tracked.", fields[2]);
+        } else {
+            session.chrome.status = "Rewind cancelled".into();
+        }
+    }
+    Ok(true)
 }

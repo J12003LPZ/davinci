@@ -102,6 +102,47 @@ fn validate_report_bytes(
     Ok(())
 }
 
+/// Create the existing report format before a prompt can mutate files. An empty
+/// report is valid and lets recovery distinguish no effects from a missing file.
+pub fn ensure_effect_report(path: &Path) -> Result<(), String> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.is_file() && !metadata.file_type().is_symlink() => return Ok(()),
+        Ok(_) => return Err("Effect report must be a regular file, not a symlink".into()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(format!("Inspect effect report: {error}")),
+    }
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+    }
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let file = match options.open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            let metadata = fs::symlink_metadata(path).map_err(|error| error.to_string())?;
+            if metadata.is_file() && !metadata.file_type().is_symlink() {
+                return Ok(());
+            }
+            return Err("Effect report must be a regular file, not a symlink".into());
+        }
+        Err(error) => return Err(format!("Create effect report: {error}")),
+    };
+    file.sync_all()
+        .map_err(|error| format!("Persist effect report: {error}"))?;
+    #[cfg(unix)]
+    if let Some(parent) = path.parent() {
+        fs::File::open(parent)
+            .and_then(|directory| directory.sync_all())
+            .map_err(|error| format!("Persist effect report directory: {error}"))?;
+    }
+    Ok(())
+}
+
 /// Append one validated effect report and durably flush it to disk.
 pub fn append_effect_report(
     path: &Path,
@@ -111,6 +152,7 @@ pub fn append_effect_report(
 ) -> Result<(), String> {
     validate_report_bytes("before_bytes", effect.before_blob.as_deref(), before_bytes)?;
     validate_report_bytes("after_bytes", effect.after_blob.as_deref(), after_bytes)?;
+    ensure_effect_report(path)?;
     let report = OwnedFileEffectReport {
         effect: effect.clone(),
         before_bytes: before_bytes.map(ToOwned::to_owned),
@@ -133,9 +175,14 @@ pub fn append_effect_report(
         .filter(|parent| !parent.as_os_str().is_empty())
         .unwrap_or_else(|| Path::new("."));
     fs::create_dir_all(parent).map_err(|e| format!("create effect report directory: {e}"))?;
-    let mut file = OpenOptions::new()
-        .create(true)
-        .append(true)
+    let mut options = OpenOptions::new();
+    options.create(true).append(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options
         .open(path)
         .map_err(|e| format!("open effect report: {e}"))?;
     file.write_all(&line)
@@ -150,6 +197,17 @@ pub fn append_effect_report(
 
 /// Read and validate a bounded JSONL effect report.
 pub fn read_effect_report(path: &Path) -> Result<Vec<OwnedFileEffectReport>, String> {
+    let metadata =
+        fs::symlink_metadata(path).map_err(|error| format!("Inspect effect report: {error}"))?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Err("Effect report must be a regular file, not a symlink".into());
+    }
+    if metadata.len() > MAX_EFFECT_REPORT_BYTES as u64 {
+        return Err(format!(
+            "effect report exceeds the {} byte limit",
+            MAX_EFFECT_REPORT_BYTES
+        ));
+    }
     let raw = fs::read(path).map_err(|e| format!("read effect report: {e}"))?;
     if raw.len() > MAX_EFFECT_REPORT_BYTES {
         return Err(format!(

@@ -37,6 +37,11 @@ pub fn builtin_slash_commands() -> Vec<SlashCommand> {
         ),
         ("tree", "Navigate session tree (switch branches)", None),
         (
+            "rewind",
+            "Restore code, conversation, or both from a recent prompt",
+            None,
+        ),
+        (
             "export",
             "Export session (HTML default, or specify path: .html/.jsonl)",
             None,
@@ -160,6 +165,7 @@ pub enum SlashAction {
     Clone,
     Resume,
     Tree,
+    Rewind,
     Copy,
     Reload,
     Import(String),
@@ -247,6 +253,7 @@ pub fn parse_line(line: &str) -> SlashAction {
         "clone" => SlashAction::Clone,
         "resume" | "sessions" => SlashAction::Resume,
         "tree" => SlashAction::Tree,
+        "rewind" => SlashAction::Rewind,
         "copy" => SlashAction::Copy,
         "reload" => SlashAction::Reload,
         "import" => SlashAction::Import(args.to_string()),
@@ -318,6 +325,14 @@ pub fn invocable_commands(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rewind_is_discoverable_and_host_owned() {
+        assert!(builtin_slash_commands()
+            .iter()
+            .any(|command| command.name == "rewind"));
+        assert_eq!(parse_line("/rewind"), SlashAction::Rewind);
+    }
 
     #[test]
     fn init_is_discoverable_and_expands_into_an_agents_file_task() {

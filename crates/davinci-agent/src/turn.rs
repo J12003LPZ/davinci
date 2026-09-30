@@ -241,10 +241,16 @@ impl Agent {
     {
         self.ensure_session_persistence()?;
         self.recover_pending_operation_publications()?;
+        self.require_prompt_checkpoint_persistence()?;
         let result = self.run_loop_body(emit_prompt_messages, complete);
         self.completion_context.clear();
         self.invalidate_context_image();
+        let rewind_persistence = self.settle_prompt_checkpoint();
         let persistence = self.ensure_session_persistence();
+        if let Err(error) = rewind_persistence {
+            self.fail_turn(&error);
+            return Err(error);
+        }
         match (&result, persistence) {
             (_, Err(error)) => {
                 self.fail_turn(&error);
@@ -2502,6 +2508,30 @@ impl Agent {
                                         }
                                     }
                                     if let Ok(mut effects) = runtime.effect_ledger.write() {
+                                        if let Some(report_path) =
+                                            &runtime.prompt_effect_report_path
+                                        {
+                                            let before_bytes = effect
+                                                .before_blob
+                                                .as_deref()
+                                                .and_then(|hash| runtime.blob_store.get_blob(hash));
+                                            let after_bytes = effect
+                                                .after_blob
+                                                .as_deref()
+                                                .and_then(|hash| runtime.blob_store.get_blob(hash));
+                                            if let Err(error) =
+                                                crate::runtime::effects::append_effect_report(
+                                                    report_path,
+                                                    &effect,
+                                                    before_bytes.as_deref(),
+                                                    after_bytes.as_deref(),
+                                                )
+                                            {
+                                                executed = self.tool_durability_failure(format!(
+                                                "Prompt rewind persistence failed after mutation: {error}"
+                                            ));
+                                            }
+                                        }
                                         effects.push(effect);
                                     } else {
                                         executed = self.tool_durability_failure(

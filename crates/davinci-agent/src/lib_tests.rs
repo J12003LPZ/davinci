@@ -2337,7 +2337,13 @@ fn pending_bash_results_flush_before_the_next_prompt() {
     assert_eq!(agent.messages[0].role, "bashExecution");
     assert_eq!(agent.messages[1].role, "user");
     let entries = &agent.session.as_ref().unwrap().entries;
-    assert_eq!(entries.len(), 2);
+    assert_eq!(
+        entries
+            .iter()
+            .filter(|entry| entry.entry_type == "message")
+            .count(),
+        2
+    );
     assert_eq!(
         entries[0]
             .message

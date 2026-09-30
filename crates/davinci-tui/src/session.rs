@@ -81,6 +81,7 @@ pub enum SessionAction {
     CycleSetting,
     OpenTree,
     OpenFork,
+    OpenRewind,
     OpenScopedModels,
     OpenLogin,
     SelectAuthProvider {
@@ -208,6 +209,7 @@ struct OscQuery {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DoubleEscapeAction {
+    Rewind,
     Tree,
     Fork,
     None,
@@ -216,6 +218,7 @@ pub enum DoubleEscapeAction {
 impl DoubleEscapeAction {
     pub fn parse(value: &str) -> Self {
         match value {
+            "rewind" => Self::Rewind,
             "fork" => Self::Fork,
             "none" => Self::None,
             _ => Self::Tree,
@@ -224,6 +227,7 @@ impl DoubleEscapeAction {
 
     pub fn as_str(self) -> &'static str {
         match self {
+            Self::Rewind => "rewind",
             Self::Tree => "tree",
             Self::Fork => "fork",
             Self::None => "none",
@@ -277,7 +281,7 @@ impl InteractiveSession {
             running: false,
             width: 80,
             overlay_kind: OverlayKind::None,
-            double_escape_action: DoubleEscapeAction::Tree,
+            double_escape_action: DoubleEscapeAction::Rewind,
             slash_commands: Vec::new(),
             extra_autocomplete: Vec::new(),
             last_autocomplete_debounce_ms: 0,
@@ -1546,6 +1550,7 @@ impl InteractiveSession {
                 self.last_escape = None;
                 return match self.double_escape_action {
                     DoubleEscapeAction::Tree => SessionAction::OpenTree,
+                    DoubleEscapeAction::Rewind => SessionAction::OpenRewind,
                     DoubleEscapeAction::Fork => SessionAction::OpenFork,
                     DoubleEscapeAction::None => SessionAction::Abort,
                 };
@@ -2561,5 +2566,30 @@ mod tests {
             .join("\n");
         assert!(thinking_levels.contains("off"));
         assert!(!thinking_levels.contains("xhigh"));
+    }
+}
+
+#[cfg(test)]
+mod rewind_shortcut_tests {
+    use super::*;
+    #[test]
+    fn double_escape_default_is_rewind_and_tree_remains_configurable() {
+        assert_eq!(
+            DoubleEscapeAction::parse("rewind"),
+            DoubleEscapeAction::Rewind
+        );
+        assert_eq!(DoubleEscapeAction::parse("tree"), DoubleEscapeAction::Tree);
+        assert_eq!(DoubleEscapeAction::Rewind.as_str(), "rewind");
+        let mut session = InteractiveSession::new(
+            crate::builtin_themes().into_iter().next().unwrap(),
+            "fixture",
+            Vec::new(),
+        );
+        assert_eq!(session.double_escape_action, DoubleEscapeAction::Rewind);
+        session.last_escape = Some(Instant::now());
+        assert_eq!(session.handle_bytes("\x1b"), SessionAction::OpenRewind);
+        session.double_escape_action = DoubleEscapeAction::Tree;
+        session.last_escape = Some(Instant::now());
+        assert_eq!(session.handle_bytes("\x1b"), SessionAction::OpenTree);
     }
 }

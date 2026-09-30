@@ -3768,3 +3768,28 @@ fn the_workflows_view_lists_phases_in_order_with_agents_and_results() {
         davinci_tui::davinci::model::WorkflowLevel::Agents
     );
 }
+
+#[test]
+fn prompt_rewind_command_opens_recent_prompt_picker_with_shell_limitation() {
+    let mut m = model();
+    let mut agent = Agent::new("offline rewind picker fixture");
+    agent.prompt("first prompt");
+    agent.prompt("second prompt");
+    let Done::Ask(question) = perform(
+        &crate::Args::default(),
+        &mut agent,
+        &mut m,
+        crate::slash::SlashAction::Rewind,
+    )
+    .unwrap() else {
+        panic!("rewind must open its picker");
+    };
+    let ask = question.ask(&agent);
+    assert_eq!(ask.items.len(), 2);
+    assert!(ask.note.contains("shell commands are not tracked"));
+    let Question::Rewind { checkpoints } = question else {
+        panic!("expected rewind picker");
+    };
+    assert_eq!(checkpoints[0].1, "second prompt");
+    assert_eq!(checkpoints[1].1, "first prompt");
+}

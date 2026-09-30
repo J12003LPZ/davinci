@@ -174,7 +174,7 @@ impl Default for InteractiveSettingsConfig {
     fn default() -> Self {
         Self {
             theme: "dark".into(),
-            double_escape: "tree".into(),
+            double_escape: "rewind".into(),
             quiet_startup: false,
             autocomplete_max_visible: 5,
             tree_filter_mode: "default".into(),
@@ -484,7 +484,7 @@ pub fn interactive_settings_list(config: &InteractiveSettingsConfig) -> Settings
                 label: "Double-escape action".into(),
                 description: Some("Action when pressing Escape twice with empty editor".into()),
                 current_value: config.double_escape.clone(),
-                values: vec!["tree".into(), "fork".into(), "none".into()],
+                values: vec!["rewind".into(), "tree".into(), "fork".into(), "none".into()],
             },
             SettingItem {
                 id: "tree-filter-mode".into(),

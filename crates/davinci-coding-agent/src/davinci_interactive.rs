@@ -2804,6 +2804,9 @@ pub enum Done {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Question {
     GraphSetup(graph_setup::Setup),
+    Rewind {
+        checkpoints: Vec<(String, String)>,
+    },
     /// Whether this project's `.pi` resources may be used.
     Trust {
         path: String,
@@ -2825,6 +2828,17 @@ impl Question {
     pub fn ask(&self, _agent: &Agent) -> Ask {
         match self {
             Question::GraphSetup(setup) => setup.ask(_agent),
+            Question::Rewind { checkpoints } => Ask {
+                title: "Rewind".into(),
+                name: "REWIND".into(),
+                key: "/rewind".into(),
+                note: davinci_agent::runtime::rewind::SHELL_REWIND_LIMITATION.into(),
+                items: checkpoints
+                    .iter()
+                    .map(|(_, prompt)| PickerItem::new(prompt, "restore from before this prompt"))
+                    .collect(),
+                ..Default::default()
+            },
             Question::Trust { path, options } => Ask {
                 title: "Trust".into(),
                 name: "TRUST".into(),
@@ -3888,6 +3902,21 @@ pub fn perform(
             store.set_name(&name).map_err(|err| err.to_string())?;
             Ok(Done::Said(format!("named this session {name}")))
         }
+        SlashAction::Rewind => {
+            let checkpoints = agent
+                .prompt_checkpoints()
+                .into_iter()
+                .take(30)
+                .map(|checkpoint| (checkpoint.id, checkpoint.prompt))
+                .collect::<Vec<_>>();
+            if checkpoints.is_empty() {
+                Ok(Done::Note(
+                    "No prompt checkpoints in this conversation".into(),
+                ))
+            } else {
+                Ok(Done::Ask(Question::Rewind { checkpoints }))
+            }
+        }
         SlashAction::Fork => {
             let mut host = crate::loaded_extension_host(parsed);
             host.runtime_flag_values = crate::flag_values_json(parsed);
@@ -4649,7 +4678,7 @@ pub fn run(
     model.double_escape_action = stored_settings
         .double_escape_action
         .clone()
-        .unwrap_or_else(|| "tree".into());
+        .unwrap_or_else(|| "rewind".into());
     let mut last_escape: Option<Instant> = None;
     // `ctrl+c` at rest, as in claude code: the first press clears what was
     // being typed and arms the exit; a second within this window leaves.
@@ -4767,6 +4796,41 @@ pub fn run(
     let mut team_mail_since: Option<Instant> = None;
     let result = loop {
         let _ = terminal.reacquire();
+        if let Some(outcome) = model
+            .rewind_modal
+            .as_mut()
+            .and_then(|modal| modal.outcome.take())
+        {
+            model.rewind_modal = None;
+            if let davinci_tui::davinci::views::rewind::RewindModalOutcome::Confirmed {
+                checkpoint_id,
+                preview_digest,
+                selection,
+            } = outcome
+            {
+                let selection = davinci_agent::runtime::rewind::RewindSelection {
+                    code: selection.code,
+                    task_state: false,
+                    transcript: selection.transcript,
+                };
+                match agent.apply_prompt_rewind(&checkpoint_id, &preview_digest, &selection) {
+                    Ok(_) => {
+                        if selection.transcript {
+                            model.transcript = transcript_from(&agent.messages);
+                            model.composer_epoch = model.composer_epoch.saturating_add(1);
+                        }
+                        model.transcript.push(Entry::notice(
+                            State::Attention,
+                            "Rewind applied. Shell changes are not tracked.",
+                        ));
+                    }
+                    Err(error) => model
+                        .transcript
+                        .push(Entry::notice(State::Attention, &error)),
+                }
+            }
+            model.dirty = true;
+        }
         if last_tick.elapsed() >= davinci_tui::davinci::runtime::TICK {
             model.tick = model.tick.wrapping_add(1);
             model.dirty = true;
@@ -5092,7 +5156,7 @@ pub fn run(
                         }
                         // Two escapes on an empty composer, within the same window
                         // the legacy chrome uses, run the stored double-escape
-                        // action: the session tree by default, a fork if asked.
+                        // action: rewind by default, with tree and fork still configurable.
                         if key.code == crossterm::event::KeyCode::Esc
                             && key.modifiers.is_empty()
                             && model.overlay.is_none()
@@ -5112,7 +5176,8 @@ pub fn run(
                                 match davinci_tui::DoubleEscapeAction::parse(
                                     &model.double_escape_action,
                                 ) {
-                                    davinci_tui::DoubleEscapeAction::Fork => {
+                                    action @ (davinci_tui::DoubleEscapeAction::Fork
+                                    | davinci_tui::DoubleEscapeAction::Rewind) => {
                                         let mut shell = Shell {
                                             voice: &mut voice,
                                             parsed,
@@ -5125,7 +5190,14 @@ pub fn run(
                                             dresser: &dresser,
                                             images: &mut attached_images,
                                         };
-                                        match on_line(&mut shell, "/fork") {
+                                        match on_line(
+                                            &mut shell,
+                                            if action == davinci_tui::DoubleEscapeAction::Rewind {
+                                                "/rewind"
+                                            } else {
+                                                "/fork"
+                                            },
+                                        ) {
                                             Next::Go => {}
                                             Next::Leave => break Ok(0),
                                             Next::Fail(err) => break Err(err),
@@ -8870,6 +8942,22 @@ fn on_choice(shell: &mut Shell<'_>, choice: Choice) -> Next {
             if let Question::GraphSetup(setup) = question {
                 return graph_setup::choose(shell, setup, index);
             }
+            if let Question::Rewind { checkpoints } = &question {
+                if let Some((id, prompt)) = checkpoints.get(index) {
+                    match shell.agent.preview_prompt_rewind(id) {
+                        Ok(preview) => {
+                            open_rewind_modal(shell.model, &preview, prompt, "before this prompt");
+                            if let Some(modal) = &mut shell.model.rewind_modal {
+                                modal.conversation_checkpoint = true;
+                                modal.selection.task_state = false;
+                                modal.selection.transcript = true;
+                            }
+                        }
+                        Err(error) => shell.note(&error),
+                    }
+                }
+                return Next::Go;
+            }
             match answer(shell, &question, index) {
                 Ok(text) => shell.say(&text),
                 Err(err) => shell.note(&err),
@@ -9366,6 +9454,7 @@ fn enable_typesafe_with_key(
 fn answer(shell: &mut Shell<'_>, question: &Question, index: usize) -> Result<String, String> {
     match question {
         Question::GraphSetup(_) => Err("Graph setup must be handled by the launch flow".into()),
+        Question::Rewind { .. } => Err("Rewind must be handled by the preview flow".into()),
         Question::Trust { options, .. } => {
             let Some(option) = options.get(index) else {
                 return Err("that trust option is gone".into());

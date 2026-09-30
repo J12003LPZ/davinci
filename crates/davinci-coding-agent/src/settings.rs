@@ -1646,7 +1646,7 @@ pub fn to_interactive_config(
         double_escape: settings
             .double_escape_action
             .clone()
-            .unwrap_or_else(|| "tree".into()),
+            .unwrap_or_else(|| "rewind".into()),
         quiet_startup: settings.quiet_startup,
         autocomplete_max_visible: settings.autocomplete_max_visible.unwrap_or(5),
         tree_filter_mode: settings

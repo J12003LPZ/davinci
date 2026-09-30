@@ -400,6 +400,16 @@ impl<'a> ToolTransaction<'a> {
                 Ok(mut ledger) => {
                     for mut report in reports {
                         report.effect.owner_generation = applied.sequence;
+                        if let Some(path) = &runtime.prompt_effect_report_path {
+                            if let Err(error) = super::super::effects::append_effect_report(
+                                path,
+                                &report.effect,
+                                report.before_bytes.as_deref(),
+                                report.after_bytes.as_deref(),
+                            ) {
+                                handoff_error.get_or_insert(error);
+                            }
+                        }
                         if let Some(path) = std::env::var_os("PI_GRAPH_EFFECT_REPORT") {
                             if let Err(error) = super::super::effects::append_effect_report(
                                 Path::new(&path),

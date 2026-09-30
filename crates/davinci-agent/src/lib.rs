@@ -462,6 +462,7 @@ pub struct Agent {
     pub templates: Vec<PromptTemplate>,
     pub context_files: Vec<ContextFile>,
     pub session: Option<JsonlSession>,
+    pub(crate) prompt_rewind: runtime::rewind::PromptRewindState,
     pub cwd: PathBuf,
     pub aborted: bool,
     pub is_streaming: bool,
@@ -660,6 +661,7 @@ impl Agent {
             templates: Vec::new(),
             context_files: Vec::new(),
             session: None,
+            prompt_rewind: runtime::rewind::PromptRewindState::default(),
             cwd: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
             aborted: false,
             is_streaming: false,
@@ -779,6 +781,17 @@ impl Agent {
 
     pub fn set_runtime(&mut self, mut runtime: RuntimeHandle) {
         runtime.ensure_conversation_identity_current();
+        let rewind_binding = self.prompt_rewind_binding();
+        if self.prompt_rewind.binding == rewind_binding {
+            if let Some(previous) = &self.runtime {
+                runtime.blob_store = previous.blob_store.clone();
+                runtime.effect_ledger = previous.effect_ledger.clone();
+            }
+        }
+        runtime.prompt_effect_report_path = self
+            .session
+            .as_ref()
+            .map(|session| session.path.with_extension("rewind-effects.jsonl"));
         // One Context VM per conversation. Hosts build a fresh handle for each
         // prompt; the derived state, metrics and diagnostics of the handle it
         // replaces carry over while the bound session is unchanged.
@@ -1788,6 +1801,7 @@ impl Agent {
         if self.auto_resize_images {
             content = crate::normalize_tool_result_images(&content, true);
         }
+        let rewind_start = real_user_origin.then(|| self.begin_prompt_checkpoint(text));
         let mut message = ChatMessage {
             role: "user".into(),
             content,
@@ -1805,6 +1819,9 @@ impl Agent {
                 serde_json::to_value(&message.content).unwrap_or(Value::Null),
                 &message.extra,
             ));
+        }
+        if let Some(checkpoint) = rewind_start {
+            self.record_prompt_checkpoint(checkpoint);
         }
         self.pending_prompt_messages.push(message.clone());
         message
@@ -3672,6 +3689,7 @@ impl Agent {
                     )
                 })?;
         }
+        let rewind = runtime::rewind::prepare_prompt_rewind(&session)?;
         let messages = messages_from_session(&session);
         if session_changed {
             self.runtime_environment = None;
@@ -3690,6 +3708,7 @@ impl Agent {
         self.session = Some(session);
         self.tool_ledger = Arc::new(std::sync::Mutex::new(candidate_ledger));
         self.set_runtime(candidate);
+        self.install_prompt_checkpoints(rewind);
         self.restore_living_plan();
         let _ = self.restore_prompt_session();
         Ok(())
@@ -3859,6 +3878,7 @@ impl Agent {
         if let Some(session) = &self.session {
             self.messages = messages_from_session(session);
         }
+        self.restore_prompt_checkpoints()?;
         self.restore_plan()?;
         Ok(TreeNavigateResult {
             cancelled: false,
