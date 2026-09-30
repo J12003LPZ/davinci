@@ -188,3 +188,41 @@ fn a_runtime_read_gate_prevents_attachment_after_rewind_bootstrap() {
     assert!(!text.contains("<named_files"), "{text}");
     assert!(!text.contains("RUNTIME_GATED_BODY"), "{text}");
 }
+
+#[test]
+fn host_runtime_rebinding_after_checkpoint_bootstrap_preserves_the_read_fence() {
+    for rebind_kind in 0..4 {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("calc.py"), "HOST_GATED_BODY").unwrap();
+        let mut agent = agent(dir.path(), TurnContextPlacement::Appended);
+        agent.prompt_user_with("Explain the next step", &[]);
+        if rebind_kind == 0 {
+            // Even a host binding of the same bus is conservatively fenced.
+            agent.set_runtime(agent.runtime.clone().unwrap());
+        } else {
+            let previous = agent.runtime.as_ref().unwrap();
+            agent.runtime = Some(davinci_agent::RuntimeHandle::new(
+                if rebind_kind == 3 {
+                    previous.run_id
+                } else {
+                    davinci_agent::RunId::new()
+                },
+                if rebind_kind == 3 {
+                    previous.agent_id
+                } else {
+                    davinci_agent::AgentId::new()
+                },
+                if rebind_kind >= 2 {
+                    previous.bus.clone()
+                } else {
+                    davinci_agent::RuntimeBus::new()
+                },
+            ));
+        }
+        agent.prompt_user_with("Fix calc.py", &[]);
+        agent.commit_turn_context(None);
+        assert!(!serde_json::to_string(&agent.messages_for_provider())
+            .unwrap()
+            .contains("HOST_GATED_BODY"));
+    }
+}

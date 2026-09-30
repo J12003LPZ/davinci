@@ -613,6 +613,9 @@ pub struct Agent {
     pub last_prepared_manifest: Option<runtime::context_manifest::PreparedContextManifest>,
     /// Optional shared runtime handle for versioned lifecycle events and coordination.
     pub runtime: Option<RuntimeHandle>,
+    /// The bus created solely for prompt checkpoints. Host-bound runtimes
+    /// retain the conservative automatic-read fence, even before subscription.
+    pub(crate) prompt_checkpoint_bus: Option<(Arc<()>, RuntimeBus)>,
     /// Optional additive decision-intelligence runtime. It is deliberately
     /// separate from deterministic routing and remains disabled by default.
     pub decision_runtime: Option<Arc<decision::DecisionRuntime>>,
@@ -768,6 +771,7 @@ impl Agent {
             provider_system_prompt_suffix: None,
             last_prepared_manifest: None,
             runtime: None,
+            prompt_checkpoint_bus: None,
             decision_runtime: None,
             runtime_session: None,
         };
@@ -811,6 +815,7 @@ impl Agent {
     }
 
     pub fn set_runtime(&mut self, mut runtime: RuntimeHandle) {
+        self.prompt_checkpoint_bus = None;
         runtime.ensure_conversation_identity_current();
         let rewind_binding = self.prompt_rewind_binding();
         if self.prompt_rewind.binding == rewind_binding {
@@ -874,6 +879,19 @@ impl Agent {
             }
         }
         self.runtime = Some(runtime);
+    }
+
+    pub(crate) fn runtime_requires_file_capture_guard(&self) -> bool {
+        self.runtime.as_ref().is_some_and(|runtime| {
+            !self
+                .prompt_checkpoint_bus
+                .as_ref()
+                .is_some_and(|(identity, bus)| {
+                    Arc::ptr_eq(identity, &runtime.file_capture_identity())
+                        && bus.shares_state_with(&runtime.bus)
+                })
+                || runtime.bus.has_subscribers()
+        })
     }
 
     pub fn with_runtime(mut self, runtime: RuntimeHandle) -> Self {

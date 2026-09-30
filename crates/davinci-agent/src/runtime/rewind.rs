@@ -1704,11 +1704,15 @@ impl crate::Agent {
             };
         }
         if self.runtime.is_none() {
-            self.set_runtime(super::RuntimeHandle::new(
+            let bus = super::RuntimeBus::new();
+            let runtime = super::RuntimeHandle::new(
                 super::RunId::new(),
                 self.tool_context.transaction_owner.agent_id,
-                super::RuntimeBus::new(),
-            ));
+                bus.clone(),
+            );
+            let identity = runtime.file_capture_identity();
+            self.set_runtime(runtime);
+            self.prompt_checkpoint_bus = Some((identity, bus));
         }
         if let Some(path) = self
             .runtime

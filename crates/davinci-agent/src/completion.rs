@@ -133,10 +133,7 @@ impl Agent {
         if !self.completion_auxiliary_observation_allowed()
             || self.pre_tool.is_some()
             || self.named_file_hooks_active
-            || self
-                .runtime
-                .as_ref()
-                .is_some_and(|runtime| runtime.bus.has_subscribers())
+            || self.runtime_requires_file_capture_guard()
             || !self.tools.iter().any(|tool| tool == "read")
         {
             return None;
@@ -429,6 +426,35 @@ mod tests {
         agent.auto_compaction = false;
         agent.auto_verify = false;
         agent
+    }
+
+    #[test]
+    fn completion_snapshots_only_exempt_the_internally_minted_checkpoint_runtime() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("app.py"), "fixture").unwrap();
+        let inputs = vec![PathBuf::from("app.py")];
+        for rebind_kind in 0..4 {
+            let mut agent = fixture(root.path());
+            agent.prompt("Explain the next step");
+            assert!(agent.completion_file_snapshot(&inputs).is_some());
+            let previous = agent.runtime.clone().unwrap();
+            if rebind_kind == 0 {
+                agent.set_runtime(previous);
+            } else {
+                let mut runtime = crate::RuntimeHandle::new(
+                    previous.run_id,
+                    previous.agent_id,
+                    previous.bus.clone(),
+                );
+                if rebind_kind == 2 {
+                    runtime = runtime.with_session_state_from(&previous);
+                } else if rebind_kind == 3 {
+                    runtime.bus = crate::RuntimeBus::new();
+                }
+                agent.runtime = Some(runtime);
+            }
+            assert!(agent.completion_file_snapshot(&inputs).is_none());
+        }
     }
 
     fn git(root: &Path, args: &[&str]) {

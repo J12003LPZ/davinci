@@ -143,6 +143,7 @@ pub struct RuntimeHandle {
     pub parent_agent_id: Option<AgentId>,
     pub session_id: Option<String>,
     sequence: Arc<AtomicU64>,
+    file_capture_identity: Arc<()>,
     pub bus: RuntimeBus,
     pub cancellation_token: CancellationToken,
     pub registry: RuntimeRegistry,
@@ -254,6 +255,7 @@ impl RuntimeHandle {
             parent_agent_id: None,
             session_id: None,
             sequence: Arc::new(AtomicU64::new(0)),
+            file_capture_identity: Arc::new(()),
             bus,
             cancellation_token: CancellationToken::new(),
             registry,
@@ -279,6 +281,10 @@ impl RuntimeHandle {
         self.cache = cache.clone();
         self.context_vm = context_vm::ContextVmRuntime::new(config, cache);
         self
+    }
+
+    pub(crate) fn file_capture_identity(&self) -> Arc<()> {
+        self.file_capture_identity.clone()
     }
 
     pub fn with_capability_registry(mut self, registry: RuntimeCapabilityRegistry) -> Self {
