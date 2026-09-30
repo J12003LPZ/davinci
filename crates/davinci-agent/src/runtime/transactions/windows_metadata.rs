@@ -395,6 +395,29 @@ mod tests {
     use std::os::windows::io::AsRawHandle;
 
     #[test]
+    fn transaction_recreation_does_not_inherit_deleted_creation_time() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("a.txt");
+        std::fs::write(&path, b"deleted").unwrap();
+        let old = capture(&std::fs::metadata(&path).unwrap()).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        std::fs::remove_file(&path).unwrap();
+        let manager =
+            TransactionCoordinator::new(root.path(), TransactionOwner::default()).unwrap();
+        let preview = manager
+            .preview(vec![ProposedChange::write("a.txt", b"new".to_vec())])
+            .unwrap();
+        manager.apply(&preview.id, &|_| Ok(()), None).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"new");
+        assert_ne!(
+            capture(&std::fs::metadata(&path).unwrap()).unwrap().created,
+            old.created
+        );
+        manager.rollback(&preview.id, &|_| Ok(()), None).unwrap();
+        assert!(!path.exists());
+    }
+
+    #[test]
     fn transaction_stage_does_not_publish_temporary_short_name() {
         use crate::runtime::cache::directory::Directory;
         use std::io::Write;

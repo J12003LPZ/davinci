@@ -480,8 +480,9 @@ impl TransactionCoordinator {
                 }
             }
             for change in &record.changes {
-                if files::capture(&self.root,&change.path)?.0 != change.proposed {
-                    let reason = format!("conflict: {} changed during application; journal retained",change.path);
+                let current = files::capture(&self.root,&change.path)?.0;
+                if current != change.proposed {
+                    let reason = format!("conflict: {} changed during application; journal retained; expected {:?}, observed {:?}",change.path,change.proposed,current);
                     return self.conflict(store,&mut record,reason);
                 }
             }

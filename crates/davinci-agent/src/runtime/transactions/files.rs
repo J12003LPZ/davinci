@@ -183,7 +183,16 @@ pub(super) fn stage(
         #[cfg(windows)]
         {
             super::windows_streams::restore(&dir, &name, &file, &original.streams)?;
-            super::windows_metadata::restore(&file, original.windows_metadata.as_ref())?;
+            // Explicitly set creation metadata even for a new source. Otherwise
+            // NTFS tunneling may replace the stage's creation time on rename
+            // with that of a recently deleted destination.
+            let metadata = match &original.windows_metadata {
+                Some(metadata) => Some(metadata.clone()),
+                None => super::windows_metadata::capture(
+                    &file.metadata().map_err(|error| error.to_string())?,
+                ),
+            };
+            super::windows_metadata::restore(&file, metadata.as_ref())?;
             if let Some(access) = &original.access {
                 super::windows_acl::apply(&file, access)?;
             }
