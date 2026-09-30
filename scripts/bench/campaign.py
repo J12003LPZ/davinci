@@ -172,6 +172,14 @@ def manifest_errors(manifest, rows):
         for field, value in identity.items():
             if field not in row or row[field] != value:
                 errors.append("row differs from manifest identity: " + field)
+        for field in ("private_suite_digest", "price_table_hash"):
+            if field in manifest and row.get(field) != manifest[field]:
+                errors.append("row differs from manifest: " + field)
+        if "private_labels" in manifest:
+            labels = manifest["private_labels"].get(row.get("task"), {})
+            for field in ("size_class", "split", "language", "repository_id", "reference_commit", "visible_tests", "requires_existing_test_changes"):
+                if field not in labels or row.get(field) != labels[field]:
+                    errors.append("row differs from frozen private labels: " + field)
     return errors
 
 

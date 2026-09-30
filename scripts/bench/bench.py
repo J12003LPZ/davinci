@@ -38,6 +38,8 @@ from runner import (create_campaign, isolate_settings, controlled_environment, s
                     pin_model_store, model_stop_reason, validate_large_manifest, container_command,
                     campaign_lock, parent_identity, source_identity)
 from codex_otel import Collector, request_metrics
+from private_suite import apply_hidden, import_suite, load_frozen, run_check
+from readiness_metrics import report as readiness_report, load_prices
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 TASKS = os.path.join(HERE, "tasks")
@@ -65,7 +67,7 @@ def copy_tree(src, dst):
             rel = os.path.relpath(os.path.join(base, name), src)
             out = os.path.join(dst, rel)
             os.makedirs(os.path.dirname(out), exist_ok=True)
-            shutil.copyfile(os.path.join(base, name), out)
+            shutil.copy2(os.path.join(base, name), out)
 
 
 def git(cwd, *args):
@@ -109,6 +111,12 @@ def prepare(tid, dest):
 
 def grade(tid, workdir):
     hidden = os.path.join(TASKS, tid, "hidden")
+    spec = load(tid)
+    if "private_provenance" in spec:
+        apply_hidden(spec, hidden, workdir)
+        checked = run_check(spec["grader_command"], workdir)
+        detail = (checked["stdout"] or checked["stderr"]).strip().splitlines()
+        return checked["pass"], int(checked["pass"]), int(not checked["pass"]), detail[-1] if detail else str(checked["exit"])
     copy_tree(hidden, workdir)
     files = []
     for base, _, names in os.walk(hidden):
@@ -212,7 +220,7 @@ def parse_stream(harness, stdout):
     Returns dict(input, cached, output, tool_calls, requests, tools).
     `input` is total input tokens (cached plus uncached).
     """
-    stats = {"input": None, "cached": None, "output": None,
+    stats = {"input": None, "cached": None, "output": None, "cache_write": None,
              "tool_calls": 0, "requests": None, "user_turns": 0, "tools": {}}
     usage_seen = False
     missing = set()
@@ -252,7 +260,7 @@ def parse_stream(harness, stdout):
                 u = u if isinstance(u, dict) else {}
                 add_usage({"input": u.get("input_tokens"),
                            "cached": u.get("cached_input_tokens"),
-                           "output": u.get("output_tokens")})
+                           "output": u.get("output_tokens"), "cache_write": 0})
                 reasoning_values.append(u.get("reasoning_output_tokens"))
             item = event.get("item") or {}
             item = item if isinstance(item, dict) else {}
@@ -272,7 +280,7 @@ def parse_stream(harness, stdout):
                 if isinstance(identity, str) and identity:
                     if identity in completed_usage:
                         if completed_usage[identity] != u:
-                            add_usage({"input": None, "cached": None, "output": None})
+                            add_usage({"input": None, "cached": None, "output": None, "cache_write": None})
                             usage_conflict = True
                         continue
                     completed_usage[identity] = u
@@ -283,7 +291,7 @@ def parse_stream(harness, stdout):
                 request_usage.append({"input_tokens": total, "cached_tokens": cached if valid else None})
                 reasoning_values.append(u.get("reasoning"))
                 add_usage({"input": total,
-                           "cached": cached, "output": u.get("output")})
+                           "cached": cached, "output": u.get("output"), "cache_write": written})
                 # Completed messages are not authoritative dispatch telemetry.
                 stats["completed_assistant_messages"] = (
                     stats.get("completed_assistant_messages", 0) + 1)
@@ -356,7 +364,9 @@ def run_one(harness, tid, rep, campaign=None):
         stopped = stopped or "change_inventory_failed"
     if stopped:
         ok, passed, failed, tail = False, 0, 0, "not run: " + stopped
+        regression = None
     else:
+        regression = run_check(spec["regression_command"], workdir) if "private_provenance" in spec else None
         try:
             ok, passed, failed, tail = grade(tid, workdir)
         except (subprocess.TimeoutExpired, OSError) as error:
@@ -371,7 +381,7 @@ def run_one(harness, tid, rep, campaign=None):
         "harness": harness, "task": tid, "rep": rep, "exit": code, "grader_pass": ok,
         "tests_passed": passed, "tests_failed": failed, "pytest": tail,
         "wall_s": wall, "input_tokens": s["input"], "cached_tokens": s["cached"],
-        "output_tokens": s["output"], "tool_calls": s["tool_calls"], "requests": s["requests"],
+        "output_tokens": s["output"], "cache_write_tokens": s["cache_write"], "tool_calls": s["tool_calls"], "requests": s["requests"],
         "tools": s["tools"], "changed": changed, "unrelated": unrelated,
         **artifacts, "cleanup_complete": measured.get("cleanup_complete"),
         "started_at": measured["started_at"], "finished_at": measured["finished_at"],
@@ -379,7 +389,14 @@ def run_one(harness, tid, rep, campaign=None):
                                if campaign else "diagnostic-only"),
         "task_set": "legacy" if tid in LEGACY_TASKS else "large",
         "stop_reason": stopped,
+        "regression_pass": regression["pass"] if regression else None,
+        "regression_exit": regression["exit"] if regression else None,
+        "execution_mode": "print",
     }
+    if "private_provenance" in spec:
+        result.update({key: spec["private_provenance"][key] for key in
+                       ("size_class", "split", "language", "repository_id", "reference_commit", "visible_tests", "requires_existing_test_changes")})
+        result["task_set"] = "private"
     for key in ("logical_requests", "provider_attempts", "prewarm_attempts", "jev_attempts",
                 "gate_reminders", "auto_verify_runs", "requests_after_first_reminder",
                 "mutations_after_reminder", "executed_leaf_operations", "batch_children_reported",
@@ -396,6 +413,9 @@ def run_one(harness, tid, rep, campaign=None):
         result.update({key: campaign[key] for key in
             ("schema_version", "campaign", "variant", "fixture_hash", "model", "effort_policy", "service_tier")})
         result.update(campaign["identities"][harness])
+        for field in ("private_suite_digest", "price_table_hash"):
+            if field in campaign:
+                result[field] = campaign[field]
     result["pass"] = task_success(result)
     with open(os.path.join(RUNS, "results.jsonl"), "a", encoding="utf-8") as f:
         f.write(json.dumps(result) + "\n")
@@ -445,9 +465,9 @@ def validate_fixture_manifest(task_ids, large_manifest):
     return errors
 
 
-def validate(task_set="legacy", large_manifest=None):
-    task_ids = select_tasks(task_set, ["all"], large_manifest)
-    manifest_errors = validate_fixture_manifest(task_ids, large_manifest) if task_set != "legacy" else []
+def validate(task_set="legacy", large_manifest=None, private_tasks=None):
+    task_ids = private_tasks or select_tasks(task_set, ["all"], large_manifest)
+    manifest_errors = validate_fixture_manifest(task_ids, large_manifest) if large_manifest else []
     if manifest_errors:
         for error in manifest_errors:
             print("FAIL " + error)
@@ -458,9 +478,14 @@ def validate(task_set="legacy", large_manifest=None):
         prepare(tid, d)
         before = grade(tid, d)
         prepare(tid, d)
-        copy_tree(os.path.join(TASKS, tid, "solution"), d)
+        if "private_provenance" in load(tid):
+            shutil.rmtree(d, onexc=_force_remove)
+            shutil.copytree(os.path.join(TASKS, tid, "solution"), d)
+        else:
+            copy_tree(os.path.join(TASKS, tid, "solution"), d)
         after = grade(tid, d)
-        good = (not before[0]) and after[0]
+        reference_regression = run_check(load(tid)["regression_command"], d) if "private_provenance" in load(tid) else None
+        good = (not before[0]) and after[0] and (reference_regression is None or reference_regression["pass"])
         bad += not good
         print(f"{tid:14} start={'PASS' if before[0] else 'fail'} "
               f"solution={'PASS' if after[0] else 'FAIL'}  {after[3]}")
@@ -548,6 +573,8 @@ def campaign_errors(root, rows):
 
 
 def stratified_summary(rows):
+    if any(row.get("task_set") == "private" for row in rows):
+        return {name: summarize([row for row in rows if row.get("size_class") == name]) for name in ("small", "large")}
     return {name: summarize([row for row in rows if (row["task"] in LEGACY_TASKS) == (name == "legacy")])
             for name in ("legacy", "large")}
 
@@ -632,7 +659,14 @@ def compare(baseline, candidate, base_ref=None, repo=None):
 def report():
     rows = load_rows()
     errors = campaign_errors(RUNS, rows)
+    manifest = json.loads(Path(RUNS, "campaign.json").read_text(encoding="utf-8"))
+    prices = None
+    if manifest.get("price_table_hash"):
+        prices, price_hash = load_prices(Path(RUNS, "prices.json"))
+        if price_hash != manifest["price_table_hash"]:
+            raise ValueError("campaign price table changed after freezing")
     summary = {"arms": summarize(rows), "strata": stratified_summary(rows),
+               "readiness": readiness_report(rows, prices),
                "per_task": {task: summarize([row for row in rows if row["task"] == task])
                             for task in sorted({row["task"] for row in rows})},
                "integrity_errors": errors, "scope": "diagnostic; no promotion acceptance"}
@@ -676,8 +710,14 @@ def gate():
 
 
 def main():
+    global TASKS
     ap = argparse.ArgumentParser()
-    ap.add_argument("mode", choices=["validate", "run", "report", "gate", "compare"])
+    ap.add_argument("mode", choices=["validate", "run", "report", "gate", "compare", "private-import"])
+    ap.add_argument("--private-manifest", help="owner-authored source commits and human prompts for private-import")
+    ap.add_argument("--destination", help="new private fixture directory outside the checkout")
+    ap.add_argument("--private-suite", help="frozen private fixture directory")
+    ap.add_argument("--price-table", help="explicit USD model price table to freeze with a new campaign")
+    ap.add_argument("--split", choices=["dev", "holdout"], help="explicit private split; holdout is never a tuning set")
     ap.add_argument("--harness", nargs="+", choices=["davinci", "codex"], default=["davinci", "codex"])
     ap.add_argument("--tasks", nargs="+", default=["all"])
     ap.add_argument("--reps", type=int, default=1)
@@ -694,10 +734,23 @@ def main():
     ap.add_argument("--base-ref", help="declared PR target ref used to verify the actual parent merge-base")
     ap.add_argument("--parent-for", help="candidate source SHA when running a parent control; requires --base-ref")
     args = ap.parse_args()
+    private = None
+    private_tids = None
+    private_digest = None
+    if args.mode == "private-import":
+        if not args.private_manifest or not args.destination:
+            ap.error("private-import requires --private-manifest and --destination")
+        print(json.dumps(import_suite(args.private_manifest, args.destination), indent=2))
+        return
+    if args.private_suite:
+        if not args.split or args.tasks != ["all"]:
+            ap.error("private suite requires --split and the complete frozen split")
+        TASKS = str(Path(args.private_suite).resolve())
+        private, private_tids, private_digest = load_frozen(TASKS, args.split)
     if args.mode == "validate":
         large = json.loads(Path(args.large_manifest).read_text(encoding="utf-8")) if args.large_manifest else None
         try:
-            validate(args.task_set, large)
+            validate(args.task_set, large, private_tids)
         except ValueError as error:
             ap.error(str(error))
     elif args.mode == "report":
@@ -713,7 +766,7 @@ def main():
             ap.error("reps must be positive and rep-start nonnegative")
         with campaign_lock(RUNS) as lock:
             large = json.loads(Path(args.large_manifest).read_text(encoding="utf-8")) if args.large_manifest else None
-            tids = select_tasks(args.task_set, args.tasks, large)
+            tids = private_tids or select_tasks(args.task_set, args.tasks, large)
             frozen_errors = validate_fixture_manifest(tids, large) if large else []
             if frozen_errors:
                 raise ValueError("; ".join(frozen_errors))
@@ -721,6 +774,13 @@ def main():
             settings = json.loads(Path(args.settings).read_text(encoding="utf-8")) if args.settings else BASE_SETTINGS
             manifest = campaign_identity(RUNS, args.variant, fixtures, args.harness,
                                          MODEL, EFFORT, settings, Path(HERE).parents[1])
+            prices = None
+            if args.price_table:
+                prices, price_hash = load_prices(args.price_table)
+                manifest["price_table_hash"] = price_hash
+            if private:
+                manifest.update(private_suite_digest=private_digest, private_split=args.split,
+                                private_inventory=private["inventory"], private_labels=private["labels"])
             if args.parent_for:
                 if not args.base_ref or "davinci" not in args.harness:
                     ap.error("--parent-for requires --base-ref and a DaVinci arm")
@@ -737,6 +797,8 @@ def main():
             if pinned_models:
                 manifest["identities"]["davinci"]["model_catalog_hash"] = digest(pinned_models)
             create_campaign(RUNS, manifest)
+            if prices is not None:
+                Path(RUNS, "prices.json").write_text(json.dumps(prices, indent=2) + "\n", encoding="utf-8")
             Path(RUNS, "fixtures.json").write_text(json.dumps(fixtures, indent=2), encoding="utf-8")
             if "davinci" in args.harness:
                 isolate_settings(agent_source(), Path(manifest["agent_dir"]), settings)
@@ -748,6 +810,8 @@ def main():
                     raise ValueError("runner source changed during campaign")
                 if fixture_manifest(TASKS, tids)["fixture_hash"] != manifest["fixture_hash"]:
                     raise ValueError("fixture changed during campaign")
+                if private and load_frozen(TASKS, args.split)[2] != private_digest:
+                    raise ValueError("private split metadata changed during campaign")
                 run_one(harness, tid, rep, manifest)
 
 
