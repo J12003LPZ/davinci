@@ -141,6 +141,10 @@ fn run_git(args: &[&str], cwd: Option<&Path>) -> Result<(), String> {
         }
     }
     let mut command = std::process::Command::new(git_program());
+    // Plugin paths include both a staging directory and upstream subdirectories.
+    // Scope this to our command rather than changing the user's Git settings.
+    #[cfg(windows)]
+    command.args(["-c", "core.longpaths=true"]);
     command.args(args);
     // Also covers submodules and redirects git itself might follow.
     command.env("GIT_ALLOW_PROTOCOL", "https:http:ssh:git");
@@ -560,6 +564,44 @@ pub fn copy_tree(from: &Path, to: &Path) -> Result<(), String> {
 mod tests {
     use super::*;
     use crate::plugins::external::tests::{write, FakeHomes};
+
+    #[test]
+    #[cfg(windows)]
+    fn git_handles_long_plugin_staging_paths_without_global_configuration() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("marketplace");
+        std::fs::create_dir(&root).unwrap();
+        for args in [
+            vec!["init", "--quiet"],
+            vec!["config", "core.longpaths", "false"],
+        ] {
+            assert!(std::process::Command::new(git_program())
+                .args(args)
+                .current_dir(&root)
+                .status()
+                .unwrap()
+                .success());
+        }
+        let relative = format!(
+            "plugins/{}/skills/{}/references/fixture.md",
+            "a".repeat(100),
+            "b".repeat(100)
+        );
+        let file = root.join(&relative);
+        assert!(file.as_os_str().len() > 260);
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+        std::fs::write(&file, "fixture").unwrap();
+        run_git(&["add", "--", &relative], Some(&root)).unwrap();
+        let configured = std::process::Command::new(git_program())
+            .args(["config", "--local", "--get", "core.longpaths"])
+            .current_dir(&root)
+            .output()
+            .unwrap();
+        assert_eq!(
+            String::from_utf8(configured.stdout).unwrap().trim(),
+            "false"
+        );
+    }
 
     #[test]
     fn parses_marketplace_sources() {

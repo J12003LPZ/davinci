@@ -699,6 +699,12 @@ fn offline_stub_message(current: &Agent, last_user: usize) -> AssistantMessage {
                     || message
                         .extra
                         .contains_key(davinci_agent::COMPLETION_REMINDER_FIELD)
+                    || (message.role == "custom"
+                        && message
+                            .extra
+                            .get("customType")
+                            .and_then(|value| value.as_str())
+                            == Some(davinci_agent::turn_context::TURN_CONTEXT_CUSTOM_TYPE))
             };
             let is_prompt = |message: &davinci_ai::ChatMessage| {
                 message.role == "user" && !harness_reminder(message)
@@ -706,7 +712,9 @@ fn offline_stub_message(current: &Agent, last_user: usize) -> AssistantMessage {
             let Some(calls) = fixture.as_array() else {
                 return current
                     .messages
-                    .last()
+                    .iter()
+                    .rev()
+                    .find(|message| !harness_reminder(message))
                     .is_some_and(is_prompt)
                     .then_some(fixture);
             };

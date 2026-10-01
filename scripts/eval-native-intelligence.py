@@ -186,9 +186,11 @@ def main():
             "--permission-mode",
             "always-approve",
             "--provider",
-            "openai",
+            "openai-codex",
             "--model",
-            "gpt-5",
+            "gpt-6-luna",
+            "--thinking",
+            "low",
             "--mode",
             "json",
             "-p",
@@ -208,7 +210,7 @@ def main():
         assert not marker.exists(), "--no-mcp started an unrelated server"
         events = [json.loads(line) for line in result.stdout.splitlines() if line.startswith("{")]
         results = [event for event in events if event.get("type") == "tool_execution_end"]
-        assert len(results) == len(calls), results
+        assert len(results) == len(calls), (results, result.stdout, result.stderr)
         states = list((root / ".davinci/graph/runs").glob("*/state.json"))
         assert len(states) == 1, states
         state = json.loads(states[0].read_text(encoding="utf-8"))

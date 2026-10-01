@@ -103,10 +103,10 @@ pub fn advised_tool_families(response: &DecisionResponse) -> Vec<String> {
         ("verification_planner_relevant", "verification"),
     ]
     .into_iter()
-    .filter_map(|(question, family)| {
-        matches!(response.answers.get(question), Some(DecisionAnswer::Noul { value }) if *value >= 0.85)
-            .then(|| family.to_owned())
+    .filter(|(question, _)| {
+        matches!(response.answers.get(*question), Some(DecisionAnswer::Noul { value }) if *value >= 0.85)
     })
+    .map(|(_, family)| family.to_owned())
     .collect()
 }
 

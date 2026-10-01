@@ -280,6 +280,7 @@ fn inspector_facts(
         out.fact("Phase", &run.phase, text);
         out.heading("Original prompt");
         out.plain(&run.goal, th.text);
+        run_facts(&mut out, run);
         out.heading("Progress");
         for (task, bucket) in run.tasks.iter().zip(run.buckets()) {
             out.rows.push(Line::from(vec![
@@ -316,7 +317,7 @@ fn inspector_facts(
         out.blank();
         out.plain("Arrows select an agent; Enter inspects.", th.muted);
     }
-    run_facts(&mut out, run, model.graph_canvas.inspecting_goal);
+    run_facts(&mut out, run);
     out.rows
 }
 
@@ -473,13 +474,13 @@ pub fn next_steps(run: &GraphRunSheet, task: &GraphTask) -> Vec<String> {
         .collect()
 }
 
-fn run_facts(out: &mut Facts<'_>, run: &GraphRunSheet, inspecting_goal: bool) {
+fn run_facts(out: &mut Facts<'_>, run: &GraphRunSheet) {
     let th = &out.model.theme;
     let text = Style::default().fg(th.text);
     // Phase and goal already head the command center; the panel only
     // repeats the run when it is in trouble.
     let has_trouble = run.blocked_reason.is_some() || !run.verification.is_empty();
-    if inspecting_goal || !has_trouble {
+    if !has_trouble {
         return;
     }
     out.heading("Run");
@@ -708,6 +709,24 @@ mod tests {
         let rows = inspector_lines(&model, Some("writer"), 30, 7);
         assert!(rows.iter().any(|r| r.to_string().contains("PUBLIC_END")));
         assert!(rows.len() <= 7);
+    }
+
+    #[test]
+    fn goal_inspector_shows_verification_progress_and_blocked_reason() {
+        let mut model = Model::new(Theme::da_vinci(ColorDepth::TrueColor, true), 100, 40, false);
+        let mut run = fixtures::blueprint_graph();
+        run.phase = "verify".into();
+        run.blocked_reason = Some("verification needs attention".into());
+        run.verification = vec!["Verification running 3/8: cargo test".into()];
+        model.graph_run = Some(run);
+        model.graph_canvas.inspecting_goal = true;
+        let text = squash(&joined(&inspector_lines(&model, None, 100, 100)));
+        assert!(text.contains("Original prompt"), "{text}");
+        assert!(
+            text.contains("Verification running 3/8: cargo test"),
+            "{text}"
+        );
+        assert!(text.contains("verification needs attention"), "{text}");
     }
 
     #[test]

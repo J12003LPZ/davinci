@@ -4,7 +4,9 @@ use davinci_protocol::{
     SandboxId, SandboxMode, SandboxSpec,
 };
 use serde::{Deserialize, Serialize};
-use std::path::{Path, PathBuf};
+use std::path::Path;
+#[cfg(unix)]
+use std::path::PathBuf;
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
 #[serde(default, rename_all = "camelCase", deny_unknown_fields)]
@@ -507,9 +509,9 @@ const RUNTIME_PATHS: &[&str] = &[
 ];
 
 fn runtime_layout(workspace: &Path) -> RuntimeLayout {
-    let mut layout = RuntimeLayout::default();
     #[cfg(unix)]
     {
+        let mut layout = RuntimeLayout::default();
         let mut mounts = RuntimeMounts::default();
         for path in RUNTIME_PATHS {
             mounts.push(Path::new(path), workspace);
@@ -582,12 +584,16 @@ fn runtime_layout(workspace: &Path) -> RuntimeLayout {
             .environment
             .insert("CARGO_HOME".into(), format!("{SANDBOX_HOME}/.cargo"));
         layout.mounts = mounts.into_rules();
+        layout
     }
     #[cfg(not(unix))]
-    let _ = workspace;
-    layout
+    {
+        let _ = workspace;
+        RuntimeLayout::default()
+    }
 }
 
+#[cfg(unix)]
 #[derive(Default)]
 struct RuntimeMounts {
     /// Canonical host directories and files, mounted at the same path.
@@ -596,6 +602,7 @@ struct RuntimeMounts {
     aliases: Vec<(PathBuf, PathBuf)>,
 }
 
+#[cfg(unix)]
 impl RuntimeMounts {
     /// Records `path`; returns its canonical spelling when it is mounted.
     fn push(&mut self, path: &Path, workspace: &Path) -> Option<String> {
@@ -670,6 +677,7 @@ impl RuntimeMounts {
     }
 }
 
+#[cfg(unix)]
 fn runtime_covers(parent: &Path, child: &Path) -> bool {
     // The Seatbelt /System rule deliberately excludes mounted host volumes.
     // Preserve an explicit, narrower OS-runtime grant on the Preboot volume.
@@ -683,6 +691,7 @@ fn runtime_covers(parent: &Path, child: &Path) -> bool {
 }
 
 /// `path` without `.` components; `None` when it has `..`.
+#[cfg(unix)]
 fn lexical(path: &Path) -> Option<PathBuf> {
     let mut out = PathBuf::new();
     for component in path.components() {
@@ -695,6 +704,7 @@ fn lexical(path: &Path) -> Option<PathBuf> {
     Some(out)
 }
 
+#[cfg(unix)]
 fn exposes_user_home_root(path: &Path) -> bool {
     let Some(home) = std::env::var_os("HOME").map(PathBuf::from) else {
         return false;

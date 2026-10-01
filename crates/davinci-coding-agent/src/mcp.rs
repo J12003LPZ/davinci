@@ -80,6 +80,7 @@ pub fn auto_requires_restart(current: &ConfigFile, confined: &ConfigFile) -> boo
 #[cfg(test)]
 mod tests {
     use super::*;
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     #[test]
     fn legacy_project_stdio_prevents_in_place_auto_transition() {
@@ -103,6 +104,7 @@ mod tests {
 
     #[test]
     fn mcp_execution_provenance_never_lets_project_or_plugin_local_commands_run_on_host() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let dir = tempfile::tempdir().unwrap();
         let agent_dir = dir.path().join("agent");
         let project = dir.path().join("project");
@@ -147,6 +149,7 @@ mod tests {
 
     #[test]
     fn without_a_sandbox_project_and_plugin_servers_keep_running_on_the_host() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         // Compatibility mode claims no OS isolation, so forcing `sandboxed`
         // here would only refuse every project and plugin server.
         let dir = tempfile::tempdir().unwrap();
@@ -176,6 +179,7 @@ mod tests {
 
     #[test]
     fn pi_mcp_config_wins_and_an_untrusted_project_file_is_ignored() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let dir = tempfile::tempdir().unwrap();
         let fixture = dir.path().join("fixture.json");
         std::fs::write(

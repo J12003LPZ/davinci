@@ -16,25 +16,29 @@ from winpty import PtyProcess
 
 
 class Terminal:
-    def __init__(self, executable, cwd, fixture, width, height):
-        args = [executable, "--davinci", "--offline", "--no-animation",
-                "--no-session", "--no-extensions", "--no-skills", "--no-context-files"]
+    def __init__(self, executable, cwd, fixture, width, height, *, offline=True, extra_args=()):
+        args = [executable, "--davinci", "--no-animation",
+                "--no-session", "--no-extensions", "--no-mcp", "--no-skills", "--no-context-files",
+                "--provider", "openai-codex", "--model", "gpt-6-luna", "--thinking", "low"]
+        if offline:
+            args.append("--offline")
+        args.extend(extra_args)
         if fixture:
             args.extend(["--screen", fixture])
         env = dict(os.environ)
         config = Path(cwd) / "eval-config"
         config.mkdir(exist_ok=True)
         env.update(PI_CODING_AGENT_DIR=str(config), DAVINCI_CODING_AGENT_DIR=str(config))
-        if not fixture:
+        if offline and not fixture:
             env["OPENAI_API_KEY"] = "offline-eval-placeholder"
-            args.extend(["--provider", "openai", "--model", "gpt-5"])
         self.process = PtyProcess.spawn(
             args, cwd=cwd, dimensions=(height, width), env=env,
         )
         self.screen = pyte.Screen(width, height)
         self.stream = pyte.Stream(self.screen)
         self.chunks = queue.Queue()
-        threading.Thread(target=self.read, daemon=True).start()
+        self.reader = threading.Thread(target=self.read, daemon=True)
+        self.reader.start()
 
     def read(self):
         try:
@@ -56,8 +60,23 @@ class Terminal:
         self.process.write(text)
         return self.pump(seconds)
 
+    def command(self, text):
+        # ConPTY can split a write into bursts. Wait beyond the Windows paste
+        # detector's quiet window before sending the submit key.
+        self.send(text, 1.2)
+        return self.send("\r", 1.2)
+
     def close(self):
-        self.process.terminate(force=True)
+        if self.process is None:
+            return
+        if not self.process.terminate(force=True):
+            raise RuntimeError("Could not terminate the eval terminal")
+        self.process.close(force=True)
+        self.reader.join(timeout=5)
+        if self.reader.is_alive():
+            raise RuntimeError("Eval terminal reader did not stop")
+        # Release the ConPTY handle before TemporaryDirectory removes its cwd.
+        self.process = None
 
 
 def main():
@@ -68,12 +87,11 @@ def main():
             terminal = Terminal(executable, cwd, "blueprint", width, 30)
             try:
                 text = terminal.pump(8)
-                assert "GRAPH RUN" in text, text
+                assert "Agent command center" in text, text
                 if width >= 100:
-                    heading = next(line for line in terminal.screen.display if "WORKER ACTIVITY" in line)
-                    assert heading.index("WORKER ACTIVITY") > width // 2
+                    assert "Working 2" in text and "Attention 2" in text, text
                 text = terminal.send("g")
-                assert "MAIN GOAL" in text, text
+                assert "Original prompt" in text, text
                 assert "Validate parallel execution" in " ".join(text.split()), text
                 terminal.send("\x1b")
                 results.append({"graph_width": width, "goal": "passed"})
@@ -101,27 +119,26 @@ def main():
         terminal = Terminal(executable, cwd, None, 120, 36)
         try:
             terminal.pump(8)
-            terminal.send("/graph --dry-run test role configuration", 0.8)
-            text = terminal.send("\r", 0.8)
-            assert "GRAPH SETUP" in text, text
+            text = terminal.command("/graph --dry-run test role configuration")
+            assert "Graph setup" in text, text
             assert not list(Path(cwd).glob(".davinci/graph/runs/*")), "Started before confirmation"
             terminal.send("\x1b[B")  # researcher
             text = terminal.send("\r")
-            assert "GRAPH MODEL: RESEARCHER" in text, text
-            text = terminal.send("openai/gpt-5", 0.8)
-            assert "openai/gpt-5" in text, text
+            assert "Graph model: researcher" in text, text
+            text = terminal.send("openai-codex/gpt-6-luna", 0.8)
+            assert "openai-codex/gpt-6-luna" in text, text
             text = terminal.send("\r")
-            assert "GRAPH SETUP" in text, text
-            assert "researcher: openai/gpt-5" in text, text
+            assert "Graph setup" in text, text
+            assert "researcher: openai-codex/gpt-6-luna" in text, text
             terminal.send("\x1b")
             assert not list(Path(cwd).glob(".davinci/graph/runs/*")), "Cancel launched workers"
-            terminal.send("/graph --dry-run test role configuration", 0.8)
-            text = terminal.send("\r", 0.8)
-            assert "GRAPH SETUP" in text, text
+            text = terminal.command("/graph --dry-run test role configuration")
+            assert "Graph setup" in text, text
             for _ in range(7):
                 terminal.send("\x1b[B", 0.1)
             text = terminal.send("\r", 3)
-            assert "GRAPH RUN" in text, text
+            # A fast dry run may already return to the conversation.
+            assert "Agent command center" in text or "Graph COMPLETED" in text, text
             assert list(Path(cwd).glob(".davinci/graph/runs/*")), "Start did not launch graph"
             deadline = time.monotonic() + 10
             while "COMPLETED" not in text and time.monotonic() < deadline:
@@ -145,8 +162,7 @@ def main():
         terminal = Terminal(executable, cwd, None, 160, 36)
         try:
             terminal.pump(8)
-            terminal.send("/graph-status", 0.8)
-            terminal.send("\r", 1)
+            terminal.command("/graph-status")
             text = terminal.send("g")
             assert "Verification running" in text, text
             assert "3/8" in text, text
@@ -163,16 +179,18 @@ def main():
         terminal = Terminal(executable, cwd, None, 160, 36)
         try:
             terminal.pump(8)
-            terminal.send("/graph-status", 0.8)
-            text = terminal.send("\r", 1)
+            text = terminal.command("/graph-status")
             assert "BLOCKED - goal not completed" in text, text
-            assert "4 total (limit 3/milestone)" in text, text
-            assert "s resume graph" in text, text
+            # Revision counts belong to an agent's details in the new canvas.
+            text = terminal.send("\x1b[B")
+            text = terminal.send("\r")
+            assert "Revisions:" in text and "4 of 3" in text, text
+            assert "s resume" in text, text
+            terminal.send("\x1b")
             text = terminal.send("\x1b")
             assert "Graph BLOCKED" in text, text
             assert "verification still failing" in text, text
-            terminal.send("/graph-status", 0.8)
-            terminal.send("\r", 0.8)
+            terminal.command("/graph-status")
             text = terminal.send("s", 3)
             deadline = time.monotonic() + 10
             while "COMPLETED" not in text and time.monotonic() < deadline:

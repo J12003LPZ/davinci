@@ -465,6 +465,12 @@ fn argument_suggestions(
     };
     let mut filtered = fuzzy_filter(args, pool);
     if command == "model" {
+        let exact = |value: &str| {
+            let (provider, id) = value.split_once('/').unwrap_or(("", value));
+            let normalized = format!("{}/{}", provider.trim(), id.trim());
+            normalized.eq_ignore_ascii_case(args.trim())
+                || id.trim().eq_ignore_ascii_case(args.trim())
+        };
         filtered.sort_by(|left, right| {
             let provider = |value: &str| {
                 value
@@ -473,8 +479,9 @@ fn argument_suggestions(
                     .trim()
                     .to_string()
             };
-            provider(left)
-                .cmp(&provider(right))
+            exact(right)
+                .cmp(&exact(left))
+                .then_with(|| provider(left).cmp(&provider(right)))
                 .then_with(|| model_picker_rank(left).cmp(&model_picker_rank(right)))
         });
     }
@@ -1142,6 +1149,18 @@ mod tests {
             extra_providers: &[],
             cwd,
             force_path: false,
+        }
+    }
+
+    #[test]
+    fn exact_model_argument_precedes_featured_fuzzy_matches() {
+        let models = vec![
+            "openai-codex / gpt-5.6-luna".into(),
+            "openai-codex / gpt-6-luna".into(),
+        ];
+        for input in ["/model openai-codex/gpt-6-luna", "/model gpt-6-luna"] {
+            let found = suggestions(query(input, &[], &models, Path::new("."))).unwrap();
+            assert_eq!(found.items[0].value, "openai-codex/gpt-6-luna", "{input}");
         }
     }
 

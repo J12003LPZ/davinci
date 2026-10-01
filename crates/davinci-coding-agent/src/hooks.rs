@@ -550,8 +550,15 @@ pub fn append_event(
     if let Some(ok) = ok {
         row["ok"] = Value::Bool(ok);
     }
+    // Parallel tool callbacks share the session ledger. Formatting directly
+    // into separate append handles emits many writes that can interleave.
+    let line = format!("{row}\n");
+    static EVENT_WRITE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _guard = EVENT_WRITE_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     if let Ok(mut out) = OpenOptions::new().create(true).append(true).open(file) {
-        let _ = writeln!(out, "{row}");
+        let _ = out.write_all(line.as_bytes());
     }
 }
 
@@ -1525,6 +1532,7 @@ mod tests {
 
     #[test]
     fn status_report_does_not_trust_project_hooks_by_default() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let dir = tempfile::tempdir().unwrap();
         let agent = dir.path().join("agent");
         let project = dir.path().join("proj");
@@ -1693,6 +1701,43 @@ mod tests {
         assert_eq!(rows[0]["ok"], true);
         assert_eq!(rows[1]["kind"], "denied");
         assert_eq!(rows[1]["ok"], false);
+    }
+
+    #[test]
+    fn concurrent_tool_events_remain_complete_json_lines() {
+        let dir = tempfile::tempdir().unwrap();
+        let session = dir.path().join("parallel.jsonl");
+        let barrier = std::sync::Barrier::new(8);
+        std::thread::scope(|scope| {
+            for worker in 0..8 {
+                let session = &session;
+                let barrier = &barrier;
+                scope.spawn(move || {
+                    barrier.wait();
+                    for call in 0..32 {
+                        append_event(
+                            Some(session),
+                            "tool",
+                            "read",
+                            Some(&format!("worker-{worker}-call-{call}")),
+                            Some(true),
+                        );
+                    }
+                });
+            }
+        });
+        let content = std::fs::read_to_string(session.with_extension("events.jsonl")).unwrap();
+        let rows: Vec<Value> = content
+            .lines()
+            .map(|line| serde_json::from_str(line).expect("complete JSON event"))
+            .collect();
+        let ids: std::collections::BTreeSet<_> = rows
+            .iter()
+            .map(|row| row["toolCallId"].as_str().unwrap())
+            .collect();
+        assert_eq!(rows.len(), 8 * 32);
+        assert_eq!(ids.len(), rows.len());
+        assert!(rows.iter().all(|row| row["ok"] == true));
     }
 
     #[test]

@@ -134,16 +134,15 @@ fn rollout_enabled(value: Option<&str>) -> bool {
 }
 
 pub fn function_tool_value(tool: &ToolSpec) -> Value {
-    let mut function = json!({
+    // Responses may otherwise normalize optional properties into required ones.
+    // Preserve the tool's declared schema unless it explicitly requests strict sampling.
+    json!({
         "type": "function",
         "name": tool.name,
         "description": tool.description,
         "parameters": tool.parameters,
-    });
-    if crate::stream::resolve_json_schema_strict_sampling(tool).unwrap_or(false) {
-        function["strict"] = Value::Bool(true);
-    }
-    function
+        "strict": crate::stream::resolve_json_schema_strict_sampling(tool).unwrap_or(false),
+    })
 }
 
 fn custom_tool_value(tool: &ToolSpec) -> Value {
@@ -361,6 +360,22 @@ mod tests {
                 constrained_sampling: None,
             },
         ]
+    }
+
+    #[test]
+    fn optional_function_arguments_do_not_opt_into_provider_strict_normalization() {
+        let mut tool = tools().remove(0);
+        tool.parameters = json!({
+            "type": "object",
+            "properties": {"id": {"type": "string"}, "endLine": {"type": "integer"}},
+            "required": ["id"]
+        });
+        let wire = function_tool_value(&tool);
+        assert_eq!(wire["strict"], false);
+        assert_eq!(wire["parameters"], tool.parameters);
+
+        tool.constrained_sampling = Some(json!({"type": "json_schema", "strict": "require"}));
+        assert_eq!(function_tool_value(&tool)["strict"], true);
     }
 
     #[test]
