@@ -219,6 +219,11 @@ mod tests {
     use super::*;
     use davinci_ai::{AuthStorage, Credential, CredentialKind};
 
+    // Hosted Windows runners can spend more than 30 seconds starting Python
+    // while other tests compete for resources. These tests check child
+    // behavior, not startup speed; the timeout regression keeps its short bound.
+    const FIXTURE_TIMEOUT: Duration = Duration::from_secs(120);
+
     fn api_key_credential(value: &str) -> Credential {
         Credential {
             kind: CredentialKind::ApiKey,
@@ -250,8 +255,7 @@ mod tests {
             prompt_profile: PromptProfile::Stable,
             prompt_model_policy_override: None,
             permission_mode: "read-only".into(),
-            // Python startup competes with other test processes on Windows CI.
-            timeout: Duration::from_secs(30),
+            timeout: FIXTURE_TIMEOUT,
             clean_agent_dir: dir.path().join("agent"),
             auth_source: None,
             allowed_env: allowed,
@@ -286,7 +290,7 @@ print(os.environ.get('DAVINCI_EVAL_PROMPT_MODEL_POLICY', 'missing'), file=sys.st
             prompt_profile: PromptProfile::Stable,
             prompt_model_policy_override: Some(PromptModelPolicy::Default),
             permission_mode: "read-only".into(),
-            timeout: Duration::from_secs(30),
+            timeout: FIXTURE_TIMEOUT,
             clean_agent_dir: dir.path().join("agent"),
             auth_source: None,
             allowed_env: BTreeMap::new(),
@@ -320,7 +324,7 @@ print(os.environ.get('DAVINCI_EVAL_PROMPT_MODEL_POLICY', 'missing'), file=sys.st
             prompt_profile: PromptProfile::Stable,
             prompt_model_policy_override: None,
             permission_mode: "read-only".into(),
-            timeout: Duration::from_secs(30),
+            timeout: FIXTURE_TIMEOUT,
             clean_agent_dir: clean_agent_dir.clone(),
             auth_source: Some(source_path),
             allowed_env: BTreeMap::new(),
@@ -376,7 +380,7 @@ print(os.environ.get('DAVINCI_EVAL_PROMPT_MODEL_POLICY', 'missing'), file=sys.st
             // a slow hosted runner (2 s was not enough on Windows) cannot
             // turn Python startup into a false failure. A pass returns as
             // soon as the child exits.
-            timeout: Duration::from_secs(30),
+            timeout: FIXTURE_TIMEOUT,
             clean_agent_dir: dir.path().join("agent"),
             auth_source: None,
             allowed_env: BTreeMap::new(),

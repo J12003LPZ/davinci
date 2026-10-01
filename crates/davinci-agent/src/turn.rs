@@ -1508,7 +1508,19 @@ impl Agent {
         match &self.runtime {
             Some(runtime) => {
                 let capability = runtime.capability_registry.get(name);
-                crate::scheduler::lane_for_capability(capability.as_ref(), name, class)
+                let lane = crate::scheduler::lane_for_capability(capability.as_ref(), name, class);
+                // A journaled call that holds an effect claim conflicts with
+                // any other claim in the workspace; overlapping two of them
+                // fails the second with a resource claim conflict.
+                if lane == crate::scheduler::ToolLane::Parallel
+                    && self.operation_runtime_for_tool(name).is_some()
+                    && crate::runtime::operations::ToolOperationPlanner::holds_effect_claim(
+                        capability.as_ref(),
+                    )
+                {
+                    return crate::scheduler::ToolLane::Serial;
+                }
+                lane
             }
             None => crate::scheduler::lane_for(name, class),
         }
@@ -6890,6 +6902,51 @@ mod operation_dispatch_tests {
         agent.cwd = workspace.path().to_path_buf();
         agent.set_runtime(runtime);
         (agent, workspace, journal)
+    }
+
+    #[test]
+    fn journaled_calls_that_hold_claims_do_not_share_the_parallel_lane() {
+        use crate::scheduler::ToolLane;
+        let (agent, _workspace, _) = configured_agent();
+        let runtime = agent.runtime.as_ref().unwrap();
+        runtime
+            .capability_registry
+            .register(crate::RuntimeCapability::new(
+                "repo_map",
+                crate::CapabilitySource::NativeExtension,
+                crate::ToolClass::Read,
+                true,
+                &json!({"type": "object"}),
+                None,
+            ));
+        runtime
+            .capability_registry
+            .register(crate::RuntimeCapability::new(
+                "mcp__srv__lookup",
+                crate::CapabilitySource::Mcp,
+                crate::ToolClass::Read,
+                true,
+                &json!({"type": "object"}),
+                None,
+            ));
+        let lane = |name: &str, class| agent.lane_for_call(name, class, &json!({}));
+        use crate::permission::ToolClass;
+        assert_eq!(lane("read", ToolClass::Read), ToolLane::Parallel);
+        assert_eq!(lane("repo_map", ToolClass::Read), ToolLane::Parallel);
+        assert_eq!(lane("web_search", ToolClass::Network), ToolLane::Serial);
+        assert_eq!(lane("mcp__srv__lookup", ToolClass::Read), ToolLane::Serial);
+
+        // Without a journal nothing takes a claim, so the lanes are unchanged.
+        let mut plain = Agent::new("");
+        plain.set_runtime(RuntimeHandle::new(
+            RunId::new(),
+            AgentId::new(),
+            RuntimeBus::new(),
+        ));
+        assert_eq!(
+            plain.lane_for_call("web_search", ToolClass::Network, &json!({})),
+            ToolLane::Parallel
+        );
     }
 
     #[test]

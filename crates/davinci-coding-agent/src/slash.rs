@@ -273,16 +273,29 @@ pub fn parse_line(line: &str) -> SlashAction {
         "agents" => SlashAction::Agents(args.to_string()),
         "plugin" | "plugins" => SlashAction::Plugin(args.to_string()),
         "tasks" => SlashAction::Tasks,
-        "help" => SlashAction::Status(
-            builtin_slash_commands()
-                .into_iter()
-                .map(|c| format!("/{} — {}", c.name, c.description))
-                .collect::<Vec<_>>()
-                .join("\n"),
-        ),
+        "help" => SlashAction::Status(help_lines().join("\n")),
         // TS sends unknown slashes (skills, templates, extension commands) to prompt().
         _ => SlashAction::Prompt(trimmed.to_string()),
     }
+}
+
+/// `/help` rows: built-in commands, then the publicly listed native commands
+/// (`command_specs()`), so every discoverable command typed at the composer
+/// also appears here.
+fn help_lines() -> Vec<String> {
+    let builtins = builtin_slash_commands();
+    let mut seen: std::collections::HashSet<String> =
+        builtins.iter().map(|c| c.name.clone()).collect();
+    let mut lines: Vec<String> = builtins
+        .into_iter()
+        .map(|c| format!("/{} — {}", c.name, c.description))
+        .collect();
+    for (name, description, _) in crate::native_extensions::command_specs() {
+        if seen.insert(name.to_string()) {
+            lines.push(format!("/{name} — {description}"));
+        }
+    }
+    lines
 }
 
 pub fn invocable_commands(
@@ -373,6 +386,29 @@ mod tests {
         assert!(names.iter().any(|name| name == "help"));
         assert!(!names.iter().any(|name| name == "session"));
         assert!(!names.iter().any(|name| name == "sessions"));
+    }
+
+    #[test]
+    fn help_lists_builtin_and_public_native_commands_once() {
+        let SlashAction::Status(text) = parse_line("/help") else {
+            panic!("help is not a status");
+        };
+        let names: Vec<&str> = text
+            .lines()
+            .map(|line| line.split_whitespace().next().unwrap())
+            .collect();
+        for (name, _, _) in crate::native_extensions::command_specs() {
+            assert!(names.contains(&format!("/{name}").as_str()), "/{name}");
+        }
+        for command in builtin_slash_commands() {
+            assert!(names.contains(&format!("/{}", command.name).as_str()));
+        }
+        let unique: std::collections::HashSet<_> = names.iter().collect();
+        assert_eq!(unique.len(), names.len(), "{text}");
+        assert!(
+            !names.iter().any(|name| name.ends_with("-status")),
+            "{text}"
+        );
     }
 
     #[test]
