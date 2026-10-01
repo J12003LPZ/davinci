@@ -1,8 +1,8 @@
 use davinci_agent::runtime::operations::{
-    EffectClass, ExecutionOwner, ExecutionOwnerId, IdempotencyScope, JournalId, JournalIdentity,
-    OperationAdmission, OperationContext, OperationJournal, OperationState, RootNamespaceId,
-    ToolOperationDispatcher, ToolOperationPlanner, WorkspaceId, WorkspaceIdentity,
-    JOURNAL_DATABASE_FILE_NAME,
+    EffectClass, ExecutionOwner, ExecutionOwnerId, IdempotencyScope, JournalError, JournalId,
+    JournalIdentity, OperationAdmission, OperationContext, OperationJournal, OperationState,
+    RootNamespaceId, ToolOperationDispatchError, ToolOperationDispatcher, ToolOperationPlanner,
+    WorkspaceId, WorkspaceIdentity, JOURNAL_DATABASE_FILE_NAME,
 };
 use davinci_agent::runtime::{
     AgentId, CapabilitySource, ReplayPolicy, RunId, RuntimeCapabilityRegistry,
@@ -405,23 +405,26 @@ fn a_returned_tool_error_releases_its_claim_for_the_next_mutation() {
 }
 
 /// The scheduler runs up to eight read-class calls on parallel threads. Each
-/// writes the journal briefly (admit, claim, latch, complete); contention
-/// must wait for the writer rather than fail the tool call.
+/// writes the journal (admit, claim, latch, complete). Slow durable writes may
+/// exhaust the bounded writer wait; only that explicit contention error is
+/// allowed. Unit tests separately prove waiting and deadline enforcement.
 #[test]
-fn parallel_read_dispatch_waits_for_the_journal_writer() {
+fn parallel_read_dispatch_respects_bounded_writer_contention() {
     let fixture = Fixture::new();
     let read = fixture.read_capability();
     let threads = 8;
     let rounds = 12;
     let barrier = std::sync::Barrier::new(threads);
     let failures = std::sync::Mutex::new(Vec::new());
+    let completed = AtomicUsize::new(0);
     std::thread::scope(|scope| {
         for thread in 0..threads {
-            let (fixture, read, barrier, failures) = (&fixture, &read, &barrier, &failures);
+            let (fixture, read, barrier, failures, completed) =
+                (&fixture, &read, &barrier, &failures, &completed);
             scope.spawn(move || {
                 for round in 0..rounds {
                     barrier.wait();
-                    let outcome = (|| -> Result<(), String> {
+                    let outcome = (|| -> Result<(), ToolOperationDispatchError> {
                         let plan = ToolOperationPlanner::provider_call(
                             fixture.context.clone(),
                             &format!("provider-read-{thread}-{round}"),
@@ -429,42 +432,37 @@ fn parallel_read_dispatch_waits_for_the_journal_writer() {
                             &json!({"path": format!("src/{thread}.rs")}),
                             Some(read),
                             None,
-                        )
-                        .map_err(|error| format!("{error:?}"))?;
-                        let admitted = new_operation(
-                            fixture
-                                .dispatcher
-                                .admit(plan.clone(), 7)
-                                .map_err(|error| error.to_string())?,
-                        );
-                        let result = fixture
-                            .dispatcher
-                            .dispatch(
-                                &admitted,
-                                &plan,
-                                Some(7),
-                                false,
-                                || Ok(()),
-                                || davinci_agent::ToolResult {
-                                    content: "ok".into(),
-                                    is_error: false,
-                                    details: None,
-                                },
-                            )
-                            .map_err(|error| error.to_string())?;
+                        )?;
+                        let admitted = new_operation(fixture.dispatcher.admit(plan.clone(), 7)?);
+                        let result = fixture.dispatcher.dispatch(
+                            &admitted,
+                            &plan,
+                            Some(7),
+                            false,
+                            || Ok(()),
+                            || davinci_agent::ToolResult {
+                                content: "ok".into(),
+                                is_error: false,
+                                details: None,
+                            },
+                        )?;
                         fixture
                             .dispatcher
                             .complete_for_session(&admitted, &result, false)
-                            .map_err(|error| error.to_string())
                     })();
-                    if let Err(error) = outcome {
-                        failures.lock().unwrap().push(error);
+                    match outcome {
+                        Ok(()) => {
+                            completed.fetch_add(1, Ordering::Relaxed);
+                        }
+                        Err(ToolOperationDispatchError::Journal(JournalError::WriterBusy)) => {}
+                        Err(error) => failures.lock().unwrap().push(error.to_string()),
                     }
                 }
             });
         }
     });
     let failures = failures.into_inner().unwrap();
+    assert!(completed.load(Ordering::Relaxed) > 0, "no reader completed");
     assert!(
         failures.is_empty(),
         "{} failed: {failures:?}",
