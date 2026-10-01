@@ -102,7 +102,7 @@ All 37 advertised built-in command entry points were exercised across the termin
 | Existing evals extended | `scripts/eval-native-intelligence.py`, `scripts/eval-terminal-input.py` |
 | New reusable evals | `scripts/eval-harness-state.py`, `scripts/eval-live-governor.py`, `scripts/eval-slash-commands.py`, `scripts/eval-live-session.py` |
 
-No production dependency was added. Twenty-three existing Rust files, two existing Python scripts and one JavaScript fixture were modified; two Rust integration tests and six Python eval scripts were added, plus this report (35 files total). The behavior-preserving iterator cleanup in `crates/davinci-agent/src/decision/advice.rs` resolves a Clippy warning exposed by a narrower build; its seven existing tests were rerun.
+No production dependency was added. Twenty-four existing Rust files, two existing Python scripts and one JavaScript fixture were modified; two Rust integration tests and six Python eval scripts were added, plus this report (36 files total). The behavior-preserving iterator cleanup in `crates/davinci-agent/src/decision/advice.rs` resolves a Clippy warning exposed by a narrower build; its seven existing tests were rerun.
 
 ## Follow-up verification of the six reported gaps
 
@@ -138,6 +138,8 @@ A later integration run exposed an overstrict journal stress-test expectation: e
 
 After this correction, `cargo test -p davinci-agent --locked` passed all 61 reported result groups: 1,703 reported test passes, zero failures, six ignores and nine filtered helper-fixture entries. These totals include subprocess fixture results. All 1,350 library tests passed. Agent Clippy for all targets with `-D warnings` and formatting passed again.
 
+The Windows readiness job subsequently exposed a cache-test timing assumption. Its reuse assertions could cross the production document-symbol cache's 250-millisecond TTL. An explicit 300-millisecond delay reproduced the exact extra-request failure. The fixture now supplies a bounded 120-second TTL through a private helper, keeps the delay, and separately verifies expiration using a zero TTL. The production entry point still supplies 250 milliseconds. The full coding-agent library passed **1,412 tests**, with 17 intentional ignores, after building the fixture-enabled CLI as CI does. An initial local run used the regular CLI and failed three security fixture tests; correcting the fixture build resolved them. The original debug executable was restored and independently SHA-256 verified afterward. A final assertion refinement uses the same fixture TTL after restart so the generation-invalidation check remains meaningful; that regression, all-target coding-agent Clippy with both optional features and `-D warnings`, and formatting passed again.
+
 The branch's audit commits are consolidated before merge to remove the historical synthetic URL false positive from the submitted commit history. The previous two-commit tip is preserved in the local bare repository. The fixture still verifies that URL userinfo cannot disguise a remote host as localhost; no real secret was involved and no security check was disabled.
 
 ## Evidence location
@@ -148,7 +150,7 @@ Artifacts are under:
 
 - `original/`: pre-edit source backup.
 - `diffs/`, `changes.json`: comparison of modified files against the backup.
-- `audit-fixes.patch`, `audit-manifest.json`: combined review patch and before/after SHA-256 hashes for all 35 changed or added files, including this report.
+- `audit-fixes.patch`, `audit-manifest.json`: combined review patch and before/after SHA-256 hashes for all 36 changed or added files, including this report.
 - `merge/`: failed hosted-job log, fixture handshake red/green evidence, affected tests, stress repetitions and final delivery/CI records.
 - `verified-results.json`: original audit results; the follow-up supersedes its remaining-ignore list.
 - `followup/verified-followup.json`, `followup/coverage.json`, `followup/coverage-final.log`: all 19 opt-in dispositions, measured coverage, final test counts and executable hashes.
