@@ -299,6 +299,9 @@ mod tests {
     use super::*;
     use std::{sync::Arc, time::Duration};
 
+    // Startup allowance only; cancellation and cleanup keep their own bounds.
+    const FIXTURE_TIMEOUT: Duration = Duration::from_secs(120);
+
     #[test]
     fn foreground_supervisor_fixture() {
         if std::env::var_os("DAVINCI_INTERNAL_PROCESS_SUPERVISOR").is_some() {
@@ -311,7 +314,7 @@ mod tests {
         let Ok(ready) = std::env::var("DAVINCI_FOREGROUND_PIPE_FIXTURE") else {
             return;
         };
-        let script = format!("const s=require('net').createServer(c=>c.end());s.listen(0,'127.0.0.1',()=>require('fs').writeFileSync({},JSON.stringify(s.address().port)));setTimeout(()=>process.exit(),10000)", serde_json::to_string(&ready).unwrap());
+        let script = format!("const s=require('net').createServer(c=>c.end());s.listen(0,'127.0.0.1',()=>require('fs').writeFileSync({},JSON.stringify(s.address().port)));setTimeout(()=>process.exit(),240000)", serde_json::to_string(&ready).unwrap());
         let mut child = std::process::Command::new("node")
             .args(["-e", &script])
             .stdin(std::process::Stdio::null())
@@ -321,7 +324,7 @@ mod tests {
             .unwrap();
         let start = Instant::now();
         while !std::path::Path::new(&ready).exists() {
-            assert!(start.elapsed() < Duration::from_secs(5));
+            assert!(start.elapsed() < FIXTURE_TIMEOUT);
             std::thread::sleep(Duration::from_millis(10));
         }
         assert!(child.try_wait().unwrap().is_none());
@@ -396,7 +399,7 @@ mod tests {
                     .collect(),
             )
         };
-        let output = run(&host, config("let b='';process.stdin.on('data',s=>b+=s);process.stdin.on('end',()=>{process.stdout.write(b);process.stderr.write('err');process.exitCode=7})"), b"literal input", Some(5_000), Some("5"), &ToolContext::default()).unwrap();
+        let output = run(&host, config("let b='';process.stdin.on('data',s=>b+=s);process.stdin.on('end',()=>{process.stdout.write(b);process.stderr.write('err');process.exitCode=7})"), b"literal input", Some(FIXTURE_TIMEOUT.as_millis() as u64), Some("120"), &ToolContext::default()).unwrap();
         assert_eq!(output.status.code(), Some(7));
         assert_eq!(output.stdout, b"literal input");
         assert_eq!(output.stderr, b"err");
@@ -465,8 +468,8 @@ mod tests {
             &host,
             held,
             b"",
-            Some(5_000),
-            Some("5"),
+            Some(FIXTURE_TIMEOUT.as_millis() as u64),
+            Some("120"),
             &incomplete_context,
         )
         .unwrap_err();
@@ -481,11 +484,11 @@ mod tests {
         );
         assert_eq!(evidence.output_complete, Some(false));
         assert!(receipt.stdout_hash.is_some() && receipt.stderr_hash.is_some());
-        assert!(start.elapsed() < Duration::from_secs(5));
+        assert!(start.elapsed() < FIXTURE_TIMEOUT);
         let port: u16 = serde_json::from_slice(&std::fs::read(ready).unwrap()).unwrap();
         // Group termination requests precede helper reaping, but the kernel may
         // close a descendant's socket just after it reaps the helper. Require
-        // bounded cleanup, well before the fixture's ten-second self-exit.
+        // bounded cleanup, well before the fixture's four-minute self-exit.
         let cleanup_deadline = Instant::now() + Duration::from_secs(2);
         while std::net::TcpStream::connect_timeout(
             &std::net::SocketAddr::from(([127, 0, 0, 1], port)),

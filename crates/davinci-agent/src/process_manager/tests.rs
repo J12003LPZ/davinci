@@ -42,7 +42,7 @@ fn call(agent: &crate::Agent, id: &str, name: &str, args: &Value) -> ToolResult 
 }
 
 fn server() -> Value {
-    json!({"executable":"node", "argv":["-e", "process.stdout.write('READY\\n');process.stdin.on('data',b=>process.stdout.write(b));setTimeout(()=>process.exit(0),20000)"]})
+    json!({"executable":"node", "argv":["-e", "process.stdout.write('READY\\n');process.stdin.on('data',b=>process.stdout.write(b));setTimeout(()=>process.exit(0),240000)"]})
 }
 
 #[test]
@@ -224,9 +224,9 @@ fn browser_socket_proof_for(host: &str) {
         let reserved = std::net::TcpListener::bind((address, 0)).unwrap();
         let port = reserved.local_addr().unwrap().port();
         drop(reserved);
-        let script = format!("const s=require('net').createServer();s.listen({port},'{host}',()=>console.log('LISTENING'));process.stdin.on('data',()=>s.close(()=>console.log('CLOSED')));setTimeout(()=>process.exit(),20000)");
+        let script = format!("const s=require('net').createServer();s.listen({port},'{host}',()=>console.log('LISTENING'));process.stdin.on('data',()=>s.close(()=>console.log('CLOSED')));setTimeout(()=>process.exit(),240000)");
         let script = if descendant {
-            format!("const c=require('child_process').spawn(process.execPath,['-e',{}],{{stdio:['pipe','pipe','pipe']}});c.stdout.pipe(process.stdout);c.stderr.pipe(process.stderr);process.stdin.pipe(c.stdin);setTimeout(()=>process.exit(),20000)", serde_json::to_string(&script).unwrap())
+            format!("const c=require('child_process').spawn(process.execPath,['-e',{}],{{stdio:['pipe','pipe','pipe']}});c.stdout.pipe(process.stdout);c.stderr.pipe(process.stderr);process.stdin.pipe(c.stdin);setTimeout(()=>process.exit(),240000)", serde_json::to_string(&script).unwrap())
         } else {
             script
         };
@@ -644,8 +644,10 @@ fn browser_dev_server_rejects_evidence_after_authority_changes_during_callback()
 
 /// Bound for fixture processes (`node`, shells) to start, exit or react.
 /// Every wait returns as soon as its condition holds; the bound only has to
-/// outlast a loaded windows-latest runner, where 5 s was not enough.
-const FIXTURE_TIMEOUT: Duration = Duration::from_secs(30);
+/// outlast a loaded windows-latest runner, where even 30 s was not enough.
+/// Fixture self-exit timers exceed this bound; explicit stop/revocation remains
+/// responsible for teardown.
+const FIXTURE_TIMEOUT: Duration = Duration::from_secs(120);
 
 fn wait_for(mut condition: impl FnMut() -> bool) {
     let until = Instant::now() + FIXTURE_TIMEOUT;

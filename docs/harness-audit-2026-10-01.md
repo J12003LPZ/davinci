@@ -102,7 +102,7 @@ All 37 advertised built-in command entry points were exercised across the termin
 | Existing evals extended | `scripts/eval-native-intelligence.py`, `scripts/eval-terminal-input.py` |
 | New reusable evals | `scripts/eval-harness-state.py`, `scripts/eval-live-governor.py`, `scripts/eval-slash-commands.py`, `scripts/eval-live-session.py` |
 
-No production dependency was added. Eighteen existing Rust files, two existing Python scripts and one JavaScript fixture were modified; two Rust integration tests and six Python eval scripts were added, plus this report (30 files total). The behavior-preserving iterator cleanup in `crates/davinci-agent/src/decision/advice.rs` resolves a Clippy warning exposed by a narrower build; its seven existing tests were rerun.
+No production dependency was added. Twenty-one existing Rust files, two existing Python scripts and one JavaScript fixture were modified; two Rust integration tests and six Python eval scripts were added, plus this report (33 files total). The behavior-preserving iterator cleanup in `crates/davinci-agent/src/decision/advice.rs` resolves a Clippy warning exposed by a narrower build; its seven existing tests were rerun.
 
 ## Follow-up verification of the six reported gaps
 
@@ -130,6 +130,10 @@ The Windows coding-agent job at the second PR head exposed two fixture timing fa
 
 The original JavaScript fixture failed an explicit withheld-response check; the repaired fixture passed ten repetitions. The affected graph/language groups passed 58 tests with six intentional ignores. Both previously failing tests passed 20 further repetitions each (40 test executions). Formatting and JavaScript syntax checks passed. Hosted CI remains the acceptance gate for the full matrix; its final status is recorded on PR #79.
 
+A subsequent Windows agent job exposed eight related failures under parallel load. Guarded workspace snapshots used a hardcoded 100-millisecond budget even in tests, unlike the existing ten-second test budget for ordinary snapshots. `verification/workspace.rs` now shares that budget; production remains at 100 milliseconds. A regression with a deliberately slow permission check failed before the fix and passed afterward. Process-manager and foreground fixtures now allow 120 seconds for startup, with four-minute fixture lifetimes so they cannot expire during setup. Dedicated timeout, cancellation and prompt cleanup assertions retain their original limits.
+
+The 53 affected agent tests passed, followed by all **1,348 agent library tests** with zero failures or ignores. Agent Clippy passed for all targets with `-D warnings`, and formatting passed. These CI repairs came after the workspace coverage measurement above; that percentage has not been remeasured for the added regression.
+
 The branch's audit commits are consolidated before merge to remove the historical synthetic URL false positive from the submitted commit history. The previous two-commit tip is preserved in the local bare repository. The fixture still verifies that URL userinfo cannot disguise a remote host as localhost; no real secret was involved and no security check was disabled.
 
 ## Evidence location
@@ -140,7 +144,7 @@ Artifacts are under:
 
 - `original/`: pre-edit source backup.
 - `diffs/`, `changes.json`: comparison of modified files against the backup.
-- `audit-fixes.patch`, `audit-manifest.json`: combined review patch and before/after SHA-256 hashes for all 30 changed or added files, including this report.
+- `audit-fixes.patch`, `audit-manifest.json`: combined review patch and before/after SHA-256 hashes for all 33 changed or added files, including this report.
 - `merge/`: failed hosted-job log, fixture handshake red/green evidence, affected tests, stress repetitions and final delivery/CI records.
 - `verified-results.json`: original audit results; the follow-up supersedes its remaining-ignore list.
 - `followup/verified-followup.json`, `followup/coverage.json`, `followup/coverage-final.log`: all 19 opt-in dispositions, measured coverage, final test counts and executable hashes.
