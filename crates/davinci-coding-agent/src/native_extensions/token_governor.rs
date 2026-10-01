@@ -1482,11 +1482,21 @@ impl TokenGovernor {
         }
         let mut text = selected.join("\n");
         match stopped_at {
-            Some(line_no) => text.push_str(&format!(
-                "\n\n[… output truncated at line {line_no} of {total} to stay under {budget} bytes; see tokenGovernor.nextCursor for continuation]"
-            )),
+            Some(line_no) => {
+                // Only content reaches the model; details are for the UI.
+                let cursor = json!({
+                    "id": id,
+                    "startLine": line_no,
+                    "lineByteOffset": next_line_byte_offset.unwrap_or(0),
+                });
+                text.push_str(&format!(
+                    "\n\n[… truncated at line {line_no} of {total}; continue with retrieve_output {cursor}; keep any grep/endLine filters]"
+                ));
+            }
             None if matched == 0 => text.push_str(&match pattern {
-                Some(pattern) => format!("[no line of {id} matches \"{pattern}\" in that range; {total} lines total]"),
+                Some(pattern) => format!(
+                    "[no line of {id} matches \"{pattern}\" in that range; {total} lines total]"
+                ),
                 None => format!("[no lines in that range; {id} has {total} lines]"),
             }),
             None => {}
@@ -2038,6 +2048,13 @@ mod tests {
             .as_u64()
             .is_some_and(|line| line > 1));
         assert_eq!(page_details["nextCursor"]["lineByteOffset"], 0);
+        assert!(
+            page.content.contains(&format!(
+                "\"startLine\":{}",
+                page_details["nextCursor"]["startLine"]
+            )),
+            "the model must see the continuation cursor without UI-only details"
+        );
         let filtered = governor
             .retrieve(&json!({"id": id, "grep": "row 0299"}))
             .unwrap();
@@ -2080,6 +2097,11 @@ mod tests {
             .as_u64()
             .expect("oversized line should return a byte cursor");
         assert!(first_offset > 0);
+        assert!(
+            page.content
+                .contains(&format!("\"lineByteOffset\":{first_offset}")),
+            "the model must see the byte cursor for an oversized line"
+        );
 
         let next_page = governor
             .retrieve(&json!({

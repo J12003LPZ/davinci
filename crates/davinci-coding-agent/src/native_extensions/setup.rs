@@ -207,23 +207,29 @@ fn pull_line(progress: &PullProgress) -> String {
     }
 }
 
+fn reserve_pull(slot: &mut Option<PullProgress>, url: &str, model: &str) -> bool {
+    if slot.as_ref().is_some_and(|existing| !existing.finished) {
+        return false;
+    }
+    *slot = Some(PullProgress {
+        model: model.to_string(),
+        url: url.to_string(),
+        status: "starting".into(),
+        ..PullProgress::default()
+    });
+    true
+}
+
 /// Start `ollama pull` through the HTTP API on a background thread, then
 /// embed the records that have no vector. Returns false when a pull for the
-/// same model is already running.
+/// server or model is already running. Its progress slot belongs to that worker
+/// until it finishes, including its embedding pass.
 pub fn start_pull(memory: Arc<Mutex<VectorMemory>>, url: &str, model: &str) -> bool {
     {
         let mut guard = pulls().lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(existing) = guard.as_ref() {
-            if !existing.finished && existing.model == model {
-                return false;
-            }
+        if !reserve_pull(&mut guard, url, model) {
+            return false;
         }
-        *guard = Some(PullProgress {
-            model: model.to_string(),
-            url: url.to_string(),
-            status: "starting".into(),
-            ..PullProgress::default()
-        });
     }
     let url = url.trim_end_matches('/').to_string();
     let model = model.to_string();
@@ -325,14 +331,14 @@ fn find_on_path(program: &str) -> Option<PathBuf> {
 
 /// Only a local Ollama is ever started; a remote URL is the user's server.
 fn is_local_url(url: &str) -> bool {
-    let host = url
-        .split("://")
-        .nth(1)
-        .unwrap_or(url)
-        .split(['/', ':'])
-        .next()
-        .unwrap_or("");
-    matches!(host, "127.0.0.1" | "localhost" | "[::1]" | "0.0.0.0")
+    let Ok(url) = url::Url::parse(url) else {
+        return false;
+    };
+    matches!(url.scheme(), "http" | "https")
+        && matches!(
+            url.host_str(),
+            Some("127.0.0.1" | "localhost" | "[::1]" | "0.0.0.0")
+        )
 }
 
 fn spawn_ollama_serve(program: &Path) -> Result<(), String> {
@@ -557,28 +563,33 @@ fn inside_git_work_tree(cwd: &Path) -> bool {
     cwd.ancestors().any(|dir| dir.join(".git").exists())
 }
 
-fn normalized_pattern(line: &str) -> String {
-    line.trim()
-        .trim_start_matches('/')
-        .trim_end_matches('/')
-        .to_string()
-}
-
 /// Entries of [`IGNORED_STATE`] that `cwd/.gitignore` does not name. A line
 /// that ignores the whole `.davinci` directory covers all of them.
 pub fn missing_ignores(cwd: &Path) -> Vec<&'static str> {
     let existing = std::fs::read_to_string(cwd.join(".gitignore")).unwrap_or_default();
-    let patterns = existing.lines().map(normalized_pattern).collect::<Vec<_>>();
-    if patterns
-        .iter()
-        .any(|pattern| pattern == ".davinci" || pattern == ".davinci/*")
-    {
-        return Vec::new();
+    missing_ignore_patterns(cwd, &existing)
+}
+
+fn missing_ignore_patterns(cwd: &Path, existing: &str) -> Vec<&'static str> {
+    let mut builder = ignore::gitignore::GitignoreBuilder::new(cwd);
+    for line in existing.lines() {
+        if builder.add_line(None, line).is_err() {
+            return IGNORED_STATE.to_vec();
+        }
     }
+    let Ok(patterns) = builder.build() else {
+        return IGNORED_STATE.to_vec();
+    };
     IGNORED_STATE
         .iter()
         .copied()
-        .filter(|entry| !patterns.iter().any(|p| *p == normalized_pattern(entry)))
+        .filter(|entry| {
+            !patterns
+                // `is_dir` carries the directory marker. A trailing slash in
+                // the candidate itself prevents anchored matches on Unix.
+                .matched_path_or_any_parents(cwd.join(entry.trim_end_matches('/')), true)
+                .is_ignore()
+        })
         .collect()
 }
 
@@ -588,7 +599,21 @@ pub fn gitignore_step(cwd: &Path, apply: bool) -> Step {
     if !inside_git_work_tree(cwd) {
         return Step::new(ID, TITLE, StepState::Skipped, "not a Git work tree".into());
     }
-    let missing = missing_ignores(cwd);
+    let path = cwd.join(".gitignore");
+    let mut content = match std::fs::read_to_string(&path) {
+        Ok(content) => content,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(error) => {
+            return Step::new(
+                ID,
+                TITLE,
+                StepState::Action,
+                format!("could not read {}: {error}", path.display()),
+            )
+            .with_action("check .gitignore permissions and UTF-8 encoding");
+        }
+    };
+    let missing = missing_ignore_patterns(cwd, &content);
     if missing.is_empty() {
         return Step::new(
             ID,
@@ -607,8 +632,6 @@ pub fn gitignore_step(cwd: &Path, apply: bool) -> Step {
         )
         .with_action("run /setup to add them to .gitignore");
     }
-    let path = cwd.join(".gitignore");
-    let mut content = std::fs::read_to_string(&path).unwrap_or_default();
     if !content.is_empty() && !content.ends_with('\n') {
         content.push('\n');
     }
@@ -618,7 +641,7 @@ pub fn gitignore_step(cwd: &Path, apply: bool) -> Step {
         content.push_str(entry);
         content.push('\n');
     }
-    match std::fs::write(&path, content) {
+    match davinci_sys::fs::atomic_write(&path, content.as_bytes()) {
         Ok(()) => Step::new(
             ID,
             TITLE,
@@ -907,10 +930,85 @@ mod tests {
     }
 
     #[test]
+    fn another_model_cannot_replace_an_active_pull() {
+        let mut slot = None;
+        assert!(reserve_pull(&mut slot, "http://first:11434", "first-model"));
+        assert!(!reserve_pull(
+            &mut slot,
+            "http://second:11434",
+            "second-model"
+        ));
+        assert_eq!(slot.as_ref().unwrap().model, "first-model");
+        assert_eq!(slot.as_ref().unwrap().url, "http://first:11434");
+        slot.as_mut().unwrap().finished = true;
+        assert!(reserve_pull(
+            &mut slot,
+            "http://second:11434",
+            "second-model"
+        ));
+    }
+
+    #[test]
+    fn negated_gitignore_patterns_require_a_later_ignore() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join(".git")).unwrap();
+        std::fs::write(
+            dir.path().join(".gitignore"),
+            ".davinci/*\n!/.davinci/vector-memory/\n",
+        )
+        .unwrap();
+        assert!(missing_ignores(dir.path()).contains(&".davinci/vector-memory/"));
+        assert_eq!(gitignore_step(dir.path(), true).state, StepState::Done);
+        assert!(missing_ignores(dir.path()).is_empty());
+    }
+
+    #[test]
+    fn apply_preserves_an_unreadable_gitignore() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join(".git")).unwrap();
+        let path = dir.path().join(".gitignore");
+        let original = b"target/\n\xffprivate-key\n";
+        std::fs::write(&path, original).unwrap();
+        let step = gitignore_step(dir.path(), true);
+        assert_eq!(step.state, StepState::Action);
+        assert_eq!(std::fs::read(path).unwrap(), original);
+        assert!(step.detail.contains("could not read"), "{}", step.detail);
+    }
+
+    #[test]
+    fn local_ollama_url_uses_the_parsed_host() {
+        for url in [
+            "http://[::1]:11434",
+            "http://LOCALHOST:11434",
+            "http://127.0.0.1:11434",
+        ] {
+            assert!(is_local_url(url), "{url}");
+        }
+        // A synthetic port in userinfo must not disguise a remote host as local.
+        let misleading_userinfo = format!("http://localhost:{}@remote.example", 11434);
+        for url in [
+            misleading_userinfo.as_str(),
+            "http://localhost.example",
+            "file://localhost/x",
+            "localhost:11434",
+        ] {
+            assert!(!is_local_url(url), "{url}");
+        }
+    }
+
+    #[test]
     fn a_whole_davinci_ignore_covers_every_entry() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join(".gitignore"), "/.davinci/\n").unwrap();
         assert!(missing_ignores(dir.path()).is_empty());
+    }
+
+    #[test]
+    fn anchored_state_directories_are_recognized_before_they_exist() {
+        let dir = tempfile::tempdir().unwrap();
+        let content = "/.davinci/vector-memory/\n/.davinci/graph/\n";
+        assert!(!dir.path().join(".davinci").exists());
+        assert!(missing_ignore_patterns(dir.path(), content).is_empty());
     }
 
     #[test]

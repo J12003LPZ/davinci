@@ -1177,7 +1177,9 @@ mod tests {
                 .unwrap()
         });
 
-        let deadline = Instant::now() + Duration::from_secs(3);
+        // Process startup can be slow under the full Windows test matrix.
+        // The fixture holds its response until this test explicitly releases it.
+        let deadline = Instant::now() + Duration::from_secs(120);
         loop {
             if workspace.events().iter().any(|event| {
                 event["kind"] == "client_message" && event["method"] == "textDocument/hover"
@@ -1192,6 +1194,7 @@ mod tests {
         }
 
         workspace.write("a.ts", "changed while query was pending");
+        workspace.write("lsp-events.jsonl.release", "ready");
         let result = handle.join().unwrap();
         assert!(result.is_error, "{result:?}");
         assert_eq!(result.details.unwrap()["error"]["code"], "stale_result");

@@ -497,6 +497,16 @@ impl LocalLspSession {
         file_path: &str,
         params: Value,
     ) -> Result<Value, String> {
+        self.request_for_document_with_ttl(method, file_path, params, 250)
+    }
+
+    fn request_for_document_with_ttl(
+        &self,
+        method: &str,
+        file_path: &str,
+        params: Value,
+        symbol_ttl_ms: u64,
+    ) -> Result<Value, String> {
         let target = resolve_target(&self.root, file_path)?;
         let mut connection = self
             .connection
@@ -536,7 +546,9 @@ impl LocalLspSession {
                         CacheDependency::ContentHash(document.content_hash.clone()),
                     ],
                 ),
-                CachePolicy::TtlBound { ttl_ms: 250 },
+                CachePolicy::TtlBound {
+                    ttl_ms: symbol_ttl_ms,
+                },
             );
             drop(documents);
             let result = self
@@ -1166,7 +1178,7 @@ mod tests {
                 std::thread::spawn(move || {
                     barrier.wait();
                     backend
-                        .start_session(key, &spec, &root, Duration::from_secs(5))
+                        .start_session(key, &spec, &root, Duration::from_secs(120))
                         .unwrap();
                 })
             })
@@ -1179,27 +1191,53 @@ mod tests {
         let session = backend.sessions.lock().unwrap().sessions[&key].clone();
         let query = || {
             session
-                .request_for_document("textDocument/documentSymbol", "file.rs", json!({}))
+                .request_for_document_with_ttl(
+                    "textDocument/documentSymbol",
+                    "file.rs",
+                    json!({}),
+                    120_000,
+                )
                 .unwrap()
         };
         assert_eq!(query()["calls"], 1);
         assert_eq!(query()["calls"], 1);
         std::fs::write(root.path().join("file.rs"), "edited").unwrap();
         assert_eq!(query()["text"], "edited");
+        // Reuse assertions must tolerate scheduling beyond the production TTL.
+        std::thread::sleep(Duration::from_millis(300));
         assert_eq!(query()["calls"], 2);
+        // Expiry is a separate assertion, independent of scheduler speed.
+        for calls in [3, 4] {
+            assert_eq!(
+                session
+                    .request_for_document_with_ttl(
+                        "textDocument/documentSymbol",
+                        "file.rs",
+                        json!({}),
+                        0,
+                    )
+                    .unwrap()["calls"],
+                calls
+            );
+        }
         session.connection.lock().unwrap().child.kill().unwrap();
         session.connection.lock().unwrap().child.wait().unwrap();
         assert!(session
             .request_for_document("textDocument/documentSymbol", "file.rs", json!({}))
             .is_err());
         backend
-            .start_session(key.clone(), &spec, root.path(), Duration::from_secs(5))
+            .start_session(key.clone(), &spec, root.path(), Duration::from_secs(120))
             .unwrap();
         let restarted = backend.sessions.lock().unwrap().sessions[&key].clone();
         assert_ne!(session.generation, restarted.generation);
         assert_eq!(
             restarted
-                .request_for_document("textDocument/documentSymbol", "file.rs", json!({}))
+                .request_for_document_with_ttl(
+                    "textDocument/documentSymbol",
+                    "file.rs",
+                    json!({}),
+                    120_000,
+                )
                 .unwrap()["calls"],
             1
         );

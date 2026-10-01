@@ -1199,7 +1199,7 @@ impl VectorMemory {
             last_indexed_at: None,
             dense_offline_until: Arc::new(Mutex::new(None)),
         };
-        memory.load_local();
+        let _ = memory.load_local();
         memory
     }
 
@@ -1223,9 +1223,11 @@ impl VectorMemory {
         davinci_path
     }
 
-    fn load_local(&mut self) {
-        let Ok(content) = fs::read_to_string(self.local_path()) else {
-            return;
+    fn load_local(&mut self) -> Result<(), ToolError> {
+        let content = match fs::read_to_string(self.local_path()) {
+            Ok(content) => content,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
+            Err(error) => return Err(ToolError::Failed(error.to_string())),
         };
         self.records.clear();
         self.foreign_lines.clear();
@@ -1248,6 +1250,7 @@ impl VectorMemory {
                 )
             })
             .collect();
+        Ok(())
     }
 
     fn persist_local(&self) -> Result<(), ToolError> {
@@ -2014,7 +2017,7 @@ impl VectorMemory {
     /// a bounded batch of records that have no current vector. Embedding
     /// failures leave the records lexical-only and are reported, not raised.
     pub fn reindex(&mut self) -> Result<Value, ToolError> {
-        self.load_local();
+        self.load_local()?;
         let repaired_ids = self.repair_duplicate_ids();
         if repaired_ids > 0 {
             self.persist_local()?;
@@ -2038,6 +2041,11 @@ impl VectorMemory {
     /// with their promoted twin. The later twin gets the id it would get now.
     fn repair_duplicate_ids(&mut self) -> usize {
         let mut seen = HashSet::new();
+        let mut reserved: HashSet<_> = self
+            .records
+            .iter()
+            .map(|record| record.id.clone())
+            .collect();
         let mut repaired = 0;
         for record in &mut self.records {
             if seen.insert(record.id.clone()) {
@@ -2050,7 +2058,13 @@ impl VectorMemory {
                 record.kind,
                 record.content_hash
             );
-            record.id = hash_to_uuid(&sha256_hex(seed));
+            let mut candidate = hash_to_uuid(&sha256_hex(&seed));
+            let mut suffix = 0usize;
+            while !reserved.insert(candidate.clone()) {
+                suffix += 1;
+                candidate = hash_to_uuid(&sha256_hex(format!("{seed}\0{suffix}")));
+            }
+            record.id = candidate;
             record.embedding = None;
             record.embedding_identity = None;
             seen.insert(record.id.clone());
@@ -2060,12 +2074,16 @@ impl VectorMemory {
     }
 
     pub fn clear(&mut self) -> Result<Value, ToolError> {
-        self.records.clear();
-        self.known.clear();
-        let path = self.local_path();
-        if path.exists() {
-            fs::remove_file(path).map_err(|err| ToolError::Failed(err.to_string()))?;
-        }
+        // Keep the store present to shadow legacy data, preserve foreign records,
+        // and only publish the cleared state after the atomic write succeeds.
+        let mut cleared = self.clone();
+        cleared.load_local()?;
+        cleared.records.clear();
+        cleared.known.clear();
+        cleared.last_indexed = 0;
+        cleared.last_indexed_at = None;
+        cleared.persist_local()?;
+        *self = cleared;
         Ok(self.status())
     }
 
@@ -2682,6 +2700,96 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn clear_preserves_foreign_records_and_does_not_restore_legacy_memory() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut memory = memory_with_fake_ollama(directory.path());
+        memory
+            .index_messages(&[MemoryMessage {
+                role: "user".into(),
+                content: "remember the deployment region".into(),
+            }])
+            .unwrap();
+        let path = memory.local_path();
+        let legacy = directory.path().join(".pi/vector-memory/records.jsonl");
+        fs::create_dir_all(legacy.parent().unwrap()).unwrap();
+        fs::copy(&path, &legacy).unwrap();
+        let mut foreign = memory.records[0].clone();
+        foreign.repo_id = "another-repository".into();
+        memory
+            .foreign_lines
+            .push(serde_json::to_string(&foreign).unwrap());
+        memory.persist_local().unwrap();
+
+        memory.clear().unwrap();
+        assert_eq!(memory.record_count(), 0);
+        assert!(
+            path.is_file(),
+            "an empty current store must shadow legacy data"
+        );
+        let raw = fs::read_to_string(&path).unwrap();
+        assert!(
+            raw.contains("another-repository"),
+            "foreign records must survive"
+        );
+        let reloaded = VectorMemory::with_config(directory.path().into(), memory.config.clone());
+        assert_eq!(reloaded.record_count(), 0);
+        assert_eq!(reloaded.foreign_lines.len(), 1);
+    }
+
+    #[test]
+    fn failed_clear_preserves_in_memory_records() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut memory = memory_with_fake_ollama(directory.path());
+        memory
+            .index_messages(&[MemoryMessage {
+                role: "user".into(),
+                content: "remember the build command".into(),
+            }])
+            .unwrap();
+        let before = memory.record_count();
+        let path = memory.local_path();
+        fs::remove_file(&path).unwrap();
+        fs::create_dir(&path).unwrap();
+        assert!(memory.clear().is_err());
+        assert_eq!(memory.record_count(), before);
+    }
+
+    #[test]
+    fn reindex_does_not_resurrect_an_externally_deleted_store() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut memory = memory_with_fake_ollama(directory.path());
+        memory
+            .index_messages(&[MemoryMessage {
+                role: "user".into(),
+                content: "remember the build command".into(),
+            }])
+            .unwrap();
+        fs::remove_file(memory.local_path()).unwrap();
+        memory.reindex().unwrap();
+        assert_eq!(memory.record_count(), 0);
+        assert!(memory.known.is_empty());
+    }
+
+    #[test]
+    fn reindex_repairs_three_identical_ids_and_is_idempotent() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut memory = memory_with_fake_ollama(directory.path());
+        memory
+            .index_messages(&[MemoryMessage {
+                role: "user".into(),
+                content: "remember the build command".into(),
+            }])
+            .unwrap();
+        let record = memory.records[0].clone();
+        memory.records = vec![record; 3];
+        memory.persist_local().unwrap();
+        assert_eq!(memory.reindex().unwrap()["repairedIds"], 2);
+        let ids: HashSet<_> = memory.records.iter().map(|r| r.id.clone()).collect();
+        assert_eq!(ids.len(), 3);
+        assert_eq!(memory.reindex().unwrap()["repairedIds"], 0);
+    }
+
+    #[test]
     fn memory_search_output_never_carries_embedding_vectors() {
         let directory = tempfile::tempdir().unwrap();
         let mut memory = memory_with_fake_ollama(directory.path());
@@ -2749,7 +2857,7 @@ pub(crate) mod tests {
 
         let mut first = VectorMemory::new(cwd.clone());
         first.repo_id = "repo-a".into();
-        first.load_local();
+        first.load_local().unwrap();
         first.mark_dense_offline();
         first
             .index_learning_memory(
@@ -2765,7 +2873,7 @@ pub(crate) mod tests {
 
         let mut second = VectorMemory::new(cwd.clone());
         second.repo_id = "repo-b".into();
-        second.load_local();
+        second.load_local().unwrap();
         second.mark_dense_offline();
         second
             .index_learning_memory(

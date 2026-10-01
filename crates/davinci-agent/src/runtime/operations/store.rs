@@ -817,7 +817,14 @@ impl OperationJournal {
     /// failing it at once turned parallel reads into tool errors. The wait
     /// is bounded, so no unbounded queue can form behind a stuck writer.
     fn try_state(&self) -> Result<MutexGuard<'_, JournalState>, JournalError> {
-        let deadline = std::time::Instant::now() + WRITER_WAIT;
+        self.try_state_with_wait(WRITER_WAIT)
+    }
+
+    fn try_state_with_wait(
+        &self,
+        wait: Duration,
+    ) -> Result<MutexGuard<'_, JournalState>, JournalError> {
+        let deadline = std::time::Instant::now() + wait;
         loop {
             match self.state.try_lock() {
                 Ok(state) => return Ok(state),
@@ -900,5 +907,66 @@ impl OperationJournal {
                 Err(error)
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod writer_wait_tests {
+    use super::*;
+    use crate::runtime::operations::{JournalId, WorkspaceId, WorkspaceIdentity};
+
+    fn journal(directory: &Path) -> OperationJournal {
+        let identity = JournalIdentity::new(
+            JournalId::new(),
+            WorkspaceIdentity {
+                id: WorkspaceId::new(),
+                binding_version: 1,
+            },
+        )
+        .unwrap();
+        OperationJournal::open(directory, identity, RootNamespaceId::new()).unwrap()
+    }
+
+    #[test]
+    fn writer_waits_until_the_active_lock_is_released() {
+        let directory = tempfile::tempdir().unwrap();
+        let journal = journal(directory.path());
+        let guard = journal.state.lock().unwrap();
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (result_tx, result_rx) = std::sync::mpsc::channel();
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                started_tx.send(()).unwrap();
+                // Isolate lock-wait semantics from hosted-runner scheduling.
+                let result = journal
+                    .try_state_with_wait(Duration::from_secs(120))
+                    .map(drop);
+                result_tx.send(result).unwrap();
+            });
+            started_rx.recv_timeout(Duration::from_secs(120)).unwrap();
+            let while_locked = result_rx.recv_timeout(Duration::from_millis(100));
+            drop(guard);
+            assert!(matches!(
+                while_locked,
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+            ));
+            result_rx
+                .recv_timeout(Duration::from_secs(120))
+                .unwrap()
+                .unwrap();
+        });
+    }
+
+    #[test]
+    fn writer_rejects_contention_at_the_deadline() {
+        let directory = tempfile::tempdir().unwrap();
+        let journal = journal(directory.path());
+        let guard = journal.state.lock().unwrap();
+        assert!(matches!(
+            journal.try_state_with_wait(Duration::ZERO),
+            Err(JournalError::WriterBusy)
+        ));
+        drop(guard);
+        assert!(journal.try_state_with_wait(Duration::ZERO).is_ok());
     }
 }

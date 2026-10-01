@@ -52,7 +52,7 @@ impl Snapshot {
         paths: &[PathBuf],
         allowed: &dyn Fn(&Path) -> bool,
     ) -> Self {
-        Self::capture_with_guard(root, paths, 16_384, Duration::from_millis(100), allowed)
+        Self::capture_with_guard(root, paths, 16_384, CAPTURE_BUDGET, allowed)
     }
 
     pub(crate) fn complete(&self) -> bool {
@@ -305,6 +305,22 @@ mod tests {
         assert!(!incomplete.complete());
         let timed_out = Snapshot::capture_with_limits(root.path(), &[], 100, Duration::ZERO);
         assert!(!timed_out.complete());
+    }
+
+    #[test]
+    fn guarded_fixture_capture_tolerates_slow_permission_checks() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("app.py"), "original").unwrap();
+        let snapshot = Snapshot::capture_guarded(root.path(), &[], &|_| {
+            // Exercise the same scheduling delay as a loaded hosted runner.
+            std::thread::sleep(Duration::from_millis(150));
+            true
+        });
+        assert!(snapshot.complete());
+        assert_eq!(
+            snapshot.path_changed(&Snapshot::capture(root.path()), Path::new("app.py")),
+            Some(false)
+        );
     }
 
     #[test]

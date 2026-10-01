@@ -617,6 +617,20 @@ pub fn live_complete_with(
     tools: &[ToolSpec],
     options: &StreamOptions,
 ) -> Result<AssistantMessage, String> {
+    // Codex requires streaming even when the caller only needs the final reply
+    // (for example, context compaction). Reuse its normal transport and decoder.
+    if model.api == "openai-codex-responses" {
+        return live_complete_streaming_with_sink_envelope(
+            model,
+            messages,
+            auth,
+            system,
+            tools,
+            options,
+            &mut |_| {},
+        )
+        .map(|envelope| envelope.message);
+    }
     let options = options_with_auth_context(options, auth);
     refuse_unsupported_tools(&model.api, tools.len())?;
     let body = request_body_with(model, messages, system, tools, &options);
@@ -631,30 +645,6 @@ pub fn live_complete_with(
             prepared.manifest().request_bytes_before_compression
         ));
     }
-    if model.api == "openai-codex-responses" {
-        if let Some(token) = auth.api_key.as_deref() {
-            let codex_affinity_id = codex_responses_affinity_id(&options);
-            match crate::codex::try_codex_websocket_transport_with_affinity(
-                model,
-                body,
-                token,
-                options.transport.as_deref(),
-                options.session_id.as_deref(),
-                codex_affinity_id.as_deref(),
-                options.cache_retention.as_deref(),
-                options.websocket_connect_timeout_ms,
-                options.timeout_ms,
-                options.abort_signal.as_ref(),
-                &mut |_| {},
-            ) {
-                Ok(crate::codex::CodexWebsocketOutcome::Message(message)) => {
-                    return Ok(message.message)
-                }
-                Ok(crate::codex::CodexWebsocketOutcome::FallbackToSse) => {}
-                Err(error) => return Err(error),
-            }
-        }
-    }
     let url = request_url_checked(model, auth)?;
     let headers = crate::merge_provider_attribution_headers(
         model,
@@ -663,11 +653,10 @@ pub fn live_complete_with(
         &collect_request_headers(model, auth, &options),
     );
     let timeout_ms = options.timeout_ms.filter(|ms| *ms > 0);
-    let compress_zstd = model.api == "openai-codex-responses";
     let (text, observation) = crate::provider_retry::retry_provider_request_controlled(
         || {
             let observation = crate::provider_observation::Attempt::start("http");
-            match send_provider_body(&url, &headers, body, timeout_ms, compress_zstd) {
+            match send_provider_body(&url, &headers, body, timeout_ms, false) {
                 Ok(text) => Ok((text, observation)),
                 Err(error) => {
                     observation.finish("failed", error.status, None);

@@ -176,7 +176,18 @@ function handle(message) {
   }
   if (mode === 'delayed-query' && /^textDocument\//.test(message.method) && message.id !== undefined) {
     const result = normalResult(message.method, message);
-    setTimeout(() => send({ id: message.id, result: result === undefined ? null : result }), 250);
+    // A timer alone races the test thread on loaded runners. Only respond once
+    // the parent has edited the source and explicitly released this request.
+    const deadline = Date.now() + 120_000;
+    const pending = setInterval(() => {
+      if (fs.existsSync(`${eventsPath}.release`)) {
+        clearInterval(pending);
+        send({ id: message.id, result: result === undefined ? null : result });
+      } else if (Date.now() >= deadline) {
+        clearInterval(pending);
+        send({ id: message.id, error: { code: -32000, message: 'fixture release timed out' } });
+      }
+    }, 10);
     return;
   }
   if (mode === 'late-once' && /^textDocument\//.test(message.method) && message.id !== undefined) {

@@ -321,8 +321,9 @@ mod tests {
         let marker = dir.path().join("relative-script.ok");
         // Full Windows workspace tests run many process-heavy tests in
         // parallel. Wait for the managed child rather than assuming Node gets
-        // scheduled within five seconds, while keeping the regression bounded.
-        let until = Instant::now() + Duration::from_secs(30);
+        // scheduled promptly, while keeping the regression bounded. Match the
+        // other subprocess fixtures' allowance for loaded Windows CI runners.
+        let until = Instant::now() + Duration::from_secs(120);
         loop {
             if marker.is_file() {
                 assert_eq!(

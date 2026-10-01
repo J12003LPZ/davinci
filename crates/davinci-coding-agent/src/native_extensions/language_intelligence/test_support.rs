@@ -51,6 +51,11 @@ impl TestWorkspace {
                 config.rust.enabled = false;
                 config.python.enabled = false;
                 config.typescript.server = Some(server);
+                if mode == "delayed-query" {
+                    // This fixture tests source invalidation, not request latency.
+                    config.typescript.initialization_timeout_ms = 120_000;
+                    config.typescript.cold_request_timeout_ms = 120_000;
+                }
                 std::fs::write(root.join("package.json"), r#"{"private":true}"#).unwrap();
                 std::fs::write(root.join("a.ts"), "hello").unwrap();
             }

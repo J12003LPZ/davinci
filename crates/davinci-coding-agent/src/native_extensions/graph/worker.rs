@@ -1337,11 +1337,28 @@ mod tests {
         spec.thinking_level = None;
         spec.extra_extensions = Vec::new();
         spec.tools = vec!["read".into(), "graph_submit".into()];
+        spec.runtime_agent_id = Some(davinci_agent::AgentId::new());
+        spec.authorized_tools = spec.tools.clone();
+        spec.initially_exposed_tools = spec.tools.clone();
+        let run_id = crate::native_extensions::graph::store::new_run_id();
+        crate::native_extensions::graph::store::create_run_dir(&spec.cwd, &run_id).unwrap();
+        spec.artifact_path = crate::native_extensions::graph::store::artifact_path(
+            &spec.cwd,
+            &run_id,
+            &spec.task_id,
+        );
+        spec.worker_session = Some(
+            crate::native_extensions::graph::worker_sessions::WorkerSessionBinding::create(
+                &spec, &run_id, 1, 1, None, None,
+            )
+            .unwrap(),
+        );
 
         let abort = Arc::new(AtomicBool::new(false));
         let mut progress = |_: &str, _: &WorkerUsage, _: Option<&str>| {};
         let result = run_worker(&spec, &abort, &mut progress);
 
+        assert!(result.child_pid.is_some(), "{result:?}");
         assert!(!result.ok, "a child that never submitted must not be ok");
         assert!(!spec.artifact_path.exists());
         let reason = result.failure_reason.expect("a reason");

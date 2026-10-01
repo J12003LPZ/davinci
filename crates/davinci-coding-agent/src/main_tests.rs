@@ -1317,6 +1317,12 @@ fn the_offline_tool_call_fixture_scripts_one_call_then_the_usual_stub() {
         "PI_OFFLINE_TOOL_CALL",
         r#"{"name":"bash","arguments":{"command":"git status --short"}}"#,
     );
+    let mut context = davinci_ai::ChatMessage::text("custom", "runtime state");
+    context.extra.insert(
+        "customType".into(),
+        davinci_agent::turn_context::TURN_CONTEXT_CUSTOM_TYPE.into(),
+    );
+    agent.messages.push(context);
     let scripted = offline_stub_message(&agent, 14);
     assert_eq!(scripted.stop_reason, Some(StopReason::ToolUse));
     match scripted.content.first() {
@@ -1356,6 +1362,12 @@ fn offline_tool_sequence_waits_for_results_and_stops_on_failure() {
     );
     let mut agent = Agent::new("fixture");
     agent.prompt("edit and submit");
+    let mut context = davinci_ai::ChatMessage::text("custom", "runtime state");
+    context.extra.insert(
+        "customType".into(),
+        davinci_agent::turn_context::TURN_CONTEXT_CUSTOM_TYPE.into(),
+    );
+    agent.messages.push(context.clone());
     let call_name = |agent: &Agent| match offline_stub_message(agent, 15).content.first() {
         Some(ContentBlock::ToolCall { name, .. }) => Some(name.clone()),
         _ => None,
@@ -1373,6 +1385,7 @@ fn offline_tool_sequence_waits_for_results_and_stops_on_failure() {
         .extra
         .insert("davinciCapabilityReminder".into(), serde_json::json!(true));
     agent.messages.push(reminder);
+    agent.messages.push(context);
     assert_eq!(call_name(&agent).as_deref(), Some("graph_submit"));
     agent.messages.push(davinci_ai::ChatMessage::tool_result(
         "two",
@@ -1458,6 +1471,7 @@ fn f03_print_recovery_failure_exits_and_stops_prompts() {
         let log = davinci_session::runtime_log_path(&session.path);
         let corrupt = b"{broken record}\n{broken record}\n";
         std::fs::write(&log, corrupt).unwrap();
+        let original_session = std::fs::read(&session.path).unwrap();
         let stdout = dir.path().join("stdout");
         let stderr = dir.path().join("stderr");
         let mut command = Command::new(&binary);
@@ -1503,14 +1517,18 @@ fn f03_print_recovery_failure_exits_and_stops_prompts() {
             }
             std::thread::sleep(std::time::Duration::from_millis(25));
         };
-        let output = std::fs::read_to_string(if json { stdout } else { stderr }).unwrap();
+        let output = format!(
+            "{}\n{}",
+            std::fs::read_to_string(stdout).unwrap(),
+            std::fs::read_to_string(stderr).unwrap()
+        );
         assert_eq!(status.code(), Some(1), "{output}");
         assert!(output.contains("Runtime recovery required:"), "{output}");
         assert_eq!(std::fs::read(log).unwrap(), corrupt);
         assert!(!dir.path().join("must-not-exist.txt").exists());
-        let saved = std::fs::read_to_string(&session.path).unwrap();
-        assert!(saved.contains("first recovery fixture"));
-        assert!(!saved.contains("second recovery fixture"));
+        // A corrupt runtime log blocks the session's append transaction too.
+        // Neither prompt may be persisted before recovery succeeds.
+        assert_eq!(std::fs::read(&session.path).unwrap(), original_session);
     }
 }
 
