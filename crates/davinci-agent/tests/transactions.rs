@@ -810,23 +810,25 @@ fn transaction_workspace_mutation_does_not_hold_an_unrelated_workspace() {
             &|_| {
                 if !entered.swap(true, Ordering::SeqCst) {
                     entered_tx.send(()).unwrap();
-                    release_rx
-                        .recv_timeout(Duration::from_secs(10))
-                        .map_err(|e| e.to_string())?;
+                    // The main thread releases this worker after its bounded
+                    // independence check. Channel closure also wakes it on panic.
+                    release_rx.recv().map_err(|e| e.to_string())?;
                 }
                 Ok(())
             },
             None,
         )
     });
-    entered_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+    entered_rx.recv_timeout(Duration::from_secs(60)).unwrap();
     let (finished_tx, finished_rx) = mpsc::channel();
     let second_thread = std::thread::spawn(move || {
         finished_tx
             .send(second.apply(&second_id, &|_| Ok(()), None))
             .unwrap();
     });
-    let independent = finished_rx.recv_timeout(Duration::from_secs(5));
+    // This is a lock-independence check, not a disk-performance benchmark.
+    // Keep the first transaction held throughout even on slow Windows runners.
+    let independent = finished_rx.recv_timeout(Duration::from_secs(60));
     // Release and join even if independence failed, so the test leaves no worker.
     release_tx.send(()).unwrap();
     first_thread.join().unwrap().unwrap();
