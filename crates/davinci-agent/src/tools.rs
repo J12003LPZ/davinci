@@ -1056,12 +1056,20 @@ fn tool_search_usize(input: &Value, key: &str, default: usize) -> Result<usize, 
         return usize::try_from(number)
             .map_err(|_| ToolError::Failed(format!("tool_search {key} is too large")));
     }
-    value
+    if value.is_null() {
+        return Ok(default);
+    }
+    let text = value
         .as_str()
         .ok_or_else(|| {
             ToolError::Failed(format!("tool_search {key} must be a non-negative integer"))
         })?
-        .parse::<usize>()
+        .trim();
+    // The cursor is a string in the schema, so a first page arrives as "".
+    if text.is_empty() {
+        return Ok(default);
+    }
+    text.parse::<usize>()
         .map_err(|_| ToolError::Failed(format!("tool_search {key} must be a non-negative integer")))
 }
 
@@ -4406,6 +4414,28 @@ mod tests {
 
     use super::*;
     use tempfile::tempdir;
+
+    #[test]
+    fn tool_search_treats_an_empty_cursor_as_the_first_page() {
+        for cursor in [
+            serde_json::json!(""),
+            serde_json::json!("  "),
+            serde_json::json!(null),
+        ] {
+            let input = serde_json::json!({"query": "x", "cursor": cursor});
+            assert_eq!(tool_search_usize(&input, "cursor", 0).unwrap(), 0);
+        }
+        assert_eq!(
+            tool_search_usize(&serde_json::json!({"cursor": "10"}), "cursor", 0).unwrap(),
+            10
+        );
+        assert_eq!(
+            tool_search_usize(&serde_json::json!({"cursor": 5}), "cursor", 0).unwrap(),
+            5
+        );
+        assert!(tool_search_usize(&serde_json::json!({"cursor": "abc"}), "cursor", 0).is_err());
+        assert!(tool_search_usize(&serde_json::json!({"cursor": -1}), "cursor", 0).is_err());
+    }
 
     #[test]
     fn pathological_glob_finishes_quickly() {

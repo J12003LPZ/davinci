@@ -111,6 +111,13 @@ impl ToolOperationPlanner {
         Self::plan(context, key, tool, args, capability, contract_digest)
     }
 
+    /// Whether a journaled call of this capability holds an effect claim while
+    /// it runs. Claimed operations conflict with each other in the journal,
+    /// so the scheduler must not overlap them.
+    pub fn holds_effect_claim(capability: Option<&RuntimeCapability>) -> bool {
+        effect_profile(capability).classification != EffectClass::ReadOnly
+    }
+
     fn plan(
         context: OperationContext,
         key: ScopedIdempotencyKey,
@@ -179,8 +186,18 @@ fn operation_kind(tool: &str) -> OperationKind {
 }
 
 fn effect_profile(capability: Option<&RuntimeCapability>) -> EffectProfile {
+    // Built-in and native-extension tools are compiled into this binary and
+    // their classes come from the host's own `tool_class` table, so their
+    // declared effects are trusted. Without this, a read-only native tool
+    // (`repo_map`, `symbol_search`, ...) became an external mutation holding
+    // the workspace-wide `*` claim while the scheduler ran it in the parallel
+    // lane, and the second of two overlapping calls failed with a resource
+    // claim conflict. MCP and JS declarations stay conservative.
     let Some(capability) = capability.filter(|capability| {
-        capability.source == CapabilitySource::Builtin && !capability.declared_effects.is_empty()
+        matches!(
+            capability.source,
+            CapabilitySource::Builtin | CapabilitySource::NativeExtension
+        ) && !capability.declared_effects.is_empty()
     }) else {
         return EffectProfile {
             classification: EffectClass::ExternalMutation,

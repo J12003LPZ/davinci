@@ -471,3 +471,110 @@ fn parallel_read_dispatch_waits_for_the_journal_writer() {
         failures.len()
     );
 }
+
+/// Holds both effect permits at once, the way the scheduler's parallel lane
+/// runs two calls of one assistant message, and returns the second result.
+fn dispatch_two_concurrently(
+    fixture: &Fixture,
+    tool: &str,
+    capability: &davinci_agent::runtime::RuntimeCapability,
+) -> Result<(), String> {
+    let plan = |call_id: &str| {
+        ToolOperationPlanner::provider_call(
+            fixture.context.clone(),
+            call_id,
+            tool,
+            &json!({"query": call_id}),
+            Some(capability),
+            None,
+        )
+        .unwrap()
+    };
+    let (first_plan, second_plan) = (plan("parallel-1"), plan("parallel-2"));
+    let first = new_operation(fixture.dispatcher.admit(first_plan.clone(), 1).unwrap());
+    let second = new_operation(fixture.dispatcher.admit(second_plan.clone(), 1).unwrap());
+    let _first_permit = fixture
+        .dispatcher
+        .begin_dispatch(&first, &first_plan, Some(1), false, || Ok(()))
+        .unwrap();
+    fixture
+        .dispatcher
+        .begin_dispatch(&second, &second_plan, Some(1), false, || Ok(()))
+        .map(|_| ())
+        .map_err(|error| error.to_string())
+}
+
+#[test]
+fn parallel_safe_native_read_tools_do_not_claim_the_whole_workspace() {
+    let fixture = Fixture::new();
+    let capability = davinci_agent::runtime::RuntimeCapability::new(
+        "repo_map",
+        CapabilitySource::NativeExtension,
+        davinci_agent::ToolClass::Read,
+        true,
+        &json!({"type": "object"}),
+        None,
+    );
+    assert_eq!(
+        capability.concurrency_policy,
+        davinci_agent::runtime::ConcurrencyPolicy::ParallelSafe
+    );
+    let plan = ToolOperationPlanner::provider_call(
+        fixture.context.clone(),
+        "native-read-1",
+        "repo_map",
+        &json!({}),
+        Some(&capability),
+        None,
+    )
+    .unwrap();
+    assert_eq!(plan.spec().effects().classification, EffectClass::ReadOnly);
+    dispatch_two_concurrently(&fixture, "repo_map", &capability).unwrap();
+}
+
+#[test]
+fn only_claim_free_capabilities_may_overlap_in_the_journal() {
+    let registry = RuntimeCapabilityRegistry::with_builtins();
+    let native_read = davinci_agent::runtime::RuntimeCapability::new(
+        "symbol_search",
+        CapabilitySource::NativeExtension,
+        davinci_agent::ToolClass::Read,
+        true,
+        &json!({"type": "object"}),
+        None,
+    );
+    let mcp_read = davinci_agent::runtime::RuntimeCapability::new(
+        "mcp__srv__read",
+        CapabilitySource::Mcp,
+        davinci_agent::ToolClass::Read,
+        true,
+        &json!({"type": "object"}),
+        None,
+    );
+    assert!(!ToolOperationPlanner::holds_effect_claim(
+        registry.get("read").as_ref()
+    ));
+    assert!(!ToolOperationPlanner::holds_effect_claim(Some(
+        &native_read
+    )));
+    for capability in [
+        registry.get("web_search").unwrap(),
+        registry.get("agent").unwrap(),
+        mcp_read,
+    ] {
+        assert!(
+            ToolOperationPlanner::holds_effect_claim(Some(&capability)),
+            "{}",
+            capability.name
+        );
+        // These are the overlaps the scheduler now keeps serial.
+        let fixture = Fixture::new();
+        assert!(
+            dispatch_two_concurrently(&fixture, &capability.name, &capability)
+                .unwrap_err()
+                .contains("resource claim"),
+            "{}",
+            capability.name
+        );
+    }
+}
