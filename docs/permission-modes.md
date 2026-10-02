@@ -24,7 +24,19 @@ This is an **approval policy, not an OS sandbox**. Allowed project checks can ex
 
 The policy classifies every patch target separately, including deletion actions; a harmless target cannot conceal a secret or outside-workspace target in a compound display string. Path checks include protected harness settings, Git metadata, common credential paths, Windows aliases and existing symlink ancestors. Deny rules take precedence over grants. Subagent profiles cannot request a mode more permissive than their parent's mode. Existing graph subprocesses explicitly request the former non-interactive behavior using `always-approve`, retaining their separate role-tool and shell-policy guards.
 
+## Web requests and delegation
+
+Web permission rules use the hostname parsed by the HTTP URL parser, including
+encoded hostnames, user information, and IPv6 addresses. Every `web_fetch`
+redirect destination is checked before it is fetched; a destination requiring
+approval prompts separately. Relative links in the result use the final URL.
+
+An explicit request to work without subagents remains in force until the user
+gives an unambiguous, unconditional instruction allowing them. Quoted examples,
+negated permissions, questions, and conditional instructions do not lift it.
+
 ## Additional writable directories
+
 
 `--add-dir <dir>` (repeatable, also `--add-dir=<dir>`) adds an existing project
 directory beside the primary workspace. Relative values resolve against the

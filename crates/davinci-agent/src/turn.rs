@@ -2401,7 +2401,23 @@ impl Agent {
                         crate::verification::workspace::Snapshot::capture_inputs(&self.cwd, &paths);
                     self.record_shell_verification_start(id, snapshot);
                 }
-                let mut executed = match execute_tool_with(cwd, name, args, &context) {
+                let result = if name == "web_fetch" {
+                    crate::web::fetch_tool_with_redirect_check(args, &mut |url| {
+                        if self.abort_requested() {
+                            return Err("web_fetch cancelled".into());
+                        }
+                        let mut redirected_args = args.clone();
+                        redirected_args["url"] = Value::String(url.to_string());
+                        match self.permission_denial(cwd, id, name, &redirected_args) {
+                            Some(reason) => Err(reason),
+                            None => Ok(()),
+                        }
+                    })
+                    .map_err(crate::tools::ToolError::Failed)
+                } else {
+                    execute_tool_with(cwd, name, args, &context)
+                };
+                let mut executed = match result {
                     Ok(result) => result,
                     Err(crate::tools::ToolError::Unknown(_)) => {
                         if let Some(executor) = &self.custom_tool_executor {

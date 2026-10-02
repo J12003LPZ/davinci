@@ -255,13 +255,14 @@ impl JsonlSessionRepo {
                 if path.extension().and_then(|ext| ext.to_str()) != Some("jsonl") {
                     continue;
                 }
-                let Ok(raw) = fs::read_to_string(&path) else {
+                let Ok(file) = fs::File::open(&path) else {
                     continue;
                 };
-                let Some(first) = raw.lines().next() else {
+                let Some(Ok(first)) = std::io::BufRead::lines(std::io::BufReader::new(file)).next()
+                else {
                     continue;
                 };
-                let Ok(header) = parse_header(first) else {
+                let Ok(header) = parse_header(&first) else {
                     continue;
                 };
                 listed.push(JsonlSessionInfo::from_header(&header, &path));
@@ -698,6 +699,30 @@ mod tests {
             reopened.append_message("recovered").unwrap();
             assert_eq!(reopened.get_stats().message_count, 2);
         }
+    }
+
+    #[test]
+    fn audit_listing_reads_only_the_header() {
+        let dir = tempdir().unwrap();
+        let repo = JsonlSessionRepo::new(dir.path());
+        let session = repo
+            .create(JsonlCreateOptions {
+                id: Some("header-only".into()),
+                cwd: "/fixture".into(),
+                parent_session_id: None,
+                metadata: None,
+            })
+            .unwrap();
+        // A damaged or unfinished transcript must not hide a valid header.
+        let mut file = OpenOptions::new()
+            .append(true)
+            .open(&session.info.path)
+            .unwrap();
+        file.write_all(&[0xff; 64 * 1024]).unwrap();
+        drop(file);
+        let listed = repo.list(Some("/fixture")).unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].id, "header-only");
     }
 
     #[test]

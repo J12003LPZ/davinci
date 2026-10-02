@@ -44,7 +44,9 @@ impl ActivePlugin {
         let Some(digest) = &self.plugin.hooks_digest else {
             return false;
         };
-        let installed = store::load(&self.agent_dir);
+        let Ok(installed) = store::load(&self.agent_dir) else {
+            return false;
+        };
         let Some(record) = installed.plugins.get(&self.key) else {
             return false;
         };
@@ -110,7 +112,14 @@ pub fn active(agent_dir: &Path) -> ActivePlugins {
     if disabled_by_env() {
         return out;
     }
-    for (key, record) in store::load(agent_dir).plugins {
+    let installed = match store::load(agent_dir) {
+        Ok(installed) => installed,
+        Err(err) => {
+            out.errors.push(("installed.json".into(), err));
+            return out;
+        }
+    };
+    for (key, record) in installed.plugins {
         if !record.enabled {
             continue;
         }
@@ -583,6 +592,26 @@ mod tests {
     use crate::plugins::external::tests::{write, FakeHomes};
 
     #[test]
+    fn audit_corrupt_registry_is_visible_in_loader_command_and_manager() {
+        let dir = tempfile::tempdir().unwrap();
+        let _homes = FakeHomes::new(dir.path());
+        let registry = dir.path().join("plugins/installed.json");
+        write(&registry, "{broken");
+        let loaded = active(dir.path());
+        assert!(loaded.plugins.is_empty());
+        assert_eq!(loaded.errors.len(), 1);
+        assert!(loaded.errors[0].1.contains("invalid registry"));
+        assert!(command::run(&[], dir.path(), dir.path())
+            .unwrap_err()
+            .contains("installed.json"));
+        let rows = manager::plugin_rows(dir.path());
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].health, manager::Health::Failed);
+        assert!(!rows[0].can_toggle && !rows[0].can_approve && !rows[0].can_delete);
+        assert_eq!(std::fs::read_to_string(registry).unwrap(), "{broken");
+    }
+
+    #[test]
     fn stop_payload_reports_continuation_only_for_stop() {
         for active in [false, true] {
             let input = HookInput {
@@ -700,6 +729,8 @@ mod tests {
         std::fs::remove_file(&marker).unwrap();
         if change == "env-off" {
             std::env::set_var("DAVINCI_PLUGINS", "off");
+        } else if change == "corrupt" {
+            write(&agent_dir.join("plugins/installed.json"), "{broken");
         } else {
             store::update(&agent_dir, |file| {
                 if change == "remove" {
@@ -752,6 +783,11 @@ mod tests {
     #[test]
     fn loaded_hooks_recheck_environment_off() {
         loaded_hook_revocation("env-off");
+    }
+
+    #[test]
+    fn audit_loaded_hooks_stop_when_the_registry_is_corrupt() {
+        loaded_hook_revocation("corrupt");
     }
 
     #[test]

@@ -18,6 +18,8 @@ serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 ureq.workspace = true
+# Pinned because the transport hooks are unversioned. 3.2 retains our MSRV.
+ureq-stream = { package = "ureq", version = "=3.2.0", default-features = false, features = ["rustls"] }
 url.workspace = true
 uuid.workspace = true
 webpki-roots.workspace = true

@@ -273,7 +273,10 @@ enum Hop {
 /// (`PI_WEB_FETCH_FIXTURE`) answers each hop by URL: an entry with a 3xx
 /// `status` and a `location` redirects, `truncatedBody: true` stands in for
 /// a body that hit the cap, and no name is ever resolved.
-fn fetch(url: &Url) -> Result<Fetched, String> {
+fn fetch_with_redirect_check(
+    url: &Url,
+    authorize_redirect: &mut dyn FnMut(&Url) -> Result<(), String>,
+) -> Result<Fetched, String> {
     let fixtures = fixture("PI_WEB_FETCH_FIXTURE");
     let agent = match fixtures {
         Some(_) => None,
@@ -304,6 +307,8 @@ fn fetch(url: &Url) -> Result<Fetched, String> {
         let next = current.join(&location).map_err(|err| {
             format!("{current} redirected to `{location}`, which is not a URL: {err}")
         })?;
+        guard(&next, false)?;
+        authorize_redirect(&next)?;
         if davinci_ai::trace::enabled() {
             davinci_ai::trace::log(&format!("web_fetch redirect {current} → {next}"));
         }
@@ -403,7 +408,7 @@ fn live_hop(agent: &ureq::Agent, url: &Url) -> Result<Hop, String> {
     }))
 }
 
-fn parse_url(raw: &str) -> Result<Url, String> {
+pub(crate) fn parse_url(raw: &str) -> Result<Url, String> {
     let raw = raw.trim();
     let candidate = if raw.contains("://") {
         raw.to_string()
@@ -422,12 +427,22 @@ fn parse_url(raw: &str) -> Result<Url, String> {
 
 /// `web_fetch { url, maxChars? }`.
 pub fn fetch_tool(input: &Value) -> Result<ToolResult, String> {
+    fetch_tool_with_redirect_check(input, &mut |_| Ok(()))
+}
+
+/// The host has authorized the initial call; every redirect needs its own
+/// permission decision before the destination is contacted.
+pub(crate) fn fetch_tool_with_redirect_check(
+    input: &Value,
+    authorize_redirect: &mut dyn FnMut(&Url) -> Result<(), String>,
+) -> Result<ToolResult, String> {
     let raw = input
         .get("url")
         .and_then(Value::as_str)
         .ok_or("Missing url")?;
     let url = parse_url(raw)?;
-    let fetched = fetch(&url)?;
+    let fetched = fetch_with_redirect_check(&url, authorize_redirect)?;
+    let final_url = parse_url(&fetched.final_url)?;
     let kind = fetched
         .content_type
         .split(';')
@@ -437,7 +452,7 @@ pub fn fetch_tool(input: &Value) -> Result<ToolResult, String> {
         .to_ascii_lowercase();
     let (title, text) =
         if kind.contains("html") || kind.contains("xml") && fetched.body.contains("<html") {
-            let (title, text) = html_to_text(&fetched.body, Some(&url));
+            let (title, text) = html_to_text(&fetched.body, Some(&final_url));
             (title, text)
         } else if kind.starts_with("text/")
             || kind.contains("json")
@@ -1495,6 +1510,99 @@ and <a href="https://example.com/x">https://example.com/x</a>.</p>
     }
 
     #[test]
+    fn audit_redirects_require_destination_permission_in_agent_dispatch() {
+        use crate::{
+            Agent, PermissionMode, PermissionPolicy, PermissionRule, PermissionState,
+            ToolApprovalDecision, ToolApprover,
+        };
+        use std::sync::Arc;
+        let _guard = env_lock();
+        let dir = tempfile::tempdir().unwrap();
+        fixture_env(
+            dir.path(),
+            json!({
+                "https://allowed.example/start": {"status":302, "location":"https://next.example/docs/"},
+                "https://next.example/docs/": {"body":"destination content", "contentType":"text/plain"}
+            }),
+        );
+        let results: Vec<_> = ["deny", "ask-deny", "ask-allow", "allow"]
+            .into_iter()
+            .map(|case| {
+                let mut agent = Agent::new("offline redirect authorization fixture");
+                agent.tools = vec!["web_fetch".into()];
+                let mut policy = PermissionPolicy::new(PermissionMode::Ask);
+                policy
+                    .allow
+                    .push(PermissionRule::parse("web_fetch(allowed.example)").unwrap());
+                if case == "deny" {
+                    policy
+                        .deny
+                        .push(PermissionRule::parse("web_fetch(next.example)").unwrap());
+                } else if case == "allow" {
+                    policy
+                        .allow
+                        .push(PermissionRule::parse("web_fetch(next.example)").unwrap());
+                }
+                agent.permissions = Arc::new(PermissionState::new(policy));
+                let approvals = Arc::new(Mutex::new(Vec::new()));
+                let observed = approvals.clone();
+                agent.approver = Some(ToolApprover(Arc::new(move |request| {
+                    observed
+                        .lock()
+                        .unwrap()
+                        .push(request.args["url"].as_str().unwrap().to_string());
+                    if case == "ask-allow" {
+                        ToolApprovalDecision::AllowOnce
+                    } else {
+                        ToolApprovalDecision::Deny
+                    }
+                })));
+                let args = json!({"url":"https://allowed.example/start"});
+                let result = match agent.prepare_tool_call(
+                    dir.path(),
+                    "redirect-call",
+                    "web_fetch",
+                    &args,
+                    0,
+                ) {
+                    crate::turn::Preparation::Ready { .. } => {
+                        agent.run_prepared_call(dir.path(), "redirect-call", "web_fetch", &args, 0)
+                    }
+                    crate::turn::Preparation::Immediate(result) => result,
+                    crate::turn::Preparation::Wait { .. } => {
+                        panic!("unexpected redirect fixture wait")
+                    }
+                };
+                let observed = approvals.lock().unwrap().clone();
+                (case, result, observed)
+            })
+            .collect();
+        std::env::remove_var("PI_WEB_FETCH_FIXTURE");
+        for (case, result, approvals) in results {
+            assert_eq!(
+                result.is_error,
+                matches!(case, "deny" | "ask-deny"),
+                "{case}: {}",
+                result.content
+            );
+            assert_eq!(
+                approvals,
+                if case.starts_with("ask-") {
+                    vec!["https://next.example/docs/".to_string()]
+                } else {
+                    vec![]
+                },
+                "{case}"
+            );
+            assert_eq!(
+                result.content.contains("destination content"),
+                !result.is_error,
+                "{case}"
+            );
+        }
+    }
+
+    #[test]
     fn addresses_of_this_machine_and_its_networks_are_refused() {
         let refused = |ip: &str| ip_refusal(ip.parse().unwrap());
         assert_eq!(refused("127.0.0.1"), Some("loopback address"));
@@ -1651,6 +1759,36 @@ and <a href="https://example.com/x">https://example.com/x</a>.</p>
         assert!(scheme.contains("only http and https"), "{scheme}");
         std::env::remove_var("PI_WEB_FETCH_ALLOW_PRIVATE");
         std::env::remove_var("PI_WEB_FETCH_FIXTURE");
+    }
+
+    #[test]
+    fn audit_redirected_html_uses_the_final_link_base() {
+        let _guard = env_lock();
+        let dir = tempfile::tempdir().unwrap();
+        fixture_env(
+            dir.path(),
+            json!({
+                "https://a.example/start": {"status":302,"location":"https://b.example/docs/"},
+                "https://a.example/docs": {"status":301,"location":"/versioned/"},
+                "https://b.example/docs/": {"body":"<a href='guide'>Guide</a>"},
+                "https://a.example/versioned/": {"body":"<a href='guide'>Guide</a>"}
+            }),
+        );
+        let cross_host = fetch_tool(&json!({"url":"https://a.example/start"})).unwrap();
+        let directory = fetch_tool(&json!({"url":"https://a.example/docs"})).unwrap();
+        std::env::remove_var("PI_WEB_FETCH_FIXTURE");
+        assert!(
+            cross_host.content.contains("https://b.example/docs/guide"),
+            "{}",
+            cross_host.content
+        );
+        assert!(
+            directory
+                .content
+                .contains("https://a.example/versioned/guide"),
+            "{}",
+            directory.content
+        );
     }
 
     #[test]

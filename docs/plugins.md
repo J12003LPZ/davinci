@@ -120,7 +120,7 @@ and similar) are not passed to hooks.
 ```text
 plugin [list]                          installed plugins
 plugin browse [query]                  plugins in every known marketplace
-plugin install <name>[@marketplace]    install and enable
+plugin install <name>[@marketplace]    install or replace (preserves enabled state)
 plugin import [claude|codex] [<key>|--all]
 plugin info <plugin>                   components, hooks and warnings
 plugin approve | revoke <plugin>       hooks on or off
@@ -136,6 +136,19 @@ plugin marketplace list | update [name] | remove <name>
 
 `DAVINCI_PLUGINS=off` loads no plugin for that process. `plugin disable
 <plugin>` turns one off persistently.
+
+Updating or reinstalling an existing plugin preserves its enabled/disabled
+state. A failed marketplace refresh stops the update and reports the error.
+Each replacement is validated in a separate cache directory before the
+installed registry is switched to it. Previous copies remain available to
+sessions that already loaded them; repeated updates can therefore grow the
+plugin cache.
+
+Registry changes are locked across processes and saved atomically. If
+`plugins/installed.json` or `plugins/marketplaces.json` is unreadable or
+contains invalid JSON, the operation reports its path and leaves the file
+intact. Restore or repair that file before retrying. A missing registry is
+treated as a new, empty registry.
 
 ## Limits
 

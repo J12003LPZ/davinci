@@ -65,6 +65,7 @@ pub mod provider_observation;
 mod stream_decoder;
 mod stream_decoder_anthropic;
 mod stream_decoder_completions;
+mod stream_http;
 mod stream_reader;
 mod thinking;
 pub mod trace;

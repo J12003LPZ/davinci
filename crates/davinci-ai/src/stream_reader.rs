@@ -1,13 +1,41 @@
 //! Provider-body reader, independent of decoding and foreground cancellation.
+use crate::stream_http::Cancellation;
 use std::io::{self, BufRead, BufReader, Read};
 use std::sync::mpsc::{self, Receiver};
 
 pub(crate) const MAX_FRAME_BYTES: usize = 16 * 1024 * 1024;
 const READ_AHEAD_LINES: usize = 8;
 
-pub(crate) fn response_lines(reader: impl Read + Send + 'static) -> Receiver<io::Result<String>> {
+pub(crate) struct ResponseLines {
+    receiver: Option<Receiver<io::Result<String>>>,
+    worker: Option<std::thread::JoinHandle<()>>,
+    cancellation: Cancellation,
+}
+
+impl std::ops::Deref for ResponseLines {
+    type Target = Receiver<io::Result<String>>;
+    fn deref(&self) -> &Self::Target {
+        self.receiver.as_ref().expect("live receiver")
+    }
+}
+
+impl Drop for ResponseLines {
+    fn drop(&mut self) {
+        self.cancellation.cancel();
+        // Release a sender waiting on backpressure before joining it.
+        self.receiver.take();
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.join();
+        }
+    }
+}
+
+pub(crate) fn response_lines(
+    reader: impl Read + Send + 'static,
+    cancellation: Cancellation,
+) -> ResponseLines {
     let (sender, receiver) = mpsc::sync_channel(READ_AHEAD_LINES);
-    std::thread::spawn(move || {
+    let worker = std::thread::spawn(move || {
         let mut reader = BufReader::new(reader);
         let mut frame_bytes = 0;
         loop {
@@ -53,12 +81,19 @@ pub(crate) fn response_lines(reader: impl Read + Send + 'static) -> Receiver<io:
             }
         }
     });
-    receiver
+    ResponseLines {
+        receiver: Some(receiver),
+        worker: Some(worker),
+        cancellation,
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn response_lines(reader: impl Read + Send + 'static) -> ResponseLines {
+        super::response_lines(reader, Cancellation::default())
+    }
     use std::sync::mpsc::Sender;
     use std::time::Duration;
 
@@ -122,7 +157,7 @@ mod tests {
         let body = fragment.repeat(MAX_FRAME_BYTES / fragment.len() + 1);
         let receiver = response_lines(io::Cursor::new(body));
         let mut rejected = false;
-        for line in receiver {
+        for line in receiver.iter() {
             if let Err(error) = line {
                 assert_eq!(error.kind(), io::ErrorKind::InvalidData);
                 rejected = true;
@@ -136,7 +171,7 @@ mod tests {
         let data = format!("data: {}\n\n", "x".repeat(MAX_FRAME_BYTES / 2));
         let expected = data.repeat(3);
         let actual = response_lines(io::Cursor::new(expected.clone()))
-            .into_iter()
+            .iter()
             .collect::<io::Result<Vec<_>>>()
             .unwrap()
             .concat();
@@ -149,7 +184,7 @@ mod tests {
             let body = format!("{}{}", "x".repeat(MAX_FRAME_BYTES - ending.len()), ending);
             assert_eq!(body.len(), MAX_FRAME_BYTES);
             let received = response_lines(io::Cursor::new(body.clone()))
-                .into_iter()
+                .iter()
                 .collect::<io::Result<Vec<_>>>()
                 .unwrap()
                 .concat();
@@ -157,7 +192,7 @@ mod tests {
 
             let oversized = format!("x{body}");
             let result = response_lines(io::Cursor::new(oversized))
-                .into_iter()
+                .iter()
                 .collect::<io::Result<Vec<_>>>();
             assert_eq!(result.unwrap_err().kind(), io::ErrorKind::InvalidData);
         }

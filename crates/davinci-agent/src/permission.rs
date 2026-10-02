@@ -1645,18 +1645,13 @@ fn has_command_substitution(segment: &str) -> bool {
 /// `docs.rs` from `https://docs.rs/similar/latest/`: the host a fetch rule
 /// names. Lower-cased, port and credentials dropped, scheme optional.
 pub fn host_of(url: &str) -> String {
-    let trimmed = url.trim();
-    let without_scheme = trimmed
-        .split_once("://")
-        .map(|(_, rest)| rest)
-        .unwrap_or(trimmed);
-    let authority = without_scheme
-        .split(['/', '?', '#'])
-        .next()
-        .unwrap_or_default();
-    let host = authority.rsplit('@').next().unwrap_or(authority);
-    let host = host.split(':').next().unwrap_or(host);
-    host.trim().to_ascii_lowercase()
+    crate::web::parse_url(url)
+        .ok()
+        .and_then(|url| {
+            url.host_str()
+                .map(|host| host.trim_end_matches('.').to_string())
+        })
+        .unwrap_or_default()
 }
 
 pub fn summary_of(tool: &str, subject: &str) -> String {

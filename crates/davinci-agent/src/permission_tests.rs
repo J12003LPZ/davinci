@@ -1,6 +1,34 @@
 use super::*;
 use serde_json::json;
 
+#[test]
+fn audit_url_authorization_uses_the_transport_hostname() {
+    for (raw, host) in [
+        (
+            r"https://blocked.example\@allowed.example/",
+            "blocked.example",
+        ),
+        ("https://%62locked.example/path", "blocked.example"),
+        (
+            "https://allowed.example@blocked.example/",
+            "blocked.example",
+        ),
+        ("https://[2001:db8::1]:8443/path", "[2001:db8::1]"),
+        (" HTTPS://BLOCKED.EXAMPLE/path ", "blocked.example"),
+    ] {
+        assert_eq!(host_of(raw), host, "{raw}");
+        let mut p = policy(PermissionMode::Ask);
+        p.allow
+            .push(PermissionRule::parse("web_fetch(allowed.example)").unwrap());
+        p.deny
+            .push(PermissionRule::parse(&format!("web_fetch({host})")).unwrap());
+        assert!(
+            is_deny(&verdict(&p, "web_fetch", json!({"url":raw}))),
+            "{raw}"
+        );
+    }
+}
+
 fn cwd() -> PathBuf {
     if cfg!(windows) {
         PathBuf::from("C:\\work\\proj")
