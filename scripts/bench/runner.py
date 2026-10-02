@@ -172,7 +172,7 @@ def stop_reason(stdout, stderr):
             if isinstance(message, dict) and message.get("stopReason") == "error":
                 errors.append(str(message.get("errorMessage", "")))
     text = "\n".join(errors).lower()
-    if any(value in text for value in ("usage limit", "rate limit", "rate_limit", "quota exceeded", "insufficient_quota")):
+    if any(value in text for value in ("usage limit", "usage_limit_reached", "rate limit", "rate_limit", "quota exceeded", "insufficient_quota")):
         return "usage_limit"
     if any(value in text for value in ("unauthorized", "invalid api key", "incorrect api key",
             "authentication failed", "credentials expired", "refresh token expired", "not logged in")):
@@ -585,7 +585,7 @@ def create_campaign(root, manifest):
         json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
 
 
-def isolate_settings(source, target, settings):
+def isolate_settings(source, target, settings, *, subscription_only=False):
     """Restrict host permissions; tools in the same agent remain able to read auth."""
     source, target = Path(source), Path(target)
     auth = source / "auth.json"
@@ -593,8 +593,18 @@ def isolate_settings(source, target, settings):
         raise ValueError("credential file is unavailable in the selected agent directory")
     if auth.is_symlink():
         raise ValueError("linked credential files require an explicit resolved source")
+    credentials = None
+    if subscription_only:
+        store = json.loads(auth.read_text(encoding="utf-8"))
+        oauth = store.get("openai-codex") if isinstance(store, dict) else None
+        if not isinstance(oauth, dict) or oauth.get("type") != "oauth" or not oauth.get("access"):
+            raise ValueError("subscription campaign requires existing Codex OAuth credentials")
+        credentials = {"openai-codex": oauth}
     target.mkdir(parents=True, exist_ok=False, mode=0o700)
-    shutil.copyfile(auth, target / "auth.json")
+    if credentials is None:
+        shutil.copyfile(auth, target / "auth.json")
+    else:
+        (target / "auth.json").write_text(json.dumps(credentials) + "\n", encoding="utf-8")
     (target / "auth.json").chmod(0o600)
     (target / "settings.json").write_text(
         json.dumps(settings, indent=2) + "\n", encoding="utf-8")
@@ -778,14 +788,15 @@ def campaign_lock(campaign):
                 fcntl.flock(lock, fcntl.LOCK_UN)
 
 
-def controlled_environment(inherited, agent_dir):
+def controlled_environment(inherited, agent_dir, *, subscription_only=False):
     """Use copied credentials and declared settings, not inherited experiment knobs."""
     excluded = {"OPENAI_API_KEY", "OPENAI_BASE_URL", "OPENAI_ORG_ID",
                 "OPENAI_PROJECT_ID", "ANTHROPIC_API_KEY", "PYTHONPATH",
                 "PYTHONSTARTUP", "PYTHONOPTIMIZE"}
     result = {key: value for key, value in inherited.items()
               if not key.upper().startswith(("BENCH_", "DAVINCI_", "PI_", "OTEL_"))
-              and key.upper() not in excluded}
+              and key.upper() not in excluded
+              and not (subscription_only and key.upper().endswith(("_API_KEY", "_AUTH_TOKEN")))}
     result.update({"DAVINCI_CODING_AGENT_DIR": str(Path(agent_dir).resolve()),
                    "PI_CODING_AGENT_DIR": str(Path(agent_dir).resolve()),
                    "PI_LEARNING_DISABLE_BACKGROUND": "1", "PYTHONUTF8": "1"})

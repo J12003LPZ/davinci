@@ -103,7 +103,9 @@ impl Agent {
                 .is_some_and(|(current, _)| current == &identity);
             if !(local_matches || process_matches)
                 || binding.output_limit.is_some_and(|limit| {
-                    process.as_ref().is_none_or(|(_, current)| *current > limit)
+                    process
+                        .as_ref()
+                        .is_none_or(|(_, current)| current.is_none_or(|current| current > limit))
                 })
                 || restored
                     .as_ref()
@@ -135,7 +137,7 @@ impl Agent {
         }
         let output_limit = davinci_ai::provider_observation::process_budget_binding()
             .filter(|(identity, _)| identity == &budget.binding_identity())
-            .map(|(_, limit)| limit);
+            .and_then(|(_, limit)| limit);
         let data = serde_json::to_value(Binding {
             root: budget.root_id().into(),
             ledger: budget.path().into(),

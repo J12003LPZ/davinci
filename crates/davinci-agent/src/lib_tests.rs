@@ -4090,7 +4090,7 @@ fn a_passing_rerun_that_misses_the_change_is_not_reported_as_failed() {
         .unwrap();
 
     assert_eq!(agent.run_stats().completion_requirement_reminders, 1);
-    assert_eq!(harness_runs(&agent), 1);
+    assert_eq!(harness_runs(&agent), 1, "messages: {:?}", agent.messages);
     let reminders = reminders(&agent);
     assert_eq!(reminders.len(), 1, "{reminders:?}");
     assert!(

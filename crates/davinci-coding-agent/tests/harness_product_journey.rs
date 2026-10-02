@@ -73,8 +73,18 @@ fn request(
     route: &str,
     authorized: bool,
 ) -> std::io::Result<String> {
+    request_with_timeout(address, method, route, authorized, Duration::from_secs(10))
+}
+
+fn request_with_timeout(
+    address: SocketAddr,
+    method: &str,
+    route: &str,
+    authorized: bool,
+    read_timeout: Duration,
+) -> std::io::Result<String> {
     let mut stream = TcpStream::connect_timeout(&address, Duration::from_secs(2))?;
-    stream.set_read_timeout(Some(Duration::from_millis(500)))?;
+    stream.set_read_timeout(Some(read_timeout))?;
     stream.set_write_timeout(Some(Duration::from_secs(2)))?;
     write!(stream, "{method} {route} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\nContent-Length: 0\r\n{}\r\n", if authorized { "Authorization: Bearer synthetic-user\r\n" } else { "" })?;
     let mut result = String::new();
@@ -169,7 +179,17 @@ fn harness_operational_failures_have_observable_outcomes() {
     assert!(request(address, "GET", "/health", false)
         .unwrap()
         .starts_with("HTTP/1.1 200"));
-    assert!(request(address, "GET", "/hang", true).is_err());
+    // Ordinary journeys allow loaded CI scheduling; the deliberately silent
+    // endpoint still exercises a short, explicit socket timeout.
+    let timeout = request_with_timeout(address, "GET", "/hang", true, Duration::from_millis(500))
+        .unwrap_err();
+    assert!(
+        matches!(
+            timeout.kind(),
+            std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+        ),
+        "{timeout}"
+    );
     let logs = call(
         &manager,
         root.path(),

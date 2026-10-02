@@ -12,6 +12,12 @@ The subsequent authorized PR handoff uses a separate Git worktree based on [audi
 
 The evidence directory contains command receipts, exit codes, complete logs and log hashes. `final-source.json` and `local-build.identity.json` identify the final source and fixture executable after the final build; `validation-summary.json` indexes the executed checks. These are local evidence, not release provenance. A fixture-enabled build is rejected by release/campaign admission.
 
+The subsequent production-acceptance configuration fixes `gpt-6-luna` with high reasoning effort on the user's existing Codex subscription, through `openai-codex-responses` and Codex OAuth. Desktop-app usage is not a prerequisite. PR [#82](https://github.com/J12003LPZ/davinci/pull/82) precedes live acceptance. The user subsequently authorized reader subagents for acceptance work; source changes remain with one writer. The accepted native Windows artifact may be installed locally after the gates pass and its installed SHA-256 must match the tested executable. Public release publication and external deployment remain unauthorized.
+
+No API spend authorized. Subscription-only campaign. Budget by subscription usage allowance, request count, task count, and wall-clock time; API-equivalent dollars are reporting-only.
+
+The first pass uses at most 25% of the currently available subscription allowance only if that allowance can be measured and enforced reliably. The present adapter has no reliable durable allowance measurement, so the campaign instead freezes hard request, task and wall-clock caps, with available account usage snapshots recorded before and after. Account-wide changes are not attributed solely to DaVinci. Quota exhaustion, transport failure and unsupported functionality stop the campaign; there is no billing-route fallback. The initial suite requires 40–60 real tasks plus an untouched holdout. A future superiority claim requires at least 150 independent tasks across 3–5 real repositories and repeated matched-model runs.
+
 ## Delivered behavior
 
 - Actual provider sends carry root/actor/request/attempt identities and requested/returned model metadata. Foreground, worker, reviewer, compaction and enabled background purposes retain raw usage provenance. Missing cache-write counts, missing final usage, overflow and conflicting duplicate receipts remain unknown. Message summaries do not charge the same attempts again.
@@ -25,11 +31,13 @@ The evidence directory contains command receipts, exit codes, complete logs and 
 
 ## Budget operation
 
-`--root-budget <path>` is an opt-in JSON configuration. The path is resolved from the launch directory; the ledger path inside it is resolved from the configuration's directory. The schema contains `root_id`, `ledger`, `limits`, `per_attempt_max_output_tokens` and optional `parent_actor_id`. Limits contain positive `max_requests`, `max_output_tokens`, `deadline_unix_ms` and optional `max_cost_microusd` in millionths of USD. The deadline is absolute Unix milliseconds, so resume cannot renew it. Configuration is bounded to 16 KiB and rejects unknown fields.
+`--root-budget <path>` is an opt-in JSON configuration. The path is resolved from the launch directory; the ledger path inside it is resolved from the configuration's directory. The schema contains `root_id`, `ledger`, `limits`, `per_attempt_max_output_tokens` and optional `parent_actor_id`. Limits contain positive `max_requests` and `deadline_unix_ms`. The existing strict mode also requires positive `max_output_tokens`; its optional `max_cost_microusd` is in millionths of USD. The deadline is absolute Unix milliseconds, so resume cannot renew it. Configuration is bounded to 16 KiB and rejects unknown fields.
 
 Child CLIs inherit an immutable descriptor through `DAVINCI_INHERITED_ROOT_BUDGET`, reopen the existing ledger, and reject a replacement CLI budget flag. Persisted sessions require the same budget binding before execution. Starting or resuming without that binding does not reset the root. A cold resume retains unfinished reservations as unknown; reconcile them from trustworthy provider evidence before admitting more work.
 
 Request and output limits can be enforced on supported public/Azure Responses and configured completion routes. The private Codex route does not have a verified output-ceiling contract here, so strict output-bounded admission refuses it. Price estimates do not establish a strict spend bound. The absolute deadline gates new admissions; it does not guarantee termination of a request already in flight. This is host accounting, not an OS security boundary against arbitrary programs running as the same user.
+
+The separate subscription mode declares `limits.codex_subscription` with the fixed model and effort and requires both output and money ceilings, including the per-attempt output ceiling, to be null. It counts actual sends durably without asserting a public Responses output/cache contract. Before transport dispatch it requires Codex OAuth, the exact ChatGPT Codex endpoint, matching model/high effort, explicit SSE and zero retries. Budgeted HTTP requests do not follow redirects. Failed or unidentifiable terminal responses halt the ledger, while missing token counters remain null. Raw unaccounted provider probes are refused. The campaign supervisor additionally enforces task and wall-clock caps and requires new committed receipts for each launch without dropping previous receipts. Isolated credentials contain only the Codex OAuth entry; inherited API keys are stripped. Native process ownership does not isolate arbitrary tool code from all files or network access available to the OS user.
 
 ## Telemetry interpretation
 
@@ -53,7 +61,7 @@ Coverage is explicit: `diagnosticComparableOperations` and `diagnosticUnknownOpe
 | S02 | Delegation restriction parser and regressions, including curly apostrophes | Fixed and fixture verified |
 | S03–S04 | Existing plugin transaction, corruption, disabled-state and publication tests | Local regression coverage retained |
 | S05 | AI stream cancellation/backpressure fixtures and owned process lifecycle tests | Local cleanup covered; remote cancellation is not proof of zero usage |
-| M00 | `scripts/release_identity.py`, runner identity tests | Export/build identity implemented; verifiable Git/CI provenance unavailable |
+| M00 | `scripts/release_identity.py`, runner identity tests | Export transferred to isolated PR worktree; exact submitted-head green CI and release build still required |
 | M01 | Provider observations, agent stats, background ledger, Python receipt reconciliation | Fixture accounting verified; live print/RPC/interactive reconciliation remains unmeasured |
 | M02 | `harness_root_budget`, AI process-budget wire test, capacity tests | Durable admission and resume verified; monetary/private-Codex bounds limited as above |
 | M03 | `harness_accounting`, `tool_diagnostics`, stats, transaction dispatch and benchmark/readiness metrics | Stage separation, overlap and bounded state-matched diagnostics; coverage limits above remain explicit |
@@ -79,8 +87,8 @@ Coverage is explicit: `diagnosticComparableOperations` and `diagnosticUnknownOpe
 | P01 | Acceptance pack and planner tests | Risk-specific required checks implemented; a suggested pack is not a passing receipt |
 | P02 | `harness_product_journey` and product acceptance evals | Owned synthetic app exercised; real product/browser/platform journeys remain external acceptance |
 | P03 | `completion_delivery` and graph status | Evidence levels implemented; graph status stays at implemented when host semantic receipts are absent |
-| E01 | Existing private-suite importer, holdout and grader fixtures | Infrastructure verified; owner-supplied repositories/tasks unavailable |
-| E02 | Existing paired protocol, all-attempt metrics and admission gates | Offline protocol verified; no approved finite live campaign manifest |
+| E01 | Existing private-suite importer, holdout and grader fixtures | Real historical DaVinci tasks being curated; candidate count alone is not validated task admission |
+| E02 | Existing paired protocol, subscription campaign policy, all-attempt metrics and admission gates | Subscription-only campaign authorized; fixed baseline and finite manifest required before launch |
 | E03 | Existing ablation controls plus compaction/resume/background regressions | Offline boundaries covered; dev/holdout and long-session efficacy unmeasured |
 | R01 | Existing release validator plus delivery levels | No candidate promoted, installed or deployed; canary/rollback acceptance not exercised |
 | R02 | Keep/cut decisions below | Unmeasured components retained or left opt-in; no speculative deletion |
@@ -103,3 +111,11 @@ Before rollback, preserve session and root-ledger files; never erase reservation
 See `C:\Users\sergi\.codex\tmp\openai-harness-01a0fac0\validation-summary.json` for exact executed commands and counts. The final validation lanes are the whole offline Rust workspace with `test-fixtures`, strict workspace Clippy, formatting, Python benchmark/identity regressions, and a freshly built isolated executable. Ignored platform/live/browser/benchmark tests are not counted as passed. Windows-native fixture success does not establish Linux/WSL/macOS containment or a real browser journey.
 
 The acceptance level for this delivery is local engineering verification with the specific unmeasured gates above. Production readiness, measured efficiency and independent semantic superiority are not established by this record.
+
+### Subscription acceptance follow-up
+
+The subscription policy is now enforced at final request admission and each actual transport attempt. Budgeted HTTP clients refuse redirects; rejected or unidentified terminal receipts fail the operation and halt the subscription ledger. Each task must add fresh receipts without replacing prior reservations. Only Codex OAuth credentials are copied into the campaign settings directory, and inherited API-key environment variables are removed. Native Windows process ownership is verified separately from filesystem/network isolation; the native campaign remains diagnostic-only.
+
+The updated local workspace run passed 5,325 tests with zero failures and 40 ignored tests. Python benchmark checks ran 169 tests, with 165 passing and four skipped. Workspace formatting and strict all-target Clippy with `test-fixtures` passed. Full command receipts and log hashes are recorded in `acceptance-local-validation.json` beside the earlier evidence. Initial failed runs exposed a nonblocking Windows fixture socket and an MCP fixture path prerequisite; the final run uses an explicit fixture executable path. The actual 303 redirect regression failed before the redirect fix and passed afterward; 307 was already refused.
+
+The real-task catalog currently contains 40 development candidates and five unchanged holdout entries. Four historical Python cases have behavioral starter failures and passing reference tests; three Rust pilot candidates await validation. These counts are curation progress, not live task successes. Exact submitted-source CI, a fresh production release build, the authorized subscription campaign, operational acceptance and tested/installed hash equality remain required before installation.

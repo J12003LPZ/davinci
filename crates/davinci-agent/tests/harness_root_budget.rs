@@ -5,10 +5,100 @@ use std::sync::{Arc, Barrier};
 fn limits() -> BudgetLimits {
     BudgetLimits {
         max_requests: 2,
-        max_output_tokens: 100,
+        max_output_tokens: Some(100),
         max_cost_microusd: None,
+        codex_subscription: None,
         deadline_unix_ms: u64::MAX,
     }
+}
+
+fn subscription_event() -> davinci_ai::provider_observation::ProviderAttemptObservation {
+    serde_json::from_value(serde_json::json!({
+        "schema_version":1,"kind":"attempt_start","logical_request_id":"request",
+        "root_id":"root","actor_id":"actor","attempt_id":1,"purpose":"coding",
+        "model":"openai-codex/gpt-6-luna","selected_effort":"high","schema_hash":"fixture",
+        "transport":"http","elapsed_ms":0.0,"duration_ms":null,"status":"completed",
+        "http_status":200,"usage":null,"returned_model":"gpt-6-luna"
+    }))
+    .unwrap()
+}
+
+fn subscription_limits() -> BudgetLimits {
+    serde_json::from_value(serde_json::json!({"max_requests":1,
+        "max_output_tokens":null,"max_cost_microusd":null,"deadline_unix_ms":u64::MAX,
+        "codex_subscription":{"model":"gpt-6-luna","effort":"high"}
+    }))
+    .unwrap()
+}
+
+#[test]
+fn subscription_counts_requests_without_claiming_unknown_output_or_cost() {
+    use davinci_ai::provider_observation::AttemptBudget;
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("budget.json");
+    let budget = RootBudget::open(path.clone(), "root", subscription_limits()).unwrap();
+    let event = subscription_event();
+    AttemptBudget::reserve(&budget, &event, None).unwrap();
+    AttemptBudget::reconcile(&budget, &event).unwrap();
+    let child = RootBudget::reopen(path.clone(), "root", subscription_limits()).unwrap();
+    let mut next = event;
+    next.attempt_id = Some(2);
+    assert!(AttemptBudget::reserve(&child, &next, None)
+        .unwrap_err()
+        .contains("allowance exhausted"));
+    assert_eq!(child.snapshot().unwrap().requests, 1);
+    let ledger: serde_json::Value = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+    assert!(ledger["reservations"]["request:1"]["output"].is_null());
+    assert!(ledger["reservations"]["request:1"]["cost_microusd"].is_null());
+    assert!(ledger["reservations"]["request:1"]["output_ceiling"].is_null());
+}
+
+#[test]
+fn subscription_unknown_failed_and_changed_model_receipts_halt_after_reopen() {
+    use davinci_ai::provider_observation::AttemptBudget;
+    for case in 0..4 {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("budget.json");
+        let mut limits = subscription_limits();
+        limits.max_requests = 10;
+        let budget = RootBudget::open(path.clone(), "root", limits.clone()).unwrap();
+        let mut event = subscription_event();
+        AttemptBudget::reserve(&budget, &event, None).unwrap();
+        match case {
+            0 => event.status = "failed".into(),
+            1 => event.status = "unknown".into(),
+            2 => event.returned_model = None,
+            _ => event.returned_model = Some("other".into()),
+        }
+        assert!(AttemptBudget::reconcile(&budget, &event).is_err());
+        let child = RootBudget::reopen(path, "root", limits).unwrap();
+        assert!(child.snapshot().unwrap().halted);
+        event.attempt_id = Some(2);
+        assert!(AttemptBudget::reserve(&child, &event, None).is_err());
+        assert_eq!(child.snapshot().unwrap().requests, 1);
+    }
+}
+
+#[test]
+fn subscription_baseline_changes_are_denied_before_reservation() {
+    use davinci_ai::provider_observation::AttemptBudget;
+    let directory = tempfile::tempdir().unwrap();
+    let budget = RootBudget::open(
+        directory.path().join("budget.json"),
+        "root",
+        subscription_limits(),
+    )
+    .unwrap();
+    for case in 0..3 {
+        let mut event = subscription_event();
+        match case {
+            0 => event.model = "openai/gpt-6-luna".into(),
+            1 => event.selected_effort = Some("low".into()),
+            _ => event.transport = Some("websocket".into()),
+        }
+        assert!(AttemptBudget::reserve(&budget, &event, None).is_err());
+    }
+    assert_eq!(budget.snapshot().unwrap().requests, 0);
 }
 
 #[test]

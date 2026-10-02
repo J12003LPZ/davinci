@@ -19,6 +19,8 @@ fn non_retryable_limit_pattern() -> &'static Regex {
             "Monthly usage limit reached",
             "available balance",
             "insufficient_quota",
+            "usage_limit_reached",
+            "subscription-only",
             "out of budget",
             "quota exceeded",
             "billing",
@@ -103,6 +105,17 @@ pub fn is_retryable_error_text(text: &str) -> bool {
 mod tests {
     use super::*;
     use crate::stream::AssistantMessage;
+
+    #[test]
+    fn codex_subscription_exhaustion_and_policy_denials_never_retry() {
+        for error in [
+            "HTTP 429 usage_limit_reached",
+            "subscription-only receipt rejected: HTTP 503",
+        ] {
+            assert!(!is_retryable_error_text(error));
+            assert!(!is_retryable_assistant_error(&error_message(error)));
+        }
+    }
 
     fn error_message(text: &str) -> AssistantMessage {
         AssistantMessage {

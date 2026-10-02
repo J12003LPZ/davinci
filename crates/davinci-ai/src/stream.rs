@@ -646,6 +646,7 @@ pub fn live_complete_with(
         ));
     }
     let url = request_url_checked(model, auth)?;
+    crate::provider_observation::validate_request(model, auth, &options, body, &url)?;
     let headers = crate::merge_provider_attribution_headers(
         model,
         options.session_id.as_deref(),
@@ -683,6 +684,7 @@ pub fn live_complete_with(
         None,
         message.usage.clone(),
     );
+    crate::provider_observation::validate_completion()?;
     Ok(message)
 }
 
@@ -756,6 +758,9 @@ pub fn live_complete_streaming_with_sink_envelope(
     let result = live_complete_streaming_with_sink_envelope_inner(
         model, messages, auth, system, tools, &options, on_event,
     );
+    if result.is_ok() {
+        crate::provider_observation::validate_completion()?;
+    }
     if let (Some(dump), Ok(envelope)) = (&dump, &result) {
         dump.write(
             "usage",
@@ -803,6 +808,13 @@ fn live_complete_streaming_with_sink_envelope_inner(
     let prepared = crate::responses_request::PreparedProviderRequest::new(body);
     let body = prepared.body();
     observe_request(model, body);
+    crate::provider_observation::validate_request(
+        model,
+        auth,
+        options,
+        body,
+        &request_url_checked(model, auth)?,
+    )?;
     if crate::trace::enabled() {
         crate::trace::log(&format!(
             "prepared stream request segments={} prefix={} bytes={}",
@@ -1019,6 +1031,9 @@ pub fn raw_provider_post(
     url: &str,
     body: &Value,
 ) -> Result<RawProviderReply, String> {
+    if crate::provider_observation::active_budget().is_some() {
+        return Err("root budget denied: unaccounted raw provider probes are unavailable".into());
+    }
     let headers = collect_request_headers(model, auth, &StreamOptions::default());
     let mut request = crate::http::agent(crate::http::PROVIDER_IDLE_TIMEOUT).post(url);
     for (key, value) in &headers {

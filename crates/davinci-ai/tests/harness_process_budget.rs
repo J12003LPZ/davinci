@@ -36,7 +36,7 @@ fn host_limit_reaches_the_wire_and_cannot_be_replaced_by_a_worker_scope() {
         "approved-root".into(),
         "lead".into(),
         None,
-        17,
+        Some(17),
         Arc::new(OneRequest(AtomicUsize::new(0))),
     )
     .unwrap();
@@ -72,6 +72,14 @@ fn host_limit_reaches_the_wire_and_cannot_be_replaced_by_a_worker_scope() {
     };
     let error = live_complete_with(&model, &[], &auth, None, &[], &options).unwrap_err();
     assert!(error.contains("no observation scope"), "{error}");
+    assert!(davinci_ai::raw_provider_post(
+        &model,
+        &auth,
+        "http://127.0.0.1:1",
+        &serde_json::json!({})
+    )
+    .unwrap_err()
+    .contains("unaccounted raw provider probes"));
     let server = std::thread::spawn(move || {
         listener.set_nonblocking(true).unwrap();
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);

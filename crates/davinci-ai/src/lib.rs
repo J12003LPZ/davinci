@@ -59,6 +59,7 @@ pub mod responses_tools;
 mod retry;
 mod shell;
 mod stream;
+pub mod subscription_policy;
 #[doc(hidden)]
 pub use stream::{openai_responses_input, openai_responses_input_with};
 pub mod provider_observation;

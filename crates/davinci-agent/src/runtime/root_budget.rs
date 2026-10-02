@@ -17,10 +17,37 @@ const MAX_LEDGER_BYTES: usize = 16 * 1024 * 1024;
 #[serde(deny_unknown_fields)]
 pub struct BudgetLimits {
     pub max_requests: u64,
-    pub max_output_tokens: u64,
+    pub max_output_tokens: Option<u64>,
     pub max_cost_microusd: Option<u64>,
+    #[serde(default)]
+    pub codex_subscription: Option<davinci_ai::subscription_policy::CodexSubscriptionPolicy>,
     /// Absolute, persisted deadline; resuming never resets elapsed allowance.
     pub deadline_unix_ms: u64,
+}
+
+impl BudgetLimits {
+    pub fn validate(&self) -> Result<(), String> {
+        if self.max_requests == 0
+            || self.deadline_unix_ms == 0
+            || self.max_output_tokens == Some(0)
+            || self.max_cost_microusd == Some(0)
+        {
+            return Err("root budget requires positive finite limits".into());
+        }
+        match &self.codex_subscription {
+            Some(policy) => {
+                policy.validate()?;
+                if self.max_output_tokens.is_some() || self.max_cost_microusd.is_some() {
+                    return Err("subscription-only budget uses requests and time, not API USD or unverified output caps".into());
+                }
+            }
+            None if self.max_output_tokens.is_none() => {
+                return Err("strict root budget requires an output cap".into())
+            }
+            None => {}
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -36,7 +63,7 @@ enum Disposition {
 #[serde(deny_unknown_fields)]
 struct Reservation {
     actor: String,
-    output_ceiling: u64,
+    output_ceiling: Option<u64>,
     cost_ceiling: Option<u64>,
     output: Option<u64>,
     cost_microusd: Option<u64>,
@@ -89,11 +116,8 @@ impl Ledger {
             }
             if let Some(output) = reservation.output {
                 add(&mut snapshot.committed_output_tokens, output)?;
-            } else {
-                add(
-                    &mut snapshot.reserved_output_tokens,
-                    reservation.output_ceiling,
-                )?;
+            } else if let Some(ceiling) = reservation.output_ceiling {
+                add(&mut snapshot.reserved_output_tokens, ceiling)?;
             }
             if let Some(cost) = reservation.cost_microusd {
                 add(&mut snapshot.committed_cost_microusd, cost)?;
@@ -124,10 +148,10 @@ impl RootBudget {
     }
 
     fn load(path: PathBuf, root: &str, limits: BudgetLimits, create: bool) -> Result<Self, String> {
+        limits.validate()?;
         if root.is_empty()
             || root.len() > 256
             || limits.max_requests == 0
-            || limits.max_output_tokens == 0
             || limits.max_cost_microusd == Some(0)
             || limits.deadline_unix_ms == 0
         {
@@ -209,17 +233,19 @@ impl RootBudget {
                 || attempt.len() > 512
                 || reservation.actor.is_empty()
                 || reservation.actor.len() > 256
-                || reservation.output_ceiling == 0
+                || reservation.output_ceiling == Some(0)
+                || (self.limits.max_output_tokens.is_some() && reservation.output_ceiling.is_none())
                 || reservation
                     .output
-                    .is_some_and(|n| n > reservation.output_ceiling)
+                    .zip(reservation.output_ceiling)
+                    .is_some_and(|(n, ceiling)| n > ceiling)
                 || reservation
                     .cost_microusd
                     .zip(reservation.cost_ceiling)
                     .is_some_and(|(n, bound)| n > bound)
                 || (self.limits.max_cost_microusd.is_some() && reservation.cost_ceiling.is_none())
                 || (reservation.disposition == Disposition::Committed
-                    && (reservation.output.is_none()
+                    && ((self.limits.max_output_tokens.is_some() && reservation.output.is_none())
                         || (self.limits.max_cost_microusd.is_some()
                             && reservation.cost_microusd.is_none())))
             {
@@ -257,6 +283,16 @@ impl RootBudget {
         output: u64,
         cost_ceiling: Option<u64>,
     ) -> Result<(), String> {
+        self.reserve_attempt(actor, attempt, Some(output), cost_ceiling)
+    }
+
+    fn reserve_attempt(
+        &self,
+        actor: &str,
+        attempt: &str,
+        output: Option<u64>,
+        cost_ceiling: Option<u64>,
+    ) -> Result<(), String> {
         if self.faulted.load(Ordering::SeqCst) {
             return Err("root budget denied: persistence failed".into());
         }
@@ -264,7 +300,8 @@ impl RootBudget {
             || actor.len() > 256
             || attempt.is_empty()
             || attempt.len() > 512
-            || output == 0
+            || output == Some(0)
+            || (self.limits.max_output_tokens.is_some() && output.is_none())
         {
             return Err(
                 "root budget reservation needs bounded owner, attempt and output ceiling".into(),
@@ -290,9 +327,10 @@ impl RootBudget {
             .committed_output_tokens
             .checked_add(snapshot.reserved_output_tokens);
         if snapshot.requests >= self.limits.max_requests
-            || used
-                .and_then(|n| n.checked_add(output))
-                .is_none_or(|n| n > self.limits.max_output_tokens)
+            || self.limits.max_output_tokens.is_some_and(|limit| {
+                used.and_then(|n| n.checked_add(output.unwrap_or(0)))
+                    .is_none_or(|n| n > limit)
+            })
         {
             return Err("root budget denied: request or output allowance exhausted".into());
         }
@@ -337,7 +375,9 @@ impl RootBudget {
             .get_mut(attempt)
             .ok_or("unknown root reservation")?;
         let conflict = reservation.disposition == Disposition::Released
-            || output.is_some_and(|n| n > reservation.output_ceiling)
+            || output
+                .zip(reservation.output_ceiling)
+                .is_some_and(|(n, ceiling)| n > ceiling)
             || cost
                 .zip(reservation.cost_ceiling)
                 .is_some_and(|(n, ceiling)| n > ceiling)
@@ -353,7 +393,8 @@ impl RootBudget {
         }
         reservation.output = output.or(reservation.output);
         reservation.cost_microusd = cost.or(reservation.cost_microusd);
-        reservation.disposition = if reservation.output.is_some()
+        reservation.disposition = if (self.limits.max_output_tokens.is_none()
+            || reservation.output.is_some())
             && (self.limits.max_cost_microusd.is_none() || reservation.cost_microusd.is_some())
         {
             Disposition::Committed
@@ -396,6 +437,20 @@ impl RootBudget {
 }
 
 impl davinci_ai::provider_observation::AttemptBudget for RootBudget {
+    fn validate_request(
+        &self,
+        model: &davinci_ai::Model,
+        auth: &davinci_ai::ResolvedAuth,
+        options: &davinci_ai::StreamOptions,
+        body: &serde_json::Value,
+        url: &str,
+    ) -> Result<(), String> {
+        if let Some(policy) = &self.limits.codex_subscription {
+            policy.validate_request(model, auth, options, body, url)?;
+        }
+        Ok(())
+    }
+
     fn binding_identity(&self) -> Option<String> {
         Some(self.binding_identity())
     }
@@ -417,10 +472,22 @@ impl davinci_ai::provider_observation::AttemptBudget for RootBudget {
             .ok_or("root budget denied: missing attempt")?;
         // Catalog estimates do not establish a route/tier monetary guarantee.
         // Until a trusted bound is supplied, strict monetary admission refuses.
-        self.reserve(
+        if let Some(policy) = &self.limits.codex_subscription {
+            if event.model != format!("openai-codex/{}", policy.model)
+                || event.selected_effort.as_deref() != Some(policy.effort.as_str())
+                || event.transport.as_deref() != Some("http")
+            {
+                return Err("subscription-only admission denied: request baseline changed".into());
+            }
+        }
+        self.reserve_attempt(
             actor,
             &format!("{}:{id}", event.logical_request_id),
-            output.ok_or("root budget denied: provider output ceiling is unknown")?,
+            if self.limits.codex_subscription.is_some() {
+                None
+            } else {
+                Some(output.ok_or("root budget denied: provider output ceiling is unknown")?)
+            },
             None,
         )
     }
@@ -432,6 +499,23 @@ impl davinci_ai::provider_observation::AttemptBudget for RootBudget {
         let id = event
             .attempt_id
             .ok_or("root budget receipt lacks attempt identity")?;
+        if let Some(policy) = &self.limits.codex_subscription {
+            if event.status != "completed"
+                || event.returned_model.as_deref() != Some(policy.model.as_str())
+            {
+                let _lock = self.lock()?;
+                let mut ledger = self.read()?;
+                ledger.halted = true;
+                if let Some(reservation) = ledger
+                    .reservations
+                    .get_mut(&format!("{}:{id}", event.logical_request_id))
+                {
+                    reservation.disposition = Disposition::Unknown;
+                }
+                self.write(&ledger)?;
+                return Err("subscription-only receipt rejected: unsuccessful or unidentified response; campaign halted".into());
+            }
+        }
         // Output can be measured even when input cache-write provenance is
         // absent. Settle only this known dimension; monetary uncertainty is
         // independently retained by reconcile.
@@ -463,8 +547,9 @@ mod tests {
             "root",
             BudgetLimits {
                 max_requests: 65_536,
-                max_output_tokens: u64::MAX,
+                max_output_tokens: Some(u64::MAX),
                 max_cost_microusd: None,
+                codex_subscription: None,
                 deadline_unix_ms: u64::MAX,
             },
         )
@@ -476,7 +561,7 @@ mod tests {
                 format!("{index:08}{}", "x".repeat(500)),
                 Reservation {
                     actor: "a".repeat(256),
-                    output_ceiling: 1,
+                    output_ceiling: Some(1),
                     cost_ceiling: None,
                     output: None,
                     cost_microusd: None,

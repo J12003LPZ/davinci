@@ -13,7 +13,7 @@ pub struct RootBudgetConfig {
     pub root_id: String,
     pub ledger: PathBuf,
     pub limits: BudgetLimits,
-    pub per_attempt_max_output_tokens: u64,
+    pub per_attempt_max_output_tokens: Option<u64>,
     #[serde(default)]
     pub parent_actor_id: Option<String>,
 }
@@ -25,10 +25,11 @@ impl RootBudgetConfig {
         }
         let mut config: Self = serde_json::from_slice(bytes)
             .map_err(|e| format!("invalid root budget configuration: {e}"))?;
-        if config.per_attempt_max_output_tokens == 0
-            || config.per_attempt_max_output_tokens > config.limits.max_output_tokens
-        {
-            return Err("per-attempt output limit must fit the positive root allowance".into());
+        config.limits.validate()?;
+        match (config.per_attempt_max_output_tokens, config.limits.max_output_tokens) {
+            (None, None) => {},
+            (Some(attempt), Some(root)) if attempt > 0 && attempt <= root => {},
+            _ => return Err("per-attempt output limit must fit the positive root allowance or be absent for subscription-only admission".into()),
         }
         config.ledger =
             std::path::absolute(base.join(&config.ledger)).map_err(|e| e.to_string())?;
@@ -105,6 +106,32 @@ pub fn initialize(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn subscription_config_has_request_and_time_limits_without_api_spend_or_output_claims() {
+        let directory = tempfile::tempdir().unwrap();
+        let value = serde_json::json!({"root_id":"subscription", "ledger":"root.json", "limits": {
+            "max_requests":20, "max_output_tokens":null, "max_cost_microusd":null,
+            "deadline_unix_ms":18446744073709551615u64,
+            "codex_subscription":{"model":"gpt-6-luna","effort":"high"}},
+            "per_attempt_max_output_tokens":null});
+        let parse = |value: &serde_json::Value| {
+            RootBudgetConfig::parse(&serde_json::to_vec(value).unwrap(), directory.path())
+        };
+        let config = parse(&value).unwrap();
+        assert!(config.bind(false).is_ok());
+        for field in ["max_output_tokens", "max_cost_microusd"] {
+            let mut invalid = value.clone();
+            invalid["limits"][field] = serde_json::json!(100);
+            assert!(parse(&invalid).is_err(), "{field}");
+        }
+        let mut invalid = value.clone();
+        invalid["limits"]["codex_subscription"] = serde_json::Value::Null;
+        assert!(parse(&invalid).is_err());
+        let mut invalid = value;
+        invalid["per_attempt_max_output_tokens"] = serde_json::json!(10);
+        assert!(parse(&invalid).is_err());
+    }
 
     #[test]
     fn config_is_finite_and_children_reopen_the_same_allowance() {

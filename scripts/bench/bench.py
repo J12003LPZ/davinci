@@ -40,6 +40,7 @@ from runner import (create_campaign, isolate_settings, controlled_environment, s
 from codex_otel import Collector, request_metrics
 from private_suite import apply_hidden, import_suite, load_frozen, run_check, GradingLifecycleError
 from readiness_metrics import report as readiness_report, load_prices
+import subscription_campaign
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 TASKS = os.path.join(HERE, "tasks")
@@ -113,12 +114,12 @@ def prepare(tid, dest):
     checked_git(dest, "commit", "-q", "--no-verify", "-m", "fixture")
 
 
-def grade(tid, workdir):
+def grade(tid, workdir, timeout=120):
     hidden = os.path.join(TASKS, tid, "hidden")
     spec = load(tid)
     if "private_provenance" in spec:
         apply_hidden(spec, hidden, workdir)
-        checked = run_check(spec["grader_command"], workdir)
+        checked = run_check(spec["grader_command"], workdir, timeout)
         if checked["cleanup_complete"] is not True:
             raise GradingLifecycleError("private grader cleanup incomplete")
         detail = (checked["stdout"] or checked["stderr"]).strip().splitlines()
@@ -130,6 +131,7 @@ def grade(tid, workdir):
     checked = run_check(
         [sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider", *files],
         workdir,
+        timeout,
     )
     if checked["cleanup_complete"] is not True:
         raise GradingLifecycleError("public grader cleanup incomplete")
@@ -425,13 +427,25 @@ def parse_stream(harness, stdout):
     return stats
 
 
+def grading_timeout(campaign):
+    campaign = campaign or {}
+    timeout = campaign.get("grading_timeout_seconds", 120)
+    if campaign.get("subscription"):
+        timeout = min(timeout, subscription_campaign.remaining_seconds(campaign["subscription"]))
+    return timeout
+
+
 def run_one(harness, tid, rep, campaign=None):
+    subscription = campaign.get("subscription") if campaign else None
+    if subscription:
+        subscription_campaign.remaining_seconds(subscription)
+    before = subscription_campaign.snapshot(subscription) if subscription else None
     spec = load(tid)
     workdir = os.path.join(RUNS, harness, f"{tid}-r{rep}")
     if os.path.exists(workdir):
         raise FileExistsError("run directory already exists")
     prepare(tid, workdir)
-    env = (controlled_environment(os.environ, campaign["agent_dir"])
+    env = (controlled_environment(os.environ, campaign["agent_dir"], subscription_only=bool(subscription))
            if campaign else dict(os.environ, PI_LEARNING_DISABLE_BACKGROUND="1", PYTHONUTF8="1"))
     with Collector() if harness == "codex" else nullcontext() as collector:
         args = command(harness, spec["prompt"], workdir)
@@ -444,14 +458,23 @@ def run_one(harness, tid, rep, campaign=None):
                 catalog = json.loads(Path(campaign["agent_dir"], "models-store.json").read_text(encoding="utf-8"))
                 if digest(catalog) != catalog_hash:
                     raise ValueError("model catalog changed during campaign")
+            if subscription:
+                frozen_budget = json.loads(Path(subscription["config_path"]).read_text(encoding="utf-8"))
+                if frozen_budget != subscription["root_budget"]:
+                    raise ValueError("subscription budget changed during campaign")
+                args[1:1] = ["--root-budget", subscription["config_path"]]
+                env["DAVINCI_EFFORT_POLICY"] = "fixed"
             args = container_command(args, workdir, env, campaign, harness)
         if collector:
             for value in collector.overrides():
                 args[-1:-1] = ["-c", value]
-        measured = execute(args, workdir, env, TIMEOUT)
+        timeout = min(TIMEOUT, subscription_campaign.remaining_seconds(subscription)) if subscription else TIMEOUT
+        measured = execute(args, workdir, env, timeout)
     code, stdout, stderr = measured["exit"], measured["stdout"], measured["stderr"]
     stopped = ("cleanup_failed" if measured.get("cleanup_complete") is not True else None)
     stopped = stopped or stop_reason(stdout, stderr)
+    if subscription and measured.get("cleanup_complete") is True:
+        stopped = stopped or subscription_campaign.stop_reason(subscription, code, before)
     if harness == "davinci":
         stopped = stopped or model_stop_reason(stdout, MODEL)
     wall = measured["wall_s"]
@@ -479,11 +502,11 @@ def run_one(harness, tid, rep, campaign=None):
     else:
         regression = None
         try:
-            regression = run_check(spec["regression_command"], workdir) if "private_provenance" in spec else None
+            regression = run_check(spec["regression_command"], workdir, grading_timeout(campaign)) if "private_provenance" in spec else None
             if regression is not None and regression["cleanup_complete"] is not True:
                 stopped = "regression_cleanup_failed"
                 raise GradingLifecycleError("regression cleanup incomplete")
-            ok, passed, failed, tail = grade(tid, workdir)
+            ok, passed, failed, tail = grade(tid, workdir, grading_timeout(campaign))
         except GradingLifecycleError as error:
             cleanup_complete = False
             stopped = stopped or "grader_cleanup_failed"
@@ -518,6 +541,9 @@ def run_one(harness, tid, rep, campaign=None):
         "regression_exit": regression["exit"] if regression else None,
         "execution_mode": "print",
     }
+    if subscription:
+        result.update(billing="subscription-only", api_spend_authorized_usd=0, actual_api_spend_usd=None,
+                      spend_policy=subscription_campaign.SPEND_POLICY)
     if "private_provenance" in spec:
         result.update({key: spec["private_provenance"][key] for key in
                        ("size_class", "split", "language", "repository_id", "reference_commit", "visible_tests", "requires_existing_test_changes")})
@@ -592,7 +618,7 @@ def validate_fixture_manifest(task_ids, large_manifest):
     return errors
 
 
-def validate(task_set="legacy", large_manifest=None, private_tasks=None):
+def validate(task_set="legacy", large_manifest=None, private_tasks=None, timeout=120):
     task_ids = private_tasks or select_tasks(task_set, ["all"], large_manifest)
     manifest_errors = validate_fixture_manifest(task_ids, large_manifest) if large_manifest else []
     if manifest_errors:
@@ -603,15 +629,15 @@ def validate(task_set="legacy", large_manifest=None, private_tasks=None):
     for tid in task_ids:
         d = os.path.join(RUNS, "_validate", tid)
         prepare(tid, d)
-        before = grade(tid, d)
+        before = grade(tid, d, timeout)
         prepare(tid, d)
         if "private_provenance" in load(tid):
             shutil.rmtree(d, onexc=_force_remove)
             shutil.copytree(os.path.join(TASKS, tid, "solution"), d)
         else:
             copy_tree(os.path.join(TASKS, tid, "solution"), d)
-        after = grade(tid, d)
-        reference_regression = run_check(load(tid)["regression_command"], d) if "private_provenance" in load(tid) else None
+        after = grade(tid, d, timeout)
+        reference_regression = run_check(load(tid)["regression_command"], d, timeout) if "private_provenance" in load(tid) else None
         if reference_regression is not None and reference_regression["cleanup_complete"] is not True:
             raise GradingLifecycleError("reference regression cleanup incomplete")
         good = (not before[0]) and after[0] and (reference_regression is None or reference_regression["pass"])
@@ -857,12 +883,16 @@ def main():
     ap.add_argument("--large-manifest")
     ap.add_argument("--variant", default="baseline")
     ap.add_argument("--settings", help="explicit DaVinci settings JSON")
+    ap.add_argument("--subscription-policy", help="subscription-only request/task/time caps; fixed gpt-6-luna/high")
+    ap.add_argument("--grading-timeout", type=int, default=120, help="maximum seconds per grader/regression process (1–3600)")
     ap.add_argument("--model-store", help="existing public model catalog to pin for DaVinci")
     ap.add_argument("--baseline")
     ap.add_argument("--candidate")
     ap.add_argument("--base-ref", help="declared PR target ref used to verify the actual parent merge-base")
     ap.add_argument("--parent-for", help="candidate source SHA when running a parent control; requires --base-ref")
     args = ap.parse_args()
+    if not 1 <= args.grading_timeout <= 3600:
+        ap.error("grading-timeout must be between 1 and 3600 seconds")
     private = None
     private_tids = None
     private_digest = None
@@ -879,7 +909,7 @@ def main():
     if args.mode == "validate":
         large = json.loads(Path(args.large_manifest).read_text(encoding="utf-8")) if args.large_manifest else None
         try:
-            validate(args.task_set, large, private_tids)
+            validate(args.task_set, large, private_tids, args.grading_timeout)
         except ValueError as error:
             ap.error(str(error))
     elif args.mode == "report":
@@ -921,16 +951,27 @@ def main():
                      [(h, t, r) for r in repetitions for t in tids for h in args.harness])
             manifest["campaign_lock"] = lock
             manifest.update(tasks=tids, repetitions=repetitions, harnesses=args.harness,
-                            order=args.order, order_seed=args.order_seed, schedule=order)
+                            order=args.order, order_seed=args.order_seed, schedule=order,
+                            grading_timeout_seconds=args.grading_timeout)
+            if args.subscription_policy:
+                if any(value != "diagnostic-only" for value in manifest["grading_isolation"].values()):
+                    raise ValueError("subscription campaign currently requires native process ownership")
+                policy = json.loads(Path(args.subscription_policy).read_text(encoding="utf-8"))
+                manifest["subscription"] = subscription_campaign.prepare(
+                    policy, RUNS, len(order), args.harness, MODEL, EFFORT, settings)
             pinned_models = pin_model_store(args.model_store, MODEL) if args.model_store else None
             if pinned_models:
                 manifest["identities"]["davinci"]["model_catalog_hash"] = digest(pinned_models)
             create_campaign(RUNS, manifest)
+            if "subscription" in manifest:
+                Path(manifest["subscription"]["config_path"]).write_text(
+                    json.dumps(manifest["subscription"]["root_budget"], indent=2) + "\n", encoding="utf-8")
             if prices is not None:
                 Path(RUNS, "prices.json").write_text(json.dumps(prices, indent=2) + "\n", encoding="utf-8")
             Path(RUNS, "fixtures.json").write_text(json.dumps(fixtures, indent=2), encoding="utf-8")
             if "davinci" in args.harness:
-                isolate_settings(agent_source(), Path(manifest["agent_dir"]), settings)
+                isolate_settings(agent_source(), Path(manifest["agent_dir"]), settings,
+                                 subscription_only="subscription" in manifest)
                 if pinned_models:
                     Path(manifest["agent_dir"], "models-store.json").write_text(
                         json.dumps(pinned_models, indent=2), encoding="utf-8")

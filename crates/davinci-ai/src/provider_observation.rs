@@ -92,11 +92,22 @@ struct State {
     budget: Option<Arc<dyn AttemptBudget>>,
     output_limit: Option<u64>,
     purpose_override: Option<String>,
+    reconciliation_error: Option<String>,
 }
 
 /// Host-owned admission at the actual transport send, including retries.
 /// No implementation can grant authority by changing model-visible text.
 pub trait AttemptBudget: Send + Sync {
+    fn validate_request(
+        &self,
+        _model: &crate::Model,
+        _auth: &crate::ResolvedAuth,
+        _options: &crate::StreamOptions,
+        _body: &Value,
+        _url: &str,
+    ) -> Result<(), String> {
+        Ok(())
+    }
     /// Opaque host binding for durable session admission; absent is unverified.
     fn binding_identity(&self) -> Option<String> {
         None
@@ -113,13 +124,13 @@ struct ProcessBudget {
     root: String,
     actor: String,
     parent_actor: Option<String>,
-    output_limit: u64,
+    output_limit: Option<u64>,
     budget: Arc<dyn AttemptBudget>,
 }
 
 static PROCESS_BUDGET: OnceLock<ProcessBudget> = OnceLock::new();
 
-pub fn process_budget_binding() -> Option<(String, u64)> {
+pub fn process_budget_binding() -> Option<(String, Option<u64>)> {
     let budget = PROCESS_BUDGET.get()?;
     Some((budget.budget.binding_identity()?, budget.output_limit))
 }
@@ -130,10 +141,10 @@ pub fn install_process_budget(
     root: String,
     actor: String,
     parent_actor: Option<String>,
-    output_limit: u64,
+    output_limit: Option<u64>,
     budget: Arc<dyn AttemptBudget>,
 ) -> Result<(), String> {
-    if root.is_empty() || actor.is_empty() || output_limit == 0 {
+    if root.is_empty() || actor.is_empty() || output_limit == Some(0) {
         return Err("process budget requires root, actor and positive output limit".into());
     }
     PROCESS_BUDGET
@@ -148,15 +159,48 @@ pub fn install_process_budget(
 }
 
 pub(crate) fn bounded_output_limit(requested: Option<u64>) -> Option<u64> {
-    match PROCESS_BUDGET.get() {
-        Some(budget) => Some(
-            requested
-                .filter(|n| *n > 0)
-                .unwrap_or(budget.output_limit)
-                .min(budget.output_limit),
-        ),
+    match PROCESS_BUDGET.get().and_then(|budget| budget.output_limit) {
+        Some(limit) => Some(requested.filter(|n| *n > 0).unwrap_or(limit).min(limit)),
         None => requested,
     }
+}
+
+pub(crate) fn active_budget() -> Option<Arc<dyn AttemptBudget>> {
+    PROCESS_BUDGET.get().map(|p| p.budget.clone()).or_else(|| {
+        CURRENT.with(|current| {
+            current
+                .borrow()
+                .as_ref()
+                .and_then(|s| s.borrow().budget.clone())
+        })
+    })
+}
+
+pub(crate) fn validate_request(
+    model: &crate::Model,
+    auth: &crate::ResolvedAuth,
+    options: &crate::StreamOptions,
+    body: &Value,
+    url: &str,
+) -> Result<(), String> {
+    if let Some(budget) = active_budget() {
+        budget.validate_request(model, auth, options, body, url)?;
+    }
+    Ok(())
+}
+
+/// A rejected terminal receipt must not become a successful one-request task.
+pub(crate) fn validate_completion() -> Result<(), String> {
+    CURRENT.with(|current| {
+        match current
+            .borrow()
+            .as_ref()
+            .and_then(|s| s.borrow().reconciliation_error.clone())
+        {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
+    })
 }
 
 impl State {
@@ -244,6 +288,7 @@ impl ObservationScope {
             budget,
             output_limit: None,
             purpose_override: None,
+            reconciliation_error: None,
         }));
         let previous = CURRENT.with(|current| current.replace(Some(Rc::clone(&state))));
         Self { state, previous }
@@ -469,12 +514,11 @@ impl Attempt {
             event.returned_model = state.template.returned_model.clone();
             event.returned_service_tier = state.template.returned_service_tier.clone();
             event.duration_ms = Some(self.started.elapsed().as_secs_f64() * 1000.0);
-            if state
-                .budget
-                .as_ref()
-                .is_some_and(|budget| budget.reconcile(&event).is_err())
-            {
-                event.status = "unknown".into();
+            if let Some(budget) = &state.budget {
+                if let Err(error) = budget.reconcile(&event) {
+                    state.reconciliation_error = Some(error);
+                    event.status = "unknown".into();
+                }
             }
             state.record(event);
         }
@@ -490,6 +534,32 @@ impl Drop for Attempt {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rejected_terminal_receipt_cannot_return_success() {
+        struct Reject;
+        impl AttemptBudget for Reject {
+            fn reserve(
+                &self,
+                _: &ProviderAttemptObservation,
+                _: Option<u64>,
+            ) -> Result<(), String> {
+                Ok(())
+            }
+            fn reconcile(&self, _: &ProviderAttemptObservation) -> Result<(), String> {
+                Err("subscription-only receipt rejected".into())
+            }
+        }
+        let scope = ObservationScope::capture().with_budget(Arc::new(Reject));
+        begin_request("coding", "fixture", None, "fixture");
+        Attempt::try_start("http")
+            .unwrap()
+            .finish("completed", Some(200), None);
+        assert!(validate_completion()
+            .unwrap_err()
+            .contains("subscription-only"));
+        assert_eq!(scope.finish("failed")[2].status, "unknown");
+    }
 
     #[test]
     fn harness_attempts_preserve_root_and_nested_lineage() {

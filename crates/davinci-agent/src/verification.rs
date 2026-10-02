@@ -120,9 +120,13 @@ fn syntax(name: &str, source: &str) -> Option<SyntaxFacts> {
     }
     let mut command = Command::new(&interpreter);
     command.args(["-I", "-S", "-c", include_str!("verification/python_ast.py")]);
-    #[cfg(windows)]
+    // Classification is deterministic; loaded CI must not turn a coverage
+    // regression into a process-start timing test. Production remains bounded.
+    #[cfg(test)]
+    let inspection_budget = Duration::from_secs(10);
+    #[cfg(all(windows, not(test)))]
     let inspection_budget = Duration::from_secs(1);
-    #[cfg(not(windows))]
+    #[cfg(all(not(windows), not(test)))]
     let inspection_budget = Duration::from_millis(250);
     let facts = inspect_command(command, source, inspection_budget)?;
     let mut cache = cache.lock().ok()?;
