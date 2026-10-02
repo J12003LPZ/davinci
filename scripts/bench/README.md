@@ -272,6 +272,12 @@ hidden-grader secrecy. Independent acceptance remains a separate gate.
   Grading/parsing are excluded. All failures/timeouts stay in distributions;
   paired both-successful rows are reported separately so an early failure is
   visible rather than silently rewarded as a speedup.
+- **Startup state:** readiness reports retain all rows and separately summarize
+  an optional workload-recorded `startup_state` of `cold` or `warm`. Missing or
+  unrecognized values are `unknown`; provider cache hits and repetition order
+  never establish process warmth. `attempt_outcomes` counts process completion,
+  failure, timeout, abort, and unknown exit status separately from composite
+  task success. Missing token usage stays unavailable in each group.
 - **Task success:** integer exit zero, grader success, confirmed cleanup, no
   unrelated changes, no transaction leak, and no detected forbidden artifact.
   Missing evidence cannot pass. Cleanup and inspection failures are written as
