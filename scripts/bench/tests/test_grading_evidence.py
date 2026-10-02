@@ -58,7 +58,8 @@ class GradingEvidenceTests(unittest.TestCase):
                 for phase, checked in (("regression", regression), ("grader", grader)):
                     ref = row["grading_evidence"][phase]
                     path = Path(ref["path"])
-                    self.assertEqual(path.parent, workdir.parent)
+                    # Windows CI may spell its temp root using an 8.3 alias.
+                    self.assertEqual(path.parent, workdir.parent.resolve())
                     self.assertEqual(ref["sha256"], hashlib.sha256(path.read_bytes()).hexdigest())
                     receipt = json.loads(path.read_text(encoding="utf-8"))
                     self.assertEqual(receipt["command"], spec[phase + "_command"])
