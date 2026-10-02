@@ -243,11 +243,13 @@ impl Agent {
         self.ensure_session_persistence()?;
         self.recover_pending_operation_publications()?;
         self.require_prompt_checkpoint_persistence()?;
+        let run_started = std::time::Instant::now();
         let result = self.run_loop_body(emit_prompt_messages, complete);
         self.completion_context.clear();
         self.invalidate_context_image();
         let rewind_persistence = self.settle_prompt_checkpoint();
         let persistence = self.ensure_session_persistence();
+        crate::RunStats::add_elapsed(&mut self.stats.wall_ms, run_started.elapsed());
         if let Err(error) = rewind_persistence {
             self.fail_turn(&error);
             return Err(error);
@@ -394,6 +396,7 @@ impl Agent {
         }
 
         loop {
+            let preparation_started = std::time::Instant::now();
             self.ensure_session_persistence()?;
             if self.abort_requested() {
                 self.finish_run(&mut events, new_messages);
@@ -424,6 +427,43 @@ impl Agent {
 
             self.inject_queued(&mut events, &mut new_messages, true);
             self.inject_job_notices(&mut events, &mut new_messages)?;
+
+            let repair = self.runtime.as_ref().and_then(|runtime| {
+                runtime
+                    .progress_watchdog
+                    .lock()
+                    .ok()
+                    .map(|mut watchdog| watchdog.repair_action())
+            });
+            self.persist_harness_checkpoint()?;
+            if let Some(action) = repair {
+                use crate::runtime::progress_watchdog::RepairAction;
+                match action {
+                    RepairAction::Continue => {}
+                    RepairAction::ChangeApproach(signal) => {
+                        let packet = self
+                            .completion_state
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .failure_packet
+                            .clone()
+                            .unwrap_or_else(|| {
+                                crate::runtime::contracts::redact_secrets(&signal.description())
+                            });
+                        self.queue_capability_reminder(&format!(
+                            "Repeated unchanged failure. Change the hypothesis or obtain new evidence in one bounded recovery attempt. Keep the repair focused on this failure; if it cannot be resolved, report blocked/unverified.\n{packet}"),
+                            "completion.repair", &mut events, &mut new_messages);
+                    }
+                    RepairAction::Blocked(_) => {
+                        self.push_event(&mut events, AgentEvent::CompletionNotice {
+                            reason_code: "completion.no_progress".into(),
+                            text: "Blocked/unverified: the same failure returned after the bounded recovery attempt. Prior evidence and remaining root budget are retained.".into(),
+                        });
+                        self.finish_run(&mut events, new_messages);
+                        return Ok(events);
+                    }
+                }
+            }
 
             let environment_changed = self.refresh_runtime_environment_for_request();
             if self.prompt_session.is_builtin()
@@ -541,8 +581,12 @@ impl Agent {
             self.record_decision_request_effort();
             self.stats.model_turns += 1;
             turns_this_run += 1;
+            crate::RunStats::add_elapsed(
+                &mut self.stats.preparation_ms,
+                preparation_started.elapsed(),
+            );
             let model_started = std::time::Instant::now();
-            let observations = davinci_ai::provider_observation::ObservationScope::capture();
+            let observations = self.provider_observation_scope("coding");
             let completion = self.complete_with_retry(&mut complete, &mut events);
             let status = match &completion {
                 Ok((message, _, _, _)) => match message.stop_reason {
@@ -553,6 +597,7 @@ impl Agent {
                 Err(_) => "failed",
             };
             for observation in observations.finish(status) {
+                self.stats.note_provider_observation(&observation);
                 self.push_event(
                     &mut events,
                     AgentEvent::ProviderObservation {
@@ -999,11 +1044,10 @@ impl Agent {
             false
         };
         for queued in drained {
-            let message = if batch_prepared {
-                self.prompt_user_with_prepared(&queued.text, &queued.images)
-            } else {
-                self.prompt_user_with(&queued.text, &queued.images)
-            };
+            if !batch_prepared {
+                let _ = self.prepare_builtin_prompt_for_user_turn(&queued.text);
+            }
+            let message = self.prompt_user_with_completion(&queued.text, &queued.images, steer);
             let _ = self.pending_prompt_messages.pop();
             new_messages.push(message.clone());
             self.push_event(
@@ -1069,10 +1113,12 @@ impl Agent {
         let mut last_error = None;
         let mut scheduled_attempt = 0_u32;
         for attempt in 0..attempts {
+            let queue_started = std::time::Instant::now();
             let permit = crate::runtime::capacity::REQUEST_CAPACITY
                 .acquire(crate::runtime::capacity::RequestClass::Foreground, || {
                     self.abort_requested() || self.retry_aborted
                 });
+            crate::RunStats::add_elapsed(&mut self.stats.queue_ms, queue_started.elapsed());
             if permit.is_none() {
                 if scheduled_attempt > 0 {
                     self.push_event(
@@ -1103,7 +1149,9 @@ impl Agent {
             if attempt > 0 {
                 self.stats.provider_retries += 1;
             }
+            let provider_started = std::time::Instant::now();
             let result = complete(self);
+            crate::RunStats::add_elapsed(&mut self.stats.provider_ms, provider_started.elapsed());
             drop(permit);
             match result {
                 Ok(output) => {
@@ -1119,21 +1167,6 @@ impl Agent {
                         self.tool_context
                             .cache
                             .record_provider_cost(usage.cost.total);
-                        self.stats.budget_tokens_charged = self
-                            .stats
-                            .budget_tokens_charged
-                            .saturating_add(usage.total_tokens);
-                        if usage.cost.total > 0.0 {
-                            let minor = (usage.cost.total * 10_000.0) as u64;
-                            self.stats.cost_minor_units = Some(
-                                self.stats
-                                    .cost_minor_units
-                                    .unwrap_or(0)
-                                    .saturating_add(minor),
-                            );
-                        } else {
-                            self.stats.has_unknown_cost = true;
-                        }
                     }
 
                     if message.stop_reason == Some(StopReason::Error)
@@ -1154,7 +1187,12 @@ impl Agent {
                                     .unwrap_or_else(|| "Unknown error".into()),
                             },
                         );
+                        let retry_started = std::time::Instant::now();
                         sleep_retry_delay(delay, || self.abort_requested() || self.retry_aborted);
+                        crate::RunStats::add_elapsed(
+                            &mut self.stats.retry_wait_ms,
+                            retry_started.elapsed(),
+                        );
                         continue;
                     }
                     if scheduled_attempt > 0 {
@@ -1196,7 +1234,12 @@ impl Agent {
                                 error_message: err,
                             },
                         );
+                        let retry_started = std::time::Instant::now();
                         sleep_retry_delay(delay, || self.abort_requested() || self.retry_aborted);
+                        crate::RunStats::add_elapsed(
+                            &mut self.stats.retry_wait_ms,
+                            retry_started.elapsed(),
+                        );
                     } else {
                         // A refused request (a 400, a bad key) comes back the
                         // same every time; TS fails at once and so does this.
@@ -2401,6 +2444,11 @@ impl Agent {
                         crate::verification::workspace::Snapshot::capture_inputs(&self.cwd, &paths);
                     self.record_shell_verification_start(id, snapshot);
                 }
+                let retrieval_timing =
+                    (name == "retrieve_context").then(|| self.counters.digest_retrieval.start());
+                let read_probe = self.begin_read_diagnostic(cwd, name, args);
+                let integration_timing =
+                    (name == "patch_apply").then(|| self.counters.integration.start());
                 let result = if name == "web_fetch" {
                     crate::web::fetch_tool_with_redirect_check(args, &mut |url| {
                         if self.abort_requested() {
@@ -2417,6 +2465,24 @@ impl Agent {
                 } else {
                     execute_tool_with(cwd, name, args, &context)
                 };
+                drop(retrieval_timing);
+                drop(integration_timing);
+                if let Ok(result) = &result {
+                    self.finish_read_diagnostic(read_probe, cwd, id, name, args, result);
+                } else {
+                    self.finish_read_diagnostic(
+                        read_probe,
+                        cwd,
+                        id,
+                        name,
+                        args,
+                        &crate::ToolResult {
+                            content: String::new(),
+                            is_error: true,
+                            details: None,
+                        },
+                    );
+                }
                 let mut executed = match result {
                     Ok(result) => result,
                     Err(crate::tools::ToolError::Unknown(_)) => {
@@ -3087,7 +3153,7 @@ impl Agent {
             .cloned();
         let terminal = if original.is_error != decorated.is_error {
             None
-        } else if let Some(receipt) = receipt {
+        } else if let Some(ref receipt) = receipt {
             if !receipt.started
                 || receipt.exit_code.is_none()
                 || receipt.timed_out
@@ -3097,40 +3163,26 @@ impl Agent {
                 || receipt.simulated
                 || receipt.hook_vetoed
                 || (original.is_error && receipt.exit_code == Some(0))
+                || (receipt.requires_test_discovery() && receipt.assertion_counts.is_none())
             {
                 None
             } else {
                 Some(receipt.is_passed() && !original.is_error)
             }
         } else {
-            original.details.as_ref().and_then(|details| {
-                if [
-                    "denied",
-                    "cancelled",
-                    "timed_out",
-                    "timeout",
-                    "not_dispatched",
-                    "pending",
-                    "background",
-                ]
-                .iter()
-                .any(|key| details.get(key).and_then(Value::as_bool) == Some(true))
-                {
-                    return None;
-                }
-                details
-                    .get("exitCode")
-                    .and_then(Value::as_i64)
-                    .and_then(|exit| {
-                        if exit == 0 && original.is_error {
-                            None
-                        } else {
-                            Some(exit == 0)
-                        }
-                    })
-            })
+            // Tool metadata and hook output are not process execution proof.
+            None
         };
         if let Some(passed) = terminal {
+            if let Some(receipt) = receipt {
+                crate::stats::SharedCounters::add(
+                    &self.counters.verification_work_ms,
+                    receipt
+                        .finished_at_ms
+                        .saturating_sub(receipt.started_at_ms)
+                        .max(0) as u64,
+                );
+            }
             crate::stats::SharedCounters::add(&self.counters.verification_commands_run, 1);
             if !passed {
                 crate::stats::SharedCounters::add(&self.counters.verification_failures, 1);
@@ -3252,7 +3304,7 @@ impl Agent {
         };
 
         if let Some(runtime) = &self.runtime {
-            let input_fp = if let Some(cmd) = args.get("command").and_then(Value::as_str) {
+            let mut input_fp = if let Some(cmd) = args.get("command").and_then(Value::as_str) {
                 cmd.to_string()
             } else if let Some(path) = args.get("path").and_then(Value::as_str) {
                 path.to_string()
@@ -3283,6 +3335,27 @@ impl Agent {
 
             let normalized_output =
                 crate::runtime::progress_watchdog::normalize_output_noise(&pre_hook.content);
+            // Incomplete host inventory stays explicitly unknown.
+            let source = if pre_hook.is_error && matches!(name, "bash" | "powershell") {
+                self.completion_file_snapshot(&[])
+                    .and_then(|s| s.fingerprint())
+            } else {
+                None
+            };
+            let generation = self.mutation_verification_state().mutation_generation;
+            input_fp.push_str(&format!(
+                " [actor={} source={} generation={generation}]",
+                runtime.agent_id,
+                source.as_deref().unwrap_or("unknown")
+            ));
+            if pre_hook.is_error {
+                let diagnostic = crate::runtime::contracts::redact_secrets(&pre_hook.content)
+                    .chars()
+                    .take(1600)
+                    .collect::<String>();
+                self.completion_state.lock().unwrap_or_else(|e| e.into_inner()).failure_packet = Some(format!(
+                    "Failing tool: {name}; recovery: tool-call {id}; source: {}; mutation generation: {generation}\nDiagnostic (bounded; full result retained at that tool call):\n{diagnostic}", source.as_deref().unwrap_or("unknown")));
+            }
             let output_digest = {
                 use std::hash::{Hash, Hasher};
                 let mut hasher = std::collections::hash_map::DefaultHasher::new();
@@ -3296,7 +3369,7 @@ impl Agent {
                         || normalized_output.contains("assertion failed")
                         || normalized_output.contains("error:")
                     {
-                        Some(normalized_output.chars().take(200).collect())
+                        Some(format!("{input_fp} {output_digest}"))
                     } else {
                         None
                     }
@@ -6524,6 +6597,38 @@ mod tests {
     }
 
     #[test]
+    fn harness_synthetic_exit_code_has_no_verification_authority() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("changed.py"), "value = 1\n").unwrap();
+        let mut agent = Agent::new("receipt fixture");
+        agent.cwd = root.path().into();
+        agent.record_successful_mutation_paths(vec![PathBuf::from("changed.py")]);
+        let generation = agent.mutation_verification_state().mutation_generation;
+        agent
+            .verification_starts
+            .lock()
+            .unwrap()
+            .insert("fabricated".into(), generation);
+        let result = crate::ToolResult {
+            content: "passed".into(),
+            is_error: false,
+            details: Some(serde_json::json!({"exitCode":0})),
+        };
+        agent.observe_shell_verification(
+            "fabricated",
+            root.path(),
+            "bash",
+            &serde_json::json!({"command":"python -c 'import changed; assert changed.value == 1'"}),
+            &result,
+            &result,
+        );
+        assert_ne!(
+            agent.mutation_verification_state().verified_generation,
+            Some(generation)
+        );
+    }
+
+    #[test]
     fn transactional_normal_dispatch_publishes_exact_effects_and_invalidates_evidence() {
         let root = tempfile::tempdir().unwrap();
         std::fs::write(root.path().join("a.txt"), b"before").unwrap();
@@ -6668,6 +6773,7 @@ mod tests {
         assert_eq!(effects[0].after_blob, effects[1].before_blob);
         assert_eq!(effects[0].before_blob, effects[1].after_blob);
         assert_eq!(agent.mutation_verification_state().mutation_generation, 2);
+        assert!(agent.run_stats().integration_ms.is_some());
     }
 
     #[test]

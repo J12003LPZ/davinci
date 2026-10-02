@@ -97,7 +97,8 @@ class RunnerTests(unittest.TestCase):
             source = runner.source_identity(repo)
             identity = self.green_identity(binary, source)
             binary.with_suffix(".exe.identity.json").write_text(json.dumps(identity))
-            self.assertEqual(runner.checkpoint_identity(binary, repo), source)
+            validated = runner.checkpoint_identity(binary, repo)
+            self.assertEqual({key: validated[key] for key in source}, source)
             binary.write_bytes(b"changed")
             with self.assertRaises(ValueError):
                 runner.checkpoint_identity(binary, repo)
@@ -130,7 +131,9 @@ class RunnerTests(unittest.TestCase):
             identity = self.green_identity(binary, runner.source_identity(repo))
             for changes in ({"schema_version": 1}, {"dirty_diff_hash": None},
                             {"dirty_diff_hash": "b" * 64}, {"source_clean": False},
-                            {"source_sha": "c" * 40}, {"source_tree": "d" * 40}):
+                            {"source_sha": "c" * 40}, {"source_tree": "d" * 40},
+                            {"build_features": ["test-fixtures"]}, {"build_features": None},
+                            {"build_platform": None}):
                 binary.with_suffix(".exe.identity.json").write_text(json.dumps(dict(identity, **changes)))
                 with self.subTest(changes=changes), self.assertRaises(ValueError):
                     runner.checkpoint_identity(binary, repo)

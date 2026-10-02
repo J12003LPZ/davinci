@@ -655,7 +655,8 @@ pub fn live_complete_with(
     let timeout_ms = options.timeout_ms.filter(|ms| *ms > 0);
     let (text, observation) = crate::provider_retry::retry_provider_request_controlled(
         || {
-            let observation = crate::provider_observation::Attempt::start("http");
+            let observation = crate::provider_observation::Attempt::try_start("http")
+                .map_err(|error| crate::provider_retry::ProviderError::new(None, error))?;
             match send_provider_body(&url, &headers, body, timeout_ms, false) {
                 Ok(text) => Ok((text, observation)),
                 Err(error) => {
@@ -698,6 +699,7 @@ fn observe_request(model: &Model, body: &Value) {
         effort,
         &schema_hash,
     );
+    crate::provider_observation::dispatch_options(body);
 }
 
 /// Streaming complete: the events the provider sent, replayed after the fact.
@@ -881,7 +883,8 @@ fn live_complete_streaming_with_sink_envelope_inner(
     crate::trace::log(&format!("sse post {}", crate::trace::redact_url(&url)));
     let (response, observation) = crate::provider_retry::retry_provider_request_controlled(
         || {
-            let observation = crate::provider_observation::Attempt::start("http");
+            let observation = crate::provider_observation::Attempt::try_start("http")
+                .map_err(|error| crate::provider_retry::ProviderError::new(None, error))?;
             match crate::stream_http::send(
                 &url,
                 &headers,
@@ -1272,7 +1275,7 @@ pub fn request_body_with(
         }
         _ => openai_body(model, messages, system, tools, options),
     };
-    apply_max_tokens_override(&mut body, options);
+    apply_max_tokens_override(model, &mut body, options);
     apply_native_responses_resume(&mut body, model, messages, options);
     body
 }
@@ -1717,13 +1720,33 @@ fn apply_native_responses_resume(
     }
 }
 
-fn apply_max_tokens_override(body: &mut Value, options: &StreamOptions) {
-    let Some(max_tokens) = options.max_tokens.filter(|value| *value > 0) else {
+fn apply_max_tokens_override(model: &Model, body: &mut Value, options: &StreamOptions) {
+    let Some(max_tokens) = crate::provider_observation::bounded_output_limit(options.max_tokens)
+        .filter(|value| *value > 0)
+    else {
         return;
     };
     let Value::Object(map) = body else {
         return;
     };
+    // Only emit explicit host limits on supported dialects. Codex's private
+    // route has no established output-limit contract, so strict admission
+    // refuses it instead of pretending the catalog maximum is enforced.
+    match model.api.as_str() {
+        "openai-responses" | "azure-openai-responses" => {
+            map.insert("max_output_tokens".into(), Value::from(max_tokens));
+        }
+        "openai-completions" => {
+            let field = model
+                .compat
+                .get("maxTokensField")
+                .and_then(Value::as_str)
+                .filter(|field| matches!(*field, "max_tokens" | "max_completion_tokens"))
+                .unwrap_or("max_completion_tokens");
+            map.insert(field.into(), Value::from(max_tokens));
+        }
+        _ => {}
+    }
     if map.contains_key("max_tokens") {
         map.insert("max_tokens".into(), Value::from(max_tokens));
     }
@@ -2439,6 +2462,9 @@ fn google_body(
 /// - openai-responses-shared.ts:561-570 (subtract details from input_tokens)
 /// - bedrock-converse-stream.ts:693 (camelCase converse keys)
 pub(crate) fn usage_from_value(model: &Model, usage: &Value) -> Usage {
+    if usage.get("prompt_tokens").is_some() || usage.get("input_tokens_details").is_some() {
+        crate::provider_observation::record_openai_usage(usage);
+    }
     let get = |key: &str| usage.get(key).and_then(Value::as_u64);
     let base_input = get("prompt_tokens")
         .or_else(|| get("input_tokens"))

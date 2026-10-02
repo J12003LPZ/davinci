@@ -1,5 +1,7 @@
 # Production harness readiness evidence
 
+The current exported-tree implementation is recorded in [OpenAI harness implementation — 2026-10-02](openai-harness-implementation.md). The branch, CI and benchmark statements below are the historical September 30 record, not evidence for the October 2 source export.
+
 This branch implements the engineering portions of the [authoritative plan](production-harness-readiness-plan.md), based on `2e52d0f68f9cc989fc69a6114409e237e1990158`. The [requirement ledger](requirements-evidence.json) retains every checkbox and its source line. It distinguishes code verification from acceptance evidence. The product is not certified as better than Codex or Claude Code.
 
 The work is isolated in the cloud branch `codex/production-readiness-cloud-20260930`, reviewed in [draft PR #74](https://github.com/J12003LPZ/davinci/pull/74). No release tag, installation, deployment, private campaign or paid model call was made. Copilot's quota-blocked review is not independent review evidence.

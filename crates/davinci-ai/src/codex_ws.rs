@@ -95,7 +95,7 @@ pub fn process_codex_websocket(
         map.insert("type".into(), Value::String("response.create".into()));
     }
     crate::wire_dump::write_current("wire", &outgoing);
-    let observation = crate::provider_observation::Attempt::start("websocket");
+    let observation = crate::provider_observation::Attempt::try_start("websocket")?;
     let send = write_text_frame(&mut stream, &outgoing.to_string());
     if let Err(err) = send {
         observation.finish("failed", None, None);

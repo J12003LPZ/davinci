@@ -12,6 +12,7 @@ pub mod subagent_progress;
 pub use permission_state::PermissionState;
 mod batch;
 mod branch;
+mod budget_session;
 pub mod command_receipt;
 mod compaction;
 mod completion;
@@ -43,6 +44,7 @@ mod stats;
 mod subagent;
 mod templates;
 pub mod todo;
+mod tool_diagnostics;
 pub mod tool_ledger;
 mod tool_name;
 pub mod tools;
@@ -555,6 +557,8 @@ pub struct Agent {
     /// peak context, prunings. Read them through `run_stats`, which also
     /// folds in the counters bumped from inside tool calls.
     pub stats: RunStats,
+    observation_root_id: String,
+    root_budget: Option<runtime::capacity::RootBudget>,
     pub counters: Arc<SharedCounters>,
     /// When old tool output leaves the provider's view (`pruning.rs`).
     pub prune_settings: PruneSettings,
@@ -738,6 +742,8 @@ impl Agent {
             event_sink: None,
             abort_signal: None,
             stats: RunStats::default(),
+            observation_root_id: uuid::Uuid::new_v4().to_string(),
+            root_budget: None,
             counters: SharedCounters::shared(),
             prune_settings: PruneSettings::default(),
             evidence: None,
@@ -829,6 +835,13 @@ impl Agent {
     }
 
     pub fn set_runtime(&mut self, mut runtime: RuntimeHandle) {
+        // Rebuilding turn observers must never erase the host's spending
+        // boundary. Workers inherit the same handle from their parent.
+        if let Some(budget) = &self.root_budget {
+            runtime.root_budget = Some(budget.clone());
+        } else {
+            self.root_budget = runtime.root_budget.clone();
+        }
         self.prompt_checkpoint_bus = None;
         runtime.ensure_conversation_identity_current();
         let rewind_binding = self.prompt_rewind_binding();
@@ -912,6 +925,85 @@ impl Agent {
     pub fn with_runtime(mut self, runtime: RuntimeHandle) -> Self {
         self.set_runtime(runtime);
         self
+    }
+
+    /// Bind a host-approved durable budget before executing requests. A live
+    /// agent cannot replace its ledger to reset consumed allowance.
+    pub fn bind_root_budget(
+        &mut self,
+        budget: runtime::capacity::RootBudget,
+    ) -> Result<(), String> {
+        if self.root_budget.as_ref().is_some_and(|current| {
+            current.path() != budget.path() || current.root_id() != budget.root_id()
+        }) {
+            return Err("cannot replace an agent's root budget".into());
+        }
+        budget.snapshot()?;
+        self.persist_root_budget(&budget)?;
+        if let Some(runtime) = &mut self.runtime {
+            runtime.root_budget = Some(budget.clone());
+            self.tool_context.runtime = Some(runtime.clone());
+        }
+        self.root_budget = Some(budget);
+        Ok(())
+    }
+
+    pub(crate) fn provider_observation_scope(
+        &self,
+        purpose: &str,
+    ) -> davinci_ai::provider_observation::ObservationScope {
+        let (mut root, actor, parent) = self.runtime.as_ref().map_or_else(
+            || {
+                (
+                    self.observation_root_id.clone(),
+                    self.observation_root_id.clone(),
+                    None,
+                )
+            },
+            |runtime| {
+                (
+                    runtime.run_id.to_string(),
+                    runtime.agent_id.to_string(),
+                    runtime.parent_agent_id.map(|id| id.to_string()),
+                )
+            },
+        );
+        let budget = self.root_budget.as_ref().or_else(|| {
+            self.runtime
+                .as_ref()
+                .and_then(|runtime| runtime.root_budget.as_ref())
+        });
+        if let Some(budget) = budget {
+            root = budget.root_id().into();
+        }
+        let purpose = if purpose == "coding" && parent.is_some() {
+            "worker"
+        } else {
+            purpose
+        };
+        let scope = davinci_ai::provider_observation::ObservationScope::capture_for(
+            &root,
+            &actor,
+            parent.as_deref(),
+        )
+        .with_purpose(purpose);
+        match budget {
+            Some(budget) => scope.with_budget(Arc::new(budget.clone())),
+            None => scope,
+        }
+    }
+
+    fn finish_auxiliary_observations(
+        &mut self,
+        scope: davinci_ai::provider_observation::ObservationScope,
+        status: &str,
+    ) {
+        for observation in scope.finish(status) {
+            self.stats.note_provider_observation(&observation);
+            self.emit_live(AgentEvent::ProviderObservation {
+                observation: Box::new(observation),
+            });
+        }
     }
 
     pub fn set_decision_runtime(&mut self, runtime: Arc<decision::DecisionRuntime>) {
@@ -1909,9 +2001,33 @@ impl Agent {
         text: &str,
         images: &[davinci_ai::MessageContent],
     ) -> ChatMessage {
-        self.begin_completion_prompt(text);
+        self.prompt_user_with_completion(text, images, false)
+    }
+
+    pub(crate) fn prompt_user_with_completion(
+        &mut self,
+        text: &str,
+        images: &[davinci_ai::MessageContent],
+        correction: bool,
+    ) -> ChatMessage {
+        if correction {
+            self.begin_completion_correction(text);
+        } else {
+            self.begin_completion_prompt(text);
+        }
         self.clear_turn_decision();
-        let message = self.prompt_with_origin(text, images, true);
+        let message = self.prompt_with_origin(text, images, true, correction);
+        if let (Some(runtime), Some(budget)) = (&self.runtime, &self.root_budget) {
+            let admitted = budget.snapshot().is_ok_and(|snapshot| {
+                !snapshot.halted
+                    && snapshot.unknown == 0
+                    && snapshot.requests < budget.limits().max_requests
+                    && (crate::command_receipt::now() as u64) < budget.limits().deadline_unix_ms
+            });
+            if let Ok(mut watchdog) = runtime.progress_watchdog.lock() {
+                watchdog.resume_budgeted(admitted);
+            }
+        }
         self.delegation_forbidden =
             crate::delegation::delegation_forbidden_after(self.delegation_forbidden, [text]);
         self.last_real_user_request = Some(text.to_string());
@@ -1924,7 +2040,7 @@ impl Agent {
         text: &str,
         images: &[davinci_ai::MessageContent],
     ) -> ChatMessage {
-        self.prompt_with_origin(text, images, false)
+        self.prompt_with_origin(text, images, false, false)
     }
 
     fn prompt_with_origin(
@@ -1932,6 +2048,7 @@ impl Agent {
         text: &str,
         images: &[davinci_ai::MessageContent],
         real_user_origin: bool,
+        correction: bool,
     ) -> ChatMessage {
         self.flush_pending_bash_messages();
         // A job that finished while the user was typing is in context
@@ -1961,9 +2078,23 @@ impl Agent {
             ..ChatMessage::default()
         };
         if real_user_origin {
+            message.extra.insert(
+                "davinciRequirementCorrection".into(),
+                Value::Bool(correction),
+            );
             message
                 .extra
                 .insert(REAL_USER_ORIGIN_FIELD.into(), Value::Bool(true));
+            let state = self
+                .completion_state
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            if state.request != text && state.request.len() <= 64 * 1024 {
+                message.extra.insert(
+                    completion::REQUIREMENT_CONTEXT_FIELD.into(),
+                    Value::String(state.request.clone()),
+                );
+            }
         }
         self.messages.push(message.clone());
         if let Some(session) = &mut self.session {
@@ -2326,6 +2457,7 @@ impl Agent {
     pub fn run_stats(&self) -> RunStats {
         let mut stats = self.stats;
         self.counters.fold_into(&mut stats);
+        self.read_diagnostics().fold_into(&mut stats);
         stats
     }
 
@@ -3554,6 +3686,7 @@ impl Agent {
             .context_vm
             .load_state_from_root()
             .unwrap_or_default();
+        let observations = self.provider_observation_scope("compaction");
         let proposal = self.summarizer.as_ref().and_then(|summarizer| {
             let request = runtime::context_vm::fold_request(
                 &parent,
@@ -3579,6 +3712,17 @@ impl Agent {
                 })
                 .ok()
         });
+        let observed = observations.finish(if proposal.is_some() {
+            "completed"
+        } else {
+            "failed"
+        });
+        for observation in observed {
+            self.stats.note_provider_observation(&observation);
+            self.emit_live(AgentEvent::ProviderObservation {
+                observation: Box::new(observation),
+            });
+        }
         let root = runtime
             .context_vm
             .fold_with_proposal(reason, &events, proposal)?;
@@ -3714,6 +3858,7 @@ impl Agent {
                 inner.summarize(&request)
             })
         });
+        let observations = self.provider_observation_scope("compaction");
         let mut result = compact_messages_with_options(
             &self.messages,
             custom_instructions,
@@ -3721,6 +3866,14 @@ impl Agent {
             self.compaction.reserve_tokens,
             previous_summary.as_deref(),
             bound.as_ref(),
+        );
+        self.finish_auxiliary_observations(
+            observations,
+            if result.compacted {
+                "completed"
+            } else {
+                "failed"
+            },
         );
         if result.compacted {
             if let Some(session) = &mut self.session {
@@ -3799,6 +3952,8 @@ impl Agent {
     /// Activate durable task state before replacing the active session.
     /// Reloading the live source preserves its writer lease and worker handles.
     pub fn load_from_session(&mut self, mut session: JsonlSession) -> Result<(), String> {
+        let session_budget = self.restore_root_budget(&session)?;
+        let repair_checkpoint = Self::restore_repair_checkpoint(&session)?;
         let source = std::fs::canonicalize(&session.path).map_err(|error| {
             format!("Runtime recovery required: session source could not be resolved: {error}")
         })?;
@@ -3837,6 +3992,14 @@ impl Agent {
             })?,
         };
         let ledger_path = session.path.with_extension("tool-ledger.json");
+        if session_changed {
+            if let Some(watchdog) = repair_checkpoint {
+                *candidate
+                    .progress_watchdog
+                    .lock()
+                    .map_err(|_| "repair watchdog unavailable")? = watchdog;
+            }
+        }
         let legacy_observations =
             ToolCallLedger::legacy_observations_from_path(&ledger_path, &session.header.id)
                 .map_err(|error| format!("Runtime recovery required: {error}"))?;
@@ -3870,8 +4033,40 @@ impl Agent {
         self.delegation_forbidden = delegation_forbidden_from_session(&session);
         self.reset_session_approvals();
         self.messages = messages;
+        self.completion_state = Arc::new(Mutex::new(completion::CompletionState::default()));
+        for message in davinci_session::branch_entries(&session.entries, session.leaf_id.as_deref())
+            .into_iter()
+            .filter_map(entry_to_chat)
+            .filter(|message| message.role == "user" && message.extra_bool(REAL_USER_ORIGIN_FIELD))
+        {
+            self.last_real_user_request = Some(davinci_ai::content_text(&message.content));
+            let saved = message
+                .extra
+                .get(completion::REQUIREMENT_CONTEXT_FIELD)
+                .and_then(Value::as_str)
+                .filter(|text| text.len() <= 64 * 1024)
+                .map(str::to_owned);
+            let text = davinci_ai::content_text(&message.content);
+            let mut state = self
+                .completion_state
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            // Restored prose is context, never restored proof of verification.
+            state.request = if let Some(saved) = saved {
+                saved
+            } else if message.extra_bool("davinciRequirementCorrection")
+                && !state.request.is_empty()
+            {
+                format!("{}\n\nLater user correction:\n{text}", state.request)
+            } else {
+                text
+            };
+        }
         self.pending_prompt_messages.clear();
         self.session = Some(session);
+        if let Some(budget) = session_budget {
+            self.root_budget = Some(budget);
+        }
         self.tool_ledger = Arc::new(std::sync::Mutex::new(candidate_ledger));
         self.set_runtime(candidate);
         self.install_prompt_checkpoints(rewind);
@@ -4007,6 +4202,7 @@ impl Agent {
                     inner.summarize(&request)
                 })
             });
+            let observations = self.provider_observation_scope("compaction");
             let result = generate_branch_summary(
                 &collected,
                 self.context_window,
@@ -4014,6 +4210,16 @@ impl Agent {
                 custom_instructions,
                 replace_instructions,
                 bound.as_ref(),
+            );
+            self.finish_auxiliary_observations(
+                observations,
+                if result.aborted {
+                    "aborted"
+                } else if result.error.is_some() {
+                    "failed"
+                } else {
+                    "completed"
+                },
             );
             if result.aborted {
                 return Ok(TreeNavigateResult {

@@ -38,6 +38,7 @@ Options:
                                  Print/json mode: also write the final reply text to <file> (atomic;
                                  written even when the run fails). Davinci addition, Codex exec parity
   --output-schema <file>         Print/json mode: the final reply must be JSON matching the JSON schema
+  --root-budget <file>           Bind requests and output to a durable root budget (all modes)
                                  in <file>. OpenAI routes also enforce it on the wire. One repair turn
                                  on a mismatch, then exit 1. Davinci addition, Codex exec parity
   --cd, -C <dir>                 Run as if started in <dir>: settings, trust, AGENTS.md and

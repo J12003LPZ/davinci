@@ -642,7 +642,12 @@ mod tests {
             };
             begin_request("security-watch", "fixture", None, "fixture");
             Attempt::start("websocket").finish("failed", None, None);
-            Attempt::start("http").finish("completed", Some(200), Some(usage.clone()));
+            let attempt = Attempt::start("http");
+            davinci_ai::provider_observation::record_openai_usage(&serde_json::json!({
+                "input_tokens":10,"output_tokens":5,"total_tokens":15,
+                "input_tokens_details":{"cached_tokens":0,"cache_write_tokens":0}
+            }));
+            attempt.finish("completed", Some(200), Some(usage.clone()));
             Ok(AssistantMessage {
                 extra: Default::default(),
                 id: "fixture".into(),

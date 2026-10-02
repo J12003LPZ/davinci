@@ -1,5 +1,9 @@
 # Context VM
 
+The [October 2 keep/cut record](readiness/openai-harness-implementation.md)
+retains the off default. Compaction/resume fixtures prove boundary behavior,
+not a long-task success or efficiency advantage for active mode.
+
 Context VM compiles a bounded working set from authoritative session history.
 The default mode remains off; shadow compares projections and active mode uses
 the compiled image. The agent API selects the mode with

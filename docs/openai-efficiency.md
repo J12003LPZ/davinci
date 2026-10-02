@@ -1,5 +1,10 @@
 # OpenAI cache and Responses efficiency
 
+The [October 2 implementation record](readiness/openai-harness-implementation.md)
+documents raw-usage completeness, root budgets, retained defaults and unmeasured
+live gates. Local prefix similarity is not evidence of provider cache reuse or
+subscription billing savings.
+
 This guide describes the OpenAI cache behavior implemented on the `openai-cache` branch. It is an operator guide, not evidence that a provider cache hit occurred. The normative invariants are in [the OpenAI cache contract](cache/openai-cache-contract.md).
 
 ## Supported route matrix
@@ -196,4 +201,3 @@ This plan was re-audited against current `main` at `0cadf67d0081b969ac0b8fc495c0
 - The branch adds regressions that prove those two compatibility/cache invariants, including that `tool_search` cannot mutate the provider `tools` prefix after the OpenAI cache freeze.
 - Backend-specific features remain evidence-gated. `docs/cache/codex-backend-probe.md` still records the authenticated probe as not run, so freeform grammar `apply_patch`, `additional_tools`, cache-sharing compaction, and remote compaction remain disabled or unimplemented as required by the plan.
 - Live cache measurements, Codex CLI comparison runs, and installed-executable delivery were not repeated in this audit because the connected development device was offline. No synthetic probe or benchmark result is substituted for those gates.
-

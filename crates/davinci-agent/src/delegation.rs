@@ -139,6 +139,10 @@ fn unambiguous_allow(text: &str, start: usize) -> bool {
 
 /// The last delegation directive in `text`, if it states one.
 pub fn delegation_directive(text: &str) -> Option<DelegationDirective> {
+    // User input commonly contains smart apostrophes. Normalize contractions
+    // before matching; standalone quotes still fail the authority check.
+    let normalized = text.replace(['\u{2018}', '\u{2019}'], "'");
+    let text = normalized.as_str();
     let mut last: Option<(usize, DelegationDirective)> = None;
     let mut consider = |patterns: &[Regex], directive: DelegationDirective| {
         for pattern in patterns {
@@ -196,6 +200,27 @@ pub fn is_delegation_tool(name: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn harness_negated_allow_never_revokes_delegation_ban() {
+        for text in [
+            "Don’t use subagents.",
+            "You can’t use subagents.",
+            "You are not allowed to use subagents.",
+            "You are not allowed to use subagents, even if needed.",
+        ] {
+            assert!(delegation_forbidden_after(false, [text]), "{text}");
+            assert!(delegation_forbidden_after(true, [text]), "{text}");
+        }
+        for text in [
+            "‘Use subagents.’",
+            "You can use subagents if necessary.",
+            "I didn’t say you can use subagents.",
+            "Example: you can use subagents.",
+        ] {
+            assert!(delegation_forbidden_after(true, [text]), "{text}");
+        }
+    }
 
     #[test]
     fn audit_negated_or_quoted_permission_never_lifts_a_ban() {

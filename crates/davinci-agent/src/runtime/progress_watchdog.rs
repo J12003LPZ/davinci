@@ -174,20 +174,53 @@ pub enum WatchdogState {
     Stopped,
 }
 
+/// A warning allows one bounded change of approach; it never grants success.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RepairAction {
+    Continue,
+    ChangeApproach(LoopSignal),
+    Blocked(LoopSignal),
+}
+
 /// Progress watchdog state machine bounding task history and detecting loops.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProgressWatchdog {
+    #[serde(skip, default = "history_limit")]
     max_history: usize,
     observations: Vec<ProgressObservation>,
     state: WatchdogState,
+    last_escalation: Option<LoopSignal>,
+    // Enforcement is host configuration, never restored from session data.
+    #[serde(skip)]
+    repair_disabled: bool,
+}
+
+fn history_limit() -> usize {
+    MAX_WATCHDOG_HISTORY
+}
+
+impl Default for ProgressWatchdog {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl ProgressWatchdog {
+    pub(crate) fn restore(value: serde_json::Value) -> Result<Self, String> {
+        let watchdog: Self =
+            serde_json::from_value(value).map_err(|e| format!("invalid repair checkpoint: {e}"))?;
+        if watchdog.observations.len() > MAX_WATCHDOG_HISTORY {
+            return Err("repair checkpoint exceeds history limit".into());
+        }
+        Ok(watchdog)
+    }
     pub fn new() -> Self {
         Self {
             max_history: MAX_WATCHDOG_HISTORY,
             observations: Vec::with_capacity(MAX_WATCHDOG_HISTORY),
             state: WatchdogState::Running,
+            last_escalation: None,
+            repair_disabled: false,
         }
     }
 
@@ -202,6 +235,49 @@ impl ProgressWatchdog {
     /// Check whether new tool/turn dispatch is permitted.
     pub fn can_dispatch(&self) -> bool {
         matches!(self.state, WatchdogState::Running)
+    }
+
+    /// Called at the provider boundary, after the finished tool batch is saved.
+    pub fn repair_action(&mut self) -> RepairAction {
+        if self.repair_disabled {
+            return RepairAction::Continue;
+        }
+        match &self.state {
+            WatchdogState::Paused(
+                signal @ LoopSignal::RepeatedTestFailureWithoutNewDiagnosis { .. },
+            ) => {
+                let signal = signal.clone();
+                if self.last_escalation.as_ref() == Some(&signal) {
+                    self.state = WatchdogState::Stopped;
+                    RepairAction::Blocked(signal)
+                } else {
+                    self.last_escalation = Some(signal.clone());
+                    self.state = WatchdogState::Running;
+                    RepairAction::ChangeApproach(signal)
+                }
+            }
+            WatchdogState::Stopped => self
+                .last_escalation
+                .clone()
+                .map(RepairAction::Blocked)
+                .unwrap_or(RepairAction::Continue),
+            _ => RepairAction::Continue,
+        }
+    }
+
+    /// Roll back candidate repair enforcement without disabling permissions,
+    /// root budget admission, verification or watchdog observations.
+    pub fn set_repair_enforcement(&mut self, enabled: bool) {
+        self.repair_disabled = !enabled;
+    }
+
+    /// A new explicit user turn may continue only under a finite root budget.
+    /// The prior failure and escalation are retained, so another unchanged
+    /// failure stops again instead of receiving a fresh retry allowance.
+    pub fn resume_budgeted(&mut self, admitted: bool) {
+        if admitted && matches!(self.state, WatchdogState::Stopped) {
+            self.state = WatchdogState::Running;
+        }
     }
 
     /// Pause the watchdog with an identified loop signal.

@@ -1008,9 +1008,25 @@ pub struct VerificationCommandResult {
     pub exit_code: i32,
     pub duration_ms: u64,
     pub output_tail: String,
+    /// Actual process discovery, before output truncation. Missing evidence
+    /// in legacy records cannot certify a test run.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub test_discovery: Option<davinci_agent::runtime::evidence::AssertionCounts>,
     /// Plan-invented command that does not exist; excluded from pass/fail.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub skipped: bool,
+}
+
+impl VerificationCommandResult {
+    pub fn verified(&self) -> bool {
+        !self.skipped
+            && self.exit_code == 0
+            && (!davinci_agent::verification::is_test_runner(&self.command)
+                || self
+                    .test_discovery
+                    .as_ref()
+                    .is_some_and(davinci_agent::verification::tests_passed))
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

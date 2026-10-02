@@ -20,6 +20,35 @@ def fixture(success=True, **changes):
 
 
 class ReadinessMetricsTests(unittest.TestCase):
+    def test_harness_stage_diagnostics_preserve_overlap_and_unknowns(self):
+        row = fixture(runtime_stats={"wallMs": 2000, "queueMs": 10, "providerMs": 900,
+                                     "verificationWorkMs": 4000, "integrationMs": None})
+        summary = readiness_metrics.summarize([row])
+        self.assertEqual(summary["latency_ms"]["wallMs"], 2000)
+        self.assertEqual(summary["latency_ms"]["verificationWorkMs"], 4000)
+        self.assertIsNone(summary["latency_ms"]["integrationMs"])
+        self.assertIsNone(readiness_metrics.summarize([row, fixture()])["latency_ms"]["queueMs"])
+        self.assertIsNone(readiness_metrics.summarize([fixture(runtime_stats=[])])["latency_ms"]["queueMs"])
+
+    def test_harness_waste_diagnostics_preserve_coverage(self):
+        row = fixture(runtime_stats={"diagnosticComparableOperations": 4,
+                                     "diagnosticUnknownOperations": 3,
+                                     "repeatedReads": 2, "repeatedSearches": 0,
+                                     "workerDuplicateOperations": 1, "diagnosticsMs": 7})
+        result = readiness_metrics.summarize([row])
+        self.assertEqual(result["read_search_diagnostics"]["repeatedReads"], 2)
+        self.assertEqual(result["read_search_diagnostics"]["diagnosticUnknownOperations"], 3)
+        self.assertEqual(result["latency_ms"]["diagnosticsMs"], 7)
+        mixed = readiness_metrics.summarize([row, fixture()])
+        self.assertIsNone(mixed["read_search_diagnostics"]["repeatedReads"])
+
+    def test_harness_parallel_time_is_not_summed_as_wall_time(self):
+        summary = readiness_metrics.summarize([
+            fixture(wall_s=2, worker_wall_s=100, provider_attempts=2,
+                    usage_complete_attempts=1, usage_unknown_attempts=1)])
+        self.assertEqual(summary["median_wall_s"], 2)
+        self.assertEqual(summary["usage_completeness_ratio"], .5)
+
     def prices(self):
         return {"schema_version": 1, "currency": "USD", "as_of": "2026-09-30",
                 "source": "https://example.invalid/fixture-prices", "models": {"fixture-model": {

@@ -247,6 +247,11 @@ def checkpoint_identity(executable, repo):
         raise ValueError("checkpoint requires schema 3 clean committed green-CI build provenance")
     if identity.get("ci_verified") is not True:
         raise ValueError("checkpoint has no green CI proof")
+    features = identity.get("build_features")
+    if (not isinstance(features, list) or any(not isinstance(feature, str) or not feature
+            or feature.split("/")[-1] == "test-fixtures" for feature in features)
+            or not isinstance(identity.get("build_platform"), str) or not identity["build_platform"]):
+        raise ValueError("checkpoint requires explicit non-fixture build features and platform")
     ci = identity.get("ci")
     release_identity.validate_ci(ci, identity.get("repository"), identity.get("source_sha", ""))
     if identity.get("ci_evidence_sha256") != hashlib.sha256(json.dumps(ci, sort_keys=True).encode()).hexdigest():
@@ -264,7 +269,7 @@ def checkpoint_identity(executable, repo):
     if result.returncode or result.stdout.strip() != identity["source_tree"]:
         raise ValueError("checkpoint source commit/tree is unavailable or mismatched")
     return {field: identity[field] for field in
-            ("source_sha", "source_tree", "source_clean", "dirty_diff_hash")}
+            ("source_sha", "source_tree", "source_clean", "dirty_diff_hash", "build_features", "build_platform")}
 
 
 def parent_identity(repo, candidate_sha, base_ref, parent_sha):
@@ -345,7 +350,7 @@ def campaign_identity(root, variant, fixtures, harnesses, model, effort, setting
             raise ValueError("DaVinci executable must be an immutable copy outside the repository")
         executables[harness] = executable
         identities[harness] = {
-            "binary_sha256": file_hash(executable), "version": version,
+            "binary_sha256": file_hash(executable), "version": version, "launch_path": executable,
             **(checkpoint_identity(executable, repo) if harness == "davinci" else {"source_sha": None, "dirty_diff_hash": None}),
             "grading_isolation": isolation,
             "grading_assurance": "diagnostic-only",
@@ -354,6 +359,9 @@ def campaign_identity(root, variant, fixtures, harnesses, model, effort, setting
             "effective_settings": settings if harness == "davinci" else {
                 "ignore_user_config": True, "effort": effort, "service_tier": service_tier(),
                 "telemetry": "local-sanitized-otlp-logs-and-traces"}}
+        identities[harness]["configuration_sha256"] = hashlib.sha256(json.dumps(
+            identities[harness]["effective_settings"], sort_keys=True,
+            separators=(",", ":"), allow_nan=False).encode()).hexdigest()
     return {"schema_version": 2, "campaign": Path(root).name, "variant": variant,
             "fixture_hash": fixtures["fixture_hash"], "model": model,
             "effort_policy": effort, "service_tier": service_tier(),

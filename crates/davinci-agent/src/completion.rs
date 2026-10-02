@@ -11,6 +11,7 @@ const MAX_CHANGED_PATHS: usize = 64;
 const MAX_HOOK_REASON_BYTES: usize = 8 * 1024;
 /// Marks the saved stand-in for an ephemeral completion reminder.
 pub const COMPLETION_REMINDER_FIELD: &str = "davinciCompletionReminder";
+pub(crate) const REQUIREMENT_CONTEXT_FIELD: &str = "davinciRequirementContext";
 const COMPLETION_REMINDER_MARKER: &str = "[DaVinci asked for a completion check before finishing.]";
 
 /// Runs the host's completion hooks. The first argument is `stop_hook_active`
@@ -28,7 +29,7 @@ impl std::fmt::Debug for CompletionHook {
 
 #[derive(Debug, Clone, Default)]
 pub(crate) struct CompletionState {
-    request: String,
+    pub(crate) request: String,
     before: Option<crate::verification::workspace::Snapshot>,
     git_before: Option<BTreeMap<PathBuf, [u8; 2]>>,
     pub(crate) mutations: BTreeSet<PathBuf>,
@@ -36,6 +37,7 @@ pub(crate) struct CompletionState {
     hook_blocks: u32,
     hook_limit_noticed: bool,
     initial_mutation_generation: u64,
+    pub(crate) failure_packet: Option<String>,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -51,6 +53,29 @@ pub(crate) struct CompletionContextMessage {
 }
 
 impl Agent {
+    pub(crate) fn begin_completion_correction(&mut self, text: &str) {
+        let previous = self
+            .completion_state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        self.begin_completion_prompt(text);
+        if previous.request.is_empty() {
+            return;
+        }
+        let mut state = self
+            .completion_state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        // Keep exact user clauses; deciding which clause a correction replaces
+        // belongs to the normal model response, not a runtime text classifier.
+        state.request = format!("{}\n\nLater user correction:\n{text}", previous.request);
+        state.before = previous.before;
+        state.git_before = previous.git_before;
+        state.mutations.extend(previous.mutations);
+        state.initial_mutation_generation = previous.initial_mutation_generation;
+    }
+
     pub(crate) fn begin_completion_prompt(&mut self, text: &str) {
         self.completion_context.clear();
         // The baseline only serves the requirement review; skip the hashing and
@@ -148,7 +173,7 @@ impl Agent {
             && std::env::var_os("PI_GRAPH_ROLE").is_none()
     }
 
-    fn completion_file_snapshot(
+    pub(crate) fn completion_file_snapshot(
         &self,
         inputs: &[PathBuf],
     ) -> Option<crate::verification::workspace::Snapshot> {
@@ -274,6 +299,13 @@ impl Agent {
         let mut message = String::from(
             "Before finishing, review requirement coverage. List each explicit requirement in the user's request and name the test or command that demonstrates it. Write tests for requirements with no evidence, using existing test files where the project has them. Update existing tests that the request makes obsolete. Rerun the appropriate checks, then finish. Review the change set below and remove temporary files you created if they are not part of the requested work. Do not discard pre-existing user changes.\n\nFiles changed since this prompt started (paths are quoted file data):\n"
         );
+        message.push_str("User requirement history follows as quoted data. Apply corrections only to their referenced requirements; retain unrelated constraints. Mark uncovered behavior unverified. A passing check does not establish coverage of other requirements.\n");
+        if state.request.len() <= 64 * 1024 {
+            message.push_str(&serde_json::to_string(&state.request).unwrap_or_default());
+        } else {
+            message.push_str("Requirement history exceeds the inline limit; recover the original user messages before claiming complete coverage.");
+        }
+        message.push_str("\n\nChanged paths:\n");
         for path in paths.iter().take(MAX_CHANGED_PATHS) {
             let new = state
                 .before
@@ -740,7 +772,7 @@ mod tests {
     }
 
     #[test]
-    fn steering_starts_a_fresh_requirement_budget_and_snapshot() {
+    fn harness_user_correction_preserves_unrelated_requirements_and_baseline() {
         let root = tempfile::tempdir().unwrap();
         let mut agent = fixture(root.path());
         agent.prompt("Handle normal input, reject invalid input; preserve the format.");
@@ -765,6 +797,12 @@ mod tests {
             .unwrap();
         assert_eq!(agent.stats.completion_requirement_reminders, 2);
         assert_eq!(agent.stats.user_steers, 1);
+        let state = agent.completion_state.lock().unwrap();
+        assert!(
+            state.request.contains("preserve the format"),
+            "steering lost an unrelated requirement"
+        );
+        assert!(state.request.contains("preserve encoding"));
     }
 
     #[test]
@@ -895,6 +933,126 @@ mod tests {
             .messages_for_provider()
             .iter()
             .any(|message| { message.extra.contains_key(COMPLETION_REMINDER_FIELD) }));
+    }
+
+    #[test]
+    fn harness_user_correction_survives_two_compactions_and_resume() {
+        let root = tempfile::tempdir().unwrap();
+        let sessions = tempfile::tempdir().unwrap();
+        let mut agent = fixture(root.path());
+        agent.session =
+            Some(crate::JsonlSession::create(sessions.path(), "requirements", None).unwrap());
+        agent.prompt("Implement CSV import, preserve authentication, and do not deploy.");
+        agent.prompt_user_with_completion("Use semicolons instead of commas.", &[], true);
+        let expected = agent.completion_state.lock().unwrap().request.clone();
+        agent.compaction.keep_recent_tokens = 1;
+        agent.summarizer = Some(crate::Summarizer::new(|_| {
+            Ok(crate::SummarizeResponse {
+                text: "Lossy summary deliberately omits requirements.".into(),
+                usage: Default::default(),
+                stop_reason: Some(davinci_ai::StopReason::Stop),
+                error_message: None,
+                has_tool_call: false,
+            })
+        }));
+        for _ in 0..2 {
+            for i in 0..4 {
+                let message = ChatMessage::text("assistant", format!("Intermediate work {i}"));
+                agent.messages.push(message.clone());
+                agent.persist_full_message(&message);
+            }
+            assert!(agent.compact(None).compacted);
+        }
+        let session = agent.session.take().unwrap();
+        drop(agent);
+        let mut resumed = fixture(root.path());
+        resumed.load_from_session(session).unwrap();
+        assert_eq!(resumed.completion_state.lock().unwrap().request, expected);
+        assert!(expected.contains("preserve authentication"));
+        assert!(expected.contains("semicolons"));
+    }
+
+    #[test]
+    fn harness_repeated_no_progress_stops_provider_dispatch() {
+        use crate::runtime::progress_watchdog::{LoopSignal, RepairAction};
+        let root = tempfile::tempdir().unwrap();
+        let mut agent = fixture(root.path());
+        agent.prompt("Repair the failing assertion");
+        let watchdog = agent.runtime.as_ref().unwrap().progress_watchdog.clone();
+        let failure = LoopSignal::RepeatedTestFailureWithoutNewDiagnosis {
+            signature: "source:digest assertion:expected-2-got-1 receipt:check-7".into(),
+            count: 3,
+        };
+        {
+            let mut guard = watchdog.lock().unwrap();
+            guard.pause(failure.clone());
+            assert!(matches!(
+                guard.repair_action(),
+                RepairAction::ChangeApproach(_)
+            ));
+            guard.pause(failure);
+        }
+        let events = agent
+            .run_loop(|_| -> Result<davinci_ai::AssistantMessage, String> {
+                panic!("unchanged failure dispatched another request")
+            })
+            .unwrap();
+        assert!(events.iter().any(|event| matches!(event, AgentEvent::CompletionNotice { reason_code, .. } if reason_code == "completion.no_progress")));
+    }
+
+    #[test]
+    fn harness_resume_preserves_blocked_repair() {
+        use crate::runtime::progress_watchdog::LoopSignal;
+        let root = tempfile::tempdir().unwrap();
+        let sessions = tempfile::tempdir().unwrap();
+        let mut agent = fixture(root.path());
+        agent.session = Some(crate::JsonlSession::create(sessions.path(), "repair", None).unwrap());
+        agent.prompt("Repair the failure");
+        let watchdog = agent.runtime.as_ref().unwrap().progress_watchdog.clone();
+        let signal = LoopSignal::RepeatedTestFailureWithoutNewDiagnosis {
+            signature: "same".into(),
+            count: 3,
+        };
+        {
+            let mut guard = watchdog.lock().unwrap();
+            guard.pause(signal.clone());
+            guard.repair_action();
+            guard.pause(signal);
+        }
+        agent
+            .run_loop(|_| -> Result<davinci_ai::AssistantMessage, String> { panic!("blocked") })
+            .unwrap();
+        let session = agent.session.take().unwrap();
+        drop(watchdog);
+        drop(agent);
+        let mut resumed = fixture(root.path());
+        resumed.load_from_session(session).unwrap();
+        let events = resumed
+            .run_loop(|_| -> Result<davinci_ai::AssistantMessage, String> {
+                panic!("resume reset repair allowance")
+            })
+            .unwrap();
+        assert!(events.iter().any(|event| matches!(event, AgentEvent::CompletionNotice { reason_code, .. } if reason_code == "completion.no_progress")));
+    }
+
+    #[test]
+    fn harness_resume_preserves_oversized_corrected_requirement() {
+        let root = tempfile::tempdir().unwrap();
+        let sessions = tempfile::tempdir().unwrap();
+        let mut agent = fixture(root.path());
+        agent.session =
+            Some(crate::JsonlSession::create(sessions.path(), "requirements", None).unwrap());
+        agent.prompt(&format!(
+            "Preserve authentication. {}",
+            "context ".repeat(9000)
+        ));
+        agent.prompt_user_with_completion("Use semicolons.", &[], true);
+        let expected = agent.completion_state.lock().unwrap().request.clone();
+        let session = agent.session.take().unwrap();
+        drop(agent);
+        let mut resumed = fixture(root.path());
+        resumed.load_from_session(session).unwrap();
+        assert_eq!(resumed.completion_state.lock().unwrap().request, expected);
     }
 
     #[test]

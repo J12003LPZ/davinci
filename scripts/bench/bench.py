@@ -29,7 +29,7 @@ import sys
 import time
 from pathlib import Path
 from contextlib import nullcontext
-from observations import activity
+from observations import PURPOSES, activity
 from campaign import (LEGACY_TASKS, COMPARABLE, fixture_manifest, schedule, task_success,
                       manifest_errors, paired_metrics, file_hash, digest, metric,
                       latency_uncertainty, promotion_gates)
@@ -323,14 +323,29 @@ def parse_stream(harness, stdout):
                 stats["tools"][name] = stats["tools"].get(name, 0) + 1
     if harness == "davinci":
         stats.update(activity(events))
+    stats["runtime_stats"] = None
+    if harness == "davinci" and not malformed_stream:
+        for event in events:
+            runtime = event.get("runtime")
+            if (event.get("type") == "harness_stats" and event.get("schema_version") == 1
+                    and isinstance(runtime, dict)):
+                # Cumulative host snapshot, not another charge or summed interval.
+                stats["runtime_stats"] = {
+                    field: runtime.get(field) if type(runtime.get(field)) is int and runtime[field] >= 0 else None
+                    for field in ("wallMs", "preparationMs", "queueMs", "providerMs", "retryWaitMs",
+                                  "toolWallMs", "verificationWorkMs", "integrationMs", "digestRetrievalMs",
+                                  "diagnosticsMs", "diagnosticComparableOperations", "diagnosticUnknownOperations",
+                                  "repeatedReads", "repeatedSearches", "workerDuplicateOperations",
+                                  "toolCalls", "batchOperations", "subagents")}
     if observed:
         receipts, coding_groups = {}, {}
+        complete_receipts, uncertain_receipts = set(), set()
         for event in events:
             observation = event.get("observation") if event.get("type") == "provider_observation" else None
             if not isinstance(observation, dict):
                 continue
             purpose, request = observation.get("purpose"), observation.get("logical_request_id")
-            if purpose not in ("coding", "prewarm", "jev") or not isinstance(request, str) or not request:
+            if purpose not in PURPOSES or not isinstance(request, str) or not request:
                 continue
             key = (purpose, request)
             if observation.get("kind") == "logical_start" and purpose == "coding":
@@ -340,7 +355,19 @@ def parse_stream(harness, stdout):
                 if type(attempt) is not int or attempt < 1:
                     continue
                 identity = (*key, attempt)
-                receipt = observation.get("status"), observation.get("usage")
+                receipt = (observation.get("status"), observation.get("usage"),
+                           observation.get("raw_usage"), observation.get("usage_complete"),
+                           observation.get("root_id"), observation.get("actor_id"),
+                           observation.get("returned_model"), observation.get("returned_service_tier"))
+                valid = (observation.get("usage_complete") is True
+                         and observation.get("status") in ("completed", "failed", "cancelled")
+                         and all(type(value) is int and value >= 0 for value in davinci_usage(receipt[1]).values()))
+                if not valid or (identity in receipts and receipts[identity] != receipt):
+                    uncertain_receipts.add(identity)
+                if valid:
+                    complete_receipts.add(identity)
+                if observation.get("usage_complete") is not True:
+                    usage_conflict = True
                 # Validate every receipt before replay comparison: Python
                 # considers True == 1 and 1.0 == 1, but token types are exact.
                 if any(type(value) is not int or value < 0 for value in davinci_usage(receipt[1]).values()):
@@ -348,13 +375,19 @@ def parse_stream(harness, stdout):
                 if identity in receipts and receipts[identity] != receipt:
                     usage_conflict = True
                 receipts[identity] = receipt
+        attempts = stats.get("provider_attempts")
+        complete_count = len(complete_receipts - uncertain_receipts)
+        stats["usage_complete_attempts"] = complete_count
+        stats["usage_unknown_attempts"] = (attempts - complete_count if type(attempts) is int else None)
+        stats["usage_completeness_ratio"] = complete_count / attempts if attempts else None
         if not stats["request_metrics_complete"] or not receipts or usage_conflict:
             add_usage({"input": None, "cached": None, "output": None, "cache_write": None})
             usage_conflict = True
         else:
             # Every purpose contributes spend; first/later request groups refer
             # only to coding logical requests and include all their retries.
-            for (purpose, request, _), (_, usage) in receipts.items():
+            for (purpose, request, _), receipt in receipts.items():
+                usage = receipt[1]
                 values = davinci_usage(usage)
                 add_usage(values)
                 usage = usage if isinstance(usage, dict) else {}
@@ -373,6 +406,7 @@ def parse_stream(harness, stdout):
         # A truncated JSON record may have omitted an entire paid attempt.
         add_usage({"input": None, "cached": None, "output": None, "cache_write": None})
         usage_conflict = True
+        stats["usage_unknown_attempts"] = stats["usage_completeness_ratio"] = None
         if harness == "davinci":
             stats["request_metrics_available"] = stats["request_metrics_complete"] = False
             for field in ("logical_requests", "requests", "provider_attempts", "coding_provider_attempts",
@@ -489,6 +523,8 @@ def run_one(harness, tid, rep, campaign=None):
                        ("size_class", "split", "language", "repository_id", "reference_commit", "visible_tests", "requires_existing_test_changes")})
         result["task_set"] = "private"
     for key in ("logical_requests", "provider_attempts", "prewarm_attempts", "jev_attempts",
+                "runtime_stats",
+                "usage_complete_attempts", "usage_unknown_attempts", "usage_completeness_ratio",
                 "gate_reminders", "auto_verify_runs", "requests_after_first_reminder",
                 "mutations_after_reminder", "executed_leaf_operations", "batch_children_reported",
                 "mutation_metric_scope", "executed_leaf_scope",

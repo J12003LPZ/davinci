@@ -578,7 +578,13 @@ mod tests {
     ) -> ControllerDeps {
         ControllerDeps {
             runner: full_circle_runner(cwd.to_path_buf()),
-            verify_exec: Arc::new(|_, _, _, _| (0, "all tests pass".into(), 5)),
+            verify_exec: Arc::new(|_, _, _, _| {
+                (
+                    0,
+                    "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s".into(),
+                    5,
+                )
+            }),
             config: GraphConfig {
                 verify_commands: vec![VerifyCommandSpec {
                     command: "cargo test".into(),

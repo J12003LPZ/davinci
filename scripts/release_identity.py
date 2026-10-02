@@ -2,13 +2,15 @@
 """Bind installed/benchmarked bytes to clean source and completed green CI.
 
 Only the preflight command contacts GitHub, through the user's existing gh
-authentication. Tests exercise pure fixture validation; there is no CLI bypass.
+authentication. Export snapshots and local identities do not satisfy release gates.
 """
 import argparse
 from datetime import datetime, timezone
 import hashlib
 import json
+import os
 from pathlib import Path
+import platform
 import re
 import subprocess
 
@@ -40,11 +42,59 @@ def git(repo, *args):
 
 
 def source_identity(repo):
-    if git(repo, "status", "--porcelain=v1", "--untracked-files=all"):
+    try:
+        status = git(repo, "status", "--porcelain=v1", "--untracked-files=all")
+    except subprocess.CalledProcessError as error:
+        raise ValueError("release/benchmark source requires verifiable committed Git provenance") from error
+    if status:
         raise ValueError("release/benchmark source must be a clean committed checkout")
     return {"source_sha": git(repo, "rev-parse", "HEAD"),
             "source_tree": git(repo, "rev-parse", "HEAD^{tree}"),
             "source_clean": True, "dirty_diff_hash": CLEAN_DIFF_HASH}
+
+
+# Export identities are local evidence, never a replacement for the release gate.
+SNAPSHOT_EXCLUDES = frozenset({".git", "target", "node_modules", "__pycache__",
+                              ".venv", ".superpowers", ".pytest_cache"})
+NESTED_EXCLUDES = frozenset({".git", "node_modules", "__pycache__", ".pytest_cache"})
+
+
+def export_snapshot(repo):
+    root = Path(repo).resolve(strict=True)
+    files = {}
+    for directory, names, filenames in os.walk(root, followlinks=False):
+        excluded = SNAPSHOT_EXCLUDES if Path(directory) == root else NESTED_EXCLUDES
+        names[:] = sorted(name for name in names if name not in excluded
+                          and name != ".env" and not name.startswith(".env."))
+        for name in names + sorted(filenames):
+            path = Path(directory) / name
+            if name == ".env" or name.startswith(".env."):
+                continue
+            if path.is_symlink() or (hasattr(path, "is_junction") and path.is_junction()):
+                raise ValueError("source snapshot cannot follow linked paths")
+            if path.is_file():
+                files[path.relative_to(root).as_posix()] = file_hash(path)
+    if not files:
+        raise ValueError("source snapshot is empty")
+    files = dict(sorted(files.items()))
+    digest = hashlib.sha256(json.dumps(files, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+    return {"source_kind": "exported_snapshot", "source_sha": None,
+            "snapshot_sha256": digest, "files": files,
+            "excluded_root": sorted(SNAPSHOT_EXCLUDES),
+            "excluded_anywhere": sorted(NESTED_EXCLUDES | {".env", ".env.*"})}
+
+
+def local_build_identity(repo, binary, before, configuration, build_features):
+    """Bind a caller-observed local build to unchanged content; no CI attestation."""
+    if export_snapshot(repo) != before:
+        raise ValueError("source changed during the local build")
+    binary = Path(binary).resolve(strict=True)
+    return {"schema_version": 1, "identity_kind": "local_build", "source": before,
+            "release_eligible": False, "binary_sha256": file_hash(binary),
+            "launch_path": str(binary), "build_features": sorted(set(build_features)),
+            "platform": platform.platform(),
+            "configuration_sha256": hashlib.sha256(json.dumps(
+                configuration, sort_keys=True, separators=(",", ":"), allow_nan=False).encode()).hexdigest()}
 
 
 def require_same_source(repo, before):
@@ -139,7 +189,12 @@ def preflight(repo, require_tag=False, repository="J12003LPZ/davinci"):
             "release_tag": tag, "ci": ci, "checked_at": datetime.now(timezone.utc).isoformat()}
 
 
-def make_identity(binary, source, ci, tag, version="1.0.71", require_tag=True):
+def make_identity(binary, source, ci, tag, version="1.0.71", require_tag=True, build_features=()):
+    if not isinstance(build_features, (list, tuple)) or any(
+            not isinstance(feature, str) or not feature or feature.split("/")[-1] == "test-fixtures"
+            for feature in build_features):
+        raise ValueError("fixture-enabled builds are not release or benchmark artifacts")
+    features = sorted(set(build_features))
     if source.get("source_clean") is not True or source.get("dirty_diff_hash") != CLEAN_DIFF_HASH:
         raise ValueError("binary identity requires clean committed source")
     validate_ci(ci, ci.get("repository"), source.get("source_sha", ""))
@@ -148,7 +203,9 @@ def make_identity(binary, source, ci, tag, version="1.0.71", require_tag=True):
     return {"schema_version": 3, **source, "release_tag": tag,
             "repository": ci["repository"], "ci_run": ci["ci_run"], "ci_url": ci["ci_url"],
             "ci_verified": True, "ci": ci, "ci_evidence_sha256": hashlib.sha256(json.dumps(ci, sort_keys=True).encode()).hexdigest(),
-            "binary_sha256": file_hash(binary), "built_at": datetime.now(timezone.utc).isoformat()}
+            "binary_sha256": file_hash(binary), "build_features": features,
+            "build_platform": platform.platform(),
+            "built_at": datetime.now(timezone.utc).isoformat()}
 
 
 def record_identity(proof, binary, output, require_tag=True):
@@ -171,9 +228,31 @@ def main():
     after.add_argument("--binary", required=True)
     after.add_argument("--output", required=True)
     after.add_argument("--benchmark", action="store_true", help="green committed benchmark, not a tagged installation")
+    snapshot = commands.add_parser("snapshot", help="local exported-source evidence; not release provenance")
+    snapshot.add_argument("--repo", required=True)
+    snapshot.add_argument("--output", required=True)
+    local = commands.add_parser("record-local", help="bind a local build to an unchanged snapshot")
+    local.add_argument("--repo", required=True)
+    local.add_argument("--snapshot", required=True)
+    local.add_argument("--binary", required=True)
+    local.add_argument("--configuration", required=True, help="JSON configuration; only its digest is recorded")
+    local.add_argument("--feature", action="append", default=[])
+    local.add_argument("--output", required=True)
     args = parser.parse_args()
     try:
-        if args.command == "preflight":
+        if args.command in {"snapshot", "record-local"}:
+            # Evidence must not become a changing input to its own identity.
+            if Path(args.output).resolve().is_relative_to(Path(args.repo).resolve()):
+                raise ValueError("local evidence output must be outside the source directory")
+            if args.command == "snapshot":
+                identity = export_snapshot(args.repo)
+            else:
+                identity = local_build_identity(
+                    args.repo, args.binary, json.loads(Path(args.snapshot).read_text(encoding="utf-8")),
+                    json.loads(Path(args.configuration).read_text(encoding="utf-8")), args.feature)
+            Path(args.output).write_text(json.dumps(identity, indent=2) + "\n", encoding="utf-8")
+            print(f"Recorded local evidence (not release eligible): {args.output}")
+        elif args.command == "preflight":
             proof = preflight(args.repo, args.require_tag)
             Path(args.output).write_text(json.dumps(proof, indent=2) + "\n", encoding="utf-8")
             print(f"Green CI: {proof['ci']['ci_url']}; source: {proof['source']['source_sha']}")

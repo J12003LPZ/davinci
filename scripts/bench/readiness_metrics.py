@@ -49,8 +49,8 @@ def estimate(row, prices):
     uncached, cached, output = metric(row, "uncached_input_tokens"), row.get("cached_tokens"), row.get("output_tokens")
     if rates is None or not all(number(value) for value in (uncached, cached, output)):
         return None
-    # Responses has no separate cache-write charge. Other providers must supply
-    # cache-write tokens and a pinned rate rather than price them as plain input.
+    # Benchmark input is inclusive. Remove R and W exactly once to recover U.
+    # An absent write measurement never establishes a zero route-specific charge.
     written = row.get("cache_write_tokens")
     if not number(written) or written > uncached:
         return None
@@ -99,6 +99,19 @@ def summarize(rows, prices=None):
     requests = [row.get("logical_requests") if row.get("request_metrics_complete") is True else None for row in rows]
     tools = [row.get("tool_calls") for row in rows]
     background, scope = background_summary(rows)
+    measured_attempts = available_sum([row.get("usage_complete_attempts") for row in rows])
+    unknown_attempts = available_sum([row.get("usage_unknown_attempts") for row in rows])
+    total_attempts = available_sum([measured_attempts, unknown_attempts])
+    # Separate stage sums are diagnostic. Verification can overlap tools and
+    # workers; no sum of these fields is substituted for host elapsed time.
+    latency = {field: available_sum([
+        row["runtime_stats"].get(field) if isinstance(row.get("runtime_stats"), dict) else None for row in rows])
+        for field in ("wallMs", "preparationMs", "queueMs", "providerMs", "retryWaitMs",
+                      "toolWallMs", "verificationWorkMs", "integrationMs", "digestRetrievalMs", "diagnosticsMs")}
+    waste = {field: available_sum([
+        row["runtime_stats"].get(field) if isinstance(row.get("runtime_stats"), dict) else None for row in rows])
+        for field in ("diagnosticComparableOperations", "diagnosticUnknownOperations",
+                      "repeatedReads", "repeatedSearches", "workerDuplicateOperations")}
     return {"runs": len(rows), "composite_successes": successes, "composite_success_rate": successes / len(rows),
             "regression_free_successes": sum(task_success(row) and row.get("regression_pass") is True for row in rows)
                 if all(type(value) is bool for value in regression) else None,
@@ -110,11 +123,17 @@ def summarize(rows, prices=None):
             "cached_input_per_verified_success": per_success(cached),
             "output_per_verified_success": per_success(output),
             "estimated_usd": costs, "estimated_usd_per_verified_success": per_success(costs),
+            "usage_complete_attempts": measured_attempts, "usage_unknown_attempts": unknown_attempts,
+            "usage_completeness_ratio": measured_attempts / total_attempts if total_attempts else None,
             "median_wall_s": statistics.median(walls) if all(number(value) for value in walls) else None,
             "p90_wall_s": percentile(walls, .9) if all(number(value) for value in walls) else None,
             "model_requests_per_task": available_sum(requests) / len(rows) if available_sum(requests) is not None else None,
             "tool_calls_per_task": available_sum(tools) / len(rows) if available_sum(tools) is not None else None,
             "background_tokens": background, "background_scope": scope,
+            "latency_ms": latency,
+            "read_search_diagnostics": waste,
+            "read_search_scope": "bounded observations in each in-process runtime root; unknown operations and evicted history are not zero waste",
+            "latency_scope": "stage sums across runs; nested and concurrent work may overlap",
             "spend_scope": "all attempted runs, including failures, divided by verified composite successes"}
 
 

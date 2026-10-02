@@ -30,6 +30,13 @@ def load(path):
 
 
 def first_break(prev, cur):
+    if prev.get("model") != cur.get("model"):
+        return "model", None
+    # These differences are diagnostic hypotheses, not provider miss reasons.
+    for key in ("reasoning", "text", "temperature", "top_p", "tool_choice",
+                "parallel_tool_calls", "service_tier", "prompt_cache_key", "prompt_cache_retention"):
+        if prev.get(key) != cur.get(key):
+            return f"settings.{key}", None
     if prev.get("instructions") != cur.get("instructions"):
         return "instructions", None
     if prev.get("tools") != cur.get("tools"):
@@ -52,7 +59,7 @@ def brief(item):
 def token_pair(usage):
     if not isinstance(usage, dict):
         return None, None
-    values = [usage.get("input"), usage.get("cacheRead"), usage.get("cacheWrite", 0)]
+    values = [usage.get("input"), usage.get("cacheRead"), usage.get("cacheWrite")]
     if any(type(value) is not int or value < 0 for value in values):
         return None, None
     return sum(values), values[1]
@@ -93,7 +100,7 @@ def group_report(name, pairs):
 
 
 def first_request_cache_state(pairs):
-    if not pairs or pairs[0][1] is None:
+    if not pairs or not pairs[0][0] or pairs[0][1] is None:
         return "unavailable"
     return "yes" if pairs[0][1] == 0 else "no"
 

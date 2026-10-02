@@ -1,5 +1,28 @@
 //! Conservative verification classification; never grants execution authority.
+pub mod acceptance;
+pub(crate) mod discovery;
 pub(crate) mod workspace;
+
+/// Whether a command invokes a recognized test runner. Recognition does not
+/// imply that its output format is supported or that any tests ran.
+pub fn is_test_runner(command: &str) -> bool {
+    discovery::runner(command).is_some()
+}
+
+/// Parse discovery evidence from the original captured process streams.
+pub fn test_discovery(
+    command: &str,
+    stdout: &[u8],
+    stderr: &[u8],
+) -> Option<crate::runtime::evidence::AssertionCounts> {
+    discovery::counts(command, stdout, stderr)
+}
+
+pub fn tests_passed(counts: &crate::runtime::evidence::AssertionCounts) -> bool {
+    counts.passed > 0
+        && counts.failed == 0
+        && counts.passed.checked_add(counts.skipped) == Some(counts.total)
+}
 use std::collections::{BTreeSet, VecDeque};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};

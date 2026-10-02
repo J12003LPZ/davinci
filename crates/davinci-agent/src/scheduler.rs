@@ -16,7 +16,7 @@
 //! independent reads costs one round of latency instead of N.
 
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Mutex;
 
 use crate::permission::ToolClass;
 use crate::runtime::{ConcurrencyPolicy, RuntimeCapability};
@@ -99,7 +99,7 @@ pub struct ScheduleReport {
 ///
 /// Consecutive `Parallel` calls form a group that runs on up to
 /// `max_parallelism` threads; a `Serial` call runs alone between groups.
-/// `abort` is checked before every group: once it is set, nothing more is
+/// `abort` is checked before every dispatch: once it is set, nothing more is
 /// started and the result vector ends early (the caller reports the
 /// missing calls the way it reports an interrupted sequential run).
 /// `sequential` forces every group to width one, which is what
@@ -120,7 +120,7 @@ pub fn run_lanes<T: Send>(
     )
 }
 
-/// Check the host's combined cancellation sources before each group.
+/// Check the host's combined cancellation sources before dispatching queued work.
 pub(crate) fn run_lanes_with_cancel<'a, T: Send>(
     calls: Vec<ScheduledCall<'a, T>>,
     sequential: bool,
@@ -153,57 +153,101 @@ pub(crate) fn run_lanes_with_cancel<'a, T: Send>(
                 }
                 continue;
             }
-            if lane == ToolLane::Serial || group.len() >= width_cap {
+            if lane == ToolLane::Serial || sequential {
                 break;
             }
             group.push(pending.next().expect("peeked"));
         }
-        let indices: Vec<usize> = group.iter().map(|(index, _)| *index).collect();
-        on_group_start(&indices);
         if group.len() == 1 {
-            let (_, call) = group.pop().expect("one");
+            let (index, call) = group.pop().expect("one");
+            on_group_start(&[index]);
             results.push((call.run)());
             continue;
         }
-        report.parallel_groups += 1;
-        report.max_group_width = report.max_group_width.max(group.len());
-        results.extend(run_group(group.into_iter().map(|(_, call)| call).collect()));
+        let active_width = group.len().min(width_cap);
+        if active_width > 1 {
+            report.parallel_groups += 1;
+            report.max_group_width = report.max_group_width.max(active_width);
+        }
+        results.extend(run_group(group, width_cap, &aborted, &mut on_group_start));
     }
     report.skipped = total.saturating_sub(results.len());
     (results, report)
 }
 
-/// Fan a group out over scoped threads and fan the results back in, in the
-/// group's own order. One thread per call: the caller already capped the
-/// width, and a scoped thread costs less than the I/O it hides.
-fn run_group<T: Send>(group: Vec<ScheduledCall<'_, T>>) -> Vec<T> {
+/// A bounded worker pool covers the entire contiguous safe region. The
+/// coordinator owns admission, callbacks and cancellation; workers only run
+/// admitted calls. A completed read frees its slot without waiting for slower
+/// neighbours. Results remain a source-ordered prefix, even on cancellation.
+fn run_group<T: Send>(
+    group: Vec<(usize, ScheduledCall<'_, T>)>,
+    max_parallelism: usize,
+    aborted: &impl Fn() -> bool,
+    on_start: &mut impl FnMut(&[usize]),
+) -> Vec<T> {
     let count = group.len();
-    let slots: Mutex<Vec<Option<T>>> = Mutex::new((0..count).map(|_| None).collect());
-    let queue = Arc::new(Mutex::new(
-        group
-            .into_iter()
-            .enumerate()
-            .map(|(index, call)| (index, call.run))
-            .collect::<Vec<_>>(),
-    ));
+    let width = max_parallelism.min(count);
+    let (tasks, pending) = std::sync::mpsc::sync_channel::<(usize, ScheduledCall<'_, T>)>(width);
+    let pending = Mutex::new(pending);
+    let (finished, completions) = std::sync::mpsc::channel();
+    let mut slots: Vec<Option<T>> = (0..count).map(|_| None).collect();
+    let mut panic = None;
+    let mut started = 0;
     std::thread::scope(|scope| {
-        for _ in 0..count {
-            let queue = Arc::clone(&queue);
-            let slots = &slots;
+        for _ in 0..width {
+            let pending = &pending;
+            let finished = finished.clone();
             scope.spawn(move || loop {
-                let next = queue.lock().unwrap_or_else(|err| err.into_inner()).pop();
-                let Some((index, run)) = next else {
+                let next = pending.lock().unwrap_or_else(|err| err.into_inner()).recv();
+                let Ok((index, call)) = next else { break };
+                let value = std::panic::catch_unwind(std::panic::AssertUnwindSafe(call.run));
+                if finished.send((index, value)).is_err() {
                     break;
-                };
-                let value = run();
-                slots.lock().unwrap_or_else(|err| err.into_inner())[index] = Some(value);
+                }
             });
         }
+        drop(finished);
+        let mut calls = group.into_iter().enumerate();
+        let mut active = 0;
+        let mut cancelled = false;
+        loop {
+            while active < width && panic.is_none() && !cancelled {
+                cancelled = aborted();
+                if cancelled {
+                    break;
+                }
+                let Some((slot, (index, call))) = calls.next() else {
+                    break;
+                };
+                on_start(&[index]);
+                tasks
+                    .send((slot, call))
+                    .expect("workers are scoped to this region");
+                started += 1;
+                active += 1;
+            }
+            if active == 0 {
+                break;
+            }
+            let (slot, result) = completions
+                .recv()
+                .expect("every admitted call reports completion");
+            active -= 1;
+            match result {
+                Ok(value) => slots[slot] = Some(value),
+                Err(error) => {
+                    panic.get_or_insert(error);
+                }
+            }
+        }
+        drop(tasks);
     });
+    if let Some(error) = panic {
+        std::panic::resume_unwind(error);
+    }
     slots
-        .into_inner()
-        .unwrap_or_else(|err| err.into_inner())
         .into_iter()
+        .take(started)
         .map(|slot| slot.expect("every scheduled call produced a result"))
         .collect()
 }
@@ -211,7 +255,62 @@ fn run_group<T: Send>(group: Vec<ScheduledCall<'_, T>>) -> Vec<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn harness_refills_a_free_slot_before_the_slow_read_finishes() {
+        let (release, wait) = std::sync::mpsc::channel();
+        let calls = vec![
+            ScheduledCall {
+                lane: ToolLane::Parallel,
+                run: Box::new(move || {
+                    wait.recv_timeout(Duration::from_secs(2))
+                        .expect("third read must start while the first is still running");
+                    0
+                }),
+            },
+            ScheduledCall {
+                lane: ToolLane::Parallel,
+                run: Box::new(|| 1),
+            },
+            ScheduledCall {
+                lane: ToolLane::Parallel,
+                run: Box::new(move || {
+                    release.send(()).unwrap();
+                    2
+                }),
+            },
+        ];
+        let (values, report) = run_lanes(calls, false, 2, None, |_| {});
+        assert_eq!(values, [0, 1, 2]);
+        assert_eq!(report.max_group_width, 2);
+    }
+
+    #[test]
+    fn harness_cancellation_stops_queued_reads_and_barriers() {
+        let flag = AtomicBool::new(false);
+        let calls = (0..5)
+            .map(|index| ScheduledCall {
+                lane: if index == 4 {
+                    ToolLane::Serial
+                } else {
+                    ToolLane::Parallel
+                },
+                run: Box::new(|| {
+                    flag.store(true, Ordering::SeqCst);
+                    1
+                }),
+            })
+            .collect();
+        let mut starts = Vec::new();
+        let (values, report) = run_lanes(calls, false, 2, Some(&flag), |group| {
+            starts.extend_from_slice(group)
+        });
+        assert!(values.len() <= 2);
+        assert_eq!(starts.len(), values.len());
+        assert_eq!(report.skipped, 5 - values.len());
+    }
 
     fn sleeper(lane: ToolLane, ms: u64, tag: &'static str) -> ScheduledCall<'static, &'static str> {
         ScheduledCall {
@@ -279,7 +378,7 @@ mod tests {
         let mut groups = Vec::new();
         let (results, report) = run_lanes(calls, false, 8, None, |g| groups.push(g.to_vec()));
         assert_eq!(results, vec!["r1", "r2", "w", "r3"]);
-        assert_eq!(groups, vec![vec![0, 1], vec![2], vec![3]]);
+        assert_eq!(groups, vec![vec![0], vec![1], vec![2], vec![3]]);
         assert_eq!(report.parallel_groups, 1);
         let order = order.lock().unwrap().clone();
         let position = |tag: &str| order.iter().position(|item| item == tag).unwrap();
@@ -298,7 +397,7 @@ mod tests {
         let mut groups = Vec::new();
         let (results, report) = run_lanes(calls, false, 2, None, |g| groups.push(g.len()));
         assert_eq!(results.len(), 5);
-        assert_eq!(groups, vec![2, 2, 1]);
+        assert_eq!(groups, vec![1; 5]);
         assert_eq!(report.max_group_width, 2);
     }
 

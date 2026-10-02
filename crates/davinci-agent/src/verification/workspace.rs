@@ -15,7 +15,7 @@ const CAPTURE_BUDGET: Duration = if cfg!(test) {
     Duration::from_millis(100)
 };
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 struct FileStamp {
     // A dangling symlink and a present empty target have different identities.
     len: Option<u64>,
@@ -57,6 +57,13 @@ impl Snapshot {
 
     pub(crate) fn complete(&self) -> bool {
         self.complete
+    }
+
+    pub(crate) fn fingerprint(&self) -> Option<String> {
+        self.complete
+            .then(|| serde_json::to_vec(&self.files).ok())
+            .flatten()
+            .map(|bytes| format!("{:x}", Sha256::digest(bytes)))
     }
 
     pub(crate) fn required_paths(&self) -> &[PathBuf] {

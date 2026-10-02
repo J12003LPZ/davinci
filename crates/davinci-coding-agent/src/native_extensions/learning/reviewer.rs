@@ -774,9 +774,10 @@ mod tests {
                     },
                     ..Default::default()
                 });
-                let observed = |id, kind, status, usage| {
+                let observed = |id, kind, status, usage: serde_json::Value| {
                     json!({"type":"provider_observation","observation":{
-                        "logical_request_id":"fixture","attempt_id":id,"kind":kind,"status":status,"usage":usage
+                        "logical_request_id":"fixture","attempt_id":id,"kind":kind,"status":status,
+                        "usage_complete":!usage.is_null(),"usage":usage
                     }})
                 };
                 let terminal = json!({"type":"message_end","message":{
@@ -824,6 +825,7 @@ mod tests {
         let stream = [
             json!({"type":"provider_observation","observation":{
                 "logical_request_id":"fixture","attempt_id":1,"kind":"attempt_end","status":"completed",
+                "usage_complete":true,
                 "usage":davinci_protocol::Usage {input:10,output:5,total_tokens:15,..Default::default()}
             }}),
             json!({"type":"provider_observation","observation":{
@@ -848,6 +850,7 @@ mod tests {
             json!({"type":"auto_retry_start","attempt":1}),
             json!({"type":"provider_observation","observation":{
                 "logical_request_id":"fixture","attempt_id":1,"kind":"attempt_end","status":"failed",
+                "usage_complete":true,
                 "usage":davinci_protocol::Usage {input:7,total_tokens:7,..Default::default()}
             }}),
             json!({"type":"message_end","message":{"role":"assistant","content":[],"stopReason":"aborted"}}),

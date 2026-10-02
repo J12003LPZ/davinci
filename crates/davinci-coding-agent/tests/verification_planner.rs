@@ -65,6 +65,12 @@ fn docs_only_plans_have_no_runtime_steps() {
         .iter()
         .any(|warning| warning.as_str().unwrap().contains("documentation-only")));
     assert_eq!(result["complete"], false);
+    assert_eq!(result["acceptancePacks"]["schemaVersion"], 1);
+    assert_eq!(
+        result["acceptancePacks"]["packs"][0]["risk"],
+        "documentation"
+    );
+    assert_eq!(result["acceptancePacks"]["status"], "unverified");
     assert!(result["sourceIdentity"]
         .as_str()
         .unwrap()

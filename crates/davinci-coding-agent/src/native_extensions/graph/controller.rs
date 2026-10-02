@@ -4941,6 +4941,14 @@ mod tests {
                             exit_code: 0,
                             duration_ms: 10,
                             output_tail: "ok".into(),
+                            test_discovery: Some(
+                                davinci_agent::runtime::evidence::AssertionCounts {
+                                    total: 1,
+                                    passed: 1,
+                                    failed: 0,
+                                    skipped: 0,
+                                },
+                            ),
                             skipped: false,
                         },
                     ],
