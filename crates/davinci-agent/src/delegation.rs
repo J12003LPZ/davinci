@@ -123,7 +123,7 @@ pub const DELEGATION_FORBIDDEN_MESSAGE: &str = "The user asked not to use subage
 
 /// Tools that start delegated work.
 pub fn is_delegation_tool(name: &str) -> bool {
-    matches!(name, "agent" | "workflow_run")
+    matches!(name, "agent" | "workflow_run" | "graph_run")
 }
 
 #[cfg(test)]
@@ -221,6 +221,9 @@ mod tests {
     fn only_delegation_tools_are_gated() {
         assert!(is_delegation_tool("agent"));
         assert!(is_delegation_tool("workflow_run"));
+        assert!(is_delegation_tool("graph_run"));
+        assert!(!is_delegation_tool("graph_status"));
+        assert!(!is_delegation_tool("agent_stop"));
         assert!(!is_delegation_tool("agent_message"));
         assert!(!is_delegation_tool("read"));
     }

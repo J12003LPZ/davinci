@@ -3867,7 +3867,7 @@ impl Agent {
             }
         }
         self.last_real_user_request = last_real_user_request_from_messages(&messages);
-        self.delegation_forbidden = delegation_forbidden_from_messages(&messages);
+        self.delegation_forbidden = delegation_forbidden_from_session(&session);
         self.reset_session_approvals();
         self.messages = messages;
         self.pending_prompt_messages.clear();
@@ -4390,6 +4390,25 @@ impl From<AssistantMessage> for CompleteOutput {
 /// job finished.
 pub const JOB_NOTICE_TYPE: &str = "backgroundJob";
 const REAL_USER_ORIGIN_FIELD: &str = "davinciRealUserOrigin";
+
+/// User authority comes from the selected WAL branch, not the compacted
+/// provider projection. Summaries, tool output and abandoned branches cannot
+/// grant permission. Deserialize only real user messages, not tool artifacts.
+fn delegation_forbidden_from_session(session: &JsonlSession) -> bool {
+    let messages: Vec<_> =
+        davinci_session::branch_entries(&session.entries, session.leaf_id.as_deref())
+            .into_iter()
+            .filter(|entry| {
+                entry.entry_type == "message"
+                    && entry.message.as_ref().is_some_and(|message| {
+                        message.get("role").and_then(Value::as_str) == Some("user")
+                            && message.get(REAL_USER_ORIGIN_FIELD) == Some(&Value::Bool(true))
+                    })
+            })
+            .filter_map(entry_to_chat)
+            .collect();
+    delegation_forbidden_from_messages(&messages)
+}
 
 /// Replay the user's own messages to recover "don't use subagents" after a
 /// resume. Agent messages and harness notices are not the user speaking.

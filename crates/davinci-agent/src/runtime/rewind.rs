@@ -1775,6 +1775,10 @@ pub struct PromptCheckpoint {
     pub effect_end: Option<usize>,
     #[serde(skip)]
     messages_before: Option<Vec<davinci_ai::ChatMessage>>,
+    /// Unsaved conversations may already have compacted away the directive.
+    /// Saved conversations rebuild authority from their selected WAL branch.
+    #[serde(skip)]
+    delegation_forbidden_before: bool,
 }
 
 pub(crate) type PreparedPromptRewind = (PromptRewindState, BlobStore, Vec<OwnedFileEffect>);
@@ -2051,6 +2055,7 @@ impl crate::Agent {
             effect_start,
             effect_end: None,
             messages_before: self.session.is_none().then(|| self.messages.clone()),
+            delegation_forbidden_before: self.delegation_forbidden,
         }
     }
 
@@ -2438,7 +2443,11 @@ impl crate::Agent {
             self.pending_prompt_messages.clear();
             self.last_real_user_request =
                 crate::last_real_user_request_from_messages(&self.messages);
-            self.delegation_forbidden = crate::delegation_forbidden_from_messages(&self.messages);
+            self.delegation_forbidden = self
+                .session
+                .as_ref()
+                .map(crate::delegation_forbidden_from_session)
+                .unwrap_or(checkpoint.delegation_forbidden_before);
             self.restore_living_plan();
         }
         Ok(RewindOutcome {

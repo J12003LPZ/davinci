@@ -28,13 +28,22 @@ An environment variable, when set, wins over the setting, as Claude Code's envir
 
 The system prompt tells the model to use `agent` workers on its own initiative when a task needs broad searching across many files or several independent investigations that would flood its context, and not to delegate what a few direct calls finish.
 
-Tell Davinci not to use subagents and it stops. Phrases such as "don't use subagents", "no agents please", "do it without subagents", "never spawn workers" or "don't delegate" forbid delegation for the rest of the conversation. The prompt carries the rule, and a deterministic check (`crates/davinci-agent/src/delegation.rs`) backs it: while forbidden, every `agent` and `workflow_run` call is refused with a message telling the model to do the work itself. Say "you can use subagents again" (or "feel free to spawn agents", "subagents are fine now") to lift it.
+Tell Davinci not to use subagents and it stops. Phrases such as "don't use subagents", "no agents please", "do it without subagents", "never spawn workers" or "don't delegate" forbid delegation for the rest of the conversation. The prompt carries the rule, and a deterministic check (`crates/davinci-agent/src/delegation.rs`) backs it: while forbidden, every `agent`, `workflow_run` and `graph_run` call is refused with a message telling the model to do the work itself, including launches inside a batch. Say "you can use subagents again" (or "feel free to spawn agents", "subagents are fine now") to lift it. Status and stop tools remain available.
 
 - Only your own messages count. A message relayed from another agent cannot forbid or allow delegation.
 - The latest directive wins, including within one message.
 - Mentions are not directives: "read AGENTS.md", "don't modify the agents directory" and "no agent profile found" change nothing.
-- The policy survives `/resume`: it is rebuilt from your messages in the session.
-- To disable delegation permanently, add a deny rule: `"permissions": {"deny": ["agent", "workflow_run"]}`.
+- The policy survives compaction and `/resume`: it is rebuilt from your original messages on the selected session branch, even when they are absent from the model's context. Summaries and abandoned branches cannot change it.
+- Conversation rewind restores the policy at the selected checkpoint. Saved sessions use the original branch; unsaved conversations keep the policy alongside their in-memory conversation checkpoints. Code-only rewind leaves the current policy in place.
+- To disable delegation permanently, add a deny rule: `"permissions": {"deny": ["agent", "workflow_run", "graph_run"]}`.
+
+Offline regressions live in `crates/davinci-agent/tests/delegation_policy.rs` and
+`crates/davinci-evals/tests/agent_orchestration.rs`. They exercise compacted resume,
+branch selection, saved and unsaved rewind, both tool-dispatch paths, and a
+24-case direct/batched launch matrix across Astra, generic OpenAI and Anthropic
+profiles. Provider replies and graph executors are fixtures; these tests check
+runtime enforcement, not live model quality or task-success rates. Stable prompt
+text and provider tool schemas are unchanged by these enforcement fixes.
 
 ## Watching subagents work
 
