@@ -38,7 +38,7 @@ from runner import (create_campaign, isolate_settings, controlled_environment, s
                     pin_model_store, model_stop_reason, validate_large_manifest, container_command,
                     campaign_lock, parent_identity, source_identity)
 from codex_otel import Collector, request_metrics
-from private_suite import apply_hidden, import_suite, load_frozen, run_check, GradingLifecycleError
+from private_suite import apply_hidden, argv, import_suite, load_frozen, run_check, GradingLifecycleError
 from readiness_metrics import report as readiness_report, load_prices
 import subscription_campaign
 
@@ -51,6 +51,16 @@ SERVICE_TIER = os.environ.get("BENCH_SERVICE_TIER", "default")
 TIMEOUT = int(os.environ.get("BENCH_TIMEOUT", "900"))
 IGNORED = ("__pycache__", ".pytest_cache", ".git/", ".pi/", ".davinci/", ".codex/",
            ".davinci-transactions/", ".serena/")
+WORKSPACE_CONTRACT = (
+    "Execution environment for this task: the current working directory is an isolated, single-owner "
+    "repository fixture. Its setup is already complete. Make and verify the requested changes here; "
+    "this is the directory that will be graded. Do not create another checkout or worktree, require "
+    "a session ID, change Git operating modes, or perform remote fetch/push, PR, publication or "
+    "deployment steps. Those repository bootstrap and shipping instructions do not apply to this "
+    "local run. Keep repository coding and testing instructions and the task's mutation scope. "
+    "Leave the repository instruction files unchanged unless the task explicitly asks to edit them.\n\n"
+    "Task (unchanged):\n"
+)
 
 
 def task_ids():
@@ -114,12 +124,27 @@ def prepare(tid, dest):
     checked_git(dest, "commit", "-q", "--no-verify", "-m", "fixture")
 
 
-def grade(tid, workdir, timeout=120):
+def run_grading_check(command, workdir, timeout, phase, evidence=None):
+    command = argv(command)
+    checked = run_check(command, workdir, timeout)
+    # Keep both streams outside the graded tree, including failed cleanup.
+    # A compact stdout summary must not discard assertion details on stderr.
+    path = Path(str(workdir) + f".{phase}.json")
+    path.write_text(json.dumps({
+        "schema_version": 1, "phase": phase, "command": command,
+        "cwd": str(Path(workdir).resolve()), "timeout_seconds": timeout, **checked,
+    }, indent=2), encoding="utf-8")
+    if evidence is not None:
+        evidence[phase] = {"path": str(path.resolve()), "sha256": file_hash(path)}
+    return checked
+
+
+def grade(tid, workdir, timeout=120, *, phase="grader", evidence=None):
     hidden = os.path.join(TASKS, tid, "hidden")
     spec = load(tid)
     if "private_provenance" in spec:
         apply_hidden(spec, hidden, workdir)
-        checked = run_check(spec["grader_command"], workdir, timeout)
+        checked = run_grading_check(spec["grader_command"], workdir, timeout, phase, evidence)
         if checked["cleanup_complete"] is not True:
             raise GradingLifecycleError("private grader cleanup incomplete")
         detail = (checked["stdout"] or checked["stderr"]).strip().splitlines()
@@ -128,10 +153,12 @@ def grade(tid, workdir, timeout=120):
     files = []
     for base, _, names in os.walk(hidden):
         files += [os.path.relpath(os.path.join(base, n), hidden) for n in names]
-    checked = run_check(
+    checked = run_grading_check(
         [sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider", *files],
         workdir,
         timeout,
+        phase,
+        evidence,
     )
     if checked["cleanup_complete"] is not True:
         raise GradingLifecycleError("public grader cleanup incomplete")
@@ -448,7 +475,7 @@ def run_one(harness, tid, rep, campaign=None):
     env = (controlled_environment(os.environ, campaign["agent_dir"], subscription_only=bool(subscription))
            if campaign else dict(os.environ, PI_LEARNING_DISABLE_BACKGROUND="1", PYTHONUTF8="1"))
     with Collector() if harness == "codex" else nullcontext() as collector:
-        args = command(harness, spec["prompt"], workdir)
+        args = command(harness, WORKSPACE_CONTRACT + spec["prompt"], workdir)
         if campaign:
             args[0] = campaign["executables"][harness]
             if file_hash(args[0]) != campaign["identities"][harness]["binary_sha256"]:
@@ -496,17 +523,20 @@ def run_one(harness, tid, rep, campaign=None):
     except (OSError, RuntimeError, subprocess.SubprocessError):
         changed = unrelated = None
         stopped = stopped or "change_inventory_failed"
+    grading_evidence = {}
     if stopped:
         ok, passed, failed, tail = False, 0, 0, "not run: " + stopped
         regression = None
     else:
         regression = None
         try:
-            regression = run_check(spec["regression_command"], workdir, grading_timeout(campaign)) if "private_provenance" in spec else None
+            if "private_provenance" in spec:
+                regression = run_grading_check(spec["regression_command"], workdir,
+                    grading_timeout(campaign), "regression", grading_evidence)
             if regression is not None and regression["cleanup_complete"] is not True:
                 stopped = "regression_cleanup_failed"
                 raise GradingLifecycleError("regression cleanup incomplete")
-            ok, passed, failed, tail = grade(tid, workdir, grading_timeout(campaign))
+            ok, passed, failed, tail = grade(tid, workdir, grading_timeout(campaign), evidence=grading_evidence)
         except GradingLifecycleError as error:
             cleanup_complete = False
             stopped = stopped or "grader_cleanup_failed"
@@ -539,6 +569,7 @@ def run_one(harness, tid, rep, campaign=None):
         "stop_reason": stopped,
         "regression_pass": regression["pass"] if regression else None,
         "regression_exit": regression["exit"] if regression else None,
+        "grading_evidence": grading_evidence,
         "execution_mode": "print",
     }
     if subscription:
@@ -629,15 +660,16 @@ def validate(task_set="legacy", large_manifest=None, private_tasks=None, timeout
     for tid in task_ids:
         d = os.path.join(RUNS, "_validate", tid)
         prepare(tid, d)
-        before = grade(tid, d, timeout)
+        before = grade(tid, d, timeout, phase="starter-grader")
         prepare(tid, d)
         if "private_provenance" in load(tid):
             shutil.rmtree(d, onexc=_force_remove)
             shutil.copytree(os.path.join(TASKS, tid, "solution"), d)
         else:
             copy_tree(os.path.join(TASKS, tid, "solution"), d)
-        after = grade(tid, d, timeout)
-        reference_regression = run_check(load(tid)["regression_command"], d, timeout) if "private_provenance" in load(tid) else None
+        after = grade(tid, d, timeout, phase="reference-grader")
+        reference_regression = (run_grading_check(load(tid)["regression_command"], d, timeout,
+                                "reference-regression") if "private_provenance" in load(tid) else None)
         if reference_regression is not None and reference_regression["cleanup_complete"] is not True:
             raise GradingLifecycleError("reference regression cleanup incomplete")
         good = (not before[0]) and after[0] and (reference_regression is None or reference_regression["pass"])

@@ -4,7 +4,7 @@ Execution record for the supplied October 1 OpenAI production-harness plan (`202
 
 ## Identity and authority
 
-The input is an exported source tree at `C:\Users\sergi\Desktop\davinci-main`, without Git metadata. No commit or branch is asserted. The original 4,462-file export is backed up in `C:\Users\sergi\.codex\tmp\openai-harness-01a0fac0\source-before.zip`, with a SHA-256 file inventory in `source-before.json`. Changes are compared against that archive, preserving pre-existing content.
+The initial input was an exported source tree at `C:\Users\sergi\Desktop\davinci-main`, without Git metadata. Its original 4,462-file export is backed up in `C:\Users\sergi\.codex\tmp\openai-harness-01a0fac0\source-before.zip`, with a SHA-256 file inventory in `source-before.json`. Changes are compared against that archive, preserving pre-existing content. Subsequent PR and tested-release revisions are identified below.
 
 Implementation and review were solo, as requested. Tests used an external Cargo target directory, offline dependency resolution after the initial locked dependency fetch, disabled live-provider paths, and isolated fixtures. The initial implementation phase performed no paid campaign, credential change, installation, release, commit, push, deployment, or competing harness run. The implementation does not claim measured savings or superior task success.
 
@@ -61,7 +61,7 @@ Coverage is explicit: `diagnosticComparableOperations` and `diagnosticUnknownOpe
 | S02 | Delegation restriction parser and regressions, including curly apostrophes | Fixed and fixture verified |
 | S03–S04 | Existing plugin transaction, corruption, disabled-state and publication tests | Local regression coverage retained |
 | S05 | AI stream cancellation/backpressure fixtures and owned process lifecycle tests | Local cleanup covered; remote cancellation is not proof of zero usage |
-| M00 | `scripts/release_identity.py`, runner identity tests | Export transferred to isolated PR worktree; exact submitted-head green CI and release build still required |
+| M00 | `scripts/release_identity.py`, runner identity tests | Tested source `bd745f64` has green CI and an immutable production release build; later runner-only fixes are not live-accepted |
 | M01 | Provider observations, agent stats, background ledger, Python receipt reconciliation | Fixture accounting verified; live print/RPC/interactive reconciliation remains unmeasured |
 | M02 | `harness_root_budget`, AI process-budget wire test, capacity tests | Durable admission and resume verified; monetary/private-Codex bounds limited as above |
 | M03 | `harness_accounting`, `tool_diagnostics`, stats, transaction dispatch and benchmark/readiness metrics | Stage separation, overlap and bounded state-matched diagnostics; coverage limits above remain explicit |
@@ -81,16 +81,16 @@ Coverage is explicit: `diagnosticComparableOperations` and `diagnosticUnknownOpe
 | T02 | Refilling scheduler tests | Implemented and fixture verified; no latency improvement claim |
 | T03 | Existing managed-process readiness/reuse plus product journey fixture | Owned local lifecycle verified; production startup/reuse remains application specific |
 | A01 | Existing task strategy/delegation contracts | Retained; no worker-count optimization claim |
-| A02 | Existing worktree/worker isolation and graph artifact verification tests | Fixture covered; this export cannot prove a Git-backed final combined delivery |
+| A02 | Existing worktree/worker isolation and graph artifact verification tests | Fixture covered in the Git-backed PR; live multi-worker combined-delivery acceptance remains unmeasured |
 | A03 | Existing durable graph/operation journals plus root admission | Recovery and root limits covered locally; no live multi-worker campaign |
 | A04 | Existing fixed-model worker/bootstrap controls | Retained; no automatic model-routing promotion |
 | P01 | Acceptance pack and planner tests | Risk-specific required checks implemented; a suggested pack is not a passing receipt |
 | P02 | `harness_product_journey` and product acceptance evals | Owned synthetic app exercised; real product/browser/platform journeys remain external acceptance |
 | P03 | `completion_delivery` and graph status | Evidence levels implemented; graph status stays at implemented when host semantic receipts are absent |
 | E01 | Existing private-suite importer, holdout and grader fixtures | Real historical DaVinci tasks being curated; candidate count alone is not validated task admission |
-| E02 | Existing paired protocol, subscription campaign policy, all-attempt metrics and admission gates | Subscription-only campaign authorized; fixed baseline and finite manifest required before launch |
+| E02 | Existing paired protocol, subscription campaign policy, all-attempt metrics and admission gates | Four-task subscription pilot failed and halted; no matched efficacy or production acceptance |
 | E03 | Existing ablation controls plus compaction/resume/background regressions | Offline boundaries covered; dev/holdout and long-session efficacy unmeasured |
-| R01 | Existing release validator plus delivery levels | No candidate promoted, installed or deployed; canary/rollback acceptance not exercised |
+| R01 | Existing release validator plus delivery levels | Exact-release local permission/file-rollback drills passed with limits below; failed task acceptance prevents installation or promotion |
 | R02 | Keep/cut decisions below | Unmeasured components retained or left opt-in; no speculative deletion |
 
 ## Keep/cut and rollback
@@ -118,4 +118,29 @@ The subscription policy is now enforced at final request admission and each actu
 
 The updated local workspace run passed 5,325 tests with zero failures and 40 ignored tests. Python benchmark checks ran 169 tests, with 165 passing and four skipped. Workspace formatting and strict all-target Clippy with `test-fixtures` passed. Full command receipts and log hashes are recorded in `acceptance-local-validation.json` beside the earlier evidence. Initial failed runs exposed a nonblocking Windows fixture socket and an MCP fixture path prerequisite; the final run uses an explicit fixture executable path. The actual 303 redirect regression failed before the redirect fix and passed afterward; 307 was already refused.
 
-The real-task catalog currently contains 40 development candidates and five unchanged holdout entries. Four historical Python cases have behavioral starter failures and passing reference tests; three Rust pilot candidates await validation. These counts are curation progress, not live task successes. Exact submitted-source CI, a fresh production release build, the authorized subscription campaign, operational acceptance and tested/installed hash equality remain required before installation.
+The initial real-task catalog contains 40 development candidates and five unchanged holdout entries. Candidates require compiled behavioral starter failures, passing reference checks and affected regressions before admission; compile failures, duplicate fixes and narrow graders for broad tasks are excluded. Candidate and qualified-fixture counts are not live task successes. The holdout has not been used for tuning.
+
+### First subscription pilot: not accepted
+
+The first live pass used source `bd745f6400027f2ff77c8889524f72d879effbf6`, with all 41 jobs passing in [CI run 36984077827](https://github.com/J12003LPZ/davinci/actions/runs/36984077827) and successful workflow lint. Its fresh, default-feature native Windows release executable has SHA-256 `c0fd037558ad31c80a8ef17e6f70797c02917d7ea8c7e8a135e2eb4ba771cc00`. It was built without `test-fixtures`; its schema-3 identity binds the source, source tree, CI and binary bytes. This is the tested candidate, not an accepted installation.
+
+The campaign ran from 09:11 to 09:34 UTC on October 2 with the fixed `gpt-6-luna` / high baseline, Codex OAuth and explicit SSE. Four admitted historical Python tasks were scheduled. Frozen caps were 80 actual requests, seven tasks and 5,400 seconds; individual process and grading bounds were 900 and 300 seconds, clamped to remaining campaign time. Reliable percentage enforcement was unavailable, so the hard caps governed this pass.
+
+| Historical task | Actual requests | Result |
+| --- | ---: | --- |
+| Private-suite inventory, `68e05685` | 10 | Failed: model stopped at repository session/worktree bootstrap despite the runner's prepared fixture; no edits |
+| Completion metrics, `d0d88dd2` | 28 | Failed: completion-reminder cause counts omitted; independent offline replay reproduced two assertion failures in 33 tests |
+| Safe grading, `4c1d0c3b` | 27 | Failed: missing cache-write usage still became zero; independent offline replay reproduced one failure in the first 22-test command, so three later commands were not run |
+| Provider attempts, `f269335c` | 6 | Stopped: HTTP 200 stream lacked a final receipt after approximately 305 seconds; provider cause unconfirmed |
+
+No task passed acceptance. The first three passed their visible regression commands but failed their frozen graders; the fourth was not graded after transport failure. The durable ledger retains **71 reservations: 70 committed and one unknown**, with admission halted. There were no retries or model/billing fallback. All four process trees were cleaned up, owned launcher processes were absent, and only the campaign's copied credential file was removed. Original subscription credentials and the halted ledger were preserved. The unknown reservation has not been reconciled or erased.
+
+Account-wide usage snapshots showed 19% remaining before launch and 13% afterward in the same weekly window. These snapshots include this orchestration and other sessions; their change is not attributed solely to DaVinci. No reliable campaign percentage or actual dollar spending was measured. The available quota was not reported exhausted; the stop was an incomplete provider stream.
+
+The same immutable executable passed four native process-supervisor gates and nine offline CLI checks. A separate direct-CLI policy drill passed 83 assertions across 11 invocations: plan-mode write denial, preview/apply/rollback of file updates/additions/deletions, denied rollback preserving bytes and journal, persistent write revocation, refused replay of a rolled-back transaction, later-edit conflict refusal and retained session history. Its nonzero budget reservation was seeded test data, not subscription usage. These checks do not cover in-flight permission revocation, general prompt rewind, acknowledged external-effect replay or a real browser/product journey.
+
+Two general runner fixes followed this pilot. Both harnesses now receive the same prepared-workspace contract before the unchanged task text, retaining coding/testing instructions while excluding redundant worktree and remote shipping steps. Grading now preserves complete command/exit/cleanup/stdout/stderr receipts outside the graded directory, including separate pre-hidden regression and starter/reference validation evidence. These fixes have RED/GREEN regressions and a passing 173-test Python run (169 passed, four skipped); they have **not** been validated by another live campaign. The earlier 5,325-passing Rust workspace run and release artifact identify `bd745f64`, not a later runner revision.
+
+Local evidence under `C:\Users\sergi\.codex\tmp\openai-harness-01a0fac0` includes `acceptance/pilot-outcome.json`, the sealed `acceptance/subscription-pilot-bd745f64` results and ledger, `acceptance/pilot-failure-diagnosis/diagnosis.json`, `acceptance/native-policy-drill/verification.json`, and `acceptance-python-final.json`. Raw transcripts, authentication, private fixtures and full grader output are not published in this PR.
+
+**Production acceptance is blocked.** The required 40–60-task pass, broader real-product/platform acceptance and independent grading isolation are not established. The fixed baseline was preserved and no optimization was promoted. The native same-user run is diagnostic-only, not a secrecy boundary for graders or credentials. Nothing was installed at `C:\Users\sergi\.cargo\bin\davinci.exe`; installed/tested hash equality remains gated on a passing campaign. No public release or external deployment occurred.

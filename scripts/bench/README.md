@@ -213,6 +213,25 @@ Inherited product/provider/OTEL overrides are stripped. Codex uses
 binary bytes, fixture hashes, and the pinned model catalog are rechecked during
 the campaign.
 
+Both harnesses receive the same execution-environment preamble followed by the
+unchanged task text. The runner has already prepared an isolated repository;
+the preamble directs edits and verification to that directory and excludes
+repository worktree/session bootstrap and remote shipping rituals. Repository
+coding/testing guidance and task scope still apply. Instruction files are not
+rewritten. This preamble is part of the runner revision and must remain fixed
+within a matched comparison.
+
+Grading saves complete local `.regression.json` and `.grader.json` receipts
+beside each task workspace, outside the graded tree. They include command,
+working directory, timeout, exit, cleanup status and both output streams.
+Result rows contain receipt paths and SHA-256 hashes; their compact summaries
+are not the full failure evidence. The visible regression receipt is saved
+before hidden tests are overlaid. Fixture validation uses separate
+`.starter-grader.json`, `.reference-grader.json` and
+`.reference-regression.json` files. These receipts can contain private source
+paths and test output; keep them with the local campaign evidence and review
+them before sharing. A receipt does not establish independent grader isolation.
+
 ## Metric definitions and acceptance
 
 ### Codex subscription acceptance
