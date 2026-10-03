@@ -167,6 +167,15 @@ fn native_confined_capture_and_prototype_actions() {
         assert!(result.capture.screenshot.size > 100);
         captures.push(result);
     }
+    let export_capture = davinci_coding_agent::design::render::capture(
+        &store,
+        &ctx,
+        session,
+        &runtime,
+        request.render.clone(),
+        OperationId::new(),
+    )
+    .unwrap();
     // interact closes its browser before returning. Drop the session writer and
     // retrieve each adopted screenshot through its persisted, owner-bound receipt.
     let session_path = session.path.clone();
@@ -174,6 +183,14 @@ fn native_confined_capture_and_prototype_actions() {
     agent.session = Some(JsonlSession::open(&session_path).unwrap());
     let reopened_ctx = AuthorizedDesignContext::from_agent(&agent, &root).unwrap();
     let reopened = agent.session.as_ref().unwrap();
+    verify_native_exports(
+        &store,
+        &reopened_ctx,
+        reopened,
+        &runtime,
+        &root,
+        &export_capture,
+    );
     if let Some(directory) = std::env::var_os("DAVINCI_DESIGN_EVIDENCE") {
         use sha2::{Digest, Sha256};
         use std::io::Read;
@@ -239,6 +256,99 @@ fn native_confined_capture_and_prototype_actions() {
             viewport.height,
             retained.capture.screenshot.sha256
         );
+    }
+}
+
+fn verify_native_exports(
+    store: &davinci_coding_agent::design::store::DesignStore,
+    ctx: &AuthorizedDesignContext,
+    session: &JsonlSession,
+    runtime: &TrustedDesignRuntime,
+    root: &Path,
+    capture: &davinci_coding_agent::design::records::RenderReceipt,
+) {
+    use davinci_coding_agent::design::{
+        commands::ExportFormat, export::*, skills::byte_hash, store::digest, types::*,
+    };
+    let request = &capture.request;
+    let sources = store
+        .read_sources(ctx, session, request.artifact_id, request.revision)
+        .unwrap();
+    let original = compile::compile(ctx, runtime, "app.tsx", &sources).unwrap();
+    let mut receipts = BTreeMap::new();
+    for (label, format) in [
+        ("source", ExportFormat::Source),
+        ("html", ExportFormat::Html),
+        ("png", ExportFormat::Png),
+    ] {
+        let destination = root.join(format!("export-{label}"));
+        let receipt = export_revision(
+            store,
+            ctx,
+            session,
+            &ExportRequest {
+                artifact_id: request.artifact_id,
+                revision: request.revision,
+                format,
+                destination: destination.to_string_lossy().into_owned(),
+                artboard_id: Some(request.artboard_id),
+                viewport: Some(request.viewport.clone()),
+                operation_id: OperationId::new(),
+            },
+            Some(runtime),
+        )
+        .unwrap();
+        assert!(receipt.complete && receipt.omitted_assets.is_empty());
+        assert_eq!(receipt.source_hash, capture.source_hash);
+        assert_eq!(
+            receipt.manifest_hash,
+            byte_hash(&std::fs::read(destination.join("design.json")).unwrap())
+        );
+        receipts.insert(label, receipt);
+    }
+    let reopened: BTreeMap<String, String> = sources
+        .keys()
+        .map(|name| {
+            (
+                name.clone(),
+                std::fs::read_to_string(root.join("export-source/source").join(name)).unwrap(),
+            )
+        })
+        .collect();
+    assert_eq!(reopened, sources);
+    let rebuilt = compile::compile(ctx, runtime, "app.tsx", &reopened).unwrap();
+    assert_eq!(rebuilt.source_hash, original.source_hash);
+    assert_eq!(rebuilt.files, original.files);
+    for (name, expected) in &rebuilt.files {
+        assert_eq!(
+            std::fs::read_to_string(root.join("export-html/html").join(name)).unwrap(),
+            *expected
+        );
+    }
+    assert!(receipts["html"].warning.is_some());
+    let png = std::fs::read(root.join("export-png/capture.png")).unwrap();
+    let retained = davinci_agent::runtime::evidence_store::VerificationEvidenceStore::new(
+        store.blob_directory(ctx),
+    )
+    .get_artifact(&(&capture.screenshot).into())
+    .unwrap();
+    assert_eq!(png, retained);
+    if let Some(directory) = std::env::var_os("DAVINCI_DESIGN_EVIDENCE") {
+        let directory = Path::new(&directory);
+        std::fs::create_dir_all(directory).unwrap();
+        std::fs::write(directory.join("native-export.png"), png).unwrap();
+        std::fs::write(
+            directory.join("native-export.json"),
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "receipts":receipts, "runtime_hash":runtime.fingerprint(),
+                "capture":capture, "compiled_source_hash":rebuilt.source_hash,
+                "compiled_files_hash":digest(&rebuilt.files).unwrap(),
+                "exported_source_exact":true, "recompiled_bundle_exact":true,
+                "exported_html_exact":true, "exported_png_exact":true
+            }))
+            .unwrap(),
+        )
+        .unwrap();
     }
 }
 

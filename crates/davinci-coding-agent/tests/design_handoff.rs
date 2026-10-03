@@ -181,25 +181,31 @@ fn host_commands_obey_hook_veto_and_cancellation() {
         .is_err());
     cancelled.store(false, Ordering::Release);
     let ready = root.join("cancel-ready");
-    let began = std::time::Instant::now();
     std::thread::scope(|scope| {
-        scope.spawn(|| {
-            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let cancellation = scope.spawn(|| {
+            // Allow cold CI process startup without charging it to cancellation.
+            // The marker proves the child was running before we signal abort.
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
             while !ready.exists() && std::time::Instant::now() < deadline {
                 std::thread::sleep(std::time::Duration::from_millis(20));
             }
+            let signalled_at = ready.exists().then(std::time::Instant::now);
             cancelled.store(true, Ordering::Release);
+            signalled_at
         });
         let result = agent.execute_host_verification_command(
             &root,
-            "node -e 'require(\"node:fs\").writeFileSync(\"cancel-ready\",\"ready\");setTimeout(()=>{},30000)'",
-            15_000,
+            "node -e 'require(\"node:fs\").writeFileSync(\"cancel-ready\",\"ready\");setTimeout(()=>{},60000)'",
+            60_000,
             cancelled.clone(),
         );
-        assert!(ready.exists(), "child must start before cancellation");
+        let signalled_at = cancellation
+            .join()
+            .unwrap()
+            .unwrap_or_else(|| panic!("child must start before cancellation: {result:?}"));
+        assert!(signalled_at.elapsed() < std::time::Duration::from_secs(10));
         assert!(result.unwrap_err().contains("verification cancelled"));
     });
-    assert!(began.elapsed() < std::time::Duration::from_secs(10));
 }
 
 #[test]
