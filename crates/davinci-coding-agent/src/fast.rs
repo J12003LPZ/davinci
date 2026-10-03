@@ -12,9 +12,7 @@ pub fn toggle(agent: &mut davinci_agent::Agent, capability: FastCapability) -> R
     let next = if agent.service_tier == CodexServiceTier::Fast {
         CodexServiceTier::Standard
     } else {
-        if capability == FastCapability::Unsupported {
-            return Err(format!("Fast is not advertised for {}", agent.model_id));
-        }
+        CodexServiceTier::Fast.validate_capability(capability, &agent.model_id)?;
         CodexServiceTier::Fast
     };
     agent.service_tier = next;
@@ -68,10 +66,14 @@ pub fn speed_label(agent: &davinci_agent::Agent, capability: FastCapability) -> 
         return String::new();
     }
     let label = agent.service_tier.label();
-    if agent.service_tier == CodexServiceTier::Fast && capability == FastCapability::Unknown {
-        format!("{label} · capability unverified")
-    } else {
-        label.into()
+    match (agent.service_tier, capability) {
+        (CodexServiceTier::Fast, FastCapability::Unknown) => {
+            format!("{label} · capability unverified")
+        }
+        (CodexServiceTier::Fast, FastCapability::Unsupported) => {
+            format!("{label} requested · blocked: not advertised")
+        }
+        _ => label.into(),
     }
 }
 
@@ -79,6 +81,18 @@ pub fn speed_label(agent: &davinci_agent::Agent, capability: FastCapability) -> 
 mod tests {
     use super::*;
     use davinci_ai::{CodexServiceTier, FastCapability};
+
+    #[test]
+    fn saved_unsupported_fast_is_labeled_blocked_and_can_be_disabled() {
+        let mut agent = davinci_agent::Agent::new("system");
+        agent.provider = "openai-codex".into();
+        agent.model_id = "fixture-model".into();
+        agent.service_tier = CodexServiceTier::Fast;
+        assert!(speed_label(&agent, FastCapability::Unsupported).contains("blocked"));
+        toggle(&mut agent, FastCapability::Unsupported).unwrap();
+        assert_eq!(agent.service_tier, CodexServiceTier::Standard);
+        assert!(toggle(&mut agent, FastCapability::Unsupported).is_err());
+    }
 
     #[test]
     fn fast_toggle_preserves_model_effort_and_session() {
