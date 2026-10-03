@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
-  "recorded_at_utc": "2026-10-03T20:40:27.217262+00:00",
-  "status": "incomplete_draft_not_release_certified",
+  "recorded_at_utc": "2026-10-03T21:25:01.229153+00:00",
+  "status": "submitted_for_review_validation_incomplete_not_release_certified",
   "baseline_commit": "a669549c5356af8110feff589bc15864fce7209b",
   "original_local_snapshot_commit": "d9725d0cb89db8ca07a7d3920ce1a3aaf55a825f",
   "pre_integration_feature_commit": "cb2903cba828d519f8fc1f94b10198b68b1ead62",
@@ -24,6 +24,13 @@
     "native-ci-e751.log": "Namespace probe, compiler/host and managed target handoff passed. Both confined tests failed during Playwright import because the isolated child had no home path or account database. Linux design HOME and temporary paths now select private /tmp; native execution pending.",
     "contracts-e751": "Both platform design jobs passed on e751806e; complete logs retained.",
     "native-ci-8681.log": "Compiler/host and managed target handoff passed; both confined tests reached a transport allowlist mismatch for prototype assertions. Focused key/text regression failed before the fix, all 12 transport tests passed afterward. Native fixture expanded to three viewports, session reopen and test-binary hash retention; compile/Clippy passed, native execution pending.",
+    "native-ci-ed99.log": "Strict Linux capture passed all three viewports, keyboard/click/text actions, and receipt/screenshot retrieval after session reopen. Supervised compiler/host and managed target handoff passed. Hostile-page test failed; its WebSocket fixture now recognizes intercepted policy closure. Corrected native execution pending.",
+    "native-capture-bindings-ed99.log": "All three PNG dimensions, sizes, SHA-256 hashes, source/runtime bindings and current render/interaction states validated. Overall helper exited incomplete because the security receipt was missing.",
+    "linux-design-ci-d8db.log": "Linux contract job passed on d8db81d8: all 20 integration targets, two offline evaluations, focused recovery and real companion browser checks.",
+    "windows-design-ci-d8db.log": "Windows job stopped in the handoff cancellation fixture: its five-second startup deadline expired before observing the child marker. The prior ed997c1c job passed; this newer failure remains recorded.",
+    "handoff-cancel-startup.log": "One exact Windows test passed after separating bounded child startup from the ten-second post-signal cancellation assertion. Formatting passed; no broad suite rerun.",
+    "native-ci-d8db.log": "All three strict native tests passed: three-viewport captures and reopened evidence, hostile fetch/WebSocket/image denial with zero host connections and 14 observed descendants stopped, and supervised compiler/host. Actual managed target handoff also passed.",
+    "native-bindings-d8db.log": "Downloaded PNG signatures, dimensions, sizes, hashes, source/runtime bindings and current interaction/render states validated. Security receipt confirms three blocked requests, zero host connections and all 14 observed descendants stopped.",
     "workflow-warning-focused.log": "One exact local test passed after the Linux agent-wide CI job failed in workflow phase execution. Does not establish the cause or resolve that remote suite failure."
   },
   "platform": "windows-x86_64",
@@ -39,363 +46,427 @@
   },
   "linux_target_browser_evidence": {
     "target-handoff.json": {
-      "sha256": "8082c42260b32f6b58cf58b796130f25411152ef2f1d5dbc578e0ac7f9c55b1c",
-      "bytes": 15908
+      "sha256": "dea9baac62183e936b324e0a6cda5144e877fbb97d9131b5bad2b67807f3a88f",
+      "bytes": 15857
     },
     "target-handoff.png": {
-      "sha256": "df5a3ae39035fe36f4e9c485d1b96be2160fc96ef94fc644fab6eeeb9d6a444f",
-      "bytes": 7726
+      "sha256": "4842f789dcc5ee7cbd752359ab9b9f6c8bb62ac5a89f71efcf84d0c98dfc4d39",
+      "bytes": 7584
     }
   },
   "remote_validation": {
-    "commit": "f2ea8218b4fd016f8d352818d3b1a36a10a0c491",
-    "run_url": "https://github.com/J12003LPZ/davinci/actions/runs/37148254516",
-    "integration_targets": {
-      "linux-design-ci-f2ea.log": [
-        {
-          "target": "design_acceptance",
-          "state": "ok",
-          "passed": 1,
-          "failed": 0,
-          "ignored": 0,
-          "package": "davinci-coding-agent"
-        },
-        {
-          "target": "design_baseline",
-          "state": "ok",
-          "passed": 3,
-          "failed": 0,
-          "ignored": 0,
-          "package": "davinci-coding-agent"
-        },
-        {
-          "target": "design_budget",
-          "state": "ok",
-          "passed": 2,
-          "failed": 0,
-          "ignored": 0,
-          "package": "davinci-coding-agent"
-        },
-        {
-          "target": "design_commands",
-          "state": "ok",
-          "passed": 3,
-          "failed": 0,
-          "ignored": 0,
-          "package": "davinci-coding-agent"
-        },
-        {
-          "target": "design_controller",
-          "state": "ok",
-          "passed": 2,
-          "failed": 0,
-          "ignored": 0,
-          "package": "davinci-coding-agent"
-        },
-        {
-          "target": "design_export",
-          "state": "ok",
-          "passed": 1,
-          "failed": 0,
-          "ignored": 0,
-          "package": "davinci-coding-agent"
-        },
-        {
-          "target": "design_generation",
-          "state": "ok",
-          "passed": 4,
-          "failed": 0,
-          "ignored": 0,
-          "package": "davinci-coding-agent"
-        },
-        {
-          "target": "design_handoff",
-          "state": "ok",
-          "passed": 8,
-          "failed": 0,
-          "ignored": 1,
-          "package": "davinci-coding-agent"
-        },
-        {
-          "target": "design_host",
-          "state": "ok",
-          "passed": 1,
-          "failed": 0,
-          "ignored": 0,
-          "package": "davinci-coding-agent"
-        },
-        {
-          "target": "design_interaction",
-          "state": "ok",
-          "passed": 1,
-          "failed": 0,
-          "ignored": 0,
-          "package": "davinci-coding-agent"
-        },
-        {
-          "target": "design_limits",
-          "state": "ok",
-          "passed": 2,
-          "failed": 0,
-          "ignored": 0,
-          "package": "davinci-coding-agent"
-        },
-        {
-          "target": "design_model",
-          "state": "ok",
-          "passed": 2,
-          "failed": 0,
-          "ignored": 0,
-          "package": "davinci-coding-agent"
-        },
-        {
-          "target": "design_profiles",
-          "state": "ok",
-          "passed": 2,
-          "failed": 0,
-          "ignored": 0,
-          "package": "davinci-coding-agent"
-        },
-        {
-          "target": "design_quality",
-          "state": "ok",
-          "passed": 1,
-          "failed": 0,
-          "ignored": 0,
-          "package": "davinci-coding-agent"
-        },
-        {
-          "target": "design_recovery",
-          "state": "ok",
-          "passed": 3,
-          "failed": 0,
-          "ignored": 0,
-          "package": "davinci-coding-agent"
-        },
-        {
-          "target": "design_runtime",
-          "state": "ok",
-          "passed": 1,
-          "failed": 0,
-          "ignored": 3,
-          "package": "davinci-coding-agent"
-        },
-        {
-          "target": "design_security",
-          "state": "ok",
-          "passed": 1,
-          "failed": 0,
-          "ignored": 0,
-          "package": "davinci-coding-agent"
-        },
-        {
-          "target": "design_store",
-          "state": "ok",
-          "passed": 5,
-          "failed": 0,
-          "ignored": 0,
-          "package": "davinci-coding-agent"
-        },
-        {
-          "target": "design_sync",
-          "state": "ok",
-          "passed": 1,
-          "failed": 0,
-          "ignored": 0,
-          "package": "davinci-coding-agent"
-        },
-        {
-          "target": "design_types",
-          "state": "ok",
-          "passed": 5,
-          "failed": 0,
-          "ignored": 0,
-          "package": "davinci-coding-agent"
-        },
-        {
-          "target": "design_quality",
-          "state": "ok",
-          "passed": 2,
-          "failed": 0,
-          "ignored": 0,
-          "package": "davinci-evals"
-        }
-      ],
-      "windows-design-ci-f2ea.log": [
-        {
-          "target": "design_acceptance",
-          "state": "ok",
-          "passed": 1,
-          "failed": 0,
-          "ignored": 0,
-          "package": "davinci-coding-agent"
-        },
-        {
-          "target": "design_baseline",
-          "state": "ok",
-          "passed": 3,
-          "failed": 0,
-          "ignored": 0,
-          "package": "davinci-coding-agent"
-        },
-        {
-          "target": "design_budget",
-          "state": "ok",
-          "passed": 2,
-          "failed": 0,
-          "ignored": 0,
-          "package": "davinci-coding-agent"
-        },
-        {
-          "target": "design_commands",
-          "state": "ok",
-          "passed": 3,
-          "failed": 0,
-          "ignored": 0,
-          "package": "davinci-coding-agent"
-        },
-        {
-          "target": "design_controller",
-          "state": "ok",
-          "passed": 2,
-          "failed": 0,
-          "ignored": 0,
-          "package": "davinci-coding-agent"
-        },
-        {
-          "target": "design_export",
-          "state": "ok",
-          "passed": 1,
-          "failed": 0,
-          "ignored": 0,
-          "package": "davinci-coding-agent"
-        },
-        {
-          "target": "design_generation",
-          "state": "ok",
-          "passed": 4,
-          "failed": 0,
-          "ignored": 0,
-          "package": "davinci-coding-agent"
-        },
-        {
-          "target": "design_handoff",
-          "state": "ok",
-          "passed": 8,
-          "failed": 0,
-          "ignored": 1,
-          "package": "davinci-coding-agent"
-        },
-        {
-          "target": "design_host",
-          "state": "ok",
-          "passed": 1,
-          "failed": 0,
-          "ignored": 0,
-          "package": "davinci-coding-agent"
-        },
-        {
-          "target": "design_interaction",
-          "state": "ok",
-          "passed": 1,
-          "failed": 0,
-          "ignored": 0,
-          "package": "davinci-coding-agent"
-        },
-        {
-          "target": "design_limits",
-          "state": "ok",
-          "passed": 2,
-          "failed": 0,
-          "ignored": 0,
-          "package": "davinci-coding-agent"
-        },
-        {
-          "target": "design_model",
-          "state": "ok",
-          "passed": 2,
-          "failed": 0,
-          "ignored": 0,
-          "package": "davinci-coding-agent"
-        },
-        {
-          "target": "design_profiles",
-          "state": "ok",
-          "passed": 2,
-          "failed": 0,
-          "ignored": 0,
-          "package": "davinci-coding-agent"
-        },
-        {
-          "target": "design_quality",
-          "state": "ok",
-          "passed": 1,
-          "failed": 0,
-          "ignored": 0,
-          "package": "davinci-coding-agent"
-        },
-        {
-          "target": "design_recovery",
-          "state": "ok",
-          "passed": 3,
-          "failed": 0,
-          "ignored": 0,
-          "package": "davinci-coding-agent"
-        },
-        {
-          "target": "design_runtime",
-          "state": "ok",
-          "passed": 1,
-          "failed": 0,
-          "ignored": 3,
-          "package": "davinci-coding-agent"
-        },
-        {
-          "target": "design_security",
-          "state": "ok",
-          "passed": 1,
-          "failed": 0,
-          "ignored": 0,
-          "package": "davinci-coding-agent"
-        },
-        {
-          "target": "design_store",
-          "state": "ok",
-          "passed": 5,
-          "failed": 0,
-          "ignored": 0,
-          "package": "davinci-coding-agent"
-        },
-        {
-          "target": "design_sync",
-          "state": "ok",
-          "passed": 1,
-          "failed": 0,
-          "ignored": 0,
-          "package": "davinci-coding-agent"
-        },
-        {
-          "target": "design_types",
-          "state": "ok",
-          "passed": 5,
-          "failed": 0,
-          "ignored": 0,
-          "package": "davinci-coding-agent"
-        },
-        {
-          "target": "design_quality",
-          "state": "ok",
-          "passed": 2,
-          "failed": 0,
-          "ignored": 0,
-          "package": "davinci-evals"
-        }
-      ]
+    "last_all_platform_contract_pass": {
+      "commit": "ed997c1c3406078919927430c9743391bc75cd78",
+      "run_url": "https://github.com/J12003LPZ/davinci/actions/runs/37152410278",
+      "integration_targets": {
+        "linux-design-ci-ed99.log": [
+          {
+            "target": "design_acceptance",
+            "state": "ok",
+            "passed": 1,
+            "failed": 0,
+            "ignored": 0,
+            "package": "davinci-coding-agent"
+          },
+          {
+            "target": "design_baseline",
+            "state": "ok",
+            "passed": 3,
+            "failed": 0,
+            "ignored": 0,
+            "package": "davinci-coding-agent"
+          },
+          {
+            "target": "design_budget",
+            "state": "ok",
+            "passed": 2,
+            "failed": 0,
+            "ignored": 0,
+            "package": "davinci-coding-agent"
+          },
+          {
+            "target": "design_commands",
+            "state": "ok",
+            "passed": 3,
+            "failed": 0,
+            "ignored": 0,
+            "package": "davinci-coding-agent"
+          },
+          {
+            "target": "design_controller",
+            "state": "ok",
+            "passed": 2,
+            "failed": 0,
+            "ignored": 0,
+            "package": "davinci-coding-agent"
+          },
+          {
+            "target": "design_export",
+            "state": "ok",
+            "passed": 1,
+            "failed": 0,
+            "ignored": 0,
+            "package": "davinci-coding-agent"
+          },
+          {
+            "target": "design_generation",
+            "state": "ok",
+            "passed": 4,
+            "failed": 0,
+            "ignored": 0,
+            "package": "davinci-coding-agent"
+          },
+          {
+            "target": "design_handoff",
+            "state": "ok",
+            "passed": 8,
+            "failed": 0,
+            "ignored": 1,
+            "package": "davinci-coding-agent"
+          },
+          {
+            "target": "design_host",
+            "state": "ok",
+            "passed": 1,
+            "failed": 0,
+            "ignored": 0,
+            "package": "davinci-coding-agent"
+          },
+          {
+            "target": "design_interaction",
+            "state": "ok",
+            "passed": 1,
+            "failed": 0,
+            "ignored": 0,
+            "package": "davinci-coding-agent"
+          },
+          {
+            "target": "design_limits",
+            "state": "ok",
+            "passed": 2,
+            "failed": 0,
+            "ignored": 0,
+            "package": "davinci-coding-agent"
+          },
+          {
+            "target": "design_model",
+            "state": "ok",
+            "passed": 2,
+            "failed": 0,
+            "ignored": 0,
+            "package": "davinci-coding-agent"
+          },
+          {
+            "target": "design_profiles",
+            "state": "ok",
+            "passed": 2,
+            "failed": 0,
+            "ignored": 0,
+            "package": "davinci-coding-agent"
+          },
+          {
+            "target": "design_quality",
+            "state": "ok",
+            "passed": 1,
+            "failed": 0,
+            "ignored": 0,
+            "package": "davinci-coding-agent"
+          },
+          {
+            "target": "design_recovery",
+            "state": "ok",
+            "passed": 3,
+            "failed": 0,
+            "ignored": 0,
+            "package": "davinci-coding-agent"
+          },
+          {
+            "target": "design_runtime",
+            "state": "ok",
+            "passed": 1,
+            "failed": 0,
+            "ignored": 3,
+            "package": "davinci-coding-agent"
+          },
+          {
+            "target": "design_security",
+            "state": "ok",
+            "passed": 1,
+            "failed": 0,
+            "ignored": 0,
+            "package": "davinci-coding-agent"
+          },
+          {
+            "target": "design_store",
+            "state": "ok",
+            "passed": 5,
+            "failed": 0,
+            "ignored": 0,
+            "package": "davinci-coding-agent"
+          },
+          {
+            "target": "design_sync",
+            "state": "ok",
+            "passed": 1,
+            "failed": 0,
+            "ignored": 0,
+            "package": "davinci-coding-agent"
+          },
+          {
+            "target": "design_types",
+            "state": "ok",
+            "passed": 5,
+            "failed": 0,
+            "ignored": 0,
+            "package": "davinci-coding-agent"
+          },
+          {
+            "target": "design_quality",
+            "state": "ok",
+            "passed": 2,
+            "failed": 0,
+            "ignored": 0,
+            "package": "davinci-evals"
+          }
+        ],
+        "windows-design-ci-ed99.log": [
+          {
+            "target": "design_acceptance",
+            "state": "ok",
+            "passed": 1,
+            "failed": 0,
+            "ignored": 0,
+            "package": "davinci-coding-agent"
+          },
+          {
+            "target": "design_baseline",
+            "state": "ok",
+            "passed": 3,
+            "failed": 0,
+            "ignored": 0,
+            "package": "davinci-coding-agent"
+          },
+          {
+            "target": "design_budget",
+            "state": "ok",
+            "passed": 2,
+            "failed": 0,
+            "ignored": 0,
+            "package": "davinci-coding-agent"
+          },
+          {
+            "target": "design_commands",
+            "state": "ok",
+            "passed": 3,
+            "failed": 0,
+            "ignored": 0,
+            "package": "davinci-coding-agent"
+          },
+          {
+            "target": "design_controller",
+            "state": "ok",
+            "passed": 2,
+            "failed": 0,
+            "ignored": 0,
+            "package": "davinci-coding-agent"
+          },
+          {
+            "target": "design_export",
+            "state": "ok",
+            "passed": 1,
+            "failed": 0,
+            "ignored": 0,
+            "package": "davinci-coding-agent"
+          },
+          {
+            "target": "design_generation",
+            "state": "ok",
+            "passed": 4,
+            "failed": 0,
+            "ignored": 0,
+            "package": "davinci-coding-agent"
+          },
+          {
+            "target": "design_handoff",
+            "state": "ok",
+            "passed": 8,
+            "failed": 0,
+            "ignored": 1,
+            "package": "davinci-coding-agent"
+          },
+          {
+            "target": "design_host",
+            "state": "ok",
+            "passed": 1,
+            "failed": 0,
+            "ignored": 0,
+            "package": "davinci-coding-agent"
+          },
+          {
+            "target": "design_interaction",
+            "state": "ok",
+            "passed": 1,
+            "failed": 0,
+            "ignored": 0,
+            "package": "davinci-coding-agent"
+          },
+          {
+            "target": "design_limits",
+            "state": "ok",
+            "passed": 2,
+            "failed": 0,
+            "ignored": 0,
+            "package": "davinci-coding-agent"
+          },
+          {
+            "target": "design_model",
+            "state": "ok",
+            "passed": 2,
+            "failed": 0,
+            "ignored": 0,
+            "package": "davinci-coding-agent"
+          },
+          {
+            "target": "design_profiles",
+            "state": "ok",
+            "passed": 2,
+            "failed": 0,
+            "ignored": 0,
+            "package": "davinci-coding-agent"
+          },
+          {
+            "target": "design_quality",
+            "state": "ok",
+            "passed": 1,
+            "failed": 0,
+            "ignored": 0,
+            "package": "davinci-coding-agent"
+          },
+          {
+            "target": "design_recovery",
+            "state": "ok",
+            "passed": 3,
+            "failed": 0,
+            "ignored": 0,
+            "package": "davinci-coding-agent"
+          },
+          {
+            "target": "design_runtime",
+            "state": "ok",
+            "passed": 1,
+            "failed": 0,
+            "ignored": 3,
+            "package": "davinci-coding-agent"
+          },
+          {
+            "target": "design_security",
+            "state": "ok",
+            "passed": 1,
+            "failed": 0,
+            "ignored": 0,
+            "package": "davinci-coding-agent"
+          },
+          {
+            "target": "design_store",
+            "state": "ok",
+            "passed": 5,
+            "failed": 0,
+            "ignored": 0,
+            "package": "davinci-coding-agent"
+          },
+          {
+            "target": "design_sync",
+            "state": "ok",
+            "passed": 1,
+            "failed": 0,
+            "ignored": 0,
+            "package": "davinci-coding-agent"
+          },
+          {
+            "target": "design_types",
+            "state": "ok",
+            "passed": 5,
+            "failed": 0,
+            "ignored": 0,
+            "package": "davinci-coding-agent"
+          },
+          {
+            "target": "design_quality",
+            "state": "ok",
+            "passed": 2,
+            "failed": 0,
+            "ignored": 0,
+            "package": "davinci-evals"
+          }
+        ]
+      }
     },
-    "native_confined_capture": "failed_before_chromium_network_namespace_denied"
+    "commit": "d8db81d8f2c11c135eb6f1db0a3fda9d36136855",
+    "run_url": "https://github.com/J12003LPZ/davinci/actions/runs/37153529035",
+    "ci_merge_parents_verified_via_github": [
+      "a669549c5356af8110feff589bc15864fce7209b",
+      "d8db81d8f2c11c135eb6f1db0a3fda9d36136855"
+    ],
+    "linux_contract_job": "passed_all_targets_and_companion_checks",
+    "windows_contract_job": "failed_handoff_fixture_child_start_deadline",
+    "post_run_change": "Only test fixtures and readiness documentation changed. The exact local Windows cancellation test and focused native-export Clippy passed; production code is unchanged.",
+    "pending_run": {
+      "commit": "7a6d97da986b25c2e577a8f73b9b8af59095a90d",
+      "url": "https://github.com/J12003LPZ/davinci/actions/runs/37154901474",
+      "scope": "Contract jobs and native export/reimport extension still running at delivery."
+    },
+    "native_confined_capture": "passed_three_required_viewports_and_session_reopen",
+    "native_hostile_page_process_cleanup": "passed_three_denied_requests_zero_host_connections_fourteen_descendants_stopped",
+    "native_environment": {
+      "arch": "x86_64",
+      "binary_sha256": "9836c9f9cda8fb166772a5dde4b88bc544796a77def5a2148125dbed983b4ec4",
+      "ci_run_id": "37153529035",
+      "ci_source_commit": "4b3a8eaac33d7fdd740ef02735a000c33b51f050",
+      "installed_launch_path_verified": false,
+      "platform": "linux",
+      "runtime_hash": "9d5b59d8a788ea53af59f0086bb5f4e485643b35ede98605e3843e7f9ec997b7"
+    },
+    "native_artifacts": {
+      "native-capture-1440x900.json": {
+        "sha256": "1e174d6403807e6708408470333da49092ec7709c0c8392eaef0be3ce0fe6ffe",
+        "bytes": 2840
+      },
+      "native-capture-1440x900.png": {
+        "sha256": "5928e4f71f88b8dbde1a72eb0ddfcb9725a7fda2013e78ecc6514a291ddbb3b7",
+        "bytes": 8763
+      },
+      "native-capture-390x844.json": {
+        "sha256": "a3855bdf4a7d9647a22f821e288687f1e498aa1df19bd29f7939d148d6a43cc9",
+        "bytes": 2838
+      },
+      "native-capture-390x844.png": {
+        "sha256": "7ede241239cca246b2e445f21e54596c70192af1f3048fe5de78cdbf7950848d",
+        "bytes": 5463
+      },
+      "native-capture-768x1024.json": {
+        "sha256": "d37c4fc2dea5267149d76cbceb0f23b4d05a871aa477ae5f2417fc1ef05dafc6",
+        "bytes": 2840
+      },
+      "native-capture-768x1024.png": {
+        "sha256": "1389f906600468ee854fb420cfdd07e53f3d23f3f666c88f576b577ea8e48444",
+        "bytes": 7312
+      },
+      "native-environment.json": {
+        "sha256": "dd320f5b7bb1bd8627912db65b780b9d1c61379ea4e96a1099e8000645fd1899",
+        "bytes": 357
+      },
+      "native-security.json": {
+        "sha256": "867c047edb3b0167d72e4e17003a8f844329ddd2fb85cfed7d0c654259b2d19c",
+        "bytes": 1694
+      },
+      "native-tests.log": {
+        "sha256": "f13dcedc11e11c67472affbff09f903dfd291703a8e9dce13b5bd1a74c14ed2e",
+        "bytes": 14288
+      }
+    }
   },
   "workflow_validation": "actionlint 1.7.7 passed; optional ShellCheck not installed",
-  "source_files_sha256": "5e902ce7378727b8f3f6a2460b41f6d9a417c46477fa6d117221d1d2258d6f9a",
+  "source_files_sha256": "65ee6ebb2d792d0d3157f33f36ab1e3657d421ff5bd5616847a69041550104f8",
   "source_files": {
     ".gitattributes": "c692c1168246fea7980c8562efae5889afa7eac2df20a6408cc0a92c5271b8e7",
     ".github/workflows/design-artifacts.yml": "a36bc7084f26f8962c9e1b7877edb72c0b5b059b01c8883bd9dd8acd5ac725c9",
@@ -495,7 +566,7 @@
     "crates/davinci-coding-agent/tests/design_controller.rs": "1dd39c0851082808bca5dcbb7785f31bf94654147bb5b1d6d29ed26f3e0405fd",
     "crates/davinci-coding-agent/tests/design_export.rs": "d5036df933787252509d46c866915a9591ca791268a4cf1105a4b61b983369de",
     "crates/davinci-coding-agent/tests/design_generation.rs": "03c00d51510522295e840fb4ba42f72bc88596e6d12e2b517d886fdae3b61564",
-    "crates/davinci-coding-agent/tests/design_handoff.rs": "e24fc0864f5b48b79a9f84589d4ecb141a9701445b4828e9e7266bf5ff4ba705",
+    "crates/davinci-coding-agent/tests/design_handoff.rs": "cdcd98364208373f502905e9232e3e90e65031c6b5f4a8206b7f14d8136060eb",
     "crates/davinci-coding-agent/tests/design_host.rs": "5909bf46c7a4a25460b089738464379240a9c97e5f62827e0b3e042abba107aa",
     "crates/davinci-coding-agent/tests/design_interaction.rs": "cd2262b91ec128bbfc59d676b71559516935059ef72311423a9d5082e1b54e41",
     "crates/davinci-coding-agent/tests/design_limits.rs": "e6d153af4b6646f78c820496ad55d80ceb82e4ccf2eec933d9804d8a05c5e87e",
@@ -503,7 +574,7 @@
     "crates/davinci-coding-agent/tests/design_profiles.rs": "87bfbbb82cdf537b551cead4ea3eac591ac13b4ec1f793fcfa55d8db95bf4e78",
     "crates/davinci-coding-agent/tests/design_quality.rs": "f155c685c1e20344d8e77207fe2053ed3cf4ae04b0b8473b04d220bbc239c84b",
     "crates/davinci-coding-agent/tests/design_recovery.rs": "94cf59aeb5c8f18f8fb6053e019f5bc2d4494bf9a30fa23b7f6ffe2d0ccd77ae",
-    "crates/davinci-coding-agent/tests/design_runtime.rs": "50712afba9d46bdb73d3528c0ef42cad3e5cd926b79db8edd0adee67bcccf2a9",
+    "crates/davinci-coding-agent/tests/design_runtime.rs": "8a412ffb6966399062c0cf8114a66710ef8cb99dd286929b4c897cfda563a019",
     "crates/davinci-coding-agent/tests/design_security.rs": "eebe6ac654bb8ce9c2333cf29893f222985531b1377abdebd817c684291f100d",
     "crates/davinci-coding-agent/tests/design_store.rs": "318695a83bb7b964499d268284642e47b1895a6aed168a5d200ba4b6a67a8b52",
     "crates/davinci-coding-agent/tests/design_sync.rs": "2ccf22963689755acb1fd5d01bb7b23e7e50e5e1dc466d224e30abea2982093d",
@@ -622,7 +693,7 @@
     "crates/davinci-coding-agent/tests/design_controller.rs": "73da8ab68e5d523ee7a43fc1ce0afd7d06282272",
     "crates/davinci-coding-agent/tests/design_export.rs": "5a9d580dce43f7514a32f2ea9efe4a85682a1a59",
     "crates/davinci-coding-agent/tests/design_generation.rs": "c003ffabfc4c72d58f0f94b9afd8aadf63602fc6",
-    "crates/davinci-coding-agent/tests/design_handoff.rs": "ae8bb80f2f7ac6d92ad76b73045bd390ca831e40",
+    "crates/davinci-coding-agent/tests/design_handoff.rs": "dbb8c5ea7dd6482fb2b19d7198872e598bcb4f5e",
     "crates/davinci-coding-agent/tests/design_host.rs": "99646cf8aa52293132c22e6019ab8c891a3a7a69",
     "crates/davinci-coding-agent/tests/design_interaction.rs": "99dd4e7bbf3b38b782e79123d423997088fa444a",
     "crates/davinci-coding-agent/tests/design_limits.rs": "98a3f56b7f2861189f868ae539019cfcf343e609",
@@ -630,7 +701,7 @@
     "crates/davinci-coding-agent/tests/design_profiles.rs": "840f318850036d81da8012797ab8a8575af87df7",
     "crates/davinci-coding-agent/tests/design_quality.rs": "37ac7250520eadd009bbd61498208a2f376f625b",
     "crates/davinci-coding-agent/tests/design_recovery.rs": "cfaf28c221c0ba0995eadaa8a561acf71c1a9178",
-    "crates/davinci-coding-agent/tests/design_runtime.rs": "26a498291afa4483c01ba8bd9654d98c6898e029",
+    "crates/davinci-coding-agent/tests/design_runtime.rs": "5a13287737fdad4e047d8943808ecc7a9787148b",
     "crates/davinci-coding-agent/tests/design_security.rs": "597173705743307435ba93b35930a0bc70cd24bb",
     "crates/davinci-coding-agent/tests/design_store.rs": "326910106b90ed10d0d6721c4d6610dd2105f1a3",
     "crates/davinci-coding-agent/tests/design_sync.rs": "af5a1b10cd3a84fc516be2ca9327cf15fbdc94ea",
@@ -650,10 +721,10 @@
     "scripts/design-contracts.py": "6a6e196e4905fb9d76a437dc9ec3803846ddd4ce",
     "scripts/test-design.py": "d9ee602b9b17ec86fabea73ecf9dcc0251669b3f"
   },
-  "git_source_blobs_sha256": "299d5df57051c958991b320b92d82b687e564fe6e00fde23388d863d3dab763d",
+  "git_source_blobs_sha256": "8405d3810db311e50c4367bdcfce5829607975d35e7264314c3fab0ed920ef8e",
   "local_test_binary": {
     "path": "target/debug/davinci.exe",
-    "sha256": "809b0c181bf50bb2e7e8303caa2b8c41379bdda01516913c58f75b002023f01a",
+    "sha256": "fcd54e82b295313b457ecc8e35c74b7929153ff68ef2a981620a4062c58d6d09",
     "installed_launch_path_verified": false
   },
   "runtime": {
@@ -1099,6 +1170,54 @@
     "prototype-transport-green.log": {
       "sha256": "0807910ba1e0d0f08c7bf23079e411a97b8f167d48bc3c11873265217e945113",
       "bytes": 1085
+    },
+    "linux-design-ci-ed99.log": {
+      "sha256": "f670af69ab4dd970f833e3fa57cabab2d6773a289802d2c6aed5bdfdcedad730",
+      "bytes": 110646
+    },
+    "windows-design-ci-ed99.log": {
+      "sha256": "fb11190f8caf74b5b76514e42f7ddc83e8f373902d6ba2520e467c9edce2f57c",
+      "bytes": 97488
+    },
+    "native-ci-ed99.log": {
+      "sha256": "1d5dc6bfaf93aef4971d4adb5d1d028e667b87b67f700bb5c6a40272c9862c85",
+      "bytes": 80271
+    },
+    "native-capture-bindings-ed99.log": {
+      "sha256": "2f39855e08539c8b66ebae4e5c1ee14da2a4b41da43632e0ba83ce0d2ef1842c",
+      "bytes": 719
+    },
+    "hostile-fixture-compile.log": {
+      "sha256": "dfeac41e80a6233a3cec9eee61537e2e2029281b0c0b35e6986fd7e64f872576",
+      "bytes": 209
+    },
+    "linux-design-ci-d8db.log": {
+      "sha256": "6cc35c53ebcef162f4c38dfab67466ff3980e3bc80bd39fbdf5e3e827ffbd89d",
+      "bytes": 110637
+    },
+    "windows-design-ci-d8db.log": {
+      "sha256": "3e8abf0556709a48281a97445bb6861f69cbfb51883ff1467f3d3836f10cc152",
+      "bytes": 55729
+    },
+    "native-ci-d8db.log": {
+      "sha256": "08673492f471f2ba30e0c18217cb823b7c677f93d09a637da78271d872cd6a0e",
+      "bytes": 79807
+    },
+    "native-bindings-d8db.log": {
+      "sha256": "b79f2a9d78d94f9bff5403ad6fd4ba65933d223984f57afae313449a99e10fd5",
+      "bytes": 788
+    },
+    "handoff-cancel-startup.log": {
+      "sha256": "b459eaec61cc9897c9dac02c077489c3a022f13adec56a5b995cbc3cd48ba996",
+      "bytes": 473
+    },
+    "native-export-compile.log": {
+      "sha256": "2cbb39d1221cf0c4263f66c38f65bbffa53bcd8c84de2cc3cb8a6f314b66e7b6",
+      "bytes": 1260
+    },
+    "native-export-clippy.log": {
+      "sha256": "bab39d16af1f3c3b5312822ac746b885a66c7c9538372f75a5984535980c82cb",
+      "bytes": 208
     }
   },
   "counts_scope": "Historical initial local validation; current platform runs are separately bound under remote_validation and validation_phases.",
@@ -1118,10 +1237,11 @@
   },
   "limitations": [
     "native Windows capture blocked by required sandbox capability",
-    "refreshed runtime inventoried but no successful generated-content render",
+    "Linux native gates passed; latest Windows contract job failed a child-start deadline, exact corrected test passed locally",
     "full workspace suite stopped at one timeout test; exact isolated rerun passed",
     "production API, mock removal, RSC/client and transitive target source coverage incomplete",
     "generated-content cross-platform process-tree matrix incomplete",
-    "Linux/macOS native behavior, live model quality, human preference, coverage and installed release unverified"
+    "macOS native behavior, live model quality, human preference, coverage and installed release unverified",
+    "complete native export and reimport round trip not certified"
   ]
 }
