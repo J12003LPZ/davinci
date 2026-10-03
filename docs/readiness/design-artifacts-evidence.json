@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "recorded_at_utc": "2026-10-03T19:13:50.791616+00:00",
+  "recorded_at_utc": "2026-10-03T19:31:59.033646+00:00",
   "status": "incomplete_draft_not_release_certified",
   "baseline_commit": "a669549c5356af8110feff589bc15864fce7209b",
   "original_local_snapshot_commit": "d9725d0cb89db8ca07a7d3920ce1a3aaf55a825f",
@@ -14,7 +14,10 @@
     "initial": "Initial checks preceded upstream integration; check-specific limitations are in readiness prose.",
     "integrated-budget.log": "12 upstream root-budget and 13 design budget/generation/handoff/model checks on the integrated source.",
     "publication-green.log": "One focused unit test covers source/manifest/event interruption boundaries and exact retry after reopen.",
-    "native-evidence-compile.log": "Compile only: no native runtime was executed again on this unsupported Windows host."
+    "native-evidence-compile.log": "Compile only: no native runtime was executed again on this unsupported Windows host.",
+    "latest_handoff": "handoff-final.log covers nine tests including the real target browser. Later focused stale-input and cancellation checks are separate logs, not a full rerun.",
+    "native-hardening": "Private font-cache cleanup failed before its fix and passed after it; stale-handoff regression passed. The new native hostile-page/process test is compiled but awaits Linux execution.",
+    "native-ci-8796.log": "Linux pinned setup and supervised compiler/host passed; confined capture exited without complete output. This is not native rendering success."
   },
   "platform": "windows-x86_64",
   "target_browser_evidence": {
@@ -28,10 +31,10 @@
     }
   },
   "workflow_validation": "actionlint 1.7.7 passed; optional ShellCheck not installed",
-  "source_files_sha256": "1d85de34d9b3546347d88aed527a053ec507c18bd249250f9ce47182afec156f",
+  "source_files_sha256": "1f0409fcbd4648a9419f1ee439e073149eabd33044d54d78bcb7101bb6bd50e7",
   "source_files": {
     ".gitattributes": "c692c1168246fea7980c8562efae5889afa7eac2df20a6408cc0a92c5271b8e7",
-    ".github/workflows/design-artifacts.yml": "d72e06efcfc154890faff93a1fb12da1ed5418f38dabc073aa4e608f3ab069c6",
+    ".github/workflows/design-artifacts.yml": "a594fe9cc50f87cbecd436dc89d9326682958cb96f9b3fd59ea9ba812af7fce4",
     "crates/davinci-agent/src/host_operation.rs": "9a7984ee65c0348337050b022c53b882890c6f1062065cab84f52d72ff0335a4",
     "crates/davinci-agent/src/lib.rs": "df52712ab3405d3477cd544c4c6ec84d21927d38a951c39486dd27f72745e289",
     "crates/davinci-agent/src/permission.rs": "5fba4974f2445442545979f08585618dad21bc5f23569ec839abbc651fbb90ab",
@@ -114,7 +117,7 @@
     "crates/davinci-coding-agent/src/interaction_testing/browser_backend.js": "5032dd8b3aff64eb61bbffc672955185921db57fb523345c693bf0f33f65c12c",
     "crates/davinci-coding-agent/src/interaction_testing/browser_backend.test.cjs": "7b7e86a3bfc632272152cdba3db3dda2060ab81bb46869d1c45bc11af415e450",
     "crates/davinci-coding-agent/src/interaction_testing/browser_host.js": "5d22d9aac56ca403aab8634348ad3b2484190b128a391a6d7c1b1f71d060e02c",
-    "crates/davinci-coding-agent/src/interaction_testing/browser_process.rs": "c344a9cb5c8a0554ebe167571743a6d94eb81dc6ec10c258b2faff2bde09aae3",
+    "crates/davinci-coding-agent/src/interaction_testing/browser_process.rs": "a5b6cc8671df6fa79081f2bf5794448486f681560ddb7cb34a7cc00a4e09457e",
     "crates/davinci-coding-agent/src/interaction_testing/browser_transport.js": "0b00ff710cf4e4d12834f7f4f8c822f516dc001e9e2e03142bed8f5059e9ca6a",
     "crates/davinci-coding-agent/src/lib.rs": "5a04308dddfc7e079be41712adf49497241a6163e93467a54526ff23085d6e8c",
     "crates/davinci-coding-agent/src/main.rs": "724165913b5c5f969a3d25f4e28ab84a9de064810dddb189a27911b41cb026b7",
@@ -127,7 +130,7 @@
     "crates/davinci-coding-agent/tests/design_controller.rs": "1dd39c0851082808bca5dcbb7785f31bf94654147bb5b1d6d29ed26f3e0405fd",
     "crates/davinci-coding-agent/tests/design_export.rs": "d5036df933787252509d46c866915a9591ca791268a4cf1105a4b61b983369de",
     "crates/davinci-coding-agent/tests/design_generation.rs": "03c00d51510522295e840fb4ba42f72bc88596e6d12e2b517d886fdae3b61564",
-    "crates/davinci-coding-agent/tests/design_handoff.rs": "8e84e8d8ebe8cd7a9c9abcd650c531827dbc7be7a990c6c6a79554b7754d01f0",
+    "crates/davinci-coding-agent/tests/design_handoff.rs": "e24fc0864f5b48b79a9f84589d4ecb141a9701445b4828e9e7266bf5ff4ba705",
     "crates/davinci-coding-agent/tests/design_host.rs": "5909bf46c7a4a25460b089738464379240a9c97e5f62827e0b3e042abba107aa",
     "crates/davinci-coding-agent/tests/design_interaction.rs": "cd2262b91ec128bbfc59d676b71559516935059ef72311423a9d5082e1b54e41",
     "crates/davinci-coding-agent/tests/design_limits.rs": "e6d153af4b6646f78c820496ad55d80ceb82e4ccf2eec933d9804d8a05c5e87e",
@@ -135,7 +138,7 @@
     "crates/davinci-coding-agent/tests/design_profiles.rs": "87bfbbb82cdf537b551cead4ea3eac591ac13b4ec1f793fcfa55d8db95bf4e78",
     "crates/davinci-coding-agent/tests/design_quality.rs": "f155c685c1e20344d8e77207fe2053ed3cf4ae04b0b8473b04d220bbc239c84b",
     "crates/davinci-coding-agent/tests/design_recovery.rs": "94cf59aeb5c8f18f8fb6053e019f5bc2d4494bf9a30fa23b7f6ffe2d0ccd77ae",
-    "crates/davinci-coding-agent/tests/design_runtime.rs": "a7c5d3e89d57f76ca6f220ddb9500d75dd96f6011cc982df0066769c06ea67c4",
+    "crates/davinci-coding-agent/tests/design_runtime.rs": "b415fa517b3149d50e2cc8de75c11296005e3d80e01d0965027982d5c6e4d444",
     "crates/davinci-coding-agent/tests/design_security.rs": "eebe6ac654bb8ce9c2333cf29893f222985531b1377abdebd817c684291f100d",
     "crates/davinci-coding-agent/tests/design_store.rs": "318695a83bb7b964499d268284642e47b1895a6aed168a5d200ba4b6a67a8b52",
     "crates/davinci-coding-agent/tests/design_sync.rs": "2ccf22963689755acb1fd5d01bb7b23e7e50e5e1dc466d224e30abea2982093d",
@@ -157,7 +160,7 @@
   },
   "git_source_blobs": {
     ".gitattributes": "f546e407f238a0edf2a54397c0f8c31ca314a3b3",
-    ".github/workflows/design-artifacts.yml": "f0ea03e2607daa8d7ef721f272531e3774b10210",
+    ".github/workflows/design-artifacts.yml": "9079315315aa9391eaed71baf976e64677b6a21b",
     "crates/davinci-agent/src/host_operation.rs": "dbd9a0145b991dbec5bac20ea0e5af9bf2aaa092",
     "crates/davinci-agent/src/lib.rs": "b0253454ab6add8c0ae308e28988035ce695f395",
     "crates/davinci-agent/src/permission.rs": "66c5c30ddeea64ef4eb776d19b671b3249ec4ce6",
@@ -240,7 +243,7 @@
     "crates/davinci-coding-agent/src/interaction_testing/browser_backend.js": "9e6e4cc2faf3edd4ff94a71f589abf176ad592b5",
     "crates/davinci-coding-agent/src/interaction_testing/browser_backend.test.cjs": "5d9b7c72adc08d20218853f10e50ec49658f85e7",
     "crates/davinci-coding-agent/src/interaction_testing/browser_host.js": "5dde53660692bbae94c14db823c6cd62c83fad0e",
-    "crates/davinci-coding-agent/src/interaction_testing/browser_process.rs": "f9986734aae27acbc2ebcecf62cd2d1c0da8d0f3",
+    "crates/davinci-coding-agent/src/interaction_testing/browser_process.rs": "8156f251b04746e49450be448958d282f87d9eea",
     "crates/davinci-coding-agent/src/interaction_testing/browser_transport.js": "9eaa0f08ac3f2fb8063a74af830ec1721c01d41a",
     "crates/davinci-coding-agent/src/lib.rs": "ef46afbca2590acec87e68b6ac1210630f20e2db",
     "crates/davinci-coding-agent/src/main.rs": "7b74685a2851e2c6756ae9fddbd31a76b13bb8c9",
@@ -253,7 +256,7 @@
     "crates/davinci-coding-agent/tests/design_controller.rs": "73da8ab68e5d523ee7a43fc1ce0afd7d06282272",
     "crates/davinci-coding-agent/tests/design_export.rs": "5a9d580dce43f7514a32f2ea9efe4a85682a1a59",
     "crates/davinci-coding-agent/tests/design_generation.rs": "c003ffabfc4c72d58f0f94b9afd8aadf63602fc6",
-    "crates/davinci-coding-agent/tests/design_handoff.rs": "39ccb8e6067a69d0bd50e262a570d21b12b83c3c",
+    "crates/davinci-coding-agent/tests/design_handoff.rs": "ae8bb80f2f7ac6d92ad76b73045bd390ca831e40",
     "crates/davinci-coding-agent/tests/design_host.rs": "99646cf8aa52293132c22e6019ab8c891a3a7a69",
     "crates/davinci-coding-agent/tests/design_interaction.rs": "99dd4e7bbf3b38b782e79123d423997088fa444a",
     "crates/davinci-coding-agent/tests/design_limits.rs": "98a3f56b7f2861189f868ae539019cfcf343e609",
@@ -261,7 +264,7 @@
     "crates/davinci-coding-agent/tests/design_profiles.rs": "840f318850036d81da8012797ab8a8575af87df7",
     "crates/davinci-coding-agent/tests/design_quality.rs": "37ac7250520eadd009bbd61498208a2f376f625b",
     "crates/davinci-coding-agent/tests/design_recovery.rs": "cfaf28c221c0ba0995eadaa8a561acf71c1a9178",
-    "crates/davinci-coding-agent/tests/design_runtime.rs": "92a33d629d9ab8aef2141f9347e9eb03ebc6d5ff",
+    "crates/davinci-coding-agent/tests/design_runtime.rs": "957e982463b3af8fff001e2044292dd70c60cb8e",
     "crates/davinci-coding-agent/tests/design_security.rs": "597173705743307435ba93b35930a0bc70cd24bb",
     "crates/davinci-coding-agent/tests/design_store.rs": "326910106b90ed10d0d6721c4d6610dd2105f1a3",
     "crates/davinci-coding-agent/tests/design_sync.rs": "af5a1b10cd3a84fc516be2ca9327cf15fbdc94ea",
@@ -281,10 +284,10 @@
     "scripts/design-contracts.py": "6a6e196e4905fb9d76a437dc9ec3803846ddd4ce",
     "scripts/test-design.py": "d9ee602b9b17ec86fabea73ecf9dcc0251669b3f"
   },
-  "git_source_blobs_sha256": "33578f19c35897938915343db474aac6a6ef84992605c7e79525e1df192da872",
+  "git_source_blobs_sha256": "afd9bf807921897b669679dbbb857a759719ce6e3c567e1a2e86feb21c147bf2",
   "local_test_binary": {
     "path": "target/debug/davinci.exe",
-    "sha256": "5b4265c3d51abf168bf74324b9df3ebdac200a7dcc210478490c0f4cb013dcc5",
+    "sha256": "809b0c181bf50bb2e7e8303caa2b8c41379bdda01516913c58f75b002023f01a",
     "installed_launch_path_verified": false
   },
   "runtime": {
@@ -451,6 +454,34 @@
     }
   },
   "logs": {
+    "font-cache-red.log": {
+      "sha256": "d1443c8590525c45e6f16e4b394cabcbf0ea7a2adef74feac2d21915cc92bd2d",
+      "bytes": 1321
+    },
+    "font-cache-green.log": {
+      "sha256": "6d80061dfa61b6f8cf1f540b9dfee2a4a4cedc9c329ab09a26019cb56863ed72",
+      "bytes": 539
+    },
+    "stale-handoff-and-native-compile.log": {
+      "sha256": "7a4b53d15eb2f1fbaca95d9c7706026e80a6bcdf806ac99481f0d210a92e002e",
+      "bytes": 680
+    },
+    "native-hardening-clippy.log": {
+      "sha256": "71e63b55a3b278d1de9340d2dbb4dcf6690b8280433c72371ed43f196b5497cc",
+      "bytes": 1269
+    },
+    "linux-design-ci-8796.log": {
+      "sha256": "484a465ddcd23f06a5c8f8ebe703b45900a4484b93bd90be3d8ae7c5eec15012",
+      "bytes": 53720
+    },
+    "windows-design-ci-8796.log": {
+      "sha256": "5b92865f726bc95ad2df3d133f2d64c2f6beb97135cc24d171e63820f74da6c3",
+      "bytes": 55407
+    },
+    "native-ci-8796.log": {
+      "sha256": "2cfcf0e1ca4466c212643f7fd1e04c0c402d7a7d954f604bda8ba78d227b8043",
+      "bytes": 80156
+    },
     "node-discovery-red.log": {
       "sha256": "a1a700560d9ae6a483452507fe852d0ccbd41170ea5edb3e2a7c77265adbd4b2",
       "bytes": 3063

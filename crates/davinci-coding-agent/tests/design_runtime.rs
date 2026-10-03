@@ -181,3 +181,174 @@ fn native_confined_capture_and_prototype_actions() {
         result.capture.screenshot.sha256
     );
 }
+
+#[test]
+#[ignore = "requires the pinned native Linux sandbox and browser; run native tests serially"]
+fn native_hostile_page_and_process_cleanup() {
+    use davinci_coding_agent::interaction_testing::browser_process::{
+        BrowserProcess, BrowserProcessConfig,
+    };
+    use serde_json::json;
+    assert!(
+        cfg!(target_os = "linux"),
+        "native process inspection requires Linux"
+    );
+    let root = tempfile::tempdir().unwrap();
+    let workspace = root.path().canonicalize().unwrap();
+    let runtime = TrustedDesignRuntime::configured(&workspace).unwrap();
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let address = listener.local_addr().unwrap();
+    let html = format!(
+        r#"<!doctype html><html lang="en"><title>Hostile fixture</title><body><main>Trying requests</main><script>
+        const denied = [
+          fetch('http://{address}/fetch').then(() => false, () => true),
+          new Promise(resolve => {{
+            try {{ const ws = new WebSocket('ws://{address}/socket');
+              ws.onopen = () => {{ ws.close(); resolve(false); }};
+              ws.onerror = () => resolve(true);
+            }} catch {{ resolve(true); }}
+          }}),
+          new Promise(resolve => {{ const image = new Image();
+            image.onload = () => resolve(false); image.onerror = () => resolve(true);
+            image.src = 'http://{address}/image'; document.body.append(image);
+          }})
+        ];
+        Promise.all(denied).then(results => {{ document.querySelector('main').textContent =
+          results.every(Boolean) ? 'Blocked all three requests' : 'NETWORK ESCAPE'; }});
+        </script></body></html>"#
+    );
+    let runtime_directory =
+        std::path::PathBuf::from(std::env::var_os("DAVINCI_DESIGN_RUNTIME").unwrap());
+    let node = std::path::PathBuf::from(std::env::var_os("DAVINCI_DESIGN_NODE").unwrap());
+    // configured() above validates the whole installation before its paths are
+    // used by this direct transport fixture. Do not widen the runtime's API.
+    let manifest: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(runtime_directory.join("runtime-manifest.json")).unwrap(),
+    )
+    .unwrap();
+    let package = runtime_directory.join("node_modules/playwright-core");
+    let environment = BTreeMap::from([
+        (
+            "PLAYWRIGHT_BROWSERS_PATH".into(),
+            manifest["browser"]["cache"].as_str().unwrap().into(),
+        ),
+        (
+            "FONTCONFIG_FILE".into(),
+            runtime_directory
+                .join("fonts.conf")
+                .to_string_lossy()
+                .into_owned(),
+        ),
+    ]);
+    let browser = BrowserProcess::start_design(
+        &SupervisorCommand {
+            executable: env!("CARGO_BIN_EXE_davinci").into(),
+            argv: vec!["--internal-process-supervisor".into()],
+        },
+        BrowserProcessConfig {
+            node: &node,
+            package: &package,
+            version: "1.62.1",
+            workspace: &workspace,
+            environment,
+        },
+        &json!({"files":{"index.html":html},"assets":{},"theme":"light",
+            "reducedMotion":true,"executable":manifest["browser"]["executable"]}),
+    )
+    .unwrap();
+    let send = |value| browser.request(value, Duration::from_secs(30)).unwrap();
+    let opened = send(json!({"op":"open","options":{"origins":["https://design.invalid"]}}));
+    let resource = opened["resource"].as_u64().unwrap();
+    send(
+        json!({"op":"execute","resource":resource,"command":{"action":"navigate","url":"https://design.invalid/index.html"}}),
+    );
+    send(
+        json!({"op":"execute","resource":resource,"command":{"action":"expect_text","text":"Blocked all three requests"}}),
+    );
+    let geometry =
+        send(json!({"op":"execute","resource":resource,"command":{"action":"design_geometry"}}));
+    assert!(!geometry["events"].as_array().unwrap().is_empty());
+    assert_eq!(
+        davinci_coding_agent::design::render::geometry_checks(&geometry).unwrap()["render"].state,
+        davinci_coding_agent::design::records::CheckState::Failed
+    );
+    assert!(
+        matches!(listener.accept(), Err(error) if error.kind() == std::io::ErrorKind::WouldBlock)
+    );
+
+    let processes = linux_processes();
+    let mut descendants = std::collections::BTreeSet::from([std::process::id()]);
+    loop {
+        let before = descendants.len();
+        for (&pid, (parent, _, _)) in &processes {
+            if descendants.contains(parent) {
+                descendants.insert(pid);
+            }
+        }
+        if descendants.len() == before {
+            break;
+        }
+    }
+    descendants.remove(&std::process::id());
+    assert!(
+        descendants.iter().any(|pid| {
+            std::fs::read_to_string(format!("/proc/{pid}/comm"))
+                .is_ok_and(|name| name.contains("chrome"))
+        }),
+        "must observe real Chromium descendants before testing cleanup"
+    );
+    drop(browser);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let current = linux_processes();
+        let alive: Vec<_> = descendants
+            .iter()
+            .filter(|pid| {
+                current.get(pid).is_some_and(|(_, state, started)| {
+                    *state != 'Z' && *started == processes[pid].2
+                })
+            })
+            .collect();
+        if alive.is_empty() {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "browser descendants survived close: {alive:?}"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    if let Some(directory) = std::env::var_os("DAVINCI_DESIGN_EVIDENCE") {
+        std::fs::create_dir_all(&directory).unwrap();
+        std::fs::write(
+            Path::new(&directory).join("native-security.json"),
+            serde_json::to_vec_pretty(&json!({"runtime_hash":runtime.fingerprint(),"blocked_requests":3,"host_connections":0,
+                "observed_descendants":descendants,"all_observed_descendants_stopped":true,
+                "geometry":geometry}))
+            .unwrap(),
+        )
+        .unwrap();
+    }
+}
+
+fn linux_processes() -> BTreeMap<u32, (u32, char, u64)> {
+    std::fs::read_dir("/proc")
+        .unwrap()
+        .filter_map(|entry| {
+            let entry = entry.ok()?;
+            let pid = entry.file_name().to_str()?.parse::<u32>().ok()?;
+            let stat = std::fs::read_to_string(entry.path().join("stat")).ok()?;
+            let (_, fields) = stat.rsplit_once(") ")?;
+            let fields: Vec<_> = fields.split_whitespace().collect();
+            Some((
+                pid,
+                (
+                    fields.get(1)?.parse().ok()?,
+                    fields.first()?.chars().next()?,
+                    fields.get(19)?.parse().ok()?,
+                ),
+            ))
+        })
+        .collect()
+}

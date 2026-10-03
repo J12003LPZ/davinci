@@ -690,7 +690,7 @@ fn draft_is_accounted_resumable_and_supports_new_ui_files_without_applying() {
     }
 }
 #[test]
-fn drafting_cannot_ignore_changes_to_selected_html_outside_static_sync() {
+fn drafting_cannot_ignore_changes_to_selected_html() {
     let (dir, mut agent, store, request) = fixture(true);
     let root = agent.cwd.clone();
     std::fs::write(root.join("page.html"), "<h1>Before</h1>\n").unwrap();
@@ -730,10 +730,7 @@ fn drafting_cannot_ignore_changes_to_selected_html_outside_static_sync() {
         None,
     )
     .unwrap_err();
-    assert!(
-        error.to_string().contains("selected target changed"),
-        "{error}"
-    );
+    assert!(matches!(error, DesignError::StaleSource(_)), "{error}");
     assert_eq!(
         std::fs::read_to_string(root.join("page.html")).unwrap(),
         "concurrent edit"

@@ -578,6 +578,18 @@ fn clean_directory(directory: &Path) {
     }
     let _ = fs::remove_file(directory.join("config.json"));
     let _ = fs::remove_file(directory.join("design.json"));
+    // Fontconfig writes only inside this private cache. Resolve its final target
+    // before recursive removal; a replaced link must never delete another tree.
+    if let (Ok(root), Ok(cache)) = (
+        directory.canonicalize(),
+        directory.join("font-cache").canonicalize(),
+    ) {
+        if cache.parent() == Some(root.as_path())
+            && cache.file_name().is_some_and(|name| name == "font-cache")
+        {
+            let _ = fs::remove_dir_all(cache);
+        }
+    }
     if let Ok(entries) = fs::read_dir(directory) {
         for entry in entries.flatten() {
             let name = entry.file_name();
@@ -596,6 +608,24 @@ fn clean_directory(directory: &Path) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn private_font_cache_is_removed_without_touching_neighbor_data() {
+        let root = tempfile::tempdir().unwrap();
+        let private = root.path().join("browser");
+        fs::create_dir_all(private.join("font-cache/fontconfig")).unwrap();
+        fs::write(private.join("font-cache/fontconfig/cache"), "cache").unwrap();
+        let neighbor = root.path().join("preserved");
+        fs::write(&neighbor, "user data").unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&neighbor, private.join("font-cache/alias")).unwrap();
+        clean_directory(&private);
+        assert!(
+            !private.exists(),
+            "private font cache leaked after browser close"
+        );
+        assert_eq!(fs::read_to_string(neighbor).unwrap(), "user data");
+    }
 
     #[test]
     fn helper_entry() {

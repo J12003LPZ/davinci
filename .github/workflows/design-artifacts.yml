@@ -54,6 +54,8 @@ jobs:
         run: cargo test -p davinci-coding-agent --lib design::publication_tests --locked
       - name: Recovery after physical process termination
         run: cargo test -p davinci-coding-agent --lib design::termination_tests::physical_termination --locked
+      - name: Private browser font cache cleanup
+        run: cargo test -p davinci-coding-agent --lib private_font_cache_is_removed --locked
       - name: Install locked companion development tools
         run: npm --prefix crates/davinci-coding-agent/design-ui ci
       - run: npm --prefix crates/davinci-coding-agent/design-ui run typecheck
@@ -104,15 +106,18 @@ jobs:
         working-directory: crates/davinci-coding-agent/design-ui
         run: npx --no-install playwright install --with-deps chromium
       - name: Pin the native runtime outside the workspace
+        id: runtime
         run: |
           node crates/davinci-coding-agent/design-ui/scripts/install-runtime.cjs "$DAVINCI_DESIGN_RUNTIME"
           echo "DAVINCI_DESIGN_NODE=$(node -p 'process.execPath')" >> "$GITHUB_ENV"
       - name: Strict real compiler, host, confined capture and prototype actions
         shell: bash
+        env:
+          DAVINCI_BROWSER_DIAGNOSTICS: '1'
         run: |
           mkdir -p "$DAVINCI_DESIGN_EVIDENCE"
           set -o pipefail
-          cargo test -p davinci-coding-agent --locked --test design_runtime -- --ignored --nocapture 2>&1 | tee "$DAVINCI_DESIGN_EVIDENCE/native-tests.log"
+          cargo test -p davinci-coding-agent --locked --test design_runtime -- --ignored --nocapture --test-threads=1 2>&1 | tee "$DAVINCI_DESIGN_EVIDENCE/native-tests.log"
       - name: Preserve native gate diagnostics and successful capture evidence
         if: always()
         uses: actions/upload-artifact@v4
@@ -121,6 +126,7 @@ jobs:
           path: ${{ env.DAVINCI_DESIGN_EVIDENCE }}
           if-no-files-found: warn
       - name: Actual managed target handoff and retained screenshot
+        if: ${{ !cancelled() && steps.runtime.outcome == 'success' }}
         run: cargo test -p davinci-coding-agent --locked --test design_handoff native_target_flow -- --ignored --nocapture
       - name: Preserve target handoff receipt
         if: always()
