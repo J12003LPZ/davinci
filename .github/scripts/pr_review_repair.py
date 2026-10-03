@@ -49,6 +49,22 @@ def collect():
     (OUT / "manifest.json").write_text(json.dumps({"base": BASE, "branch": BRANCH, "paths": DATA["paths"]}, indent=2))
 
 
+def finalize_green():
+    path = Path("crates/davinci-coding-agent/src/main.rs")
+    text = path.read_text()
+    warning = '''    if agent.provider == "openai-codex" {
+        let capability = davinci_ai::fast_capability_for_model(&default_agent_dir(), &agent.model_id);
+        if let Err(error) = agent.service_tier.validate_capability(&agent.model_id, capability) {
+            eprintln!("{error}. Preference retained; use /fast to disable Fast or choose a supported model.");
+        }
+    }
+'''
+    anchor = '    apply_resolved_models(parsed, &mut agent)?;\n    startup_mark("models resolved");\n'
+    assert text.count(warning) == 1 and text.count(anchor) == 1
+    text = text.replace(warning, "", 1).replace(anchor, anchor + warning, 1)
+    path.write_text(text)
+
+
 phase = sys.argv[1]
 if phase in ("red", "green"):
     patch = OUT / f"{phase}.patch"
@@ -56,6 +72,7 @@ if phase in ("red", "green"):
     subprocess.run(["git", "apply", "--check", str(patch)], check=True)
     subprocess.run(["git", "apply", str(patch)], check=True)
     if phase == "green":
+        finalize_green()
         rust = [name for name in DATA["paths"] if name.endswith(".rs")]
         run("format", ["rustfmt", "--edition", "2021", "--config", "skip_children=true", *rust])
         run("format-check", ["rustfmt", "--edition", "2021", "--config", "skip_children=true", "--check", *rust])
@@ -63,7 +80,7 @@ if phase in ("red", "green"):
 elif phase in ("test-red", "test-green"):
     red = phase == "test-red"
     prefix = "red" if red else "green"
-    run(f"{prefix}-usage", ["node", "--test", "scripts/tests/subscription-usage.test.mjs", "scripts/tests/subscription-usage-review.test.mjs"], red=red)
+    run(f"{prefix}-usage", ["node", "--test", "--test-reporter=tap", "scripts/tests/subscription-usage.test.mjs", "scripts/tests/subscription-usage-review.test.mjs"], red=red)
     run(f"{prefix}-tier", ["cargo", "test", "-p", "davinci-ai", "--locked", "--lib", "review_"], red=red)
     run(f"{prefix}-design-options", ["cargo", "test", "-p", "davinci-coding-agent", "--locked", "--lib", "review_"], red=red)
     run(f"{prefix}-execution", ["cargo", "test", "-p", "davinci-coding-agent", "--locked", "--bin", "davinci", "review_integration_tests"], red=red)
