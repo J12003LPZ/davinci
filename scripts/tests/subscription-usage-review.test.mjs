@@ -93,3 +93,15 @@ test("cache measurement CLI does not advertise legacy normalized zero as observe
     assert.match(result.stdout, /fresh=unknown/);
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
+
+
+test("telemetry overflow stays unknown even when its attempt was already settled", () => {
+  const one = receipt({ raw_usage: raw, usage_complete: true });
+  const overflow = receipt({ kind: "telemetry_overflow", status: "unknown", raw_usage: raw, usage_complete: true });
+  for (const events of [[one, overflow], [overflow, one]]) {
+    const result = summarize(...events);
+    assert.equal(result.output, null);
+    assert.equal(result.inputTotal, null);
+    assert.equal(result.unknownUsageRecords, 1);
+  }
+});

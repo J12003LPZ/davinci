@@ -81,6 +81,12 @@ export function usageFromEvents(harness, lines) {
       providerEvidence = true;
       const observation = event.observation;
       if (!["attempt_start", "attempt_end", "telemetry_overflow"].includes(observation?.kind)) continue;
+      if (observation.kind === "telemetry_overflow") {
+        // Overflow may reuse an already settled attempt's identifiers. It is
+        // evidence of missing receipts, not a duplicate of that settled attempt.
+        attempts.set(`overflow:${unidentified++}`, { usage: davinciUsage(null), terminal: false });
+        continue;
+      }
       const identified = typeof observation.logical_request_id === "string" && observation.logical_request_id.length > 0 &&
         count(observation.attempt_id) !== null && observation.attempt_id > 0;
       const key = identified ? JSON.stringify([observation.root_id ?? null, observation.actor_id ?? null,
