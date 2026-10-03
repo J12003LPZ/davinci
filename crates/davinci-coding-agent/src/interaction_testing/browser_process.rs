@@ -236,11 +236,19 @@ impl BrowserProcess {
                 )
                 .map_err(|_| "cannot materialize design bundle")?;
             }
+            // The application workspace is intentionally absent inside the
+            // design sandbox. Its host resolves paths against the private
+            // directory; dependency ownership was checked outside the sandbox.
+            let browser_workspace = if design.is_some() {
+                &directory
+            } else {
+                &workspace
+            };
             fs::write(
                 directory.join("config.json"),
                 serde_json::to_vec(&json!({
                     "packagePath": crate::design::runtime::node_path(&package), "version": config.version,
-                    "workspace": crate::design::runtime::node_path(&workspace),
+                    "workspace": crate::design::runtime::node_path(browser_workspace),
                     "design": design.is_some()
                 }))
                 .map_err(|_| "invalid browser host configuration")?,
