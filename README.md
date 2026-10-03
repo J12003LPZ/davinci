@@ -700,11 +700,23 @@ Set `autoVerify` to `false`, or `DAVINCI_AUTO_VERIFY` to `0`, `false`, or `off`,
 to keep the model reminder instead. The environment switch takes precedence
 and also applies when settings are reloaded.
 
-`serviceTier` is optional and applies only to ChatGPT sign-in (Codex) requests.
-`fast` and `priority` request priority processing; `flex` requests flex processing.
-Omit it for the standard tier. Priority processing may consume plan limits faster;
-availability and speed depend on the backend. `DAVINCI_OPENAI_SERVICE_TIER` accepts
-the same values when the setting is absent. Other values omit the request field.
+Fast mode keeps the selected model and reasoning effort on the ChatGPT/Codex
+subscription route; no API key is required. Use `/fast` to toggle Fast and Standard
+for the active session. The choice is saved to user settings for future sessions;
+a failed save is reported as “this run only.” `/status` and the model footer show
+the requested speed. Unknown model capabilities are marked unverified; an explicit
+backend downgrade produces a notice without retrying the turn. Fast is available
+only for OpenAI Codex models; other providers receive no service-tier field and
+show no speed indicator.
+
+In user-level `settings.json`, set `"serviceTier": "fast"`. `priority` remains an
+accepted alias and `flex` remains supported. `standard`/`default` or an omitted
+setting uses Standard, the default. Project settings cannot select the user's tier.
+`DAVINCI_OPENAI_SERVICE_TIER=fast` overrides user settings at startup; `/fast`
+overrides that input for the current session. Invalid values produce a diagnostic
+and use Standard. These settings apply to interactive, print, JSON and RPC calls;
+child agents inherit the host selection. Fast may consume subscription limits
+faster, and availability depends on the model, backend and account.
 
 `effortPolicy` defaults to `fixed`. Opt in with `adaptive` to request lower reasoning
 effort before the turn's first successful edit, the configured effort after an edit,

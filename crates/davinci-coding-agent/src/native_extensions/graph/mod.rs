@@ -355,6 +355,7 @@ pub struct GraphController {
     cwd: PathBuf,
     session_model: Option<String>,
     session_thinking: Option<String>,
+    pub session_service_tier: davinci_ai::CodexServiceTier,
     session_role_models: Option<std::collections::BTreeMap<Role, String>>,
     project_trusted: bool,
     pub memory: Option<crate::native_extensions::SharedVectorMemory>,
@@ -422,6 +423,7 @@ impl GraphController {
             cwd,
             session_model: None,
             session_thinking: None,
+            session_service_tier: davinci_ai::CodexServiceTier::Standard,
             session_role_models: None,
             project_trusted: false,
             memory: None,
@@ -532,6 +534,7 @@ impl GraphController {
             config: loaded.config,
             session_model: self.session_model.clone(),
             session_thinking: self.session_thinking.clone(),
+            session_service_tier: self.session_service_tier,
             project_trusted: self.project_trusted,
             on_update: Arc::new(move |run: &GraphRun, _note: Option<&str>| {
                 *sink

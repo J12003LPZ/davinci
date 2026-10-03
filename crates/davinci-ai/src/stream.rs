@@ -16,6 +16,7 @@ use std::time::{Duration, Instant};
 
 #[derive(Debug, Clone, Default)]
 pub struct StreamOptions {
+    pub service_tier: Option<crate::CodexServiceTier>,
     pub thinking_level: Option<ThinkingLevel>,
     pub thinking_budgets: Option<ThinkingBudgets>,
     /// Provider HTTP idle timeout per socket read, in milliseconds. Defaults to 300 seconds.
@@ -747,6 +748,10 @@ pub fn live_complete_streaming_with_sink_envelope(
     options: &StreamOptions,
     on_event: &mut dyn FnMut(&AssistantMessageEvent),
 ) -> Result<ProviderCompletionEnvelope, String> {
+    options
+        .service_tier
+        .unwrap_or_default()
+        .validate_for_model(model)?;
     let options = options_with_auth_context(options, auth);
     let dump = crate::wire_dump::begin();
     if let Some(dump) = &dump {
@@ -1488,30 +1493,9 @@ fn openai_responses_body(
     tools: &[ToolSpec],
     options: &StreamOptions,
 ) -> Value {
-    let tier = service_tier_from(std::env::var("DAVINCI_OPENAI_SERVICE_TIER").ok().as_deref());
-    openai_responses_body_with_service_tier(model, messages, system, tools, options, tier)
-}
-
-/// Codex's fast setting uses the priority wire value. Unknown values omit it.
-fn service_tier_from(value: Option<&str>) -> Option<&'static str> {
-    match value
-        .map(|value| value.trim().to_ascii_lowercase())
-        .as_deref()
-    {
-        Some("fast" | "priority") => Some("priority"),
-        Some("flex") => Some("flex"),
-        _ => None,
-    }
-}
-
-fn openai_responses_body_with_service_tier(
-    model: &Model,
-    messages: &[ChatMessage],
-    system: Option<&str>,
-    tools: &[ToolSpec],
-    options: &StreamOptions,
-    service_tier: Option<&str>,
-) -> Value {
+    let service_tier = options
+        .service_tier
+        .and_then(crate::CodexServiceTier::request_value);
     let codex = model.api == "openai-codex-responses";
     let retention = crate::cache::cache_retention_from_options(options);
     let cache_capabilities = match model.api.as_str() {
@@ -2767,44 +2751,196 @@ mod tests {
     static REASONING_SUMMARY_ENV_LOCK: Mutex<()> = Mutex::new(());
 
     #[test]
-    fn service_tier_maps_codex_names_to_wire_values() {
-        for value in ["fast", "priority", " FAST "] {
-            assert_eq!(service_tier_from(Some(value)), Some("priority"));
-        }
-        assert_eq!(service_tier_from(Some("Flex")), Some("flex"));
-        assert_eq!(service_tier_from(Some("standard")), None);
-        assert_eq!(service_tier_from(None), None);
-    }
-
-    #[test]
     fn service_tier_is_optional_and_only_sent_on_codex_requests() {
         let mut model = load_builtin_models()
             .into_iter()
-            .find(|model| model.api == "openai-codex-responses")
+            .find(|m| m.api == "openai-codex-responses")
             .unwrap();
         for api in [
             "openai-codex-responses",
             "openai-responses",
             "azure-openai-responses",
+            "openai-completions",
+            "anthropic-messages",
+            "google-generative-ai",
         ] {
             model.api = api.into();
-            for tier in [None, Some("priority"), Some("flex")] {
-                let body = openai_responses_body_with_service_tier(
-                    &model,
-                    &[],
-                    None,
-                    &[],
-                    &StreamOptions::default(),
-                    tier,
-                );
+            for tier in [
+                crate::CodexServiceTier::Standard,
+                crate::CodexServiceTier::Fast,
+                crate::CodexServiceTier::Flex,
+            ] {
+                let options = StreamOptions {
+                    service_tier: Some(tier),
+                    ..Default::default()
+                };
+                let body = request_body_with(&model, &[], None, &[], &options);
                 let expected = if api == "openai-codex-responses" {
-                    tier
+                    tier.request_value()
                 } else {
                     None
                 };
                 assert_eq!(body.get("service_tier").and_then(Value::as_str), expected);
             }
         }
+    }
+
+    #[test]
+    fn fast_service_tier_survives_websocket_continuation() {
+        let model = load_builtin_models()
+            .into_iter()
+            .find(|m| m.api == "openai-codex-responses")
+            .unwrap();
+        let options = StreamOptions {
+            service_tier: Some(crate::CodexServiceTier::Fast),
+            session_id: Some("same-session".into()),
+            thinking_level: Some(ThinkingLevel::High),
+            ..Default::default()
+        };
+        let first = request_body_with(
+            &model,
+            &[ChatMessage::text("user", "hi")],
+            None,
+            &[],
+            &options,
+        );
+        assert_eq!(first["service_tier"], "priority");
+        assert_eq!(first["model"], model.id);
+        assert_eq!(first["reasoning"]["effort"], "high");
+        let (full, _) = crate::codex::build_cached_websocket_request_body(&first, None);
+        assert_eq!(full["service_tier"], "priority");
+        let second = request_body_with(
+            &model,
+            &[
+                ChatMessage::text("user", "hi"),
+                ChatMessage::text("assistant", "hello"),
+                ChatMessage::text("user", "again"),
+            ],
+            None,
+            &[],
+            &options,
+        );
+        let continuation = crate::codex::CachedWebSocketContinuation {
+            last_request_body: first.clone(),
+            last_response_id: "resp_1".into(),
+            last_response_items: serde_json::json!([second["input"][1].clone()]),
+        };
+        let (delta, used) =
+            crate::codex::build_cached_websocket_request_body(&second, Some(&continuation));
+        assert!(used);
+        assert_eq!(delta["service_tier"], "priority");
+        let standard = request_body_with(
+            &model,
+            &[ChatMessage::text("user", "hi")],
+            None,
+            &[],
+            &StreamOptions {
+                service_tier: Some(crate::CodexServiceTier::Standard),
+                ..options.clone()
+            },
+        );
+        assert!(standard.get("service_tier").is_none());
+        assert_eq!(first["prompt_cache_key"], standard["prompt_cache_key"]);
+    }
+
+    #[test]
+    fn fast_service_tier_reaches_oauth_sse_without_api_key() {
+        use std::io::{BufRead, BufReader, Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let server = std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            socket
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let mut request = BufReader::new(&mut socket);
+            let mut length = 0;
+            let mut headers = String::new();
+            loop {
+                let mut line = String::new();
+                assert!(request.read_line(&mut line).unwrap() > 0);
+                if line == "\r\n" {
+                    break;
+                }
+                if let Some(value) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+                    length = value.trim().parse::<usize>().unwrap();
+                }
+                headers.push_str(&line);
+            }
+            let mut body = vec![0; length];
+            if headers
+                .to_ascii_lowercase()
+                .contains("transfer-encoding: chunked")
+            {
+                loop {
+                    let mut size = String::new();
+                    request.read_line(&mut size).unwrap();
+                    let size =
+                        usize::from_str_radix(size.trim().split(';').next().unwrap(), 16).unwrap();
+                    if size == 0 {
+                        request.read_exact(&mut [0; 2]).unwrap();
+                        break;
+                    }
+                    let start = body.len();
+                    body.resize(start + size, 0);
+                    request.read_exact(&mut body[start..]).unwrap();
+                    request.read_exact(&mut [0; 2]).unwrap();
+                }
+            } else {
+                request.read_exact(&mut body).unwrap();
+            }
+            drop(request);
+            socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_fixture\",\"status\":\"completed\",\"service_tier\":\"priority\",\"output\":[],\"usage\":{\"input_tokens\":1,\"output_tokens\":0}}}\n\n").unwrap();
+            let body = if headers
+                .to_ascii_lowercase()
+                .contains("content-encoding: zstd")
+            {
+                zstd::stream::decode_all(body.as_slice()).unwrap()
+            } else {
+                body
+            };
+            let body = serde_json::from_slice::<Value>(&body).unwrap();
+            (headers, body)
+        });
+        let mut model = load_builtin_models()
+            .into_iter()
+            .find(|m| m.api == "openai-codex-responses")
+            .unwrap();
+        model.base_url = Some(base);
+        let auth = ResolvedAuth {
+            api_key: None,
+            headers: [("Authorization".into(), "Bearer fixture-oauth".into())]
+                .into_iter()
+                .collect(),
+            source: "oauth".into(),
+        };
+        let scope = crate::provider_observation::ObservationScope::capture();
+        live_complete_streaming_with_sink(
+            &model,
+            &[ChatMessage::text("user", "hi")],
+            &auth,
+            None,
+            &[],
+            &StreamOptions {
+                service_tier: Some(crate::CodexServiceTier::Fast),
+                transport: Some("sse".into()),
+                max_retries: Some(0),
+                ..Default::default()
+            },
+            &mut |_| {},
+        )
+        .unwrap();
+        let (headers, body) = server.join().unwrap();
+        assert!(headers
+            .to_ascii_lowercase()
+            .contains("authorization: bearer fixture-oauth"));
+        assert_eq!(body["service_tier"], "priority");
+        assert_eq!(body["model"], model.id);
+        let observations = scope.finish("completed");
+        assert_eq!(
+            observations.last().unwrap().service_tier_honored(),
+            Some(true)
+        );
     }
 
     fn output_schema_fixture() -> Value {
