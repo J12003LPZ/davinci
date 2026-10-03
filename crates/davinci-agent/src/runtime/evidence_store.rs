@@ -104,6 +104,21 @@ impl Default for ExecutionReceipt {
 }
 
 impl ExecutionReceipt {
+    /// Execution plus discovery, not proof of requirement or source coverage.
+    /// Old receipts without discovery stay unverified for recognized test runners.
+    pub fn is_verified_check(&self) -> bool {
+        self.is_passed() && (!self.requires_test_discovery() || self.assertion_counts.is_some())
+    }
+
+    pub fn requires_test_discovery(&self) -> bool {
+        let command = match self.argv.as_slice() {
+            [command] => command.as_str(),
+            [] => self.tool_name.as_str(),
+            words => return crate::verification::discovery::runner_words(words).is_some(),
+        };
+        crate::verification::discovery::runner(command).is_some()
+    }
+
     pub fn is_passed(&self) -> bool {
         execution_passed(self.started, self.exit_code, self.timed_out, self.cancelled)
             && !self.killed
@@ -125,7 +140,10 @@ impl ExecutionReceipt {
 
     fn assertions_passed(&self) -> bool {
         if let Some(ref counts) = self.assertion_counts {
-            counts.total > 0 && counts.failed == 0 && counts.passed > 0
+            counts.total > 0
+                && counts.failed == 0
+                && counts.passed > 0
+                && counts.passed.checked_add(counts.skipped) == Some(counts.total)
         } else {
             true
         }

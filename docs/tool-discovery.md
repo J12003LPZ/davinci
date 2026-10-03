@@ -1,5 +1,9 @@
 # Deferred tool discovery and patch inputs
 
+The [October 2 keep/cut record](readiness/openai-harness-implementation.md)
+retains Full as the default. No local fixture result promotes Lean or establishes
+lower end-to-end cost; comparisons must include expanded operations and task success.
+
 `ToolSurface::Lean` remains opt-in. On cache-sensitive routes, a fresh Lean
 root exposes the authorized core: `read`, `grep`, `find`, `ls`, `exec_command`,
 `write_stdin`, `apply_patch`, `batch`, `tool_search`, `update_plan`,

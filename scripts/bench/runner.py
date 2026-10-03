@@ -172,7 +172,7 @@ def stop_reason(stdout, stderr):
             if isinstance(message, dict) and message.get("stopReason") == "error":
                 errors.append(str(message.get("errorMessage", "")))
     text = "\n".join(errors).lower()
-    if any(value in text for value in ("usage limit", "rate limit", "rate_limit", "quota exceeded", "insufficient_quota")):
+    if any(value in text for value in ("usage limit", "usage_limit_reached", "rate limit", "rate_limit", "quota exceeded", "insufficient_quota")):
         return "usage_limit"
     if any(value in text for value in ("unauthorized", "invalid api key", "incorrect api key",
             "authentication failed", "credentials expired", "refresh token expired", "not logged in")):
@@ -247,6 +247,11 @@ def checkpoint_identity(executable, repo):
         raise ValueError("checkpoint requires schema 3 clean committed green-CI build provenance")
     if identity.get("ci_verified") is not True:
         raise ValueError("checkpoint has no green CI proof")
+    features = identity.get("build_features")
+    if (not isinstance(features, list) or any(not isinstance(feature, str) or not feature
+            or feature.split("/")[-1] == "test-fixtures" for feature in features)
+            or not isinstance(identity.get("build_platform"), str) or not identity["build_platform"]):
+        raise ValueError("checkpoint requires explicit non-fixture build features and platform")
     ci = identity.get("ci")
     release_identity.validate_ci(ci, identity.get("repository"), identity.get("source_sha", ""))
     if identity.get("ci_evidence_sha256") != hashlib.sha256(json.dumps(ci, sort_keys=True).encode()).hexdigest():
@@ -264,7 +269,7 @@ def checkpoint_identity(executable, repo):
     if result.returncode or result.stdout.strip() != identity["source_tree"]:
         raise ValueError("checkpoint source commit/tree is unavailable or mismatched")
     return {field: identity[field] for field in
-            ("source_sha", "source_tree", "source_clean", "dirty_diff_hash")}
+            ("source_sha", "source_tree", "source_clean", "dirty_diff_hash", "build_features", "build_platform")}
 
 
 def parent_identity(repo, candidate_sha, base_ref, parent_sha):
@@ -345,7 +350,7 @@ def campaign_identity(root, variant, fixtures, harnesses, model, effort, setting
             raise ValueError("DaVinci executable must be an immutable copy outside the repository")
         executables[harness] = executable
         identities[harness] = {
-            "binary_sha256": file_hash(executable), "version": version,
+            "binary_sha256": file_hash(executable), "version": version, "launch_path": executable,
             **(checkpoint_identity(executable, repo) if harness == "davinci" else {"source_sha": None, "dirty_diff_hash": None}),
             "grading_isolation": isolation,
             "grading_assurance": "diagnostic-only",
@@ -354,6 +359,9 @@ def campaign_identity(root, variant, fixtures, harnesses, model, effort, setting
             "effective_settings": settings if harness == "davinci" else {
                 "ignore_user_config": True, "effort": effort, "service_tier": service_tier(),
                 "telemetry": "local-sanitized-otlp-logs-and-traces"}}
+        identities[harness]["configuration_sha256"] = hashlib.sha256(json.dumps(
+            identities[harness]["effective_settings"], sort_keys=True,
+            separators=(",", ":"), allow_nan=False).encode()).hexdigest()
     return {"schema_version": 2, "campaign": Path(root).name, "variant": variant,
             "fixture_hash": fixtures["fixture_hash"], "model": model,
             "effort_policy": effort, "service_tier": service_tier(),
@@ -577,7 +585,7 @@ def create_campaign(root, manifest):
         json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
 
 
-def isolate_settings(source, target, settings):
+def isolate_settings(source, target, settings, *, subscription_only=False):
     """Restrict host permissions; tools in the same agent remain able to read auth."""
     source, target = Path(source), Path(target)
     auth = source / "auth.json"
@@ -585,8 +593,18 @@ def isolate_settings(source, target, settings):
         raise ValueError("credential file is unavailable in the selected agent directory")
     if auth.is_symlink():
         raise ValueError("linked credential files require an explicit resolved source")
+    credentials = None
+    if subscription_only:
+        store = json.loads(auth.read_text(encoding="utf-8"))
+        oauth = store.get("openai-codex") if isinstance(store, dict) else None
+        if not isinstance(oauth, dict) or oauth.get("type") != "oauth" or not oauth.get("access"):
+            raise ValueError("subscription campaign requires existing Codex OAuth credentials")
+        credentials = {"openai-codex": oauth}
     target.mkdir(parents=True, exist_ok=False, mode=0o700)
-    shutil.copyfile(auth, target / "auth.json")
+    if credentials is None:
+        shutil.copyfile(auth, target / "auth.json")
+    else:
+        (target / "auth.json").write_text(json.dumps(credentials) + "\n", encoding="utf-8")
     (target / "auth.json").chmod(0o600)
     (target / "settings.json").write_text(
         json.dumps(settings, indent=2) + "\n", encoding="utf-8")
@@ -770,14 +788,15 @@ def campaign_lock(campaign):
                 fcntl.flock(lock, fcntl.LOCK_UN)
 
 
-def controlled_environment(inherited, agent_dir):
+def controlled_environment(inherited, agent_dir, *, subscription_only=False):
     """Use copied credentials and declared settings, not inherited experiment knobs."""
     excluded = {"OPENAI_API_KEY", "OPENAI_BASE_URL", "OPENAI_ORG_ID",
                 "OPENAI_PROJECT_ID", "ANTHROPIC_API_KEY", "PYTHONPATH",
                 "PYTHONSTARTUP", "PYTHONOPTIMIZE"}
     result = {key: value for key, value in inherited.items()
               if not key.upper().startswith(("BENCH_", "DAVINCI_", "PI_", "OTEL_"))
-              and key.upper() not in excluded}
+              and key.upper() not in excluded
+              and not (subscription_only and key.upper().endswith(("_API_KEY", "_AUTH_TOKEN")))}
     result.update({"DAVINCI_CODING_AGENT_DIR": str(Path(agent_dir).resolve()),
                    "PI_CODING_AGENT_DIR": str(Path(agent_dir).resolve()),
                    "PI_LEARNING_DISABLE_BACKGROUND": "1", "PYTHONUTF8": "1"})

@@ -349,6 +349,12 @@ mod tests {
                 exit_code: 0,
                 duration_ms: 100,
                 output_tail: "ok".into(),
+                test_discovery: Some(davinci_agent::runtime::evidence::AssertionCounts {
+                    total: 1,
+                    passed: 1,
+                    failed: 0,
+                    skipped: 0,
+                }),
                 skipped: false,
             }],
         };
@@ -367,6 +373,7 @@ mod tests {
                 exit_code: 0,
                 duration_ms: 0,
                 output_tail: "".into(),
+                test_discovery: None,
                 skipped: true,
             }],
         };
@@ -394,6 +401,7 @@ mod tests {
                 exit_code: 1,
                 duration_ms: 100,
                 output_tail: "failed".into(),
+                test_discovery: None,
                 skipped: false,
             }],
         };

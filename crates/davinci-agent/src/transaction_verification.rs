@@ -129,7 +129,7 @@ impl Agent {
                 .find(|receipt| receipt.operation_id == id)
                 .cloned()
         });
-        let receipt = receipt.filter(|receipt| passed && receipt.is_passed());
+        let receipt = receipt.filter(|receipt| passed && receipt.is_verified_check());
         let mut outcomes = Vec::new();
         for pending in observations {
             let result = match receipt

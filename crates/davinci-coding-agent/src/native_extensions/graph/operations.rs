@@ -1819,7 +1819,13 @@ mod tests {
             from_plan: false,
         }];
         let abort = Arc::new(AtomicBool::new(false));
-        let exec = |_: &str, _: &Path, _: &Arc<AtomicBool>, _: u64| (0, "ok".to_string(), 10);
+        let exec = |_: &str, _: &Path, _: &Arc<AtomicBool>, _: u64| {
+            (
+                0,
+                "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s".to_string(),
+                10,
+            )
+        };
         let report = execute_verify_only(
             &mut run,
             dir.path(),
@@ -2024,7 +2030,13 @@ mod tests {
             from_plan: false,
         }];
         let abort = Arc::new(AtomicBool::new(false));
-        let exec = |_: &str, _: &Path, _: &Arc<AtomicBool>, _: u64| (0, "ok".to_string(), 10);
+        let exec = |_: &str, _: &Path, _: &Arc<AtomicBool>, _: u64| {
+            (
+                0,
+                "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s".to_string(),
+                10,
+            )
+        };
         let report = execute_verify_only(
             &mut run,
             dir.path(),

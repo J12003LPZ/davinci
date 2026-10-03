@@ -1,5 +1,28 @@
 //! Conservative verification classification; never grants execution authority.
+pub mod acceptance;
+pub(crate) mod discovery;
 pub(crate) mod workspace;
+
+/// Whether a command invokes a recognized test runner. Recognition does not
+/// imply that its output format is supported or that any tests ran.
+pub fn is_test_runner(command: &str) -> bool {
+    discovery::runner(command).is_some()
+}
+
+/// Parse discovery evidence from the original captured process streams.
+pub fn test_discovery(
+    command: &str,
+    stdout: &[u8],
+    stderr: &[u8],
+) -> Option<crate::runtime::evidence::AssertionCounts> {
+    discovery::counts(command, stdout, stderr)
+}
+
+pub fn tests_passed(counts: &crate::runtime::evidence::AssertionCounts) -> bool {
+    counts.passed > 0
+        && counts.failed == 0
+        && counts.passed.checked_add(counts.skipped) == Some(counts.total)
+}
 use std::collections::{BTreeSet, VecDeque};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
@@ -97,9 +120,13 @@ fn syntax(name: &str, source: &str) -> Option<SyntaxFacts> {
     }
     let mut command = Command::new(&interpreter);
     command.args(["-I", "-S", "-c", include_str!("verification/python_ast.py")]);
-    #[cfg(windows)]
+    // Classification is deterministic; loaded CI must not turn a coverage
+    // regression into a process-start timing test. Production remains bounded.
+    #[cfg(test)]
+    let inspection_budget = Duration::from_secs(10);
+    #[cfg(all(windows, not(test)))]
     let inspection_budget = Duration::from_secs(1);
-    #[cfg(not(windows))]
+    #[cfg(all(not(windows), not(test)))]
     let inspection_budget = Duration::from_millis(250);
     let facts = inspect_command(command, source, inspection_budget)?;
     let mut cache = cache.lock().ok()?;
@@ -355,6 +382,16 @@ fn python_name(name: &str) -> bool {
 
 fn unfiltered_suite(words: &[String]) -> bool {
     let args = match words {
+        [python, module, runner, discover, rest @ ..]
+            if python_name(python)
+                && module == "-m"
+                && runner == "unittest"
+                && discover == "discover" =>
+        {
+            return rest
+                .iter()
+                .all(|arg| matches!(arg.as_str(), "-q" | "--quiet" | "-v" | "--verbose"));
+        }
         [python, module, runner, rest @ ..]
             if python_name(python) && module == "-m" && runner == "pytest" =>
         {
@@ -584,6 +621,14 @@ pub(crate) fn classify_in_workspace(
             let suite = words.join(" ");
             full_workspace |= directory == workspace && unfiltered_suite(&words);
             for path in paths {
+                // unittest selectors and discovery patterns do not establish
+                // coverage of an entire source tree merely by naming tests/.
+                if python
+                    && words.get(2).is_some_and(|runner| runner == "unittest")
+                    && !unfiltered_suite(&words)
+                {
+                    continue;
+                }
                 if let Some(relative) = normalized(&workspace, path)
                     .and_then(|path| path.strip_prefix(&directory).ok().map(Path::to_path_buf))
                 {
@@ -677,6 +722,30 @@ mod tests {
         let mut command = Command::new(interpreter("python").unwrap());
         command.args(["-I", "-S", "-c", "print('x' * 16385)"]);
         assert!(inspect_command(command, "", Duration::from_millis(250)).is_none());
+    }
+
+    #[test]
+    fn focused_unittest_does_not_cover_other_changed_modules() {
+        let root = tempfile::tempdir().unwrap();
+        let paths = [PathBuf::from("app.py"), PathBuf::from("other.py")];
+        for command in [
+            "python -m unittest test_app.TestApp.test_value",
+            "python -m unittest discover -s tests -p test_app.py",
+            "python -m unittest discover -k test_value",
+        ] {
+            let focused = classify_in_workspace("bash", command, root.path(), root.path(), &paths);
+            assert!(!focused.complete, "{command}");
+            assert!(!focused.full_workspace, "{command}");
+        }
+        let whole = classify_in_workspace(
+            "bash",
+            "python -m unittest discover",
+            root.path(),
+            root.path(),
+            &paths,
+        );
+        assert!(whole.complete);
+        assert!(whole.full_workspace);
     }
 
     #[test]

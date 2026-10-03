@@ -49,8 +49,8 @@ def estimate(row, prices):
     uncached, cached, output = metric(row, "uncached_input_tokens"), row.get("cached_tokens"), row.get("output_tokens")
     if rates is None or not all(number(value) for value in (uncached, cached, output)):
         return None
-    # Responses has no separate cache-write charge. Other providers must supply
-    # cache-write tokens and a pinned rate rather than price them as plain input.
+    # Benchmark input is inclusive. Remove R and W exactly once to recover U.
+    # An absent write measurement never establishes a zero route-specific charge.
     written = row.get("cache_write_tokens")
     if not number(written) or written > uncached:
         return None
@@ -81,6 +81,17 @@ def background_summary(rows):
     return result, "separate measured interactive/RPC background calls"
 
 
+def attempt_outcome(row):
+    status = row.get("exit")
+    if type(status) is int:
+        return "completed" if status == 0 else "failed"
+    if status in ("timeout", "supervisor_timeout"):
+        return "timed_out"
+    if status == "aborted":
+        return "aborted"
+    return "unknown"
+
+
 def summarize(rows, prices=None):
     if not rows:
         raise ValueError("readiness summary needs at least one run")
@@ -99,7 +110,22 @@ def summarize(rows, prices=None):
     requests = [row.get("logical_requests") if row.get("request_metrics_complete") is True else None for row in rows]
     tools = [row.get("tool_calls") for row in rows]
     background, scope = background_summary(rows)
+    measured_attempts = available_sum([row.get("usage_complete_attempts") for row in rows])
+    unknown_attempts = available_sum([row.get("usage_unknown_attempts") for row in rows])
+    total_attempts = available_sum([measured_attempts, unknown_attempts])
+    # Separate stage sums are diagnostic. Verification can overlap tools and
+    # workers; no sum of these fields is substituted for host elapsed time.
+    latency = {field: available_sum([
+        row["runtime_stats"].get(field) if isinstance(row.get("runtime_stats"), dict) else None for row in rows])
+        for field in ("wallMs", "preparationMs", "queueMs", "providerMs", "retryWaitMs",
+                      "toolWallMs", "verificationWorkMs", "integrationMs", "digestRetrievalMs", "diagnosticsMs")}
+    waste = {field: available_sum([
+        row["runtime_stats"].get(field) if isinstance(row.get("runtime_stats"), dict) else None for row in rows])
+        for field in ("diagnosticComparableOperations", "diagnosticUnknownOperations",
+                      "repeatedReads", "repeatedSearches", "workerDuplicateOperations")}
     return {"runs": len(rows), "composite_successes": successes, "composite_success_rate": successes / len(rows),
+            "attempt_outcomes": {outcome: sum(attempt_outcome(row) == outcome for row in rows)
+                                 for outcome in ("completed", "failed", "timed_out", "aborted", "unknown")},
             "regression_free_successes": sum(task_success(row) and row.get("regression_pass") is True for row in rows)
                 if all(type(value) is bool for value in regression) else None,
             "regression_observed_runs": sum(type(value) is bool for value in regression),
@@ -110,11 +136,17 @@ def summarize(rows, prices=None):
             "cached_input_per_verified_success": per_success(cached),
             "output_per_verified_success": per_success(output),
             "estimated_usd": costs, "estimated_usd_per_verified_success": per_success(costs),
+            "usage_complete_attempts": measured_attempts, "usage_unknown_attempts": unknown_attempts,
+            "usage_completeness_ratio": measured_attempts / total_attempts if total_attempts else None,
             "median_wall_s": statistics.median(walls) if all(number(value) for value in walls) else None,
             "p90_wall_s": percentile(walls, .9) if all(number(value) for value in walls) else None,
             "model_requests_per_task": available_sum(requests) / len(rows) if available_sum(requests) is not None else None,
             "tool_calls_per_task": available_sum(tools) / len(rows) if available_sum(tools) is not None else None,
             "background_tokens": background, "background_scope": scope,
+            "latency_ms": latency,
+            "read_search_diagnostics": waste,
+            "read_search_scope": "bounded observations in each in-process runtime root; unknown operations and evicted history are not zero waste",
+            "latency_scope": "stage sums across runs; nested and concurrent work may overlap",
             "spend_scope": "all attempted runs, including failures, divided by verified composite successes"}
 
 
@@ -123,6 +155,15 @@ def report(rows, prices=None):
     for harness in sorted({row["harness"] for row in rows}):
         selected = [row for row in rows if row["harness"] == harness]
         arms[harness] = {"all": summarize(selected, prices)}
+        # Startup state must be recorded by the workload owner. Token-cache
+        # hits, repetition number and missing metadata do not establish warmth.
+        startup = {}
+        for state in ("cold", "warm", "unknown"):
+            started = [row for row in selected if
+                       (row.get("startup_state") if row.get("startup_state") in ("cold", "warm") else "unknown") == state]
+            if started:
+                startup[state] = summarize(started, prices)
+        arms[harness]["startup"] = startup
         for size in ("small", "large"):
             sized = [row for row in selected if row.get("size_class", "small" if row.get("task_set") == "legacy" else "large") == size]
             if sized:

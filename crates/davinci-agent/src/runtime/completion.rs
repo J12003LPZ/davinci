@@ -178,11 +178,15 @@ pub fn evaluate_task_completion_with_budget(
 
     let mut checks = Vec::new();
     let mut gaps = Vec::new();
+    let receipts: Vec<_> = receipts
+        .iter()
+        .filter(|receipt| receipt.task_id == Some(task.id) && receipt.attempt == expected_attempt)
+        .collect();
 
     // 1. Implementation: Always required
     let mut impl_passed = false;
     let mut impl_ev = None;
-    for r in receipts {
+    for r in &receipts {
         if r.attempt == expected_attempt
             && r.is_passed()
             && (r.tool_name == "write"
@@ -197,7 +201,7 @@ pub fn evaluate_task_completion_with_budget(
     }
     // If no explicit mutation tool was used, but task has result or is docs-only, check if any passed receipt exists
     if !impl_passed {
-        for r in receipts {
+        for r in &receipts {
             if r.attempt == expected_attempt && r.is_passed() {
                 impl_passed = true;
                 impl_ev = Some(r.receipt_id);
@@ -221,13 +225,7 @@ pub fn evaluate_task_completion_with_budget(
 
     // 2. Targeted Tests: Check contract verification_requirements
     let test_reqs: Vec<String> = contract
-        .map(|c| {
-            c.verification_requirements
-                .iter()
-                .filter(|r| *r != "security" && *r != "security_scan")
-                .cloned()
-                .collect()
-        })
+        .map(|c| c.verification_requirements.clone())
         .unwrap_or_default();
 
     let tests_required = !test_reqs.is_empty();
@@ -235,8 +233,8 @@ pub fn evaluate_task_completion_with_budget(
         for req in test_reqs {
             let mut req_passed = false;
             let mut req_ev = None;
-            for r in receipts {
-                if r.attempt == expected_attempt && r.is_passed() {
+            for r in &receipts {
+                if r.is_verified_check() {
                     // Match exact requirement ID if present
                     if r.requirement_id.as_deref() == Some(&req)
                         || (r.tool_name == "cargo test" && req == "tests")
@@ -279,7 +277,7 @@ pub fn evaluate_task_completion_with_budget(
     if build_required {
         let mut build_passed = false;
         let mut build_ev = None;
-        for r in receipts {
+        for r in &receipts {
             if r.attempt == expected_attempt
                 && r.is_passed()
                 && (r.tool_name == "cargo build" || r.requirement_id.as_deref() == Some("build"))
@@ -322,7 +320,7 @@ pub fn evaluate_task_completion_with_budget(
     if install_required {
         let mut install_passed = false;
         let mut install_ev = None;
-        for r in receipts {
+        for r in &receipts {
             if r.attempt == expected_attempt
                 && r.is_passed()
                 && (r.tool_name == "installed_app"
@@ -466,6 +464,52 @@ mod tests {
         // expected_attempt is 2, old receipt is attempt 1
         let eval = evaluate_task_completion(&task, None, &[old_attempt_receipt], &manifest, 2);
         assert!(!eval.allowed);
+    }
+
+    #[test]
+    fn harness_completion_rejects_another_tasks_receipt() {
+        let dir = tempdir().unwrap();
+        let manifest = SourceManifestBuilder::new(dir.path()).build().unwrap();
+        let task = TaskRecord::new(RunId::new(), "current");
+        let other = TaskRecord::new(task.run_id, "other");
+        let receipt = ExecutionReceipt {
+            task_id: Some(other.id),
+            tool_name: "edit".into(),
+            started: true,
+            exit_code: Some(0),
+            ..Default::default()
+        };
+        assert!(!evaluate_task_completion(&task, None, &[receipt], &manifest, 0).allowed);
+    }
+
+    #[test]
+    fn harness_required_security_is_not_silently_omitted() {
+        let dir = tempdir().unwrap();
+        let manifest = SourceManifestBuilder::new(dir.path()).build().unwrap();
+        let task = TaskRecord::new(RunId::new(), "security required");
+        let contract = TaskContract::new(
+            "security",
+            1,
+            task.id,
+            1,
+            vec!["src/**".into()],
+            vec![],
+            false,
+            vec![],
+            vec!["security_scan".into()],
+            vec![],
+        )
+        .unwrap();
+        let receipt = ExecutionReceipt {
+            task_id: Some(task.id),
+            tool_name: "edit".into(),
+            started: true,
+            exit_code: Some(0),
+            ..Default::default()
+        };
+        assert!(
+            !evaluate_task_completion(&task, Some(&contract), &[receipt], &manifest, 0).allowed
+        );
     }
 
     #[test]

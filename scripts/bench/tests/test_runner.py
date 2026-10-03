@@ -42,6 +42,51 @@ class RunnerTests(unittest.TestCase):
             command = bench.command("codex", "prompt", "workdir")
             self.assertNotIn('service_tier="fast"', command)
 
+    def test_prepared_fixture_contract_preserves_task_and_repository_rules(self):
+        task = "Fix the real issue.\nKeep compatibility and add a regression test."
+        instructions = b"Before edits create a worktree using CLAUDE_CODE_SESSION_ID.\nKeep tests.\n"
+        prompts = []
+        collector = MagicMock()
+        collector.__enter__.return_value = collector
+        collector.records, collector.spans, collector.errors, collector.error_categories = [], [], [], []
+        collector.overrides.return_value = []
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            starter = root / "tasks/case/repo"
+            starter.mkdir(parents=True)
+            (starter.parent / "hidden").mkdir()
+            (starter / "CLAUDE.md").write_bytes(instructions)
+            (starter / "source.txt").write_text("original", encoding="utf-8")
+            (starter.parent / "task.json").write_text(json.dumps({"prompt": task, "allowed": ["source.txt"]}))
+
+            def execute(args, cwd, env, timeout):
+                workdir = Path(cwd)
+                self.assertEqual(workdir.parent.parent, root / "runs")
+                self.assertTrue((workdir / ".git").is_dir())
+                self.assertEqual(bench.checked_git(cwd, "status", "--porcelain").stdout, "")
+                self.assertEqual((workdir / "CLAUDE.md").read_bytes(), instructions)
+                prompt = args[-1]
+                self.assertIn("isolated, single-owner", prompt)
+                self.assertIn("setup is already complete", prompt)
+                self.assertIn("Do not create another checkout or worktree", prompt)
+                self.assertIn("Keep repository coding and testing instructions", prompt)
+                self.assertTrue(prompt.endswith(task))
+                prompts.append(prompt)
+                return {"exit": 0, "stdout": "", "stderr": "", "wall_s": 0,
+                        "started_at": "start", "finished_at": "end", "cleanup_complete": True}
+
+            with (patch.object(bench, "TASKS", str(root / "tasks")),
+                  patch.object(bench, "RUNS", str(root / "runs")),
+                  patch.object(bench, "execute", side_effect=execute),
+                  patch.object(bench, "grade", return_value=(True, 1, 0, "offline fixture")),
+                  patch.object(bench, "Collector", return_value=collector),
+                  patch.object(bench, "request_metrics", return_value={"request_telemetry_complete": False}),
+                  patch("builtins.print")):
+                for harness in ("davinci", "codex"):
+                    bench.run_one(harness, "case", 0)
+            self.assertEqual(prompts[0], prompts[1])
+            self.assertEqual((starter / "CLAUDE.md").read_bytes(), instructions)
+
     def test_pin_model_store_selects_exact_public_profile(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "models-store.json"
@@ -97,7 +142,8 @@ class RunnerTests(unittest.TestCase):
             source = runner.source_identity(repo)
             identity = self.green_identity(binary, source)
             binary.with_suffix(".exe.identity.json").write_text(json.dumps(identity))
-            self.assertEqual(runner.checkpoint_identity(binary, repo), source)
+            validated = runner.checkpoint_identity(binary, repo)
+            self.assertEqual({key: validated[key] for key in source}, source)
             binary.write_bytes(b"changed")
             with self.assertRaises(ValueError):
                 runner.checkpoint_identity(binary, repo)
@@ -130,7 +176,9 @@ class RunnerTests(unittest.TestCase):
             identity = self.green_identity(binary, runner.source_identity(repo))
             for changes in ({"schema_version": 1}, {"dirty_diff_hash": None},
                             {"dirty_diff_hash": "b" * 64}, {"source_clean": False},
-                            {"source_sha": "c" * 40}, {"source_tree": "d" * 40}):
+                            {"source_sha": "c" * 40}, {"source_tree": "d" * 40},
+                            {"build_features": ["test-fixtures"]}, {"build_features": None},
+                            {"build_platform": None}):
                 binary.with_suffix(".exe.identity.json").write_text(json.dumps(dict(identity, **changes)))
                 with self.subTest(changes=changes), self.assertRaises(ValueError):
                     runner.checkpoint_identity(binary, repo)

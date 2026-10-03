@@ -26,6 +26,8 @@ fn codex_simple_completion_streams_and_preserves_compaction_options() {
                 Err(error) => panic!("accept provider request: {error}"),
             }
         };
+        // Windows accepted sockets can inherit the listener's nonblocking mode.
+        socket.set_nonblocking(false).unwrap();
         socket
             .set_read_timeout(Some(Duration::from_secs(5)))
             .unwrap();

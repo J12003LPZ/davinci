@@ -168,7 +168,8 @@ pub(crate) fn send(
         .http_status_as_error(false)
         // Match the existing provider agent: no environment proxy feature.
         .proxy(None)
-        .max_redirects(5)
+        // Budget admission covers exactly one send to the validated endpoint.
+        .max_redirects(if crate::provider_observation::active_budget().is_some() { 0 } else { 5 })
         .timeout_connect(Some(Duration::from_secs(30)))
         .timeout_resolve(Some(Duration::from_secs(30)))
         .timeout_send_request(Some(Duration::from_secs(60)))

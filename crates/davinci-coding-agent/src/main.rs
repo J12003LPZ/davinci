@@ -538,6 +538,14 @@ fn run(raw: Vec<String>) -> Result<i32, String> {
     if let Some(export) = &parsed.export {
         return export_session(&parsed, export);
     }
+    let root_budget = davinci_coding_agent::root_budget::initialize(
+        parsed.root_budget.as_deref().map(Path::new),
+        &launch_dir,
+        parsed.resume
+            || parsed.continue_session
+            || parsed.session.is_some()
+            || parsed.fork.is_some(),
+    )?;
     if let Some(path) = parsed.codex_probe.as_deref() {
         codex_probe::run(&parsed, std::path::Path::new(path))?;
         return Ok(0);
@@ -602,6 +610,9 @@ fn run(raw: Vec<String>) -> Result<i32, String> {
         other => other?,
     };
     startup_mark("agent built");
+    if let Some(budget) = root_budget {
+        agent.bind_root_budget(budget)?;
+    }
     // Evidence older than a week is nobody's: a `read` of its path would
     // have happened in the session that wrote it.
     if let Some(store) = &agent.evidence {
@@ -3997,6 +4008,13 @@ fn run_print_turns(
         })
         .unwrap_or_default();
     // Written before any approval_required, which stays the final line.
+    if json_mode {
+        let encoded = serde_json::to_string(&serde_json::json!({
+            "type": "harness_stats", "schema_version": 1, "runtime": agent.run_stats(),
+        }))
+        .map_err(|err| err.to_string())?;
+        output::write_raw_stdout_line(&encoded).map_err(|err| err.to_string())?;
+    }
     if json_mode && !denied.is_empty() {
         let encoded = serde_json::to_string(&serde_json::json!({
             "type": "denied_actions",
@@ -8751,6 +8769,23 @@ fn format_runtime_stats(runtime: Option<&serde_json::Value>) -> String {
             get("completionHookBlocks"),
             get("completionHookLimitHits")
         ));
+    }
+    for (key, label) in [
+        ("wallMs", "Host elapsed"),
+        ("preparationMs", "Preparation"),
+        ("queueMs", "Queue"),
+        ("providerMs", "Completion adapter"),
+        ("retryWaitMs", "Retry wait"),
+        ("verificationWorkMs", "Verification work (may overlap)"),
+        ("integrationMs", "Integration"),
+        ("digestRetrievalMs", "Digest/retrieval"),
+    ] {
+        let value = runtime
+            .get(key)
+            .and_then(serde_json::Value::as_u64)
+            .map(|ms| format!("{:.3}s", ms as f64 / 1000.0))
+            .unwrap_or_else(|| "unavailable".into());
+        text.push_str(&format!("\n{label}: {value}"));
     }
     text
 }

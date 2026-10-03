@@ -646,6 +646,7 @@ pub fn live_complete_with(
         ));
     }
     let url = request_url_checked(model, auth)?;
+    crate::provider_observation::validate_request(model, auth, &options, body, &url)?;
     let headers = crate::merge_provider_attribution_headers(
         model,
         options.session_id.as_deref(),
@@ -655,7 +656,8 @@ pub fn live_complete_with(
     let timeout_ms = options.timeout_ms.filter(|ms| *ms > 0);
     let (text, observation) = crate::provider_retry::retry_provider_request_controlled(
         || {
-            let observation = crate::provider_observation::Attempt::start("http");
+            let observation = crate::provider_observation::Attempt::try_start("http")
+                .map_err(|error| crate::provider_retry::ProviderError::new(None, error))?;
             match send_provider_body(&url, &headers, body, timeout_ms, false) {
                 Ok(text) => Ok((text, observation)),
                 Err(error) => {
@@ -682,6 +684,7 @@ pub fn live_complete_with(
         None,
         message.usage.clone(),
     );
+    crate::provider_observation::validate_completion()?;
     Ok(message)
 }
 
@@ -698,6 +701,7 @@ fn observe_request(model: &Model, body: &Value) {
         effort,
         &schema_hash,
     );
+    crate::provider_observation::dispatch_options(body);
 }
 
 /// Streaming complete: the events the provider sent, replayed after the fact.
@@ -754,6 +758,9 @@ pub fn live_complete_streaming_with_sink_envelope(
     let result = live_complete_streaming_with_sink_envelope_inner(
         model, messages, auth, system, tools, &options, on_event,
     );
+    if result.is_ok() {
+        crate::provider_observation::validate_completion()?;
+    }
     if let (Some(dump), Ok(envelope)) = (&dump, &result) {
         dump.write(
             "usage",
@@ -801,6 +808,13 @@ fn live_complete_streaming_with_sink_envelope_inner(
     let prepared = crate::responses_request::PreparedProviderRequest::new(body);
     let body = prepared.body();
     observe_request(model, body);
+    crate::provider_observation::validate_request(
+        model,
+        auth,
+        options,
+        body,
+        &request_url_checked(model, auth)?,
+    )?;
     if crate::trace::enabled() {
         crate::trace::log(&format!(
             "prepared stream request segments={} prefix={} bytes={}",
@@ -881,7 +895,8 @@ fn live_complete_streaming_with_sink_envelope_inner(
     crate::trace::log(&format!("sse post {}", crate::trace::redact_url(&url)));
     let (response, observation) = crate::provider_retry::retry_provider_request_controlled(
         || {
-            let observation = crate::provider_observation::Attempt::start("http");
+            let observation = crate::provider_observation::Attempt::try_start("http")
+                .map_err(|error| crate::provider_retry::ProviderError::new(None, error))?;
             match crate::stream_http::send(
                 &url,
                 &headers,
@@ -1016,6 +1031,9 @@ pub fn raw_provider_post(
     url: &str,
     body: &Value,
 ) -> Result<RawProviderReply, String> {
+    if crate::provider_observation::active_budget().is_some() {
+        return Err("root budget denied: unaccounted raw provider probes are unavailable".into());
+    }
     let headers = collect_request_headers(model, auth, &StreamOptions::default());
     let mut request = crate::http::agent(crate::http::PROVIDER_IDLE_TIMEOUT).post(url);
     for (key, value) in &headers {
@@ -1272,7 +1290,7 @@ pub fn request_body_with(
         }
         _ => openai_body(model, messages, system, tools, options),
     };
-    apply_max_tokens_override(&mut body, options);
+    apply_max_tokens_override(model, &mut body, options);
     apply_native_responses_resume(&mut body, model, messages, options);
     body
 }
@@ -1717,13 +1735,33 @@ fn apply_native_responses_resume(
     }
 }
 
-fn apply_max_tokens_override(body: &mut Value, options: &StreamOptions) {
-    let Some(max_tokens) = options.max_tokens.filter(|value| *value > 0) else {
+fn apply_max_tokens_override(model: &Model, body: &mut Value, options: &StreamOptions) {
+    let Some(max_tokens) = crate::provider_observation::bounded_output_limit(options.max_tokens)
+        .filter(|value| *value > 0)
+    else {
         return;
     };
     let Value::Object(map) = body else {
         return;
     };
+    // Only emit explicit host limits on supported dialects. Codex's private
+    // route has no established output-limit contract, so strict admission
+    // refuses it instead of pretending the catalog maximum is enforced.
+    match model.api.as_str() {
+        "openai-responses" | "azure-openai-responses" => {
+            map.insert("max_output_tokens".into(), Value::from(max_tokens));
+        }
+        "openai-completions" => {
+            let field = model
+                .compat
+                .get("maxTokensField")
+                .and_then(Value::as_str)
+                .filter(|field| matches!(*field, "max_tokens" | "max_completion_tokens"))
+                .unwrap_or("max_completion_tokens");
+            map.insert(field.into(), Value::from(max_tokens));
+        }
+        _ => {}
+    }
     if map.contains_key("max_tokens") {
         map.insert("max_tokens".into(), Value::from(max_tokens));
     }
@@ -2439,6 +2477,9 @@ fn google_body(
 /// - openai-responses-shared.ts:561-570 (subtract details from input_tokens)
 /// - bedrock-converse-stream.ts:693 (camelCase converse keys)
 pub(crate) fn usage_from_value(model: &Model, usage: &Value) -> Usage {
+    if usage.get("prompt_tokens").is_some() || usage.get("input_tokens_details").is_some() {
+        crate::provider_observation::record_openai_usage(usage);
+    }
     let get = |key: &str| usage.get(key).and_then(Value::as_u64);
     let base_input = get("prompt_tokens")
         .or_else(|| get("input_tokens"))
@@ -3081,16 +3122,33 @@ mod tests {
         std::sync::mpsc::Sender<()>,
         std::thread::JoinHandle<bool>,
     ) {
-        use std::io::{Read, Write};
+        use std::io::{BufRead, BufReader, Read, Write};
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
         let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
         let server = std::thread::spawn(move || {
             let (mut stream, _) = listener.accept().unwrap();
-            let mut buf = vec![0u8; 65536];
-            let n = stream.read(&mut buf).unwrap();
-            let request = String::from_utf8_lossy(&buf[..n]).to_string();
-            assert!(request.starts_with("POST "), "{request}");
+            // Drain the complete request before closing the socket. A single
+            // read can leave body bytes unread and turn close into a reset on
+            // Windows, discarding the final response frame nondeterministically.
+            stream.set_read_timeout(Some(patience)).unwrap();
+            let mut request = BufReader::new(&mut stream);
+            let mut first_line = String::new();
+            request.read_line(&mut first_line).unwrap();
+            assert!(first_line.starts_with("POST "), "{first_line}");
+            let mut length = 0;
+            loop {
+                let mut line = String::new();
+                assert!(request.read_line(&mut line).unwrap() > 0);
+                if line == "\r\n" {
+                    break;
+                }
+                if let Some(value) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+                    length = value.trim().parse::<usize>().unwrap();
+                }
+            }
+            request.read_exact(&mut vec![0; length]).unwrap();
+            drop(request);
             stream
                 .write_all(
                     b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n",

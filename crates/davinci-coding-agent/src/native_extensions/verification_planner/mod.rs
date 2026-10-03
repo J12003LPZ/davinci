@@ -213,7 +213,51 @@ impl VerificationPlanner {
             &self.config,
             snapshot.as_deref(),
         )?;
-        serde_json::to_value(plan).map_err(|error| error.to_string())
+        use davinci_agent::verification::acceptance::{acceptance_pack, ChangeRisk};
+        let mut risks = Vec::new();
+        if plan
+            .classification
+            .iter()
+            .any(|label| label == "documentation-only")
+        {
+            risks.push(ChangeRisk::Documentation);
+        } else {
+            // File hints may add obligations but cannot prove narrow impact.
+            risks.push(ChangeRisk::Unknown);
+            if plan
+                .changed_files
+                .iter()
+                .any(|path| path.to_ascii_lowercase().contains("migration"))
+            {
+                risks.push(ChangeRisk::Migration);
+            }
+            if plan
+                .classification
+                .iter()
+                .any(|label| label.contains("security"))
+            {
+                risks.push(ChangeRisk::Authorization);
+            }
+            if plan
+                .classification
+                .iter()
+                .any(|label| label.contains("public-api"))
+            {
+                risks.push(ChangeRisk::ApiContract);
+            }
+            if plan
+                .classification
+                .iter()
+                .any(|label| label.contains("frontend") || label.contains("browser"))
+            {
+                risks.push(ChangeRisk::UserInterface);
+            }
+        }
+        let mut value = serde_json::to_value(plan).map_err(|error| error.to_string())?;
+        value["acceptancePacks"] = json!({"schemaVersion": 1,
+            "packs": risks.into_iter().map(acceptance_pack).collect::<Vec<_>>(),
+            "status": "unverified", "source": "observed_change_risk_hints"});
+        Ok(value)
     }
 
     fn resolve_transaction(

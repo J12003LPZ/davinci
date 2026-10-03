@@ -1,8 +1,12 @@
 """Parse host-owned activity, retaining unavailable or incomplete evidence."""
 
+PURPOSES = frozenset({"coding", "worker", "reviewer", "compaction", "learning",
+                      "security_watch", "prewarm", "jev"})
+
 
 def activity(events):
     logical, ended, attempts, attempts_ended = set(), set(), set(), set()
+    owners = {}
     reasons, auto_ids, started_tools, ended_batches = {}, set(), set(), set()
     causes = {}
     auto_runs = batch_children = top_level = after_reminder = 0
@@ -43,10 +47,17 @@ def activity(events):
                 continue
             request = observation.get("logical_request_id")
             purpose = observation.get("purpose")
-            if not isinstance(request, str) or not request or purpose not in ("coding", "prewarm", "jev"):
+            if not isinstance(request, str) or not request or purpose not in PURPOSES:
                 overflow = True
                 continue
             telemetry_seen = True
+            # A logical request cannot change attribution on replay. Treat
+            # conflicting identity as incomplete rather than another paid send.
+            owner = (observation.get("root_id"), purpose, observation.get("actor_id"))
+            if observation.get("root_id") is not None:
+                if request in owners and owners[request] != owner:
+                    overflow = True
+                owners[request] = owner
             key = (purpose, request)
             phase = observation.get("kind")
             if (phase in ("attempt_end", "logical_end")
