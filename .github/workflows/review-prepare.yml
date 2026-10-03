@@ -1,0 +1,62 @@
+name: Prepare and validate PR review fixes
+on:
+  push:
+    branches: [chore/review-fix-preparation-20261003]
+concurrency:
+  group: review-fix-preparation-20261003
+  cancel-in-progress: true
+permissions:
+  contents: read
+env:
+  PI_OFFLINE: '1'
+  CARGO_TERM_COLOR: always
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    outputs:
+      combined: ${{ steps.source.outputs.combined_commit }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: '1.83.0'
+          components: rustfmt
+      - name: Prepare isolated source-only trees
+        id: source
+        run: python3 prepare.py
+  validate:
+    needs: prepare
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.prepare.outputs.combined }}
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: '1.83.0'
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Subscription usage regressions
+        run: node --test scripts/tests/subscription-usage*.test.mjs
+      - name: Formatting
+        run: cargo fmt --all -- --check
+      - name: Fast capability regressions
+        run: cargo test -p davinci-ai --locked --lib service_tier
+      - name: Fast host regressions
+        run: cargo test -p davinci-coding-agent --locked --bin davinci fast::tests
+      - name: Design error and cancellation regressions
+        run: cargo test -p davinci-coding-agent --locked --bin davinci review_regression_tests -- --test-threads=1
+      - name: Design tier propagation regressions
+        run: cargo test -p davinci-coding-agent --locked --lib service_tier_regression_tests
+      - name: Affected crates Clippy
+        run: cargo clippy -p davinci-ai -p davinci-coding-agent --locked --all-targets -- -D warnings
