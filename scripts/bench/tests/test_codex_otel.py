@@ -20,6 +20,34 @@ def payload(attributes):
 
 
 class CodexOtelTests(unittest.TestCase):
+    def test_nearest_sampling_keeps_nested_requests_and_retries_distinct(self):
+        spans = [
+            {"span": "outer", "parent": None, "name": "run_sampling_request", "warmup": None},
+            {"span": "child-a", "parent": "outer", "name": "run_sampling_request", "warmup": None},
+            {"span": "child-b", "parent": "outer", "name": "run_sampling_request", "warmup": None},
+            {"span": "prewarm", "parent": "child-a", "name": "other", "warmup": True},
+        ]
+        records = [{"timeUnixNano": str(i), "span": span,
+                    "event.name": "codex.websocket_request"}
+                   for i, span in enumerate(("outer", "child-a", "child-a", "child-b", "prewarm"))]
+        result = request_metrics(records + records[:1], spans)
+        self.assertEqual(result["provider_attempts"], 5)
+        self.assertEqual(result["logical_requests"], 3)
+        self.assertEqual(result["prewarm_attempts"], 1)
+        self.assertTrue(result["request_telemetry_complete"])
+
+    def test_sampling_requires_complete_acyclic_ancestry_even_for_prewarm(self):
+        for parent in ("missing", "sampling"):
+            for warmup in (None, True):
+                with self.subTest(parent=parent, warmup=warmup):
+                    spans = [{"span": "sampling", "parent": parent,
+                              "name": "run_sampling_request", "warmup": warmup}]
+                    result = request_metrics([{"span": "sampling", "timeUnixNano": "1"}], spans)
+                    self.assertEqual(result["provider_attempts"], 1)
+                    self.assertIsNone(result["logical_requests"])
+                    self.assertIsNone(result["prewarm_attempts"])
+                    self.assertFalse(result["request_telemetry_complete"])
+
     def test_malformed_endpoint_and_warmup_are_controlled_errors(self):
         value = payload({"event.name": "codex.api_request", "endpoint": "unused"})
         value["resourceLogs"][0]["scopeLogs"][0]["logRecords"][0]["attributes"][-1]["value"] = None

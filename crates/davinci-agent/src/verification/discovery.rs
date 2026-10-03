@@ -93,16 +93,21 @@ pub(crate) fn counts(command: &str, stdout: &[u8], stderr: &[u8]) -> Option<Asse
                 .filter(|s| !s.is_empty())
                 .collect();
             let end = *lines.last()?;
-            if end != "OK" {
-                return None;
-            }
+            counts.skipped = if end == "OK" {
+                0
+            } else {
+                end.strip_prefix("OK (skipped=")?
+                    .strip_suffix(')')?
+                    .parse()
+                    .ok()?
+            };
             let summary = lines.iter().rev().nth(1)?.strip_prefix("Ran ")?;
             let (number, rest) = summary.split_once(' ')?;
             if !(rest.starts_with("tests in ") || rest.starts_with("test in ")) {
                 return None;
             }
             counts.total = number.parse().ok()?;
-            counts.passed = counts.total;
+            counts.passed = counts.total.checked_sub(counts.skipped)?;
         }
         _ => return None,
     }
@@ -112,6 +117,33 @@ pub(crate) fn counts(command: &str, stdout: &[u8], stderr: &[u8]) -> Option<Asse
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn standard_unittest_summaries_preserve_actual_pass_and_skip_counts() {
+        let command = "python -m unittest discover";
+        for (summary, total, passed, skipped) in [
+            ("Ran 8 tests in 0.01s\n\nOK\n", 8, 8, 0),
+            ("Ran 8 tests in 0.01s\n\nOK (skipped=4)\n", 8, 4, 4),
+            ("Ran 4 tests in 0.01s\n\nOK (skipped=4)\n", 4, 0, 4),
+            ("Ran 0 tests in 0.01s\n\nOK\n", 0, 0, 0),
+        ] {
+            let result = counts(command, b"", summary.as_bytes()).unwrap();
+            assert_eq!(
+                (result.total, result.passed, result.skipped),
+                (total, passed, skipped)
+            );
+            assert_eq!(crate::verification::tests_passed(&result), passed > 0);
+        }
+        for summary in [
+            "Ran 8 tests in 0.01s\n\nFAILED (failures=1)\n",
+            "Ran 3 tests in 0.01s\n\nOK (skipped=4)\n",
+            "Ran 8 tests in 0.01s\n\nOK (skipped=invalid)\n",
+            "Ran 8 tests in 0.01s\n\nOK (skipped=4294967296)\n",
+            "Ran 8 tests in 0.01s\n\nOK (unexpected successes=1)\n",
+        ] {
+            assert!(counts(command, b"", summary.as_bytes()).is_none());
+        }
+    }
+
     #[test]
     fn harness_zero_tests_and_echoed_pass_are_not_test_success() {
         let zero = b"test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 12 filtered out; finished in 0.00s\n";

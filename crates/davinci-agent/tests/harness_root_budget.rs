@@ -56,7 +56,7 @@ fn subscription_counts_requests_without_claiming_unknown_output_or_cost() {
 #[test]
 fn subscription_unknown_failed_and_changed_model_receipts_halt_after_reopen() {
     use davinci_ai::provider_observation::AttemptBudget;
-    for case in 0..4 {
+    for case in 0..5 {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("budget.json");
         let mut limits = subscription_limits();
@@ -68,15 +68,40 @@ fn subscription_unknown_failed_and_changed_model_receipts_halt_after_reopen() {
             0 => event.status = "failed".into(),
             1 => event.status = "unknown".into(),
             2 => event.returned_model = None,
-            _ => event.returned_model = Some("other".into()),
+            3 => event.returned_model = Some("other".into()),
+            _ => event.status = "cancelled".into(),
         }
         assert!(AttemptBudget::reconcile(&budget, &event).is_err());
         let child = RootBudget::reopen(path, "root", limits).unwrap();
         assert!(child.snapshot().unwrap().halted);
+        assert!(child.release_unsent("request:1").is_err());
+        assert_eq!(child.snapshot().unwrap().unknown, 1);
         event.attempt_id = Some(2);
         assert!(AttemptBudget::reserve(&child, &event, None).is_err());
         assert_eq!(child.snapshot().unwrap().requests, 1);
     }
+}
+
+#[test]
+fn subscription_unsent_release_and_cold_recovery_do_not_fabricate_settlement() {
+    use davinci_ai::provider_observation::AttemptBudget;
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("budget.json");
+    let budget = RootBudget::open(path.clone(), "root", subscription_limits()).unwrap();
+    let event = subscription_event();
+    AttemptBudget::reserve(&budget, &event, None).unwrap();
+    budget.release_unsent("request:1").unwrap();
+    assert_eq!(budget.snapshot().unwrap().requests, 0);
+    let mut sent = event;
+    sent.attempt_id = Some(2);
+    AttemptBudget::reserve(&budget, &sent, None).unwrap();
+    let recovered = RootBudget::reopen(path, "root", subscription_limits()).unwrap();
+    recovered.recover_pending().unwrap();
+    assert_eq!(recovered.snapshot().unwrap().requests, 1);
+    assert_eq!(recovered.snapshot().unwrap().unknown, 1);
+    assert!(recovered.release_unsent("request:2").is_err());
+    sent.attempt_id = Some(3);
+    assert!(AttemptBudget::reserve(&recovered, &sent, None).is_err());
 }
 
 #[test]

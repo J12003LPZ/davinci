@@ -141,10 +141,12 @@ def request_metrics(records, spans, errors=0):
             visited.add(key)
             span = index[key]
             warmup |= span["warmup"] is True
-            if span["name"] == "run_sampling_request":
+            if sampling is None and span["name"] == "run_sampling_request":
                 sampling = key
             key = span["parent"]
-        if key in visited:
+        # Only an explicit root completes the chain. Keep walking after finding
+        # the nearest sampling span to validate ancestry and classify prewarm.
+        if key is not None:
             return result
         if warmup:
             prewarm += 1
