@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "recorded_at_utc": "2026-10-03T17:56:04.555558+00:00",
+  "recorded_at_utc": "2026-10-03T18:09:28.876066+00:00",
   "status": "incomplete_draft_not_release_certified",
   "baseline_commit": "a669549c5356af8110feff589bc15864fce7209b",
   "original_local_snapshot_commit": "d9725d0cb89db8ca07a7d3920ce1a3aaf55a825f",
@@ -17,9 +17,10 @@
     "native-evidence-compile.log": "Compile only: no native runtime was executed again on this unsupported Windows host."
   },
   "platform": "windows-x86_64",
-  "source_files_sha256": "bfb7e88f014a3e3c2f017854e7b17174b51858b49895a4cbaf1f03e4649c48ed",
+  "workflow_validation": "actionlint 1.7.7 passed; optional ShellCheck not installed",
+  "source_files_sha256": "1410564c48290fdc47171436c08c94af971dd804608cf0eb829f3888ec140847",
   "source_files": {
-    ".github/workflows/design-artifacts.yml": "0bfa98e6cf196ddf1c7aa240fb446a4da4eb25747e4c682c0def279591a7b63e",
+    ".github/workflows/design-artifacts.yml": "1f48cfecb9678992a50e6e00b99aba299609c6dec0d273dcc4e9d479bf9b0eb6",
     "crates/davinci-agent/src/host_operation.rs": "9a7984ee65c0348337050b022c53b882890c6f1062065cab84f52d72ff0335a4",
     "crates/davinci-agent/src/lib.rs": "523308e04d89fe194730764f2e1d0149dea134187515960c4818e83b9f45ec1d",
     "crates/davinci-agent/src/permission.rs": "5fba4974f2445442545979f08585618dad21bc5f23569ec839abbc651fbb90ab",
@@ -136,7 +137,7 @@
     "scripts/test-design.py": "5bb56c91919cfe0852a9f11bf705503ffc30dc380c4905da814127f6341ed3b6"
   },
   "git_source_blobs": {
-    ".github/workflows/design-artifacts.yml": "ebb8a6d293f2ab3449e3fe6e2f54b15f6a9e4f2a",
+    ".github/workflows/design-artifacts.yml": "1227b94ae4ea893ceed76ae468c32cd746d96735",
     "crates/davinci-agent/src/host_operation.rs": "dbd9a0145b991dbec5bac20ea0e5af9bf2aaa092",
     "crates/davinci-agent/src/lib.rs": "02269cc3970fc9e7aca470f1fda028cd6af7ef77",
     "crates/davinci-agent/src/permission.rs": "66c5c30ddeea64ef4eb776d19b671b3249ec4ce6",
@@ -252,7 +253,7 @@
     "scripts/design-contracts.py": "3c92527ba34e84fdf970e7553ffeae6a6727e7b4",
     "scripts/test-design.py": "d9ee602b9b17ec86fabea73ecf9dcc0251669b3f"
   },
-  "git_source_blobs_sha256": "b175449435739f98c39c561dc071e8faa178b25b0fdbc07dbda22ca4cd04bbaf",
+  "git_source_blobs_sha256": "17356a7975828104fa921e05c58619e3aeb9761d269e8360044991bd569896da",
   "local_test_binary": {
     "path": "target/debug/davinci.exe",
     "sha256": "0cdb9bb0612e668a0866186ffdfae74478284ad790e6c13395c5b24b2720ca4a",
@@ -521,6 +522,10 @@
     "native-evidence-compile.log": {
       "sha256": "8253d7bb5c9aa754a658918886fc21e7387090a09f39ea4808a2c06fe0ef7534",
       "bytes": 302
+    },
+    "workflow-lint.log": {
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "bytes": 0
     }
   },
   "counts": {

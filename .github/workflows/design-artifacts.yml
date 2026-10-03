@@ -81,14 +81,17 @@ jobs:
     env:
       PI_OFFLINE: '1'
       CARGO_INCREMENTAL: '0'
-      DAVINCI_DESIGN_RUNTIME: ${{ runner.temp }}/design-runtime
-      DAVINCI_DESIGN_EVIDENCE: ${{ runner.temp }}/design-native-evidence
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
           node-version: '24.19.0'
       - run: rustup show
+      - name: Select isolated runtime and evidence directories
+        shell: bash
+        run: |
+          echo "DAVINCI_DESIGN_RUNTIME=$RUNNER_TEMP/design-runtime" >> "$GITHUB_ENV"
+          echo "DAVINCI_DESIGN_EVIDENCE=$RUNNER_TEMP/design-native-evidence" >> "$GITHUB_ENV"
       - name: Install explicit CI confinement and compiler fixtures
         run: |
           sudo apt-get update
