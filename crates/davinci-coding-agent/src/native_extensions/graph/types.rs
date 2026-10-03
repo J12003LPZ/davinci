@@ -1078,6 +1078,7 @@ impl std::error::Error for WorkerError {}
 
 #[derive(Debug, Clone)]
 pub struct WorkerSpec {
+    pub service_tier: davinci_ai::CodexServiceTier,
     pub task_id: String,
     pub role: Role,
     pub expect: ArtifactKind,

@@ -4020,6 +4020,11 @@ pub fn perform(
         }
         // Bare `/thinking` or `/effort`: the model picker opens on the
         // current model, whose effort row adjusts with ←/→.
+        SlashAction::ToggleFast => {
+            let text = crate::toggle_fast(parsed, agent);
+            model.speed_mode = crate::speed_label(agent);
+            Ok(Done::Said(text))
+        }
         SlashAction::SetThinking(level) if level.trim().is_empty() => {
             open_models_sheet(parsed, agent, model);
             Ok(Done::Opened)
@@ -4454,6 +4459,7 @@ fn model_has_credential(parsed: &crate::args::Args, provider: &str, model_id: &s
 /// and the row Cogitator marks as the one in hand all move together.
 fn sync_thinking_state(agent: &Agent, model: &mut Model) {
     model.thinking_level = agent.thinking_level.as_str().to_string();
+    model.speed_mode = crate::speed_label(agent);
     model.thinking_levels = crate::current_runtime_model(agent)
         .map(|runtime| {
             crate::get_supported_thinking_levels(&runtime)

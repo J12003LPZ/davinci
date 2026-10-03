@@ -4,6 +4,7 @@ pub fn fixture(cwd: &Path) -> (WorkerSpec, WorkerSessionBinding) {
     let run_id = store::new_run_id();
     store::create_run_dir(cwd, &run_id).unwrap();
     let mut spec = WorkerSpec {
+        service_tier: davinci_ai::CodexServiceTier::Standard,
         task_id: "private-worker".into(),
         role: super::super::types::Role::Researcher,
         expect: super::super::types::ArtifactKind::Evidence,

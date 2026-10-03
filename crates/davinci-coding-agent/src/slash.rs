@@ -17,6 +17,7 @@ pub fn builtin_slash_commands() -> Vec<SlashCommand> {
             Some("[focus]"),
         ),
         ("settings", "Open settings menu", None),
+        ("fast", "Toggle Fast mode for OpenAI Codex", None),
         ("config", "Open configuration (alias for /settings)", None),
         (
             "model",
@@ -152,6 +153,7 @@ pub enum SlashAction {
     OpenModel,
     SetModel(String),
     SetThinking(String),
+    ToggleFast,
     Export(Option<String>),
     Login {
         provider: String,
@@ -231,6 +233,7 @@ pub fn parse_line(line: &str) -> SlashAction {
         "model" if args.is_empty() => SlashAction::OpenModel,
         "model" => SlashAction::SetModel(args.to_string()),
         "thinking" | "effort" => SlashAction::SetThinking(args.to_string()),
+        "fast" if args.is_empty() => SlashAction::ToggleFast,
         "export" => SlashAction::Export(if args.is_empty() {
             None
         } else {
@@ -413,6 +416,7 @@ mod tests {
 
     #[test]
     fn session_stats_and_info_subcommands_route_to_session_info() {
+        assert_eq!(parse_line("/fast"), SlashAction::ToggleFast);
         assert_eq!(parse_line("/session info"), SlashAction::SessionInfo);
         assert_eq!(parse_line("/session stats"), SlashAction::SessionInfo);
     }

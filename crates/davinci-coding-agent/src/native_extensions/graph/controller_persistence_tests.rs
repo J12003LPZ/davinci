@@ -63,6 +63,7 @@ fn checkpoint_failure_prevents_dispatch_and_preserves_last_durable_state() {
                 config: Default::default(),
                 session_model: None,
                 session_thinking: None,
+                session_service_tier: davinci_ai::CodexServiceTier::Standard,
                 project_trusted: false,
                 on_update: Arc::new(move |run, note| {
                     observed
