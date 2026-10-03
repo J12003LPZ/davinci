@@ -15,6 +15,8 @@ Listing, status, saved source and source export do not require Node or Chromium.
 
 The installer does not install DaVinci globally. A release installation and verification of the actual PATH-resolved executable are separate actions. Font inventories bind evidence to that machine; they do not establish pixel parity across operating systems. Explicit Linux setup resolves installed font links into bounded regular-file copies inside the pinned runtime and creates a private Fontconfig configuration. Runtime requests still reject links and verify the copied hashes. Recreate older Linux bundles with the setup command before rendering.
 
+Linux rendering also requires a host that permits Bubblewrap's user, process and network namespaces. The native CI fixture uses Ubuntu 22.04 and checks this prerequisite before compilation. Ubuntu 24.04's [AppArmor namespace restrictions](https://documentation.ubuntu.com/security/security-features/privilege-restriction/apparmor/) require an appropriate administrator-managed profile; an installed `bwrap` alone does not prove the capability is usable. A namespace denial leaves rendering unavailable. DaVinci does not disable host protections or use an unrestricted browser fallback.
+
 ## Commands and controls
 
 Use `/design` in an existing persistent coding session. The terminal `design` entry point accepts the same arguments; put ordinary DaVinci flags before `design`. UUIDs and revision numbers below are placeholders from `list` or `status`.

@@ -80,7 +80,10 @@ jobs:
 
   native-render:
     if: github.event_name == 'pull_request' || inputs.native_render
-    runs-on: ubuntu-latest
+    # The namespace fixture needs a host that permits unprivileged bwrap setup.
+    # Ubuntu 24.04 requires an administrator-provided AppArmor profile; do not
+    # disable its host protections or relax the application's sandbox policy.
+    runs-on: ubuntu-22.04
     timeout-minutes: 45
     env:
       PI_OFFLINE: '1'
@@ -100,6 +103,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y bubblewrap
+          bwrap --unshare-user-try --unshare-pid --unshare-net --ro-bind / / -- /usr/bin/true
           npm --prefix crates/davinci-coding-agent/design-ui ci
           npm --prefix crates/davinci-coding-agent/design-ui run build
       - name: Install explicit CI Chromium fixture

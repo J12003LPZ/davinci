@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "recorded_at_utc": "2026-10-03T19:31:59.033646+00:00",
+  "recorded_at_utc": "2026-10-03T19:47:33.631543+00:00",
   "status": "incomplete_draft_not_release_certified",
   "baseline_commit": "a669549c5356af8110feff589bc15864fce7209b",
   "original_local_snapshot_commit": "d9725d0cb89db8ca07a7d3920ce1a3aaf55a825f",
@@ -16,8 +16,9 @@
     "publication-green.log": "One focused unit test covers source/manifest/event interruption boundaries and exact retry after reopen.",
     "native-evidence-compile.log": "Compile only: no native runtime was executed again on this unsupported Windows host.",
     "latest_handoff": "handoff-final.log covers nine tests including the real target browser. Later focused stale-input and cancellation checks are separate logs, not a full rerun.",
-    "native-hardening": "Private font-cache cleanup failed before its fix and passed after it; stale-handoff regression passed. The new native hostile-page/process test is compiled but awaits Linux execution.",
-    "native-ci-8796.log": "Linux pinned setup and supervised compiler/host passed; confined capture exited without complete output. This is not native rendering success."
+    "native-hardening": "Private font-cache cleanup failed before its fix and passed after it; stale-handoff regression passed. The new native hostile-page/process test compiled; Linux execution is recorded separately.",
+    "native-ci-8796.log": "Linux pinned setup and supervised compiler/host passed; confined capture exited without complete output. This is not native rendering success.",
+    "native-ci-f2ea.log": "Compiler/host and actual target handoff passed. Both confined tests failed before Chromium because bwrap could not configure its network namespace (RTM_NEWADDR: Operation not permitted). Ubuntu 22.04 fixture pending; policy unchanged."
   },
   "platform": "windows-x86_64",
   "target_browser_evidence": {
@@ -30,11 +31,326 @@
       "bytes": 6582
     }
   },
+  "linux_target_browser_evidence": {
+    "target-handoff.json": {
+      "sha256": "8082c42260b32f6b58cf58b796130f25411152ef2f1d5dbc578e0ac7f9c55b1c",
+      "bytes": 15908
+    },
+    "target-handoff.png": {
+      "sha256": "df5a3ae39035fe36f4e9c485d1b96be2160fc96ef94fc644fab6eeeb9d6a444f",
+      "bytes": 7726
+    }
+  },
+  "remote_validation": {
+    "commit": "f2ea8218b4fd016f8d352818d3b1a36a10a0c491",
+    "run_url": "https://github.com/J12003LPZ/davinci/actions/runs/37148254516",
+    "integration_targets": {
+      "linux-design-ci-f2ea.log": [
+        {
+          "target": "design_acceptance",
+          "state": "ok",
+          "passed": 1,
+          "failed": 0,
+          "ignored": 0
+        },
+        {
+          "target": "design_baseline",
+          "state": "ok",
+          "passed": 3,
+          "failed": 0,
+          "ignored": 0
+        },
+        {
+          "target": "design_budget",
+          "state": "ok",
+          "passed": 2,
+          "failed": 0,
+          "ignored": 0
+        },
+        {
+          "target": "design_commands",
+          "state": "ok",
+          "passed": 3,
+          "failed": 0,
+          "ignored": 0
+        },
+        {
+          "target": "design_controller",
+          "state": "ok",
+          "passed": 2,
+          "failed": 0,
+          "ignored": 0
+        },
+        {
+          "target": "design_export",
+          "state": "ok",
+          "passed": 1,
+          "failed": 0,
+          "ignored": 0
+        },
+        {
+          "target": "design_generation",
+          "state": "ok",
+          "passed": 4,
+          "failed": 0,
+          "ignored": 0
+        },
+        {
+          "target": "design_handoff",
+          "state": "ok",
+          "passed": 8,
+          "failed": 0,
+          "ignored": 1
+        },
+        {
+          "target": "design_host",
+          "state": "ok",
+          "passed": 1,
+          "failed": 0,
+          "ignored": 0
+        },
+        {
+          "target": "design_interaction",
+          "state": "ok",
+          "passed": 1,
+          "failed": 0,
+          "ignored": 0
+        },
+        {
+          "target": "design_limits",
+          "state": "ok",
+          "passed": 2,
+          "failed": 0,
+          "ignored": 0
+        },
+        {
+          "target": "design_model",
+          "state": "ok",
+          "passed": 2,
+          "failed": 0,
+          "ignored": 0
+        },
+        {
+          "target": "design_profiles",
+          "state": "ok",
+          "passed": 2,
+          "failed": 0,
+          "ignored": 0
+        },
+        {
+          "target": "design_quality",
+          "state": "ok",
+          "passed": 1,
+          "failed": 0,
+          "ignored": 0
+        },
+        {
+          "target": "design_recovery",
+          "state": "ok",
+          "passed": 3,
+          "failed": 0,
+          "ignored": 0
+        },
+        {
+          "target": "design_runtime",
+          "state": "ok",
+          "passed": 1,
+          "failed": 0,
+          "ignored": 3
+        },
+        {
+          "target": "design_security",
+          "state": "ok",
+          "passed": 1,
+          "failed": 0,
+          "ignored": 0
+        },
+        {
+          "target": "design_store",
+          "state": "ok",
+          "passed": 5,
+          "failed": 0,
+          "ignored": 0
+        },
+        {
+          "target": "design_sync",
+          "state": "ok",
+          "passed": 1,
+          "failed": 0,
+          "ignored": 0
+        },
+        {
+          "target": "design_types",
+          "state": "ok",
+          "passed": 5,
+          "failed": 0,
+          "ignored": 0
+        },
+        {
+          "target": "design_quality",
+          "state": "ok",
+          "passed": 2,
+          "failed": 0,
+          "ignored": 0
+        }
+      ],
+      "windows-design-ci-f2ea.log": [
+        {
+          "target": "design_acceptance",
+          "state": "ok",
+          "passed": 1,
+          "failed": 0,
+          "ignored": 0
+        },
+        {
+          "target": "design_baseline",
+          "state": "ok",
+          "passed": 3,
+          "failed": 0,
+          "ignored": 0
+        },
+        {
+          "target": "design_budget",
+          "state": "ok",
+          "passed": 2,
+          "failed": 0,
+          "ignored": 0
+        },
+        {
+          "target": "design_commands",
+          "state": "ok",
+          "passed": 3,
+          "failed": 0,
+          "ignored": 0
+        },
+        {
+          "target": "design_controller",
+          "state": "ok",
+          "passed": 2,
+          "failed": 0,
+          "ignored": 0
+        },
+        {
+          "target": "design_export",
+          "state": "ok",
+          "passed": 1,
+          "failed": 0,
+          "ignored": 0
+        },
+        {
+          "target": "design_generation",
+          "state": "ok",
+          "passed": 4,
+          "failed": 0,
+          "ignored": 0
+        },
+        {
+          "target": "design_handoff",
+          "state": "ok",
+          "passed": 8,
+          "failed": 0,
+          "ignored": 1
+        },
+        {
+          "target": "design_host",
+          "state": "ok",
+          "passed": 1,
+          "failed": 0,
+          "ignored": 0
+        },
+        {
+          "target": "design_interaction",
+          "state": "ok",
+          "passed": 1,
+          "failed": 0,
+          "ignored": 0
+        },
+        {
+          "target": "design_limits",
+          "state": "ok",
+          "passed": 2,
+          "failed": 0,
+          "ignored": 0
+        },
+        {
+          "target": "design_model",
+          "state": "ok",
+          "passed": 2,
+          "failed": 0,
+          "ignored": 0
+        },
+        {
+          "target": "design_profiles",
+          "state": "ok",
+          "passed": 2,
+          "failed": 0,
+          "ignored": 0
+        },
+        {
+          "target": "design_quality",
+          "state": "ok",
+          "passed": 1,
+          "failed": 0,
+          "ignored": 0
+        },
+        {
+          "target": "design_recovery",
+          "state": "ok",
+          "passed": 3,
+          "failed": 0,
+          "ignored": 0
+        },
+        {
+          "target": "design_runtime",
+          "state": "ok",
+          "passed": 1,
+          "failed": 0,
+          "ignored": 3
+        },
+        {
+          "target": "design_security",
+          "state": "ok",
+          "passed": 1,
+          "failed": 0,
+          "ignored": 0
+        },
+        {
+          "target": "design_store",
+          "state": "ok",
+          "passed": 5,
+          "failed": 0,
+          "ignored": 0
+        },
+        {
+          "target": "design_sync",
+          "state": "ok",
+          "passed": 1,
+          "failed": 0,
+          "ignored": 0
+        },
+        {
+          "target": "design_types",
+          "state": "ok",
+          "passed": 5,
+          "failed": 0,
+          "ignored": 0
+        },
+        {
+          "target": "design_quality",
+          "state": "ok",
+          "passed": 2,
+          "failed": 0,
+          "ignored": 0
+        }
+      ]
+    },
+    "native_confined_capture": "failed_before_chromium_network_namespace_denied"
+  },
   "workflow_validation": "actionlint 1.7.7 passed; optional ShellCheck not installed",
-  "source_files_sha256": "1f0409fcbd4648a9419f1ee439e073149eabd33044d54d78bcb7101bb6bd50e7",
+  "source_files_sha256": "e8648ebd7d6ea598ad9c1ce34ba249b89f8f1eac4245a4081722bf8f0780663c",
   "source_files": {
     ".gitattributes": "c692c1168246fea7980c8562efae5889afa7eac2df20a6408cc0a92c5271b8e7",
-    ".github/workflows/design-artifacts.yml": "a594fe9cc50f87cbecd436dc89d9326682958cb96f9b3fd59ea9ba812af7fce4",
+    ".github/workflows/design-artifacts.yml": "a36bc7084f26f8962c9e1b7877edb72c0b5b059b01c8883bd9dd8acd5ac725c9",
     "crates/davinci-agent/src/host_operation.rs": "9a7984ee65c0348337050b022c53b882890c6f1062065cab84f52d72ff0335a4",
     "crates/davinci-agent/src/lib.rs": "df52712ab3405d3477cd544c4c6ec84d21927d38a951c39486dd27f72745e289",
     "crates/davinci-agent/src/permission.rs": "5fba4974f2445442545979f08585618dad21bc5f23569ec839abbc651fbb90ab",
@@ -149,7 +465,7 @@
     "crates/davinci-evals/tests/design_quality.rs": "c0ae61e6fe52d7663df9465f047f30d28d6ab74eb645e1c99edbf56095f7c8dc",
     "crates/davinci-session/src/lib.rs": "39d0c6a989dbf060f0c0fc7fe0f82f02ba0df339cbcbad6c6e17787ad2dac231",
     "docs/design-artifacts-baseline.md": "4f12f11d38417ce05d9c19952e1f2a7f8fc2fc1b0df3626b7ed70b333645b08f",
-    "docs/design-artifacts.md": "aef2f70a4fc178743a9952c977916ca735645ab6d7b79f6f1b62b28df7792d26",
+    "docs/design-artifacts.md": "cf8f48b8642c3baa30eed1c41ad5ec9a70e0d095d9bba105cf6c5f19afb10b0d",
     "docs/evals/design/fixtures/reference.md": "ecc44ceb8207d6774e085942511ae00511b1e2ae61cad7dacecfbc7392cf4dd3",
     "docs/evals/design/manifest.json": "bfe56ce30deb02c399d6667f35b69fb4fc571ea2ec1bfe56c70c53cd8519c581",
     "docs/evals/design/protocol.md": "9ee664e7984d27fb1bb802f5ce6bb5ddeb05bb3546bd29bd594d662b688326ae",
@@ -160,7 +476,7 @@
   },
   "git_source_blobs": {
     ".gitattributes": "f546e407f238a0edf2a54397c0f8c31ca314a3b3",
-    ".github/workflows/design-artifacts.yml": "9079315315aa9391eaed71baf976e64677b6a21b",
+    ".github/workflows/design-artifacts.yml": "95bae35929eb03cba38b1a2008f0e8c18723e7be",
     "crates/davinci-agent/src/host_operation.rs": "dbd9a0145b991dbec5bac20ea0e5af9bf2aaa092",
     "crates/davinci-agent/src/lib.rs": "b0253454ab6add8c0ae308e28988035ce695f395",
     "crates/davinci-agent/src/permission.rs": "66c5c30ddeea64ef4eb776d19b671b3249ec4ce6",
@@ -275,7 +591,7 @@
     "crates/davinci-evals/tests/design_quality.rs": "1d35d74d0ffd1d3bc2f8f378672259e09b75c186",
     "crates/davinci-session/src/lib.rs": "0e2f6b69d786f45b97768125e3ce14c5aa632311",
     "docs/design-artifacts-baseline.md": "9abd9c704730753467c36fbe5d8800c1c9eef12f",
-    "docs/design-artifacts.md": "7ea53a6117d58d1466553846b7a768b14b642af1",
+    "docs/design-artifacts.md": "8f3357f258aaa400848ac3ae7ca49da36060001f",
     "docs/evals/design/fixtures/reference.md": "b863a75dd030ab30dd4717b32d34d0dfb31ea44f",
     "docs/evals/design/manifest.json": "f5f5b04df2c6ad34b46e6bf5ccbd6ee3f08d57b7",
     "docs/evals/design/protocol.md": "66feb72398419c4f827dc35f63bf76a26c6674c6",
@@ -284,7 +600,7 @@
     "scripts/design-contracts.py": "6a6e196e4905fb9d76a437dc9ec3803846ddd4ce",
     "scripts/test-design.py": "d9ee602b9b17ec86fabea73ecf9dcc0251669b3f"
   },
-  "git_source_blobs_sha256": "afd9bf807921897b669679dbbb857a759719ce6e3c567e1a2e86feb21c147bf2",
+  "git_source_blobs_sha256": "3bd724204aaaf52b544f826eee34bc714771fc8f7dcdc865ed63fcc302eedac2",
   "local_test_binary": {
     "path": "target/debug/davinci.exe",
     "sha256": "809b0c181bf50bb2e7e8303caa2b8c41379bdda01516913c58f75b002023f01a",
@@ -454,6 +770,18 @@
     }
   },
   "logs": {
+    "linux-design-ci-f2ea.log": {
+      "sha256": "ed0c06bb5ce3f606ef608d2d0f7f8553b6c354bf6766b22a94eed36795c6dcf6",
+      "bytes": 110519
+    },
+    "windows-design-ci-f2ea.log": {
+      "sha256": "4a2604a9216e837b0bed84b3ecbff0d6bb31747ee196f3db5eb00088fd06d91a",
+      "bytes": 97443
+    },
+    "native-ci-f2ea.log": {
+      "sha256": "f7fcd392fb186fbb12115c26151f91073d3a0abb38f6a4ab15c03b5dc4887390",
+      "bytes": 83262
+    },
     "font-cache-red.log": {
       "sha256": "d1443c8590525c45e6f16e4b394cabcbf0ea7a2adef74feac2d21915cc92bd2d",
       "bytes": 1321
