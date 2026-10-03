@@ -1,4 +1,34 @@
-# OpenAI cache and Responses efficiency
+# Codex subscription efficiency and OpenAI compatibility
+
+## Subscription priority
+
+DaVinci's primary workflow here is ChatGPT-authenticated `openai-codex`, without
+an API key. Optimize completed, verified tasks per subscription usage. Public
+API compatibility below is background information, not a recommendation to
+enable API-only options on the Codex backend.
+
+The October 3 changes replace duplicated repository instructions with a focused
+`AGENTS.md` and remove `CLAUDE.md`. Stable and Preview prompts on `openai-codex`
+use a stable subscription strategy: batch independent reads, load selected skill
+bodies, avoid mandatory planner/reviewer/tournament calls, and preserve the chosen
+model and reasoning effort. Legacy prompts and other provider routes retain their
+existing behavior. Existing native replay, authorized tool-prefix freezing and
+cache-aware pruning remain the foundation; no speculative backend cache features
+or automatic model downgrades are introduced.
+
+`scripts/compare-codex.mjs` and `scripts/measure-codex-cache.mjs` report observed
+tokens and timing. Missing usage is unknown, not zero. Comparison pass rates
+include failed attempts and require both a successful harness exit and successful
+task checks. Transcripts can omit retries and auxiliary calls; these scripts alone
+do not establish total account usage or savings.
+
+API token prices cannot estimate included subscription allowance. Purchased
+credits and included usage have separate rules; consult the account usage dashboard
+and [official Codex pricing](https://learn.chatgpt.com/docs/pricing).
+The [skills and prompts guidance](https://developers.openai.com/blog/rethinking-skills-and-prompts-for-gpt-6-astra)
+supports concise instructions and selective loading. No live savings result is
+claimed for these changes. Rebuild/restart DaVinci to load the runtime changes and
+start a fresh coding session to load repository instructions.
 
 The [October 2 implementation record](readiness/openai-harness-implementation.md)
 documents raw-usage completeness, root budgets, retained defaults and unmeasured
@@ -176,19 +206,23 @@ Prepared on 2026-09-24 from the current `main` branch.
 - Capability-ready Codex cache-policy plumbing. New explicit cache options remain disabled unless model compatibility data is backed by a successful probe.
 - ChatGPT Codex usage-window parsing, threshold warnings, `usage_limit_reached` retry suppression, and `/cache-status` visibility.
 - Economy-model routing for read-only graph roles during `openai-codex/*` sessions. Set `graphEconomyModel` or `DAVINCI_GRAPH_ECONOMY_MODEL`; use `off` to disable it.
-- Accumulated provider USD cost in cache telemetry and an explicitly labeled ChatGPT-plan credit estimate in `/cache-status`.
+- Accumulated provider USD cost in cache telemetry. `/cache-status` retains `codexCreditsEstimate` as null with an unavailable explanation; API prices do not establish subscription usage.
 - Cache measurement and Codex CLI comparison scripts.
 
-### Awaiting live backend evidence
+### Backend evidence and remaining measurements
 
-The following plan items are intentionally not enabled until the explicit authenticated backend probe records support:
+The September 26 authenticated probe in [the probe record](cache/codex-backend-probe.md)
+supersedes the earlier pending status. Rejected request shapes remain disabled;
+public API support is insufficient to enable them on the subscription route.
+The recorded outcomes distinguish rejected shapes from accepted requests whose
+full behavior remains unverified:
 
 - prompt-cache TTL and explicit bootstrap breakpoints in the model catalog;
-- freeform grammar `apply_patch` request wiring;
+- freeform grammar `apply_patch` request wiring (request shape accepted; application semantics require validation);
 - `additional_tools` late-tool delivery;
-- cache-sharing compaction using `tool_choice: "none"`;
+- cache-sharing compaction using `tool_choice: "none"` (shape accepted, with zero observed cache reuse);
 - the remote `/responses/compact` decision;
-- final Codex usage-header names if the live backend differs from the conservative parser names.
+- usage-window parsing against the observed header names (names alone do not prove parser correctness).
 
 Live before/after cache measurements and Codex CLI comparison results are also pending. The implementation does not commit synthetic benchmark numbers or claim probe acceptance without an authenticated run.
 
@@ -199,5 +233,5 @@ This plan was re-audited against current `main` at `0cadf67d0081b969ac0b8fc495c0
 - The cache-stable turn path is wired through the production host: OpenAI reasoning routes commit the persisted turn-context message, install the runtime capability registry, then freeze the authorized provider tool schema before provider dispatch.
 - Non-OpenAI families retain system-prompt turn state.
 - The branch adds regressions that prove those two compatibility/cache invariants, including that `tool_search` cannot mutate the provider `tools` prefix after the OpenAI cache freeze.
-- Backend-specific features remain evidence-gated. `docs/cache/codex-backend-probe.md` still records the authenticated probe as not run, so freeform grammar `apply_patch`, `additional_tools`, cache-sharing compaction, and remote compaction remain disabled or unimplemented as required by the plan.
+- At the time of this September 25 audit the authenticated probe had not run. The September 26 probe record now supersedes that status; backend-specific features remain evidence-gated.
 - Live cache measurements, Codex CLI comparison runs, and installed-executable delivery were not repeated in this audit because the connected development device was offline. No synthetic probe or benchmark result is substituted for those gates.
