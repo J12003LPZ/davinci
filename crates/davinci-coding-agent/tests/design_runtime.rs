@@ -265,7 +265,8 @@ fn native_hostile_page_and_process_cleanup() {
           fetch('http://{address}/fetch').then(() => false, () => true),
           new Promise(resolve => {{
             try {{ const ws = new WebSocket('ws://{address}/socket');
-              ws.onopen = () => {{ ws.close(); resolve(false); }};
+              ws.onmessage = () => {{ ws.close(); resolve(false); }};
+              ws.onclose = event => resolve([1006, 1008].includes(event.code));
               ws.onerror = () => resolve(true);
             }} catch {{ resolve(true); }}
           }}),
@@ -317,7 +318,11 @@ fn native_hostile_page_and_process_cleanup() {
             "reducedMotion":true,"executable":manifest["browser"]["executable"]}),
     )
     .unwrap();
-    let send = |value| browser.request(value, Duration::from_secs(30)).unwrap();
+    let send = |value: serde_json::Value| {
+        browser
+            .request(value.clone(), Duration::from_secs(30))
+            .unwrap_or_else(|error| panic!("native fixture request {value} failed: {error}"))
+    };
     let opened = send(json!({"op":"open","options":{"origins":["https://design.invalid"]}}));
     let resource = opened["resource"].as_u64().unwrap();
     send(
